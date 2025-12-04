@@ -1,0 +1,39 @@
+{
+  "name": "nexustrade-topg",
+  "version": "1.0.0",
+  "description": "Solana Trading Bot",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whojosegonzalez/NeXusTrade-TopG.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/whojosegonzalez/NeXusTrade-TopG/issues"
+  },
+  "homepage": "https://github.com/whojosegonzalez/NeXusTrade-TopG#readme",
+  "dependencies": {
+    "@jup-ag/api": "^6.0.47",
+    "@prisma/client": "^7.1.0",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.13.2",
+    "bs58": "^6.0.0",
+    "chalk": "^5.6.2",
+    "decimal.js": "^10.6.0",
+    "dotenv": "^17.2.3",
+    "winston": "^3.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "nodemon": "^3.1.11",
+    "prisma": "^7.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
