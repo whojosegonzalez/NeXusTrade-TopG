@@ -10,18 +10,19 @@ This document tracks the phased rollout of the NeXusTrade bot, moving from a loc
 - [x] **Safety Rails:** `ConfigManager` to enforce `SIMULATION_MODE`.
 - [x] **Persistence:** Session and Trade tables defined and migrated.
 
-## 🏗️ Phase 2: The Sensory System (Current)
+## ✅ Phase 2: The Sensory System (Current)
 **Goal:** Detect new tokens and filter out scams immediately.
 - [x] **Scanner Module:** Poll Helius RPC for new Raydium Pools.
 - [x] **Risk Engine:** Implement "Rug Check" (Mint/Freeze authority) using Helius DAS.
 - [x] **Data Pipeline:** Save detected tokens to the `TokenRadar` database table.
 
-## 🏗️ Phase 3: The Strategy Engine (The Brain)
+## ✅ Phase 3: The Strategy Engine (The Brain)
 **Goal:** Decide *when* to buy based on math, not just hype.
-- [x] **Session Manager:** Track real-time P/L and enforce "Stop Loss" limits.
-- [x] **Scoring Logic:** Implement basic strategy rules (Risk > 80, Liquidity checks).
-- [ ] **Position Manager:** Track open simulated trades (Entry vs Current Price).
-- [x] **Simulation Loop:** The "Tick" loop (Scan -> Risk -> Decide -> Trade).
+- [x] **Session Manager:** Track real-time P/L, Stop Loss, and Max Positions.
+- [x] **Scoring Logic:** Implement basic strategy rules (Risk > 80).
+- [x] **Simulation Loop:** Full cycle (Scan -> Risk -> Decide -> Trade).
+- [x] **Real-World Paper Trading:** Integrated Jupiter Price Oracle for realistic simulation.
+- [x] **Position Manager:** Track prices and sell at +30% profit or -30% loss.
 
 ## ⏳ Phase 4: The Live Engine (The Hands)
 **Goal:** Swap "Monopoly Money" for real SOL.

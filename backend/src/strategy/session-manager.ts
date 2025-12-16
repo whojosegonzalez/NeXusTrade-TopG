@@ -1,22 +1,23 @@
 import { prisma } from '../database/client';
 
 export interface SessionConfig {
-    startBalance: number;  // e.g., 10.0 SOL
-    targetProfit: number;  // e.g., 15.0 SOL (Stop when we hit this)
-    stopLoss: number;      // e.g., 8.0 SOL (Stop when we drop to this)
+    startBalance: number;
+    targetProfit: number;
+    stopLoss: number;      // Realized PnL limit
+    maxPositions: number;  // NEW: Max open trades allowed
+    tradeSizeSOL: number;  // NEW: Amount to buy per trade
 }
 
 export class SessionManager {
     private sessionId: string | null = null;
-    private config: SessionConfig | null = null;
+    public config: SessionConfig | null = null; // Changed to public for easy access
+    private realizedPnL: number = 0;
 
-    /**
-     * Starts a new trading session or resumes an active one.
-     */
     async start(config: SessionConfig): Promise<string> {
         this.config = config;
+        this.realizedPnL = 0;
 
-        // 1. Check for an existing active session to resume (safety feature)
+        // Resume active session logic...
         const activeSession = await prisma.session.findFirst({
             where: { status: 'ACTIVE' }
         });
@@ -24,17 +25,16 @@ export class SessionManager {
         if (activeSession) {
             console.log(`🔄 Resuming Active Session: ${activeSession.id}`);
             this.sessionId = activeSession.id;
-            // Update our local config with what was in the DB
-            this.config = {
-                startBalance: activeSession.startBalance,
-                targetProfit: activeSession.targetProfit,
-                stopLoss: activeSession.stopLoss
-            };
+            // Note: In a full app, we would load these specific values from DB extra columns
+            // For now, we assume the passed config is correct for resume
             return this.sessionId;
         }
 
-        // 2. Create a fresh session
-        console.log(`🆕 Starting New Session with ${config.startBalance} SOL...`);
+        console.log(`🆕 Starting New Session...`);
+        console.log(`   💰 Balance: ${config.startBalance} SOL`);
+        console.log(`   🎲 Trade Size: ${config.tradeSizeSOL} SOL`);
+        console.log(`   ✋ Max Positions: ${config.maxPositions}`);
+
         const session = await prisma.session.create({
             data: {
                 status: 'ACTIVE',
@@ -49,53 +49,48 @@ export class SessionManager {
         return this.sessionId;
     }
 
-    /**
-     * Updates the current balance and checks for Stop Loss / Take Profit hits.
-     */
-    async updateBalance(newBalance: number): Promise<{ status: 'CONTINUE' | 'STOP', reason?: string }> {
+    async updateBalance(newBalance: number, tradePnL: number = 0): Promise<{ status: 'CONTINUE' | 'WIND_DOWN', reason?: string }> {
         if (!this.sessionId || !this.config) throw new Error("Session not started");
 
-        // 1. Update DB
+        this.realizedPnL += tradePnL;
+
         await prisma.session.update({
             where: { id: this.sessionId },
             data: { currentBalance: newBalance }
         });
 
-        // 2. Check Guard Rails
+        // 1. Global Take Profit
         if (newBalance >= this.config.targetProfit) {
-            await this.end('TAKE_PROFIT');
-            return { status: 'STOP', reason: 'Target Profit Hit 🚀' };
+            return { status: 'WIND_DOWN', reason: 'Global Take Profit Hit 🚀' };
         }
 
-        if (newBalance <= this.config.stopLoss) {
-            await this.end('STOP_LOSS');
-            return { status: 'STOP', reason: 'Stop Loss Hit 🛑' };
+        // 2. Global Stop Loss (Realized)
+        // e.g. Start 10, StopLoss 8. Max Loss allowed is 2.
+        // If realizedPnL is -2.1, we stop.
+        const maxLoss = -Math.abs(this.config.stopLoss - this.config.startBalance);
+        
+        if (this.realizedPnL <= maxLoss) {
+            return { status: 'WIND_DOWN', reason: 'Global Stop Loss Hit (Realized) 🛑' };
         }
 
         return { status: 'CONTINUE' };
     }
 
-    /**
-     * Closes the session properly.
-     */
     async end(reason: string): Promise<void> {
         if (!this.sessionId) return;
-
-        console.log(`🛑 Ending Session: ${reason}`);
+        console.log(`🛑 Closing Session: ${reason}`);
         await prisma.session.update({
             where: { id: this.sessionId },
             data: {
                 status: 'COMPLETED',
                 endTime: new Date(),
-                // We store the reason in a generic way or add a column later.
-                // For now, status 'COMPLETED' implies a clean exit.
             }
         });
-
         this.sessionId = null;
     }
     
-    getSessionId(): string | null {
-        return this.sessionId;
+    // Helper to get config
+    getConfig() {
+        return this.config;
     }
 }
