@@ -13,22 +13,24 @@
 
 ## 2. Scanner Module (The Eyes)
 **Location:** `/backend/src/scanners`
-**Status:** ✅ Phase 2.1 Complete
+**Status:** ✅ Phase 2 Complete
 
 | File | Purpose | Key Functions | Status |
 | :--- | :--- | :--- | :--- |
 | `interfaces.ts` | **Contract:** Defines standard `TokenCandidate` & `IScanner`. | `TokenCandidate` | ✅ Ready |
 | `helius.ts` | **Implementation:** Polls Helius for Raydium liquidity events. | `start()`, `scan()` | ✅ Ready |
 | `../test-scanner.ts`| **Validation:** Runs the scanner in isolation to verify data. | `main()` | ✅ Ready |
+| `../test-integrated.ts` | **Validation:** Runs Scanner + Risk Loop (Integration Test). | `main()` | ✅ Ready |
 
 ## 3. Risk Engine (The Firewall)
 **Location:** `/backend/src/risk`
-**Status:** 🏗️ Phase 2.2 In Progress
+**Status:** ✅ Phase 2 Complete
 
-| File | Purpose | Status |
-| :--- | :--- | :--- |
-| `interfaces.ts` | Defines `RiskScore` and `IRiskEngine`. | 🚧 Drafted |
-| `helius-risk.ts` | Checks token metadata (Mint Auth, Freeze) via DAS API. | 🚧 Drafted |
+| File | Purpose | Key Functions | Status |
+| :--- | :--- | :--- | :--- |
+| `interfaces.ts` | **Contract:** Defines `RiskScore` and `IRiskEngine`. | `RiskScore` | ✅ Ready |
+| `helius-risk.ts` | **Implementation:** Checks token metadata (Mint/Freeze) via DAS. | `evaluate()` | ✅ Ready |
+| `../test-risk.ts` | **Validation:** Checks specific mints for rug risk. | `main()` | ✅ Ready |
 
 ## 4. Shared (Type Definitions)
 **Location:** `/shared`
