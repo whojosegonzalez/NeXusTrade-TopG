@@ -1,15 +1,42 @@
-# NeXusTrade Project Structure & Inventory
+# NeXusTrade - Structure & Component Tracker
 
-## Status: Phase 1 - Initialization
+## 1. Backend (The "Twin Engine" Core)
+**Location:** `/backend`
+**Status:** ✅ Phase 1 Complete
 
-| File Path | Purpose | Key Parameters/Exports | Status | Tested? |
-| :--- | :--- | :--- | :--- | :--- |
-| `src/index.ts` | Main Entry Point | `main()` | 🚧 Pending | ❌ |
-| `src/config/config.ts` | Central Config Hub | `HELIUS_API_KEY`, `DB_PATH` | 🚧 Pending | ❌ |
-| `tsconfig.json` | TS Compiler Settings | `strict: true` | ✅ Complete | N/A |
-| `prisma/schema.prisma` | DB Schema | `Session`, `Trade` | ✅ Complete | ⏳ In Progress |
-| `src/database/client.ts`| Twin Engine Factory | `initDatabase(isSim)` | ✅ Complete | ⏳ In Progress |
----
-## Notes
-- **Twin Engine**: System is designed to switch DBs based on runtime flags.
-- **Local-First**: Using SQLite (WAL mode).
+| File | Purpose | Key Functions | Status |
+| :--- | :--- | :--- | :--- |
+| `src/config.ts` | **Safety Rail:** Validates API keys & Mode on startup. | `ConfigManager` | ✅ Ready |
+| `src/database/client.ts` | **Factory:** Switches Sim/Live DB based on config. | `prisma` instance | ✅ Ready |
+| `src/test-db.ts` | **Validation:** Smoke test for database connectivity. | `main()` | ✅ Ready |
+| `src/index.ts` | **Entry Point:** Starts the bot. | `main()` | ⏳ Pending |
+
+## 2. Scanner Module (The Eyes)
+**Location:** `/backend/src/scanners`
+**Status:** ✅ Phase 2.1 Complete
+
+| File | Purpose | Key Functions | Status |
+| :--- | :--- | :--- | :--- |
+| `interfaces.ts` | **Contract:** Defines standard `TokenCandidate` & `IScanner`. | `TokenCandidate` | ✅ Ready |
+| `helius.ts` | **Implementation:** Polls Helius for Raydium liquidity events. | `start()`, `scan()` | ✅ Ready |
+| `../test-scanner.ts`| **Validation:** Runs the scanner in isolation to verify data. | `main()` | ✅ Ready |
+
+## 3. Risk Engine (The Firewall)
+**Location:** `/backend/src/risk`
+**Status:** 🏗️ Phase 2.2 In Progress
+
+| File | Purpose | Status |
+| :--- | :--- | :--- |
+| `interfaces.ts` | Defines `RiskScore` and `IRiskEngine`. | 🚧 Drafted |
+| `helius-risk.ts` | Checks token metadata (Mint Auth, Freeze) via DAS API. | 🚧 Drafted |
+
+## 4. Shared (Type Definitions)
+**Location:** `/shared`
+**Status:** ⏳ Pending
+
+## 5. Database (Twin Engine Persistence)
+**Location:** `/backend/prisma`
+**Status:** ✅ Ready
+
+- **Live DB:** `nexus_live.db` (Real funds, encrypted keys)
+- **Sim DB:** `nexus_sim.db` (Paper money, simulated latency)

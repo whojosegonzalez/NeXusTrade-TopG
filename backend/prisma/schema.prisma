@@ -1,0 +1,64 @@
+// --- Database Configuration ---
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// --- 1. Session Tracking (The "Manager") ---
+model Session {
+  id                String   @id @default(uuid())
+  startTime         DateTime @default(now())
+  endTime           DateTime?
+  status            String   // "ACTIVE", "COMPLETED", "STOPPED"
+  
+  targetProfit      Float
+  stopLoss          Float
+  startBalance      Float
+  currentBalance    Float
+  
+  trades            Trade[]
+}
+
+// --- 2. Trade Execution (The "Worker") ---
+model Trade {
+  id                String   @id @default(uuid())
+  sessionId         String
+  session           Session  @relation(fields: [sessionId], references: [id])
+  
+  mint              String
+  symbol            String
+  
+  buyPrice          Float
+  buyAmount         Float
+  buyCostSOL        Float
+  buyTxHash         String?
+  buyTimestamp      DateTime @default(now())
+  
+  sellPrice         Float?
+  sellAmount        Float?
+  sellValueSOL      Float?
+  sellTxHash        String?
+  sellTimestamp     DateTime?
+  
+  status            String
+  pnlSOL            Float?
+  pnlPercent        Float?
+}
+
+// --- 3. Token Radar (The "Scanner") ---
+model TokenRadar {
+  id                String   @id @default(uuid())
+  mint              String   @unique
+  symbol            String
+  detectedAt        DateTime @default(now())
+  
+  liquidityUSD      Float
+  volume24h         Float
+  riskScore         Int
+  
+  decision          String
+  rejectReason      String?
+}
