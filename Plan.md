@@ -14,13 +14,14 @@ This document tracks the phased rollout of the NeXusTrade bot, moving from a loc
 **Goal:** Detect new tokens and filter out scams immediately.
 - [x] **Scanner Module:** Poll Helius RPC for new Raydium Pools.
 - [x] **Risk Engine:** Implement "Rug Check" (Mint/Freeze authority) using Helius DAS.
-- [ ] **Data Pipeline:** Save detected tokens to the `TokenRadar` database table.
+- [x] **Data Pipeline:** Save detected tokens to the `TokenRadar` database table.
 
-## ⏳ Phase 3: The Strategy Engine (The Brain)
+## 🏗️ Phase 3: The Strategy Engine (The Brain)
 **Goal:** Decide *when* to buy based on math, not just hype.
-- [ ] **Simulation Loop:** Create the "Tick" loop (Scan -> Risk -> Decide -> Trade).
-- [ ] **Scoring Logic:** Implement basic scoring (Liquidity > $1k, Risk Score > 80).
-- [ ] **Position Manager:** Track open simulated trades and calculate P/L.
+- [x] **Session Manager:** Track real-time P/L and enforce "Stop Loss" limits.
+- [x] **Scoring Logic:** Implement basic strategy rules (Risk > 80, Liquidity checks).
+- [ ] **Position Manager:** Track open simulated trades (Entry vs Current Price).
+- [x] **Simulation Loop:** The "Tick" loop (Scan -> Risk -> Decide -> Trade).
 
 ## ⏳ Phase 4: The Live Engine (The Hands)
 **Goal:** Swap "Monopoly Money" for real SOL.
