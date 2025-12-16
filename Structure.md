@@ -6,9 +6,9 @@
 | :--- | :--- | :--- | :--- | :--- |
 | `src/index.ts` | Main Entry Point | `main()` | 🚧 Pending | ❌ |
 | `src/config/config.ts` | Central Config Hub | `HELIUS_API_KEY`, `DB_PATH` | 🚧 Pending | ❌ |
-| `prisma/schema.prisma` | DB Schema Definition | `Session`, `Trade`, `TokenRadar` | 🚧 Pending | ❌ |
 | `tsconfig.json` | TS Compiler Settings | `strict: true` | ✅ Complete | N/A |
-
+| `prisma/schema.prisma` | DB Schema | `Session`, `Trade` | ✅ Complete | ⏳ In Progress |
+| `src/database/client.ts`| Twin Engine Factory | `initDatabase(isSim)` | ✅ Complete | ⏳ In Progress |
 ---
 ## Notes
 - **Twin Engine**: System is designed to switch DBs based on runtime flags.
