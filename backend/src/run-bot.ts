@@ -1,6 +1,13 @@
 import { BotEngine } from "./engine/bot-engine";
+import { HeliusScanner } from "./scanners/helius";
 
-const bot = new BotEngine();
+// FACTORY: We can now add multiple scanners here!
+const scanners = [
+    new HeliusScanner(),
+    // new DexScreenerScanner() // Coming soon...
+];
+
+const bot = new BotEngine(scanners);
 
 process.on('SIGINT', async () => {
     console.log("\n🛑 Stopping Bot...");
@@ -8,8 +15,5 @@ process.on('SIGINT', async () => {
     process.exit(0);
 });
 
-// CONFIGURATION:
-// Start with 10 SOL
-// Max 10 Positions
-// 0.2 SOL per Trade
-void bot.start(10.0, 10, 0.2);
+// Start Simulation (10 SOL, 5 Max Pos, 0.1 Trade)
+void bot.start(10.0, 5, 0.1);

@@ -1,31 +1,30 @@
-import { HeliusScanner } from "../scanners/helius";
 import { HeliusRiskEngine } from "../risk/helius-risk";
 import { TokenIngestor } from "../pipeline/ingestor";
 import { SessionManager } from "../strategy/session-manager";
 import { PositionManager } from "../strategy/position-manager";
 import { SimpleSafeStrategy } from "../strategy/simple-strategy";
 import { prisma } from "../database/client";
-import { TokenCandidate } from "../scanners/interfaces";
-import { JupiterPriceOracle } from "../market/jupiter-price"; // Need this to get initial buy price!
+import { TokenCandidate, IScanner } from "../scanners/interfaces"; // Updated import
+import { JupiterPriceOracle } from "../market/jupiter-price";
 
 export class BotEngine {
-    private scanner: HeliusScanner;
+    private scanners: IScanner[]; // CHANGED: Array of scanners
     private riskEngine: HeliusRiskEngine;
     private ingestor: TokenIngestor;
     private sessionManager: SessionManager;
     private positionManager: PositionManager;
     private strategy: SimpleSafeStrategy;
-    private priceOracle: JupiterPriceOracle; // New
+    private priceOracle: JupiterPriceOracle;
 
     private isRunning = false;
     private isBuying = true;
     private sessionId: string | null = null;
     
-    // We can rely on the DB count for accuracy, or keep a local cache
     private activePositionsCount = 0;
 
-    constructor() {
-        this.scanner = new HeliusScanner();
+    // CHANGED: Constructor now accepts scanners
+    constructor(scanners: IScanner[]) {
+        this.scanners = scanners;
         this.riskEngine = new HeliusRiskEngine();
         this.ingestor = new TokenIngestor();
         this.sessionManager = new SessionManager();
@@ -43,35 +42,48 @@ export class BotEngine {
             startBalance: startBalance,
             targetProfit: startBalance * 1.5,
             stopLoss: startBalance * 0.8,
-            maxPositions: maxPositions, // Configurable Limit
-            tradeSizeSOL: tradeSize     // Configurable Size
+            maxPositions: maxPositions,
+            tradeSizeSOL: tradeSize
         });
 
         this.activePositionsCount = 0;
         this.isRunning = true;
         this.isBuying = true;
 
-        await this.scanner.start(async (token) => {
-            if (this.sessionId) {
-                // 1. Manage Positions
-                await this.positionManager.managePositions(this.sessionId);
-                
-                // Sync position count occasionally (or just query DB here if not high frequency)
-                this.activePositionsCount = await prisma.trade.count({
-                    where: { sessionId: this.sessionId, status: 'OPEN' }
-                });
-            }
+        // CHANGED: Loop through all scanners and start them
+        for (const scanner of this.scanners) {
+            console.log(`   🔌 Attaching Scanner: ${scanner.name}`);
+            // We don't await here because we want them running in parallel
+            // and we don't want one scanner to block the others.
+            scanner.start(async (token) => {
+                // Shared Callback: All scanners pipe data to this function
+                if (this.sessionId) {
+                    await this.positionManager.managePositions(this.sessionId);
+                    
+                    // Sync count less frequently (optimization)
+                    if (Math.random() < 0.1) {
+                        this.activePositionsCount = await prisma.trade.count({
+                            where: { sessionId: this.sessionId, status: 'OPEN' }
+                        });
+                    }
+                }
 
-            if (this.isBuying) {
-                await this.processToken(token);
-            }
-        });
+                if (this.isBuying) {
+                    await this.processToken(token);
+                }
+            }).catch(e => console.error(`❌ Scanner ${scanner.name} crashed:`, e));
+        }
     }
 
     async stop() {
         this.isRunning = false;
         this.isBuying = false;
-        this.scanner.stop();
+        
+        // CHANGED: Stop all scanners
+        for (const scanner of this.scanners) {
+            scanner.stop();
+        }
+        
         await this.sessionManager.end("USER_STOPPED");
     }
 
@@ -80,13 +92,12 @@ export class BotEngine {
         const config = this.sessionManager.getConfig();
         if (!config) return;
 
-        // 1. CHECK LIMITS: Max Positions
-        if (this.activePositionsCount >= config.maxPositions) {
-            // Silent skip to reduce log spam
-            return;
-        }
+        // 1. CHECK LIMITS
+        if (this.activePositionsCount >= config.maxPositions) return;
 
-        // 2. CHECK: Duplicate
+        // 2. CHECK DUPLICATE (Dedup Logic)
+        // This is critical now that we have multiple scanners. 
+        // Helius and DexScreener might find the same token.
         const exists = await prisma.trade.findFirst({
             where: { sessionId: this.sessionId, mint: token.mint }
         });
@@ -98,7 +109,6 @@ export class BotEngine {
         const decision = await this.strategy.evaluate(token, risk);
 
         if (decision.action === 'BUY') {
-            // Use the Configured Trade Size
             await this.executeSimulatedBuy(token, config.tradeSizeSOL);
         }
     }
@@ -106,13 +116,11 @@ export class BotEngine {
     private async executeSimulatedBuy(token: TokenCandidate, amountSOL: number) {
         if (!this.sessionId) return;
 
-        // FETCH REAL PRICE for Entry
-        // If we can't get a price, we can't open a "Real" paper trade
+        // Fetch Real Price
         const realPrice = await this.priceOracle.getPriceInSOL(token.mint);
         
         if (!realPrice) {
-            // Silent skip to reduce log spam
-            // Console.log(`   ⚠️ Skipping Buy: No market price found for ${token.symbol} yet.`);
+            // console.log(`   ⚠️ Skipping Buy: No market price found for ${token.symbol} yet.`);
             return;
         }
 
@@ -133,7 +141,6 @@ export class BotEngine {
             }
         });
 
-        // Deduct "Cash" (Paper Money)
         const currentBal = (await prisma.session.findUnique({where: {id: this.sessionId}}))?.currentBalance || 0;
         const result = await this.sessionManager.updateBalance(currentBal - amountSOL, 0);
 
