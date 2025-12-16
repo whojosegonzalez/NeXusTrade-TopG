@@ -1,49 +1,52 @@
 import { HeliusScanner } from './scanners/helius';
 import { HeliusRiskEngine } from './risk/helius-risk';
+import { TokenIngestor } from './pipeline/ingestor';
 import { TokenCandidate } from './scanners/interfaces';
+import { prisma } from './database/client';
 
 async function main() {
-    console.log("🚀 Starting Integrated System Test (Scanner + Risk Engine)...");
+    console.log("🚀 Starting Full Pipeline Test (Scan -> Risk -> DB)...");
     console.log("----------------------------------------------------------------");
 
+    // Initialize all 3 components of the Sensory System
     const scanner = new HeliusScanner();
     const riskEngine = new HeliusRiskEngine();
+    const ingestor = new TokenIngestor();
 
-    // Define the full pipeline
     const onNewToken = async (token: TokenCandidate) => {
         const startTime = Date.now();
         
-        // 1. Log Detection
-        console.log(`\n🔎 DETECTED: ${token.mint}`);
+        console.log(`\n🔎 DETECTED: ${token.mint} (${token.symbol})`);
         
-        // 2. Perform Risk Analysis
-        console.log("   🛡️  Running Risk Check...");
+        // 1. Risk Check
+        // console.log("   🛡️  Analyzing Risk...");
         const risk = await riskEngine.evaluate(token.mint);
+        
+        // 2. Database Ingestion (The new step)
+        // console.log("   💾 Saving to DB...");
+        await ingestor.ingest(token, risk);
         
         const latency = Date.now() - startTime;
 
-        // 3. Display Results
+        // 3. Log Result
         if (risk.isRug) {
-            console.log(`   ❌ RUG DETECTED (Score: ${risk.score})`);
-            console.log(`      Reasons: ${risk.reasons.join(', ')}`);
+            console.log(`   ❌ RUG (Score: ${risk.score}) | Reason: ${risk.reasons[0]}`);
         } else if (risk.score < 70) {
-            console.log(`   ⚠️  HIGH RISK (Score: ${risk.score})`);
-            console.log(`      Reasons: ${risk.reasons.join(', ')}`);
+            console.log(`   ⚠️  RISKY (Score: ${risk.score}) | Reason: ${risk.reasons[0]}`);
         } else {
-            console.log(`   ✅ SAFE CANDIDATE (Score: ${risk.score})`);
+            console.log(`   ✅ SAFE (Score: ${risk.score}) | Ready for Strategy`);
         }
-        
-        console.log(`   ⏱️  Analysis Time: ${latency}ms`);
-        console.log("----------------------------------------------------------------");
+        console.log(`   ⏱️  Pipeline Latency: ${latency}ms`);
     };
 
-    // Start the engine
+    // Start scanning
     await scanner.start(onNewToken);
 }
 
-// Handle shutdown
-process.on('SIGINT', () => {
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
     console.log("\n🛑 Shutting down...");
+    await prisma.$disconnect();
     process.exit(0);
 });
 

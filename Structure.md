@@ -32,11 +32,20 @@
 | `helius-risk.ts` | **Implementation:** Checks token metadata (Mint/Freeze) via DAS. | `evaluate()` | ✅ Ready |
 | `../test-risk.ts` | **Validation:** Checks specific mints for rug risk. | `main()` | ✅ Ready |
 
-## 4. Shared (Type Definitions)
+## 4. Data Pipeline (The Memory)
+**Location:** `/backend/src/pipeline`
+**Status:** ✅ Phase 2 Complete
+
+| File | Purpose | Status |
+| :--- | :--- | :--- |
+| `ingestor.ts` | **Service:** Saves scored tokens to `TokenRadar` DB. | ✅ Ready |
+| `../check-db.ts` | **Validation:** specific script to verify DB writes. | ✅ Ready |
+
+## 5. Shared (Type Definitions)
 **Location:** `/shared`
 **Status:** ⏳ Pending
 
-## 5. Database (Twin Engine Persistence)
+## 6. Database (Twin Engine Persistence)
 **Location:** `/backend/prisma`
 **Status:** ✅ Ready
 

@@ -13,7 +13,7 @@ This document tracks the phased rollout of the NeXusTrade bot, moving from a loc
 ## 🏗️ Phase 2: The Sensory System (Current)
 **Goal:** Detect new tokens and filter out scams immediately.
 - [x] **Scanner Module:** Poll Helius RPC for new Raydium Pools.
-- [ ] **Risk Engine:** Implement "Rug Check" (Mint/Freeze authority) using Helius DAS.
+- [x] **Risk Engine:** Implement "Rug Check" (Mint/Freeze authority) using Helius DAS.
 - [ ] **Data Pipeline:** Save detected tokens to the `TokenRadar` database table.
 
 ## ⏳ Phase 3: The Strategy Engine (The Brain)
