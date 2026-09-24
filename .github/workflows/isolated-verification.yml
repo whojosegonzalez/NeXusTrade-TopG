@@ -1,0 +1,34 @@
+name: Isolated verification
+on:
+  pull_request:
+  push:
+    branches: [main, isolation, "codex/**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: isolated-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      HUSKY: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # verified v4
+        with:
+          node-version: "24.17.0"
+      - name: Provision pinned package manager
+        run: npm install --prefix .tmp/h4-tooling --ignore-scripts --no-package-lock pnpm@11.8.0
+      - name: Install locked dependencies with explicit peer setting
+        run: node .tmp/h4-tooling/node_modules/pnpm/bin/pnpm.mjs install --frozen-lockfile --config.auto-install-peers=true --config.manage-package-manager-versions=false --store-dir .tmp/pnpm-store
+      - name: Verify synthetic source and fixtures
+        run: node scripts/verify-isolated.mjs

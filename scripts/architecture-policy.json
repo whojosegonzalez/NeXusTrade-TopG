@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "name": "analyzer",
+      "roots": [
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisConfig.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisErrors.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisFormatter.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIdentity.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisLoader.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisPaths.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisService.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisTypes.ts",
+        "backend/src/scripts/research-measurement-cohort-analyze.ts"
+      ],
+      "files": [
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisConfig.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisErrors.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisFormatter.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIdentity.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisLoader.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisPaths.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisService.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisTypes.ts",
+        "backend/src/scripts/research-measurement-cohort-analyze.ts"
+      ],
+      "external": {
+        "node:fs": ["existsSync", "lstatSync", "realpathSync", "readFileSync", "readdirSync"],
+        "node:crypto": ["createHash"],
+        "node:path": ["default"],
+        "node:url": ["fileURLToPath"],
+        "zod": "AUDITED_PACKAGE"
+      },
+      "typeFiles": [
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisTypes.ts"
+      ],
+      "capabilities": {
+        "backend/src/scripts/research-measurement-cohort-analyze.ts": ["process"]
+      }
+    },
+    {
+      "name": "analytics-pure",
+      "pure": true,
+      "roots": [
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsQuoteBudget.ts",
+        "backend/src/analytics/AnalyticsReportTypes.ts"
+      ],
+      "files": [
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsQuoteBudget.ts",
+        "backend/src/analytics/AnalyticsReportTypes.ts"
+      ],
+      "external": {},
+      "typeFiles": [
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsReportTypes.ts",
+        "backend/src/db/schema/index.ts"
+      ]
+    },
+    {
+      "name": "analytics-service",
+      "roots": ["backend/src/analytics/AnalyticsReportService.ts"],
+      "files": [
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsQuoteBudget.ts",
+        "backend/src/analytics/AnalyticsReportService.ts",
+        "backend/src/db/schema/enums.ts",
+        "backend/src/db/schema/equitySnapshots.ts",
+        "backend/src/db/schema/fills.ts",
+        "backend/src/db/schema/index.ts",
+        "backend/src/db/schema/integrity.ts",
+        "backend/src/db/schema/orders.ts",
+        "backend/src/db/schema/paperOperations.ts",
+        "backend/src/db/schema/positionSnapshots.ts",
+        "backend/src/db/schema/positions.ts",
+        "backend/src/db/schema/providerHealth.ts",
+        "backend/src/db/schema/riskAssessments.ts",
+        "backend/src/db/schema/sessions.ts",
+        "backend/src/db/schema/strategyDecisions.ts",
+        "backend/src/db/schema/systemLogs.ts",
+        "backend/src/db/schema/tokenRadar.ts",
+        "backend/src/db/schema/watchlistReturnObservations.ts",
+        "backend/src/db/utils/json.ts",
+        "backend/src/db/utils/timestamps.ts",
+        "backend/src/providers/ProviderPressureClassifier.ts",
+        "shared/src/index.ts",
+        "shared/src/market/enrichment.types.ts",
+        "shared/src/market/quote.types.ts",
+        "shared/src/market/token.types.ts",
+        "shared/src/modes.ts",
+        "shared/src/providers/provider-errors.ts",
+        "shared/src/providers/provider-results.ts",
+        "shared/src/providers/provider.types.ts",
+        "shared/src/research-dashboard.ts"
+      ],
+      "external": {
+        "drizzle-orm": "AUDITED_PACKAGE",
+        "drizzle-orm/sqlite-core": "AUDITED_PACKAGE",
+        "zod": "AUDITED_PACKAGE"
+      },
+      "typeFiles": [
+        "backend/src/analytics/AnalyticsConfig.ts",
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsReadRepositories.ts",
+        "backend/src/analytics/AnalyticsReportTypes.ts",
+        "backend/src/db/schema/index.ts",
+        "shared/src/config.ts",
+        "shared/src/market/enrichment.types.ts",
+        "shared/src/market/liquidity.types.ts",
+        "shared/src/market/metadata.types.ts",
+        "shared/src/market/price.types.ts",
+        "shared/src/market/priority-fee.types.ts",
+        "shared/src/market/quote.types.ts",
+        "shared/src/market/risk-evidence.types.ts",
+        "shared/src/market/token.types.ts",
+        "shared/src/modes.ts",
+        "shared/src/providers/provider-errors.ts",
+        "shared/src/providers/provider-results.ts",
+        "shared/src/providers/provider.types.ts",
+        "shared/src/research-dashboard.ts"
+      ],
+      "typePackages": {
+        "backend/src/db/schema/fills.ts": ["drizzle-orm/sqlite-core"],
+        "backend/src/db/schema/orders.ts": ["drizzle-orm/sqlite-core"],
+        "backend/src/db/schema/paperOperations.ts": ["drizzle-orm/sqlite-core"]
+      }
+    }
+  ]
+}

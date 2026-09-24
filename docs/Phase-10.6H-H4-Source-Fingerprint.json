@@ -1,0 +1,95 @@
+{
+  "baseline": "3b7b229",
+  "format": "SHA-256 of worktree bytes; aggregate uses sorted file + NUL + lowercase digest + LF. Documentation excluded to avoid circular records.",
+  "aggregateSha256": "0491c95a8d9f85f6d1f1b94bec4a376dcb3fbfa4ae5bec577793f0c7db92c2b8",
+  "files": [
+    {
+      "file": ".github/workflows/isolated-verification.yml",
+      "sha256": "8dcbbe46256fda2b7abb0bfee7ade08584b0845b3369e986f8d3cf89dad63e83"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsJsonReaders.ts",
+      "sha256": "91048177e75fe1d2f863d1975aad44e5dc9147b1717a5c3d537717f86f135ea3"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsQuoteBudget.ts",
+      "sha256": "018e282ec43ce5bc67eb58f5c8225d7c0be9358d9564567055a6c20299791ca8"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsReadRepositories.ts",
+      "sha256": "b85ac6e4aefe173a7d945b7d6f34ce8e180b8ed25f2c6f759b3190161e855641"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsReportService.test.ts",
+      "sha256": "280a79381caf158298f71cc424991ca8fca9b141ad773e3692782f089815a92b"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsReportService.ts",
+      "sha256": "d78bf89d47cde088c77ab2a9a9131020cb691c4227137f3c0ede8f1c3e2a4cf9"
+    },
+    {
+      "file": "backend/src/analytics/AnalyticsReportTypes.ts",
+      "sha256": "d14b9f9a6fd3bbd8ea3373650ec5d6e3b9829cc5e8719fd17549b3c59f40d3e1"
+    },
+    {
+      "file": "backend/src/analytics/__snapshots__/AnalyticsReportService.test.ts.snap",
+      "sha256": "fb41faa0700914cada873606d9038295321ac77ca7c55b734ad0706d82696d88"
+    },
+    {
+      "file": "backend/src/analytics/h4/H4Boundary.test.ts",
+      "sha256": "bcbc6357bd82e10afc6867c6b906f27782e5be6e9892fcd66fdc78612d1b78a6"
+    },
+    {
+      "file": "backend/src/analytics/h4/H4ReadFacade.test.ts",
+      "sha256": "dbc1790a21bd1489f4911bed13efc21aa780c713f893c07050456a328e71a442"
+    },
+    {
+      "file": "backend/src/analytics/h4/H4ReadGuard.ts",
+      "sha256": "a03ccb2f8f953d282f6552b0b95b40fd5bf9b1bf598b0ff71014236277795c0d"
+    },
+    {
+      "file": "backend/src/analytics/h4/H4Readers.test.ts",
+      "sha256": "44e471cd7fc016fd3416a00aa0cbcdf51298a2ac42927f8966f478779063bd1c"
+    },
+    {
+      "file": "backend/src/analytics/h4/H4TestSetup.ts",
+      "sha256": "c4bfcb37628637a2962d04ab575827d10a8f206ec27abc73725ee59d476f75bf"
+    },
+    {
+      "file": "backend/vitest.h4.config.ts",
+      "sha256": "58db6dc32abc5affa93381c11336caeabc1e7395b82090ff5e1a113474838c8a"
+    },
+    {
+      "file": "package.json",
+      "sha256": "1785fcac0b6110f66eb7b85314930ca2ecb1038bd240728cce607f0875244b5d"
+    },
+    {
+      "file": "scripts/architecture-check.mjs",
+      "sha256": "9a73982ab46bcec3ffa451b642fb79126afa1431bbdbfffe22c844eacf3348ae"
+    },
+    {
+      "file": "scripts/architecture-check.test.mjs",
+      "sha256": "c05f16aa3ce25ac361837e297ca6d85e7ca7d9286a5be06ebdce259549de426f"
+    },
+    {
+      "file": "scripts/architecture-policy.json",
+      "sha256": "e53dca23deea7533aa9c5c3501c296e0e5003fbd16c0d1d19bd9c3cbf0255315"
+    },
+    {
+      "file": "scripts/check-isolation.mjs",
+      "sha256": "e1910c6a41fd1ae7c7f21e976038a63dc5808d7a600dbfc864e7d26708e35c3b"
+    },
+    {
+      "file": "scripts/isolated-paths.mjs",
+      "sha256": "b812c8c6392b01425e47dacaef2b871e1dc62590381f621454ef0d5ebe73bf8b"
+    },
+    {
+      "file": "scripts/verify-isolated.mjs",
+      "sha256": "53d793358a0d597947f5196b09fcd71b623dd540510d8c24795d112cbbe6ae4e"
+    },
+    {
+      "file": "scripts/verify-isolated.test.mjs",
+      "sha256": "ddc824e41dec131f1fcd53be3f3d84d1291918e9259d83c76f9f6d18b5c6d288"
+    }
+  ]
+}

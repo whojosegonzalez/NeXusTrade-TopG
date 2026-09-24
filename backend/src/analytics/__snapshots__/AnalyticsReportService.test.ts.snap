@@ -1,0 +1,390 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`AnalyticsReportService > reports funnel counts, score buckets, near misses, provider health, and missed opportunities 1`] = `
+{
+  "funnel": {
+    "equitySnapshotTotal": 0,
+    "fillTotal": 0,
+    "orderTotal": 0,
+    "ordersByStatus": {
+      "CANCELLED": 0,
+      "CREATED": 0,
+      "FAILED": 0,
+      "FILLED": 0,
+      "PARTIALLY_FILLED": 0,
+      "QUOTED": 0,
+      "REJECTED": 0,
+    },
+    "positionsByStatus": {
+      "CLOSED": 0,
+      "CLOSING": 0,
+      "ERROR": 0,
+      "OPEN": 0,
+    },
+    "riskAssessmentTotal": 1,
+    "riskByResult": {
+      "FAIL": 0,
+      "PASS": 0,
+      "UNKNOWN": 0,
+      "WARN": 1,
+    },
+    "strategyByDecision": {
+      "BUY": 0,
+      "HOLD": 0,
+      "SELL": 0,
+      "SKIP": 0,
+      "WATCH": 1,
+    },
+    "strategyDecisionTotal": 1,
+    "tokenRadarByStatus": {
+      "APPROVED": 0,
+      "BOUGHT": 0,
+      "DISCOVERED": 0,
+      "ERROR": 0,
+      "IGNORED": 0,
+      "REJECTED": 0,
+      "WATCHING": 1,
+    },
+    "tokenRadarTotal": 1,
+    "watchlistReturnTotal": 1,
+    "watchlistReturnsByStatus": {
+      "FAILED": 0,
+      "MISSED": 0,
+      "OBSERVED": 1,
+      "PENDING": 0,
+    },
+  },
+  "generatedAtMs": 1800000000000,
+  "jupiterRateLimitSummary": {
+    "authorityEvidenceSourceCounts": {},
+    "birdeyeBudgetReasonCounts": {},
+    "birdeyeCacheStatusCounts": {},
+    "birdeyeEndpointCounts": {},
+    "birdeyeFailureCategoryCounts": {},
+    "birdeyeSelectionReasonCounts": {},
+    "combinedRateLimitedPercent": 100,
+    "dasFailureCategoryCounts": {},
+    "dasProviderCounts": {},
+    "degradedPercent": 0,
+    "errorPercent": 0,
+    "freezeAuthorityStateCounts": {},
+    "heliusCacheStatusCounts": {},
+    "heliusEvidenceSourceCounts": {},
+    "jupiterAdaptiveLevelMax": 0,
+    "jupiterControllerRateLimitObservedCount": 0,
+    "jupiterDemandActionCounts": {},
+    "jupiterDemandDeferredCount": 0,
+    "jupiterDemandOperationCounts": {},
+    "jupiterDemandPriorityCounts": {},
+    "jupiterEffectiveIntervalMsAverage": 0,
+    "jupiterLiveAllowedCount": 0,
+    "jupiterSharedWindowUsageMax": 0,
+    "latestErrorMessage": "rate limited",
+    "latestStatus": "RATE_LIMITED",
+    "liveErrorPercent": 0,
+    "liveQuoteCallsAvoidedEstimate": 0,
+    "liveRateLimitedPercent": 100,
+    "liveRows": 1,
+    "mintAuthorityStateCounts": {},
+    "okPercent": 0,
+    "operation": undefined,
+    "provider": "JUPITER",
+    "quoteDemandActionCounts": {},
+    "quoteFallbackReasonCounts": {},
+    "quoteNegativeCacheHitCount": 0,
+    "quoteNegativeCacheReasonCounts": {},
+    "quoteSchedulerWaitMsTotal": 0,
+    "quoteSingleFlightJoinCount": 0,
+    "quoteSourceTypeCounts": {},
+    "rateLimitedPercent": 100,
+    "raydiumFailureCategoryCounts": {},
+    "raydiumPreflightStatusCounts": {},
+    "raydiumVenueGuardDecisionCounts": {},
+    "raydiumVenueGuardReasonCounts": {},
+    "routerCacheHits": 0,
+    "routerCooldownSkipPercent": 0,
+    "routerCooldownSkips": 0,
+    "routerRows": 0,
+    "routerUnavailable": 0,
+    "rpcCacheStatusCounts": {},
+    "rpcFailureCategoryCounts": {},
+    "statusCounts": {
+      "DEGRADED": 0,
+      "DISABLED": 0,
+      "ERROR": 0,
+      "OK": 0,
+      "RATE_LIMITED": 1,
+    },
+    "total": 1,
+  },
+  "missedOpportunities": [
+    {
+      "baselinePriceSol": "0.00001",
+      "bestHorizonMinutes": 60,
+      "bestReturnPct": "20",
+      "blockingFactors": [
+        "unknown_rule",
+      ],
+      "decision": "WATCH",
+      "mintAddress": "So11111111111111111111111111111111111111112",
+      "reason": "WATCH: score=80 risk=WARN",
+      "returnsByHorizon": {
+        "60m": "20",
+      },
+      "riskResult": "WARN",
+      "score": 80,
+      "symbol": "SOL",
+    },
+  ],
+  "nearMisses": [
+    {
+      "ageSeconds": 3600,
+      "blockingFactors": [
+        "unknown_rule",
+      ],
+      "decidedAtMs": 1800000000000,
+      "decision": "WATCH",
+      "liquidityUsd": "100000",
+      "maxPriceImpactPct": 1,
+      "mintAddress": "So11111111111111111111111111111111111111112",
+      "reason": "WATCH: score=80 risk=WARN",
+      "riskFlags": [
+        "MISSING_QUOTE",
+      ],
+      "riskResult": "WARN",
+      "score": 80,
+      "symbol": "SOL",
+      "volume1hUsd": "50000",
+    },
+  ],
+  "providerHealth": [
+    {
+      "authorityEvidenceSourceCounts": {},
+      "birdeyeBudgetReasonCounts": {},
+      "birdeyeCacheStatusCounts": {},
+      "birdeyeEndpointCounts": {},
+      "birdeyeFailureCategoryCounts": {},
+      "birdeyeSelectionReasonCounts": {},
+      "combinedRateLimitedPercent": 100,
+      "dasFailureCategoryCounts": {},
+      "dasProviderCounts": {},
+      "degradedPercent": 0,
+      "errorPercent": 0,
+      "freezeAuthorityStateCounts": {},
+      "heliusCacheStatusCounts": {},
+      "heliusEvidenceSourceCounts": {},
+      "jupiterAdaptiveLevelMax": 0,
+      "jupiterControllerRateLimitObservedCount": 0,
+      "jupiterDemandActionCounts": {},
+      "jupiterDemandDeferredCount": 0,
+      "jupiterDemandOperationCounts": {},
+      "jupiterDemandPriorityCounts": {},
+      "jupiterEffectiveIntervalMsAverage": 0,
+      "jupiterLiveAllowedCount": 0,
+      "jupiterSharedWindowUsageMax": 0,
+      "latestErrorMessage": "rate limited",
+      "latestStatus": "RATE_LIMITED",
+      "liveErrorPercent": 0,
+      "liveQuoteCallsAvoidedEstimate": 0,
+      "liveRateLimitedPercent": 100,
+      "liveRows": 1,
+      "mintAuthorityStateCounts": {},
+      "okPercent": 0,
+      "operation": undefined,
+      "provider": "JUPITER",
+      "quoteDemandActionCounts": {},
+      "quoteFallbackReasonCounts": {},
+      "quoteNegativeCacheHitCount": 0,
+      "quoteNegativeCacheReasonCounts": {},
+      "quoteSchedulerWaitMsTotal": 0,
+      "quoteSingleFlightJoinCount": 0,
+      "quoteSourceTypeCounts": {},
+      "rateLimitedPercent": 100,
+      "raydiumFailureCategoryCounts": {},
+      "raydiumPreflightStatusCounts": {},
+      "raydiumVenueGuardDecisionCounts": {},
+      "raydiumVenueGuardReasonCounts": {},
+      "routerCacheHits": 0,
+      "routerCooldownSkipPercent": 0,
+      "routerCooldownSkips": 0,
+      "routerRows": 0,
+      "routerUnavailable": 0,
+      "rpcCacheStatusCounts": {},
+      "rpcFailureCategoryCounts": {},
+      "statusCounts": {
+        "DEGRADED": 0,
+        "DISABLED": 0,
+        "ERROR": 0,
+        "OK": 0,
+        "RATE_LIMITED": 1,
+      },
+      "total": 1,
+    },
+    {
+      "authorityEvidenceSourceCounts": {},
+      "birdeyeBudgetReasonCounts": {},
+      "birdeyeCacheStatusCounts": {},
+      "birdeyeEndpointCounts": {},
+      "birdeyeFailureCategoryCounts": {},
+      "birdeyeSelectionReasonCounts": {},
+      "combinedRateLimitedPercent": 100,
+      "dasFailureCategoryCounts": {},
+      "dasProviderCounts": {},
+      "degradedPercent": 0,
+      "errorPercent": 0,
+      "freezeAuthorityStateCounts": {},
+      "heliusCacheStatusCounts": {},
+      "heliusEvidenceSourceCounts": {},
+      "jupiterAdaptiveLevelMax": 0,
+      "jupiterControllerRateLimitObservedCount": 0,
+      "jupiterDemandActionCounts": {},
+      "jupiterDemandDeferredCount": 0,
+      "jupiterDemandOperationCounts": {},
+      "jupiterDemandPriorityCounts": {},
+      "jupiterEffectiveIntervalMsAverage": 0,
+      "jupiterLiveAllowedCount": 0,
+      "jupiterSharedWindowUsageMax": 0,
+      "latestErrorMessage": "rate limited",
+      "latestStatus": "RATE_LIMITED",
+      "liveErrorPercent": 0,
+      "liveQuoteCallsAvoidedEstimate": 0,
+      "liveRateLimitedPercent": 100,
+      "liveRows": 1,
+      "mintAuthorityStateCounts": {},
+      "okPercent": 0,
+      "operation": "quote",
+      "provider": "JUPITER",
+      "quoteDemandActionCounts": {},
+      "quoteFallbackReasonCounts": {},
+      "quoteNegativeCacheHitCount": 0,
+      "quoteNegativeCacheReasonCounts": {},
+      "quoteSchedulerWaitMsTotal": 0,
+      "quoteSingleFlightJoinCount": 0,
+      "quoteSourceTypeCounts": {},
+      "rateLimitedPercent": 100,
+      "raydiumFailureCategoryCounts": {},
+      "raydiumPreflightStatusCounts": {},
+      "raydiumVenueGuardDecisionCounts": {},
+      "raydiumVenueGuardReasonCounts": {},
+      "routerCacheHits": 0,
+      "routerCooldownSkipPercent": 0,
+      "routerCooldownSkips": 0,
+      "routerRows": 0,
+      "routerUnavailable": 0,
+      "rpcCacheStatusCounts": {},
+      "rpcFailureCategoryCounts": {},
+      "statusCounts": {
+        "DEGRADED": 0,
+        "DISABLED": 0,
+        "ERROR": 0,
+        "OK": 0,
+        "RATE_LIMITED": 1,
+      },
+      "total": 1,
+    },
+  ],
+  "quoteBudget": {
+    "assessmentsWithPlan": 1,
+    "notSelectedCount": 0,
+    "quoteSuccessCount": 1,
+    "rankBucketCounts": {
+      "1-5": 1,
+    },
+    "selectedCount": 1,
+    "selectionReasonCounts": {
+      "SELECTED": 1,
+    },
+    "signalCounts": {
+      "liquidity_at_or_above_risk_floor": 1,
+      "recent_discovery": 1,
+    },
+    "skippedLiveCallsEstimate": 0,
+  },
+  "scoreBuckets": [
+    {
+      "bucket": "80-84",
+      "buyCount": 0,
+      "skipCount": 0,
+      "total": 1,
+      "watchCount": 1,
+    },
+  ],
+  "session": {
+    "createdAtMs": 1800000000000,
+    "currentCashLamports": 0,
+    "endedAtMs": null,
+    "id": "session_analytics",
+    "maxDrawdownLamports": null,
+    "mode": "PAPER",
+    "realizedPnlLamports": 0,
+    "startedAtMs": 1799996400000,
+    "startingBalanceLamports": 0,
+    "status": "RUNNING",
+    "targetProfitBps": null,
+    "targetProfitLamports": null,
+    "terminationReason": "NOT_TERMINATED",
+    "unrealizedPnlLamports": 0,
+    "updatedAtMs": 1800000000000,
+  },
+}
+`;
+
+exports[`AnalyticsReportService > reports funnel counts, score buckets, near misses, provider health, and missed opportunities 2`] = `
+"NeXusTrade Analytics Report
+Generated: 2027-01-15T08:00:00.000Z
+
+Session
+  id: session_analytics
+  mode: PAPER
+  status: RUNNING
+  currentCashLamports: 0
+  realizedPnlLamports: 0
+  unrealizedPnlLamports: 0
+  terminationReason: NOT_TERMINATED
+
+Funnel
+  TokenRadar total: 1
+  TokenRadar by status: WATCHING=1
+  Risk total: 1
+  Risk by result: WARN=1
+  Strategy total: 1
+  Strategy by decision: WATCH=1
+  Orders total: 0
+  Orders by status: 
+  Fills total: 0
+  Positions by status: 
+  Equity snapshots: 0
+  Watchlist returns total: 1
+  Watchlist returns by status: OBSERVED=1
+
+Quote Budget Allocation
+  assessments=1 selected=1 notSelected=0 selectedWithQuote=1 skippedLiveCallsEstimate=0
+  reasons=SELECTED=1
+  signals=recent_discovery=1, liquidity_at_or_above_risk_floor=1
+  ranks=1-5=1
+
+Score Buckets
+  80-84: total=1 BUY=0 WATCH=1 SKIP=0
+
+Near Misses
+  So11111111111111111111111111111111111111112 SOL decision=WATCH score=80 risk=WARN blockers=unknown_rule
+    reason=WATCH: score=80 risk=WARN
+
+Missed Opportunities
+  So11111111111111111111111111111111111111112 SOL decision=WATCH score=80 best=20%@60m
+    returns=60m=20
+    blockers=unknown_rule
+
+Provider Health
+  JUPITER total=1 live=1 router=0 statuses=RATE_LIMITED=1 liveRateLimited=100.00% combinedRateLimited=100.00% cacheHits=0 cooldownSkips=0 avoided=0 schedulerWaitMs=0 singleFlightJoins=0 negativeCacheHits=0 jupiterDeferred=0 jupiterAllowed=0 jupiter429Observed=0 jupiterIntervalAvgMs=0 jupiterAdaptiveMax=0 jupiterWindowUsageMax=0 latest=RATE_LIMITED
+  JUPITER:quote total=1 live=1 router=0 statuses=RATE_LIMITED=1 liveRateLimited=100.00% combinedRateLimited=100.00% cacheHits=0 cooldownSkips=0 avoided=0 schedulerWaitMs=0 singleFlightJoins=0 negativeCacheHits=0 jupiterDeferred=0 jupiterAllowed=0 jupiter429Observed=0 jupiterIntervalAvgMs=0 jupiterAdaptiveMax=0 jupiterWindowUsageMax=0 latest=RATE_LIMITED
+
+Jupiter Rate Limit Summary
+  total=1 liveRateLimited=100.00% combinedRateLimited=100.00% cacheHits=0 cooldownSkips=0
+
+Recommended Next Run
+  pnpm risk:evaluate --once
+  pnpm strategy:evaluate --once --buy-score-threshold=75
+  pnpm watchlist:returns --once
+  pnpm analytics:report --once"
+`;

@@ -1,0 +1,2457 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "tables": {
+    "equity_snapshots": {
+      "name": "equity_snapshots",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "timestamp_ms": {
+          "name": "timestamp_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "cash_lamports": {
+          "name": "cash_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "open_position_value_lamports": {
+          "name": "open_position_value_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "total_equity_lamports": {
+          "name": "total_equity_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "realized_pnl_lamports": {
+          "name": "realized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "unrealized_pnl_lamports": {
+          "name": "unrealized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "drawdown_lamports": {
+          "name": "drawdown_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_equity_snapshots_session_id": {
+          "name": "idx_equity_snapshots_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_equity_snapshots_timestamp_ms": {
+          "name": "idx_equity_snapshots_timestamp_ms",
+          "columns": ["timestamp_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "equity_snapshots_session_id_sessions_id_fk": {
+          "name": "equity_snapshots_session_id_sessions_id_fk",
+          "tableFrom": "equity_snapshots",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "fills": {
+      "name": "fills",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "order_id": {
+          "name": "order_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "filled_at_ms": {
+          "name": "filled_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "fill_price_sol": {
+          "name": "fill_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "fill_price_usd": {
+          "name": "fill_price_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "tokens_filled": {
+          "name": "tokens_filled",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sol_spent_lamports": {
+          "name": "sol_spent_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sol_received_lamports": {
+          "name": "sol_received_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "estimated_base_fee_lamports": {
+          "name": "estimated_base_fee_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "estimated_priority_fee_lamports": {
+          "name": "estimated_priority_fee_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "estimated_slippage_lamports": {
+          "name": "estimated_slippage_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "price_impact_bps": {
+          "name": "price_impact_bps",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "quote_source": {
+          "name": "quote_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "raw_quote_json": {
+          "name": "raw_quote_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_fills_owner": {
+          "name": "h2_fills_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "h2_fills_operation": {
+          "name": "h2_fills_operation",
+          "columns": ["operation_id"],
+          "isUnique": true
+        },
+        "idx_fills_order_id": {
+          "name": "idx_fills_order_id",
+          "columns": ["order_id"],
+          "isUnique": false
+        },
+        "idx_fills_session_id": {
+          "name": "idx_fills_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_fills_filled_at_ms": {
+          "name": "idx_fills_filled_at_ms",
+          "columns": ["filled_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "fills_order_id_orders_id_fk": {
+          "name": "fills_order_id_orders_id_fk",
+          "tableFrom": "fills",
+          "tableTo": "orders",
+          "columnsFrom": ["order_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "fills_session_id_sessions_id_fk": {
+          "name": "fills_session_id_sessions_id_fk",
+          "tableFrom": "fills",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "fills_operation_id_paper_operations_id_fk": {
+          "name": "fills_operation_id_paper_operations_id_fk",
+          "tableFrom": "fills",
+          "tableTo": "paper_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_fills_order_owner": {
+          "name": "h2_fills_order_owner",
+          "tableFrom": "fills",
+          "tableTo": "orders",
+          "columnsFrom": ["order_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_fills_operation_owner": {
+          "name": "h2_fills_operation_owner",
+          "tableFrom": "fills",
+          "tableTo": "paper_operations",
+          "columnsFrom": ["operation_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_fills_filled_at_ms": {
+          "name": "h2_fills_filled_at_ms",
+          "value": "\"fills\".\"filled_at_ms\" IS NULL OR (typeof(\"fills\".\"filled_at_ms\") = 'integer' AND \"fills\".\"filled_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_created_at_ms": {
+          "name": "h2_fills_created_at_ms",
+          "value": "\"fills\".\"created_at_ms\" IS NULL OR (typeof(\"fills\".\"created_at_ms\") = 'integer' AND \"fills\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_sol_spent_lamports": {
+          "name": "h2_fills_sol_spent_lamports",
+          "value": "\"fills\".\"sol_spent_lamports\" IS NULL OR (typeof(\"fills\".\"sol_spent_lamports\") = 'integer' AND \"fills\".\"sol_spent_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_sol_received_lamports": {
+          "name": "h2_fills_sol_received_lamports",
+          "value": "\"fills\".\"sol_received_lamports\" IS NULL OR (typeof(\"fills\".\"sol_received_lamports\") = 'integer' AND \"fills\".\"sol_received_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_estimated_base_fee_lamports": {
+          "name": "h2_fills_estimated_base_fee_lamports",
+          "value": "\"fills\".\"estimated_base_fee_lamports\" IS NULL OR (typeof(\"fills\".\"estimated_base_fee_lamports\") = 'integer' AND \"fills\".\"estimated_base_fee_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_estimated_priority_fee_lamports": {
+          "name": "h2_fills_estimated_priority_fee_lamports",
+          "value": "\"fills\".\"estimated_priority_fee_lamports\" IS NULL OR (typeof(\"fills\".\"estimated_priority_fee_lamports\") = 'integer' AND \"fills\".\"estimated_priority_fee_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_estimated_slippage_lamports": {
+          "name": "h2_fills_estimated_slippage_lamports",
+          "value": "\"fills\".\"estimated_slippage_lamports\" IS NULL OR (typeof(\"fills\".\"estimated_slippage_lamports\") = 'integer' AND \"fills\".\"estimated_slippage_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_fills_price_impact_bps": {
+          "name": "h2_fills_price_impact_bps",
+          "value": "\"fills\".\"price_impact_bps\" IS NULL OR (typeof(\"fills\".\"price_impact_bps\") = 'integer' AND \"fills\".\"price_impact_bps\" BETWEEN -9007199254740991 AND 9007199254740991)"
+        }
+      }
+    },
+    "orders": {
+      "name": "orders",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mode": {
+          "name": "mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "side": {
+          "name": "side",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'CREATED'"
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "requested_sol_lamports": {
+          "name": "requested_sol_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "requested_token_amount": {
+          "name": "requested_token_amount",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "quote_source": {
+          "name": "quote_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "quote_id": {
+          "name": "quote_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "strategy_decision_id": {
+          "name": "strategy_decision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "raw_order_json": {
+          "name": "raw_order_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_orders_owner": {
+          "name": "h2_orders_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "h2_orders_operation": {
+          "name": "h2_orders_operation",
+          "columns": ["operation_id"],
+          "isUnique": true
+        },
+        "idx_orders_session_id": {
+          "name": "idx_orders_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_orders_mint_address": {
+          "name": "idx_orders_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_orders_status": {
+          "name": "idx_orders_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_orders_side": {
+          "name": "idx_orders_side",
+          "columns": ["side"],
+          "isUnique": false
+        },
+        "idx_orders_created_at_ms": {
+          "name": "idx_orders_created_at_ms",
+          "columns": ["created_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "orders_session_id_sessions_id_fk": {
+          "name": "orders_session_id_sessions_id_fk",
+          "tableFrom": "orders",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "orders_strategy_decision_id_strategy_decisions_id_fk": {
+          "name": "orders_strategy_decision_id_strategy_decisions_id_fk",
+          "tableFrom": "orders",
+          "tableTo": "strategy_decisions",
+          "columnsFrom": ["strategy_decision_id"],
+          "columnsTo": ["id"],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "orders_operation_id_paper_operations_id_fk": {
+          "name": "orders_operation_id_paper_operations_id_fk",
+          "tableFrom": "orders",
+          "tableTo": "paper_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_orders_session_mode": {
+          "name": "h2_orders_session_mode",
+          "tableFrom": "orders",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id", "mode"],
+          "columnsTo": ["id", "mode"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_orders_decision_owner": {
+          "name": "h2_orders_decision_owner",
+          "tableFrom": "orders",
+          "tableTo": "strategy_decisions",
+          "columnsFrom": ["strategy_decision_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_orders_operation_owner": {
+          "name": "h2_orders_operation_owner",
+          "tableFrom": "orders",
+          "tableTo": "paper_operations",
+          "columnsFrom": ["operation_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_orders_mode": {
+          "name": "h2_orders_mode",
+          "value": "\"orders\".\"mode\" IN ('PAPER', 'LIVE', 'BACKTEST')"
+        },
+        "h2_orders_side": {
+          "name": "h2_orders_side",
+          "value": "\"orders\".\"side\" IN ('BUY', 'SELL')"
+        },
+        "h2_orders_status": {
+          "name": "h2_orders_status",
+          "value": "\"orders\".\"status\" IN ('CREATED', 'QUOTED', 'FILLED', 'PARTIALLY_FILLED', 'REJECTED', 'FAILED', 'CANCELLED')"
+        },
+        "h2_orders_created_at_ms": {
+          "name": "h2_orders_created_at_ms",
+          "value": "\"orders\".\"created_at_ms\" IS NULL OR (typeof(\"orders\".\"created_at_ms\") = 'integer' AND \"orders\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_orders_updated_at_ms": {
+          "name": "h2_orders_updated_at_ms",
+          "value": "\"orders\".\"updated_at_ms\" IS NULL OR (typeof(\"orders\".\"updated_at_ms\") = 'integer' AND \"orders\".\"updated_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_orders_requested_sol_lamports": {
+          "name": "h2_orders_requested_sol_lamports",
+          "value": "\"orders\".\"requested_sol_lamports\" IS NULL OR (typeof(\"orders\".\"requested_sol_lamports\") = 'integer' AND \"orders\".\"requested_sol_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_orders_time_order": {
+          "name": "h2_orders_time_order",
+          "value": "\"orders\".\"updated_at_ms\" >= \"orders\".\"created_at_ms\""
+        },
+        "h2_orders_operation_mode": {
+          "name": "h2_orders_operation_mode",
+          "value": "\"orders\".\"operation_id\" IS NULL OR \"orders\".\"mode\" = 'PAPER'"
+        }
+      }
+    },
+    "paper_operations": {
+      "name": "paper_operations",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mode": {
+          "name": "mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'PAPER'"
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "side": {
+          "name": "side",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "source_id": {
+          "name": "source_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "strategy_decision_id": {
+          "name": "strategy_decision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "input_position_id": {
+          "name": "input_position_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "radar_id": {
+          "name": "radar_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "intent_digest": {
+          "name": "intent_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "intent_json": {
+          "name": "intent_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'PENDING'"
+        },
+        "order_id": {
+          "name": "order_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "fill_id": {
+          "name": "fill_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "result_position_id": {
+          "name": "result_position_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "result_json": {
+          "name": "result_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_operations_owner": {
+          "name": "h2_operations_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "h2_operations_order": {
+          "name": "h2_operations_order",
+          "columns": ["order_id"],
+          "isUnique": true
+        },
+        "h2_operations_fill": {
+          "name": "h2_operations_fill",
+          "columns": ["fill_id"],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "paper_operations_session_id_sessions_id_fk": {
+          "name": "paper_operations_session_id_sessions_id_fk",
+          "tableFrom": "paper_operations",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_session_mode": {
+          "name": "h2_operations_session_mode",
+          "tableFrom": "paper_operations",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id", "mode"],
+          "columnsTo": ["id", "mode"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_decision_owner": {
+          "name": "h2_operations_decision_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "strategy_decisions",
+          "columnsFrom": ["strategy_decision_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_input_position_owner": {
+          "name": "h2_operations_input_position_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "positions",
+          "columnsFrom": ["input_position_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_radar_owner": {
+          "name": "h2_operations_radar_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "token_radar",
+          "columnsFrom": ["radar_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_order_owner": {
+          "name": "h2_operations_order_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "orders",
+          "columnsFrom": ["order_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_fill_owner": {
+          "name": "h2_operations_fill_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "fills",
+          "columnsFrom": ["fill_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "h2_operations_result_position_owner": {
+          "name": "h2_operations_result_position_owner",
+          "tableFrom": "paper_operations",
+          "tableTo": "positions",
+          "columnsFrom": ["result_position_id", "session_id"],
+          "columnsTo": ["id", "session_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_operations_mode": {
+          "name": "h2_operations_mode",
+          "value": "\"paper_operations\".\"mode\" = 'PAPER'"
+        },
+        "h2_operations_side": {
+          "name": "h2_operations_side",
+          "value": "\"paper_operations\".\"side\" IN ('BUY', 'SELL')"
+        },
+        "h2_operations_state": {
+          "name": "h2_operations_state",
+          "value": "\"paper_operations\".\"state\" IN ('PENDING', 'COMMITTED', 'REJECTED')"
+        },
+        "h2_operations_version": {
+          "name": "h2_operations_version",
+          "value": "\"paper_operations\".\"version\" = 1"
+        },
+        "h2_operations_digest": {
+          "name": "h2_operations_digest",
+          "value": "length(\"paper_operations\".\"intent_digest\") = 64 AND \"paper_operations\".\"intent_digest\" NOT GLOB '*[^0-9a-f]*'"
+        },
+        "h2_operations_intent_json": {
+          "name": "h2_operations_intent_json",
+          "value": "json_valid(\"paper_operations\".\"intent_json\") AND json_type(\"paper_operations\".\"intent_json\") = 'object'"
+        },
+        "h2_operations_source": {
+          "name": "h2_operations_source",
+          "value": "(\"paper_operations\".\"side\" = 'BUY' AND \"paper_operations\".\"strategy_decision_id\" IS NOT NULL AND \"paper_operations\".\"source_id\" = \"paper_operations\".\"strategy_decision_id\" AND \"paper_operations\".\"radar_id\" IS NOT NULL AND \"paper_operations\".\"input_position_id\" IS NULL) OR (\"paper_operations\".\"side\" = 'SELL' AND \"paper_operations\".\"input_position_id\" IS NOT NULL AND \"paper_operations\".\"source_id\" = \"paper_operations\".\"input_position_id\" AND \"paper_operations\".\"strategy_decision_id\" IS NULL)"
+        },
+        "h2_operations_result": {
+          "name": "h2_operations_result",
+          "value": "(\"paper_operations\".\"state\" = 'PENDING' AND \"paper_operations\".\"order_id\" IS NULL AND \"paper_operations\".\"fill_id\" IS NULL AND \"paper_operations\".\"result_position_id\" IS NULL AND \"paper_operations\".\"result_json\" IS NULL) OR (\"paper_operations\".\"state\" = 'REJECTED' AND \"paper_operations\".\"order_id\" IS NOT NULL AND \"paper_operations\".\"fill_id\" IS NULL AND \"paper_operations\".\"result_position_id\" IS NULL AND \"paper_operations\".\"result_json\" IS NOT NULL AND json_valid(\"paper_operations\".\"result_json\") AND json_type(\"paper_operations\".\"result_json\") = 'object') OR (\"paper_operations\".\"state\" = 'COMMITTED' AND \"paper_operations\".\"order_id\" IS NOT NULL AND \"paper_operations\".\"fill_id\" IS NOT NULL AND \"paper_operations\".\"result_position_id\" IS NOT NULL AND \"paper_operations\".\"result_json\" IS NOT NULL AND json_valid(\"paper_operations\".\"result_json\") AND json_type(\"paper_operations\".\"result_json\") = 'object')"
+        },
+        "h2_operations_created_at_ms": {
+          "name": "h2_operations_created_at_ms",
+          "value": "\"paper_operations\".\"created_at_ms\" IS NULL OR (typeof(\"paper_operations\".\"created_at_ms\") = 'integer' AND \"paper_operations\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_operations_updated_at_ms": {
+          "name": "h2_operations_updated_at_ms",
+          "value": "\"paper_operations\".\"updated_at_ms\" IS NULL OR (typeof(\"paper_operations\".\"updated_at_ms\") = 'integer' AND \"paper_operations\".\"updated_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_operations_time_order": {
+          "name": "h2_operations_time_order",
+          "value": "\"paper_operations\".\"updated_at_ms\" >= \"paper_operations\".\"created_at_ms\""
+        }
+      }
+    },
+    "position_snapshots": {
+      "name": "position_snapshots",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "position_id": {
+          "name": "position_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "timestamp_ms": {
+          "name": "timestamp_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mark_price_sol": {
+          "name": "mark_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "sell_quote_lamports": {
+          "name": "sell_quote_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "unrealized_pnl_lamports": {
+          "name": "unrealized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "unrealized_pnl_bps": {
+          "name": "unrealized_pnl_bps",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "liquidity_usd": {
+          "name": "liquidity_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "raw_quote_json": {
+          "name": "raw_quote_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_position_snapshots_position_id": {
+          "name": "idx_position_snapshots_position_id",
+          "columns": ["position_id"],
+          "isUnique": false
+        },
+        "idx_position_snapshots_session_id": {
+          "name": "idx_position_snapshots_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_position_snapshots_timestamp_ms": {
+          "name": "idx_position_snapshots_timestamp_ms",
+          "columns": ["timestamp_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "position_snapshots_position_id_positions_id_fk": {
+          "name": "position_snapshots_position_id_positions_id_fk",
+          "tableFrom": "position_snapshots",
+          "tableTo": "positions",
+          "columnsFrom": ["position_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "position_snapshots_session_id_sessions_id_fk": {
+          "name": "position_snapshots_session_id_sessions_id_fk",
+          "tableFrom": "position_snapshots",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "positions": {
+      "name": "positions",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'OPEN'"
+        },
+        "opened_at_ms": {
+          "name": "opened_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "closed_at_ms": {
+          "name": "closed_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "avg_entry_price_sol": {
+          "name": "avg_entry_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "avg_exit_price_sol": {
+          "name": "avg_exit_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "tokens_held": {
+          "name": "tokens_held",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "cost_basis_lamports": {
+          "name": "cost_basis_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "proceeds_lamports": {
+          "name": "proceeds_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "realized_pnl_lamports": {
+          "name": "realized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "realized_pnl_bps": {
+          "name": "realized_pnl_bps",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "fees_paid_lamports": {
+          "name": "fees_paid_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_positions_owner": {
+          "name": "h2_positions_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "h2_positions_active_mint": {
+          "name": "h2_positions_active_mint",
+          "columns": ["session_id", "mint_address"],
+          "isUnique": true,
+          "where": "\"positions\".\"status\" IN ('OPEN', 'CLOSING')"
+        },
+        "idx_positions_session_id": {
+          "name": "idx_positions_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_positions_mint_address": {
+          "name": "idx_positions_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_positions_status": {
+          "name": "idx_positions_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_positions_opened_at_ms": {
+          "name": "idx_positions_opened_at_ms",
+          "columns": ["opened_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "positions_session_id_sessions_id_fk": {
+          "name": "positions_session_id_sessions_id_fk",
+          "tableFrom": "positions",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_positions_status": {
+          "name": "h2_positions_status",
+          "value": "\"positions\".\"status\" IN ('OPEN', 'CLOSING', 'CLOSED', 'ERROR')"
+        },
+        "h2_positions_opened_at_ms": {
+          "name": "h2_positions_opened_at_ms",
+          "value": "\"positions\".\"opened_at_ms\" IS NULL OR (typeof(\"positions\".\"opened_at_ms\") = 'integer' AND \"positions\".\"opened_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_closed_at_ms": {
+          "name": "h2_positions_closed_at_ms",
+          "value": "\"positions\".\"closed_at_ms\" IS NULL OR (typeof(\"positions\".\"closed_at_ms\") = 'integer' AND \"positions\".\"closed_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_created_at_ms": {
+          "name": "h2_positions_created_at_ms",
+          "value": "\"positions\".\"created_at_ms\" IS NULL OR (typeof(\"positions\".\"created_at_ms\") = 'integer' AND \"positions\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_updated_at_ms": {
+          "name": "h2_positions_updated_at_ms",
+          "value": "\"positions\".\"updated_at_ms\" IS NULL OR (typeof(\"positions\".\"updated_at_ms\") = 'integer' AND \"positions\".\"updated_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_cost_basis_lamports": {
+          "name": "h2_positions_cost_basis_lamports",
+          "value": "\"positions\".\"cost_basis_lamports\" IS NULL OR (typeof(\"positions\".\"cost_basis_lamports\") = 'integer' AND \"positions\".\"cost_basis_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_proceeds_lamports": {
+          "name": "h2_positions_proceeds_lamports",
+          "value": "\"positions\".\"proceeds_lamports\" IS NULL OR (typeof(\"positions\".\"proceeds_lamports\") = 'integer' AND \"positions\".\"proceeds_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_fees_paid_lamports": {
+          "name": "h2_positions_fees_paid_lamports",
+          "value": "\"positions\".\"fees_paid_lamports\" IS NULL OR (typeof(\"positions\".\"fees_paid_lamports\") = 'integer' AND \"positions\".\"fees_paid_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_positions_realized_pnl_lamports": {
+          "name": "h2_positions_realized_pnl_lamports",
+          "value": "\"positions\".\"realized_pnl_lamports\" IS NULL OR (typeof(\"positions\".\"realized_pnl_lamports\") = 'integer' AND \"positions\".\"realized_pnl_lamports\" BETWEEN -9007199254740991 AND 9007199254740991)"
+        },
+        "h2_positions_realized_pnl_bps": {
+          "name": "h2_positions_realized_pnl_bps",
+          "value": "\"positions\".\"realized_pnl_bps\" IS NULL OR (typeof(\"positions\".\"realized_pnl_bps\") = 'integer' AND \"positions\".\"realized_pnl_bps\" BETWEEN -9007199254740991 AND 9007199254740991)"
+        },
+        "h2_positions_time_order": {
+          "name": "h2_positions_time_order",
+          "value": "\"positions\".\"updated_at_ms\" >= \"positions\".\"created_at_ms\" AND (\"positions\".\"closed_at_ms\" IS NULL OR \"positions\".\"closed_at_ms\" >= \"positions\".\"opened_at_ms\")"
+        }
+      }
+    },
+    "provider_health": {
+      "name": "provider_health",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "timestamp_ms": {
+          "name": "timestamp_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "latency_ms": {
+          "name": "latency_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "rate_limited": {
+          "name": "rate_limited",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "credits_used": {
+          "name": "credits_used",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "context_json": {
+          "name": "context_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_provider_health_session_id": {
+          "name": "idx_provider_health_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_provider_health_provider": {
+          "name": "idx_provider_health_provider",
+          "columns": ["provider"],
+          "isUnique": false
+        },
+        "idx_provider_health_status": {
+          "name": "idx_provider_health_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_provider_health_timestamp_ms": {
+          "name": "idx_provider_health_timestamp_ms",
+          "columns": ["timestamp_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "provider_health_session_id_sessions_id_fk": {
+          "name": "provider_health_session_id_sessions_id_fk",
+          "tableFrom": "provider_health",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "risk_assessments": {
+      "name": "risk_assessments",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "token_radar_id": {
+          "name": "token_radar_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "checked_at_ms": {
+          "name": "checked_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "score": {
+          "name": "score",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "result": {
+          "name": "result",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'UNKNOWN'"
+        },
+        "passed": {
+          "name": "passed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "mint_authority_disabled": {
+          "name": "mint_authority_disabled",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "freeze_authority_disabled": {
+          "name": "freeze_authority_disabled",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "token_program": {
+          "name": "token_program",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "top_holders_percent": {
+          "name": "top_holders_percent",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "liquidity_usd": {
+          "name": "liquidity_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "risk_flags_json": {
+          "name": "risk_flags_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "raw_provider_data_json": {
+          "name": "raw_provider_data_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_risk_assessments_session_id": {
+          "name": "idx_risk_assessments_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_risk_assessments_mint_address": {
+          "name": "idx_risk_assessments_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_risk_assessments_result": {
+          "name": "idx_risk_assessments_result",
+          "columns": ["result"],
+          "isUnique": false
+        },
+        "idx_risk_assessments_checked_at_ms": {
+          "name": "idx_risk_assessments_checked_at_ms",
+          "columns": ["checked_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "risk_assessments_session_id_sessions_id_fk": {
+          "name": "risk_assessments_session_id_sessions_id_fk",
+          "tableFrom": "risk_assessments",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "risk_assessments_token_radar_id_token_radar_id_fk": {
+          "name": "risk_assessments_token_radar_id_token_radar_id_fk",
+          "tableFrom": "risk_assessments",
+          "tableTo": "token_radar",
+          "columnsFrom": ["token_radar_id"],
+          "columnsTo": ["id"],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "sessions": {
+      "name": "sessions",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mode": {
+          "name": "mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'CREATED'"
+        },
+        "started_at_ms": {
+          "name": "started_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ended_at_ms": {
+          "name": "ended_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "starting_balance_lamports": {
+          "name": "starting_balance_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "current_cash_lamports": {
+          "name": "current_cash_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "target_profit_lamports": {
+          "name": "target_profit_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "target_profit_bps": {
+          "name": "target_profit_bps",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "max_drawdown_lamports": {
+          "name": "max_drawdown_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "realized_pnl_lamports": {
+          "name": "realized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "unrealized_pnl_lamports": {
+          "name": "unrealized_pnl_lamports",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "termination_reason": {
+          "name": "termination_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'NOT_TERMINATED'"
+        },
+        "config_snapshot_json": {
+          "name": "config_snapshot_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_sessions_owner_mode": {
+          "name": "h2_sessions_owner_mode",
+          "columns": ["id", "mode"],
+          "isUnique": true
+        },
+        "idx_sessions_mode": {
+          "name": "idx_sessions_mode",
+          "columns": ["mode"],
+          "isUnique": false
+        },
+        "idx_sessions_status": {
+          "name": "idx_sessions_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_sessions_started_at_ms": {
+          "name": "idx_sessions_started_at_ms",
+          "columns": ["started_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_sessions_mode": {
+          "name": "h2_sessions_mode",
+          "value": "\"sessions\".\"mode\" IN ('PAPER', 'LIVE', 'BACKTEST')"
+        },
+        "h2_sessions_status": {
+          "name": "h2_sessions_status",
+          "value": "\"sessions\".\"status\" IN ('CREATED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED')"
+        },
+        "h2_sessions_termination": {
+          "name": "h2_sessions_termination",
+          "value": "\"sessions\".\"termination_reason\" IN ('TARGET_REACHED', 'MAX_DRAWDOWN', 'DURATION_EXPIRED', 'USER_STOP', 'ENGINE_ERROR', 'NOT_TERMINATED')"
+        },
+        "h2_sessions_started_at_ms": {
+          "name": "h2_sessions_started_at_ms",
+          "value": "\"sessions\".\"started_at_ms\" IS NULL OR (typeof(\"sessions\".\"started_at_ms\") = 'integer' AND \"sessions\".\"started_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_ended_at_ms": {
+          "name": "h2_sessions_ended_at_ms",
+          "value": "\"sessions\".\"ended_at_ms\" IS NULL OR (typeof(\"sessions\".\"ended_at_ms\") = 'integer' AND \"sessions\".\"ended_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_created_at_ms": {
+          "name": "h2_sessions_created_at_ms",
+          "value": "\"sessions\".\"created_at_ms\" IS NULL OR (typeof(\"sessions\".\"created_at_ms\") = 'integer' AND \"sessions\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_updated_at_ms": {
+          "name": "h2_sessions_updated_at_ms",
+          "value": "\"sessions\".\"updated_at_ms\" IS NULL OR (typeof(\"sessions\".\"updated_at_ms\") = 'integer' AND \"sessions\".\"updated_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_starting_balance_lamports": {
+          "name": "h2_sessions_starting_balance_lamports",
+          "value": "\"sessions\".\"starting_balance_lamports\" IS NULL OR (typeof(\"sessions\".\"starting_balance_lamports\") = 'integer' AND \"sessions\".\"starting_balance_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_current_cash_lamports": {
+          "name": "h2_sessions_current_cash_lamports",
+          "value": "\"sessions\".\"current_cash_lamports\" IS NULL OR (typeof(\"sessions\".\"current_cash_lamports\") = 'integer' AND \"sessions\".\"current_cash_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_target_profit_lamports": {
+          "name": "h2_sessions_target_profit_lamports",
+          "value": "\"sessions\".\"target_profit_lamports\" IS NULL OR (typeof(\"sessions\".\"target_profit_lamports\") = 'integer' AND \"sessions\".\"target_profit_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_target_profit_bps": {
+          "name": "h2_sessions_target_profit_bps",
+          "value": "\"sessions\".\"target_profit_bps\" IS NULL OR (typeof(\"sessions\".\"target_profit_bps\") = 'integer' AND \"sessions\".\"target_profit_bps\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_max_drawdown_lamports": {
+          "name": "h2_sessions_max_drawdown_lamports",
+          "value": "\"sessions\".\"max_drawdown_lamports\" IS NULL OR (typeof(\"sessions\".\"max_drawdown_lamports\") = 'integer' AND \"sessions\".\"max_drawdown_lamports\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_sessions_realized_pnl_lamports": {
+          "name": "h2_sessions_realized_pnl_lamports",
+          "value": "\"sessions\".\"realized_pnl_lamports\" IS NULL OR (typeof(\"sessions\".\"realized_pnl_lamports\") = 'integer' AND \"sessions\".\"realized_pnl_lamports\" BETWEEN -9007199254740991 AND 9007199254740991)"
+        },
+        "h2_sessions_unrealized_pnl_lamports": {
+          "name": "h2_sessions_unrealized_pnl_lamports",
+          "value": "\"sessions\".\"unrealized_pnl_lamports\" IS NULL OR (typeof(\"sessions\".\"unrealized_pnl_lamports\") = 'integer' AND \"sessions\".\"unrealized_pnl_lamports\" BETWEEN -9007199254740991 AND 9007199254740991)"
+        },
+        "h2_sessions_time_order": {
+          "name": "h2_sessions_time_order",
+          "value": "\"sessions\".\"updated_at_ms\" >= \"sessions\".\"created_at_ms\" AND (\"sessions\".\"ended_at_ms\" IS NULL OR \"sessions\".\"ended_at_ms\" >= \"sessions\".\"started_at_ms\")"
+        }
+      }
+    },
+    "strategy_decisions": {
+      "name": "strategy_decisions",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decided_at_ms": {
+          "name": "decided_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decision": {
+          "name": "decision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "strategy_name": {
+          "name": "strategy_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "score": {
+          "name": "score",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "input_snapshot_json": {
+          "name": "input_snapshot_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_decisions_owner": {
+          "name": "h2_decisions_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "idx_strategy_decisions_session_id": {
+          "name": "idx_strategy_decisions_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_strategy_decisions_mint_address": {
+          "name": "idx_strategy_decisions_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_strategy_decisions_decision": {
+          "name": "idx_strategy_decisions_decision",
+          "columns": ["decision"],
+          "isUnique": false
+        },
+        "idx_strategy_decisions_decided_at_ms": {
+          "name": "idx_strategy_decisions_decided_at_ms",
+          "columns": ["decided_at_ms"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "strategy_decisions_session_id_sessions_id_fk": {
+          "name": "strategy_decisions_session_id_sessions_id_fk",
+          "tableFrom": "strategy_decisions",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_decisions_decision": {
+          "name": "h2_decisions_decision",
+          "value": "\"strategy_decisions\".\"decision\" IN ('WATCH', 'SKIP', 'BUY', 'HOLD', 'SELL')"
+        },
+        "h2_decisions_created_at_ms": {
+          "name": "h2_decisions_created_at_ms",
+          "value": "\"strategy_decisions\".\"created_at_ms\" IS NULL OR (typeof(\"strategy_decisions\".\"created_at_ms\") = 'integer' AND \"strategy_decisions\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_decisions_decided_at_ms": {
+          "name": "h2_decisions_decided_at_ms",
+          "value": "\"strategy_decisions\".\"decided_at_ms\" IS NULL OR (typeof(\"strategy_decisions\".\"decided_at_ms\") = 'integer' AND \"strategy_decisions\".\"decided_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        }
+      }
+    },
+    "system_logs": {
+      "name": "system_logs",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "timestamp_ms": {
+          "name": "timestamp_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "level": {
+          "name": "level",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "message": {
+          "name": "message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "context_json": {
+          "name": "context_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_system_logs_session_id": {
+          "name": "idx_system_logs_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_system_logs_timestamp_ms": {
+          "name": "idx_system_logs_timestamp_ms",
+          "columns": ["timestamp_ms"],
+          "isUnique": false
+        },
+        "idx_system_logs_level": {
+          "name": "idx_system_logs_level",
+          "columns": ["level"],
+          "isUnique": false
+        },
+        "idx_system_logs_scope": {
+          "name": "idx_system_logs_scope",
+          "columns": ["scope"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "system_logs_session_id_sessions_id_fk": {
+          "name": "system_logs_session_id_sessions_id_fk",
+          "tableFrom": "system_logs",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "token_radar": {
+      "name": "token_radar",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "pair_address": {
+          "name": "pair_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "first_seen_at_ms": {
+          "name": "first_seen_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "discovered_at_ms": {
+          "name": "discovered_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "price_usd": {
+          "name": "price_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "price_sol": {
+          "name": "price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "liquidity_usd": {
+          "name": "liquidity_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "volume_5m_usd": {
+          "name": "volume_5m_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "volume_1h_usd": {
+          "name": "volume_1h_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "age_seconds": {
+          "name": "age_seconds",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'DISCOVERED'"
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "raw_data_json": {
+          "name": "raw_data_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "h2_radar_owner": {
+          "name": "h2_radar_owner",
+          "columns": ["id", "session_id"],
+          "isUnique": true
+        },
+        "h2_radar_null_pair": {
+          "name": "h2_radar_null_pair",
+          "columns": ["session_id", "mint_address", "source"],
+          "isUnique": true,
+          "where": "\"token_radar\".\"pair_address\" IS NULL"
+        },
+        "idx_token_radar_session_id": {
+          "name": "idx_token_radar_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_token_radar_mint_address": {
+          "name": "idx_token_radar_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_token_radar_status": {
+          "name": "idx_token_radar_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_token_radar_first_seen_at_ms": {
+          "name": "idx_token_radar_first_seen_at_ms",
+          "columns": ["first_seen_at_ms"],
+          "isUnique": false
+        },
+        "uq_token_radar_session_mint_source_pair": {
+          "name": "uq_token_radar_session_mint_source_pair",
+          "columns": ["session_id", "mint_address", "source", "pair_address"],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "token_radar_session_id_sessions_id_fk": {
+          "name": "token_radar_session_id_sessions_id_fk",
+          "tableFrom": "token_radar",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "h2_radar_status": {
+          "name": "h2_radar_status",
+          "value": "\"token_radar\".\"status\" IN ('DISCOVERED', 'WATCHING', 'REJECTED', 'APPROVED', 'BOUGHT', 'IGNORED', 'ERROR')"
+        },
+        "h2_radar_pair": {
+          "name": "h2_radar_pair",
+          "value": "\"token_radar\".\"pair_address\" IS NULL OR length(trim(\"token_radar\".\"pair_address\")) > 0"
+        },
+        "h2_radar_first_seen_at_ms": {
+          "name": "h2_radar_first_seen_at_ms",
+          "value": "\"token_radar\".\"first_seen_at_ms\" IS NULL OR (typeof(\"token_radar\".\"first_seen_at_ms\") = 'integer' AND \"token_radar\".\"first_seen_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_radar_discovered_at_ms": {
+          "name": "h2_radar_discovered_at_ms",
+          "value": "\"token_radar\".\"discovered_at_ms\" IS NULL OR (typeof(\"token_radar\".\"discovered_at_ms\") = 'integer' AND \"token_radar\".\"discovered_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_radar_created_at_ms": {
+          "name": "h2_radar_created_at_ms",
+          "value": "\"token_radar\".\"created_at_ms\" IS NULL OR (typeof(\"token_radar\".\"created_at_ms\") = 'integer' AND \"token_radar\".\"created_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_radar_updated_at_ms": {
+          "name": "h2_radar_updated_at_ms",
+          "value": "\"token_radar\".\"updated_at_ms\" IS NULL OR (typeof(\"token_radar\".\"updated_at_ms\") = 'integer' AND \"token_radar\".\"updated_at_ms\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_radar_age_seconds": {
+          "name": "h2_radar_age_seconds",
+          "value": "\"token_radar\".\"age_seconds\" IS NULL OR (typeof(\"token_radar\".\"age_seconds\") = 'integer' AND \"token_radar\".\"age_seconds\" BETWEEN 0 AND 9007199254740991)"
+        },
+        "h2_radar_time_order": {
+          "name": "h2_radar_time_order",
+          "value": "\"token_radar\".\"updated_at_ms\" >= \"token_radar\".\"created_at_ms\""
+        }
+      }
+    },
+    "watchlist_return_observations": {
+      "name": "watchlist_return_observations",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "strategy_decision_id": {
+          "name": "strategy_decision_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "token_radar_id": {
+          "name": "token_radar_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "mint_address": {
+          "name": "mint_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "pair_address": {
+          "name": "pair_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "symbol": {
+          "name": "symbol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "decision": {
+          "name": "decision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "strategy_name": {
+          "name": "strategy_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "strategy_score": {
+          "name": "strategy_score",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "horizon_minutes": {
+          "name": "horizon_minutes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "baseline_observed_at_ms": {
+          "name": "baseline_observed_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "baseline_price_sol": {
+          "name": "baseline_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "baseline_price_usd": {
+          "name": "baseline_price_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "baseline_liquidity_usd": {
+          "name": "baseline_liquidity_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "baseline_volume_5m_usd": {
+          "name": "baseline_volume_5m_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "baseline_volume_1h_usd": {
+          "name": "baseline_volume_1h_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "baseline_source": {
+          "name": "baseline_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "due_at_ms": {
+          "name": "due_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "observed_at_ms": {
+          "name": "observed_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_price_sol": {
+          "name": "observed_price_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_price_usd": {
+          "name": "observed_price_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_liquidity_usd": {
+          "name": "observed_liquidity_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_volume_5m_usd": {
+          "name": "observed_volume_5m_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_volume_1h_usd": {
+          "name": "observed_volume_1h_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "observed_source": {
+          "name": "observed_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "return_pct_sol": {
+          "name": "return_pct_sol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "return_pct_usd": {
+          "name": "return_pct_usd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'PENDING'"
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "raw_data_json": {
+          "name": "raw_data_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at_ms": {
+          "name": "created_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at_ms": {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_watchlist_returns_session_id": {
+          "name": "idx_watchlist_returns_session_id",
+          "columns": ["session_id"],
+          "isUnique": false
+        },
+        "idx_watchlist_returns_mint_address": {
+          "name": "idx_watchlist_returns_mint_address",
+          "columns": ["mint_address"],
+          "isUnique": false
+        },
+        "idx_watchlist_returns_strategy_decision_id": {
+          "name": "idx_watchlist_returns_strategy_decision_id",
+          "columns": ["strategy_decision_id"],
+          "isUnique": false
+        },
+        "idx_watchlist_returns_status": {
+          "name": "idx_watchlist_returns_status",
+          "columns": ["status"],
+          "isUnique": false
+        },
+        "idx_watchlist_returns_due_at_ms": {
+          "name": "idx_watchlist_returns_due_at_ms",
+          "columns": ["due_at_ms"],
+          "isUnique": false
+        },
+        "idx_watchlist_returns_horizon_minutes": {
+          "name": "idx_watchlist_returns_horizon_minutes",
+          "columns": ["horizon_minutes"],
+          "isUnique": false
+        },
+        "uq_watchlist_returns_decision_horizon": {
+          "name": "uq_watchlist_returns_decision_horizon",
+          "columns": ["strategy_decision_id", "horizon_minutes"],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "watchlist_return_observations_session_id_sessions_id_fk": {
+          "name": "watchlist_return_observations_session_id_sessions_id_fk",
+          "tableFrom": "watchlist_return_observations",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "watchlist_return_observations_strategy_decision_id_strategy_decisions_id_fk": {
+          "name": "watchlist_return_observations_strategy_decision_id_strategy_decisions_id_fk",
+          "tableFrom": "watchlist_return_observations",
+          "tableTo": "strategy_decisions",
+          "columnsFrom": ["strategy_decision_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "watchlist_return_observations_token_radar_id_token_radar_id_fk": {
+          "name": "watchlist_return_observations_token_radar_id_token_radar_id_fk",
+          "tableFrom": "watchlist_return_observations",
+          "tableTo": "token_radar",
+          "columnsFrom": ["token_radar_id"],
+          "columnsTo": ["id"],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  },
+  "id": "2c46d8b6-1db9-44fe-a7d2-03dca9a7efea",
+  "prevId": "ec0b1138-4d30-4761-9ff3-ec61fe756974"
+}

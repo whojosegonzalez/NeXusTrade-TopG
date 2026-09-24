@@ -1,0 +1,14 @@
+{
+  "contractVersion": "1",
+  "archiveRoot": "data/archive/phase10.6a/measurement-v3-20260904-2100Z/",
+  "cohortStartAt": "2026-09-04T21:00:00.000Z",
+  "protocolPath": "docs/research-protocols/phase10.6a-exploratory-cohort.v3.json",
+  "protocolSha256": "dd57285927474e3e646bd4a52c5d37fbb550d5cb73f836db69b02827c5360458",
+  "protocolValidationFingerprint": "b992982000ac2e0fb51cd7944a979adc0114f77a6845b3d36a3d88b9eab3e4e6",
+  "authorization": "USER_AUTHORIZED_FOR_ONE_MEASUREMENT_ONLY_COLLECTION",
+  "authorizationReference": "User approved V3 measurement root 20260904 2100Z",
+  "operator": {
+    "kind": "EXTERNAL_OPERATOR",
+    "label": "User managed operator"
+  }
+}

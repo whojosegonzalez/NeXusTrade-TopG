@@ -1,5 +1,87 @@
 {
+  "name": "nexustrade-otis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first Solana meme-coin paper-trading research and automation system.",
+  "type": "module",
+  "packageManager": "pnpm@11.8.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "analytics:report": "pnpm --filter @nexustrade/backend analytics:report",
+    "build": "pnpm -r --if-present build",
+    "calibration:report": "pnpm --filter @nexustrade/backend calibration:report",
+    "check:secrets": "node scripts/check-secrets.mjs",
+    "db:generate": "pnpm --filter @nexustrade/backend db:generate",
+    "db:migrate:paper": "pnpm --filter @nexustrade/backend db:migrate:paper",
+    "db:reset:paper": "pnpm --filter @nexustrade/backend db:reset:paper",
+    "db:seed:paper": "pnpm --filter @nexustrade/backend db:seed:paper",
+    "db:smoke:paper": "pnpm --filter @nexustrade/backend db:smoke:paper",
+    "db:studio:paper": "pnpm --filter @nexustrade/backend db:studio:paper",
+    "dashboard:build": "pnpm --filter @nexustrade/research-dashboard build",
+    "dashboard:dev": "pnpm --filter @nexustrade/research-dashboard dev",
+    "dashboard:export": "pnpm --filter @nexustrade/backend dashboard:export",
+    "dev:backend": "pnpm --filter @nexustrade/backend dev",
+    "exits:manage": "pnpm --filter @nexustrade/backend exits:manage",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "lint": "eslint .",
+    "paper:execute": "pnpm --filter @nexustrade/backend paper:execute",
+    "paper:sell": "pnpm --filter @nexustrade/backend paper:sell",
+    "prepare": "husky",
+    "providers:smoke": "pnpm --filter @nexustrade/backend providers:smoke",
+    "quote:diagnose": "pnpm --filter @nexustrade/backend quote:diagnose",
+    "research:aggregate": "pnpm --filter @nexustrade/backend research:aggregate",
+    "research:brief": "pnpm --filter @nexustrade/backend research:brief",
+    "research:counterfactual": "pnpm --filter @nexustrade/backend research:counterfactual",
+    "research:exploratory-cohort:analyze": "pnpm --filter @nexustrade/backend research:exploratory-cohort:analyze",
+    "research:exploratory-cohort:collect": "pnpm --filter @nexustrade/backend research:exploratory-cohort:collect",
+    "research:exploratory-cohort:measurement-audit": "pnpm --filter @nexustrade/backend research:exploratory-cohort:measurement-audit",
+    "research:interpret": "pnpm --filter @nexustrade/backend research:interpret",
+    "research:measurement-protocol:validate": "pnpm --filter @nexustrade/backend research:measurement-protocol:validate",
+    "research:measurement-cohort:collect": "pnpm --filter @nexustrade/backend research:measurement-cohort:collect",
+    "research:measurement-cohort:analyze": "pnpm --filter @nexustrade/backend research:measurement-cohort:analyze",
+    "research:protocol:validate": "pnpm --filter @nexustrade/backend research:protocol:validate",
+    "research:review-gate": "pnpm --filter @nexustrade/backend research:review-gate",
+    "research:truth": "pnpm --filter @nexustrade/backend research:truth",
+    "risk:evaluate": "pnpm --filter @nexustrade/backend risk:evaluate",
+    "scanner:discover": "pnpm --filter @nexustrade/backend scanner:discover",
+    "session:manage": "pnpm --filter @nexustrade/backend session:manage",
+    "shadow:calibrate": "pnpm --filter @nexustrade/backend shadow:calibrate",
+    "shadow:entries": "pnpm --filter @nexustrade/backend shadow:entries",
+    "shadow:exits": "pnpm --filter @nexustrade/backend shadow:exits",
+    "shadow:fast-observe": "pnpm --filter @nexustrade/backend shadow:fast-observe",
+    "shadow:fast-exit-validate": "pnpm --filter @nexustrade/backend shadow:fast-exit-validate",
+    "shadow:fast-feature-attribute": "pnpm --filter @nexustrade/backend shadow:fast-feature-attribute",
+    "shadow:observe": "pnpm --filter @nexustrade/backend shadow:observe",
+    "shadow:threshold-validate": "pnpm --filter @nexustrade/backend shadow:threshold-validate",
+    "strategy:evaluate": "pnpm --filter @nexustrade/backend strategy:evaluate",
+    "terminal:run": "pnpm --filter @nexustrade/backend terminal:run",
+    "watchlist:returns": "pnpm --filter @nexustrade/backend watchlist:returns",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm check:secrets",
+    "verify:isolated": "node scripts/verify-isolated.mjs",
+    "check:architecture": "node scripts/architecture-check.mjs"
+  },
+  "lint-staged": {
+    "*.{js,mjs,cjs,ts,tsx,json,md,yml,yaml}": [
+      "prettier --write"
+    ],
+    "*.{js,mjs,cjs,ts,tsx}": [
+      "eslint --fix"
+    ]
+  },
   "devDependencies": {
-    "@types/node": "^25.0.2"
+    "@eslint/js": "^9.28.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.28.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.33.1",
+    "vitest": "^4.1.11"
   }
 }

@@ -1,0 +1,39 @@
+{
+  "title": "Phase 10.6A Exploratory Cohort V2 Launch Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "archiveRoot",
+    "cohortStartAt",
+    "protocolPath",
+    "protocolSha256",
+    "protocolValidationFingerprint",
+    "authorization",
+    "authorizationReference"
+  ],
+  "properties": {
+    "contractVersion": { "const": "1" },
+    "archiveRoot": {
+      "type": "string",
+      "pattern": "^data/archive/phase10\\.6a/exploratory-cohort-v2-[0-9]{8}-0000Z$"
+    },
+    "cohortStartAt": { "type": "string", "format": "date-time" },
+    "protocolPath": {
+      "const": "docs/research-protocols/phase10.6a-exploratory-cohort.v2.json"
+    },
+    "protocolSha256": {
+      "const": "2662a4cbc1d3458d55b64f9c4cc826561aad1cb6f6b5faf11079194377f5a0ed"
+    },
+    "protocolValidationFingerprint": {
+      "const": "1fbe8a70792d872c7199d7182d095f13cce7c9908939526b44ecc7e2f872c283"
+    },
+    "authorization": { "const": "USER_AUTHORIZED_FOR_ONE_OBSERVATIONAL_COLLECTION" },
+    "authorizationReference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    }
+  }
+}

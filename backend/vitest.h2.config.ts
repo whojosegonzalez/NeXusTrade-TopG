@@ -1,0 +1,40 @@
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  root: fileURLToPath(new URL(".", import.meta.url)),
+  envDir: false,
+  publicDir: false,
+  cacheDir: "../node_modules/.cache/h2",
+  test: {
+    include: [
+      "src/paper/PaperRunner.test.ts",
+      "src/paper/PaperSellRunner.test.ts",
+      "src/paper/PaperExchangeConfig.test.ts",
+      "src/paper/PaperSellConfig.test.ts",
+      "src/paper/PaperOperationIdentity.test.ts",
+      "src/db/h2/H2Baseline.test.ts",
+      "src/db/h2/H2Boundary.test.ts",
+      "src/db/h2/H2Migrations.test.ts",
+      "src/db/h2/H2AccountingCharacterization.test.ts",
+      "src/db/h2/H2Schema.test.ts",
+      "src/db/h2/H2Transactions.test.ts",
+      "src/db/h2/H2Operations.test.ts",
+      "src/db/h2/H2Buy.test.ts",
+      "src/db/h2/H2Sell.test.ts",
+      "src/db/h2/H2Reconciliation.test.ts",
+      "src/db/h2/H2Recovery.test.ts",
+      "src/exits/ExitManagerRunner.test.ts",
+      "src/exits/ExitManagerConfig.test.ts",
+      "src/session/SessionManagerRunner.test.ts",
+      "src/session/SessionManagerConfig.test.ts",
+      "src/db/repositories/repositories.test.ts",
+      "src/db/connection.test.ts",
+    ],
+    setupFiles: ["src/db/h2/H2TestSetup.ts"],
+    environment: "node",
+    maxWorkers: 1,
+    fileParallelism: false,
+    watch: false,
+  },
+});

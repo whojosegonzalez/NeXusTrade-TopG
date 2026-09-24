@@ -1,0 +1,253 @@
+{
+  "contractVersion": "2",
+  "protocolId": "EXPLORATORY_COHORT@v2",
+  "authorityStatus": "NOT_AUTHORIZED_FOR_COLLECTION",
+  "supersedes": {
+    "protocolPath": "docs/research-protocols/phase10.6a-exploratory-cohort.v1.json",
+    "protocolSha256": "748a159464ddfae3d7821e5e18bc690d87c2ac82cf2d89b596a11f4612fce152",
+    "reason": "REQUEST_CAPS_COVER_ALL_168_ATTEMPTED_SLOTS_WITHOUT_RETRY_OR_FALLBACK"
+  },
+  "sourceEvidence": {
+    "researchBrief": {
+      "fingerprint": "5fb59e2bf4472ea4da2a516d1298398491b812d1a3ae811d745aa46d5ee308c7",
+      "citation": "docs/NeXusTrade-Phase-10.4-Detailed-Checklist.md"
+    },
+    "researchReviewGate": {
+      "fingerprint": "2846a8509f523104417e460d0bc0a6812d161f393ade666b73faea5caa19828b",
+      "citation": "docs/research-reviews/phase10.5-initial.v1.json"
+    },
+    "phase929Conclusion": {
+      "status": "NO_DEFENSIBLE_HYPOTHESIS",
+      "citation": "docs/NeXusTrade-Phase-9.29-Detailed-Checklist.md"
+    }
+  },
+  "purpose": {
+    "kind": "OUTCOME_BLIND_OBSERVATIONAL_MEASUREMENT",
+    "designQuestion": "Can a broad outcome-blind observational cohort gather enough independent decision-time evidence to let a later archive-only review decide whether any distinct study is defensible?",
+    "strategyValidation": false,
+    "profitabilityClaim": false
+  },
+  "population": {
+    "discoveryUniverse": "ALL_CANONICAL_SOLANA_MINTS_FROM_UNMODIFIED_DISCOVERY_UNIVERSE",
+    "technicalValidityAnchor": {
+      "mintEncoding": "BASE58_32_BYTE_CANONICAL_MINT",
+      "sourceKindRequired": true,
+      "firstReceivedAtUtcRequired": true,
+      "decisionTimeAnchor": "SLOT_SELECTION_TIMESTAMP"
+    },
+    "permittedExclusions": [
+      "MALFORMED_OR_NON_CANONICAL_IDENTIFIER",
+      "DUPLICATE_SAMPLING_UNIT",
+      "UNAVAILABLE_REQUIRED_COLLECTION_TIME_ANCHOR_FACT",
+      "PREDECLARED_TECHNICAL_OR_SAFETY_STOP"
+    ],
+    "forbiddenInputs": [
+      "BUY_WATCH_SKIP_CLASSIFICATION",
+      "F65E_FACT",
+      "LATER_LABEL",
+      "LATER_RETURN",
+      "RISK_SCORE",
+      "STRATEGY_DECISION",
+      "STRATEGY_SCORE"
+    ]
+  },
+  "samplingPlan": {
+    "seed": "phase10.6a-exploratory-cohort.v2",
+    "slotDurationMinutes": 120,
+    "selectionHash": "SHA256(seed|canonicalMint|slotId)",
+    "selectionRule": "LEXICOGRAPHICALLY_LOWEST_HASH",
+    "maximumUnitsPerSlot": 1,
+    "postSlotBackfill": false,
+    "plannedUnits": 96,
+    "minimumValidUnits": 72,
+    "maximumAttemptedSlots": 168,
+    "consecutiveUtcDates": 14
+  },
+  "independencePlan": {
+    "slotIdDefinition": "[UTC_START,UTC_START_PLUS_2_HOURS)",
+    "minimumUtcDates": 8,
+    "maximumValidUnitSharePerUtcDatePct": 20,
+    "maximumUnitsPerSlot": 1,
+    "minimumDistinctMints": 72
+  },
+  "deduplicationPlan": {
+    "canonicalMintRule": "ONE_CANONICAL_MINT_PER_COHORT",
+    "marketWindowRule": "ONE_UNIT_PER_NON_OVERLAPPING_UTC_SLOT",
+    "duplicateAction": "SKIP_UNIT_WITH_REASON",
+    "replacementRule": "NO_OUTCOME_DRIVEN_REPLACEMENT"
+  },
+  "decisionTimeSchema": {
+    "allowlistedFields": [
+      "unitId",
+      "canonicalMint",
+      "anchorAt",
+      "slotId",
+      "partition",
+      "discovery.sourceKind",
+      "discovery.firstObservedAt",
+      "market.assetAgeSeconds",
+      "market.priceUsd",
+      "market.liquidityUsd",
+      "market.volume5mUsd",
+      "market.volume1hUsd",
+      "market.momentum5mPct",
+      "market.momentum15mPct",
+      "quote.available",
+      "quote.priceImpactBps",
+      "risk.blockerCodes",
+      "attention.repeatedAttentionCount"
+    ],
+    "fieldValueTypes": {
+      "unitId": "NON_EMPTY_STRING",
+      "canonicalMint": "NON_EMPTY_STRING",
+      "anchorAt": "ISO_8601_UTC_STRING",
+      "slotId": "NON_EMPTY_STRING",
+      "partition": "NON_EMPTY_STRING",
+      "discovery.sourceKind": "NON_EMPTY_STRING",
+      "discovery.firstObservedAt": "ISO_8601_UTC_STRING",
+      "market.assetAgeSeconds": "NON_NEGATIVE_INTEGER",
+      "market.priceUsd": "FINITE_NUMBER",
+      "market.liquidityUsd": "FINITE_NUMBER",
+      "market.volume5mUsd": "FINITE_NUMBER",
+      "market.volume1hUsd": "FINITE_NUMBER",
+      "market.momentum5mPct": "FINITE_NUMBER",
+      "market.momentum15mPct": "FINITE_NUMBER",
+      "quote.available": "BOOLEAN",
+      "quote.priceImpactBps": "FINITE_NUMBER",
+      "risk.blockerCodes": "LEXICALLY_SORTED_STRING_ARRAY",
+      "attention.repeatedAttentionCount": "NON_NEGATIVE_INTEGER"
+    },
+    "availabilityCodes": [
+      "AVAILABLE_AT_ANCHOR",
+      "NOT_REQUESTED",
+      "UNAVAILABLE_AT_ANCHOR",
+      "STALE_AT_ANCHOR",
+      "BUDGET_EXHAUSTED",
+      "PROVIDER_ERROR",
+      "UNSUPPORTED",
+      "INVALID_VALUE"
+    ],
+    "provenanceCategories": ["DISCOVERY", "MARKET_CONTEXT", "QUOTE_IMPACT", "LATER_OBSERVATION"],
+    "valueOrMissingnessRequired": true,
+    "availabilityRequired": true,
+    "sourceKindRequired": true,
+    "relativeSourceIdentifierRequired": true,
+    "sourceTimestampWhenAvailableRequired": true,
+    "freshnessSeconds": {
+      "priceUsd": 60,
+      "quoteAvailable": 60,
+      "quotePriceImpactBps": 60,
+      "liquidityUsd": 300,
+      "volume5mUsd": 300,
+      "volume1hUsd": 300,
+      "momentum5mPct": 300,
+      "momentum15mPct": 300
+    },
+    "descriptiveOnlyFields": ["attention.repeatedAttentionCount", "risk.blockerCodes"],
+    "forbiddenFields": [
+      "ACCOUNT_FACT",
+      "LATER_OBSERVATION",
+      "RAW_PROVIDER_PAYLOAD",
+      "STRATEGY_DECISION",
+      "STRATEGY_SCORE",
+      "WALLET_FACT"
+    ]
+  },
+  "providerBudgetPlan": {
+    "categories": ["DISCOVERY", "MARKET_CONTEXT", "QUOTE_IMPACT", "LATER_OBSERVATION"],
+    "maximumRequestsPerMinutePerCategory": 1,
+    "maximumConcurrencyPerCategory": 1,
+    "timeoutSeconds": 10,
+    "retryCount": 0,
+    "backoff": "NONE",
+    "undeclaredFallback": "PROHIBITED",
+    "cohortRequestCaps": {
+      "DISCOVERY": 168,
+      "MARKET_CONTEXT": 168,
+      "QUOTE_IMPACT": 168,
+      "LATER_OBSERVATION": 672
+    }
+  },
+  "observationPlan": {
+    "horizons": [
+      { "minutesAfterAnchor": 3, "toleranceSeconds": 30 },
+      { "minutesAfterAnchor": 5, "toleranceSeconds": 30 },
+      { "minutesAfterAnchor": 15, "toleranceSeconds": 60 },
+      { "minutesAfterAnchor": 60, "toleranceSeconds": 300 }
+    ],
+    "validSnapshotResult": "NUMERIC_RETURN",
+    "availabilityLabels": ["OBSERVED_ON_TIME", "OBSERVED_LATE", "MISSING", "INVALID"],
+    "targetStopProfile": "ABSENT",
+    "tradingResult": "ABSENT"
+  },
+  "splitPlan": {
+    "assignmentHash": "SHA256(phase10.6a-exploratory-cohort.v2|canonicalMint|slotId)",
+    "discoveryAssignment": "EVEN_FINAL_HEXADECIMAL_DIGIT",
+    "validationAssignment": "ODD_FINAL_HEXADECIMAL_DIGIT",
+    "minimumValidUnitsPerPartition": 32,
+    "minimumUtcDatesPerPartition": 4,
+    "incompleteOutcome": "INCOMPLETE_EXPLORATORY_COHORT"
+  },
+  "dataQualityStops": {
+    "immediateStopConditions": [
+      "CLOCK_ORDER_VIOLATION",
+      "MANIFEST_SCHEMA_VIOLATION",
+      "SECRET_LIKE_CONTENT"
+    ],
+    "upstreamRateLimitOrErrorAction": "PAUSE_AFFECTED_SLOT_RECORD_MISSINGNESS_NO_RETRY",
+    "requiredAnchorStaleOrMissingRate": {
+      "maximumPct": 25,
+      "evaluationAfterValidUnits": 24,
+      "action": "STOP_COHORT_DATA_QUALITY"
+    },
+    "providerBudgetExhaustionAction": "STOP_COHORT_DATA_QUALITY",
+    "incompleteConditions": [
+      "CONCENTRATION_FAILURE",
+      "DATE_REQUIREMENT_FAILURE",
+      "MINIMUM_SIZE_FAILURE",
+      "PARTITION_REQUIREMENT_FAILURE"
+    ]
+  },
+  "archiveContract": {
+    "rootPattern": "data/archive/phase10.6a/exploratory-cohort-v2-YYYYMMDD-HHmmZ/",
+    "files": [
+      "cohort-manifest.v1.json",
+      "units.v1.ndjson",
+      "source-inventory.v1.json",
+      "collection-summary.v1.json"
+    ],
+    "retention": "IMMUTABLE_INDEFINITE",
+    "forbiddenContent": ["CREDENTIAL", "HEADER", "RAW_PROVIDER_PAYLOAD"]
+  },
+  "analysisBoundary": {
+    "decisionTimeFacts": "DESCRIPTIVE_ONLY",
+    "laterOutcomes": "LABELS_ONLY",
+    "forbiddenInputsToSelection": ["LATER_LABEL", "LATER_RETURN", "TARGET_STOP_RESULT"],
+    "allowedPhase10_6BOutcomes": [
+      "NO_DEFENSIBLE_HYPOTHESIS",
+      "DATA_INSUFFICIENT",
+      "PRE_REGISTRATION_CANDIDATE_REJECTED",
+      "HUMAN_REVIEW_REQUIRED",
+      "PRE_REGISTRATION_READY_FOR_SEPARATE_APPROVAL"
+    ]
+  },
+  "prohibitedChanges": {
+    "buyScoreThreshold": 90,
+    "watchScoreThreshold": 70,
+    "paperExecution": "DISABLED",
+    "unchangedF65E": "PROHIBITED",
+    "oneOrTwoMinuteMonitoringChange": "PROHIBITED",
+    "strategyDefaultChange": "PROHIBITED"
+  },
+  "downstreamAuthority": {
+    "phase10_6A": {
+      "authority": "REQUIRES_SEPARATE_APPROVED_CHECKLIST_AND_EXPLICIT_USER_AUTHORIZATION",
+      "commandAndConfigSurface": "ABSENT_IN_PHASE_10_5A",
+      "providerAdapters": "ABSENT_IN_PHASE_10_5A",
+      "runtimeConfiguration": "ABSENT_IN_PHASE_10_5A"
+    },
+    "phase10_6B": "ARCHIVE_ONLY_AFTER_COMPLETED_COLLECTION",
+    "phase10_6C": "REQUIRES_SEPARATE_APPROVED_PRE_REGISTRATION_AND_CHECKLIST",
+    "execution": "NOT_AUTHORIZED"
+  }
+}

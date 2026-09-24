@@ -1,0 +1,51 @@
+{
+  "contractVersion": "1",
+  "briefFingerprint": "5fb59e2bf4472ea4da2a516d1298398491b812d1a3ae811d745aa46d5ee308c7",
+  "scope": {
+    "archiveRoot": "data/archive",
+    "includePhases": ["phase9.28", "phase9.29"],
+    "includeCohorts": ["phase9.29/combined-valid-three-20260818-1539"]
+  },
+  "reviewAssertions": [
+    {
+      "factKey": "EXACT_COVERAGE",
+      "assertionCode": "CONFIRMS_COUNT"
+    },
+    {
+      "factKey": "LATER_LABELS",
+      "assertionCode": "CONFIRMS_LABEL_BOUNDARY"
+    },
+    {
+      "factKey": "SELECTED_RUN_CONCENTRATION",
+      "assertionCode": "CONFIRMS_GATE_FAILURE"
+    },
+    {
+      "factKey": "NON_TARGET_RUN_CONCENTRATION",
+      "assertionCode": "CONFIRMS_GATE_FAILURE"
+    },
+    {
+      "factKey": "RECORDED_CONCLUSION",
+      "assertionCode": "CONFIRMS_DEFAULT_DENY"
+    },
+    {
+      "factKey": "FAILED_GATES",
+      "assertionCode": "CONFIRMS_GATE_FAILURE"
+    },
+    {
+      "factKey": "UNCHANGED_F65E_PROHIBITED",
+      "assertionCode": "CONFIRMS_PROHIBITION"
+    }
+  ],
+  "outcome": {
+    "status": "NO_STUDY_AUTHORIZED",
+    "blockingReasons": [
+      "independent_label_run_support",
+      "leave_one_mint_out_direction",
+      "leave_one_run_out_direction",
+      "narrow_single_fact_predicate",
+      "non_target_run_concentration",
+      "selected_run_concentration",
+      "target_run_concentration"
+    ]
+  }
+}

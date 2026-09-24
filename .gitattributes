@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Preserve the frozen protocol's raw SHA-256 identity in every checkout.
+docs/research-protocols/phase10.6a-exploratory-cohort.v3.json -text

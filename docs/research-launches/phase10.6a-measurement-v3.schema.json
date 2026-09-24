@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 10.6A V3 Measurement-Only Launch Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "archiveRoot",
+    "cohortStartAt",
+    "protocolPath",
+    "protocolSha256",
+    "protocolValidationFingerprint",
+    "authorization",
+    "authorizationReference",
+    "operator"
+  ],
+  "properties": {
+    "contractVersion": { "const": "1" },
+    "archiveRoot": { "pattern": "^data/archive/phase10\\.6a/measurement-v3-\\d{8}-\\d{4}Z/$" },
+    "cohortStartAt": { "format": "date-time" },
+    "protocolPath": { "const": "docs/research-protocols/phase10.6a-exploratory-cohort.v3.json" },
+    "protocolSha256": { "pattern": "^[a-f0-9]{64}$" },
+    "protocolValidationFingerprint": { "pattern": "^[a-f0-9]{64}$" },
+    "authorization": { "const": "USER_AUTHORIZED_FOR_ONE_MEASUREMENT_ONLY_COLLECTION" },
+    "authorizationReference": { "pattern": "^[A-Za-z0-9._ -]{1,200}$" },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "label"],
+      "properties": {
+        "kind": { "const": "EXTERNAL_OPERATOR" },
+        "label": { "pattern": "^[A-Za-z0-9._ -]{1,80}$" }
+      }
+    }
+  }
+}

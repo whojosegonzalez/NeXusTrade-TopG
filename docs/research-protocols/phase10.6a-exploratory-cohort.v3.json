@@ -1,0 +1,296 @@
+{
+  "contractVersion": "3",
+  "protocolId": "EXPLORATORY_COHORT_MEASUREMENT@v3",
+  "authorityStatus": "NOT_AUTHORIZED_FOR_COLLECTION",
+  "supersedes": {
+    "protocolPath": "docs/research-protocols/phase10.6a-exploratory-cohort.v2.json",
+    "protocolSha256": "2662a4cbc1d3458d55b64f9c4cc826561aad1cb6f6b5faf11079194377f5a0ed",
+    "reason": "MEASUREMENT_AVAILABILITY_REPAIR_ONLY"
+  },
+  "sourceEvidence": {
+    "measurementAudit": {
+      "contentFingerprint": "843d1d27aee452f7fcccb000128fec10a38d0fbe80652fc9eb50511a9447b486",
+      "v2ArchiveRoot": "data/archive/phase10.6a/exploratory-cohort-v2-20260821-0000Z",
+      "v2ProtocolSha256": "2662a4cbc1d3458d55b64f9c4cc826561aad1cb6f6b5faf11079194377f5a0ed"
+    },
+    "aggregateMeasurementSignatures": [
+      {
+        "fieldId": "LIQUIDITY",
+        "discoveryAvailable": 26,
+        "discoveryTotal": 46,
+        "validationAvailable": 21,
+        "validationTotal": 50,
+        "availability": "UNAVAILABLE_AT_ANCHOR",
+        "provenanceCategory": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR",
+        "utcDateSupport": 9
+      },
+      {
+        "fieldId": "MOMENTUM_5M",
+        "discoveryAvailable": 0,
+        "discoveryTotal": 46,
+        "validationAvailable": 0,
+        "validationTotal": 50,
+        "availability": "UNSUPPORTED",
+        "provenanceCategory": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR",
+        "utcDateSupport": 9
+      },
+      {
+        "fieldId": "MOMENTUM_15M",
+        "discoveryAvailable": 0,
+        "discoveryTotal": 46,
+        "validationAvailable": 0,
+        "validationTotal": 50,
+        "availability": "UNSUPPORTED",
+        "provenanceCategory": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR",
+        "utcDateSupport": 9
+      }
+    ]
+  },
+  "purpose": {
+    "kind": "OUTCOME_BLIND_MEASUREMENT_AVAILABILITY",
+    "designQuestion": "Can fixed direct decision-time observations provide complete, fresh measurement availability for the three pre-registered fields?",
+    "strategyValidation": false,
+    "profitabilityClaim": false,
+    "literalLimit": "V3 measurement availability can validate only a data-collection capability. It cannot validate a strategy, reproduce a return effect, create a candidate, or promote trading."
+  },
+  "populationAndAnchor": {
+    "discoveryUniverse": "ALL_CANONICAL_SOLANA_MINTS_FROM_UNMODIFIED_DISCOVERY_UNIVERSE",
+    "discoveryRequestLimit": 100,
+    "canonicalIdentity": {
+      "mintEncoding": "BASE58_32_BYTE_CANONICAL_MINT",
+      "sourceKindRequired": true,
+      "firstReceivedAtUtcRequired": true
+    },
+    "selectionAt": "SLOT_ANCHOR_MINUS_16_MINUTES",
+    "anchorAt": "SLOT_ANCHOR",
+    "technicalValidityAnchor": "CANONICAL_IDENTITY_AND_SELECTION_TIME_SOURCE_METADATA_ONLY",
+    "sampling": {
+      "seed": "phase10.6a-exploratory-cohort.v3",
+      "selectionHash": "SHA256(seed|canonicalMint|slotId)",
+      "selectionRule": "LEXICOGRAPHICALLY_LOWEST_HASH",
+      "maximumUnitsPerSlot": 1,
+      "deduplication": "ONE_CANONICAL_MINT_PER_COHORT"
+    },
+    "permittedExclusions": [
+      "MALFORMED_OR_NON_CANONICAL_IDENTIFIER",
+      "DUPLICATE_SAMPLING_UNIT",
+      "PREDECLARED_TECHNICAL_OR_SAFETY_STOP"
+    ],
+    "forbiddenSelectionInputs": [
+      "BUY_WATCH_SKIP_CLASSIFICATION",
+      "F65E_FACT",
+      "LATER_LABEL",
+      "LATER_RETURN",
+      "RISK_SCORE",
+      "STRATEGY_DECISION",
+      "STRATEGY_SCORE",
+      "MEASUREMENT_FIELD_VALUE",
+      "MEASUREMENT_FIELD_MISSINGNESS"
+    ]
+  },
+  "measurementObjectives": [
+    {
+      "fieldId": "LIQUIDITY",
+      "decisionTimePath": "market.liquidityUsd",
+      "valueType": "FINITE_NON_NEGATIVE_USD",
+      "unit": "USD",
+      "missingnessCodes": [
+        "AVAILABLE_AT_ANCHOR",
+        "NOT_REQUESTED",
+        "UNAVAILABLE_AT_ANCHOR",
+        "STALE_AT_ANCHOR",
+        "BUDGET_EXHAUSTED",
+        "PROVIDER_ERROR",
+        "UNSUPPORTED",
+        "INVALID_VALUE"
+      ],
+      "provenance": {
+        "category": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR"
+      },
+      "method": {
+        "kind": "DIRECT_OBSERVATION",
+        "snapshotOffsetMinutes": 0,
+        "maximumSourceToAnchorSeconds": 60,
+        "valuePath": "BEST_PAIR.liquidityUsd"
+      },
+      "selectionInput": false
+    },
+    {
+      "fieldId": "MOMENTUM_5M",
+      "decisionTimePath": "market.momentum5mPct",
+      "valueType": "FINITE_SIGNED_PERCENT",
+      "unit": "PCT",
+      "missingnessCodes": [
+        "AVAILABLE_AT_ANCHOR",
+        "NOT_REQUESTED",
+        "UNAVAILABLE_AT_ANCHOR",
+        "STALE_AT_ANCHOR",
+        "BUDGET_EXHAUSTED",
+        "PROVIDER_ERROR",
+        "UNSUPPORTED",
+        "INVALID_VALUE"
+      ],
+      "provenance": {
+        "category": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR"
+      },
+      "method": {
+        "kind": "FIXED_PRE_ANCHOR_CALCULATION",
+        "requiredSnapshotOffsetsMinutes": [-15, -10, -5, 0],
+        "maximumSourceToScheduledSnapshotSeconds": 60,
+        "inputValuePath": "BEST_PAIR.priceUsd",
+        "formula": "((PRICE_AT_0 / PRICE_AT_NEGATIVE_5) - 1) * 100",
+        "absentComponentAction": "RECORD_DECLARED_MISSINGNESS"
+      },
+      "selectionInput": false
+    },
+    {
+      "fieldId": "MOMENTUM_15M",
+      "decisionTimePath": "market.momentum15mPct",
+      "valueType": "FINITE_SIGNED_PERCENT",
+      "unit": "PCT",
+      "missingnessCodes": [
+        "AVAILABLE_AT_ANCHOR",
+        "NOT_REQUESTED",
+        "UNAVAILABLE_AT_ANCHOR",
+        "STALE_AT_ANCHOR",
+        "BUDGET_EXHAUSTED",
+        "PROVIDER_ERROR",
+        "UNSUPPORTED",
+        "INVALID_VALUE"
+      ],
+      "provenance": {
+        "category": "MARKET_CONTEXT",
+        "sourceIdentifier": "BEST_PAIR"
+      },
+      "method": {
+        "kind": "FIXED_PRE_ANCHOR_CALCULATION",
+        "requiredSnapshotOffsetsMinutes": [-15, -10, -5, 0],
+        "maximumSourceToScheduledSnapshotSeconds": 60,
+        "inputValuePath": "BEST_PAIR.priceUsd",
+        "formula": "((PRICE_AT_0 / PRICE_AT_NEGATIVE_15) - 1) * 100",
+        "absentComponentAction": "RECORD_DECLARED_MISSINGNESS"
+      },
+      "selectionInput": false
+    }
+  ],
+  "providerPlan": {
+    "directProvider": "DEXSCREENER",
+    "categories": [
+      {
+        "category": "DISCOVERY",
+        "capability": "DISCOVER_TOKENS",
+        "requestShape": "discoverTokens(100)",
+        "cohortRequestCap": 168
+      },
+      {
+        "category": "MARKET_CONTEXT",
+        "capability": "BEST_PAIR",
+        "requestShape": "getBestPairForToken(canonicalMint)",
+        "cohortRequestCap": 672
+      }
+    ],
+    "maximumRequestsPerMinutePerCategory": 1,
+    "maximumConcurrencyPerCategory": 1,
+    "timeoutSeconds": 10,
+    "retryCount": 0,
+    "fallback": "PROHIBITED",
+    "rawPayloadRetention": "PROHIBITED",
+    "providerExpansion": "PROHIBITED"
+  },
+  "collectionPlan": {
+    "slotDurationMinutes": 120,
+    "maximumAttemptedSlots": 168,
+    "consecutiveUtcDates": 14,
+    "plannedUnits": 96,
+    "minimumValidUnits": 72,
+    "maximumUnitsPerSlot": 1,
+    "externalInvocation": {
+      "startsAt": "SLOT_ANCHOR_MINUS_16_MINUTES",
+      "finishesAt": "SLOT_ANCHOR",
+      "overlappingInvocation": "PROHIBITED"
+    },
+    "scheduledSnapshots": [-15, -10, -5, 0],
+    "partitionAssignment": {
+      "assignmentHash": "SHA256(phase10.6a-exploratory-cohort.v3|canonicalMint|slotId)",
+      "discoveryAssignment": "EVEN_FINAL_HEXADECIMAL_DIGIT",
+      "validationAssignment": "ODD_FINAL_HEXADECIMAL_DIGIT",
+      "minimumValidUnitsPerPartition": 32,
+      "minimumUtcDatesPerPartition": 4
+    },
+    "independence": {
+      "minimumUtcDates": 8,
+      "maximumValidUnitSharePerUtcDatePct": 20,
+      "minimumDistinctMints": 72
+    },
+    "catchUp": "PROHIBITED",
+    "replacement": "PROHIBITED",
+    "sourceInventory": "SAFE_AGGREGATES_ONLY"
+  },
+  "dataQualityAndMeasurementGates": {
+    "availabilityPercentFormula": "(AVAILABLE_AT_ANCHOR / VALID_UNITS_IN_PARTITION) * 100",
+    "minimumAvailabilityPctPerObjectivePerPartition": 90,
+    "minimumUtcDateSupportPerObjectivePerPartition": 4,
+    "provenanceConsistency": "EXACT_CATEGORY_AND_SOURCE_IDENTIFIER",
+    "freshness": "DECLARED_OBJECTIVE_RULE_REQUIRED",
+    "missingness": "EIGHT_CODE_ENUM_REQUIRED",
+    "dataQualityStopConditions": [
+      "CLOCK_ORDER_VIOLATION",
+      "MANIFEST_SCHEMA_VIOLATION",
+      "SECRET_LIKE_CONTENT",
+      "PROVIDER_BUDGET_EXHAUSTION"
+    ],
+    "insufficiencyOutcome": "MEASUREMENT_COHORT_DATA_INSUFFICIENT",
+    "stopOutcome": "MEASUREMENT_COHORT_DATA_QUALITY_STOP"
+  },
+  "archiveContract": {
+    "rootPattern": "data/archive/phase10.6a/measurement-v3-YYYYMMDD-HHmmZ/",
+    "files": [
+      "cohort-manifest.v1.json",
+      "units.v1.ndjson",
+      "source-inventory.v1.json",
+      "collection-summary.v1.json"
+    ],
+    "retention": "IMMUTABLE_INDEFINITE",
+    "forbiddenContent": ["CREDENTIAL", "HEADER", "RAW_PROVIDER_PAYLOAD"]
+  },
+  "outcomeBoundary": {
+    "laterObservations": "ABSENT",
+    "labels": "ABSENT",
+    "prohibitedInputs": [
+      "LATER_LABEL",
+      "LATER_RETURN",
+      "TARGET_STOP_RESULT",
+      "MEASUREMENT_SUCCESS_RESULT"
+    ],
+    "protocolMutationWhileRunning": "PROHIBITED"
+  },
+  "safety": {
+    "buyScoreThreshold": 90,
+    "watchScoreThreshold": 70,
+    "paperExecution": "DISABLED",
+    "unchangedF65E": "PROHIBITED",
+    "oneOrTwoMinuteMonitoringChange": "PROHIBITED",
+    "strategyDefaultChange": "PROHIBITED",
+    "wallet": "PROHIBITED",
+    "signing": "PROHIBITED",
+    "submission": "PROHIBITED",
+    "orders": "PROHIBITED",
+    "fills": "PROHIBITED",
+    "positions": "PROHIBITED"
+  },
+  "downstreamAuthority": {
+    "staticValidation": "REQUIRES_SEPARATE_EXPLICIT_APPROVAL",
+    "collectionChecklist": "REQUIRES_SEPARATE_APPROVED_CHECKLIST",
+    "collectorImplementation": "REQUIRES_SEPARATE_EXPLICIT_APPROVAL",
+    "namedArchiveRoot": "REQUIRES_SEPARATE_EXPLICIT_APPROVAL",
+    "scheduler": "REQUIRES_SEPARATE_EXPLICIT_APPROVAL",
+    "analysis": "REQUIRES_SEPARATE_ARCHIVE_ONLY_APPROVAL",
+    "phase10_6C": "NOT_AUTHORIZED",
+    "execution": "NOT_AUTHORIZED"
+  }
+}

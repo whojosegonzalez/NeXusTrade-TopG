@@ -1,41 +1,51 @@
-# --- Dependencies ---
+# Dependencies
 node_modules/
-package-lock.json
-yarn.lock
+.pnpm-store/
 
-# --- Environment & Secrets (CRITICAL) ---
+# Build output
+dist/
+build/
+coverage/
+.turbo/
+tmp/
+.temp/
+.tmp/
+
+# Local env
 .env
-.env.local
-.env.development
-.env.test
-.env.production
-*.key
-*.pem
+.env.*
+!.env.example
 
-# --- Database (Local-First Architecture) ---
-# We ignore these because they contain real/simulated money history
+# Local databases
 *.db
-*.db-journal
-*.sqlite
-*.sqlite-journal
-/backend/prisma/*.db
-/backend/prisma/*.db-journal
+*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+data/*.db-*
 
-# --- Logs ---
+# Wallets / keys / secrets
+keypair.json
+wallet.json
+*.pem
+*.key
+*.enc.json
+
+# Logs
 logs/
 *.log
 npm-debug.log*
+pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+lerna-debug.log*
 
-# --- Build Outputs ---
-dist/
-build/
-out/
-.next/
-
-# --- IDE/OS ---
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+# Validation transcripts
+data/phase8.6-long-validation.txt
+data/*-validation.txt
+data/*.txt
+data/*.json
+data/phase*-test*/
+data/phase*-interpret*/
+data/archive/
+data/phase*/

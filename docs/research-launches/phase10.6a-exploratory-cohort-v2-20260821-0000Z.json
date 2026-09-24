@@ -1,0 +1,10 @@
+{
+  "contractVersion": "1",
+  "archiveRoot": "data/archive/phase10.6a/exploratory-cohort-v2-20260821-0000Z",
+  "cohortStartAt": "2026-08-21T00:00:00.000Z",
+  "protocolPath": "docs/research-protocols/phase10.6a-exploratory-cohort.v2.json",
+  "protocolSha256": "2662a4cbc1d3458d55b64f9c4cc826561aad1cb6f6b5faf11079194377f5a0ed",
+  "protocolValidationFingerprint": "1fbe8a70792d872c7199d7182d095f13cce7c9908939526b44ecc7e2f872c283",
+  "authorization": "USER_AUTHORIZED_FOR_ONE_OBSERVATIONAL_COLLECTION",
+  "authorizationReference": "phase10.6a-20260819-user-approved"
+}

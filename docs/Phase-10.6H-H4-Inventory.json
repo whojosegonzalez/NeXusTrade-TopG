@@ -1,0 +1,857 @@
+{
+  "baseline": "3b7b229",
+  "scope": "Static source inventory, not a security sandbox. Runtime closures include statically visible mock-original edges; harnesses replace selected paths. Dependencies inside node_modules are not expanded here.",
+  "workspaceSourceModules": 595,
+  "groups": {
+    "measurement-analysis": {
+      "tests": [
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts"
+      ],
+      "setup": [],
+      "runtimeSourceClosure": [
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test-support.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisConfig.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisErrors.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisFormatter.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIdentity.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisLoader.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisPaths.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisService.ts",
+        "backend/src/research-measurement-cohort-analysis/MeasurementCohortAnalysisTypes.ts"
+      ]
+    },
+    "h2": {
+      "tests": [
+        "backend/src/db/connection.test.ts",
+        "backend/src/db/h2/H2AccountingCharacterization.test.ts",
+        "backend/src/db/h2/H2Baseline.test.ts",
+        "backend/src/db/h2/H2Boundary.test.ts",
+        "backend/src/db/h2/H2Buy.test.ts",
+        "backend/src/db/h2/H2Migrations.test.ts",
+        "backend/src/db/h2/H2Operations.test.ts",
+        "backend/src/db/h2/H2Reconciliation.test.ts",
+        "backend/src/db/h2/H2Recovery.test.ts",
+        "backend/src/db/h2/H2Schema.test.ts",
+        "backend/src/db/h2/H2Sell.test.ts",
+        "backend/src/db/h2/H2Transactions.test.ts",
+        "backend/src/db/repositories/repositories.test.ts",
+        "backend/src/exits/ExitManagerConfig.test.ts",
+        "backend/src/exits/ExitManagerRunner.test.ts",
+        "backend/src/paper/PaperExchangeConfig.test.ts",
+        "backend/src/paper/PaperOperationIdentity.test.ts",
+        "backend/src/paper/PaperRunner.test.ts",
+        "backend/src/paper/PaperSellConfig.test.ts",
+        "backend/src/paper/PaperSellRunner.test.ts",
+        "backend/src/session/SessionManagerConfig.test.ts",
+        "backend/src/session/SessionManagerRunner.test.ts"
+      ],
+      "setup": ["backend/src/db/h2/H2TestSetup.ts"],
+      "runtimeSourceClosure": [
+        "backend/src/db/AccountingUnitOfWork.ts",
+        "backend/src/db/DatabaseFactory.ts",
+        "backend/src/db/DatabaseMode.ts",
+        "backend/src/db/H2MigrationPreflight.ts",
+        "backend/src/db/MigrationContract.ts",
+        "backend/src/db/MigrationReadiness.ts",
+        "backend/src/db/connection.test.ts",
+        "backend/src/db/connection.ts",
+        "backend/src/db/h2/H2AccountingCharacterization.test.ts",
+        "backend/src/db/h2/H2Baseline.test.ts",
+        "backend/src/db/h2/H2Boundary.test.ts",
+        "backend/src/db/h2/H2Buy.test.ts",
+        "backend/src/db/h2/H2FixturePaths.ts",
+        "backend/src/db/h2/H2Fixtures.ts",
+        "backend/src/db/h2/H2Migrations.test.ts",
+        "backend/src/db/h2/H2Operations.test.ts",
+        "backend/src/db/h2/H2Reconciliation.test.ts",
+        "backend/src/db/h2/H2Recovery.test.ts",
+        "backend/src/db/h2/H2Schema.test.ts",
+        "backend/src/db/h2/H2Sell.test.ts",
+        "backend/src/db/h2/H2TestDatabase.ts",
+        "backend/src/db/h2/H2TestSetup.ts",
+        "backend/src/db/h2/H2Transactions.test.ts",
+        "backend/src/db/migrations.ts",
+        "backend/src/db/repositories/FillRepository.ts",
+        "backend/src/db/repositories/OrderRepository.ts",
+        "backend/src/db/repositories/PaperOperationRepository.ts",
+        "backend/src/db/repositories/PositionRepository.ts",
+        "backend/src/db/repositories/ProviderHealthRepository.ts",
+        "backend/src/db/repositories/RepositoryFactory.ts",
+        "backend/src/db/repositories/RiskAssessmentRepository.ts",
+        "backend/src/db/repositories/SessionRepository.ts",
+        "backend/src/db/repositories/SnapshotRepository.ts",
+        "backend/src/db/repositories/StrategyDecisionRepository.ts",
+        "backend/src/db/repositories/SystemLogRepository.ts",
+        "backend/src/db/repositories/TokenRadarRepository.ts",
+        "backend/src/db/repositories/WatchlistReturnObservationRepository.ts",
+        "backend/src/db/repositories/helpers.ts",
+        "backend/src/db/repositories/index.ts",
+        "backend/src/db/repositories/repositories.test.ts",
+        "backend/src/db/schema/enums.ts",
+        "backend/src/db/schema/equitySnapshots.ts",
+        "backend/src/db/schema/fills.ts",
+        "backend/src/db/schema/index.ts",
+        "backend/src/db/schema/integrity.ts",
+        "backend/src/db/schema/orders.ts",
+        "backend/src/db/schema/paperOperations.ts",
+        "backend/src/db/schema/positionSnapshots.ts",
+        "backend/src/db/schema/positions.ts",
+        "backend/src/db/schema/providerHealth.ts",
+        "backend/src/db/schema/riskAssessments.ts",
+        "backend/src/db/schema/sessions.ts",
+        "backend/src/db/schema/strategyDecisions.ts",
+        "backend/src/db/schema/systemLogs.ts",
+        "backend/src/db/schema/tokenRadar.ts",
+        "backend/src/db/schema/watchlistReturnObservations.ts",
+        "backend/src/db/seeds/seedPaperDatabase.ts",
+        "backend/src/db/testing/createTestDatabase.ts",
+        "backend/src/db/testing/databaseTestHelpers.ts",
+        "backend/src/db/utils/ids.ts",
+        "backend/src/db/utils/json.ts",
+        "backend/src/db/utils/money.ts",
+        "backend/src/db/utils/paths.ts",
+        "backend/src/db/utils/timestamps.ts",
+        "backend/src/exits/ExitActionService.ts",
+        "backend/src/exits/ExitCandidateSelector.ts",
+        "backend/src/exits/ExitCompletionService.ts",
+        "backend/src/exits/ExitManagerConfig.test.ts",
+        "backend/src/exits/ExitManagerConfig.ts",
+        "backend/src/exits/ExitManagerRunner.test.ts",
+        "backend/src/exits/ExitManagerRunner.ts",
+        "backend/src/exits/ExitManagerService.ts",
+        "backend/src/exits/ExitTriggerService.ts",
+        "backend/src/paper/PaperBuyAccounting.ts",
+        "backend/src/paper/PaperExchangeConfig.test.ts",
+        "backend/src/paper/PaperExchangeConfig.ts",
+        "backend/src/paper/PaperExecutionCandidateSelector.ts",
+        "backend/src/paper/PaperExecutionService.ts",
+        "backend/src/paper/PaperFillFactory.ts",
+        "backend/src/paper/PaperMath.ts",
+        "backend/src/paper/PaperOperationIdentity.test.ts",
+        "backend/src/paper/PaperOperationIdentity.ts",
+        "backend/src/paper/PaperOperationResult.ts",
+        "backend/src/paper/PaperOrderFactory.ts",
+        "backend/src/paper/PaperPositionFactory.ts",
+        "backend/src/paper/PaperReconciliation.ts",
+        "backend/src/paper/PaperRunner.test.ts",
+        "backend/src/paper/PaperRunner.ts",
+        "backend/src/paper/PaperSellAccounting.ts",
+        "backend/src/paper/PaperSellAccountingService.ts",
+        "backend/src/paper/PaperSellCandidateSelector.ts",
+        "backend/src/paper/PaperSellConfig.test.ts",
+        "backend/src/paper/PaperSellConfig.ts",
+        "backend/src/paper/PaperSellExecutionService.ts",
+        "backend/src/paper/PaperSellFillFactory.ts",
+        "backend/src/paper/PaperSellOrderFactory.ts",
+        "backend/src/paper/PaperSellQuoteService.ts",
+        "backend/src/paper/PaperSellRunner.test.ts",
+        "backend/src/paper/PaperSellRunner.ts",
+        "backend/src/paper/PaperSellValidationService.ts",
+        "backend/src/session/DrawdownTrackingService.ts",
+        "backend/src/session/EquityCalculationService.ts",
+        "backend/src/session/PositionValuationService.ts",
+        "backend/src/session/SessionCandidateSelector.ts",
+        "backend/src/session/SessionManagerConfig.test.ts",
+        "backend/src/session/SessionManagerConfig.ts",
+        "backend/src/session/SessionManagerRunner.test.ts",
+        "backend/src/session/SessionManagerRunner.ts",
+        "backend/src/session/SessionManagerService.ts",
+        "backend/src/session/SnapshotService.ts",
+        "backend/src/session/TargetTrackingService.ts",
+        "shared/src/index.ts",
+        "shared/src/market/enrichment.types.ts",
+        "shared/src/market/quote.types.ts",
+        "shared/src/market/token.types.ts",
+        "shared/src/modes.ts",
+        "shared/src/providers/provider-errors.ts",
+        "shared/src/providers/provider-results.ts",
+        "shared/src/providers/provider.types.ts",
+        "shared/src/research-dashboard.ts"
+      ]
+    },
+    "h3": {
+      "tests": [
+        "backend/src/providers/birdeye/BirdeyeAdapter.test.ts",
+        "backend/src/providers/config/providerConfig.test.ts",
+        "backend/src/providers/das/DasMetadataAdapter.test.ts",
+        "backend/src/providers/h3/H3Admission.test.ts",
+        "backend/src/providers/h3/H3Adversarial.test.ts",
+        "backend/src/providers/h3/H3Boundary.test.ts",
+        "backend/src/providers/h3/H3Controls.test.ts",
+        "backend/src/providers/h3/H3HttpControls.test.ts",
+        "backend/src/providers/h3/H3RegistryOwnership.test.ts",
+        "backend/src/providers/h3/H3TimeBudget.test.ts",
+        "backend/src/providers/helius/HeliusAdapter.test.ts",
+        "backend/src/providers/http/ProviderHttpClient.test.ts",
+        "backend/src/providers/http/providerRateLimiter.test.ts",
+        "backend/src/providers/jupiter/JupiterDemandController.test.ts",
+        "backend/src/providers/ProviderHealthService.test.ts",
+        "backend/src/providers/ProviderRegistry.test.ts",
+        "backend/src/providers/quotes/QuoteBudgetPlanner.test.ts",
+        "backend/src/providers/quotes/QuoteProviderRouter.test.ts",
+        "backend/src/providers/raydium/RaydiumAdapter.test.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcAdapter.test.ts"
+      ],
+      "setup": ["backend/src/providers/h3/H3TestSetup.ts"],
+      "runtimeSourceClosure": [
+        "backend/src/db/AccountingUnitOfWork.ts",
+        "backend/src/db/DatabaseFactory.ts",
+        "backend/src/db/DatabaseMode.ts",
+        "backend/src/db/H2MigrationPreflight.ts",
+        "backend/src/db/MigrationContract.ts",
+        "backend/src/db/MigrationReadiness.ts",
+        "backend/src/db/connection.ts",
+        "backend/src/db/migrations.ts",
+        "backend/src/db/repositories/FillRepository.ts",
+        "backend/src/db/repositories/OrderRepository.ts",
+        "backend/src/db/repositories/PaperOperationRepository.ts",
+        "backend/src/db/repositories/PositionRepository.ts",
+        "backend/src/db/repositories/ProviderHealthRepository.ts",
+        "backend/src/db/repositories/RepositoryFactory.ts",
+        "backend/src/db/repositories/RiskAssessmentRepository.ts",
+        "backend/src/db/repositories/SessionRepository.ts",
+        "backend/src/db/repositories/SnapshotRepository.ts",
+        "backend/src/db/repositories/StrategyDecisionRepository.ts",
+        "backend/src/db/repositories/SystemLogRepository.ts",
+        "backend/src/db/repositories/TokenRadarRepository.ts",
+        "backend/src/db/repositories/WatchlistReturnObservationRepository.ts",
+        "backend/src/db/repositories/helpers.ts",
+        "backend/src/db/repositories/index.ts",
+        "backend/src/db/schema/enums.ts",
+        "backend/src/db/schema/equitySnapshots.ts",
+        "backend/src/db/schema/fills.ts",
+        "backend/src/db/schema/index.ts",
+        "backend/src/db/schema/integrity.ts",
+        "backend/src/db/schema/orders.ts",
+        "backend/src/db/schema/paperOperations.ts",
+        "backend/src/db/schema/positionSnapshots.ts",
+        "backend/src/db/schema/positions.ts",
+        "backend/src/db/schema/providerHealth.ts",
+        "backend/src/db/schema/riskAssessments.ts",
+        "backend/src/db/schema/sessions.ts",
+        "backend/src/db/schema/strategyDecisions.ts",
+        "backend/src/db/schema/systemLogs.ts",
+        "backend/src/db/schema/tokenRadar.ts",
+        "backend/src/db/schema/watchlistReturnObservations.ts",
+        "backend/src/db/testing/createTestDatabase.ts",
+        "backend/src/db/utils/ids.ts",
+        "backend/src/db/utils/json.ts",
+        "backend/src/db/utils/paths.ts",
+        "backend/src/db/utils/timestamps.ts",
+        "backend/src/paper/PaperOperationIdentity.ts",
+        "backend/src/paper/PaperOperationResult.ts",
+        "backend/src/providers/ProviderHealthService.test.ts",
+        "backend/src/providers/ProviderHealthService.ts",
+        "backend/src/providers/ProviderRegistry.test.ts",
+        "backend/src/providers/ProviderRegistry.ts",
+        "backend/src/providers/birdeye/BirdeyeAdapter.test.ts",
+        "backend/src/providers/birdeye/BirdeyeAdapter.ts",
+        "backend/src/providers/birdeye/BirdeyeBudgetTracker.ts",
+        "backend/src/providers/birdeye/BirdeyeCache.ts",
+        "backend/src/providers/birdeye/birdeye.mappers.ts",
+        "backend/src/providers/birdeye/birdeye.schemas.ts",
+        "backend/src/providers/config/providerConfig.test.ts",
+        "backend/src/providers/config/providerConfig.ts",
+        "backend/src/providers/das/DasMetadataAdapter.test.ts",
+        "backend/src/providers/das/DasMetadataAdapter.ts",
+        "backend/src/providers/das/das.mappers.ts",
+        "backend/src/providers/das/das.schemas.ts",
+        "backend/src/providers/dexscreener/DexScreenerAdapter.ts",
+        "backend/src/providers/dexscreener/dexscreener.mappers.ts",
+        "backend/src/providers/dexscreener/dexscreener.schemas.ts",
+        "backend/src/providers/h3/H3Admission.test.ts",
+        "backend/src/providers/h3/H3Adversarial.test.ts",
+        "backend/src/providers/h3/H3Boundary.test.ts",
+        "backend/src/providers/h3/H3Controls.test.ts",
+        "backend/src/providers/h3/H3FakeScheduler.ts",
+        "backend/src/providers/h3/H3HttpControls.test.ts",
+        "backend/src/providers/h3/H3RegistryOwnership.test.ts",
+        "backend/src/providers/h3/H3TestSetup.ts",
+        "backend/src/providers/h3/H3TimeBudget.test.ts",
+        "backend/src/providers/helius/HeliusAdapter.test.ts",
+        "backend/src/providers/helius/HeliusAdapter.ts",
+        "backend/src/providers/helius/HeliusBackoffPolicy.ts",
+        "backend/src/providers/helius/HeliusEvidenceCache.ts",
+        "backend/src/providers/helius/helius.mappers.ts",
+        "backend/src/providers/helius/helius.schemas.ts",
+        "backend/src/providers/http/ProviderHttpClient.test.ts",
+        "backend/src/providers/http/ProviderHttpClient.ts",
+        "backend/src/providers/http/providerAbort.ts",
+        "backend/src/providers/http/providerRateLimiter.test.ts",
+        "backend/src/providers/http/providerRateLimiter.ts",
+        "backend/src/providers/http/providerRetry.ts",
+        "backend/src/providers/jupiter/JupiterAdapter.ts",
+        "backend/src/providers/jupiter/JupiterDemandController.test.ts",
+        "backend/src/providers/jupiter/JupiterDemandController.ts",
+        "backend/src/providers/jupiter/jupiter.mappers.ts",
+        "backend/src/providers/jupiter/jupiter.schemas.ts",
+        "backend/src/providers/quotes/QuoteAttemptJournal.ts",
+        "backend/src/providers/quotes/QuoteBackoffPolicy.ts",
+        "backend/src/providers/quotes/QuoteBudgetPlanner.test.ts",
+        "backend/src/providers/quotes/QuoteBudgetPlanner.ts",
+        "backend/src/providers/quotes/QuoteCache.ts",
+        "backend/src/providers/quotes/QuoteNegativeCache.ts",
+        "backend/src/providers/quotes/QuotePriority.ts",
+        "backend/src/providers/quotes/QuoteProviderRouter.test.ts",
+        "backend/src/providers/quotes/QuoteProviderRouter.ts",
+        "backend/src/providers/quotes/QuoteRequestKey.ts",
+        "backend/src/providers/quotes/QuoteScheduler.ts",
+        "backend/src/providers/quotes/QuoteSingleFlight.ts",
+        "backend/src/providers/quotes/index.ts",
+        "backend/src/providers/raydium/RaydiumAdapter.test.ts",
+        "backend/src/providers/raydium/RaydiumAdapter.ts",
+        "backend/src/providers/raydium/RaydiumErrorClassifier.ts",
+        "backend/src/providers/raydium/RaydiumNegativeCache.ts",
+        "backend/src/providers/raydium/RaydiumPoolPreflightService.ts",
+        "backend/src/providers/raydium/RaydiumPreflightCache.ts",
+        "backend/src/providers/raydium/RaydiumVenueGuard.ts",
+        "backend/src/providers/raydium/raydium.mappers.ts",
+        "backend/src/providers/raydium/raydium.mintPrice.mappers.ts",
+        "backend/src/providers/raydium/raydium.mintPrice.schemas.ts",
+        "backend/src/providers/raydium/raydium.pool.mappers.ts",
+        "backend/src/providers/raydium/raydium.pool.schemas.ts",
+        "backend/src/providers/raydium/raydium.schemas.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcAdapter.test.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcAdapter.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcMintAccountCache.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcMintAccountParser.ts",
+        "backend/src/providers/solana-rpc/solanaRpc.mappers.ts",
+        "shared/src/index.ts",
+        "shared/src/market/enrichment.types.ts",
+        "shared/src/market/quote.types.ts",
+        "shared/src/market/token.types.ts",
+        "shared/src/modes.ts",
+        "shared/src/providers/provider-errors.ts",
+        "shared/src/providers/provider-results.ts",
+        "shared/src/providers/provider.types.ts",
+        "shared/src/research-dashboard.ts"
+      ]
+    },
+    "h4": {
+      "tests": [
+        "backend/src/analytics/AnalyticsReportService.test.ts",
+        "backend/src/analytics/h4/H4Boundary.test.ts",
+        "backend/src/analytics/h4/H4Readers.test.ts",
+        "backend/src/analytics/h4/H4ReadFacade.test.ts"
+      ],
+      "setup": ["backend/src/analytics/h4/H4TestSetup.ts"],
+      "runtimeSourceClosure": [
+        "backend/src/analytics/AnalyticsConfig.ts",
+        "backend/src/analytics/AnalyticsJsonReaders.ts",
+        "backend/src/analytics/AnalyticsQuoteBudget.ts",
+        "backend/src/analytics/AnalyticsReportFormatter.ts",
+        "backend/src/analytics/AnalyticsReportService.test.ts",
+        "backend/src/analytics/AnalyticsReportService.ts",
+        "backend/src/analytics/h4/H4Boundary.test.ts",
+        "backend/src/analytics/h4/H4ReadFacade.test.ts",
+        "backend/src/analytics/h4/H4ReadGuard.ts",
+        "backend/src/analytics/h4/H4Readers.test.ts",
+        "backend/src/analytics/h4/H4TestSetup.ts",
+        "backend/src/db/AccountingUnitOfWork.ts",
+        "backend/src/db/DatabaseFactory.ts",
+        "backend/src/db/DatabaseMode.ts",
+        "backend/src/db/H2MigrationPreflight.ts",
+        "backend/src/db/MigrationContract.ts",
+        "backend/src/db/MigrationReadiness.ts",
+        "backend/src/db/connection.ts",
+        "backend/src/db/migrations.ts",
+        "backend/src/db/repositories/FillRepository.ts",
+        "backend/src/db/repositories/OrderRepository.ts",
+        "backend/src/db/repositories/PaperOperationRepository.ts",
+        "backend/src/db/repositories/PositionRepository.ts",
+        "backend/src/db/repositories/ProviderHealthRepository.ts",
+        "backend/src/db/repositories/RepositoryFactory.ts",
+        "backend/src/db/repositories/RiskAssessmentRepository.ts",
+        "backend/src/db/repositories/SessionRepository.ts",
+        "backend/src/db/repositories/SnapshotRepository.ts",
+        "backend/src/db/repositories/StrategyDecisionRepository.ts",
+        "backend/src/db/repositories/SystemLogRepository.ts",
+        "backend/src/db/repositories/TokenRadarRepository.ts",
+        "backend/src/db/repositories/WatchlistReturnObservationRepository.ts",
+        "backend/src/db/repositories/helpers.ts",
+        "backend/src/db/repositories/index.ts",
+        "backend/src/db/schema/enums.ts",
+        "backend/src/db/schema/equitySnapshots.ts",
+        "backend/src/db/schema/fills.ts",
+        "backend/src/db/schema/index.ts",
+        "backend/src/db/schema/integrity.ts",
+        "backend/src/db/schema/orders.ts",
+        "backend/src/db/schema/paperOperations.ts",
+        "backend/src/db/schema/positionSnapshots.ts",
+        "backend/src/db/schema/positions.ts",
+        "backend/src/db/schema/providerHealth.ts",
+        "backend/src/db/schema/riskAssessments.ts",
+        "backend/src/db/schema/sessions.ts",
+        "backend/src/db/schema/strategyDecisions.ts",
+        "backend/src/db/schema/systemLogs.ts",
+        "backend/src/db/schema/tokenRadar.ts",
+        "backend/src/db/schema/watchlistReturnObservations.ts",
+        "backend/src/db/testing/createTestDatabase.ts",
+        "backend/src/db/utils/ids.ts",
+        "backend/src/db/utils/json.ts",
+        "backend/src/db/utils/paths.ts",
+        "backend/src/db/utils/timestamps.ts",
+        "backend/src/paper/PaperOperationIdentity.ts",
+        "backend/src/paper/PaperOperationResult.ts",
+        "backend/src/providers/ProviderPressureClassifier.ts",
+        "shared/src/index.ts",
+        "shared/src/market/enrichment.types.ts",
+        "shared/src/market/quote.types.ts",
+        "shared/src/market/token.types.ts",
+        "shared/src/modes.ts",
+        "shared/src/providers/provider-errors.ts",
+        "shared/src/providers/provider-results.ts",
+        "shared/src/providers/provider.types.ts",
+        "shared/src/research-dashboard.ts"
+      ]
+    }
+  },
+  "excludedTests": [
+    {
+      "file": "backend/src/calibration/CalibrationConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/calibration/CalibrationServices.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/config/env.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/db/DatabaseMode.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/db/utils/json.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/db/utils/money.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/db/utils/timestamps.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/health/healthCheck.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/MarketDataService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/ProviderPressureClassifier.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/birdeye/birdeye.mappers.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/dexscreener/dexscreener.mappers.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/helius/HeliusBackoffPolicy.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/helius/HeliusEvidenceCache.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/helius/helius.mappers.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/jupiter/jupiter.mappers.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteAttemptJournal.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteBackoffPolicy.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteCache.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteNegativeCache.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteRequestKey.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteScheduler.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/quotes/QuoteSingleFlight.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/RaydiumErrorClassifier.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/RaydiumNegativeCache.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/RaydiumPoolPreflightService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/RaydiumPreflightCache.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/RaydiumVenueGuard.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/raydium/raydium.mappers.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/providers/solana-rpc/SolanaRpcMintAccountParser.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/quote-diagnostics/QuoteDiagnoseConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-brief/ResearchBriefCatalog.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-brief/ResearchBriefCli.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-brief/ResearchBriefConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-brief/ResearchBriefService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-counterfactual/CounterfactualConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-counterfactual/CounterfactualReplayService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-dashboard/ArchiveCatalogBuilder.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-dashboard/DashboardExportConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-dashboard/DashboardExportService.test.ts",
+      "reason": "Known operational archive/DB reads and frontend public writes; requires synthetic replacement before admission."
+    },
+    {
+      "file": "backend/src/research-exploratory-analysis/ExploratoryCohortAnalysis.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-exploratory-cohort/ExploratoryCohortRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-exploratory-measurement-audit/ExploratoryMeasurementAudit.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-interpretation/ResearchInterpretationConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-interpretation/ResearchInterpretationServices.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-measurement-cohort/MeasurementCohortRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-measurement-protocol/MeasurementProtocolValidator.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-protocol/ResearchProtocolCli.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-protocol/ResearchProtocolConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-protocol/ResearchProtocolService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-review-gate/ResearchReviewGateCli.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-review-gate/ResearchReviewGateConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-review-gate/ResearchReviewGateService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-truthing/ResearchTruthingConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research-truthing/ResearchTruthingServices.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research/CrossRunResearchService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research/PromotionGateService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research/ResearchAggregateConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/research/ResearchRunArchiveLoader.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/risk/RiskCandidateSelector.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/risk/RiskConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/risk/RiskRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/risk/RiskScoringService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/risk/rules/RiskRules.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/CandidateEnrichmentService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/ScannerConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/ScannerDiscoveryService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/ScannerRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/TokenRadarPersistenceService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/scanner/mappers/RadarCandidateMapper.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-calibration/ShadowCalibrationConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-calibration/ShadowCalibrationReportService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-entry/ShadowEntryConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-entry/ShadowEntryProfile.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-entry/ShadowEntryReportService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast-attribution/FastEntryAttributionConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast-attribution/FastEntryAttributionService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast/FastShadowCandidateSelector.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast/FastShadowConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast/FastShadowObservationRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-fast/FastShadowValidationService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-threshold/ShadowThresholdAnalysisService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow-threshold/ShadowThresholdConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow/ShadowConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/shadow/ShadowServices.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/strategy/StrategyCandidateSelector.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/strategy/StrategyConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/strategy/StrategyRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/strategy/StrategyScoringService.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/strategy/rules/StrategyRules.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/terminal-runner/TerminalRunSummary.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/terminal-runner/TerminalRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/terminal-runner/TerminalRunnerConfig.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "backend/src/watchlist/WatchlistReturnRunner.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "frontend/src/App.test.tsx",
+      "reason": "Frontend DOM suite is outside the admitted backend harnesses; audit fixture/browser environment and network behavior before admission."
+    },
+    {
+      "file": "frontend/src/dashboardData.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "shared/src/market/enrichment.types.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "shared/src/market/token.types.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "shared/src/modes.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    },
+    {
+      "file": "shared/src/providers/provider-results.test.ts",
+      "reason": "Not audited/admitted by H1-H4 harnesses; review transitive I/O, env, fixtures and transport guards before admission."
+    }
+  ],
+  "legacyJsonHelperConsumers": [
+    "backend/src/calibration/ScoreAttributionService.ts",
+    "backend/src/db/repositories/OrderRepository.ts",
+    "backend/src/db/repositories/SessionRepository.ts",
+    "backend/src/db/seeds/seedPaperDatabase.ts",
+    "backend/src/db/testing/databaseSmokeTest.ts",
+    "backend/src/exits/ExitManagerService.ts",
+    "backend/src/index.ts",
+    "backend/src/paper/PaperExecutionService.ts",
+    "backend/src/paper/PaperFillFactory.ts",
+    "backend/src/paper/PaperOrderFactory.ts",
+    "backend/src/paper/PaperSellExecutionService.ts",
+    "backend/src/paper/PaperSellFillFactory.ts",
+    "backend/src/paper/PaperSellOrderFactory.ts",
+    "backend/src/providers/birdeye/BirdeyeSelectiveEnrichmentService.ts",
+    "backend/src/providers/ProviderHealthService.ts",
+    "backend/src/providers/ProviderPressureClassifier.ts",
+    "backend/src/research-truthing/BirdeyeTruthService.ts",
+    "backend/src/research-truthing/ProviderReclassificationService.ts",
+    "backend/src/risk/RiskAssessmentWriter.ts",
+    "backend/src/risk/RiskEvaluationService.ts",
+    "backend/src/scanner/mappers/RadarCandidateMapper.ts",
+    "backend/src/scanner/ScannerDiscoveryService.ts",
+    "backend/src/scanner/ScannerRunner.ts",
+    "backend/src/scanner/TokenRadarPersistenceService.ts",
+    "backend/src/scripts/providers-smoke.ts",
+    "backend/src/scripts/terminal-runner.ts",
+    "backend/src/session/SessionManagerService.ts",
+    "backend/src/session/SnapshotService.ts",
+    "backend/src/shadow-fast-attribution/FastEntryAttributionService.ts",
+    "backend/src/shadow-fast/FastShadowCandidateSelector.ts",
+    "backend/src/shadow/ShadowCandidateSelector.ts",
+    "backend/src/strategy/StrategyEvaluationService.ts",
+    "backend/src/strategy/StrategyScoringService.ts",
+    "backend/src/watchlist/WatchlistReturnRunner.ts"
+  ]
+}
