@@ -51,6 +51,16 @@ No conditional protocol draft was created. The frozen 90% gate is unchanged. Ope
 inspection and automated protocol validation remain separately gated, and no provider, protocol,
 collector, named root, scheduler, collection, Phase 10.6C, PAPER, or execution action is authorized.
 
+Phase 10.6B — Exploratory Cohort Formulation B (Liquidity-Independent Momentum Acceleration)
+advanced through protocol freeze and complete synthetic verification on 2026-09-24. Following
+selection of Option 1 (Formulation B) in the post-B.4 measurement brief, the protocol design was
+formally frozen (`phase10.6a-exploratory-cohort.formulation-b.v1.json`, SHA-256: `241ac7b18711c0b08cc9083b02085c847f71594448c7d9286eb4333194036fda`).
+Both the downstream analysis validator (`research-formulation-b-analysis`) and the collector pipeline
+(`research-formulation-b-collection`) passed 100% synthetic isolated verification (63 test files, 616
+tests). On 2026-09-24, the user approved Option 1 for operational progression: drafting a bounded
+Operational Execution Plan & Run Specification to govern a PowerShell-operated 8-day distributed
+collection run across public provider endpoints before operational authorization.
+
 Near-term sequence, parallel-work rules, and future phase requirements:
 
 - [Post-V3 Development Plan](./Post-V3-Development-Plan.md)
@@ -58,6 +68,10 @@ Near-term sequence, parallel-work rules, and future phase requirements:
 - [Phase 10.6B.4 Evidence And Uncertainty Ledger](./research-reviews/phase10.6b.4-evidence-uncertainty-ledger.md)
 - [Phase 10.6B.4 Liquidity-Necessity And Material-Alternatives Assessment](./research-reviews/phase10.6b.4-liquidity-necessity-material-alternatives-assessment.md)
 - [Phase 10.6B.4 Proposed Decision Memo](./research-reviews/phase10.6b.4-proposed-decision-memo.md)
+- [Phase 10.6B Formulation B Exploratory Protocol Design](./research-protocols/formulation-b-exploratory-protocol-design.md)
+- [Phase 10.6B Formulation B Tooling Verification Record](./Phase-10.6B-Formulation-B-Tooling-Verification.md)
+- [Phase 10.6B Formulation B Collection Detailed Checklist](./NeXusTrade-Phase-10.6B-Formulation-B-Collection-Detailed-Checklist.md)
+- [Phase 10.6B Formulation B Collection Verification Record](./Phase-10.6B-Formulation-B-Collection-Verification.md)
 - [Phase 10.6H Engineering Integrity And Development Hardening](./NeXusTrade-Phase-10.6H-Detailed-Checklist.md)
 
 The following paragraphs retain the completed foundation and earlier research evidence.
@@ -1226,3 +1240,46 @@ version, but only between fixed pilot batches. Every changed version returns to 
 validation before another paper pilot. Phase 11 then
 hardens the system for guarded live readiness; Phase 12 permits only tiny, explicitly bounded live
 experiments; and a separate future Phase 14 gate is required before autonomous live-wallet trading.
+
+## Automated Day-Trading System Architecture & Roadmap (Meme-Coin Focus)
+
+On 2026-09-24, user governance established the architectural blueprint, operational targets, and risk-management principles for transitioning NeXusTrade from offline research cohorts into a high-win-rate, automated day-trading system for Solana meme coins.
+
+### 1. Operational Profile & Session Controls
+
+- **Execution Mode**: Autonomous background trading daemon run via PowerShell for 4 to 10 hours per day.
+- **Monitoring & Visibility**: Real-time React dashboard (`frontend/`) tracking live sessions, open paper positions, equity curves, win/loss rates, and trade history.
+- **Trading Style**: Fast-moving, high-velocity day trading. Fast opportunistic entry, rapid profit lock-in, and disciplined early exits (zero peak-chasing greed).
+- **Execution Gating**: Strict progression through synthetic validation -> live-market paper trading -> micro-allocated hot wallet (real SOL).
+
+### 2. Pre-Entry Discovery Patterns (Meme-Coin Screeners)
+
+The candidate scanner (`backend/src/scanner/`) and strategy engine (`backend/src/strategy/rules/`) evaluate incoming Solana tokens against four core structural filters:
+
+1. **Liquidity-to-Market-Cap (L/MC) Ratio**: Target a healthy 15% to 30% ratio to guarantee pool depth and minimize price impact on entry/exit. Rejects illiquid traps where sells crash price.
+2. **Survival Window & Rug Protection**: Minimum asset age of 5 to 15 minutes to bypass the initial 0–2 minute sniper/rug dump. Enforces burned/locked LP (Raydium/Meteora) and renounced freeze/mint authorities.
+3. **Volume-to-Transaction Count Ratio**: Identifies organic viral breakout volume with high distinct wallet participation, rejecting artificial low-tx wash volume or single-whale dumps.
+4. **Momentum Acceleration**: Positive divergence between short and medium momentum velocities ($\text{mom}_{5m} - \text{mom}_{15m} > 0$), filtering for expanding breakout velocity.
+
+### 3. Dynamic Multi-Tiered Ratchet Stop-Loss Engine
+
+Implemented within `backend/src/exits/` to enforce an aggressive capital-preservation and asymmetric-upside policy:
+
+- **Initial Hard Stop**: Set tightly at -8% to -10% from entry price to prevent catastrophic drawdowns from sudden market drops or instant rugs.
+- **Scratch / Momentum Stall Exit**: If price momentum flattens or volume drops within 3 to 5 minutes after entry, execute an immediate market exit at +0.5% to +1.5% (or break-even). Prevents stalled positions from deteriorating into losses.
+- **Level 1 Ratchet (+24% Gain Milestone)**: When unrealized P/L reaches +24%, the stop-loss immediately ratchets up to +20%, guaranteeing a minimum +20% locked-in gain.
+- **Level 2 Ratchet (+49% Gain Milestone)**: When unrealized P/L reaches +49%, the stop-loss ratchets up to +45%, securing massive profits while leaving runners uncapped to capture multi-leg explosions.
+- **Technical Indicator Trailing**: For runners beyond +50%, stop-loss dynamically trails behind key short-term moving averages or liquidity support levels.
+
+### 4. Performance Targets & Win-Rate Objectives
+
+- **Target Win Rate**: 90% to 99% nominal win rate (with an ideal 100% target).
+- **Enforcement Principle**: High nominal win rates in volatile meme coins are achieved not by predicting every move, but by aggressively scratching stalled trades at +0.5% to +1.5% and ratcheting stops on runners, ensuring losses remain rare, tiny, and strictly bounded while wins capture +20% to +45%+.
+
+### 5. Staged Evolution Roadmap
+
+- **Phase 10.6B (Active)**: Formulation B Operational Execution Plan & 8-Day Live Exploratory Collection via PowerShell.
+- **Phase 11**: Strategy Rule Calibration & Dynamic Ratchet Exit Service implementation (wiring L/MC ratio, pair age, volume/tx ratio, and multi-tier ratchet stops into `backend/src/exits/`).
+- **Phase 12**: Live Background Paper-Trading Daemon (PowerShell CLI runner) integrated with live Solana RPC market data and real-time React dashboard streaming (4–10 hr daily operational sessions).
+- **Phase 13**: Statistical Paper-Trading Pilot Review (validating execution fill quality, slippage models, ratchet triggers, and win rate across hundreds of live simulated trades).
+- **Phase 14**: Guarded Hot-Wallet Live Trading (controlled micro-allocations, e.g. 0.1 SOL position sizing, strict daily circuit-breaker loss limits, and emergency kill switches).
