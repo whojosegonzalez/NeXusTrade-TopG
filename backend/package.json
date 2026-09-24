@@ -27,6 +27,7 @@
     "research:exploratory-cohort:analyze": "tsx src/scripts/research-exploratory-cohort-analyze.ts",
     "research:exploratory-cohort:analyze-formulation-b": "tsx src/scripts/research-formulation-b-analyze.ts",
     "research:exploratory-cohort:collect": "tsx src/scripts/research-exploratory-cohort-collect.ts",
+    "research:exploratory-cohort:collect-formulation-b": "tsx src/scripts/research-formulation-b-collect.ts",
     "research:exploratory-cohort:measurement-audit": "tsx src/scripts/research-exploratory-cohort-measurement-audit.ts",
     "research:interpret": "tsx src/scripts/research-interpret.ts",
     "research:measurement-protocol:validate": "tsx src/scripts/research-measurement-protocol-validate.ts",

@@ -78,6 +78,55 @@
       }
     },
     {
+      "name": "formulation-b-collector",
+      "roots": [
+        "backend/src/research-formulation-b-collection/FormulationBArchiveWriter.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionCli.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionConfig.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionErrors.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionRunner.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionTypes.ts",
+        "backend/src/research-formulation-b-collection/FormulationBMomentumCapture.ts",
+        "backend/src/research-formulation-b-collection/FormulationBOutcomeQueue.ts",
+        "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts",
+        "backend/src/research-formulation-b-collection/FormulationBTokenDiscovery.ts",
+        "backend/src/scripts/research-formulation-b-collect.ts"
+      ],
+      "files": [
+        "backend/src/research-formulation-b-collection/FormulationBArchiveWriter.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionCli.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionConfig.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionErrors.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionRunner.ts",
+        "backend/src/research-formulation-b-collection/FormulationBCollectionTypes.ts",
+        "backend/src/research-formulation-b-collection/FormulationBMomentumCapture.ts",
+        "backend/src/research-formulation-b-collection/FormulationBOutcomeQueue.ts",
+        "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts",
+        "backend/src/research-formulation-b-collection/FormulationBTokenDiscovery.ts",
+        "backend/src/scripts/research-formulation-b-collect.ts"
+      ],
+      "external": {
+        "node:fs": [
+          "appendFileSync",
+          "existsSync",
+          "mkdirSync",
+          "readFileSync",
+          "unlinkSync",
+          "writeFileSync"
+        ],
+        "node:crypto": ["createHash"],
+        "node:path": ["default"],
+        "zod": "AUDITED_PACKAGE"
+      },
+      "typeFiles": [
+        "backend/src/research-formulation-b-collection/FormulationBCollectionTypes.ts",
+        "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts"
+      ],
+      "capabilities": {
+        "backend/src/scripts/research-formulation-b-collect.ts": ["process"]
+      }
+    },
+    {
       "name": "analytics-pure",
       "pure": true,
       "roots": [

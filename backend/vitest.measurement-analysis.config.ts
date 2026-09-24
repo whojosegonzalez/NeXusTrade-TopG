@@ -11,6 +11,7 @@ export default defineConfig({
     include: [
       "src/research-measurement-cohort-analysis/*.test.ts",
       "src/research-formulation-b-analysis/*.test.ts",
+      "src/research-formulation-b-collection/*.test.ts",
     ],
     environment: "node",
     watch: false,

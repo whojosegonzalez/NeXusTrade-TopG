@@ -1,6 +1,6 @@
 # NeXusTrade Phase 10.6B Formulation B Collection Detailed Implementation Checklist & Architecture Specification
 
-Status: **PROPOSED — Awaiting Human Approval Prior to Implementation**
+Status: **COMPLETED & SYNTHETICALLY VERIFIED (100% Isolated Check Pass)**
 
 Date: 2026-09-24  
 Author: Planning and Implementation Developer  
@@ -9,6 +9,7 @@ Governing Protocol: [Approved Formulation B Protocol Design](file:///u:/Projects
 Pinned Protocol Specification: [Phase 10.6A Formulation B Protocol JSON](file:///u:/Projects/TopG/docs/research-protocols/phase10.6a-exploratory-cohort.formulation-b.v1.json)  
 Verified Tooling Baseline: [Phase 10.6B Formulation B Tooling Verification Record](file:///u:/Projects/TopG/docs/Phase-10.6B-Formulation-B-Tooling-Verification.md)  
 Approved Scope Proposal: [Formulation B Collection Scope Proposal](file:///u:/Projects/TopG/docs/research-planning/formulation-b-collection-scope.md)
+Verification Record: [Phase 10.6B Formulation B Collection Verification Record](file:///u:/Projects/TopG/docs/Phase-10.6B-Formulation-B-Collection-Verification.md)
 
 ---
 
@@ -245,38 +246,38 @@ data/archive/phase10.6a/exploratory-cohort-formulation-b-20260925-1400Z/
 
 ## 7. Phased Implementation Tasks Checklist
 
-The following 6 ordered tasks will be implemented and verified:
+The following 6 ordered tasks have been implemented and verified:
 
-- [ ] **Task 1: Configuration & CLI Argument Parser**
-  - [ ] Implement `FormulationBCollectionConfig.ts` with strict Zod parsing.
-  - [ ] Enforce archive path validation and reject unsafe path shapes.
-  - [ ] Add unit tests in `FormulationBCollectionConfig.test.ts`.
+- [x] **Task 1: Configuration & CLI Argument Parser**
+  - [x] Implement `FormulationBCollectionConfig.ts` with strict Zod parsing.
+  - [x] Enforce archive path validation and reject unsafe path shapes.
+  - [x] Add unit tests in `FormulationBCollectionConfig.test.ts`.
 
-- [ ] **Task 2: Rate Limiter & Provider Fetchers**
-  - [ ] Implement token-bucket rate limiter ($\le 1.0\text{ req/s}$, $\text{concurrency}=1$).
-  - [ ] Implement `FormulationBTokenDiscovery.ts` with mint deduplication.
-  - [ ] Implement `FormulationBMomentumCapture.ts` with $< 10\text{s}$ freshness verification and liquidity exclusion.
-  - [ ] Add unit tests with mock HTTP fixtures in `FormulationBMomentumCapture.test.ts`.
+- [x] **Task 2: Rate Limiter & Provider Fetchers**
+  - [x] Implement token-bucket rate limiter ($\le 1.0\text{ req/s}$, $\text{concurrency}=1$).
+  - [x] Implement `FormulationBTokenDiscovery.ts` with mint deduplication.
+  - [x] Implement `FormulationBMomentumCapture.ts` with $< 10\text{s}$ freshness verification and liquidity exclusion.
+  - [x] Add unit tests with mock HTTP fixtures in `FormulationBMomentumCapture.test.ts`.
 
-- [ ] **Task 3: Delayed Real-Time Outcome Queue**
-  - [ ] Implement `FormulationBOutcomeQueue.ts` with delayed timers at $+3\text{m}, +5\text{m}, +15\text{m}, +60\text{m}$.
-  - [ ] Calculate return percentages and assign primary/descriptive labels.
-  - [ ] Add timer simulation tests in `FormulationBOutcomeQueue.test.ts`.
+- [x] **Task 3: Delayed Real-Time Outcome Queue**
+  - [x] Implement `FormulationBOutcomeQueue.ts` with delayed timers at $+3\text{m}, +5\text{m}, +15\text{m}, +60\text{m}$.
+  - [x] Calculate return percentages and assign primary/descriptive labels.
+  - [x] Add timer simulation tests in `FormulationBOutcomeQueue.test.ts`.
 
-- [ ] **Task 4: Safety Monitor & Lock Protocol**
-  - [ ] Implement `FormulationBSafetyMonitor.ts` with all 6 tripwires.
-  - [ ] Implement `FormulationBArchiveWriter.ts` with `collection.lock` management and SHA-256 artifact hashing.
-  - [ ] Add fail-closed tripwire tests in `FormulationBSafetyMonitor.test.ts`.
+- [x] **Task 4: Safety Monitor & Lock Protocol**
+  - [x] Implement `FormulationBSafetyMonitor.ts` with all 6 tripwires.
+  - [x] Implement `FormulationBArchiveWriter.ts` with `collection.lock` management and SHA-256 artifact hashing.
+  - [x] Add fail-closed tripwire tests in `FormulationBSafetyMonitor.test.ts`.
 
-- [ ] **Task 5: Collection Orchestrator & CLI Runner**
-  - [ ] Implement `FormulationBCollectionRunner.ts` managing 12 slots/day across 8 days.
-  - [ ] Implement CLI entrypoint `backend/src/scripts/research-formulation-b-collect.ts`.
-  - [ ] Add script to `package.json`: `"research:exploratory-cohort:collect-formulation-b"`.
+- [x] **Task 5: Collection Orchestrator & CLI Runner**
+  - [x] Implement `FormulationBCollectionRunner.ts` managing 12 slots/day across 8 days.
+  - [x] Implement CLI entrypoint `backend/src/scripts/research-formulation-b-collect.ts`.
+  - [x] Add script to `package.json`: `"research:exploratory-cohort:collect-formulation-b"`.
 
-- [ ] **Task 6: Synthetic Verification & Isolated Harness Conformance**
-  - [ ] Add comprehensive synthetic test suite running end-to-end dry-run collection.
-  - [ ] Verify that finalized synthetic collection archive passes `pnpm research:exploratory-cohort:analyze-formulation-b`.
-  - [ ] Execute `node scripts/verify-isolated.mjs` to ensure 100% pass across all static checks and test suites.
+- [x] **Task 6: Synthetic Verification & Isolated Harness Conformance**
+  - [x] Add comprehensive synthetic test suite running end-to-end dry-run collection.
+  - [x] Verify that finalized synthetic collection archive passes `pnpm research:exploratory-cohort:analyze-formulation-b`.
+  - [x] Execute `node scripts/verify-isolated.mjs` to ensure 100% pass across all static checks and test suites.
 
 ---
 
