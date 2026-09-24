@@ -86,6 +86,7 @@
         "backend/src/research-formulation-b-collection/FormulationBCollectionErrors.ts",
         "backend/src/research-formulation-b-collection/FormulationBCollectionRunner.ts",
         "backend/src/research-formulation-b-collection/FormulationBCollectionTypes.ts",
+        "backend/src/research-formulation-b-collection/FormulationBHttpProviderClient.ts",
         "backend/src/research-formulation-b-collection/FormulationBMomentumCapture.ts",
         "backend/src/research-formulation-b-collection/FormulationBOutcomeQueue.ts",
         "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts",
@@ -99,6 +100,7 @@
         "backend/src/research-formulation-b-collection/FormulationBCollectionErrors.ts",
         "backend/src/research-formulation-b-collection/FormulationBCollectionRunner.ts",
         "backend/src/research-formulation-b-collection/FormulationBCollectionTypes.ts",
+        "backend/src/research-formulation-b-collection/FormulationBHttpProviderClient.ts",
         "backend/src/research-formulation-b-collection/FormulationBMomentumCapture.ts",
         "backend/src/research-formulation-b-collection/FormulationBOutcomeQueue.ts",
         "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts",
@@ -123,6 +125,10 @@
         "backend/src/research-formulation-b-collection/FormulationBSafetyMonitor.ts"
       ],
       "capabilities": {
+        "backend/src/research-formulation-b-collection/FormulationBHttpProviderClient.ts": [
+          "fetch",
+          "setTimeout"
+        ],
         "backend/src/scripts/research-formulation-b-collect.ts": ["process"]
       }
     },

@@ -1,6 +1,7 @@
 import { parseFormulationBCollectionArgs } from "./FormulationBCollectionConfig.js";
 import { FormulationBCollectionError } from "./FormulationBCollectionErrors.js";
 import { FormulationBCollectionRunner } from "./FormulationBCollectionRunner.js";
+import { FormulationBHttpProviderClient } from "./FormulationBHttpProviderClient.js";
 import type { FormulationBProviderClient } from "./FormulationBCollectionTypes.js";
 
 export async function runFormulationBCollectionCli(
@@ -12,14 +13,14 @@ export async function runFormulationBCollectionCli(
   try {
     const config = parseFormulationBCollectionArgs(args);
 
-    if (!providerClient) {
-      throw new FormulationBCollectionError(
-        "FORMULATION_B_COLLECTION_INVALID_SCOPE",
-        "Provider client instance is required for collection execution",
-      );
-    }
+    const client =
+      providerClient ??
+      new FormulationBHttpProviderClient({
+        timeoutMs: config.requestTimeoutMs,
+        rateLimitMs: config.rateLimitMs,
+      });
 
-    const runner = new FormulationBCollectionRunner(config, providerClient);
+    const runner = new FormulationBCollectionRunner(config, client);
     const result = await runner.run();
 
     outStream(

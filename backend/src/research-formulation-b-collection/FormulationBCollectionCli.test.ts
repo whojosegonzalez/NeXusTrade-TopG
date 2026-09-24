@@ -32,20 +32,7 @@ describe("FormulationBCollectionCli", () => {
     expect(errLogs[0]).toContain("FORMULATION_B_COLLECTION_INVALID_SCOPE");
   });
 
-  it("returns exit code 1 when provider client is omitted", async () => {
-    const errLogs: string[] = [];
-    const exitCode = await runFormulationBCollectionCli(
-      [`--archive-root=${CLI_TEST_ARCHIVE}`],
-      undefined,
-      () => {},
-      (msg) => errLogs.push(msg),
-    );
-
-    expect(exitCode).toBe(1);
-    expect(errLogs[0]).toContain("Provider client instance is required");
-  });
-
-  it("returns exit code 0 on successful synthetic run", async () => {
+  it("returns exit code 0 on successful synthetic run with mock provider", async () => {
     const outLogs: string[] = [];
     const provider = new MockFormulationBProviderClient();
     const exitCode = await runFormulationBCollectionCli(
@@ -60,5 +47,23 @@ describe("FormulationBCollectionCli", () => {
     const parsed = JSON.parse(outLogs[0] ?? "{}");
     expect(parsed.status).toBe("SUCCESS");
     expect(parsed.finalOutcome).toBe("COHORT_COMPLETE");
+  });
+
+  it("returns exit code 1 on collection error with proper error code prefix", async () => {
+    const errLogs: string[] = [];
+    const provider = new MockFormulationBProviderClient({
+      injectedLiquidityKey: "liquidityUsd", // triggers FORMULATION_B_LIQUIDITY_PROHIBITION_STOP
+    });
+
+    const exitCode = await runFormulationBCollectionCli(
+      [`--archive-root=${CLI_TEST_ARCHIVE}`, "--rate-limit-ms=0"],
+      provider,
+      () => {},
+      (msg) => errLogs.push(msg),
+    );
+
+    expect(exitCode).toBe(1);
+    expect(errLogs.length).toBeGreaterThan(0);
+    expect(errLogs[0]).toContain("FORMULATION_B_LIQUIDITY_PROHIBITION_STOP");
   });
 });
