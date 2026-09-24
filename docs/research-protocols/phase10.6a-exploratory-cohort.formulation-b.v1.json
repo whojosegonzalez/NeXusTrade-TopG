@@ -1,0 +1,195 @@
+{
+  "contractVersion": "1",
+  "protocolId": "EXPLORATORY_COHORT_FORMULATION_B@v1",
+  "authorityStatus": "NOT_AUTHORIZED_FOR_COLLECTION",
+  "sourceEvidence": {
+    "protocolDesign": {
+      "citation": "docs/research-protocols/formulation-b-exploratory-protocol-design.md",
+      "governingScope": "docs/research-planning/formulation-b-protocol-design-scope.md"
+    },
+    "researchBrief": {
+      "citation": "docs/research-planning/post-b4-research-question-measurement-requirements-brief.md",
+      "selectedOption": "OPTION_1_FORMULATION_B"
+    },
+    "historicalBaseline": {
+      "v2Outcome": "NO_DEFENSIBLE_HYPOTHESIS",
+      "v3CapabilityOutcome": "MEASUREMENT_CAPABILITY_NOT_CONFIRMED",
+      "b4Outcome": "NO_NEW_MEASUREMENT_PROTOCOL_JUSTIFIED"
+    }
+  },
+  "purpose": {
+    "kind": "OUTCOME_BLIND_OBSERVATIONAL_ACCELERATION_EVALUATION",
+    "designQuestion": "In early-stage Solana DEX discovery tokens, does decision-time kinematic price acceleration identify persistent buying pressure resulting in a statistically significant positive forward 60-minute price continuation rate relative to the non-accelerating comparison population?",
+    "strategyValidation": false,
+    "profitabilityClaim": false,
+    "literalLimit": "Formulation B evaluates an exploratory observational research hypothesis. It does not validate a strategy, simulate execution slippage, generate candidate alpha, or authorize trading."
+  },
+  "populationAndSampling": {
+    "discoveryUniverse": "ALL_CANONICAL_SOLANA_MINTS_FROM_UNMODIFIED_DISCOVERY_UNIVERSE",
+    "technicalValidityAnchor": {
+      "mintEncoding": "BASE58_32_BYTE_CANONICAL_MINT",
+      "decisionTimeAnchor": "SLOT_ANCHOR_TIMESTAMP",
+      "maxObservationLatencySeconds": 60
+    },
+    "sampling": {
+      "seed": "formulation-b-exploratory-protocol.v1",
+      "selectionHash": "SHA256(seed|canonicalMint|slotId)",
+      "selectionRule": "LEXICOGRAPHICALLY_LOWEST_HASH",
+      "maximumUnitsPerSlot": 1,
+      "deduplication": "ONE_CANONICAL_MINT_PER_COHORT",
+      "plannedUnits": 96,
+      "minimumValidUnits": 72,
+      "maximumAttemptedSlots": 168
+    },
+    "partitioning": {
+      "seed": "formulation-b-exploratory-protocol.v1",
+      "partitionHash": "SHA256(seed|canonicalMint|slotId)",
+      "rule": "EVEN_FINAL_HEX_DIGIT_DISCOVERY_ODD_VALIDATION",
+      "minimumPartitionUnits": 32,
+      "zeroCrossPartitionOverlap": true
+    },
+    "independence": {
+      "minimumTotalUtcDates": 8,
+      "minimumPartitionUtcDates": 4,
+      "maximumValidUnitSharePerUtcDatePct": 20
+    },
+    "permittedExclusions": [
+      "MALFORMED_OR_NON_CANONICAL_IDENTIFIER",
+      "DUPLICATE_SAMPLING_UNIT",
+      "UNAVAILABLE_ANCHOR_PRICE",
+      "PREDECLARED_TECHNICAL_OR_SAFETY_STOP"
+    ]
+  },
+  "decisionTimeSchema": {
+    "allowlistedFields": [
+      "unitId",
+      "canonicalMint",
+      "anchorAt",
+      "slotId",
+      "partition",
+      "market.assetAgeSeconds",
+      "market.priceUsd",
+      "market.momentum5mPct",
+      "market.momentum15mPct",
+      "market.momentumAccelerationPct"
+    ],
+    "forbiddenFields": [
+      "market.liquidityUsd",
+      "quote.priceImpactBps",
+      "quote.available",
+      "risk.blockerCodes",
+      "LATER_LABEL",
+      "LATER_RETURN",
+      "BUY_WATCH_SKIP_CLASSIFICATION",
+      "STRATEGY_DECISION",
+      "STRATEGY_SCORE"
+    ],
+    "fieldDefinitions": {
+      "market.priceUsd": {
+        "type": "FINITE_POSITIVE_FLOAT",
+        "unit": "USD",
+        "maxAgeSeconds": 60
+      },
+      "market.momentum5mPct": {
+        "type": "FINITE_FLOAT",
+        "unit": "PERCENT",
+        "windowSeconds": 300,
+        "maxAgeSeconds": 60
+      },
+      "market.momentum15mPct": {
+        "type": "FINITE_FLOAT",
+        "unit": "PERCENT",
+        "windowSeconds": 900,
+        "maxAgeSeconds": 60
+      },
+      "market.momentumAccelerationPct": {
+        "type": "FINITE_FLOAT",
+        "unit": "PERCENT",
+        "derivationFormula": "momentum5mPct - momentum15mPct"
+      },
+      "market.assetAgeSeconds": {
+        "type": "NON_NEGATIVE_INTEGER",
+        "unit": "SECONDS"
+      }
+    },
+    "missingnessCodes": [
+      "MISSING_ANCHOR_PRICE",
+      "MISSING_MOMENTUM_5M",
+      "MISSING_MOMENTUM_15M",
+      "UNCOMPUTABLE_ACCELERATION",
+      "STALE_OBSERVATION"
+    ]
+  },
+  "candidatePredicate": {
+    "predicateId": "ACCELERATION__HIGH_V1",
+    "featurePath": "market.momentumAccelerationPct",
+    "thresholdType": "NON_PARAMETRIC_Q3_DISCOVERY",
+    "indexingConvention": "0_BASED",
+    "indexCalculation": "ceil(0.75 * (n - 1))",
+    "evaluationRule": "market.momentumAccelerationPct >= Q3(Discovery)",
+    "comparisonGroup": "ALL_OTHER_VALID_DISCOVERY_UNITS_WITH_FINITE_ACCELERATION"
+  },
+  "outcomeLabels": {
+    "primary": {
+      "horizon": "60m",
+      "targetSecondsAfterAnchor": 3600,
+      "windowToleranceSeconds": 60,
+      "formula": "(P(t0 + 3600s) - P(t0)) / P(t0) * 100",
+      "labels": {
+        "POSITIVE_60M": "return60m > 0.00",
+        "NON_POSITIVE_60M": "return60m <= 0.00",
+        "UNUSABLE_60M": "missing, late, invalid, non-finite"
+      }
+    },
+    "secondaryDescriptive": [
+      {
+        "horizon": "3m",
+        "targetSecondsAfterAnchor": 180,
+        "role": "DESCRIPTIVE_TRAJECTORY_ONLY"
+      },
+      {
+        "horizon": "5m",
+        "targetSecondsAfterAnchor": 300,
+        "role": "DESCRIPTIVE_TRAJECTORY_ONLY"
+      },
+      {
+        "horizon": "15m",
+        "targetSecondsAfterAnchor": 900,
+        "role": "DESCRIPTIVE_TRAJECTORY_ONLY"
+      }
+    ],
+    "temporalIsolationRule": "ZERO_FORWARD_LABEL_LEAKAGE_INTO_DECISION_TIME_EVIDENCE"
+  },
+  "gates": {
+    "dataQualityAndAvailability": {
+      "momentumAvailabilityFloorPct": 90.0,
+      "minimumLabelCoveragePct": 90.0,
+      "clockDriftMaxSeconds": 5.0
+    },
+    "discoverySelection": {
+      "minFeatureCoveragePct": 90.0,
+      "minRuleSupportUnits": 8,
+      "minComparisonSupportUnits": 24,
+      "minDistinctUtcDates": 4,
+      "maxDateSharePct": 35.0,
+      "minPositiveRateDifference": 0.2
+    },
+    "validationReplication": {
+      "minRuleSupportUnits": 8,
+      "minDistinctUtcDates": 4,
+      "maxDateSharePct": 35.0,
+      "minPositiveRateDifference": 0.0
+    }
+  },
+  "archiveArtifactContract": {
+    "requiredArtifacts": [
+      "cohort-manifest.v1.json",
+      "units.v1.ndjson",
+      "source-inventory.v1.json",
+      "collection-summary.v1.json"
+    ],
+    "hashing": "SHA-256",
+    "canonicalOrdering": "ASCENDING_BY_UNIT_ID",
+    "zeroSideEffectRequirement": true
+  }
+}

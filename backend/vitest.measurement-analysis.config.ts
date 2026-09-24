@@ -8,7 +8,10 @@ export default defineConfig({
   publicDir: false,
   cacheDir: "../node_modules/.cache/measurement-analysis",
   test: {
-    include: ["src/research-measurement-cohort-analysis/*.test.ts"],
+    include: [
+      "src/research-measurement-cohort-analysis/*.test.ts",
+      "src/research-formulation-b-analysis/*.test.ts",
+    ],
     environment: "node",
     watch: false,
     maxWorkers: 1,

@@ -42,6 +42,42 @@
       }
     },
     {
+      "name": "formulation-b-analyzer",
+      "roots": [
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisCli.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisErrors.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisFormatter.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisGates.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBArchiveLoader.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisService.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisTypes.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBQuantile.ts",
+        "backend/src/scripts/research-formulation-b-analyze.ts"
+      ],
+      "files": [
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisCli.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisErrors.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisFormatter.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisGates.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBArchiveLoader.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisService.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBAnalysisTypes.ts",
+        "backend/src/research-formulation-b-analysis/FormulationBQuantile.ts",
+        "backend/src/scripts/research-formulation-b-analyze.ts"
+      ],
+      "external": {
+        "node:fs": ["existsSync", "lstatSync", "realpathSync", "readFileSync", "readdirSync"],
+        "node:crypto": ["createHash"],
+        "node:path": ["default"],
+        "node:url": ["fileURLToPath"],
+        "zod": "AUDITED_PACKAGE"
+      },
+      "typeFiles": ["backend/src/research-formulation-b-analysis/FormulationBAnalysisTypes.ts"],
+      "capabilities": {
+        "backend/src/scripts/research-formulation-b-analyze.ts": ["process"]
+      }
+    },
+    {
       "name": "analytics-pure",
       "pure": true,
       "roots": [

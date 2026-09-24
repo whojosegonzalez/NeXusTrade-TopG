@@ -36,6 +36,7 @@
     "research:brief": "pnpm --filter @nexustrade/backend research:brief",
     "research:counterfactual": "pnpm --filter @nexustrade/backend research:counterfactual",
     "research:exploratory-cohort:analyze": "pnpm --filter @nexustrade/backend research:exploratory-cohort:analyze",
+    "research:exploratory-cohort:analyze-formulation-b": "pnpm --filter @nexustrade/backend research:exploratory-cohort:analyze-formulation-b",
     "research:exploratory-cohort:collect": "pnpm --filter @nexustrade/backend research:exploratory-cohort:collect",
     "research:exploratory-cohort:measurement-audit": "pnpm --filter @nexustrade/backend research:exploratory-cohort:measurement-audit",
     "research:interpret": "pnpm --filter @nexustrade/backend research:interpret",
