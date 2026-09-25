@@ -8,14 +8,24 @@ import type {
 } from "@nexustrade/shared";
 
 import { loadDashboardData, type DashboardData } from "./dashboardData.js";
+import { useLiveSessionState } from "./hooks/useLiveSessionState.js";
+import { ActiveSessionView } from "./views/ActiveSessionView.js";
+import { HistoryView } from "./views/HistoryView.js";
+import { SettingsView } from "./views/SettingsView.js";
 
 const outcomeLabels = ["TARGET_FIRST", "STOP_FIRST", "MAX_HOLD"] as const;
 
+export type DashboardTab = "ACTIVE_SESSION" | "SETTINGS" | "HISTORY" | "ARCHIVE";
+
 interface AppProps {
   readonly load?: () => Promise<DashboardData>;
+  readonly defaultTab?: DashboardTab;
 }
 
-export function App({ load = loadDashboardData }: AppProps) {
+export function App({ load = loadDashboardData, defaultTab = "ACTIVE_SESSION" }: AppProps) {
+  const [activeTab, setActiveTab] = useState<DashboardTab>(defaultTab);
+  const liveState = useLiveSessionState();
+
   const [data, setData] = useState<DashboardData>();
   const [error, setError] = useState<string>();
   const [phase, setPhase] = useState("ALL");
@@ -35,19 +45,112 @@ export function App({ load = loadDashboardData }: AppProps) {
       });
   }, [load]);
 
-  if (error) {
-    return (
-      <main className="state-panel" aria-live="polite">
-        <h1>Local dashboard data is unavailable</h1>
-        <p>{error}</p>
-        <p>Generate archive data locally, then refresh this read-only page.</p>
-      </main>
-    );
-  }
-  if (!data) {
-    return <main className="state-panel">Loading local research archive data…</main>;
-  }
+  return (
+    <main>
+      <nav className="top-nav-bar" aria-label="Main Navigation">
+        <button
+          type="button"
+          className={`nav-tab ${activeTab === "ACTIVE_SESSION" ? "active" : ""}`}
+          onClick={() => setActiveTab("ACTIVE_SESSION")}
+        >
+          ⚡ Active Session
+        </button>
+        <button
+          type="button"
+          className={`nav-tab ${activeTab === "SETTINGS" ? "active" : ""}`}
+          onClick={() => setActiveTab("SETTINGS")}
+        >
+          ⚙️ Settings & Control
+        </button>
+        <button
+          type="button"
+          className={`nav-tab ${activeTab === "HISTORY" ? "active" : ""}`}
+          onClick={() => setActiveTab("HISTORY")}
+        >
+          📜 Past Sessions
+        </button>
+        <button
+          type="button"
+          className={`nav-tab ${activeTab === "ARCHIVE" ? "active" : ""}`}
+          onClick={() => setActiveTab("ARCHIVE")}
+        >
+          🔬 Archive Explorer
+        </button>
+      </nav>
 
+      {activeTab === "ACTIVE_SESSION" && (
+        <ActiveSessionView
+          session={liveState.activeSession}
+          onSendCommand={liveState.sendCommand}
+        />
+      )}
+
+      {activeTab === "SETTINGS" && (
+        <SettingsView
+          initialSettings={liveState.settings}
+          walletTelemetry={liveState.walletTelemetry}
+          onRefreshWallet={liveState.refreshWallet}
+          onSaveSettings={liveState.setSettings}
+        />
+      )}
+
+      {activeTab === "HISTORY" && <HistoryView sessions={liveState.historySessions} />}
+
+      {activeTab === "ARCHIVE" &&
+        (error ? (
+          <section className="state-panel" aria-live="polite">
+            <h1>Local dashboard data is unavailable</h1>
+            <p>{error}</p>
+            <p>Generate archive data locally, then refresh this read-only page.</p>
+          </section>
+        ) : !data ? (
+          <section className="state-panel">Loading local research archive data…</section>
+        ) : (
+          <ArchiveExplorerView
+            data={data}
+            phase={phase}
+            setPhase={setPhase}
+            runId={runId}
+            setRunId={setRunId}
+            reportKind={reportKind}
+            setReportKind={setReportKind}
+            providerEvidence={providerEvidence}
+            setProviderEvidence={setProviderEvidence}
+            selectedCandidateId={selectedCandidateId}
+            setSelectedCandidateId={setSelectedCandidateId}
+          />
+        ))}
+    </main>
+  );
+}
+
+interface ArchiveExplorerViewProps {
+  readonly data: DashboardData;
+  readonly phase: string;
+  readonly setPhase: (phase: string) => void;
+  readonly runId: string;
+  readonly setRunId: (runId: string) => void;
+  readonly reportKind: string;
+  readonly setReportKind: (kind: string) => void;
+  readonly providerEvidence: string;
+  readonly setProviderEvidence: (evidence: string) => void;
+  readonly selectedCandidateId?: string | undefined;
+  readonly setSelectedCandidateId: (id?: string) => void;
+}
+
+function ArchiveExplorerView({
+  data,
+  phase,
+  setPhase,
+  runId,
+  setRunId,
+  reportKind,
+  setReportKind,
+  providerEvidence,
+  setProviderEvidence,
+  selectedCandidateId,
+  setSelectedCandidateId,
+}: ArchiveExplorerViewProps) {
   const phases = [...new Set([...data.runs, ...data.cohorts].map((item) => item.phase))].sort();
   const reportKinds = [
     ...new Set([
@@ -86,8 +189,9 @@ export function App({ load = loadDashboardData }: AppProps) {
   const selectedCandidate =
     visibleCandidates.find((candidate) => candidate.id === selectedCandidateId) ??
     visibleCandidates[0];
+
   return (
-    <main>
+    <div>
       <header className="safety-banner">
         <div>
           <p className="eyebrow">Local research archive explorer</p>
@@ -184,7 +288,7 @@ export function App({ load = loadDashboardData }: AppProps) {
         onSelect={setSelectedCandidateId}
         safety={data.manifest.safety}
       />
-    </main>
+    </div>
   );
 }
 

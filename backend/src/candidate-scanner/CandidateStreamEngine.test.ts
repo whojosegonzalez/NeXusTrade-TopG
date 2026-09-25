@@ -98,4 +98,43 @@ describe("CandidateStreamEngine", () => {
     expect(results.length).toBe(0);
     expect(engine.stats.errors).toBe(1);
   });
+
+  it("ingests and evaluates pools from DexScreener token profiles", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const mockFetch: typeof fetch = async (input) => {
+      if (typeof input === "string" && input.includes("dexscreener.com")) {
+        return new Response(
+          JSON.stringify([
+            {
+              url: "https://dexscreener.com/solana/pump111",
+              chainId: "solana",
+              tokenAddress: "PumpMint11111111111111111111111111111111111",
+              icon: "https://icon.png",
+              description: "Pump fun migrated token",
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ success: true, data: { data: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const admittedCandidates: CandidateScannerCandidate[] = [];
+    const engine = new CandidateStreamEngine({
+      config,
+      fetchFn: mockFetch,
+      onCandidate: (c) => admittedCandidates.push(c),
+    });
+
+    const results = await engine.scanOnce(nowSec);
+    expect(results.length).toBe(1);
+    expect(results[0]?.admitted).toBe(true);
+    expect(admittedCandidates.length).toBe(1);
+    expect(admittedCandidates[0]?.canonicalMint).toBe(
+      "PumpMint11111111111111111111111111111111111",
+    );
+  });
 });

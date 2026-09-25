@@ -198,4 +198,84 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.status).toBe("HALTED");
     expect(snapshot.haltReason).toBe("PORTFOLIO_DRAWDOWN_BREACHED");
   });
+
+  it("handles pause and resume lifecycle transitions correctly", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+    expect(daemon.getSnapshot().status).toBe("RUNNING");
+
+    daemon.pause();
+    expect(daemon.getSnapshot().status).toBe("PAUSED");
+
+    // Rejected while paused
+    const admitted = daemon.processScannedPool(validPool, nowMs);
+    expect(admitted).toBe(false);
+
+    daemon.resume();
+    expect(daemon.getSnapshot().status).toBe("RUNNING");
+
+    // Admitted after resume
+    const admittedAfterResume = daemon.processScannedPool(validPool, nowMs);
+    expect(admittedAfterResume).toBe(true);
+  });
+
+  it("handles startExiting graceful wind-down and transitions to COMPLETED when positions clear", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, nowMs);
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
+
+    daemon.startExiting();
+    expect(daemon.getSnapshot().status).toBe("EXITING");
+
+    // New pools must be rejected in EXITING mode
+    const acceptedInExiting = daemon.processScannedPool(
+      { ...validPool, poolId: "pool-during-exiting" },
+      nowMs,
+    );
+    expect(acceptedInExiting).toBe(false);
+
+    // Close remaining position
+    const pos = daemon.getSnapshot().openPositions[0]!;
+    daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.043, // Stop out
+      },
+      nowMs,
+    );
+
+    // All positions cleared -> status transitions to COMPLETED
+    const finalSnapshot = daemon.getSnapshot();
+    expect(finalSnapshot.status).toBe("COMPLETED");
+    expect(finalSnapshot.openPositions.length).toBe(0);
+  });
+
+  it("supports manual operator exit for an open position", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, nowMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    const closed = daemon.manualExit(pos.positionId, 0.06, nowMs);
+    expect(closed).toBeDefined();
+    expect(closed?.exitReason).toBe("MANUAL_OPERATOR_EXIT");
+    expect(closed?.realizedPnlSol).toBeCloseTo(0.2, 4); // (0.06 - 0.05)/0.05 * 1.0 SOL = +0.2 SOL
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(0);
+    expect(snapshot.closedTrades.length).toBe(1);
+  });
 });

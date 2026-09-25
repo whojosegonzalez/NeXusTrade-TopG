@@ -60,9 +60,18 @@ export interface ClosedTradeRecord {
   readonly closedAtMs: number;
 }
 
+export type DaemonStatus =
+  | "IDLE"
+  | "RUNNING"
+  | "PAUSED"
+  | "EXITING"
+  | "COMPLETED"
+  | "STOPPED"
+  | "HALTED";
+
 export interface PaperTradingDaemonSnapshot {
   readonly sessionId: string;
-  readonly status: "RUNNING" | "STOPPED" | "HALTED";
+  readonly status: DaemonStatus;
   readonly haltReason?: DaemonHaltReason | undefined;
   readonly openPositions: readonly PaperPosition[];
   readonly closedTrades: readonly ClosedTradeRecord[];
@@ -90,7 +99,7 @@ export class PaperTradingDaemon {
   private readonly scannerEvaluator: CandidateScannerEvaluator;
   private readonly clock: () => number;
 
-  private isRunning = false;
+  private status: DaemonStatus = "IDLE";
   private haltReason: DaemonHaltReason | undefined;
   private consecutiveErrorCount = 0;
   private readonly startedAtMs: number;
@@ -113,14 +122,80 @@ export class PaperTradingDaemon {
   }
 
   start(): void {
-    if (this.isRunning) return;
-    this.isRunning = true;
+    if (this.status === "RUNNING") return;
+    this.status = "RUNNING";
     this.haltReason = undefined;
   }
 
+  pause(): void {
+    if (this.status === "RUNNING") {
+      this.status = "PAUSED";
+    }
+  }
+
+  resume(): void {
+    if (this.status === "PAUSED") {
+      this.status = "RUNNING";
+    }
+  }
+
+  startExiting(): void {
+    if (this.status === "HALTED" || this.status === "STOPPED" || this.status === "COMPLETED") {
+      return;
+    }
+    if (this.openPositions.size === 0) {
+      this.status = "COMPLETED";
+    } else {
+      this.status = "EXITING";
+    }
+  }
+
   stop(reason: DaemonHaltReason = "MANUAL_STOP"): void {
-    this.isRunning = false;
+    this.status = reason === "MANUAL_STOP" ? "STOPPED" : "HALTED";
     this.haltReason = reason;
+  }
+
+  manualExit(
+    positionId: string,
+    currentSpotPriceSol?: number,
+    nowTimestampMs?: number,
+  ): ClosedTradeRecord | null {
+    const position = this.openPositions.get(positionId);
+    if (!position) return null;
+
+    const now = nowTimestampMs ?? this.clock();
+    const exitPriceSol = currentSpotPriceSol ?? position.spotPriceSol;
+    const proceedsSol = position.tokensHeld * exitPriceSol;
+    const realizedPnlSol = proceedsSol - position.costBasisSol;
+    const realizedPnlBps = Math.round(
+      ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
+    );
+
+    this.currentCashSol += proceedsSol;
+
+    const closedRecord: ClosedTradeRecord = {
+      positionId: position.positionId,
+      mintAddress: position.mintAddress,
+      entryPriceSol: position.entryPriceSol,
+      exitPriceSol,
+      costBasisSol: position.costBasisSol,
+      proceedsSol,
+      realizedPnlSol,
+      realizedPnlBps,
+      exitReason: "MANUAL_OPERATOR_EXIT",
+      openedAtMs: position.openedAtMs,
+      closedAtMs: now,
+    };
+
+    this.closedTrades.push(closedRecord);
+    this.openPositions.delete(positionId);
+    this.ratchetService.getStore().delete(positionId);
+
+    if (this.status === "EXITING" && this.openPositions.size === 0) {
+      this.status = "COMPLETED";
+    }
+
+    return closedRecord;
   }
 
   getSnapshot(): PaperTradingDaemonSnapshot {
@@ -144,7 +219,7 @@ export class PaperTradingDaemon {
 
     return {
       sessionId: this.config.sessionId,
-      status: this.isRunning ? "RUNNING" : this.haltReason ? "HALTED" : "STOPPED",
+      status: this.status,
       ...(this.haltReason ? { haltReason: this.haltReason } : {}),
       openPositions: openPositionsArray,
       closedTrades: [...this.closedTrades],
@@ -163,7 +238,7 @@ export class PaperTradingDaemon {
     nowTimestampMs?: number,
     entryPriceSolOverride?: number,
   ): boolean {
-    if (!this.isRunning) return false;
+    if (this.status !== "RUNNING") return false;
     const now = nowTimestampMs ?? this.clock();
 
     // 1. Position Sizing & Capacity Check
@@ -217,7 +292,9 @@ export class PaperTradingDaemon {
     marketContext: MarketEvaluationContext,
     nowTimestampMs?: number,
   ): RatchetEvaluationResult | null {
-    if (!this.isRunning) return null;
+    if (this.status !== "RUNNING" && this.status !== "PAUSED" && this.status !== "EXITING") {
+      return null;
+    }
     const now = nowTimestampMs ?? this.clock();
     this.lastTickAtMs = now;
 
@@ -269,6 +346,10 @@ export class PaperTradingDaemon {
         this.closedTrades.push(closedRecord);
         this.openPositions.delete(positionId);
         this.ratchetService.getStore().delete(positionId);
+
+        if (this.status === "EXITING" && this.openPositions.size === 0) {
+          this.status = "COMPLETED";
+        }
       }
 
       // 4. Portfolio Drawdown Circuit Breaker

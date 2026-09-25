@@ -99,3 +99,4 @@ export {
   parseProviderName,
 } from "./providers/provider.types.js";
 export * from "./phase11-schemas.js";
+export * from "./phase12-dashboard-schemas.js";

@@ -173,11 +173,43 @@ analytics reports summarize funnels, score buckets, near misses, missed opportun
 health, and Jupiter rate limiting. These commands do not load wallets, sign transactions, submit
 transactions, or create live trades.
 
+## Phase 11: Dynamic Ratchet Exit Engine & Live Scanner
+
+Phase 11 introduces real-time pool discovery across Raydium AMM pools and an asymmetric dynamic ratchet stop-loss engine:
+
+- Anti-rug safety screening (LP burn verification, freeze/mint authority renunciation, liquidity depth).
+- Multi-tier ratchet state machine: `-12.0%` initial soft floor, `+0.5%` scratch break-even arming, `-8.0%` dip recovery grace hold, `+20.0%` Tier 1 floor lock, and `+45.0%` Tier 2 trailing floor.
+
+## Phase 12: Interactive Trading Dashboard & Control Plane
+
+Phase 12 adds a 3-page interactive visual control plane and quantitative two-stage strategy funnel:
+
+### 1. Visual Control Plane (React + Vite)
+
+- **Settings View**: Solana RPC wallet balance and SPL token holdings audit, Max Concurrent Positions slider (1–10), position sizing, gas reserve calculator, profit goal mode toggle (`% Gain Goal` vs `Final SOL Balance`), and strategy threshold tuners.
+- **Active Session View**: Real-time telemetry banner (PnL, session timer), 5-stat metric counter grid (Open, Closed, W/L/Scratch), live position cards with ratchet tier badges & stop distance meter, manual exit controls, watchlist radar table, and session controls (`PAUSE`, `RESUME`, `START EXITING`, `EMERGENCY STOP`).
+- **Past Sessions View**: Historical session ledger and cumulative equity curve progression chart with trade drill-down.
+
+### 2. Strategy Radar & Buy Gate Funnel
+
+- **Stage 1 (Watchlist Radar)**: Screener admitting baseline safe pairs (liquidity $\ge \$2,500$, LP burn $\ge 90\%$, txns $\ge 10$) and auto-evicting stagnant pairs ($> 20\text{m}$).
+- **Stage 2 (Buy Gate Confirmation)**: Confirms 5 quantitative signals (maturity age 5m–15m, depth balance $0.15 \le \text{L/MC} \le 0.30$, flow absorption $\text{Buys} \ge 1.5 \times \text{Sells}$, volume surge $\ge \$2,500$, dev dump protection $\le 5\%$) before triggering simulated buys.
+
+### Running the Dashboard & Daemon
+
+```powershell
+# Start the React Interactive Dashboard
+pnpm dev:frontend
+
+# Start the Paper Trading Daemon
+pnpm daemon:paper --session-id=session_123 --max-positions=3 --position-size-sol=1.0
+```
+
 ## Repo Layout
 
 - `backend`: TypeScript backend service foundation.
-- `shared`: Shared types and execution-mode helpers.
-- `frontend`: Placeholder for the future dashboard.
+- `shared`: Shared data contracts, schemas, and execution-mode helpers.
+- `frontend`: Interactive 3-page React dashboard and control plane.
 - `docs`: Roadmap, decisions, checklist, and structure documentation.
 - `scripts`: Local safety and automation scripts.
 - `data`: Local data directory; database files are ignored.

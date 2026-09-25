@@ -1,11 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type {
   DashboardCandidate,
   DashboardCohort,
   DashboardManifest,
   DashboardRun,
 } from "@nexustrade/shared";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { App } from "./App.js";
 
@@ -171,21 +171,26 @@ const candidates: readonly DashboardCandidate[] = [
 ];
 
 describe("App", () => {
-  it("renders traceable cohort, provider, and decision evidence using local-only filters", async () => {
-    render(<App load={async () => ({ manifest, runs, cohorts, candidates })} />);
+  afterEach(() => {
+    cleanup();
+  });
+  it("renders traceable cohort, provider, and decision evidence using local-only filters on ARCHIVE tab", async () => {
+    render(
+      <App load={async () => ({ manifest, runs, cohorts, candidates })} defaultTab="ARCHIVE" />,
+    );
 
-    expect(await screen.findByText("PAPER / shadow-only")).toBeInTheDocument();
-    expect(screen.getByText("NO_DEFENSIBLE_HYPOTHESIS")).toBeInTheDocument();
-    expect(screen.getByText("Outcome label (not an entry input)")).toBeInTheDocument();
-    expect(screen.getByText("SCORE_ATTRIBUTION")).toBeInTheDocument();
-    expect(screen.getByText("MISSING")).toBeInTheDocument();
-    expect(screen.getByText(/StrategyDecision\.quote/)).toBeInTheDocument();
-    expect(screen.getByText("Cohort evidence and provenance")).toBeInTheDocument();
-    expect(screen.getByText("Selected source-run shares")).toBeInTheDocument();
+    expect(await screen.findByText("PAPER / shadow-only")).toBeDefined();
+    expect(screen.getByText("NO_DEFENSIBLE_HYPOTHESIS")).toBeDefined();
+    expect(screen.getByText("Outcome label (not an entry input)")).toBeDefined();
+    expect(screen.getByText("SCORE_ATTRIBUTION")).toBeDefined();
+    expect(screen.getByText("MISSING")).toBeDefined();
+    expect(screen.getByText(/StrategyDecision\.quote/)).toBeDefined();
+    expect(screen.getByText("Cohort evidence and provenance")).toBeDefined();
+    expect(screen.getByText("Selected source-run shares")).toBeDefined();
     expect(screen.getAllByText("Test1: 100.00%")).toHaveLength(3);
-    expect(screen.getByText("Pre-registered cohort gates")).toBeInTheDocument();
-    expect(screen.getByText("NOT MET")).toBeInTheDocument();
-    expect(screen.getByText("Upstream rate limits")).toBeInTheDocument();
+    expect(screen.getByText("Pre-registered cohort gates")).toBeDefined();
+    expect(screen.getByText("NOT MET")).toBeDefined();
+    expect(screen.getByText("Upstream rate limits")).toBeDefined();
     expect(
       screen.getByRole("region", {
         name: "Provider pressure table; scroll horizontally for all columns",
@@ -193,30 +198,29 @@ describe("App", () => {
     ).toHaveClass("provider-table-scroll");
     expect(
       screen.getByRole("row", { name: /Test1.*JUPITER.*RUN_TOTAL.*2.*3.*1.*4.*5.*6.*7 \/ 8/ }),
-    ).toBeInTheDocument();
+    ).toBeDefined();
     expect(
       screen.getByRole("row", { name: /Test1.*BIRDEYE.*RUN_TOTAL.*NOT_REPORTED.*NOT_REPORTED/ }),
-    ).toBeInTheDocument();
+    ).toBeDefined();
     const sourcePathDisclosure = screen.getAllByText("Show source path")[0]?.closest("details");
     expect(sourcePathDisclosure).not.toHaveAttribute("open");
     expect(screen.getAllByText("phase9.28/test1/runner-output/run.json")).toHaveLength(3);
     expect(screen.getAllByText(/2026-08-18T20:00:00Z.*2026-08-18T22:00:00Z/)).toHaveLength(2);
-    expect(screen.getByText("Original decision")).toBeInTheDocument();
-    expect(screen.getByText("Original score")).toBeInTheDocument();
-    expect(screen.getByText("Original threshold context")).toBeInTheDocument();
+    expect(screen.getByText("Original decision")).toBeDefined();
+    expect(screen.getByText("Original score")).toBeDefined();
+    expect(screen.getByText("Original threshold context")).toBeDefined();
     expect(
       screen.getByRole("region", {
         name: "Decision-time facts table; scroll horizontally for all columns",
       }),
     ).toHaveClass("candidate-table-scroll");
     expect(screen.getAllByText("BUY 90 · WATCH 70")).toHaveLength(2);
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Provider pressure evidence"), {
       target: { value: "NOT_REPORTED" },
     });
-    expect(screen.getByRole("row", { name: /Test2.*PASS.*0/ })).toBeInTheDocument();
-    expect(screen.queryByRole("row", { name: /Test1.*PASS.*34/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("row", { name: /Test2.*PASS.*0/ })).toBeDefined();
+    expect(screen.queryByRole("row", { name: /Test1.*PASS.*34/ })).toBeNull();
 
     fireEvent.change(screen.getByLabelText("Provider pressure evidence"), {
       target: { value: "ALL" },
@@ -224,12 +228,12 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Report kind"), {
       target: { value: "TERMINAL_RUNNER_SUMMARY" },
     });
-    expect(screen.getByRole("row", { name: /Test1.*PASS.*34/ })).toBeInTheDocument();
+    expect(screen.getByRole("row", { name: /Test1.*PASS.*34/ })).toBeDefined();
 
     fireEvent.change(screen.getByLabelText("Report kind"), {
       target: { value: "FAST_ENTRY_ATTRIBUTION_REPORT" },
     });
-    expect(screen.getByText("F65E@v1 Phase 9.29 attribution")).toBeInTheDocument();
+    expect(screen.getByText("F65E@v1 Phase 9.29 attribution")).toBeDefined();
     expect(screen.getAllByText("FAST_ENTRY_ATTRIBUTION_REPORT")).toHaveLength(2);
 
     fireEvent.change(screen.getByLabelText("Report kind"), {
@@ -238,12 +242,34 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Display run"), {
       target: { value: "run:phase9-28-test1" },
     });
-    expect(screen.queryByRole("row", { name: /Test2.*PASS.*0/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("row", { name: /Test2.*PASS.*0/ })).toBeNull();
 
     fireEvent.change(screen.getByLabelText("Display phase"), {
       target: { value: "phase9.29" },
     });
-    expect(screen.getByText("F65E@v1 Phase 9.29 attribution")).toBeInTheDocument();
-    expect(screen.queryByRole("row", { name: /Test1.*PASS.*34/ })).not.toBeInTheDocument();
+    expect(screen.getByText("F65E@v1 Phase 9.29 attribution")).toBeDefined();
+    expect(screen.queryByRole("row", { name: /Test1.*PASS.*34/ })).toBeNull();
+  });
+
+  it("navigates across all 4 top-level tabs", async () => {
+    render(<App load={async () => ({ manifest, runs, cohorts, candidates })} />);
+
+    // Default tab is Active Session
+    expect(screen.getByTestId("active-session-view")).toBeDefined();
+
+    // Switch to Settings tab
+    const settingsTab = screen.getByText("⚙️ Settings & Control");
+    fireEvent.click(settingsTab);
+    expect(screen.getByTestId("settings-view")).toBeDefined();
+
+    // Switch to Past Sessions tab
+    const historyTab = screen.getByText("📜 Past Sessions");
+    fireEvent.click(historyTab);
+    expect(screen.getByTestId("history-view")).toBeDefined();
+
+    // Switch to Archive Explorer tab
+    const archiveTab = screen.getByText("🔬 Archive Explorer");
+    fireEvent.click(archiveTab);
+    expect(await screen.findByText("PAPER / shadow-only")).toBeDefined();
   });
 });

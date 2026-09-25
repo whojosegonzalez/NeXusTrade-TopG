@@ -1,11 +1,12 @@
 # NeXusTrade Phase 12: Interactive Trading Dashboard & Control Plane Detailed Implementation Checklist
 
-Status: **APPROVED FOR IMPLEMENTATION**  
-Date: 2026-09-24  
-Author: Architecture & Implementation Team  
-Decision Owner: User / Human Reviewer  
-Governing Scope: [Phase 12 Scope Specification](file:///u:/Projects/TopG/docs/research-planning/phase-12-trading-dashboard-and-control-plane-scope.md)  
+Status: **COMPLETED & VERIFIED**
+Date: 2026-09-24
+Author: Architecture & Implementation Team
+Decision Owner: User / Human Reviewer
+Governing Scope: [Phase 12 Scope Specification](file:///u:/Projects/TopG/docs/research-planning/phase-12-trading-dashboard-and-control-plane-scope.md)
 Baseline Repository State: Phase 11 Verified (69 test files, 654 tests passing)
+Final Verified State: Phase 12 Complete (73 test files, 697 tests passing: 675 backend, 22 frontend)
 
 ---
 
@@ -59,7 +60,7 @@ flowchart TD
 
 #### Task 1: Shared Data Contracts & Schemas
 
-- [ ] Define type-safe Zod schemas in `shared/src/phase12-dashboard-schemas.ts`:
+- [x] Define type-safe Zod schemas in `shared/src/phase12-dashboard-schemas.ts`:
   - `DashboardSettingsSchema`:
     - `maxConcurrentPositions`: `z.number().int().min(1).max(10).default(3)`
     - `positionSizeSol`: `z.number().positive().default(1.0)`
@@ -78,17 +79,17 @@ flowchart TD
     - `action`: `z.enum(["PAUSE", "RESUME", "START_EXITING", "MANUAL_EXIT", "EMERGENCY_STOP"])`
     - `targetPositionId`: `z.string().optional()`
     - `issuedAt`: `z.number()`
-- [ ] Export schemas and TypeScript inference types from `shared/src/index.ts`.
+- [x] Export schemas and TypeScript inference types from `shared/src/index.ts`.
 
 ---
 
 #### Task 2: Backend Wallet Query & IPC Control Service
 
-- [ ] Create `backend/src/wallet/WalletTelemetryService.ts`:
+- [x] Create `backend/src/wallet/WalletTelemetryService.ts`:
   - Connects to Solana RPC to fetch native lamport balance via `getBalance`.
   - Parses SPL token accounts via `getTokenAccountsByOwner` with token program ID.
   - Formats balances and computes `deployableSol = Math.max(0, solBalance - gasReserveSol)`.
-- [ ] Create `backend/src/session/SessionControlIpcService.ts`:
+- [x] Create `backend/src/session/SessionControlIpcService.ts`:
   - Manages IPC communication between React UI and `PaperTradingDaemon`.
   - Reads and dispatches commands:
     - `PAUSE`: Halts new pool admissions in daemon.
@@ -96,13 +97,13 @@ flowchart TD
     - `START_EXITING`: Freezes admissions, sets daemon wind-down flag, waits for natural scratch or profit exits before stopping.
     - `MANUAL_EXIT`: Immediately triggers market close for a specific position.
     - `EMERGENCY_STOP`: Closes all open positions and halts daemon immediately.
-- [ ] Unit tests in `backend/src/wallet/WalletTelemetryService.test.ts` and `backend/src/session/SessionControlIpcService.test.ts`.
+- [x] Unit tests in `backend/src/wallet/WalletTelemetryService.test.ts` and `backend/src/session/SessionControlIpcService.test.ts`.
 
 ---
 
 #### Task 3: Settings View (`frontend/src/views/SettingsView.tsx`)
 
-- [ ] Implement Settings View component:
+- [x] Implement Settings View component:
   - **Wallet Header Card**:
     - "Refresh Wallet Info" button with loading state.
     - SOL Balance display and SPL token account list.
@@ -121,13 +122,13 @@ flowchart TD
   - **Strategy Threshold Controls**:
     - Sliders and inputs for Min/Max L/MC, Min Buy/Sell ratio, Min 5m Volume.
   - **Save & Apply**: Persists settings to local storage / `.tmp/dashboard-settings.json`.
-- [ ] Unit test in `frontend/src/views/SettingsView.test.tsx`.
+- [x] Unit test in `frontend/src/views/SettingsView.test.tsx`.
 
 ---
 
 #### Task 4: Active Session View (`frontend/src/views/ActiveSessionView.tsx`)
 
-- [ ] Implement Active Session View component:
+- [x] Implement Active Session View component:
   - **Telemetry Banner**:
     - Session Status badge (`IDLE`, `RUNNING`, `PAUSED`, `EXITING`, `COMPLETED`).
     - Realized P/L ($SOL$ and `bps`/`%`).
@@ -163,42 +164,43 @@ flowchart TD
     - `START EXITING` button (graceful wind-down mode).
     - `EMERGENCY STOP` button.
   - **Live Activity Feed**: Real-time log of buys, ratchet advancements, and sell executions.
-- [ ] Unit test in `frontend/src/views/ActiveSessionView.test.tsx`.
+- [x] Unit test in `frontend/src/views/ActiveSessionView.test.tsx`.
 
 ---
 
 #### Task 5: Past Sessions & History View (`frontend/src/views/HistoryView.tsx`)
 
-- [ ] Implement Past Sessions View component:
+- [x] Implement Past Sessions View component:
   - **Historical Sessions Ledger Table**:
     - Columns: Session ID, Date/Time, Duration, Final Equity, Net PnL ($SOL$), Win Rate (%), Total Trades, W / L / Scratch counts.
     - Row expander showing individual trades for that session.
   - **Cumulative Equity Curve Chart**:
     - Interactive line chart tracking portfolio equity progression over historical sessions.
     - Annotations for starting capital and session milestones.
-- [ ] Unit test in `frontend/src/views/HistoryView.test.tsx`.
+- [x] Unit test in `frontend/src/views/HistoryView.test.tsx`.
 
 ---
 
 #### Task 6: Main Shell & Navigation Integration (`frontend/src/App.tsx`)
 
-- [ ] Update `frontend/src/App.tsx` with a top-level tabbed navigation bar:
-  - Tab 1: `Settings`
-  - Tab 2: `Active Session`
+- [x] Update `frontend/src/App.tsx` with a top-level tabbed navigation bar:
+  - Tab 1: `Active Session`
+  - Tab 2: `Settings`
   - Tab 3: `Past Sessions`
-- [ ] Implement live data synchronization hook (`useLiveSessionState.ts`):
+  - Tab 4: `Archive Explorer`
+- [x] Implement live data synchronization hook (`useLiveSessionState.ts`):
   - Polls `.tmp/paper-session-active.json` every 1,500ms with fallback handling.
   - Updates React state without UI jitter or layout shifts.
-- [ ] Add session goal evaluation hook:
+- [x] Add session goal evaluation hook:
   - Monitors portfolio equity against the configured goal (Mode A or Mode B).
   - Automatically emits `START_EXITING` action when goal is satisfied.
-- [ ] Component integration tests in `frontend/src/App.test.tsx`.
+- [x] Component integration tests in `frontend/src/App.test.tsx`.
 
 ---
 
 #### Task 7: Daemon Graceful "Start Exiting" Mode Support
 
-- [ ] Update `backend/src/paper/PaperTradingDaemon.ts`:
+- [x] Update `backend/src/paper/PaperTradingDaemon.ts`:
   - Add `startExiting(): void` method:
     - Sets state to `"EXITING"`.
     - Rejects all new pool admissions (`processScannedPool` returns `false`).
@@ -206,7 +208,7 @@ flowchart TD
     - Once `openPositions.size === 0`, marks status as `"COMPLETED"`.
   - Add `manualExit(positionId: string): void` method:
     - Immediately closes specified position at current spot price and logs reason code `MANUAL_OPERATOR_EXIT`.
-- [ ] Unit tests in `backend/src/paper/PaperTradingDaemon.test.ts`.
+- [x] Unit tests in `backend/src/paper/PaperTradingDaemon.test.ts`.
 
 ---
 
@@ -214,36 +216,36 @@ flowchart TD
 
 #### Task 8: Candidate Watchlist Radar Service (`backend/src/candidate-scanner/CandidateWatchlistService.ts`)
 
-- [ ] Decouple pool discovery from immediate execution by implementing an active candidate watchlist:
+- [x] Decouple pool discovery from immediate execution by implementing an active candidate watchlist:
   - Stores up to `maxWatchlistSize` (e.g. 20) pre-screened tokens meeting baseline safety:
     - Liquidity $\ge \$2,500$
     - LP burn $\ge 90.0\%$
     - Mint & freeze authorities disabled
     - Unique txns $\ge 10$
   - Discards decaying pools: Automatically drops tokens when age exceeds $1,200\text{s}$ (20m) without triggering a buy.
-- [ ] Unit tests in `backend/src/candidate-scanner/CandidateWatchlistService.test.ts`.
+- [x] Unit tests in `backend/src/candidate-scanner/CandidateWatchlistService.test.ts`.
 
 ---
 
 #### Task 9: Quantitative Buy Gate Confirmation Engine (`backend/src/candidate-scanner/BuyGateTriggerService.ts`)
 
-- [ ] Implement active multi-condition confirmation for tokens on the watchlist:
+- [x] Implement active multi-condition confirmation for tokens on the watchlist:
   - **Maturity Window Gate**: $300\text{s} \le \text{Age} \le 900\text{s}$ (5m to 15m sweet spot).
   - **Depth Balance Gate**: $0.15 \le \text{L/MC} \le 0.30$ (healthy liquidity vs. market cap).
   - **Flow Absorption Gate**: $\text{Buys}_{5m} \ge 1.5 \times \text{Sells}_{5m}$ (organic buyer dominance).
   - **Volume Surge Gate**: $\text{Volume}_{5m} \ge \$2,500$ with average transaction $\ge \$25$.
   - **Dev Disposal Gate**: Verifies no single transaction disposed $> 5\%$ of pool depth in the last 3 minutes.
-- [ ] Promotes confirmed candidate to the `PaperTradingDaemon` buy queue.
-- [ ] Unit tests in `backend/src/candidate-scanner/BuyGateTriggerService.test.ts`.
+- [x] Promotes confirmed candidate to the `PaperTradingDaemon` buy queue.
+- [x] Unit tests in `backend/src/candidate-scanner/BuyGateTriggerService.test.ts`.
 
 ---
 
 #### Task 10: Multi-Source Pool Discovery Streamer Integration
 
-- [ ] Enhance `CandidateStreamEngine.ts` with multi-source ingestion:
+- [x] Enhance `CandidateStreamEngine.ts` with multi-source ingestion:
   - Primary: Raydium AMM / CLMM / CPMM pools.
   - Secondary: DexScreener latest token profiles (`https://api.dexscreener.com/token-profiles/latest/v1`) to capture newly launched pump.fun migrations and fresh Solana pairs.
-- [ ] Unit tests in `backend/src/candidate-scanner/CandidateStreamEngine.test.ts`.
+- [x] Unit tests in `backend/src/candidate-scanner/CandidateStreamEngine.test.ts`.
 
 ---
 
@@ -251,10 +253,10 @@ flowchart TD
 
 #### Task 11: End-to-End Verification & Operator Guide
 
-- [ ] Run full static isolation checks: `node scripts/verify-isolated.mjs static`.
-- [ ] Run full test suites: `node scripts/verify-isolated.mjs tests`.
-- [ ] Verify 100% clean passes across all workspaces.
-- [ ] Update `README.md` and operator guides with dashboard launch instructions:
+- [x] Run full static isolation checks: `node scripts/verify-isolated.mjs static`.
+- [x] Run full test suites: `node scripts/verify-isolated.mjs tests`.
+- [x] Verify 100% clean passes across all workspaces.
+- [x] Update `README.md` and operator guides with dashboard launch instructions:
 
   ```powershell
   # Start the React Trading Dashboard

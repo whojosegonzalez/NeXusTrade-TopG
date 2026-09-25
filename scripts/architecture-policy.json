@@ -184,6 +184,7 @@
         "shared/src/market/token.types.ts",
         "shared/src/modes.ts",
         "shared/src/phase11-schemas.ts",
+        "shared/src/phase12-dashboard-schemas.ts",
         "shared/src/providers/provider-errors.ts",
         "shared/src/providers/provider-results.ts",
         "shared/src/providers/provider.types.ts",
@@ -211,6 +212,7 @@
         "shared/src/market/token.types.ts",
         "shared/src/modes.ts",
         "shared/src/phase11-schemas.ts",
+        "shared/src/phase12-dashboard-schemas.ts",
         "shared/src/providers/provider-errors.ts",
         "shared/src/providers/provider-results.ts",
         "shared/src/providers/provider.types.ts",
@@ -229,6 +231,8 @@
         "backend/src/candidate-scanner/CandidateScannerConfig.ts",
         "backend/src/candidate-scanner/CandidateScannerEvaluator.ts",
         "backend/src/candidate-scanner/CandidateScannerTypes.ts",
+        "backend/src/candidate-scanner/CandidateWatchlistService.ts",
+        "backend/src/candidate-scanner/BuyGateTriggerService.ts",
         "backend/src/candidate-scanner/evaluators/AntiRugEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/LiquidityMarketCapEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts"
@@ -238,12 +242,26 @@
         "backend/src/candidate-scanner/CandidateScannerConfig.ts",
         "backend/src/candidate-scanner/CandidateScannerEvaluator.ts",
         "backend/src/candidate-scanner/CandidateScannerTypes.ts",
+        "backend/src/candidate-scanner/CandidateWatchlistService.ts",
+        "backend/src/candidate-scanner/BuyGateTriggerService.ts",
         "backend/src/candidate-scanner/evaluators/AntiRugEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/LiquidityMarketCapEvaluator.ts",
-        "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts"
+        "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts",
+        "shared/src/index.ts",
+        "shared/src/phase11-schemas.ts",
+        "shared/src/phase12-dashboard-schemas.ts"
       ],
-      "external": {},
-      "typeFiles": ["backend/src/candidate-scanner/CandidateScannerTypes.ts"],
+      "external": {
+        "zod": "AUDITED_PACKAGE"
+      },
+      "typeFiles": [
+        "backend/src/candidate-scanner/CandidateScannerTypes.ts",
+        "backend/src/candidate-scanner/CandidateWatchlistService.ts",
+        "backend/src/candidate-scanner/BuyGateTriggerService.ts",
+        "shared/src/index.ts",
+        "shared/src/phase11-schemas.ts",
+        "shared/src/phase12-dashboard-schemas.ts"
+      ],
       "capabilities": {
         "backend/src/candidate-scanner/CandidateStreamEngine.ts": [
           "fetch",
