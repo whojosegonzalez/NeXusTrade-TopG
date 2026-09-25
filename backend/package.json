@@ -20,6 +20,7 @@
     "providers:smoke": "tsx src/scripts/providers-smoke.ts",
     "quote:diagnose": "tsx src/scripts/quote-diagnose.ts",
     "paper:execute": "tsx src/scripts/paper-execute.ts",
+    "paper:observation-analytics": "tsx src/scripts/paper-observation-analytics.ts",
     "paper:sell": "tsx src/scripts/paper-sell.ts",
     "research:aggregate": "tsx src/scripts/research-aggregate.ts",
     "research:brief": "tsx src/scripts/research-brief.ts",

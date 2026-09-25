@@ -3,6 +3,9 @@ import { parseArgs } from "node:util";
 import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "../paper/PaperTradingDaemon.js";
 import { CandidateStreamEngine } from "../candidate-scanner/CandidateStreamEngine.js";
 import { CANDIDATE_SCANNER_DEFAULTS } from "../candidate-scanner/CandidateScannerConfig.js";
+import { CandidateWatchlistService } from "../candidate-scanner/CandidateWatchlistService.js";
+import { BuyGateTriggerService } from "../candidate-scanner/BuyGateTriggerService.js";
+import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { MarketEvaluationContext } from "../exits/DynamicRatchetTypes.js";
 import { nowMs } from "../db/utils/timestamps.js";
 
@@ -13,13 +16,16 @@ function parseCliArgs(): PaperTradingDaemonConfig {
       "duration-hours": { type: "string" },
       "max-positions": { type: "string" },
       "position-size-sol": { type: "string" },
+      "max-drawdown-bps": { type: "string" },
+      "cooldown-min": { type: "string" },
+      "uninterrupted-research": { type: "boolean" },
       "dry-run": { type: "boolean" },
     },
     strict: false,
   });
 
   const rawDuration = values["duration-hours"];
-  const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 6;
+  const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 4;
 
   const rawMaxPos = values["max-positions"];
   const maxOpenPositions = typeof rawMaxPos === "string" ? parseInt(rawMaxPos, 10) : 3;
@@ -27,6 +33,15 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   const rawSize = values["position-size-sol"];
   const positionSizeSol = typeof rawSize === "string" ? parseFloat(rawSize) : 1.0;
 
+  const rawDrawdown = values["max-drawdown-bps"];
+  const maxPortfolioDrawdownBps =
+    typeof rawDrawdown === "string" ? parseInt(rawDrawdown, 10) : -500; // -5.0%
+
+  const rawCooldown = values["cooldown-min"];
+  const cooldownMin = typeof rawCooldown === "string" ? parseFloat(rawCooldown) : 30;
+  const antiRebuyCooldownMs = cooldownMin * 60 * 1000;
+
+  const uninterruptedResearchMode = values["uninterrupted-research"] === true;
   const dryRun = values["dry-run"] === true;
 
   const timestamp = new Date()
@@ -42,11 +57,13 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     maxOpenPositions,
     positionSizeSol,
     initialPortfolioSol: 10.0,
-    maxPortfolioDrawdownBps: -500, // -5.0%
+    maxPortfolioDrawdownBps,
     maxConsecutiveErrors: 3,
     maxClockDriftMs: 5000,
     pollIntervalMs: 2000,
     dryRun,
+    antiRebuyCooldownMs,
+    uninterruptedResearchMode,
   };
 }
 
@@ -124,6 +141,9 @@ async function run(): Promise<void> {
   console.log(
     `[PaperDaemon] Config: Duration=${config.durationHours}h, MaxPositions=${config.maxOpenPositions}, Size=${config.positionSizeSol} SOL`,
   );
+  console.log(
+    `[PaperDaemon] Protective Guardrails: MaxDrawdown=${config.maxPortfolioDrawdownBps} bps, AntiRebuyCooldown=${((config.antiRebuyCooldownMs ?? 0) / 60000).toFixed(0)}m, UninterruptedResearch=${config.uninterruptedResearchMode ? "ENABLED" : "DISABLED"}`,
+  );
 
   const daemon = new PaperTradingDaemon({ config });
   daemon.start();
@@ -132,12 +152,43 @@ async function run(): Promise<void> {
     config: config.scannerConfig ?? CANDIDATE_SCANNER_DEFAULTS,
   });
 
+  const watchlistService = new CandidateWatchlistService({
+    maxWatchlistSize: 25,
+    minLiquidityUsd: 2500,
+    minLpBurnPct: 90.0,
+    minTxCount5m: 10,
+    maxWatchlistAgeSec: 1200,
+  });
+
+  const buyGateService = new BuyGateTriggerService();
+  const tracker = new CounterfactualOpportunityTracker();
+
   const startMs = nowMs();
   const maxDurationMs = config.durationHours * 3600 * 1000;
   let lastScanMs = 0;
   let lastHeartbeatMs = 0;
   let lastPersistMs = 0;
+  let lastRadarSampleMs = 0;
   const scanIntervalMs = 5000;
+
+  const persistState = () => {
+    const snap = daemon.getSnapshot();
+    const fullState = {
+      ...snap,
+      watchlist: watchlistService.getItems(),
+    };
+    try {
+      if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
+      writeFileSync(".tmp/paper-session-active.json", JSON.stringify(fullState, null, 2), "utf8");
+      tracker.saveReportToFile(
+        ".tmp/session-paper-observation-report.json",
+        config.initialPortfolioSol,
+        snap.currentPortfolioSol,
+      );
+    } catch (err) {
+      void err;
+    }
+  };
 
   // Graceful shutdown handlers
   let terminating = false;
@@ -150,12 +201,11 @@ async function run(): Promise<void> {
     console.log(
       `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length}`,
     );
-    try {
-      if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
-      writeFileSync(".tmp/paper-session-active.json", JSON.stringify(snap, null, 2), "utf8");
-    } catch (err) {
-      void err;
-    }
+    persistState();
+    const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
+    console.log(
+      `[PaperDaemon] Counterfactual Summary: Observed=${report.totalCandidatesObserved}, Executed=${report.executedBuysCount}, MissedWinners=${report.missedWinnersCount}, AvoidedRugs=${report.avoidedRugsCount}`,
+    );
     process.exit(0);
   };
 
@@ -173,7 +223,7 @@ async function run(): Promise<void> {
     }
 
     const snap = daemon.getSnapshot();
-    if (snap.status === "HALTED") {
+    if (snap.status === "HALTED" && !config.uninterruptedResearchMode) {
       console.error(`[PaperDaemon] Daemon halted due to: ${snap.haltReason}`);
       break;
     }
@@ -183,6 +233,8 @@ async function run(): Promise<void> {
       try {
         const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
         if (!spotInfo) continue;
+
+        tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
 
         const marketContext: MarketEvaluationContext = {
           currentTimestampMs: currentNow,
@@ -205,51 +257,101 @@ async function run(): Promise<void> {
       }
     }
 
-    // 2. Scan Candidate Pools from Raydium if Capacity Available
+    // 2. Scan Candidate Pools & Ingest into Stage 1 Watchlist Radar
     if (currentNow - lastScanMs >= scanIntervalMs) {
       lastScanMs = currentNow;
-      if (daemon.getSnapshot().openPositions.length < config.maxOpenPositions) {
-        try {
-          const rawPools = await streamEngine.fetchRawPools(25);
-          for (const pool of rawPools) {
-            if (daemon.getSnapshot().openPositions.length >= config.maxOpenPositions) break;
-            const spotInfo = await fetchDexScreenerSpotInfo(pool.mintAddress);
-            const entryPriceSolOverride = spotInfo?.spotPriceSol;
-            const admitted = daemon.processScannedPool(pool, currentNow, entryPriceSolOverride);
-            if (admitted) {
-              console.log(
-                `[PaperDaemon] [BUY EXECUTED] ${pool.symbol} (${pool.mintAddress}) | Entry: ${entryPriceSolOverride ? `${entryPriceSolOverride} SOL` : `$${pool.spotPriceUsd}`} | Cost Basis: ${config.positionSizeSol} SOL`,
-              );
+      try {
+        const rawPools = await streamEngine.fetchRawPools(25);
+        const currentNowSec = Math.floor(currentNow / 1000);
+
+        // A. Ingest into Watchlist Service
+        for (const pool of rawPools) {
+          const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
+          if (admitted) {
+            tracker.recordCandidate(pool, "WATCHLIST_RADAR", pool.spotPriceUsd, currentNow);
+          } else {
+            tracker.recordCandidate(
+              pool,
+              "FILTERED_REJECTED",
+              pool.spotPriceUsd,
+              currentNow,
+              "FAILED_BASELINE_SCANNER_PRESCREEN",
+            );
+          }
+        }
+
+        // B. Prune expired candidates
+        watchlistService.pruneExpired(currentNowSec);
+
+        // C. Stage 2 Buy Gate Confirmation
+        const watchingCandidates = watchlistService.getActiveWatchingItems();
+        for (const candidate of watchingCandidates) {
+          if (daemon.getSnapshot().openPositions.length >= config.maxOpenPositions) break;
+
+          const gateResult = buyGateService.evaluateCandidate(candidate);
+          if (gateResult.triggered) {
+            // Check anti-rebuy cooldown
+            const cooldowns = daemon.getExitCooldowns();
+            const cooldownUntil = cooldowns.get(candidate.mintAddress);
+            if (cooldownUntil && currentNow < cooldownUntil) {
+              continue;
+            }
+
+            const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
+            const entryPriceSol = spotInfo?.spotPriceSol;
+            const poolRecord = rawPools.find((p) => p.mintAddress === candidate.mintAddress);
+
+            if (poolRecord) {
+              const bought = daemon.processScannedPool(poolRecord, currentNow, entryPriceSol);
+              if (bought) {
+                watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
+                tracker.recordExecutedBuy(
+                  candidate.mintAddress,
+                  entryPriceSol ?? candidate.liquidityUsd,
+                  currentNow,
+                );
+                console.log(
+                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol ? `${entryPriceSol} SOL` : `$${poolRecord.spotPriceUsd}`} | Cost Basis: ${config.positionSizeSol} SOL`,
+                );
+              }
             }
           }
-        } catch (scanErr) {
-          console.error("[PaperDaemon] Scan error:", scanErr);
+        }
+      } catch (scanErr) {
+        console.error("[PaperDaemon] Scan error:", scanErr);
+      }
+    }
+
+    // 3. Counterfactual Price Sampler for Active Radar Candidates (Every 15s)
+    if (currentNow - lastRadarSampleMs >= 15000) {
+      lastRadarSampleMs = currentNow;
+      const watching = watchlistService.getActiveWatchingItems().slice(0, 5);
+      for (const item of watching) {
+        try {
+          const spot = await fetchDexScreenerSpotInfo(item.mintAddress);
+          if (spot) {
+            tracker.samplePrice(item.mintAddress, spot.spotPriceSol, currentNow);
+          }
+        } catch {
+          // ignore transient sampling errors
         }
       }
     }
 
-    // 3. Heartbeat Telemetry Logging
+    // 4. Heartbeat Telemetry Logging (Every 15s)
     if (currentNow - lastHeartbeatMs >= 15000) {
       lastHeartbeatMs = currentNow;
       const currentSnap = daemon.getSnapshot();
+      const watchingCount = watchlistService.getActiveWatchingItems().length;
       console.log(
-        `[PaperDaemon] [HEARTBEAT] Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
+        `[PaperDaemon] [HEARTBEAT] Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
       );
     }
 
-    // 4. Persist Active Session State to File for Real-Time Inspection & Dashboard
+    // 5. Persist Active Session State to File for Dashboard (Every 3s)
     if (currentNow - lastPersistMs >= 3000) {
       lastPersistMs = currentNow;
-      try {
-        if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
-        writeFileSync(
-          ".tmp/paper-session-active.json",
-          JSON.stringify(daemon.getSnapshot(), null, 2),
-          "utf8",
-        );
-      } catch (err) {
-        void err;
-      }
+      persistState();
     }
 
     await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
@@ -257,12 +359,14 @@ async function run(): Promise<void> {
 
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);
-  try {
-    if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
-    writeFileSync(".tmp/paper-session-active.json", JSON.stringify(finalSnap, null, 2), "utf8");
-  } catch (err) {
-    void err;
-  }
+  persistState();
+  const finalReport = tracker.generateReport(
+    config.initialPortfolioSol,
+    finalSnap.currentPortfolioSol,
+  );
+  console.log(
+    `[PaperDaemon] Final Report: Observed=${finalReport.totalCandidatesObserved}, Executed=${finalReport.executedBuysCount}, MissedWinners=${finalReport.missedWinnersCount}, AvoidedRugs=${finalReport.avoidedRugsCount}`,
+  );
 }
 
 void run();

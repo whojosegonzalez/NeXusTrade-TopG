@@ -278,4 +278,83 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.openPositions.length).toBe(0);
     expect(snapshot.closedTrades.length).toBe(1);
   });
+
+  it("enforces single position per mint constraint", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    // 1st entry for mint
+    const accepted1 = daemon.processScannedPool(validPool, nowMs);
+    expect(accepted1).toBe(true);
+
+    // 2nd entry for same mint with different poolId must be rejected
+    const accepted2 = daemon.processScannedPool(
+      { ...validPool, poolId: "pool-duplicate-mint" },
+      nowMs,
+    );
+    expect(accepted2).toBe(false);
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(1);
+  });
+
+  it("enforces anti-rebuy cooldown after token exit", () => {
+    const cooldownMs = 15 * 60 * 1000; // 15m
+    const daemon = new PaperTradingDaemon({
+      config: { ...baseConfig, antiRebuyCooldownMs: cooldownMs },
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, nowMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // Exit position at nowMs
+    daemon.manualExit(pos.positionId, 0.05, nowMs);
+    expect(daemon.getSnapshot().openPositions.length).toBe(0);
+
+    // Immediate rebuy at nowMs + 10s must be rejected due to cooldown
+    const rebuyTooSoon = daemon.processScannedPool(validPool, nowMs + 10_000);
+    expect(rebuyTooSoon).toBe(false);
+
+    // Rebuy after cooldown elapsed (nowMs + 16m) must be admitted
+    const reopenMs = nowMs + cooldownMs + 1000;
+    const reopenSec = Math.floor(reopenMs / 1000);
+    const validPoolAfterCooldown = {
+      ...validPool,
+      openTimeSec: reopenSec - 500, // Keep maturity age within 300s-900s window
+    };
+    const rebuyAfterCooldown = daemon.processScannedPool(validPoolAfterCooldown, reopenMs);
+    expect(rebuyAfterCooldown).toBe(true);
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
+  });
+
+  it("handles uninterrupted research mode without halting process on drawdown", () => {
+    const daemon = new PaperTradingDaemon({
+      config: { ...baseConfig, uninterruptedResearchMode: true },
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, nowMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // Catastrophic crash causing > 5% portfolio drawdown
+    daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.01, // -80% drop on 1 SOL = -0.8 SOL loss (-8% portfolio drawdown)
+      },
+      nowMs,
+    );
+
+    const snapshot = daemon.getSnapshot();
+    // Status remains RUNNING in uninterrupted research mode
+    expect(snapshot.status).toBe("RUNNING");
+    expect(snapshot.haltReason).toBe("PORTFOLIO_DRAWDOWN_BREACHED");
+  });
 });

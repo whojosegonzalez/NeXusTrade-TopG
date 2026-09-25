@@ -23,6 +23,7 @@
     "dashboard:dev": "pnpm --filter @nexustrade/research-dashboard dev",
     "dashboard:export": "pnpm --filter @nexustrade/backend dashboard:export",
     "daemon:paper": "pnpm --filter @nexustrade/backend trading:paper-daemon",
+    "daemon:analytics": "pnpm --filter @nexustrade/backend paper:observation-analytics",
     "dev:backend": "pnpm --filter @nexustrade/backend dev",
     "dev:frontend": "pnpm --filter @nexustrade/research-dashboard dev",
     "exits:manage": "pnpm --filter @nexustrade/backend exits:manage",

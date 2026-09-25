@@ -235,7 +235,8 @@
         "backend/src/candidate-scanner/BuyGateTriggerService.ts",
         "backend/src/candidate-scanner/evaluators/AntiRugEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/LiquidityMarketCapEvaluator.ts",
-        "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts"
+        "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts",
+        "backend/src/candidate-scanner/CounterfactualOpportunityTracker.ts"
       ],
       "files": [
         "backend/src/candidate-scanner/CandidateStreamEngine.ts",
@@ -247,17 +248,21 @@
         "backend/src/candidate-scanner/evaluators/AntiRugEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/LiquidityMarketCapEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts",
+        "backend/src/candidate-scanner/CounterfactualOpportunityTracker.ts",
         "shared/src/index.ts",
         "shared/src/phase11-schemas.ts",
         "shared/src/phase12-dashboard-schemas.ts"
       ],
       "external": {
+        "node:fs": ["existsSync", "mkdirSync", "writeFileSync"],
+        "node:path": ["dirname"],
         "zod": "AUDITED_PACKAGE"
       },
       "typeFiles": [
         "backend/src/candidate-scanner/CandidateScannerTypes.ts",
         "backend/src/candidate-scanner/CandidateWatchlistService.ts",
         "backend/src/candidate-scanner/BuyGateTriggerService.ts",
+        "backend/src/candidate-scanner/CounterfactualOpportunityTracker.ts",
         "shared/src/index.ts",
         "shared/src/phase11-schemas.ts",
         "shared/src/phase12-dashboard-schemas.ts"

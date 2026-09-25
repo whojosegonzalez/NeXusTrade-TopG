@@ -8,13 +8,19 @@ export interface SettingsViewProps {
   readonly onSaveSettings?: (settings: DashboardSettings) => void;
 }
 
+const envMeta = import.meta as unknown as { env?: Record<string, string | undefined> };
+const envWallet =
+  typeof envMeta !== "undefined" && envMeta.env?.VITE_SOLANA_PUBLIC_KEY
+    ? String(envMeta.env.VITE_SOLANA_PUBLIC_KEY)
+    : "";
+
 export const DEFAULT_SETTINGS: DashboardSettings = {
   maxConcurrentPositions: 3,
   positionSizeSol: 1.0,
   gasReserveSol: 0.05,
   goalMode: "PERCENT_GAIN",
   targetGoalValue: 10.0,
-  walletAddress: "",
+  walletAddress: envWallet,
   strategyThresholds: {
     minLmcRatio: 0.15,
     maxLmcRatio: 0.3,
@@ -94,6 +100,11 @@ export function SettingsView({
                 {isRefreshingWallet ? "Querying RPC..." : "Refresh Wallet Info"}
               </button>
             </div>
+            {envWallet ? (
+              <small style={{ color: "#10b981", marginTop: "4px", display: "block" }}>
+                ✓ Pre-populated from .env (VITE_SOLANA_PUBLIC_KEY)
+              </small>
+            ) : null}
           </div>
 
           <div className="wallet-stats-grid">

@@ -32,6 +32,8 @@ export interface PaperTradingDaemonConfig {
   readonly pollIntervalMs: number; // default 1000ms
   readonly dryRun: boolean;
   readonly scannerConfig?: CandidateScannerRuntimeConfig;
+  readonly antiRebuyCooldownMs?: number; // default: 1800000 (30m)
+  readonly uninterruptedResearchMode?: boolean; // default: false
 }
 
 export interface PaperPosition {
@@ -108,6 +110,7 @@ export class PaperTradingDaemon {
   private currentCashSol: number;
   private readonly openPositions = new Map<string, PaperPosition>();
   private readonly closedTrades: ClosedTradeRecord[] = [];
+  private readonly exitCooldowns = new Map<string, number>();
 
   constructor(options: PaperTradingDaemonOptions) {
     this.config = options.config;
@@ -191,6 +194,9 @@ export class PaperTradingDaemon {
     this.openPositions.delete(positionId);
     this.ratchetService.getStore().delete(positionId);
 
+    const cooldownMs = this.config.antiRebuyCooldownMs ?? 1800000;
+    this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
+
     if (this.status === "EXITING" && this.openPositions.size === 0) {
       this.status = "COMPLETED";
     }
@@ -246,6 +252,19 @@ export class PaperTradingDaemon {
       return false;
     }
     if (this.currentCashSol < this.config.positionSizeSol) {
+      return false;
+    }
+
+    // 1b. Single Position Per Mint Check
+    for (const openPos of this.openPositions.values()) {
+      if (openPos.mintAddress === pool.mintAddress) {
+        return false;
+      }
+    }
+
+    // 1c. Anti-Rebuy Cooldown Check
+    const cooldownUntilMs = this.exitCooldowns.get(pool.mintAddress);
+    if (cooldownUntilMs !== undefined && now < cooldownUntilMs) {
       return false;
     }
 
@@ -347,6 +366,9 @@ export class PaperTradingDaemon {
         this.openPositions.delete(positionId);
         this.ratchetService.getStore().delete(positionId);
 
+        const cooldownMs = this.config.antiRebuyCooldownMs ?? 1800000;
+        this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
+
         if (this.status === "EXITING" && this.openPositions.size === 0) {
           this.status = "COMPLETED";
         }
@@ -375,7 +397,15 @@ export class PaperTradingDaemon {
     );
 
     if (portfolioPnlBps <= this.config.maxPortfolioDrawdownBps) {
-      this.stop("PORTFOLIO_DRAWDOWN_BREACHED");
+      if (this.config.uninterruptedResearchMode) {
+        this.haltReason = "PORTFOLIO_DRAWDOWN_BREACHED";
+      } else {
+        this.stop("PORTFOLIO_DRAWDOWN_BREACHED");
+      }
     }
+  }
+
+  getExitCooldowns(): ReadonlyMap<string, number> {
+    return this.exitCooldowns;
   }
 }
