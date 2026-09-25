@@ -158,7 +158,11 @@ export class PaperTradingDaemon {
     };
   }
 
-  processScannedPool(pool: ScannedPoolRecord, nowTimestampMs?: number): boolean {
+  processScannedPool(
+    pool: ScannedPoolRecord,
+    nowTimestampMs?: number,
+    entryPriceSolOverride?: number,
+  ): boolean {
     if (!this.isRunning) return false;
     const now = nowTimestampMs ?? this.clock();
 
@@ -179,7 +183,10 @@ export class PaperTradingDaemon {
 
     // 3. Execute Paper Buy
     const positionId = `pos-${pool.mintAddress}-${now}`;
-    const entryPriceSol = pool.spotPriceUsd; // Using unit price
+    const entryPriceSol =
+      entryPriceSolOverride && entryPriceSolOverride > 0
+        ? entryPriceSolOverride
+        : pool.spotPriceUsd; // Using unit price
     const tokensHeld = this.config.positionSizeSol / entryPriceSol;
     const costBasisSol = this.config.positionSizeSol;
 

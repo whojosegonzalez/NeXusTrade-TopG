@@ -14,10 +14,10 @@ if (Test-Path $pidFile) {
   $pidVal = Get-Content $pidFile -Raw
   $pidVal = $pidVal.Trim()
   if ($pidVal -match '^\d+$') {
-    $proc = Get-Process -Id [int]$pidVal -ErrorAction SilentlyContinue
+    $proc = Get-Process -Id ([int]$pidVal) -ErrorAction SilentlyContinue
     if ($proc) {
-      Stop-Process -Id [int]$pidVal -Force
-      Write-Host "[SUCCESS] Terminated paper daemon process (PID: $pidVal)." -ForegroundColor Green
+      taskkill /pid $pidVal /T /F | Out-Null
+      Write-Host "[SUCCESS] Terminated paper daemon process tree (PID: $pidVal)." -ForegroundColor Green
     } else {
       Write-Host "[INFO] Process PID $pidVal was not running." -ForegroundColor Yellow
     }

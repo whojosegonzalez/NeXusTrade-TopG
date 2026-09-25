@@ -17,7 +17,7 @@ if (Test-Path $pidFile) {
   $pidVal = Get-Content $pidFile -Raw
   $pidVal = $pidVal.Trim()
   if ($pidVal -match '^\d+$') {
-    $proc = Get-Process -Id [int]$pidVal -ErrorAction SilentlyContinue
+    $proc = Get-Process -Id ([int]$pidVal) -ErrorAction SilentlyContinue
     if ($proc) {
       $running = $true
       Write-Host " Daemon Process:     RUNNING (PID: $pidVal)" -ForegroundColor Green
@@ -27,6 +27,28 @@ if (Test-Path $pidFile) {
   }
 } else {
   Write-Host " Daemon Process:     NO ACTIVE PID FILE FOUND" -ForegroundColor Yellow
+}
+
+$activeJson = ".tmp/paper-session-active.json"
+if (Test-Path $activeJson) {
+  try {
+    $state = Get-Content $activeJson -Raw | ConvertFrom-Json
+    Write-Host "----------------------------------------------------------------"
+    Write-Host " Live Session Telemetry:" -ForegroundColor Cyan
+    Write-Host " Status:             $($state.status)"
+    Write-Host " Portfolio Value:    $([math]::Round($state.currentPortfolioSol, 4)) SOL (Initial: $($state.initialPortfolioSol) SOL)"
+    Write-Host " Realized P/L:       $([math]::Round($state.totalRealizedPnlSol, 4)) SOL"
+    Write-Host " Unrealized P/L:     $([math]::Round($state.totalUnrealizedPnlSol, 4)) SOL"
+    Write-Host " Open Positions:     $($state.openPositions.Count)"
+    Write-Host " Closed Trades:      $($state.closedTrades.Count)"
+    if ($state.openPositions.Count -gt 0) {
+      Write-Host " Active Positions:" -ForegroundColor Yellow
+      $state.openPositions | ForEach-Object {
+        $pnlPct = [math]::Round(($_.currentPnlBps / 100.0), 2)
+        Write-Host "  - Mint: $($_.mintAddress) | Spot: $($_.spotPriceSol) | PnL: $pnlPct% | Tier: $($_.ratchetState.activeTier)"
+      }
+    }
+  } catch {}
 }
 
 $logFiles = Get-ChildItem -Path ".tmp" -Filter "paper-daemon-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
