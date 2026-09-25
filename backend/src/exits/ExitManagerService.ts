@@ -12,6 +12,7 @@ import { ExitCandidateSelector } from "./ExitCandidateSelector.js";
 import { ExitTriggerService, type ExitTriggerEvaluation } from "./ExitTriggerService.js";
 import { ExitActionService, type ResolvedExitAction } from "./ExitActionService.js";
 import { ExitCompletionService, type ExitCompletionResult } from "./ExitCompletionService.js";
+import { DynamicRatchetService } from "./DynamicRatchetService.js";
 
 export interface ExitManagerSummary {
   readonly diagnosticFailureCount?: number;
@@ -45,6 +46,7 @@ export interface ExitManagerServiceOptions {
   readonly triggerService?: ExitTriggerService;
   readonly actionService?: ExitActionService;
   readonly completionService?: ExitCompletionService;
+  readonly dynamicRatchetService?: DynamicRatchetService;
 }
 
 export class ExitManagerService {
@@ -53,6 +55,7 @@ export class ExitManagerService {
   private readonly triggerService: ExitTriggerService;
   private readonly actionService: ExitActionService;
   private readonly completionService: ExitCompletionService;
+  private readonly dynamicRatchetService: DynamicRatchetService;
 
   constructor(private readonly options: ExitManagerServiceOptions) {
     this.candidateSelector =
@@ -61,6 +64,7 @@ export class ExitManagerService {
     this.actionService = options.actionService ?? new ExitActionService();
     this.completionService =
       options.completionService ?? new ExitCompletionService(options.repositories);
+    this.dynamicRatchetService = options.dynamicRatchetService ?? new DynamicRatchetService();
   }
 
   async execute(): Promise<ExitManagerSummary> {

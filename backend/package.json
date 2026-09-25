@@ -49,6 +49,7 @@
     "shadow:threshold-validate": "tsx src/scripts/shadow-threshold-validate.ts",
     "strategy:evaluate": "tsx src/scripts/strategy-evaluate.ts",
     "terminal:run": "tsx src/scripts/terminal-runner.ts",
+    "trading:paper-daemon": "tsx src/scripts/paper-trading-daemon.ts",
     "watchlist:returns": "tsx src/scripts/watchlist-returns.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"

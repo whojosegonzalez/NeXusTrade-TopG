@@ -58,6 +58,7 @@
     "shadow:fast-feature-attribute": "pnpm --filter @nexustrade/backend shadow:fast-feature-attribute",
     "shadow:observe": "pnpm --filter @nexustrade/backend shadow:observe",
     "shadow:threshold-validate": "pnpm --filter @nexustrade/backend shadow:threshold-validate",
+    "trading:paper-daemon": "pnpm --filter @nexustrade/backend trading:paper-daemon",
     "strategy:evaluate": "pnpm --filter @nexustrade/backend strategy:evaluate",
     "terminal:run": "pnpm --filter @nexustrade/backend terminal:run",
     "watchlist:returns": "pnpm --filter @nexustrade/backend watchlist:returns",

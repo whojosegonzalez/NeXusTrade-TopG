@@ -17,6 +17,7 @@ import {
   type PaperSellRejectionCode,
   type PaperSellValidationRejection,
 } from "./PaperSellValidationService.js";
+import { DynamicRatchetService } from "../exits/DynamicRatchetService.js";
 
 export interface PaperSellExecutionSummary {
   readonly diagnosticFailureCount?: number;
@@ -49,6 +50,7 @@ export interface PaperSellExecutionServiceOptions {
   readonly quoteService: PaperSellQuoteService;
   readonly validationService?: PaperSellValidationService;
   readonly accountingService?: PaperSellAccountingService;
+  readonly dynamicRatchetService?: DynamicRatchetService;
   readonly clock?: () => number;
 }
 
@@ -94,12 +96,14 @@ interface MutablePaperSellCounts {
 export class PaperSellExecutionService {
   private readonly validationService: PaperSellValidationService;
   private readonly accountingService: PaperSellAccountingService;
+  private readonly dynamicRatchetService: DynamicRatchetService;
   private readonly clock: () => number;
   private diagnosticFailureCount = 0;
 
   constructor(private readonly options: PaperSellExecutionServiceOptions) {
     this.validationService = options.validationService ?? new PaperSellValidationService();
     this.accountingService = options.accountingService ?? new PaperSellAccountingService();
+    this.dynamicRatchetService = options.dynamicRatchetService ?? new DynamicRatchetService();
     this.clock = options.clock ?? nowMs;
   }
 
