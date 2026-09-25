@@ -6,7 +6,7 @@ param(
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host " NeXusTrade Formulation B Collection Run Inspector" -ForegroundColor Cyan
 Write-Host " Archive: $ArchiveRoot" -ForegroundColor Cyan
-Write-Host " Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)" -ForegroundColor Cyan
+Write-Host " Timestamp: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss UTC'))" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Lock File Status & PID Liveness

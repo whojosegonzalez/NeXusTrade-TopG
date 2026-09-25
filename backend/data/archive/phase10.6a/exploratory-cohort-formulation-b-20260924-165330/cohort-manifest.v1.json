@@ -1,0 +1,24 @@
+{
+  "protocolPath": "docs/research-protocols/phase10.6a-exploratory-cohort.formulation-b.v1.json",
+  "protocolSha256": "241ac7b18711c0b08cc9083b02085c847f71594448c7d9286eb4333194036fda",
+  "finalOutcome": "COHORT_COMPLETE",
+  "attemptedSlotCount": 96,
+  "validUnitCount": 96,
+  "distinctMintCount": 96,
+  "safetyCounters": {
+    "clockDriftStops": 0,
+    "schemaIntegrityStops": 0,
+    "secretLeakageStops": 0,
+    "budgetExceededStops": 0
+  },
+  "executionFlags": {
+    "walletLoaded": false,
+    "transactionSigned": false,
+    "orderSubmitted": false
+  },
+  "finalFileHashes": {
+    "units.v1.ndjson": "781d1f80ad4503a37b3d75d769c5328a9dc7f4ae64eb12da4d9cfe6644597d74",
+    "source-inventory.v1.json": "3c3c3b39d158e8a3a559613ac82e4f1be224c98a00b78fdeef62bb54f38f99ef",
+    "collection-summary.v1.json": "b87e6562027f6680b3890fb2840ce4223a0e1d84a986d6b3ab71db5cb565d755"
+  }
+}
