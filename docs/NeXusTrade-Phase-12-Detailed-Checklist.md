@@ -55,7 +55,9 @@ flowchart TD
 
 ## 2. Ordered Implementation Tasks
 
-### Task 1: Shared Data Contracts & Schemas
+### Part A: Interactive Dashboard & Visual Control Plane (Phase 12A)
+
+#### Task 1: Shared Data Contracts & Schemas
 
 - [ ] Define type-safe Zod schemas in `shared/src/phase12-dashboard-schemas.ts`:
   - `DashboardSettingsSchema`:
@@ -65,6 +67,7 @@ flowchart TD
     - `goalMode`: `z.enum(["PERCENT_GAIN", "FINAL_SOL_BALANCE"]).default("PERCENT_GAIN")`
     - `targetGoalValue`: `z.number().positive().default(10.0)`
     - `walletAddress`: `z.string().default("")`
+    - `strategyThresholds`: `z.object({ minLmcRatio: z.number().default(0.15), maxLmcRatio: z.number().default(0.30), minBuyToSellRatio: z.number().default(1.5), minVolume5mUsd: z.number().default(2500), minMaturityAgeSec: z.number().default(300), maxMaturityAgeSec: z.number().default(900) }).default({})`
   - `WalletTelemetrySchema`:
     - `solBalance`: `z.number().nonnegative()`
     - `deployableSol`: `z.number().nonnegative()`
@@ -79,7 +82,7 @@ flowchart TD
 
 ---
 
-### Task 2: Backend Wallet Query & IPC Control Service
+#### Task 2: Backend Wallet Query & IPC Control Service
 
 - [ ] Create `backend/src/wallet/WalletTelemetryService.ts`:
   - Connects to Solana RPC to fetch native lamport balance via `getBalance`.
@@ -97,7 +100,7 @@ flowchart TD
 
 ---
 
-### Task 3: Settings View (`frontend/src/views/SettingsView.tsx`)
+#### Task 3: Settings View (`frontend/src/views/SettingsView.tsx`)
 
 - [ ] Implement Settings View component:
   - **Wallet Header Card**:
@@ -115,12 +118,14 @@ flowchart TD
     - Toggle between `% Gain Goal` and `Final SOL Target`.
     - Input field for target value with validation.
     - Informational badge explaining auto-trigger of graceful wind-down when target is reached.
+  - **Strategy Threshold Controls**:
+    - Sliders and inputs for Min/Max L/MC, Min Buy/Sell ratio, Min 5m Volume.
   - **Save & Apply**: Persists settings to local storage / `.tmp/dashboard-settings.json`.
 - [ ] Unit test in `frontend/src/views/SettingsView.test.tsx`.
 
 ---
 
-### Task 4: Active Session View (`frontend/src/views/ActiveSessionView.tsx`)
+#### Task 4: Active Session View (`frontend/src/views/ActiveSessionView.tsx`)
 
 - [ ] Implement Active Session View component:
   - **Telemetry Banner**:
@@ -149,6 +154,9 @@ flowchart TD
       - Floor price in SOL.
       - Relative distance meter (e.g., `-3.8% away from stop`).
     - **Manual Exit Button**: One-click market close modal with confirmation.
+  - **Candidate Watchlist / Radar Table**:
+    - Live table of tokens currently on the Watchlist.
+    - Real-time age, L/MC ratio, 5m buys/sells, and Buy Gate status (`WATCHING`, `BUY_TRIGGERED`, `DROPPED`).
   - **Session Control Suite**:
     - `PAUSE SESSION` button.
     - `RESUME SESSION` button.
@@ -159,7 +167,7 @@ flowchart TD
 
 ---
 
-### Task 5: Past Sessions & History View (`frontend/src/views/HistoryView.tsx`)
+#### Task 5: Past Sessions & History View (`frontend/src/views/HistoryView.tsx`)
 
 - [ ] Implement Past Sessions View component:
   - **Historical Sessions Ledger Table**:
@@ -172,7 +180,7 @@ flowchart TD
 
 ---
 
-### Task 6: Main Shell & Navigation Integration (`frontend/src/App.tsx`)
+#### Task 6: Main Shell & Navigation Integration (`frontend/src/App.tsx`)
 
 - [ ] Update `frontend/src/App.tsx` with a top-level tabbed navigation bar:
   - Tab 1: `Settings`
@@ -188,7 +196,7 @@ flowchart TD
 
 ---
 
-### Task 7: Daemon Graceful "Start Exiting" Mode Support
+#### Task 7: Daemon Graceful "Start Exiting" Mode Support
 
 - [ ] Update `backend/src/paper/PaperTradingDaemon.ts`:
   - Add `startExiting(): void` method:
@@ -202,7 +210,46 @@ flowchart TD
 
 ---
 
-### Task 8: Verification & Operator Documentation
+### Part B: Quantitative Strategy, Candidate Watchlist & Buy Gate Funnel (Phase 12B)
+
+#### Task 8: Candidate Watchlist Radar Service (`backend/src/candidate-scanner/CandidateWatchlistService.ts`)
+
+- [ ] Decouple pool discovery from immediate execution by implementing an active candidate watchlist:
+  - Stores up to `maxWatchlistSize` (e.g. 20) pre-screened tokens meeting baseline safety:
+    - Liquidity $\ge \$2,500$
+    - LP burn $\ge 90.0\%$
+    - Mint & freeze authorities disabled
+    - Unique txns $\ge 10$
+  - Discards decaying pools: Automatically drops tokens when age exceeds $1,200\text{s}$ (20m) without triggering a buy.
+- [ ] Unit tests in `backend/src/candidate-scanner/CandidateWatchlistService.test.ts`.
+
+---
+
+#### Task 9: Quantitative Buy Gate Confirmation Engine (`backend/src/candidate-scanner/BuyGateTriggerService.ts`)
+
+- [ ] Implement active multi-condition confirmation for tokens on the watchlist:
+  - **Maturity Window Gate**: $300\text{s} \le \text{Age} \le 900\text{s}$ (5m to 15m sweet spot).
+  - **Depth Balance Gate**: $0.15 \le \text{L/MC} \le 0.30$ (healthy liquidity vs. market cap).
+  - **Flow Absorption Gate**: $\text{Buys}_{5m} \ge 1.5 \times \text{Sells}_{5m}$ (organic buyer dominance).
+  - **Volume Surge Gate**: $\text{Volume}_{5m} \ge \$2,500$ with average transaction $\ge \$25$.
+  - **Dev Disposal Gate**: Verifies no single transaction disposed $> 5\%$ of pool depth in the last 3 minutes.
+- [ ] Promotes confirmed candidate to the `PaperTradingDaemon` buy queue.
+- [ ] Unit tests in `backend/src/candidate-scanner/BuyGateTriggerService.test.ts`.
+
+---
+
+#### Task 10: Multi-Source Pool Discovery Streamer Integration
+
+- [ ] Enhance `CandidateStreamEngine.ts` with multi-source ingestion:
+  - Primary: Raydium AMM / CLMM / CPMM pools.
+  - Secondary: DexScreener latest token profiles (`https://api.dexscreener.com/token-profiles/latest/v1`) to capture newly launched pump.fun migrations and fresh Solana pairs.
+- [ ] Unit tests in `backend/src/candidate-scanner/CandidateStreamEngine.test.ts`.
+
+---
+
+### Part C: Verification & Deployment
+
+#### Task 11: End-to-End Verification & Operator Guide
 
 - [ ] Run full static isolation checks: `node scripts/verify-isolated.mjs static`.
 - [ ] Run full test suites: `node scripts/verify-isolated.mjs tests`.

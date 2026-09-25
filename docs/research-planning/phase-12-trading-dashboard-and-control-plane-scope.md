@@ -136,7 +136,60 @@ The Past Sessions view provides retrospective analytics and performance attribut
 
 ---
 
-## 3. Technical Architecture & State Synchronization
+## 3. Quantitative Strategy & Two-Stage Funnel: Watchlist Radar vs. Buy Gate Trigger (Phase 12B)
+
+A critical architectural enhancement is decoupling **Watchlist Candidate Discovery** from **Immediate Buy Execution**. Instead of an all-or-nothing single check, NeXusTrade employs a two-tier screening pipeline:
+
+```mermaid
+flowchart TD
+    Stream["1. New Pool Stream (Raydium / DEX API)"] --> W_Gate["Stage 1: Watchlist Admission Gate<br>(Minimum Viability & Anti-Rug Check)"]
+
+    subgraph Watchlist ["2. Active Candidate Watchlist / Radar"]
+        W_Gate -->|PASS| Radar["Candidate Radar Queue<br>(Actively Polling 5m Momentum & Flow)"]
+        W_Gate -->|FAIL| Discard["Rejected / Logged to Radar Rejection Table"]
+    end
+
+    subgraph BuyGate ["3. Quantitative Buy Gate Trigger"]
+        Radar --> B_Check["Stage 2: Buy Gate Confirmation<br>- Net Buyer Flow (Buys >= 1.5x Sells)<br>- L/MC Ratio in 15% - 30% Sweet Spot<br>- 5m Volume Surge >= $2,500<br>- Fresh Age Window (5m - 15m)"]
+        B_Check -->|TRIGGERED| Buy["Execute Buy (1.0 SOL) -> Active Position Tracker"]
+        B_Check -->|MONITORING| Radar
+        B_Check -->|EXPIRED / DUMPED| Expired["Dropped from Watchlist (Age > 20m or Net Dump)"]
+    end
+```
+
+### 3.1 Stage 1: Watchlist Radar Admission Criteria
+
+To make it onto the operator's **Watchlist / Candidate Radar**, a newly discovered pool must satisfy basic viability filters:
+
+1. **Initial Liquidity**: $\ge \$2,500\text{ USD}$ (filters out micro-dust pools).
+2. **LP Security**: $\ge 90.0\%$ LP burn or permanent lock.
+3. **Authorities**: Mint authority disabled/renounced; Freeze authority disabled/renounced.
+4. **Active Trading**: At least 10 unique transactions recorded since pool open.
+
+- _Visual Output_: Admitted candidates appear in the **Candidate Watchlist / Radar Table** on the Active Session Dashboard with live momentum indicators.
+
+### 3.2 Stage 2: Buy Gate Trigger Criteria
+
+A token on the Watchlist is only promoted to an **Active Buy Order** when strict momentum and balance conditions confirm buyer dominance:
+
+1. **Maturity Sweet Spot**: $300\text{s} \le \text{Age} \le 900\text{s}$ (5–15 minutes old).
+2. **Balanced Liquidity Depth**: $0.15 \le \text{L/MC} \le 0.30$ (15%–30% ratio prevents illiquid slippage and overvalued dilution).
+3. **Net Buyer Dominance**: $\text{Buys}_{5m} \ge 1.5 \times \text{Sells}_{5m}$ (organic buyer absorption).
+4. **Volume Acceleration**: $\text{Volume}_{5m} \ge \$2,500\text{ USD}$ with average transaction size $\ge \$25$.
+5. **No Dev Dump**: Net inflow remains positive with no single seller disposing $> 5\%$ of liquidity.
+
+### 3.3 Configurable Thresholds on the Settings Page
+
+Operators can view and adjust these thresholds directly in `SettingsView.tsx`:
+
+- Min / Max L/MC Ratio sliders (default: $15\% - 30\%$).
+- Min Buy/Sell volume ratio (default: $1.5\times$).
+- Min 5m Volume (default: $\$2,500$).
+- Watchlist max capacity (e.g. track up to 20 candidates concurrently).
+
+---
+
+## 4. Technical Architecture & State Synchronization
 
 ```mermaid
 sequenceDiagram
