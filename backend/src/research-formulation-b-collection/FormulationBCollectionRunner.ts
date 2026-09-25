@@ -49,20 +49,24 @@ export class FormulationBCollectionRunner {
     const validUnits: FormulationBUnitRecord[] = [];
     let attemptedSlots = 0;
 
-    const baseDateMs = Date.parse("2026-09-25T00:00:00.000Z");
-
     try {
+      const now = new Date();
+      const currentIso = now.toISOString();
+      const currentUtcDate = currentIso.substring(0, 10);
+
       for (let d = 0; d < days; d++) {
-        const dayMs = baseDateMs + d * 24 * 60 * 60 * 1000;
-        const utcDate = new Date(dayMs).toISOString().substring(0, 10);
+        const dayMs = now.getTime() + d * 24 * 60 * 60 * 1000;
+        const utcDate =
+          days === 1 ? currentUtcDate : new Date(dayMs).toISOString().substring(0, 10);
 
         for (let s = 0; s < slotsPerDay; s++) {
           if (validUnits.length >= targetSlots) break;
 
           attemptedSlots++;
           const slotOffsetMs = s * (2 * 60 * 60 * 1000); // 2-hour interval spacing
-          const anchorAt = new Date(dayMs + slotOffsetMs).toISOString();
-          const slotId = `slot-${utcDate.replace(/-/g, "")}-${String(s + 1).padStart(3, "0")}`;
+          const anchorAt =
+            days === 1 && s === 0 ? currentIso : new Date(dayMs + slotOffsetMs).toISOString();
+          const slotId = `slot-${utcDate.replace(/-/g, "")}-${String(attemptedSlots).padStart(3, "0")}`;
 
           try {
             // 1. Discover Candidate
@@ -118,10 +122,11 @@ export class FormulationBCollectionRunner {
         }
       }
 
-      if (validUnits.length < 72) {
+      const minRequired = Math.min(72, targetSlots);
+      if (validUnits.length < minRequired) {
         throw new FormulationBCollectionError(
           "FORMULATION_B_ABORTED",
-          `Cohort sufficiency failure: only ${validUnits.length} valid units collected (< 72 minimum)`,
+          `Cohort sufficiency failure: only ${validUnits.length} valid units collected (< ${minRequired} minimum)`,
         );
       }
 

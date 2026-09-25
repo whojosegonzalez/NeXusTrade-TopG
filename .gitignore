@@ -16,13 +16,16 @@ tmp/
 .env.*
 !.env.example
 
-# Local databases
+# Local databases & WAL files
 *.db
 *.db-*
-data/*.sqlite
-data/*.sqlite3
-data/*.db
-data/*.db-*
+*.sqlite
+*.sqlite3
+**/nexus_paper.db*
+**/data/*.sqlite
+**/data/*.sqlite3
+**/data/*.db
+**/data/*.db-*
 
 # Wallets / keys / secrets
 keypair.json
@@ -40,12 +43,28 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# Validation transcripts
-data/phase8.6-long-validation.txt
+# Research & Exploratory Data Archives
+data/archive/
+backend/data/archive/
+**/data/archive/
+**/data/archive/**
+**/data/phase*/
+data/phase*/
+backend/data/phase*/
 data/*-validation.txt
 data/*.txt
 data/*.json
-data/phase*-test*/
-data/phase*-interpret*/
-data/archive/
-data/phase*/
+data/*.ndjson
+backend/data/*.json
+backend/data/*.ndjson
+backend/data/*.txt
+**/data/*.ndjson
+
+# Keep placeholder files
+!data/.gitkeep
+!backend/data/.gitkeep
+!frontend/public/research-dashboard-data/.gitignore
+
+# OS Artifacts
+.DS_Store
+Thumbs.db
