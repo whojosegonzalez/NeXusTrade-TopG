@@ -10,6 +10,7 @@ export interface BuyGateConfig {
   readonly minVolume5mUsd: number; // default: 2500
   readonly minAvgTxUsd: number; // default: 25
   readonly maxSingleTxDisposalPct: number; // default: 0.05 (5%)
+  readonly minSells5m: number; // default: 5
 }
 
 export const BUY_GATE_DEFAULTS: BuyGateConfig = {
@@ -21,6 +22,7 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   minVolume5mUsd: 2500,
   minAvgTxUsd: 25,
   maxSingleTxDisposalPct: 0.05,
+  minSells5m: 5,
 };
 
 export interface GateCheck {
@@ -41,6 +43,9 @@ export interface BuyGateEvaluationResult {
 
 export interface AdvancedMarketContext {
   readonly maxSingleDisposalUsd?: number | undefined;
+  readonly recentBuysCount60s?: number | undefined;
+  readonly recentSellsCount60s?: number | undefined;
+  readonly momentum1mBps?: number | undefined;
 }
 
 export class BuyGateTriggerService {
@@ -70,15 +75,19 @@ export class BuyGateTriggerService {
   ): BuyGateEvaluationResult {
     const gates: GateCheck[] = [];
 
-    // 1. Maturity Window Gate (300s to 900s)
+    // 1. Maturity Window Gate (Adaptive: 300s to 900s, or up to 2700s for >= $20k liq + >= $25k vol)
+    const isHighLiqVol = item.liquidityUsd >= 20000 && item.volume5mUsd >= 25000;
+    const maxMaturityAgeSec = isHighLiqVol
+      ? Math.max(this.config.maxMaturityAgeSec, 2700)
+      : this.config.maxMaturityAgeSec;
     const maturityPassed =
       item.assetAgeSeconds >= this.config.minMaturityAgeSec &&
-      item.assetAgeSeconds <= this.config.maxMaturityAgeSec;
+      item.assetAgeSeconds <= maxMaturityAgeSec;
     gates.push({
       name: "MATURITY_WINDOW_GATE",
       passed: maturityPassed,
       value: item.assetAgeSeconds,
-      requirement: `${this.config.minMaturityAgeSec}s <= Age <= ${this.config.maxMaturityAgeSec}s`,
+      requirement: `${this.config.minMaturityAgeSec}s <= Age <= ${maxMaturityAgeSec}s`,
     });
 
     // 2. Depth Balance Gate (0.15 to 0.30 L/MC)
@@ -91,13 +100,17 @@ export class BuyGateTriggerService {
       requirement: `${(this.config.minLmcRatio * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%`,
     });
 
-    // 3. Flow Absorption Gate (Buys >= 1.5 * Sells)
-    const flowPassed = item.buyToSellRatio >= this.config.minBuyToSellRatio;
+    // 3. Flow Absorption Gate (Buys >= 1.5 * Sells, or >= 1.20 for high-volume breakouts >= $50k)
+    const isHighVolumeBreakout = item.volume5mUsd >= 50000;
+    const effectiveMinRatio = isHighVolumeBreakout
+      ? Math.min(this.config.minBuyToSellRatio, 1.2)
+      : this.config.minBuyToSellRatio;
+    const flowPassed = item.buyToSellRatio >= effectiveMinRatio;
     gates.push({
       name: "FLOW_ABSORPTION_GATE",
       passed: flowPassed,
       value: item.buyToSellRatio,
-      requirement: `Buys/Sells >= ${this.config.minBuyToSellRatio}x`,
+      requirement: `Buys/Sells >= ${effectiveMinRatio}x`,
     });
 
     // 4. Volume Surge Gate (Volume >= $2,500 & Avg Tx >= $25)
@@ -112,7 +125,34 @@ export class BuyGateTriggerService {
       requirement: `Vol5m >= $${this.config.minVolume5mUsd} & AvgTx >= $${this.config.minAvgTxUsd}`,
     });
 
-    // 5. Dev Disposal Gate (No single disposal > 5% of liquidity)
+    // 5. Min Sells Gate (Anti-Sniper: require >= 5 sells to avoid untested pools)
+    const minSellsPassed = item.sells5m >= this.config.minSells5m;
+    gates.push({
+      name: "MIN_SELLS_GATE",
+      passed: minSellsPassed,
+      value: item.sells5m,
+      requirement: `Sells5m >= ${this.config.minSells5m}`,
+    });
+
+    // 6. Short Horizon Flow Gate (1m flow & momentum check when available)
+    const hasShortHorizonData =
+      marketContext.recentBuysCount60s !== undefined ||
+      marketContext.recentSellsCount60s !== undefined ||
+      marketContext.momentum1mBps !== undefined;
+    if (hasShortHorizonData) {
+      const buys60s = marketContext.recentBuysCount60s ?? 0;
+      const sells60s = marketContext.recentSellsCount60s ?? 0;
+      const mom1m = marketContext.momentum1mBps ?? 0;
+      const shortFlowPassed = !(sells60s > buys60s || mom1m < -500);
+      gates.push({
+        name: "SHORT_HORIZON_FLOW_GATE",
+        passed: shortFlowPassed,
+        value: mom1m,
+        requirement: "Buys60s >= Sells60s & Mom1m >= -5.0%",
+      });
+    }
+
+    // 7. Dev Disposal Gate (No single disposal > 5% of liquidity)
     const maxDisposal = marketContext.maxSingleDisposalUsd ?? 0;
     const maxDisposalPct = item.liquidityUsd > 0 ? maxDisposal / item.liquidityUsd : 0;
     const devDisposalPassed = maxDisposalPct <= this.config.maxSingleTxDisposalPct;

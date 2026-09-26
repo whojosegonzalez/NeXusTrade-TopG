@@ -2,7 +2,7 @@ export type RatchetTier = "HARD_STOP" | "TIER_0_DRAWDOWN" | "SCRATCH" | "TIER_1"
 
 export type DrawdownState = "NORMAL" | "EVALUATING_DRAWDOWN";
 
-export type ExitActionType = "HOLD" | "SELL_ALL";
+export type ExitActionType = "HOLD" | "SELL_ALL" | "SELL_PARTIAL_50" | "SELL_PARTIAL_25";
 
 export type ExitReasonCode =
   | "HOLD_NORMAL"
@@ -13,7 +13,9 @@ export type ExitReasonCode =
   | "DRAWDOWN_GRACE_EXPIRED"
   | "SCRATCH_EXIT"
   | "RATCHET_TIER_1_TRIGGERED"
-  | "RATCHET_TIER_2_TRIGGERED";
+  | "RATCHET_TIER_2_TRIGGERED"
+  | "STAGNANCY_TIMEOUT_EXIT"
+  | "MANUAL_OPERATOR_EXIT";
 
 export interface PositionRatchetState {
   readonly positionId: string;
@@ -26,6 +28,8 @@ export interface PositionRatchetState {
   readonly drawdownState: DrawdownState;
   readonly drawdownEnteredAtMs: number | null;
   readonly lastEvaluatedAtMs: number;
+  readonly tier1ProfitTaken?: boolean | undefined;
+  readonly tier2ProfitTaken?: boolean | undefined;
 }
 
 export interface MarketEvaluationContext {
@@ -64,10 +68,10 @@ export interface DynamicRatchetConfig {
   readonly drawdownGracePeriodMs: number; // default 120_000 (120s)
   readonly scratchPnlMinBps: number; // default 50 (+0.5%)
   readonly scratchPnlMaxBps: number; // default 150 (+1.5%)
-  readonly tier1PeakThresholdBps: number; // default 2400 (+24.0%)
-  readonly tier1LockedFloorBps: number; // default 2000 (+20.0%)
-  readonly tier2PeakThresholdBps: number; // default 4900 (+49.0%)
-  readonly tier2LockedFloorBps: number; // default 4500 (+45.0%)
+  readonly tier1PeakThresholdBps: number; // default 2400 (+24.0% / +25.0%)
+  readonly tier1LockedFloorBps: number; // default 0 (Breakeven +0.0% floor on remaining 50%)
+  readonly tier2PeakThresholdBps: number; // default 4900 (+49.0% / +50.0%)
+  readonly tier2LockedFloorBps: number; // default 4000 (+40.0% floor on remaining 25%)
 }
 
 export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
@@ -78,7 +82,7 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   scratchPnlMinBps: 50,
   scratchPnlMaxBps: 150,
   tier1PeakThresholdBps: 2400,
-  tier1LockedFloorBps: 2000,
+  tier1LockedFloorBps: 0,
   tier2PeakThresholdBps: 4900,
-  tier2LockedFloorBps: 4500,
+  tier2LockedFloorBps: 4000,
 };

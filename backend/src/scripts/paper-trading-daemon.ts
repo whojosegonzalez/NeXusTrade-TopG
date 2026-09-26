@@ -268,6 +268,14 @@ async function run(): Promise<void> {
           console.log(
             `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
           );
+        } else if (result?.action === "SELL_PARTIAL_50") {
+          console.log(
+            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +25% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+          );
+        } else if (result?.action === "SELL_PARTIAL_25") {
+          console.log(
+            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +50% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+          );
         }
       } catch (tickErr) {
         console.error(`[PaperDaemon] Tick error on ${pos.mintAddress}:`, tickErr);
@@ -305,8 +313,8 @@ async function run(): Promise<void> {
         for (const candidate of watchingCandidates) {
           if (daemon.getSnapshot().openPositions.length >= config.maxOpenPositions) break;
 
-          const gateResult = buyGateService.evaluateCandidate(candidate);
-          if (gateResult.triggered) {
+          const preliminaryGate = buyGateService.evaluateCandidate(candidate);
+          if (preliminaryGate.triggered) {
             // Check anti-rebuy cooldown
             const cooldowns = daemon.getExitCooldowns();
             const cooldownUntil = cooldowns.get(candidate.mintAddress);
@@ -322,6 +330,24 @@ async function run(): Promise<void> {
                 candidate.liquidityUsd,
                 currentNow,
                 "REJECTED_NO_ACTIVE_DEX_PAIR",
+              );
+              continue;
+            }
+
+            // Evaluate complete market context with 60s flow & momentum
+            const fullGateResult = buyGateService.evaluateCandidate(candidate, {
+              recentBuysCount60s: spotInfo.recentBuys60s,
+              recentSellsCount60s: spotInfo.recentSells60s,
+              momentum1mBps: Math.round(spotInfo.momentum5mBps / 5),
+            });
+
+            if (!fullGateResult.triggered) {
+              tracker.recordCandidate(
+                candidate,
+                "FILTERED_REJECTED",
+                spotInfo.spotPriceSol,
+                currentNow,
+                fullGateResult.rejectionReason,
               );
               continue;
             }
@@ -346,11 +372,11 @@ async function run(): Promise<void> {
       }
     }
 
-    // 3. Counterfactual Price Sampler for Active Radar Candidates (Every 15s)
+    // 3. Counterfactual Price Sampler for Top Candidates across ALL cohorts (Every 15s)
     if (currentNow - lastRadarSampleMs >= 15000) {
       lastRadarSampleMs = currentNow;
-      const watching = watchlistService.getActiveWatchingItems().slice(0, 5);
-      for (const item of watching) {
+      const topCandidates = tracker.getTopCandidatesForSampling(10);
+      for (const item of topCandidates) {
         try {
           const spot = await fetchDexScreenerSpotInfo(item.mintAddress);
           if (spot) {

@@ -99,7 +99,7 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.currentPortfolioSol).toBeCloseTo(10.0, 4);
   });
 
-  it("evaluates open positions and closes them on dynamic ratchet trigger", () => {
+  it("evaluates open positions, executes milestone partial sales, and closes on dynamic ratchet trigger", () => {
     const daemon = new PaperTradingDaemon({
       config: baseConfig,
       clock: () => nowMs,
@@ -111,9 +111,10 @@ describe("PaperTradingDaemon", () => {
     expect(snapshotBefore.openPositions.length).toBe(1);
 
     const pos = snapshotBefore.openPositions[0]!;
+    const initialTokens = pos.tokensHeld;
 
-    // Peak at +25% (0.05 * 1.25 = 0.0625)
-    daemon.tickPosition(
+    // Peak at +25% (0.05 * 1.25 = 0.0625) -> triggers SELL_PARTIAL_50
+    const partialResult = daemon.tickPosition(
       pos.positionId,
       {
         ...baseMarketContext,
@@ -122,12 +123,21 @@ describe("PaperTradingDaemon", () => {
       nowMs,
     );
 
-    // Retracement to +18% (0.05 * 1.18 = 0.059) <= +20% locked floor
+    expect(partialResult?.action).toBe("SELL_PARTIAL_50");
+    expect(partialResult?.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+
+    // Position remains open with 50% tokens and cost basis
+    const snapshotMid = daemon.getSnapshot();
+    expect(snapshotMid.openPositions.length).toBe(1);
+    expect(snapshotMid.openPositions[0]?.tokensHeld).toBeCloseTo(initialTokens * 0.5, 4);
+    expect(snapshotMid.openPositions[0]?.costBasisSol).toBeCloseTo(0.5, 4);
+
+    // Retracement to -1% (0.05 * 0.99 = 0.0495) <= breakeven +0% locked floor
     const exitResult = daemon.tickPosition(
       pos.positionId,
       {
         ...baseMarketContext,
-        spotPriceSol: 0.059,
+        spotPriceSol: 0.0495,
       },
       nowMs,
     );
@@ -138,7 +148,10 @@ describe("PaperTradingDaemon", () => {
     const snapshotAfter = daemon.getSnapshot();
     expect(snapshotAfter.openPositions.length).toBe(0);
     expect(snapshotAfter.closedTrades.length).toBe(1);
-    expect(snapshotAfter.closedTrades[0]?.realizedPnlSol).toBeGreaterThan(0.15); // +18% gain
+    // Realized PnL: 50% sold at +25% (0.625 SOL) + 50% sold at -1% (0.495 SOL) = 1.120 SOL total proceeds - 1.0 SOL basis = +0.120 SOL (+12%)
+    expect(snapshotAfter.closedTrades[0]?.realizedPnlSol).toBeCloseTo(0.12, 4);
+    expect(snapshotAfter.closedTrades[0]?.costBasisSol).toBeCloseTo(1.0, 4);
+    expect(snapshotAfter.closedTrades[0]?.proceedsSol).toBeCloseTo(1.12, 4);
   });
 
   it("halts immediately on clock drift violation", () => {

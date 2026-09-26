@@ -148,6 +148,17 @@ export class CounterfactualOpportunityTracker {
     return Array.from(this.records.values());
   }
 
+  public getTopCandidatesForSampling(limit = 20): readonly CandidateObservationRecord[] {
+    return Array.from(this.records.values())
+      .sort(
+        (a, b) =>
+          b.initialLiquidityUsd +
+          b.initialMarketCapUsd -
+          (a.initialLiquidityUsd + a.initialMarketCapUsd),
+      )
+      .slice(0, limit);
+  }
+
   public generateReport(
     portfolioStartSol: number,
     portfolioCurrentSol: number,

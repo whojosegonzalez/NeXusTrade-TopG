@@ -44,8 +44,87 @@ export class DynamicRatchetService {
     let nextFloorBps = state.currentStopFloorBps;
     let nextDrawdownState: DrawdownState = state.drawdownState;
     let nextDrawdownEnteredAtMs: number | null = state.drawdownEnteredAtMs;
+    let tier1ProfitTaken = state.tier1ProfitTaken ?? false;
+    let tier2ProfitTaken = state.tier2ProfitTaken ?? false;
 
-    // 1. Ratchet Progression Rules
+    // 1. Milestone Take-Profit Scaling Checks
+    // Check Tier 1 Milestone (+25%): Sell 50% of position, move floor to Breakeven (+0%)
+    if (nextPeakGainBps >= this.config.tier1PeakThresholdBps && !tier1ProfitTaken) {
+      tier1ProfitTaken = true;
+      nextTier = "TIER_1";
+      nextFloorBps = Math.max(nextFloorBps, this.config.tier1LockedFloorBps);
+
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: nextTier,
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        nextTier,
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_PARTIAL_50",
+        reasonCode: "RATCHET_TIER_1_TRIGGERED",
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Check Tier 2 Milestone (+50%): Sell 25% of position, move floor to Tier 2 (+40%)
+    if (nextPeakGainBps >= this.config.tier2PeakThresholdBps && !tier2ProfitTaken) {
+      tier2ProfitTaken = true;
+      nextTier = "TIER_2";
+      nextFloorBps = Math.max(nextFloorBps, this.config.tier2LockedFloorBps);
+
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: nextTier,
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        nextTier,
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_PARTIAL_25",
+        reasonCode: "RATCHET_TIER_2_TRIGGERED",
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Update active tier and floor if milestones were previously reached
     if (nextPeakGainBps >= this.config.tier2PeakThresholdBps) {
       nextTier = "TIER_2";
       nextFloorBps = Math.max(nextFloorBps, this.config.tier2LockedFloorBps);
@@ -73,6 +152,8 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
       };
       this.store.update(updatedState);
 
@@ -94,9 +175,9 @@ export class DynamicRatchetService {
       };
     }
 
-    // Rule B: Ratchet locked floor breach (+20% / +45%)
+    // Rule B: Ratchet locked floor breach (+0% / +40%)
     if (
-      (nextTier === "TIER_1" || nextTier === "TIER_2" || nextFloorBps > 0) &&
+      (nextTier === "TIER_1" || nextTier === "TIER_2" || nextFloorBps >= 0) &&
       currentPnlBps <= nextFloorBps
     ) {
       const updatedState: PositionRatchetState = {
@@ -108,6 +189,8 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
       };
       this.store.update(updatedState);
 
@@ -147,6 +230,8 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
       };
       this.store.update(updatedState);
 
@@ -190,6 +275,8 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          tier1ProfitTaken,
+          tier2ProfitTaken,
         };
         this.store.update(updatedState);
 
@@ -225,6 +312,8 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          tier1ProfitTaken,
+          tier2ProfitTaken,
         };
         this.store.update(updatedState);
 
@@ -257,6 +346,8 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          tier1ProfitTaken,
+          tier2ProfitTaken,
         };
         this.store.update(updatedState);
 
@@ -288,6 +379,8 @@ export class DynamicRatchetService {
         drawdownState: "EVALUATING_DRAWDOWN",
         drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
       };
       this.store.update(updatedState);
 
@@ -328,6 +421,8 @@ export class DynamicRatchetService {
       drawdownState: nextDrawdownState,
       drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
       lastEvaluatedAtMs: context.currentTimestampMs,
+      tier1ProfitTaken,
+      tier2ProfitTaken,
     };
     this.store.update(updatedState);
 

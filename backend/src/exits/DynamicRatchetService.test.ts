@@ -162,7 +162,7 @@ describe("DynamicRatchetService", () => {
     expect(result.reasonCode).toBe("SCRATCH_EXIT");
   });
 
-  it("Ratchet_Tier1_Lock: locks floor at +20% after +25% peak and triggers exit on drop below floor", () => {
+  it("Ratchet_Tier1_Lock: triggers SELL_PARTIAL_50 at +25% peak, locks floor at breakeven +0%, and exits on drop below floor", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
@@ -174,14 +174,16 @@ describe("DynamicRatchetService", () => {
       currentTimestampMs: 1_000_100,
     });
 
-    expect(peakResult.action).toBe("HOLD");
+    expect(peakResult.action).toBe("SELL_PARTIAL_50");
+    expect(peakResult.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
     expect(peakResult.updatedState.activeTier).toBe("TIER_1");
-    expect(peakResult.updatedState.currentStopFloorBps).toBe(2000); // Locked at +20%
+    expect(peakResult.updatedState.currentStopFloorBps).toBe(0); // Locked at breakeven +0%
+    expect(peakResult.updatedState.tier1ProfitTaken).toBe(true);
 
-    // Retracement to +19%
+    // Retracement to -0.5% (below breakeven floor)
     const exitResult = service.evaluate(peakResult.updatedState, {
       ...baseContext,
-      spotPriceSol: 1.19, // +19% = 1900 bps (<= 2000 bps floor)
+      spotPriceSol: 0.995, // -0.5% = -50 bps (<= 0 bps floor)
       currentTimestampMs: 1_000_200,
     });
 
@@ -189,26 +191,36 @@ describe("DynamicRatchetService", () => {
     expect(exitResult.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
   });
 
-  it("Ratchet_Tier2_Lock: locks floor at +45% after +50% peak and triggers exit on drop below floor", () => {
+  it("Ratchet_Tier2_Lock: triggers SELL_PARTIAL_25 at +50% peak, locks floor at +40%, and exits on drop below floor", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Peak at +50%
-    const peakResult = service.evaluate(state, {
+    // Reach Tier 1 first (+25%)
+    const tier1Result = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.5, // +50% = 5000 bps (>= 4900 bps Tier 2 threshold)
+      spotPriceSol: 1.25,
       currentTimestampMs: 1_000_100,
     });
+    expect(tier1Result.action).toBe("SELL_PARTIAL_50");
 
-    expect(peakResult.action).toBe("HOLD");
+    // Peak at +50%
+    const peakResult = service.evaluate(tier1Result.updatedState, {
+      ...baseContext,
+      spotPriceSol: 1.5, // +50% = 5000 bps (>= 4900 bps Tier 2 threshold)
+      currentTimestampMs: 1_000_150,
+    });
+
+    expect(peakResult.action).toBe("SELL_PARTIAL_25");
+    expect(peakResult.reasonCode).toBe("RATCHET_TIER_2_TRIGGERED");
     expect(peakResult.updatedState.activeTier).toBe("TIER_2");
-    expect(peakResult.updatedState.currentStopFloorBps).toBe(4500); // Locked at +45%
+    expect(peakResult.updatedState.currentStopFloorBps).toBe(4000); // Locked at +40%
+    expect(peakResult.updatedState.tier2ProfitTaken).toBe(true);
 
-    // Retracement to +44%
+    // Retracement to +39% (below +40% floor)
     const exitResult = service.evaluate(peakResult.updatedState, {
       ...baseContext,
-      spotPriceSol: 1.44, // +44% = 4400 bps (<= 4500 bps floor)
+      spotPriceSol: 1.39, // +39% = 3900 bps (<= 4000 bps floor)
       currentTimestampMs: 1_000_200,
     });
 
@@ -221,18 +233,25 @@ describe("DynamicRatchetService", () => {
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Reach Tier 1 (+24% peak -> floor +20%)
-    const peakResult = service.evaluate(state, {
+    // Reach Tier 1 (+25% peak -> floor 0 bps)
+    const tier1Result = service.evaluate(state, {
       ...baseContext,
       spotPriceSol: 1.25,
     });
-    expect(peakResult.updatedState.currentStopFloorBps).toBe(2000);
+    expect(tier1Result.updatedState.currentStopFloorBps).toBe(0);
+
+    // Reach Tier 2 (+50% peak -> floor +40% = 4000 bps)
+    const tier2Result = service.evaluate(tier1Result.updatedState, {
+      ...baseContext,
+      spotPriceSol: 1.5,
+    });
+    expect(tier2Result.updatedState.currentStopFloorBps).toBe(4000);
 
     // Attempt to manually lower floor in store
     expect(() => {
       store.update({
-        ...peakResult.updatedState,
-        currentStopFloorBps: 1500, // lower than 2000!
+        ...tier2Result.updatedState,
+        currentStopFloorBps: 3500, // lower than 4000!
       });
     }).toThrow(/Monotonicity violation/);
   });

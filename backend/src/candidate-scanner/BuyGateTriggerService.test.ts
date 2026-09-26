@@ -21,17 +21,22 @@ describe("BuyGateTriggerService", () => {
     lastEvaluatedAt: new Date().toISOString(),
   };
 
-  it("confirms candidate and triggers buy when all 5 quantitative gates pass", () => {
+  it("confirms candidate and triggers buy when all quantitative gates pass", () => {
     const service = new BuyGateTriggerService();
-    const result = service.evaluateCandidate(candidate, { maxSingleDisposalUsd: 500 }); // $500 / $20,000 = 2.5% <= 5%
+    const result = service.evaluateCandidate(candidate, {
+      maxSingleDisposalUsd: 500, // $500 / $20,000 = 2.5% <= 5%
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 100,
+    });
 
     expect(result.triggered).toBe(true);
-    expect(result.gates.length).toBe(5);
+    expect(result.gates.length).toBe(7);
     expect(result.gates.every((g) => g.passed)).toBe(true);
     expect(result.rejectionReason).toBeUndefined();
   });
 
-  it("fails when outside the 300s - 900s maturity window", () => {
+  it("fails when outside the maturity window", () => {
     const service = new BuyGateTriggerService();
 
     // Too young (150s)
@@ -39,10 +44,25 @@ describe("BuyGateTriggerService", () => {
     expect(tooYoung.triggered).toBe(false);
     expect(tooYoung.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
 
-    // Too old (1000s)
+    // Too old for standard volume/liquidity (1000s)
     const tooOld = service.evaluateCandidate({ ...candidate, assetAgeSeconds: 1000 });
     expect(tooOld.triggered).toBe(false);
     expect(tooOld.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
+  });
+
+  it("permits extended maturity age up to 2700s for high liquidity and volume candidates", () => {
+    const service = new BuyGateTriggerService();
+
+    // 1800s (30m) age with $25k liquidity and $30k volume -> passes adaptive window
+    const extendedCandidate = {
+      ...candidate,
+      liquidityUsd: 25_000,
+      volume5mUsd: 30_000,
+      assetAgeSeconds: 1800,
+    };
+    const result = service.evaluateCandidate(extendedCandidate, { maxSingleDisposalUsd: 500 });
+    expect(result.triggered).toBe(true);
+    expect(result.gates.find((g) => g.name === "MATURITY_WINDOW_GATE")?.passed).toBe(true);
   });
 
   it("fails when L/MC depth ratio is outside 15% - 30% balance", () => {
@@ -70,6 +90,55 @@ describe("BuyGateTriggerService", () => {
     });
     expect(lowBuyerRatio.triggered).toBe(false);
     expect(lowBuyerRatio.rejectionReason).toBe("FLOW_ABSORPTION_GATE_FAILED");
+  });
+
+  it("relaxes buy-to-sell ratio to 1.20x for high-volume breakouts (>= $50k)", () => {
+    const service = new BuyGateTriggerService();
+
+    // Volume $60k, buy/sell ratio 1.25 (would fail standard 1.50x, passes high-volume 1.20x)
+    const highVolBreakout = {
+      ...candidate,
+      volume5mUsd: 60_000,
+      buys5m: 50,
+      sells5m: 40,
+      buyToSellRatio: 1.25,
+    };
+    const result = service.evaluateCandidate(highVolBreakout, { maxSingleDisposalUsd: 500 });
+    expect(result.triggered).toBe(true);
+    expect(result.gates.find((g) => g.name === "FLOW_ABSORPTION_GATE")?.passed).toBe(true);
+  });
+
+  it("fails when 5m sells count is below 5 (anti-sniper trap protection)", () => {
+    const service = new BuyGateTriggerService();
+
+    const lowSells = service.evaluateCandidate({
+      ...candidate,
+      sells5m: 2, // only 2 sells
+    });
+    expect(lowSells.triggered).toBe(false);
+    expect(lowSells.rejectionReason).toBe("MIN_SELLS_GATE_FAILED");
+  });
+
+  it("fails when short-horizon flow deteriorates (sells60s > buys60s or momentum1m < -5%)", () => {
+    const service = new BuyGateTriggerService();
+
+    // Sells outweigh buys in 60s
+    const sellOverwhelm = service.evaluateCandidate(candidate, {
+      recentBuysCount60s: 3,
+      recentSellsCount60s: 8,
+      momentum1mBps: 0,
+    });
+    expect(sellOverwhelm.triggered).toBe(false);
+    expect(sellOverwhelm.rejectionReason).toBe("SHORT_HORIZON_FLOW_GATE_FAILED");
+
+    // 1m momentum drops below -5% (-500 bps)
+    const flashDrop = service.evaluateCandidate(candidate, {
+      recentBuysCount60s: 5,
+      recentSellsCount60s: 5,
+      momentum1mBps: -650, // -6.5%
+    });
+    expect(flashDrop.triggered).toBe(false);
+    expect(flashDrop.rejectionReason).toBe("SHORT_HORIZON_FLOW_GATE_FAILED");
   });
 
   it("fails when volume surge is insufficient (< $2,500)", () => {

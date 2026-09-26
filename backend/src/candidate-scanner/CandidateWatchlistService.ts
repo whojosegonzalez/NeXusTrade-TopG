@@ -32,15 +32,20 @@ export class CandidateWatchlistService {
       pool.sells5m > 0 ? pool.buys5m / pool.sells5m : pool.buys5m > 0 ? 999 : 1.0;
     const nowIso = new Date(nowSec * 1000).toISOString();
 
+    const isHighLiquidity = pool.liquidityUsd >= 20000;
+    const effectiveMaxAgeSec = isHighLiquidity ? 3600 : this.config.maxWatchlistAgeSec;
+
     const existing = this.items.get(pool.poolId);
     if (existing) {
       // Check if age expired while on watchlist
       let updatedStatus = existing.status;
       let rejectionReason = existing.rejectionReason;
 
-      if (existing.status === "WATCHING" && ageSeconds > this.config.maxWatchlistAgeSec) {
+      if (existing.status === "WATCHING" && ageSeconds > effectiveMaxAgeSec) {
         updatedStatus = "DROPPED";
-        rejectionReason = "EXCEEDED_MAX_WATCHLIST_AGE_20M";
+        rejectionReason = isHighLiquidity
+          ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+          : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
       }
 
       const updated: WatchlistCandidateItem = {
@@ -76,7 +81,7 @@ export class CandidateWatchlistService {
     if (pool.txCount5m < this.config.minTxCount5m) {
       return null;
     }
-    if (ageSeconds > this.config.maxWatchlistAgeSec) {
+    if (ageSeconds > effectiveMaxAgeSec) {
       return null;
     }
 
@@ -146,11 +151,15 @@ export class CandidateWatchlistService {
   public pruneExpired(nowSec: number): number {
     let prunedCount = 0;
     for (const [poolId, item] of this.items.entries()) {
-      if (item.status === "WATCHING" && item.assetAgeSeconds > this.config.maxWatchlistAgeSec) {
+      const isHighLiquidity = item.liquidityUsd >= 20000;
+      const effectiveMaxAgeSec = isHighLiquidity ? 3600 : this.config.maxWatchlistAgeSec;
+      if (item.status === "WATCHING" && item.assetAgeSeconds > effectiveMaxAgeSec) {
         this.items.set(poolId, {
           ...item,
           status: "DROPPED",
-          rejectionReason: "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+          rejectionReason: isHighLiquidity
+            ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+            : "EXCEEDED_MAX_WATCHLIST_AGE_20M",
           lastEvaluatedAt: new Date(nowSec * 1000).toISOString(),
         });
         prunedCount++;

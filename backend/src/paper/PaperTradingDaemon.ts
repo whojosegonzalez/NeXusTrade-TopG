@@ -41,8 +41,11 @@ export interface PaperPosition {
   readonly positionId: string;
   readonly mintAddress: string;
   readonly entryPriceSol: number;
-  readonly tokensHeld: number;
-  readonly costBasisSol: number;
+  readonly initialTokensHeld?: number;
+  readonly initialCostBasisSol?: number;
+  tokensHeld: number;
+  costBasisSol: number;
+  realizedProceedsSol?: number;
   readonly openedAtMs: number;
   spotPriceSol: number;
   currentPnlBps: number;
@@ -171,21 +174,21 @@ export class PaperTradingDaemon {
 
     const now = nowTimestampMs ?? this.clock();
     const exitPriceSol = currentSpotPriceSol ?? position.spotPriceSol;
-    const proceedsSol = position.tokensHeld * exitPriceSol;
-    const realizedPnlSol = proceedsSol - position.costBasisSol;
-    const realizedPnlBps = Math.round(
-      ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
-    );
+    const finalProceedsSol = position.tokensHeld * exitPriceSol;
+    this.currentCashSol += finalProceedsSol;
 
-    this.currentCashSol += proceedsSol;
+    const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
+    const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+    const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
+    const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
     const closedRecord: ClosedTradeRecord = {
       positionId: position.positionId,
       mintAddress: position.mintAddress,
       entryPriceSol: position.entryPriceSol,
       exitPriceSol,
-      costBasisSol: position.costBasisSol,
-      proceedsSol,
+      costBasisSol: totalCostBasisSol,
+      proceedsSol: totalProceedsSol,
       realizedPnlSol,
       realizedPnlBps,
       exitReason: "MANUAL_OPERATOR_EXIT",
@@ -288,10 +291,10 @@ export class PaperTradingDaemon {
       return false;
     }
 
-    const tokensHeld = this.config.positionSizeSol / entryPriceSol;
-    const costBasisSol = this.config.positionSizeSol;
+    const initialTokensHeld = this.config.positionSizeSol / entryPriceSol;
+    const initialCostBasisSol = this.config.positionSizeSol;
 
-    this.currentCashSol -= costBasisSol;
+    this.currentCashSol -= initialCostBasisSol;
 
     const ratchetState = this.ratchetService
       .getStore()
@@ -301,8 +304,11 @@ export class PaperTradingDaemon {
       positionId,
       mintAddress: pool.mintAddress,
       entryPriceSol,
-      tokensHeld,
-      costBasisSol,
+      initialTokensHeld,
+      initialCostBasisSol,
+      tokensHeld: initialTokensHeld,
+      costBasisSol: initialCostBasisSol,
+      realizedProceedsSol: 0,
       openedAtMs: now,
       spotPriceSol: entryPriceSol,
       currentPnlBps: 0,
@@ -355,21 +361,21 @@ export class PaperTradingDaemon {
       // If position has had no activity for >= 5 minutes (300,000ms), force stagnancy exit
       if (now - position.lastActivityMs >= 300_000) {
         const exitPriceSol = marketContext.spotPriceSol;
-        const proceedsSol = position.tokensHeld * exitPriceSol;
-        const realizedPnlSol = proceedsSol - position.costBasisSol;
-        const realizedPnlBps = Math.round(
-          ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
-        );
+        const finalProceedsSol = position.tokensHeld * exitPriceSol;
+        this.currentCashSol += finalProceedsSol;
 
-        this.currentCashSol += proceedsSol;
+        const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
+        const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+        const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
+        const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
         const closedRecord: ClosedTradeRecord = {
           positionId: position.positionId,
           mintAddress: position.mintAddress,
           entryPriceSol: position.entryPriceSol,
           exitPriceSol,
-          costBasisSol: position.costBasisSol,
-          proceedsSol,
+          costBasisSol: totalCostBasisSol,
+          proceedsSol: totalProceedsSol,
           realizedPnlSol,
           realizedPnlBps,
           exitReason: "STAGNANCY_TIMEOUT_EXIT",
@@ -415,24 +421,48 @@ export class PaperTradingDaemon {
       position.currentPnlBps = result.diagnostics.currentPnlBps;
       position.ratchetState = result.updatedState;
 
-      // 4. If Sell Triggered, Execute Market Close
-      if (result.action === "SELL_ALL") {
+      // 4. Handle Partial Scale-Out or Full Sell
+      if (result.action === "SELL_PARTIAL_50") {
+        const initialTokens = position.initialTokensHeld ?? position.tokensHeld;
+        const initialCost = position.initialCostBasisSol ?? position.costBasisSol;
+        const tokensToSell = Math.min(position.tokensHeld, initialTokens * 0.5);
+        if (tokensToSell > 0) {
+          const proceedsSol = tokensToSell * marketContext.spotPriceSol;
+          const costRelievedSol = (tokensToSell / initialTokens) * initialCost;
+          position.tokensHeld -= tokensToSell;
+          position.costBasisSol -= costRelievedSol;
+          position.realizedProceedsSol = (position.realizedProceedsSol ?? 0) + proceedsSol;
+          this.currentCashSol += proceedsSol;
+        }
+      } else if (result.action === "SELL_PARTIAL_25") {
+        const initialTokens = position.initialTokensHeld ?? position.tokensHeld;
+        const initialCost = position.initialCostBasisSol ?? position.costBasisSol;
+        const tokensToSell = Math.min(position.tokensHeld, initialTokens * 0.25);
+        if (tokensToSell > 0) {
+          const proceedsSol = tokensToSell * marketContext.spotPriceSol;
+          const costRelievedSol = (tokensToSell / initialTokens) * initialCost;
+          position.tokensHeld -= tokensToSell;
+          position.costBasisSol -= costRelievedSol;
+          position.realizedProceedsSol = (position.realizedProceedsSol ?? 0) + proceedsSol;
+          this.currentCashSol += proceedsSol;
+        }
+      } else if (result.action === "SELL_ALL") {
         const exitPriceSol = marketContext.spotPriceSol;
-        const proceedsSol = position.tokensHeld * exitPriceSol;
-        const realizedPnlSol = proceedsSol - position.costBasisSol;
-        const realizedPnlBps = Math.round(
-          ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
-        );
+        const finalProceedsSol = position.tokensHeld * exitPriceSol;
+        this.currentCashSol += finalProceedsSol;
 
-        this.currentCashSol += proceedsSol;
+        const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
+        const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+        const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
+        const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
         const closedRecord: ClosedTradeRecord = {
           positionId: position.positionId,
           mintAddress: position.mintAddress,
           entryPriceSol: position.entryPriceSol,
           exitPriceSol,
-          costBasisSol: position.costBasisSol,
-          proceedsSol,
+          costBasisSol: totalCostBasisSol,
+          proceedsSol: totalProceedsSol,
           realizedPnlSol,
           realizedPnlBps,
           exitReason: result.reasonCode,
@@ -476,21 +506,21 @@ export class PaperTradingDaemon {
     // Check if inactivity has reached 5 minutes (300,000ms)
     if (now - position.lastActivityMs >= 300_000) {
       const exitPriceSol = position.spotPriceSol;
-      const proceedsSol = position.tokensHeld * exitPriceSol;
-      const realizedPnlSol = proceedsSol - position.costBasisSol;
-      const realizedPnlBps = Math.round(
-        ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
-      );
+      const finalProceedsSol = position.tokensHeld * exitPriceSol;
+      this.currentCashSol += finalProceedsSol;
 
-      this.currentCashSol += proceedsSol;
+      const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
+      const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+      const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
+      const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
       const closedRecord: ClosedTradeRecord = {
         positionId: position.positionId,
         mintAddress: position.mintAddress,
         entryPriceSol: position.entryPriceSol,
         exitPriceSol,
-        costBasisSol: position.costBasisSol,
-        proceedsSol,
+        costBasisSol: totalCostBasisSol,
+        proceedsSol: totalProceedsSol,
         realizedPnlSol,
         realizedPnlBps,
         exitReason: "STAGNANCY_TIMEOUT_EXIT",

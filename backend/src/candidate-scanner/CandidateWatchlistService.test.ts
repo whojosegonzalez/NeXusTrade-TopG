@@ -106,6 +106,27 @@ describe("CandidateWatchlistService", () => {
     expect(activeItems.length).toBe(0);
   });
 
+  it("retains high-liquidity candidate (>= $20k) beyond 20m up to 60m (3,600s)", () => {
+    const service = new CandidateWatchlistService();
+    const highLiqPool: ScannedPoolRecord = {
+      ...validPool,
+      liquidityUsd: 25_000,
+      openTimeSec: nowSec - 1800, // 30m age (1800s)
+    };
+
+    const item = service.admitOrUpdate(highLiqPool, nowSec);
+    expect(item?.status).toBe("WATCHING");
+
+    // Later scan at 3,700s age -> dropped with EXCEEDED_MAX_WATCHLIST_AGE_60M
+    const expiredPool = {
+      ...highLiqPool,
+      openTimeSec: nowSec - 3700,
+    };
+    const droppedItem = service.admitOrUpdate(expiredPool, nowSec);
+    expect(droppedItem?.status).toBe("DROPPED");
+    expect(droppedItem?.rejectionReason).toBe("EXCEEDED_MAX_WATCHLIST_AGE_60M");
+  });
+
   it("respects maxWatchlistSize capacity", () => {
     const service = new CandidateWatchlistService({ maxWatchlistSize: 2 });
 
