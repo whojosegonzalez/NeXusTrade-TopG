@@ -717,12 +717,27 @@ meter {
   box-shadow: 0 0 8px rgba(139, 92, 246, 0.4);
 }
 
-/* Watchlist & History Tables */
+/* Watchlist, Positions, Activity & History Tables */
 .watchlist-table,
+.positions-table,
+.activity-table,
 .history-table,
 .trades-table {
   width: 100%;
   border-collapse: collapse;
+}
+.positions-table td,
+.activity-table td {
+  vertical-align: middle;
+}
+.row-drawdown-evaluating {
+  background: rgba(245, 158, 11, 0.08);
+}
+.drawdown-tag {
+  display: block;
+  font-size: 0.72rem;
+  color: #fde68a;
+  margin-top: 0.2rem;
 }
 .status-pill {
   padding: 0.15rem 0.45rem;

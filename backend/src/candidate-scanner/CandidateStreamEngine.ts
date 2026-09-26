@@ -322,6 +322,66 @@ export class CandidateStreamEngine {
     }
   }
 
+  public async fetchDexScreenerBoostedPools(): Promise<ScannedPoolRecord[]> {
+    if (!this.enableDexScreener) return [];
+    const urls = [
+      "https://api.dexscreener.com/token-boosts/top/v1",
+      "https://api.dexscreener.com/token-boosts/latest/v1",
+    ];
+
+    const tokenAddresses = new Set<string>();
+    await Promise.allSettled(
+      urls.map(async (url) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 4000);
+        try {
+          const res = await this.fetchImpl(url, {
+            signal: controller.signal,
+            headers: { Accept: "application/json" },
+          });
+          if (!res.ok) return;
+          const body = (await res.json()) as Array<{ chainId?: string; tokenAddress?: string }>;
+          if (!Array.isArray(body)) return;
+          for (const item of body) {
+            if ((item.chainId === "solana" || !item.chainId) && item.tokenAddress) {
+              tokenAddresses.add(item.tokenAddress);
+            }
+          }
+        } catch {
+          // ignore transient failure
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      }),
+    );
+
+    if (tokenAddresses.size === 0) return [];
+
+    const records: ScannedPoolRecord[] = [];
+    const nowSec = Math.floor(Date.now() / 1000);
+    const candidates = Array.from(tokenAddresses).slice(0, 15);
+    const pairPromises = candidates.map((addr) => this.fetchDexScreenerTokenPair(addr));
+    const pairResults = await Promise.allSettled(pairPromises);
+
+    for (const res of pairResults) {
+      if (res.status === "fulfilled" && res.value !== null) {
+        const pool = res.value;
+        const ageSec = Math.max(0, nowSec - pool.openTimeSec);
+        // Established Runner criteria: 2h (7200s) to 24h (86400s), >= $40k liquidity, >= $100k market cap
+        if (
+          pool.liquidityUsd >= 40000 &&
+          pool.marketCapUsd >= 100000 &&
+          ageSec >= 7200 &&
+          ageSec <= 86400
+        ) {
+          records.push(pool);
+        }
+      }
+    }
+
+    return records;
+  }
+
   public async fetchRawPools(
     pageSize: number = this.config.pageSize,
   ): Promise<ScannedPoolRecord[]> {
@@ -340,14 +400,21 @@ export class CandidateStreamEngine {
       dexPools = [];
     }
 
-    if (raydiumError && dexPools.length === 0) {
+    let boostedPools: ScannedPoolRecord[] = [];
+    try {
+      boostedPools = await this.fetchDexScreenerBoostedPools();
+    } catch {
+      boostedPools = [];
+    }
+
+    if (raydiumError && dexPools.length === 0 && boostedPools.length === 0) {
       throw raydiumError;
     }
 
     const seenPoolMints = new Set<string>();
     const combined: ScannedPoolRecord[] = [];
 
-    for (const pool of [...raydiumPools, ...dexPools]) {
+    for (const pool of [...raydiumPools, ...dexPools, ...boostedPools]) {
       if (!seenPoolMints.has(pool.mintAddress)) {
         seenPoolMints.add(pool.mintAddress);
         combined.push(pool);

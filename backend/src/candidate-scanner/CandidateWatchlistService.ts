@@ -32,8 +32,13 @@ export class CandidateWatchlistService {
       pool.sells5m > 0 ? pool.buys5m / pool.sells5m : pool.buys5m > 0 ? 999 : 1.0;
     const nowIso = new Date(nowSec * 1000).toISOString();
 
+    const isEstablishedRunner = pool.liquidityUsd >= 40000 && pool.marketCapUsd >= 100000;
     const isHighLiquidity = pool.liquidityUsd >= 20000;
-    const effectiveMaxAgeSec = isHighLiquidity ? 3600 : this.config.maxWatchlistAgeSec;
+    const effectiveMaxAgeSec = isEstablishedRunner
+      ? 86400
+      : isHighLiquidity
+        ? 3600
+        : this.config.maxWatchlistAgeSec;
 
     const existing = this.items.get(pool.poolId);
     if (existing) {
@@ -43,9 +48,11 @@ export class CandidateWatchlistService {
 
       if (existing.status === "WATCHING" && ageSeconds > effectiveMaxAgeSec) {
         updatedStatus = "DROPPED";
-        rejectionReason = isHighLiquidity
-          ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
-          : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
+        rejectionReason = isEstablishedRunner
+          ? "EXCEEDED_MAX_WATCHLIST_AGE_24H"
+          : isHighLiquidity
+            ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+            : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
       }
 
       const updated: WatchlistCandidateItem = {
@@ -151,15 +158,23 @@ export class CandidateWatchlistService {
   public pruneExpired(nowSec: number): number {
     let prunedCount = 0;
     for (const [poolId, item] of this.items.entries()) {
+      const isEstablishedRunner = item.liquidityUsd >= 40000 && item.marketCapUsd >= 100000;
       const isHighLiquidity = item.liquidityUsd >= 20000;
-      const effectiveMaxAgeSec = isHighLiquidity ? 3600 : this.config.maxWatchlistAgeSec;
+      const effectiveMaxAgeSec = isEstablishedRunner
+        ? 86400
+        : isHighLiquidity
+          ? 3600
+          : this.config.maxWatchlistAgeSec;
+
       if (item.status === "WATCHING" && item.assetAgeSeconds > effectiveMaxAgeSec) {
         this.items.set(poolId, {
           ...item,
           status: "DROPPED",
-          rejectionReason: isHighLiquidity
-            ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
-            : "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+          rejectionReason: isEstablishedRunner
+            ? "EXCEEDED_MAX_WATCHLIST_AGE_24H"
+            : isHighLiquidity
+              ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+              : "EXCEEDED_MAX_WATCHLIST_AGE_20M",
           lastEvaluatedAt: new Date(nowSec * 1000).toISOString(),
         });
         prunedCount++;

@@ -48,6 +48,7 @@ interface RawDaemonSnapshot {
   closedTrades?: RawDaemonTrade[];
   netSessionPnlSol?: number;
   watchlist?: unknown[];
+  maxOpenPositions?: number;
 }
 
 function nexusDevApiPlugin(): Plugin {
@@ -132,7 +133,7 @@ function nexusDevApiPlugin(): Plugin {
                 netSessionPnlSol: netPnlSol,
                 netSessionPnlPct: netPnlPct,
                 openPositionCount: openPositions.length,
-                maxConcurrentPositions: 3,
+                maxConcurrentPositions: raw.maxOpenPositions || 5,
                 closedTradesCount: closedTrades.length,
                 winsCount: wins,
                 lossesCount: losses,

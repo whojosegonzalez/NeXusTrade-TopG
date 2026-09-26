@@ -31,9 +31,38 @@ describe("BuyGateTriggerService", () => {
     });
 
     expect(result.triggered).toBe(true);
-    expect(result.gates.length).toBe(7);
+    expect(result.gates.length).toBe(8);
     expect(result.gates.every((g) => g.passed)).toBe(true);
     expect(result.rejectionReason).toBeUndefined();
+  });
+
+  it("permits established runners with 2h to 24h age and high liquidity/market-cap", () => {
+    const service = new BuyGateTriggerService();
+    const runner = {
+      ...candidate,
+      assetAgeSeconds: 14400, // 4 hours
+      liquidityUsd: 50_000,
+      marketCapUsd: 200_000,
+      lmcRatio: 0.25,
+      buys5m: 50,
+      sells5m: 25,
+      buyToSellRatio: 2.0,
+      volume5mUsd: 15_000,
+    };
+    const result = service.evaluateCandidate(runner, { maxSingleDisposalUsd: 500 });
+    expect(result.triggered).toBe(true);
+    expect(result.gates.find((g) => g.name === "MATURITY_WINDOW_GATE")?.passed).toBe(true);
+  });
+
+  it("fails when liquidity is below $20,000", () => {
+    const service = new BuyGateTriggerService();
+
+    const lowLiq = service.evaluateCandidate({
+      ...candidate,
+      liquidityUsd: 15_000, // below $20,000
+    });
+    expect(lowLiq.triggered).toBe(false);
+    expect(lowLiq.rejectionReason).toBe("MIN_LIQUIDITY_GATE_FAILED");
   });
 
   it("fails when outside the maturity window", () => {
@@ -44,7 +73,7 @@ describe("BuyGateTriggerService", () => {
     expect(tooYoung.triggered).toBe(false);
     expect(tooYoung.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
 
-    // Too old for standard volume/liquidity (1000s)
+    // Too old for standard micro-cap (1000s)
     const tooOld = service.evaluateCandidate({ ...candidate, assetAgeSeconds: 1000 });
     expect(tooOld.triggered).toBe(false);
     expect(tooOld.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
@@ -108,12 +137,12 @@ describe("BuyGateTriggerService", () => {
     expect(result.gates.find((g) => g.name === "FLOW_ABSORPTION_GATE")?.passed).toBe(true);
   });
 
-  it("fails when 5m sells count is below 5 (anti-sniper trap protection)", () => {
+  it("fails when 5m sells count is below 15 (anti-sniper trap protection)", () => {
     const service = new BuyGateTriggerService();
 
     const lowSells = service.evaluateCandidate({
       ...candidate,
-      sells5m: 2, // only 2 sells
+      sells5m: 10, // only 10 sells (requires >= 15)
     });
     expect(lowSells.triggered).toBe(false);
     expect(lowSells.rejectionReason).toBe("MIN_SELLS_GATE_FAILED");

@@ -96,7 +96,26 @@ describe("PaperTradingDaemon", () => {
 
     const snapshot = daemon.getSnapshot();
     expect(snapshot.openPositions.length).toBe(3);
+    expect(snapshot.maxOpenPositions).toBe(3);
     expect(snapshot.currentPortfolioSol).toBeCloseTo(10.0, 4);
+  });
+
+  it("supports positionSizeSolOverride for dynamic capital-based sizing", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    // Pass custom position size override of 0.45 SOL
+    const accepted = daemon.processScannedPool(validPool, nowMs, 0.05, 0.45);
+    expect(accepted).toBe(true);
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(1);
+    expect(snapshot.openPositions[0]?.costBasisSol).toBeCloseTo(0.45, 4);
+    // 0.45 SOL / 0.05 entry price = 9.0 tokens
+    expect(snapshot.openPositions[0]?.tokensHeld).toBeCloseTo(9.0, 4);
   });
 
   it("evaluates open positions, executes milestone partial sales, and closes on dynamic ratchet trigger", () => {

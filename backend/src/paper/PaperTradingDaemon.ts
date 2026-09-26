@@ -87,6 +87,7 @@ export interface PaperTradingDaemonSnapshot {
   readonly currentPortfolioSol: number;
   readonly totalRealizedPnlSol: number;
   readonly totalUnrealizedPnlSol: number;
+  readonly maxOpenPositions: number;
   readonly consecutiveErrorCount: number;
   readonly startedAtMs: number;
   readonly lastTickAtMs: number;
@@ -239,6 +240,7 @@ export class PaperTradingDaemon {
       currentPortfolioSol,
       totalRealizedPnlSol,
       totalUnrealizedPnlSol,
+      maxOpenPositions: this.config.maxOpenPositions,
       consecutiveErrorCount: this.consecutiveErrorCount,
       startedAtMs: this.startedAtMs,
       lastTickAtMs: this.lastTickAtMs,
@@ -249,6 +251,7 @@ export class PaperTradingDaemon {
     pool: ScannedPoolRecord,
     nowTimestampMs?: number,
     entryPriceSolOverride?: number,
+    positionSizeSolOverride?: number,
   ): boolean {
     if (this.status !== "RUNNING") return false;
     const now = nowTimestampMs ?? this.clock();
@@ -257,7 +260,10 @@ export class PaperTradingDaemon {
     if (this.openPositions.size >= this.config.maxOpenPositions) {
       return false;
     }
-    if (this.currentCashSol < this.config.positionSizeSol) {
+    const positionSize =
+      positionSizeSolOverride !== undefined ? positionSizeSolOverride : this.config.positionSizeSol;
+
+    if (this.currentCashSol < positionSize || positionSize <= 0) {
       return false;
     }
 
@@ -291,8 +297,8 @@ export class PaperTradingDaemon {
       return false;
     }
 
-    const initialTokensHeld = this.config.positionSizeSol / entryPriceSol;
-    const initialCostBasisSol = this.config.positionSizeSol;
+    const initialTokensHeld = positionSize / entryPriceSol;
+    const initialCostBasisSol = positionSize;
 
     this.currentCashSol -= initialCostBasisSol;
 

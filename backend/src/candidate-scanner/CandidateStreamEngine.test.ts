@@ -198,4 +198,77 @@ describe("CandidateStreamEngine", () => {
     expect(admittedCandidates[0]?.symbol).toBe("REAL");
     expect(admittedCandidates[0]?.liquidityUsd).toBe(25000);
   });
+
+  it("ingests and admits established runners from DexScreener boosted pools (Stream B)", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const mockFetch: typeof fetch = async (input) => {
+      const urlStr = typeof input === "string" ? input : (input as Request).url;
+      if (urlStr.includes("token-boosts/top/v1") || urlStr.includes("token-boosts/latest/v1")) {
+        return new Response(
+          JSON.stringify([
+            {
+              chainId: "solana",
+              tokenAddress: "RunnerMint11111111111111111111111111111111",
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (urlStr.includes("dex/tokens/RunnerMint11111111111111111111111111111111")) {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [
+              {
+                chainId: "solana",
+                pairAddress: "RunnerPair11111111111111111111111111111111",
+                baseToken: {
+                  address: "RunnerMint11111111111111111111111111111111",
+                  name: "Established Runner",
+                  symbol: "RUNNER",
+                },
+                quoteToken: {
+                  address: "So11111111111111111111111111111111111111112",
+                  name: "Wrapped SOL",
+                  symbol: "SOL",
+                },
+                priceNative: "0.001",
+                priceUsd: "0.14",
+                txns: {
+                  m5: { buys: 60, sells: 30 },
+                },
+                volume: {
+                  m5: 25000,
+                },
+                liquidity: {
+                  usd: 60000,
+                  quote: 420,
+                },
+                fdv: 250000,
+                marketCap: 250000,
+                pairCreatedAt: (nowSec - 14400) * 1000, // 4 hours old (7200s - 86400s)
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ success: true, data: { data: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const engine = new CandidateStreamEngine({
+      config,
+      fetchFn: mockFetch,
+    });
+
+    const boostedPools = await engine.fetchDexScreenerBoostedPools();
+    expect(boostedPools.length).toBe(1);
+    expect(boostedPools[0]?.symbol).toBe("RUNNER");
+    expect(boostedPools[0]?.liquidityUsd).toBe(60000);
+    expect(boostedPools[0]?.marketCapUsd).toBe(250000);
+    expect(nowSec - (boostedPools[0]?.openTimeSec ?? 0)).toBeGreaterThanOrEqual(7200);
+  });
 });

@@ -212,90 +212,85 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
         {session.openPositions.length === 0 ? (
           <div className="empty-state-box">No open positions currently active in this session.</div>
         ) : (
-          <div className="positions-grid">
-            {session.openPositions.map((pos: LivePaperPosition) => {
-              const isPos = pos.currentPnlBps >= 0;
-              const pnlPct = (pos.currentPnlBps / 100).toFixed(2);
-              const peakPct = (pos.peakGainBps / 100).toFixed(2);
-              const floorPct = (pos.currentStopFloorBps / 100).toFixed(2);
-              const tierInfo = getTierBadgeInfo(pos.activeTier);
-              const stopDistancePct = ((pos.currentPnlBps - pos.currentStopFloorBps) / 100).toFixed(
-                2,
-              );
+          <div className="table-responsive" style={{ maxHeight: "320px", overflowY: "auto" }}>
+            <table className="positions-table">
+              <thead>
+                <tr>
+                  <th>Token / Symbol</th>
+                  <th>Entry Price</th>
+                  <th>Current Spot</th>
+                  <th>Unrealized PnL</th>
+                  <th>Peak Gain</th>
+                  <th>Stop Floor</th>
+                  <th>Tier Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {session.openPositions.map((pos: LivePaperPosition) => {
+                  const isPos = pos.currentPnlBps >= 0;
+                  const pnlPct = (pos.currentPnlBps / 100).toFixed(2);
+                  const peakPct = (pos.peakGainBps / 100).toFixed(2);
+                  const floorPct = (pos.currentStopFloorBps / 100).toFixed(2);
+                  const tierInfo = getTierBadgeInfo(pos.activeTier);
+                  const stopDistancePct = (
+                    (pos.currentPnlBps - pos.currentStopFloorBps) /
+                    100
+                  ).toFixed(2);
 
-              return (
-                <div
-                  key={pos.positionId}
-                  className={`position-card ${
-                    pos.drawdownState === "EVALUATING_DRAWDOWN" ? "drawdown-evaluating" : ""
-                  }`}
-                  data-testid={`active-pos-${pos.positionId}`}
-                >
-                  <div className="position-header">
-                    <div className="token-id-group">
-                      <span className="pos-symbol">
-                        {pos.symbol ??
-                          `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
-                      </span>
-                      <span className="pos-mint" title={pos.mintAddress}>
-                        {pos.mintAddress.slice(0, 4)}...{pos.mintAddress.slice(-4)}
-                      </span>
-                    </div>
-                    <span className={tierInfo.className}>{tierInfo.label}</span>
-                  </div>
-
-                  <div className="position-metrics">
-                    <div className="metric-row main-metric">
-                      <span className="metric-label">Unrealized PnL:</span>
-                      <span className={`metric-value ${isPos ? "pnl-positive" : "pnl-negative"}`}>
-                        {isPos ? `+${pnlPct}%` : `${pnlPct}%`}
-                      </span>
-                    </div>
-
-                    <div className="metric-row">
-                      <span className="metric-label">Entry Price:</span>
-                      <span className="metric-value">{pos.entryPriceSol.toFixed(6)} SOL</span>
-                    </div>
-
-                    <div className="metric-row">
-                      <span className="metric-label">Current Spot:</span>
-                      <span className="metric-value">{pos.spotPriceSol.toFixed(6)} SOL</span>
-                    </div>
-
-                    <div className="metric-row">
-                      <span className="metric-label">Peak Gain:</span>
-                      <span className="metric-value text-green">+{peakPct}%</span>
-                    </div>
-
-                    <div className="metric-row">
-                      <span className="metric-label">Stop Floor:</span>
-                      <span className="metric-value">{floorPct}%</span>
-                    </div>
-
-                    <div className="metric-row">
-                      <span className="metric-label">Distance to Stop:</span>
-                      <span className="metric-value text-muted">{stopDistancePct}% away</span>
-                    </div>
-
-                    {pos.drawdownState === "EVALUATING_DRAWDOWN" && (
-                      <div className="drawdown-alert">
-                        ⚠️ Smart Hold: 3m Grace Period Active (-8% Dip Absorption)
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="position-card-footer">
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-outline-danger"
-                      onClick={() => handleAction("MANUAL_EXIT", pos.positionId)}
+                  return (
+                    <tr
+                      key={pos.positionId}
+                      className={
+                        pos.drawdownState === "EVALUATING_DRAWDOWN" ? "row-drawdown-evaluating" : ""
+                      }
+                      data-testid={`active-pos-${pos.positionId}`}
                     >
-                      Market Close Position
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+                      <td>
+                        <strong className="pos-symbol">
+                          {pos.symbol ??
+                            `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
+                        </strong>
+                        <span className="sub-mint" title={pos.mintAddress}>
+                          {pos.mintAddress.slice(0, 4)}...{pos.mintAddress.slice(-4)}
+                        </span>
+                      </td>
+                      <td>{pos.entryPriceSol.toFixed(6)} SOL</td>
+                      <td>{pos.spotPriceSol.toFixed(6)} SOL</td>
+                      <td>
+                        <span
+                          className={`metric-value ${isPos ? "pnl-positive text-green" : "pnl-negative text-red"}`}
+                        >
+                          {isPos ? `+${pnlPct}%` : `${pnlPct}%`}
+                        </span>
+                      </td>
+                      <td>
+                        <span className="text-green">+{peakPct}%</span>
+                      </td>
+                      <td>
+                        <span>{floorPct}%</span>
+                        <span className="sub-text text-muted"> ({stopDistancePct}% away)</span>
+                      </td>
+                      <td>
+                        <span className={tierInfo.className}>{tierInfo.label}</span>
+                        {pos.drawdownState === "EVALUATING_DRAWDOWN" && (
+                          <span className="sub-tag drawdown-tag">⚠️ Smart Hold (-8%)</span>
+                        )}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-outline-danger"
+                          onClick={() => handleAction("MANUAL_EXIT", pos.positionId)}
+                        >
+                          Market Close Position
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </section>
@@ -372,18 +367,31 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
         {session.recentActivityLogs.length === 0 ? (
           <div className="empty-state-box">No activity events logged yet.</div>
         ) : (
-          <div className="activity-feed">
-            {session.recentActivityLogs.map((log, idx) => (
-              <div key={`${log.timestamp}-${idx}`} className="activity-entry">
-                <span className="activity-time">
-                  {new Date(log.timestamp).toLocaleTimeString()}
-                </span>
-                <span className={`activity-badge badge-log-${log.type.toLowerCase()}`}>
-                  {log.type}
-                </span>
-                <span className="activity-message">{log.message}</span>
-              </div>
-            ))}
+          <div className="table-responsive" style={{ maxHeight: "280px", overflowY: "auto" }}>
+            <table className="activity-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Type</th>
+                  <th>Activity Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {session.recentActivityLogs.map((log, idx) => (
+                  <tr key={`${log.timestamp}-${idx}`}>
+                    <td className="activity-time">
+                      {new Date(log.timestamp).toLocaleTimeString()}
+                    </td>
+                    <td>
+                      <span className={`activity-badge badge-log-${log.type.toLowerCase()}`}>
+                        {log.type}
+                      </span>
+                    </td>
+                    <td className="activity-message">{log.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </section>

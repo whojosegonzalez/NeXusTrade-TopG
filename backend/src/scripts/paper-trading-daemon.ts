@@ -356,12 +356,32 @@ async function run(): Promise<void> {
             const poolRecord = rawPools.find((p) => p.mintAddress === candidate.mintAddress);
 
             if (poolRecord) {
-              const bought = daemon.processScannedPool(poolRecord, currentNow, entryPriceSol);
+              const currentSnap = daemon.getSnapshot();
+              const gasReserveSol = 0.05;
+              const dynamicSize = Math.max(
+                0.1,
+                Math.min(
+                  1.0,
+                  parseFloat(
+                    (
+                      (currentSnap.currentPortfolioSol - gasReserveSol) /
+                      config.maxOpenPositions
+                    ).toFixed(4),
+                  ),
+                ),
+              );
+
+              const bought = daemon.processScannedPool(
+                poolRecord,
+                currentNow,
+                entryPriceSol,
+                dynamicSize,
+              );
               if (bought) {
                 watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
                 tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
                 console.log(
-                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${config.positionSizeSol} SOL`,
+                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
                 );
               }
             }
