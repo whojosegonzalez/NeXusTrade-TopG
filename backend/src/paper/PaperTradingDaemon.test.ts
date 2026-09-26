@@ -357,4 +357,98 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.status).toBe("RUNNING");
     expect(snapshot.haltReason).toBe("PORTFOLIO_DRAWDOWN_BREACHED");
   });
+
+  it("forces stagnancy exit when a position has no activity for 5 minutes (300,000ms)", () => {
+    let currentClockMs = nowMs;
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => currentClockMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, currentClockMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // 4 minutes pass with stagnant ticks (no price change, zero transactions)
+    currentClockMs += 240_000;
+    const midResult = daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.05, // Same price
+        recentBuysCount60s: 0,
+        recentSellsCount60s: 0,
+        volumeStalled3m: true,
+        currentTimestampMs: currentClockMs,
+      },
+      currentClockMs,
+    );
+    expect(midResult?.action).toBe("HOLD");
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
+
+    // 5 minutes total elapsed (300,000ms since opened/last activity)
+    currentClockMs += 60_000;
+    const stagnancyResult = daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.05,
+        recentBuysCount60s: 0,
+        recentSellsCount60s: 0,
+        volumeStalled3m: true,
+        currentTimestampMs: currentClockMs,
+      },
+      currentClockMs,
+    );
+
+    expect(stagnancyResult?.action).toBe("SELL_ALL");
+    expect(stagnancyResult?.reasonCode).toBe("STAGNANCY_TIMEOUT_EXIT");
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(0);
+    expect(snapshot.closedTrades.length).toBe(1);
+    expect(snapshot.closedTrades[0]?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
+  });
+
+  it("forces stagnancy exit via recordStagnantTick when spot query returns null for 5 minutes", () => {
+    let currentClockMs = nowMs;
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => currentClockMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, currentClockMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // Spot queries fail for 4 minutes
+    currentClockMs += 240_000;
+    const closed1 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
+    expect(closed1).toBeNull();
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
+
+    // Spot queries fail at 5 minutes mark (>= 300,000ms)
+    currentClockMs += 60_000;
+    const closed2 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
+    expect(closed2).toBeDefined();
+    expect(closed2?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(0);
+    expect(snapshot.closedTrades.length).toBe(1);
+  });
+
+  it("rejects non-positive entry price", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    const rejectedZero = daemon.processScannedPool({ ...validPool, spotPriceUsd: 0 }, nowMs, 0);
+    expect(rejectedZero).toBe(false);
+
+    const rejectedNegative = daemon.processScannedPool(validPool, nowMs, -0.05);
+    expect(rejectedNegative).toBe(false);
+  });
 });

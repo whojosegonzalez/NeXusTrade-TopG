@@ -78,6 +78,18 @@ describe("BuyGateTriggerService", () => {
     const lowVolume = service.evaluateCandidate({ ...candidate, volume5mUsd: 1500 });
     expect(lowVolume.triggered).toBe(false);
     expect(lowVolume.rejectionReason).toBe("VOLUME_SURGE_GATE_FAILED");
+
+    // Extreme low-activity token ($119 volume, 1 transaction)
+    const lowActivityToken = service.evaluateCandidate({
+      ...candidate,
+      volume5mUsd: 119,
+      buys5m: 1,
+      sells5m: 0,
+      buyToSellRatio: 2.0,
+    });
+    expect(lowActivityToken.triggered).toBe(false);
+    expect(lowActivityToken.rejectionReason).toBe("VOLUME_SURGE_GATE_FAILED");
+    expect(lowActivityToken.gates.find((g) => g.name === "VOLUME_SURGE_GATE")?.passed).toBe(false);
   });
 
   it("fails when a single dev/whale disposal breaches 5% of liquidity depth", () => {

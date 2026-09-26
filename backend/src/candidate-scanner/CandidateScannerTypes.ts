@@ -7,7 +7,8 @@ export type CandidateScannerRejectionReason =
   | "REJECTED_INSUFFICIENT_TRANSACTION_COUNT"
   | "REJECTED_WASH_TRADE_SIZE_ANOMALY"
   | "REJECTED_NET_SELLER_DOMINANCE"
-  | "REJECTED_INVALID_POOL_METADATA";
+  | "REJECTED_INVALID_POOL_METADATA"
+  | "REJECTED_NO_ACTIVE_DEX_PAIR";
 
 export interface ScannedPoolRecord {
   readonly poolId: string;

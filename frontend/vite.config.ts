@@ -64,7 +64,9 @@ function nexusDevApiPlugin(): Plugin {
             "../backend/.tmp/paper-session-active.json",
           );
           const localTmp = path.resolve(process.cwd(), ".tmp/paper-session-active.json");
-          const target = [localTmp, rootTmp, backendTmp].find((p) => fs.existsSync(p));
+          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
+          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const target = candidates[0];
 
           if (target) {
             try {
@@ -136,7 +138,7 @@ function nexusDevApiPlugin(): Plugin {
                 lossesCount: losses,
                 scratchesCount: scratches,
                 openPositions,
-                watchlist: [],
+                watchlist: raw.watchlist || [],
                 recentActivityLogs: logs,
               };
 

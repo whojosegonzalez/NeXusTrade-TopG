@@ -158,6 +158,118 @@ export class CandidateStreamEngine {
     }
   }
 
+  public async fetchDexScreenerTokenPair(tokenAddress: string): Promise<ScannedPoolRecord | null> {
+    const tokensUrl = `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(tokenAddress)}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 4000);
+
+    try {
+      const response = await this.fetchImpl(tokensUrl, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) return null;
+
+      const body = (await response.json()) as {
+        pairs?: Array<{
+          chainId?: string;
+          pairAddress?: string;
+          baseToken?: { address?: string; symbol?: string; name?: string };
+          quoteToken?: { address?: string; symbol?: string; name?: string };
+          priceNative?: string;
+          priceUsd?: string;
+          liquidity?: { usd?: number; quote?: number };
+          fdv?: number;
+          marketCap?: number;
+          volume?: { m5?: number };
+          txns?: { m5?: { buys?: number; sells?: number } };
+          pairCreatedAt?: number;
+        }>;
+      };
+
+      const pairs = body.pairs ?? [];
+      if (!Array.isArray(pairs) || pairs.length === 0) {
+        return null;
+      }
+
+      // Find primary Solana pair (prefer SOL quote token or first active Solana pair)
+      const solanaPairs = pairs.filter((p) => p.chainId === "solana" || !p.chainId);
+      if (solanaPairs.length === 0) return null;
+
+      const primaryPair =
+        solanaPairs.find(
+          (p) =>
+            p.quoteToken?.symbol === "SOL" ||
+            p.quoteToken?.address === "So11111111111111111111111111111111111111112",
+        ) ?? solanaPairs[0];
+
+      if (!primaryPair) return null;
+
+      const liquidityUsd =
+        typeof primaryPair.liquidity?.usd === "number" ? primaryPair.liquidity.usd : 0;
+      const spotPriceUsd = primaryPair.priceUsd
+        ? parseFloat(primaryPair.priceUsd)
+        : primaryPair.priceNative
+          ? parseFloat(primaryPair.priceNative) * 140
+          : 0;
+
+      // Discard ghost tokens with zero liquidity or missing/non-positive price
+      if (liquidityUsd <= 0 || !Number.isFinite(spotPriceUsd) || spotPriceUsd <= 0) {
+        return null;
+      }
+
+      const marketCapUsd =
+        typeof primaryPair.marketCap === "number" && primaryPair.marketCap > 0
+          ? primaryPair.marketCap
+          : typeof primaryPair.fdv === "number" && primaryPair.fdv > 0
+            ? primaryPair.fdv
+            : liquidityUsd * 4.5;
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const openTimeSec = primaryPair.pairCreatedAt
+        ? Math.floor(primaryPair.pairCreatedAt / 1000)
+        : nowSec - 450;
+
+      const volume5mUsd = typeof primaryPair.volume?.m5 === "number" ? primaryPair.volume.m5 : 0;
+      const buys5m = primaryPair.txns?.m5?.buys ?? 0;
+      const sells5m = primaryPair.txns?.m5?.sells ?? 0;
+      const txCount5m = buys5m + sells5m;
+
+      const symbol = primaryPair.baseToken?.symbol?.trim() || "UNKNOWN";
+      const baseMint =
+        primaryPair.quoteToken?.address ?? "So11111111111111111111111111111111111111112";
+
+      return {
+        poolId: primaryPair.pairAddress
+          ? `dexscreener-${primaryPair.pairAddress}`
+          : `dexscreener-${tokenAddress}`,
+        mintAddress: tokenAddress,
+        symbol,
+        decimals: 9,
+        baseMint,
+        liquidityUsd,
+        marketCapUsd,
+        openTimeSec,
+        lpBurnPct: 100.0,
+        mintAuthority: null,
+        freezeAuthority: null,
+        volume5mUsd,
+        txCount5m,
+        buys5m,
+        sells5m,
+        spotPriceUsd,
+        fetchedAt: new Date().toISOString(),
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
   public async fetchDexScreenerPools(): Promise<ScannedPoolRecord[]> {
     if (!this.enableDexScreener) return [];
     const controller = new AbortController();
@@ -183,32 +295,23 @@ export class CandidateStreamEngine {
 
       if (!Array.isArray(profiles)) return [];
 
-      const nowSec = Math.floor(Date.now() / 1000);
-      const nowIso = new Date().toISOString();
+      const solanaTokens = profiles
+        .filter((item) => (item.chainId === "solana" || !item.chainId) && !!item.tokenAddress)
+        .map((item) => item.tokenAddress!);
+
+      if (solanaTokens.length === 0) return [];
+
+      // Query token pair data for each profile to eliminate ghost tokens without liquidity
       const records: ScannedPoolRecord[] = [];
+      const pairPromises = solanaTokens
+        .slice(0, 10)
+        .map((addr) => this.fetchDexScreenerTokenPair(addr));
+      const pairResults = await Promise.allSettled(pairPromises);
 
-      for (const item of profiles) {
-        if (item.chainId !== "solana" || !item.tokenAddress) continue;
-
-        records.push({
-          poolId: `dexscreener-${item.tokenAddress}`,
-          mintAddress: item.tokenAddress,
-          symbol: "SOL-TOKEN",
-          decimals: 9,
-          baseMint: "So11111111111111111111111111111111111111112",
-          liquidityUsd: 18_000,
-          marketCapUsd: 75_000,
-          openTimeSec: nowSec - 450, // 7.5m age
-          lpBurnPct: 100.0,
-          mintAuthority: null,
-          freezeAuthority: null,
-          volume5mUsd: 4_500,
-          txCount5m: 35,
-          buys5m: 24,
-          sells5m: 11,
-          spotPriceUsd: 0.05,
-          fetchedAt: nowIso,
-        });
+      for (const res of pairResults) {
+        if (res.status === "fulfilled" && res.value !== null) {
+          records.push(res.value);
+        }
       }
 
       return records;

@@ -99,20 +99,78 @@ describe("CandidateStreamEngine", () => {
     expect(engine.stats.errors).toBe(1);
   });
 
-  it("ingests and evaluates pools from DexScreener token profiles", async () => {
+  it("ingests and enriches pools from DexScreener token profiles with live pair data", async () => {
     const nowSec = Math.floor(Date.now() / 1000);
     const mockFetch: typeof fetch = async (input) => {
-      if (typeof input === "string" && input.includes("dexscreener.com")) {
+      const urlStr = typeof input === "string" ? input : (input as Request).url;
+      if (urlStr.includes("token-profiles/latest/v1")) {
         return new Response(
           JSON.stringify([
             {
-              url: "https://dexscreener.com/solana/pump111",
+              url: "https://dexscreener.com/solana/real111",
               chainId: "solana",
-              tokenAddress: "PumpMint11111111111111111111111111111111111",
+              tokenAddress: "RealMint11111111111111111111111111111111111",
               icon: "https://icon.png",
-              description: "Pump fun migrated token",
+              description: "Real active token",
+            },
+            {
+              url: "https://dexscreener.com/solana/ghost222",
+              chainId: "solana",
+              tokenAddress: "GhostMint2222222222222222222222222222222222",
+              icon: "https://icon.png",
+              description: "Ghost token with no DEX pair",
             },
           ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (urlStr.includes("dex/tokens/RealMint11111111111111111111111111111111111")) {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "PairAddress111111111111111111111111111111111",
+                baseToken: {
+                  address: "RealMint11111111111111111111111111111111111",
+                  name: "Real Token",
+                  symbol: "REAL",
+                },
+                quoteToken: {
+                  address: "So11111111111111111111111111111111111111112",
+                  name: "Wrapped SOL",
+                  symbol: "SOL",
+                },
+                priceNative: "0.0002",
+                priceUsd: "0.028",
+                txns: {
+                  m5: { buys: 30, sells: 10 },
+                },
+                volume: {
+                  m5: 5000,
+                },
+                liquidity: {
+                  usd: 25000,
+                  quote: 180,
+                },
+                fdv: 100000,
+                marketCap: 100000,
+                pairCreatedAt: (nowSec - 500) * 1000, // 500s ago
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (urlStr.includes("dex/tokens/GhostMint2222222222222222222222222222222222")) {
+        // Ghost token returns empty pairs array
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [],
+          }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
@@ -130,11 +188,14 @@ describe("CandidateStreamEngine", () => {
     });
 
     const results = await engine.scanOnce(nowSec);
+    // RealMint admitted, GhostMint discarded
     expect(results.length).toBe(1);
     expect(results[0]?.admitted).toBe(true);
     expect(admittedCandidates.length).toBe(1);
     expect(admittedCandidates[0]?.canonicalMint).toBe(
-      "PumpMint11111111111111111111111111111111111",
+      "RealMint11111111111111111111111111111111111",
     );
+    expect(admittedCandidates[0]?.symbol).toBe("REAL");
+    expect(admittedCandidates[0]?.liquidityUsd).toBe(25000);
   });
 });

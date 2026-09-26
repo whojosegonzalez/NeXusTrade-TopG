@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ScannedPoolRecord } from "./CandidateScannerTypes.js";
 
 export type OpportunityCohort = "EXECUTED_BUY" | "WATCHLIST_RADAR" | "FILTERED_REJECTED";
 
@@ -63,7 +62,14 @@ export class CounterfactualOpportunityTracker {
   private readonly records = new Map<string, CandidateObservationRecord>();
 
   public recordCandidate(
-    pool: ScannedPoolRecord,
+    pool: {
+      readonly poolId: string;
+      readonly mintAddress: string;
+      readonly symbol: string;
+      readonly liquidityUsd: number;
+      readonly marketCapUsd: number;
+      readonly spotPriceUsd?: number;
+    },
     cohort: OpportunityCohort,
     initialPriceSol: number,
     nowMs: number,
@@ -81,7 +87,7 @@ export class CounterfactualOpportunityTracker {
       return existing;
     }
 
-    const price = initialPriceSol > 0 ? initialPriceSol : pool.spotPriceUsd;
+    const price = initialPriceSol > 0 ? initialPriceSol : (pool.spotPriceUsd ?? 0);
 
     const record: CandidateObservationRecord = {
       poolId: pool.poolId,

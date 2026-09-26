@@ -28,10 +28,19 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 4;
 
   const rawMaxPos = values["max-positions"];
-  const maxOpenPositions = typeof rawMaxPos === "string" ? parseInt(rawMaxPos, 10) : 3;
+  const maxOpenPositions =
+    typeof rawMaxPos === "string" ? Math.min(10, Math.max(1, parseInt(rawMaxPos, 10))) : 5;
+
+  const initialPortfolioSol = 10.0;
+  const gasReserveSol = 0.05;
+  const calculatedBalancedSize = Math.min(
+    1.0,
+    parseFloat(((initialPortfolioSol - gasReserveSol) / maxOpenPositions).toFixed(4)),
+  );
 
   const rawSize = values["position-size-sol"];
-  const positionSizeSol = typeof rawSize === "string" ? parseFloat(rawSize) : 1.0;
+  const positionSizeSol =
+    typeof rawSize === "string" ? parseFloat(rawSize) : calculatedBalancedSize;
 
   const rawDrawdown = values["max-drawdown-bps"];
   const maxPortfolioDrawdownBps =
@@ -56,7 +65,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     durationHours,
     maxOpenPositions,
     positionSizeSol,
-    initialPortfolioSol: 10.0,
+    initialPortfolioSol,
     maxPortfolioDrawdownBps,
     maxConsecutiveErrors: 3,
     maxClockDriftMs: 5000,
@@ -232,7 +241,15 @@ async function run(): Promise<void> {
     for (const pos of snap.openPositions) {
       try {
         const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
-        if (!spotInfo) continue;
+        if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+          const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
+          if (stagnantClosed) {
+            console.log(
+              `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${(stagnantClosed.realizedPnlBps / 100).toFixed(2)}%`,
+            );
+          }
+          continue;
+        }
 
         tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
 
@@ -298,20 +315,27 @@ async function run(): Promise<void> {
             }
 
             const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
-            const entryPriceSol = spotInfo?.spotPriceSol;
+            if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+              tracker.recordCandidate(
+                candidate,
+                "FILTERED_REJECTED",
+                candidate.liquidityUsd,
+                currentNow,
+                "REJECTED_NO_ACTIVE_DEX_PAIR",
+              );
+              continue;
+            }
+
+            const entryPriceSol = spotInfo.spotPriceSol;
             const poolRecord = rawPools.find((p) => p.mintAddress === candidate.mintAddress);
 
             if (poolRecord) {
               const bought = daemon.processScannedPool(poolRecord, currentNow, entryPriceSol);
               if (bought) {
                 watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
-                tracker.recordExecutedBuy(
-                  candidate.mintAddress,
-                  entryPriceSol ?? candidate.liquidityUsd,
-                  currentNow,
-                );
+                tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
                 console.log(
-                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol ? `${entryPriceSol} SOL` : `$${poolRecord.spotPriceUsd}`} | Cost Basis: ${config.positionSizeSol} SOL`,
+                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${config.positionSizeSol} SOL`,
                 );
               }
             }

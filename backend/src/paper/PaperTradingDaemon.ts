@@ -2,6 +2,7 @@ import type { Repositories } from "../db/repositories/index.js";
 import { nowMs } from "../db/utils/timestamps.js";
 import { DynamicRatchetService } from "../exits/DynamicRatchetService.js";
 import type {
+  ExitReasonCode,
   MarketEvaluationContext,
   PositionRatchetState,
   RatchetEvaluationResult,
@@ -46,6 +47,8 @@ export interface PaperPosition {
   spotPriceSol: number;
   currentPnlBps: number;
   ratchetState: PositionRatchetState;
+  lastActivityMs: number;
+  stagnantTicksCount: number;
 }
 
 export interface ClosedTradeRecord {
@@ -278,9 +281,13 @@ export class PaperTradingDaemon {
     // 3. Execute Paper Buy
     const positionId = `pos-${pool.mintAddress}-${now}`;
     const entryPriceSol =
-      entryPriceSolOverride && entryPriceSolOverride > 0
-        ? entryPriceSolOverride
-        : pool.spotPriceUsd; // Using unit price
+      entryPriceSolOverride !== undefined ? entryPriceSolOverride : pool.spotPriceUsd;
+
+    // Discard non-positive or non-finite entry prices
+    if (!entryPriceSol || entryPriceSol <= 0 || !Number.isFinite(entryPriceSol)) {
+      return false;
+    }
+
     const tokensHeld = this.config.positionSizeSol / entryPriceSol;
     const costBasisSol = this.config.positionSizeSol;
 
@@ -300,6 +307,8 @@ export class PaperTradingDaemon {
       spotPriceSol: entryPriceSol,
       currentPnlBps: 0,
       ratchetState,
+      lastActivityMs: now,
+      stagnantTicksCount: 0,
     };
 
     this.openPositions.set(positionId, position);
@@ -329,7 +338,76 @@ export class PaperTradingDaemon {
         );
       }
 
-      // 2. Evaluate Dynamic Ratchet Stop-Loss Engine
+      // 2. Inactivity Tracking & 5-Minute Stagnancy Timeout
+      const priceChanged = Math.abs(marketContext.spotPriceSol - position.spotPriceSol) > 1e-9;
+      const hasRecentActivity =
+        (marketContext.recentBuysCount60s ?? 0) > 0 ||
+        (marketContext.recentSellsCount60s ?? 0) > 0 ||
+        !marketContext.volumeStalled3m;
+
+      if (priceChanged || hasRecentActivity) {
+        position.lastActivityMs = now;
+        position.stagnantTicksCount = 0;
+      } else {
+        position.stagnantTicksCount += 1;
+      }
+
+      // If position has had no activity for >= 5 minutes (300,000ms), force stagnancy exit
+      if (now - position.lastActivityMs >= 300_000) {
+        const exitPriceSol = marketContext.spotPriceSol;
+        const proceedsSol = position.tokensHeld * exitPriceSol;
+        const realizedPnlSol = proceedsSol - position.costBasisSol;
+        const realizedPnlBps = Math.round(
+          ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
+        );
+
+        this.currentCashSol += proceedsSol;
+
+        const closedRecord: ClosedTradeRecord = {
+          positionId: position.positionId,
+          mintAddress: position.mintAddress,
+          entryPriceSol: position.entryPriceSol,
+          exitPriceSol,
+          costBasisSol: position.costBasisSol,
+          proceedsSol,
+          realizedPnlSol,
+          realizedPnlBps,
+          exitReason: "STAGNANCY_TIMEOUT_EXIT",
+          openedAtMs: position.openedAtMs,
+          closedAtMs: now,
+        };
+
+        this.closedTrades.push(closedRecord);
+        this.openPositions.delete(positionId);
+        this.ratchetService.getStore().delete(positionId);
+
+        const cooldownMs = this.config.antiRebuyCooldownMs ?? 1800000;
+        this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
+
+        if (this.status === "EXITING" && this.openPositions.size === 0) {
+          this.status = "COMPLETED";
+        }
+
+        return {
+          action: "SELL_ALL",
+          reasonCode: "STAGNANCY_TIMEOUT_EXIT" as unknown as ExitReasonCode,
+          diagnostics: {
+            currentPnlBps: realizedPnlBps,
+            peakGainBps: position.ratchetState.peakGainBps,
+            currentStopFloorBps: position.ratchetState.currentStopFloorBps,
+            activeTier: position.ratchetState.activeTier,
+            drawdownState: position.ratchetState.drawdownState,
+            drawdownElapsedMs: null,
+            lpIntact: marketContext.lpIntact,
+            buySellRatio60s:
+              marketContext.recentBuysCount60s / Math.max(1, marketContext.recentSellsCount60s),
+            momentum5mBps: marketContext.momentum5mBps,
+          },
+          updatedState: position.ratchetState,
+        };
+      }
+
+      // 3. Evaluate Dynamic Ratchet Stop-Loss Engine
       const result = this.ratchetService.evaluate(position.ratchetState, marketContext);
 
       // Update position pricing state
@@ -337,7 +415,7 @@ export class PaperTradingDaemon {
       position.currentPnlBps = result.diagnostics.currentPnlBps;
       position.ratchetState = result.updatedState;
 
-      // 3. If Sell Triggered, Execute Market Close
+      // 4. If Sell Triggered, Execute Market Close
       if (result.action === "SELL_ALL") {
         const exitPriceSol = marketContext.spotPriceSol;
         const proceedsSol = position.tokensHeld * exitPriceSol;
@@ -374,7 +452,7 @@ export class PaperTradingDaemon {
         }
       }
 
-      // 4. Portfolio Drawdown Circuit Breaker
+      // 5. Portfolio Drawdown Circuit Breaker
       this.checkPortfolioCircuitBreakers();
 
       this.consecutiveErrorCount = 0;
@@ -386,6 +464,55 @@ export class PaperTradingDaemon {
       }
       throw err;
     }
+  }
+
+  recordStagnantTick(positionId: string, nowTimestampMs?: number): ClosedTradeRecord | null {
+    const position = this.openPositions.get(positionId);
+    if (!position) return null;
+    const now = nowTimestampMs ?? this.clock();
+    this.lastTickAtMs = now;
+    position.stagnantTicksCount += 1;
+
+    // Check if inactivity has reached 5 minutes (300,000ms)
+    if (now - position.lastActivityMs >= 300_000) {
+      const exitPriceSol = position.spotPriceSol;
+      const proceedsSol = position.tokensHeld * exitPriceSol;
+      const realizedPnlSol = proceedsSol - position.costBasisSol;
+      const realizedPnlBps = Math.round(
+        ((exitPriceSol - position.entryPriceSol) / position.entryPriceSol) * 10_000,
+      );
+
+      this.currentCashSol += proceedsSol;
+
+      const closedRecord: ClosedTradeRecord = {
+        positionId: position.positionId,
+        mintAddress: position.mintAddress,
+        entryPriceSol: position.entryPriceSol,
+        exitPriceSol,
+        costBasisSol: position.costBasisSol,
+        proceedsSol,
+        realizedPnlSol,
+        realizedPnlBps,
+        exitReason: "STAGNANCY_TIMEOUT_EXIT",
+        openedAtMs: position.openedAtMs,
+        closedAtMs: now,
+      };
+
+      this.closedTrades.push(closedRecord);
+      this.openPositions.delete(positionId);
+      this.ratchetService.getStore().delete(positionId);
+
+      const cooldownMs = this.config.antiRebuyCooldownMs ?? 1800000;
+      this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
+
+      if (this.status === "EXITING" && this.openPositions.size === 0) {
+        this.status = "COMPLETED";
+      }
+
+      return closedRecord;
+    }
+
+    return null;
   }
 
   private checkPortfolioCircuitBreakers(): void {
