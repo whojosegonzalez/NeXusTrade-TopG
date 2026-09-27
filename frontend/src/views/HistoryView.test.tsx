@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import type { HistoricalSessionSummary } from "@nexustrade/shared";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -11,38 +11,64 @@ describe("HistoryView", () => {
 
   const mockSessions: readonly HistoricalSessionSummary[] = [
     {
-      sessionId: "session-20260924-001",
-      startedAt: "2026-09-24T18:00:00.000Z",
-      endedAt: "2026-09-24T22:00:00.000Z",
+      sessionId: "session-paper-12.4-01",
+      startedAt: "2026-09-26T14:30:00.000Z",
+      endedAt: "2026-09-26T18:30:00.000Z",
       durationMinutes: 240,
       startingCapitalSol: 10.0,
-      endingCapitalSol: 11.5,
-      netPnlSol: 1.5,
-      netPnlPct: 15.0,
-      totalTrades: 3,
-      winsCount: 2,
-      lossesCount: 1,
+      endingCapitalSol: 10.708,
+      netPnlSol: 0.708,
+      netPnlPct: 7.08,
+      totalTrades: 12,
+      buysCount: 12,
+      sellsCount: 12,
+      winsCount: 8,
+      lossesCount: 4,
       scratchesCount: 0,
-      winRatePct: 66.7,
-      trades: [
-        {
-          tradeId: "trade-001",
-          poolId: "pool-raydium-01",
-          mintAddress: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
-          symbol: "POPCAT",
-          entryPriceSol: 0.001,
-          exitPriceSol: 0.00145,
-          sizeSol: 1.0,
-          enteredAt: "2026-09-24T18:10:00.000Z",
-          exitedAt: "2026-09-24T18:25:00.000Z",
-          holdDurationSeconds: 900,
-          peakGainBps: 4800,
-          finalPnlBps: 4500,
-          finalPnlSol: 0.45,
-          finalTier: "TIER_2",
-          exitReason: "RATCHET_TIER_2_TRAIL_EXIT",
-        },
-      ],
+      winRatePct: 66.67,
+      coinsWatchedCount: 73,
+      missedOpportunitiesCount: 0,
+      trades: [],
+    },
+    {
+      sessionId: "session-paper-12.5-01",
+      startedAt: "2026-09-26T20:00:00.000Z",
+      endedAt: "2026-09-27T00:00:00.000Z",
+      durationMinutes: 240,
+      startingCapitalSol: 10.0,
+      endingCapitalSol: 9.974,
+      netPnlSol: -0.026,
+      netPnlPct: -0.26,
+      totalTrades: 7,
+      buysCount: 7,
+      sellsCount: 7,
+      winsCount: 2,
+      lossesCount: 5,
+      scratchesCount: 0,
+      winRatePct: 28.57,
+      coinsWatchedCount: 54,
+      missedOpportunitiesCount: 0,
+      trades: [],
+    },
+    {
+      sessionId: "session-paper-12.3-01",
+      startedAt: "2026-09-25T18:00:00.000Z",
+      endedAt: "2026-09-25T22:00:00.000Z",
+      durationMinutes: 240,
+      startingCapitalSol: 10.0,
+      endingCapitalSol: 9.58,
+      netPnlSol: -0.42,
+      netPnlPct: -4.2,
+      totalTrades: 8,
+      buysCount: 8,
+      sellsCount: 8,
+      winsCount: 3,
+      lossesCount: 5,
+      scratchesCount: 0,
+      winRatePct: 37.5,
+      coinsWatchedCount: 48,
+      missedOpportunitiesCount: 0,
+      trades: [],
     },
   ];
 
@@ -52,28 +78,33 @@ describe("HistoryView", () => {
     expect(screen.getByText("No historical trading sessions found in archive.")).toBeDefined();
   });
 
-  it("renders cumulative performance stats and session table", () => {
+  it("renders cumulative performance stats and date-grouped sections", () => {
     render(<HistoryView sessions={mockSessions} />);
 
-    expect(screen.getAllByText(/\+1.5000 SOL/).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText(/66.7%/).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("session-20260924-001")).toBeDefined();
-    expect(screen.getByRole("img", { name: "Cumulative Equity Curve" })).toBeDefined();
+    expect(screen.getByTestId("history-view")).toBeDefined();
+    expect(screen.getByTestId("day-section-2026-09-26")).toBeDefined();
+    expect(screen.getByTestId("day-section-2026-09-25")).toBeDefined();
+
+    // Check sessions rendered under date groups
+    expect(screen.getByTestId("session-row-session-paper-12.4-01")).toBeDefined();
+    expect(screen.getByTestId("session-row-session-paper-12.5-01")).toBeDefined();
+    expect(screen.getByTestId("session-row-session-paper-12.3-01")).toBeDefined();
+
+    // Total watched across sessions = 73 + 54 + 48 = 175
+    expect(screen.getAllByText(/175/).length).toBeGreaterThanOrEqual(1);
+
+    // Check column values
+    expect(screen.getByText("73 candidates")).toBeDefined();
+    expect(screen.getByText("54 candidates")).toBeDefined();
+    expect(screen.getByText("48 candidates")).toBeDefined();
   });
 
-  it("expands and collapses trade drill-down section", () => {
+  it("renders correct daily P/L and capital delta aggregation in date headers", () => {
     render(<HistoryView sessions={mockSessions} />);
 
-    const expandBtn = screen.getByText("View Trades (1)");
-    fireEvent.click(expandBtn);
-
-    expect(screen.getByTestId("trade-drilldown")).toBeDefined();
-    expect(screen.getByText("POPCAT")).toBeDefined();
-    expect(screen.getByText("RATCHET_TIER_2_TRAIL_EXIT")).toBeDefined();
-
-    const hideBtn = screen.getByText("Hide Trades");
-    fireEvent.click(hideBtn);
-
-    expect(screen.queryByTestId("trade-drilldown")).toBeNull();
+    // September 26 has 2 sessions: +0.708 and -0.026 = +0.6820 SOL
+    expect(screen.getByText(/2 Sessions Ran/)).toBeDefined();
+    expect(screen.getByText(/1 Session Ran/)).toBeDefined();
+    expect(screen.getByText(/\+0.6820 SOL/)).toBeDefined();
   });
 });

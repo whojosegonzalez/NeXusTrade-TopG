@@ -12,6 +12,9 @@ export interface BuyGateConfig {
   readonly maxSingleTxDisposalPct: number; // default: 0.05 (5%)
   readonly minSells5m: number; // default: 15
   readonly minLiquidityUsd: number; // default: 20000
+  readonly maxBundlerPct: number; // default: 0.35 (35%)
+  readonly maxTop10HolderPct: number; // default: 0.30 (30%)
+  readonly minHoldersCount: number; // default: 350
 }
 
 export const BUY_GATE_DEFAULTS: BuyGateConfig = {
@@ -25,6 +28,9 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   maxSingleTxDisposalPct: 0.05,
   minSells5m: 15,
   minLiquidityUsd: 20000,
+  maxBundlerPct: 0.35,
+  maxTop10HolderPct: 0.3,
+  minHoldersCount: 350,
 };
 
 export interface GateCheck {
@@ -48,6 +54,9 @@ export interface AdvancedMarketContext {
   readonly recentBuysCount60s?: number | undefined;
   readonly recentSellsCount60s?: number | undefined;
   readonly momentum1mBps?: number | undefined;
+  readonly bundlerPct?: number | undefined;
+  readonly top10HolderPct?: number | undefined;
+  readonly holdersCount?: number | undefined;
 }
 
 export class BuyGateTriggerService {
@@ -187,6 +196,25 @@ export class BuyGateTriggerService {
       requirement: `Single Tx Disposal <= ${(this.config.maxSingleTxDisposalPct * 100).toFixed(0)}% of Liquidity`,
     });
 
+    // 9. Anti-Bundler & Top-Holder Concentration Gate
+    const bundlerPct = marketContext.bundlerPct;
+    const top10HolderPct = marketContext.top10HolderPct;
+    const holdersCount = marketContext.holdersCount;
+
+    const bundlerViolation = bundlerPct !== undefined && bundlerPct > this.config.maxBundlerPct;
+    const top10Violation =
+      top10HolderPct !== undefined && top10HolderPct > this.config.maxTop10HolderPct;
+    const holdersViolation =
+      holdersCount !== undefined && holdersCount < this.config.minHoldersCount;
+
+    const bundlerPassed = !bundlerViolation && !top10Violation && !holdersViolation;
+    gates.push({
+      name: "BUNDLER_CONCENTRATION_GATE",
+      passed: bundlerPassed,
+      value: bundlerPct ?? top10HolderPct ?? (holdersCount !== undefined ? holdersCount : 0),
+      requirement: `Bundler <= ${(this.config.maxBundlerPct * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${this.config.minHoldersCount}`,
+    });
+
     const failedGate = gates.find((g) => !g.passed);
     const triggered = !failedGate;
 
@@ -198,5 +226,68 @@ export class BuyGateTriggerService {
       gates,
       ...(failedGate ? { rejectionReason: `${failedGate.name}_FAILED` } : {}),
     };
+  }
+
+  public static async fetchRugCheckMetrics(
+    mintAddress: string,
+    fetchFn: typeof fetch = fetch,
+  ): Promise<{ bundlerPct?: number; top10HolderPct?: number; holdersCount?: number } | null> {
+    const url = `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mintAddress)}/report/summary`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    try {
+      const res = await fetchFn(url, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        risks?: Array<{ name?: string; value?: string; score?: number; level?: string }>;
+        tokenMeta?: { mutable?: boolean };
+        topHolders?: Array<{ pct?: number; address?: string }>;
+        totalHolders?: number;
+      };
+
+      let bundlerPct: number | undefined;
+      let top10HolderPct: number | undefined;
+      const holdersCount: number | undefined = data.totalHolders;
+
+      if (Array.isArray(data.topHolders) && data.topHolders.length > 0) {
+        top10HolderPct = data.topHolders
+          .slice(0, 10)
+          .reduce((acc, h) => acc + (typeof h.pct === "number" ? h.pct / 100 : 0), 0);
+      }
+
+      if (Array.isArray(data.risks)) {
+        for (const risk of data.risks) {
+          const riskName = (risk.name || "").toLowerCase();
+          if (
+            riskName.includes("bundled") ||
+            riskName.includes("insider") ||
+            riskName.includes("dev holding")
+          ) {
+            const rawVal = parseFloat(risk.value || "0");
+            if (!Number.isNaN(rawVal)) {
+              bundlerPct = rawVal > 1 ? rawVal / 100 : rawVal;
+            }
+          }
+        }
+      }
+
+      const result: {
+        bundlerPct?: number;
+        top10HolderPct?: number;
+        holdersCount?: number;
+      } = {};
+      if (bundlerPct !== undefined) result.bundlerPct = bundlerPct;
+      if (top10HolderPct !== undefined) result.top10HolderPct = top10HolderPct;
+      if (holdersCount !== undefined) result.holdersCount = holdersCount;
+
+      return result;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }

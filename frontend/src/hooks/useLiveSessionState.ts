@@ -111,6 +111,38 @@ export function useLiveSessionState(options: LiveSessionStateOptions = {}) {
     };
   }, [fetchFn, pollIntervalMs]);
 
+  // Polling loop for historical session ledger
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchHistory = async () => {
+      try {
+        const res = await fetchFn("/api/session/history");
+        if (res.ok && isMounted) {
+          const history = (await res.json()) as HistoricalSessionSummary[];
+          if (Array.isArray(history) && history.length > 0) {
+            setHistorySessions(history);
+          }
+        }
+      } catch {
+        // Keep existing historySessions
+      }
+    };
+
+    void fetchHistory();
+    const interval = setInterval(
+      () => {
+        void fetchHistory();
+      },
+      Math.max(5000, pollIntervalMs * 3),
+    );
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [fetchFn, pollIntervalMs]);
+
   // Goal evaluation effect
   useEffect(() => {
     if (!activeSession || activeSession.status !== "RUNNING" || autoExitTriggeredRef.current) {

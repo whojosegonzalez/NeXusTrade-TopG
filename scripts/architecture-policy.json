@@ -268,10 +268,15 @@
         "shared/src/phase12-dashboard-schemas.ts"
       ],
       "capabilities": {
-        "backend/src/candidate-scanner/CandidateStreamEngine.ts": [
+        "backend/src/candidate-scanner/BuyGateTriggerService.ts": [
+          "clearTimeout",
           "fetch",
-          "setTimeout",
-          "clearTimeout"
+          "setTimeout"
+        ],
+        "backend/src/candidate-scanner/CandidateStreamEngine.ts": [
+          "clearTimeout",
+          "fetch",
+          "setTimeout"
         ]
       }
     }

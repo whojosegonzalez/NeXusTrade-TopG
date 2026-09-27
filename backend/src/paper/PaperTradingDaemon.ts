@@ -13,6 +13,7 @@ import type {
   CandidateScannerRuntimeConfig,
   ScannedPoolRecord,
 } from "../candidate-scanner/CandidateScannerTypes.js";
+import type { HistoricalSessionSummary, HistoricalTrade } from "@nexustrade/shared";
 
 export type DaemonHaltReason =
   | "PORTFOLIO_DRAWDOWN_BREACHED"
@@ -571,5 +572,70 @@ export class PaperTradingDaemon {
 
   getExitCooldowns(): ReadonlyMap<string, number> {
     return this.exitCooldowns;
+  }
+
+  getHistoricalSummary(stats?: {
+    coinsWatchedCount?: number;
+    missedOpportunitiesCount?: number;
+  }): HistoricalSessionSummary {
+    const snapshot = this.getSnapshot();
+    const durationMinutes = Math.max(1, Math.round((this.lastTickAtMs - this.startedAtMs) / 60000));
+    const netPnlSol = parseFloat(
+      (snapshot.currentPortfolioSol - this.config.initialPortfolioSol).toFixed(4),
+    );
+    const netPnlPct = parseFloat(
+      (
+        ((snapshot.currentPortfolioSol - this.config.initialPortfolioSol) /
+          this.config.initialPortfolioSol) *
+        100
+      ).toFixed(2),
+    );
+
+    const winsCount = this.closedTrades.filter((t) => t.realizedPnlSol > 0).length;
+    const lossesCount = this.closedTrades.filter((t) => t.realizedPnlSol < 0).length;
+    const scratchesCount = this.closedTrades.filter((t) => t.realizedPnlSol === 0).length;
+    const totalTrades = this.closedTrades.length;
+    const winRatePct =
+      totalTrades > 0 ? parseFloat(((winsCount / totalTrades) * 100).toFixed(2)) : 0;
+
+    const trades: HistoricalTrade[] = this.closedTrades.map((t) => ({
+      tradeId: t.positionId,
+      poolId: `pool-${t.mintAddress.slice(0, 8)}`,
+      mintAddress: t.mintAddress,
+      symbol: t.mintAddress.slice(0, 6).toUpperCase(),
+      entryPriceSol: t.entryPriceSol,
+      exitPriceSol: t.exitPriceSol,
+      sizeSol: t.costBasisSol,
+      enteredAt: new Date(t.openedAtMs).toISOString(),
+      exitedAt: new Date(t.closedAtMs).toISOString(),
+      holdDurationSeconds: Math.max(1, Math.round((t.closedAtMs - t.openedAtMs) / 1000)),
+      peakGainBps: Math.max(t.realizedPnlBps, 0),
+      finalPnlBps: t.realizedPnlBps,
+      finalPnlSol: parseFloat(t.realizedPnlSol.toFixed(4)),
+      exitReason: t.exitReason,
+      finalTier:
+        t.realizedPnlBps >= 5000 ? "TIER_2" : t.realizedPnlBps >= 1500 ? "TIER_1" : "BASELINE",
+    }));
+
+    return {
+      sessionId: this.config.sessionId,
+      startedAt: new Date(this.startedAtMs).toISOString(),
+      endedAt: new Date(this.lastTickAtMs).toISOString(),
+      durationMinutes,
+      startingCapitalSol: this.config.initialPortfolioSol,
+      endingCapitalSol: parseFloat(snapshot.currentPortfolioSol.toFixed(4)),
+      netPnlSol,
+      netPnlPct,
+      totalTrades,
+      buysCount: totalTrades + this.openPositions.size,
+      sellsCount: totalTrades,
+      winsCount,
+      lossesCount,
+      scratchesCount,
+      winRatePct,
+      coinsWatchedCount: stats?.coinsWatchedCount ?? 0,
+      missedOpportunitiesCount: stats?.missedOpportunitiesCount ?? 0,
+      trades,
+    };
   }
 }

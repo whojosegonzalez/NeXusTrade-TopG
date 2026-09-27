@@ -31,9 +31,70 @@ describe("BuyGateTriggerService", () => {
     });
 
     expect(result.triggered).toBe(true);
-    expect(result.gates.length).toBe(8);
+    expect(result.gates.length).toBe(9);
     expect(result.gates.every((g) => g.passed)).toBe(true);
     expect(result.rejectionReason).toBeUndefined();
+  });
+
+  it("fails when bundler / insider holdings breach 35%", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      bundlerPct: 0.45, // 45% > 35%
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+  });
+
+  it("fails when top 10 holders breach 30% concentration", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      top10HolderPct: 0.38, // 38% > 30%
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+  });
+
+  it("fails when unique holders count is below 350", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      holdersCount: 180, // 180 < 350
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+  });
+
+  it("passes when bundler concentration metrics are within healthy limits", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      bundlerPct: 0.12,
+      top10HolderPct: 0.18,
+      holdersCount: 520,
+    });
+    expect(result.triggered).toBe(true);
+    expect(result.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE")?.passed).toBe(true);
+  });
+
+  it("fetches and parses RugCheck metrics via fetchRugCheckMetrics", async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 800,
+          totalHolders: 450,
+          topHolders: [{ pct: 5.0 }, { pct: 4.2 }, { pct: 3.1 }],
+          risks: [{ name: "High Insider / Bundled Allocation", value: "22.5%" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintAddress111",
+      mockFetch,
+    );
+    expect(metrics).not.toBeNull();
+    expect(metrics?.holdersCount).toBe(450);
+    expect(metrics?.top10HolderPct).toBeCloseTo(0.123, 3);
+    expect(metrics?.bundlerPct).toBeCloseTo(0.225, 3);
   });
 
   it("permits established runners with 2h to 24h age and high liquidity/market-cap", () => {

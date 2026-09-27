@@ -167,6 +167,90 @@ function nexusDevApiPlugin(): Plugin {
           return;
         }
 
+        if (url === "/api/session/history" || url.startsWith("/api/session/history")) {
+          const defaultPastSessions = [
+            {
+              sessionId: "session-paper-12.3-01",
+              startedAt: "2026-09-25T18:00:00.000Z",
+              endedAt: "2026-09-25T22:00:00.000Z",
+              durationMinutes: 240,
+              startingCapitalSol: 10.0,
+              endingCapitalSol: 9.58,
+              netPnlSol: -0.42,
+              netPnlPct: -4.2,
+              totalTrades: 8,
+              buysCount: 8,
+              sellsCount: 8,
+              winsCount: 3,
+              lossesCount: 5,
+              scratchesCount: 0,
+              winRatePct: 37.5,
+              coinsWatchedCount: 48,
+              missedOpportunitiesCount: 0,
+              trades: [],
+            },
+            {
+              sessionId: "session-paper-12.4-01",
+              startedAt: "2026-09-26T14:30:00.000Z",
+              endedAt: "2026-09-26T18:30:00.000Z",
+              durationMinutes: 240,
+              startingCapitalSol: 10.0,
+              endingCapitalSol: 10.708,
+              netPnlSol: 0.708,
+              netPnlPct: 7.08,
+              totalTrades: 12,
+              buysCount: 12,
+              sellsCount: 12,
+              winsCount: 8,
+              lossesCount: 4,
+              scratchesCount: 0,
+              winRatePct: 66.67,
+              coinsWatchedCount: 73,
+              missedOpportunitiesCount: 0,
+              trades: [],
+            },
+            {
+              sessionId: "session-paper-12.5-01",
+              startedAt: "2026-09-26T20:00:00.000Z",
+              endedAt: "2026-09-27T00:00:00.000Z",
+              durationMinutes: 240,
+              startingCapitalSol: 10.0,
+              endingCapitalSol: 9.974,
+              netPnlSol: -0.026,
+              netPnlPct: -0.26,
+              totalTrades: 7,
+              buysCount: 7,
+              sellsCount: 7,
+              winsCount: 2,
+              lossesCount: 5,
+              scratchesCount: 0,
+              winRatePct: 28.57,
+              coinsWatchedCount: 54,
+              missedOpportunitiesCount: 0,
+              trades: [],
+            },
+          ];
+
+          const rootTmp = path.resolve(process.cwd(), "../.tmp/past-sessions.json");
+          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/past-sessions.json");
+          const localTmp = path.resolve(process.cwd(), ".tmp/past-sessions.json");
+          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
+          let sessions = defaultPastSessions;
+          if (candidates.length > 0) {
+            try {
+              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              if (Array.isArray(raw) && raw.length > 0) {
+                sessions = raw;
+              }
+            } catch (err) {
+              void err;
+            }
+          }
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(sessions));
+          return;
+        }
+
         next();
       });
     },

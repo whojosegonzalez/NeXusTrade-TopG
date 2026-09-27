@@ -271,4 +271,110 @@ describe("CandidateStreamEngine", () => {
     expect(boostedPools[0]?.marketCapUsd).toBe(250000);
     expect(nowSec - (boostedPools[0]?.openTimeSec ?? 0)).toBeGreaterThanOrEqual(7200);
   });
+
+  it("fetches top traded pools from Raydium 24H volume API", async () => {
+    const mockFetch: typeof fetch = async (input) => {
+      const urlStr = typeof input === "string" ? input : (input as Request).url;
+      if (urlStr.includes("poolSortField=volume24h")) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            data: {
+              data: [
+                {
+                  id: "raydiumTopPool111111111111111111111111111111",
+                  openTime: "1700000000",
+                  tvl: 150000,
+                  burnPercent: 1.0,
+                  price: 2.5,
+                  mintA: {
+                    address: "So11111111111111111111111111111111111111112",
+                    symbol: "WSOL",
+                    decimals: 9,
+                  },
+                  mintB: {
+                    address: "TopTradedMint11111111111111111111111111111",
+                    symbol: "TOPG",
+                    decimals: 6,
+                  },
+                  day: { volume: 500000 },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    };
+
+    const engine = new CandidateStreamEngine({
+      config,
+      fetchFn: mockFetch,
+    });
+
+    const topPools = await engine.fetchRaydiumTopTradedPools(10);
+    expect(topPools.length).toBe(1);
+    expect(topPools[0]?.symbol).toBe("TOPG");
+    expect(topPools[0]?.mintAddress).toBe("TopTradedMint11111111111111111111111111111");
+    expect(topPools[0]?.liquidityUsd).toBe(150000);
+  });
+
+  it("fetches recent token updates from DexScreener token-profiles/recent-updates", async () => {
+    const mockFetch: typeof fetch = async (input) => {
+      const urlStr = typeof input === "string" ? input : (input as Request).url;
+      if (urlStr.includes("token-profiles/recent-updates/v1")) {
+        return new Response(
+          JSON.stringify([
+            {
+              chainId: "solana",
+              tokenAddress: "UpdatedMint1111111111111111111111111111111",
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (urlStr.includes("dex/tokens/UpdatedMint1111111111111111111111111111111")) {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [
+              {
+                chainId: "solana",
+                pairAddress: "UpdatedPair111111111111111111111111111111",
+                baseToken: {
+                  address: "UpdatedMint1111111111111111111111111111111",
+                  name: "Updated Token",
+                  symbol: "UPDATE",
+                },
+                quoteToken: {
+                  address: "So11111111111111111111111111111111111111112",
+                  name: "Wrapped SOL",
+                  symbol: "SOL",
+                },
+                priceNative: "0.005",
+                priceUsd: "0.75",
+                liquidity: { usd: 85000 },
+                txns: { m5: { buys: 40, sells: 20 } },
+                volume: { m5: 12000 },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    };
+
+    const engine = new CandidateStreamEngine({
+      config,
+      fetchFn: mockFetch,
+    });
+
+    const recentUpdatedPools = await engine.fetchDexScreenerRecentUpdates();
+    expect(recentUpdatedPools.length).toBe(1);
+    expect(recentUpdatedPools[0]?.symbol).toBe("UPDATE");
+    expect(recentUpdatedPools[0]?.mintAddress).toBe("UpdatedMint1111111111111111111111111111111");
+    expect(recentUpdatedPools[0]?.liquidityUsd).toBe(85000);
+  });
 });

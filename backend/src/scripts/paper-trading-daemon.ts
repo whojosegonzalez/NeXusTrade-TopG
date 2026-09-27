@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "../paper/PaperTradingDaemon.js";
 import { CandidateStreamEngine } from "../candidate-scanner/CandidateStreamEngine.js";
@@ -8,6 +8,7 @@ import { BuyGateTriggerService } from "../candidate-scanner/BuyGateTriggerServic
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { MarketEvaluationContext } from "../exits/DynamicRatchetTypes.js";
 import { nowMs } from "../db/utils/timestamps.js";
+import { BACKFILLED_PAST_SESSIONS, type HistoricalSessionSummary } from "@nexustrade/shared";
 
 function parseCliArgs(): PaperTradingDaemonConfig {
   const { values } = parseArgs({
@@ -202,6 +203,57 @@ async function run(): Promise<void> {
     }
   };
 
+  const archiveSession = () => {
+    try {
+      if (!existsSync(".tmp/sessions")) mkdirSync(".tmp/sessions", { recursive: true });
+      const report = tracker.generateReport(
+        config.initialPortfolioSol,
+        daemon.getSnapshot().currentPortfolioSol,
+      );
+      const summary = daemon.getHistoricalSummary({
+        coinsWatchedCount: report.totalCandidatesObserved,
+        missedOpportunitiesCount: report.missedWinnersCount,
+      });
+
+      // 1. Write individual session JSON
+      writeFileSync(
+        `.tmp/sessions/${config.sessionId}.json`,
+        JSON.stringify(summary, null, 2),
+        "utf8",
+      );
+
+      // 2. Read, update, and write past-sessions.json
+      let pastSessions: HistoricalSessionSummary[] = [];
+      if (existsSync(".tmp/past-sessions.json")) {
+        try {
+          const raw = readFileSync(".tmp/past-sessions.json", "utf8");
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            pastSessions = parsed;
+          }
+        } catch {
+          pastSessions = [...BACKFILLED_PAST_SESSIONS];
+        }
+      } else {
+        pastSessions = [...BACKFILLED_PAST_SESSIONS];
+      }
+
+      const existingIdx = pastSessions.findIndex((s) => s.sessionId === summary.sessionId);
+      if (existingIdx >= 0) {
+        pastSessions[existingIdx] = summary;
+      } else {
+        pastSessions = [summary, ...pastSessions];
+      }
+
+      writeFileSync(".tmp/past-sessions.json", JSON.stringify(pastSessions, null, 2), "utf8");
+      console.log(
+        `[PaperDaemon] Archived session summary to .tmp/sessions/${config.sessionId}.json and updated .tmp/past-sessions.json`,
+      );
+    } catch (archiveErr) {
+      console.error("[PaperDaemon] Failed to archive session summary:", archiveErr);
+    }
+  };
+
   // Graceful shutdown handlers
   let terminating = false;
   const handleShutdown = () => {
@@ -214,6 +266,7 @@ async function run(): Promise<void> {
       `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length}`,
     );
     persistState();
+    archiveSession();
     const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
     console.log(
       `[PaperDaemon] Counterfactual Summary: Observed=${report.totalCandidatesObserved}, Executed=${report.executedBuysCount}, MissedWinners=${report.missedWinnersCount}, AvoidedRugs=${report.avoidedRugsCount}`,
@@ -351,11 +404,19 @@ async function run(): Promise<void> {
               continue;
             }
 
-            // Evaluate complete market context with 60s flow & momentum
+            // Fetch RugCheck anti-bundler metrics (bundler ratio, top10 concentration, holder count)
+            const rugMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+              candidate.mintAddress,
+            );
+
+            // Evaluate complete market context with 60s flow, momentum & anti-bundler metrics
             const fullGateResult = buyGateService.evaluateCandidate(candidate, {
               recentBuysCount60s: spotInfo.recentBuys60s,
               recentSellsCount60s: spotInfo.recentSells60s,
               momentum1mBps: Math.round(spotInfo.momentum5mBps / 5),
+              bundlerPct: rugMetrics?.bundlerPct,
+              top10HolderPct: rugMetrics?.top10HolderPct,
+              holdersCount: rugMetrics?.holdersCount,
             });
 
             if (!fullGateResult.triggered) {
@@ -464,6 +525,7 @@ async function run(): Promise<void> {
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);
   persistState();
+  archiveSession();
   const finalReport = tracker.generateReport(
     config.initialPortfolioSol,
     finalSnap.currentPortfolioSol,
