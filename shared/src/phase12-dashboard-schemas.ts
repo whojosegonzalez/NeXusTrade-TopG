@@ -3,7 +3,7 @@ import { livePaperPositionSchema } from "./phase11-schemas.js";
 
 export const strategyThresholdsSchema = z.object({
   minLmcRatio: z.number().default(0.15),
-  maxLmcRatio: z.number().default(0.3),
+  maxLmcRatio: z.number().default(0.55),
   minBuyToSellRatio: z.number().default(1.5),
   minVolume5mUsd: z.number().default(2500),
   minMaturityAgeSec: z.number().default(300),

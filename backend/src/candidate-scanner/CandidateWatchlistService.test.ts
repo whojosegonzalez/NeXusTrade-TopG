@@ -161,4 +161,26 @@ describe("CandidateWatchlistService", () => {
     expect(service.getItems().length).toBe(2);
     expect(service.getItem("pool-3")).toBeDefined();
   });
+
+  it("revives DROPPED candidate when fresh bullish reversal occurs (buys >= 25, ratio >= 1.8, vol >= $5k)", () => {
+    const service = new CandidateWatchlistService();
+    service.admitOrUpdate(validPool, nowSec);
+
+    // Explicitly mark candidate as DROPPED
+    service.updateStatus(validPool.poolId, "DROPPED", "MOMENTUM_STALLED");
+    expect(service.getItem(validPool.poolId)?.status).toBe("DROPPED");
+
+    // Candidate prints a fresh reversal wave
+    const reversalPool: ScannedPoolRecord = {
+      ...validPool,
+      buys5m: 30, // >= 25
+      sells5m: 10, // ratio 3.0 >= 1.8
+      volume5mUsd: 7500, // >= $5000
+    };
+
+    const revived = service.admitOrUpdate(reversalPool, nowSec + 60);
+    expect(revived?.status).toBe("WATCHING");
+    expect(revived?.rejectionReason).toBeUndefined();
+    expect(service.getActiveWatchingItems().length).toBe(1);
+  });
 });

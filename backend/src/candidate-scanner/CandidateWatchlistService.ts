@@ -53,6 +53,17 @@ export class CandidateWatchlistService {
           : isHighLiquidity
             ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
             : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
+      } else if (existing.status === "DROPPED") {
+        // Check for fresh bullish reversal / dip-bounce
+        if (
+          pool.buys5m >= 25 &&
+          pool.buys5m / Math.max(1, pool.sells5m) >= 1.8 &&
+          pool.volume5mUsd >= 5000 &&
+          ageSeconds <= effectiveMaxAgeSec
+        ) {
+          updatedStatus = "WATCHING";
+          rejectionReason = undefined;
+        }
       }
 
       const updated: WatchlistCandidateItem = {

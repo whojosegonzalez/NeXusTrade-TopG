@@ -175,6 +175,7 @@ async function run(): Promise<void> {
   const startMs = nowMs();
   const maxDurationMs = config.durationHours * 3600 * 1000;
   let lastScanMs = 0;
+  let lastWatchlistRefreshMs = 0;
   let lastHeartbeatMs = 0;
   let lastPersistMs = 0;
   let lastRadarSampleMs = 0;
@@ -184,6 +185,8 @@ async function run(): Promise<void> {
     const snap = daemon.getSnapshot();
     const fullState = {
       ...snap,
+      durationHours: config.durationHours,
+      lastTickAtMs: nowMs(),
       watchlist: watchlistService.getItems(),
     };
     try {
@@ -226,7 +229,21 @@ async function run(): Promise<void> {
     const currentNow = nowMs();
     const elapsed = currentNow - startMs;
     if (elapsed >= maxDurationMs) {
-      console.log(`[PaperDaemon] Duration of ${config.durationHours} hours reached. Completing.`);
+      console.log(
+        `[PaperDaemon] Duration of ${config.durationHours} hours reached. Executing end-of-session cashout...`,
+      );
+      const openPositions = daemon.getSnapshot().openPositions;
+      for (const pos of openPositions) {
+        try {
+          const exitPrice = pos.spotPriceSol > 0 ? pos.spotPriceSol : pos.entryPriceSol;
+          daemon.manualExit(pos.positionId, exitPrice, currentNow, "SESSION_DURATION_CASHOUT");
+          console.log(
+            `[PaperDaemon] [SESSION CASHOUT] Liquidated ${pos.mintAddress} at ${exitPrice} SOL`,
+          );
+        } catch (cashoutErr) {
+          console.error(`[PaperDaemon] Error cashing out ${pos.mintAddress}:`, cashoutErr);
+        }
+      }
       daemon.stop("DURATION_ELAPSED");
       break;
     }
@@ -389,6 +406,23 @@ async function run(): Promise<void> {
         }
       } catch (scanErr) {
         console.error("[PaperDaemon] Scan error:", scanErr);
+      }
+    }
+
+    // 2b. Dedicated Watchlist Poller by Mint Address (Every 10s)
+    if (currentNow - lastWatchlistRefreshMs >= 10000) {
+      lastWatchlistRefreshMs = currentNow;
+      const itemsToRefresh = watchlistService.getItems();
+      for (const item of itemsToRefresh) {
+        try {
+          const freshRecord = await streamEngine.fetchDexScreenerTokenPair(item.mintAddress);
+          if (freshRecord) {
+            const currentNowSec = Math.floor(currentNow / 1000);
+            watchlistService.admitOrUpdate(freshRecord, currentNowSec);
+          }
+        } catch {
+          // ignore transient refresh errors
+        }
       }
     }
 

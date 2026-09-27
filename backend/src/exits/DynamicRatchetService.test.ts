@@ -162,15 +162,15 @@ describe("DynamicRatchetService", () => {
     expect(result.reasonCode).toBe("SCRATCH_EXIT");
   });
 
-  it("Ratchet_Tier1_Lock: triggers SELL_PARTIAL_50 at +25% peak, locks floor at breakeven +0%, and exits on drop below floor", () => {
+  it("Ratchet_Tier1_Lock: triggers SELL_PARTIAL_50 at +15% peak, locks floor at breakeven +0%, and exits on drop below floor", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Peak at +25%
+    // Peak at +15%
     const peakResult = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.25, // +25% = 2500 bps (>= 2400 bps Tier 1 threshold)
+      spotPriceSol: 1.15, // +15% = 1500 bps (>= 1500 bps Tier 1 threshold)
       currentTimestampMs: 1_000_100,
     });
 
@@ -191,15 +191,66 @@ describe("DynamicRatchetService", () => {
     expect(exitResult.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
   });
 
+  it("SmartHold_Recovery_Breakeven: recovers from drawdown to +8.0% and locks stop floor to breakeven +0%", () => {
+    const store = new RatchetStateStore();
+    const service = new DynamicRatchetService({}, store);
+    const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
+
+    // 1. Enter drawdown grace (-8.5%)
+    const dipResult = service.evaluate(state, {
+      ...baseContext,
+      spotPriceSol: 0.915,
+      lpIntact: true,
+      recentBuysCount60s: 15,
+      recentSellsCount60s: 5,
+      currentTimestampMs: 1_000_010,
+    });
+    expect(dipResult.action).toBe("HOLD");
+    expect(dipResult.updatedState.drawdownState).toBe("EVALUATING_DRAWDOWN");
+
+    // 2. Rally to +8.0% (+800 bps) -> recovers to NORMAL and locks floor to breakeven +0%
+    const recoveryResult = service.evaluate(dipResult.updatedState, {
+      ...baseContext,
+      spotPriceSol: 1.08, // +8.0% = 800 bps
+      currentTimestampMs: 1_000_050,
+    });
+    expect(recoveryResult.action).toBe("HOLD");
+    expect(recoveryResult.updatedState.drawdownState).toBe("NORMAL");
+    expect(recoveryResult.updatedState.currentStopFloorBps).toBe(0); // Locked to breakeven!
+
+    // 3. Drop to -0.5% -> exits because floor is locked at breakeven
+    const exitResult = service.evaluate(recoveryResult.updatedState, {
+      ...baseContext,
+      spotPriceSol: 0.995,
+      currentTimestampMs: 1_000_090,
+    });
+    expect(exitResult.action).toBe("SELL_ALL");
+  });
+
+  it("HardTakeProfit_Cap: triggers SELL_ALL when spot reaches configured hardTakeProfitBps", () => {
+    const store = new RatchetStateStore();
+    const service = new DynamicRatchetService({ hardTakeProfitBps: 10000 }, store); // +100% hard cap
+    const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
+
+    const capResult = service.evaluate(state, {
+      ...baseContext,
+      spotPriceSol: 2.05, // +105% = 10500 bps (>= 10000 bps)
+      currentTimestampMs: 1_000_100,
+    });
+
+    expect(capResult.action).toBe("SELL_ALL");
+    expect(capResult.reasonCode).toBe("HARD_TAKE_PROFIT_CAP_TRIGGERED");
+  });
+
   it("Ratchet_Tier2_Lock: triggers SELL_PARTIAL_25 at +50% peak, locks floor at +40%, and exits on drop below floor", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Reach Tier 1 first (+25%)
+    // Reach Tier 1 first (+15%)
     const tier1Result = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.25,
+      spotPriceSol: 1.15,
       currentTimestampMs: 1_000_100,
     });
     expect(tier1Result.action).toBe("SELL_PARTIAL_50");

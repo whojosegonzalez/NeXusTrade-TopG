@@ -47,12 +47,61 @@ export class DynamicRatchetService {
     let tier1ProfitTaken = state.tier1ProfitTaken ?? false;
     let tier2ProfitTaken = state.tier2ProfitTaken ?? false;
 
+    // 0. Optional Hard Take-Profit Cap Check
+    if (
+      this.config.hardTakeProfitBps !== undefined &&
+      currentPnlBps >= this.config.hardTakeProfitBps
+    ) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: nextTier,
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        nextTier,
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_ALL",
+        reasonCode: "HARD_TAKE_PROFIT_CAP_TRIGGERED",
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Smart Hold Recovery Check
+    if (state.drawdownState === "EVALUATING_DRAWDOWN") {
+      if (currentPnlBps >= 800) {
+        nextDrawdownState = "NORMAL";
+        nextDrawdownEnteredAtMs = null;
+        nextFloorBps = Math.max(nextFloorBps, 0);
+      } else if (currentPnlBps >= this.config.drawdownRecoveryBps) {
+        nextDrawdownState = "NORMAL";
+        nextDrawdownEnteredAtMs = null;
+      }
+    }
+
     // 1. Milestone Take-Profit Scaling Checks
-    // Check Tier 1 Milestone (+25%): Sell 50% of position, move floor to Breakeven (+0%)
+    // Check Tier 1 Milestone (+15%): Sell 50% of position, move floor to Breakeven (+0%)
     if (nextPeakGainBps >= this.config.tier1PeakThresholdBps && !tier1ProfitTaken) {
       tier1ProfitTaken = true;
       nextTier = "TIER_1";
-      nextFloorBps = Math.max(nextFloorBps, this.config.tier1LockedFloorBps);
+      nextFloorBps = Math.max(nextFloorBps, this.config.tier1LockedFloorBps, 0);
 
       const updatedState: PositionRatchetState = {
         ...state,

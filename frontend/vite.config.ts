@@ -49,6 +49,7 @@ interface RawDaemonSnapshot {
   netSessionPnlSol?: number;
   watchlist?: unknown[];
   maxOpenPositions?: number;
+  durationHours?: number;
 }
 
 function nexusDevApiPlugin(): Plugin {
@@ -93,7 +94,7 @@ function nexusDevApiPlugin(): Plugin {
                 (t: RawDaemonTrade) => t.realizedPnlBps < -100,
               ).length;
               const scratches = closedTrades.length - wins - losses;
-              const now = raw.lastTickAtMs || Date.now();
+              const now = Date.now();
               const start = raw.startedAtMs || now;
               const elapsed = Math.floor((now - start) / 1000);
 
@@ -124,7 +125,7 @@ function nexusDevApiPlugin(): Plugin {
                 status: raw.status || "HALTED",
                 haltReason: raw.haltReason,
                 startedAtMs: start,
-                durationHours: 1,
+                durationHours: raw.durationHours || 4,
                 elapsedSeconds: elapsed,
                 initialPortfolioSol: initial,
                 currentPortfolioSol: current,

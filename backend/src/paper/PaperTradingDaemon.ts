@@ -169,6 +169,7 @@ export class PaperTradingDaemon {
     positionId: string,
     currentSpotPriceSol?: number,
     nowTimestampMs?: number,
+    exitReason: string = "MANUAL_OPERATOR_EXIT",
   ): ClosedTradeRecord | null {
     const position = this.openPositions.get(positionId);
     if (!position) return null;
@@ -192,7 +193,7 @@ export class PaperTradingDaemon {
       proceedsSol: totalProceedsSol,
       realizedPnlSol,
       realizedPnlBps,
-      exitReason: "MANUAL_OPERATOR_EXIT",
+      exitReason,
       openedAtMs: position.openedAtMs,
       closedAtMs: now,
     };

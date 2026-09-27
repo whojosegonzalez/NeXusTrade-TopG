@@ -311,6 +311,26 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.closedTrades.length).toBe(1);
   });
 
+  it("supports custom exitReason (e.g. SESSION_DURATION_CASHOUT) in manualExit", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, nowMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    const closed = daemon.manualExit(pos.positionId, 0.055, nowMs, "SESSION_DURATION_CASHOUT");
+    expect(closed).toBeDefined();
+    expect(closed?.exitReason).toBe("SESSION_DURATION_CASHOUT");
+    expect(closed?.realizedPnlSol).toBeCloseTo(0.1, 4);
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(0);
+    expect(snapshot.closedTrades[0]?.exitReason).toBe("SESSION_DURATION_CASHOUT");
+  });
+
   it("enforces single position per mint constraint", () => {
     const daemon = new PaperTradingDaemon({
       config: baseConfig,

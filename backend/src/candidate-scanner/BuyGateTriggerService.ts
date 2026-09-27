@@ -5,7 +5,7 @@ export interface BuyGateConfig {
   readonly minMaturityAgeSec: number; // default: 300 (5m)
   readonly maxMaturityAgeSec: number; // default: 900 (15m)
   readonly minLmcRatio: number; // default: 0.15 (15%)
-  readonly maxLmcRatio: number; // default: 0.30 (30%)
+  readonly maxLmcRatio: number; // default: 0.55 (55%)
   readonly minBuyToSellRatio: number; // default: 1.5
   readonly minVolume5mUsd: number; // default: 2500
   readonly minAvgTxUsd: number; // default: 25
@@ -18,7 +18,7 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   minMaturityAgeSec: 300,
   maxMaturityAgeSec: 900,
   minLmcRatio: 0.15,
-  maxLmcRatio: 0.3,
+  maxLmcRatio: 0.55,
   minBuyToSellRatio: 1.5,
   minVolume5mUsd: 2500,
   minAvgTxUsd: 25,

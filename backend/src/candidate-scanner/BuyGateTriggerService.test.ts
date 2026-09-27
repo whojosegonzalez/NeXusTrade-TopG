@@ -94,7 +94,7 @@ describe("BuyGateTriggerService", () => {
     expect(result.gates.find((g) => g.name === "MATURITY_WINDOW_GATE")?.passed).toBe(true);
   });
 
-  it("fails when L/MC depth ratio is outside 15% - 30% balance", () => {
+  it("permits healthy deep liquidity up to 55% L/MC and fails when outside 15% - 55% range", () => {
     const service = new BuyGateTriggerService();
 
     // Low depth (10%)
@@ -102,10 +102,19 @@ describe("BuyGateTriggerService", () => {
     expect(lowDepth.triggered).toBe(false);
     expect(lowDepth.rejectionReason).toBe("DEPTH_BALANCE_GATE_FAILED");
 
-    // High depth / thin cap (35%)
-    const highDepth = service.evaluateCandidate({ ...candidate, lmcRatio: 0.35 });
-    expect(highDepth.triggered).toBe(false);
-    expect(highDepth.rejectionReason).toBe("DEPTH_BALANCE_GATE_FAILED");
+    // Deep healthy liquidity (35% & 45%) -> passes with 55% ceiling
+    const deepLiq35 = service.evaluateCandidate({ ...candidate, lmcRatio: 0.35 });
+    expect(deepLiq35.triggered).toBe(true);
+    expect(deepLiq35.gates.find((g) => g.name === "DEPTH_BALANCE_GATE")?.passed).toBe(true);
+
+    const deepLiq45 = service.evaluateCandidate({ ...candidate, lmcRatio: 0.45 });
+    expect(deepLiq45.triggered).toBe(true);
+    expect(deepLiq45.gates.find((g) => g.name === "DEPTH_BALANCE_GATE")?.passed).toBe(true);
+
+    // Excessively high depth / thin cap (60%)
+    const extremeDepth = service.evaluateCandidate({ ...candidate, lmcRatio: 0.6 });
+    expect(extremeDepth.triggered).toBe(false);
+    expect(extremeDepth.rejectionReason).toBe("DEPTH_BALANCE_GATE_FAILED");
   });
 
   it("fails when seller flow dominates or buyer dominance < 1.5x", () => {

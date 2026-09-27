@@ -14,6 +14,8 @@ export type ExitReasonCode =
   | "SCRATCH_EXIT"
   | "RATCHET_TIER_1_TRIGGERED"
   | "RATCHET_TIER_2_TRIGGERED"
+  | "HARD_TAKE_PROFIT_CAP_TRIGGERED"
+  | "SESSION_DURATION_CASHOUT"
   | "STAGNANCY_TIMEOUT_EXIT"
   | "MANUAL_OPERATOR_EXIT";
 
@@ -68,10 +70,11 @@ export interface DynamicRatchetConfig {
   readonly drawdownGracePeriodMs: number; // default 120_000 (120s)
   readonly scratchPnlMinBps: number; // default 50 (+0.5%)
   readonly scratchPnlMaxBps: number; // default 150 (+1.5%)
-  readonly tier1PeakThresholdBps: number; // default 2400 (+24.0% / +25.0%)
+  readonly tier1PeakThresholdBps: number; // default 1500 (+15.0%)
   readonly tier1LockedFloorBps: number; // default 0 (Breakeven +0.0% floor on remaining 50%)
   readonly tier2PeakThresholdBps: number; // default 4900 (+49.0% / +50.0%)
   readonly tier2LockedFloorBps: number; // default 4000 (+40.0% floor on remaining 25%)
+  readonly hardTakeProfitBps?: number | undefined; // optional hard take-profit cap
 }
 
 export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
@@ -81,7 +84,7 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   drawdownGracePeriodMs: 120_000,
   scratchPnlMinBps: 50,
   scratchPnlMaxBps: 150,
-  tier1PeakThresholdBps: 2400,
+  tier1PeakThresholdBps: 1500,
   tier1LockedFloorBps: 0,
   tier2PeakThresholdBps: 4900,
   tier2LockedFloorBps: 4000,
