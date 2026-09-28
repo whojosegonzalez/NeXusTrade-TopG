@@ -30,6 +30,7 @@
     "format": "prettier . --write",
     "format:check": "prettier . --check",
     "lint": "eslint .",
+    "paper:daemon": "pnpm --filter @nexustrade/backend trading:paper-daemon",
     "paper:execute": "pnpm --filter @nexustrade/backend paper:execute",
     "paper:sell": "pnpm --filter @nexustrade/backend paper:sell",
     "prepare": "husky",
