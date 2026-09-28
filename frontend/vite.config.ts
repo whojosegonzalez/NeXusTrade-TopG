@@ -229,6 +229,26 @@ function nexusDevApiPlugin(): Plugin {
               missedOpportunitiesCount: 0,
               trades: [],
             },
+            {
+              sessionId: "session-paper-12.6-01",
+              startedAt: "2026-09-27T00:30:00.000Z",
+              endedAt: "2026-09-27T04:30:00.000Z",
+              durationMinutes: 240,
+              startingCapitalSol: 10.0,
+              endingCapitalSol: 8.307,
+              netPnlSol: -1.693,
+              netPnlPct: -16.93,
+              totalTrades: 11,
+              buysCount: 11,
+              sellsCount: 11,
+              winsCount: 4,
+              lossesCount: 7,
+              scratchesCount: 0,
+              winRatePct: 36.36,
+              coinsWatchedCount: 62,
+              missedOpportunitiesCount: 0,
+              trades: [],
+            },
           ];
 
           const rootTmp = path.resolve(process.cwd(), "../.tmp/past-sessions.json");

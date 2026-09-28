@@ -417,6 +417,8 @@ async function run(): Promise<void> {
               bundlerPct: rugMetrics?.bundlerPct,
               top10HolderPct: rugMetrics?.top10HolderPct,
               holdersCount: rugMetrics?.holdersCount,
+              rugScore: rugMetrics?.rugScore,
+              hasDangerRisk: rugMetrics?.hasDangerRisk,
             });
 
             if (!fullGateResult.triggered) {
@@ -434,17 +436,25 @@ async function run(): Promise<void> {
             const poolRecord = rawPools.find((p) => p.mintAddress === candidate.mintAddress);
 
             if (poolRecord) {
+              const isEstablished =
+                candidate.liquidityUsd >= 40000 ||
+                candidate.assetAgeSeconds >= 3600 ||
+                candidate.marketCapUsd >= 250000;
+
+              // Tiered Sizing: 0.25 SOL for unproven micro-caps; 0.80 SOL for established runners
+              const targetCohortSize = isEstablished ? 0.8 : 0.25;
+
               const currentSnap = daemon.getSnapshot();
               const gasReserveSol = 0.05;
               const dynamicSize = Math.max(
                 0.1,
                 Math.min(
-                  1.0,
+                  targetCohortSize,
                   parseFloat(
                     (
                       (currentSnap.currentPortfolioSol - gasReserveSol) /
                       config.maxOpenPositions
-                    ).toFixed(4),
+                    ).toFixed(3),
                   ),
                 ),
               );

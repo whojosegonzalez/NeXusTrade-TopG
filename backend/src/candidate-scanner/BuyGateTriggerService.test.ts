@@ -51,7 +51,7 @@ describe("BuyGateTriggerService", () => {
       top10HolderPct: 0.38, // 38% > 30%
     });
     expect(result.triggered).toBe(false);
-    expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+    expect(result.rejectionReason).toBe("TOP_10_CONCENTRATION_FAILED");
   });
 
   it("fails when unique holders count is below 350", () => {
@@ -60,12 +60,35 @@ describe("BuyGateTriggerService", () => {
       holdersCount: 180, // 180 < 350
     });
     expect(result.triggered).toBe(false);
-    expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+    expect(result.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
   });
 
-  it("passes when bundler concentration metrics are within healthy limits", () => {
+  it("fails when RugCheck risk score exceeds 700", () => {
     const service = new BuyGateTriggerService();
     const result = service.evaluateCandidate(candidate, {
+      rugScore: 850, // 850 > 700
+      holdersCount: 500,
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("RUGCHECK_HIGH_RISK_SCORE_FAILED");
+  });
+
+  it("fails when RugCheck flags any danger risk level", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      rugScore: 400, // <= 700
+      hasDangerRisk: true,
+      holdersCount: 500,
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("RUGCHECK_DANGER_FLAG_FAILED");
+  });
+
+  it("passes when bundler and RugCheck security metrics are within healthy limits", () => {
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      rugScore: 250,
+      hasDangerRisk: false,
       bundlerPct: 0.12,
       top10HolderPct: 0.18,
       holdersCount: 520,
@@ -74,27 +97,68 @@ describe("BuyGateTriggerService", () => {
     expect(result.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE")?.passed).toBe(true);
   });
 
-  it("fetches and parses RugCheck metrics via fetchRugCheckMetrics", async () => {
-    const mockFetch: typeof fetch = async () => {
+  it("fetches and parses live RugCheck /report format with score, danger risks, and holders", async () => {
+    const mockFetch: typeof fetch = async (url) => {
+      expect(String(url)).toContain("/report");
       return new Response(
         JSON.stringify({
-          score: 800,
-          totalHolders: 450,
-          topHolders: [{ pct: 5.0 }, { pct: 4.2 }, { pct: 3.1 }],
-          risks: [{ name: "High Insider / Bundled Allocation", value: "22.5%" }],
+          score: 2884,
+          score_normalised: 28.84,
+          totalHolders: 39,
+          topHolders: [{ pct: 15.0 }, { pct: 8.5 }],
+          risks: [
+            { name: "Top 10 Holders Concentration", level: "danger", score: 500 },
+            { name: "Single holder ownership", level: "warn", score: 200 },
+          ],
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
 
     const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
-      "TestMintAddress111",
+      "2z1kjXiQzWtq75QEnAEQEMyS332toNEcSno3wceJpump",
       mockFetch,
     );
     expect(metrics).not.toBeNull();
-    expect(metrics?.holdersCount).toBe(450);
-    expect(metrics?.top10HolderPct).toBeCloseTo(0.123, 3);
-    expect(metrics?.bundlerPct).toBeCloseTo(0.225, 3);
+    expect(metrics?.rugScore).toBe(2884);
+    expect(metrics?.hasDangerRisk).toBe(true);
+    expect(metrics?.holdersCount).toBe(39);
+    expect(metrics?.top10HolderPct).toBeCloseTo(0.235, 3);
+
+    // Evaluate candidate with these metrics -> immediately rejected
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      rugScore: metrics?.rugScore,
+      hasDangerRisk: metrics?.hasDangerRisk,
+      holdersCount: metrics?.holdersCount,
+      top10HolderPct: metrics?.top10HolderPct,
+    });
+    expect(result.triggered).toBe(false);
+    expect(result.rejectionReason).toBe("RUGCHECK_HIGH_RISK_SCORE_FAILED");
+  });
+
+  it("permits established pool with $100k liquidity and $1.5M market cap (L/MC 6.6%) via adaptive depth gate", () => {
+    const service = new BuyGateTriggerService();
+    const establishedPool: WatchlistCandidateItem = {
+      ...candidate,
+      liquidityUsd: 100_000,
+      marketCapUsd: 1_500_000,
+      lmcRatio: 100_000 / 1_500_000, // 0.0667 (6.67%)
+      assetAgeSeconds: 14_400, // 4 hours
+      volume5mUsd: 35_000,
+      buys5m: 50,
+      sells5m: 25,
+      buyToSellRatio: 2.0,
+    };
+    const result = service.evaluateCandidate(establishedPool, {
+      maxSingleDisposalUsd: 1000,
+      recentBuysCount60s: 10,
+      recentSellsCount60s: 4,
+      momentum1mBps: 50,
+    });
+    expect(result.triggered).toBe(true);
+    const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
+    expect(depthGate?.passed).toBe(true);
   });
 
   it("permits established runners with 2h to 24h age and high liquidity/market-cap", () => {

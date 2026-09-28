@@ -15,6 +15,8 @@ export interface BuyGateConfig {
   readonly maxBundlerPct: number; // default: 0.35 (35%)
   readonly maxTop10HolderPct: number; // default: 0.30 (30%)
   readonly minHoldersCount: number; // default: 350
+  readonly maxRugScore: number; // default: 700
+  readonly rejectDangerRisks: boolean; // default: true
 }
 
 export const BUY_GATE_DEFAULTS: BuyGateConfig = {
@@ -31,6 +33,8 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   maxBundlerPct: 0.35,
   maxTop10HolderPct: 0.3,
   minHoldersCount: 350,
+  maxRugScore: 700,
+  rejectDangerRisks: true,
 };
 
 export interface GateCheck {
@@ -57,6 +61,8 @@ export interface AdvancedMarketContext {
   readonly bundlerPct?: number | undefined;
   readonly top10HolderPct?: number | undefined;
   readonly holdersCount?: number | undefined;
+  readonly rugScore?: number | undefined;
+  readonly hasDangerRisk?: boolean | undefined;
 }
 
 export class BuyGateTriggerService {
@@ -86,16 +92,17 @@ export class BuyGateTriggerService {
   ): BuyGateEvaluationResult {
     const gates: GateCheck[] = [];
 
-    // 1. Maturity Window Gate (Supports Established Runners 2h-24h, or Adaptive Micro-Caps 300s to 900s/2700s)
+    // Established / High-Volume pool detection
+    const isEstablished =
+      item.liquidityUsd >= 40000 || item.assetAgeSeconds >= 3600 || item.marketCapUsd >= 250000;
+
+    // 1. Maturity Window Gate (Supports Established Runners, or Adaptive Micro-Caps 300s to 900s/2700s)
     const isEstablishedRunner =
-      item.liquidityUsd >= 40000 &&
-      item.marketCapUsd >= 100000 &&
-      item.assetAgeSeconds >= 7200 &&
-      item.assetAgeSeconds <= 86400;
+      (item.liquidityUsd >= 40000 || item.marketCapUsd >= 100000) && item.assetAgeSeconds >= 3600;
 
     const isHighLiqVol = item.liquidityUsd >= 20000 && item.volume5mUsd >= 25000;
     const maxMaturityAgeSec = isEstablishedRunner
-      ? 86400
+      ? Math.max(item.assetAgeSeconds, 86400)
       : isHighLiqVol
         ? Math.max(this.config.maxMaturityAgeSec, 2700)
         : this.config.maxMaturityAgeSec;
@@ -110,7 +117,7 @@ export class BuyGateTriggerService {
       passed: maturityPassed,
       value: item.assetAgeSeconds,
       requirement: isEstablishedRunner
-        ? "7200s <= Age <= 86400s (Established Runner)"
+        ? "Age >= 3600s (Established Runner)"
         : `${this.config.minMaturityAgeSec}s <= Age <= ${maxMaturityAgeSec}s`,
     });
 
@@ -123,14 +130,15 @@ export class BuyGateTriggerService {
       requirement: `Liquidity >= $${this.config.minLiquidityUsd}`,
     });
 
-    // 3. Depth Balance Gate (0.15 to 0.30 L/MC)
+    // 3. Adaptive Depth Balance Gate (3% for established, 15% for micro-caps, up to 55%)
+    const effectiveMinLmc = isEstablished ? 0.03 : this.config.minLmcRatio;
     const depthPassed =
-      item.lmcRatio >= this.config.minLmcRatio && item.lmcRatio <= this.config.maxLmcRatio;
+      item.lmcRatio >= effectiveMinLmc && item.lmcRatio <= this.config.maxLmcRatio;
     gates.push({
       name: "DEPTH_BALANCE_GATE",
       passed: depthPassed,
       value: item.lmcRatio,
-      requirement: `${(this.config.minLmcRatio * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%`,
+      requirement: `${(effectiveMinLmc * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%${isEstablished ? " (Adaptive Established Pool)" : ""}`,
     });
 
     // 4. Flow Absorption Gate (Buys >= 1.5 * Sells, or >= 1.20 for high-volume breakouts >= $50k)
@@ -196,27 +204,47 @@ export class BuyGateTriggerService {
       requirement: `Single Tx Disposal <= ${(this.config.maxSingleTxDisposalPct * 100).toFixed(0)}% of Liquidity`,
     });
 
-    // 9. Anti-Bundler & Top-Holder Concentration Gate
+    // 9. RugCheck Security & Holder Concentration Gate
+    const rugScore = marketContext.rugScore;
+    const hasDangerRisk = marketContext.hasDangerRisk;
     const bundlerPct = marketContext.bundlerPct;
     const top10HolderPct = marketContext.top10HolderPct;
     const holdersCount = marketContext.holdersCount;
 
-    const bundlerViolation = bundlerPct !== undefined && bundlerPct > this.config.maxBundlerPct;
-    const top10Violation =
-      top10HolderPct !== undefined && top10HolderPct > this.config.maxTop10HolderPct;
-    const holdersViolation =
-      holdersCount !== undefined && holdersCount < this.config.minHoldersCount;
+    let rugCheckFailureReason: string | undefined;
 
-    const bundlerPassed = !bundlerViolation && !top10Violation && !holdersViolation;
+    if (rugScore !== undefined && rugScore > this.config.maxRugScore) {
+      rugCheckFailureReason = "RUGCHECK_HIGH_RISK_SCORE_FAILED";
+    } else if (this.config.rejectDangerRisks && hasDangerRisk) {
+      rugCheckFailureReason = "RUGCHECK_DANGER_FLAG_FAILED";
+    } else if (holdersCount !== undefined && holdersCount < this.config.minHoldersCount) {
+      rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
+    } else if (top10HolderPct !== undefined && top10HolderPct > this.config.maxTop10HolderPct) {
+      rugCheckFailureReason = "TOP_10_CONCENTRATION_FAILED";
+    } else if (bundlerPct !== undefined && bundlerPct > this.config.maxBundlerPct) {
+      rugCheckFailureReason = "BUNDLER_CONCENTRATION_GATE_FAILED";
+    }
+
+    const bundlerPassed = !rugCheckFailureReason;
     gates.push({
       name: "BUNDLER_CONCENTRATION_GATE",
       passed: bundlerPassed,
-      value: bundlerPct ?? top10HolderPct ?? (holdersCount !== undefined ? holdersCount : 0),
-      requirement: `Bundler <= ${(this.config.maxBundlerPct * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${this.config.minHoldersCount}`,
+      value:
+        rugScore ?? bundlerPct ?? top10HolderPct ?? (holdersCount !== undefined ? holdersCount : 0),
+      requirement: `Score <= ${this.config.maxRugScore}, No Danger, Bundler <= ${(this.config.maxBundlerPct * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${this.config.minHoldersCount}`,
     });
 
     const failedGate = gates.find((g) => !g.passed);
     const triggered = !failedGate;
+
+    let rejectionReason: string | undefined;
+    if (failedGate) {
+      if (failedGate.name === "BUNDLER_CONCENTRATION_GATE" && rugCheckFailureReason) {
+        rejectionReason = rugCheckFailureReason;
+      } else {
+        rejectionReason = `${failedGate.name}_FAILED`;
+      }
+    }
 
     return {
       triggered,
@@ -224,15 +252,21 @@ export class BuyGateTriggerService {
       mintAddress: item.mintAddress,
       symbol: item.symbol,
       gates,
-      ...(failedGate ? { rejectionReason: `${failedGate.name}_FAILED` } : {}),
+      ...(rejectionReason ? { rejectionReason } : {}),
     };
   }
 
   public static async fetchRugCheckMetrics(
     mintAddress: string,
     fetchFn: typeof fetch = fetch,
-  ): Promise<{ bundlerPct?: number; top10HolderPct?: number; holdersCount?: number } | null> {
-    const url = `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mintAddress)}/report/summary`;
+  ): Promise<{
+    rugScore?: number;
+    hasDangerRisk?: boolean;
+    bundlerPct?: number;
+    top10HolderPct?: number;
+    holdersCount?: number;
+  } | null> {
+    const url = `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mintAddress)}/report`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3500);
     try {
@@ -242,22 +276,27 @@ export class BuyGateTriggerService {
       });
       if (!res.ok) return null;
       const data = (await res.json()) as {
+        score?: number;
+        score_normalised?: number;
         risks?: Array<{ name?: string; value?: string; score?: number; level?: string }>;
         tokenMeta?: { mutable?: boolean };
         topHolders?: Array<{ pct?: number; address?: string }>;
         totalHolders?: number;
       };
 
-      let bundlerPct: number | undefined;
-      let top10HolderPct: number | undefined;
-      const holdersCount: number | undefined = data.totalHolders;
+      const rugScore = typeof data.score === "number" ? data.score : 0;
+      const hasDangerRisk =
+        Array.isArray(data.risks) && data.risks.some((r) => r.level === "danger");
+      const holdersCount = typeof data.totalHolders === "number" ? data.totalHolders : undefined;
 
+      let top10HolderPct: number | undefined;
       if (Array.isArray(data.topHolders) && data.topHolders.length > 0) {
         top10HolderPct = data.topHolders
           .slice(0, 10)
           .reduce((acc, h) => acc + (typeof h.pct === "number" ? h.pct / 100 : 0), 0);
       }
 
+      let bundlerPct: number | undefined;
       if (Array.isArray(data.risks)) {
         for (const risk of data.risks) {
           const riskName = (risk.name || "").toLowerCase();
@@ -275,10 +314,15 @@ export class BuyGateTriggerService {
       }
 
       const result: {
+        rugScore?: number;
+        hasDangerRisk?: boolean;
         bundlerPct?: number;
         top10HolderPct?: number;
         holdersCount?: number;
-      } = {};
+      } = {
+        rugScore,
+        hasDangerRisk,
+      };
       if (bundlerPct !== undefined) result.bundlerPct = bundlerPct;
       if (top10HolderPct !== undefined) result.top10HolderPct = top10HolderPct;
       if (holdersCount !== undefined) result.holdersCount = holdersCount;
