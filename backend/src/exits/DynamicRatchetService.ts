@@ -26,13 +26,19 @@ export class DynamicRatchetService {
     return this.store;
   }
 
-  evaluate(state: PositionRatchetState, context: MarketEvaluationContext): RatchetEvaluationResult {
+  evaluate(
+    state: PositionRatchetState,
+    context: MarketEvaluationContext,
+    configOverride?: Partial<DynamicRatchetConfig>,
+  ): RatchetEvaluationResult {
     if (state.entryPriceSol <= 0) {
       throw new Error(`Invalid entryPriceSol: ${state.entryPriceSol}. Must be > 0.`);
     }
     if (context.spotPriceSol <= 0) {
       throw new Error(`Invalid spotPriceSol: ${context.spotPriceSol}. Must be > 0.`);
     }
+
+    const activeConfig = configOverride ? { ...this.config, ...configOverride } : this.config;
 
     const currentPnlBps = Math.round(
       ((context.spotPriceSol - state.entryPriceSol) / state.entryPriceSol) * 10_000,
@@ -49,8 +55,8 @@ export class DynamicRatchetService {
 
     // 0. Optional Hard Take-Profit Cap Check
     if (
-      this.config.hardTakeProfitBps !== undefined &&
-      currentPnlBps >= this.config.hardTakeProfitBps
+      activeConfig.hardTakeProfitBps !== undefined &&
+      currentPnlBps >= activeConfig.hardTakeProfitBps
     ) {
       const updatedState: PositionRatchetState = {
         ...state,
@@ -90,7 +96,7 @@ export class DynamicRatchetService {
         nextDrawdownState = "NORMAL";
         nextDrawdownEnteredAtMs = null;
         nextFloorBps = Math.max(nextFloorBps, 0);
-      } else if (currentPnlBps >= this.config.drawdownRecoveryBps) {
+      } else if (currentPnlBps >= activeConfig.drawdownRecoveryBps) {
         nextDrawdownState = "NORMAL";
         nextDrawdownEnteredAtMs = null;
       }
@@ -98,10 +104,10 @@ export class DynamicRatchetService {
 
     // 1. Milestone Take-Profit Scaling Checks
     // Check Tier 1 Milestone (+15%): Sell 50% of position, move floor to Breakeven (+0%)
-    if (nextPeakGainBps >= this.config.tier1PeakThresholdBps && !tier1ProfitTaken) {
+    if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps && !tier1ProfitTaken) {
       tier1ProfitTaken = true;
       nextTier = "TIER_1";
-      nextFloorBps = Math.max(nextFloorBps, this.config.tier1LockedFloorBps, 0);
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier1LockedFloorBps, 0);
 
       const updatedState: PositionRatchetState = {
         ...state,
@@ -136,10 +142,10 @@ export class DynamicRatchetService {
     }
 
     // Check Tier 2 Milestone (+50%): Sell 25% of position, move floor to Tier 2 (+40%)
-    if (nextPeakGainBps >= this.config.tier2PeakThresholdBps && !tier2ProfitTaken) {
+    if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps && !tier2ProfitTaken) {
       tier2ProfitTaken = true;
       nextTier = "TIER_2";
-      nextFloorBps = Math.max(nextFloorBps, this.config.tier2LockedFloorBps);
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier2LockedFloorBps);
 
       const updatedState: PositionRatchetState = {
         ...state,
@@ -174,15 +180,15 @@ export class DynamicRatchetService {
     }
 
     // Update active tier and floor if milestones were previously reached
-    if (nextPeakGainBps >= this.config.tier2PeakThresholdBps) {
+    if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps) {
       nextTier = "TIER_2";
-      nextFloorBps = Math.max(nextFloorBps, this.config.tier2LockedFloorBps);
-    } else if (nextPeakGainBps >= this.config.tier1PeakThresholdBps) {
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier2LockedFloorBps);
+    } else if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps) {
       nextTier = "TIER_1";
-      nextFloorBps = Math.max(nextFloorBps, this.config.tier1LockedFloorBps);
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier1LockedFloorBps);
     } else if (
-      currentPnlBps >= this.config.scratchPnlMinBps &&
-      currentPnlBps <= this.config.scratchPnlMaxBps &&
+      currentPnlBps >= activeConfig.scratchPnlMinBps &&
+      currentPnlBps <= activeConfig.scratchPnlMaxBps &&
       nextTier !== "TIER_1" &&
       nextTier !== "TIER_2"
     ) {
@@ -191,7 +197,7 @@ export class DynamicRatchetService {
 
     // 2. Evaluation Logic
     // Rule A: Catastrophic disaster hard floor (-12.0%)
-    if (currentPnlBps <= this.config.catastrophicFloorBps) {
+    if (currentPnlBps <= activeConfig.catastrophicFloorBps) {
       const updatedState: PositionRatchetState = {
         ...state,
         peakPriceSol: nextPeakPriceSol,
@@ -256,7 +262,7 @@ export class DynamicRatchetService {
       return {
         action: "SELL_ALL",
         reasonCode:
-          nextTier === "TIER_2" || nextFloorBps >= this.config.tier2LockedFloorBps
+          nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps
             ? "RATCHET_TIER_2_TRIGGERED"
             : "RATCHET_TIER_1_TRIGGERED",
         diagnostics,
@@ -266,8 +272,8 @@ export class DynamicRatchetService {
 
     // Rule C: Scratch Exit (+0.5% to +1.5% with stalled momentum / volume drop)
     if (
-      currentPnlBps >= this.config.scratchPnlMinBps &&
-      currentPnlBps <= this.config.scratchPnlMaxBps &&
+      currentPnlBps >= activeConfig.scratchPnlMinBps &&
+      currentPnlBps <= activeConfig.scratchPnlMaxBps &&
       (context.momentum5mBps <= 0 || context.volumeStalled3m)
     ) {
       const updatedState: PositionRatchetState = {
@@ -303,7 +309,7 @@ export class DynamicRatchetService {
     }
 
     // Rule D: Smart Re-evaluation Gate at -8.0% (-800 bps)
-    if (currentPnlBps <= this.config.drawdownTriggerBps) {
+    if (currentPnlBps <= activeConfig.drawdownTriggerBps) {
       if (nextDrawdownState === "NORMAL") {
         nextDrawdownState = "EVALUATING_DRAWDOWN";
         nextDrawdownEnteredAtMs = context.currentTimestampMs;
@@ -385,7 +391,7 @@ export class DynamicRatchetService {
       }
 
       // Health Check 3: Grace period timeout
-      if (elapsedMs > this.config.drawdownGracePeriodMs) {
+      if (elapsedMs > activeConfig.drawdownGracePeriodMs) {
         const updatedState: PositionRatchetState = {
           ...state,
           peakPriceSol: nextPeakPriceSol,
@@ -454,7 +460,7 @@ export class DynamicRatchetService {
     // Rule E: Drawdown Recovery (price recovers above -5.0%)
     if (
       state.drawdownState === "EVALUATING_DRAWDOWN" &&
-      currentPnlBps >= this.config.drawdownRecoveryBps
+      currentPnlBps >= activeConfig.drawdownRecoveryBps
     ) {
       nextDrawdownState = "NORMAL";
       nextDrawdownEnteredAtMs = null;

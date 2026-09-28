@@ -6,7 +6,13 @@ import { CANDIDATE_SCANNER_DEFAULTS } from "../candidate-scanner/CandidateScanne
 import { CandidateWatchlistService } from "../candidate-scanner/CandidateWatchlistService.js";
 import { BuyGateTriggerService } from "../candidate-scanner/BuyGateTriggerService.js";
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
-import type { MarketEvaluationContext } from "../exits/DynamicRatchetTypes.js";
+import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
+import {
+  type MarketEvaluationContext,
+  type CohortTier,
+  MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+  ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+} from "../exits/DynamicRatchetTypes.js";
 import { nowMs } from "../db/utils/timestamps.js";
 import { BACKFILLED_PAST_SESSIONS, type HistoricalSessionSummary } from "@nexustrade/shared";
 
@@ -433,45 +439,78 @@ async function run(): Promise<void> {
             }
 
             const entryPriceSol = spotInfo.spotPriceSol;
-            const poolRecord = rawPools.find((p) => p.mintAddress === candidate.mintAddress);
+            let poolRecord: ScannedPoolRecord | undefined = rawPools.find(
+              (p) => p.mintAddress === candidate.mintAddress,
+            );
 
-            if (poolRecord) {
-              const isEstablished =
-                candidate.liquidityUsd >= 40000 ||
-                candidate.assetAgeSeconds >= 3600 ||
-                candidate.marketCapUsd >= 250000;
+            if (!poolRecord) {
+              poolRecord = {
+                poolId: candidate.poolId,
+                mintAddress: candidate.mintAddress,
+                symbol: candidate.symbol,
+                decimals: 9,
+                baseMint: candidate.mintAddress,
+                liquidityUsd: candidate.liquidityUsd,
+                marketCapUsd: candidate.marketCapUsd,
+                openTimeSec: Math.floor(currentNow / 1000) - candidate.assetAgeSeconds,
+                lpBurnPct: candidate.lpBurnPct ?? 100,
+                mintAuthority: null,
+                freezeAuthority: null,
+                volume5mUsd: candidate.volume5mUsd,
+                txCount5m: candidate.buys5m + candidate.sells5m,
+                buys5m: candidate.buys5m,
+                sells5m: candidate.sells5m,
+                spotPriceUsd:
+                  spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150,
+                fetchedAt: new Date(currentNow).toISOString(),
+              };
+            }
 
-              // Tiered Sizing: 0.25 SOL for unproven micro-caps; 0.80 SOL for established runners
-              const targetCohortSize = isEstablished ? 0.8 : 0.25;
+            const isEstablished =
+              candidate.liquidityUsd >= 40000 ||
+              candidate.assetAgeSeconds >= 3600 ||
+              candidate.marketCapUsd >= 250000;
 
-              const currentSnap = daemon.getSnapshot();
-              const gasReserveSol = 0.05;
-              const dynamicSize = Math.max(
-                0.1,
-                Math.min(
-                  targetCohortSize,
-                  parseFloat(
-                    (
-                      (currentSnap.currentPortfolioSol - gasReserveSol) /
-                      config.maxOpenPositions
-                    ).toFixed(3),
-                  ),
+            const cohort: CohortTier = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
+            const ratchetConfig = isEstablished
+              ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
+              : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
+
+            // Tiered Sizing: 0.25 SOL for unproven micro-caps; 0.80 SOL for established runners
+            const targetCohortSize = isEstablished ? 0.8 : 0.25;
+
+            const currentSnap = daemon.getSnapshot();
+            const gasReserveSol = 0.05;
+            const dynamicSize = Math.max(
+              0.1,
+              Math.min(
+                targetCohortSize,
+                parseFloat(
+                  (
+                    (currentSnap.currentPortfolioSol - gasReserveSol) /
+                    config.maxOpenPositions
+                  ).toFixed(3),
                 ),
-              );
+              ),
+            );
 
-              const bought = daemon.processScannedPool(
-                poolRecord,
-                currentNow,
-                entryPriceSol,
-                dynamicSize,
+            const bought = daemon.processScannedPool(
+              poolRecord,
+              currentNow,
+              entryPriceSol,
+              dynamicSize,
+              {
+                bypassScannerEvaluation: true,
+                cohort,
+                ratchetConfig,
+              },
+            );
+            if (bought) {
+              watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
+              tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
+              console.log(
+                `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] [${cohort}] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
               );
-              if (bought) {
-                watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
-                tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
-                console.log(
-                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
-                );
-              }
             }
           }
         }

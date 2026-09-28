@@ -2,6 +2,8 @@ import type { Repositories } from "../db/repositories/index.js";
 import { nowMs } from "../db/utils/timestamps.js";
 import { DynamicRatchetService } from "../exits/DynamicRatchetService.js";
 import type {
+  CohortTier,
+  DynamicRatchetConfig,
   ExitReasonCode,
   MarketEvaluationContext,
   PositionRatchetState,
@@ -44,6 +46,8 @@ export interface PaperPosition {
   readonly entryPriceSol: number;
   readonly initialTokensHeld?: number;
   readonly initialCostBasisSol?: number;
+  readonly cohort?: CohortTier | undefined;
+  readonly ratchetConfig?: DynamicRatchetConfig | undefined;
   tokensHeld: number;
   costBasisSol: number;
   realizedProceedsSol?: number;
@@ -254,6 +258,11 @@ export class PaperTradingDaemon {
     nowTimestampMs?: number,
     entryPriceSolOverride?: number,
     positionSizeSolOverride?: number,
+    options?: {
+      bypassScannerEvaluation?: boolean;
+      cohort?: CohortTier;
+      ratchetConfig?: DynamicRatchetConfig;
+    },
   ): boolean {
     if (this.status !== "RUNNING") return false;
     const now = nowTimestampMs ?? this.clock();
@@ -283,10 +292,12 @@ export class PaperTradingDaemon {
     }
 
     // 2. Anti-Rug & L/MC Evaluation Check
-    const nowSec = Math.floor(now / 1000);
-    const evaluation = this.scannerEvaluator.evaluate(pool, this.scannerConfig, nowSec);
-    if (!evaluation.admitted) {
-      return false;
+    if (!options?.bypassScannerEvaluation) {
+      const nowSec = Math.floor(now / 1000);
+      const evaluation = this.scannerEvaluator.evaluate(pool, this.scannerConfig, nowSec);
+      if (!evaluation.admitted) {
+        return false;
+      }
     }
 
     // 3. Execute Paper Buy
@@ -323,6 +334,8 @@ export class PaperTradingDaemon {
       ratchetState,
       lastActivityMs: now,
       stagnantTicksCount: 0,
+      ...(options?.cohort !== undefined ? { cohort: options.cohort } : {}),
+      ...(options?.ratchetConfig !== undefined ? { ratchetConfig: options.ratchetConfig } : {}),
     };
 
     this.openPositions.set(positionId, position);
@@ -422,7 +435,11 @@ export class PaperTradingDaemon {
       }
 
       // 3. Evaluate Dynamic Ratchet Stop-Loss Engine
-      const result = this.ratchetService.evaluate(position.ratchetState, marketContext);
+      const result = this.ratchetService.evaluate(
+        position.ratchetState,
+        marketContext,
+        position.ratchetConfig,
+      );
 
       // Update position pricing state
       position.spotPriceSol = marketContext.spotPriceSol;

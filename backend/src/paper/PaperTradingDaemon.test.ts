@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "./PaperTradingDaemon.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
-import type { MarketEvaluationContext } from "../exits/DynamicRatchetTypes.js";
+import {
+  type MarketEvaluationContext,
+  MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+  ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+} from "../exits/DynamicRatchetTypes.js";
 
 describe("PaperTradingDaemon", () => {
   const baseConfig: PaperTradingDaemonConfig = {
@@ -502,5 +506,71 @@ describe("PaperTradingDaemon", () => {
 
     const rejectedNegative = daemon.processScannedPool(validPool, nowMs, -0.05);
     expect(rejectedNegative).toBe(false);
+  });
+
+  it("admits pools older than 15 minutes when bypassScannerEvaluation is true and attaches cohort ratchet config", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    // Pool launched 2 hours ago (7200s ago)
+    const oldPool: ScannedPoolRecord = {
+      ...validPool,
+      poolId: "pool-old-runner",
+      mintAddress: "TokenMintOldRunner11111111111111111111111111",
+      openTimeSec: nowSec - 7200,
+    };
+
+    // Without bypass, it fails scanner evaluation because age > 900s
+    const rejectedWithoutBypass = daemon.processScannedPool(oldPool, nowMs);
+    expect(rejectedWithoutBypass).toBe(false);
+
+    // With bypass, it admits the pool and stores cohort & ratchetConfig
+    const acceptedWithBypass = daemon.processScannedPool(oldPool, nowMs, 0.05, 0.8, {
+      bypassScannerEvaluation: true,
+      cohort: "ESTABLISHED",
+      ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    });
+    expect(acceptedWithBypass).toBe(true);
+
+    const snapshot = daemon.getSnapshot();
+    expect(snapshot.openPositions.length).toBe(1);
+    const pos = snapshot.openPositions[0]!;
+    expect(pos.cohort).toBe("ESTABLISHED");
+    expect(pos.ratchetConfig).toEqual(ESTABLISHED_DYNAMIC_RATCHET_CONFIG);
+  });
+
+  it("evaluates position against custom cohort ratchetConfig in tickPosition", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    // Micro-cap with MICRO_CAP_DYNAMIC_RATCHET_CONFIG (+10% Tier 1)
+    daemon.processScannedPool(validPool, nowMs, 0.05, 0.25, {
+      bypassScannerEvaluation: true,
+      cohort: "MICRO_CAP",
+      ratchetConfig: MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    });
+
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // Spot price increases +10.0% (from 0.05 to 0.055)
+    // Micro-cap config triggers Tier 1 (SELL_PARTIAL_50) at +10% (standard config requires +15%)
+    const result = daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.055, // +10%
+        currentTimestampMs: nowMs + 1000,
+      },
+      nowMs + 1000,
+    );
+
+    expect(result?.action).toBe("SELL_PARTIAL_50");
+    expect(result?.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
   });
 });

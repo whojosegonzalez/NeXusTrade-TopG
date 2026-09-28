@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { DynamicRatchetService } from "./DynamicRatchetService.js";
 import { RatchetStateStore } from "./RatchetStateStore.js";
-import type { MarketEvaluationContext } from "./DynamicRatchetTypes.js";
+import {
+  type MarketEvaluationContext,
+  MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+  ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+} from "./DynamicRatchetTypes.js";
 
 describe("DynamicRatchetService", () => {
   const baseContext: MarketEvaluationContext = {
@@ -323,5 +327,143 @@ describe("DynamicRatchetService", () => {
         spotPriceSol: -1,
       });
     }).toThrow(/Invalid spotPriceSol/);
+  });
+
+  it("Cohort_Ratchets: MICRO_CAP_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +10%, Tier 2 at +25%, and 45s grace period", () => {
+    const store = new RatchetStateStore();
+    const service = new DynamicRatchetService({}, store);
+    const state = store.initPositionState("pos-micro-1", "mint-micro", 1.0, 1_000_000);
+
+    // 1. Tier 1 at +10% (1000 bps)
+    const t1 = service.evaluate(
+      state,
+      {
+        ...baseContext,
+        spotPriceSol: 1.1,
+        currentTimestampMs: 1_000_010,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(t1.action).toBe("SELL_PARTIAL_50");
+    expect(t1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+    expect(t1.updatedState.currentStopFloorBps).toBe(0);
+
+    // 2. Tier 2 at +25% (2500 bps)
+    const t2 = service.evaluate(
+      t1.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 1.25,
+        currentTimestampMs: 1_000_020,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(t2.action).toBe("SELL_PARTIAL_25");
+    expect(t2.reasonCode).toBe("RATCHET_TIER_2_TRIGGERED");
+    expect(t2.updatedState.currentStopFloorBps).toBe(1800);
+
+    // 3. 45s grace period on drawdown (-600 bps)
+    const state2 = store.initPositionState("pos-micro-2", "mint-micro-2", 1.0, 1_000_000);
+    const dip = service.evaluate(
+      state2,
+      {
+        ...baseContext,
+        spotPriceSol: 0.93, // -7.0% <= -6.0% trigger
+        recentBuysCount60s: 5,
+        recentSellsCount60s: 3,
+        currentTimestampMs: 1_000_000,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(dip.action).toBe("HOLD");
+    expect(dip.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+
+    // After 46 seconds (> 45s), grace expires
+    const expired = service.evaluate(
+      dip.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 0.93,
+        recentBuysCount60s: 5,
+        recentSellsCount60s: 3,
+        currentTimestampMs: 1_000_000 + 46_000,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(expired.action).toBe("SELL_ALL");
+    expect(expired.reasonCode).toBe("DRAWDOWN_GRACE_EXPIRED");
+  });
+
+  it("Cohort_Ratchets: ESTABLISHED_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +15%, Tier 2 at +50%, and -18% hard stop", () => {
+    const store = new RatchetStateStore();
+    const service = new DynamicRatchetService({}, store);
+    const state = store.initPositionState("pos-est-1", "mint-est", 1.0, 1_000_000);
+
+    // Below +15% (e.g. +12%) does not trigger Tier 1 for established
+    const underT1 = service.evaluate(
+      state,
+      {
+        ...baseContext,
+        spotPriceSol: 1.12,
+        currentTimestampMs: 1_000_010,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(underT1.action).toBe("HOLD");
+
+    // Tier 1 at +15%
+    const t1 = service.evaluate(
+      underT1.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 1.15,
+        currentTimestampMs: 1_000_020,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(t1.action).toBe("SELL_PARTIAL_50");
+    expect(t1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+
+    // Tier 2 at +50%
+    const t2 = service.evaluate(
+      t1.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 1.5,
+        currentTimestampMs: 1_000_030,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(t2.action).toBe("SELL_PARTIAL_25");
+    expect(t2.reasonCode).toBe("RATCHET_TIER_2_TRIGGERED");
+    expect(t2.updatedState.currentStopFloorBps).toBe(4000);
+
+    // Hard stop at -18.0%: at -15.0% it does NOT trigger catastrophic stop for established
+    const state2 = store.initPositionState("pos-est-2", "mint-est-2", 1.0, 1_000_000);
+    const dip15 = service.evaluate(
+      state2,
+      {
+        ...baseContext,
+        spotPriceSol: 0.85, // -15.0%
+        recentBuysCount60s: 5,
+        recentSellsCount60s: 2,
+        currentTimestampMs: 1_000_010,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(dip15.action).toBe("HOLD"); // In grace period, not catastrophic stop!
+
+    // Catastrophic hard stop at -18.1%
+    const hardStop = service.evaluate(
+      dip15.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 0.819, // -18.1% <= -18.0%
+        currentTimestampMs: 1_000_020,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    expect(hardStop.action).toBe("SELL_ALL");
+    expect(hardStop.reasonCode).toBe("CATASTROPHIC_HARD_STOP");
   });
 });

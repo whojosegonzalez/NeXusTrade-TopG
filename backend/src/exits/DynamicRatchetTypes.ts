@@ -89,3 +89,31 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   tier2PeakThresholdBps: 4900,
   tier2LockedFloorBps: 4000,
 };
+
+export type CohortTier = "MICRO_CAP" | "ESTABLISHED";
+
+export const MICRO_CAP_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
+  catastrophicFloorBps: -1200, // -12.0% hard stop
+  drawdownTriggerBps: -600, // -6.0% drawdown warning
+  drawdownRecoveryBps: -300, // -3.0% recovery
+  drawdownGracePeriodMs: 45_000, // 45s grace period for fast micro-cap dump protection
+  scratchPnlMinBps: 50, // +0.5%
+  scratchPnlMaxBps: 150, // +1.5%
+  tier1PeakThresholdBps: 1000, // +10.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
+  tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
+  tier2PeakThresholdBps: 2500, // +25.0% take-profit Tier 2 (sell 25%, lock floor to +18.0%)
+  tier2LockedFloorBps: 1800, // +18.0% floor
+};
+
+export const ESTABLISHED_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
+  catastrophicFloorBps: -1800, // -18.0% hard stop (wider room for established swings)
+  drawdownTriggerBps: -800, // -8.0% drawdown warning
+  drawdownRecoveryBps: -400, // -4.0% recovery
+  drawdownGracePeriodMs: 120_000, // 120s grace period
+  scratchPnlMinBps: 50, // +0.5%
+  scratchPnlMaxBps: 150, // +1.5%
+  tier1PeakThresholdBps: 1500, // +15.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
+  tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
+  tier2PeakThresholdBps: 5000, // +50.0% take-profit Tier 2 (sell 25%, lock floor to +40.0%)
+  tier2LockedFloorBps: 4000, // +40.0% floor
+};

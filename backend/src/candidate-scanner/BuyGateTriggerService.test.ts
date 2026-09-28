@@ -353,4 +353,39 @@ describe("BuyGateTriggerService", () => {
 
     expect(result.triggered).toBe(true);
   });
+
+  it("relaxes FLOW_ABSORPTION_GATE buyer dominance requirement for volume breakouts", () => {
+    const service = new BuyGateTriggerService();
+
+    // 1. Under standard volume ($6,000), a 1.28x ratio fails the standard 1.50x requirement
+    const standardFail = service.evaluateCandidate({
+      ...candidate,
+      volume5mUsd: 6000,
+      buyToSellRatio: 1.28,
+    });
+    expect(standardFail.triggered).toBe(false);
+    expect(standardFail.rejectionReason).toBe("FLOW_ABSORPTION_GATE_FAILED");
+
+    // 2. For strong volume surge >= $15,000, requirement relaxes to 1.25x (1.28x passes)
+    const surge15k = service.evaluateCandidate({
+      ...candidate,
+      volume5mUsd: 16000,
+      buyToSellRatio: 1.28,
+    });
+    expect(surge15k.triggered).toBe(true);
+    const flowGate15k = surge15k.gates.find((g) => g.name === "FLOW_ABSORPTION_GATE");
+    expect(flowGate15k?.passed).toBe(true);
+    expect(flowGate15k?.requirement).toBe("Buys/Sells >= 1.25x");
+
+    // 3. For major volume surge >= $35,000, requirement relaxes to 1.15x (1.18x passes)
+    const surge35k = service.evaluateCandidate({
+      ...candidate,
+      volume5mUsd: 40000,
+      buyToSellRatio: 1.18,
+    });
+    expect(surge35k.triggered).toBe(true);
+    const flowGate35k = surge35k.gates.find((g) => g.name === "FLOW_ABSORPTION_GATE");
+    expect(flowGate35k?.passed).toBe(true);
+    expect(flowGate35k?.requirement).toBe("Buys/Sells >= 1.15x");
+  });
 });

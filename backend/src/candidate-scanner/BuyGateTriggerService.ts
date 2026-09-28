@@ -141,11 +141,14 @@ export class BuyGateTriggerService {
       requirement: `${(effectiveMinLmc * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%${isEstablished ? " (Adaptive Established Pool)" : ""}`,
     });
 
-    // 4. Flow Absorption Gate (Buys >= 1.5 * Sells, or >= 1.20 for high-volume breakouts >= $50k)
-    const isHighVolumeBreakout = item.volume5mUsd >= 50000;
-    const effectiveMinRatio = isHighVolumeBreakout
-      ? Math.min(this.config.minBuyToSellRatio, 1.2)
-      : this.config.minBuyToSellRatio;
+    // 4. Flow Absorption Gate (Buys >= 1.5 * Sells, or relaxed for volume breakouts)
+    // For strong volume surges (>= $15k in 5m), relax buyer dominance requirement to 1.25x (or 1.15x if >= $35k)
+    let effectiveMinRatio = this.config.minBuyToSellRatio;
+    if (item.volume5mUsd >= 35000) {
+      effectiveMinRatio = Math.min(effectiveMinRatio, 1.15);
+    } else if (item.volume5mUsd >= 15000) {
+      effectiveMinRatio = Math.min(effectiveMinRatio, 1.25);
+    }
     const flowPassed = item.buyToSellRatio >= effectiveMinRatio;
     gates.push({
       name: "FLOW_ABSORPTION_GATE",
