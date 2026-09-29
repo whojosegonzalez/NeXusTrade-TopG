@@ -15,13 +15,18 @@ import {
 } from "../exits/DynamicRatchetTypes.js";
 import { nowMs } from "../db/utils/timestamps.js";
 import { BACKFILLED_PAST_SESSIONS, type HistoricalSessionSummary } from "@nexustrade/shared";
+import { BirdeyeDiscoveryService } from "../discovery/BirdeyeDiscoveryService.js";
+import { BirdeyeBudgetTracker } from "../services/BirdeyeBudgetTracker.js";
 
 function parseCliArgs(): PaperTradingDaemonConfig {
+  const rawArgs = process.argv.slice(2).filter((arg) => arg !== "--");
   const { values } = parseArgs({
+    args: rawArgs,
     options: {
       "session-id": { type: "string" },
       "duration-hours": { type: "string" },
       "max-positions": { type: "string" },
+      "max-open-positions": { type: "string" },
       "position-size-sol": { type: "string" },
       "max-drawdown-bps": { type: "string" },
       "cooldown-min": { type: "string" },
@@ -34,7 +39,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   const rawDuration = values["duration-hours"];
   const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 4;
 
-  const rawMaxPos = values["max-positions"];
+  const rawMaxPos = values["max-positions"] ?? values["max-open-positions"];
   const maxOpenPositions =
     typeof rawMaxPos === "string" ? Math.min(10, Math.max(1, parseInt(rawMaxPos, 10))) : 5;
 
@@ -178,6 +183,24 @@ async function run(): Promise<void> {
 
   const buyGateService = new BuyGateTriggerService();
   const tracker = new CounterfactualOpportunityTracker();
+
+  const birdeyeBudgetTracker = new BirdeyeBudgetTracker();
+  const birdeyeDiscovery = new BirdeyeDiscoveryService({
+    budgetTracker: birdeyeBudgetTracker,
+  });
+
+  try {
+    const probeResult = await birdeyeDiscovery.probeSmartMoney();
+    if (probeResult.supported) {
+      console.log("[PaperDaemon] Birdeye Smart Money endpoint verified and enabled.");
+    } else {
+      console.log(
+        `[PaperDaemon] Birdeye Smart Money endpoint disabled (HTTP ${probeResult.status}). Using Trending & DEX discovery.`,
+      );
+    }
+  } catch (probeErr) {
+    console.warn("[PaperDaemon] Failed to probe Smart Money:", probeErr);
+  }
 
   interface ActivityLogRecord {
     timestamp: number;
@@ -407,12 +430,12 @@ async function run(): Promise<void> {
           ).toFixed(6);
           addActivityLog(
             "RATCHET",
-            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+15% Tier 1) | Floor locked to Breakeven`,
+            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+20% Tier 1) | Floor locked to +10%`,
             pos.mintAddress,
             pos.symbol,
           );
           console.log(
-            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +15% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +20% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
           );
         } else if (result?.action === "SELL_PARTIAL_25") {
           const usdPrice = (
@@ -453,6 +476,54 @@ async function run(): Promise<void> {
               currentNow,
               "FAILED_BASELINE_SCANNER_PRESCREEN",
             );
+          }
+        }
+
+        // B. Birdeye Trending Poll (Every 2.5 minutes if budget permits)
+        if (birdeyeDiscovery.getBudgetTracker().canPollTrending(currentNow)) {
+          try {
+            const trendingTokens = await birdeyeDiscovery.fetchTrendingTokens(20, currentNow);
+            if (trendingTokens.length > 0) {
+              console.log(
+                `[PaperDaemon] [Birdeye] Fetched ${trendingTokens.length} trending tokens from Birdeye`,
+              );
+              for (const token of trendingTokens) {
+                if (streamEngine.isMintSeen(token.address)) continue;
+
+                const trendingRecord: ScannedPoolRecord = {
+                  poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
+                  mintAddress: token.address,
+                  symbol: token.symbol,
+                  decimals: token.decimals ?? 9,
+                  baseMint: token.address,
+                  liquidityUsd: token.liquidity > 0 ? token.liquidity : 50_000,
+                  marketCapUsd: token.liquidity > 0 ? token.liquidity * 4 : 200_000,
+                  openTimeSec: currentNowSec - 7200, // Established runner age (2h)
+                  lpBurnPct: 100,
+                  mintAuthority: null,
+                  freezeAuthority: null,
+                  volume5mUsd: token.volume24hUSD ? Math.round(token.volume24hUSD / 288) : 10_000,
+                  txCount5m: 25,
+                  buys5m: 16,
+                  sells5m: 9,
+                  spotPriceUsd: token.price > 0 ? token.price : 0.05,
+                  fetchedAt: new Date(currentNow).toISOString(),
+                };
+
+                const admitted = watchlistService.admitOrUpdate(trendingRecord, currentNowSec);
+                if (admitted) {
+                  streamEngine.markMintSeen(token.address);
+                  tracker.recordCandidate(
+                    trendingRecord,
+                    "WATCHLIST_RADAR",
+                    trendingRecord.spotPriceUsd,
+                    currentNow,
+                  );
+                }
+              }
+            }
+          } catch (birdeyeErr) {
+            console.error("[PaperDaemon] Error fetching Birdeye trending tokens:", birdeyeErr);
           }
         }
 
@@ -552,7 +623,17 @@ async function run(): Promise<void> {
               : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
 
             // Tiered Sizing: 0.25 SOL for unproven micro-caps; 0.80 SOL for established runners
-            const targetCohortSize = isEstablished ? 0.8 : 0.25;
+            let targetCohortSize = isEstablished ? 0.8 : 0.25;
+            if (
+              isEstablished &&
+              rugMetrics?.bundlerPct !== undefined &&
+              rugMetrics.bundlerPct > 0.7
+            ) {
+              targetCohortSize = 0.4;
+              console.log(
+                `[PaperDaemon] [ESTABLISHED_HIGH_BUNDLER] Downsizing ${candidate.symbol} to 0.40 SOL (${(rugMetrics.bundlerPct * 100).toFixed(1)}% bundlers)`,
+              );
+            }
 
             const currentSnap = daemon.getSnapshot();
             const gasReserveSol = 0.05;

@@ -385,7 +385,7 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
         {session.recentActivityLogs.length === 0 ? (
           <div className="empty-state-box">No activity events logged yet.</div>
         ) : (
-          <div className="table-responsive" style={{ maxHeight: "280px", overflowY: "auto" }}>
+          <div className="table-responsive" style={{ maxHeight: "520px", overflowY: "auto" }}>
             <table className="activity-table">
               <thead>
                 <tr>

@@ -1,5 +1,6 @@
 import {
   type DynamicRatchetConfig,
+  type ExitReasonCode,
   type MarketEvaluationContext,
   type PositionRatchetState,
   type RatchetEvaluationResult,
@@ -52,6 +53,7 @@ export class DynamicRatchetService {
     let nextDrawdownEnteredAtMs: number | null = state.drawdownEnteredAtMs;
     let tier1ProfitTaken = state.tier1ProfitTaken ?? false;
     let tier2ProfitTaken = state.tier2ProfitTaken ?? false;
+    let armedBreakeven = state.armedBreakeven ?? false;
 
     // 0. Optional Hard Take-Profit Cap Check
     if (
@@ -67,6 +69,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -102,8 +105,14 @@ export class DynamicRatchetService {
       }
     }
 
+    // Milestone 0: Armed Breakeven (+10.0%) - Risk-free stop floor without selling tokens
+    if (nextPeakGainBps >= activeConfig.armedBreakevenThresholdBps && !armedBreakeven) {
+      armedBreakeven = true;
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.armedBreakevenFloorBps);
+    }
+
     // 1. Milestone Take-Profit Scaling Checks
-    // Check Tier 1 Milestone (+15%): Sell 50% of position, move floor to Breakeven (+0%)
+    // Check Tier 1 Milestone (+20%): Sell 50% of position, move floor to +10%
     if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps && !tier1ProfitTaken) {
       tier1ProfitTaken = true;
       nextTier = "TIER_1";
@@ -118,6 +127,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -160,6 +170,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -194,6 +205,11 @@ export class DynamicRatchetService {
     } else if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps || tier1ProfitTaken) {
       nextTier = "TIER_1";
       nextFloorBps = Math.max(nextFloorBps, activeConfig.tier1LockedFloorBps);
+    } else if (armedBreakeven || nextPeakGainBps >= activeConfig.armedBreakevenThresholdBps) {
+      nextFloorBps = Math.max(nextFloorBps, activeConfig.armedBreakevenFloorBps);
+      if (nextTier !== "TIER_1" && nextTier !== "TIER_2") {
+        nextTier = "RUNNING";
+      }
     } else if (
       currentPnlBps >= activeConfig.scratchPnlMinBps &&
       currentPnlBps <= activeConfig.scratchPnlMaxBps &&
@@ -221,6 +237,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -260,6 +277,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -283,9 +301,9 @@ export class DynamicRatchetService {
       };
     }
 
-    // Rule B: Ratchet locked floor breach (+0% / +35% or trailing moonbag floor)
+    // Rule B: Ratchet locked floor breach (+0% / +10% / +35% or trailing moonbag floor)
     if (
-      (nextTier === "TIER_1" || nextTier === "TIER_2" || nextFloorBps >= 0) &&
+      (nextTier === "TIER_1" || nextTier === "TIER_2" || armedBreakeven || nextFloorBps >= 0) &&
       currentPnlBps <= nextFloorBps
     ) {
       const updatedState: PositionRatchetState = {
@@ -297,6 +315,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -312,12 +331,18 @@ export class DynamicRatchetService {
         context,
       );
 
+      let reasonCode: ExitReasonCode = "ARMED_BREAKEVEN_BREACH";
+      if (nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps) {
+        reasonCode = "RATCHET_TIER_2_BREACH";
+      } else if (nextTier === "TIER_1" || tier1ProfitTaken) {
+        reasonCode = "RATCHET_TIER_1_BREACH";
+      } else if (armedBreakeven) {
+        reasonCode = "ARMED_BREAKEVEN_BREACH";
+      }
+
       return {
         action: "SELL_ALL",
-        reasonCode:
-          nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps
-            ? "RATCHET_TIER_2_BREACH"
-            : "RATCHET_TIER_1_TRIGGERED",
+        reasonCode,
         diagnostics,
         updatedState,
       };
@@ -338,6 +363,7 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -383,6 +409,7 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          ...(armedBreakeven ? { armedBreakeven: true } : {}),
           tier1ProfitTaken,
           tier2ProfitTaken,
         };
@@ -420,6 +447,7 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          ...(armedBreakeven ? { armedBreakeven: true } : {}),
           tier1ProfitTaken,
           tier2ProfitTaken,
         };
@@ -461,6 +489,7 @@ export class DynamicRatchetService {
           drawdownState: nextDrawdownState,
           drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
           lastEvaluatedAtMs: context.currentTimestampMs,
+          ...(armedBreakeven ? { armedBreakeven: true } : {}),
           tier1ProfitTaken,
           tier2ProfitTaken,
         };
@@ -494,6 +523,7 @@ export class DynamicRatchetService {
         drawdownState: "EVALUATING_DRAWDOWN",
         drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
         lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -536,6 +566,7 @@ export class DynamicRatchetService {
       drawdownState: nextDrawdownState,
       drawdownEnteredAtMs: nextDrawdownEnteredAtMs,
       lastEvaluatedAtMs: context.currentTimestampMs,
+      ...(armedBreakeven ? { armedBreakeven: true } : {}),
       tier1ProfitTaken,
       tier2ProfitTaken,
     };

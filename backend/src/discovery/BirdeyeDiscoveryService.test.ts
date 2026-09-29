@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { BirdeyeDiscoveryService } from "./BirdeyeDiscoveryService.js";
 import { BirdeyeBudgetTracker } from "../services/BirdeyeBudgetTracker.js";
+import { CandidateWatchlistService } from "../candidate-scanner/CandidateWatchlistService.js";
+import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 
 describe("BirdeyeDiscoveryService", () => {
   it("handles missing API key gracefully without errors", async () => {
@@ -137,5 +139,47 @@ describe("BirdeyeDiscoveryService", () => {
 
     const tokens = await service.fetchTrendingTokens(20, 1_000_000);
     expect(tokens).toEqual([]);
+  });
+
+  it("converts trending token into ScannedPoolRecord and admits into CandidateWatchlistService", async () => {
+    const watchlistService = new CandidateWatchlistService();
+    const token = {
+      address: "BirdeyeTrending11111111111111111111111111111",
+      symbol: "TREND",
+      name: "Trending Token",
+      decimals: 9,
+      liquidity: 45_000,
+      price: 0.15,
+      volume24hUSD: 600_000,
+      rank: 1,
+    };
+
+    const currentNow = 1_700_000_000_000;
+    const currentNowSec = Math.floor(currentNow / 1000);
+    const trendingRecord: ScannedPoolRecord = {
+      poolId: `birdeye-${token.address.slice(0, 8)}`,
+      mintAddress: token.address,
+      symbol: token.symbol,
+      decimals: token.decimals ?? 9,
+      baseMint: token.address,
+      liquidityUsd: token.liquidity ?? 40_000,
+      marketCapUsd: (token.liquidity ?? 40_000) * 3,
+      openTimeSec: currentNowSec - 3600,
+      lpBurnPct: 100,
+      mintAuthority: null,
+      freezeAuthority: null,
+      volume5mUsd: token.volume24hUSD ? Math.round(token.volume24hUSD / 288) : 10_000,
+      txCount5m: 25,
+      buys5m: 16,
+      sells5m: 9,
+      spotPriceUsd: token.price > 0 ? token.price : 0.05,
+      fetchedAt: new Date(currentNow).toISOString(),
+    };
+
+    const admitted = watchlistService.admitOrUpdate(trendingRecord, currentNowSec);
+    expect(admitted).not.toBeNull();
+    expect(admitted?.symbol).toBe("TREND");
+    expect(admitted?.mintAddress).toBe(token.address);
+    expect(admitted?.status).toBe("WATCHING");
   });
 });

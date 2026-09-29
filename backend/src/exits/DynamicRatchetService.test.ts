@@ -166,33 +166,33 @@ describe("DynamicRatchetService", () => {
     expect(result.reasonCode).toBe("SCRATCH_EXIT");
   });
 
-  it("Ratchet_Tier1_Lock: triggers SELL_PARTIAL_50 at +15% peak, locks floor at breakeven +0%, and exits on drop below floor", () => {
+  it("Ratchet_Tier1_Lock: triggers SELL_PARTIAL_50 at +20% peak, locks floor at +10%, and exits on drop below floor", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Peak at +15%
+    // Peak at +20%
     const peakResult = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.15, // +15% = 1500 bps (>= 1500 bps Tier 1 threshold)
+      spotPriceSol: 1.2, // +20% = 2000 bps (>= 2000 bps Tier 1 threshold)
       currentTimestampMs: 1_000_100,
     });
 
     expect(peakResult.action).toBe("SELL_PARTIAL_50");
     expect(peakResult.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
     expect(peakResult.updatedState.activeTier).toBe("TIER_1");
-    expect(peakResult.updatedState.currentStopFloorBps).toBe(0); // Locked at breakeven +0%
+    expect(peakResult.updatedState.currentStopFloorBps).toBe(1000); // Locked at +10%
     expect(peakResult.updatedState.tier1ProfitTaken).toBe(true);
 
-    // Retracement to -0.5% (below breakeven floor)
+    // Retracement to +9.5% (below +10% floor)
     const exitResult = service.evaluate(peakResult.updatedState, {
       ...baseContext,
-      spotPriceSol: 0.995, // -0.5% = -50 bps (<= 0 bps floor)
+      spotPriceSol: 1.095, // +9.5% = 950 bps (<= 1000 bps floor)
       currentTimestampMs: 1_000_200,
     });
 
     expect(exitResult.action).toBe("SELL_ALL");
-    expect(exitResult.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+    expect(exitResult.reasonCode).toBe("RATCHET_TIER_1_BREACH");
   });
 
   it("SmartHold_Recovery_Breakeven: recovers from drawdown to +8.0% and locks stop floor to breakeven +0%", () => {
@@ -251,10 +251,10 @@ describe("DynamicRatchetService", () => {
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Reach Tier 1 first (+15%)
+    // Reach Tier 1 first (+20%)
     const tier1Result = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.15,
+      spotPriceSol: 1.2,
       currentTimestampMs: 1_000_100,
     });
     expect(tier1Result.action).toBe("SELL_PARTIAL_50");
@@ -288,12 +288,12 @@ describe("DynamicRatchetService", () => {
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    // Reach Tier 1 (+25% peak -> floor 0 bps)
+    // Reach Tier 1 (+25% peak -> floor +10% = 1000 bps)
     const tier1Result = service.evaluate(state, {
       ...baseContext,
       spotPriceSol: 1.25,
     });
-    expect(tier1Result.updatedState.currentStopFloorBps).toBe(0);
+    expect(tier1Result.updatedState.currentStopFloorBps).toBe(1000);
 
     // Reach Tier 2 (+50% peak -> floor +35% = 3500 bps)
     const tier2Result = service.evaluate(tier1Result.updatedState, {
@@ -329,13 +329,13 @@ describe("DynamicRatchetService", () => {
     }).toThrow(/Invalid spotPriceSol/);
   });
 
-  it("Cohort_Ratchets: MICRO_CAP_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +10%, Tier 2 at +48.5%, and 90s grace period", () => {
+  it("Cohort_Ratchets: MICRO_CAP_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +20%, Tier 2 at +48.5%, and 90s grace period", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-micro-1", "mint-micro", 1.0, 1_000_000);
 
-    // 1. Tier 1 at +10% (1000 bps)
-    const t1 = service.evaluate(
+    // 1. Arm breakeven at +10% (1000 bps) without selling
+    const armed = service.evaluate(
       state,
       {
         ...baseContext,
@@ -344,11 +344,25 @@ describe("DynamicRatchetService", () => {
       },
       MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
     );
+    expect(armed.action).toBe("HOLD");
+    expect(armed.updatedState.armedBreakeven).toBe(true);
+    expect(armed.updatedState.currentStopFloorBps).toBe(0);
+
+    // 2. Tier 1 at +20% (2000 bps) -> sell 50%, lock floor to +10% (1000 bps)
+    const t1 = service.evaluate(
+      armed.updatedState,
+      {
+        ...baseContext,
+        spotPriceSol: 1.2,
+        currentTimestampMs: 1_000_015,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    );
     expect(t1.action).toBe("SELL_PARTIAL_50");
     expect(t1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
-    expect(t1.updatedState.currentStopFloorBps).toBe(0);
+    expect(t1.updatedState.currentStopFloorBps).toBe(1000);
 
-    // 2. Tier 2 at +48.5% (4850 bps)
+    // 3. Tier 2 at +48.5% (4850 bps)
     const t2 = service.evaluate(
       t1.updatedState,
       {
@@ -362,7 +376,7 @@ describe("DynamicRatchetService", () => {
     expect(t2.reasonCode).toBe("RATCHET_TIER_2_TRIGGERED");
     expect(t2.updatedState.currentStopFloorBps).toBe(3500);
 
-    // 3. 90s base grace period on drawdown (-600 bps)
+    // 4. 90s base grace period on drawdown (-600 bps)
     const state2 = store.initPositionState("pos-micro-2", "mint-micro-2", 1.0, 1_000_000);
     const dip = service.evaluate(
       state2,
@@ -394,12 +408,12 @@ describe("DynamicRatchetService", () => {
     expect(expired.reasonCode).toBe("DRAWDOWN_GRACE_EXPIRED");
   });
 
-  it("Cohort_Ratchets: ESTABLISHED_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +15%, Tier 2 at +48.5%, and -18% hard stop", () => {
+  it("Cohort_Ratchets: ESTABLISHED_DYNAMIC_RATCHET_CONFIG triggers Tier 1 at +20%, Tier 2 at +48.5%, and -18% hard stop", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-est-1", "mint-est", 1.0, 1_000_000);
 
-    // Below +15% (e.g. +12%) does not trigger Tier 1 for established
+    // Below +20% (e.g. +12%) arms breakeven at +10% but holds without selling
     const underT1 = service.evaluate(
       state,
       {
@@ -410,19 +424,21 @@ describe("DynamicRatchetService", () => {
       ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
     );
     expect(underT1.action).toBe("HOLD");
+    expect(underT1.updatedState.armedBreakeven).toBe(true);
 
-    // Tier 1 at +15%
+    // Tier 1 at +20%
     const t1 = service.evaluate(
       underT1.updatedState,
       {
         ...baseContext,
-        spotPriceSol: 1.15,
+        spotPriceSol: 1.2,
         currentTimestampMs: 1_000_020,
       },
       ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
     );
     expect(t1.action).toBe("SELL_PARTIAL_50");
     expect(t1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+    expect(t1.updatedState.currentStopFloorBps).toBe(1000);
 
     // Tier 2 at +48.5%
     const t2 = service.evaluate(
@@ -576,10 +592,10 @@ describe("DynamicRatchetService", () => {
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-moon-1", "mint-moon-1", 1.0, 1_000_000);
 
-    // 1. Tier 1 at +15%
+    // 1. Tier 1 at +20%
     const t1 = service.evaluate(state, {
       ...baseContext,
-      spotPriceSol: 1.15,
+      spotPriceSol: 1.2,
       currentTimestampMs: 1_000_010,
     });
     expect(t1.action).toBe("SELL_PARTIAL_50");
@@ -635,5 +651,77 @@ describe("DynamicRatchetService", () => {
     });
     expect(running.action).toBe("HOLD");
     expect(running.updatedState.activeTier).toBe("RUNNING");
+  });
+
+  describe("SubPhase12_82: Armed Breakeven (+10%) & Tier 1 Take-Profit (+20%)", () => {
+    it("arms breakeven at +10.0% without selling tokens (HOLD, 0 bps floor)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-82-1", "mint-82-1", 1.0, 1_000_000);
+
+      const res = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.1, // +10.0% = 1000 bps
+        currentTimestampMs: 1_000_010,
+      });
+
+      expect(res.action).toBe("HOLD");
+      expect(res.reasonCode).toBe("HOLD_NORMAL");
+      expect(res.updatedState.armedBreakeven).toBe(true);
+      expect(res.updatedState.currentStopFloorBps).toBe(0);
+      expect(res.updatedState.activeTier).toBe("RUNNING");
+    });
+
+    it("drops back to breakeven after arming and exits with ARMED_BREAKEVEN_BREACH", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-82-2", "mint-82-2", 1.0, 1_000_000);
+
+      // 1. Arm at +10%
+      const armed = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.1,
+        currentTimestampMs: 1_000_010,
+      });
+      expect(armed.updatedState.armedBreakeven).toBe(true);
+
+      // 2. Fall to 0.0% (<= 0 bps floor)
+      const breach = service.evaluate(armed.updatedState, {
+        ...baseContext,
+        spotPriceSol: 1.0, // 0.0%
+        currentTimestampMs: 1_000_020,
+      });
+
+      expect(breach.action).toBe("SELL_ALL");
+      expect(breach.reasonCode).toBe("ARMED_BREAKEVEN_BREACH");
+    });
+
+    it("triggers Tier 1 at +20.0%, locks floor to +10.0%, and drops to +10.0% exiting with RATCHET_TIER_1_BREACH", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-82-3", "mint-82-3", 1.0, 1_000_000);
+
+      // 1. Surges to +20.0% (2000 bps)
+      const t1 = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.2,
+        currentTimestampMs: 1_000_010,
+      });
+
+      expect(t1.action).toBe("SELL_PARTIAL_50");
+      expect(t1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+      expect(t1.updatedState.activeTier).toBe("TIER_1");
+      expect(t1.updatedState.currentStopFloorBps).toBe(1000); // +10.0% locked floor
+
+      // 2. Drops to +9.9% (below +10.0% floor)
+      const breach = service.evaluate(t1.updatedState, {
+        ...baseContext,
+        spotPriceSol: 1.099, // +9.9% < 1000 bps
+        currentTimestampMs: 1_000_020,
+      });
+
+      expect(breach.action).toBe("SELL_ALL");
+      expect(breach.reasonCode).toBe("RATCHET_TIER_1_BREACH");
+    });
   });
 });

@@ -108,28 +108,39 @@ function nexusDevApiPlugin(): Plugin {
               const logFile = path.resolve(tmpDir, "daemon-spawn.log");
               const outFd = fs.openSync(logFile, "a");
 
-              const child = spawn(
-                process.platform === "win32" ? "pnpm.cmd" : "pnpm",
-                [
-                  "daemon:paper",
-                  `--duration-hours=${durationHours}`,
-                  `--session-id=${sessionId}`,
-                  `--max-open-positions=${maxPositions}`,
-                ],
-                {
-                  cwd: projectRoot,
-                  detached: true,
-                  stdio: ["ignore", outFd, outFd],
-                  shell: true,
-                },
-              );
+              const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+              const args = [
+                "--filter",
+                "@nexustrade/backend",
+                "trading:paper-daemon",
+                "--",
+                `--duration-hours=${durationHours}`,
+                `--session-id=${sessionId}`,
+                `--max-positions=${maxPositions}`,
+              ];
+
+              const child = spawn(pnpmCmd, args, {
+                cwd: projectRoot,
+                detached: true,
+                stdio: ["ignore", outFd, outFd],
+                shell: process.platform === "win32",
+              });
               child.unref();
+
+              if (child.pid) {
+                fs.writeFileSync(
+                  path.resolve(tmpDir, "paper-daemon.pid"),
+                  String(child.pid),
+                  "utf8",
+                );
+              }
 
               res.setHeader("Content-Type", "application/json");
               res.end(
                 JSON.stringify({
                   ok: true,
                   sessionId,
+                  pid: child.pid,
                   message: "Paper session started successfully",
                 }),
               );
@@ -227,7 +238,13 @@ function nexusDevApiPlugin(): Plugin {
               const scratches = closedTrades.length - wins - losses;
               const now = Date.now();
               const start = raw.startedAtMs || now;
-              const elapsed = Math.floor((now - start) / 1000);
+              const isHaltedOrDone =
+                raw.status === "HALTED" || raw.status === "STOPPED" || raw.status === "COMPLETED";
+              const plannedDurationMs = (raw.durationHours || 4) * 3600 * 1000;
+              const endTimestamp = isHaltedOrDone
+                ? Math.min(raw.lastTickAtMs || now, start + plannedDurationMs)
+                : now;
+              const elapsed = Math.max(0, Math.floor((endTimestamp - start) / 1000));
 
               const openPositions = (raw.openPositions || []).map((p: RawDaemonPosition) => ({
                 positionId: p.positionId,

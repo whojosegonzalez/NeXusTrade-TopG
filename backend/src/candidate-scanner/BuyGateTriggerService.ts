@@ -12,7 +12,7 @@ export interface BuyGateConfig {
   readonly maxSingleTxDisposalPct: number; // default: 0.05 (5%)
   readonly minSells5m: number; // default: 15
   readonly minLiquidityUsd: number; // default: 20000
-  readonly maxBundlerPct: number; // default: 0.35 (35%)
+  readonly maxBundlerPct: number; // default: 0.85 (85%)
   readonly maxTop10HolderPct: number; // default: 0.30 (30%)
   readonly minHoldersCount: number; // default: 350
   readonly maxRugScore: number; // default: 700
@@ -30,7 +30,7 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   maxSingleTxDisposalPct: 0.05,
   minSells5m: 15,
   minLiquidityUsd: 20000,
-  maxBundlerPct: 0.35,
+  maxBundlerPct: 0.85,
   maxTop10HolderPct: 0.3,
   minHoldersCount: 350,
   maxRugScore: 700,

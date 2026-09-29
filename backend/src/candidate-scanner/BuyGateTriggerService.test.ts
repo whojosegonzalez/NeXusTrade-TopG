@@ -36,10 +36,10 @@ describe("BuyGateTriggerService", () => {
     expect(result.rejectionReason).toBeUndefined();
   });
 
-  it("fails when bundler / insider holdings breach 35%", () => {
+  it("fails when bundler / insider holdings breach 85%", () => {
     const service = new BuyGateTriggerService();
     const result = service.evaluateCandidate(candidate, {
-      bundlerPct: 0.45, // 45% > 35%
+      bundlerPct: 0.88, // 88% > 85%
     });
     expect(result.triggered).toBe(false);
     expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");

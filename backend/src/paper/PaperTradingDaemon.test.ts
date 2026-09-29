@@ -166,7 +166,7 @@ describe("PaperTradingDaemon", () => {
     );
 
     expect(exitResult?.action).toBe("SELL_ALL");
-    expect(exitResult?.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+    expect(exitResult?.reasonCode).toBe("RATCHET_TIER_1_BREACH");
 
     const snapshotAfter = daemon.getSnapshot();
     expect(snapshotAfter.openPositions.length).toBe(0);
@@ -596,7 +596,7 @@ describe("PaperTradingDaemon", () => {
     });
     daemon.start();
 
-    // Micro-cap with MICRO_CAP_DYNAMIC_RATCHET_CONFIG (+10% Tier 1)
+    // Micro-cap with MICRO_CAP_DYNAMIC_RATCHET_CONFIG (+10% Armed Breakeven, +20% Tier 1)
     daemon.processScannedPool(validPool, nowMs, 0.05, 0.25, {
       bypassScannerEvaluation: true,
       cohort: "MICRO_CAP",
@@ -605,13 +605,25 @@ describe("PaperTradingDaemon", () => {
 
     const pos = daemon.getSnapshot().openPositions[0]!;
 
-    // Spot price increases +10.0% (from 0.05 to 0.055)
-    // Micro-cap config triggers Tier 1 (SELL_PARTIAL_50) at +10% (standard config requires +15%)
-    const result = daemon.tickPosition(
+    // Spot price increases +10.0% (from 0.05 to 0.055) -> arms breakeven, holds
+    const armResult = daemon.tickPosition(
       pos.positionId,
       {
         ...baseMarketContext,
         spotPriceSol: 0.055, // +10%
+        currentTimestampMs: nowMs + 500,
+      },
+      nowMs + 500,
+    );
+    expect(armResult?.action).toBe("HOLD");
+
+    // Spot price increases +20.0% (from 0.05 to 0.060)
+    // Micro-cap config triggers Tier 1 (SELL_PARTIAL_50) at +20%
+    const result = daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.06, // +20%
         currentTimestampMs: nowMs + 1000,
       },
       nowMs + 1000,

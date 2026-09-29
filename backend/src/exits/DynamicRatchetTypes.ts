@@ -18,7 +18,9 @@ export type ExitReasonCode =
   | "SELL_PRESSURE_UNABSORBED"
   | "DRAWDOWN_GRACE_EXPIRED"
   | "SCRATCH_EXIT"
+  | "ARMED_BREAKEVEN_BREACH"
   | "RATCHET_TIER_1_TRIGGERED"
+  | "RATCHET_TIER_1_BREACH"
   | "RATCHET_TIER_2_TRIGGERED"
   | "RATCHET_TIER_2_BREACH"
   | "HARD_TAKE_PROFIT_CAP_TRIGGERED"
@@ -39,6 +41,7 @@ export interface PositionRatchetState {
   readonly lastEvaluatedAtMs: number;
   readonly tier1ProfitTaken?: boolean | undefined;
   readonly tier2ProfitTaken?: boolean | undefined;
+  readonly armedBreakeven?: boolean | undefined;
 }
 
 export interface MarketEvaluationContext {
@@ -77,10 +80,12 @@ export interface DynamicRatchetConfig {
   readonly drawdownGracePeriodMs: number; // default 120_000 (120s)
   readonly scratchPnlMinBps: number; // default 50 (+0.5%)
   readonly scratchPnlMaxBps: number; // default 150 (+1.5%)
-  readonly tier1PeakThresholdBps: number; // default 1500 (+15.0%)
-  readonly tier1LockedFloorBps: number; // default 0 (Breakeven +0.0% floor on remaining 50%)
-  readonly tier2PeakThresholdBps: number; // default 4900 (+49.0% / +50.0%)
-  readonly tier2LockedFloorBps: number; // default 4000 (+40.0% floor on remaining 25%)
+  readonly armedBreakevenThresholdBps: number; // default 1000 (+10.0%)
+  readonly armedBreakevenFloorBps: number; // default 0 (Breakeven +0.0% floor)
+  readonly tier1PeakThresholdBps: number; // default 2000 (+20.0%)
+  readonly tier1LockedFloorBps: number; // default 1000 (+10.0% floor on remaining 50%)
+  readonly tier2PeakThresholdBps: number; // default 4850 (+48.5%)
+  readonly tier2LockedFloorBps: number; // default 3500 (+35.0% floor on remaining 25%)
   readonly hardTakeProfitBps?: number | undefined; // optional hard take-profit cap
 }
 
@@ -91,8 +96,10 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   drawdownGracePeriodMs: 120_000,
   scratchPnlMinBps: 50,
   scratchPnlMaxBps: 150,
-  tier1PeakThresholdBps: 1500,
-  tier1LockedFloorBps: 0,
+  armedBreakevenThresholdBps: 1000,
+  armedBreakevenFloorBps: 0,
+  tier1PeakThresholdBps: 2000,
+  tier1LockedFloorBps: 1000,
   tier2PeakThresholdBps: 4850,
   tier2LockedFloorBps: 3500,
 };
@@ -106,8 +113,10 @@ export const MICRO_CAP_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   drawdownGracePeriodMs: 90_000, // 90s base grace period for fast micro-cap dump protection
   scratchPnlMinBps: 50, // +0.5%
   scratchPnlMaxBps: 150, // +1.5%
-  tier1PeakThresholdBps: 1000, // +10.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
-  tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
+  armedBreakevenThresholdBps: 1000, // +10.0% arm breakeven floor (+0.0%) with 0% sold
+  armedBreakevenFloorBps: 0, // Breakeven (+0.0%) floor
+  tier1PeakThresholdBps: 2000, // +20.0% take-profit Tier 1 (sell 50%, lock floor to +10.0%)
+  tier1LockedFloorBps: 1000, // +10.0% floor on remaining 50%
   tier2PeakThresholdBps: 4850, // +48.5% take-profit Tier 2 (sell 25%, lock floor to +35.0%)
   tier2LockedFloorBps: 3500, // +35.0% floor
 };
@@ -119,8 +128,10 @@ export const ESTABLISHED_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   drawdownGracePeriodMs: 120_000, // 120s grace period
   scratchPnlMinBps: 50, // +0.5%
   scratchPnlMaxBps: 150, // +1.5%
-  tier1PeakThresholdBps: 1500, // +15.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
-  tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
+  armedBreakevenThresholdBps: 1000, // +10.0% arm breakeven floor (+0.0%) with 0% sold
+  armedBreakevenFloorBps: 0, // Breakeven (+0.0%) floor
+  tier1PeakThresholdBps: 2000, // +20.0% take-profit Tier 1 (sell 50%, lock floor to +10.0%)
+  tier1LockedFloorBps: 1000, // +10.0% floor on remaining 50%
   tier2PeakThresholdBps: 4850, // +48.5% take-profit Tier 2 (sell 25%, lock floor to +35.0%)
   tier2LockedFloorBps: 3500, // +35.0% floor
 };
