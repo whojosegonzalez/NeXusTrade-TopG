@@ -700,6 +700,11 @@ meter {
   color: #cbd5e1;
   border: 1px solid #64748b;
 }
+.tier-running {
+  background: #0e7490;
+  color: #a5f3fc;
+  border: 1px solid #06b6d4;
+}
 .tier-drawdown {
   background: #78350f;
   color: #fde68a;
@@ -715,6 +720,17 @@ meter {
   color: #e9d5ff;
   border: 1px solid #8b5cf6;
   box-shadow: 0 0 8px rgba(139, 92, 246, 0.4);
+}
+
+.token-link {
+  color: #818cf8;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-family: inherit;
+  transition: color 0.15s ease;
+}
+.token-link:hover {
+  color: #a5b4fc;
 }
 
 /* Watchlist, Positions, Activity & History Tables */
@@ -800,8 +816,9 @@ meter {
   color: #fecaca;
 }
 .badge-log-ratchet {
-  background: #581c87;
-  color: #e9d5ff;
+  background: #854d0e;
+  color: #fef08a;
+  border: 1px solid #ca8a04;
 }
 .badge-log-alert {
   background: #78350f;

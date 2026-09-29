@@ -1,4 +1,10 @@
-export type RatchetTier = "HARD_STOP" | "TIER_0_DRAWDOWN" | "SCRATCH" | "TIER_1" | "TIER_2";
+export type RatchetTier =
+  | "HARD_STOP"
+  | "TIER_0_DRAWDOWN"
+  | "SCRATCH"
+  | "RUNNING"
+  | "TIER_1"
+  | "TIER_2";
 
 export type DrawdownState = "NORMAL" | "EVALUATING_DRAWDOWN";
 
@@ -14,6 +20,7 @@ export type ExitReasonCode =
   | "SCRATCH_EXIT"
   | "RATCHET_TIER_1_TRIGGERED"
   | "RATCHET_TIER_2_TRIGGERED"
+  | "RATCHET_TIER_2_BREACH"
   | "HARD_TAKE_PROFIT_CAP_TRIGGERED"
   | "SESSION_DURATION_CASHOUT"
   | "STAGNANCY_TIMEOUT_EXIT"
@@ -86,23 +93,23 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   scratchPnlMaxBps: 150,
   tier1PeakThresholdBps: 1500,
   tier1LockedFloorBps: 0,
-  tier2PeakThresholdBps: 4900,
-  tier2LockedFloorBps: 4000,
+  tier2PeakThresholdBps: 4850,
+  tier2LockedFloorBps: 3500,
 };
 
 export type CohortTier = "MICRO_CAP" | "ESTABLISHED";
 
 export const MICRO_CAP_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
-  catastrophicFloorBps: -1200, // -12.0% hard stop
+  catastrophicFloorBps: -2000, // -20.0% hard stop
   drawdownTriggerBps: -600, // -6.0% drawdown warning
   drawdownRecoveryBps: -300, // -3.0% recovery
-  drawdownGracePeriodMs: 45_000, // 45s grace period for fast micro-cap dump protection
+  drawdownGracePeriodMs: 90_000, // 90s base grace period for fast micro-cap dump protection
   scratchPnlMinBps: 50, // +0.5%
   scratchPnlMaxBps: 150, // +1.5%
   tier1PeakThresholdBps: 1000, // +10.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
   tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
-  tier2PeakThresholdBps: 2500, // +25.0% take-profit Tier 2 (sell 25%, lock floor to +18.0%)
-  tier2LockedFloorBps: 1800, // +18.0% floor
+  tier2PeakThresholdBps: 4850, // +48.5% take-profit Tier 2 (sell 25%, lock floor to +35.0%)
+  tier2LockedFloorBps: 3500, // +35.0% floor
 };
 
 export const ESTABLISHED_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
@@ -114,6 +121,6 @@ export const ESTABLISHED_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   scratchPnlMaxBps: 150, // +1.5%
   tier1PeakThresholdBps: 1500, // +15.0% take-profit Tier 1 (sell 50%, lock floor to breakeven +0.0%)
   tier1LockedFloorBps: 0, // Breakeven (+0.0%) floor
-  tier2PeakThresholdBps: 5000, // +50.0% take-profit Tier 2 (sell 25%, lock floor to +40.0%)
-  tier2LockedFloorBps: 4000, // +40.0% floor
+  tier2PeakThresholdBps: 4850, // +48.5% take-profit Tier 2 (sell 25%, lock floor to +35.0%)
+  tier2LockedFloorBps: 3500, // +35.0% floor
 };

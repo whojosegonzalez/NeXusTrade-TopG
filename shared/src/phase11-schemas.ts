@@ -4,6 +4,7 @@ export const ratchetTierSchema = z.enum([
   "HARD_STOP",
   "TIER_0_DRAWDOWN",
   "SCRATCH",
+  "RUNNING",
   "TIER_1",
   "TIER_2",
 ]);

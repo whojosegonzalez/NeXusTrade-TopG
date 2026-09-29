@@ -177,6 +177,53 @@ describe("PaperTradingDaemon", () => {
     expect(snapshotAfter.closedTrades[0]?.proceedsSol).toBeCloseTo(1.12, 4);
   });
 
+  it("reconciles snapshot realized and unrealized P/L with portfolio balance during partial scaling", () => {
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => nowMs,
+    });
+    daemon.start();
+
+    // Open position: 1.0 SOL at 0.05 SOL/token = 20 tokens
+    daemon.processScannedPool(validPool, nowMs);
+    const snapInitial = daemon.getSnapshot();
+    expect(snapInitial.currentPortfolioSol).toBeCloseTo(10.0, 4);
+    expect(snapInitial.totalRealizedPnlSol).toBeCloseTo(0.0, 4);
+    expect(snapInitial.totalUnrealizedPnlSol).toBeCloseTo(0.0, 4);
+
+    const pos = snapInitial.openPositions[0]!;
+
+    // Peak at +25% (spotPriceSol = 0.0625) -> triggers SELL_PARTIAL_50
+    // Sells 10 tokens (50%) for 10 * 0.0625 = 0.625 SOL proceeds
+    // Basis of sold portion = 0.50 SOL -> Realized P/L on active position = +0.125 SOL
+    // Remaining 10 tokens at 0.0625 = 0.625 SOL market value vs 0.50 basis -> Unrealized P/L = +0.125 SOL
+    // Cash = 9.0 + 0.625 = 9.625 SOL
+    // Total portfolio = 9.625 + 0.625 = 10.250 SOL
+    daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.0625,
+      },
+      nowMs,
+    );
+
+    const snapMid = daemon.getSnapshot();
+    expect(snapMid.openPositions.length).toBe(1);
+    expect(snapMid.closedTrades.length).toBe(0);
+
+    // Verify partial realized gain is counted in snapshot
+    expect(snapMid.totalRealizedPnlSol).toBeCloseTo(0.125, 4);
+    expect(snapMid.totalUnrealizedPnlSol).toBeCloseTo(0.125, 4);
+    expect(snapMid.currentPortfolioSol).toBeCloseTo(10.25, 4);
+
+    // Invariant: totalRealizedPnlSol + totalUnrealizedPnlSol === currentPortfolioSol - initialPortfolioSol
+    const totalPnl = snapMid.totalRealizedPnlSol + snapMid.totalUnrealizedPnlSol;
+    const portfolioDelta = snapMid.currentPortfolioSol - snapMid.initialPortfolioSol;
+    expect(totalPnl).toBeCloseTo(portfolioDelta, 4);
+    expect(totalPnl).toBeCloseTo(0.25, 4);
+  });
+
   it("halts immediately on clock drift violation", () => {
     const daemon = new PaperTradingDaemon({
       config: baseConfig,

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
@@ -58,6 +59,101 @@ function nexusDevApiPlugin(): Plugin {
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const url = req.url ?? "";
+
+        if (url === "/api/session/start" && req.method === "POST") {
+          let bodyStr = "";
+          req.on("data", (chunk) => {
+            bodyStr += chunk;
+          });
+          req.on("end", () => {
+            try {
+              const body = JSON.parse(bodyStr || "{}");
+              const durationHours = body.durationHours ?? 4;
+              const sessionId = body.sessionId ?? `session-paper-${Date.now()}`;
+              const maxPositions = body.maxConcurrentPositions ?? 5;
+
+              const projectRoot = path.resolve(process.cwd(), "..");
+              const child = spawn(
+                process.platform === "win32" ? "pnpm.cmd" : "pnpm",
+                [
+                  "daemon:paper",
+                  `--duration-hours=${durationHours}`,
+                  `--session-id=${sessionId}`,
+                  `--max-open-positions=${maxPositions}`,
+                ],
+                {
+                  cwd: projectRoot,
+                  detached: true,
+                  stdio: "ignore",
+                  shell: true,
+                },
+              );
+              child.unref();
+
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  ok: true,
+                  sessionId,
+                  message: "Paper session started successfully",
+                }),
+              );
+            } catch (err) {
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: false, error: String(err) }));
+            }
+          });
+          return;
+        }
+
+        if (
+          (url === "/api/session/control" || url === "/api/session/stop") &&
+          req.method === "POST"
+        ) {
+          let bodyStr = "";
+          req.on("data", (chunk) => {
+            bodyStr += chunk;
+          });
+          req.on("end", () => {
+            try {
+              const body = JSON.parse(bodyStr || "{}");
+              const action =
+                url === "/api/session/stop" ? "START_EXITING" : (body.action ?? "START_EXITING");
+              const cmd = {
+                action,
+                ...(body.targetPositionId ? { targetPositionId: body.targetPositionId } : {}),
+                issuedAt: Date.now(),
+              };
+
+              const rootTmp = path.resolve(process.cwd(), "../.tmp");
+              const localTmp = path.resolve(process.cwd(), ".tmp");
+              for (const dir of [rootTmp, localTmp]) {
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                const cmdFile = path.join(dir, "session-commands.json");
+                let existing: unknown[] = [];
+                if (fs.existsSync(cmdFile)) {
+                  try {
+                    const parsed = JSON.parse(fs.readFileSync(cmdFile, "utf8"));
+                    if (Array.isArray(parsed)) existing = parsed;
+                  } catch {
+                    existing = [];
+                  }
+                }
+                existing.push(cmd);
+                fs.writeFileSync(cmdFile, JSON.stringify(existing, null, 2), "utf8");
+              }
+
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, command: cmd }));
+            } catch (err) {
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: false, error: String(err) }));
+            }
+          });
+          return;
+        }
 
         if (url === "/api/session/active") {
           const rootTmp = path.resolve(process.cwd(), "../.tmp/paper-session-active.json");

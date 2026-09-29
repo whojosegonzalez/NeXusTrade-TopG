@@ -90,6 +90,8 @@ export const activityLogEntrySchema = z.object({
   timestamp: z.number(),
   type: z.enum(["INFO", "BUY", "SELL", "RATCHET", "ALERT", "CONTROL"]),
   message: z.string(),
+  symbol: z.string().optional(),
+  mintAddress: z.string().optional(),
 });
 
 export type ActivityLogEntry = z.infer<typeof activityLogEntrySchema>;

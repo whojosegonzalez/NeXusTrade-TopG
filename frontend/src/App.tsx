@@ -91,6 +91,7 @@ export function App({ load = loadDashboardData, defaultTab = "ACTIVE_SESSION" }:
           walletTelemetry={liveState.walletTelemetry}
           onRefreshWallet={liveState.refreshWallet}
           onSaveSettings={liveState.setSettings}
+          onNavigateToActive={() => setActiveTab("ACTIVE_SESSION")}
         />
       )}
 

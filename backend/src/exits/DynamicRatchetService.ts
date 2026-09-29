@@ -141,11 +141,15 @@ export class DynamicRatchetService {
       };
     }
 
-    // Check Tier 2 Milestone (+50%): Sell 25% of position, move floor to Tier 2 (+40%)
+    // Check Tier 2 Milestone (+48.5%): Sell 25% of position, move floor to Tier 2 (+35%) or trailing moonbag
     if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps && !tier2ProfitTaken) {
       tier2ProfitTaken = true;
       nextTier = "TIER_2";
-      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier2LockedFloorBps);
+      const trailingMoonbagFloor = Math.max(
+        activeConfig.tier2LockedFloorBps,
+        nextPeakGainBps - 2500,
+      );
+      nextFloorBps = Math.max(nextFloorBps, trailingMoonbagFloor);
 
       const updatedState: PositionRatchetState = {
         ...state,
@@ -180,10 +184,14 @@ export class DynamicRatchetService {
     }
 
     // Update active tier and floor if milestones were previously reached
-    if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps) {
+    if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps || tier2ProfitTaken) {
       nextTier = "TIER_2";
-      nextFloorBps = Math.max(nextFloorBps, activeConfig.tier2LockedFloorBps);
-    } else if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps) {
+      const trailingMoonbagFloor = Math.max(
+        activeConfig.tier2LockedFloorBps,
+        nextPeakGainBps - 2500,
+      );
+      nextFloorBps = Math.max(nextFloorBps, trailingMoonbagFloor);
+    } else if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps || tier1ProfitTaken) {
       nextTier = "TIER_1";
       nextFloorBps = Math.max(nextFloorBps, activeConfig.tier1LockedFloorBps);
     } else if (
@@ -193,10 +201,16 @@ export class DynamicRatchetService {
       nextTier !== "TIER_2"
     ) {
       nextTier = "SCRATCH";
+    } else if (
+      nextTier === "SCRATCH" &&
+      (currentPnlBps > activeConfig.scratchPnlMaxBps ||
+        currentPnlBps < activeConfig.scratchPnlMinBps)
+    ) {
+      nextTier = "RUNNING";
     }
 
     // 2. Evaluation Logic
-    // Rule A: Catastrophic disaster hard floor (-12.0%)
+    // Rule A: Catastrophic disaster hard floor (-20.0%) and flow-aware stop (-12.0% to -20.0%)
     if (currentPnlBps <= activeConfig.catastrophicFloorBps) {
       const updatedState: PositionRatchetState = {
         ...state,
@@ -230,7 +244,46 @@ export class DynamicRatchetService {
       };
     }
 
-    // Rule B: Ratchet locked floor breach (+0% / +40%)
+    // Flow-Aware Stop: If price dips between -12.0% (-1200 bps) and catastrophic floor
+    // and buyer flow is unabsorbed (buys < sells or buys === 0), cut immediately!
+    // But if buyer dominance is strong (buys >= 1.25 * sells), allow position to breathe down to catastrophic floor.
+    if (
+      currentPnlBps <= -1200 &&
+      (context.recentBuysCount60s === 0 || context.recentBuysCount60s < context.recentSellsCount60s)
+    ) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: "HARD_STOP",
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        "HARD_STOP",
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_ALL",
+        reasonCode: "SELL_PRESSURE_UNABSORBED",
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Rule B: Ratchet locked floor breach (+0% / +35% or trailing moonbag floor)
     if (
       (nextTier === "TIER_1" || nextTier === "TIER_2" || nextFloorBps >= 0) &&
       currentPnlBps <= nextFloorBps
@@ -263,7 +316,7 @@ export class DynamicRatchetService {
         action: "SELL_ALL",
         reasonCode:
           nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps
-            ? "RATCHET_TIER_2_TRIGGERED"
+            ? "RATCHET_TIER_2_BREACH"
             : "RATCHET_TIER_1_TRIGGERED",
         diagnostics,
         updatedState,
@@ -391,7 +444,14 @@ export class DynamicRatchetService {
       }
 
       // Health Check 3: Grace period timeout
-      if (elapsedMs > activeConfig.drawdownGracePeriodMs) {
+      // Dynamic Grace Extension: If buyer dominance is strong (buys >= 1.25 * sells), extend grace up to 180s (3m)
+      const hasStrongBuyerDominance =
+        context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
+      const effectiveGracePeriodMs = hasStrongBuyerDominance
+        ? Math.max(activeConfig.drawdownGracePeriodMs, 180_000)
+        : activeConfig.drawdownGracePeriodMs;
+
+      if (elapsedMs > effectiveGracePeriodMs) {
         const updatedState: PositionRatchetState = {
           ...state,
           peakPriceSol: nextPeakPriceSol,

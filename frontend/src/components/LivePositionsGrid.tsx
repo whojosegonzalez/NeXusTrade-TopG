@@ -7,11 +7,13 @@ interface LivePositionsGridProps {
 function getTierBadgeClass(tier: RatchetTier): string {
   switch (tier) {
     case "TIER_2":
-      return "tier-badge tier-2"; // +45% lock (purple/gold)
+      return "tier-badge tier-2"; // +35% lock (purple/gold)
     case "TIER_1":
-      return "tier-badge tier-1"; // +20% lock (green)
+      return "tier-badge tier-1"; // breakeven lock (green)
     case "SCRATCH":
       return "tier-badge tier-scratch"; // scratch exit (slate)
+    case "RUNNING":
+      return "tier-badge tier-running"; // running state (cyan/blue)
     case "TIER_0_DRAWDOWN":
       return "tier-badge tier-drawdown"; // drawdown grace (orange)
     case "HARD_STOP":
@@ -47,9 +49,20 @@ export function LivePositionsGrid({ positions }: LivePositionsGridProps) {
               data-testid={`position-${pos.positionId}`}
             >
               <div className="position-header">
-                <span className="position-mint" title={pos.mintAddress}>
-                  {pos.symbol ?? `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
-                </span>
+                <a
+                  href={`https://birdeye.so/solana/token/${encodeURIComponent(pos.mintAddress)}?tab=trades&trades_layout=table`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="token-link position-mint"
+                  title={`View ${pos.symbol ?? pos.mintAddress} on Birdeye`}
+                >
+                  <strong>
+                    {pos.symbol ?? `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
+                  </strong>
+                  <span className="sub-mint opacity-60 ml-1">
+                    ({pos.mintAddress.slice(0, 4)}...{pos.mintAddress.slice(-4)})
+                  </span>
+                </a>
                 <span className={getTierBadgeClass(pos.activeTier)}>{pos.activeTier}</span>
               </div>
 

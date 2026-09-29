@@ -179,6 +179,32 @@ async function run(): Promise<void> {
   const buyGateService = new BuyGateTriggerService();
   const tracker = new CounterfactualOpportunityTracker();
 
+  interface ActivityLogRecord {
+    timestamp: number;
+    type: "INFO" | "BUY" | "SELL" | "RATCHET" | "ALERT" | "CONTROL";
+    message: string;
+    symbol?: string;
+    mintAddress?: string;
+  }
+  const activityLogs: ActivityLogRecord[] = [];
+  const addActivityLog = (
+    type: "INFO" | "BUY" | "SELL" | "RATCHET" | "ALERT" | "CONTROL",
+    message: string,
+    mintAddress?: string,
+    symbol?: string,
+  ) => {
+    activityLogs.unshift({
+      timestamp: nowMs(),
+      type,
+      message,
+      ...(symbol ? { symbol } : {}),
+      ...(mintAddress ? { mintAddress } : {}),
+    });
+    if (activityLogs.length > 50) {
+      activityLogs.pop();
+    }
+  };
+
   const startMs = nowMs();
   const maxDurationMs = config.durationHours * 3600 * 1000;
   let lastScanMs = 0;
@@ -195,6 +221,7 @@ async function run(): Promise<void> {
       durationHours: config.durationHours,
       lastTickAtMs: nowMs(),
       watchlist: watchlistService.getItems(),
+      recentActivityLogs: activityLogs,
     };
     try {
       if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
@@ -296,6 +323,13 @@ async function run(): Promise<void> {
         try {
           const exitPrice = pos.spotPriceSol > 0 ? pos.spotPriceSol : pos.entryPriceSol;
           daemon.manualExit(pos.positionId, exitPrice, currentNow, "SESSION_DURATION_CASHOUT");
+          const timeStr = new Date(currentNow).toLocaleTimeString();
+          addActivityLog(
+            "SELL",
+            `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at session cashout at ${timeStr} | Exit: SESSION_DURATION_CASHOUT`,
+            pos.mintAddress,
+            pos.symbol,
+          );
           console.log(
             `[PaperDaemon] [SESSION CASHOUT] Liquidated ${pos.mintAddress} at ${exitPrice} SOL`,
           );
@@ -320,8 +354,16 @@ async function run(): Promise<void> {
         if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
           const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
           if (stagnantClosed) {
+            const timeStr = new Date(currentNow).toLocaleTimeString();
+            const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
+            addActivityLog(
+              "SELL",
+              `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
+              pos.mintAddress,
+              pos.symbol,
+            );
             console.log(
-              `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${(stagnantClosed.realizedPnlBps / 100).toFixed(2)}%`,
+              `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
             );
           }
           continue;
@@ -341,16 +383,49 @@ async function run(): Promise<void> {
 
         const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
         if (result?.action === "SELL_ALL") {
+          const timeStr = new Date(currentNow).toLocaleTimeString();
+          const usdPrice = (
+            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+          ).toFixed(6);
+          const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
+          const closedTrade = daemon
+            .getSnapshot()
+            .closedTrades.find((t) => t.positionId === pos.positionId);
+          const pnlSol = closedTrade ? closedTrade.realizedPnlSol.toFixed(4) : "0.0000";
+          addActivityLog(
+            "SELL",
+            `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at $${usdPrice} at ${timeStr} | Exit: ${result.reasonCode} | Realized PnL: ${pnlSol} SOL (${pnlPct}%)`,
+            pos.mintAddress,
+            pos.symbol,
+          );
           console.log(
-            `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+            `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${pnlPct}%`,
           );
         } else if (result?.action === "SELL_PARTIAL_50") {
+          const usdPrice = (
+            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+          ).toFixed(6);
+          addActivityLog(
+            "RATCHET",
+            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+15% Tier 1) | Floor locked to Breakeven`,
+            pos.mintAddress,
+            pos.symbol,
+          );
           console.log(
-            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +25% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +15% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
           );
         } else if (result?.action === "SELL_PARTIAL_25") {
+          const usdPrice = (
+            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+          ).toFixed(6);
+          addActivityLog(
+            "RATCHET",
+            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag`,
+            pos.mintAddress,
+            pos.symbol,
+          );
           console.log(
-            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +50% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
           );
         }
       } catch (tickErr) {
@@ -508,6 +583,17 @@ async function run(): Promise<void> {
             if (bought) {
               watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
               tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
+              const timeStr = new Date(currentNow).toLocaleTimeString();
+              const usdStr = (
+                spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : entryPriceSol * 150
+              ).toFixed(6);
+              const solStr = entryPriceSol.toFixed(6);
+              addActivityLog(
+                "BUY",
+                `🟢 ${candidate.symbol} bought at $${usdStr} (${solStr} SOL) at ${timeStr} | Size: ${dynamicSize} SOL [${cohort}]`,
+                candidate.mintAddress,
+                candidate.symbol,
+              );
               console.log(
                 `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] [${cohort}] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
               );

@@ -43,6 +43,7 @@ export interface PaperTradingDaemonConfig {
 export interface PaperPosition {
   readonly positionId: string;
   readonly mintAddress: string;
+  readonly symbol?: string | undefined;
   readonly entryPriceSol: number;
   readonly initialTokensHeld?: number;
   readonly initialCostBasisSol?: number;
@@ -62,6 +63,7 @@ export interface PaperPosition {
 export interface ClosedTradeRecord {
   readonly positionId: string;
   readonly mintAddress: string;
+  readonly symbol?: string | undefined;
   readonly entryPriceSol: number;
   readonly exitPriceSol: number;
   readonly costBasisSol: number;
@@ -201,6 +203,7 @@ export class PaperTradingDaemon {
       exitReason,
       openedAtMs: position.openedAtMs,
       closedAtMs: now,
+      ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
     };
 
     this.closedTrades.push(closedRecord);
@@ -224,10 +227,16 @@ export class PaperTradingDaemon {
       return acc + (currentValSol - pos.costBasisSol);
     }, 0);
 
-    const totalRealizedPnlSol = this.closedTrades.reduce(
-      (acc, trade) => acc + trade.realizedPnlSol,
-      0,
-    );
+    const partialRealizedFromOpenPositions = openPositionsArray.reduce((acc, pos) => {
+      const initialCost = pos.initialCostBasisSol ?? pos.costBasisSol;
+      const costRelieved = initialCost - pos.costBasisSol;
+      const realizedProceeds = pos.realizedProceedsSol ?? 0;
+      return acc + (realizedProceeds - costRelieved);
+    }, 0);
+
+    const totalRealizedPnlSol =
+      this.closedTrades.reduce((acc, trade) => acc + trade.realizedPnlSol, 0) +
+      partialRealizedFromOpenPositions;
 
     const totalPositionEquitySol = openPositionsArray.reduce(
       (acc, pos) => acc + pos.tokensHeld * pos.spotPriceSol,
@@ -334,6 +343,7 @@ export class PaperTradingDaemon {
       ratchetState,
       lastActivityMs: now,
       stagnantTicksCount: 0,
+      ...(pool.symbol !== undefined ? { symbol: pool.symbol } : {}),
       ...(options?.cohort !== undefined ? { cohort: options.cohort } : {}),
       ...(options?.ratchetConfig !== undefined ? { ratchetConfig: options.ratchetConfig } : {}),
     };
@@ -402,6 +412,7 @@ export class PaperTradingDaemon {
           exitReason: "STAGNANCY_TIMEOUT_EXIT",
           openedAtMs: position.openedAtMs,
           closedAtMs: now,
+          ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
         };
 
         this.closedTrades.push(closedRecord);
@@ -493,6 +504,7 @@ export class PaperTradingDaemon {
           exitReason: result.reasonCode,
           openedAtMs: position.openedAtMs,
           closedAtMs: now,
+          ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
         };
 
         this.closedTrades.push(closedRecord);
@@ -551,6 +563,7 @@ export class PaperTradingDaemon {
         exitReason: "STAGNANCY_TIMEOUT_EXIT",
         openedAtMs: position.openedAtMs,
         closedAtMs: now,
+        ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
       };
 
       this.closedTrades.push(closedRecord);

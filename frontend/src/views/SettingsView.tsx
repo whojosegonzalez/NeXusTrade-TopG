@@ -6,6 +6,7 @@ export interface SettingsViewProps {
   readonly walletTelemetry?: WalletTelemetry;
   readonly onRefreshWallet?: (walletAddress: string) => Promise<void>;
   readonly onSaveSettings?: (settings: DashboardSettings) => void;
+  readonly onNavigateToActive?: () => void;
 }
 
 const envMeta = import.meta as unknown as { env?: Record<string, string | undefined> };
@@ -36,10 +37,44 @@ export function SettingsView({
   walletTelemetry,
   onRefreshWallet,
   onSaveSettings,
+  onNavigateToActive,
 }: SettingsViewProps) {
   const [settings, setSettings] = useState<DashboardSettings>(initialSettings);
   const [isRefreshingWallet, setIsRefreshingWallet] = useState(false);
   const [savedNotification, setSavedNotification] = useState(false);
+
+  const [durationHours, setDurationHours] = useState(4);
+  const [sessionId, setSessionId] = useState("session-paper-12.81-01");
+  const [launchMaxPositions, setLaunchMaxPositions] = useState(5);
+  const [isStartingSession, setIsStartingSession] = useState(false);
+  const [startSessionError, setStartSessionError] = useState<string | null>(null);
+
+  const handleStartSession = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsStartingSession(true);
+    setStartSessionError(null);
+    try {
+      const res = await fetch("/api/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          durationHours,
+          sessionId,
+          maxConcurrentPositions: launchMaxPositions,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Failed to start session: ${res.statusText}`);
+      }
+      if (onNavigateToActive) {
+        onNavigateToActive();
+      }
+    } catch (err) {
+      setStartSessionError(err instanceof Error ? err.message : "Failed to start session");
+    } finally {
+      setIsStartingSession(false);
+    }
+  };
 
   const totalSol = walletTelemetry?.solBalance ?? 0;
   const gasReserve = settings.gasReserveSol;
@@ -371,6 +406,71 @@ export function SettingsView({
                 className="text-input"
               />
             </div>
+          </div>
+        </section>
+
+        {/* 5. Launch Paper Trading Session */}
+        <section className="dashboard-section" aria-label="Launch Paper Trading Session">
+          <h2>5. Launch Paper Trading Session</h2>
+          <div className="grid-2col">
+            <div className="form-group">
+              <label htmlFor="launchDurationHours">Planned Session Duration (Hours)</label>
+              <input
+                id="launchDurationHours"
+                type="number"
+                min="0.1"
+                max="24"
+                step="0.5"
+                value={durationHours}
+                onChange={(e) => setDurationHours(parseFloat(e.target.value) || 4)}
+                className="text-input"
+              />
+              <small className="help-text">Default: 4 hours (e.g. 0.5 to 24h)</small>
+            </div>
+
+            <div className="form-group">
+              <label htmlFor="launchSessionId">Session ID Identifier</label>
+              <input
+                id="launchSessionId"
+                type="text"
+                value={sessionId}
+                onChange={(e) => setSessionId(e.target.value)}
+                className="text-input"
+              />
+              <small className="help-text">Auto-generated or custom run label</small>
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="launchMaxPositions">
+              Session Max Positions: <strong>{launchMaxPositions}</strong>
+            </label>
+            <input
+              id="launchMaxPositions"
+              type="range"
+              min="1"
+              max="10"
+              step="1"
+              value={launchMaxPositions}
+              onChange={(e) => setLaunchMaxPositions(parseInt(e.target.value, 10))}
+              className="slider"
+            />
+          </div>
+
+          <div style={{ marginTop: "1rem" }}>
+            <button
+              type="button"
+              className="btn btn-success"
+              disabled={isStartingSession || !sessionId.trim()}
+              onClick={handleStartSession}
+            >
+              {isStartingSession ? "Launching Engine..." : "🚀 Start Paper Trading Session"}
+            </button>
+            {startSessionError && (
+              <span className="text-red ml-3" style={{ color: "#ef4444", marginLeft: "12px" }}>
+                ⚠️ {startSessionError}
+              </span>
+            )}
           </div>
         </section>
 

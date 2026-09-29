@@ -13,16 +13,18 @@ export interface ActiveSessionViewProps {
 function getTierBadgeInfo(tier: RatchetTier): { label: string; className: string } {
   switch (tier) {
     case "TIER_2":
-      return { label: "TIER 2 LOCKED (+45%)", className: "tier-badge tier-2" };
+      return { label: "TIER 2 LOCKED (+35%)", className: "tier-badge tier-2" };
     case "TIER_1":
       return { label: "TIER 1 LOCKED (+20%)", className: "tier-badge tier-1" };
     case "SCRATCH":
       return { label: "SCRATCH ARMED (+0.5%)", className: "tier-badge tier-scratch" };
+    case "RUNNING":
+      return { label: "RUNNING", className: "tier-badge tier-running" };
     case "TIER_0_DRAWDOWN":
       return { label: "SMART HOLD (-8% GRACE)", className: "tier-badge tier-drawdown" };
     case "HARD_STOP":
     default:
-      return { label: "ENTRY (-12% STOP)", className: "tier-badge tier-hard-stop" };
+      return { label: "ENTRY STOP", className: "tier-badge tier-hard-stop" };
   }
 }
 
@@ -247,13 +249,21 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
                       data-testid={`active-pos-${pos.positionId}`}
                     >
                       <td>
-                        <strong className="pos-symbol">
-                          {pos.symbol ??
-                            `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
-                        </strong>
-                        <span className="sub-mint" title={pos.mintAddress}>
-                          {pos.mintAddress.slice(0, 4)}...{pos.mintAddress.slice(-4)}
-                        </span>
+                        <a
+                          href={`https://birdeye.so/solana/token/${encodeURIComponent(pos.mintAddress)}?tab=trades&trades_layout=table`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="token-link"
+                          title={`View ${pos.symbol ?? pos.mintAddress} on Birdeye`}
+                        >
+                          <strong className="pos-symbol">
+                            {pos.symbol ??
+                              `${pos.mintAddress.slice(0, 4)}...${pos.mintAddress.slice(-4)}`}
+                          </strong>
+                          <span className="sub-mint opacity-60 ml-1" title={pos.mintAddress}>
+                            ({pos.mintAddress.slice(0, 4)}...{pos.mintAddress.slice(-4)})
+                          </span>
+                        </a>
                       </td>
                       <td>{pos.entryPriceSol.toFixed(6)} SOL</td>
                       <td>{pos.spotPriceSol.toFixed(6)} SOL</td>
@@ -326,10 +336,18 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
                       data-testid={`watchlist-${item.poolId}`}
                     >
                       <td>
-                        <strong title={item.mintAddress}>{item.symbol}</strong>
-                        <span className="sub-mint">
-                          {item.mintAddress.slice(0, 4)}...{item.mintAddress.slice(-4)}
-                        </span>
+                        <a
+                          href={`https://birdeye.so/solana/token/${encodeURIComponent(item.mintAddress)}?tab=trades&trades_layout=table`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="token-link"
+                          title={`View ${item.symbol} on Birdeye`}
+                        >
+                          <strong title={item.mintAddress}>{item.symbol}</strong>
+                          <span className="sub-mint opacity-60 ml-1">
+                            ({item.mintAddress.slice(0, 4)}...{item.mintAddress.slice(-4)})
+                          </span>
+                        </a>
                       </td>
                       <td>
                         {ageMins}m {ageSecs}s
@@ -387,7 +405,28 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
                         {log.type}
                       </span>
                     </td>
-                    <td className="activity-message">{log.message}</td>
+                    <td className="activity-message">
+                      {log.mintAddress ? (
+                        <>
+                          <a
+                            href={`https://birdeye.so/solana/token/${encodeURIComponent(log.mintAddress)}?tab=trades&trades_layout=table`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="token-link"
+                            title={`View ${log.symbol ?? "token"} on Birdeye`}
+                            style={{ marginRight: "8px" }}
+                          >
+                            <strong>
+                              {log.symbol ??
+                                `${log.mintAddress.slice(0, 4)}...${log.mintAddress.slice(-4)}`}
+                            </strong>
+                          </a>
+                          <span>{log.message}</span>
+                        </>
+                      ) : (
+                        log.message
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

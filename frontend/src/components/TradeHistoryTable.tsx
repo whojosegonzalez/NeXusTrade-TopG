@@ -43,7 +43,15 @@ export function TradeHistoryTable({ trades }: TradeHistoryTableProps) {
                   data-testid={`trade-${trade.positionId}`}
                 >
                   <td title={trade.mintAddress}>
-                    {trade.mintAddress.slice(0, 4)}...{trade.mintAddress.slice(-4)}
+                    <a
+                      href={`https://birdeye.so/solana/token/${encodeURIComponent(trade.mintAddress)}?tab=trades&trades_layout=table`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="token-link text-indigo-400 hover:text-indigo-300 underline font-mono"
+                      title={`View on Birdeye: ${trade.mintAddress}`}
+                    >
+                      {trade.mintAddress.slice(0, 4)}...{trade.mintAddress.slice(-4)}
+                    </a>
                   </td>
                   <td>{trade.entryPriceSol.toFixed(6)} SOL</td>
                   <td>{trade.exitPriceSol.toFixed(6)} SOL</td>
