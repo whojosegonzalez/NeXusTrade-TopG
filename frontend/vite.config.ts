@@ -14,6 +14,7 @@ interface RawPositionRatchetState {
 interface RawDaemonPosition {
   positionId: string;
   mintAddress: string;
+  symbol?: string;
   entryPriceSol: number;
   spotPriceSol: number;
   currentPnlBps: number;
@@ -24,6 +25,7 @@ interface RawDaemonPosition {
 interface RawDaemonTrade {
   positionId: string;
   mintAddress: string;
+  symbol?: string;
   entryPriceSol: number;
   exitPriceSol: number;
   costBasisSol: number;
@@ -51,6 +53,13 @@ interface RawDaemonSnapshot {
   watchlist?: unknown[];
   maxOpenPositions?: number;
   durationHours?: number;
+  recentActivityLogs?: Array<{
+    timestamp: number;
+    type: string;
+    message: string;
+    symbol?: string;
+    mintAddress?: string;
+  }>;
 }
 
 function nexusDevApiPlugin(): Plugin {
@@ -72,7 +81,33 @@ function nexusDevApiPlugin(): Plugin {
               const sessionId = body.sessionId ?? `session-paper-${Date.now()}`;
               const maxPositions = body.maxConcurrentPositions ?? 5;
 
-              const projectRoot = path.resolve(process.cwd(), "..");
+              let projectRoot = process.cwd();
+              const checkRoot = (dir: string) => {
+                const pkgPath = path.resolve(dir, "package.json");
+                if (fs.existsSync(pkgPath)) {
+                  try {
+                    const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+                    return parsed.name === "nexustrade-otis";
+                  } catch {
+                    return false;
+                  }
+                }
+                return false;
+              };
+              if (!checkRoot(projectRoot)) {
+                const parentDir = path.resolve(projectRoot, "..");
+                if (checkRoot(parentDir)) {
+                  projectRoot = parentDir;
+                }
+              }
+
+              const tmpDir = path.resolve(projectRoot, ".tmp");
+              if (!fs.existsSync(tmpDir)) {
+                fs.mkdirSync(tmpDir, { recursive: true });
+              }
+              const logFile = path.resolve(tmpDir, "daemon-spawn.log");
+              const outFd = fs.openSync(logFile, "a");
+
               const child = spawn(
                 process.platform === "win32" ? "pnpm.cmd" : "pnpm",
                 [
@@ -84,7 +119,7 @@ function nexusDevApiPlugin(): Plugin {
                 {
                   cwd: projectRoot,
                   detached: true,
-                  stdio: "ignore",
+                  stdio: ["ignore", outFd, outFd],
                   shell: true,
                 },
               );
@@ -198,7 +233,7 @@ function nexusDevApiPlugin(): Plugin {
                 positionId: p.positionId,
                 poolId: p.positionId,
                 mintAddress: p.mintAddress,
-                symbol: p.mintAddress.slice(0, 4) + "..." + p.mintAddress.slice(-4),
+                symbol: p.symbol || p.mintAddress.slice(0, 4) + "..." + p.mintAddress.slice(-4),
                 entryPriceSol: p.entryPriceSol,
                 spotPriceSol: p.spotPriceSol,
                 currentPnlBps: p.currentPnlBps,
@@ -210,11 +245,16 @@ function nexusDevApiPlugin(): Plugin {
                 holdDurationSeconds: Math.floor((now - p.openedAtMs) / 1000),
               }));
 
-              const logs = closedTrades.map((t: RawDaemonTrade) => ({
-                timestamp: t.closedAtMs || now,
-                type: t.realizedPnlSol >= 0 ? "RATCHET" : "SELL",
-                message: `${t.exitReason}: ${t.mintAddress.slice(0, 8)}... closed at ${t.exitPriceSol} SOL (${(t.realizedPnlBps / 100).toFixed(2)}%)`,
-              }));
+              const logs =
+                Array.isArray(raw.recentActivityLogs) && raw.recentActivityLogs.length > 0
+                  ? raw.recentActivityLogs
+                  : closedTrades.map((t: RawDaemonTrade) => ({
+                      timestamp: t.closedAtMs || now,
+                      type: t.realizedPnlSol >= 0 ? "RATCHET" : "SELL",
+                      message: `${t.exitReason}: ${t.symbol ? t.symbol : t.mintAddress.slice(0, 8) + "..."} closed at ${t.exitPriceSol} SOL (${(t.realizedPnlBps / 100).toFixed(2)}%)`,
+                      symbol: t.symbol,
+                      mintAddress: t.mintAddress,
+                    }));
 
               const telemetry = {
                 sessionId: raw.sessionId || "session-paper",

@@ -414,12 +414,12 @@ export function ActiveSessionView({ session, onSendCommand }: ActiveSessionViewP
                             rel="noopener noreferrer"
                             className="token-link"
                             title={`View ${log.symbol ?? "token"} on Birdeye`}
-                            style={{ marginRight: "8px" }}
+                            style={{ marginRight: "8px", fontWeight: "bold" }}
                           >
-                            <strong>
-                              {log.symbol ??
-                                `${log.mintAddress.slice(0, 4)}...${log.mintAddress.slice(-4)}`}
-                            </strong>
+                            [
+                            {log.symbol ??
+                              `${log.mintAddress.slice(0, 4)}...${log.mintAddress.slice(-4)}`}
+                            ]
                           </a>
                           <span>{log.message}</span>
                         </>
