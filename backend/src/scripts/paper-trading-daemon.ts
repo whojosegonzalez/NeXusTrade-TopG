@@ -1,5 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { parseArgs } from "node:util";
+
+// Automatically load .env file from workspace root or cwd if available
+try {
+  const rootEnv = path.resolve(process.cwd(), ".env");
+  const parentEnv = path.resolve(process.cwd(), "..", ".env");
+  if (existsSync(rootEnv)) {
+    process.loadEnvFile(rootEnv);
+  } else if (existsSync(parentEnv)) {
+    process.loadEnvFile(parentEnv);
+  }
+} catch {
+  // Ignore if already loaded or unavailable
+}
 import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "../paper/PaperTradingDaemon.js";
 import { CandidateStreamEngine } from "../candidate-scanner/CandidateStreamEngine.js";
 import { CANDIDATE_SCANNER_DEFAULTS } from "../candidate-scanner/CandidateScannerConfig.js";
