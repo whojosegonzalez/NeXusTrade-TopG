@@ -632,4 +632,88 @@ describe("PaperTradingDaemon", () => {
     expect(result?.action).toBe("SELL_PARTIAL_50");
     expect(result?.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
   });
+
+  describe("SubPhase12_83: Scale-In Pyramiding & VWAP Exit Prices", () => {
+    it("scaleInPosition correctly updates tokens, blended entry price, cost basis, and ratchet state", () => {
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => nowMs,
+      });
+      daemon.start();
+
+      // 1. Initial 0.25 SOL probe at 0.05 SOL/token -> 5 tokens
+      daemon.processScannedPool(validPool, nowMs, 0.05, 0.25, {
+        bypassScannerEvaluation: true,
+        cohort: "MICRO_CAP",
+      });
+
+      const pos = daemon.getSnapshot().openPositions[0]!;
+      expect(pos.tokensHeld).toBeCloseTo(5, 4);
+      expect(pos.costBasisSol).toBeCloseTo(0.25, 4);
+      expect(pos.entryPriceSol).toBeCloseTo(0.05, 4);
+      expect(pos.pyramided).toBeUndefined();
+      expect(daemon.getCurrentCashSol()).toBeCloseTo(9.75, 4);
+
+      // 2. Token runs to 0.055 SOL (+10% gain) -> Execute Scale-In (+0.25 SOL)
+      const spotPriceSol = 0.055;
+      const addOnSol = 0.25;
+      const updated = daemon.scaleInPosition(pos.positionId, addOnSol, spotPriceSol, nowMs + 1000);
+
+      expect(updated).not.toBeNull();
+      // Additional tokens = 0.25 / 0.055 = 4.54545 tokens
+      // Total tokens = 5 + 4.54545 = 9.54545 tokens
+      expect(updated?.tokensHeld).toBeCloseTo(9.54545, 4);
+      expect(updated?.costBasisSol).toBeCloseTo(0.5, 4);
+      // Blended entry price = 0.50 / 9.54545 = 0.05238 SOL
+      expect(updated?.entryPriceSol).toBeCloseTo(0.05238, 4);
+      expect(updated?.pyramided).toBe(true);
+      expect(updated?.scaleInCount).toBe(1);
+      expect(daemon.getCurrentCashSol()).toBeCloseTo(9.5, 4);
+      expect(updated?.ratchetState.armedBreakeven).toBe(true);
+      expect(updated?.ratchetState.currentStopFloorBps).toBeGreaterThanOrEqual(0);
+    });
+
+    it("calculates accurate volume-weighted average price (VWAP) exitPriceSol across multi-tier exits", () => {
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => nowMs,
+      });
+      daemon.start();
+
+      // Open position: 1.0 SOL at 0.05 SOL = 20 tokens
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // 1. Partial sell 50% (10 tokens) at +20% (0.060 SOL) -> proceeds = 0.60 SOL
+      daemon.tickPosition(
+        pos.positionId,
+        {
+          ...baseMarketContext,
+          spotPriceSol: 0.06,
+        },
+        nowMs + 1000,
+      );
+
+      // 2. Final sell remaining 50% (10 tokens) at +10% (0.055 SOL) -> proceeds = 0.55 SOL
+      daemon.tickPosition(
+        pos.positionId,
+        {
+          ...baseMarketContext,
+          spotPriceSol: 0.055,
+        },
+        nowMs + 2000,
+      );
+
+      const snapshot = daemon.getSnapshot();
+      expect(snapshot.closedTrades.length).toBe(1);
+      const trade = snapshot.closedTrades[0]!;
+      // Total proceeds = 0.60 + 0.55 = 1.15 SOL
+      // Total tokens = 20 tokens
+      // VWAP exit price = 1.15 / 20 = 0.0575 SOL (reflecting true +15% net trade gain)
+      expect(trade.proceedsSol).toBeCloseTo(1.15, 4);
+      expect(trade.exitPriceSol).toBeCloseTo(0.0575, 4);
+      expect(trade.realizedPnlSol).toBeCloseTo(0.15, 4);
+      expect(trade.realizedPnlBps).toBe(1500);
+    });
+  });
 });

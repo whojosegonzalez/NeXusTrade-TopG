@@ -66,6 +66,29 @@ function nexusDevApiPlugin(): Plugin {
   return {
     name: "nexus-dev-api",
     configureServer(server) {
+      // Sub-Phase 12.84: Archive past-sessions.json to past-sessions-archive-12.83.json if needed
+      const rootPastSessions = path.resolve(process.cwd(), "../.tmp/past-sessions.json");
+      const backendPastSessions = path.resolve(process.cwd(), "../backend/.tmp/past-sessions.json");
+      const localPastSessions = path.resolve(process.cwd(), ".tmp/past-sessions.json");
+      for (const p of [backendPastSessions, rootPastSessions, localPastSessions]) {
+        if (fs.existsSync(p)) {
+          const dir = path.dirname(p);
+          const archivePath = path.join(dir, "past-sessions-archive-12.83.json");
+          if (!fs.existsSync(archivePath)) {
+            try {
+              const content = fs.readFileSync(p, "utf8");
+              const parsed = JSON.parse(content);
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                fs.writeFileSync(archivePath, content, "utf8");
+                fs.writeFileSync(p, "[]", "utf8");
+              }
+            } catch {
+              // Ignore
+            }
+          }
+        }
+      }
+
       server.middlewares.use((req, res, next) => {
         const url = req.url ?? "";
 
@@ -124,6 +147,7 @@ function nexusDevApiPlugin(): Plugin {
                 detached: true,
                 stdio: ["ignore", outFd, outFd],
                 shell: process.platform === "win32",
+                env: { ...process.env },
               });
               child.unref();
 
@@ -306,12 +330,130 @@ function nexusDevApiPlugin(): Plugin {
           }
         }
 
+        if (url === "/api/session/logs" || url.startsWith("/api/session/logs")) {
+          const rootTmp = path.resolve(process.cwd(), "../.tmp");
+          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp");
+          const localTmp = path.resolve(process.cwd(), ".tmp");
+
+          const logCandidates = [
+            path.join(rootTmp, "paper-daemon.log"),
+            path.join(rootTmp, "daemon-spawn.log"),
+            path.join(backendTmp, "paper-daemon.log"),
+            path.join(backendTmp, "daemon-spawn.log"),
+            path.join(localTmp, "paper-daemon.log"),
+            path.join(localTmp, "daemon-spawn.log"),
+          ].filter((p) => fs.existsSync(p));
+
+          logCandidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const targetLog = logCandidates[0];
+
+          let logs: string[] = [];
+          if (targetLog) {
+            try {
+              const content = fs.readFileSync(targetLog, "utf8");
+              const lines = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
+              logs = lines.slice(-100);
+            } catch (err) {
+              void err;
+            }
+          }
+
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: true, logs }));
+          return;
+        }
+
+        if (url === "/api/wallet/virtual" && req.method === "GET") {
+          const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
+          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
+          const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
+          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
+          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+
+          const defaultWallet = {
+            walletAddress: "SimulatedVirtualWallet111111111111111111111111",
+            currentBalanceSol: 10.0,
+            initialBalanceSol: 10.0,
+            totalSessionsCompleted: 0,
+            allTimeRealizedPnlSol: 0.0,
+            lastUpdatedMs: Date.now(),
+          };
+
+          let wallet = defaultWallet;
+          if (candidates.length > 0) {
+            try {
+              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              if (typeof raw?.currentBalanceSol === "number") {
+                wallet = { ...defaultWallet, ...raw };
+              }
+            } catch {
+              // Fallback
+            }
+          }
+
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(wallet));
+          return;
+        }
+
+        if (url === "/api/wallet/reset" && req.method === "POST") {
+          const defaultWallet = {
+            walletAddress: "SimulatedVirtualWallet111111111111111111111111",
+            currentBalanceSol: 10.0,
+            initialBalanceSol: 10.0,
+            totalSessionsCompleted: 0,
+            allTimeRealizedPnlSol: 0.0,
+            lastUpdatedMs: Date.now(),
+          };
+
+          const targetDirs = [
+            path.resolve(process.cwd(), "../.tmp"),
+            path.resolve(process.cwd(), "../backend/.tmp"),
+            path.resolve(process.cwd(), ".tmp"),
+          ];
+
+          for (const dir of targetDirs) {
+            if (fs.existsSync(dir)) {
+              try {
+                fs.writeFileSync(
+                  path.join(dir, "virtual-wallet.json"),
+                  JSON.stringify(defaultWallet, null, 2),
+                  "utf8",
+                );
+              } catch {
+                // Ignore
+              }
+            }
+          }
+
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: true, wallet: defaultWallet }));
+          return;
+        }
+
         if (url.startsWith("/api/wallet/telemetry")) {
+          const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
+          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
+          const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
+          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
+          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          let solBalance = 10.0;
+          if (candidates.length > 0) {
+            try {
+              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              if (typeof raw?.currentBalanceSol === "number") {
+                solBalance = raw.currentBalanceSol;
+              }
+            } catch {
+              // Fallback
+            }
+          }
+
           res.setHeader("Content-Type", "application/json");
           res.end(
             JSON.stringify({
-              solBalance: 10.0,
-              deployableSol: 9.95,
+              solBalance,
+              deployableSol: Math.max(0, parseFloat((solBalance - 0.05).toFixed(4))),
               tokens: [],
               signatureReady: true,
               fetchedAt: new Date().toISOString(),
@@ -321,98 +463,26 @@ function nexusDevApiPlugin(): Plugin {
         }
 
         if (url === "/api/session/history" || url.startsWith("/api/session/history")) {
-          const defaultPastSessions = [
-            {
-              sessionId: "session-paper-12.3-01",
-              startedAt: "2026-09-25T18:00:00.000Z",
-              endedAt: "2026-09-25T22:00:00.000Z",
-              durationMinutes: 240,
-              startingCapitalSol: 10.0,
-              endingCapitalSol: 9.58,
-              netPnlSol: -0.42,
-              netPnlPct: -4.2,
-              totalTrades: 8,
-              buysCount: 8,
-              sellsCount: 8,
-              winsCount: 3,
-              lossesCount: 5,
-              scratchesCount: 0,
-              winRatePct: 37.5,
-              coinsWatchedCount: 48,
-              missedOpportunitiesCount: 0,
-              trades: [],
-            },
-            {
-              sessionId: "session-paper-12.4-01",
-              startedAt: "2026-09-26T14:30:00.000Z",
-              endedAt: "2026-09-26T18:30:00.000Z",
-              durationMinutes: 240,
-              startingCapitalSol: 10.0,
-              endingCapitalSol: 10.708,
-              netPnlSol: 0.708,
-              netPnlPct: 7.08,
-              totalTrades: 12,
-              buysCount: 12,
-              sellsCount: 12,
-              winsCount: 8,
-              lossesCount: 4,
-              scratchesCount: 0,
-              winRatePct: 66.67,
-              coinsWatchedCount: 73,
-              missedOpportunitiesCount: 0,
-              trades: [],
-            },
-            {
-              sessionId: "session-paper-12.5-01",
-              startedAt: "2026-09-26T20:00:00.000Z",
-              endedAt: "2026-09-27T00:00:00.000Z",
-              durationMinutes: 240,
-              startingCapitalSol: 10.0,
-              endingCapitalSol: 9.974,
-              netPnlSol: -0.026,
-              netPnlPct: -0.26,
-              totalTrades: 7,
-              buysCount: 7,
-              sellsCount: 7,
-              winsCount: 2,
-              lossesCount: 5,
-              scratchesCount: 0,
-              winRatePct: 28.57,
-              coinsWatchedCount: 54,
-              missedOpportunitiesCount: 0,
-              trades: [],
-            },
-            {
-              sessionId: "session-paper-12.6-01",
-              startedAt: "2026-09-27T00:30:00.000Z",
-              endedAt: "2026-09-27T04:30:00.000Z",
-              durationMinutes: 240,
-              startingCapitalSol: 10.0,
-              endingCapitalSol: 8.307,
-              netPnlSol: -1.693,
-              netPnlPct: -16.93,
-              totalTrades: 11,
-              buysCount: 11,
-              sellsCount: 11,
-              winsCount: 4,
-              lossesCount: 7,
-              scratchesCount: 0,
-              winRatePct: 36.36,
-              coinsWatchedCount: 62,
-              missedOpportunitiesCount: 0,
-              trades: [],
-            },
-          ];
+          const rootTmp = path.resolve(process.cwd(), "../.tmp");
+          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp");
+          const localTmp = path.resolve(process.cwd(), ".tmp");
 
-          const rootTmp = path.resolve(process.cwd(), "../.tmp/past-sessions.json");
-          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/past-sessions.json");
-          const localTmp = path.resolve(process.cwd(), ".tmp/past-sessions.json");
-          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
-          let sessions = defaultPastSessions;
+          const isArchiveRequest = url.includes("archive=true") || url.includes("archived=true");
+          const targetFilename = isArchiveRequest
+            ? "past-sessions-archive-12.83.json"
+            : "past-sessions.json";
+
+          const candidates = [
+            path.join(backendTmp, targetFilename),
+            path.join(rootTmp, targetFilename),
+            path.join(localTmp, targetFilename),
+          ].filter((p) => fs.existsSync(p));
+
+          let sessions: unknown[] = [];
           if (candidates.length > 0) {
             try {
               const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
-              if (Array.isArray(raw) && raw.length > 0) {
+              if (Array.isArray(raw)) {
                 sessions = raw;
               }
             } catch (err) {

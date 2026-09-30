@@ -44,9 +44,9 @@ export interface PaperPosition {
   readonly positionId: string;
   readonly mintAddress: string;
   readonly symbol?: string | undefined;
-  readonly entryPriceSol: number;
-  readonly initialTokensHeld?: number;
-  readonly initialCostBasisSol?: number;
+  entryPriceSol: number;
+  initialTokensHeld?: number;
+  initialCostBasisSol?: number;
   readonly cohort?: CohortTier | undefined;
   readonly ratchetConfig?: DynamicRatchetConfig | undefined;
   tokensHeld: number;
@@ -58,6 +58,8 @@ export interface PaperPosition {
   ratchetState: PositionRatchetState;
   lastActivityMs: number;
   stagnantTicksCount: number;
+  pyramided?: boolean | undefined;
+  scaleInCount?: number | undefined;
 }
 
 export interface ClosedTradeRecord {
@@ -172,6 +174,65 @@ export class PaperTradingDaemon {
     this.haltReason = reason;
   }
 
+  getCurrentCashSol(): number {
+    return this.currentCashSol;
+  }
+
+  scaleInPosition(
+    positionId: string,
+    addOnCostBasisSol: number,
+    spotPriceSol: number,
+    nowTimestampMs?: number,
+  ): PaperPosition | null {
+    if (this.status !== "RUNNING" && this.status !== "PAUSED") return null;
+    const position = this.openPositions.get(positionId);
+    if (!position) return null;
+
+    if (addOnCostBasisSol <= 0 || spotPriceSol <= 0 || !Number.isFinite(spotPriceSol)) {
+      return null;
+    }
+
+    if (this.currentCashSol < addOnCostBasisSol) {
+      return null;
+    }
+
+    const now = nowTimestampMs ?? this.clock();
+    const tokensToAdd = addOnCostBasisSol / spotPriceSol;
+
+    position.tokensHeld += tokensToAdd;
+    position.costBasisSol += addOnCostBasisSol;
+    position.initialTokensHeld =
+      (position.initialTokensHeld ?? position.tokensHeld - tokensToAdd) + tokensToAdd;
+    position.initialCostBasisSol =
+      (position.initialCostBasisSol ?? position.costBasisSol - addOnCostBasisSol) +
+      addOnCostBasisSol;
+
+    const blendedEntryPriceSol = position.costBasisSol / position.tokensHeld;
+    position.entryPriceSol = blendedEntryPriceSol;
+    position.spotPriceSol = spotPriceSol;
+    position.currentPnlBps = Math.round(
+      ((spotPriceSol - blendedEntryPriceSol) / blendedEntryPriceSol) * 10_000,
+    );
+    position.pyramided = true;
+    position.scaleInCount = (position.scaleInCount ?? 0) + 1;
+    position.lastActivityMs = now;
+
+    this.currentCashSol -= addOnCostBasisSol;
+
+    // Adjust ratchet: Lock floor stop to blended entryPriceSol (0 bps from new basis)
+    const updatedRatchetState: PositionRatchetState = {
+      ...position.ratchetState,
+      entryPriceSol: blendedEntryPriceSol,
+      currentStopFloorBps: Math.max(0, position.ratchetState.currentStopFloorBps),
+      armedBreakeven: true,
+      lastEvaluatedAtMs: now,
+    };
+    position.ratchetState = updatedRatchetState;
+    this.ratchetService.getStore().update(updatedRatchetState);
+
+    return position;
+  }
+
   manualExit(
     positionId: string,
     currentSpotPriceSol?: number,
@@ -188,6 +249,9 @@ export class PaperTradingDaemon {
 
     const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
     const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+    const totalTokensSold = position.initialTokensHeld ?? position.tokensHeld;
+    const vwapExitPriceSol =
+      totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
     const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
     const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
@@ -195,7 +259,7 @@ export class PaperTradingDaemon {
       positionId: position.positionId,
       mintAddress: position.mintAddress,
       entryPriceSol: position.entryPriceSol,
-      exitPriceSol,
+      exitPriceSol: vwapExitPriceSol,
       costBasisSol: totalCostBasisSol,
       proceedsSol: totalProceedsSol,
       realizedPnlSol,
@@ -397,6 +461,9 @@ export class PaperTradingDaemon {
 
         const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
         const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+        const totalTokensSold = position.initialTokensHeld ?? position.tokensHeld;
+        const vwapExitPriceSol =
+          totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
         const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
         const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
@@ -404,7 +471,7 @@ export class PaperTradingDaemon {
           positionId: position.positionId,
           mintAddress: position.mintAddress,
           entryPriceSol: position.entryPriceSol,
-          exitPriceSol,
+          exitPriceSol: vwapExitPriceSol,
           costBasisSol: totalCostBasisSol,
           proceedsSol: totalProceedsSol,
           realizedPnlSol,
@@ -489,6 +556,9 @@ export class PaperTradingDaemon {
 
         const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
         const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+        const totalTokensSold = position.initialTokensHeld ?? position.tokensHeld;
+        const vwapExitPriceSol =
+          totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
         const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
         const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
@@ -496,7 +566,7 @@ export class PaperTradingDaemon {
           positionId: position.positionId,
           mintAddress: position.mintAddress,
           entryPriceSol: position.entryPriceSol,
-          exitPriceSol,
+          exitPriceSol: vwapExitPriceSol,
           costBasisSol: totalCostBasisSol,
           proceedsSol: totalProceedsSol,
           realizedPnlSol,
@@ -548,6 +618,9 @@ export class PaperTradingDaemon {
 
       const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
       const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
+      const totalTokensSold = position.initialTokensHeld ?? position.tokensHeld;
+      const vwapExitPriceSol =
+        totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
       const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
       const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
@@ -555,7 +628,7 @@ export class PaperTradingDaemon {
         positionId: position.positionId,
         mintAddress: position.mintAddress,
         entryPriceSol: position.entryPriceSol,
-        exitPriceSol,
+        exitPriceSol: vwapExitPriceSol,
         costBasisSol: totalCostBasisSol,
         proceedsSol: totalProceedsSol,
         realizedPnlSol,

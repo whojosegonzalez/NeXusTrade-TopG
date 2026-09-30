@@ -388,4 +388,178 @@ describe("BuyGateTriggerService", () => {
     expect(flowGate35k?.passed).toBe(true);
     expect(flowGate35k?.requirement).toBe("Buys/Sells >= 1.15x");
   });
+
+  describe("SubPhase12_83: Established Macro Trend Gate (Anti-Dead-Cat Bounce)", () => {
+    const establishedRunner: WatchlistCandidateItem = {
+      ...candidate,
+      liquidityUsd: 100_000,
+      marketCapUsd: 1_500_000,
+      lmcRatio: 100_000 / 1_500_000,
+      assetAgeSeconds: 7200, // 2h (Established)
+      volume5mUsd: 35_000,
+      buys5m: 50,
+      sells5m: 25,
+      buyToSellRatio: 2.0,
+    };
+
+    it("rejects established tokens in macro downtrends (priceChange1h < -15%)", () => {
+      const service = new BuyGateTriggerService();
+      const deadCatResult = service.evaluateCandidate(establishedRunner, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        priceChange1hPct: -45.2, // e.g. cNFTs (-45.2%) or BOT (-60.2%)
+      });
+
+      expect(deadCatResult.triggered).toBe(false);
+      expect(deadCatResult.rejectionReason).toBe("REJECTED_ESTABLISHED_MACRO_DOWNTREND");
+      const macroGate = deadCatResult.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate?.passed).toBe(false);
+      expect(macroGate?.value).toBe(-45.2);
+    });
+
+    it("accepts established tokens with healthy macro trend (priceChange1h >= -15%)", () => {
+      const service = new BuyGateTriggerService();
+      const healthyResult = service.evaluateCandidate(establishedRunner, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        priceChange1hPct: 120.0, // e.g. PFSOL (+120%) or ARCH (+246%)
+      });
+
+      expect(healthyResult.triggered).toBe(true);
+      const macroGate = healthyResult.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate?.passed).toBe(true);
+      expect(macroGate?.value).toBe(120.0);
+    });
+
+    it("does not reject fresh micro-caps even if priceChange1h < -15%", () => {
+      const service = new BuyGateTriggerService();
+      const microCapResult = service.evaluateCandidate(candidate, {
+        recentBuysCount60s: 8,
+        recentSellsCount60s: 3,
+        momentum1mBps: 50,
+        priceChange1hPct: -25.0, // Fresh micro-cap (< 1h age, not established)
+      });
+
+      expect(microCapResult.triggered).toBe(true);
+      const macroGate = microCapResult.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate).toBeUndefined(); // Gate not added for micro-caps
+    });
+  });
+
+  describe("SubPhase12_84: Mandatory Liquidity Floor for Established Cohort", () => {
+    it("never classifies tokens with liquidity < $50,000 as Established, even with mature age (2h) or high MC ($300k)", () => {
+      const service = new BuyGateTriggerService();
+      // Token with $45k liquidity, $450k MC (L/MC = 10%), age 7200s (2h)
+      // Because liquidity < $50k, this is strictly a MICRO_CAP:
+      // 1. It must satisfy micro-cap L/MC >= 15% (10% fails DEPTH_BALANCE_GATE)
+      // 2. It does not get the ESTABLISHED_MACRO_TREND_GATE
+      const thinCandidate: WatchlistCandidateItem = {
+        poolId: "pool-thin-1",
+        mintAddress: "ThinMint111111111111111111111111111111111111",
+        symbol: "THIN",
+        liquidityUsd: 45_000,
+        marketCapUsd: 450_000,
+        lmcRatio: 0.1, // 10% (< 15% micro-cap threshold, but >= 3% established threshold)
+        lpBurnPct: 100,
+        assetAgeSeconds: 7200, // 2 hours
+        volume5mUsd: 30_000,
+        buys5m: 40,
+        sells5m: 20,
+        buyToSellRatio: 2.0,
+        status: "WATCHING",
+        discoveredAt: new Date().toISOString(),
+        lastEvaluatedAt: new Date().toISOString(),
+      };
+
+      const result = service.evaluateCandidate(thinCandidate, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+      });
+
+      // Should fail DEPTH_BALANCE_GATE because micro-cap requires 15%
+      expect(result.triggered).toBe(false);
+      const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
+      expect(depthGate?.passed).toBe(false);
+      expect(depthGate?.requirement).toContain("15% <= L/MC <= 55%");
+      expect(depthGate?.requirement).not.toContain("Adaptive Established Pool");
+
+      // Gate 10 should not be attached to non-established tokens
+      const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate).toBeUndefined();
+    });
+
+    it("classifies tokens with liquidity >= $50,000 and age >= 1h as Established (3% L/MC floor, macro gate active)", () => {
+      const service = new BuyGateTriggerService();
+      // Token with $55k liquidity, $700k MC (L/MC = 7.8%), age 7200s (2h)
+      const establishedCandidate: WatchlistCandidateItem = {
+        poolId: "pool-estab-1",
+        mintAddress: "EstabMint11111111111111111111111111111111111",
+        symbol: "ESTAB",
+        liquidityUsd: 55_000,
+        marketCapUsd: 700_000,
+        lmcRatio: 55_000 / 700_000, // ~7.86% (passes established 3% floor)
+        lpBurnPct: 100,
+        assetAgeSeconds: 7200,
+        volume5mUsd: 30_000,
+        buys5m: 40,
+        sells5m: 20,
+        buyToSellRatio: 2.0,
+        status: "WATCHING",
+        discoveredAt: new Date().toISOString(),
+        lastEvaluatedAt: new Date().toISOString(),
+      };
+
+      const result = service.evaluateCandidate(establishedCandidate, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        priceChange1hPct: 25.0,
+      });
+
+      expect(result.triggered).toBe(true);
+      const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
+      expect(depthGate?.passed).toBe(true);
+      expect(depthGate?.requirement).toContain("3% <= L/MC <= 55% (Adaptive Established Pool)");
+
+      const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate).toBeDefined();
+      expect(macroGate?.passed).toBe(true);
+    });
+
+    it("classifies tokens with liquidity >= $50,000 and marketCap >= $250,000 as Established even if young", () => {
+      const service = new BuyGateTriggerService();
+      const largeCapCandidate: WatchlistCandidateItem = {
+        poolId: "pool-large-1",
+        mintAddress: "LargeCapMint11111111111111111111111111111111",
+        symbol: "LARGE",
+        liquidityUsd: 60_000,
+        marketCapUsd: 600_000,
+        lmcRatio: 0.1, // 10%
+        lpBurnPct: 100,
+        assetAgeSeconds: 500, // Young (< 1h)
+        volume5mUsd: 30_000,
+        buys5m: 40,
+        sells5m: 20,
+        buyToSellRatio: 2.0,
+        status: "WATCHING",
+        discoveredAt: new Date().toISOString(),
+        lastEvaluatedAt: new Date().toISOString(),
+      };
+
+      const result = service.evaluateCandidate(largeCapCandidate, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        priceChange1hPct: 10.0,
+      });
+
+      expect(result.triggered).toBe(true);
+      const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
+      expect(depthGate?.passed).toBe(true);
+      expect(depthGate?.requirement).toContain("Adaptive Established Pool");
+    });
+  });
 });

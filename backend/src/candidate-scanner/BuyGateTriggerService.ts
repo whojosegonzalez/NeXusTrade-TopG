@@ -17,6 +17,7 @@ export interface BuyGateConfig {
   readonly minHoldersCount: number; // default: 350
   readonly maxRugScore: number; // default: 700
   readonly rejectDangerRisks: boolean; // default: true
+  readonly maxEstablishedMacroDrawdownPct: number; // default: -15.0 (-15%)
 }
 
 export const BUY_GATE_DEFAULTS: BuyGateConfig = {
@@ -35,6 +36,7 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   minHoldersCount: 350,
   maxRugScore: 700,
   rejectDangerRisks: true,
+  maxEstablishedMacroDrawdownPct: -15.0,
 };
 
 export interface GateCheck {
@@ -53,6 +55,14 @@ export interface BuyGateEvaluationResult {
   readonly rejectionReason?: string | undefined;
 }
 
+export interface ArmedPullbackState {
+  readonly mintAddress: string;
+  readonly armedAtMs: number;
+  readonly peakPriceSol: number;
+  readonly peakPriceUsd: number;
+  ticksObserved: number;
+}
+
 export interface AdvancedMarketContext {
   readonly maxSingleDisposalUsd?: number | undefined;
   readonly recentBuysCount60s?: number | undefined;
@@ -63,6 +73,7 @@ export interface AdvancedMarketContext {
   readonly holdersCount?: number | undefined;
   readonly rugScore?: number | undefined;
   readonly hasDangerRisk?: boolean | undefined;
+  readonly priceChange1hPct?: number | undefined;
 }
 
 export class BuyGateTriggerService {
@@ -93,12 +104,12 @@ export class BuyGateTriggerService {
     const gates: GateCheck[] = [];
 
     // Established / High-Volume pool detection
+    // MANDATORY Liquidity Floor: Must have >= $50,000 liquidity to ever be classified as ESTABLISHED
     const isEstablished =
-      item.liquidityUsd >= 40000 || item.assetAgeSeconds >= 3600 || item.marketCapUsd >= 250000;
+      item.liquidityUsd >= 50000 && (item.assetAgeSeconds >= 3600 || item.marketCapUsd >= 250000);
 
     // 1. Maturity Window Gate (Supports Established Runners, or Adaptive Micro-Caps 300s to 900s/2700s)
-    const isEstablishedRunner =
-      (item.liquidityUsd >= 40000 || item.marketCapUsd >= 100000) && item.assetAgeSeconds >= 3600;
+    const isEstablishedRunner = item.liquidityUsd >= 50000 && item.assetAgeSeconds >= 3600;
 
     const isHighLiqVol = item.liquidityUsd >= 20000 && item.volume5mUsd >= 25000;
     const maxMaturityAgeSec = isEstablishedRunner
@@ -237,6 +248,19 @@ export class BuyGateTriggerService {
       requirement: `Score <= ${this.config.maxRugScore}, No Danger, Bundler <= ${(this.config.maxBundlerPct * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${this.config.minHoldersCount}`,
     });
 
+    // 10. Established Macro Trend Gate (Anti-Dead-Cat Bounce Gate)
+    if (isEstablished) {
+      const priceChange1h = marketContext.priceChange1hPct;
+      const macroPassed =
+        priceChange1h === undefined || priceChange1h >= this.config.maxEstablishedMacroDrawdownPct;
+      gates.push({
+        name: "ESTABLISHED_MACRO_TREND_GATE",
+        passed: macroPassed,
+        value: priceChange1h ?? 0,
+        requirement: `1h Price Change >= ${this.config.maxEstablishedMacroDrawdownPct.toFixed(1)}%`,
+      });
+    }
+
     const failedGate = gates.find((g) => !g.passed);
     const triggered = !failedGate;
 
@@ -244,6 +268,8 @@ export class BuyGateTriggerService {
     if (failedGate) {
       if (failedGate.name === "BUNDLER_CONCENTRATION_GATE" && rugCheckFailureReason) {
         rejectionReason = rugCheckFailureReason;
+      } else if (failedGate.name === "ESTABLISHED_MACRO_TREND_GATE") {
+        rejectionReason = "REJECTED_ESTABLISHED_MACRO_DOWNTREND";
       } else {
         rejectionReason = `${failedGate.name}_FAILED`;
       }
