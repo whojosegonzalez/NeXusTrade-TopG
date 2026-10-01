@@ -1761,3 +1761,53 @@ These should be locked during Phase 9 implementation:
 - Titan integration API access status and suitable endpoint docs.
 - Autobahn hosted API token availability versus self-hosting deferral.
 - Whether QuickNode or another RPC provider is needed for reliability before live readiness.
+
+---
+
+## 2026-09-24 - Phase 12 Interactive Dashboard & Visual Control Plane
+
+Decision: Implement an operator-grade 3-view React 19 + Vite 7 dashboard (`Settings`, `Active Session`, `Past Sessions`) decoupled from the execution engine via file-based IPC (`.tmp/paper-session-active.json`, `.tmp/session-commands.json`, `.tmp/dashboard-settings.json`).
+Reason: Operating multi-hour autonomous sessions requires sub-second telemetry visibility, real-time equity curves, dynamic ratchet position monitoring, and manual operator overrides (`PAUSE`, `RESUME`, `START_EXITING`, `EMERGENCY_STOP`) without direct shell access or database locks.
+Status: Accepted and implemented in production.
+
+## 2026-09-27 - Continuous Virtual Wallet & Compounding Capital Preservation
+
+Decision: Introduce `ContinuousVirtualWallet.ts` in `backend/src/paper/` to persist equity balances across session restarts rather than resetting capital to a static 10.0 SOL baseline.
+Reason: Real trading operates continuously. Compounding profits and realistic balance drawdowns must be tracked across days to validate portfolio survivability, position sizing scaling, and long-term expectancy.
+Status: Accepted and verified in production.
+
+## 2026-09-29 - Multi-Tier Dynamic Ratchet & Uncapped Trailing Moonbag
+
+Decision: Replace rigid stop-loss/take-profit boundaries with a multi-tier asymmetric dynamic ratchet:
+
+1. Breakeven scratch armed at $+0.5\%$ gain (stagnant cut after 180s).
+2. Tier 1: Sell 50% at $+20.0\%$, locking stop floor at $+10.0\%$.
+3. Tier 2: Sell 25% at $+48.5\%$, locking stop floor at $+35.0\%$.
+4. Trailing Moonbag: Float remaining 25% tokens at a $25\%$ trailing distance from peak.
+   Reason: Eliminates round-tripping green trades into red losses while maintaining uncapped upside for explosive runners (`BANDIT` $+72.4\%$, `SACC` $+84.0\%$).
+   Status: Accepted and verified in production.
+
+## 2026-09-30 - Real-Time Emergency Circuit Breakers (Whale Dump & Sell Pressure Cuts)
+
+Decision: Add deterministic in-trade emergency liquidation triggers:
+
+1. `WHALE_DEV_DUMP_CLIFF_CUT`: Triggers when single-tick price drops $\le -10.0\%$ with 0 recent buys and PnL $\le -8.0\%$.
+2. `EMERGENCY_SELL_PRESSURE_CUT`: Triggers when 60s sells $\ge 25$, sells $\ge 2\times$ buys, and PnL $\le -3.0\%$.
+   Reason: Prevents catastrophic insider or dev rug-pull slippage by liquidating positions at $-2.9\%$ to $-8.0\%$ before liquidity pools drain to zero.
+   Status: Accepted and verified in production.
+
+## 2026-10-01 - Retest Pullback Gate & Verified Holder Floor Hardening
+
+Decision:
+
+1. Retest Pullback Gate (Gate 11): Require candidate tokens to exhibit a $5.0\%$ to $12.0\%$ discount pullback from peak with buyer absorption ($\text{buys} \ge 1.2\times \text{sells}$) prior to entry.
+2. Verified Holder Floor: Elevate established runner minimum verified holder requirement from 100 to 250 holders ($50k+ liquidity, 30m–2h age).
+3. Candidate Established Decoupling: Decouple candidate established pre-screening from restrictive candidate scanner filters.
+   Reason: Empirically eliminates buying local tops during artificial volume spikes and filters out bot-dominated pools with concentrated dev holdings.
+   Status: Accepted and verified in production.
+
+## 2026-10-01 - Multi-Regime 12-Hour Calibration & Phase 12.89/12.90 Pathway
+
+Decision: Formulate Phase 12.89 (compounding sizing unlock on established entries) and Phase 12.90 (168-hour / 7-day 24/7 chrono-regime stress test) as the final empirical validation pathway before Phase 13 Hot Wallet Jito mainnet transition.
+Reason: Certifies the execution engine against all weekly liquidity cycles (Asia, Europe, US market opens, low-liquidity weekend lulls, dead hours) ensuring system durability before committing real capital.
+Status: Accepted and active.

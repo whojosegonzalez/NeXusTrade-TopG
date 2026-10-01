@@ -75,22 +75,27 @@ Use these related historical docs for project context:
   and selects only the bounded analyzer suite. `.gitattributes` preserves the frozen V3 protocol's
   committed bytes; analyzer path checks reject symlink/junction redirection along the entire path.
 
-#### docs/ROADMAP_Phase9Plus.md
+#### docs/ROADMAP_Phase12.9Plus.md
 
-- Purpose: Active roadmap for Phase 9 through Phase 13+.
-- Usage: Read before planning or implementing Phase 9+ work.
-- Important parameters: Links back to historical roadmap and handoff docs; keeps Phase 9
-  shadow-first; lists future Phase 9.x, dashboard, live-readiness, and provider-expansion phases.
-- Status: Started.
+- Purpose: Master active roadmap for Phase 12.89 through Phase 14 (Hot Wallet & Mainnet Fleet).
+- Usage: Read before planning or implementing Phase 12.89+ execution, weekly stress tests, and hot wallet transitions.
+- Important parameters: Defines Phase 12.89 (compounding sizing unlock), Phase 12.90 (168-hour / 7-day 24/7 chrono-regime stress test), Phase 12.9X/12.9Z sign-off, Phase 13 (Hot Wallet Jito MEV bundles), and Phase 14 (Cloud/VPS deployment).
+- Status: Active Master Roadmap.
+- Tests: Manual documentation review.
+
+#### docs/ROADMAP_Phase9_to_12.88.md
+
+- Purpose: Historical roadmap covering Phase 9 through Sub-Phase 12.88.
+- Usage: Reference for historical milestones, research protocols, and previous calibration stages.
+- Status: Completed & Preserved.
 - Tests: Manual documentation review.
 
 #### docs/DECISIONS_Phase9Plus.md
 
-- Purpose: Active decision log for Phase 9 and later.
-- Usage: Add new decisions here instead of appending to the large historical `DECISIONS.md`.
-- Important parameters: Records the Phase 9+ doc split, shadow-first TerminalRunner boundary, and
-  pending Phase 9 implementation decisions.
-- Status: Started.
+- Purpose: Active decision log for Phase 9 and later (through Phase 12.88).
+- Usage: Add new architectural and strategy decisions here.
+- Important parameters: Records Phase 9+ research splits, Phase 12 3-page interactive dashboard, Continuous Virtual Wallet compounding, Multi-tier Dynamic Ratchet Moonbag, Emergency Whale Cliff and Avalanche Sell Pressure cuts, Retest Pullback Gate, and 250 Holder Floor.
+- Status: Active.
 - Tests: Manual documentation review.
 
 #### docs/Structure_Phase9Plus.md
@@ -98,10 +103,18 @@ Use these related historical docs for project context:
 - Purpose: Active file inventory for Phase 9 and later.
 - Usage: Add new Phase 9+ files here. Do not duplicate historical entries from `Structure.md`
   unless a file is materially changed in Phase 9+.
-- Important parameters: Links back to historical structure; keeps this file focused on new or
-  changed Phase 9+ artifacts.
-- Status: Started.
+- Important parameters: Links back to historical structure; keeps this file focused on active production and architecture suites.
+- Status: Active.
 - Tests: Manual documentation review.
+
+#### docs/architecture/
+
+Production architecture specifications for current production systems:
+
+- `docs/architecture/dynamic-ratchet-engine.md`: Dynamic ratchet state machine, profit tiers (+20% T1, +48.5% T2, trailing moonbag with 25% buffer), emergency sell pressure & whale dump cliff cuts.
+- `docs/architecture/buy-gate-trigger-engine.md`: 12 fail-closed buy gates, Retest Pullback Gate (5%–12% discounts with flow absorption), Established Runner criteria, 250 holder floor.
+- `docs/architecture/paper-trading-daemon.md`: 24/7 paper trading daemon, continuous virtual wallet persistence, proportional compounding sizing, counterfactual tracking.
+- `docs/architecture/control-plane-dashboard.md`: React 19 + Vite 7 dashboard, 3-tab layout, sub-second telemetry, IPC command dispatching, terminal activity feed.
 
 #### docs/NeXusTrade-Phase-9-Detailed-Checklist.md
 

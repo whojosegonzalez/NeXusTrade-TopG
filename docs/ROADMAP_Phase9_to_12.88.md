@@ -1,8 +1,9 @@
-# NeXusTrade Roadmap Phase 9+
+# NeXusTrade Roadmap: Phases 9 through 12.88
 
-Active roadmap for Phase 9 and later.
+Historical master roadmap governing Phase 9 through Phase 12 Sub-Phase 12.88.
+Successor Roadmap: [ROADMAP_Phase12.9Plus.md](./ROADMAP_Phase12.9Plus.md) (Active Master Roadmap).
 
-Last updated: 2026-09-24
+Finalized: 2026-10-01 (Concluded with Sub-Phase 12.88 Candidate Established Pre-Screening Unblock)
 
 ## Historical References
 
