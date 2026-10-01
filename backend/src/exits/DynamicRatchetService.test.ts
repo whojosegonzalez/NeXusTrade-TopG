@@ -724,4 +724,167 @@ describe("DynamicRatchetService", () => {
       expect(breach.reasonCode).toBe("RATCHET_TIER_1_BREACH");
     });
   });
+
+  describe("SubPhase12_85: Parabolic Moonbag Trailing Stop Tightening", () => {
+    it("dynamically tightens moonbag trailing buffer from 25% to 15% at >= 100% gain, and to 10% at >= 200% gain", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-moon-1", "mint-moon-1", 1.0, 1_000_000);
+
+      // 1. Reach Tier 1 first at +20% (1.20 SOL)
+      const t1 = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.2,
+        currentTimestampMs: 1_000_005,
+      });
+      expect(t1.action).toBe("SELL_PARTIAL_50");
+
+      // 2. Surges to +60.0% (6000 bps) -> Tier 2 triggered with 25% buffer (floor = 6000 - 2500 = 3500 bps)
+      const t2Initial = service.evaluate(t1.updatedState, {
+        ...baseContext,
+        spotPriceSol: 1.6,
+        currentTimestampMs: 1_000_010,
+      });
+      expect(t2Initial.action).toBe("SELL_PARTIAL_25");
+      expect(t2Initial.updatedState.activeTier).toBe("TIER_2");
+      expect(t2Initial.updatedState.currentStopFloorBps).toBe(3500); // 6000 - 2500
+
+      // 3. Parabolic surge to +120.0% (12000 bps) -> Buffer tightens to 15% (1500 bps), floor = 12000 - 1500 = 10500 bps
+      const t2Parabolic = service.evaluate(t2Initial.updatedState, {
+        ...baseContext,
+        spotPriceSol: 2.2,
+        currentTimestampMs: 1_000_020,
+      });
+      expect(t2Parabolic.action).toBe("HOLD");
+      expect(t2Parabolic.updatedState.currentStopFloorBps).toBe(10500); // 12000 - 1500
+
+      // 4. Super-parabolic surge to +220.0% (22000 bps) -> Buffer tightens to 10% (1000 bps), floor = 22000 - 1000 = 21000 bps
+      const t2SuperParabolic = service.evaluate(t2Parabolic.updatedState, {
+        ...baseContext,
+        spotPriceSol: 3.2,
+        currentTimestampMs: 1_000_030,
+      });
+      expect(t2SuperParabolic.action).toBe("HOLD");
+      expect(t2SuperParabolic.updatedState.currentStopFloorBps).toBe(21000); // 22000 - 1000
+    });
+  });
+
+  describe("SubPhase12_86: In-Trade Avalanche Sell-Pressure Emergency Cut", () => {
+    it("triggers EMERGENCY_SELL_PRESSURE_CUT when position is underwater (pnl <= -4.0%) and sellers overwhelm (sells >= 25 in 60s & sells >= 3.0 * buys)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-emergency-1", "mint-emergency-1", 1.0, 1_000_000);
+
+      // Price dips to -4.5% (-450 bps, 0.955 SOL) with severe seller avalanche: 30 sells vs 5 buys in 60s (ratio 6.0x >= 3.0x)
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.955,
+        recentSellsCount60s: 30,
+        recentBuysCount60s: 5,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("EMERGENCY_SELL_PRESSURE_CUT");
+      expect(result.updatedState.activeTier).toBe("HARD_STOP");
+    });
+
+    it("does not trigger EMERGENCY_SELL_PRESSURE_CUT if pnl is above -4.0% even with heavy sells", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-emergency-2", "mint-emergency-2", 1.0, 1_000_000);
+
+      // Price is only down -2.5% (-250 bps, 0.975 SOL) with 30 sells vs 5 buys
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.975,
+        recentSellsCount60s: 30,
+        recentBuysCount60s: 5,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).not.toBe("EMERGENCY_SELL_PRESSURE_CUT");
+    });
+
+    it("does not trigger EMERGENCY_SELL_PRESSURE_CUT if sell volume is not overwhelming (< 3x buys or < 25 sells)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-emergency-3", "mint-emergency-3", 1.0, 1_000_000);
+
+      // Price is down -5.0% (-500 bps, 0.95 SOL) but sells = 20 (< 25)
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.95,
+        recentSellsCount60s: 20,
+        recentBuysCount60s: 5,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).not.toBe("EMERGENCY_SELL_PRESSURE_CUT");
+    });
+  });
+
+  describe("SubPhase12_87: Single-Tick Whale/Dev Dump Circuit Breaker", () => {
+    it("triggers WHALE_DEV_DUMP_CLIFF_CUT when underwater (pnl <= -8.0%), zero buys, and single-tick drop <= -10.0%", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-cliff-1", "mint-cliff-1", 1.0, 1_000_000);
+
+      // Price plunges in a single tick to 0.88 SOL (-12.0% pnl, -1200 bps single-tick drop), 0 buys
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.88,
+        recentBuysCount60s: 0,
+        recentSellsCount60s: 1, // Single massive dev dump transaction
+        singleTickDropBps: -1200, // -12.0% <= -10.0% (-1000 bps)
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("WHALE_DEV_DUMP_CLIFF_CUT");
+      expect(result.updatedState.activeTier).toBe("HARD_STOP");
+    });
+
+    it("does not trigger WHALE_DEV_DUMP_CLIFF_CUT if buyers are actively present (recentBuys > 0)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-cliff-2", "mint-cliff-2", 1.0, 1_000_000);
+
+      // Price dips to 0.90 SOL (-10.0% pnl, -1000 bps single-tick drop), but buyers are absorbing (6 buys vs 4 sells)
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.9,
+        recentBuysCount60s: 6,
+        recentSellsCount60s: 4,
+        singleTickDropBps: -1000,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+      expect(result.reasonCode).not.toBe("WHALE_DEV_DUMP_CLIFF_CUT");
+    });
+
+    it("does not trigger WHALE_DEV_DUMP_CLIFF_CUT if single-tick drop is milder than -10.0% (e.g. -400 bps)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-cliff-3", "mint-cliff-3", 1.0, 1_000_000);
+
+      // Price is down -8.5% (-850 bps pnl), with healthy gradual pullback (5 buys vs 3 sells) and -4.0% single tick
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.915,
+        recentBuysCount60s: 5,
+        recentSellsCount60s: 3,
+        singleTickDropBps: -400,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+      expect(result.reasonCode).not.toBe("WHALE_DEV_DUMP_CLIFF_CUT");
+    });
+  });
 });

@@ -155,9 +155,15 @@ export class DynamicRatchetService {
     if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps && !tier2ProfitTaken) {
       tier2ProfitTaken = true;
       nextTier = "TIER_2";
+      let trailBufferBps = 2500;
+      if (nextPeakGainBps >= 20000) {
+        trailBufferBps = 1000;
+      } else if (nextPeakGainBps >= 10000) {
+        trailBufferBps = 1500;
+      }
       const trailingMoonbagFloor = Math.max(
         activeConfig.tier2LockedFloorBps,
-        nextPeakGainBps - 2500,
+        nextPeakGainBps - trailBufferBps,
       );
       nextFloorBps = Math.max(nextFloorBps, trailingMoonbagFloor);
 
@@ -197,9 +203,15 @@ export class DynamicRatchetService {
     // Update active tier and floor if milestones were previously reached
     if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps || tier2ProfitTaken) {
       nextTier = "TIER_2";
+      let trailBufferBps = 2500;
+      if (nextPeakGainBps >= 20000) {
+        trailBufferBps = 1000;
+      } else if (nextPeakGainBps >= 10000) {
+        trailBufferBps = 1500;
+      }
       const trailingMoonbagFloor = Math.max(
         activeConfig.tier2LockedFloorBps,
-        nextPeakGainBps - 2500,
+        nextPeakGainBps - trailBufferBps,
       );
       nextFloorBps = Math.max(nextFloorBps, trailingMoonbagFloor);
     } else if (nextPeakGainBps >= activeConfig.tier1PeakThresholdBps || tier1ProfitTaken) {
@@ -226,6 +238,90 @@ export class DynamicRatchetService {
     }
 
     // 2. Evaluation Logic
+    // Rule A0: Emergency Avalanche Sell-Pressure Cut
+    // If position is underwater (currentPnlBps <= -400, i.e. <= -4.0%)
+    // and live flow shows an extreme seller avalanche (sells >= 25 in 60s AND sells >= 3.0 * buys)
+    if (
+      currentPnlBps <= -400 &&
+      context.recentSellsCount60s >= 25 &&
+      context.recentSellsCount60s >= 3.0 * Math.max(1, context.recentBuysCount60s)
+    ) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: "HARD_STOP",
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        "HARD_STOP",
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_ALL",
+        reasonCode: "EMERGENCY_SELL_PRESSURE_CUT",
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Rule A0-Cliff: Single-Tick Whale/Dev Dump Circuit Breaker
+    // If position is underwater (currentPnlBps <= -800, i.e. <= -8.0%),
+    // buyer flow has completely ceased (recentBuysCount60s === 0),
+    // and price experienced a severe instantaneous cliff in a single tick (singleTickDropBps <= -1000, i.e. <= -10.0%)
+    if (
+      currentPnlBps <= -800 &&
+      context.recentBuysCount60s === 0 &&
+      context.singleTickDropBps !== undefined &&
+      context.singleTickDropBps <= -1000
+    ) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: "HARD_STOP",
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        "HARD_STOP",
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_ALL",
+        reasonCode: "WHALE_DEV_DUMP_CLIFF_CUT",
+        diagnostics,
+        updatedState,
+      };
+    }
+
     // Rule A: Catastrophic disaster hard floor (-20.0%) and flow-aware stop (-12.0% to -20.0%)
     if (currentPnlBps <= activeConfig.catastrophicFloorBps) {
       const updatedState: PositionRatchetState = {

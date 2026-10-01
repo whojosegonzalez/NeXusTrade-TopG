@@ -32,10 +32,11 @@ export class CandidateWatchlistService {
       pool.sells5m > 0 ? pool.buys5m / pool.sells5m : pool.buys5m > 0 ? 999 : 1.0;
     const nowIso = new Date(nowSec * 1000).toISOString();
 
-    const isEstablishedRunner = pool.liquidityUsd >= 40000 && pool.marketCapUsd >= 100000;
+    const isEstablishedRunner =
+      pool.liquidityUsd >= 50000 && ageSeconds >= 1800 && ageSeconds <= 7200;
     const isHighLiquidity = pool.liquidityUsd >= 20000;
     const effectiveMaxAgeSec = isEstablishedRunner
-      ? 86400
+      ? 7200
       : isHighLiquidity
         ? 3600
         : this.config.maxWatchlistAgeSec;
@@ -48,11 +49,12 @@ export class CandidateWatchlistService {
 
       if (existing.status === "WATCHING" && ageSeconds > effectiveMaxAgeSec) {
         updatedStatus = "DROPPED";
-        rejectionReason = isEstablishedRunner
-          ? "EXCEEDED_MAX_WATCHLIST_AGE_24H"
-          : isHighLiquidity
-            ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
-            : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
+        rejectionReason =
+          pool.liquidityUsd >= 50000 && ageSeconds > 7200
+            ? "EXCEEDED_MAX_ESTABLISHED_AGE_2H"
+            : isHighLiquidity
+              ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+              : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
       } else if (existing.status === "DROPPED") {
         // Check for fresh bullish reversal / dip-bounce
         if (
@@ -166,32 +168,42 @@ export class CandidateWatchlistService {
     });
   }
 
-  public pruneExpired(nowSec: number): number {
-    let prunedCount = 0;
+  public pruneExpired(nowSec: number): WatchlistCandidateItem[] {
+    const expiredItems: WatchlistCandidateItem[] = [];
     for (const [poolId, item] of this.items.entries()) {
-      const isEstablishedRunner = item.liquidityUsd >= 40000 && item.marketCapUsd >= 100000;
+      const lastEvaluatedSec = Math.floor(new Date(item.lastEvaluatedAt).getTime() / 1000);
+      const elapsedSec = Number.isFinite(lastEvaluatedSec)
+        ? Math.max(0, nowSec - lastEvaluatedSec)
+        : 0;
+      const currentAgeSec = item.assetAgeSeconds + elapsedSec;
+
+      const isEstablishedRunner =
+        item.liquidityUsd >= 50000 && currentAgeSec >= 1800 && currentAgeSec <= 7200;
       const isHighLiquidity = item.liquidityUsd >= 20000;
       const effectiveMaxAgeSec = isEstablishedRunner
-        ? 86400
+        ? 7200
         : isHighLiquidity
           ? 3600
           : this.config.maxWatchlistAgeSec;
 
-      if (item.status === "WATCHING" && item.assetAgeSeconds > effectiveMaxAgeSec) {
-        this.items.set(poolId, {
+      if (item.status === "WATCHING" && currentAgeSec > effectiveMaxAgeSec) {
+        const droppedItem: WatchlistCandidateItem = {
           ...item,
+          assetAgeSeconds: currentAgeSec,
           status: "DROPPED",
-          rejectionReason: isEstablishedRunner
-            ? "EXCEEDED_MAX_WATCHLIST_AGE_24H"
-            : isHighLiquidity
-              ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
-              : "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+          rejectionReason:
+            item.liquidityUsd >= 50000 && currentAgeSec > 7200
+              ? "EXCEEDED_MAX_ESTABLISHED_AGE_2H"
+              : isHighLiquidity
+                ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
+                : "EXCEEDED_MAX_WATCHLIST_AGE_20M",
           lastEvaluatedAt: new Date(nowSec * 1000).toISOString(),
-        });
-        prunedCount++;
+        };
+        this.items.set(poolId, droppedItem);
+        expiredItems.push(droppedItem);
       }
     }
-    return prunedCount;
+    return expiredItems;
   }
 
   private pruneDropped(): void {

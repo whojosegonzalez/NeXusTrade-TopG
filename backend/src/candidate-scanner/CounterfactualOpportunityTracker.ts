@@ -80,9 +80,15 @@ export class CounterfactualOpportunityTracker {
       if (cohort === "EXECUTED_BUY") {
         existing.cohort = "EXECUTED_BUY";
         existing.rejectionReason = undefined;
+      } else if (cohort === "FILTERED_REJECTED" && existing.cohort !== "EXECUTED_BUY") {
+        existing.cohort = "FILTERED_REJECTED";
+        existing.rejectionReason = rejectionReason ?? existing.rejectionReason;
       } else if (existing.cohort === "FILTERED_REJECTED" && cohort === "WATCHLIST_RADAR") {
         existing.cohort = "WATCHLIST_RADAR";
         existing.rejectionReason = undefined;
+      }
+      if (initialPriceSol > 0) {
+        this.samplePrice(pool.mintAddress, initialPriceSol, nowMs);
       }
       return existing;
     }

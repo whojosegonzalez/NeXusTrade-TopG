@@ -127,26 +127,26 @@ describe("CandidateWatchlistService", () => {
     expect(droppedItem?.rejectionReason).toBe("EXCEEDED_MAX_WATCHLIST_AGE_60M");
   });
 
-  it("retains established runner (>= $40k liq, >= $100k mcap) up to 24h (86,400s)", () => {
+  it("retains established runner (>= $50k liq) within 30m to 2h (7,200s) and drops stale > 2h with EXCEEDED_MAX_ESTABLISHED_AGE_2H", () => {
     const service = new CandidateWatchlistService();
     const runnerPool: ScannedPoolRecord = {
       ...validPool,
       liquidityUsd: 50_000,
       marketCapUsd: 200_000,
-      openTimeSec: nowSec - 28800, // 8h age
+      openTimeSec: nowSec - 3600, // 1h age (within 1800s - 7200s)
     };
 
     const item = service.admitOrUpdate(runnerPool, nowSec);
     expect(item?.status).toBe("WATCHING");
 
-    // Scan past 24h (e.g. 90,000s) -> dropped with EXCEEDED_MAX_WATCHLIST_AGE_24H
+    // Scan past 2h (e.g. 7,500s) -> dropped with EXCEEDED_MAX_ESTABLISHED_AGE_2H
     const expiredRunner = {
       ...runnerPool,
-      openTimeSec: nowSec - 90000,
+      openTimeSec: nowSec - 7500,
     };
     const droppedItem = service.admitOrUpdate(expiredRunner, nowSec);
     expect(droppedItem?.status).toBe("DROPPED");
-    expect(droppedItem?.rejectionReason).toBe("EXCEEDED_MAX_WATCHLIST_AGE_24H");
+    expect(droppedItem?.rejectionReason).toBe("EXCEEDED_MAX_ESTABLISHED_AGE_2H");
   });
 
   it("respects maxWatchlistSize capacity", () => {
@@ -182,5 +182,35 @@ describe("CandidateWatchlistService", () => {
     expect(revived?.status).toBe("WATCHING");
     expect(revived?.rejectionReason).toBeUndefined();
     expect(service.getActiveWatchingItems().length).toBe(1);
+  });
+
+  it("pruneExpired drops expired items and returns array of dropped candidate records", () => {
+    const service = new CandidateWatchlistService();
+    // Micro-cap pool (limit: 1200s)
+    service.admitOrUpdate(validPool, nowSec);
+
+    // Established runner pool (limit: 7200s)
+    const runnerPool: ScannedPoolRecord = {
+      ...validPool,
+      poolId: "pool-runner",
+      mintAddress: "MintRunner111111111111111111111111111111111",
+      liquidityUsd: 60_000,
+      openTimeSec: nowSec - 3600,
+    };
+    service.admitOrUpdate(runnerPool, nowSec);
+
+    // Call pruneExpired when micro-cap has exceeded 1200s (e.g. nowSec + 1300), but runner is still valid
+    const droppedAt1300 = service.pruneExpired(nowSec + 1300);
+    expect(droppedAt1300.length).toBe(1);
+    expect(droppedAt1300[0]?.poolId).toBe(validPool.poolId);
+    expect(droppedAt1300[0]?.status).toBe("DROPPED");
+    expect(droppedAt1300[0]?.rejectionReason).toBe("EXCEEDED_MAX_WATCHLIST_AGE_20M");
+
+    // Later, when runner has exceeded 7200s (openTimeSec was nowSec - 3600, so age > 7200 at nowSec + 3700)
+    const droppedAt3700 = service.pruneExpired(nowSec + 3700);
+    expect(droppedAt3700.length).toBe(1);
+    expect(droppedAt3700[0]?.poolId).toBe("pool-runner");
+    expect(droppedAt3700[0]?.status).toBe("DROPPED");
+    expect(droppedAt3700[0]?.rejectionReason).toBe("EXCEEDED_MAX_ESTABLISHED_AGE_2H");
   });
 });

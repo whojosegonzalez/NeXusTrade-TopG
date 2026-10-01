@@ -18,6 +18,9 @@ export interface BuyGateConfig {
   readonly maxRugScore: number; // default: 700
   readonly rejectDangerRisks: boolean; // default: true
   readonly maxEstablishedMacroDrawdownPct: number; // default: -15.0 (-15%)
+  readonly maxMicroTxCount5m: number; // default: 300
+  readonly maxMicroSells5m: number; // default: 100
+  readonly minEstablishedHolders: number; // default: 250
 }
 
 export const BUY_GATE_DEFAULTS: BuyGateConfig = {
@@ -37,6 +40,9 @@ export const BUY_GATE_DEFAULTS: BuyGateConfig = {
   maxRugScore: 700,
   rejectDangerRisks: true,
   maxEstablishedMacroDrawdownPct: -15.0,
+  maxMicroTxCount5m: 300,
+  maxMicroSells5m: 100,
+  minEstablishedHolders: 250,
 };
 
 export interface GateCheck {
@@ -74,6 +80,7 @@ export interface AdvancedMarketContext {
   readonly rugScore?: number | undefined;
   readonly hasDangerRisk?: boolean | undefined;
   readonly priceChange1hPct?: number | undefined;
+  readonly requireVerifiedHolders?: boolean | undefined;
 }
 
 export class BuyGateTriggerService {
@@ -104,16 +111,28 @@ export class BuyGateTriggerService {
     const gates: GateCheck[] = [];
 
     // Established / High-Volume pool detection
-    // MANDATORY Liquidity Floor: Must have >= $50,000 liquidity to ever be classified as ESTABLISHED
-    const isEstablished =
-      item.liquidityUsd >= 50000 && (item.assetAgeSeconds >= 3600 || item.marketCapUsd >= 250000);
+    // MANDATORY Liquidity Floor & Anti-Stale Distribution Ceiling:
+    // Must have >= $50,000 liquidity AND age between 1800s (30m) and 7200s (2h)
+    const isCandidateEstablished =
+      item.liquidityUsd >= 50000 && item.assetAgeSeconds >= 1800 && item.assetAgeSeconds <= 7200;
 
-    // 1. Maturity Window Gate (Supports Established Runners, or Adaptive Micro-Caps 300s to 900s/2700s)
-    const isEstablishedRunner = item.liquidityUsd >= 50000 && item.assetAgeSeconds >= 3600;
+    // When holdersCount is provided (Stage 2 post-RugCheck), enforce minEstablishedHolders (>= 250).
+    // When holdersCount is undefined:
+    //   - If requireVerifiedHolders is false or undefined (Preliminary in-memory screening):
+    //     permit the candidate to qualify preliminarily so spot info and RugCheck can be queried.
+    //   - If requireVerifiedHolders is true: fail-closed (cannot be established).
+    const hasEstablishedHolders =
+      marketContext.holdersCount !== undefined
+        ? marketContext.holdersCount >= this.config.minEstablishedHolders
+        : !marketContext.requireVerifiedHolders;
+
+    const isEstablished = isCandidateEstablished && hasEstablishedHolders;
+
+    const isEstablishedRunner = isEstablished || isCandidateEstablished;
 
     const isHighLiqVol = item.liquidityUsd >= 20000 && item.volume5mUsd >= 25000;
     const maxMaturityAgeSec = isEstablishedRunner
-      ? Math.max(item.assetAgeSeconds, 86400)
+      ? 7200
       : isHighLiqVol
         ? Math.max(this.config.maxMaturityAgeSec, 2700)
         : this.config.maxMaturityAgeSec;
@@ -128,7 +147,7 @@ export class BuyGateTriggerService {
       passed: maturityPassed,
       value: item.assetAgeSeconds,
       requirement: isEstablishedRunner
-        ? "Age >= 3600s (Established Runner)"
+        ? "1800s <= Age <= 7200s (Established Runner)"
         : `${this.config.minMaturityAgeSec}s <= Age <= ${maxMaturityAgeSec}s`,
     });
 
@@ -142,14 +161,14 @@ export class BuyGateTriggerService {
     });
 
     // 3. Adaptive Depth Balance Gate (3% for established, 15% for micro-caps, up to 55%)
-    const effectiveMinLmc = isEstablished ? 0.03 : this.config.minLmcRatio;
+    const effectiveMinLmc = isEstablishedRunner ? 0.03 : this.config.minLmcRatio;
     const depthPassed =
       item.lmcRatio >= effectiveMinLmc && item.lmcRatio <= this.config.maxLmcRatio;
     gates.push({
       name: "DEPTH_BALANCE_GATE",
       passed: depthPassed,
       value: item.lmcRatio,
-      requirement: `${(effectiveMinLmc * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%${isEstablished ? " (Adaptive Established Pool)" : ""}`,
+      requirement: `${(effectiveMinLmc * 100).toFixed(0)}% <= L/MC <= ${(this.config.maxLmcRatio * 100).toFixed(0)}%${isEstablishedRunner ? " (Adaptive Established Pool)" : ""}`,
     });
 
     // 4. Flow Absorption Gate (Buys >= 1.5 * Sells, or relaxed for volume breakouts)
@@ -168,7 +187,30 @@ export class BuyGateTriggerService {
       requirement: `Buys/Sells >= ${effectiveMinRatio}x`,
     });
 
-    // 5. Volume Surge Gate (Volume >= $2,500 & Avg Tx >= $25)
+    // 5. Wash-Trading Transaction Ceiling Gate (Anti-Wash-Trading botnet filter)
+    const totalTx5m = item.buys5m + item.sells5m;
+    const txCountPassed = isEstablishedRunner || totalTx5m <= this.config.maxMicroTxCount5m;
+    gates.push({
+      name: "WASH_TRADING_CEILING_GATE",
+      passed: txCountPassed,
+      value: totalTx5m,
+      requirement: isEstablishedRunner
+        ? "Uncapped (Established Pool)"
+        : `TotalTx5m <= ${this.config.maxMicroTxCount5m} (Anti-Wash-Trading)`,
+    });
+
+    // 6. Sell Congestion Ceiling Gate (Anti-Avalanche dump filter)
+    const sellCongestionPassed = isEstablishedRunner || item.sells5m <= this.config.maxMicroSells5m;
+    gates.push({
+      name: "SELL_CONGESTION_CEILING_GATE",
+      passed: sellCongestionPassed,
+      value: item.sells5m,
+      requirement: isEstablishedRunner
+        ? "Uncapped (Established Pool)"
+        : `Sells5m <= ${this.config.maxMicroSells5m} (Anti-Sell-Congestion)`,
+    });
+
+    // 7. Volume Surge Gate (Volume >= $2,500 & Avg Tx >= $25)
     const totalTx = item.buys5m + item.sells5m;
     const avgTxUsd = totalTx > 0 ? item.volume5mUsd / totalTx : 0;
     const volumePassed =
@@ -180,7 +222,7 @@ export class BuyGateTriggerService {
       requirement: `Vol5m >= $${this.config.minVolume5mUsd} & AvgTx >= $${this.config.minAvgTxUsd}`,
     });
 
-    // 6. Min Sells Gate (Anti-Sniper: require >= 15 sells to avoid untested pools)
+    // 8. Min Sells Gate (Anti-Sniper: require >= 15 sells to avoid untested pools)
     const minSellsPassed = item.sells5m >= this.config.minSells5m;
     gates.push({
       name: "MIN_SELLS_GATE",
@@ -189,7 +231,7 @@ export class BuyGateTriggerService {
       requirement: `Sells5m >= ${this.config.minSells5m}`,
     });
 
-    // 7. Short Horizon Flow Gate (1m flow & momentum check when available)
+    // 9. Short Horizon Flow Gate (1m flow & momentum check when available)
     const hasShortHorizonData =
       marketContext.recentBuysCount60s !== undefined ||
       marketContext.recentSellsCount60s !== undefined ||
@@ -207,7 +249,7 @@ export class BuyGateTriggerService {
       });
     }
 
-    // 8. Dev Disposal Gate (No single disposal > 5% of liquidity)
+    // 10. Dev Disposal Gate (No single disposal > 5% of liquidity)
     const maxDisposal = marketContext.maxSingleDisposalUsd ?? 0;
     const maxDisposalPct = item.liquidityUsd > 0 ? maxDisposal / item.liquidityUsd : 0;
     const devDisposalPassed = maxDisposalPct <= this.config.maxSingleTxDisposalPct;
@@ -218,7 +260,7 @@ export class BuyGateTriggerService {
       requirement: `Single Tx Disposal <= ${(this.config.maxSingleTxDisposalPct * 100).toFixed(0)}% of Liquidity`,
     });
 
-    // 9. RugCheck Security & Holder Concentration Gate
+    // 11. RugCheck Security & Holder Concentration Gate
     const rugScore = marketContext.rugScore;
     const hasDangerRisk = marketContext.hasDangerRisk;
     const bundlerPct = marketContext.bundlerPct;
@@ -226,16 +268,32 @@ export class BuyGateTriggerService {
     const holdersCount = marketContext.holdersCount;
 
     let rugCheckFailureReason: string | undefined;
+    const maxBundlerAllowed = isEstablished ? this.config.maxBundlerPct : 0.5; // 50% ceiling on micro-caps
+    const effectiveMinHolders = isEstablishedRunner
+      ? this.config.minEstablishedHolders
+      : this.config.minHoldersCount;
 
     if (rugScore !== undefined && rugScore > this.config.maxRugScore) {
       rugCheckFailureReason = "RUGCHECK_HIGH_RISK_SCORE_FAILED";
     } else if (this.config.rejectDangerRisks && hasDangerRisk) {
       rugCheckFailureReason = "RUGCHECK_DANGER_FLAG_FAILED";
-    } else if (holdersCount !== undefined && holdersCount < this.config.minHoldersCount) {
+    } else if (marketContext.requireVerifiedHolders && holdersCount === undefined) {
+      rugCheckFailureReason = "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN";
+    } else if (
+      marketContext.requireVerifiedHolders &&
+      holdersCount !== undefined &&
+      holdersCount < (isEstablishedRunner ? this.config.minEstablishedHolders : 100)
+    ) {
+      rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
+    } else if (
+      !marketContext.requireVerifiedHolders &&
+      holdersCount !== undefined &&
+      holdersCount < effectiveMinHolders
+    ) {
       rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
     } else if (top10HolderPct !== undefined && top10HolderPct > this.config.maxTop10HolderPct) {
       rugCheckFailureReason = "TOP_10_CONCENTRATION_FAILED";
-    } else if (bundlerPct !== undefined && bundlerPct > this.config.maxBundlerPct) {
+    } else if (bundlerPct !== undefined && bundlerPct > maxBundlerAllowed) {
       rugCheckFailureReason = "BUNDLER_CONCENTRATION_GATE_FAILED";
     }
 
@@ -245,10 +303,10 @@ export class BuyGateTriggerService {
       passed: bundlerPassed,
       value:
         rugScore ?? bundlerPct ?? top10HolderPct ?? (holdersCount !== undefined ? holdersCount : 0),
-      requirement: `Score <= ${this.config.maxRugScore}, No Danger, Bundler <= ${(this.config.maxBundlerPct * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${this.config.minHoldersCount}`,
+      requirement: `Score <= ${this.config.maxRugScore}, No Danger, Bundler <= ${(maxBundlerAllowed * 100).toFixed(0)}%, Top10 <= ${(this.config.maxTop10HolderPct * 100).toFixed(0)}%, Holders >= ${effectiveMinHolders}`,
     });
 
-    // 10. Established Macro Trend Gate (Anti-Dead-Cat Bounce Gate)
+    // 12. Established Macro Trend Gate (Anti-Dead-Cat Bounce Gate)
     if (isEstablished) {
       const priceChange1h = marketContext.priceChange1hPct;
       const macroPassed =
@@ -270,6 +328,10 @@ export class BuyGateTriggerService {
         rejectionReason = rugCheckFailureReason;
       } else if (failedGate.name === "ESTABLISHED_MACRO_TREND_GATE") {
         rejectionReason = "REJECTED_ESTABLISHED_MACRO_DOWNTREND";
+      } else if (failedGate.name === "WASH_TRADING_CEILING_GATE") {
+        rejectionReason = "REJECTED_EXCESSIVE_WASH_TRADING_TX_COUNT";
+      } else if (failedGate.name === "SELL_CONGESTION_CEILING_GATE") {
+        rejectionReason = "REJECTED_EXCESSIVE_SELL_CONGESTION";
       } else {
         rejectionReason = `${failedGate.name}_FAILED`;
       }

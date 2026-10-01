@@ -716,4 +716,30 @@ describe("PaperTradingDaemon", () => {
       expect(trade.realizedPnlBps).toBe(1500);
     });
   });
+
+  describe("SubPhase12_88: Daemon Idle Heartbeat and Telemetry Duration", () => {
+    it("updates lastTickAtMs via heartbeat and accurately computes durationMinutes in getHistoricalSummary for zero-trade sessions", () => {
+      const startTimeMs = 1_700_000_000_000;
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => startTimeMs,
+      });
+      daemon.start();
+
+      expect(daemon.getSnapshot().lastTickAtMs).toBe(startTimeMs);
+
+      // Session runs for 4 hours (240 minutes) without any opened trades
+      const fourHoursLaterMs = startTimeMs + 240 * 60_000;
+      daemon.heartbeat(fourHoursLaterMs);
+
+      expect(daemon.getSnapshot().lastTickAtMs).toBe(fourHoursLaterMs);
+
+      daemon.stop("DURATION_ELAPSED");
+      const summary = daemon.getHistoricalSummary();
+
+      expect(summary.durationMinutes).toBe(240);
+      expect(summary.totalTrades).toBe(0);
+      expect(summary.endedAt).toBe(new Date(fourHoursLaterMs).toISOString());
+    });
+  });
 });

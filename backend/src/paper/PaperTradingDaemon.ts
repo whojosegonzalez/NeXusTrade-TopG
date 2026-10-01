@@ -326,6 +326,10 @@ export class PaperTradingDaemon {
     };
   }
 
+  public heartbeat(nowTimestampMs?: number): void {
+    this.lastTickAtMs = nowTimestampMs ?? this.clock();
+  }
+
   processScannedPool(
     pool: ScannedPoolRecord,
     nowTimestampMs?: number,
@@ -513,9 +517,21 @@ export class PaperTradingDaemon {
       }
 
       // 3. Evaluate Dynamic Ratchet Stop-Loss Engine
+      const prevPrice = position.spotPriceSol;
+      const singleTickDropBps =
+        marketContext.singleTickDropBps ??
+        (prevPrice > 0
+          ? Math.round(((marketContext.spotPriceSol - prevPrice) / prevPrice) * 10_000)
+          : 0);
+
+      const enrichedContext: MarketEvaluationContext = {
+        ...marketContext,
+        singleTickDropBps,
+      };
+
       const result = this.ratchetService.evaluate(
         position.ratchetState,
-        marketContext,
+        enrichedContext,
         position.ratchetConfig,
       );
 

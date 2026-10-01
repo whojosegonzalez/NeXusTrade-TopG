@@ -105,4 +105,38 @@ describe("CounterfactualOpportunityTracker", () => {
 
     expect(report.rejectionReasonBreakdown["REJECTED_LOW_LIQUIDITY_UNDER_2500"]).toBe(1);
   });
+
+  it("updates existing WATCHLIST_RADAR candidate to FILTERED_REJECTED on drop and records missed winner if it pumps", () => {
+    const tracker = new CounterfactualOpportunityTracker();
+    const nowMs = 1_000_000_000;
+
+    // 1. First seen and placed on radar
+    tracker.recordCandidate(basePool, "WATCHLIST_RADAR", 0.0001, nowMs);
+    let record = tracker.getRecords()[0]!;
+    expect(record.cohort).toBe("WATCHLIST_RADAR");
+
+    // 2. Candidate drops after aging out
+    tracker.recordCandidate(
+      basePool,
+      "FILTERED_REJECTED",
+      0.0001,
+      nowMs + 7200_000,
+      "EXCEEDED_MAX_ESTABLISHED_AGE_2H",
+    );
+    record = tracker.getRecords()[0]!;
+    expect(record.cohort).toBe("FILTERED_REJECTED");
+    expect(record.rejectionReason).toBe("EXCEEDED_MAX_ESTABLISHED_AGE_2H");
+
+    // 3. Post-drop price pumps +40%
+    tracker.samplePrice(basePool.mintAddress, 0.00014, nowMs + 7300_000);
+    expect(record.maxGainBps).toBe(4000); // +40.00%
+
+    // 4. Report identifies it as missed winner
+    const report = tracker.generateReport(10.0, 10.0);
+    expect(report.missedWinnersCount).toBe(1);
+    expect(report.missedWinners[0]?.symbol).toBe("ALPHA");
+    expect(report.missedWinners[0]?.cohort).toBe("FILTERED_REJECTED");
+    expect(report.missedWinners[0]?.rejectionReason).toBe("EXCEEDED_MAX_ESTABLISHED_AGE_2H");
+    expect(report.missedWinners[0]?.peakGainPct).toBe(40);
+  });
 });

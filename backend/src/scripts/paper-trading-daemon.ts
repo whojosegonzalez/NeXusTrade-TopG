@@ -135,6 +135,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     options: {
       "session-id": { type: "string" },
       "duration-hours": { type: "string" },
+      duration: { type: "string" },
       "max-positions": { type: "string" },
       "max-open-positions": { type: "string" },
       "position-size-sol": { type: "string" },
@@ -147,7 +148,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     strict: false,
   });
 
-  const rawDuration = values["duration-hours"];
+  const rawDuration = values["duration-hours"] ?? values["duration"];
   const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 4;
 
   const rawMaxPos = values["max-positions"] ?? values["max-open-positions"];
@@ -211,6 +212,7 @@ interface DexScreenerSpotInfo {
   readonly spotPriceSol: number;
   readonly spotPriceUsd: number;
   readonly liquiditySol: number;
+  readonly liquidityUsd: number;
   readonly buyVolume5mSol: number;
   readonly sellVolume5mSol: number;
   readonly recentBuys60s: number;
@@ -259,6 +261,7 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
     if (!Number.isFinite(spotPriceSol) || spotPriceSol <= 0) return null;
 
     const spotPriceUsd = solPair.priceUsd ? parseFloat(solPair.priceUsd) : 0;
+    const liquidityUsd = solPair.liquidity?.usd ?? 0;
     const liquiditySol =
       solPair.liquidity?.quote ?? (solPair.liquidity?.usd ? solPair.liquidity.usd / 140 : 100);
     const m5Vol = solPair.volume?.m5 ?? 0;
@@ -278,6 +281,7 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
       spotPriceSol,
       spotPriceUsd,
       liquiditySol,
+      liquidityUsd,
       buyVolume5mSol: buyVolSol,
       sellVolume5mSol: sellVolSol,
       recentBuys60s,
@@ -497,6 +501,7 @@ async function run(): Promise<void> {
   // In daemon mode, tick and monitor until duration elapsed
   while (!terminating) {
     const currentNow = nowMs();
+    daemon.heartbeat(currentNow);
     const elapsed = currentNow - startMs;
     if (elapsed >= maxDurationMs) {
       console.log(
@@ -555,6 +560,12 @@ async function run(): Promise<void> {
 
         tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
 
+        const prevPrice = pos.spotPriceSol;
+        const singleTickDropBps =
+          prevPrice > 0
+            ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
+            : 0;
+
         const marketContext: MarketEvaluationContext = {
           currentTimestampMs: currentNow,
           spotPriceSol: spotInfo.spotPriceSol,
@@ -563,6 +574,7 @@ async function run(): Promise<void> {
           recentSellsCount60s: spotInfo.recentSells60s,
           momentum5mBps: spotInfo.momentum5mBps,
           volumeStalled3m: false,
+          singleTickDropBps,
         };
 
         const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
@@ -602,14 +614,17 @@ async function run(): Promise<void> {
           const usdPrice = (
             spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
           ).toFixed(6);
+          const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
+          const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 25;
+          const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
           addActivityLog(
             "RATCHET",
-            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag`,
+            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag (${trailBufferPct}% buffer, Floor: +${floorPct}%)`,
             pos.mintAddress,
             pos.symbol,
           );
           console.log(
-            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}% | Moonbag Buffer: ${trailBufferPct}% | Floor: +${floorPct}%`,
           );
         }
 
@@ -659,7 +674,17 @@ async function run(): Promise<void> {
         for (const pool of rawPools) {
           const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
           if (admitted) {
-            tracker.recordCandidate(pool, "WATCHLIST_RADAR", pool.spotPriceUsd, currentNow);
+            if (admitted.status === "DROPPED") {
+              tracker.recordCandidate(
+                pool,
+                "FILTERED_REJECTED",
+                pool.spotPriceUsd,
+                currentNow,
+                admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+              );
+            } else {
+              tracker.recordCandidate(pool, "WATCHLIST_RADAR", pool.spotPriceUsd, currentNow);
+            }
           } else {
             tracker.recordCandidate(
               pool,
@@ -682,39 +707,51 @@ async function run(): Promise<void> {
               for (const token of trendingTokens) {
                 if (streamEngine.isMintSeen(token.address)) continue;
 
-                const isThinLiq = !token.liquidity || token.liquidity < 50_000;
-                const liquidityUsd = token.liquidity > 0 ? token.liquidity : 40_000;
-                const openTimeSec = isThinLiq ? currentNowSec - 300 : currentNowSec - 7200;
+                // Deliverable 1: Real-Data Pre-Enrichment for Birdeye Trending (Zero Synthetic Defaults)
+                const dexRecord = await streamEngine.fetchDexScreenerTokenPair(token.address);
+                if (
+                  !dexRecord ||
+                  !dexRecord.spotPriceUsd ||
+                  dexRecord.spotPriceUsd <= 0 ||
+                  !dexRecord.liquidityUsd ||
+                  dexRecord.liquidityUsd <= 0
+                ) {
+                  tracker.recordCandidate(
+                    {
+                      poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
+                      mintAddress: token.address,
+                      symbol: token.symbol ?? "UNKNOWN",
+                      liquidityUsd: token.liquidity ?? 0,
+                      marketCapUsd: 0,
+                      spotPriceUsd: token.price ?? 0,
+                    },
+                    "FILTERED_REJECTED",
+                    token.price ?? 0,
+                    currentNow,
+                    "FAILED_BIRDEYE_ENRICHMENT",
+                  );
+                  continue;
+                }
 
-                const trendingRecord: ScannedPoolRecord = {
-                  poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
-                  mintAddress: token.address,
-                  symbol: token.symbol,
-                  decimals: token.decimals ?? 9,
-                  baseMint: token.address,
-                  liquidityUsd,
-                  marketCapUsd: liquidityUsd > 0 ? liquidityUsd * 4 : 160_000,
-                  openTimeSec,
-                  lpBurnPct: 100,
-                  mintAuthority: null,
-                  freezeAuthority: null,
-                  volume5mUsd: token.volume24hUSD ? Math.round(token.volume24hUSD / 288) : 10_000,
-                  txCount5m: 25,
-                  buys5m: 16,
-                  sells5m: 9,
-                  spotPriceUsd: token.price > 0 ? token.price : 0.05,
-                  fetchedAt: new Date(currentNow).toISOString(),
-                };
-
-                const admitted = watchlistService.admitOrUpdate(trendingRecord, currentNowSec);
+                const admitted = watchlistService.admitOrUpdate(dexRecord, currentNowSec);
                 if (admitted) {
                   streamEngine.markMintSeen(token.address);
-                  tracker.recordCandidate(
-                    trendingRecord,
-                    "WATCHLIST_RADAR",
-                    trendingRecord.spotPriceUsd,
-                    currentNow,
-                  );
+                  if (admitted.status === "DROPPED") {
+                    tracker.recordCandidate(
+                      dexRecord,
+                      "FILTERED_REJECTED",
+                      dexRecord.spotPriceUsd,
+                      currentNow,
+                      admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+                    );
+                  } else {
+                    tracker.recordCandidate(
+                      dexRecord,
+                      "WATCHLIST_RADAR",
+                      dexRecord.spotPriceUsd,
+                      currentNow,
+                    );
+                  }
                 }
               }
             }
@@ -724,11 +761,21 @@ async function run(): Promise<void> {
         }
 
         // B. Prune expired candidates
-        watchlistService.pruneExpired(currentNowSec);
+        const expiredCandidates = watchlistService.pruneExpired(currentNowSec);
+        for (const expired of expiredCandidates) {
+          armedPullbackCandidates.delete(expired.mintAddress);
+          tracker.recordCandidate(
+            expired,
+            "FILTERED_REJECTED",
+            0,
+            currentNow,
+            expired.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+          );
+        }
 
-        // Prune stale armed pullback candidates (> 90s)
+        // Prune stale armed pullback candidates (> 120s)
         for (const [mint, state] of armedPullbackCandidates.entries()) {
-          if (currentNow - state.armedAtMs > 90_000) {
+          if (currentNow - state.armedAtMs > 120_000) {
             armedPullbackCandidates.delete(mint);
           }
         }
@@ -784,7 +831,33 @@ async function run(): Promise<void> {
                 candidate.mintAddress,
               );
 
-              // Evaluate complete market context with 60s flow, momentum & anti-bundler metrics
+              // Deliverable 2: Live Spot Liquidity Hard Floor at Execution Time & Verified Holder Floor
+              const isCandidateEstablished =
+                candidate.liquidityUsd >= 50000 &&
+                candidate.assetAgeSeconds >= 1800 &&
+                candidate.assetAgeSeconds <= 7200 &&
+                rugMetrics?.holdersCount !== undefined &&
+                rugMetrics.holdersCount >= 250;
+              const requiredLiveLiq = isCandidateEstablished ? 50000 : 20000;
+              if (spotInfo.liquidityUsd < requiredLiveLiq) {
+                if (armedPullbackCandidates.has(candidate.mintAddress)) {
+                  armedPullbackCandidates.delete(candidate.mintAddress);
+                }
+                watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                tracker.recordCandidate(
+                  candidate,
+                  "FILTERED_REJECTED",
+                  spotInfo.spotPriceSol,
+                  currentNow,
+                  "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
+                );
+                console.log(
+                  `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${spotInfo.liquidityUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
+                );
+                continue;
+              }
+
+              // Deliverable 3: Fail-Closed RugCheck on Micro-Caps (requireVerifiedHolders: !isCandidateEstablished)
               const fullGateResult = buyGateService.evaluateCandidate(candidate, {
                 recentBuysCount60s: spotInfo.recentBuys60s,
                 recentSellsCount60s: spotInfo.recentSells60s,
@@ -795,6 +868,7 @@ async function run(): Promise<void> {
                 rugScore: rugMetrics?.rugScore,
                 hasDangerRisk: rugMetrics?.hasDangerRisk,
                 priceChange1hPct: spotInfo.priceChange1hPct,
+                requireVerifiedHolders: !isCandidateEstablished,
               });
 
               if (!fullGateResult.triggered) {
@@ -811,130 +885,176 @@ async function run(): Promise<void> {
                 continue;
               }
 
-              // MANDATORY Liquidity Floor: Must have >= $50,000 liquidity to ever be classified as ESTABLISHED
+              // Deliverable 4: Established Token Age Ceiling (Max 2 Hours / 7,200s, Min 30m / 1,800s, Min 250 Holders)
               const isEstablished =
                 candidate.liquidityUsd >= 50000 &&
-                (candidate.assetAgeSeconds >= 3600 || candidate.marketCapUsd >= 250000);
+                spotInfo.liquidityUsd >= 50000 &&
+                candidate.assetAgeSeconds >= 1800 &&
+                candidate.assetAgeSeconds <= 7200 &&
+                rugMetrics?.holdersCount !== undefined &&
+                rugMetrics.holdersCount >= 250;
 
-              // Retest / Pullback Entry Confirmation for MICRO_CAP
-              if (!isEstablished) {
-                const armed = armedPullbackCandidates.get(candidate.mintAddress);
-                if (!armed) {
-                  armedPullbackCandidates.set(candidate.mintAddress, {
-                    mintAddress: candidate.mintAddress,
-                    armedAtMs: currentNow,
-                    peakPriceSol: spotInfo.spotPriceSol,
-                    peakPriceUsd: spotInfo.spotPriceUsd,
-                    ticksObserved: 1,
-                  });
-                  console.log(
-                    `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}). Awaiting 10-18% pullback or consolidation...`,
-                  );
-                  addActivityLog(
-                    "INFO",
-                    `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL. Awaiting retest/pullback...`,
-                    candidate.mintAddress,
-                    candidate.symbol,
-                  );
-                  continue;
-                }
-
-                // Candidate already armed: update ticks & peak price
-                const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
-                const newPeakUsd =
-                  spotInfo.spotPriceSol >= armed.peakPriceSol
-                    ? spotInfo.spotPriceUsd
-                    : armed.peakPriceUsd;
-                const updatedArmed: ArmedPullbackState = {
-                  ...armed,
-                  peakPriceSol: newPeakSol,
-                  peakPriceUsd: newPeakUsd,
-                  ticksObserved: armed.ticksObserved + 1,
-                };
-                armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
-
-                // Rule C: Plunged > 25% below peak (knife avoidance)
-                if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * 0.75) {
-                  armedPullbackCandidates.delete(candidate.mintAddress);
-                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                  tracker.recordCandidate(
-                    candidate,
-                    "FILTERED_REJECTED",
-                    spotInfo.spotPriceSol,
-                    currentNow,
-                    "REJECTED_PULLBACK_CRATERED",
-                  );
-                  console.log(
-                    `[PaperDaemon] [ARMED_PULLBACK_CRATERED] ${candidate.symbol} plunged >25% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * 0.75).toFixed(6)} SOL). Dropping candidate.`,
-                  );
-                  addActivityLog(
-                    "ALERT",
-                    `⚠️ ${candidate.symbol} dropped: cratered >25% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
-                    candidate.mintAddress,
-                    candidate.symbol,
-                  );
-                  continue;
-                }
-
-                // Rule D: Expiry after 90 seconds
-                if (currentNow - updatedArmed.armedAtMs > 90_000) {
-                  armedPullbackCandidates.delete(candidate.mintAddress);
-                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                  tracker.recordCandidate(
-                    candidate,
-                    "FILTERED_REJECTED",
-                    spotInfo.spotPriceSol,
-                    currentNow,
-                    "REJECTED_PULLBACK_EXPIRED",
-                  );
-                  console.log(
-                    `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after 90s without entry confirmation. Dropping candidate.`,
-                  );
-                  continue;
-                }
-
-                // Rule A: Retest Pullback Discount (10% to 18% pullback with flow absorption)
-                const isPullbackDiscount =
-                  spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * 0.9 &&
-                  spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * 0.8;
-                const hasPullbackFlow = spotInfo.recentBuys60s >= 1.25 * spotInfo.recentSells60s;
-                const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
-
-                // Rule B: Consolidation Breakout (within 5% of peak for >= 30s or >= 3 ticks with strong flow)
-                const isConsolidatingNearPeak =
-                  spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * 0.95;
-                const hasConsolidationDuration =
-                  currentNow - updatedArmed.armedAtMs >= 30_000 || updatedArmed.ticksObserved >= 3;
-                const hasConsolidationFlow =
-                  spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s;
-                const ruleBConfirmed =
-                  isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
-
-                if (!ruleAConfirmed && !ruleBConfirmed) {
-                  const pullbackPct = (
-                    ((spotInfo.spotPriceSol - updatedArmed.peakPriceSol) /
-                      updatedArmed.peakPriceSol) *
-                    100
-                  ).toFixed(1);
-                  console.log(
-                    `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL, Pullback: ${pullbackPct}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${updatedArmed.ticksObserved}`,
-                  );
-                  continue;
-                }
-
-                const confirmReason = ruleAConfirmed
-                  ? "RETEST_PULLBACK_DISCOUNT"
-                  : "CONSOLIDATION_BREAKOUT";
+              // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
+              const armed = armedPullbackCandidates.get(candidate.mintAddress);
+              if (!armed) {
+                armedPullbackCandidates.set(candidate.mintAddress, {
+                  mintAddress: candidate.mintAddress,
+                  armedAtMs: currentNow,
+                  peakPriceSol: spotInfo.spotPriceSol,
+                  peakPriceUsd: spotInfo.spotPriceUsd,
+                  ticksObserved: 1,
+                });
+                const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
+                const targetWait = isEstablished
+                  ? "5-12% pullback or consolidation"
+                  : "10-18% pullback or consolidation";
                 console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} entry confirmed via ${confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL)`,
+                  `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
                 );
-                armedPullbackCandidates.delete(candidate.mintAddress);
-              } else {
-                // If established, clear any previous armed state
-                if (armedPullbackCandidates.has(candidate.mintAddress)) {
-                  armedPullbackCandidates.delete(candidate.mintAddress);
-                }
+                addActivityLog(
+                  "INFO",
+                  `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${cohortLabel}]. Awaiting retest/pullback...`,
+                  candidate.mintAddress,
+                  candidate.symbol,
+                );
+                continue;
               }
+
+              // Candidate already armed: update ticks & peak price
+              const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
+              const newPeakUsd =
+                spotInfo.spotPriceSol >= armed.peakPriceSol
+                  ? spotInfo.spotPriceUsd
+                  : armed.peakPriceUsd;
+              const updatedArmed: ArmedPullbackState = {
+                ...armed,
+                peakPriceSol: newPeakSol,
+                peakPriceUsd: newPeakUsd,
+                ticksObserved: armed.ticksObserved + 1,
+              };
+              armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
+
+              // Cohort parameters for Retest Gate:
+              // Both cohorts capped at 15% crater ceiling (Deliverable 5)
+              // Established: 120s expiry, 5-12% pullback (1.15x flow), 3% consolidation (1.25x flow)
+              // Micro-Cap: 90s expiry, 10-15% pullback (1.25x flow), 5% consolidation (1.5x flow)
+              const maxCraterDropPct = 0.15;
+              const maxExpiryMs = isEstablished ? 120_000 : 90_000;
+
+              // Rule C: Plunged below crater threshold (-15% knife avoidance)
+              if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * (1 - maxCraterDropPct)) {
+                armedPullbackCandidates.delete(candidate.mintAddress);
+                watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                tracker.recordCandidate(
+                  candidate,
+                  "FILTERED_REJECTED",
+                  spotInfo.spotPriceSol,
+                  currentNow,
+                  "REJECTED_PULLBACK_CRATERED",
+                );
+                console.log(
+                  `[PaperDaemon] [ARMED_PULLBACK_CRATERED] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
+                );
+                addActivityLog(
+                  "ALERT",
+                  `⚠️ ${candidate.symbol} dropped: cratered >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
+                  candidate.mintAddress,
+                  candidate.symbol,
+                );
+                continue;
+              }
+
+              // Rule E: In-Flight Seller Surge (Anti-Cabal exit wave while awaiting pullback)
+              if (
+                spotInfo.recentSells60s >= 25 &&
+                spotInfo.recentSells60s >= 2.5 * Math.max(1, spotInfo.recentBuys60s)
+              ) {
+                armedPullbackCandidates.delete(candidate.mintAddress);
+                watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                tracker.recordCandidate(
+                  candidate,
+                  "FILTERED_REJECTED",
+                  spotInfo.spotPriceSol,
+                  currentNow,
+                  "REJECTED_IN_FLIGHT_SELLER_SURGE",
+                );
+                console.log(
+                  `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
+                );
+                addActivityLog(
+                  "ALERT",
+                  `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
+                  candidate.mintAddress,
+                  candidate.symbol,
+                );
+                continue;
+              }
+
+              // Rule D: Expiry after timeout
+              if (currentNow - updatedArmed.armedAtMs > maxExpiryMs) {
+                armedPullbackCandidates.delete(candidate.mintAddress);
+                watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                tracker.recordCandidate(
+                  candidate,
+                  "FILTERED_REJECTED",
+                  spotInfo.spotPriceSol,
+                  currentNow,
+                  "REJECTED_PULLBACK_EXPIRED",
+                );
+                console.log(
+                  `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
+                );
+                continue;
+              }
+
+              // Rule A: Retest Pullback Discount with flow absorption
+              // Established: 5% to 12% pullback discount with recentBuys60s >= 1.15 * recentSells60s
+              // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
+              const minPullbackRatio = isEstablished ? 0.88 : 0.85;
+              const maxPullbackRatio = isEstablished ? 0.95 : 0.9;
+              const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
+
+              const isPullbackDiscount =
+                spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * maxPullbackRatio &&
+                spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * minPullbackRatio;
+              const hasPullbackFlow =
+                spotInfo.recentBuys60s >= minPullbackFlowRatio * spotInfo.recentSells60s;
+              const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
+
+              // Rule B: Consolidation Breakout
+              // Established: within 3% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
+              // Micro-Cap: within 5% of peak for >= 30s or >= 3 ticks with strong flow (>= 1.5 * sells)
+              const maxConsolidationDropPct = isEstablished ? 0.03 : 0.05;
+              const minConsolidationFlowRatio = isEstablished ? 1.25 : 1.5;
+
+              const isConsolidatingNearPeak =
+                spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * (1 - maxConsolidationDropPct);
+              const hasConsolidationDuration =
+                currentNow - updatedArmed.armedAtMs >= 30_000 || updatedArmed.ticksObserved >= 3;
+              const hasConsolidationFlow =
+                spotInfo.recentBuys60s >= minConsolidationFlowRatio * spotInfo.recentSells60s;
+              const ruleBConfirmed =
+                isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
+
+              if (!ruleAConfirmed && !ruleBConfirmed) {
+                const pullbackPct = (
+                  ((spotInfo.spotPriceSol - updatedArmed.peakPriceSol) /
+                    updatedArmed.peakPriceSol) *
+                  100
+                ).toFixed(1);
+                console.log(
+                  `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL, Pullback: ${pullbackPct}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${updatedArmed.ticksObserved}`,
+                );
+                continue;
+              }
+
+              const confirmReason = ruleAConfirmed
+                ? "RETEST_PULLBACK_DISCOUNT"
+                : "CONSOLIDATION_BREAKOUT";
+              console.log(
+                `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL)`,
+              );
+              armedPullbackCandidates.delete(candidate.mintAddress);
 
               const entryPriceSol = spotInfo.spotPriceSol;
               let poolRecord: ScannedPoolRecord | undefined = rawPools.find(
@@ -969,12 +1089,15 @@ async function run(): Promise<void> {
                 ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
                 : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
 
-              // Sizing: Bump clean established tokens to 1.00 SOL (or config.positionSizeSol).
-              // Downsize established tokens with > 60% bundlers or > 30% top-10 holders to 0.50 SOL.
-              // Micro-Caps: Probe size 0.25 SOL
+              // Deliverable 3: Compounding Wallet Sizing Scale-Up
+              const currentCash = daemon.getCurrentCashSol();
+              const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
+              const establishedBaseSize = Math.min(1.25, Number((1.0 * walletScale).toFixed(2)));
+              const microProbeBaseSize = Math.min(0.35, Number((0.25 * walletScale).toFixed(2)));
+
               let targetCohortSize = isEstablished
-                ? Math.min(1.0, config.positionSizeSol || 1.0)
-                : 0.25;
+                ? Math.min(establishedBaseSize, config.positionSizeSol || establishedBaseSize)
+                : microProbeBaseSize;
               if (isEstablished) {
                 const highBundler =
                   rugMetrics?.bundlerPct !== undefined && rugMetrics.bundlerPct > 0.6;
@@ -1049,7 +1172,16 @@ async function run(): Promise<void> {
           const freshRecord = await streamEngine.fetchDexScreenerTokenPair(item.mintAddress);
           if (freshRecord) {
             const currentNowSec = Math.floor(currentNow / 1000);
-            watchlistService.admitOrUpdate(freshRecord, currentNowSec);
+            const updated = watchlistService.admitOrUpdate(freshRecord, currentNowSec);
+            if (updated && updated.status === "DROPPED") {
+              tracker.recordCandidate(
+                updated,
+                "FILTERED_REJECTED",
+                freshRecord.spotPriceUsd ?? 0,
+                currentNow,
+                updated.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+              );
+            }
           }
         } catch {
           // ignore transient refresh errors

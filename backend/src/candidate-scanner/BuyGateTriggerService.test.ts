@@ -31,7 +31,7 @@ describe("BuyGateTriggerService", () => {
     });
 
     expect(result.triggered).toBe(true);
-    expect(result.gates.length).toBe(9);
+    expect(result.gates.length).toBe(11);
     expect(result.gates.every((g) => g.passed)).toBe(true);
     expect(result.rejectionReason).toBeUndefined();
   });
@@ -144,7 +144,7 @@ describe("BuyGateTriggerService", () => {
       liquidityUsd: 100_000,
       marketCapUsd: 1_500_000,
       lmcRatio: 100_000 / 1_500_000, // 0.0667 (6.67%)
-      assetAgeSeconds: 14_400, // 4 hours
+      assetAgeSeconds: 3600, // 1 hour (within 30m - 2h established window)
       volume5mUsd: 35_000,
       buys5m: 50,
       sells5m: 25,
@@ -155,17 +155,18 @@ describe("BuyGateTriggerService", () => {
       recentBuysCount60s: 10,
       recentSellsCount60s: 4,
       momentum1mBps: 50,
+      holdersCount: 500,
     });
     expect(result.triggered).toBe(true);
     const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
     expect(depthGate?.passed).toBe(true);
   });
 
-  it("permits established runners with 2h to 24h age and high liquidity/market-cap", () => {
+  it("permits established runners within 30m to 2h age ceiling and rejects stale tokens > 2h", () => {
     const service = new BuyGateTriggerService();
     const runner = {
       ...candidate,
-      assetAgeSeconds: 14400, // 4 hours
+      assetAgeSeconds: 3600, // 1 hour (within 1800s - 7200s)
       liquidityUsd: 50_000,
       marketCapUsd: 200_000,
       lmcRatio: 0.25,
@@ -174,9 +175,21 @@ describe("BuyGateTriggerService", () => {
       buyToSellRatio: 2.0,
       volume5mUsd: 15_000,
     };
-    const result = service.evaluateCandidate(runner, { maxSingleDisposalUsd: 500 });
+    const result = service.evaluateCandidate(runner, {
+      maxSingleDisposalUsd: 500,
+      holdersCount: 500,
+    });
     expect(result.triggered).toBe(true);
     expect(result.gates.find((g) => g.name === "MATURITY_WINDOW_GATE")?.passed).toBe(true);
+
+    // Stale token > 7200s (e.g. 4 hours = 14400s) must fail maturity
+    const staleRunner = {
+      ...runner,
+      assetAgeSeconds: 14400,
+    };
+    const staleResult = service.evaluateCandidate(staleRunner, { maxSingleDisposalUsd: 500 });
+    expect(staleResult.triggered).toBe(false);
+    expect(staleResult.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
   });
 
   it("fails when liquidity is below $20,000", () => {
@@ -409,6 +422,7 @@ describe("BuyGateTriggerService", () => {
         recentSellsCount60s: 4,
         momentum1mBps: 50,
         priceChange1hPct: -45.2, // e.g. cNFTs (-45.2%) or BOT (-60.2%)
+        holdersCount: 500,
       });
 
       expect(deadCatResult.triggered).toBe(false);
@@ -425,6 +439,7 @@ describe("BuyGateTriggerService", () => {
         recentSellsCount60s: 4,
         momentum1mBps: 50,
         priceChange1hPct: 120.0, // e.g. PFSOL (+120%) or ARCH (+246%)
+        holdersCount: 500,
       });
 
       expect(healthyResult.triggered).toBe(true);
@@ -517,6 +532,7 @@ describe("BuyGateTriggerService", () => {
         recentSellsCount60s: 4,
         momentum1mBps: 50,
         priceChange1hPct: 25.0,
+        holdersCount: 500,
       });
 
       expect(result.triggered).toBe(true);
@@ -529,7 +545,7 @@ describe("BuyGateTriggerService", () => {
       expect(macroGate?.passed).toBe(true);
     });
 
-    it("classifies tokens with liquidity >= $50,000 and marketCap >= $250,000 as Established even if young", () => {
+    it("enforces that tokens younger than 1800s are not classified as Established even with high MC and liquidity", () => {
       const service = new BuyGateTriggerService();
       const largeCapCandidate: WatchlistCandidateItem = {
         poolId: "pool-large-1",
@@ -537,9 +553,9 @@ describe("BuyGateTriggerService", () => {
         symbol: "LARGE",
         liquidityUsd: 60_000,
         marketCapUsd: 600_000,
-        lmcRatio: 0.1, // 10%
+        lmcRatio: 0.1, // 10% (fails standard micro-cap 15% depth floor)
         lpBurnPct: 100,
-        assetAgeSeconds: 500, // Young (< 1h)
+        assetAgeSeconds: 500, // Young (< 30m / 1800s)
         volume5mUsd: 30_000,
         buys5m: 40,
         sells5m: 20,
@@ -556,10 +572,316 @@ describe("BuyGateTriggerService", () => {
         priceChange1hPct: 10.0,
       });
 
+      // Because age < 1800s, it is NOT classified as Established; standard micro-cap 15% floor applies
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("DEPTH_BALANCE_GATE_FAILED");
+    });
+  });
+
+  describe("SubPhase12_85: Stale Age Ceiling and Fail-Closed RugCheck", () => {
+    it("fails closed on micro-caps when RugCheck is unindexed or holders count is unknown", () => {
+      const service = new BuyGateTriggerService();
+      const microCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+      };
+
+      const result = service.evaluateCandidate(microCandidate, {
+        requireVerifiedHolders: true,
+        holdersCount: undefined,
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN");
+    });
+
+    it("fails micro-caps when verified holders count is below 100", () => {
+      const service = new BuyGateTriggerService();
+      const microCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+      };
+
+      const result = service.evaluateCandidate(microCandidate, {
+        requireVerifiedHolders: true,
+        holdersCount: 85, // < 100
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
+    });
+
+    it("passes micro-caps when verified holders count is >= 100", () => {
+      const service = new BuyGateTriggerService();
+      const microCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+      };
+
+      const result = service.evaluateCandidate(microCandidate, {
+        requireVerifiedHolders: true,
+        holdersCount: 150, // >= 100
+        recentBuysCount60s: 8,
+        recentSellsCount60s: 3,
+        momentum1mBps: 50,
+      });
+
+      expect(result.triggered).toBe(true);
+    });
+
+    it("rejects tokens older than 7200s (2h) even with >= $50,000 liquidity", () => {
+      const service = new BuyGateTriggerService();
+      const staleToken: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 65_000,
+        assetAgeSeconds: 7300, // > 7200s (2h)
+        marketCapUsd: 500_000,
+      };
+
+      const result = service.evaluateCandidate(staleToken, {
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
+    });
+  });
+
+  describe("SubPhase12_86: Anti-Cabal Wash-Trading Defense & Sell Congestion Shield", () => {
+    it("rejects micro-caps when 5m total transactions exceed 300", () => {
+      const service = new BuyGateTriggerService();
+      const washTradedCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+        buys5m: 250,
+        sells5m: 80, // Total tx = 330 > 300
+        buyToSellRatio: 250 / 80,
+      };
+
+      const result = service.evaluateCandidate(washTradedCandidate);
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("REJECTED_EXCESSIVE_WASH_TRADING_TX_COUNT");
+      const washGate = result.gates.find((g) => g.name === "WASH_TRADING_CEILING_GATE");
+      expect(washGate?.passed).toBe(false);
+    });
+
+    it("rejects micro-caps when 5m sells exceed 100", () => {
+      const service = new BuyGateTriggerService();
+      const sellCongestedCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+        buys5m: 160,
+        sells5m: 105, // Sells = 105 > 100, Total tx = 265 <= 300
+        buyToSellRatio: 160 / 105,
+      };
+
+      const result = service.evaluateCandidate(sellCongestedCandidate);
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("REJECTED_EXCESSIVE_SELL_CONGESTION");
+      const congestionGate = result.gates.find((g) => g.name === "SELL_CONGESTION_CEILING_GATE");
+      expect(congestionGate?.passed).toBe(false);
+    });
+
+    it("permits established runners even with totalTx5m > 300 and sells5m > 100", () => {
+      const service = new BuyGateTriggerService();
+      const highVolumeRunner: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 75_000,
+        assetAgeSeconds: 2700, // 45m (Established)
+        marketCapUsd: 600_000,
+        lmcRatio: 75_000 / 600_000,
+        buys5m: 280,
+        sells5m: 140, // Total tx = 420 > 300, Sells = 140 > 100
+        buyToSellRatio: 2.0,
+        volume5mUsd: 50_000,
+      };
+
+      const result = service.evaluateCandidate(highVolumeRunner, {
+        recentBuysCount60s: 20,
+        recentSellsCount60s: 8,
+        momentum1mBps: 50,
+        holdersCount: 500,
+      });
+
+      expect(result.triggered).toBe(true);
+      const washGate = result.gates.find((g) => g.name === "WASH_TRADING_CEILING_GATE");
+      expect(washGate?.passed).toBe(true);
+      expect(washGate?.requirement).toContain("Uncapped (Established Pool)");
+
+      const congestionGate = result.gates.find((g) => g.name === "SELL_CONGESTION_CEILING_GATE");
+      expect(congestionGate?.passed).toBe(true);
+      expect(congestionGate?.requirement).toContain("Uncapped (Established Pool)");
+    });
+
+    it("rejects micro-caps when bundler concentration exceeds 50%", () => {
+      const service = new BuyGateTriggerService();
+      const microCandidate: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 25_000,
+        assetAgeSeconds: 600,
+      };
+
+      // 55% bundler is > 50% micro ceiling, but < 85% established ceiling
+      const result = service.evaluateCandidate(microCandidate, {
+        bundlerPct: 0.55,
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+    });
+
+    it("permits established runners with bundler concentration between 50% and 85%", () => {
+      const service = new BuyGateTriggerService();
+      const runner: WatchlistCandidateItem = {
+        ...candidate,
+        liquidityUsd: 60_000,
+        assetAgeSeconds: 3600, // 1h (Established)
+        marketCapUsd: 500_000,
+        lmcRatio: 60_000 / 500_000,
+        volume5mUsd: 30_000,
+        buys5m: 50,
+        sells5m: 25,
+        buyToSellRatio: 2.0,
+      };
+
+      const result = service.evaluateCandidate(runner, {
+        bundlerPct: 0.65, // 65% > 50% but <= 85%
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        holdersCount: 500,
+      });
+
+      expect(result.triggered).toBe(true);
+      const bundlerGate = result.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(true);
+    });
+  });
+
+  describe("SubPhase12_87: Mandatory Verified Holder Floor for Established Runners", () => {
+    const candidate50k: WatchlistCandidateItem = {
+      ...candidate,
+      liquidityUsd: 55_000,
+      marketCapUsd: 220_000,
+      lmcRatio: 55_000 / 220_000, // 25% (passes both 3% and 15% depth gates)
+      assetAgeSeconds: 2700, // 45m (within 30m-2h)
+      volume5mUsd: 30_000,
+      buys5m: 50,
+      sells5m: 20,
+      buyToSellRatio: 2.5,
+    };
+
+    it("does not classify candidate as established if holdersCount < 250 (e.g. 86 holders) and rejects when holders < 100", () => {
+      const service = new BuyGateTriggerService();
+      // Candidate like SIC: $55k liquidity, 45m age, but only 86 holders
+      const result = service.evaluateCandidate(candidate50k, {
+        holdersCount: 86,
+        requireVerifiedHolders: true,
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+      });
+
+      expect(result.triggered).toBe(false);
+      // Because holders < 250, isEstablished = false; falls back to micro-cap rules
+      // With requireVerifiedHolders and holders < 100, fails INSUFFICIENT_HOLDERS_COUNT_FAILED
+      expect(result.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
+      const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate).toBeUndefined(); // Micro-cap does not get macro gate
+    });
+
+    it("classifies candidate as established when holdersCount >= 250 (e.g. 300 holders)", () => {
+      const service = new BuyGateTriggerService();
+      const result = service.evaluateCandidate(candidate50k, {
+        holdersCount: 300,
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+        priceChange1hPct: 20.0,
+      });
+
       expect(result.triggered).toBe(true);
       const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
       expect(depthGate?.passed).toBe(true);
       expect(depthGate?.requirement).toContain("Adaptive Established Pool");
+
+      const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate).toBeDefined();
+      expect(macroGate?.passed).toBe(true);
+    });
+  });
+
+  describe("SubPhase12_88: Candidate Established Runner Pre-Screening Unblock", () => {
+    const candidate60k: WatchlistCandidateItem = {
+      ...candidate,
+      liquidityUsd: 60_000,
+      marketCapUsd: 460_000, // L/MC = ~13% (healthy depth)
+      lmcRatio: 60_000 / 460_000,
+      assetAgeSeconds: 3600, // 60m age (within 30m - 2h)
+      volume5mUsd: 30_000,
+      buys5m: 50,
+      sells5m: 20,
+      buyToSellRatio: 2.5,
+    };
+
+    it("passes preliminary in-memory screening with empty marketContext ({})", () => {
+      const service = new BuyGateTriggerService();
+      // Preliminary in-memory screening has no RugCheck or spot metrics yet
+      const result = service.evaluateCandidate(candidate60k, {});
+
+      expect(result.triggered).toBe(true);
+      expect(result.rejectionReason).toBeUndefined();
+      const maturityGate = result.gates.find((g) => g.name === "MATURITY_WINDOW_GATE");
+      expect(maturityGate?.passed).toBe(true);
+      expect(maturityGate?.requirement).toContain("Established Runner");
+
+      const depthGate = result.gates.find((g) => g.name === "DEPTH_BALANCE_GATE");
+      expect(depthGate?.passed).toBe(true);
+      expect(depthGate?.requirement).toContain("Adaptive Established Pool");
+    });
+
+    it("fails Stage 2 evaluation when candidate has insufficient holders (holdersCount: 86, requireVerifiedHolders: true)", () => {
+      const service = new BuyGateTriggerService();
+      // Stage 2 post-RugCheck verification for dev trap with 86 holders
+      const result = service.evaluateCandidate(candidate60k, {
+        holdersCount: 86,
+        requireVerifiedHolders: true,
+        recentBuysCount60s: 10,
+        recentSellsCount60s: 4,
+        momentum1mBps: 50,
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
+      const bundlerGate = result.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(false);
+    });
+
+    it("passes Stage 2 evaluation when candidate has verified sufficient holders (holdersCount: 4180, bundlerPct: 0.42)", () => {
+      const service = new BuyGateTriggerService();
+      // Stage 2 post-RugCheck verification for genuine runner like SII
+      const result = service.evaluateCandidate(candidate60k, {
+        holdersCount: 4180,
+        bundlerPct: 0.42,
+        recentBuysCount60s: 15,
+        recentSellsCount60s: 6,
+        momentum1mBps: 100,
+        priceChange1hPct: 25.0,
+      });
+
+      expect(result.triggered).toBe(true);
+      expect(result.rejectionReason).toBeUndefined();
+      const bundlerGate = result.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(true);
+      const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
+      expect(macroGate?.passed).toBe(true);
     });
   });
 });

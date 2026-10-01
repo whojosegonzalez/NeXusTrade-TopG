@@ -16,6 +16,8 @@ export type ExitReasonCode =
   | "CATASTROPHIC_HARD_STOP"
   | "RUG_PULL_DETECTED"
   | "SELL_PRESSURE_UNABSORBED"
+  | "EMERGENCY_SELL_PRESSURE_CUT"
+  | "WHALE_DEV_DUMP_CLIFF_CUT"
   | "DRAWDOWN_GRACE_EXPIRED"
   | "SCRATCH_EXIT"
   | "ARMED_BREAKEVEN_BREACH"
@@ -52,6 +54,7 @@ export interface MarketEvaluationContext {
   readonly momentum5mBps: number;
   readonly volumeStalled3m: boolean;
   readonly currentTimestampMs: number;
+  readonly singleTickDropBps?: number | undefined;
 }
 
 export interface RatchetEvaluationDiagnostics {
