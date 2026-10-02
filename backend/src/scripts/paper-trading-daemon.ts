@@ -142,6 +142,8 @@ function parseCliArgs(): PaperTradingDaemonConfig {
       "max-drawdown-bps": { type: "string" },
       "cooldown-min": { type: "string" },
       "uninterrupted-research": { type: "boolean" },
+      uninterrupted: { type: "boolean" },
+      "waive-drawdown": { type: "boolean" },
       "dry-run": { type: "boolean" },
       "initial-sol": { type: "string" },
     },
@@ -182,7 +184,10 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   const cooldownMin = typeof rawCooldown === "string" ? parseFloat(rawCooldown) : 30;
   const antiRebuyCooldownMs = cooldownMin * 60 * 1000;
 
-  const uninterruptedResearchMode = values["uninterrupted-research"] === true;
+  const uninterruptedResearchMode =
+    values["uninterrupted-research"] === true ||
+    values["uninterrupted"] === true ||
+    values["waive-drawdown"] === true;
   const dryRun = values["dry-run"] === true;
 
   const timestamp = new Date()
@@ -380,7 +385,8 @@ async function run(): Promise<void> {
   const SESSION_START_WARMUP_MS = 60_000;
   const armedPullbackCandidates = new Map<string, ArmedPullbackState>();
 
-  const persistState = () => {
+  let lastReportSaveMs = 0;
+  const persistState = (forceReportSave = false) => {
     const snap = daemon.getSnapshot();
     const fullState = {
       ...snap,
@@ -392,11 +398,15 @@ async function run(): Promise<void> {
     try {
       if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
       writeFileSync(".tmp/paper-session-active.json", JSON.stringify(fullState, null, 2), "utf8");
-      tracker.saveReportToFile(
-        ".tmp/session-paper-observation-report.json",
-        config.initialPortfolioSol,
-        snap.currentPortfolioSol,
-      );
+      const currentNow = nowMs();
+      if (forceReportSave || currentNow - lastReportSaveMs >= 60_000) {
+        lastReportSaveMs = currentNow;
+        tracker.saveReportToFile(
+          ".tmp/session-paper-observation-report.json",
+          config.initialPortfolioSol,
+          snap.currentPortfolioSol,
+        );
+      }
     } catch (err) {
       void err;
     }
@@ -486,7 +496,7 @@ async function run(): Promise<void> {
     console.log(
       `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length}`,
     );
-    persistState();
+    persistState(true);
     archiveSession();
     const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
     console.log(
@@ -1226,7 +1236,7 @@ async function run(): Promise<void> {
 
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);
-  persistState();
+  persistState(true);
   archiveSession();
   const finalReport = tracker.generateReport(
     config.initialPortfolioSol,
