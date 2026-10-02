@@ -1811,3 +1811,15 @@ Decision:
 Decision: Formulate Phase 12.89 (compounding sizing unlock on established entries) and Phase 12.90 (168-hour / 7-day 24/7 chrono-regime stress test) as the final empirical validation pathway before Phase 13 Hot Wallet Jito mainnet transition.
 Reason: Certifies the execution engine against all weekly liquidity cycles (Asia, Europe, US market opens, low-liquidity weekend lulls, dead hours) ensuring system durability before committing real capital.
 Status: Accepted and active.
+
+## 2026-10-01 - Phase 12.89: Sizing Compounding Unlock, Holder Verification Enforcement & Symbol Blacklist
+
+Decision:
+
+1. Sizing Unlock: Remove static 1.0 SOL clamp for Established pool entries, scaling them dynamically with `walletScale` (up to 1.25 SOL) when continuous virtual wallet equity is above 10.0 SOL baseline.
+2. Verified Holders Fail-Closed: Enforce `requireVerifiedHolders: true` across all cohorts (micro-cap and established), preventing phantom liquidity bot-farm pools (`test`, `SAPLING`) from bypassing holder checks.
+3. Symbol Integrity Blacklist: Introduce `BLACKLISTED_SYMBOLS` (`TEST`, `TEST1`, `TEST2`, `TESTCOIN`, `NULL`, `UNDEFINED`, `PUMP`, `SOL`, `WSOL`) failing candidates immediately with `REJECTED_BLACKLISTED_SYMBOL`.
+4. Counterfactual Outlier Normalization: Guard price recording and reporting in `CounterfactualOpportunityTracker` to eliminate synthetic billion-percent artifacts resulting from USD/SOL unit mismatches.
+5. Chrono-Regime Pinning: Time-of-day trading window restrictions are intentionally deferred until raw 24/7 empirical data is gathered during the Phase 12.90 168-hour (7-day) endurance run.
+   Reason: Prevents bot-farm scams and placeholder coins from causing drawdown breaches while allowing high-conviction runner winners (`SACC`, `BANDIT`) to compound equity cleanly.
+   Status: Implemented, verified with 100% test pass, and certified for 12-hour rerun.

@@ -883,5 +883,18 @@ describe("BuyGateTriggerService", () => {
       const macroGate = result.gates.find((g) => g.name === "ESTABLISHED_MACRO_TREND_GATE");
       expect(macroGate?.passed).toBe(true);
     });
+
+    it("rejects dummy, placeholder, and infrastructure tokens (e.g. symbol TEST, SOL, USDC)", () => {
+      const service = new BuyGateTriggerService();
+      for (const symbol of ["TEST", "SOL", "USDC"]) {
+        const testToken: WatchlistCandidateItem = {
+          ...candidate,
+          symbol,
+        };
+        const result = service.evaluateCandidate(testToken);
+        expect(result.triggered).toBe(false);
+        expect(result.rejectionReason).toBe("REJECTED_BLACKLISTED_SYMBOL");
+      }
+    });
   });
 });

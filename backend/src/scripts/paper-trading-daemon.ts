@@ -673,23 +673,25 @@ async function run(): Promise<void> {
         // A. Ingest into Watchlist Service
         for (const pool of rawPools) {
           const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
+          const initialSolPrice =
+            pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
           if (admitted) {
             if (admitted.status === "DROPPED") {
               tracker.recordCandidate(
                 pool,
                 "FILTERED_REJECTED",
-                pool.spotPriceUsd,
+                initialSolPrice,
                 currentNow,
                 admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
               );
             } else {
-              tracker.recordCandidate(pool, "WATCHLIST_RADAR", pool.spotPriceUsd, currentNow);
+              tracker.recordCandidate(pool, "WATCHLIST_RADAR", initialSolPrice, currentNow);
             }
           } else {
             tracker.recordCandidate(
               pool,
               "FILTERED_REJECTED",
-              pool.spotPriceUsd,
+              initialSolPrice,
               currentNow,
               "FAILED_BASELINE_SCANNER_PRESCREEN",
             );
@@ -857,7 +859,7 @@ async function run(): Promise<void> {
                 continue;
               }
 
-              // Deliverable 3: Fail-Closed RugCheck on Micro-Caps (requireVerifiedHolders: !isCandidateEstablished)
+              // Phase 12.89: Fail-Closed RugCheck on all cohorts (requireVerifiedHolders: true)
               const fullGateResult = buyGateService.evaluateCandidate(candidate, {
                 recentBuysCount60s: spotInfo.recentBuys60s,
                 recentSellsCount60s: spotInfo.recentSells60s,
@@ -868,7 +870,7 @@ async function run(): Promise<void> {
                 rugScore: rugMetrics?.rugScore,
                 hasDangerRisk: rugMetrics?.hasDangerRisk,
                 priceChange1hPct: spotInfo.priceChange1hPct,
-                requireVerifiedHolders: !isCandidateEstablished,
+                requireVerifiedHolders: true,
               });
 
               if (!fullGateResult.triggered) {
@@ -1089,15 +1091,13 @@ async function run(): Promise<void> {
                 ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
                 : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
 
-              // Deliverable 3: Compounding Wallet Sizing Scale-Up
+              // Phase 12.89: Unlock Compounding Wallet Sizing Scale-Up for Established Entries
               const currentCash = daemon.getCurrentCashSol();
               const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
               const establishedBaseSize = Math.min(1.25, Number((1.0 * walletScale).toFixed(2)));
               const microProbeBaseSize = Math.min(0.35, Number((0.25 * walletScale).toFixed(2)));
 
-              let targetCohortSize = isEstablished
-                ? Math.min(establishedBaseSize, config.positionSizeSol || establishedBaseSize)
-                : microProbeBaseSize;
+              let targetCohortSize = isEstablished ? establishedBaseSize : microProbeBaseSize;
               if (isEstablished) {
                 const highBundler =
                   rugMetrics?.bundlerPct !== undefined && rugMetrics.bundlerPct > 0.6;

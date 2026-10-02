@@ -129,7 +129,10 @@ export class CounterfactualOpportunityTracker {
 
   public samplePrice(mintAddress: string, currentPriceSol: number, nowMs: number): void {
     const record = this.records.get(mintAddress);
-    if (!record || currentPriceSol <= 0) return;
+    if (!record || currentPriceSol <= 0 || record.initialPriceSol <= 0) return;
+
+    // Discard unit mixup anomalies where a USD market cap (e.g. 50,000) is sampled against a SOL price (e.g. 0.00005)
+    if (currentPriceSol > record.initialPriceSol * 1000) return;
 
     record.lastSampledAtMs = nowMs;
     record.latestPriceSol = currentPriceSol;
@@ -175,9 +178,11 @@ export class CounterfactualOpportunityTracker {
     const watchlistRadar = allRecords.filter((r) => r.cohort === "WATCHLIST_RADAR");
     const filteredRejected = allRecords.filter((r) => r.cohort === "FILTERED_REJECTED");
 
-    // Missed winners: Not bought, but peaked at >= +15.0% (+1500 bps)
+    // Missed winners: Not bought, but peaked at >= +15.0% (+1500 bps) and <= +50,000% (filtering unit anomalies)
     const missedWinners: MissedOpportunityItem[] = allRecords
-      .filter((r) => r.cohort !== "EXECUTED_BUY" && r.maxGainBps >= 1500)
+      .filter(
+        (r) => r.cohort !== "EXECUTED_BUY" && r.maxGainBps >= 1500 && r.maxGainBps <= 5_000_000,
+      )
       .sort((a, b) => b.maxGainBps - a.maxGainBps)
       .map((r) => ({
         symbol: r.symbol,
@@ -190,9 +195,9 @@ export class CounterfactualOpportunityTracker {
         durationMinutes: Math.max(1, Math.round((r.lastSampledAtMs - r.firstSeenAtMs) / 60000)),
       }));
 
-    // Avoided rugs: Rejected tokens that dropped <= -30.0% (-3000 bps)
+    // Avoided rugs: Rejected tokens that dropped <= -30.0% (-3000 bps) and had a plausible SOL price (<= 10 SOL)
     const avoidedRugs: AvoidedRugItem[] = filteredRejected
-      .filter((r) => r.minReturnBps <= -3000)
+      .filter((r) => r.minReturnBps <= -3000 && r.initialPriceSol <= 10)
       .sort((a, b) => a.minReturnBps - b.minReturnBps)
       .map((r) => ({
         symbol: r.symbol,

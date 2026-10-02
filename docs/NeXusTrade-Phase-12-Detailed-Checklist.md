@@ -328,5 +328,18 @@ Active In Live Session: `session-paper-12.88-01`
 
 - [x] Patched CLI argument parser in `backend/src/scripts/paper-trading-daemon.ts` to accept `--duration <N>` alongside `--duration-hours <N>`.
 - [x] Launched multi-regime empirical calibration session `session-paper-12.88-01` with `--duration 12`.
-- [x] Real-time session metrics: Portfolio grew from `10.8758 SOL` to `11.2465+ SOL` (+0.3707 SOL net green, +12.46% all-time green).
-- [x] Zero unhandled crashes, zero memory leaks, 100% fail-closed safety preserved.
+- [x] Real-time session metrics: Portfolio peaked at `10.8758 SOL`, drawdown circuit breaker halted cleanly at `10.1429 SOL` (-6.74%) after 9.1 hours.
+- [x] Completed forensic audit identifying fake liquidity pools (`test`, `SAPLING`) and sizing clamp on established runners.
+
+### Sub-Phase 12.89: Sizing Unlock & RugCheck Defense Hardening
+
+- [x] **Unlocked Established Compounding Sizing**:
+  - Eliminated static 1.0 SOL clamp in `paper-trading-daemon.ts` so established entries dynamically scale to `1.0 * walletScale` (up to 1.25 SOL) as wallet equity compounds.
+- [x] **Fail-Closed RugCheck Across All Cohorts**:
+  - Enforced `requireVerifiedHolders: true` uniformly across both Micro-Caps and Established candidates, preventing unverified bot-farm pools with phantom liquidity from bypassing holder distribution checks.
+- [x] **Hardcoded Symbol Integrity Blacklist**:
+  - Implemented `REJECTED_BLACKLISTED_SYMBOL` gate in `BuyGateTriggerService.ts` blocking `TEST`, `TEST1`, `TEST2`, `TESTCOIN`, `NULL`, `UNDEFINED`, `PUMP`, `SOL`, `WSOL`.
+- [x] **Counterfactual Opportunity Tracker Unit Normalization**:
+  - Normalized initial price intake (`pool.spotPriceUsd / 140`) and added unit outlier guards in `CounterfactualOpportunityTracker.ts` to eliminate synthetic billion-percent gain/drop reporting artifacts.
+- [x] **Verification & Isolation Audit**:
+  - Executed `scripts/verify-isolated.mjs` (tsc, eslint, prettier, architecture check, check-secrets, and all Vitest configurations) with 100% passing tests.

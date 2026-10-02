@@ -110,6 +110,32 @@ export class BuyGateTriggerService {
   ): BuyGateEvaluationResult {
     const gates: GateCheck[] = [];
 
+    // 0. Symbol Integrity / Blacklist Check
+    const BLACKLISTED_SYMBOLS = new Set([
+      "TEST",
+      "TEST1",
+      "TEST2",
+      "TESTCOIN",
+      "NULL",
+      "UNDEFINED",
+      "PUMP",
+      "SOL",
+      "WSOL",
+      "USDC",
+      "USDT",
+      "USD",
+    ]);
+    if (BLACKLISTED_SYMBOLS.has(item.symbol.trim().toUpperCase())) {
+      return {
+        triggered: false,
+        poolId: item.poolId,
+        mintAddress: item.mintAddress,
+        symbol: item.symbol,
+        gates,
+        rejectionReason: "REJECTED_BLACKLISTED_SYMBOL",
+      };
+    }
+
     // Established / High-Volume pool detection
     // MANDATORY Liquidity Floor & Anti-Stale Distribution Ceiling:
     // Must have >= $50,000 liquidity AND age between 1800s (30m) and 7200s (2h)
