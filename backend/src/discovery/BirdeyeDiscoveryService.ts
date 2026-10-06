@@ -30,6 +30,7 @@ export class BirdeyeDiscoveryService {
   private readonly logger: (msg: string) => void;
 
   private smartMoneyAvailable = false;
+  private quotaExhausted = false;
   private cachedTrendingTokens: readonly BirdeyeTrendingToken[] = [];
 
   constructor(options: BirdeyeDiscoveryOptions = {}) {
@@ -45,6 +46,10 @@ export class BirdeyeDiscoveryService {
 
   isSmartMoneyAvailable(): boolean {
     return this.smartMoneyAvailable;
+  }
+
+  isQuotaExhausted(): boolean {
+    return this.quotaExhausted;
   }
 
   async probeSmartMoney(): Promise<ProbeSmartMoneyResult> {
@@ -91,7 +96,7 @@ export class BirdeyeDiscoveryService {
     limit = 20,
     nowMs: number = Date.now(),
   ): Promise<readonly BirdeyeTrendingToken[]> {
-    if (!this.apiKey) {
+    if (!this.apiKey || this.quotaExhausted) {
       return this.cachedTrendingTokens;
     }
 
@@ -110,9 +115,17 @@ export class BirdeyeDiscoveryService {
       });
 
       if (!response.ok) {
-        this.logger(
-          `[BirdeyeDiscovery] Trending tokens fetch returned status ${response.status}: ${response.statusText}`,
-        );
+        if (response.status === 400 || response.status === 401 || response.status === 429) {
+          this.quotaExhausted = true;
+          this.logger(
+            `[BirdeyeDiscovery] Birdeye monthly quota limit or auth reached (status ${response.status}). Disabling Birdeye trending polling for this session; smoothly falling back to Raydium/DexScreener.`,
+          );
+        } else {
+          this.logger(
+            `[BirdeyeDiscovery] Trending tokens fetch returned status ${response.status}: ${response.statusText}`,
+          );
+        }
+        this.budgetTracker.recordTrendingPoll(nowMs);
         return this.cachedTrendingTokens;
       }
 
@@ -153,6 +166,7 @@ export class BirdeyeDiscoveryService {
       return parsedTokens;
     } catch (err) {
       this.logger(`[BirdeyeDiscovery] Error fetching trending tokens: ${String(err)}`);
+      this.budgetTracker.recordTrendingPoll(nowMs);
       return this.cachedTrendingTokens;
     }
   }

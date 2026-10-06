@@ -708,11 +708,14 @@ async function run(): Promise<void> {
           }
         }
 
-        // B. Birdeye Trending Poll (Every 2.5 minutes if budget permits)
-        if (birdeyeDiscovery.getBudgetTracker().canPollTrending(currentNow)) {
+        // B. Birdeye Trending Poll (Every 2.5 minutes if budget permits and quota is not exhausted)
+        if (
+          !birdeyeDiscovery.isQuotaExhausted() &&
+          birdeyeDiscovery.getBudgetTracker().canPollTrending(currentNow)
+        ) {
           try {
             const trendingTokens = await birdeyeDiscovery.fetchTrendingTokens(20, currentNow);
-            if (trendingTokens.length > 0) {
+            if (trendingTokens.length > 0 && !birdeyeDiscovery.isQuotaExhausted()) {
               console.log(
                 `[PaperDaemon] [Birdeye] Fetched ${trendingTokens.length} trending tokens from Birdeye`,
               );
