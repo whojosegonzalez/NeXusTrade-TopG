@@ -24,6 +24,142 @@ export type DaemonHaltReason =
   | "MANUAL_STOP"
   | "DURATION_ELAPSED";
 
+export interface TradingScheduleConfig {
+  readonly startMinutes: number;
+  readonly endMinutes: number;
+  readonly timeZone: string;
+  readonly rawString: string;
+}
+
+export function parseScheduleString(scheduleStr: string): TradingScheduleConfig | undefined {
+  const trimmed = scheduleStr.trim();
+  const match = /^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})(?::([a-zA-Z0-9_/]+))?$/.exec(trimmed);
+  if (!match) {
+    console.warn(
+      `[PaperDaemon] Invalid --schedule format: "${scheduleStr}". Expected HH:MM-HH:MM[:TZ] (e.g. 07:00-17:30:PDT)`,
+    );
+    return undefined;
+  }
+  const startStr = match[1];
+  const endStr = match[2];
+  const rawTz = match[3];
+  if (!startStr || !endStr) return undefined;
+
+  const startParts = startStr.split(":");
+  const endParts = endStr.split(":");
+  const sh = Number(startParts[0]);
+  const sm = Number(startParts[1]);
+  const eh = Number(endParts[0]);
+  const em = Number(endParts[1]);
+
+  if (
+    !Number.isFinite(sh) ||
+    !Number.isFinite(sm) ||
+    !Number.isFinite(eh) ||
+    !Number.isFinite(em)
+  ) {
+    return undefined;
+  }
+
+  if (sh < 0 || sh > 23 || sm < 0 || sm > 59 || eh < 0 || eh > 23 || em < 0 || em > 59) {
+    console.warn(`[PaperDaemon] Invalid hour/minute in --schedule: "${scheduleStr}"`);
+    return undefined;
+  }
+  const startMinutes = sh * 60 + sm;
+  const endMinutes = eh * 60 + em;
+
+  let timeZone = "America/Los_Angeles";
+  if (rawTz) {
+    const upperTz = rawTz.toUpperCase();
+    if (upperTz === "PDT" || upperTz === "PST" || upperTz === "PT" || upperTz === "PACIFIC") {
+      timeZone = "America/Los_Angeles";
+    } else if (
+      upperTz === "EDT" ||
+      upperTz === "EST" ||
+      upperTz === "ET" ||
+      upperTz === "EASTERN"
+    ) {
+      timeZone = "America/New_York";
+    } else if (
+      upperTz === "CDT" ||
+      upperTz === "CST" ||
+      upperTz === "CT" ||
+      upperTz === "CENTRAL"
+    ) {
+      timeZone = "America/Chicago";
+    } else if (
+      upperTz === "MDT" ||
+      upperTz === "MST" ||
+      upperTz === "MT" ||
+      upperTz === "MOUNTAIN"
+    ) {
+      timeZone = "America/Denver";
+    } else if (upperTz === "UTC" || upperTz === "GMT") {
+      timeZone = "UTC";
+    } else {
+      timeZone = rawTz;
+    }
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+  } catch {
+    console.warn(
+      `[PaperDaemon] Unrecognized timezone "${rawTz}", falling back to "America/Los_Angeles"`,
+    );
+    timeZone = "America/Los_Angeles";
+  }
+
+  return {
+    startMinutes,
+    endMinutes,
+    timeZone,
+    rawString: scheduleStr,
+  };
+}
+
+export function isWithinTradingSchedule(
+  timestampMs: number,
+  schedule: TradingScheduleConfig,
+): { isWithin: boolean; currentMinutes: number; minutesUntilNext: number } {
+  const date = new Date(timestampMs);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: schedule.timeZone,
+    hour12: false,
+    hour: "numeric",
+    minute: "numeric",
+  });
+  const parts = formatter.formatToParts(date);
+  const hour = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0", 10);
+  const minute = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0", 10);
+  const currentMinutes = (hour % 24) * 60 + minute;
+
+  let isWithin = false;
+  if (schedule.startMinutes <= schedule.endMinutes) {
+    isWithin = currentMinutes >= schedule.startMinutes && currentMinutes < schedule.endMinutes;
+  } else {
+    isWithin = currentMinutes >= schedule.startMinutes || currentMinutes < schedule.endMinutes;
+  }
+
+  let minutesUntilNext = 0;
+  if (!isWithin) {
+    if (schedule.startMinutes <= schedule.endMinutes) {
+      if (currentMinutes < schedule.startMinutes) {
+        minutesUntilNext = schedule.startMinutes - currentMinutes;
+      } else {
+        minutesUntilNext = 24 * 60 - currentMinutes + schedule.startMinutes;
+      }
+    } else {
+      minutesUntilNext =
+        currentMinutes < schedule.startMinutes
+          ? schedule.startMinutes - currentMinutes
+          : 24 * 60 - currentMinutes + schedule.startMinutes;
+    }
+  }
+
+  return { isWithin, currentMinutes, minutesUntilNext };
+}
+
 export interface PaperTradingDaemonConfig {
   readonly sessionId: string;
   readonly durationHours: number;
@@ -38,6 +174,7 @@ export interface PaperTradingDaemonConfig {
   readonly scannerConfig?: CandidateScannerRuntimeConfig;
   readonly antiRebuyCooldownMs?: number; // default: 1800000 (30m)
   readonly uninterruptedResearchMode?: boolean; // default: false
+  readonly tradingSchedule?: TradingScheduleConfig | undefined;
 }
 
 export interface PaperPosition {

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "./PaperTradingDaemon.js";
+import {
+  PaperTradingDaemon,
+  type PaperTradingDaemonConfig,
+  type TradingScheduleConfig,
+  parseScheduleString,
+  isWithinTradingSchedule,
+} from "./PaperTradingDaemon.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
   type MarketEvaluationContext,
@@ -740,6 +746,139 @@ describe("PaperTradingDaemon", () => {
       expect(summary.durationMinutes).toBe(240);
       expect(summary.totalTrades).toBe(0);
       expect(summary.endedAt).toBe(new Date(fourHoursLaterMs).toISOString());
+    });
+  });
+
+  describe("SubPhase12_90: Chrono-Regime Gating and Schedule Parser", () => {
+    it("parses valid schedule strings into TradingScheduleConfig with accurate minutes and timezones", () => {
+      const pdtSchedule = parseScheduleString("07:00-17:30:PDT");
+      expect(pdtSchedule).toBeDefined();
+      expect(pdtSchedule?.startMinutes).toBe(420); // 7 * 60
+      expect(pdtSchedule?.endMinutes).toBe(1050); // 17 * 60 + 30
+      expect(pdtSchedule?.timeZone).toBe("America/Los_Angeles");
+      expect(pdtSchedule?.rawString).toBe("07:00-17:30:PDT");
+
+      const defaultTzSchedule = parseScheduleString("07:00-17:30");
+      expect(defaultTzSchedule).toBeDefined();
+      expect(defaultTzSchedule?.startMinutes).toBe(420);
+      expect(defaultTzSchedule?.endMinutes).toBe(1050);
+      expect(defaultTzSchedule?.timeZone).toBe("America/Los_Angeles");
+
+      const edtSchedule = parseScheduleString("09:30-16:00:EDT");
+      expect(edtSchedule).toBeDefined();
+      expect(edtSchedule?.startMinutes).toBe(570); // 9 * 60 + 30
+      expect(edtSchedule?.endMinutes).toBe(960); // 16 * 60
+      expect(edtSchedule?.timeZone).toBe("America/New_York");
+
+      const utcSchedule = parseScheduleString("00:00-12:00:UTC");
+      expect(utcSchedule).toBeDefined();
+      expect(utcSchedule?.startMinutes).toBe(0);
+      expect(utcSchedule?.endMinutes).toBe(720);
+      expect(utcSchedule?.timeZone).toBe("UTC");
+    });
+
+    it("rejects invalid schedule formats or out of bounds values", () => {
+      expect(parseScheduleString("invalid")).toBeUndefined();
+      expect(parseScheduleString("25:00-17:00:PDT")).toBeUndefined();
+      expect(parseScheduleString("07:65-17:00:PDT")).toBeUndefined();
+      expect(parseScheduleString("07:00-24:00:PDT")).toBeUndefined();
+    });
+
+    it("evaluates isWithinTradingSchedule accurately across active and standby windows", () => {
+      const schedule: TradingScheduleConfig = {
+        startMinutes: 420, // 07:00
+        endMinutes: 1050, // 17:30
+        timeZone: "America/Los_Angeles",
+        rawString: "07:00-17:30:PDT",
+      };
+
+      // 2026-10-06 08:30:00 PDT -> UTC: 15:30:00 (1050min in UTC, 510min in LA)
+      const insideTimeMs = new Date("2026-10-06T15:30:00Z").getTime();
+      const insideCheck = isWithinTradingSchedule(insideTimeMs, schedule);
+      expect(insideCheck.isWithin).toBe(true);
+      expect(insideCheck.currentMinutes).toBe(510); // 8:30 AM LA
+      expect(insideCheck.minutesUntilNext).toBe(0);
+
+      // 2026-10-06 06:30:00 PDT -> UTC: 13:30:00 (390min in LA, before 420 start)
+      const beforeTimeMs = new Date("2026-10-06T13:30:00Z").getTime();
+      const beforeCheck = isWithinTradingSchedule(beforeTimeMs, schedule);
+      expect(beforeCheck.isWithin).toBe(false);
+      expect(beforeCheck.currentMinutes).toBe(390); // 6:30 AM LA
+      expect(beforeCheck.minutesUntilNext).toBe(30); // 30 minutes until 7:00 AM
+
+      // 2026-10-06 18:30:00 PDT -> UTC: 2026-10-07T01:30:00Z (1110min in LA, after 1050 end)
+      const afterTimeMs = new Date("2026-10-07T01:30:00Z").getTime();
+      const afterCheck = isWithinTradingSchedule(afterTimeMs, schedule);
+      expect(afterCheck.isWithin).toBe(false);
+      expect(afterCheck.currentMinutes).toBe(1110); // 6:30 PM LA
+      // 1440 - 1110 + 420 = 750 minutes (12.5 hours) until 7:00 AM tomorrow
+      expect(afterCheck.minutesUntilNext).toBe(750);
+    });
+
+    it("supports overnight trading schedules across midnight", () => {
+      const overnightSchedule: TradingScheduleConfig = {
+        startMinutes: 1320, // 22:00
+        endMinutes: 240, // 04:00
+        timeZone: "America/Los_Angeles",
+        rawString: "22:00-04:00:PDT",
+      };
+
+      // 23:00 LA -> inside
+      const lateNightMs = new Date("2026-10-07T06:00:00Z").getTime(); // 23:00 PDT
+      expect(isWithinTradingSchedule(lateNightMs, overnightSchedule).isWithin).toBe(true);
+
+      // 02:00 LA -> inside
+      const earlyMorningMs = new Date("2026-10-07T09:00:00Z").getTime(); // 02:00 PDT
+      expect(isWithinTradingSchedule(earlyMorningMs, overnightSchedule).isWithin).toBe(true);
+
+      // 12:00 LA -> outside
+      const middayMs = new Date("2026-10-07T19:00:00Z").getTime(); // 12:00 PDT
+      expect(isWithinTradingSchedule(middayMs, overnightSchedule).isWithin).toBe(false);
+    });
+  });
+
+  describe("SubPhase12_90: Staged Established Sizing and Pyramiding Scale-In", () => {
+    it("handles 0.50 SOL probe entry and scales in +0.50 SOL upon breakout confirmation", () => {
+      const daemon = new PaperTradingDaemon({
+        config: {
+          ...baseConfig,
+          positionSizeSol: 0.5,
+          initialPortfolioSol: 10.0,
+        },
+        clock: () => nowMs,
+      });
+      daemon.start();
+
+      // 1. Enter Established position with 0.50 SOL probe
+      const entered = daemon.processScannedPool(validPool, nowMs, 0.05, 0.5, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      expect(entered).toBe(true);
+
+      const openPos = daemon.getSnapshot().openPositions[0]!;
+      expect(openPos.costBasisSol).toBe(0.5);
+      expect(openPos.tokensHeld).toBe(10); // 0.5 SOL / 0.05 = 10 tokens
+      expect(openPos.entryPriceSol).toBe(0.05);
+      expect(openPos.pyramided).toBeUndefined();
+      expect(daemon.getCurrentCashSol()).toBe(9.5);
+
+      // 2. Token surges +8% to 0.054 SOL (meets >= +7% breakout threshold)
+      const scaled = daemon.scaleInPosition(openPos.positionId, 0.5, 0.054, nowMs + 10_000);
+      expect(scaled).toBeDefined();
+      expect(scaled?.costBasisSol).toBe(1.0); // 0.5 + 0.5 = 1.0 SOL total
+      expect(scaled?.pyramided).toBe(true);
+      expect(scaled?.scaleInCount).toBe(1);
+      expect(daemon.getCurrentCashSol()).toBe(9.0);
+
+      // Tokens added: 0.5 / 0.054 = 9.259259 tokens -> total tokens: 19.259259
+      // Blended entry: 1.0 / 19.259259 = 0.051923 SOL
+      expect(scaled?.tokensHeld).toBeCloseTo(19.259, 2);
+      expect(scaled?.entryPriceSol).toBeCloseTo(0.0519, 3);
+      // Floor locked to breakeven (>= 0 bps)
+      expect(scaled?.ratchetState.currentStopFloorBps).toBeGreaterThanOrEqual(0);
+      expect(scaled?.ratchetState.armedBreakeven).toBe(true);
     });
   });
 });

@@ -14,7 +14,12 @@ try {
 } catch {
   // Ignore if already loaded or unavailable
 }
-import { PaperTradingDaemon, type PaperTradingDaemonConfig } from "../paper/PaperTradingDaemon.js";
+import {
+  PaperTradingDaemon,
+  type PaperTradingDaemonConfig,
+  parseScheduleString,
+  isWithinTradingSchedule,
+} from "../paper/PaperTradingDaemon.js";
 import { CandidateStreamEngine } from "../candidate-scanner/CandidateStreamEngine.js";
 import { CANDIDATE_SCANNER_DEFAULTS } from "../candidate-scanner/CandidateScannerConfig.js";
 import { CandidateWatchlistService } from "../candidate-scanner/CandidateWatchlistService.js";
@@ -146,6 +151,8 @@ function parseCliArgs(): PaperTradingDaemonConfig {
       "waive-drawdown": { type: "boolean" },
       "dry-run": { type: "boolean" },
       "initial-sol": { type: "string" },
+      schedule: { type: "string" },
+      "reset-wallet": { type: "boolean" },
     },
     strict: false,
   });
@@ -157,14 +164,31 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   const maxOpenPositions =
     typeof rawMaxPos === "string" ? Math.min(10, Math.max(1, parseInt(rawMaxPos, 10))) : 5;
 
+  const resetWallet = values["reset-wallet"] === true;
   const rawInitial = values["initial-sol"];
   let initialPortfolioSol = 10.0;
-  if (typeof rawInitial === "string" && !Number.isNaN(parseFloat(rawInitial))) {
+  if (resetWallet) {
+    initialPortfolioSol = 10.0;
+    const vWallet = loadVirtualWallet();
+    vWallet.currentBalanceSol = 10.0;
+    vWallet.initialBalanceSol = 10.0;
+    vWallet.totalSessionsCompleted = 0;
+    vWallet.allTimeRealizedPnlSol = 0.0;
+    vWallet.lastUpdatedMs = Date.now();
+    saveVirtualWallet(vWallet);
+    console.log(
+      "[PaperDaemon] [WALLET_RESET] Continuous virtual wallet reinitialized to 10.0000 SOL.",
+    );
+  } else if (typeof rawInitial === "string" && !Number.isNaN(parseFloat(rawInitial))) {
     initialPortfolioSol = parseFloat(rawInitial);
   } else {
     const vWallet = loadVirtualWallet();
     initialPortfolioSol = vWallet.currentBalanceSol;
   }
+
+  const rawSchedule = values.schedule;
+  const tradingSchedule =
+    typeof rawSchedule === "string" ? parseScheduleString(rawSchedule) : undefined;
 
   const gasReserveSol = 0.05;
   const calculatedBalancedSize = Math.min(
@@ -210,6 +234,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     dryRun,
     antiRebuyCooldownMs,
     uninterruptedResearchMode,
+    ...(tradingSchedule ? { tradingSchedule } : {}),
   };
 }
 
@@ -311,6 +336,11 @@ async function run(): Promise<void> {
   console.log(
     `[PaperDaemon] Protective Guardrails: MaxDrawdown=${config.maxPortfolioDrawdownBps} bps, AntiRebuyCooldown=${((config.antiRebuyCooldownMs ?? 0) / 60000).toFixed(0)}m, UninterruptedResearch=${config.uninterruptedResearchMode ? "ENABLED" : "DISABLED"}`,
   );
+  if (config.tradingSchedule) {
+    console.log(
+      `[PaperDaemon] Chrono-Regime Gating: ACTIVE (${config.tradingSchedule.rawString}) [Timezone: ${config.tradingSchedule.timeZone}]`,
+    );
+  }
 
   const daemon = new PaperTradingDaemon({ config });
   daemon.start();
@@ -381,6 +411,8 @@ async function run(): Promise<void> {
   let lastHeartbeatMs = 0;
   let lastPersistMs = 0;
   let lastRadarSampleMs = 0;
+  let lastStandbyLogMs = 0;
+  let wasInStandby = false;
   const scanIntervalMs = 5000;
   const SESSION_START_WARMUP_MS = 60_000;
   const armedPullbackCandidates = new Map<string, ArmedPullbackState>();
@@ -546,6 +578,42 @@ async function run(): Promise<void> {
       break;
     }
 
+    let isStandby = false;
+    let minutesUntilNextWindow = 0;
+    if (config.tradingSchedule) {
+      const scheduleCheck = isWithinTradingSchedule(currentNow, config.tradingSchedule);
+      isStandby = !scheduleCheck.isWithin;
+      minutesUntilNextWindow = scheduleCheck.minutesUntilNext;
+
+      if (isStandby) {
+        if (!wasInStandby) {
+          wasInStandby = true;
+          lastStandbyLogMs = currentNow;
+          console.log(
+            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m. Radar scanning and new entries paused.`,
+          );
+          addActivityLog(
+            "CONTROL",
+            `⏸️ Standby active: Outside trading window (${config.tradingSchedule.rawString}). Next window in ${minutesUntilNextWindow}m.`,
+          );
+        } else if (currentNow - lastStandbyLogMs >= 15 * 60 * 1000) {
+          lastStandbyLogMs = currentNow;
+          console.log(
+            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m.`,
+          );
+        }
+      } else if (wasInStandby) {
+        wasInStandby = false;
+        console.log(
+          `[PaperDaemon] [ACTIVE] Trading window active (${config.tradingSchedule.rawString})! Radar scanning and buy gates re-engaged.`,
+        );
+        addActivityLog(
+          "CONTROL",
+          `🟢 Trading window active (${config.tradingSchedule.rawString}). Radar scanning and buy gates re-engaged.`,
+        );
+      }
+    }
+
     // 1. Tick Open Positions with Live DexScreener Prices
     for (const pos of snap.openPositions) {
       try {
@@ -638,6 +706,42 @@ async function run(): Promise<void> {
           );
         }
 
+        // Established Scale-In Pyramiding (Deliverable 1):
+        // If open position is ESTABLISHED, !pos.pyramided, pos.currentPnlBps >= 700 (+7.0% breakout confirmation),
+        // daemon portfolio cash > 0.5 SOL, and spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s:
+        if (
+          result?.action !== "SELL_ALL" &&
+          pos.cohort === "ESTABLISHED" &&
+          !pos.pyramided &&
+          pos.currentPnlBps >= 700 &&
+          daemon.getCurrentCashSol() > 0.5 &&
+          spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s
+        ) {
+          const currentCash = daemon.getCurrentCashSol();
+          const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
+          const establishedScaleInAmountSol = Math.min(
+            0.65,
+            Number((0.5 * walletScale).toFixed(2)),
+          );
+          const updatedPos = daemon.scaleInPosition(
+            pos.positionId,
+            establishedScaleInAmountSol,
+            spotInfo.spotPriceSol,
+            currentNow,
+          );
+          if (updatedPos) {
+            console.log(
+              `[PaperDaemon] [ESTABLISHED_PYRAMIDING_SCALE_IN] Added +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (+7% confirmation) | Blended Entry: ${updatedPos.entryPriceSol} SOL`,
+            );
+            addActivityLog(
+              "BUY",
+              `🟢 Scaled in +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL [ESTABLISHED +7% breakout] | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+              pos.mintAddress,
+              pos.symbol,
+            );
+          }
+        }
+
         // Micro-Cap Scale-In Pyramiding:
         // If open position is MICRO_CAP, !pos.pyramided, pos.currentPnlBps >= 1000 (+10% Armed Breakeven),
         // daemon portfolio cash > 0.5 SOL, and spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s:
@@ -674,7 +778,7 @@ async function run(): Promise<void> {
     }
 
     // 2. Scan Candidate Pools & Ingest into Stage 1 Watchlist Radar
-    if (currentNow - lastScanMs >= scanIntervalMs) {
+    if (!isStandby && currentNow - lastScanMs >= scanIntervalMs) {
       lastScanMs = currentNow;
       try {
         const rawPools = await streamEngine.fetchRawPools(25);
@@ -921,7 +1025,7 @@ async function run(): Promise<void> {
                 });
                 const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
                 const targetWait = isEstablished
-                  ? "5-12% pullback or consolidation"
+                  ? "4-8% pullback or consolidation"
                   : "10-18% pullback or consolidation";
                 console.log(
                   `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
@@ -950,29 +1054,31 @@ async function run(): Promise<void> {
               armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
 
               // Cohort parameters for Retest Gate:
-              // Both cohorts capped at 15% crater ceiling (Deliverable 5)
-              // Established: 120s expiry, 5-12% pullback (1.15x flow), 3% consolidation (1.25x flow)
-              // Micro-Cap: 90s expiry, 10-15% pullback (1.25x flow), 5% consolidation (1.5x flow)
-              const maxCraterDropPct = 0.15;
+              // Established: max 8% crater drop ceiling, 120s expiry, 4-8% pullback (1.15x flow), 3% consolidation (1.25x flow)
+              // Micro-Cap: max 15% crater drop ceiling, 90s expiry, 10-15% pullback (1.25x flow), 5% consolidation (1.5x flow)
+              const maxCraterDropPct = isEstablished ? 0.08 : 0.15;
               const maxExpiryMs = isEstablished ? 120_000 : 90_000;
 
-              // Rule C: Plunged below crater threshold (-15% knife avoidance)
+              // Rule C: Plunged below crater threshold (anti-falling knife)
               if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * (1 - maxCraterDropPct)) {
                 armedPullbackCandidates.delete(candidate.mintAddress);
                 watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                const rejectReason = isEstablished
+                  ? "REJECTED_EXCESSIVE_PULLBACK"
+                  : "REJECTED_PULLBACK_CRATERED";
                 tracker.recordCandidate(
                   candidate,
                   "FILTERED_REJECTED",
                   spotInfo.spotPriceSol,
                   currentNow,
-                  "REJECTED_PULLBACK_CRATERED",
+                  rejectReason,
                 );
                 console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK_CRATERED] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
+                  `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
                 );
                 addActivityLog(
                   "ALERT",
-                  `⚠️ ${candidate.symbol} dropped: cratered >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
+                  `⚠️ ${candidate.symbol} dropped: pullback >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
                   candidate.mintAddress,
                   candidate.symbol,
                 );
@@ -1023,10 +1129,10 @@ async function run(): Promise<void> {
               }
 
               // Rule A: Retest Pullback Discount with flow absorption
-              // Established: 5% to 12% pullback discount with recentBuys60s >= 1.15 * recentSells60s
+              // Established: 4% to 8% pullback discount with recentBuys60s >= 1.15 * recentSells60s
               // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
-              const minPullbackRatio = isEstablished ? 0.88 : 0.85;
-              const maxPullbackRatio = isEstablished ? 0.95 : 0.9;
+              const minPullbackRatio = isEstablished ? 0.92 : 0.85;
+              const maxPullbackRatio = isEstablished ? 0.96 : 0.9;
               const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
 
               const isPullbackDiscount =
@@ -1104,22 +1210,25 @@ async function run(): Promise<void> {
                 ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
                 : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
 
-              // Phase 12.89: Unlock Compounding Wallet Sizing Scale-Up for Established Entries
+              // Phase 12.90 Deliverable 1: Staged Established Sizing (0.50 SOL Probe -> Scale-In at +7%)
               const currentCash = daemon.getCurrentCashSol();
               const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
-              const establishedBaseSize = Math.min(1.25, Number((1.0 * walletScale).toFixed(2)));
+              const establishedProbeBaseSize = Math.min(
+                0.65,
+                Number((0.5 * walletScale).toFixed(2)),
+              );
               const microProbeBaseSize = Math.min(0.35, Number((0.25 * walletScale).toFixed(2)));
 
-              let targetCohortSize = isEstablished ? establishedBaseSize : microProbeBaseSize;
+              let targetCohortSize = isEstablished ? establishedProbeBaseSize : microProbeBaseSize;
               if (isEstablished) {
                 const highBundler =
                   rugMetrics?.bundlerPct !== undefined && rugMetrics.bundlerPct > 0.6;
                 const highTop10 =
                   rugMetrics?.top10HolderPct !== undefined && rugMetrics.top10HolderPct > 0.3;
                 if (highBundler || highTop10) {
-                  targetCohortSize = 0.5;
+                  targetCohortSize = Math.min(0.35, targetCohortSize);
                   console.log(
-                    `[PaperDaemon] [ESTABLISHED_HIGH_RISK] Downsizing ${candidate.symbol} to 0.50 SOL (Bundlers: ${((rugMetrics?.bundlerPct ?? 0) * 100).toFixed(1)}%, Top10: ${((rugMetrics?.top10HolderPct ?? 0) * 100).toFixed(1)}%)`,
+                    `[PaperDaemon] [ESTABLISHED_HIGH_RISK] Downsizing probe for ${candidate.symbol} to ${targetCohortSize} SOL (Bundlers: ${((rugMetrics?.bundlerPct ?? 0) * 100).toFixed(1)}%, Top10: ${((rugMetrics?.top10HolderPct ?? 0) * 100).toFixed(1)}%)`,
                   );
                 }
               }
@@ -1177,7 +1286,7 @@ async function run(): Promise<void> {
     }
 
     // 2b. Dedicated Watchlist Poller by Mint Address (Every 10s)
-    if (currentNow - lastWatchlistRefreshMs >= 10000) {
+    if (!isStandby && currentNow - lastWatchlistRefreshMs >= 10000) {
       lastWatchlistRefreshMs = currentNow;
       const itemsToRefresh = watchlistService.getItems();
       for (const item of itemsToRefresh) {
@@ -1203,7 +1312,7 @@ async function run(): Promise<void> {
     }
 
     // 3. Counterfactual Price Sampler for Top Candidates across ALL cohorts (Every 15s)
-    if (currentNow - lastRadarSampleMs >= 15000) {
+    if (!isStandby && currentNow - lastRadarSampleMs >= 15000) {
       lastRadarSampleMs = currentNow;
       const topCandidates = tracker.getTopCandidatesForSampling(10);
       for (const item of topCandidates) {
@@ -1222,9 +1331,10 @@ async function run(): Promise<void> {
     if (currentNow - lastHeartbeatMs >= 15000) {
       lastHeartbeatMs = currentNow;
       const currentSnap = daemon.getSnapshot();
-      const watchingCount = watchlistService.getActiveWatchingItems().length;
+      const watchingCount = isStandby ? 0 : watchlistService.getActiveWatchingItems().length;
+      const statusPrefix = isStandby ? `[STANDBY (Next in ${minutesUntilNextWindow}m)] ` : "";
       console.log(
-        `[PaperDaemon] [HEARTBEAT] Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
+        `[PaperDaemon] [HEARTBEAT] ${statusPrefix}Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
       );
     }
 
