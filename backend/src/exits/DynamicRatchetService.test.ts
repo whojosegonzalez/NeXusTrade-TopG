@@ -106,7 +106,13 @@ describe("DynamicRatchetService", () => {
     const service = new DynamicRatchetService({}, store);
     const state = store.initPositionState("pos-1", "mint-1", 1.0, 1_000_000);
 
-    const result = service.evaluate(state, {
+    const confirmed = service.evaluate(state, {
+      ...baseContext,
+      spotPriceSol: 1.02, // +2.0% confirmed gain
+      currentTimestampMs: 1_000_005,
+    });
+
+    const result = service.evaluate(confirmed.updatedState, {
       ...baseContext,
       spotPriceSol: 0.879, // -12.1% = -1210 bps
       lpIntact: true,
@@ -454,10 +460,19 @@ describe("DynamicRatchetService", () => {
     expect(t2.reasonCode).toBe("RATCHET_TIER_2_TRIGGERED");
     expect(t2.updatedState.currentStopFloorBps).toBe(3500);
 
-    // Hard stop at -18.0%: at -15.0% it does NOT trigger catastrophic stop for established
+    // Hard stop at -18.0%: confirmed position at -15.0% does NOT trigger catastrophic stop for established
     const state2 = store.initPositionState("pos-est-2", "mint-est-2", 1.0, 1_000_000);
-    const dip15 = service.evaluate(
+    const confirmed = service.evaluate(
       state2,
+      {
+        ...baseContext,
+        spotPriceSol: 1.02, // +2.0% (200 bps confirmed)
+        currentTimestampMs: 1_000_005,
+      },
+      ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+    );
+    const dip15 = service.evaluate(
+      confirmed.updatedState,
       {
         ...baseContext,
         spotPriceSol: 0.85, // -15.0%
@@ -885,6 +900,59 @@ describe("DynamicRatchetService", () => {
       expect(result.action).toBe("HOLD");
       expect(result.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
       expect(result.reasonCode).not.toBe("WHALE_DEV_DUMP_CLIFF_CUT");
+    });
+  });
+
+  describe("Phase 12.91 Deliverable 2: Unconfirmed Probe Quick-Cut", () => {
+    it("immediately exits with PROBE_UNCONFIRMED_DUMP_CUT when peak gain < +1.0% and pnl drops to <= -12.0%, regardless of buyer flow", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState(
+        "pos-unconfirmed-1",
+        "mint-unconfirmed-1",
+        1.0,
+        1_000_000,
+      );
+
+      // Price immediately drops to 0.875 SOL (-12.5% / -1250 bps) without ever reaching +1.0% (100 bps) peak gain
+      // Even with 20 buys vs 5 sells, unconfirmed probe is cut!
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.875,
+        recentBuysCount60s: 20,
+        recentSellsCount60s: 5,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("PROBE_UNCONFIRMED_DUMP_CUT");
+      expect(result.diagnostics.currentPnlBps).toBe(-1250);
+      expect(result.diagnostics.peakGainBps).toBe(0);
+    });
+
+    it("does not trigger PROBE_UNCONFIRMED_DUMP_CUT if position previously demonstrated confirmed gain (peak gain >= 100 bps)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-confirmed-1", "mint-confirmed-1", 1.0, 1_000_000);
+
+      // 1. Initial surge to +5.0% (500 bps) -> confirmed runner
+      const surge = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.05,
+        currentTimestampMs: 1_000_010,
+      });
+      expect(surge.updatedState.peakGainBps).toBe(500);
+
+      // 2. Deep pullback to 0.875 SOL (-12.5%) with strong buyer absorption
+      const pullback = service.evaluate(surge.updatedState, {
+        ...baseContext,
+        spotPriceSol: 0.875,
+        recentBuysCount60s: 15,
+        recentSellsCount60s: 10,
+        currentTimestampMs: 1_000_020,
+      });
+
+      expect(pullback.reasonCode).not.toBe("PROBE_UNCONFIRMED_DUMP_CUT");
     });
   });
 });

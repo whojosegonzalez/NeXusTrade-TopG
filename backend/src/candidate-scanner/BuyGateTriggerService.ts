@@ -142,19 +142,34 @@ export class BuyGateTriggerService {
     const isCandidateEstablished =
       item.liquidityUsd >= 50000 && item.assetAgeSeconds >= 1800 && item.assetAgeSeconds <= 7200;
 
-    // When holdersCount is provided (Stage 2 post-RugCheck), enforce minEstablishedHolders (>= 250).
+    // Phase 12.91 Deliverable 1: Graduated Viral Runner (CHROME Exception)
+    // High-adoption viral tokens graduating from pump.fun with massive retail volume:
+    // Age between 900s (15m) and 7200s (2h), Liquidity >= $30,000, Market Cap >= $150,000,
+    // 5m Volume >= $15,000, and Buy/Sell flow >= 1.5x
+    const isCandidateViralRunner =
+      item.liquidityUsd >= 30000 &&
+      item.liquidityUsd < 50000 &&
+      item.marketCapUsd >= 150000 &&
+      item.assetAgeSeconds >= 900 &&
+      item.assetAgeSeconds <= 3600 &&
+      item.volume5mUsd >= 15000 &&
+      item.buyToSellRatio >= 1.5;
+
+    // When holdersCount is provided (Stage 2 post-RugCheck), enforce minEstablishedHolders (>= 250) or viral floor (>= 1000).
     // When holdersCount is undefined:
     //   - If requireVerifiedHolders is false or undefined (Preliminary in-memory screening):
     //     permit the candidate to qualify preliminarily so spot info and RugCheck can be queried.
     //   - If requireVerifiedHolders is true: fail-closed (cannot be established).
+    const minHoldersRequired = isCandidateViralRunner ? 1000 : this.config.minEstablishedHolders;
     const hasEstablishedHolders =
       marketContext.holdersCount !== undefined
-        ? marketContext.holdersCount >= this.config.minEstablishedHolders
+        ? marketContext.holdersCount >= minHoldersRequired
         : !marketContext.requireVerifiedHolders;
 
-    const isEstablished = isCandidateEstablished && hasEstablishedHolders;
+    const isEstablished =
+      (isCandidateEstablished || isCandidateViralRunner) && hasEstablishedHolders;
 
-    const isEstablishedRunner = isEstablished || isCandidateEstablished;
+    const isEstablishedRunner = isEstablished || isCandidateEstablished || isCandidateViralRunner;
 
     const isHighLiqVol = item.liquidityUsd >= 20000 && item.volume5mUsd >= 25000;
     const maxMaturityAgeSec = isEstablishedRunner
@@ -295,9 +310,11 @@ export class BuyGateTriggerService {
 
     let rugCheckFailureReason: string | undefined;
     const maxBundlerAllowed = isEstablished ? this.config.maxBundlerPct : 0.5; // 50% ceiling on micro-caps
-    const effectiveMinHolders = isEstablishedRunner
-      ? this.config.minEstablishedHolders
-      : this.config.minHoldersCount;
+    const effectiveMinHolders = isCandidateViralRunner
+      ? 1000
+      : isEstablishedRunner
+        ? this.config.minEstablishedHolders
+        : this.config.minHoldersCount;
 
     if (rugScore !== undefined && rugScore > this.config.maxRugScore) {
       rugCheckFailureReason = "RUGCHECK_HIGH_RISK_SCORE_FAILED";
@@ -308,7 +325,12 @@ export class BuyGateTriggerService {
     } else if (
       marketContext.requireVerifiedHolders &&
       holdersCount !== undefined &&
-      holdersCount < (isEstablishedRunner ? this.config.minEstablishedHolders : 100)
+      holdersCount <
+        (isEstablishedRunner
+          ? isCandidateViralRunner
+            ? 1000
+            : this.config.minEstablishedHolders
+          : 100)
     ) {
       rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
     } else if (

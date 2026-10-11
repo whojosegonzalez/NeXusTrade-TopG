@@ -897,4 +897,69 @@ describe("BuyGateTriggerService", () => {
       }
     });
   });
+
+  describe("Phase 12.91 Deliverable 1: Graduated Viral Runner (CHROME Exception)", () => {
+    const chromeCandidate: WatchlistCandidateItem = {
+      poolId: "pool-chrome-1",
+      mintAddress: "TokenMintChrome111111111111111111111111111111111",
+      symbol: "CHROME",
+      liquidityUsd: 38_000, // $30k - $50k range
+      marketCapUsd: 220_000, // >= $150k (L/MC = 0.1727)
+      lmcRatio: 0.1727,
+      lpBurnPct: 100.0,
+      assetAgeSeconds: 2100, // 35m old (between 900s and 7200s)
+      volume5mUsd: 32_000, // >= $15,000
+      buys5m: 800,
+      sells5m: 400, // buys/sells = 2.0x (>= 1.5x)
+      buyToSellRatio: 2.0,
+      status: "WATCHING",
+      discoveredAt: new Date().toISOString(),
+      lastEvaluatedAt: new Date().toISOString(),
+    };
+
+    it("qualifies in preliminary screening with uncapped wash trading and sell ceilings", () => {
+      const service = new BuyGateTriggerService();
+      const result = service.evaluateCandidate(chromeCandidate);
+
+      expect(result.triggered).toBe(true);
+      const washGate = result.gates.find((g) => g.name === "WASH_TRADING_CEILING_GATE");
+      expect(washGate?.passed).toBe(true);
+      expect(washGate?.requirement).toContain("Uncapped");
+
+      const sellGate = result.gates.find((g) => g.name === "SELL_CONGESTION_CEILING_GATE");
+      expect(sellGate?.passed).toBe(true);
+      expect(sellGate?.requirement).toContain("Uncapped");
+    });
+
+    it("fails Stage 2 post-RugCheck verification if holders count < 1000", () => {
+      const service = new BuyGateTriggerService();
+      const result = service.evaluateCandidate(chromeCandidate, {
+        requireVerifiedHolders: true,
+        holdersCount: 450, // 450 < 1000 viral holder floor
+        bundlerPct: 0.15,
+        recentBuysCount60s: 25,
+        recentSellsCount60s: 10,
+        momentum1mBps: 200,
+      });
+
+      expect(result.triggered).toBe(false);
+      expect(result.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
+    });
+
+    it("passes Stage 2 post-RugCheck verification when verified holders >= 1000", () => {
+      const service = new BuyGateTriggerService();
+      const result = service.evaluateCandidate(chromeCandidate, {
+        requireVerifiedHolders: true,
+        holdersCount: 2850, // >= 1000 viral holder floor
+        bundlerPct: 0.12,
+        top10HolderPct: 0.18,
+        recentBuysCount60s: 30,
+        recentSellsCount60s: 12,
+        momentum1mBps: 250,
+      });
+
+      expect(result.triggered).toBe(true);
+      expect(result.rejectionReason).toBeUndefined();
+    });
+  });
 });

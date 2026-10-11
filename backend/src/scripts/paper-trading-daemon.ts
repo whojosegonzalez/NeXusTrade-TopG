@@ -158,7 +158,8 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   });
 
   const rawDuration = values["duration-hours"] ?? values["duration"];
-  const durationHours = typeof rawDuration === "string" ? parseFloat(rawDuration) : 4;
+  const durationHours =
+    typeof rawDuration === "string" ? parseFloat(rawDuration) : values.schedule ? 24 : 4;
 
   const rawMaxPos = values["max-positions"] ?? values["max-open-positions"];
   const maxOpenPositions =
@@ -266,7 +267,10 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
         priceUsd?: string;
         liquidity?: { usd?: number; quote?: number };
         volume?: { m5?: number };
-        txns?: { m5?: { buys?: number; sells?: number } };
+        txns?: {
+          m5?: { buys?: number; sells?: number };
+          h1?: { buys?: number; sells?: number };
+        };
         priceChange?: { m5?: number; h1?: number };
       }>;
     };
@@ -297,10 +301,22 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
     const m5Vol = solPair.volume?.m5 ?? 0;
     const buyVolSol = (m5Vol / 140) * 0.6;
     const sellVolSol = (m5Vol / 140) * 0.4;
-    const buys5m = solPair.txns?.m5?.buys ?? 15;
-    const sells5m = solPair.txns?.m5?.sells ?? 10;
-    const recentBuys60s = Math.max(1, Math.round(buys5m / 5));
-    const recentSells60s = Math.max(1, Math.round(sells5m / 5));
+    // Phase 12.91 Deliverable 3: 3-Tier Defensive Real-Flow Defaults (Zero Phantom Buyers)
+    // Tier 1: Real 5m counts. Tier 2: 1h counts scaled down (/ 12). Tier 3: 0/0 conservative defaults.
+    const buys5m =
+      solPair.txns?.m5?.buys !== undefined
+        ? solPair.txns.m5.buys
+        : solPair.txns?.h1?.buys !== undefined
+          ? Math.round(solPair.txns.h1.buys / 12)
+          : 0;
+    const sells5m =
+      solPair.txns?.m5?.sells !== undefined
+        ? solPair.txns.m5.sells
+        : solPair.txns?.h1?.sells !== undefined
+          ? Math.round(solPair.txns.h1.sells / 12)
+          : 0;
+    const recentBuys60s = Math.round(buys5m / 5);
+    const recentSells60s = Math.round(sells5m / 5);
     const momentum5mBps = solPair.priceChange?.m5 ? Math.round(solPair.priceChange.m5 * 100) : 0;
     const priceChange1hPct =
       solPair.priceChange?.h1 !== undefined && Number.isFinite(solPair.priceChange.h1)
@@ -406,6 +422,9 @@ async function run(): Promise<void> {
 
   const startMs = nowMs();
   const maxDurationMs = config.durationHours * 3600 * 1000;
+  let activeTradingMs = 0;
+  let lastActiveTickMs = startMs;
+  let hasEnteredActiveSchedule = false;
   let lastScanMs = 0;
   let lastWatchlistRefreshMs = 0;
   let lastHeartbeatMs = 0;
@@ -544,10 +563,82 @@ async function run(): Promise<void> {
   while (!terminating) {
     const currentNow = nowMs();
     daemon.heartbeat(currentNow);
-    const elapsed = currentNow - startMs;
-    if (elapsed >= maxDurationMs) {
+    let isStandby = false;
+    let minutesUntilNextWindow = 0;
+    if (config.tradingSchedule) {
+      const scheduleCheck = isWithinTradingSchedule(currentNow, config.tradingSchedule);
+      isStandby = !scheduleCheck.isWithin;
+      minutesUntilNextWindow = scheduleCheck.minutesUntilNext;
+
+      if (!isStandby) {
+        hasEnteredActiveSchedule = true;
+        activeTradingMs += currentNow - lastActiveTickMs;
+        lastActiveTickMs = currentNow;
+
+        if (wasInStandby) {
+          wasInStandby = false;
+          console.log(
+            `[PaperDaemon] [ACTIVE] Trading window active (${config.tradingSchedule.rawString})! Radar scanning and buy gates re-engaged.`,
+          );
+          addActivityLog(
+            "CONTROL",
+            `🟢 Trading window active (${config.tradingSchedule.rawString}). Radar scanning and buy gates re-engaged.`,
+          );
+        }
+      } else {
+        lastActiveTickMs = currentNow;
+
+        // Auto-cashout if the active schedule window has just concluded
+        if (hasEnteredActiveSchedule) {
+          console.log(
+            `[PaperDaemon] [SCHEDULE_WINDOW_CONCLUDED] Scheduled trading window (${config.tradingSchedule.rawString}) has concluded. Executing end-of-schedule cashout...`,
+          );
+          const openPositions = daemon.getSnapshot().openPositions;
+          for (const pos of openPositions) {
+            try {
+              const exitPrice = pos.spotPriceSol > 0 ? pos.spotPriceSol : pos.entryPriceSol;
+              daemon.manualExit(pos.positionId, exitPrice, currentNow, "SCHEDULE_WINDOW_CONCLUDED");
+              const timeStr = new Date(currentNow).toLocaleTimeString();
+              addActivityLog(
+                "SELL",
+                `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at schedule window conclusion at ${timeStr} | Exit: SCHEDULE_WINDOW_CONCLUDED`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+              console.log(
+                `[PaperDaemon] [SCHEDULE CASHOUT] Liquidated ${pos.mintAddress} at ${exitPrice} SOL`,
+              );
+            } catch (cashoutErr) {
+              console.error(`[PaperDaemon] Error cashing out ${pos.mintAddress}:`, cashoutErr);
+            }
+          }
+          daemon.stop("SCHEDULE_WINDOW_CONCLUDED");
+          break;
+        }
+
+        if (!wasInStandby) {
+          wasInStandby = true;
+          lastStandbyLogMs = currentNow;
+          console.log(
+            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m. Radar scanning and new entries paused.`,
+          );
+          addActivityLog(
+            "CONTROL",
+            `⏸️ Standby active: Outside trading window (${config.tradingSchedule.rawString}). Next window in ${minutesUntilNextWindow}m.`,
+          );
+        } else if (currentNow - lastStandbyLogMs >= 15 * 60 * 1000) {
+          lastStandbyLogMs = currentNow;
+          console.log(
+            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m.`,
+          );
+        }
+      }
+    }
+
+    const effectiveElapsedMs = config.tradingSchedule ? activeTradingMs : currentNow - startMs;
+    if (effectiveElapsedMs >= maxDurationMs) {
       console.log(
-        `[PaperDaemon] Duration of ${config.durationHours} hours reached. Executing end-of-session cashout...`,
+        `[PaperDaemon] Active duration of ${config.durationHours} hours reached. Executing end-of-session cashout...`,
       );
       const openPositions = daemon.getSnapshot().openPositions;
       for (const pos of openPositions) {
@@ -576,42 +667,6 @@ async function run(): Promise<void> {
     if (snap.status === "HALTED" && !config.uninterruptedResearchMode) {
       console.error(`[PaperDaemon] Daemon halted due to: ${snap.haltReason}`);
       break;
-    }
-
-    let isStandby = false;
-    let minutesUntilNextWindow = 0;
-    if (config.tradingSchedule) {
-      const scheduleCheck = isWithinTradingSchedule(currentNow, config.tradingSchedule);
-      isStandby = !scheduleCheck.isWithin;
-      minutesUntilNextWindow = scheduleCheck.minutesUntilNext;
-
-      if (isStandby) {
-        if (!wasInStandby) {
-          wasInStandby = true;
-          lastStandbyLogMs = currentNow;
-          console.log(
-            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m. Radar scanning and new entries paused.`,
-          );
-          addActivityLog(
-            "CONTROL",
-            `⏸️ Standby active: Outside trading window (${config.tradingSchedule.rawString}). Next window in ${minutesUntilNextWindow}m.`,
-          );
-        } else if (currentNow - lastStandbyLogMs >= 15 * 60 * 1000) {
-          lastStandbyLogMs = currentNow;
-          console.log(
-            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m.`,
-          );
-        }
-      } else if (wasInStandby) {
-        wasInStandby = false;
-        console.log(
-          `[PaperDaemon] [ACTIVE] Trading window active (${config.tradingSchedule.rawString})! Radar scanning and buy gates re-engaged.`,
-        );
-        addActivityLog(
-          "CONTROL",
-          `🟢 Trading window active (${config.tradingSchedule.rawString}). Radar scanning and buy gates re-engaged.`,
-        );
-      }
     }
 
     // 1. Tick Open Positions with Live DexScreener Prices
@@ -951,13 +1006,19 @@ async function run(): Promise<void> {
               );
 
               // Deliverable 2: Live Spot Liquidity Hard Floor at Execution Time & Verified Holder Floor
+              // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
+              const isViral =
+                candidate.liquidityUsd >= 30000 &&
+                candidate.marketCapUsd >= 150000 &&
+                candidate.assetAgeSeconds >= 900 &&
+                candidate.assetAgeSeconds <= 7200;
               const isCandidateEstablished =
-                candidate.liquidityUsd >= 50000 &&
-                candidate.assetAgeSeconds >= 1800 &&
+                ((candidate.liquidityUsd >= 50000 && candidate.assetAgeSeconds >= 1800) ||
+                  isViral) &&
                 candidate.assetAgeSeconds <= 7200 &&
                 rugMetrics?.holdersCount !== undefined &&
-                rugMetrics.holdersCount >= 250;
-              const requiredLiveLiq = isCandidateEstablished ? 50000 : 20000;
+                rugMetrics.holdersCount >= (isViral ? 1000 : 250);
+              const requiredLiveLiq = isCandidateEstablished ? (isViral ? 30000 : 50000) : 20000;
               if (spotInfo.liquidityUsd < requiredLiveLiq) {
                 if (armedPullbackCandidates.has(candidate.mintAddress)) {
                   armedPullbackCandidates.delete(candidate.mintAddress);
@@ -1005,13 +1066,20 @@ async function run(): Promise<void> {
               }
 
               // Deliverable 4: Established Token Age Ceiling (Max 2 Hours / 7,200s, Min 30m / 1,800s, Min 250 Holders)
+              // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
+              const isCandidateViral =
+                candidate.liquidityUsd >= 30000 &&
+                candidate.marketCapUsd >= 150000 &&
+                candidate.assetAgeSeconds >= 900 &&
+                candidate.assetAgeSeconds <= 7200;
               const isEstablished =
-                candidate.liquidityUsd >= 50000 &&
-                spotInfo.liquidityUsd >= 50000 &&
-                candidate.assetAgeSeconds >= 1800 &&
+                ((candidate.liquidityUsd >= 50000 &&
+                  spotInfo.liquidityUsd >= 50000 &&
+                  candidate.assetAgeSeconds >= 1800) ||
+                  (isCandidateViral && spotInfo.liquidityUsd >= 30000)) &&
                 candidate.assetAgeSeconds <= 7200 &&
                 rugMetrics?.holdersCount !== undefined &&
-                rugMetrics.holdersCount >= 250;
+                rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
 
               // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
               const armed = armedPullbackCandidates.get(candidate.mintAddress);
@@ -1333,8 +1401,11 @@ async function run(): Promise<void> {
       const currentSnap = daemon.getSnapshot();
       const watchingCount = isStandby ? 0 : watchlistService.getActiveWatchingItems().length;
       const statusPrefix = isStandby ? `[STANDBY (Next in ${minutesUntilNextWindow}m)] ` : "";
+      const elapsedLabel = config.tradingSchedule
+        ? `Active: ${(activeTradingMs / 60000).toFixed(1)}m (Wall: ${((currentNow - startMs) / 60000).toFixed(1)}m)`
+        : `Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m`;
       console.log(
-        `[PaperDaemon] [HEARTBEAT] ${statusPrefix}Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
+        `[PaperDaemon] [HEARTBEAT] ${statusPrefix}${elapsedLabel} | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
       );
     }
 

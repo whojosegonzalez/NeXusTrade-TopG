@@ -22,7 +22,8 @@ export type DaemonHaltReason =
   | "CONSECUTIVE_ERRORS_EXCEEDED"
   | "CLOCK_DRIFT_EXCEEDED"
   | "MANUAL_STOP"
-  | "DURATION_ELAPSED";
+  | "DURATION_ELAPSED"
+  | "SCHEDULE_WINDOW_CONCLUDED";
 
 export interface TradingScheduleConfig {
   readonly startMinutes: number;

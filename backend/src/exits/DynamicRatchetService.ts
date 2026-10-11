@@ -322,6 +322,44 @@ export class DynamicRatchetService {
       };
     }
 
+    // Phase 12.91 Deliverable 2: Unconfirmed Probe Quick-Cut
+    // If a probe (established or default cohort) has never demonstrated positive momentum (peak gain < +1.0% / 100 bps)
+    // and drops to <= -12.0% (-1200 bps), cut it immediately regardless of buyer flow.
+    const isProbeConfig = activeConfig.catastrophicFloorBps > -2000;
+    if (isProbeConfig && nextPeakGainBps < 100 && currentPnlBps <= -1200) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: "HARD_STOP",
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        "HARD_STOP",
+        "NORMAL",
+        null,
+        context,
+      );
+
+      return {
+        action: "SELL_ALL",
+        reasonCode: "PROBE_UNCONFIRMED_DUMP_CUT",
+        diagnostics,
+        updatedState,
+      };
+    }
+
     // Rule A: Catastrophic disaster hard floor (-20.0%) and flow-aware stop (-12.0% to -20.0%)
     if (currentPnlBps <= activeConfig.catastrophicFloorBps) {
       const updatedState: PositionRatchetState = {
