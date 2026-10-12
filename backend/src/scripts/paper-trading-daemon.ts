@@ -748,7 +748,7 @@ async function run(): Promise<void> {
             spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
           ).toFixed(6);
           const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
-          const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 25;
+          const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
           const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
           addActivityLog(
             "RATCHET",
