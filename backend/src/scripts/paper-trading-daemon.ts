@@ -761,16 +761,21 @@ async function run(): Promise<void> {
           );
         }
 
-        // Established Scale-In Pyramiding (Deliverable 1):
-        // If open position is ESTABLISHED, !pos.pyramided, pos.currentPnlBps >= 700 (+7.0% breakout confirmation),
-        // daemon portfolio cash > 0.5 SOL, and spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s:
+        // Phase 12.92 Deliverable 1: Momentum-Only Scale-In Pyramiding
+        // Only scale in if candidate exhibits genuine retail velocity (>= 15 buys/60s, >= 2.0x dominance, and >= +4% 5m momentum).
+        // Non-momentum runners remain at flat 0.50 SOL probe to prevent fakeout reversal losses.
+        const hasViralScaleInMomentum =
+          spotInfo.recentBuys60s >= 15 &&
+          spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
+          spotInfo.momentum5mBps >= 400;
+
         if (
           result?.action !== "SELL_ALL" &&
           pos.cohort === "ESTABLISHED" &&
           !pos.pyramided &&
           pos.currentPnlBps >= 700 &&
           daemon.getCurrentCashSol() > 0.5 &&
-          spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s
+          hasViralScaleInMomentum
         ) {
           const currentCash = daemon.getCurrentCashSol();
           const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
@@ -799,14 +804,14 @@ async function run(): Promise<void> {
 
         // Micro-Cap Scale-In Pyramiding:
         // If open position is MICRO_CAP, !pos.pyramided, pos.currentPnlBps >= 1000 (+10% Armed Breakeven),
-        // daemon portfolio cash > 0.5 SOL, and spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s:
+        // daemon portfolio cash > 0.5 SOL, and hasViralScaleInMomentum:
         if (
           result?.action !== "SELL_ALL" &&
           pos.cohort === "MICRO_CAP" &&
           !pos.pyramided &&
           pos.currentPnlBps >= 1000 &&
           daemon.getCurrentCashSol() > 0.5 &&
-          spotInfo.recentBuys60s >= 1.5 * spotInfo.recentSells60s
+          hasViralScaleInMomentum
         ) {
           const scaleInAmountSol = 0.25;
           const updatedPos = daemon.scaleInPosition(
@@ -1121,10 +1126,12 @@ async function run(): Promise<void> {
               };
               armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
 
-              // Cohort parameters for Retest Gate:
-              // Established: max 8% crater drop ceiling, 120s expiry, 4-8% pullback (1.15x flow), 3% consolidation (1.25x flow)
-              // Micro-Cap: max 15% crater drop ceiling, 90s expiry, 10-15% pullback (1.25x flow), 5% consolidation (1.5x flow)
-              const maxCraterDropPct = isEstablished ? 0.08 : 0.15;
+              // Cohort parameters for Retest Gate (Phase 12.92 Flow-Aware Retest Gate):
+              // Established: Flow-aware crater drop ceiling: 12% if buyers absorbing (>= 1.15x), 8% if unabsorbed.
+              // Micro-Cap: max 15% crater drop ceiling, 90s expiry.
+              const isFlowAbsorbing =
+                spotInfo.recentBuys60s >= 1.15 * Math.max(1, spotInfo.recentSells60s);
+              const maxCraterDropPct = isEstablished ? (isFlowAbsorbing ? 0.12 : 0.08) : 0.15;
               const maxExpiryMs = isEstablished ? 120_000 : 90_000;
 
               // Rule C: Plunged below crater threshold (anti-falling knife)
@@ -1197,9 +1204,9 @@ async function run(): Promise<void> {
               }
 
               // Rule A: Retest Pullback Discount with flow absorption
-              // Established: 4% to 8% pullback discount with recentBuys60s >= 1.15 * recentSells60s
+              // Established: 4% to 10% pullback discount with recentBuys60s >= 1.15 * recentSells60s
               // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
-              const minPullbackRatio = isEstablished ? 0.92 : 0.85;
+              const minPullbackRatio = isEstablished ? 0.9 : 0.85;
               const maxPullbackRatio = isEstablished ? 0.96 : 0.9;
               const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
 
@@ -1211,9 +1218,9 @@ async function run(): Promise<void> {
               const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
 
               // Rule B: Consolidation Breakout
-              // Established: within 3% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
+              // Established: within 4% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
               // Micro-Cap: within 5% of peak for >= 30s or >= 3 ticks with strong flow (>= 1.5 * sells)
-              const maxConsolidationDropPct = isEstablished ? 0.03 : 0.05;
+              const maxConsolidationDropPct = isEstablished ? 0.04 : 0.05;
               const minConsolidationFlowRatio = isEstablished ? 1.25 : 1.5;
 
               const isConsolidatingNearPeak =

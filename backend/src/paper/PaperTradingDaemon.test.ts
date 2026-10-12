@@ -467,7 +467,7 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.haltReason).toBe("PORTFOLIO_DRAWDOWN_BREACHED");
   });
 
-  it("forces stagnancy exit when a position has no activity for 5 minutes (300,000ms)", () => {
+  it("forces stagnancy exit when a position has no activity for 3 minutes (180,000ms)", () => {
     let currentClockMs = nowMs;
     const daemon = new PaperTradingDaemon({
       config: baseConfig,
@@ -478,8 +478,8 @@ describe("PaperTradingDaemon", () => {
     daemon.processScannedPool(validPool, currentClockMs);
     const pos = daemon.getSnapshot().openPositions[0]!;
 
-    // 4 minutes pass with stagnant ticks (no price change, zero transactions)
-    currentClockMs += 240_000;
+    // 2 minutes pass with stagnant ticks (no price change, zero transactions)
+    currentClockMs += 120_000;
     const midResult = daemon.tickPosition(
       pos.positionId,
       {
@@ -495,7 +495,7 @@ describe("PaperTradingDaemon", () => {
     expect(midResult?.action).toBe("HOLD");
     expect(daemon.getSnapshot().openPositions.length).toBe(1);
 
-    // 5 minutes total elapsed (300,000ms since opened/last activity)
+    // 3 minutes total elapsed (180,000ms since opened/last activity)
     currentClockMs += 60_000;
     const stagnancyResult = daemon.tickPosition(
       pos.positionId,
@@ -519,7 +519,7 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.closedTrades[0]?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
   });
 
-  it("forces stagnancy exit via recordStagnantTick when spot query returns null for 5 minutes", () => {
+  it("forces stagnancy exit via recordStagnantTick when spot query returns null for 3 minutes", () => {
     let currentClockMs = nowMs;
     const daemon = new PaperTradingDaemon({
       config: baseConfig,
@@ -530,13 +530,13 @@ describe("PaperTradingDaemon", () => {
     daemon.processScannedPool(validPool, currentClockMs);
     const pos = daemon.getSnapshot().openPositions[0]!;
 
-    // Spot queries fail for 4 minutes
-    currentClockMs += 240_000;
+    // Spot queries fail for 2 minutes
+    currentClockMs += 120_000;
     const closed1 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
     expect(closed1).toBeNull();
     expect(daemon.getSnapshot().openPositions.length).toBe(1);
 
-    // Spot queries fail at 5 minutes mark (>= 300,000ms)
+    // Spot queries fail at 3 minutes mark (>= 180,000ms)
     currentClockMs += 60_000;
     const closed2 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
     expect(closed2).toBeDefined();

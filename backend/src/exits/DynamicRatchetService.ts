@@ -155,7 +155,7 @@ export class DynamicRatchetService {
     if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps && !tier2ProfitTaken) {
       tier2ProfitTaken = true;
       nextTier = "TIER_2";
-      let trailBufferBps = 2500;
+      let trailBufferBps = 1800;
       if (nextPeakGainBps >= 20000) {
         trailBufferBps = 1000;
       } else if (nextPeakGainBps >= 10000) {
@@ -203,7 +203,7 @@ export class DynamicRatchetService {
     // Update active tier and floor if milestones were previously reached
     if (nextPeakGainBps >= activeConfig.tier2PeakThresholdBps || tier2ProfitTaken) {
       nextTier = "TIER_2";
-      let trailBufferBps = 2500;
+      let trailBufferBps = 1800;
       if (nextPeakGainBps >= 20000) {
         trailBufferBps = 1000;
       } else if (nextPeakGainBps >= 10000) {
@@ -322,11 +322,15 @@ export class DynamicRatchetService {
       };
     }
 
-    // Phase 12.91 Deliverable 2: Unconfirmed Probe Quick-Cut
-    // If a probe (established or default cohort) has never demonstrated positive momentum (peak gain < +1.0% / 100 bps)
-    // and drops to <= -12.0% (-1200 bps), cut it immediately regardless of buyer flow.
-    const isProbeConfig = activeConfig.catastrophicFloorBps > -2000;
-    if (isProbeConfig && nextPeakGainBps < 100 && currentPnlBps <= -1200) {
+    // Phase 12.92 Deliverable 2: Universal Unconfirmed Quick-Cut (-12%)
+    // Any token (Established or Micro-Cap) that has never demonstrated positive momentum (peak gain < +1.0% / 100 bps)
+    // and drops to <= -12.0% (-1200 bps) must cut immediately with PROBE_UNCONFIRMED_DUMP_CUT,
+    // unless high-velocity buyer absorption is actively absorbing the dip (buys >= 50 in 60s and buys >= 1.25 * sells).
+    const hasViralAbsorption =
+      context.recentBuysCount60s >= 50 &&
+      context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
+
+    if (nextPeakGainBps < 100 && currentPnlBps <= -1200 && !hasViralAbsorption) {
       const updatedState: PositionRatchetState = {
         ...state,
         peakPriceSol: nextPeakPriceSol,

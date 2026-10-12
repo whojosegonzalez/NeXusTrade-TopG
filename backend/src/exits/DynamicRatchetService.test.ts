@@ -569,10 +569,20 @@ describe("DynamicRatchetService", () => {
     expect(resultA.action).toBe("HOLD"); // Breathes through the wick!
     expect(resultA.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
 
-    // Scenario B: Unabsorbed sell pressure at -14.0% (5 buys vs 20 sells)
+    // Scenario B: Unabsorbed sell pressure at -14.0% (5 buys vs 20 sells) on a confirmed position
     const stateB = store.initPositionState("pos-flow-2", "mint-flow-2", 1.0, 1_000_000);
-    const resultB = service.evaluate(
+    const confirmedStateB = service.evaluate(
       stateB,
+      {
+        ...baseContext,
+        spotPriceSol: 1.02, // +2% confirmed peak
+        currentTimestampMs: 1_000_005,
+      },
+      MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+    ).updatedState;
+
+    const resultB = service.evaluate(
+      confirmedStateB,
       {
         ...baseContext,
         spotPriceSol: 0.86, // -14.0%
@@ -615,27 +625,27 @@ describe("DynamicRatchetService", () => {
     });
     expect(t1.action).toBe("SELL_PARTIAL_50");
 
-    // 2. Surge to +90.0% (9000 bps) -> Tier 2 triggered and trailing floor locks to 9000 - 2500 = 6500 bps (+65%)
+    // 2. Surge to +90.0% (9000 bps) -> Tier 2 triggered and trailing floor locks to 9000 - 1800 = 7200 bps (+72%)
     const runner = service.evaluate(t1.updatedState, {
       ...baseContext,
       spotPriceSol: 1.9, // +90.0%
       currentTimestampMs: 1_000_020,
     });
     expect(runner.action).toBe("SELL_PARTIAL_25");
-    expect(runner.updatedState.currentStopFloorBps).toBe(6500); // 90% - 25% = +65% floor!
+    expect(runner.updatedState.currentStopFloorBps).toBe(7200); // 90% - 18% = +72% floor!
 
-    // 3. Shallow pullback to +70.0% -> holds!
+    // 3. Shallow pullback to +75.0% -> holds!
     const pullback = service.evaluate(runner.updatedState, {
       ...baseContext,
-      spotPriceSol: 1.7, // +70.0% > 65.0% floor
+      spotPriceSol: 1.75, // +75.0% > 72.0% floor
       currentTimestampMs: 1_000_030,
     });
     expect(pullback.action).toBe("HOLD");
 
-    // 4. Drop to +64.0% (below +65.0% trailing moonbag floor) -> exits with RATCHET_TIER_2_BREACH
+    // 4. Drop to +71.0% (below +72.0% trailing moonbag floor) -> exits with RATCHET_TIER_2_BREACH
     const breach = service.evaluate(pullback.updatedState, {
       ...baseContext,
-      spotPriceSol: 1.64, // +64.0% <= 65.0% floor
+      spotPriceSol: 1.71, // +71.0% <= 72.0% floor
       currentTimestampMs: 1_000_040,
     });
     expect(breach.action).toBe("SELL_ALL");
@@ -754,7 +764,7 @@ describe("DynamicRatchetService", () => {
       });
       expect(t1.action).toBe("SELL_PARTIAL_50");
 
-      // 2. Surges to +60.0% (6000 bps) -> Tier 2 triggered with 25% buffer (floor = 6000 - 2500 = 3500 bps)
+      // 2. Surges to +60.0% (6000 bps) -> Tier 2 triggered with 18% buffer (floor = 6000 - 1800 = 4200 bps)
       const t2Initial = service.evaluate(t1.updatedState, {
         ...baseContext,
         spotPriceSol: 1.6,
@@ -762,7 +772,7 @@ describe("DynamicRatchetService", () => {
       });
       expect(t2Initial.action).toBe("SELL_PARTIAL_25");
       expect(t2Initial.updatedState.activeTier).toBe("TIER_2");
-      expect(t2Initial.updatedState.currentStopFloorBps).toBe(3500); // 6000 - 2500
+      expect(t2Initial.updatedState.currentStopFloorBps).toBe(4200); // 6000 - 1800
 
       // 3. Parabolic surge to +120.0% (12000 bps) -> Buffer tightens to 15% (1500 bps), floor = 12000 - 1500 = 10500 bps
       const t2Parabolic = service.evaluate(t2Initial.updatedState, {
@@ -903,7 +913,7 @@ describe("DynamicRatchetService", () => {
     });
   });
 
-  describe("Phase 12.91 Deliverable 2: Unconfirmed Probe Quick-Cut", () => {
+  describe("Phase 12.92 Deliverable 2: Universal Unconfirmed Quick-Cut", () => {
     it("immediately exits with PROBE_UNCONFIRMED_DUMP_CUT when peak gain < +1.0% and pnl drops to <= -12.0%, regardless of buyer flow", () => {
       const store = new RatchetStateStore();
       const service = new DynamicRatchetService({}, store);
@@ -928,6 +938,51 @@ describe("DynamicRatchetService", () => {
       expect(result.reasonCode).toBe("PROBE_UNCONFIRMED_DUMP_CUT");
       expect(result.diagnostics.currentPnlBps).toBe(-1250);
       expect(result.diagnostics.peakGainBps).toBe(0);
+    });
+
+    it("immediately exits micro-cap positions with PROBE_UNCONFIRMED_DUMP_CUT when pnl drops to <= -12.0% with zero peak gain (FDEBYP fix)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService(MICRO_CAP_DYNAMIC_RATCHET_CONFIG, store);
+      const state = store.initPositionState(
+        "pos-micro-fdebyp",
+        "mint-micro-fdebyp",
+        1.0,
+        1_000_000,
+      );
+
+      // Micro-cap drops to -12.5% with 0% peak gain -> cut immediately instead of bleeding to -25.9%!
+      const result = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.875,
+          recentBuysCount60s: 10,
+          recentSellsCount60s: 8,
+          currentTimestampMs: 1_000_015,
+        },
+        MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("PROBE_UNCONFIRMED_DUMP_CUT");
+      expect(result.diagnostics.currentPnlBps).toBe(-1250);
+    });
+
+    it("does not trigger PROBE_UNCONFIRMED_DUMP_CUT if extreme viral buyer absorption is active (>= 50 buys & >= 1.25x ratio)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-viral-1", "mint-viral-1", 1.0, 1_000_000);
+
+      // Drops to -12.5%, but massive absorption: 60 buys vs 30 sells (2.0x >= 1.25x and 60 >= 50)
+      const result = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 0.875,
+        recentBuysCount60s: 60,
+        recentSellsCount60s: 30,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(result.reasonCode).not.toBe("PROBE_UNCONFIRMED_DUMP_CUT");
     });
 
     it("does not trigger PROBE_UNCONFIRMED_DUMP_CUT if position previously demonstrated confirmed gain (peak gain >= 100 bps)", () => {

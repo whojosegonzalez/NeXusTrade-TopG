@@ -595,8 +595,8 @@ export class PaperTradingDaemon {
         position.stagnantTicksCount += 1;
       }
 
-      // If position has had no activity for >= 5 minutes (300,000ms), force stagnancy exit
-      if (now - position.lastActivityMs >= 300_000) {
+      // If position has had no activity for >= 3 minutes (180,000ms), force stagnancy exit
+      if (now - position.lastActivityMs >= 180_000) {
         const exitPriceSol = marketContext.spotPriceSol;
         const finalProceedsSol = position.tokensHeld * exitPriceSol;
         this.currentCashSol += finalProceedsSol;
@@ -764,8 +764,8 @@ export class PaperTradingDaemon {
     this.lastTickAtMs = now;
     position.stagnantTicksCount += 1;
 
-    // Check if inactivity has reached 5 minutes (300,000ms)
-    if (now - position.lastActivityMs >= 300_000) {
+    // Check if inactivity has reached 3 minutes (180,000ms)
+    if (now - position.lastActivityMs >= 180_000) {
       const exitPriceSol = position.spotPriceSol;
       const finalProceedsSol = position.tokensHeld * exitPriceSol;
       this.currentCashSol += finalProceedsSol;
