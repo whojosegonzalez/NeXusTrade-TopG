@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -24,6 +25,7 @@ try {
 import {
   PaperTradingDaemon,
   type PaperTradingDaemonConfig,
+  type UnresolvedPositionRecord,
   parseScheduleString,
   isWithinTradingSchedule,
 } from "../paper/PaperTradingDaemon.js";
@@ -314,9 +316,137 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
   }
 }
 
+export interface SettlementJournalEntry {
+  sessionId: string;
+  startedAtMs: number;
+  stage:
+    | "STARTED"
+    | "SESSION_FILE_WRITTEN"
+    | "PAST_SESSIONS_WRITTEN"
+    | "WALLET_SETTLED"
+    | "COMMITTED";
+  sessionSummary: HistoricalSessionSummary;
+  sessionNewRealizedPnlSol: number;
+  liquidCashSol: number;
+  initialPortfolioSol: number;
+  unresolvedPositions?: readonly UnresolvedPositionRecord[] | undefined;
+  reconciledPositionIds?: readonly string[] | undefined;
+}
+
+export function resolveJournalPath(): string {
+  if (existsSync(".tmp")) return ".tmp/settlement-journal.json";
+  if (existsSync("backend/.tmp")) return "backend/.tmp/settlement-journal.json";
+  return ".tmp/settlement-journal.json";
+}
+
+export function recoverSettlementJournal(): void {
+  const possiblePaths = [".tmp/settlement-journal.json", "backend/.tmp/settlement-journal.json"];
+  for (const journalPath of possiblePaths) {
+    if (!existsSync(journalPath)) continue;
+    try {
+      const raw = readFileSync(journalPath, "utf8");
+      const entry = JSON.parse(raw) as SettlementJournalEntry;
+      if (!entry || !entry.sessionId || entry.stage === "COMMITTED") {
+        try {
+          unlinkSync(journalPath);
+        } catch (err) {
+          void err;
+        }
+        continue;
+      }
+      console.warn(
+        `[PaperDaemon] [RECOVERY] Detected uncommitted settlement journal for session ${entry.sessionId} at stage ${entry.stage}. Replaying remaining settlement operations...`,
+      );
+
+      // Replay Stage 1: Individual session file
+      const sessionDir = existsSync(".tmp/sessions")
+        ? ".tmp/sessions"
+        : existsSync("backend/.tmp/sessions")
+          ? "backend/.tmp/sessions"
+          : ".tmp/sessions";
+      mkdirSync(sessionDir, { recursive: true });
+      const sessionFile = `${sessionDir}/${entry.sessionId}.json`;
+      if (!existsSync(sessionFile)) {
+        writeFileSync(sessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
+        console.log(
+          `[PaperDaemon] [RECOVERY] Replayed individual session file write: ${sessionFile}`,
+        );
+      }
+
+      // Replay Stage 2: past-sessions.json
+      const pastSessionsPath = existsSync(".tmp/past-sessions.json")
+        ? ".tmp/past-sessions.json"
+        : existsSync("backend/.tmp/past-sessions.json")
+          ? "backend/.tmp/past-sessions.json"
+          : ".tmp/past-sessions.json";
+      let pastSessions: HistoricalSessionSummary[] = [];
+      if (existsSync(pastSessionsPath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(pastSessionsPath, "utf8"));
+          if (Array.isArray(parsed)) pastSessions = parsed;
+        } catch (err) {
+          void err;
+        }
+      }
+      const existingIdx = pastSessions.findIndex((s) => s.sessionId === entry.sessionId);
+      if (existingIdx < 0) {
+        pastSessions = [entry.sessionSummary, ...pastSessions];
+        writeFileSync(pastSessionsPath, JSON.stringify(pastSessions, null, 2), "utf8");
+        console.log(
+          `[PaperDaemon] [RECOVERY] Replayed past-sessions.json update for session ${entry.sessionId}`,
+        );
+      }
+
+      // Replay Stage 3: Virtual wallet settlement
+      const wallet = loadVirtualWallet();
+      if (!wallet.settledSessionIds?.includes(entry.sessionId)) {
+        const settled = settleSessionInWallet(
+          wallet,
+          entry.sessionId,
+          entry.liquidCashSol,
+          entry.initialPortfolioSol,
+          Date.now(),
+          entry.unresolvedPositions,
+          entry.sessionNewRealizedPnlSol,
+          entry.reconciledPositionIds,
+        );
+        if (settled) {
+          saveVirtualWallet(wallet);
+          console.log(
+            `[PaperDaemon] [RECOVERY] Replayed virtual wallet settlement for session ${entry.sessionId}`,
+          );
+        }
+      }
+
+      // Mark COMMITTED and clean up
+      entry.stage = "COMMITTED";
+      try {
+        writeFileSync(journalPath, JSON.stringify(entry, null, 2), "utf8");
+        unlinkSync(journalPath);
+      } catch (err) {
+        void err;
+      }
+      console.log(
+        `[PaperDaemon] [RECOVERY] Successfully resolved and committed settlement for session ${entry.sessionId}`,
+      );
+    } catch (recoveryErr) {
+      console.error(
+        `[PaperDaemon] [FATAL] Failed to recover settlement journal at ${journalPath}:`,
+        recoveryErr,
+      );
+      throw new Error(
+        `[PaperDaemon] [FATAL] Unresolved settlement journal inconsistency for session at ${journalPath}. Startup aborted to fail closed and protect ledger integrity.`,
+      );
+    }
+  }
+}
+
 async function run(): Promise<void> {
   const config = parseCliArgs();
   console.log(`[PaperDaemon] Starting Paper Trading Daemon Session: ${config.sessionId}`);
+
+  // D7-03: Recover any uncommitted settlement journals before starting session
+  recoverSettlementJournal();
   console.log(
     `[PaperDaemon] [STARTUP_CONFIG] Session=${config.sessionId} | InitialPortfolio=${config.initialPortfolioSol.toFixed(4)} SOL | PositionSize=${config.positionSizeSol} SOL | MaxOpenPositions=${config.maxOpenPositions} | MaxDrawdownBps=${config.maxPortfolioDrawdownBps} bps (${(config.maxPortfolioDrawdownBps / 100).toFixed(1)}%) | Uninterrupted=${config.uninterruptedResearchMode ? "ENABLED" : "DISABLED"} | Cooldown=${((config.antiRebuyCooldownMs ?? 0) / 60000).toFixed(0)}m | Schedule=${config.tradingSchedule ? config.tradingSchedule.rawString : "NONE"}`,
   );
@@ -498,11 +628,49 @@ async function run(): Promise<void> {
         missedOpportunitiesCount: report.missedWinnersCount,
       });
 
+      const liquidCashSol =
+        snap.currentCashSol ??
+        snap.currentPortfolioSol -
+          snap.openPositions.reduce((acc, p) => acc + p.tokensHeld * p.spotPriceSol, 0);
+      const reconciledIds = snap.closedTrades
+        .filter(
+          (t) =>
+            t.exitReason === "MANUAL_RECONCILIATION" || t.exitReason.includes("RECONCILIATION"),
+        )
+        .map((t) => t.positionId);
+
+      // 0. Initialize Settlement Journal (D7-03)
+      const journalPath = resolveJournalPath();
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: config.sessionId,
+        startedAtMs: nowMs(),
+        stage: "STARTED",
+        sessionSummary: summary,
+        sessionNewRealizedPnlSol: snap.sessionNewRealizedPnlSol,
+        liquidCashSol,
+        initialPortfolioSol: config.initialPortfolioSol,
+        unresolvedPositions: snap.unresolvedPositions,
+        reconciledPositionIds: reconciledIds,
+      };
+      const updateJournal = (stage: SettlementJournalEntry["stage"]) => {
+        journalEntry.stage = stage;
+        try {
+          writeFileSync(journalPath, JSON.stringify(journalEntry, null, 2), "utf8");
+        } catch (err) {
+          console.error(
+            `[PaperDaemon] [JOURNAL_ERROR] Failed to record journal stage ${stage}:`,
+            err,
+          );
+        }
+      };
+      updateJournal("STARTED");
+
       // 1. Write individual session JSON atomically (P0-3)
       const sessionFile = `.tmp/sessions/${config.sessionId}.json`;
       const tempSessionFile = `${sessionFile}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
       writeFileSync(tempSessionFile, JSON.stringify(summary, null, 2), "utf8");
       renameSync(tempSessionFile, sessionFile);
+      updateJournal("SESSION_FILE_WRITTEN");
 
       // 2. Read, update, and write past-sessions.json atomically (P0-3 & P0-R4)
       let pastSessions: HistoricalSessionSummary[] = [];
@@ -547,21 +715,12 @@ async function run(): Promise<void> {
       const tempPastSessionsPath = `${pastSessionsPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
       writeFileSync(tempPastSessionsPath, JSON.stringify(pastSessions, null, 2), "utf8");
       renameSync(tempPastSessionsPath, pastSessionsPath);
+      updateJournal("PAST_SESSIONS_WRITTEN");
       console.log(
         `[PaperDaemon] Archived session summary to ${sessionFile} and updated ${pastSessionsPath}`,
       );
 
-      // 3. Update Continuous Virtual Wallet (Idempotent settlement: P0-C & P0-1)
-      const liquidCashSol =
-        snap.currentCashSol ??
-        snap.currentPortfolioSol -
-          snap.openPositions.reduce((acc, p) => acc + p.tokensHeld * p.spotPriceSol, 0);
-      const reconciledIds = snap.closedTrades
-        .filter(
-          (t) =>
-            t.exitReason === "MANUAL_RECONCILIATION" || t.exitReason.includes("RECONCILIATION"),
-        )
-        .map((t) => t.positionId);
+      // 3. Update Continuous Virtual Wallet (Idempotent settlement: P0-C, P0-1, & D7-01 incremental realized P&L)
       const wallet = loadVirtualWallet();
       const settled = settleSessionInWallet(
         wallet,
@@ -570,7 +729,7 @@ async function run(): Promise<void> {
         config.initialPortfolioSol,
         nowMs(),
         snap.unresolvedPositions,
-        snap.totalRealizedPnlSol,
+        snap.sessionNewRealizedPnlSol,
         reconciledIds,
       );
       if (settled) {
@@ -583,9 +742,20 @@ async function run(): Promise<void> {
           `[PaperDaemon] Continuous Virtual Wallet already settled for session ${config.sessionId}. Skipping duplicate balance update.`,
         );
       }
+      updateJournal("WALLET_SETTLED");
+
+      // 4. Mark COMMITTED and clean up
+      updateJournal("COMMITTED");
+      try {
+        unlinkSync(journalPath);
+      } catch (err) {
+        void err;
+      }
+
       archived = true;
     } catch (archiveErr) {
       console.error("[PaperDaemon] Failed to archive session summary:", archiveErr);
+      throw archiveErr;
     }
   };
 
@@ -612,8 +782,16 @@ async function run(): Promise<void> {
     console.log(
       `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length} | Unresolved Positions: ${snap.unresolvedPositions?.length ?? 0}`,
     );
-    persistState(true);
-    archiveSession();
+    try {
+      persistState(true);
+      archiveSession();
+    } catch (shutdownErr) {
+      console.error(
+        "[PaperDaemon] [FATAL] Persistence or archive failed during shutdown:",
+        shutdownErr,
+      );
+      process.exit(1);
+    }
     const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
     console.log(
       `[PaperDaemon] Counterfactual Summary: Observed=${report.totalCandidatesObserved}, Executed=${report.executedBuysCount}, MissedWinners=${report.missedWinnersCount}, AvoidedRugs=${report.avoidedRugsCount}`,
@@ -1573,8 +1751,16 @@ async function run(): Promise<void> {
 
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);
-  persistState(true);
-  archiveSession();
+  try {
+    persistState(true);
+    archiveSession();
+  } catch (finalArchiveErr) {
+    console.error(
+      "[PaperDaemon] [FATAL] Persistence or archive failed at session completion:",
+      finalArchiveErr,
+    );
+    process.exit(1);
+  }
   const finalReport = tracker.generateReport(
     config.initialPortfolioSol,
     finalSnap.currentPortfolioSol,

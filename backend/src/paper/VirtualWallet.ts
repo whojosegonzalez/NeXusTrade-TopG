@@ -14,6 +14,7 @@ export interface UnresolvedTokenInventory {
   readonly lastObservedAtMs: number;
   readonly reasonForMissingData: string;
   readonly sessionId: string;
+  readonly estimatedLiquidationSol?: number | undefined;
 }
 
 export interface VirtualWalletState {
@@ -138,6 +139,19 @@ export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: strin
   const payload = JSON.stringify(wallet, null, 2);
   writeFileSync(tempPath, payload, "utf8");
   renameSync(tempPath, primaryPath);
+
+  // Best-effort synchronization between repo root .tmp and backend/.tmp
+  try {
+    const isBackend = primaryPath.includes("backend");
+    const mirrorPath = isBackend
+      ? primaryPath.replace(/backend[\\/]\.tmp/, ".tmp")
+      : path.join(path.dirname(primaryPath), "backend", ".tmp", path.basename(primaryPath));
+    if (mirrorPath !== primaryPath && existsSync(path.dirname(mirrorPath))) {
+      writeFileSync(mirrorPath, payload, "utf8");
+    }
+  } catch {
+    // mirror sync is best-effort
+  }
 }
 
 export function settleSessionInWallet(
@@ -169,7 +183,7 @@ export function settleSessionInWallet(
   wallet.settledSessionIds.push(sessionId);
   wallet.currentBalanceSol = Number(finalCashSol.toFixed(4));
 
-  // P0-1: Settle realized P&L strictly from closed trades.
+  // P0-1: Settle realized P&L strictly from closed trades and incremental session gains.
   // Do not book unsold unresolved tokens as realized loss!
   const netRealizedPnlSol =
     sessionRealizedPnlSol !== undefined
@@ -184,7 +198,7 @@ export function settleSessionInWallet(
   if (reconciledPositionIds && reconciledPositionIds.length > 0) {
     const reconciledSet = new Set(reconciledPositionIds);
     wallet.unresolvedTokens = wallet.unresolvedTokens.filter(
-      (t) => !reconciledSet.has(t.positionId),
+      (t) => !reconciledSet.has(t.positionId) && !reconciledSet.has(t.mintAddress),
     );
   }
 
@@ -205,6 +219,9 @@ export function settleSessionInWallet(
         lastObservedAtMs: pos.lastObservedAtMs,
         reasonForMissingData: pos.reasonForMissingData,
         sessionId: (pos as { sessionId?: string }).sessionId ?? sessionId,
+        ...("estimatedLiquidationSol" in pos && typeof pos.estimatedLiquidationSol === "number"
+          ? { estimatedLiquidationSol: pos.estimatedLiquidationSol }
+          : {}),
       };
       if (existingIdx >= 0) {
         wallet.unresolvedTokens[existingIdx] = inventoryItem;
@@ -217,4 +234,166 @@ export function settleSessionInWallet(
   wallet.totalSessionsCompleted += 1;
   wallet.lastUpdatedMs = nowMsTimestamp ?? Date.now();
   return true;
+}
+
+export interface ReconcileWalletOptions {
+  identifier: string; // positionId or mintAddress
+  operationType: "SIMULATED_SALE" | "WRITE_DOWN" | "FINAL_DISPOSAL";
+  exitPriceSol?: number;
+  writeDownEstimatedSol?: number;
+  reason?: string;
+  nowMsTimestamp?: number;
+}
+
+export interface ReconcileWalletResult {
+  operationType: "SIMULATED_SALE" | "WRITE_DOWN" | "FINAL_DISPOSAL";
+  matchedPosition: UnresolvedTokenInventory;
+  proceedsSol: number;
+  incrementalPnlSol: number;
+  updatedWallet: VirtualWalletState;
+  auditRecord: {
+    timestamp: number;
+    sessionId?: string | undefined;
+    positionId: string;
+    mintAddress: string;
+    symbol?: string | undefined;
+    tokensHeld: number;
+    costBasisSol: number;
+    operationType: string;
+    exitPriceSol?: number | undefined;
+    proceedsSol: number;
+    incrementalPnlSol: number;
+    reason: string;
+    previousBalanceSol: number;
+    newBalanceSol: number;
+    previousAllTimePnlSol: number;
+    newAllTimePnlSol: number;
+  };
+}
+
+export function reconcileWalletInventory(
+  wallet: VirtualWalletState,
+  options: ReconcileWalletOptions,
+): ReconcileWalletResult {
+  wallet.unresolvedTokens = wallet.unresolvedTokens ?? [];
+  const idx = wallet.unresolvedTokens.findIndex(
+    (t) => t.positionId === options.identifier || t.mintAddress === options.identifier,
+  );
+  if (idx < 0) {
+    throw new Error(
+      `[VirtualWallet] No unresolved position found for identifier '${options.identifier}'`,
+    );
+  }
+  const pos = wallet.unresolvedTokens[idx]!;
+  const now = options.nowMsTimestamp ?? Date.now();
+  const prevBalance = wallet.currentBalanceSol;
+  const prevPnl = wallet.allTimeRealizedPnlSol;
+
+  if (options.operationType === "WRITE_DOWN") {
+    const updatedEst = Math.max(0, options.writeDownEstimatedSol ?? 0);
+    wallet.unresolvedTokens[idx] = {
+      ...pos,
+      estimatedLiquidationSol: updatedEst,
+      lastObservedAtMs: now,
+    };
+    wallet.lastUpdatedMs = now;
+    return {
+      operationType: "WRITE_DOWN",
+      matchedPosition: pos,
+      proceedsSol: 0,
+      incrementalPnlSol: 0,
+      updatedWallet: wallet,
+      auditRecord: {
+        timestamp: now,
+        sessionId: pos.sessionId,
+        positionId: pos.positionId,
+        mintAddress: pos.mintAddress,
+        symbol: pos.symbol,
+        tokensHeld: pos.tokensHeld,
+        costBasisSol: pos.costBasisSol,
+        operationType: "WRITE_DOWN",
+        proceedsSol: 0,
+        incrementalPnlSol: 0,
+        reason: options.reason ?? "Manual valuation adjustment / write-down",
+        previousBalanceSol: prevBalance,
+        newBalanceSol: prevBalance,
+        previousAllTimePnlSol: prevPnl,
+        newAllTimePnlSol: prevPnl,
+      },
+    };
+  }
+
+  if (options.operationType === "FINAL_DISPOSAL") {
+    const incrementalPnlSol = Number((-pos.costBasisSol).toFixed(4));
+    wallet.allTimeRealizedPnlSol = Number(
+      (wallet.allTimeRealizedPnlSol + incrementalPnlSol).toFixed(4),
+    );
+    wallet.unresolvedTokens.splice(idx, 1);
+    wallet.lastUpdatedMs = now;
+    return {
+      operationType: "FINAL_DISPOSAL",
+      matchedPosition: pos,
+      proceedsSol: 0,
+      incrementalPnlSol,
+      updatedWallet: wallet,
+      auditRecord: {
+        timestamp: now,
+        sessionId: pos.sessionId,
+        positionId: pos.positionId,
+        mintAddress: pos.mintAddress,
+        symbol: pos.symbol,
+        tokensHeld: pos.tokensHeld,
+        costBasisSol: pos.costBasisSol,
+        operationType: "FINAL_DISPOSAL",
+        proceedsSol: 0,
+        incrementalPnlSol,
+        reason: options.reason ?? "Permanent disposal / abandonment",
+        previousBalanceSol: prevBalance,
+        newBalanceSol: prevBalance,
+        previousAllTimePnlSol: prevPnl,
+        newAllTimePnlSol: wallet.allTimeRealizedPnlSol,
+      },
+    };
+  }
+
+  // SIMULATED_SALE
+  const exitPriceSol = options.exitPriceSol ?? 0;
+  if (exitPriceSol <= 0 || !Number.isFinite(exitPriceSol)) {
+    throw new Error(`[VirtualWallet] Invalid exitPriceSol ${exitPriceSol} for simulated sale`);
+  }
+  const proceedsSol = Number((pos.tokensHeld * exitPriceSol).toFixed(4));
+  const incrementalPnlSol = Number((proceedsSol - pos.costBasisSol).toFixed(4));
+
+  wallet.currentBalanceSol = Number((wallet.currentBalanceSol + proceedsSol).toFixed(4));
+  wallet.allTimeRealizedPnlSol = Number(
+    (wallet.allTimeRealizedPnlSol + incrementalPnlSol).toFixed(4),
+  );
+  wallet.unresolvedTokens.splice(idx, 1);
+  wallet.lastUpdatedMs = now;
+
+  return {
+    operationType: "SIMULATED_SALE",
+    matchedPosition: pos,
+    proceedsSol,
+    incrementalPnlSol,
+    updatedWallet: wallet,
+    auditRecord: {
+      timestamp: now,
+      sessionId: pos.sessionId,
+      positionId: pos.positionId,
+      mintAddress: pos.mintAddress,
+      symbol: pos.symbol,
+      tokensHeld: pos.tokensHeld,
+      costBasisSol: pos.costBasisSol,
+      operationType: "SIMULATED_SALE",
+      exitPriceSol,
+      proceedsSol,
+      incrementalPnlSol,
+      reason: options.reason ?? "Simulated operator sale",
+      previousBalanceSol: prevBalance,
+      newBalanceSol: wallet.currentBalanceSol,
+      previousAllTimePnlSol: prevPnl,
+      newAllTimePnlSol: wallet.allTimeRealizedPnlSol,
+    },
+  };
 }

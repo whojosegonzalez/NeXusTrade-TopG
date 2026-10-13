@@ -251,6 +251,15 @@ export type DaemonStatus =
   | "STOPPED"
   | "HALTED";
 
+export interface ReconciliationOptions {
+  readonly exitPriceSol?: number | undefined;
+  readonly nowTimestampMs?: number | undefined;
+  readonly exitReason?: string | undefined;
+  readonly operationType?: "SIMULATED_SALE" | "WRITE_DOWN" | "FINAL_DISPOSAL" | undefined;
+  readonly writeDownEstimatedSol?: number | undefined;
+  readonly disposalReason?: string | undefined;
+}
+
 export interface PaperTradingDaemonSnapshot {
   readonly sessionId: string;
   readonly status: DaemonStatus;
@@ -263,6 +272,7 @@ export interface PaperTradingDaemonSnapshot {
   readonly unresolvedCostBasisSol?: number | undefined;
   readonly currentPortfolioSol: number;
   readonly totalRealizedPnlSol: number;
+  readonly sessionNewRealizedPnlSol: number;
   readonly totalUnrealizedPnlSol: number;
   readonly maxOpenPositions: number;
   readonly consecutiveErrorCount: number;
@@ -296,6 +306,7 @@ export class PaperTradingDaemon {
   private lastTickAtMs: number;
 
   private currentCashSol: number;
+  private sessionNewRealizedPnlSol = 0;
   private readonly openPositions = new Map<string, PaperPosition>();
   private readonly closedTrades: ClosedTradeRecord[] = [];
   private readonly unresolvedPositions: UnresolvedPositionRecord[] = [];
@@ -398,6 +409,10 @@ export class PaperTradingDaemon {
 
   getCurrentCashSol(): number {
     return this.currentCashSol;
+  }
+
+  getSessionNewRealizedPnlSol(): number {
+    return Number(this.sessionNewRealizedPnlSol.toFixed(6));
   }
 
   scaleInPosition(
@@ -539,17 +554,89 @@ export class PaperTradingDaemon {
   }
 
   reconcileUnresolvedPosition(
-    mintAddress: string,
-    exitPriceSol: number,
+    identifier: string,
+    exitPriceOrOptions?: number | ReconciliationOptions,
     nowTimestampMs?: number,
     exitReason = "MANUAL_RECONCILIATION",
   ): ClosedTradeRecord | null {
-    const idx = this.unresolvedPositions.findIndex((p) => p.mintAddress === mintAddress);
+    const idx = this.unresolvedPositions.findIndex(
+      (p) => p.positionId === identifier || p.mintAddress === identifier,
+    );
     if (idx < 0) return null;
     const unresolved = this.unresolvedPositions[idx]!;
-    const now = nowTimestampMs ?? this.clock();
-    this.lastTickAtMs = now;
 
+    let options: ReconciliationOptions;
+    if (typeof exitPriceOrOptions === "number") {
+      options = {
+        exitPriceSol: exitPriceOrOptions,
+        nowTimestampMs,
+        exitReason,
+        operationType: "SIMULATED_SALE",
+      };
+    } else if (exitPriceOrOptions && typeof exitPriceOrOptions === "object") {
+      options = exitPriceOrOptions;
+    } else {
+      return null;
+    }
+
+    const now = options.nowTimestampMs ?? this.clock();
+    this.lastTickAtMs = now;
+    const operationType = options.operationType ?? "SIMULATED_SALE";
+
+    if (operationType === "WRITE_DOWN") {
+      // Adjust estimated valuation without removing inventory or claiming tokens were sold
+      const updatedEstimatedSol = Math.max(0, options.writeDownEstimatedSol ?? 0);
+      this.unresolvedPositions[idx] = {
+        ...unresolved,
+        estimatedLiquidationSol: updatedEstimatedSol,
+        lastObservedAtMs: now,
+      };
+      return null;
+    }
+
+    if (operationType === "FINAL_DISPOSAL") {
+      // Explicit write-off/abandonment (e.g. rug pull, permanently untradeable)
+      const reason = options.disposalReason
+        ? `FINAL_DISPOSAL_${options.disposalReason}`
+        : (options.exitReason ?? "FINAL_DISPOSAL");
+      const totalCostBasisSol = unresolved.initialCostBasisSol ?? unresolved.costBasisSol;
+      const totalProceedsSol = unresolved.realizedProceedsSol ?? 0;
+      const realizedPnlSol = Number((totalProceedsSol - totalCostBasisSol).toFixed(6));
+      const realizedPnlBps = -10_000;
+
+      // Incremental PnL in this session relieves the remaining cost basis as a loss:
+      const incrementalPnlSol = -unresolved.costBasisSol;
+      this.sessionNewRealizedPnlSol += incrementalPnlSol;
+
+      const closedRecord: ClosedTradeRecord = {
+        positionId: unresolved.positionId,
+        mintAddress: unresolved.mintAddress,
+        entryPriceSol: unresolved.lastObservedPriceSol,
+        exitPriceSol: 0,
+        costBasisSol: totalCostBasisSol,
+        proceedsSol: totalProceedsSol,
+        realizedPnlSol,
+        realizedPnlBps,
+        peakGainBps: 0,
+        exitReason: reason,
+        openedAtMs: unresolved.lastObservedAtMs,
+        closedAtMs: now,
+        finalTier: unresolved.tier2ProfitTaken
+          ? "TIER_2"
+          : unresolved.tier1ProfitTaken
+            ? "TIER_1"
+            : "BASELINE",
+        ...(unresolved.symbol !== undefined ? { symbol: unresolved.symbol } : {}),
+      };
+
+      this.closedTrades.push(closedRecord);
+      this.unresolvedPositions.splice(idx, 1);
+      this.exitCooldowns.delete(unresolved.mintAddress);
+      return closedRecord;
+    }
+
+    // SIMULATED_SALE
+    const exitPriceSol = options.exitPriceSol ?? 0;
     if (exitPriceSol <= 0 || !Number.isFinite(exitPriceSol)) {
       return null;
     }
@@ -567,6 +654,10 @@ export class PaperTradingDaemon {
     const realizedPnlSol = Number((totalProceedsSol - totalCostBasisSol).toFixed(6));
     const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
+    // Incremental PnL recognized in this active session:
+    const incrementalPnlSol = finalProceedsSol - unresolved.costBasisSol;
+    this.sessionNewRealizedPnlSol += incrementalPnlSol;
+
     const closedRecord: ClosedTradeRecord = {
       positionId: unresolved.positionId,
       mintAddress: unresolved.mintAddress,
@@ -577,7 +668,7 @@ export class PaperTradingDaemon {
       realizedPnlSol,
       realizedPnlBps,
       peakGainBps: Math.max(realizedPnlBps, 0),
-      exitReason,
+      exitReason: options.exitReason ?? "MANUAL_RECONCILIATION",
       openedAtMs: unresolved.lastObservedAtMs,
       closedAtMs: now,
       finalTier: unresolved.tier2ProfitTaken
@@ -590,7 +681,7 @@ export class PaperTradingDaemon {
 
     this.closedTrades.push(closedRecord);
     this.unresolvedPositions.splice(idx, 1);
-    this.exitCooldowns.delete(mintAddress);
+    this.exitCooldowns.delete(unresolved.mintAddress);
 
     return closedRecord;
   }
@@ -614,6 +705,10 @@ export class PaperTradingDaemon {
     const now = nowTimestampMs ?? this.clock();
     const finalProceedsSol = position.tokensHeld * exitPriceSol;
     this.currentCashSol += finalProceedsSol;
+
+    // Incremental PnL recognized in this active session:
+    const incrementalPnlSol = finalProceedsSol - position.costBasisSol;
+    this.sessionNewRealizedPnlSol += incrementalPnlSol;
 
     const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
     const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
@@ -710,6 +805,7 @@ export class PaperTradingDaemon {
       unresolvedCostBasisSol,
       currentPortfolioSol,
       totalRealizedPnlSol,
+      sessionNewRealizedPnlSol: Number(this.sessionNewRealizedPnlSol.toFixed(6)),
       totalUnrealizedPnlSol,
       maxOpenPositions: this.config.maxOpenPositions,
       consecutiveErrorCount: this.consecutiveErrorCount,
@@ -877,6 +973,9 @@ export class PaperTradingDaemon {
         const finalProceedsSol = position.tokensHeld * exitPriceSol;
         this.currentCashSol += finalProceedsSol;
 
+        const incrementalPnlSol = finalProceedsSol - position.costBasisSol;
+        this.sessionNewRealizedPnlSol += incrementalPnlSol;
+
         const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
         const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
         const totalTokensSold = position.initialTokensHeld ?? position.tokensHeld;
@@ -971,6 +1070,7 @@ export class PaperTradingDaemon {
           position.costBasisSol -= costRelievedSol;
           position.realizedProceedsSol = (position.realizedProceedsSol ?? 0) + proceedsSol;
           this.currentCashSol += proceedsSol;
+          this.sessionNewRealizedPnlSol += proceedsSol - costRelievedSol;
         }
       } else if (result.action === "SELL_PARTIAL_25") {
         position.tier2ProfitTaken = true;
@@ -984,11 +1084,15 @@ export class PaperTradingDaemon {
           position.costBasisSol -= costRelievedSol;
           position.realizedProceedsSol = (position.realizedProceedsSol ?? 0) + proceedsSol;
           this.currentCashSol += proceedsSol;
+          this.sessionNewRealizedPnlSol += proceedsSol - costRelievedSol;
         }
       } else if (result.action === "SELL_ALL") {
         const exitPriceSol = marketContext.spotPriceSol;
         const finalProceedsSol = position.tokensHeld * exitPriceSol;
         this.currentCashSol += finalProceedsSol;
+
+        const incrementalPnlSol = finalProceedsSol - position.costBasisSol;
+        this.sessionNewRealizedPnlSol += incrementalPnlSol;
 
         const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
         const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;
@@ -1096,6 +1200,9 @@ export class PaperTradingDaemon {
       const exitPriceSol = spotPrice;
       const finalProceedsSol = position.tokensHeld * exitPriceSol;
       this.currentCashSol += finalProceedsSol;
+
+      const incrementalPnlSol = finalProceedsSol - position.costBasisSol;
+      this.sessionNewRealizedPnlSol += incrementalPnlSol;
 
       const totalProceedsSol = (position.realizedProceedsSol ?? 0) + finalProceedsSol;
       const totalCostBasisSol = position.initialCostBasisSol ?? position.costBasisSol;

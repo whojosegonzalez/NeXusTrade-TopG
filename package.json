@@ -32,6 +32,7 @@
     "lint": "eslint .",
     "paper:daemon": "pnpm --filter @nexustrade/backend trading:paper-daemon",
     "paper:execute": "pnpm --filter @nexustrade/backend paper:execute",
+    "paper:reconcile": "pnpm --filter @nexustrade/backend paper:reconcile",
     "paper:sell": "pnpm --filter @nexustrade/backend paper:sell",
     "prepare": "husky",
     "providers:smoke": "pnpm --filter @nexustrade/backend providers:smoke",
