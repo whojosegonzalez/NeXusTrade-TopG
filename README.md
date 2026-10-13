@@ -193,7 +193,32 @@ Phase 12 adds a 3-page interactive visual control plane and quantitative two-sta
 ### 2. Strategy Radar & Buy Gate Funnel
 
 - **Stage 1 (Watchlist Radar)**: Screener admitting baseline safe pairs (liquidity $\ge \$2,500$, LP burn $\ge 90\%$, txns $\ge 10$) and auto-evicting stagnant pairs ($> 20\text{m}$).
-- **Stage 2 (Buy Gate Confirmation)**: Confirms 5 quantitative signals (maturity age 5m–15m, depth balance $0.15 \le \text{L/MC} \le 0.30$, flow absorption $\text{Buys} \ge 1.5 \times \text{Sells}$, volume surge $\ge \$2,500$, dev dump protection $\le 5\%$) before triggering simulated buys.
+- **Stage 2 (Buy Gate Confirmation)**: Confirms quantitative signals (maturity age, depth balance $0.15 \le \text{L/MC} \le 0.30$, flow absorption $\text{Buys} \ge 1.5 \times \text{Sells}$, volume surge, dev dump protection $\le 5\%$, retest pullback) before triggering simulated buys.
+
+## Phase 12.80–12.89: Dual-Cohort Architecture & Sizing Automation
+
+- **Dual-Cohort Bifurcation**:
+  - **Established Runners**: $\text{Liquidity} \ge \$50,000$, $\text{Age} \ge 30\text{m}$, $\text{Holders} \ge 250$. Base probe: $0.50\text{ SOL}$.
+  - **Micro-Cap Probes**: $\text{Liquidity} \ge \$20,000$, $\text{Age} \ge 5\text{m}$, $\text{Holders} \ge 100$. Base probe: $0.35\text{ SOL}$.
+- **Scale-In Pyramiding**: Adds $+100\%$ size when position confirms with $+7.0\%$ gain, strong volume, and $\text{Buys} \ge 1.5 \times \text{Sells}$.
+- **Retest Pullback Gate**: Requires $5.0\%$ to $12.0\%$ discount pullback from peak with buyer absorption ($\ge 1.2\times$) to prevent top-buying.
+- **Fail-Closed Security**: RugCheck holder verification required across all cohorts, hardcoded symbol blacklist (`TEST`, `PUMP`, etc.), and anti-cabal wash-trading filters.
+
+## Phase 12.90–12.92: Chrono-Regime Scheduler & Continuous Virtual Wallet
+
+- **Chrono-Regime Scheduler**: Launch automated daily or weekly trading windows via `--schedule "HH:mm-HH:mm[:TZ]"` (e.g., `--schedule "07:00-18:00:PDT"`). Manages automated startup, hourly heartbeats, and end-of-window orderly cashout.
+- **Continuous Virtual Wallet**: Preserves virtual balance, all-time PnL, and session history across restarts (`.tmp/virtual-wallet.json`), compounding gains realistically across sessions.
+- **Observation Analytics Engine (`pnpm daemon:analytics`)**: Analyzes all candidates observed during a run, tracking executed buys, counterfactual missed winners ($\ge +15\%$), and avoided rugs ($\le -30\%$) with filter attribution.
+
+## Phase 12.93: Turbo-Defense & Execution Hardening
+
+Phase 12.93 hardens the execution loop against discrete liquidity gap drops:
+
+1. **Moonbag Capital-Preservation Guarantee**: After Tier 1 (+20%) is taken and 50% profit realized, if the remaining moonbag drops below $-2.0\%$ of cost basis, it exits immediately (`MOONBAG_PROTECTION_EXIT`), guaranteeing the trade closes net green ($+0.09\text{ SOL}$ minimum net gain on $1.0\text{ SOL}$).
+2. **Scaled-In Breakeven Blended Shield**: Pyramided trades instantly arm breakeven on blended cost basis, exiting at $0.0\%$ (`SCALED_BREAKEVEN_EXIT`) if momentum fades.
+3. **Universal Strict Pre-Breakeven Cut**: Exits any unconfirmed position dropping $\le -12.0\%$ (`UNCONFIRMED_PRE_BREAKEVEN_CUT`) regardless of peak gain, cutting illiquid bleeders early.
+4. **1500ms Parallel High-Frequency Poller**: Decouples open position monitoring (1500ms ticker via `Promise.all`) from discovery scanning (5000ms), eliminating tick delays during market cascades.
+5. **Calibrated Probe Sizing**: Base probe $0.50\text{ SOL}$ for Established and $0.35\text{ SOL}$ for Micro-Caps.
 
 ### Running the Dashboard & Daemon
 
@@ -201,17 +226,27 @@ Phase 12 adds a 3-page interactive visual control plane and quantitative two-sta
 # Start the React Interactive Dashboard
 pnpm dev:frontend
 
-# Start the Paper Trading Daemon
-pnpm daemon:paper --session-id=session_123 --max-positions=3 --position-size-sol=1.0
+# Start Scheduled Trading Window on Continuous Wallet (e.g. 7am-6pm PDT)
+pnpm daemon:paper --schedule "07:00-18:00:PDT" --session-id=session-paper-day4
+
+# Start Continuous 24/7 Run (e.g. 168-hour endurance test)
+pnpm daemon:paper --duration 168 --session-id=session-paper-fedora-phase1293
+
+# Reset Continuous Virtual Wallet to Clean 10.0 SOL Baseline
+pnpm daemon:paper --wallet-reset --session-id=session-paper-new
+
+# Run Observational Strategy Analytics & Missed Opportunity Attribution
+pnpm daemon:analytics
 ```
 
 ## Repo Layout
 
-- `backend`: TypeScript backend service foundation.
+- `backend`: TypeScript backend service foundation, candidate scanner, risk engine, dynamic ratchet, and paper daemon.
 - `shared`: Shared data contracts, schemas, and execution-mode helpers.
 - `frontend`: Interactive 3-page React dashboard and control plane.
-- `docs`: Roadmap, decisions, checklist, and structure documentation.
-- `scripts`: Local safety and automation scripts.
-- `data`: Local data directory; database files are ignored.
+- `docs`: Strategy documentation, master roadmap, decisions, and architecture guides.
+- `docs/strategy_set`: Master Strategy Set and Phase 12.93 Specification in Markdown, Word (.docx), and PDF (.pdf).
+- `scripts`: Test isolation harness, trade history exporters, and historical patch backtesting simulators.
+- `data`: Local data directory; SQLite databases and trade logs are stored here.
 
-See [docs/Structure.md](./docs/Structure.md) for the full file inventory.
+See [docs/Structure_Phase9Plus.md](./docs/Structure_Phase9Plus.md) for the active file inventory.

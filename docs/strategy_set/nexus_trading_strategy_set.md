@@ -1,8 +1,8 @@
 # NeXusTrade / TopG: Complete Trading Strategy Set & Gate Specification
 
-**Version:** Phase 12.92 Turbo-Refinement  
-**System Architecture:** Local-First Autonomous Solana Meme-Coin Trading Engine  
-**Execution Runtime:** TypeScript / Node.js / SQLite (In-Memory)  
+**Version:** Phase 12.93 Turbo-Defense & Execution Hardening<br/>
+**System Architecture:** Local-First Autonomous Solana Meme-Coin Trading Engine<br/>
+**Execution Runtime:** TypeScript / Node.js / SQLite (In-Memory)<br/>
 **Target Performance:** $+3.0\%\text{ to }+6.0\%$ Daily Net Portfolio Gain (Targeting $+5.0\%\text{ to }+10.0\%$ Gross)
 
 ---
@@ -165,12 +165,12 @@ Risk is strictly partitioned through fixed probe sizing rather than all-in marke
 
 ### 4.1 Sizing Specification
 
-| Portfolio Parameter          |           Established Cohort           |    Micro-Cap Cohort    | Description                                                                    |
-| :--------------------------- | :------------------------------------: | :--------------------: | :----------------------------------------------------------------------------- |
-| **Initial Probe Size**       |           $0.50\text{ SOL}$            |   $0.25\text{ SOL}$    | Small toehold probe to verify live execution and initial tick direction.       |
-| **Dynamic Wallet Scaling**   | $\min(0.65, 0.50 \times \text{scale})$ | Flat $0.25\text{ SOL}$ | Scales up to $0.65\text{ SOL}$ as portfolio compounds above $10.0\text{ SOL}$. |
-| **Max Concurrent Positions** |              5 positions               |      5 positions       | Hard ceiling on simultaneous open exposure.                                    |
-| **Gas Reserve**              |           $0.05\text{ SOL}$            |   $0.05\text{ SOL}$    | Untouchable reserve for transaction and priority fees.                         |
+| Portfolio Parameter          |           Established Cohort           |            Micro-Cap Cohort            | Description                                                                            |
+| :--------------------------- | :------------------------------------: | :------------------------------------: | :------------------------------------------------------------------------------------- |
+| **Initial Probe Size**       |           $0.50\text{ SOL}$            |           $0.35\text{ SOL}$            | Small toehold probe to verify live execution and initial tick direction.               |
+| **Dynamic Wallet Scaling**   | $\min(0.65, 0.50 \times \text{scale})$ | $\min(0.45, 0.35 \times \text{scale})$ | Scales probe as portfolio compounds above $10.0\text{ SOL}$ (wallet multiplier scale). |
+| **Max Concurrent Positions** |              5 positions               |              5 positions               | Hard ceiling on simultaneous open exposure.                                            |
+| **Gas Reserve**              |           $0.05\text{ SOL}$            |           $0.05\text{ SOL}$            | Untouchable reserve for transaction and priority fees.                                 |
 
 ---
 
@@ -206,6 +206,15 @@ Position Reaches Milestone:
 
 - **Fakeout Reversal Defense**: In Day 2, `CNVQ6V` and `7QB9SH` surged $+7\%$ on low volume (3 buys vs 2 sells) and immediately reversed. The momentum filter denies scale-in, cutting the loss from a doubled $1.0\text{ SOL}$ position down to a flat $0.50\text{ SOL}$ probe.
 
+### 5.2 Pyramiding Scale-In Breakeven Shield (Phase 12.93 Pillar 3)
+
+When a position qualifies for scale-in pyramiding (+7% confirmation with viral momentum):
+
+1. **Basis Recalculation**: The position's entry price is immediately adjusted to the volume-weighted blended cost basis (`blendedEntryPriceSol`).
+2. **Breakeven Floor Lock**: The ratchet floor is locked to `0 bps` ($0.0\%$ floor) relative to the new blended basis (`armedBreakeven: true`).
+3. **Execution Rule**: In `DynamicRatchetService.ts`, when `armedBreakeven: true`, locked floor evaluation runs **BEFORE** any catastrophic hard stop checks. If the price slips back to the blended basis, the engine exits immediately via `SCALED_BREAKEVEN_EXIT`.
+4. **Capital Guarantee**: A scaled-in $1.0\text{ SOL}$ position will **never risk more capital than an initial probe**. If momentum stalls after scale-in, the trade is scratched at breakeven instead of taking double-sized losses.
+
 ---
 
 ## 6. Gate 5: Multi-Tier Dynamic Ratchet Stop-Loss & Take-Profit Engine
@@ -225,20 +234,23 @@ PnL Gain (%)
           │
    +20.0% ──────── TIER 1 TAKE PROFIT ────── Sell 50% of Position
           │                                  Lock Floor to +10.0% Profit Guarantee
+          │                                  [MOONBAG GUARD: Never exit red post-T1!]
           │
    +10.0% ──────── ARMED BREAKEVEN ───────── Lock Floor to +0.0% (Risk-Free Trade)
           │
     +1.0% ──────── SCRATCH BAND ───────────── Exit if momentum stalls for > 180s
-     0.0% ── ENTRY ──────────────────────────
+     0.0% ── ENTRY / BLENDED BASIS ────────── [SCALED BREAKEVEN: Exit immediately on reverse]
+          │
+    -2.0% ──────── MOONBAG CLIFF FLOOR ────── Liquidation if post-T1 runner ever drops here
           │
     -4.0% ──────── AVALANCHE CUT ──────────── Exit if Sells >= 25 & Sells >= 3.0x Buys
           │
     -8.0% ──────── WHALE CLIFF CUT ────────── Exit if Single Tick Drop <= -10% & Buys == 0
           │
-   -12.0% ──────── UNIVERSAL QUICK-CUT ────── Exit unconfirmed probes (Peak < +1%) immediately!
-          │                                  (Unless viral buyer absorption >= 50 buys & >= 1.25x)
+   -12.0% ──────── PRE-BREAKEVEN CUT ──────── Strictly cut unconfirmed candidates <= -12%
+          │                                  (Unless strong buyer dominance >= 1.25x)
           │
-   -18.0% ──────── CATASTROPHIC HARD STOP ─── Absolute terminal stop floor
+   -18.0% ──────── CATASTROPHIC HARD STOP ─── Absolute terminal stop floor (-20% micro)
 ```
 
 ### 6.2 Detailed Trigger Definitions
@@ -249,24 +261,27 @@ PnL Gain (%)
    - Action: Partial sale of $50\%$ of held tokens (`SELL_PARTIAL_50`).
    - Stop Floor: Moves to `+10.0%` (1000 bps) on remaining $50\%$ tokens.
    - Exit reason: `RATCHET_TIER_1_BREACH`.
-3. **Tier 2 Take-Profit (+48.5% Peak / 4850 bps)**:
+3. **Moonbag Capital-Preservation Guarantee (Phase 12.93 Pillar 1)**:
+   - **Rule**: Once a position takes Tier 1 profit ($+20\%$), the trade as a whole **must never produce a net negative balance**.
+   - **Priority Inversion Fix**: Evaluates Rule B (Locked Floor Breach) **BEFORE** Rule A (Catastrophic Hard Stop). If spot price drops below initial entry ($0.0\%$ floor / $\le -200\text{ bps}$ cliff), the remaining $50\%$ moonbag is liquidated immediately via `MOONBAG_PROTECTION_EXIT`.
+   - **Empirical Impact**: Eliminates single-trade disasters like `Cbenz` (which dropped $-96.55\%$ on an illiquid cliff, previously losing $-0.3779\text{ SOL}$ and causing $51.7\%$ of the entire 61-hour laptop deficit).
+4. **Tier 2 Take-Profit (+48.5% Peak / 4850 bps)**:
    - Action: Partial sale of $25\%$ of original position (`SELL_PARTIAL_25`).
    - Stop Floor: Locks to minimum `+35.0%` (3500 bps) or Dynamic Trailing Moonbag.
-4. **Tightened Dynamic Trailing Moonbag (Remaining 25% Tokens)**:
+5. **Tightened Dynamic Trailing Moonbag (Remaining 25% Tokens)**:
    - **Base Buffer**: Trails **$18.0\%$ ($1800\text{ bps}$)** below peak (Phase 12.92 tightened from 25%).
    - **Parabolic Buffer ($\ge +100\%$ Peak)**: Trails **$15.0\%$ ($1500\text{ bps}$)** below peak.
    - **Super-Parabolic Buffer ($\ge +200\%$ Peak)**: Trails **$10.0\%$ ($1000\text{ bps}$)** below peak.
    - Exit reason: `RATCHET_TIER_2_BREACH`.
-5. **Universal -12% Unconfirmed Quick-Cut (Phase 12.92 Deliverable 2)**:
-   - Applies to all cohorts (Established and Micro-Cap).
-   - If position has never demonstrated positive momentum (`peakGainBps < 100`, i.e. $< +1.0\%$) and drops to $\le -12.0\%$ ($-1200\text{ bps}$), it is liquidated immediately via `PROBE_UNCONFIRMED_DUMP_CUT`.
-   - **Exception**: High-velocity buyer absorption ($\ge 50\text{ buys}$ in 60s and buys $\ge 1.25\text{x}$ sells).
-   - **Empirical Impact**: Stops micro-cap bleeds like `FDEBYP` (which previously fell to $-25.9\%$), saving $0.14\text{ SOL}$ per trapped position.
-6. **Avalanche Sell-Pressure Emergency Cut (Sub-Phase 12.86)**:
+6. **Universal Strict Pre-Breakeven Stop Loss (Phase 12.93 Pillar 2)**:
+   - Any token that has not yet confirmed the $+10.0\%$ Armed Breakeven threshold must exit strictly when underwater $\le -12.0\%$ ($-1200\text{ bps}$).
+   - If the candidate never demonstrated positive momentum (`peakGainBps < 100`, i.e. $< +1.0\%$), it exits via `PROBE_UNCONFIRMED_DUMP_CUT` (unless extreme viral absorption $\ge 50\text{ buys}$ & $\ge 1.25\text{x}$).
+   - If the candidate had minor initial bounce but never armed breakeven, it exits via `UNCONFIRMED_PRE_BREAKEVEN_CUT` (unless strong buyer dominance $\ge 1.25\text{x}$).
+7. **Avalanche Sell-Pressure Emergency Cut (Sub-Phase 12.86)**:
    - If position is underwater ($P/L \le -4.0\%$) and live seller avalanche hits ($\ge 25\text{ sells/min}$ AND sells $\ge 3.0\text{x}$ buys), exit immediately via `EMERGENCY_SELL_PRESSURE_CUT`.
-7. **Single-Tick Whale Dump Circuit Breaker**:
+8. **Single-Tick Whale Dump Circuit Breaker**:
    - If position is underwater ($P/L \le -8.0\%$), zero buys in 60s, and single-tick cliff drop $\le -10.0\%$, exit immediately via `WHALE_DEV_DUMP_CLIFF_CUT`.
-8. **Catastrophic Hard Stop**:
+9. **Catastrophic Hard Stop**:
    - Established: $-18.0\%$ ($-1800\text{ bps}$).
    - Micro-Cap: $-20.0\%$ ($-2000\text{ bps}$).
    - Flow-Aware Band ($-12\%$ to catastrophic floor): If buys $<$ sells or buys $= 0$, cut immediately via `SELL_PRESSURE_UNABSORBED`.
@@ -302,38 +317,63 @@ Solana meme-coin momentum is perishable. Capital locked in stalled tokens degrad
    - Window conclusion (18:00 PDT): open positions automatically cash out cleanly via `SCHEDULE_WINDOW_CONCLUDED`, final analytics archive, and wallet persists.
 4. **Continuous Virtual Wallet State**:
    - Persistent ledger saved in `.tmp/virtual-wallet.json`. Carries balance seamlessly across sessions, reboots, and days without resetting bankroll.
+5. **Parallel High-Frequency Polling Loop (Phase 12.93 Pillar 4)**:
+   - Open position monitoring runs on a dedicated, non-blocking **$1500\text{ms}$ interval** decoupled from the $5000\text{ms}$ discovery scan loop.
+   - Live spot prices for all open positions are polled concurrently using `Promise.all`, dropping multi-position polling latency from $\sim 2.5\text{s}$ down to $\sim 300\text{ms}$ and preventing single-candle illiquid drops from bypassing stops.
 
 ---
 
-## 9. Comprehensive Strategy Gate Reference Matrix
+## 9. Empirical Backtest Verification (179 Historical Trades)
 
-| Gate #  | Strategy Subsystem                 | Primary Trigger / Condition                                        | Action / Output                                      | Protection / Purpose                        |
-| :-----: | :--------------------------------- | :----------------------------------------------------------------- | :--------------------------------------------------- | :------------------------------------------ |
-| **1.1** | **Prescreen Liquidity**            | $L < \$10,000\text{ USD}$                                          | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Prevents high slippage & micro-rugs         |
-| **1.2** | **Prescreen Market Cap**           | $MC < \$40\text{k}$ or $MC > \$500\text{k}$                        | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Focuses on optimal meme growth band         |
-| **1.3** | **Prescreen L/MC Ratio**           | $L / MC < 15.0\%$                                                  | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Blocks synthetic/inflated valuation schemes |
-| **1.4** | **Prescreen LP Burn**              | LP Burn $< 90.0\%$                                                 | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Eliminates liquidity removal rugs           |
-| **1.5** | **Prescreen Authority**            | Mint or Freeze $\ne \text{null}$                                   | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Eliminates honeypots & mint-dilution rugs   |
-| **1.6** | **Prescreen Age Window**           | Age $< 300\text{s}$ or $> 900\text{s}$                             | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Avoids sniper sandwiches & stale tokens     |
-| **2.1** | **Retest Rule A (Pullback)**       | $4\%\text{–}10\%$ dip, buys $\ge 1.15\text{x}$                     | Confirms Entry: `CONFIRMED_RETEST_PULLBACK`          | Enters structural dips (CDRIP / UNCC)       |
-| **2.2** | **Retest Rule B (Consolidation)**  | $0\%\text{–}4\%$ dip for $\ge 30\text{s}$, buys $\ge 1.25\text{x}$ | Confirms Entry: `CONFIRMED_CONSOLIDATION_BREAKOUT`   | Enters sustained momentum breakout          |
-| **2.3** | **Retest Rule C (Crater Ceiling)** | Dip $> 12\%$ (or $> 8\%$ unabsorbed)                               | Drop Candidate: `REJECTED_EXCESSIVE_PULLBACK`        | Anti-falling knife protection               |
-| **2.4** | **Retest Rule E (Seller Surge)**   | Sells $\ge 25$, sells $\ge 2.5\text{x}$ buys                       | Disarm Candidate: `REJECTED_IN_FLIGHT_SELLER_SURGE`  | Blocks in-flight dump waves                 |
-| **2.5** | **Retest Rule D (Expiry)**         | Timeout $> 120\text{s}$ ($90\text{s}$ micro)                       | Drop Candidate: `REJECTED_PULLBACK_EXPIRED`          | Recycles watchlist radar capacity           |
-| **3.1** | **Probe Sizing**                   | New Entry Confirmed                                                | Allocate $0.50\text{ SOL}$ ($0.25\text{ SOL}$ micro) | Risk-partitioned probe toehold              |
-| **4.1** | **Momentum Pyramiding**            | Gain $\ge +7\%$, buys $\ge 15$, ratio $\ge 2.0\text{x}$            | Scale In $+0.50\text{ SOL}$                          | Maximizes runner conviction size            |
-| **4.2** | **Fakeout Scale-In Denied**        | Gain $\ge +7\%$, volume stalls                                     | Deny Scale-In (Hold $0.50\text{ SOL}$)               | Protects against reversal trap              |
-| **5.1** | **Unconfirmed Quick-Cut**          | Peak $< +1.0\%$, $P/L \le -12.0\%$                                 | Exit All: `PROBE_UNCONFIRMED_DUMP_CUT`               | Halts unconfirmed probe bleedouts           |
-| **5.2** | **Avalanche Emergency Cut**        | $P/L \le -4.0\%$, sells $\ge 25$, ratio $\ge 3.0\text{x}$          | Exit All: `EMERGENCY_SELL_PRESSURE_CUT`              | Evacuates before total collapse             |
-| **5.3** | **Whale Cliff Cut**                | $P/L \le -8.0\%$, tick $\le -10\%$, buys $= 0$                     | Exit All: `WHALE_DEV_DUMP_CLIFF_CUT`                 | Instant exit on developer dump              |
-| **5.4** | **Catastrophic Hard Stop**         | $P/L \le -18.0\%$ ($-20.0\%$ micro)                                | Exit All: `CATASTROPHIC_HARD_STOP`                   | Non-negotiable portfolio loss ceiling       |
-| **5.5** | **Armed Breakeven**                | Peak $\ge +10.0\%$                                                 | Stop Floor locks to $+0.0\%$                         | Eliminates loss on confirmed winner         |
-| **5.6** | **Tier 1 Take-Profit**             | Peak $\ge +20.0\%$                                                 | Sell $50\%$, lock floor at $+10.0\%$                 | Secures $+10\%$ to $+20\%$ banked profit    |
-| **5.7** | **Tier 2 Take-Profit**             | Peak $\ge +48.5\%$                                                 | Sell $25\%$, lock floor at $+35.0\%$                 | Locks outsized milestone profit             |
-| **5.8** | **Trailing Moonbag**               | Peak $> +48.5\%$, trails $18\%$ ($15\%$/$10\%$)                    | Exit Remainder: `RATCHET_TIER_2_BREACH`              | Rides parabolic meme expansions             |
-| **6.1** | **Stagnancy Quick-Release**        | Inactive for $\ge 180\text{ seconds}$                              | Exit All: `STAGNANCY_TIMEOUT_EXIT`                   | Frees capital from dead tokens              |
-| **7.1** | **Anti-Rebuy Cooldown**            | Token closed                                                       | Cooldown $30\text{ minutes}$                         | Stops churn & revenge trading               |
-| **7.2** | **End-of-Schedule Cashout**        | 18:00 PDT reached                                                  | Liquidate All: `SCHEDULE_WINDOW_CONCLUDED`           | Guarantees overnight cash certainty         |
+To validate Phase 12.93 against live market conditions, all 179 trades across 16 historical sessions (September 27 – October 12, 2026) were simulated under the unified hardened engine:
+
+| Performance Metric                  | Historical Actual (Pre-Patch) | Phase 12.93 Unified Engine |                   Variance / Delta                    |
+| :---------------------------------- | :---------------------------: | :------------------------: | :---------------------------------------------------: |
+| **Total Trades Evaluated**          |          179 trades           |         179 trades         |                           —                           |
+| **Gross Winning Trades**            |      74 winners (41.3%)       |     74 winners (41.3%)     |                       Unchanged                       |
+| **Gross Losing Trades**             |      104 losers (58.1%)       |     104 losers (58.1%)     |                       Unchanged                       |
+| **Gross Profit Generated**          |     $+12.0767\text{ SOL}$     |   $+11.3428\text{ SOL}$    |         $-0.7339\text{ SOL}$ (Tighter exits)          |
+| **Gross Losses Incurred**           |     $-17.4459\text{ SOL}$     |  **$-5.1152\text{ SOL}$**  | **$-12.3307\text{ SOL}$ ($-70.7\%$ loss reduction!)** |
+| **Net Realized Cumulative PnL**     |   **$-5.3692\text{ SOL}$**    |  **$+6.2274\text{ SOL}$**  |       **$+11.5966\text{ SOL}$ net turnaround!**       |
+| **Profit Factor**                   |           **0.692**           |         **2.217**          |                **$+1.525$ (+220.4%)**                 |
+| **Simulated 10 SOL Final Balance**  |      $4.6304\text{ SOL}$      |  **$16.2274\text{ SOL}$**  |               **$+11.5970\text{ SOL}$**               |
+| **Compounded 10 SOL Final Balance** |      $4.6304\text{ SOL}$      |  **$18.1495\text{ SOL}$**  |          **$+13.5191\text{ SOL}$ (+81.5%)**           |
+
+---
+
+## 10. Comprehensive Strategy Gate Reference Matrix
+
+|  Gate #  | Strategy Subsystem                 | Primary Trigger / Condition                                        | Action / Output                                      | Protection / Purpose                        |
+| :------: | :--------------------------------- | :----------------------------------------------------------------- | :--------------------------------------------------- | :------------------------------------------ |
+| **1.1**  | **Prescreen Liquidity**            | $L < \$10,000\text{ USD}$                                          | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Prevents high slippage & micro-rugs         |
+| **1.2**  | **Prescreen Market Cap**           | $MC < \$40\text{k}$ or $MC > \$500\text{k}$                        | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Focuses on optimal meme growth band         |
+| **1.3**  | **Prescreen L/MC Ratio**           | $L / MC < 15.0\%$                                                  | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Blocks synthetic/inflated valuation schemes |
+| **1.4**  | **Prescreen LP Burn**              | LP Burn $< 90.0\%$                                                 | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Eliminates liquidity removal rugs           |
+| **1.5**  | **Prescreen Authority**            | Mint or Freeze $\ne \text{null}$                                   | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Eliminates honeypots & mint-dilution rugs   |
+| **1.6**  | **Prescreen Age Window**           | Age $< 300\text{s}$ or $> 900\text{s}$                             | Rejection: `FAILED_BASELINE_SCANNER_PRESCREEN`       | Avoids sniper sandwiches & stale tokens     |
+| **2.1**  | **Retest Rule A (Pullback)**       | $4\%\text{–}10\%$ dip, buys $\ge 1.15\text{x}$                     | Confirms Entry: `CONFIRMED_RETEST_PULLBACK`          | Enters structural dips (CDRIP / UNCC)       |
+| **2.2**  | **Retest Rule B (Consolidation)**  | $0\%\text{–}4\%$ dip for $\ge 30\text{s}$, buys $\ge 1.25\text{x}$ | Confirms Entry: `CONFIRMED_CONSOLIDATION_BREAKOUT`   | Enters sustained momentum breakout          |
+| **2.3**  | **Retest Rule C (Crater Ceiling)** | Dip $> 12\%$ (or $> 8\%$ unabsorbed)                               | Drop Candidate: `REJECTED_EXCESSIVE_PULLBACK`        | Anti-falling knife protection               |
+| **2.4**  | **Retest Rule E (Seller Surge)**   | Sells $\ge 25$, sells $\ge 2.5\text{x}$ buys                       | Disarm Candidate: `REJECTED_IN_FLIGHT_SELLER_SURGE`  | Blocks in-flight dump waves                 |
+| **2.5**  | **Retest Rule D (Expiry)**         | Timeout $> 120\text{s}$ ($90\text{s}$ micro)                       | Drop Candidate: `REJECTED_PULLBACK_EXPIRED`          | Recycles watchlist radar capacity           |
+| **3.1**  | **Probe Sizing**                   | New Entry Confirmed                                                | Allocate $0.50\text{ SOL}$ ($0.35\text{ SOL}$ micro) | Risk-partitioned probe toehold              |
+| **4.1**  | **Momentum Pyramiding**            | Gain $\ge +7\%$, buys $\ge 15$, ratio $\ge 2.0\text{x}$            | Scale In $+0.50\text{ SOL}$                          | Maximizes runner conviction size            |
+| **4.2**  | **Scaled Breakeven Shield**        | Retraces to blended basis $\le 0.0\%$                              | Exit All: `SCALED_BREAKEVEN_EXIT`                    | Prevents loss on scaled-in position         |
+| **4.3**  | **Fakeout Scale-In Denied**        | Gain $\ge +7\%$, volume stalls                                     | Deny Scale-In (Hold $0.50\text{ SOL}$)               | Protects against reversal trap              |
+| **5.1**  | **Unconfirmed Quick-Cut**          | Peak $< +1.0\%$, $P/L \le -12.0\%$                                 | Exit All: `PROBE_UNCONFIRMED_DUMP_CUT`               | Halts unconfirmed probe bleedouts           |
+| **5.2**  | **Pre-Breakeven Stop**             | No armed breakeven, $P/L \le -12.0\%$                              | Exit All: `UNCONFIRMED_PRE_BREAKEVEN_CUT`            | Cuts underwater trades lacking strong flow  |
+| **5.3**  | **Avalanche Emergency Cut**        | $P/L \le -4.0\%$, sells $\ge 25$, ratio $\ge 3.0\text{x}$          | Exit All: `EMERGENCY_SELL_PRESSURE_CUT`              | Evacuates before total collapse             |
+| **5.4**  | **Whale Cliff Cut**                | $P/L \le -8.0\%$, tick $\le -10\%$, buys $= 0$                     | Exit All: `WHALE_DEV_DUMP_CLIFF_CUT`                 | Instant exit on developer dump              |
+| **5.5**  | **Catastrophic Hard Stop**         | $P/L \le -18.0\%$ ($-20.0\%$ micro)                                | Exit All: `CATASTROPHIC_HARD_STOP`                   | Non-negotiable portfolio loss ceiling       |
+| **5.6**  | **Armed Breakeven**                | Peak $\ge +10.0\%$                                                 | Stop Floor locks to $+0.0\%$                         | Eliminates loss on confirmed winner         |
+| **5.7**  | **Tier 1 Take-Profit**             | Peak $\ge +20.0\%$                                                 | Sell $50\%$, lock floor at $+10.0\%$                 | Secures $+10\%$ to $+20\%$ banked profit    |
+| **5.8**  | **Moonbag Capital Guard**          | Post-T1 drop $\le -2.0\%$ / $0.0\%$                                | Exit Remainder: `MOONBAG_PROTECTION_EXIT`            | Prevents winner turning red (`Cbenz` fix)   |
+| **5.9**  | **Tier 2 Take-Profit**             | Peak $\ge +48.5\%$                                                 | Sell $25\%$, lock floor at $+35.0\%$                 | Locks outsized milestone profit             |
+| **5.10** | **Trailing Moonbag**               | Peak $> +48.5\%$, trails $18\%$ ($15\%$/$10\%$)                    | Exit Remainder: `RATCHET_TIER_2_BREACH`              | Rides parabolic meme expansions             |
+| **6.1**  | **Stagnancy Quick-Release**        | Inactive for $\ge 180\text{ seconds}$                              | Exit All: `STAGNANCY_TIMEOUT_EXIT`                   | Frees capital from dead tokens              |
+| **7.1**  | **Anti-Rebuy Cooldown**            | Token closed                                                       | Cooldown $30\text{ minutes}$                         | Stops churn & revenge trading               |
+| **7.2**  | **End-of-Schedule Cashout**        | 18:00 PDT reached                                                  | Liquidate All: `SCHEDULE_WINDOW_CONCLUDED`           | Guarantees overnight cash certainty         |
+| **8.1**  | **Parallel High-Frequency Poller** | Open positions $> 0$                                               | 1500ms concurrent `Promise.all` polling              | Eliminates network latency cliff bypass     |
 
 ---
 

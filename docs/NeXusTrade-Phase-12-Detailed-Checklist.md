@@ -343,3 +343,43 @@ Active In Live Session: `session-paper-12.88-01`
   - Normalized initial price intake (`pool.spotPriceUsd / 140`) and added unit outlier guards in `CounterfactualOpportunityTracker.ts` to eliminate synthetic billion-percent gain/drop reporting artifacts.
 - [x] **Verification & Isolation Audit**:
   - Executed `scripts/verify-isolated.mjs` (tsc, eslint, prettier, architecture check, check-secrets, and all Vitest configurations) with 100% passing tests.
+
+### Sub-Phase 12.90: Chrono-Regime 7-Day Scheduler & Continuous Virtual Wallet
+
+- [x] **Chrono-Regime Scheduler Engine**:
+  - Added CLI flag `--schedule "HH:mm-HH:mm[:TZ]"` (e.g., `--schedule "07:00-18:00:PDT"`) in `paper-trading-daemon.ts`.
+  - Supports automatic window startup, active/wall clock accounting, periodic hourly heartbeats, and graceful end-of-window liquidation (`SCHEDULE_WINDOW_CONCLUDED`).
+- [x] **Continuous Virtual Wallet State Persistence**:
+  - Persists wallet balance, all-time PnL, and session history to `.tmp/virtual-wallet.json`.
+  - Realistic multi-day equity compounding across daemon restarts with optional `--wallet-reset` flag.
+- [x] **Operational Benchmarks**:
+  - Successfully executed Day 1 and Day 2 scheduled trading sessions with zero runtime crashes.
+
+### Sub-Phase 12.91 & 12.92: Observation Analytics Engine & Multi-Day Benchmarking
+
+- [x] **Paper Observation Analytics Engine**:
+  - Created `backend/src/scripts/paper-observation-analytics.ts` (`pnpm daemon:analytics`).
+  - Forensic tracking of executed paper buys, pre-screen filtered candidates, missed winners ($\ge +15\%$), and avoided rugs ($\le -30\%$) with filter attribution.
+- [x] **Trade History Exporter & Backtest Simulator**:
+  - Created `scripts/export-trade-history.mjs` exporting 178+ historical trades across 16 sessions to CSV (`data/trade-history-2026-09-27-to-2026-10-12.csv`).
+  - Created `scripts/simulate-all-historical-patches.mjs` validating cumulative performance uplift of all patches (+81.5% net compounding uplift).
+- [x] **Multi-Day Benchmark Execution**:
+  - Completed Day 3 scheduled benchmark on PC (`session-paper-12.92-day3`) and 61.8-hour continuous run on Fedora laptop (`session-paper-fedora-7d`).
+
+### Sub-Phase 12.93: Turbo-Defense & Execution Hardening
+
+- [x] **Moonbag Capital-Preservation Guarantee**:
+  - Added `MOONBAG_PROTECTION_EXIT` in `DynamicRatchetService.ts`: post-Tier-1 tranches immediately exit if spot price falls below $-2.0\%$ of cost basis.
+  - Guarantees any trade taking Tier 1 profit closes net green ($+0.09\text{ SOL}$ minimum net gain on $1.0\text{ SOL}$).
+- [x] **Scaled-In Breakeven Blended Shield**:
+  - Added `SCALED_BREAKEVEN_EXIT` in `DynamicRatchetService.ts` and `PaperTradingDaemon.ts`: pyramided positions immediately arm breakeven on blended cost basis, exiting at $0.0\%$ if momentum stalls.
+- [x] **Universal Strict Pre-Breakeven Cut**:
+  - Added `UNCONFIRMED_PRE_BREAKEVEN_CUT`: cuts any unconfirmed position dropping $\le -12.0\%$ regardless of previous peak gain.
+- [x] **1500ms Parallel High-Frequency Poller**:
+  - Decoupled open position monitoring loop (1500ms ticker via `Promise.all`) from discovery scanning (5000ms), eliminating tick lag and price gap slippage.
+- [x] **Calibrated Probe Sizing**:
+  - Set default base probes to $0.50\text{ SOL}$ for Established and $0.35\text{ SOL}$ for Micro-Caps.
+- [x] **Verification & Parallel Deployment**:
+  - All 769 tests pass across all Vitest suites (`scripts/verify-isolated.mjs all`).
+  - Master strategy documents exported (`docs/strategy_set/nexus_trading_strategy_set` and `phase_12_93_implementation_specification` in MD, DOCX, and PDF).
+  - Deployed to 24/7 Fedora endurance runner (`session-paper-fedora-phase1293` in `tmux` with 10.0000 SOL clean baseline) and PC scheduled Day 4 runner.

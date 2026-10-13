@@ -198,6 +198,9 @@ export interface PaperPosition {
   stagnantTicksCount: number;
   pyramided?: boolean | undefined;
   scaleInCount?: number | undefined;
+  tier1ProfitTaken?: boolean | undefined;
+  tier2ProfitTaken?: boolean | undefined;
+  peakGainBps?: number | undefined;
 }
 
 export interface ClosedTradeRecord {
@@ -210,6 +213,7 @@ export interface ClosedTradeRecord {
   readonly proceedsSol: number;
   readonly realizedPnlSol: number;
   readonly realizedPnlBps: number;
+  readonly peakGainBps?: number | undefined;
   readonly exitReason: string;
   readonly openedAtMs: number;
   readonly closedAtMs: number;
@@ -322,9 +326,14 @@ export class PaperTradingDaemon {
     spotPriceSol: number,
     nowTimestampMs?: number,
   ): PaperPosition | null {
-    if (this.status !== "RUNNING" && this.status !== "PAUSED") return null;
+    if (this.status !== "RUNNING") return null;
     const position = this.openPositions.get(positionId);
     if (!position) return null;
+
+    // P0-06: Disallow scaling in after profit-taking has begun or if already pyramided
+    if (position.tier1ProfitTaken || position.tier2ProfitTaken || position.pyramided) {
+      return null;
+    }
 
     if (addOnCostBasisSol <= 0 || spotPriceSol <= 0 || !Number.isFinite(spotPriceSol)) {
       return null;
@@ -357,10 +366,17 @@ export class PaperTradingDaemon {
 
     this.currentCashSol -= addOnCostBasisSol;
 
-    // Adjust ratchet: Lock floor stop to blended entryPriceSol (0 bps from new basis)
+    // P0-07: Adjust & Rebase ratchet state against new blended cost basis
+    const rebasedPeakPriceSol = Math.max(spotPriceSol, blendedEntryPriceSol);
+    const rebasedPeakGainBps = Math.max(
+      0,
+      Math.round(((rebasedPeakPriceSol - blendedEntryPriceSol) / blendedEntryPriceSol) * 10_000),
+    );
     const updatedRatchetState: PositionRatchetState = {
       ...position.ratchetState,
       entryPriceSol: blendedEntryPriceSol,
+      peakPriceSol: rebasedPeakPriceSol,
+      peakGainBps: rebasedPeakGainBps,
       currentStopFloorBps: Math.max(0, position.ratchetState.currentStopFloorBps),
       armedBreakeven: true,
       lastEvaluatedAtMs: now,
@@ -402,6 +418,8 @@ export class PaperTradingDaemon {
       proceedsSol: totalProceedsSol,
       realizedPnlSol,
       realizedPnlBps,
+      peakGainBps:
+        position.peakGainBps ?? position.ratchetState?.peakGainBps ?? Math.max(realizedPnlBps, 0),
       exitReason,
       openedAtMs: position.openedAtMs,
       closedAtMs: now,
@@ -416,7 +434,7 @@ export class PaperTradingDaemon {
     this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
 
     if (this.status === "EXITING" && this.openPositions.size === 0) {
-      this.status = "COMPLETED";
+      this.status = this.haltReason ? "HALTED" : "COMPLETED";
     }
 
     return closedRecord;
@@ -673,13 +691,18 @@ export class PaperTradingDaemon {
         position.ratchetConfig,
       );
 
-      // Update position pricing state
+      // Update position pricing state & track high-water mark
       position.spotPriceSol = marketContext.spotPriceSol;
       position.currentPnlBps = result.diagnostics.currentPnlBps;
+      position.peakGainBps = Math.max(
+        position.peakGainBps ?? 0,
+        result.diagnostics.peakGainBps ?? 0,
+      );
       position.ratchetState = result.updatedState;
 
       // 4. Handle Partial Scale-Out or Full Sell
       if (result.action === "SELL_PARTIAL_50") {
+        position.tier1ProfitTaken = true;
         const initialTokens = position.initialTokensHeld ?? position.tokensHeld;
         const initialCost = position.initialCostBasisSol ?? position.costBasisSol;
         const tokensToSell = Math.min(position.tokensHeld, initialTokens * 0.5);
@@ -692,6 +715,7 @@ export class PaperTradingDaemon {
           this.currentCashSol += proceedsSol;
         }
       } else if (result.action === "SELL_PARTIAL_25") {
+        position.tier2ProfitTaken = true;
         const initialTokens = position.initialTokensHeld ?? position.tokensHeld;
         const initialCost = position.initialCostBasisSol ?? position.costBasisSol;
         const tokensToSell = Math.min(position.tokensHeld, initialTokens * 0.25);
@@ -725,6 +749,10 @@ export class PaperTradingDaemon {
           proceedsSol: totalProceedsSol,
           realizedPnlSol,
           realizedPnlBps,
+          peakGainBps:
+            position.peakGainBps ??
+            position.ratchetState.peakGainBps ??
+            Math.max(realizedPnlBps, 0),
           exitReason: result.reasonCode,
           openedAtMs: position.openedAtMs,
           closedAtMs: now,
@@ -739,7 +767,7 @@ export class PaperTradingDaemon {
         this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
 
         if (this.status === "EXITING" && this.openPositions.size === 0) {
-          this.status = "COMPLETED";
+          this.status = this.haltReason ? "HALTED" : "COMPLETED";
         }
       }
 
@@ -787,6 +815,8 @@ export class PaperTradingDaemon {
         proceedsSol: totalProceedsSol,
         realizedPnlSol,
         realizedPnlBps,
+        peakGainBps:
+          position.peakGainBps ?? position.ratchetState?.peakGainBps ?? Math.max(realizedPnlBps, 0),
         exitReason: "STAGNANCY_TIMEOUT_EXIT",
         openedAtMs: position.openedAtMs,
         closedAtMs: now,
@@ -801,7 +831,7 @@ export class PaperTradingDaemon {
       this.exitCooldowns.set(position.mintAddress, now + cooldownMs);
 
       if (this.status === "EXITING" && this.openPositions.size === 0) {
-        this.status = "COMPLETED";
+        this.status = this.haltReason ? "HALTED" : "COMPLETED";
       }
 
       return closedRecord;
@@ -822,7 +852,13 @@ export class PaperTradingDaemon {
       if (this.config.uninterruptedResearchMode) {
         this.haltReason = "PORTFOLIO_DRAWDOWN_BREACHED";
       } else {
-        this.stop("PORTFOLIO_DRAWDOWN_BREACHED");
+        this.haltReason = "PORTFOLIO_DRAWDOWN_BREACHED";
+        if (this.openPositions.size > 0) {
+          // P0-04: Freeze new admissions and scale-ins while actively managing existing open risk
+          this.status = "EXITING";
+        } else {
+          this.stop("PORTFOLIO_DRAWDOWN_BREACHED");
+        }
       }
     }
   }
@@ -859,14 +895,14 @@ export class PaperTradingDaemon {
       tradeId: t.positionId,
       poolId: `pool-${t.mintAddress.slice(0, 8)}`,
       mintAddress: t.mintAddress,
-      symbol: t.mintAddress.slice(0, 6).toUpperCase(),
+      symbol: t.symbol ?? t.mintAddress.slice(0, 6).toUpperCase(),
       entryPriceSol: t.entryPriceSol,
       exitPriceSol: t.exitPriceSol,
       sizeSol: t.costBasisSol,
       enteredAt: new Date(t.openedAtMs).toISOString(),
       exitedAt: new Date(t.closedAtMs).toISOString(),
       holdDurationSeconds: Math.max(1, Math.round((t.closedAtMs - t.openedAtMs) / 1000)),
-      peakGainBps: Math.max(t.realizedPnlBps, 0),
+      peakGainBps: t.peakGainBps ?? Math.max(t.realizedPnlBps, 0),
       finalPnlBps: t.realizedPnlBps,
       finalPnlSol: parseFloat(t.realizedPnlSol.toFixed(4)),
       exitReason: t.exitReason,

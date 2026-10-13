@@ -79,7 +79,7 @@ Use these related historical docs for project context:
 
 - Purpose: Master active roadmap for Phase 12.89 through Phase 14 (Hot Wallet & Mainnet Fleet).
 - Usage: Read before planning or implementing Phase 12.89+ execution, weekly stress tests, and hot wallet transitions.
-- Important parameters: Defines Phase 12.89 (compounding sizing unlock), Phase 12.90 (168-hour / 7-day 24/7 chrono-regime stress test), Phase 12.9X/12.9Z sign-off, Phase 13 (Hot Wallet Jito MEV bundles), and Phase 14 (Cloud/VPS deployment).
+- Important parameters: Defines Phase 12.89 (compounding sizing unlock), Phase 12.90 (168-hour / 7-day 24/7 chrono-regime stress test), Phase 12.91-12.92 (observation analytics), Phase 12.93 (turbo-defense and parallel 1500ms ticker), Phase 12.9Z sign-off, Phase 13 (Hot Wallet Jito MEV bundles), and Phase 14 (Cloud/VPS deployment).
 - Status: Active Master Roadmap.
 - Tests: Manual documentation review.
 
@@ -92,11 +92,21 @@ Use these related historical docs for project context:
 
 #### docs/DECISIONS_Phase9Plus.md
 
-- Purpose: Active decision log for Phase 9 and later (through Phase 12.88).
+- Purpose: Active decision log for Phase 9 and later (through Phase 12.93).
 - Usage: Add new architectural and strategy decisions here.
-- Important parameters: Records Phase 9+ research splits, Phase 12 3-page interactive dashboard, Continuous Virtual Wallet compounding, Multi-tier Dynamic Ratchet Moonbag, Emergency Whale Cliff and Avalanche Sell Pressure cuts, Retest Pullback Gate, and 250 Holder Floor.
+- Important parameters: Records Phase 9+ research splits, Phase 12 3-page interactive dashboard, Continuous Virtual Wallet compounding, Multi-tier Dynamic Ratchet Moonbag, Retest Pullback Gate, 250 Holder Floor, Chrono-Regime 7-Day Scheduler, Observation Analytics, Moonbag Capital Preservation Guarantee, and 1500ms Parallel Poller.
 - Status: Active.
 - Tests: Manual documentation review.
+
+#### docs/strategy_set/
+
+- Purpose: Production-grade Strategy Gate & Execution Specifications exported in Markdown, Microsoft Word (.docx), and PDF (.pdf).
+- Components:
+  - `docs/strategy_set/nexus_trading_strategy_set.md` (and `.docx`, `.pdf`): Master Strategy Specification detailing Gates 1.1 through 8.1, dynamic ratchet tiers, Moonbag Capital Preservation, pre-breakeven cuts, and empirical backtest matrix.
+  - `docs/strategy_set/phase_12_93_implementation_specification.md` (and `.docx`, `.pdf`): Phase 12.93 Turbo-Defense forensic analysis, mathematical proofs, and verification checklists.
+  - `docs/strategy_set/convert_strategy_doc.py`: Automated compiler converting Markdown strategy documentation to formatted Word documents and high-resolution PDFs via python-docx and Word COM automation.
+- Status: Production Master Documents.
+- Tests: Automated compilation tests.
 
 #### docs/Structure_Phase9Plus.md
 

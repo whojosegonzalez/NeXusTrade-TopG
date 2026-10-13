@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -47,6 +47,7 @@ interface VirtualWalletState {
   totalSessionsCompleted: number;
   allTimeRealizedPnlSol: number;
   lastUpdatedMs: number;
+  settledSessionIds?: string[];
 }
 
 const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
@@ -56,6 +57,7 @@ const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
   totalSessionsCompleted: 0,
   allTimeRealizedPnlSol: 0.0,
   lastUpdatedMs: Date.now(),
+  settledSessionIds: [],
 };
 
 function resolveVirtualWalletFile(): string {
@@ -91,45 +93,49 @@ function loadVirtualWallet(): VirtualWalletState {
           totalSessionsCompleted: parsed.totalSessionsCompleted ?? 0,
           allTimeRealizedPnlSol: parsed.allTimeRealizedPnlSol ?? 0.0,
           lastUpdatedMs: parsed.lastUpdatedMs ?? Date.now(),
+          settledSessionIds: Array.isArray(parsed.settledSessionIds)
+            ? parsed.settledSessionIds
+            : [],
         };
       }
-    } catch {
-      // Fallback
+    } catch (parseErr) {
+      console.error(
+        `[PaperDaemon] Corrupt or unreadable virtual wallet at ${filePath}. Creating backup...`,
+        parseErr,
+      );
+      try {
+        const corruptBackup = `${filePath}.corrupt-${Date.now()}`;
+        writeFileSync(corruptBackup, readFileSync(filePath, "utf8"), "utf8");
+        console.warn(`[PaperDaemon] Preserved corrupt virtual wallet state at ${corruptBackup}`);
+      } catch {
+        // ignore backup error
+      }
     }
   }
-  return { ...DEFAULT_VIRTUAL_WALLET, lastUpdatedMs: Date.now() };
+  return { ...DEFAULT_VIRTUAL_WALLET, settledSessionIds: [], lastUpdatedMs: Date.now() };
 }
 
 function saveVirtualWallet(wallet: VirtualWalletState): void {
-  const targetDirs = [
-    path.resolve(process.cwd(), ".tmp"),
-    path.resolve(process.cwd(), "backend/.tmp"),
-    path.resolve(process.cwd(), "../.tmp"),
-    path.resolve(process.cwd(), "../backend/.tmp"),
-  ];
-  let written = false;
-  for (const dir of targetDirs) {
-    if (existsSync(dir)) {
-      try {
-        writeFileSync(
-          path.join(dir, "virtual-wallet.json"),
-          JSON.stringify(wallet, null, 2),
-          "utf8",
-        );
-        written = true;
-      } catch {
-        // Ignore
-      }
+  const primaryPath = resolveVirtualWalletFile();
+  const dir = path.dirname(primaryPath);
+  mkdirSync(dir, { recursive: true });
+  const tempPath = `${primaryPath}.tmp.${Date.now()}`;
+  const payload = JSON.stringify(wallet, null, 2);
+  writeFileSync(tempPath, payload, "utf8");
+  renameSync(tempPath, primaryPath);
+
+  // Sync secondary mirror path if exists
+  const secondaryDir = existsSync("backend/.tmp")
+    ? "backend/.tmp"
+    : existsSync(".tmp")
+      ? ".tmp"
+      : null;
+  if (secondaryDir && path.resolve(secondaryDir) !== dir) {
+    try {
+      writeFileSync(path.join(secondaryDir, "virtual-wallet.json"), payload, "utf8");
+    } catch {
+      // ignore mirror error
     }
-  }
-  if (!written) {
-    const defaultDir = path.resolve(process.cwd(), ".tmp");
-    mkdirSync(defaultDir, { recursive: true });
-    writeFileSync(
-      path.join(defaultDir, "virtual-wallet.json"),
-      JSON.stringify(wallet, null, 2),
-      "utf8",
-    );
   }
 }
 
@@ -524,8 +530,12 @@ async function run(): Promise<void> {
       const netSessionPnlSol = currentSol - config.initialPortfolioSol;
       const wallet = loadVirtualWallet();
       wallet.currentBalanceSol = currentSol;
-      wallet.allTimeRealizedPnlSol += netSessionPnlSol;
-      wallet.totalSessionsCompleted += 1;
+      wallet.settledSessionIds = wallet.settledSessionIds ?? [];
+      if (!wallet.settledSessionIds.includes(config.sessionId)) {
+        wallet.settledSessionIds.push(config.sessionId);
+        wallet.allTimeRealizedPnlSol += netSessionPnlSol;
+        wallet.totalSessionsCompleted += 1;
+      }
       wallet.lastUpdatedMs = nowMs();
       saveVirtualWallet(wallet);
       console.log(
@@ -559,883 +569,919 @@ async function run(): Promise<void> {
   process.on("SIGINT", handleShutdown);
   process.on("SIGTERM", handleShutdown);
 
-  // In daemon mode, tick and monitor until duration elapsed
-  while (!terminating) {
+  // Cashout Helper (Fetches live DexScreener spot prices before closing)
+  const cashoutAllPositions = async (
+    reason: "SCHEDULE_WINDOW_CONCLUDED" | "SESSION_DURATION_CASHOUT" | "CIRCUIT_BREAKER_CASHOUT",
+  ): Promise<void> => {
     const currentNow = nowMs();
-    daemon.heartbeat(currentNow);
-    let isStandby = false;
-    let minutesUntilNextWindow = 0;
-    if (config.tradingSchedule) {
-      const scheduleCheck = isWithinTradingSchedule(currentNow, config.tradingSchedule);
-      isStandby = !scheduleCheck.isWithin;
-      minutesUntilNextWindow = scheduleCheck.minutesUntilNext;
+    const openPositions = daemon.getSnapshot().openPositions;
+    if (openPositions.length === 0) return;
 
-      if (!isStandby) {
-        hasEnteredActiveSchedule = true;
-        activeTradingMs += currentNow - lastActiveTickMs;
-        lastActiveTickMs = currentNow;
-
-        if (wasInStandby) {
-          wasInStandby = false;
-          console.log(
-            `[PaperDaemon] [ACTIVE] Trading window active (${config.tradingSchedule.rawString})! Radar scanning and buy gates re-engaged.`,
-          );
-          addActivityLog(
-            "CONTROL",
-            `🟢 Trading window active (${config.tradingSchedule.rawString}). Radar scanning and buy gates re-engaged.`,
-          );
-        }
-      } else {
-        lastActiveTickMs = currentNow;
-
-        // Auto-cashout if the active schedule window has just concluded
-        if (hasEnteredActiveSchedule) {
-          console.log(
-            `[PaperDaemon] [SCHEDULE_WINDOW_CONCLUDED] Scheduled trading window (${config.tradingSchedule.rawString}) has concluded. Executing end-of-schedule cashout...`,
-          );
-          const openPositions = daemon.getSnapshot().openPositions;
-          for (const pos of openPositions) {
-            try {
-              const exitPrice = pos.spotPriceSol > 0 ? pos.spotPriceSol : pos.entryPriceSol;
-              daemon.manualExit(pos.positionId, exitPrice, currentNow, "SCHEDULE_WINDOW_CONCLUDED");
-              const timeStr = new Date(currentNow).toLocaleTimeString();
-              addActivityLog(
-                "SELL",
-                `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at schedule window conclusion at ${timeStr} | Exit: SCHEDULE_WINDOW_CONCLUDED`,
-                pos.mintAddress,
-                pos.symbol,
-              );
-              console.log(
-                `[PaperDaemon] [SCHEDULE CASHOUT] Liquidated ${pos.mintAddress} at ${exitPrice} SOL`,
-              );
-            } catch (cashoutErr) {
-              console.error(`[PaperDaemon] Error cashing out ${pos.mintAddress}:`, cashoutErr);
-            }
-          }
-          daemon.stop("SCHEDULE_WINDOW_CONCLUDED");
-          break;
-        }
-
-        if (!wasInStandby) {
-          wasInStandby = true;
-          lastStandbyLogMs = currentNow;
-          console.log(
-            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m. Radar scanning and new entries paused.`,
-          );
-          addActivityLog(
-            "CONTROL",
-            `⏸️ Standby active: Outside trading window (${config.tradingSchedule.rawString}). Next window in ${minutesUntilNextWindow}m.`,
-          );
-        } else if (currentNow - lastStandbyLogMs >= 15 * 60 * 1000) {
-          lastStandbyLogMs = currentNow;
-          console.log(
-            `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m.`,
-          );
-        }
-      }
-    }
-
-    const effectiveElapsedMs = config.tradingSchedule ? activeTradingMs : currentNow - startMs;
-    if (effectiveElapsedMs >= maxDurationMs) {
-      console.log(
-        `[PaperDaemon] Active duration of ${config.durationHours} hours reached. Executing end-of-session cashout...`,
-      );
-      const openPositions = daemon.getSnapshot().openPositions;
-      for (const pos of openPositions) {
+    await Promise.all(
+      openPositions.map(async (pos) => {
         try {
-          const exitPrice = pos.spotPriceSol > 0 ? pos.spotPriceSol : pos.entryPriceSol;
-          daemon.manualExit(pos.positionId, exitPrice, currentNow, "SESSION_DURATION_CASHOUT");
+          let exitPrice = pos.spotPriceSol;
+          try {
+            const freshSpot = await fetchDexScreenerSpotInfo(pos.mintAddress);
+            if (freshSpot && freshSpot.spotPriceSol > 0) {
+              exitPrice = freshSpot.spotPriceSol;
+            }
+          } catch {
+            // fallback to last known spotPriceSol
+          }
+          if (exitPrice <= 0) {
+            exitPrice = pos.entryPriceSol;
+          }
+          daemon.manualExit(pos.positionId, exitPrice, currentNow, reason);
           const timeStr = new Date(currentNow).toLocaleTimeString();
           addActivityLog(
             "SELL",
-            `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at session cashout at ${timeStr} | Exit: SESSION_DURATION_CASHOUT`,
+            `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at session cashout at ${timeStr} | Exit: ${reason}`,
             pos.mintAddress,
             pos.symbol,
           );
           console.log(
-            `[PaperDaemon] [SESSION CASHOUT] Liquidated ${pos.mintAddress} at ${exitPrice} SOL`,
+            `[PaperDaemon] [${reason}] Liquidated ${pos.symbol ?? pos.mintAddress} at ${exitPrice} SOL`,
           );
         } catch (cashoutErr) {
           console.error(`[PaperDaemon] Error cashing out ${pos.mintAddress}:`, cashoutErr);
         }
-      }
-      daemon.stop("DURATION_ELAPSED");
-      break;
-    }
+      }),
+    );
+  };
 
-    const snap = daemon.getSnapshot();
-    if (snap.status === "HALTED" && !config.uninterruptedResearchMode) {
-      console.error(`[PaperDaemon] Daemon halted due to: ${snap.haltReason}`);
-      break;
-    }
+  // Shared state between Position Ticker and Discovery Loop
+  let isStandby = false;
+  let minutesUntilNextWindow = 0;
 
-    // 1. Parallel Tick Open Positions with Live DexScreener Prices (Phase 12.93 High-Frequency Monitor)
-    if (snap.openPositions.length > 0) {
-      const openPosWithSpots = await Promise.all(
-        snap.openPositions.map(async (pos) => {
-          try {
-            const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
-            return { pos, spotInfo };
-          } catch {
-            return { pos, spotInfo: null };
-          }
-        }),
-      );
+  // LOOP A: High-Frequency Position Monitor Ticker (every pollIntervalMs, default 1500ms)
+  const runPositionMonitorTicker = async (): Promise<void> => {
+    while (!terminating) {
+      const currentNow = nowMs();
+      daemon.heartbeat(currentNow);
 
-      for (const { pos, spotInfo } of openPosWithSpots) {
-        try {
-          if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
-            const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
-            if (stagnantClosed) {
-              const timeStr = new Date(currentNow).toLocaleTimeString();
-              const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
-              addActivityLog(
-                "SELL",
-                `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
-                pos.mintAddress,
-                pos.symbol,
-              );
-              console.log(
-                `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
-              );
-            }
-            continue;
-          }
+      if (config.tradingSchedule) {
+        const scheduleCheck = isWithinTradingSchedule(currentNow, config.tradingSchedule);
+        isStandby = !scheduleCheck.isWithin;
+        minutesUntilNextWindow = scheduleCheck.minutesUntilNext;
 
-          tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
+        if (!isStandby) {
+          hasEnteredActiveSchedule = true;
+          activeTradingMs += currentNow - lastActiveTickMs;
+          lastActiveTickMs = currentNow;
 
-          const prevPrice = pos.spotPriceSol;
-          const singleTickDropBps =
-            prevPrice > 0
-              ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
-              : 0;
-
-          const marketContext: MarketEvaluationContext = {
-            currentTimestampMs: currentNow,
-            spotPriceSol: spotInfo.spotPriceSol,
-            lpIntact: true,
-            recentBuysCount60s: spotInfo.recentBuys60s,
-            recentSellsCount60s: spotInfo.recentSells60s,
-            momentum5mBps: spotInfo.momentum5mBps,
-            volumeStalled3m: false,
-            singleTickDropBps,
-          };
-
-          const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
-          if (result?.action === "SELL_ALL") {
-            const timeStr = new Date(currentNow).toLocaleTimeString();
-            const usdPrice = (
-              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-            ).toFixed(6);
-            const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
-            const closedTrade = daemon
-              .getSnapshot()
-              .closedTrades.find((t) => t.positionId === pos.positionId);
-            const pnlSol = closedTrade ? closedTrade.realizedPnlSol.toFixed(4) : "0.0000";
-            addActivityLog(
-              "SELL",
-              `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at $${usdPrice} at ${timeStr} | Exit: ${result.reasonCode} | Realized PnL: ${pnlSol} SOL (${pnlPct}%)`,
-              pos.mintAddress,
-              pos.symbol,
-            );
+          if (wasInStandby) {
+            wasInStandby = false;
             console.log(
-              `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${pnlPct}%`,
+              `[PaperDaemon] [ACTIVE] Trading window active (${config.tradingSchedule.rawString})! Radar scanning and buy gates re-engaged.`,
             );
-          } else if (result?.action === "SELL_PARTIAL_50") {
-            const usdPrice = (
-              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-            ).toFixed(6);
             addActivityLog(
-              "RATCHET",
-              `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+20% Tier 1) | Floor locked to +10%`,
-              pos.mintAddress,
-              pos.symbol,
+              "CONTROL",
+              `🟢 Trading window active (${config.tradingSchedule.rawString}). Radar scanning and buy gates re-engaged.`,
             );
+          }
+        } else {
+          lastActiveTickMs = currentNow;
+
+          // Auto-cashout if the active schedule window has just concluded
+          if (hasEnteredActiveSchedule) {
             console.log(
-              `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +20% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+              `[PaperDaemon] [SCHEDULE_WINDOW_CONCLUDED] Scheduled trading window (${config.tradingSchedule.rawString}) has concluded. Executing end-of-schedule cashout...`,
             );
-          } else if (result?.action === "SELL_PARTIAL_25") {
-            const usdPrice = (
-              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-            ).toFixed(6);
-            const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
-            const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
-            const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
+            await cashoutAllPositions("SCHEDULE_WINDOW_CONCLUDED");
+            daemon.stop("SCHEDULE_WINDOW_CONCLUDED");
+            terminating = true;
+            break;
+          }
+
+          if (!wasInStandby) {
+            wasInStandby = true;
+            lastStandbyLogMs = currentNow;
+            console.log(
+              `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m. Radar scanning and new entries paused.`,
+            );
             addActivityLog(
-              "RATCHET",
-              `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag (${trailBufferPct}% buffer, Floor: +${floorPct}%)`,
-              pos.mintAddress,
-              pos.symbol,
+              "CONTROL",
+              `⏸️ Standby active: Outside trading window (${config.tradingSchedule.rawString}). Next window in ${minutesUntilNextWindow}m.`,
             );
+          } else if (currentNow - lastStandbyLogMs >= 15 * 60 * 1000) {
+            lastStandbyLogMs = currentNow;
             console.log(
-              `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}% | Moonbag Buffer: ${trailBufferPct}% | Floor: +${floorPct}%`,
+              `[PaperDaemon] [STANDBY] Outside trading window (${config.tradingSchedule.rawString}). Standby active. Next window in ${minutesUntilNextWindow}m.`,
             );
           }
-
-          // Phase 12.92 Deliverable 1: Momentum-Only Scale-In Pyramiding
-          // Only scale in if candidate exhibits genuine retail velocity (>= 15 buys/60s, >= 2.0x dominance, and >= +4% 5m momentum).
-          // Non-momentum runners remain at flat 0.50 SOL probe to prevent fakeout reversal losses.
-          const hasViralScaleInMomentum =
-            spotInfo.recentBuys60s >= 15 &&
-            spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
-            spotInfo.momentum5mBps >= 400;
-
-          if (
-            result?.action !== "SELL_ALL" &&
-            pos.cohort === "ESTABLISHED" &&
-            !pos.pyramided &&
-            pos.currentPnlBps >= 700 &&
-            daemon.getCurrentCashSol() > 0.5 &&
-            hasViralScaleInMomentum
-          ) {
-            const currentCash = daemon.getCurrentCashSol();
-            const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
-            const establishedScaleInAmountSol = Math.min(
-              0.65,
-              Number((0.5 * walletScale).toFixed(2)),
-            );
-            const updatedPos = daemon.scaleInPosition(
-              pos.positionId,
-              establishedScaleInAmountSol,
-              spotInfo.spotPriceSol,
-              currentNow,
-            );
-            if (updatedPos) {
-              console.log(
-                `[PaperDaemon] [ESTABLISHED_PYRAMIDING_SCALE_IN] Added +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (+7% confirmation) | Blended Entry: ${updatedPos.entryPriceSol} SOL`,
-              );
-              addActivityLog(
-                "BUY",
-                `🟢 Scaled in +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL [ESTABLISHED +7% breakout] | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
-                pos.mintAddress,
-                pos.symbol,
-              );
-            }
-          }
-
-          // Micro-Cap Scale-In Pyramiding:
-          // If open position is MICRO_CAP, !pos.pyramided, pos.currentPnlBps >= 1000 (+10% Armed Breakeven),
-          // daemon portfolio cash > 0.5 SOL, and hasViralScaleInMomentum:
-          if (
-            result?.action !== "SELL_ALL" &&
-            pos.cohort === "MICRO_CAP" &&
-            !pos.pyramided &&
-            pos.currentPnlBps >= 1000 &&
-            daemon.getCurrentCashSol() > 0.5 &&
-            hasViralScaleInMomentum
-          ) {
-            const scaleInAmountSol = 0.25;
-            const updatedPos = daemon.scaleInPosition(
-              pos.positionId,
-              scaleInAmountSol,
-              spotInfo.spotPriceSol,
-              currentNow,
-            );
-            if (updatedPos) {
-              console.log(
-                `[PaperDaemon] [PYRAMIDING_SCALE_IN] Added +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (Blended Entry: ${updatedPos.entryPriceSol} SOL)`,
-              );
-              addActivityLog(
-                "BUY",
-                `🟢 Scaled in +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
-                pos.mintAddress,
-                pos.symbol,
-              );
-            }
-          }
-        } catch (tickErr) {
-          console.error(`[PaperDaemon] Tick error on ${pos.mintAddress}:`, tickErr);
         }
       }
+
+      const effectiveElapsedMs = config.tradingSchedule ? activeTradingMs : currentNow - startMs;
+      if (effectiveElapsedMs >= maxDurationMs) {
+        console.log(
+          `[PaperDaemon] Active duration of ${config.durationHours} hours reached. Executing end-of-session cashout...`,
+        );
+        await cashoutAllPositions("SESSION_DURATION_CASHOUT");
+        daemon.stop("DURATION_ELAPSED");
+        terminating = true;
+        break;
+      }
+
+      const snap = daemon.getSnapshot();
+      if (snap.status === "HALTED" && !config.uninterruptedResearchMode) {
+        console.error(`[PaperDaemon] Daemon halted due to: ${snap.haltReason}`);
+        terminating = true;
+        break;
+      }
+
+      // 1. Parallel Tick Open Positions with Live DexScreener Prices (Phase 12.93 High-Frequency Monitor)
+      if (snap.openPositions.length > 0) {
+        const openPosWithSpots = await Promise.all(
+          snap.openPositions.map(async (pos) => {
+            try {
+              const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
+              return { pos, spotInfo };
+            } catch {
+              return { pos, spotInfo: null };
+            }
+          }),
+        );
+
+        for (const { pos, spotInfo } of openPosWithSpots) {
+          try {
+            if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+              const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
+              if (stagnantClosed) {
+                const timeStr = new Date(currentNow).toLocaleTimeString();
+                const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
+                addActivityLog(
+                  "SELL",
+                  `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
+                  pos.mintAddress,
+                  pos.symbol,
+                );
+                console.log(
+                  `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
+                );
+              }
+              continue;
+            }
+
+            tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
+
+            const prevPrice = pos.spotPriceSol;
+            const singleTickDropBps =
+              prevPrice > 0
+                ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
+                : 0;
+
+            const marketContext: MarketEvaluationContext = {
+              currentTimestampMs: currentNow,
+              spotPriceSol: spotInfo.spotPriceSol,
+              lpIntact: true,
+              recentBuysCount60s: spotInfo.recentBuys60s,
+              recentSellsCount60s: spotInfo.recentSells60s,
+              momentum5mBps: spotInfo.momentum5mBps,
+              volumeStalled3m: false,
+              singleTickDropBps,
+            };
+
+            const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
+            if (result?.action === "SELL_ALL") {
+              const timeStr = new Date(currentNow).toLocaleTimeString();
+              const usdPrice = (
+                spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+              ).toFixed(6);
+              const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
+              const closedTrade = daemon
+                .getSnapshot()
+                .closedTrades.find((t) => t.positionId === pos.positionId);
+              const pnlSol = closedTrade ? closedTrade.realizedPnlSol.toFixed(4) : "0.0000";
+              addActivityLog(
+                "SELL",
+                `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at $${usdPrice} at ${timeStr} | Exit: ${result.reasonCode} | Realized PnL: ${pnlSol} SOL (${pnlPct}%)`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+              console.log(
+                `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${pnlPct}%`,
+              );
+            } else if (result?.action === "SELL_PARTIAL_50") {
+              const usdPrice = (
+                spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+              ).toFixed(6);
+              addActivityLog(
+                "RATCHET",
+                `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+20% Tier 1) | Floor locked to +10%`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+              console.log(
+                `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +20% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
+              );
+            } else if (result?.action === "SELL_PARTIAL_25") {
+              const usdPrice = (
+                spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+              ).toFixed(6);
+              const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
+              const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
+              const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
+              addActivityLog(
+                "RATCHET",
+                `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag (${trailBufferPct}% buffer, Floor: +${floorPct}%)`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+              console.log(
+                `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}% | Moonbag Buffer: ${trailBufferPct}% | Floor: +${floorPct}%`,
+              );
+            }
+
+            // Phase 12.92 / Phase 12.93 Deliverable 1: Momentum-Only Scale-In Pyramiding
+            // P0-06: Strict guard preventing scale-in after any partial profit milestone has triggered
+            const hasViralScaleInMomentum =
+              spotInfo.recentBuys60s >= 15 &&
+              spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
+              spotInfo.momentum5mBps >= 400;
+
+            if (
+              result?.action !== "SELL_ALL" &&
+              pos.cohort === "ESTABLISHED" &&
+              !pos.pyramided &&
+              !pos.tier1ProfitTaken &&
+              !pos.tier2ProfitTaken &&
+              pos.currentPnlBps >= 700 &&
+              daemon.getCurrentCashSol() > 0.5 &&
+              hasViralScaleInMomentum
+            ) {
+              const currentCash = daemon.getCurrentCashSol();
+              const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
+              const establishedScaleInAmountSol = Math.min(
+                0.65,
+                Number((0.5 * walletScale).toFixed(2)),
+              );
+              const updatedPos = daemon.scaleInPosition(
+                pos.positionId,
+                establishedScaleInAmountSol,
+                spotInfo.spotPriceSol,
+                currentNow,
+              );
+              if (updatedPos) {
+                console.log(
+                  `[PaperDaemon] [ESTABLISHED_PYRAMIDING_SCALE_IN] Added +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (+7% confirmation) | Blended Entry: ${updatedPos.entryPriceSol} SOL`,
+                );
+                addActivityLog(
+                  "BUY",
+                  `🟢 Scaled in +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL [ESTABLISHED +7% breakout] | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+                  pos.mintAddress,
+                  pos.symbol,
+                );
+              }
+            }
+
+            // Micro-Cap Scale-In Pyramiding:
+            if (
+              result?.action !== "SELL_ALL" &&
+              pos.cohort === "MICRO_CAP" &&
+              !pos.pyramided &&
+              !pos.tier1ProfitTaken &&
+              !pos.tier2ProfitTaken &&
+              pos.currentPnlBps >= 1000 &&
+              daemon.getCurrentCashSol() > 0.5 &&
+              hasViralScaleInMomentum
+            ) {
+              const scaleInAmountSol = 0.25;
+              const updatedPos = daemon.scaleInPosition(
+                pos.positionId,
+                scaleInAmountSol,
+                spotInfo.spotPriceSol,
+                currentNow,
+              );
+              if (updatedPos) {
+                console.log(
+                  `[PaperDaemon] [PYRAMIDING_SCALE_IN] Added +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (Blended Entry: ${updatedPos.entryPriceSol} SOL)`,
+                );
+                addActivityLog(
+                  "BUY",
+                  `🟢 Scaled in +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+                  pos.mintAddress,
+                  pos.symbol,
+                );
+              }
+            }
+          } catch (tickErr) {
+            console.error(`[PaperDaemon] Tick error on ${pos.mintAddress}:`, tickErr);
+          }
+        }
+      }
+
+      // 4. Heartbeat Telemetry Logging (Every 15s)
+      if (currentNow - lastHeartbeatMs >= 15000) {
+        lastHeartbeatMs = currentNow;
+        const currentSnap = daemon.getSnapshot();
+        const watchingCount = isStandby ? 0 : watchlistService.getActiveWatchingItems().length;
+        const statusPrefix = isStandby ? `[STANDBY (Next in ${minutesUntilNextWindow}m)] ` : "";
+        const elapsedLabel = config.tradingSchedule
+          ? `Active: ${(activeTradingMs / 60000).toFixed(1)}m (Wall: ${((currentNow - startMs) / 60000).toFixed(1)}m)`
+          : `Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m`;
+        console.log(
+          `[PaperDaemon] [HEARTBEAT] ${statusPrefix}${elapsedLabel} | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
+        );
+      }
+
+      // 5. Persist Active Session State to File for Dashboard (Every 3s)
+      if (currentNow - lastPersistMs >= 3000) {
+        lastPersistMs = currentNow;
+        persistState();
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
     }
+  };
 
-    // 2. Scan Candidate Pools & Ingest into Stage 1 Watchlist Radar
-    if (!isStandby && currentNow - lastScanMs >= scanIntervalMs) {
-      lastScanMs = currentNow;
-      try {
-        const rawPools = await streamEngine.fetchRawPools(25);
-        const currentNowSec = Math.floor(currentNow / 1000);
+  // LOOP B: Candidate Discovery, Metadata Enrichment & Buy Gates (Runs independently every 5000ms)
+  const runDiscoveryAndRadarLoop = async (): Promise<void> => {
+    while (!terminating) {
+      if (isStandby || daemon.getSnapshot().status === "HALTED") {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
 
-        // A. Ingest into Watchlist Service
-        for (const pool of rawPools) {
-          const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
-          const initialSolPrice =
-            pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
-          if (admitted) {
-            if (admitted.status === "DROPPED") {
+      const currentNow = nowMs();
+
+      // 2. Scan Candidate Pools & Ingest into Stage 1 Watchlist Radar
+      if (!isStandby && currentNow - lastScanMs >= scanIntervalMs) {
+        lastScanMs = currentNow;
+        try {
+          const rawPools = await streamEngine.fetchRawPools(25);
+          const currentNowSec = Math.floor(currentNow / 1000);
+
+          // A. Ingest into Watchlist Service
+          for (const pool of rawPools) {
+            const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
+            const initialSolPrice =
+              pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
+            if (admitted) {
+              if (admitted.status === "DROPPED") {
+                tracker.recordCandidate(
+                  pool,
+                  "FILTERED_REJECTED",
+                  initialSolPrice,
+                  currentNow,
+                  admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+                );
+              } else {
+                tracker.recordCandidate(pool, "WATCHLIST_RADAR", initialSolPrice, currentNow);
+              }
+            } else {
               tracker.recordCandidate(
                 pool,
                 "FILTERED_REJECTED",
                 initialSolPrice,
                 currentNow,
-                admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+                "FAILED_BASELINE_SCANNER_PRESCREEN",
               );
-            } else {
-              tracker.recordCandidate(pool, "WATCHLIST_RADAR", initialSolPrice, currentNow);
             }
-          } else {
+          }
+
+          // B. Birdeye Trending Poll (Every 2.5 minutes if budget permits and quota is not exhausted)
+          if (
+            !birdeyeDiscovery.isQuotaExhausted() &&
+            birdeyeDiscovery.getBudgetTracker().canPollTrending(currentNow)
+          ) {
+            try {
+              const trendingTokens = await birdeyeDiscovery.fetchTrendingTokens(20, currentNow);
+              if (trendingTokens.length > 0 && !birdeyeDiscovery.isQuotaExhausted()) {
+                console.log(
+                  `[PaperDaemon] [Birdeye] Fetched ${trendingTokens.length} trending tokens from Birdeye`,
+                );
+                for (const token of trendingTokens) {
+                  if (streamEngine.isMintSeen(token.address)) continue;
+
+                  // Deliverable 1: Real-Data Pre-Enrichment for Birdeye Trending (Zero Synthetic Defaults)
+                  const dexRecord = await streamEngine.fetchDexScreenerTokenPair(token.address);
+                  if (
+                    !dexRecord ||
+                    !dexRecord.spotPriceUsd ||
+                    dexRecord.spotPriceUsd <= 0 ||
+                    !dexRecord.liquidityUsd ||
+                    dexRecord.liquidityUsd <= 0
+                  ) {
+                    tracker.recordCandidate(
+                      {
+                        poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
+                        mintAddress: token.address,
+                        symbol: token.symbol ?? "UNKNOWN",
+                        liquidityUsd: token.liquidity ?? 0,
+                        marketCapUsd: 0,
+                        spotPriceUsd: token.price ?? 0,
+                      },
+                      "FILTERED_REJECTED",
+                      token.price ?? 0,
+                      currentNow,
+                      "FAILED_BIRDEYE_ENRICHMENT",
+                    );
+                    continue;
+                  }
+
+                  const admitted = watchlistService.admitOrUpdate(dexRecord, currentNowSec);
+                  if (admitted) {
+                    streamEngine.markMintSeen(token.address);
+                    if (admitted.status === "DROPPED") {
+                      tracker.recordCandidate(
+                        dexRecord,
+                        "FILTERED_REJECTED",
+                        dexRecord.spotPriceUsd,
+                        currentNow,
+                        admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
+                      );
+                    } else {
+                      tracker.recordCandidate(
+                        dexRecord,
+                        "WATCHLIST_RADAR",
+                        dexRecord.spotPriceUsd,
+                        currentNow,
+                      );
+                    }
+                  }
+                }
+              }
+            } catch (birdeyeErr) {
+              console.error("[PaperDaemon] Error fetching Birdeye trending tokens:", birdeyeErr);
+            }
+          }
+
+          // B. Prune expired candidates
+          const expiredCandidates = watchlistService.pruneExpired(currentNowSec);
+          for (const expired of expiredCandidates) {
+            armedPullbackCandidates.delete(expired.mintAddress);
             tracker.recordCandidate(
-              pool,
+              expired,
               "FILTERED_REJECTED",
-              initialSolPrice,
+              0,
               currentNow,
-              "FAILED_BASELINE_SCANNER_PRESCREEN",
+              expired.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
             );
           }
-        }
 
-        // B. Birdeye Trending Poll (Every 2.5 minutes if budget permits and quota is not exhausted)
-        if (
-          !birdeyeDiscovery.isQuotaExhausted() &&
-          birdeyeDiscovery.getBudgetTracker().canPollTrending(currentNow)
-        ) {
-          try {
-            const trendingTokens = await birdeyeDiscovery.fetchTrendingTokens(20, currentNow);
-            if (trendingTokens.length > 0 && !birdeyeDiscovery.isQuotaExhausted()) {
-              console.log(
-                `[PaperDaemon] [Birdeye] Fetched ${trendingTokens.length} trending tokens from Birdeye`,
-              );
-              for (const token of trendingTokens) {
-                if (streamEngine.isMintSeen(token.address)) continue;
+          // Prune stale armed pullback candidates (> 120s)
+          for (const [mint, state] of armedPullbackCandidates.entries()) {
+            if (currentNow - state.armedAtMs > 120_000) {
+              armedPullbackCandidates.delete(mint);
+            }
+          }
 
-                // Deliverable 1: Real-Data Pre-Enrichment for Birdeye Trending (Zero Synthetic Defaults)
-                const dexRecord = await streamEngine.fetchDexScreenerTokenPair(token.address);
-                if (
-                  !dexRecord ||
-                  !dexRecord.spotPriceUsd ||
-                  dexRecord.spotPriceUsd <= 0 ||
-                  !dexRecord.liquidityUsd ||
-                  dexRecord.liquidityUsd <= 0
-                ) {
+          // C. Stage 2 Buy Gate Confirmation
+          const watchingCandidates = watchlistService.getActiveWatchingItems();
+
+          // 60-Second Startup Warm-Up Buffer: allow radar and watchlist ingestion/enrichment to warm up
+          const warmupRemainingMs = SESSION_START_WARMUP_MS - (currentNow - startMs);
+          if (warmupRemainingMs > 0) {
+            const remainingSec = Math.ceil(warmupRemainingMs / 1000);
+            console.log(
+              `[PaperDaemon] [WARMUP] Observing market (warmup buffer active: ${remainingSec}s remaining)...`,
+            );
+          } else {
+            for (const candidate of watchingCandidates) {
+              if (daemon.getSnapshot().openPositions.length >= config.maxOpenPositions) break;
+
+              // Require candidate to have been observed on radar for at least 30s
+              const discoveredAtMs = new Date(candidate.discoveredAt).getTime();
+              const observedDurationMs = Number.isFinite(discoveredAtMs)
+                ? currentNow - discoveredAtMs
+                : 0;
+              const hasSufficientObservation =
+                observedDurationMs >= 30_000 || candidate.assetAgeSeconds >= 30;
+              if (!hasSufficientObservation) {
+                continue;
+              }
+
+              const preliminaryGate = buyGateService.evaluateCandidate(candidate);
+              if (preliminaryGate.triggered) {
+                // Check anti-rebuy cooldown
+                const cooldowns = daemon.getExitCooldowns();
+                const cooldownUntil = cooldowns.get(candidate.mintAddress);
+                if (cooldownUntil && currentNow < cooldownUntil) {
+                  continue;
+                }
+
+                const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
+                if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
                   tracker.recordCandidate(
-                    {
-                      poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
-                      mintAddress: token.address,
-                      symbol: token.symbol ?? "UNKNOWN",
-                      liquidityUsd: token.liquidity ?? 0,
-                      marketCapUsd: 0,
-                      spotPriceUsd: token.price ?? 0,
-                    },
+                    candidate,
                     "FILTERED_REJECTED",
-                    token.price ?? 0,
+                    candidate.liquidityUsd,
                     currentNow,
-                    "FAILED_BIRDEYE_ENRICHMENT",
+                    "REJECTED_NO_ACTIVE_DEX_PAIR",
                   );
                   continue;
                 }
 
-                const admitted = watchlistService.admitOrUpdate(dexRecord, currentNowSec);
-                if (admitted) {
-                  streamEngine.markMintSeen(token.address);
-                  if (admitted.status === "DROPPED") {
-                    tracker.recordCandidate(
-                      dexRecord,
-                      "FILTERED_REJECTED",
-                      dexRecord.spotPriceUsd,
-                      currentNow,
-                      admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
-                    );
-                  } else {
-                    tracker.recordCandidate(
-                      dexRecord,
-                      "WATCHLIST_RADAR",
-                      dexRecord.spotPriceUsd,
-                      currentNow,
+                // Fetch RugCheck anti-bundler metrics (bundler ratio, top10 concentration, holder count)
+                const rugMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+                  candidate.mintAddress,
+                );
+
+                // Deliverable 2: Live Spot Liquidity Hard Floor at Execution Time & Verified Holder Floor
+                // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
+                const isViral =
+                  candidate.liquidityUsd >= 30000 &&
+                  candidate.marketCapUsd >= 150000 &&
+                  candidate.assetAgeSeconds >= 900 &&
+                  candidate.assetAgeSeconds <= 7200;
+                const isCandidateEstablished =
+                  ((candidate.liquidityUsd >= 50000 && candidate.assetAgeSeconds >= 1800) ||
+                    isViral) &&
+                  candidate.assetAgeSeconds <= 7200 &&
+                  rugMetrics?.holdersCount !== undefined &&
+                  rugMetrics.holdersCount >= (isViral ? 1000 : 250);
+                const requiredLiveLiq = isCandidateEstablished ? (isViral ? 30000 : 50000) : 20000;
+                if (spotInfo.liquidityUsd < requiredLiveLiq) {
+                  if (armedPullbackCandidates.has(candidate.mintAddress)) {
+                    armedPullbackCandidates.delete(candidate.mintAddress);
+                  }
+                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                  tracker.recordCandidate(
+                    candidate,
+                    "FILTERED_REJECTED",
+                    spotInfo.spotPriceSol,
+                    currentNow,
+                    "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
+                  );
+                  console.log(
+                    `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${spotInfo.liquidityUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
+                  );
+                  continue;
+                }
+
+                // Phase 12.89: Fail-Closed RugCheck on all cohorts (requireVerifiedHolders: true)
+                const fullGateResult = buyGateService.evaluateCandidate(candidate, {
+                  recentBuysCount60s: spotInfo.recentBuys60s,
+                  recentSellsCount60s: spotInfo.recentSells60s,
+                  momentum1mBps: Math.round(spotInfo.momentum5mBps / 5),
+                  bundlerPct: rugMetrics?.bundlerPct,
+                  top10HolderPct: rugMetrics?.top10HolderPct,
+                  holdersCount: rugMetrics?.holdersCount,
+                  rugScore: rugMetrics?.rugScore,
+                  hasDangerRisk: rugMetrics?.hasDangerRisk,
+                  priceChange1hPct: spotInfo.priceChange1hPct,
+                  requireVerifiedHolders: true,
+                });
+
+                if (!fullGateResult.triggered) {
+                  if (armedPullbackCandidates.has(candidate.mintAddress)) {
+                    armedPullbackCandidates.delete(candidate.mintAddress);
+                  }
+                  tracker.recordCandidate(
+                    candidate,
+                    "FILTERED_REJECTED",
+                    spotInfo.spotPriceSol,
+                    currentNow,
+                    fullGateResult.rejectionReason,
+                  );
+                  continue;
+                }
+
+                // Deliverable 4: Established Token Age Ceiling (Max 2 Hours / 7,200s, Min 30m / 1,800s, Min 250 Holders)
+                // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
+                const isCandidateViral =
+                  candidate.liquidityUsd >= 30000 &&
+                  candidate.marketCapUsd >= 150000 &&
+                  candidate.assetAgeSeconds >= 900 &&
+                  candidate.assetAgeSeconds <= 7200;
+                const isEstablished =
+                  ((candidate.liquidityUsd >= 50000 &&
+                    spotInfo.liquidityUsd >= 50000 &&
+                    candidate.assetAgeSeconds >= 1800) ||
+                    (isCandidateViral && spotInfo.liquidityUsd >= 30000)) &&
+                  candidate.assetAgeSeconds <= 7200 &&
+                  rugMetrics?.holdersCount !== undefined &&
+                  rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
+
+                // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
+                const armed = armedPullbackCandidates.get(candidate.mintAddress);
+                if (!armed) {
+                  armedPullbackCandidates.set(candidate.mintAddress, {
+                    mintAddress: candidate.mintAddress,
+                    armedAtMs: currentNow,
+                    peakPriceSol: spotInfo.spotPriceSol,
+                    peakPriceUsd: spotInfo.spotPriceUsd,
+                    ticksObserved: 1,
+                  });
+                  const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
+                  const targetWait = isEstablished
+                    ? "4-8% pullback or consolidation"
+                    : "10-18% pullback or consolidation";
+                  console.log(
+                    `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
+                  );
+                  addActivityLog(
+                    "INFO",
+                    `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${cohortLabel}]. Awaiting retest/pullback...`,
+                    candidate.mintAddress,
+                    candidate.symbol,
+                  );
+                  continue;
+                }
+
+                // Candidate already armed: update ticks & peak price
+                const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
+                const newPeakUsd =
+                  spotInfo.spotPriceSol >= armed.peakPriceSol
+                    ? spotInfo.spotPriceUsd
+                    : armed.peakPriceUsd;
+                const updatedArmed: ArmedPullbackState = {
+                  ...armed,
+                  peakPriceSol: newPeakSol,
+                  peakPriceUsd: newPeakUsd,
+                  ticksObserved: armed.ticksObserved + 1,
+                };
+                armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
+
+                // Cohort parameters for Retest Gate (Phase 12.92 Flow-Aware Retest Gate):
+                // Established: Flow-aware crater drop ceiling: 12% if buyers absorbing (>= 1.15x), 8% if unabsorbed.
+                // Micro-Cap: max 15% crater drop ceiling, 90s expiry.
+                const isFlowAbsorbing =
+                  spotInfo.recentBuys60s >= 1.15 * Math.max(1, spotInfo.recentSells60s);
+                const maxCraterDropPct = isEstablished ? (isFlowAbsorbing ? 0.12 : 0.08) : 0.15;
+                const maxExpiryMs = isEstablished ? 120_000 : 90_000;
+
+                // Rule C: Plunged below crater threshold (anti-falling knife)
+                if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * (1 - maxCraterDropPct)) {
+                  armedPullbackCandidates.delete(candidate.mintAddress);
+                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                  const rejectReason = isEstablished
+                    ? "REJECTED_EXCESSIVE_PULLBACK"
+                    : "REJECTED_PULLBACK_CRATERED";
+                  tracker.recordCandidate(
+                    candidate,
+                    "FILTERED_REJECTED",
+                    spotInfo.spotPriceSol,
+                    currentNow,
+                    rejectReason,
+                  );
+                  console.log(
+                    `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
+                  );
+                  addActivityLog(
+                    "ALERT",
+                    `⚠️ ${candidate.symbol} dropped: pullback >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
+                    candidate.mintAddress,
+                    candidate.symbol,
+                  );
+                  continue;
+                }
+
+                // Rule E: In-Flight Seller Surge (Anti-Cabal exit wave while awaiting pullback)
+                if (
+                  spotInfo.recentSells60s >= 25 &&
+                  spotInfo.recentSells60s >= 2.5 * Math.max(1, spotInfo.recentBuys60s)
+                ) {
+                  armedPullbackCandidates.delete(candidate.mintAddress);
+                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                  tracker.recordCandidate(
+                    candidate,
+                    "FILTERED_REJECTED",
+                    spotInfo.spotPriceSol,
+                    currentNow,
+                    "REJECTED_IN_FLIGHT_SELLER_SURGE",
+                  );
+                  console.log(
+                    `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
+                  );
+                  addActivityLog(
+                    "ALERT",
+                    `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
+                    candidate.mintAddress,
+                    candidate.symbol,
+                  );
+                  continue;
+                }
+
+                // Rule D: Expiry after timeout
+                if (currentNow - updatedArmed.armedAtMs > maxExpiryMs) {
+                  armedPullbackCandidates.delete(candidate.mintAddress);
+                  watchlistService.updateStatus(candidate.poolId, "DROPPED");
+                  tracker.recordCandidate(
+                    candidate,
+                    "FILTERED_REJECTED",
+                    spotInfo.spotPriceSol,
+                    currentNow,
+                    "REJECTED_PULLBACK_EXPIRED",
+                  );
+                  console.log(
+                    `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
+                  );
+                  continue;
+                }
+
+                // Rule A: Retest Pullback Discount with flow absorption
+                // Established: 4% to 10% pullback discount with recentBuys60s >= 1.15 * recentSells60s
+                // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
+                const minPullbackRatio = isEstablished ? 0.9 : 0.85;
+                const maxPullbackRatio = isEstablished ? 0.96 : 0.9;
+                const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
+
+                const isPullbackDiscount =
+                  spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * maxPullbackRatio &&
+                  spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * minPullbackRatio;
+                const hasPullbackFlow =
+                  spotInfo.recentBuys60s >= minPullbackFlowRatio * spotInfo.recentSells60s;
+                const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
+
+                // Rule B: Consolidation Breakout
+                // Established: within 4% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
+                // Micro-Cap: within 5% of peak for >= 30s or >= 3 ticks with strong flow (>= 1.5 * sells)
+                const maxConsolidationDropPct = isEstablished ? 0.04 : 0.05;
+                const minConsolidationFlowRatio = isEstablished ? 1.25 : 1.5;
+
+                const isConsolidatingNearPeak =
+                  spotInfo.spotPriceSol >=
+                  updatedArmed.peakPriceSol * (1 - maxConsolidationDropPct);
+                const hasConsolidationDuration =
+                  currentNow - updatedArmed.armedAtMs >= 30_000 || updatedArmed.ticksObserved >= 3;
+                const hasConsolidationFlow =
+                  spotInfo.recentBuys60s >= minConsolidationFlowRatio * spotInfo.recentSells60s;
+                const ruleBConfirmed =
+                  isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
+
+                if (!ruleAConfirmed && !ruleBConfirmed) {
+                  const pullbackPct = (
+                    ((spotInfo.spotPriceSol - updatedArmed.peakPriceSol) /
+                      updatedArmed.peakPriceSol) *
+                    100
+                  ).toFixed(1);
+                  console.log(
+                    `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL, Pullback: ${pullbackPct}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${updatedArmed.ticksObserved}`,
+                  );
+                  continue;
+                }
+
+                const confirmReason = ruleAConfirmed
+                  ? "RETEST_PULLBACK_DISCOUNT"
+                  : "CONSOLIDATION_BREAKOUT";
+                console.log(
+                  `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL)`,
+                );
+                armedPullbackCandidates.delete(candidate.mintAddress);
+
+                const entryPriceSol = spotInfo.spotPriceSol;
+                let poolRecord: ScannedPoolRecord | undefined = rawPools.find(
+                  (p) => p.mintAddress === candidate.mintAddress,
+                );
+
+                if (!poolRecord) {
+                  poolRecord = {
+                    poolId: candidate.poolId,
+                    mintAddress: candidate.mintAddress,
+                    symbol: candidate.symbol,
+                    decimals: 9,
+                    baseMint: candidate.mintAddress,
+                    liquidityUsd: candidate.liquidityUsd,
+                    marketCapUsd: candidate.marketCapUsd,
+                    openTimeSec: Math.floor(currentNow / 1000) - candidate.assetAgeSeconds,
+                    lpBurnPct: candidate.lpBurnPct ?? 100,
+                    mintAuthority: null,
+                    freezeAuthority: null,
+                    volume5mUsd: candidate.volume5mUsd,
+                    txCount5m: candidate.buys5m + candidate.sells5m,
+                    buys5m: candidate.buys5m,
+                    sells5m: candidate.sells5m,
+                    spotPriceUsd:
+                      spotInfo.spotPriceUsd > 0
+                        ? spotInfo.spotPriceUsd
+                        : spotInfo.spotPriceSol * 150,
+                    fetchedAt: new Date(currentNow).toISOString(),
+                  };
+                }
+
+                const cohort: CohortTier = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
+                const ratchetConfig = isEstablished
+                  ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
+                  : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
+
+                // Phase 12.93 Deliverable 4: Calibrated Probe Sizing (0.50 SOL Established, 0.35 SOL Micro)
+                const currentCash = daemon.getCurrentCashSol();
+                const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
+                const establishedProbeBaseSize = Math.min(
+                  0.65,
+                  Number((0.5 * walletScale).toFixed(2)),
+                );
+                const microProbeBaseSize = Math.min(0.45, Number((0.35 * walletScale).toFixed(2)));
+
+                let targetCohortSize = isEstablished
+                  ? establishedProbeBaseSize
+                  : microProbeBaseSize;
+                if (isEstablished) {
+                  const highBundler =
+                    rugMetrics?.bundlerPct !== undefined && rugMetrics.bundlerPct > 0.6;
+                  const highTop10 =
+                    rugMetrics?.top10HolderPct !== undefined && rugMetrics.top10HolderPct > 0.3;
+                  if (highBundler || highTop10) {
+                    targetCohortSize = Math.min(0.35, targetCohortSize);
+                    console.log(
+                      `[PaperDaemon] [ESTABLISHED_HIGH_RISK] Downsizing probe for ${candidate.symbol} to ${targetCohortSize} SOL (Bundlers: ${((rugMetrics?.bundlerPct ?? 0) * 100).toFixed(1)}%, Top10: ${((rugMetrics?.top10HolderPct ?? 0) * 100).toFixed(1)}%)`,
                     );
                   }
                 }
-              }
-            }
-          } catch (birdeyeErr) {
-            console.error("[PaperDaemon] Error fetching Birdeye trending tokens:", birdeyeErr);
-          }
-        }
 
-        // B. Prune expired candidates
-        const expiredCandidates = watchlistService.pruneExpired(currentNowSec);
-        for (const expired of expiredCandidates) {
-          armedPullbackCandidates.delete(expired.mintAddress);
-          tracker.recordCandidate(
-            expired,
-            "FILTERED_REJECTED",
-            0,
-            currentNow,
-            expired.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
-          );
-        }
+                const currentSnap = daemon.getSnapshot();
+                const gasReserveSol = 0.05;
+                const dynamicSize = Math.max(
+                  0.1,
+                  Math.min(
+                    targetCohortSize,
+                    parseFloat(
+                      (
+                        (currentSnap.currentPortfolioSol - gasReserveSol) /
+                        config.maxOpenPositions
+                      ).toFixed(3),
+                    ),
+                  ),
+                );
 
-        // Prune stale armed pullback candidates (> 120s)
-        for (const [mint, state] of armedPullbackCandidates.entries()) {
-          if (currentNow - state.armedAtMs > 120_000) {
-            armedPullbackCandidates.delete(mint);
-          }
-        }
-
-        // C. Stage 2 Buy Gate Confirmation
-        const watchingCandidates = watchlistService.getActiveWatchingItems();
-
-        // 60-Second Startup Warm-Up Buffer: allow radar and watchlist ingestion/enrichment to warm up
-        const warmupRemainingMs = SESSION_START_WARMUP_MS - (currentNow - startMs);
-        if (warmupRemainingMs > 0) {
-          const remainingSec = Math.ceil(warmupRemainingMs / 1000);
-          console.log(
-            `[PaperDaemon] [WARMUP] Observing market (warmup buffer active: ${remainingSec}s remaining)...`,
-          );
-        } else {
-          for (const candidate of watchingCandidates) {
-            if (daemon.getSnapshot().openPositions.length >= config.maxOpenPositions) break;
-
-            // Require candidate to have been observed on radar for at least 30s
-            const discoveredAtMs = new Date(candidate.discoveredAt).getTime();
-            const observedDurationMs = Number.isFinite(discoveredAtMs)
-              ? currentNow - discoveredAtMs
-              : 0;
-            const hasSufficientObservation =
-              observedDurationMs >= 30_000 || candidate.assetAgeSeconds >= 30;
-            if (!hasSufficientObservation) {
-              continue;
-            }
-
-            const preliminaryGate = buyGateService.evaluateCandidate(candidate);
-            if (preliminaryGate.triggered) {
-              // Check anti-rebuy cooldown
-              const cooldowns = daemon.getExitCooldowns();
-              const cooldownUntil = cooldowns.get(candidate.mintAddress);
-              if (cooldownUntil && currentNow < cooldownUntil) {
-                continue;
-              }
-
-              const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
-              if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  candidate.liquidityUsd,
+                const bought = daemon.processScannedPool(
+                  poolRecord,
                   currentNow,
-                  "REJECTED_NO_ACTIVE_DEX_PAIR",
+                  entryPriceSol,
+                  dynamicSize,
+                  {
+                    bypassScannerEvaluation: true,
+                    cohort,
+                    ratchetConfig,
+                  },
                 );
-                continue;
-              }
-
-              // Fetch RugCheck anti-bundler metrics (bundler ratio, top10 concentration, holder count)
-              const rugMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
-                candidate.mintAddress,
-              );
-
-              // Deliverable 2: Live Spot Liquidity Hard Floor at Execution Time & Verified Holder Floor
-              // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
-              const isViral =
-                candidate.liquidityUsd >= 30000 &&
-                candidate.marketCapUsd >= 150000 &&
-                candidate.assetAgeSeconds >= 900 &&
-                candidate.assetAgeSeconds <= 7200;
-              const isCandidateEstablished =
-                ((candidate.liquidityUsd >= 50000 && candidate.assetAgeSeconds >= 1800) ||
-                  isViral) &&
-                candidate.assetAgeSeconds <= 7200 &&
-                rugMetrics?.holdersCount !== undefined &&
-                rugMetrics.holdersCount >= (isViral ? 1000 : 250);
-              const requiredLiveLiq = isCandidateEstablished ? (isViral ? 30000 : 50000) : 20000;
-              if (spotInfo.liquidityUsd < requiredLiveLiq) {
-                if (armedPullbackCandidates.has(candidate.mintAddress)) {
-                  armedPullbackCandidates.delete(candidate.mintAddress);
-                }
-                watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  spotInfo.spotPriceSol,
-                  currentNow,
-                  "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
-                );
-                console.log(
-                  `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${spotInfo.liquidityUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
-                );
-                continue;
-              }
-
-              // Phase 12.89: Fail-Closed RugCheck on all cohorts (requireVerifiedHolders: true)
-              const fullGateResult = buyGateService.evaluateCandidate(candidate, {
-                recentBuysCount60s: spotInfo.recentBuys60s,
-                recentSellsCount60s: spotInfo.recentSells60s,
-                momentum1mBps: Math.round(spotInfo.momentum5mBps / 5),
-                bundlerPct: rugMetrics?.bundlerPct,
-                top10HolderPct: rugMetrics?.top10HolderPct,
-                holdersCount: rugMetrics?.holdersCount,
-                rugScore: rugMetrics?.rugScore,
-                hasDangerRisk: rugMetrics?.hasDangerRisk,
-                priceChange1hPct: spotInfo.priceChange1hPct,
-                requireVerifiedHolders: true,
-              });
-
-              if (!fullGateResult.triggered) {
-                if (armedPullbackCandidates.has(candidate.mintAddress)) {
-                  armedPullbackCandidates.delete(candidate.mintAddress);
-                }
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  spotInfo.spotPriceSol,
-                  currentNow,
-                  fullGateResult.rejectionReason,
-                );
-                continue;
-              }
-
-              // Deliverable 4: Established Token Age Ceiling (Max 2 Hours / 7,200s, Min 30m / 1,800s, Min 250 Holders)
-              // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
-              const isCandidateViral =
-                candidate.liquidityUsd >= 30000 &&
-                candidate.marketCapUsd >= 150000 &&
-                candidate.assetAgeSeconds >= 900 &&
-                candidate.assetAgeSeconds <= 7200;
-              const isEstablished =
-                ((candidate.liquidityUsd >= 50000 &&
-                  spotInfo.liquidityUsd >= 50000 &&
-                  candidate.assetAgeSeconds >= 1800) ||
-                  (isCandidateViral && spotInfo.liquidityUsd >= 30000)) &&
-                candidate.assetAgeSeconds <= 7200 &&
-                rugMetrics?.holdersCount !== undefined &&
-                rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
-
-              // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
-              const armed = armedPullbackCandidates.get(candidate.mintAddress);
-              if (!armed) {
-                armedPullbackCandidates.set(candidate.mintAddress, {
-                  mintAddress: candidate.mintAddress,
-                  armedAtMs: currentNow,
-                  peakPriceSol: spotInfo.spotPriceSol,
-                  peakPriceUsd: spotInfo.spotPriceUsd,
-                  ticksObserved: 1,
-                });
-                const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
-                const targetWait = isEstablished
-                  ? "4-8% pullback or consolidation"
-                  : "10-18% pullback or consolidation";
-                console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
-                );
-                addActivityLog(
-                  "INFO",
-                  `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${cohortLabel}]. Awaiting retest/pullback...`,
-                  candidate.mintAddress,
-                  candidate.symbol,
-                );
-                continue;
-              }
-
-              // Candidate already armed: update ticks & peak price
-              const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
-              const newPeakUsd =
-                spotInfo.spotPriceSol >= armed.peakPriceSol
-                  ? spotInfo.spotPriceUsd
-                  : armed.peakPriceUsd;
-              const updatedArmed: ArmedPullbackState = {
-                ...armed,
-                peakPriceSol: newPeakSol,
-                peakPriceUsd: newPeakUsd,
-                ticksObserved: armed.ticksObserved + 1,
-              };
-              armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
-
-              // Cohort parameters for Retest Gate (Phase 12.92 Flow-Aware Retest Gate):
-              // Established: Flow-aware crater drop ceiling: 12% if buyers absorbing (>= 1.15x), 8% if unabsorbed.
-              // Micro-Cap: max 15% crater drop ceiling, 90s expiry.
-              const isFlowAbsorbing =
-                spotInfo.recentBuys60s >= 1.15 * Math.max(1, spotInfo.recentSells60s);
-              const maxCraterDropPct = isEstablished ? (isFlowAbsorbing ? 0.12 : 0.08) : 0.15;
-              const maxExpiryMs = isEstablished ? 120_000 : 90_000;
-
-              // Rule C: Plunged below crater threshold (anti-falling knife)
-              if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * (1 - maxCraterDropPct)) {
-                armedPullbackCandidates.delete(candidate.mintAddress);
-                watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                const rejectReason = isEstablished
-                  ? "REJECTED_EXCESSIVE_PULLBACK"
-                  : "REJECTED_PULLBACK_CRATERED";
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  spotInfo.spotPriceSol,
-                  currentNow,
-                  rejectReason,
-                );
-                console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
-                );
-                addActivityLog(
-                  "ALERT",
-                  `⚠️ ${candidate.symbol} dropped: pullback >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
-                  candidate.mintAddress,
-                  candidate.symbol,
-                );
-                continue;
-              }
-
-              // Rule E: In-Flight Seller Surge (Anti-Cabal exit wave while awaiting pullback)
-              if (
-                spotInfo.recentSells60s >= 25 &&
-                spotInfo.recentSells60s >= 2.5 * Math.max(1, spotInfo.recentBuys60s)
-              ) {
-                armedPullbackCandidates.delete(candidate.mintAddress);
-                watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  spotInfo.spotPriceSol,
-                  currentNow,
-                  "REJECTED_IN_FLIGHT_SELLER_SURGE",
-                );
-                console.log(
-                  `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
-                );
-                addActivityLog(
-                  "ALERT",
-                  `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
-                  candidate.mintAddress,
-                  candidate.symbol,
-                );
-                continue;
-              }
-
-              // Rule D: Expiry after timeout
-              if (currentNow - updatedArmed.armedAtMs > maxExpiryMs) {
-                armedPullbackCandidates.delete(candidate.mintAddress);
-                watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                tracker.recordCandidate(
-                  candidate,
-                  "FILTERED_REJECTED",
-                  spotInfo.spotPriceSol,
-                  currentNow,
-                  "REJECTED_PULLBACK_EXPIRED",
-                );
-                console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
-                );
-                continue;
-              }
-
-              // Rule A: Retest Pullback Discount with flow absorption
-              // Established: 4% to 10% pullback discount with recentBuys60s >= 1.15 * recentSells60s
-              // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
-              const minPullbackRatio = isEstablished ? 0.9 : 0.85;
-              const maxPullbackRatio = isEstablished ? 0.96 : 0.9;
-              const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
-
-              const isPullbackDiscount =
-                spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * maxPullbackRatio &&
-                spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * minPullbackRatio;
-              const hasPullbackFlow =
-                spotInfo.recentBuys60s >= minPullbackFlowRatio * spotInfo.recentSells60s;
-              const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
-
-              // Rule B: Consolidation Breakout
-              // Established: within 4% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
-              // Micro-Cap: within 5% of peak for >= 30s or >= 3 ticks with strong flow (>= 1.5 * sells)
-              const maxConsolidationDropPct = isEstablished ? 0.04 : 0.05;
-              const minConsolidationFlowRatio = isEstablished ? 1.25 : 1.5;
-
-              const isConsolidatingNearPeak =
-                spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * (1 - maxConsolidationDropPct);
-              const hasConsolidationDuration =
-                currentNow - updatedArmed.armedAtMs >= 30_000 || updatedArmed.ticksObserved >= 3;
-              const hasConsolidationFlow =
-                spotInfo.recentBuys60s >= minConsolidationFlowRatio * spotInfo.recentSells60s;
-              const ruleBConfirmed =
-                isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
-
-              if (!ruleAConfirmed && !ruleBConfirmed) {
-                const pullbackPct = (
-                  ((spotInfo.spotPriceSol - updatedArmed.peakPriceSol) /
-                    updatedArmed.peakPriceSol) *
-                  100
-                ).toFixed(1);
-                console.log(
-                  `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL, Pullback: ${pullbackPct}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${updatedArmed.ticksObserved}`,
-                );
-                continue;
-              }
-
-              const confirmReason = ruleAConfirmed
-                ? "RETEST_PULLBACK_DISCOUNT"
-                : "CONSOLIDATION_BREAKOUT";
-              console.log(
-                `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL)`,
-              );
-              armedPullbackCandidates.delete(candidate.mintAddress);
-
-              const entryPriceSol = spotInfo.spotPriceSol;
-              let poolRecord: ScannedPoolRecord | undefined = rawPools.find(
-                (p) => p.mintAddress === candidate.mintAddress,
-              );
-
-              if (!poolRecord) {
-                poolRecord = {
-                  poolId: candidate.poolId,
-                  mintAddress: candidate.mintAddress,
-                  symbol: candidate.symbol,
-                  decimals: 9,
-                  baseMint: candidate.mintAddress,
-                  liquidityUsd: candidate.liquidityUsd,
-                  marketCapUsd: candidate.marketCapUsd,
-                  openTimeSec: Math.floor(currentNow / 1000) - candidate.assetAgeSeconds,
-                  lpBurnPct: candidate.lpBurnPct ?? 100,
-                  mintAuthority: null,
-                  freezeAuthority: null,
-                  volume5mUsd: candidate.volume5mUsd,
-                  txCount5m: candidate.buys5m + candidate.sells5m,
-                  buys5m: candidate.buys5m,
-                  sells5m: candidate.sells5m,
-                  spotPriceUsd:
-                    spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150,
-                  fetchedAt: new Date(currentNow).toISOString(),
-                };
-              }
-
-              const cohort: CohortTier = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
-              const ratchetConfig = isEstablished
-                ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
-                : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
-
-              // Phase 12.93 Deliverable 4: Calibrated Probe Sizing (0.50 SOL Established, 0.35 SOL Micro)
-              const currentCash = daemon.getCurrentCashSol();
-              const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
-              const establishedProbeBaseSize = Math.min(
-                0.65,
-                Number((0.5 * walletScale).toFixed(2)),
-              );
-              const microProbeBaseSize = Math.min(0.45, Number((0.35 * walletScale).toFixed(2)));
-
-              let targetCohortSize = isEstablished ? establishedProbeBaseSize : microProbeBaseSize;
-              if (isEstablished) {
-                const highBundler =
-                  rugMetrics?.bundlerPct !== undefined && rugMetrics.bundlerPct > 0.6;
-                const highTop10 =
-                  rugMetrics?.top10HolderPct !== undefined && rugMetrics.top10HolderPct > 0.3;
-                if (highBundler || highTop10) {
-                  targetCohortSize = Math.min(0.35, targetCohortSize);
+                if (bought) {
+                  watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
+                  tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
+                  const timeStr = new Date(currentNow).toLocaleTimeString();
+                  const usdStr = (
+                    spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : entryPriceSol * 150
+                  ).toFixed(6);
+                  const solStr = entryPriceSol.toFixed(6);
+                  addActivityLog(
+                    "BUY",
+                    `🟢 ${candidate.symbol} bought at $${usdStr} (${solStr} SOL) at ${timeStr} | Size: ${dynamicSize} SOL [${cohort}]`,
+                    candidate.mintAddress,
+                    candidate.symbol,
+                  );
                   console.log(
-                    `[PaperDaemon] [ESTABLISHED_HIGH_RISK] Downsizing probe for ${candidate.symbol} to ${targetCohortSize} SOL (Bundlers: ${((rugMetrics?.bundlerPct ?? 0) * 100).toFixed(1)}%, Top10: ${((rugMetrics?.top10HolderPct ?? 0) * 100).toFixed(1)}%)`,
+                    `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] [${cohort}] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
                   );
                 }
               }
+            }
+          }
+        } catch (scanErr) {
+          console.error("[PaperDaemon] Scan error:", scanErr);
+        }
+      }
 
-              const currentSnap = daemon.getSnapshot();
-              const gasReserveSol = 0.05;
-              const dynamicSize = Math.max(
-                0.1,
-                Math.min(
-                  targetCohortSize,
-                  parseFloat(
-                    (
-                      (currentSnap.currentPortfolioSol - gasReserveSol) /
-                      config.maxOpenPositions
-                    ).toFixed(3),
-                  ),
-                ),
-              );
-
-              const bought = daemon.processScannedPool(
-                poolRecord,
-                currentNow,
-                entryPriceSol,
-                dynamicSize,
-                {
-                  bypassScannerEvaluation: true,
-                  cohort,
-                  ratchetConfig,
-                },
-              );
-              if (bought) {
-                watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
-                tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
-                const timeStr = new Date(currentNow).toLocaleTimeString();
-                const usdStr = (
-                  spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : entryPriceSol * 150
-                ).toFixed(6);
-                const solStr = entryPriceSol.toFixed(6);
-                addActivityLog(
-                  "BUY",
-                  `🟢 ${candidate.symbol} bought at $${usdStr} (${solStr} SOL) at ${timeStr} | Size: ${dynamicSize} SOL [${cohort}]`,
-                  candidate.mintAddress,
-                  candidate.symbol,
-                );
-                console.log(
-                  `[PaperDaemon] [BUY GATE TRIGGERED & BOUGHT] [${cohort}] ${candidate.symbol} (${candidate.mintAddress}) | Entry: ${entryPriceSol} SOL | Cost Basis: ${dynamicSize} SOL`,
+      // 2b. Dedicated Watchlist Poller by Mint Address (Every 10s)
+      if (!isStandby && currentNow - lastWatchlistRefreshMs >= 10000) {
+        lastWatchlistRefreshMs = currentNow;
+        const itemsToRefresh = watchlistService.getItems();
+        for (const item of itemsToRefresh) {
+          try {
+            const freshRecord = await streamEngine.fetchDexScreenerTokenPair(item.mintAddress);
+            if (freshRecord) {
+              const currentNowSec = Math.floor(currentNow / 1000);
+              const updated = watchlistService.admitOrUpdate(freshRecord, currentNowSec);
+              if (updated && updated.status === "DROPPED") {
+                tracker.recordCandidate(
+                  updated,
+                  "FILTERED_REJECTED",
+                  freshRecord.spotPriceUsd ?? 0,
+                  currentNow,
+                  updated.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
                 );
               }
             }
+          } catch {
+            // ignore transient refresh errors
           }
         }
-      } catch (scanErr) {
-        console.error("[PaperDaemon] Scan error:", scanErr);
       }
-    }
 
-    // 2b. Dedicated Watchlist Poller by Mint Address (Every 10s)
-    if (!isStandby && currentNow - lastWatchlistRefreshMs >= 10000) {
-      lastWatchlistRefreshMs = currentNow;
-      const itemsToRefresh = watchlistService.getItems();
-      for (const item of itemsToRefresh) {
-        try {
-          const freshRecord = await streamEngine.fetchDexScreenerTokenPair(item.mintAddress);
-          if (freshRecord) {
-            const currentNowSec = Math.floor(currentNow / 1000);
-            const updated = watchlistService.admitOrUpdate(freshRecord, currentNowSec);
-            if (updated && updated.status === "DROPPED") {
-              tracker.recordCandidate(
-                updated,
-                "FILTERED_REJECTED",
-                freshRecord.spotPriceUsd ?? 0,
-                currentNow,
-                updated.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
-              );
+      // 3. Counterfactual Price Sampler for Top Candidates across ALL cohorts (Every 15s)
+      if (!isStandby && currentNow - lastRadarSampleMs >= 15000) {
+        lastRadarSampleMs = currentNow;
+        const topCandidates = tracker.getTopCandidatesForSampling(10);
+        for (const item of topCandidates) {
+          try {
+            const spot = await fetchDexScreenerSpotInfo(item.mintAddress);
+            if (spot) {
+              tracker.samplePrice(item.mintAddress, spot.spotPriceSol, currentNow);
             }
+          } catch {
+            // ignore transient sampling errors
           }
-        } catch {
-          // ignore transient refresh errors
         }
       }
-    }
 
-    // 3. Counterfactual Price Sampler for Top Candidates across ALL cohorts (Every 15s)
-    if (!isStandby && currentNow - lastRadarSampleMs >= 15000) {
-      lastRadarSampleMs = currentNow;
-      const topCandidates = tracker.getTopCandidatesForSampling(10);
-      for (const item of topCandidates) {
-        try {
-          const spot = await fetchDexScreenerSpotInfo(item.mintAddress);
-          if (spot) {
-            tracker.samplePrice(item.mintAddress, spot.spotPriceSol, currentNow);
-          }
-        } catch {
-          // ignore transient sampling errors
-        }
-      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
+  };
 
-    // 4. Heartbeat Telemetry Logging (Every 15s)
-    if (currentNow - lastHeartbeatMs >= 15000) {
-      lastHeartbeatMs = currentNow;
-      const currentSnap = daemon.getSnapshot();
-      const watchingCount = isStandby ? 0 : watchlistService.getActiveWatchingItems().length;
-      const statusPrefix = isStandby ? `[STANDBY (Next in ${minutesUntilNextWindow}m)] ` : "";
-      const elapsedLabel = config.tradingSchedule
-        ? `Active: ${(activeTradingMs / 60000).toFixed(1)}m (Wall: ${((currentNow - startMs) / 60000).toFixed(1)}m)`
-        : `Elapsed: ${((currentNow - startMs) / 60000).toFixed(1)}m`;
-      console.log(
-        `[PaperDaemon] [HEARTBEAT] ${statusPrefix}${elapsedLabel} | Open: ${currentSnap.openPositions.length}/${config.maxOpenPositions} | Radar: ${watchingCount} watching | Cash: ${currentSnap.currentPortfolioSol.toFixed(4)} SOL | Closed: ${currentSnap.closedTrades.length} | Realized PnL: ${currentSnap.totalRealizedPnlSol >= 0 ? "+" : ""}${currentSnap.totalRealizedPnlSol.toFixed(4)} SOL`,
-      );
-    }
-
-    // 5. Persist Active Session State to File for Dashboard (Every 3s)
-    if (currentNow - lastPersistMs >= 3000) {
-      lastPersistMs = currentNow;
-      persistState();
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
-  }
+  // Run Position Monitor Ticker and Candidate Discovery Loop concurrently
+  await Promise.all([runPositionMonitorTicker(), runDiscoveryAndRadarLoop()]);
 
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);

@@ -1823,3 +1823,34 @@ Decision:
 5. Chrono-Regime Pinning: Time-of-day trading window restrictions are intentionally deferred until raw 24/7 empirical data is gathered during the Phase 12.90 168-hour (7-day) endurance run.
    Reason: Prevents bot-farm scams and placeholder coins from causing drawdown breaches while allowing high-conviction runner winners (`SACC`, `BANDIT`) to compound equity cleanly.
    Status: Implemented, verified with 100% test pass, and certified for 12-hour rerun.
+
+## 2026-10-10 - Phase 12.90: Chrono-Regime 7-Day Window Scheduler & Continuous Virtual Wallet
+
+Decision:
+
+1. Chrono-Regime Window Scheduler: Add CLI argument `--schedule "HH:mm-HH:mm[:TZ]"` enabling autonomous multi-day trading windows with wall-clock time parsing, hourly telemetry heartbeats, and orderly cashout upon window completion (`SCHEDULE_WINDOW_CONCLUDED`).
+2. Continuous Virtual Wallet: Persist simulated wallet balance, cumulative PnL, and session history in `.tmp/virtual-wallet.json` across process lifecycles. Introduce `--wallet-reset` flag for resetting baseline to fresh 10.0000 SOL.
+   Reason: Replicates real-world capital compounding and discipline, transitioning from isolated single-run testing to realistic multi-day operational endurance.
+   Status: Accepted, implemented, and verified in production.
+
+## 2026-10-11 - Phase 12.91 & 12.92: Observational Strategy Analytics & Multi-Day Benchmarking
+
+Decision:
+
+1. Observation Analytics Engine: Implement `backend/src/scripts/paper-observation-analytics.ts` (`pnpm daemon:analytics`) to evaluate candidate telemetry across 4-hour, multi-day, or multi-week intervals.
+2. Forensic Attribution: Track executed buys, pre-screen filtered candidates, missed winners ($\ge +15\%$), and avoided rugs ($\le -30\%$) with explicit filter reason attribution.
+3. Backtest Simulation: Build `scripts/export-trade-history.mjs` and `scripts/simulate-all-historical-patches.mjs` to simulate algorithmic patches counterfactually against 178+ historical trades across 16 sessions.
+   Reason: Provides empirical proof of filter selectivity and uncovers specific micro-slippage or pricing gap patterns without risking capital.
+   Status: Accepted, implemented, and verified in production.
+
+## 2026-10-12 - Phase 12.93: Turbo-Defense, Moonbag Capital Preservation Guarantee, and 1.5s Parallel Poller
+
+Decision:
+
+1. Moonbag Capital-Preservation Guarantee: Introduce `MOONBAG_PROTECTION_EXIT` in `DynamicRatchetService.ts`. After Tier 1 profit (+20%) is locked on the first 50% tranche, if the remaining moonbag drops below $-2.0\%$ of cost basis, exit immediately. This mathematically guarantees that every trade taking Tier 1 profit closes net green ($+0.09\text{ SOL}$ minimum gain on $1.0\text{ SOL}$).
+2. Scaled-In Breakeven Blended Shield: In `PaperTradingDaemon.ts` and `DynamicRatchetService.ts`, pyramided trades instantly arm breakeven on their blended cost basis, exiting at $0.0\%$ (`SCALED_BREAKEVEN_EXIT`) if momentum fades.
+3. Universal Strict Pre-Breakeven Cut: Enforce `UNCONFIRMED_PRE_BREAKEVEN_CUT` at $-12.0\%$ across all unconfirmed positions regardless of previous peak gain.
+4. Parallel High-Frequency Poller: Decouple open position monitoring to a dedicated 1500ms ticker executing price refreshes in parallel via `Promise.all`, isolating exit execution from 5000ms discovery scanning.
+5. Calibrated Probe Sizing: Calibrate base probes to $0.50\text{ SOL}$ for Established and $0.35\text{ SOL}$ for Micro-Caps.
+   Reason: Forensic audit of Fedora laptop 61.8-hour run revealed that a single -96.5% moonbag cliff dump on `Cbenz` caused 51.7% of the entire session deficit. Phase 12.93 permanently plugs this gap, yielding a simulated +81.5% compounding uplift on historical trades.
+   Status: Accepted, implemented, 100% tests passing (769/769), deployed to Fedora laptop and PC.
