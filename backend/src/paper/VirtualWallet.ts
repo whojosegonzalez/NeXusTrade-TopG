@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { findWorkspaceRoot } from "./ProcessLock.js";
+import { findWorkspaceRoot, getCanonicalWalletPath } from "./CanonicalPaths.js";
 
 export interface UnresolvedTokenInventory {
   readonly positionId: string;
@@ -49,8 +49,7 @@ export const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
 
 export function resolveVirtualWalletFile(customPath?: string): string {
   if (customPath) return path.resolve(customPath);
-  const root = findWorkspaceRoot();
-  return path.resolve(root, ".tmp/virtual-wallet.json");
+  return getCanonicalWalletPath();
 }
 
 export function checkLegacyWalletConflict(canonicalPath: string): void {

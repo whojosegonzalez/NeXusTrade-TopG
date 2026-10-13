@@ -7,6 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
   loadVirtualWallet,
@@ -14,7 +15,12 @@ import {
   reconcileWalletInventory,
   type ReconcileWalletOptions,
 } from "../paper/VirtualWallet.js";
-import { acquireProcessLock, releaseProcessLock, findWorkspaceRoot } from "../paper/ProcessLock.js";
+import { acquireProcessLock, releaseProcessLock } from "../paper/ProcessLock.js";
+import {
+  getCanonicalReconciliationAuditPath,
+  getCanonicalReconciliationIntentPath,
+  findWorkspaceRoot,
+} from "../paper/CanonicalPaths.js";
 
 export interface ReconciliationIntent {
   intentId: string;
@@ -22,16 +28,17 @@ export interface ReconciliationIntent {
   status: "INTENT_RECORDED" | "FINALIZED";
   options: ReconcileWalletOptions;
   matchedPositionId: string;
+  expectedAuditRecord?: Record<string, unknown> | undefined;
 }
 
 export function resolveIntentPath(baseDir?: string): string {
-  const root = baseDir ?? findWorkspaceRoot();
-  return path.resolve(root, ".tmp/reconciliation-intent.json");
+  if (baseDir) return path.resolve(baseDir, ".tmp/reconciliation-intent.json");
+  return getCanonicalReconciliationIntentPath();
 }
 
 export function resolveAuditPath(baseDir?: string): string {
-  const root = baseDir ?? findWorkspaceRoot();
-  return path.resolve(root, ".tmp/reconciliation-audit.jsonl");
+  if (baseDir) return path.resolve(baseDir, ".tmp/reconciliation-audit.jsonl");
+  return getCanonicalReconciliationAuditPath();
 }
 
 export function appendAuditLog(auditRecord: Record<string, unknown>, baseDir?: string): void {
@@ -44,7 +51,7 @@ export function appendAuditLog(auditRecord: Record<string, unknown>, baseDir?: s
   const legacyDir = path.resolve(root, "backend/.tmp");
   if (existsSync(legacyDir)) {
     const legacyPath = path.resolve(legacyDir, "reconciliation-audit.jsonl");
-    if (legacyPath !== primaryPath) {
+    if (path.resolve(legacyPath) !== path.resolve(primaryPath)) {
       try {
         appendFileSync(legacyPath, line, "utf8");
       } catch (err) {
@@ -77,8 +84,33 @@ export function recoverInterruptedIntent(baseDir?: string): void {
     ) {
       if (!stillPresent) {
         console.log(
-          `[Reconcile] [RECOVERY] Operation ${intent.intentId} was already applied in virtual wallet. Finalizing intent cleanup.`,
+          `[Reconcile] [RECOVERY] Operation ${intent.intentId} was already applied in virtual wallet. Verifying audit log durability...`,
         );
+        // Ensure audit record was written before cleaning intent
+        if (intent.expectedAuditRecord) {
+          const auditPath = resolveAuditPath(baseDir);
+          let auditContainsRecord = false;
+          if (existsSync(auditPath)) {
+            const auditLines = readFileSync(auditPath, "utf8").split("\n").filter(Boolean);
+            auditContainsRecord = auditLines.some((l) => {
+              try {
+                const parsed = JSON.parse(l);
+                return (
+                  parsed.reconciliationId === intent.expectedAuditRecord?.reconciliationId ||
+                  parsed.intentId === intent.intentId
+                );
+              } catch {
+                return false;
+              }
+            });
+          }
+          if (!auditContainsRecord) {
+            console.log(
+              `[Reconcile] [RECOVERY] Appending missing audit log entry for recovered intent ${intent.intentId}`,
+            );
+            appendAuditLog(intent.expectedAuditRecord, baseDir);
+          }
+        }
         try {
           unlinkSync(intentPath);
         } catch (err) {
@@ -120,38 +152,38 @@ export function runReconciliationCli(): void {
     strict: false,
   });
 
-  const wallet = loadVirtualWallet();
-  wallet.unresolvedTokens = wallet.unresolvedTokens ?? [];
-
-  if (values.list) {
-    console.log("=== UNRESOLVED TOKEN INVENTORY ===");
-    if (wallet.unresolvedTokens.length === 0) {
-      console.log("No unresolved token positions in virtual wallet.");
-    } else {
-      wallet.unresolvedTokens.forEach((t, i) => {
-        console.log(
-          `[${i + 1}] Position ID: ${t.positionId} | Mint: ${t.mintAddress} | Symbol: ${t.symbol ?? "N/A"} | Tokens: ${t.tokensHeld} | Basis: ${t.costBasisSol.toFixed(4)} SOL | Est Liquidation: ${(t.estimatedLiquidationSol ?? 0).toFixed(4)} SOL | Session: ${t.sessionId}`,
-        );
-      });
-    }
-    return;
-  }
-
-  const identifier = values["position-id"] ?? values.mint;
-  if (!identifier || typeof identifier !== "string") {
-    console.error(
-      "[Reconcile] Error: Missing --position-id=<ID> or --mint=<MINT>. Use --list to view unresolved inventory.",
-    );
-    process.exit(1);
-  }
-
-  // P0-E7-04: Acquire exclusive process lock before reading/mutating ledger
+  // Acquire exclusive process lock before reading or mutating wallet ledger
   const lockHandle = acquireProcessLock({
     processName: "PaperReconcile",
   });
 
   try {
-    // Check for prior interrupted reconciliation intent
+    const wallet = loadVirtualWallet();
+    wallet.unresolvedTokens = wallet.unresolvedTokens ?? [];
+
+    if (values.list) {
+      console.log("=== UNRESOLVED TOKEN INVENTORY ===");
+      if (wallet.unresolvedTokens.length === 0) {
+        console.log("No unresolved token positions in virtual wallet.");
+      } else {
+        wallet.unresolvedTokens.forEach((t, i) => {
+          console.log(
+            `[${i + 1}] Position ID: ${t.positionId} | Mint: ${t.mintAddress} | Symbol: ${t.symbol ?? "N/A"} | Tokens: ${t.tokensHeld} | Basis: ${t.costBasisSol.toFixed(4)} SOL | Est Liquidation: ${(t.estimatedLiquidationSol ?? 0).toFixed(4)} SOL | Session: ${t.sessionId}`,
+          );
+        });
+      }
+      return;
+    }
+
+    const identifier = values["position-id"] ?? values.mint;
+    if (!identifier || typeof identifier !== "string") {
+      console.error(
+        "[Reconcile] Error: Missing --position-id=<ID> or --mint=<MINT>. Use --list to view unresolved inventory.",
+      );
+      process.exit(1);
+    }
+
+    // Check for prior interrupted reconciliation intent inside exclusive lock
     recoverInterruptedIntent();
 
     const isSale = values.sale === true || values["simulated-sale"] === true;
@@ -238,15 +270,24 @@ export function runReconciliationCli(): void {
     }
     const targetPos = wallet.unresolvedTokens[targetIdx]!;
 
-    // P0-E7-05: Record Write-Ahead Audit Intent before mutating wallet state
-    const intentPath = resolveIntentPath();
+    // Dry-run compute audit record for write-ahead intent durability
+    const walletSnapshot = JSON.parse(JSON.stringify(wallet));
+    const dryRunResult = reconcileWalletInventory(walletSnapshot, options);
+
+    const intentId = `rec-intent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const intent: ReconciliationIntent = {
-      intentId: `rec-intent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      intentId,
       createdAtMs: Date.now(),
       status: "INTENT_RECORDED",
       options,
       matchedPositionId: targetPos.positionId,
+      expectedAuditRecord: {
+        ...dryRunResult.auditRecord,
+        intentId,
+      },
     };
+
+    const intentPath = resolveIntentPath();
     const tempIntentPath = `${intentPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
     try {
       writeFileSync(tempIntentPath, JSON.stringify(intent, null, 2), "utf8");
@@ -256,12 +297,15 @@ export function runReconciliationCli(): void {
       process.exit(1);
     }
 
-    // Mutate wallet state and persist atomically
+    // Mutate live wallet state and persist atomically
     const result = reconcileWalletInventory(wallet, options);
     saveVirtualWallet(wallet);
 
-    // Append immutable audit log
-    appendAuditLog(result.auditRecord);
+    // Append immutable audit log with intent linkage
+    appendAuditLog({
+      ...result.auditRecord,
+      intentId,
+    });
 
     // Clean up finalized intent
     try {
@@ -294,6 +338,7 @@ export function runReconciliationCli(): void {
   }
 }
 
-if (process.argv[1]?.includes("reconcile-unresolved")) {
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) {
   runReconciliationCli();
 }

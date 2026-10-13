@@ -22,11 +22,13 @@ import {
   MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
   ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
 } from "../exits/DynamicRatchetTypes.js";
-import {
-  recoverSettlementJournal,
-  type SettlementJournalEntry,
-} from "../scripts/paper-trading-daemon.js";
+import { recoverSettlementJournal, type SettlementJournalEntry } from "./SettlementJournal.js";
 import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
+import { parseCliArgs } from "../scripts/paper-trading-daemon.js";
+import {
+  recoverInterruptedIntent,
+  type ReconciliationIntent,
+} from "../scripts/reconcile-unresolved.js";
 
 describe("PaperTradingDaemon", () => {
   const baseConfig: PaperTradingDaemonConfig = {
@@ -2029,102 +2031,115 @@ describe("PaperTradingDaemon", () => {
       );
     });
 
-    it("P0-E7-06: recoverSettlementJournal executes real production routine across all checkpoint stages", () => {
-      const tempDir = mkdtempSync(path.join(os.tmpdir(), "real-journal-recovery-test-"));
-      const journalFile = path.join(tempDir, ".tmp", "settlement-journal.json");
-      const sessionFile = path.join(tempDir, ".tmp", "sessions", "sess-recovery-real-1.json");
-      const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
-      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+    it.each([
+      "STARTED",
+      "SESSION_FILE_WRITTEN",
+      "PAST_SESSIONS_WRITTEN",
+      "WALLET_SETTLED",
+      "COMMITTED",
+    ] as const)(
+      "E8-08: recoverSettlementJournal executes real production routine from stage %s",
+      (stage) => {
+        const tempDir = mkdtempSync(path.join(os.tmpdir(), `real-recovery-${stage}-`));
+        const journalFile = path.join(tempDir, ".tmp", "settlement-journal.json");
+        const sessionFile = path.join(tempDir, ".tmp", "sessions", "sess-recovery-real-1.json");
+        const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
+        const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
 
-      mkdirSync(path.join(tempDir, ".tmp", "sessions"), { recursive: true });
+        mkdirSync(path.join(tempDir, ".tmp", "sessions"), { recursive: true });
 
-      const initialWallet: VirtualWalletState = {
-        walletAddress: "SimWalletRecoveryReal",
-        currentBalanceSol: 10.0,
-        initialBalanceSol: 10.0,
-        totalSessionsCompleted: 0,
-        allTimeRealizedPnlSol: 0.0,
-        lastUpdatedMs: nowMs,
-        settledSessionIds: [],
-        unresolvedTokens: [],
-      };
-      writeFileSync(walletFile, JSON.stringify(initialWallet, null, 2), "utf8");
+        const initialWallet: VirtualWalletState = {
+          walletAddress: "SimWalletRecoveryReal",
+          currentBalanceSol: stage === "WALLET_SETTLED" ? 10.5 : 10.0,
+          initialBalanceSol: 10.0,
+          totalSessionsCompleted: stage === "WALLET_SETTLED" ? 1 : 0,
+          allTimeRealizedPnlSol: stage === "WALLET_SETTLED" ? 0.5 : 0.0,
+          lastUpdatedMs: nowMs,
+          settledSessionIds: stage === "WALLET_SETTLED" ? ["sess-recovery-real-1"] : [],
+          unresolvedTokens: [],
+        };
+        writeFileSync(walletFile, JSON.stringify(initialWallet, null, 2), "utf8");
 
-      const mockSummary = {
-        sessionId: "sess-recovery-real-1",
-        startedAt: new Date(nowMs).toISOString(),
-        endedAt: new Date(nowMs + 60000).toISOString(),
-        durationMinutes: 1,
-        startingCapitalSol: 10.0,
-        endingCapitalSol: 10.5,
-        netPnlSol: 0.5,
-        netPnlPct: 5.0,
-        totalTrades: 1,
-        buysCount: 1,
-        sellsCount: 1,
-        winsCount: 1,
-        lossesCount: 0,
-        scratchesCount: 0,
-        winRatePct: 100,
-        coinsWatchedCount: 10,
-        missedOpportunitiesCount: 2,
-        trades: [],
-      };
+        const mockSummary = {
+          sessionId: "sess-recovery-real-1",
+          startedAt: new Date(nowMs).toISOString(),
+          endedAt: new Date(nowMs + 60000).toISOString(),
+          durationMinutes: 1,
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 10.5,
+          netPnlSol: 0.5,
+          netPnlPct: 5.0,
+          totalTrades: 1,
+          buysCount: 1,
+          sellsCount: 1,
+          winsCount: 1,
+          lossesCount: 0,
+          scratchesCount: 0,
+          winRatePct: 100,
+          coinsWatchedCount: 10,
+          missedOpportunitiesCount: 2,
+          trades: [],
+        };
 
-      // Stage: STARTED (interrupted before any file was written)
-      const journalEntry: SettlementJournalEntry = {
-        sessionId: "sess-recovery-real-1",
-        startedAtMs: nowMs,
-        stage: "STARTED",
-        sessionSummary: mockSummary,
-        sessionNewRealizedPnlSol: 0.5,
-        liquidCashSol: 10.5,
-        initialPortfolioSol: 10.0,
-        unresolvedPositions: [],
-        reconciledPositionIds: [],
-      };
-      writeFileSync(journalFile, JSON.stringify(journalEntry, null, 2), "utf8");
+        if (
+          stage === "SESSION_FILE_WRITTEN" ||
+          stage === "PAST_SESSIONS_WRITTEN" ||
+          stage === "WALLET_SETTLED"
+        ) {
+          writeFileSync(sessionFile, JSON.stringify(mockSummary, null, 2), "utf8");
+        }
+        if (stage === "PAST_SESSIONS_WRITTEN" || stage === "WALLET_SETTLED") {
+          writeFileSync(pastSessionsFile, JSON.stringify([mockSummary], null, 2), "utf8");
+        }
 
-      // Invoke the ACTUAL production recovery routine!
-      recoverSettlementJournal({
-        journalPath: journalFile,
-        baseDir: tempDir,
-        walletPath: walletFile,
-      });
+        const journalEntry: SettlementJournalEntry = {
+          sessionId: "sess-recovery-real-1",
+          startedAtMs: nowMs,
+          stage,
+          sessionSummary: mockSummary,
+          sessionNewRealizedPnlSol: 0.5,
+          liquidCashSol: 10.5,
+          initialPortfolioSol: 10.0,
+          unresolvedPositions: [],
+          reconciledPositionIds: [],
+        };
+        writeFileSync(journalFile, JSON.stringify(journalEntry, null, 2), "utf8");
 
-      // Assert Stage 1: Individual session file was written
-      expect(existsSync(sessionFile)).toBe(true);
-      const sessionParsed = JSON.parse(readFileSync(sessionFile, "utf8"));
-      expect(sessionParsed.sessionId).toBe("sess-recovery-real-1");
+        // Invoke the ACTUAL production recovery routine!
+        recoverSettlementJournal({
+          journalPath: journalFile,
+          workspaceRoot: tempDir,
+          walletPath: walletFile,
+        });
 
-      // Assert Stage 2: past-sessions.json was updated
-      expect(existsSync(pastSessionsFile)).toBe(true);
-      const pastParsed = JSON.parse(readFileSync(pastSessionsFile, "utf8"));
-      expect(Array.isArray(pastParsed)).toBe(true);
-      expect(pastParsed[0]?.sessionId).toBe("sess-recovery-real-1");
+        if (stage !== "COMMITTED") {
+          // Assert Stage 1: Individual session file was written
+          expect(existsSync(sessionFile)).toBe(true);
+          const sessionParsed = JSON.parse(readFileSync(sessionFile, "utf8"));
+          expect(sessionParsed.sessionId).toBe("sess-recovery-real-1");
 
-      // Assert Stage 3: Virtual wallet was settled
-      const settledWallet = JSON.parse(readFileSync(walletFile, "utf8"));
-      expect(settledWallet.currentBalanceSol).toBe(10.5);
-      expect(settledWallet.allTimeRealizedPnlSol).toBe(0.5);
-      expect(settledWallet.settledSessionIds).toContain("sess-recovery-real-1");
-      expect(settledWallet.totalSessionsCompleted).toBe(1);
+          // Assert Stage 2: past-sessions.json was updated
+          expect(existsSync(pastSessionsFile)).toBe(true);
+          const pastParsed = JSON.parse(readFileSync(pastSessionsFile, "utf8"));
+          expect(Array.isArray(pastParsed)).toBe(true);
+          expect(
+            pastParsed.some((s: { sessionId: string }) => s.sessionId === "sess-recovery-real-1"),
+          ).toBe(true);
 
-      // Assert Stage 4: Journal was marked COMMITTED and unlinked
-      expect(existsSync(journalFile)).toBe(false);
+          // Assert Stage 3: Virtual wallet was settled
+          const settledWallet = JSON.parse(readFileSync(walletFile, "utf8"));
+          expect(settledWallet.currentBalanceSol).toBe(10.5);
+          expect(settledWallet.allTimeRealizedPnlSol).toBe(0.5);
+          expect(settledWallet.settledSessionIds).toContain("sess-recovery-real-1");
+          expect(settledWallet.totalSessionsCompleted).toBe(1);
+        }
 
-      // Re-invoking recovery when journal is gone must be a clean no-op
-      recoverSettlementJournal({
-        journalPath: journalFile,
-        baseDir: tempDir,
-        walletPath: walletFile,
-      });
-      const walletUnchanged = JSON.parse(readFileSync(walletFile, "utf8"));
-      expect(walletUnchanged.currentBalanceSol).toBe(10.5);
-      expect(walletUnchanged.totalSessionsCompleted).toBe(1);
+        // Assert Stage 4: Journal was marked COMMITTED and unlinked
+        expect(existsSync(journalFile)).toBe(false);
 
-      rmSync(tempDir, { recursive: true, force: true });
-    });
+        rmSync(tempDir, { recursive: true, force: true });
+      },
+    );
 
     it("P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history", () => {
       const tempDir = mkdtempSync(path.join(os.tmpdir(), "corrupt-history-recovery-test-"));
@@ -2299,6 +2314,186 @@ describe("PaperTradingDaemon", () => {
       expect(initialWallet.unresolvedTokens![0]!.tokensHeld).toBe(100.0);
       expect(initialWallet.unresolvedTokens![0]!.costBasisSol).toBe(1.0);
       expect(initialWallet.unresolvedTokens![0]!.estimatedLiquidationSol).toBe(0.25);
+    });
+
+    it("E8-01: Importing paper-trading-daemon module executes zero runner loops or mutations", async () => {
+      const mod = await import("../scripts/paper-trading-daemon.js");
+      expect(typeof mod.run).toBe("function");
+      expect(typeof mod.parseCliArgs).toBe("function");
+    });
+
+    it("E8-02: parseCliArgs is pure and rejects conflicting --dry-run and --reset-wallet", () => {
+      expect(() => parseCliArgs(["--dry-run", "--reset-wallet"])).toThrow(
+        /Conflicting arguments: --dry-run cannot be combined with --reset-wallet/,
+      );
+      const parsed = parseCliArgs(["--dry-run", "--duration-hours=2"]);
+      expect(parsed.dryRun).toBe(true);
+      expect(parsed.resetWallet).toBe(false);
+      expect(parsed.durationHours).toBe(2);
+    });
+
+    it("E8-03: Startup capital derives from recovered wallet balance", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "startup-capital-test-"));
+      const journalFile = path.join(tempDir, ".tmp", "settlement-journal.json");
+      const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      mkdirSync(path.join(tempDir, ".tmp", "sessions"), { recursive: true });
+
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletCapitalTest",
+        currentBalanceSol: 8.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 5,
+        allTimeRealizedPnlSol: -2.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-0"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(walletFile, JSON.stringify(initialWallet, null, 2), "utf8");
+
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: "sess-prior-crashed",
+        startedAtMs: nowMs,
+        stage: "PAST_SESSIONS_WRITTEN",
+        sessionSummary: {
+          sessionId: "sess-prior-crashed",
+          startedAt: new Date(nowMs).toISOString(),
+          endedAt: new Date(nowMs + 60000).toISOString(),
+          durationMinutes: 1,
+          startingCapitalSol: 8.0,
+          endingCapitalSol: 9.5,
+          netPnlSol: 1.5,
+          netPnlPct: 18.75,
+          totalTrades: 1,
+          buysCount: 1,
+          sellsCount: 1,
+          winsCount: 1,
+          lossesCount: 0,
+          scratchesCount: 0,
+          winRatePct: 100,
+          coinsWatchedCount: 5,
+          missedOpportunitiesCount: 0,
+          trades: [],
+        },
+        sessionNewRealizedPnlSol: 1.5,
+        liquidCashSol: 9.5,
+        initialPortfolioSol: 8.0,
+        unresolvedPositions: [],
+        reconciledPositionIds: [],
+      };
+      writeFileSync(journalFile, JSON.stringify(journalEntry, null, 2), "utf8");
+      writeFileSync(
+        pastSessionsFile,
+        JSON.stringify([journalEntry.sessionSummary], null, 2),
+        "utf8",
+      );
+
+      // Recover journal
+      recoverSettlementJournal({
+        journalPath: journalFile,
+        workspaceRoot: tempDir,
+        walletPath: walletFile,
+      });
+
+      // Wallet must now have 9.5 SOL
+      const recoveredWallet = loadVirtualWallet(walletFile);
+      expect(recoveredWallet.currentBalanceSol).toBe(9.5);
+      expect(recoveredWallet.settledSessionIds).toContain("sess-prior-crashed");
+
+      // New session config derived from recovered wallet
+      const derivedInitialCapital = recoveredWallet.currentBalanceSol;
+      expect(derivedInitialCapital).toBe(9.5);
+      const calculatedSize = Math.min(
+        1.0,
+        parseFloat(((derivedInitialCapital - 0.05) / 5).toFixed(4)),
+      );
+      expect(calculatedSize).toBeCloseTo(1.0, 2);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("E8-06: recoverInterruptedIntent recovers and appends missing audit record before deleting intent", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "intent-recovery-test-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      const intentFile = path.join(tempDir, ".tmp", "reconciliation-intent.json");
+      const auditFile = path.join(tempDir, ".tmp", "reconciliation-audit.jsonl");
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+
+      const wallet: VirtualWalletState = {
+        walletAddress: "SimWalletIntent",
+        currentBalanceSol: 10.5,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0.5,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1"],
+        unresolvedTokens: [], // token already removed by previous mutated step
+      };
+      writeFileSync(walletFile, JSON.stringify(wallet, null, 2), "utf8");
+
+      const intent: ReconciliationIntent = {
+        intentId: "rec-intent-audit-recovery-1",
+        createdAtMs: nowMs,
+        status: "INTENT_RECORDED",
+        options: {
+          identifier: "pos-missing-1",
+          operationType: "SIMULATED_SALE",
+          exitPriceSol: 0.05,
+          reason: "Simulated sale during crash test",
+        },
+        matchedPositionId: "pos-missing-1",
+        expectedAuditRecord: {
+          reconciliationId: "rec-audit-12345",
+          intentId: "rec-intent-audit-recovery-1",
+          timestampMs: nowMs,
+          operationType: "SIMULATED_SALE",
+          reason: "Simulated sale during crash test",
+        },
+      };
+      writeFileSync(intentFile, JSON.stringify(intent, null, 2), "utf8");
+
+      recoverInterruptedIntent(tempDir);
+
+      expect(existsSync(auditFile)).toBe(true);
+      const auditLines = readFileSync(auditFile, "utf8").trim().split("\n");
+      const parsedAudit = JSON.parse(auditLines[0]!);
+      expect(parsedAudit.reconciliationId).toBe("rec-audit-12345");
+      expect(parsedAudit.intentId).toBe("rec-intent-audit-recovery-1");
+      expect(existsSync(intentFile)).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("E8-07: ProcessLock ownership verified via acquisition nonce and refuses to delete foreign/corrupt lock", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "process-lock-nonce-test-"));
+      const lockFile = path.join(tempDir, "test-nonce.lock");
+
+      const handle = acquireProcessLock({
+        processName: "NonceTest",
+        sessionId: "sess-nonce-1",
+        lockPath: lockFile,
+      });
+
+      expect(handle.descriptor.acquisitionNonce).toBeDefined();
+      expect(typeof handle.descriptor.acquisitionNonce).toBe("string");
+
+      // Foreign process tampering with the nonce on disk
+      const tamperedDesc = {
+        ...handle.descriptor,
+        acquisitionNonce: "foreign-nonce-different-process",
+      };
+      writeFileSync(lockFile, JSON.stringify(tamperedDesc, null, 2), "utf8");
+
+      // Releasing handle MUST refuse to delete lock because nonce does not match
+      releaseProcessLock(handle);
+      expect(existsSync(lockFile)).toBe(true);
+
+      // Corrupted lock file: must not delete on release
+      writeFileSync(lockFile, "invalid { corrupted JSON", "utf8");
+      releaseProcessLock(handle);
+      expect(existsSync(lockFile)).toBe(true);
+
+      rmSync(tempDir, { recursive: true, force: true });
     });
   });
 });

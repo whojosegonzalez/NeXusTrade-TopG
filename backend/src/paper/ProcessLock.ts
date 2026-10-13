@@ -9,9 +9,14 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { getCanonicalLockPath, findWorkspaceRoot } from "./CanonicalPaths.js";
+
+export { findWorkspaceRoot };
 
 export interface ProcessLockDescriptor {
   pid: number;
+  acquisitionNonce: string;
   processName: string;
   sessionId?: string | undefined;
   acquiredAtMs: number;
@@ -22,30 +27,6 @@ export interface ProcessLockHandle {
   lockPath: string;
   fd: number;
   descriptor: ProcessLockDescriptor;
-}
-
-export function findWorkspaceRoot(startDir: string = process.cwd()): string {
-  let cur = path.resolve(startDir);
-  while (true) {
-    if (existsSync(path.join(cur, "pnpm-workspace.yaml")) || existsSync(path.join(cur, ".git"))) {
-      return cur;
-    }
-    const pkgJson = path.join(cur, "package.json");
-    if (existsSync(pkgJson)) {
-      try {
-        const parsed = JSON.parse(readFileSync(pkgJson, "utf8"));
-        if (parsed.name === "nexustrade-otis") {
-          return cur;
-        }
-      } catch {
-        // ignore parse error
-      }
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return path.resolve(startDir);
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -68,8 +49,7 @@ export function isProcessAlive(pid: number): boolean {
 
 export function resolveLockPath(customPath?: string): string {
   if (customPath) return path.resolve(customPath);
-  const root = findWorkspaceRoot();
-  return path.resolve(root, ".tmp/paper-process.lock");
+  return getCanonicalLockPath();
 }
 
 export function acquireProcessLock(options: {
@@ -85,6 +65,7 @@ export function acquireProcessLock(options: {
 
   const descriptor: ProcessLockDescriptor = {
     pid: process.pid,
+    acquisitionNonce: randomUUID(),
     processName: options.processName,
     sessionId: options.sessionId,
     acquiredAtMs: Date.now(),
@@ -118,6 +99,16 @@ export function acquireProcessLock(options: {
             `[ProcessLock] [STALE_LOCK] Owning process with PID ${existingDesc.pid} is no longer active in the OS. Safely reclaiming stale lock at ${lockPath}.`,
           );
           try {
+            // Re-read and verify identity before unlinking to prevent racing with another process
+            const recheckRaw = readFileSync(lockPath, "utf8");
+            const recheckDesc = JSON.parse(recheckRaw) as ProcessLockDescriptor;
+            if (
+              recheckDesc.pid !== existingDesc.pid ||
+              (existingDesc.acquisitionNonce &&
+                recheckDesc.acquisitionNonce !== existingDesc.acquisitionNonce)
+            ) {
+              throw new Error(`Lock identity changed during stale reclamation race at ${lockPath}`);
+            }
             unlinkSync(lockPath);
           } catch (unlinkErr) {
             throw new Error(
@@ -160,14 +151,27 @@ export function acquireProcessLock(options: {
 export function releaseProcessLock(handle: ProcessLockHandle): void {
   try {
     if (existsSync(handle.lockPath)) {
+      let current: ProcessLockDescriptor | null = null;
       try {
         const raw = readFileSync(handle.lockPath, "utf8");
-        const current = JSON.parse(raw) as ProcessLockDescriptor;
-        if (current.pid === process.pid) {
-          unlinkSync(handle.lockPath);
-        }
-      } catch {
+        current = JSON.parse(raw) as ProcessLockDescriptor;
+      } catch (readErr) {
+        console.error(
+          `[ProcessLock] [FATAL] Corrupted or unreadable lock file detected during release at ${handle.lockPath}: ${String(readErr)}. Refusing to unlink unknown lock.`,
+        );
+        return;
+      }
+
+      if (
+        current &&
+        current.pid === process.pid &&
+        current.acquisitionNonce === handle.descriptor.acquisitionNonce
+      ) {
         unlinkSync(handle.lockPath);
+      } else {
+        console.warn(
+          `[ProcessLock] Warning: Refusing to release lock at ${handle.lockPath}: lock belongs to a different process/handle (Expected PID ${process.pid} nonce ${handle.descriptor.acquisitionNonce}, found PID ${current?.pid} nonce ${current?.acquisitionNonce ?? "none"}).`,
+        );
       }
     }
   } catch (err) {
