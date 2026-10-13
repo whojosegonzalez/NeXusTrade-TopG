@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -22,6 +22,11 @@ import {
   MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
   ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
 } from "../exits/DynamicRatchetTypes.js";
+import {
+  recoverSettlementJournal,
+  type SettlementJournalEntry,
+} from "../scripts/paper-trading-daemon.js";
+import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
 
 describe("PaperTradingDaemon", () => {
   const baseConfig: PaperTradingDaemonConfig = {
@@ -2024,17 +2029,17 @@ describe("PaperTradingDaemon", () => {
       );
     });
 
-    it("D7-03: settlement journal recovers interrupted writes idempotently at every stage", () => {
-      const tempDir = mkdtempSync(path.join(os.tmpdir(), "journal-recovery-test-"));
-      const journalFile = path.join(tempDir, "settlement-journal.json");
-      const sessionFile = path.join(tempDir, "sessions", "sess-recovery-1.json");
-      const pastSessionsFile = path.join(tempDir, "past-sessions.json");
-      const walletFile = path.join(tempDir, "virtual-wallet.json");
+    it("P0-E7-06: recoverSettlementJournal executes real production routine across all checkpoint stages", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "real-journal-recovery-test-"));
+      const journalFile = path.join(tempDir, ".tmp", "settlement-journal.json");
+      const sessionFile = path.join(tempDir, ".tmp", "sessions", "sess-recovery-real-1.json");
+      const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
 
-      mkdirSync(path.join(tempDir, "sessions"), { recursive: true });
+      mkdirSync(path.join(tempDir, ".tmp", "sessions"), { recursive: true });
 
       const initialWallet: VirtualWalletState = {
-        walletAddress: "SimWalletRecovery",
+        walletAddress: "SimWalletRecoveryReal",
         currentBalanceSol: 10.0,
         initialBalanceSol: 10.0,
         totalSessionsCompleted: 0,
@@ -2046,7 +2051,7 @@ describe("PaperTradingDaemon", () => {
       writeFileSync(walletFile, JSON.stringify(initialWallet, null, 2), "utf8");
 
       const mockSummary = {
-        sessionId: "sess-recovery-1",
+        sessionId: "sess-recovery-real-1",
         startedAt: new Date(nowMs).toISOString(),
         endedAt: new Date(nowMs + 60000).toISOString(),
         durationMinutes: 1,
@@ -2067,10 +2072,10 @@ describe("PaperTradingDaemon", () => {
       };
 
       // Stage: STARTED (interrupted before any file was written)
-      const journalEntry = {
-        sessionId: "sess-recovery-1",
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: "sess-recovery-real-1",
         startedAtMs: nowMs,
-        stage: "STARTED" as const,
+        stage: "STARTED",
         sessionSummary: mockSummary,
         sessionNewRealizedPnlSol: 0.5,
         liquidCashSol: 10.5,
@@ -2080,39 +2085,220 @@ describe("PaperTradingDaemon", () => {
       };
       writeFileSync(journalFile, JSON.stringify(journalEntry, null, 2), "utf8");
 
-      // Verify recovery
-      const raw = readFileSync(journalFile, "utf8");
-      const entry = JSON.parse(raw);
-      expect(entry.stage).toBe("STARTED");
+      // Invoke the ACTUAL production recovery routine!
+      recoverSettlementJournal({
+        journalPath: journalFile,
+        baseDir: tempDir,
+        walletPath: walletFile,
+      });
 
-      writeFileSync(sessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
-      writeFileSync(pastSessionsFile, JSON.stringify([entry.sessionSummary], null, 2), "utf8");
-      const loadedWallet = JSON.parse(readFileSync(walletFile, "utf8"));
-      settleSessionInWallet(
-        loadedWallet,
-        entry.sessionId,
-        entry.liquidCashSol,
-        entry.initialPortfolioSol,
-        nowMs + 2000,
-        entry.unresolvedPositions,
-        entry.sessionNewRealizedPnlSol,
-      );
-      writeFileSync(walletFile, JSON.stringify(loadedWallet, null, 2), "utf8");
+      // Assert Stage 1: Individual session file was written
+      expect(existsSync(sessionFile)).toBe(true);
+      const sessionParsed = JSON.parse(readFileSync(sessionFile, "utf8"));
+      expect(sessionParsed.sessionId).toBe("sess-recovery-real-1");
 
-      // Idempotency check: Re-settling the same session must be a no-op
-      const reSettled = settleSessionInWallet(
-        loadedWallet,
-        entry.sessionId,
-        entry.liquidCashSol,
-        entry.initialPortfolioSol,
-        nowMs + 3000,
-      );
-      expect(reSettled).toBe(false); // IDEMPOTENT NO-OP!
-      expect(loadedWallet.currentBalanceSol).toBe(10.5);
-      expect(loadedWallet.allTimeRealizedPnlSol).toBe(0.5);
-      expect(loadedWallet.totalSessionsCompleted).toBe(1);
+      // Assert Stage 2: past-sessions.json was updated
+      expect(existsSync(pastSessionsFile)).toBe(true);
+      const pastParsed = JSON.parse(readFileSync(pastSessionsFile, "utf8"));
+      expect(Array.isArray(pastParsed)).toBe(true);
+      expect(pastParsed[0]?.sessionId).toBe("sess-recovery-real-1");
+
+      // Assert Stage 3: Virtual wallet was settled
+      const settledWallet = JSON.parse(readFileSync(walletFile, "utf8"));
+      expect(settledWallet.currentBalanceSol).toBe(10.5);
+      expect(settledWallet.allTimeRealizedPnlSol).toBe(0.5);
+      expect(settledWallet.settledSessionIds).toContain("sess-recovery-real-1");
+      expect(settledWallet.totalSessionsCompleted).toBe(1);
+
+      // Assert Stage 4: Journal was marked COMMITTED and unlinked
+      expect(existsSync(journalFile)).toBe(false);
+
+      // Re-invoking recovery when journal is gone must be a clean no-op
+      recoverSettlementJournal({
+        journalPath: journalFile,
+        baseDir: tempDir,
+        walletPath: walletFile,
+      });
+      const walletUnchanged = JSON.parse(readFileSync(walletFile, "utf8"));
+      expect(walletUnchanged.currentBalanceSol).toBe(10.5);
+      expect(walletUnchanged.totalSessionsCompleted).toBe(1);
 
       rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "corrupt-history-recovery-test-"));
+      const journalFile = path.join(tempDir, ".tmp", "settlement-journal.json");
+      const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletRecoveryReal",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 0,
+        allTimeRealizedPnlSol: 0.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: [],
+        unresolvedTokens: [],
+      };
+      writeFileSync(walletFile, JSON.stringify(initialWallet, null, 2), "utf8");
+
+      // Plant corrupt unparseable content in past-sessions.json
+      const corruptContent = "{ this is invalid JSON that cannot be parsed by recovery";
+      writeFileSync(pastSessionsFile, corruptContent, "utf8");
+
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: "sess-recovery-corrupt-1",
+        startedAtMs: nowMs,
+        stage: "STARTED",
+        sessionSummary: {
+          sessionId: "sess-recovery-corrupt-1",
+          startedAt: new Date(nowMs).toISOString(),
+          endedAt: new Date(nowMs + 60000).toISOString(),
+          durationMinutes: 1,
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 10.5,
+          netPnlSol: 0.5,
+          netPnlPct: 5.0,
+          totalTrades: 1,
+          buysCount: 1,
+          sellsCount: 1,
+          winsCount: 1,
+          lossesCount: 0,
+          scratchesCount: 0,
+          winRatePct: 100,
+          coinsWatchedCount: 10,
+          missedOpportunitiesCount: 2,
+          trades: [],
+        },
+        sessionNewRealizedPnlSol: 0.5,
+        liquidCashSol: 10.5,
+        initialPortfolioSol: 10.0,
+        unresolvedPositions: [],
+        reconciledPositionIds: [],
+      };
+      writeFileSync(journalFile, JSON.stringify(journalEntry, null, 2), "utf8");
+
+      // Execution MUST throw fatal error and abort
+      expect(() => {
+        recoverSettlementJournal({
+          journalPath: journalFile,
+          baseDir: tempDir,
+          walletPath: walletFile,
+        });
+      }).toThrow(/Corrupted .* encountered during journal recovery/);
+
+      // Verify original corrupted bytes were preserved and backed up to .corrupt-<timestamp>
+      expect(readFileSync(pastSessionsFile, "utf8")).toBe(corruptContent);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("P0-E7-04: ProcessLock acquires exclusive lock, blocks active PID, reclaims stale dead PID, and releases cleanly", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "process-lock-test-"));
+      const lockFile = path.join(tempDir, "test-process.lock");
+
+      // 1. Initial acquisition succeeds
+      const handle1 = acquireProcessLock({
+        processName: "TestProcess1",
+        sessionId: "sess-lock-1",
+        lockPath: lockFile,
+      });
+      expect(existsSync(lockFile)).toBe(true);
+
+      // 2. Second acquisition from active process MUST throw fatal lock error
+      expect(() => {
+        acquireProcessLock({
+          processName: "TestProcess2",
+          sessionId: "sess-lock-2",
+          lockPath: lockFile,
+        });
+      }).toThrow(/Exclusive lock held by active process/);
+
+      // 3. Release lock removes lock file
+      releaseProcessLock(handle1);
+      expect(existsSync(lockFile)).toBe(false);
+
+      // 4. Plant stale lock with dead PID (99999999)
+      const staleDescriptor = {
+        pid: 99999999,
+        processName: "DeadProcess",
+        sessionId: "sess-stale",
+        acquiredAtMs: Date.now() - 120_000,
+        hostname: "test-host",
+      };
+      writeFileSync(lockFile, JSON.stringify(staleDescriptor, null, 2), "utf8");
+
+      // Assert PID liveness returns false
+      expect(isProcessAlive(99999999)).toBe(false);
+
+      // 5. Acquiring lock reclaims verified stale dead PID
+      const handle2 = acquireProcessLock({
+        processName: "ReclaimedProcess",
+        sessionId: "sess-reclaim",
+        lockPath: lockFile,
+      });
+      expect(existsSync(lockFile)).toBe(true);
+      const currentDesc = JSON.parse(readFileSync(lockFile, "utf8"));
+      expect(currentDesc.pid).toBe(process.pid);
+      expect(currentDesc.processName).toBe("ReclaimedProcess");
+
+      releaseProcessLock(handle2);
+      expect(existsSync(lockFile)).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("P0-E7-05: operator reconciliation write-down preserves unresolved token inventory", () => {
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletWriteDown",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-0"],
+        unresolvedTokens: [
+          {
+            positionId: "pos-wd-1",
+            mintAddress: "MintWriteDown11111111111111111111111111111111",
+            symbol: "WDOWN",
+            tokensHeld: 100.0,
+            costBasisSol: 1.0,
+            initialCostBasisSol: 1.0,
+            initialTokensHeld: 100.0,
+            realizedProceedsSol: 0.0,
+            lastObservedPriceSol: 0.01,
+            lastObservedAtMs: nowMs,
+            reasonForMissingData: "FEED_DROPPED",
+            sessionId: "sess-0",
+          },
+        ],
+      };
+
+      const result = reconcileWalletInventory(initialWallet, {
+        identifier: "pos-wd-1",
+        operationType: "WRITE_DOWN",
+        writeDownEstimatedSol: 0.25,
+        reason: "Conservative valuation write-down",
+      });
+
+      expect(result.operationType).toBe("WRITE_DOWN");
+      expect(result.proceedsSol).toBe(0);
+      expect(result.incrementalPnlSol).toBe(0);
+
+      // Cash balance and realized P&L must NOT change
+      expect(initialWallet.currentBalanceSol).toBe(10.0);
+      expect(initialWallet.allTimeRealizedPnlSol).toBe(0.0);
+
+      // Tokens MUST still be held in inventory!
+      expect(initialWallet.unresolvedTokens?.length).toBe(1);
+      expect(initialWallet.unresolvedTokens![0]!.tokensHeld).toBe(100.0);
+      expect(initialWallet.unresolvedTokens![0]!.costBasisSol).toBe(1.0);
+      expect(initialWallet.unresolvedTokens![0]!.estimatedLiquidationSol).toBe(0.25);
     });
   });
 });

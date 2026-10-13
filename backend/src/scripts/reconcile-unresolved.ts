@@ -1,4 +1,11 @@
-import { existsSync, appendFileSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -7,42 +14,88 @@ import {
   reconcileWalletInventory,
   type ReconcileWalletOptions,
 } from "../paper/VirtualWallet.js";
+import { acquireProcessLock, releaseProcessLock, findWorkspaceRoot } from "../paper/ProcessLock.js";
 
-function checkActiveDaemonLock(): void {
-  const activePaths = [".tmp/paper-session-active.json", "backend/.tmp/paper-session-active.json"];
-  for (const activePath of activePaths) {
-    if (existsSync(activePath)) {
+export interface ReconciliationIntent {
+  intentId: string;
+  createdAtMs: number;
+  status: "INTENT_RECORDED" | "FINALIZED";
+  options: ReconcileWalletOptions;
+  matchedPositionId: string;
+}
+
+export function resolveIntentPath(baseDir?: string): string {
+  const root = baseDir ?? findWorkspaceRoot();
+  return path.resolve(root, ".tmp/reconciliation-intent.json");
+}
+
+export function resolveAuditPath(baseDir?: string): string {
+  const root = baseDir ?? findWorkspaceRoot();
+  return path.resolve(root, ".tmp/reconciliation-audit.jsonl");
+}
+
+export function appendAuditLog(auditRecord: Record<string, unknown>, baseDir?: string): void {
+  const primaryPath = resolveAuditPath(baseDir);
+  const line = JSON.stringify(auditRecord) + "\n";
+  appendFileSync(primaryPath, line, "utf8");
+
+  // Also sync legacy backend/.tmp mirror if it exists
+  const root = baseDir ?? findWorkspaceRoot();
+  const legacyDir = path.resolve(root, "backend/.tmp");
+  if (existsSync(legacyDir)) {
+    const legacyPath = path.resolve(legacyDir, "reconciliation-audit.jsonl");
+    if (legacyPath !== primaryPath) {
       try {
-        const raw = readFileSync(activePath, "utf8");
-        const activeState = JSON.parse(raw);
-        if (activeState.status === "RUNNING") {
-          const lastTick = activeState.lastTickAtMs ?? 0;
-          if (Date.now() - lastTick < 60_000) {
-            console.error(
-              `[Reconcile] [FATAL] Active paper trading daemon detected (Session: ${activeState.sessionId}, status: RUNNING). Reconciliation cannot run concurrently with an active trading session.`,
-            );
-            process.exit(1);
-          }
-        }
-      } catch {
-        // ignore parse errors
+        appendFileSync(legacyPath, line, "utf8");
+      } catch (err) {
+        console.warn(`[Reconcile] Warning: Failed to mirror audit log to ${legacyPath}:`, err);
       }
     }
   }
 }
 
-function appendAuditLog(auditRecord: Record<string, unknown>): void {
-  const auditDirs = [".tmp", "backend/.tmp"];
-  const line = JSON.stringify(auditRecord) + "\n";
-  for (const dir of auditDirs) {
-    if (existsSync(dir)) {
-      const logPath = path.join(dir, "reconciliation-audit.jsonl");
-      try {
-        appendFileSync(logPath, line, "utf8");
-      } catch (err) {
-        console.error(`[Reconcile] Warning: Failed to write audit log to ${logPath}:`, err);
+export function recoverInterruptedIntent(baseDir?: string): void {
+  const intentPath = resolveIntentPath(baseDir);
+  if (!existsSync(intentPath)) return;
+
+  try {
+    const raw = readFileSync(intentPath, "utf8");
+    const intent = JSON.parse(raw) as ReconciliationIntent;
+    console.warn(
+      `[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (${intent.intentId}, Operation: ${intent.options.operationType}, Position: ${intent.matchedPositionId}). Checking wallet state...`,
+    );
+
+    const wallet = loadVirtualWallet();
+    const stillPresent = wallet.unresolvedTokens?.some(
+      (t) =>
+        t.positionId === intent.matchedPositionId || t.mintAddress === intent.options.identifier,
+    );
+
+    if (
+      intent.options.operationType === "SIMULATED_SALE" ||
+      intent.options.operationType === "FINAL_DISPOSAL"
+    ) {
+      if (!stillPresent) {
+        console.log(
+          `[Reconcile] [RECOVERY] Operation ${intent.intentId} was already applied in virtual wallet. Finalizing intent cleanup.`,
+        );
+        try {
+          unlinkSync(intentPath);
+        } catch (err) {
+          void err;
+        }
+        return;
       }
     }
+
+    throw new Error(
+      `[Reconcile] [FATAL] Interrupted reconciliation intent detected at ${intentPath}. Position ${intent.matchedPositionId} remains in wallet. Manual operator review required before re-attempting.`,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("[FATAL]")) throw err;
+    throw new Error(
+      `[Reconcile] [FATAL] Corrupted reconciliation intent file at ${intentPath}: ${String(err)}`,
+    );
   }
 }
 
@@ -92,85 +145,130 @@ export function runReconciliationCli(): void {
     process.exit(1);
   }
 
-  // Enforce concurrency lock check before executing any mutation
-  checkActiveDaemonLock();
+  // P0-E7-04: Acquire exclusive process lock before reading/mutating ledger
+  const lockHandle = acquireProcessLock({
+    processName: "PaperReconcile",
+  });
 
-  const isSale = values.sale === true || values["simulated-sale"] === true;
-  const isWriteDown = values["write-down"] === true;
-  const isDispose = values.dispose === true || values["final-disposal"] === true;
+  try {
+    // Check for prior interrupted reconciliation intent
+    recoverInterruptedIntent();
 
-  const activeModes = [isSale, isWriteDown, isDispose].filter(Boolean).length;
-  if (activeModes === 0) {
-    console.error(
-      "[Reconcile] Error: Must specify an operation: --sale, --write-down, or --dispose.",
-    );
-    process.exit(1);
-  }
-  if (activeModes > 1) {
-    console.error(
-      "[Reconcile] Error: Conflicting operations specified. Choose exactly one of: --sale, --write-down, or --dispose.",
-    );
-    process.exit(1);
-  }
+    const isSale = values.sale === true || values["simulated-sale"] === true;
+    const isWriteDown = values["write-down"] === true;
+    const isDispose = values.dispose === true || values["final-disposal"] === true;
 
-  let options: ReconcileWalletOptions;
-
-  if (isSale) {
-    const rawPrice = values["price-sol"] ?? values.price;
-    const priceSol = typeof rawPrice === "string" ? parseFloat(rawPrice) : NaN;
-    if (!Number.isFinite(priceSol) || priceSol <= 0) {
-      console.error("[Reconcile] Error: --sale requires valid --price-sol > 0");
-      process.exit(1);
-    }
-    const provenance =
-      typeof values.provenance === "string"
-        ? values.provenance
-        : typeof values.reason === "string"
-          ? values.reason
-          : "Simulated sale at operator-specified market price";
-
-    options = {
-      identifier,
-      operationType: "SIMULATED_SALE",
-      exitPriceSol: priceSol,
-      reason: provenance,
-    };
-  } else if (isWriteDown) {
-    const rawEst = values["estimated-sol"];
-    const estimatedSol = typeof rawEst === "string" ? parseFloat(rawEst) : 0;
-    if (!Number.isFinite(estimatedSol) || estimatedSol < 0) {
-      console.error("[Reconcile] Error: --write-down requires valid --estimated-sol >= 0");
-      process.exit(1);
-    }
-    options = {
-      identifier,
-      operationType: "WRITE_DOWN",
-      writeDownEstimatedSol: estimatedSol,
-      reason:
-        typeof values.reason === "string"
-          ? values.reason
-          : `Manual valuation adjustment to ${estimatedSol} SOL`,
-    };
-  } else {
-    // isDispose
-    const reason = values.reason;
-    if (!reason || typeof reason !== "string") {
+    const activeModes = [isSale, isWriteDown, isDispose].filter(Boolean).length;
+    if (activeModes === 0) {
       console.error(
-        "[Reconcile] Error: --dispose requires explicit --reason explaining why inventory is permanently closed.",
+        "[Reconcile] Error: Must specify an operation: --sale, --write-down, or --dispose.",
       );
       process.exit(1);
     }
-    options = {
-      identifier,
-      operationType: "FINAL_DISPOSAL",
-      reason,
-    };
-  }
+    if (activeModes > 1) {
+      console.error(
+        "[Reconcile] Error: Conflicting operations specified. Choose exactly one of: --sale, --write-down, or --dispose.",
+      );
+      process.exit(1);
+    }
 
-  try {
+    let options: ReconcileWalletOptions;
+
+    if (isSale) {
+      const rawPrice = values["price-sol"] ?? values.price;
+      const priceSol = typeof rawPrice === "string" ? parseFloat(rawPrice) : NaN;
+      if (!Number.isFinite(priceSol) || priceSol <= 0) {
+        console.error("[Reconcile] Error: --sale requires valid --price-sol > 0");
+        process.exit(1);
+      }
+      const provenance =
+        typeof values.provenance === "string"
+          ? values.provenance
+          : typeof values.reason === "string"
+            ? values.reason
+            : "Simulated sale at operator-specified market price";
+
+      options = {
+        identifier,
+        operationType: "SIMULATED_SALE",
+        exitPriceSol: priceSol,
+        reason: provenance,
+      };
+    } else if (isWriteDown) {
+      const rawEst = values["estimated-sol"];
+      const estimatedSol = typeof rawEst === "string" ? parseFloat(rawEst) : 0;
+      if (!Number.isFinite(estimatedSol) || estimatedSol < 0) {
+        console.error("[Reconcile] Error: --write-down requires valid --estimated-sol >= 0");
+        process.exit(1);
+      }
+      options = {
+        identifier,
+        operationType: "WRITE_DOWN",
+        writeDownEstimatedSol: estimatedSol,
+        reason:
+          typeof values.reason === "string"
+            ? values.reason
+            : `Manual valuation adjustment to ${estimatedSol} SOL`,
+      };
+    } else {
+      // isDispose
+      const reason = values.reason;
+      if (!reason || typeof reason !== "string") {
+        console.error(
+          "[Reconcile] Error: --dispose requires explicit --reason explaining why inventory is permanently closed.",
+        );
+        process.exit(1);
+      }
+      options = {
+        identifier,
+        operationType: "FINAL_DISPOSAL",
+        reason,
+      };
+    }
+
+    // Verify target position exists before intent recording
+    const targetIdx = wallet.unresolvedTokens.findIndex(
+      (t) => t.positionId === options.identifier || t.mintAddress === options.identifier,
+    );
+    if (targetIdx < 0) {
+      console.error(
+        `[Reconcile] Error: No unresolved position found matching '${options.identifier}'. Use --list to verify current inventory.`,
+      );
+      process.exit(1);
+    }
+    const targetPos = wallet.unresolvedTokens[targetIdx]!;
+
+    // P0-E7-05: Record Write-Ahead Audit Intent before mutating wallet state
+    const intentPath = resolveIntentPath();
+    const intent: ReconciliationIntent = {
+      intentId: `rec-intent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      createdAtMs: Date.now(),
+      status: "INTENT_RECORDED",
+      options,
+      matchedPositionId: targetPos.positionId,
+    };
+    const tempIntentPath = `${intentPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+    try {
+      writeFileSync(tempIntentPath, JSON.stringify(intent, null, 2), "utf8");
+      renameSync(tempIntentPath, intentPath);
+    } catch (intentErr) {
+      console.error("[Reconcile] [FATAL] Failed to persist write-ahead intent:", intentErr);
+      process.exit(1);
+    }
+
+    // Mutate wallet state and persist atomically
     const result = reconcileWalletInventory(wallet, options);
     saveVirtualWallet(wallet);
+
+    // Append immutable audit log
     appendAuditLog(result.auditRecord);
+
+    // Clean up finalized intent
+    try {
+      unlinkSync(intentPath);
+    } catch (err) {
+      void err;
+    }
 
     console.log("=== RECONCILIATION EXECUTED SUCCESSFULLY ===");
     console.log(`Operation:        ${result.operationType}`);
@@ -191,6 +289,8 @@ export function runReconciliationCli(): void {
   } catch (err) {
     console.error("[Reconcile] Reconciliation failed:", err);
     process.exit(1);
+  } finally {
+    releaseProcessLock(lockHandle);
   }
 }
 

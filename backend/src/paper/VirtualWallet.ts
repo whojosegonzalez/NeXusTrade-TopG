@@ -1,5 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
+import { findWorkspaceRoot } from "./ProcessLock.js";
 
 export interface UnresolvedTokenInventory {
   readonly positionId: string;
@@ -41,23 +49,62 @@ export const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
 
 export function resolveVirtualWalletFile(customPath?: string): string {
   if (customPath) return path.resolve(customPath);
-  const candidates = [
-    path.resolve(process.cwd(), ".tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "backend/.tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "../.tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
+  const root = findWorkspaceRoot();
+  return path.resolve(root, ".tmp/virtual-wallet.json");
+}
+
+export function checkLegacyWalletConflict(canonicalPath: string): void {
+  const root = findWorkspaceRoot();
+  const legacyPath = path.resolve(root, "backend/.tmp/virtual-wallet.json");
+  if (path.resolve(canonicalPath) === legacyPath) return;
+
+  if (existsSync(canonicalPath) && existsSync(legacyPath)) {
+    try {
+      const cRaw = readFileSync(canonicalPath, "utf8");
+      const lRaw = readFileSync(legacyPath, "utf8");
+      if (cRaw.trim() === lRaw.trim()) return;
+
+      const cParsed = JSON.parse(cRaw);
+      const lParsed = JSON.parse(lRaw);
+      const balanceMismatch =
+        Math.abs((cParsed.currentBalanceSol ?? 0) - (lParsed.currentBalanceSol ?? 0)) > 1e-6;
+      const pnlMismatch =
+        Math.abs((cParsed.allTimeRealizedPnlSol ?? 0) - (lParsed.allTimeRealizedPnlSol ?? 0)) >
+        1e-6;
+      const sessionMismatch =
+        JSON.stringify(cParsed.settledSessionIds ?? []) !==
+        JSON.stringify(lParsed.settledSessionIds ?? []);
+      const tokenMismatch =
+        JSON.stringify(cParsed.unresolvedTokens ?? []) !==
+        JSON.stringify(lParsed.unresolvedTokens ?? []);
+
+      if (balanceMismatch || pnlMismatch || sessionMismatch || tokenMismatch) {
+        throw new Error(
+          `[VirtualWallet] [FATAL] Divergent legacy virtual wallet files detected between canonical path (${canonicalPath}) and legacy path (${legacyPath}). ` +
+            `Canonical balance: ${cParsed.currentBalanceSol} SOL, Legacy balance: ${lParsed.currentBalanceSol} SOL. ` +
+            `Execution halted to require operator review and prevent split-ledger state.`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("[FATAL]")) throw err;
+      throw new Error(
+        `[VirtualWallet] [FATAL] Error verifying legacy wallet paths (${canonicalPath} vs ${legacyPath}): ${String(err)}`,
+      );
+    }
+  } else if (!existsSync(canonicalPath) && existsSync(legacyPath)) {
+    console.log(
+      `[VirtualWallet] [MIGRATION] Migrating legacy wallet from ${legacyPath} to canonical path ${canonicalPath}`,
+    );
+    mkdirSync(path.dirname(canonicalPath), { recursive: true });
+    copyFileSync(legacyPath, canonicalPath);
   }
-  if (existsSync(path.resolve(process.cwd(), "backend/.tmp"))) {
-    return path.resolve(process.cwd(), "backend/.tmp/virtual-wallet.json");
-  }
-  return path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
 }
 
 export function loadVirtualWallet(customPath?: string): VirtualWalletState {
   const filePath = resolveVirtualWalletFile(customPath);
+  if (!customPath) {
+    checkLegacyWalletConflict(filePath);
+  }
   if (existsSync(filePath)) {
     let raw = "";
     try {
@@ -140,17 +187,22 @@ export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: strin
   writeFileSync(tempPath, payload, "utf8");
   renameSync(tempPath, primaryPath);
 
-  // Best-effort synchronization between repo root .tmp and backend/.tmp
-  try {
-    const isBackend = primaryPath.includes("backend");
-    const mirrorPath = isBackend
-      ? primaryPath.replace(/backend[\\/]\.tmp/, ".tmp")
-      : path.join(path.dirname(primaryPath), "backend", ".tmp", path.basename(primaryPath));
-    if (mirrorPath !== primaryPath && existsSync(path.dirname(mirrorPath))) {
-      writeFileSync(mirrorPath, payload, "utf8");
+  // Synchronize legacy backend/.tmp mirror atomically if it exists, ensuring zero divergence
+  if (!customPath) {
+    const root = findWorkspaceRoot();
+    const legacyPath = path.resolve(root, "backend/.tmp/virtual-wallet.json");
+    if (primaryPath !== legacyPath && existsSync(path.dirname(legacyPath))) {
+      try {
+        const legacyTemp = `${legacyPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+        writeFileSync(legacyTemp, payload, "utf8");
+        renameSync(legacyTemp, legacyPath);
+      } catch (err) {
+        console.warn(
+          `[VirtualWallet] Warning: Failed to sync legacy mirror at ${legacyPath}:`,
+          err,
+        );
+      }
     }
-  } catch {
-    // mirror sync is best-effort
   }
 }
 

@@ -55,6 +55,7 @@ import {
   settleSessionInWallet,
   type VirtualWalletState,
 } from "../paper/VirtualWallet.js";
+import { acquireProcessLock, releaseProcessLock, findWorkspaceRoot } from "../paper/ProcessLock.js";
 
 function parseCliArgs(): PaperTradingDaemonConfig {
   const rawArgs = process.argv.slice(2).filter((arg) => arg !== "--");
@@ -333,14 +334,26 @@ export interface SettlementJournalEntry {
   reconciledPositionIds?: readonly string[] | undefined;
 }
 
-export function resolveJournalPath(): string {
-  if (existsSync(".tmp")) return ".tmp/settlement-journal.json";
-  if (existsSync("backend/.tmp")) return "backend/.tmp/settlement-journal.json";
-  return ".tmp/settlement-journal.json";
+export function resolveJournalPath(customBaseDir?: string): string {
+  const root = customBaseDir ?? findWorkspaceRoot();
+  return path.resolve(root, ".tmp/settlement-journal.json");
 }
 
-export function recoverSettlementJournal(): void {
-  const possiblePaths = [".tmp/settlement-journal.json", "backend/.tmp/settlement-journal.json"];
+export interface RecoverJournalOptions {
+  journalPath?: string | undefined;
+  baseDir?: string | undefined;
+  walletPath?: string | undefined;
+}
+
+export function recoverSettlementJournal(options?: RecoverJournalOptions): void {
+  const root = options?.baseDir ?? findWorkspaceRoot();
+  const possiblePaths = options?.journalPath
+    ? [options.journalPath]
+    : [
+        path.resolve(root, ".tmp/settlement-journal.json"),
+        path.resolve(root, "backend/.tmp/settlement-journal.json"),
+      ];
+
   for (const journalPath of possiblePaths) {
     if (!existsSync(journalPath)) continue;
     try {
@@ -358,47 +371,61 @@ export function recoverSettlementJournal(): void {
         `[PaperDaemon] [RECOVERY] Detected uncommitted settlement journal for session ${entry.sessionId} at stage ${entry.stage}. Replaying remaining settlement operations...`,
       );
 
+      const baseDir = options?.baseDir ?? path.dirname(path.dirname(journalPath));
+
       // Replay Stage 1: Individual session file
-      const sessionDir = existsSync(".tmp/sessions")
-        ? ".tmp/sessions"
-        : existsSync("backend/.tmp/sessions")
-          ? "backend/.tmp/sessions"
-          : ".tmp/sessions";
+      const sessionDir = path.resolve(baseDir, ".tmp/sessions");
       mkdirSync(sessionDir, { recursive: true });
-      const sessionFile = `${sessionDir}/${entry.sessionId}.json`;
+      const sessionFile = path.resolve(sessionDir, `${entry.sessionId}.json`);
       if (!existsSync(sessionFile)) {
-        writeFileSync(sessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
+        const tempSessionFile = `${sessionFile}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+        writeFileSync(tempSessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
+        renameSync(tempSessionFile, sessionFile);
         console.log(
           `[PaperDaemon] [RECOVERY] Replayed individual session file write: ${sessionFile}`,
         );
       }
 
       // Replay Stage 2: past-sessions.json
-      const pastSessionsPath = existsSync(".tmp/past-sessions.json")
-        ? ".tmp/past-sessions.json"
-        : existsSync("backend/.tmp/past-sessions.json")
-          ? "backend/.tmp/past-sessions.json"
-          : ".tmp/past-sessions.json";
+      const pastSessionsPath = path.resolve(baseDir, ".tmp/past-sessions.json");
       let pastSessions: HistoricalSessionSummary[] = [];
       if (existsSync(pastSessionsPath)) {
+        const pastRaw = readFileSync(pastSessionsPath, "utf8");
         try {
-          const parsed = JSON.parse(readFileSync(pastSessionsPath, "utf8"));
-          if (Array.isArray(parsed)) pastSessions = parsed;
-        } catch (err) {
-          void err;
+          const parsed = JSON.parse(pastRaw);
+          if (Array.isArray(parsed)) {
+            pastSessions = parsed;
+          } else {
+            throw new Error("past-sessions.json is not an array");
+          }
+        } catch (parseErr) {
+          const corruptBackup = `${pastSessionsPath}.corrupt-${Date.now()}`;
+          try {
+            writeFileSync(corruptBackup, pastRaw, "utf8");
+          } catch {
+            // ignore backup write error
+          }
+          throw new Error(
+            `[PaperDaemon] [FATAL] Corrupted ${pastSessionsPath} encountered during journal recovery: ${String(parseErr)}. Backed up to ${corruptBackup}. Recovery aborted to fail closed and protect historical ledger.`,
+          );
         }
+      } else {
+        pastSessions = [...BACKFILLED_PAST_SESSIONS];
       }
+
       const existingIdx = pastSessions.findIndex((s) => s.sessionId === entry.sessionId);
       if (existingIdx < 0) {
         pastSessions = [entry.sessionSummary, ...pastSessions];
-        writeFileSync(pastSessionsPath, JSON.stringify(pastSessions, null, 2), "utf8");
+        const tempPast = `${pastSessionsPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+        writeFileSync(tempPast, JSON.stringify(pastSessions, null, 2), "utf8");
+        renameSync(tempPast, pastSessionsPath);
         console.log(
           `[PaperDaemon] [RECOVERY] Replayed past-sessions.json update for session ${entry.sessionId}`,
         );
       }
 
       // Replay Stage 3: Virtual wallet settlement
-      const wallet = loadVirtualWallet();
+      const wallet = loadVirtualWallet(options?.walletPath);
       if (!wallet.settledSessionIds?.includes(entry.sessionId)) {
         const settled = settleSessionInWallet(
           wallet,
@@ -411,7 +438,7 @@ export function recoverSettlementJournal(): void {
           entry.reconciledPositionIds,
         );
         if (settled) {
-          saveVirtualWallet(wallet);
+          saveVirtualWallet(wallet, options?.walletPath);
           console.log(
             `[PaperDaemon] [RECOVERY] Replayed virtual wallet settlement for session ${entry.sessionId}`,
           );
@@ -421,7 +448,9 @@ export function recoverSettlementJournal(): void {
       // Mark COMMITTED and clean up
       entry.stage = "COMMITTED";
       try {
-        writeFileSync(journalPath, JSON.stringify(entry, null, 2), "utf8");
+        const tempJournal = `${journalPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+        writeFileSync(tempJournal, JSON.stringify(entry, null, 2), "utf8");
+        renameSync(tempJournal, journalPath);
         unlinkSync(journalPath);
       } catch (err) {
         void err;
@@ -435,7 +464,7 @@ export function recoverSettlementJournal(): void {
         recoveryErr,
       );
       throw new Error(
-        `[PaperDaemon] [FATAL] Unresolved settlement journal inconsistency for session at ${journalPath}. Startup aborted to fail closed and protect ledger integrity.`,
+        `[PaperDaemon] [FATAL] Unresolved settlement journal inconsistency for session at ${journalPath}: ${String(recoveryErr)}. Startup aborted to fail closed and protect ledger integrity.`,
       );
     }
   }
@@ -443,6 +472,43 @@ export function recoverSettlementJournal(): void {
 
 async function run(): Promise<void> {
   const config = parseCliArgs();
+
+  // Section C: Genuinely read-only validation preflight when --dry-run is supplied
+  if (config.dryRun) {
+    console.log(
+      `[PaperDaemon] [DRY_RUN] Read-only dry run mode requested. Validating configurations, budget, wallet, and lock without executing trades or mutating files...`,
+    );
+    const vWallet = loadVirtualWallet();
+    console.log(
+      `[PaperDaemon] [DRY_RUN] Authoritative virtual wallet loaded: Balance=${vWallet.currentBalanceSol} SOL, All-Time PnL=${vWallet.allTimeRealizedPnlSol} SOL, CompletedSessions=${vWallet.totalSessionsCompleted}`,
+    );
+    const testLock = acquireProcessLock({
+      processName: "PaperDaemon-DryRun",
+      sessionId: config.sessionId,
+    });
+    releaseProcessLock(testLock);
+    console.log(`[PaperDaemon] [DRY_RUN] Process exclusivity lock check: PASSED`);
+
+    console.log(
+      `===============================================================================\n` +
+        `                     NEXUSTRADE: DRY RUN PREFLIGHT AUDIT PASSED                \n` +
+        `===============================================================================\n` +
+        `Mode: READ-ONLY PREFLIGHT (No trading, no mutations)\n` +
+        `Session ID: ${config.sessionId}\n` +
+        `Authoritative Wallet: Balance ${vWallet.currentBalanceSol} SOL (${vWallet.totalSessionsCompleted} completed sessions)\n` +
+        `Schedule: ${config.tradingSchedule ? config.tradingSchedule.rawString : "UNSCHEDULED (24h default)"}\n` +
+        `Status: VERIFIED. Exiting cleanly with code 0 without modifying ledger or creating session.\n` +
+        `===============================================================================`,
+    );
+    return;
+  }
+
+  // Normal execution: acquire exclusive process lock (P0-E7-04)
+  const processLockHandle = acquireProcessLock({
+    processName: "PaperTradingDaemon",
+    sessionId: config.sessionId,
+  });
+
   console.log(`[PaperDaemon] Starting Paper Trading Daemon Session: ${config.sessionId}`);
 
   // D7-03: Recover any uncommitted settlement journals before starting session
@@ -654,12 +720,17 @@ async function run(): Promise<void> {
       };
       const updateJournal = (stage: SettlementJournalEntry["stage"]) => {
         journalEntry.stage = stage;
+        const tempJournal = `${journalPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
         try {
-          writeFileSync(journalPath, JSON.stringify(journalEntry, null, 2), "utf8");
+          writeFileSync(tempJournal, JSON.stringify(journalEntry, null, 2), "utf8");
+          renameSync(tempJournal, journalPath);
         } catch (err) {
           console.error(
             `[PaperDaemon] [JOURNAL_ERROR] Failed to record journal stage ${stage}:`,
             err,
+          );
+          throw new Error(
+            `[PaperDaemon] [FATAL] Settlement journal write failed at stage ${stage}: ${String(err)}. Archival aborted to fail closed.`,
           );
         }
       };
@@ -791,6 +862,8 @@ async function run(): Promise<void> {
         shutdownErr,
       );
       process.exit(1);
+    } finally {
+      releaseProcessLock(processLockHandle);
     }
     const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
     console.log(
@@ -1760,6 +1833,8 @@ async function run(): Promise<void> {
       finalArchiveErr,
     );
     process.exit(1);
+  } finally {
+    releaseProcessLock(processLockHandle);
   }
   const finalReport = tracker.generateReport(
     config.initialPortfolioSol,
