@@ -17,6 +17,9 @@ export type ExitReasonCode =
   | "RUG_PULL_DETECTED"
   | "SELL_PRESSURE_UNABSORBED"
   | "PROBE_UNCONFIRMED_DUMP_CUT"
+  | "UNCONFIRMED_PRE_BREAKEVEN_CUT"
+  | "MOONBAG_PROTECTION_EXIT"
+  | "SCALED_BREAKEVEN_EXIT"
   | "EMERGENCY_SELL_PRESSURE_CUT"
   | "WHALE_DEV_DUMP_CLIFF_CUT"
   | "DRAWDOWN_GRACE_EXPIRED"
@@ -79,6 +82,8 @@ export interface RatchetEvaluationResult {
 
 export interface DynamicRatchetConfig {
   readonly catastrophicFloorBps: number; // default -1200 (-12.0%)
+  readonly preBreakevenStopBps?: number | undefined; // Phase 12.93: default -1000 (-10.0% universal pre-breakeven hard stop)
+  readonly moonbagFloorBps?: number | undefined; // Phase 12.93: default 0 (0.0% floor on remaining moonbag after Tier 1)
   readonly drawdownTriggerBps: number; // default -800 (-8.0%)
   readonly drawdownRecoveryBps: number; // default -500 (-5.0%)
   readonly drawdownGracePeriodMs: number; // default 120_000 (120s)
@@ -95,6 +100,8 @@ export interface DynamicRatchetConfig {
 
 export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
   catastrophicFloorBps: -1200,
+  preBreakevenStopBps: -1000,
+  moonbagFloorBps: -200,
   drawdownTriggerBps: -800,
   drawdownRecoveryBps: -500,
   drawdownGracePeriodMs: 120_000,
@@ -111,7 +118,9 @@ export const DEFAULT_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
 export type CohortTier = "MICRO_CAP" | "ESTABLISHED";
 
 export const MICRO_CAP_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
-  catastrophicFloorBps: -2000, // -20.0% hard stop
+  catastrophicFloorBps: -2000, // -20.0% catastrophic disaster floor
+  preBreakevenStopBps: -1200, // Phase 12.93: -12.0% universal pre-breakeven stop
+  moonbagFloorBps: -200, // Phase 12.93: -2.0% moonbag cliff guard floor
   drawdownTriggerBps: -600, // -6.0% drawdown warning
   drawdownRecoveryBps: -300, // -3.0% recovery
   drawdownGracePeriodMs: 90_000, // 90s base grace period for fast micro-cap dump protection
@@ -126,7 +135,9 @@ export const MICRO_CAP_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
 };
 
 export const ESTABLISHED_DYNAMIC_RATCHET_CONFIG: DynamicRatchetConfig = {
-  catastrophicFloorBps: -1800, // -18.0% hard stop (wider room for established swings)
+  catastrophicFloorBps: -1800, // -18.0% catastrophic disaster floor
+  preBreakevenStopBps: -1000, // Phase 12.93: -10.0% universal pre-breakeven stop
+  moonbagFloorBps: -200, // Phase 12.93: -2.0% moonbag cliff guard floor
   drawdownTriggerBps: -800, // -8.0% drawdown warning
   drawdownRecoveryBps: -400, // -4.0% recovery
   drawdownGracePeriodMs: 120_000, // 120s grace period

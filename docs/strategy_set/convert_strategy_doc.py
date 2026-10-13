@@ -299,9 +299,14 @@ def docx_to_pdf(docx_path, pdf_path):
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    md_file = os.path.join(base_dir, "nexus_trading_strategy_set.md")
-    docx_file = os.path.join(base_dir, "nexus_trading_strategy_set.docx")
-    pdf_file = os.path.join(base_dir, "nexus_trading_strategy_set.pdf")
+    if len(sys.argv) >= 4:
+        md_file = os.path.abspath(sys.argv[1])
+        docx_file = os.path.abspath(sys.argv[2])
+        pdf_file = os.path.abspath(sys.argv[3])
+    else:
+        md_file = os.path.join(base_dir, "nexus_trading_strategy_set.md")
+        docx_file = os.path.join(base_dir, "nexus_trading_strategy_set.docx")
+        pdf_file = os.path.join(base_dir, "nexus_trading_strategy_set.pdf")
 
     print(f"Reading markdown from: {md_file}")
     markdown_to_docx(md_file, docx_file)

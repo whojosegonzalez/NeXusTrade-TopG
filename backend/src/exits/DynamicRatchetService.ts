@@ -322,10 +322,67 @@ export class DynamicRatchetService {
       };
     }
 
-    // Phase 12.92 Deliverable 2: Universal Unconfirmed Quick-Cut (-12%)
-    // Any token (Established or Micro-Cap) that has never demonstrated positive momentum (peak gain < +1.0% / 100 bps)
-    // and drops to <= -12.0% (-1200 bps) must cut immediately with PROBE_UNCONFIRMED_DUMP_CUT,
-    // unless high-velocity buyer absorption is actively absorbing the dip (buys >= 50 in 60s and buys >= 1.25 * sells).
+    // Phase 12.93 Deliverable 1 & 3: Ratchet Locked Floor, Breakeven & Moonbag Defense
+    // Evaluates FIRST when a position has achieved an active milestone or locked floor,
+    // guaranteeing that moonbags and scaled-in pyramiding positions exit at or above breakeven
+    // rather than falling through to catastrophic hard stops on discrete single-candle dumps.
+    if (
+      (nextTier === "TIER_1" || nextTier === "TIER_2" || armedBreakeven || nextFloorBps >= 0) &&
+      currentPnlBps <= nextFloorBps
+    ) {
+      const updatedState: PositionRatchetState = {
+        ...state,
+        peakPriceSol: nextPeakPriceSol,
+        peakGainBps: nextPeakGainBps,
+        currentStopFloorBps: nextFloorBps,
+        activeTier: nextTier,
+        drawdownState: "NORMAL",
+        drawdownEnteredAtMs: null,
+        lastEvaluatedAtMs: context.currentTimestampMs,
+        ...(armedBreakeven ? { armedBreakeven: true } : {}),
+        tier1ProfitTaken,
+        tier2ProfitTaken,
+      };
+      this.store.update(updatedState);
+
+      const diagnostics = this.buildDiagnostics(
+        currentPnlBps,
+        nextPeakGainBps,
+        nextFloorBps,
+        nextTier,
+        "NORMAL",
+        null,
+        context,
+      );
+
+      let reasonCode: ExitReasonCode = "ARMED_BREAKEVEN_BREACH";
+      if (nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps) {
+        reasonCode = "RATCHET_TIER_2_BREACH";
+      } else if (nextTier === "TIER_1" || tier1ProfitTaken) {
+        // Phase 12.93 Pillar 1: Moonbag Capital-Preservation Guarantee
+        // If price slipped below initial entry (0 bps) after Tier 1 profit was taken,
+        // flag as MOONBAG_PROTECTION_EXIT so realized trade profit is strictly preserved.
+        const moonbagFloor = activeConfig.moonbagFloorBps ?? 0;
+        reasonCode =
+          currentPnlBps <= moonbagFloor ? "MOONBAG_PROTECTION_EXIT" : "RATCHET_TIER_1_BREACH";
+      } else if (armedBreakeven && nextPeakGainBps < activeConfig.armedBreakevenThresholdBps) {
+        // Phase 12.93 Pillar 3: Scaled-In Breakeven Shield
+        reasonCode = "SCALED_BREAKEVEN_EXIT";
+      } else if (armedBreakeven) {
+        reasonCode = "ARMED_BREAKEVEN_BREACH";
+      }
+
+      return {
+        action: "SELL_ALL",
+        reasonCode,
+        diagnostics,
+        updatedState,
+      };
+    }
+
+    // Phase 12.92 & Phase 12.93 Probe Quick-Cut:
+    // If a position has never confirmed (+1.0% / 100 bps peak gain) and drops to <= -12.0%,
+    // cut immediately unless extreme viral buyer absorption is active.
     const hasViralAbsorption =
       context.recentBuysCount60s >= 50 &&
       context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
@@ -340,7 +397,6 @@ export class DynamicRatchetService {
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
-        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -364,7 +420,7 @@ export class DynamicRatchetService {
       };
     }
 
-    // Rule A: Catastrophic disaster hard floor (-20.0%) and flow-aware stop (-12.0% to -20.0%)
+    // Rule A: Catastrophic disaster hard floor (-18.0% / -20.0%)
     if (currentPnlBps <= activeConfig.catastrophicFloorBps) {
       const updatedState: PositionRatchetState = {
         ...state,
@@ -439,21 +495,28 @@ export class DynamicRatchetService {
       };
     }
 
-    // Rule B: Ratchet locked floor breach (+0% / +10% / +35% or trailing moonbag floor)
+    // Phase 12.93 Pillar 2: Universal Strict Pre-Breakeven Stop (-12.0%)
+    // Any candidate that has not yet confirmed the +10.0% Armed Breakeven threshold
+    // must be cut strictly when underwater <= -12.0% (-1200 bps) unless strong buyer dominance is absorbing the dip.
+    const hasStrongBuyerDominance =
+      context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
+
     if (
-      (nextTier === "TIER_1" || nextTier === "TIER_2" || armedBreakeven || nextFloorBps >= 0) &&
-      currentPnlBps <= nextFloorBps
+      !armedBreakeven &&
+      !tier1ProfitTaken &&
+      nextPeakGainBps < activeConfig.armedBreakevenThresholdBps &&
+      currentPnlBps <= (activeConfig.preBreakevenStopBps ?? -1200) &&
+      !hasStrongBuyerDominance
     ) {
       const updatedState: PositionRatchetState = {
         ...state,
         peakPriceSol: nextPeakPriceSol,
         peakGainBps: nextPeakGainBps,
         currentStopFloorBps: nextFloorBps,
-        activeTier: nextTier,
+        activeTier: "HARD_STOP",
         drawdownState: "NORMAL",
         drawdownEnteredAtMs: null,
         lastEvaluatedAtMs: context.currentTimestampMs,
-        ...(armedBreakeven ? { armedBreakeven: true } : {}),
         tier1ProfitTaken,
         tier2ProfitTaken,
       };
@@ -463,24 +526,15 @@ export class DynamicRatchetService {
         currentPnlBps,
         nextPeakGainBps,
         nextFloorBps,
-        nextTier,
+        "HARD_STOP",
         "NORMAL",
         null,
         context,
       );
 
-      let reasonCode: ExitReasonCode = "ARMED_BREAKEVEN_BREACH";
-      if (nextTier === "TIER_2" || nextFloorBps >= activeConfig.tier2LockedFloorBps) {
-        reasonCode = "RATCHET_TIER_2_BREACH";
-      } else if (nextTier === "TIER_1" || tier1ProfitTaken) {
-        reasonCode = "RATCHET_TIER_1_BREACH";
-      } else if (armedBreakeven) {
-        reasonCode = "ARMED_BREAKEVEN_BREACH";
-      }
-
       return {
         action: "SELL_ALL",
-        reasonCode,
+        reasonCode: "UNCONFIRMED_PRE_BREAKEVEN_CUT",
         diagnostics,
         updatedState,
       };

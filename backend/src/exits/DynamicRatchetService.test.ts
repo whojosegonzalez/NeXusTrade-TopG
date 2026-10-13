@@ -1010,4 +1010,103 @@ describe("DynamicRatchetService", () => {
       expect(pullback.reasonCode).not.toBe("PROBE_UNCONFIRMED_DUMP_CUT");
     });
   });
+
+  describe("Phase 12.93: Turbo-Defense & Execution Hardening", () => {
+    it("MOONBAG_PROTECTION_EXIT: immediately exits post-Tier 1 position if price drops below breakeven (Cbenz protection)", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-cbenz", "mint-cbenz", 1.0, 1_000_000);
+
+      // 1. Position achieves Tier 1 milestone (+20.0%) and locks profit
+      const tier1 = service.evaluate(state, {
+        ...baseContext,
+        spotPriceSol: 1.2, // +20.0%
+        currentTimestampMs: 1_000_005,
+      });
+
+      expect(tier1.action).toBe("SELL_PARTIAL_50");
+      expect(tier1.reasonCode).toBe("RATCHET_TIER_1_TRIGGERED");
+      expect(tier1.updatedState.tier1ProfitTaken).toBe(true);
+
+      // 2. Next tick: Illiquid cliff dump drops spot price to 0.05 SOL (-95.0% cliff)
+      // Must exit with MOONBAG_PROTECTION_EXIT, NOT falling through to CATASTROPHIC_HARD_STOP
+      const cliff = service.evaluate(tier1.updatedState, {
+        ...baseContext,
+        spotPriceSol: 0.05, // -95.0% cliff drop
+        recentBuysCount60s: 0,
+        recentSellsCount60s: 15,
+        currentTimestampMs: 1_000_010,
+      });
+
+      expect(cliff.action).toBe("SELL_ALL");
+      expect(cliff.reasonCode).toBe("MOONBAG_PROTECTION_EXIT");
+      expect(cliff.diagnostics.activeTier).toBe("TIER_1");
+    });
+
+    it("SCALED_BREAKEVEN_EXIT: immediately cuts pyramided position at breakeven before taking losses", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-scaled", "mint-scaled", 1.0, 1_000_000);
+
+      // 1. Initial surge to +7.0% where pyramiding scale-in is triggered (armedBreakeven: true)
+      const scaledState = {
+        ...state,
+        peakPriceSol: 1.07,
+        peakGainBps: 700,
+        currentStopFloorBps: 0, // Breakeven locked floor
+        armedBreakeven: true,
+      };
+      store.update(scaledState);
+
+      // 2. Pullback crosses breakeven floor to 0.995 SOL (-0.5% / -50 bps)
+      const exitResult = service.evaluate(scaledState, {
+        ...baseContext,
+        spotPriceSol: 0.995,
+        currentTimestampMs: 1_000_015,
+      });
+
+      expect(exitResult.action).toBe("SELL_ALL");
+      expect(exitResult.reasonCode).toBe("SCALED_BREAKEVEN_EXIT");
+    });
+
+    it("UNCONFIRMED_PRE_BREAKEVEN_CUT: strictly cuts unconfirmed candidate dropping to <= -12.0% without strong buyers", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService(MICRO_CAP_DYNAMIC_RATCHET_CONFIG, store);
+      const state = store.initPositionState(
+        "pos-micro-unconfirmed",
+        "mint-micro-unconfirmed",
+        1.0,
+        1_000_000,
+      );
+
+      // 1. Candidate had small bounce to +3.0% (300 bps), but never hit +10.0% armed breakeven
+      const bounce = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 1.03,
+          currentTimestampMs: 1_000_005,
+        },
+        MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+      );
+      expect(bounce.updatedState.peakGainBps).toBe(300);
+
+      // 2. Drops to 0.875 SOL (-12.5%) with balanced buyer flow (10 buys vs 10 sells)
+      // Buys >= sells (so not unabsorbed sell pressure), but 10 < 1.25 * 10 (lacks strong buyer dominance)
+      const cutResult = service.evaluate(
+        bounce.updatedState,
+        {
+          ...baseContext,
+          spotPriceSol: 0.875, // -12.5% <= -12.0% preBreakevenStopBps
+          recentBuysCount60s: 10,
+          recentSellsCount60s: 10,
+          currentTimestampMs: 1_000_015,
+        },
+        MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      expect(cutResult.action).toBe("SELL_ALL");
+      expect(cutResult.reasonCode).toBe("UNCONFIRMED_PRE_BREAKEVEN_CUT");
+    });
+  });
 });

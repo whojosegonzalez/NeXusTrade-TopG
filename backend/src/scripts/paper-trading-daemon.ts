@@ -231,7 +231,7 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     maxPortfolioDrawdownBps,
     maxConsecutiveErrors: 3,
     maxClockDriftMs: 5000,
-    pollIntervalMs: 2000,
+    pollIntervalMs: 1500,
     dryRun,
     antiRebuyCooldownMs,
     uninterruptedResearchMode,
@@ -669,171 +669,183 @@ async function run(): Promise<void> {
       break;
     }
 
-    // 1. Tick Open Positions with Live DexScreener Prices
-    for (const pos of snap.openPositions) {
-      try {
-        const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
-        if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
-          const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
-          if (stagnantClosed) {
+    // 1. Parallel Tick Open Positions with Live DexScreener Prices (Phase 12.93 High-Frequency Monitor)
+    if (snap.openPositions.length > 0) {
+      const openPosWithSpots = await Promise.all(
+        snap.openPositions.map(async (pos) => {
+          try {
+            const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
+            return { pos, spotInfo };
+          } catch {
+            return { pos, spotInfo: null };
+          }
+        }),
+      );
+
+      for (const { pos, spotInfo } of openPosWithSpots) {
+        try {
+          if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+            const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
+            if (stagnantClosed) {
+              const timeStr = new Date(currentNow).toLocaleTimeString();
+              const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
+              addActivityLog(
+                "SELL",
+                `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+              console.log(
+                `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
+              );
+            }
+            continue;
+          }
+
+          tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
+
+          const prevPrice = pos.spotPriceSol;
+          const singleTickDropBps =
+            prevPrice > 0
+              ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
+              : 0;
+
+          const marketContext: MarketEvaluationContext = {
+            currentTimestampMs: currentNow,
+            spotPriceSol: spotInfo.spotPriceSol,
+            lpIntact: true,
+            recentBuysCount60s: spotInfo.recentBuys60s,
+            recentSellsCount60s: spotInfo.recentSells60s,
+            momentum5mBps: spotInfo.momentum5mBps,
+            volumeStalled3m: false,
+            singleTickDropBps,
+          };
+
+          const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
+          if (result?.action === "SELL_ALL") {
             const timeStr = new Date(currentNow).toLocaleTimeString();
-            const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
+            const usdPrice = (
+              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+            ).toFixed(6);
+            const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
+            const closedTrade = daemon
+              .getSnapshot()
+              .closedTrades.find((t) => t.positionId === pos.positionId);
+            const pnlSol = closedTrade ? closedTrade.realizedPnlSol.toFixed(4) : "0.0000";
             addActivityLog(
               "SELL",
-              `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
+              `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at $${usdPrice} at ${timeStr} | Exit: ${result.reasonCode} | Realized PnL: ${pnlSol} SOL (${pnlPct}%)`,
               pos.mintAddress,
               pos.symbol,
             );
             console.log(
-              `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
+              `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${pnlPct}%`,
             );
-          }
-          continue;
-        }
-
-        tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
-
-        const prevPrice = pos.spotPriceSol;
-        const singleTickDropBps =
-          prevPrice > 0
-            ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
-            : 0;
-
-        const marketContext: MarketEvaluationContext = {
-          currentTimestampMs: currentNow,
-          spotPriceSol: spotInfo.spotPriceSol,
-          lpIntact: true,
-          recentBuysCount60s: spotInfo.recentBuys60s,
-          recentSellsCount60s: spotInfo.recentSells60s,
-          momentum5mBps: spotInfo.momentum5mBps,
-          volumeStalled3m: false,
-          singleTickDropBps,
-        };
-
-        const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
-        if (result?.action === "SELL_ALL") {
-          const timeStr = new Date(currentNow).toLocaleTimeString();
-          const usdPrice = (
-            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-          ).toFixed(6);
-          const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
-          const closedTrade = daemon
-            .getSnapshot()
-            .closedTrades.find((t) => t.positionId === pos.positionId);
-          const pnlSol = closedTrade ? closedTrade.realizedPnlSol.toFixed(4) : "0.0000";
-          addActivityLog(
-            "SELL",
-            `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at $${usdPrice} at ${timeStr} | Exit: ${result.reasonCode} | Realized PnL: ${pnlSol} SOL (${pnlPct}%)`,
-            pos.mintAddress,
-            pos.symbol,
-          );
-          console.log(
-            `[PaperDaemon] [SELL EXECUTED] ${pos.mintAddress} | Reason: ${result.reasonCode} | Realized PnL: ${pnlPct}%`,
-          );
-        } else if (result?.action === "SELL_PARTIAL_50") {
-          const usdPrice = (
-            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-          ).toFixed(6);
-          addActivityLog(
-            "RATCHET",
-            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+20% Tier 1) | Floor locked to +10%`,
-            pos.mintAddress,
-            pos.symbol,
-          );
-          console.log(
-            `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +20% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
-          );
-        } else if (result?.action === "SELL_PARTIAL_25") {
-          const usdPrice = (
-            spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
-          ).toFixed(6);
-          const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
-          const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
-          const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
-          addActivityLog(
-            "RATCHET",
-            `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag (${trailBufferPct}% buffer, Floor: +${floorPct}%)`,
-            pos.mintAddress,
-            pos.symbol,
-          );
-          console.log(
-            `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}% | Moonbag Buffer: ${trailBufferPct}% | Floor: +${floorPct}%`,
-          );
-        }
-
-        // Phase 12.92 Deliverable 1: Momentum-Only Scale-In Pyramiding
-        // Only scale in if candidate exhibits genuine retail velocity (>= 15 buys/60s, >= 2.0x dominance, and >= +4% 5m momentum).
-        // Non-momentum runners remain at flat 0.50 SOL probe to prevent fakeout reversal losses.
-        const hasViralScaleInMomentum =
-          spotInfo.recentBuys60s >= 15 &&
-          spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
-          spotInfo.momentum5mBps >= 400;
-
-        if (
-          result?.action !== "SELL_ALL" &&
-          pos.cohort === "ESTABLISHED" &&
-          !pos.pyramided &&
-          pos.currentPnlBps >= 700 &&
-          daemon.getCurrentCashSol() > 0.5 &&
-          hasViralScaleInMomentum
-        ) {
-          const currentCash = daemon.getCurrentCashSol();
-          const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
-          const establishedScaleInAmountSol = Math.min(
-            0.65,
-            Number((0.5 * walletScale).toFixed(2)),
-          );
-          const updatedPos = daemon.scaleInPosition(
-            pos.positionId,
-            establishedScaleInAmountSol,
-            spotInfo.spotPriceSol,
-            currentNow,
-          );
-          if (updatedPos) {
-            console.log(
-              `[PaperDaemon] [ESTABLISHED_PYRAMIDING_SCALE_IN] Added +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (+7% confirmation) | Blended Entry: ${updatedPos.entryPriceSol} SOL`,
-            );
+          } else if (result?.action === "SELL_PARTIAL_50") {
+            const usdPrice = (
+              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+            ).toFixed(6);
             addActivityLog(
-              "BUY",
-              `🟢 Scaled in +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL [ESTABLISHED +7% breakout] | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+              "RATCHET",
+              `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 50% at $${usdPrice} (+20% Tier 1) | Floor locked to +10%`,
               pos.mintAddress,
               pos.symbol,
             );
-          }
-        }
-
-        // Micro-Cap Scale-In Pyramiding:
-        // If open position is MICRO_CAP, !pos.pyramided, pos.currentPnlBps >= 1000 (+10% Armed Breakeven),
-        // daemon portfolio cash > 0.5 SOL, and hasViralScaleInMomentum:
-        if (
-          result?.action !== "SELL_ALL" &&
-          pos.cohort === "MICRO_CAP" &&
-          !pos.pyramided &&
-          pos.currentPnlBps >= 1000 &&
-          daemon.getCurrentCashSol() > 0.5 &&
-          hasViralScaleInMomentum
-        ) {
-          const scaleInAmountSol = 0.25;
-          const updatedPos = daemon.scaleInPosition(
-            pos.positionId,
-            scaleInAmountSol,
-            spotInfo.spotPriceSol,
-            currentNow,
-          );
-          if (updatedPos) {
             console.log(
-              `[PaperDaemon] [PYRAMIDING_SCALE_IN] Added +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (Blended Entry: ${updatedPos.entryPriceSol} SOL)`,
+              `[PaperDaemon] [TAKE PROFIT 50%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +20% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}%`,
             );
+          } else if (result?.action === "SELL_PARTIAL_25") {
+            const usdPrice = (
+              spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+            ).toFixed(6);
+            const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
+            const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
+            const floorPct = ((result.diagnostics.currentStopFloorBps ?? 0) / 100).toFixed(1);
             addActivityLog(
-              "BUY",
-              `🟢 Scaled in +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+              "RATCHET",
+              `🟡 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} sold 25% at $${usdPrice} (+48.5% Tier 2) | Floor locked to Trailing Moonbag (${trailBufferPct}% buffer, Floor: +${floorPct}%)`,
               pos.mintAddress,
               pos.symbol,
             );
+            console.log(
+              `[PaperDaemon] [TAKE PROFIT 25%] ${pos.mintAddress} | Reason: ${result.reasonCode} | Milestone +48.5% reached | Realized PnL: ${(result.diagnostics.currentPnlBps / 100).toFixed(2)}% | Moonbag Buffer: ${trailBufferPct}% | Floor: +${floorPct}%`,
+            );
           }
+
+          // Phase 12.92 Deliverable 1: Momentum-Only Scale-In Pyramiding
+          // Only scale in if candidate exhibits genuine retail velocity (>= 15 buys/60s, >= 2.0x dominance, and >= +4% 5m momentum).
+          // Non-momentum runners remain at flat 0.50 SOL probe to prevent fakeout reversal losses.
+          const hasViralScaleInMomentum =
+            spotInfo.recentBuys60s >= 15 &&
+            spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
+            spotInfo.momentum5mBps >= 400;
+
+          if (
+            result?.action !== "SELL_ALL" &&
+            pos.cohort === "ESTABLISHED" &&
+            !pos.pyramided &&
+            pos.currentPnlBps >= 700 &&
+            daemon.getCurrentCashSol() > 0.5 &&
+            hasViralScaleInMomentum
+          ) {
+            const currentCash = daemon.getCurrentCashSol();
+            const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
+            const establishedScaleInAmountSol = Math.min(
+              0.65,
+              Number((0.5 * walletScale).toFixed(2)),
+            );
+            const updatedPos = daemon.scaleInPosition(
+              pos.positionId,
+              establishedScaleInAmountSol,
+              spotInfo.spotPriceSol,
+              currentNow,
+            );
+            if (updatedPos) {
+              console.log(
+                `[PaperDaemon] [ESTABLISHED_PYRAMIDING_SCALE_IN] Added +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (+7% confirmation) | Blended Entry: ${updatedPos.entryPriceSol} SOL`,
+              );
+              addActivityLog(
+                "BUY",
+                `🟢 Scaled in +${establishedScaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL [ESTABLISHED +7% breakout] | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+            }
+          }
+
+          // Micro-Cap Scale-In Pyramiding:
+          // If open position is MICRO_CAP, !pos.pyramided, pos.currentPnlBps >= 1000 (+10% Armed Breakeven),
+          // daemon portfolio cash > 0.5 SOL, and hasViralScaleInMomentum:
+          if (
+            result?.action !== "SELL_ALL" &&
+            pos.cohort === "MICRO_CAP" &&
+            !pos.pyramided &&
+            pos.currentPnlBps >= 1000 &&
+            daemon.getCurrentCashSol() > 0.5 &&
+            hasViralScaleInMomentum
+          ) {
+            const scaleInAmountSol = 0.25;
+            const updatedPos = daemon.scaleInPosition(
+              pos.positionId,
+              scaleInAmountSol,
+              spotInfo.spotPriceSol,
+              currentNow,
+            );
+            if (updatedPos) {
+              console.log(
+                `[PaperDaemon] [PYRAMIDING_SCALE_IN] Added +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol} SOL (Blended Entry: ${updatedPos.entryPriceSol} SOL)`,
+              );
+              addActivityLog(
+                "BUY",
+                `🟢 Scaled in +${scaleInAmountSol} SOL to ${pos.symbol ?? pos.mintAddress.slice(0, 6)} at ${spotInfo.spotPriceSol.toFixed(6)} SOL | Blended entry: ${updatedPos.entryPriceSol.toFixed(6)} SOL`,
+                pos.mintAddress,
+                pos.symbol,
+              );
+            }
+          }
+        } catch (tickErr) {
+          console.error(`[PaperDaemon] Tick error on ${pos.mintAddress}:`, tickErr);
         }
-      } catch (tickErr) {
-        console.error(`[PaperDaemon] Tick error on ${pos.mintAddress}:`, tickErr);
       }
     }
 
@@ -1285,14 +1297,14 @@ async function run(): Promise<void> {
                 ? ESTABLISHED_DYNAMIC_RATCHET_CONFIG
                 : MICRO_CAP_DYNAMIC_RATCHET_CONFIG;
 
-              // Phase 12.90 Deliverable 1: Staged Established Sizing (0.50 SOL Probe -> Scale-In at +7%)
+              // Phase 12.93 Deliverable 4: Calibrated Probe Sizing (0.50 SOL Established, 0.35 SOL Micro)
               const currentCash = daemon.getCurrentCashSol();
               const walletScale = Math.min(1.25, Math.max(1.0, currentCash / 10.0));
               const establishedProbeBaseSize = Math.min(
                 0.65,
                 Number((0.5 * walletScale).toFixed(2)),
               );
-              const microProbeBaseSize = Math.min(0.35, Number((0.25 * walletScale).toFixed(2)));
+              const microProbeBaseSize = Math.min(0.45, Number((0.35 * walletScale).toFixed(2)));
 
               let targetCohortSize = isEstablished ? establishedProbeBaseSize : microProbeBaseSize;
               if (isEstablished) {
