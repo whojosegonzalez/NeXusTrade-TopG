@@ -16,6 +16,7 @@ import type {
   ScannedPoolRecord,
 } from "../candidate-scanner/CandidateScannerTypes.js";
 import type { HistoricalSessionSummary, HistoricalTrade } from "@nexustrade/shared";
+import type { UnresolvedTokenInventory } from "./VirtualWallet.js";
 
 export type DaemonHaltReason =
   | "PORTFOLIO_DRAWDOWN_BREACHED"
@@ -238,6 +239,7 @@ export interface UnresolvedPositionRecord {
   readonly lastObservedAtMs: number;
   readonly reasonForMissingData: string;
   readonly estimatedLiquidationSol: number; // 0 for conservative valuation
+  readonly sessionId?: string | undefined;
 }
 
 export type DaemonStatus =
@@ -274,6 +276,10 @@ export interface PaperTradingDaemonOptions {
   readonly ratchetService?: DynamicRatchetService;
   readonly scannerEvaluator?: CandidateScannerEvaluator;
   readonly clock?: () => number;
+  readonly initialUnresolvedPositions?:
+    | readonly (UnresolvedPositionRecord | UnresolvedTokenInventory)[]
+    | undefined;
+  readonly initialBlockedMints?: readonly string[] | undefined;
 }
 
 export class PaperTradingDaemon {
@@ -318,6 +324,42 @@ export class PaperTradingDaemon {
     this.currentCashSol = this.config.initialPortfolioSol;
     this.startedAtMs = this.clock();
     this.lastTickAtMs = this.startedAtMs;
+
+    // P0-R2: Restore initial unresolved positions and block duplicate buys of their mints
+    if (options.initialUnresolvedPositions && options.initialUnresolvedPositions.length > 0) {
+      for (const item of options.initialUnresolvedPositions) {
+        this.unresolvedPositions.push({
+          positionId: item.positionId,
+          mintAddress: item.mintAddress,
+          tokensHeld: item.tokensHeld,
+          costBasisSol: item.costBasisSol,
+          initialCostBasisSol: item.initialCostBasisSol,
+          initialTokensHeld: item.initialTokensHeld,
+          realizedProceedsSol: item.realizedProceedsSol,
+          lastObservedPriceSol: item.lastObservedPriceSol,
+          lastObservedAtMs: item.lastObservedAtMs,
+          reasonForMissingData: item.reasonForMissingData,
+          estimatedLiquidationSol:
+            "estimatedLiquidationSol" in item && typeof item.estimatedLiquidationSol === "number"
+              ? item.estimatedLiquidationSol
+              : 0,
+          ...("tier1ProfitTaken" in item && item.tier1ProfitTaken !== undefined
+            ? { tier1ProfitTaken: item.tier1ProfitTaken }
+            : {}),
+          ...("tier2ProfitTaken" in item && item.tier2ProfitTaken !== undefined
+            ? { tier2ProfitTaken: item.tier2ProfitTaken }
+            : {}),
+          ...(item.symbol !== undefined ? { symbol: item.symbol } : {}),
+          ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
+        });
+        this.exitCooldowns.set(item.mintAddress, Number.MAX_SAFE_INTEGER);
+      }
+    }
+    if (options.initialBlockedMints && options.initialBlockedMints.length > 0) {
+      for (const mint of options.initialBlockedMints) {
+        this.exitCooldowns.set(mint, Number.MAX_SAFE_INTEGER);
+      }
+    }
   }
 
   start(): void {
@@ -482,6 +524,7 @@ export class PaperTradingDaemon {
       reasonForMissingData,
       estimatedLiquidationSol: 0, // Conservative risk valuation
       ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
+      sessionId: this.config.sessionId,
     };
 
     this.unresolvedPositions.push(unresolvedRecord);
@@ -493,6 +536,63 @@ export class PaperTradingDaemon {
     }
 
     return unresolvedRecord;
+  }
+
+  reconcileUnresolvedPosition(
+    mintAddress: string,
+    exitPriceSol: number,
+    nowTimestampMs?: number,
+    exitReason = "MANUAL_RECONCILIATION",
+  ): ClosedTradeRecord | null {
+    const idx = this.unresolvedPositions.findIndex((p) => p.mintAddress === mintAddress);
+    if (idx < 0) return null;
+    const unresolved = this.unresolvedPositions[idx]!;
+    const now = nowTimestampMs ?? this.clock();
+    this.lastTickAtMs = now;
+
+    if (exitPriceSol <= 0 || !Number.isFinite(exitPriceSol)) {
+      return null;
+    }
+
+    const finalProceedsSol = Number((unresolved.tokensHeld * exitPriceSol).toFixed(6));
+    this.currentCashSol = Number((this.currentCashSol + finalProceedsSol).toFixed(6));
+
+    const totalProceedsSol = Number(
+      ((unresolved.realizedProceedsSol ?? 0) + finalProceedsSol).toFixed(6),
+    );
+    const totalCostBasisSol = unresolved.initialCostBasisSol ?? unresolved.costBasisSol;
+    const totalTokensSold = unresolved.initialTokensHeld ?? unresolved.tokensHeld;
+    const vwapExitPriceSol =
+      totalTokensSold > 0 ? Number((totalProceedsSol / totalTokensSold).toFixed(8)) : exitPriceSol;
+    const realizedPnlSol = Number((totalProceedsSol - totalCostBasisSol).toFixed(6));
+    const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
+
+    const closedRecord: ClosedTradeRecord = {
+      positionId: unresolved.positionId,
+      mintAddress: unresolved.mintAddress,
+      entryPriceSol: unresolved.lastObservedPriceSol,
+      exitPriceSol: vwapExitPriceSol,
+      costBasisSol: totalCostBasisSol,
+      proceedsSol: totalProceedsSol,
+      realizedPnlSol,
+      realizedPnlBps,
+      peakGainBps: Math.max(realizedPnlBps, 0),
+      exitReason,
+      openedAtMs: unresolved.lastObservedAtMs,
+      closedAtMs: now,
+      finalTier: unresolved.tier2ProfitTaken
+        ? "TIER_2"
+        : unresolved.tier1ProfitTaken
+          ? "TIER_1"
+          : "BASELINE",
+      ...(unresolved.symbol !== undefined ? { symbol: unresolved.symbol } : {}),
+    };
+
+    this.closedTrades.push(closedRecord);
+    this.unresolvedPositions.splice(idx, 1);
+    this.exitCooldowns.delete(mintAddress);
+
+    return closedRecord;
   }
 
   manualExit(
@@ -654,7 +754,12 @@ export class PaperTradingDaemon {
       }
     }
 
-    // 1c. Anti-Rebuy Cooldown Check
+    // 1c. Block Re-buys of Unresolved Mints (P0-R2)
+    if (this.unresolvedPositions.some((p) => p.mintAddress === pool.mintAddress)) {
+      return false;
+    }
+
+    // 1d. Anti-Rebuy Cooldown Check
     const cooldownUntilMs = this.exitCooldowns.get(pool.mintAddress);
     if (cooldownUntilMs !== undefined && now < cooldownUntilMs) {
       return false;

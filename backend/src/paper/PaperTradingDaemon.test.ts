@@ -1488,5 +1488,184 @@ describe("PaperTradingDaemon", () => {
       expect(loaded.unresolvedTokens?.length).toBe(1); // deduplicated!
       rmSync(tempDir, { recursive: true, force: true });
     });
+
+    it("P0-R1: termination interruption converts open positions to unresolved inventory preserving cost basis", () => {
+      const mockTime = nowMs;
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => mockTime,
+      });
+      daemon.start();
+
+      const candidate: ScannedPoolRecord = {
+        ...validPool,
+        poolId: "pool-term-1",
+        mintAddress: "MintTerm111",
+        symbol: "TERM",
+      };
+
+      daemon.processScannedPool(candidate, mockTime, 0.05, 1.0);
+
+      const openPositions = daemon.getSnapshot().openPositions;
+      expect(openPositions.length).toBe(1);
+      const pos = openPositions[0]!;
+
+      // Simulate termination signal interruption
+      daemon.stop("MANUAL_STOP");
+      const unresolved = daemon.markPositionUnresolved(
+        pos.positionId,
+        "TERMINATION_SIGNAL_INTERRUPTION",
+        mockTime + 5000,
+      );
+
+      expect(unresolved).not.toBeNull();
+      expect(unresolved?.mintAddress).toBe("MintTerm111");
+      expect(unresolved?.tokensHeld).toBe(pos.tokensHeld);
+      expect(unresolved?.costBasisSol).toBe(pos.costBasisSol);
+      expect(unresolved?.reasonForMissingData).toBe("TERMINATION_SIGNAL_INTERRUPTION");
+      expect(unresolved?.estimatedLiquidationSol).toBe(0);
+
+      const snap = daemon.getSnapshot();
+      expect(snap.openPositions.length).toBe(0);
+      expect(snap.unresolvedPositions?.length).toBe(1);
+      expect(snap.currentCashSol).toBe(9.0); // 10.0 initial - 1.0 cost basis
+    });
+
+    it("P0-R2: daemon restores unresolved positions on startup and blocks duplicate re-buys", () => {
+      const mockTime = nowMs;
+      const initialUnresolved = [
+        {
+          positionId: "pos-prev-unres-1",
+          mintAddress: "MintBlocked111",
+          symbol: "BLOCKED",
+          tokensHeld: 2000,
+          costBasisSol: 1.0,
+          lastObservedPriceSol: 0.0005,
+          lastObservedAtMs: nowMs - 100_000,
+          reasonForMissingData: "TERMINATION_SIGNAL_INTERRUPTION",
+          estimatedLiquidationSol: 0,
+          sessionId: "session-prev",
+        },
+      ];
+
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => mockTime,
+        initialUnresolvedPositions: initialUnresolved,
+      });
+      daemon.start();
+
+      const snap = daemon.getSnapshot();
+      expect(snap.unresolvedPositions?.length).toBe(1);
+      expect(snap.unresolvedPositions![0]!.mintAddress).toBe("MintBlocked111");
+
+      // Attempting to buy the same mint must be blocked
+      const pool: ScannedPoolRecord = {
+        ...validPool,
+        poolId: "pool-blocked-1",
+        mintAddress: "MintBlocked111",
+        symbol: "BLOCKED",
+      };
+
+      const bought = daemon.processScannedPool(pool, mockTime, 0.05, 1.0);
+      expect(bought).toBe(false);
+      expect(daemon.getSnapshot().openPositions.length).toBe(0);
+    });
+
+    it("P0-R2: reconcileUnresolvedPosition liquidates unresolved token into cash, closed trade, and unblocks mint", () => {
+      const mockTime = nowMs;
+      const initialUnresolved = [
+        {
+          positionId: "pos-recon-1",
+          mintAddress: "MintRecon111",
+          symbol: "RECON",
+          tokensHeld: 2000,
+          costBasisSol: 1.0,
+          lastObservedPriceSol: 0.0005,
+          lastObservedAtMs: nowMs - 50_000,
+          reasonForMissingData: "FEED_TIMEOUT",
+          estimatedLiquidationSol: 0,
+          sessionId: "session-prev",
+        },
+      ];
+
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => mockTime,
+        initialUnresolvedPositions: initialUnresolved,
+      });
+      daemon.start();
+
+      expect(daemon.getSnapshot().currentCashSol).toBe(10.0);
+      expect(daemon.getSnapshot().unresolvedPositions?.length).toBe(1);
+
+      // Reconcile unresolved position at 0.0006 SOL/token (proceeds = 1.2 SOL, profit = +0.2 SOL)
+      const closed = daemon.reconcileUnresolvedPosition(
+        "MintRecon111",
+        0.0006,
+        mockTime + 1000,
+        "MANUAL_RECONCILIATION",
+      );
+
+      expect(closed).not.toBeNull();
+      expect(closed?.mintAddress).toBe("MintRecon111");
+      expect(closed?.proceedsSol).toBeCloseTo(1.2, 4);
+      expect(closed?.realizedPnlSol).toBeCloseTo(0.2, 4);
+      expect(closed?.exitReason).toBe("MANUAL_RECONCILIATION");
+
+      const snap = daemon.getSnapshot();
+      expect(snap.unresolvedPositions?.length).toBe(0);
+      expect(snap.currentCashSol).toBeCloseTo(11.2, 4); // 10.0 + 1.2 proceeds
+      expect(snap.closedTrades.length).toBe(1);
+
+      // Settle in wallet with reconciledPositionIds to prune it from wallet inventory
+      const wallet: VirtualWalletState = {
+        walletAddress: "SimWalletRecon",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["session-0"],
+        unresolvedTokens: [
+          {
+            positionId: "pos-recon-1",
+            mintAddress: "MintRecon111",
+            tokensHeld: 2000,
+            costBasisSol: 1.0,
+            lastObservedPriceSol: 0.0005,
+            lastObservedAtMs: nowMs - 50_000,
+            reasonForMissingData: "FEED_TIMEOUT",
+            sessionId: "session-0",
+          },
+        ],
+      };
+
+      settleSessionInWallet(
+        wallet,
+        "session-1",
+        snap.currentCashSol!,
+        baseConfig.initialPortfolioSol,
+        mockTime + 2000,
+        snap.unresolvedPositions,
+        snap.totalRealizedPnlSol,
+        ["pos-recon-1"],
+      );
+
+      expect(wallet.currentBalanceSol).toBeCloseTo(11.2, 4);
+      expect(wallet.unresolvedTokens?.length).toBe(0); // Successfully pruned!
+      expect(wallet.allTimeRealizedPnlSol).toBeCloseTo(0.2, 4);
+    });
+
+    it("P0-R3: loadVirtualWallet fails closed if wallet is missing but prior session history exists", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "vw-failclosed-test-"));
+      const pastSessionsFile = path.join(tempDir, "past-sessions.json");
+      writeFileSync(pastSessionsFile, JSON.stringify([{ sessionId: "session-1" }]), "utf8");
+
+      const missingWalletFile = path.join(tempDir, "virtual-wallet.json");
+      expect(() => loadVirtualWallet(missingWalletFile)).toThrow(/FATAL.*Virtual wallet missing/);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
   });
 });

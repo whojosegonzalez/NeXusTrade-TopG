@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -44,6 +51,7 @@ import {
   loadVirtualWallet,
   saveVirtualWallet,
   settleSessionInWallet,
+  type VirtualWalletState,
 } from "../paper/VirtualWallet.js";
 
 function parseCliArgs(): PaperTradingDaemonConfig {
@@ -83,12 +91,30 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   let initialPortfolioSol = 10.0;
   if (resetWallet) {
     initialPortfolioSol = 10.0;
-    const vWallet = loadVirtualWallet();
-    vWallet.currentBalanceSol = 10.0;
-    vWallet.initialBalanceSol = 10.0;
-    vWallet.totalSessionsCompleted = 0;
-    vWallet.allTimeRealizedPnlSol = 0.0;
-    vWallet.lastUpdatedMs = Date.now();
+    const walletPath = existsSync(".tmp/virtual-wallet.json")
+      ? ".tmp/virtual-wallet.json"
+      : existsSync("backend/.tmp/virtual-wallet.json")
+        ? "backend/.tmp/virtual-wallet.json"
+        : ".tmp/virtual-wallet.json";
+    if (existsSync(walletPath)) {
+      const backupPath = `${walletPath}.reset-${Date.now()}`;
+      try {
+        copyFileSync(walletPath, backupPath);
+        console.log(`[PaperDaemon] [WALLET_BACKUP] Prior wallet backed up to ${backupPath}`);
+      } catch (err) {
+        console.warn(`[PaperDaemon] [WALLET_BACKUP_WARN] Failed to create backup:`, err);
+      }
+    }
+    const vWallet: VirtualWalletState = {
+      walletAddress: "SimulatedVirtualWallet111111111111111111111111",
+      currentBalanceSol: 10.0,
+      initialBalanceSol: 10.0,
+      totalSessionsCompleted: 0,
+      allTimeRealizedPnlSol: 0.0,
+      lastUpdatedMs: Date.now(),
+      settledSessionIds: [],
+      unresolvedTokens: [],
+    };
     saveVirtualWallet(vWallet);
     console.log(
       "[PaperDaemon] [WALLET_RESET] Continuous virtual wallet reinitialized to 10.0000 SOL.",
@@ -306,7 +332,53 @@ async function run(): Promise<void> {
     );
   }
 
-  const daemon = new PaperTradingDaemon({ config });
+  const vWallet = loadVirtualWallet();
+
+  // P0-R4: Startup reconciliation check between past-sessions.json and vWallet.settledSessionIds
+  const pastSessionsPath = existsSync(".tmp/past-sessions.json")
+    ? ".tmp/past-sessions.json"
+    : existsSync("backend/.tmp/past-sessions.json")
+      ? "backend/.tmp/past-sessions.json"
+      : null;
+  if (pastSessionsPath && existsSync(pastSessionsPath)) {
+    try {
+      const raw = readFileSync(pastSessionsPath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const pastIds = new Set(parsed.map((s) => s.sessionId));
+        const settledIds = new Set(vWallet.settledSessionIds ?? []);
+        const missingInWallet = [...pastIds].filter((id) => !settledIds.has(id));
+        const missingInArchive = [...settledIds].filter((id) => !pastIds.has(id));
+        if (missingInWallet.length > 0 || missingInArchive.length > 0) {
+          console.warn(
+            `[PaperDaemon] [SESSION_RECONCILIATION_WARNING] Inconsistency detected between past-sessions archive and virtual wallet:`,
+          );
+          if (missingInWallet.length > 0) {
+            console.warn(
+              `   - Sessions in past-sessions.json but not in settledSessionIds (${missingInWallet.length}): ${missingInWallet.slice(0, 5).join(", ")}`,
+            );
+          }
+          if (missingInArchive.length > 0) {
+            console.warn(
+              `   - Sessions in settledSessionIds but not in past-sessions.json (${missingInArchive.length}): ${missingInArchive.slice(0, 5).join(", ")}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[PaperDaemon] [SESSION_RECONCILIATION_WARN] Failed to read past-sessions for reconciliation:`,
+        err,
+      );
+    }
+  }
+
+  // P0-R2: Initialize daemon with wallet's unresolved inventory and block duplicate buys
+  const daemon = new PaperTradingDaemon({
+    config,
+    initialUnresolvedPositions: vWallet.unresolvedTokens,
+    initialBlockedMints: vWallet.unresolvedTokens?.map((t) => t.mintAddress),
+  });
   daemon.start();
 
   const streamEngine = new CandidateStreamEngine({
@@ -396,7 +468,10 @@ async function run(): Promise<void> {
     };
     try {
       if (!existsSync(".tmp")) mkdirSync(".tmp", { recursive: true });
-      writeFileSync(".tmp/paper-session-active.json", JSON.stringify(fullState, null, 2), "utf8");
+      const targetPath = ".tmp/paper-session-active.json";
+      const tempPath = `${targetPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      writeFileSync(tempPath, JSON.stringify(fullState, null, 2), "utf8");
+      renameSync(tempPath, targetPath);
       const currentNow = nowMs();
       if (forceReportSave || currentNow - lastReportSaveMs >= 60_000) {
         lastReportSaveMs = currentNow;
@@ -429,7 +504,7 @@ async function run(): Promise<void> {
       writeFileSync(tempSessionFile, JSON.stringify(summary, null, 2), "utf8");
       renameSync(tempSessionFile, sessionFile);
 
-      // 2. Read, update, and write past-sessions.json atomically (P0-3)
+      // 2. Read, update, and write past-sessions.json atomically (P0-3 & P0-R4)
       let pastSessions: HistoricalSessionSummary[] = [];
       const pastSessionsPath = existsSync(".tmp/past-sessions.json")
         ? ".tmp/past-sessions.json"
@@ -440,11 +515,23 @@ async function run(): Promise<void> {
         try {
           const raw = readFileSync(pastSessionsPath, "utf8");
           const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            pastSessions = parsed;
+          if (!Array.isArray(parsed)) {
+            throw new Error("past-sessions.json content is not an array");
           }
-        } catch {
-          pastSessions = [...BACKFILLED_PAST_SESSIONS];
+          pastSessions = parsed;
+        } catch (parseErr) {
+          const corruptBackup = `${pastSessionsPath}.corrupt-${Date.now()}`;
+          try {
+            copyFileSync(pastSessionsPath, corruptBackup);
+            console.error(
+              `[PaperDaemon] [PAST_SESSIONS_CORRUPT] Existing ${pastSessionsPath} is corrupted. Backed up to ${corruptBackup}`,
+            );
+          } catch {
+            // ignore backup failure
+          }
+          throw new Error(
+            `[PaperDaemon] [FATAL] Corrupt ${pastSessionsPath}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Archiving aborted to fail closed and preserve history.`,
+          );
         }
       } else {
         pastSessions = [...BACKFILLED_PAST_SESSIONS];
@@ -469,6 +556,12 @@ async function run(): Promise<void> {
         snap.currentCashSol ??
         snap.currentPortfolioSol -
           snap.openPositions.reduce((acc, p) => acc + p.tokensHeld * p.spotPriceSol, 0);
+      const reconciledIds = snap.closedTrades
+        .filter(
+          (t) =>
+            t.exitReason === "MANUAL_RECONCILIATION" || t.exitReason.includes("RECONCILIATION"),
+        )
+        .map((t) => t.positionId);
       const wallet = loadVirtualWallet();
       const settled = settleSessionInWallet(
         wallet,
@@ -478,6 +571,7 @@ async function run(): Promise<void> {
         nowMs(),
         snap.unresolvedPositions,
         snap.totalRealizedPnlSol,
+        reconciledIds,
       );
       if (settled) {
         saveVirtualWallet(wallet);
@@ -502,9 +596,21 @@ async function run(): Promise<void> {
     terminating = true;
     console.log("\n[PaperDaemon] Termination signal received. Stopping daemon...");
     daemon.stop("MANUAL_STOP");
+
+    // P0-R1: Mark any remaining open positions as unresolved inventory before saving/archiving
+    const openPositions = daemon.getSnapshot().openPositions;
+    if (openPositions.length > 0) {
+      console.warn(
+        `[PaperDaemon] [SHUTDOWN_UNRESOLVED] Converting ${openPositions.length} active position(s) to unresolved inventory due to termination signal interruption...`,
+      );
+      for (const pos of openPositions) {
+        daemon.markPositionUnresolved(pos.positionId, "TERMINATION_SIGNAL_INTERRUPTION", nowMs());
+      }
+    }
+
     const snap = daemon.getSnapshot();
     console.log(
-      `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length}`,
+      `[PaperDaemon] Final Equity: ${snap.currentPortfolioSol.toFixed(4)} SOL | Closed Trades: ${snap.closedTrades.length} | Unresolved Positions: ${snap.unresolvedPositions?.length ?? 0}`,
     );
     persistState(true);
     archiveSession();
@@ -1453,6 +1559,17 @@ async function run(): Promise<void> {
 
   // Run Position Monitor Ticker and Candidate Discovery Loop concurrently
   await Promise.all([runPositionMonitorTicker(), runDiscoveryAndRadarLoop()]);
+
+  // P0-R1: Convert any open positions left at normal conclusion into unresolved inventory
+  const remainingOpen = daemon.getSnapshot().openPositions;
+  if (remainingOpen.length > 0) {
+    console.warn(
+      `[PaperDaemon] [SESSION_END_UNRESOLVED] Converting ${remainingOpen.length} remaining open position(s) to unresolved inventory at session completion...`,
+    );
+    for (const pos of remainingOpen) {
+      daemon.markPositionUnresolved(pos.positionId, "UNRESOLVED_AT_SESSION_END", nowMs());
+    }
+  }
 
   const finalSnap = daemon.getSnapshot();
   console.log(`[PaperDaemon] Session finished with status: ${finalSnap.status}`);

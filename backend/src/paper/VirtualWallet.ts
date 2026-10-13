@@ -110,13 +110,16 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
       );
     }
   }
-  const pastSessionsExist =
-    existsSync(".tmp/past-sessions.json") ||
-    existsSync("backend/.tmp/past-sessions.json") ||
-    existsSync(".tmp/sessions");
+  const checkDir = customPath ? path.dirname(customPath) : process.cwd();
+  const pastSessionsExist = customPath
+    ? existsSync(path.join(checkDir, "past-sessions.json")) ||
+      existsSync(path.join(checkDir, "sessions"))
+    : existsSync(".tmp/past-sessions.json") ||
+      existsSync("backend/.tmp/past-sessions.json") ||
+      existsSync(".tmp/sessions");
   if (pastSessionsExist) {
-    console.warn(
-      `[PaperDaemon] [WALLET_WARNING] No virtual-wallet.json found at ${filePath}, but prior session history exists. Initializing default 10.0 SOL wallet.`,
+    throw new Error(
+      `[PaperDaemon] [FATAL] Virtual wallet missing at ${filePath}, but prior session history exists. Startup aborted to fail closed and prevent accidental 10.0 SOL reset. Use --reset-wallet if a fresh session lineage is explicitly intended.`,
     );
   }
   return {
@@ -157,6 +160,7 @@ export function settleSessionInWallet(
     reasonForMissingData: string;
   }[],
   sessionRealizedPnlSol?: number,
+  reconciledPositionIds?: readonly string[],
 ): boolean {
   wallet.settledSessionIds = wallet.settledSessionIds ?? [];
   if (wallet.settledSessionIds.includes(sessionId)) {
@@ -175,25 +179,37 @@ export function settleSessionInWallet(
     (wallet.allTimeRealizedPnlSol + netRealizedPnlSol).toFixed(4),
   );
 
-  // P0-1: Record unresolved token holdings into wallet inventory so they are never lost
+  // P0-1 & P0-R2: Prune reconciled positions from wallet inventory
   wallet.unresolvedTokens = wallet.unresolvedTokens ?? [];
+  if (reconciledPositionIds && reconciledPositionIds.length > 0) {
+    const reconciledSet = new Set(reconciledPositionIds);
+    wallet.unresolvedTokens = wallet.unresolvedTokens.filter(
+      (t) => !reconciledSet.has(t.positionId),
+    );
+  }
+
+  // P0-1: Record unresolved token holdings into wallet inventory so they are never lost
   if (unresolvedPositions && unresolvedPositions.length > 0) {
     for (const pos of unresolvedPositions) {
-      if (!wallet.unresolvedTokens.some((t) => t.positionId === pos.positionId)) {
-        wallet.unresolvedTokens.push({
-          positionId: pos.positionId,
-          mintAddress: pos.mintAddress,
-          ...(pos.symbol ? { symbol: pos.symbol } : {}),
-          tokensHeld: pos.tokensHeld,
-          costBasisSol: pos.costBasisSol,
-          initialCostBasisSol: pos.initialCostBasisSol,
-          initialTokensHeld: pos.initialTokensHeld,
-          realizedProceedsSol: pos.realizedProceedsSol,
-          lastObservedPriceSol: pos.lastObservedPriceSol,
-          lastObservedAtMs: pos.lastObservedAtMs,
-          reasonForMissingData: pos.reasonForMissingData,
-          sessionId,
-        });
+      const existingIdx = wallet.unresolvedTokens.findIndex((t) => t.positionId === pos.positionId);
+      const inventoryItem: UnresolvedTokenInventory = {
+        positionId: pos.positionId,
+        mintAddress: pos.mintAddress,
+        ...(pos.symbol ? { symbol: pos.symbol } : {}),
+        tokensHeld: pos.tokensHeld,
+        costBasisSol: pos.costBasisSol,
+        initialCostBasisSol: pos.initialCostBasisSol,
+        initialTokensHeld: pos.initialTokensHeld,
+        realizedProceedsSol: pos.realizedProceedsSol,
+        lastObservedPriceSol: pos.lastObservedPriceSol,
+        lastObservedAtMs: pos.lastObservedAtMs,
+        reasonForMissingData: pos.reasonForMissingData,
+        sessionId: (pos as { sessionId?: string }).sessionId ?? sessionId,
+      };
+      if (existingIdx >= 0) {
+        wallet.unresolvedTokens[existingIdx] = inventoryItem;
+      } else {
+        wallet.unresolvedTokens.push(inventoryItem);
       }
     }
   }
