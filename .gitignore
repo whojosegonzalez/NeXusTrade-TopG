@@ -68,3 +68,10 @@ backend/data/*.txt
 # OS Artifacts
 .DS_Store
 Thumbs.db
+
+# Archives, patches & audit evidence bundles
+*.zip
+*.tar.gz
+*.tgz
+*.patch
+*.diff
