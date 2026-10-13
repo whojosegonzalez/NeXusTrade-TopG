@@ -1,13 +1,13 @@
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { findWorkspaceRoot, getCanonicalWalletPath } from "./CanonicalPaths.js";
+import {
+  findWorkspaceRoot,
+  getCanonicalWalletPath,
+  getCanonicalPastSessionsPath,
+  getCanonicalSessionsDir,
+  getCanonicalJournalPath,
+  checkLegacyConflict,
+} from "./CanonicalPaths.js";
 
 export interface UnresolvedTokenInventory {
   readonly positionId: string;
@@ -53,50 +53,7 @@ export function resolveVirtualWalletFile(customPath?: string): string {
 }
 
 export function checkLegacyWalletConflict(canonicalPath: string): void {
-  const root = findWorkspaceRoot();
-  const legacyPath = path.resolve(root, "backend/.tmp/virtual-wallet.json");
-  if (path.resolve(canonicalPath) === legacyPath) return;
-
-  if (existsSync(canonicalPath) && existsSync(legacyPath)) {
-    try {
-      const cRaw = readFileSync(canonicalPath, "utf8");
-      const lRaw = readFileSync(legacyPath, "utf8");
-      if (cRaw.trim() === lRaw.trim()) return;
-
-      const cParsed = JSON.parse(cRaw);
-      const lParsed = JSON.parse(lRaw);
-      const balanceMismatch =
-        Math.abs((cParsed.currentBalanceSol ?? 0) - (lParsed.currentBalanceSol ?? 0)) > 1e-6;
-      const pnlMismatch =
-        Math.abs((cParsed.allTimeRealizedPnlSol ?? 0) - (lParsed.allTimeRealizedPnlSol ?? 0)) >
-        1e-6;
-      const sessionMismatch =
-        JSON.stringify(cParsed.settledSessionIds ?? []) !==
-        JSON.stringify(lParsed.settledSessionIds ?? []);
-      const tokenMismatch =
-        JSON.stringify(cParsed.unresolvedTokens ?? []) !==
-        JSON.stringify(lParsed.unresolvedTokens ?? []);
-
-      if (balanceMismatch || pnlMismatch || sessionMismatch || tokenMismatch) {
-        throw new Error(
-          `[VirtualWallet] [FATAL] Divergent legacy virtual wallet files detected between canonical path (${canonicalPath}) and legacy path (${legacyPath}). ` +
-            `Canonical balance: ${cParsed.currentBalanceSol} SOL, Legacy balance: ${lParsed.currentBalanceSol} SOL. ` +
-            `Execution halted to require operator review and prevent split-ledger state.`,
-        );
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("[FATAL]")) throw err;
-      throw new Error(
-        `[VirtualWallet] [FATAL] Error verifying legacy wallet paths (${canonicalPath} vs ${legacyPath}): ${String(err)}`,
-      );
-    }
-  } else if (!existsSync(canonicalPath) && existsSync(legacyPath)) {
-    console.log(
-      `[VirtualWallet] [MIGRATION] Migrating legacy wallet from ${legacyPath} to canonical path ${canonicalPath}`,
-    );
-    mkdirSync(path.dirname(canonicalPath), { recursive: true });
-    copyFileSync(legacyPath, canonicalPath);
-  }
+  checkLegacyConflict(canonicalPath, "backend/.tmp/virtual-wallet.json", "virtual wallet");
 }
 
 export function loadVirtualWallet(customPath?: string): VirtualWalletState {
@@ -157,13 +114,16 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
       );
     }
   }
-  const checkDir = customPath ? path.dirname(customPath) : process.cwd();
+  const root = findWorkspaceRoot();
   const pastSessionsExist = customPath
-    ? existsSync(path.join(checkDir, "past-sessions.json")) ||
-      existsSync(path.join(checkDir, "sessions"))
-    : existsSync(".tmp/past-sessions.json") ||
-      existsSync("backend/.tmp/past-sessions.json") ||
-      existsSync(".tmp/sessions");
+    ? existsSync(path.join(path.dirname(customPath), "past-sessions.json")) ||
+      existsSync(path.join(path.dirname(customPath), "sessions"))
+    : existsSync(getCanonicalPastSessionsPath(root)) ||
+      existsSync(getCanonicalSessionsDir(root)) ||
+      existsSync(getCanonicalJournalPath(root)) ||
+      existsSync(path.resolve(root, "backend/.tmp/past-sessions.json")) ||
+      existsSync(path.resolve(root, "backend/.tmp/sessions")) ||
+      existsSync(path.resolve(root, "backend/.tmp/settlement-journal.json"));
   if (pastSessionsExist) {
     throw new Error(
       `[PaperDaemon] [FATAL] Virtual wallet missing at ${filePath}, but prior session history exists. Startup aborted to fail closed and prevent accidental 10.0 SOL reset. Use --reset-wallet if a fresh session lineage is explicitly intended.`,
@@ -185,24 +145,6 @@ export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: strin
   const payload = JSON.stringify(wallet, null, 2);
   writeFileSync(tempPath, payload, "utf8");
   renameSync(tempPath, primaryPath);
-
-  // Synchronize legacy backend/.tmp mirror atomically if it exists, ensuring zero divergence
-  if (!customPath) {
-    const root = findWorkspaceRoot();
-    const legacyPath = path.resolve(root, "backend/.tmp/virtual-wallet.json");
-    if (primaryPath !== legacyPath && existsSync(path.dirname(legacyPath))) {
-      try {
-        const legacyTemp = `${legacyPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
-        writeFileSync(legacyTemp, payload, "utf8");
-        renameSync(legacyTemp, legacyPath);
-      } catch (err) {
-        console.warn(
-          `[VirtualWallet] Warning: Failed to sync legacy mirror at ${legacyPath}:`,
-          err,
-        );
-      }
-    }
-  }
 }
 
 export function settleSessionInWallet(

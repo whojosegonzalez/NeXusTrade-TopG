@@ -79,14 +79,16 @@ export function getCanonicalReconciliationIntentPath(workspaceRoot?: string): st
 
 /**
  * Checks for divergence between canonical file and legacy backend/.tmp mirror file.
- * Throws a fatal Error if divergent content is found, preventing silent desynchronization.
+ * Throws a fatal Error if divergent content is found, if legacy exists without canonical,
+ * or if either file cannot be read, preventing silent desynchronization or split-brain state.
  */
 export function checkLegacyConflict(
   canonicalPath: string,
   legacyRelativePath: string,
   fileLabel: string,
+  workspaceRoot?: string,
 ): void {
-  const root = findWorkspaceRoot();
+  const root = workspaceRoot ?? findWorkspaceRoot();
   const legacyPath = path.resolve(root, legacyRelativePath);
   if (path.resolve(canonicalPath) === legacyPath) return;
 
@@ -94,6 +96,16 @@ export function checkLegacyConflict(
     try {
       const cRaw = readFileSync(canonicalPath, "utf8").trim();
       const lRaw = readFileSync(legacyPath, "utf8").trim();
+      if (canonicalPath.endsWith(".json") || legacyPath.endsWith(".json")) {
+        try {
+          JSON.parse(cRaw);
+          JSON.parse(lRaw);
+        } catch (parseErr) {
+          throw new Error(
+            `[CanonicalPaths] [FATAL_CONFLICT] Failed reading legacy/canonical ${fileLabel} during conflict verification: ${String(parseErr)}. Execution halted.`,
+          );
+        }
+      }
       if (cRaw !== lRaw) {
         throw new Error(
           `[CanonicalPaths] [FATAL_CONFLICT] Detected divergence between canonical ${fileLabel} (${canonicalPath}) and legacy file (${legacyPath}). Manual operator reconciliation required. Execution halted to preserve ledger integrity.`,
@@ -101,7 +113,13 @@ export function checkLegacyConflict(
       }
     } catch (err) {
       if (err instanceof Error && err.message.includes("[FATAL_CONFLICT]")) throw err;
-      // If one file is locked or unreadable, warn
+      throw new Error(
+        `[CanonicalPaths] [FATAL_CONFLICT] Failed reading legacy/canonical ${fileLabel} during conflict verification: ${String(err)}. Execution halted.`,
+      );
     }
+  } else if (!existsSync(canonicalPath) && existsSync(legacyPath)) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_CONFLICT] Canonical ${fileLabel} missing at ${canonicalPath}, but legacy file exists at ${legacyPath}. Automatic migration is disabled; manual operator review required.`,
+    );
   }
 }

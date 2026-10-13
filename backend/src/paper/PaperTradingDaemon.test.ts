@@ -23,6 +23,7 @@ import {
   ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
 } from "../exits/DynamicRatchetTypes.js";
 import { recoverSettlementJournal, type SettlementJournalEntry } from "./SettlementJournal.js";
+import { checkLegacyConflict } from "./CanonicalPaths.js";
 import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
 import { parseCliArgs } from "../scripts/paper-trading-daemon.js";
 import {
@@ -2492,6 +2493,228 @@ describe("PaperTradingDaemon", () => {
       writeFileSync(lockFile, "invalid { corrupted JSON", "utf8");
       releaseProcessLock(handle);
       expect(existsSync(lockFile)).toBe(true);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V10-P0-1: Canonical ledger is single authority without legacy mirror writes or silent auto-copies", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v10-canonical-authority-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend/.tmp"), { recursive: true });
+      const canonicalPath = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const legacyPath = path.join(tempDir, "backend/.tmp", "virtual-wallet.json");
+
+      const legacyWallet: VirtualWalletState = {
+        walletAddress: "SimWalletLegacy",
+        currentBalanceSol: 8.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 5,
+        allTimeRealizedPnlSol: -2.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-legacy"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(legacyPath, JSON.stringify(legacyWallet, null, 2), "utf8");
+
+      // 1. Missing canonical wallet with existing legacy wallet FAILS CLOSED (no silent auto-copy)
+      expect(() => {
+        checkLegacyConflict(
+          canonicalPath,
+          "backend/.tmp/virtual-wallet.json",
+          "virtual wallet",
+          tempDir,
+        );
+      }).toThrow(/Canonical virtual wallet missing.*Automatic migration is disabled/);
+
+      // Verify canonical file was NOT automatically created
+      expect(existsSync(canonicalPath)).toBe(false);
+
+      // 2. Canonical save performs single-authority write without legacy mirror update
+      const canonicalWallet: VirtualWalletState = {
+        ...legacyWallet,
+        currentBalanceSol: 8.5,
+      };
+      saveVirtualWallet(canonicalWallet, canonicalPath);
+      expect(existsSync(canonicalPath)).toBe(true);
+
+      // Verify legacy file was NOT overwritten with canonical's 8.5 balance
+      const legacyRead = JSON.parse(readFileSync(legacyPath, "utf8"));
+      expect(legacyRead.currentBalanceSol).toBe(8.0);
+
+      // 3. Divergent contents detected and fail closed
+      expect(() => {
+        checkLegacyConflict(
+          canonicalPath,
+          "backend/.tmp/virtual-wallet.json",
+          "virtual wallet",
+          tempDir,
+        );
+      }).toThrow(/Detected divergence between canonical virtual wallet/);
+
+      // 4. Malformed legacy file fails closed
+      writeFileSync(legacyPath, "malformed {{ json", "utf8");
+      expect(() => {
+        checkLegacyConflict(
+          canonicalPath,
+          "backend/.tmp/virtual-wallet.json",
+          "virtual wallet",
+          tempDir,
+        );
+      }).toThrow(/Failed reading legacy\/canonical virtual wallet/);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v10-journal-recovery-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend/.tmp"), { recursive: true });
+      const canonicalJournal = path.join(tempDir, ".tmp", "settlement-journal.json");
+      const legacyJournal = path.join(tempDir, "backend/.tmp", "settlement-journal.json");
+
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: "sess-v10-recovery",
+        stage: "STARTED",
+        startedAtMs: nowMs,
+        sessionSummary: {
+          sessionId: "sess-v10-recovery",
+          startedAt: new Date(nowMs).toISOString(),
+          endedAt: new Date(nowMs + 60000).toISOString(),
+          durationMinutes: 1,
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 10.0,
+          netPnlSol: 0,
+          netPnlPct: 0,
+          totalTrades: 0,
+          buysCount: 0,
+          sellsCount: 0,
+          winsCount: 0,
+          lossesCount: 0,
+          scratchesCount: 0,
+          winRatePct: 0,
+          coinsWatchedCount: 0,
+          missedOpportunitiesCount: 0,
+          trades: [],
+        },
+        sessionNewRealizedPnlSol: 0,
+        liquidCashSol: 10.0,
+        initialPortfolioSol: 10.0,
+        reconciledPositionIds: [],
+      };
+
+      // 1. Standalone legacy journal fails closed
+      writeFileSync(legacyJournal, JSON.stringify(journalEntry, null, 2), "utf8");
+      expect(() => {
+        recoverSettlementJournal({ workspaceRoot: tempDir });
+      }).toThrow(/Legacy settlement journal found at .* Automatic replay is disabled/);
+
+      // 2. Simultaneous canonical + legacy journals fails closed
+      writeFileSync(canonicalJournal, JSON.stringify(journalEntry, null, 2), "utf8");
+      expect(() => {
+        recoverSettlementJournal({ workspaceRoot: tempDir });
+      }).toThrow(/Conflicting settlement journals found simultaneously/);
+
+      // 3. Canonical recovery strictly targets workspace root .tmp and cleans journal
+      rmSync(legacyJournal, { force: true });
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletRecovery",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 0,
+        allTimeRealizedPnlSol: 0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: [],
+        unresolvedTokens: [],
+      };
+      writeFileSync(
+        path.join(tempDir, ".tmp", "virtual-wallet.json"),
+        JSON.stringify(initialWallet, null, 2),
+        "utf8",
+      );
+
+      const recoveryResult = recoverSettlementJournal({ workspaceRoot: tempDir });
+      expect(recoveryResult.recovered).toBe(true);
+      expect(existsSync(canonicalJournal)).toBe(false);
+      expect(existsSync(path.join(tempDir, ".tmp", "sessions", "sess-v10-recovery.json"))).toBe(
+        true,
+      );
+      expect(existsSync(path.join(tempDir, "backend/.tmp", "sessions"))).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V10-P0-3: Missing-wallet check fails closed independent of execution CWD", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v10-missing-wallet-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend"), { recursive: true });
+      const historyFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      writeFileSync(historyFile, JSON.stringify([{ sessionId: "prior-sess" }], null, 2), "utf8");
+
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      expect(existsSync(walletFile)).toBe(false);
+
+      // Missing canonical wallet with existing history FAILS CLOSED
+      expect(() => {
+        loadVirtualWallet(walletFile);
+      }).toThrow(/Virtual wallet missing at .*, but prior session history exists/);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V10-P1-5: WRITE_DOWN recovery verifies write-down state and is fully deterministic", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v10-writedown-recovery-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      const walletFile = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const intentFile = path.join(tempDir, ".tmp", "reconciliation-intent.json");
+      const auditFile = path.join(tempDir, ".tmp", "reconciliation-audit.jsonl");
+
+      const baseWallet: VirtualWalletState = {
+        walletAddress: "SimWalletWriteDown",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1"],
+        unresolvedTokens: [
+          {
+            positionId: "pos-wd-1",
+            mintAddress: "mint-wd-1",
+            tokensHeld: 100,
+            costBasisSol: 0.1,
+            lastObservedPriceSol: 0.001,
+            lastObservedAtMs: nowMs,
+            reasonForMissingData: "TEST",
+            sessionId: "sess-1",
+            estimatedLiquidationSol: 0.02, // Already written down
+          },
+        ],
+      };
+      writeFileSync(walletFile, JSON.stringify(baseWallet, null, 2), "utf8");
+
+      const intent: ReconciliationIntent = {
+        intentId: "rec-intent-wd-applied",
+        createdAtMs: nowMs,
+        status: "INTENT_RECORDED",
+        options: {
+          identifier: "pos-wd-1",
+          operationType: "WRITE_DOWN",
+          writeDownEstimatedSol: 0.02,
+          reason: "Mark down to residual",
+        },
+        matchedPositionId: "pos-wd-1",
+        expectedAuditRecord: {
+          reconciliationId: "audit-wd-1",
+          intentId: "rec-intent-wd-applied",
+          operationType: "WRITE_DOWN",
+        },
+      };
+      writeFileSync(intentFile, JSON.stringify(intent, null, 2), "utf8");
+
+      // Recovery detects write-down was applied, verifies audit record, and unlinks intent
+      recoverInterruptedIntent(tempDir);
+      expect(existsSync(intentFile)).toBe(false);
+      expect(existsSync(auditFile)).toBe(true);
 
       rmSync(tempDir, { recursive: true, force: true });
     });

@@ -136,138 +136,155 @@ export function cleanSettlementJournal(customJournalPath?: string): void {
  */
 export function recoverSettlementJournal(options?: RecoverJournalOptions): RecoverJournalResult {
   const root = options?.workspaceRoot ?? options?.baseDir ?? findWorkspaceRoot();
-  const possiblePaths = options?.journalPath
-    ? [options.journalPath]
-    : [getCanonicalJournalPath(root), path.resolve(root, "backend/.tmp/settlement-journal.json")];
+  const canonicalJournalPath = getCanonicalJournalPath(root);
+  const legacyJournalPath = path.resolve(root, "backend/.tmp/settlement-journal.json");
 
-  let anyRecovered = false;
-  let lastSessionId: string | undefined;
-  let lastStage: SettlementJournalStage | undefined;
+  // If options.journalPath is explicitly provided (e.g. In tests), use it directly.
+  // Otherwise, inspect canonical vs legacy paths with strict fail-closed safety.
+  let journalPathToRecover: string | undefined;
 
-  for (const journalPath of possiblePaths) {
-    if (!existsSync(journalPath)) continue;
+  if (options?.journalPath) {
+    journalPathToRecover = options.journalPath;
+  } else {
+    const hasCanonical = existsSync(canonicalJournalPath);
+    const hasLegacy =
+      path.resolve(canonicalJournalPath) !== legacyJournalPath && existsSync(legacyJournalPath);
 
-    let entry: SettlementJournalEntry;
-    try {
-      const raw = readFileSync(journalPath, "utf8");
-      entry = JSON.parse(raw) as SettlementJournalEntry;
-    } catch (readErr) {
+    if (hasCanonical && hasLegacy) {
       throw new Error(
-        `[SettlementJournal] [FATAL] Corrupted settlement journal at ${journalPath}: ${String(readErr)}. Manual inspection required.`,
+        `[SettlementJournal] [FATAL] Conflicting settlement journals found simultaneously at canonical path (${canonicalJournalPath}) and legacy path (${legacyJournalPath}). Manual operator review required. Recovery halted.`,
       );
     }
-
-    if (!entry || !entry.sessionId || entry.stage === "COMMITTED") {
-      cleanSettlementJournal(journalPath);
-      continue;
+    if (!hasCanonical && hasLegacy) {
+      throw new Error(
+        `[SettlementJournal] [FATAL] Legacy settlement journal found at ${legacyJournalPath}, but canonical journal is missing at ${canonicalJournalPath}. Automatic replay is disabled; manual operator review required.`,
+      );
     }
-
-    console.warn(
-      `[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session ${entry.sessionId} at stage ${entry.stage}. Replaying remaining settlement operations...`,
-    );
-
-    const initialStage = entry.stage;
-    const baseDir =
-      options?.workspaceRoot ?? options?.baseDir ?? path.dirname(path.dirname(journalPath));
-
-    // Replay Stage 1: Individual session file
-    if (entry.stage === "STARTED") {
-      const sessionsDir = getCanonicalSessionsDir(baseDir);
-      if (!existsSync(sessionsDir)) {
-        mkdirSync(sessionsDir, { recursive: true });
-      }
-      const sessionFile = getCanonicalSessionFilePath(entry.sessionId, baseDir);
-      if (!existsSync(sessionFile)) {
-        const tempSessionFile = `${sessionFile}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
-        writeFileSync(tempSessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
-        renameSync(tempSessionFile, sessionFile);
-        console.log(
-          `[SettlementJournal] [RECOVERY] Replayed individual session file: ${sessionFile}`,
-        );
-      }
-      updateSettlementJournalStage("SESSION_FILE_WRITTEN", entry, journalPath);
+    if (hasCanonical) {
+      journalPathToRecover = canonicalJournalPath;
     }
-
-    // Replay Stage 2: past-sessions.json
-    if (entry.stage === "SESSION_FILE_WRITTEN") {
-      const pastSessionsPath = getCanonicalPastSessionsPath(baseDir);
-      let pastSessions: HistoricalSessionSummary[] = [];
-      if (existsSync(pastSessionsPath)) {
-        const pastRaw = readFileSync(pastSessionsPath, "utf8");
-        try {
-          const parsed = JSON.parse(pastRaw);
-          if (Array.isArray(parsed)) {
-            pastSessions = parsed;
-          } else {
-            throw new Error("past-sessions.json is not an array");
-          }
-        } catch (parseErr) {
-          const corruptBackup = `${pastSessionsPath}.corrupt-${Date.now()}`;
-          try {
-            writeFileSync(corruptBackup, pastRaw, "utf8");
-          } catch {
-            // ignore backup failure
-          }
-          throw new Error(
-            `[SettlementJournal] [FATAL] Corrupted past-sessions.json encountered during journal recovery: ${String(parseErr)}. Backed up to ${corruptBackup}. Recovery halted to prevent historical data loss.`,
-          );
-        }
-      } else {
-        pastSessions = [...BACKFILLED_PAST_SESSIONS];
-      }
-
-      const existingIdx = pastSessions.findIndex((s) => s.sessionId === entry.sessionId);
-      if (existingIdx < 0) {
-        pastSessions.unshift(entry.sessionSummary);
-        const tempPast = `${pastSessionsPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
-        writeFileSync(tempPast, JSON.stringify(pastSessions, null, 2), "utf8");
-        renameSync(tempPast, pastSessionsPath);
-        console.log(
-          `[SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session ${entry.sessionId}`,
-        );
-      }
-      updateSettlementJournalStage("PAST_SESSIONS_WRITTEN", entry, journalPath);
-    }
-
-    // Replay Stage 3: Virtual wallet settlement
-    if (entry.stage === "PAST_SESSIONS_WRITTEN") {
-      const walletPath = options?.walletPath ?? getCanonicalWalletPath(baseDir);
-      const wallet = loadVirtualWallet(walletPath);
-      if (!wallet.settledSessionIds?.includes(entry.sessionId)) {
-        const settled = settleSessionInWallet(
-          wallet,
-          entry.sessionId,
-          entry.liquidCashSol,
-          entry.initialPortfolioSol,
-          Date.now(),
-          entry.unresolvedPositions,
-          entry.sessionNewRealizedPnlSol,
-          entry.reconciledPositionIds,
-        );
-        if (settled) {
-          saveVirtualWallet(wallet, walletPath);
-          console.log(
-            `[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session ${entry.sessionId}. New Balance: ${wallet.currentBalanceSol} SOL`,
-          );
-        }
-      }
-      updateSettlementJournalStage("WALLET_SETTLED", entry, journalPath);
-    }
-
-    // Replay Stage 4: Journal commitment / cleanup
-    cleanSettlementJournal(journalPath);
-    console.log(
-      `[SettlementJournal] [RECOVERY] Settlement journal for session ${entry.sessionId} fully recovered and cleaned.`,
-    );
-
-    anyRecovered = true;
-    lastSessionId = entry.sessionId;
-    lastStage = initialStage;
   }
 
+  if (!journalPathToRecover || !existsSync(journalPathToRecover)) {
+    return { recovered: false };
+  }
+
+  const journalPath = journalPathToRecover;
+  let entry: SettlementJournalEntry;
+  try {
+    const raw = readFileSync(journalPath, "utf8");
+    entry = JSON.parse(raw) as SettlementJournalEntry;
+  } catch (readErr) {
+    throw new Error(
+      `[SettlementJournal] [FATAL] Corrupted settlement journal at ${journalPath}: ${String(readErr)}. Manual inspection required.`,
+    );
+  }
+
+  if (!entry || !entry.sessionId || entry.stage === "COMMITTED") {
+    cleanSettlementJournal(journalPath);
+    return { recovered: false };
+  }
+
+  console.warn(
+    `[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session ${entry.sessionId} at stage ${entry.stage}. Replaying remaining settlement operations...`,
+  );
+
+  const initialStage = entry.stage;
+  const targetBaseDir = root;
+
+  // Replay Stage 1: Individual session file
+  if (entry.stage === "STARTED") {
+    const sessionsDir = getCanonicalSessionsDir(targetBaseDir);
+    if (!existsSync(sessionsDir)) {
+      mkdirSync(sessionsDir, { recursive: true });
+    }
+    const sessionFile = getCanonicalSessionFilePath(entry.sessionId, targetBaseDir);
+    if (!existsSync(sessionFile)) {
+      const tempSessionFile = `${sessionFile}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      writeFileSync(tempSessionFile, JSON.stringify(entry.sessionSummary, null, 2), "utf8");
+      renameSync(tempSessionFile, sessionFile);
+      console.log(
+        `[SettlementJournal] [RECOVERY] Replayed individual session file: ${sessionFile}`,
+      );
+    }
+    updateSettlementJournalStage("SESSION_FILE_WRITTEN", entry, journalPath);
+  }
+
+  // Replay Stage 2: past-sessions.json
+  if (entry.stage === "SESSION_FILE_WRITTEN") {
+    const pastSessionsPath = getCanonicalPastSessionsPath(targetBaseDir);
+    let pastSessions: HistoricalSessionSummary[] = [];
+    if (existsSync(pastSessionsPath)) {
+      const pastRaw = readFileSync(pastSessionsPath, "utf8");
+      try {
+        const parsed = JSON.parse(pastRaw);
+        if (Array.isArray(parsed)) {
+          pastSessions = parsed;
+        } else {
+          throw new Error("past-sessions.json is not an array");
+        }
+      } catch (parseErr) {
+        const corruptBackup = `${pastSessionsPath}.corrupt-${Date.now()}`;
+        try {
+          writeFileSync(corruptBackup, pastRaw, "utf8");
+        } catch {
+          // ignore backup failure
+        }
+        throw new Error(
+          `[SettlementJournal] [FATAL] Corrupted past-sessions.json encountered during journal recovery: ${String(parseErr)}. Backed up to ${corruptBackup}. Recovery halted to prevent historical data loss.`,
+        );
+      }
+    } else {
+      pastSessions = [...BACKFILLED_PAST_SESSIONS];
+    }
+
+    const existingIdx = pastSessions.findIndex((s) => s.sessionId === entry.sessionId);
+    if (existingIdx < 0) {
+      pastSessions.unshift(entry.sessionSummary);
+      const tempPast = `${pastSessionsPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      writeFileSync(tempPast, JSON.stringify(pastSessions, null, 2), "utf8");
+      renameSync(tempPast, pastSessionsPath);
+      console.log(
+        `[SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session ${entry.sessionId}`,
+      );
+    }
+    updateSettlementJournalStage("PAST_SESSIONS_WRITTEN", entry, journalPath);
+  }
+
+  // Replay Stage 3: Virtual wallet settlement
+  if (entry.stage === "PAST_SESSIONS_WRITTEN") {
+    const walletPath = options?.walletPath ?? getCanonicalWalletPath(targetBaseDir);
+    const wallet = loadVirtualWallet(walletPath);
+    if (!wallet.settledSessionIds?.includes(entry.sessionId)) {
+      const settled = settleSessionInWallet(
+        wallet,
+        entry.sessionId,
+        entry.liquidCashSol,
+        entry.initialPortfolioSol,
+        Date.now(),
+        entry.unresolvedPositions,
+        entry.sessionNewRealizedPnlSol,
+        entry.reconciledPositionIds,
+      );
+      if (settled) {
+        saveVirtualWallet(wallet, walletPath);
+        console.log(
+          `[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session ${entry.sessionId}. New Balance: ${wallet.currentBalanceSol} SOL`,
+        );
+      }
+    }
+    updateSettlementJournalStage("WALLET_SETTLED", entry, journalPath);
+  }
+
+  // Replay Stage 4: Journal commitment / cleanup
+  cleanSettlementJournal(journalPath);
+  console.log(
+    `[SettlementJournal] [RECOVERY] Settlement journal for session ${entry.sessionId} fully recovered and cleaned.`,
+  );
+
   return {
-    recovered: anyRecovered,
-    sessionId: lastSessionId,
-    stageReplayed: lastStage,
+    recovered: true,
+    sessionId: entry.sessionId,
+    stageReplayed: initialStage,
   };
 }

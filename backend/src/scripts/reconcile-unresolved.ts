@@ -1,6 +1,7 @@
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -19,7 +20,6 @@ import { acquireProcessLock, releaseProcessLock } from "../paper/ProcessLock.js"
 import {
   getCanonicalReconciliationAuditPath,
   getCanonicalReconciliationIntentPath,
-  findWorkspaceRoot,
 } from "../paper/CanonicalPaths.js";
 
 export interface ReconciliationIntent {
@@ -43,25 +43,13 @@ export function resolveAuditPath(baseDir?: string): string {
 
 export function appendAuditLog(auditRecord: Record<string, unknown>, baseDir?: string): void {
   const primaryPath = resolveAuditPath(baseDir);
+  const dir = path.dirname(primaryPath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const line = JSON.stringify(auditRecord) + "\n";
   appendFileSync(primaryPath, line, "utf8");
-
-  // Also sync legacy backend/.tmp mirror if it exists
-  const root = baseDir ?? findWorkspaceRoot();
-  const legacyDir = path.resolve(root, "backend/.tmp");
-  if (existsSync(legacyDir)) {
-    const legacyPath = path.resolve(legacyDir, "reconciliation-audit.jsonl");
-    if (path.resolve(legacyPath) !== path.resolve(primaryPath)) {
-      try {
-        appendFileSync(legacyPath, line, "utf8");
-      } catch (err) {
-        console.warn(`[Reconcile] Warning: Failed to mirror audit log to ${legacyPath}:`, err);
-      }
-    }
-  }
 }
 
-export function recoverInterruptedIntent(baseDir?: string): void {
+export function recoverInterruptedIntent(baseDir?: string, customWalletPath?: string): void {
   const intentPath = resolveIntentPath(baseDir);
   if (!existsSync(intentPath)) return;
 
@@ -72,52 +60,60 @@ export function recoverInterruptedIntent(baseDir?: string): void {
       `[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (${intent.intentId}, Operation: ${intent.options.operationType}, Position: ${intent.matchedPositionId}). Checking wallet state...`,
     );
 
-    const wallet = loadVirtualWallet();
-    const stillPresent = wallet.unresolvedTokens?.some(
+    const walletFile =
+      customWalletPath ?? (baseDir ? path.resolve(baseDir, ".tmp/virtual-wallet.json") : undefined);
+    const wallet = loadVirtualWallet(walletFile);
+    const pos = wallet.unresolvedTokens?.find(
       (t) =>
         t.positionId === intent.matchedPositionId || t.mintAddress === intent.options.identifier,
     );
+    const stillPresent = !!pos;
+    const writeDownApplied =
+      intent.options.operationType === "WRITE_DOWN" &&
+      pos &&
+      Math.abs((pos.estimatedLiquidationSol ?? 0) - (intent.options.writeDownEstimatedSol ?? 0)) <
+        1e-6;
 
     if (
-      intent.options.operationType === "SIMULATED_SALE" ||
-      intent.options.operationType === "FINAL_DISPOSAL"
+      (!stillPresent &&
+        (intent.options.operationType === "SIMULATED_SALE" ||
+          intent.options.operationType === "FINAL_DISPOSAL")) ||
+      writeDownApplied
     ) {
-      if (!stillPresent) {
-        console.log(
-          `[Reconcile] [RECOVERY] Operation ${intent.intentId} was already applied in virtual wallet. Verifying audit log durability...`,
-        );
-        // Ensure audit record was written before cleaning intent
-        if (intent.expectedAuditRecord) {
-          const auditPath = resolveAuditPath(baseDir);
-          let auditContainsRecord = false;
-          if (existsSync(auditPath)) {
-            const auditLines = readFileSync(auditPath, "utf8").split("\n").filter(Boolean);
-            auditContainsRecord = auditLines.some((l) => {
-              try {
-                const parsed = JSON.parse(l);
-                return (
-                  parsed.reconciliationId === intent.expectedAuditRecord?.reconciliationId ||
-                  parsed.intentId === intent.intentId
-                );
-              } catch {
-                return false;
-              }
-            });
-          }
-          if (!auditContainsRecord) {
-            console.log(
-              `[Reconcile] [RECOVERY] Appending missing audit log entry for recovered intent ${intent.intentId}`,
-            );
-            appendAuditLog(intent.expectedAuditRecord, baseDir);
-          }
+      console.log(
+        `[Reconcile] [RECOVERY] Operation ${intent.intentId} was already applied in virtual wallet. Verifying audit log durability...`,
+      );
+      // Ensure audit record was written before cleaning intent
+      if (intent.expectedAuditRecord) {
+        const auditPath = resolveAuditPath(baseDir);
+        let auditContainsRecord = false;
+        if (existsSync(auditPath)) {
+          const auditLines = readFileSync(auditPath, "utf8").split("\n").filter(Boolean);
+          auditContainsRecord = auditLines.some((l) => {
+            try {
+              const parsed = JSON.parse(l);
+              return (
+                parsed.reconciliationId === intent.expectedAuditRecord?.reconciliationId ||
+                parsed.intentId === intent.intentId
+              );
+            } catch {
+              return false;
+            }
+          });
         }
-        try {
-          unlinkSync(intentPath);
-        } catch (err) {
-          void err;
+        if (!auditContainsRecord) {
+          console.log(
+            `[Reconcile] [RECOVERY] Appending missing audit log entry for recovered intent ${intent.intentId}`,
+          );
+          appendAuditLog(intent.expectedAuditRecord, baseDir);
         }
-        return;
       }
+      try {
+        unlinkSync(intentPath);
+      } catch (err) {
+        void err;
+      }
+      return;
     }
 
     throw new Error(
@@ -270,16 +266,22 @@ export function runReconciliationCli(): void {
     }
     const targetPos = wallet.unresolvedTokens[targetIdx]!;
 
+    const nowMs = Date.now();
+    const deterministicOptions = {
+      ...options,
+      nowMsTimestamp: nowMs,
+    };
+    const intentId = `rec-intent-${nowMs}-${Math.random().toString(36).slice(2, 6)}`;
+
     // Dry-run compute audit record for write-ahead intent durability
     const walletSnapshot = JSON.parse(JSON.stringify(wallet));
-    const dryRunResult = reconcileWalletInventory(walletSnapshot, options);
+    const dryRunResult = reconcileWalletInventory(walletSnapshot, deterministicOptions);
 
-    const intentId = `rec-intent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const intent: ReconciliationIntent = {
       intentId,
-      createdAtMs: Date.now(),
+      createdAtMs: nowMs,
       status: "INTENT_RECORDED",
-      options,
+      options: deterministicOptions,
       matchedPositionId: targetPos.positionId,
       expectedAuditRecord: {
         ...dryRunResult.auditRecord,
@@ -298,7 +300,7 @@ export function runReconciliationCli(): void {
     }
 
     // Mutate live wallet state and persist atomically
-    const result = reconcileWalletInventory(wallet, options);
+    const result = reconcileWalletInventory(wallet, deterministicOptions);
     saveVirtualWallet(wallet);
 
     // Append immutable audit log with intent linkage
