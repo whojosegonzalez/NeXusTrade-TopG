@@ -495,18 +495,15 @@ export class DynamicRatchetService {
       };
     }
 
-    // Phase 12.93 Pillar 2: Universal Strict Pre-Breakeven Stop (-12.0%)
+    // Phase 12.93 Pillar 2: Cohort-Calibrated Strict Pre-Breakeven Stop (-10.0% Established / -12.0% Micro)
     // Any candidate that has not yet confirmed the +10.0% Armed Breakeven threshold
-    // must be cut strictly when underwater <= -12.0% (-1200 bps) unless strong buyer dominance is absorbing the dip.
-    const hasStrongBuyerDominance =
-      context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
-
+    // must be cut strictly when underwater <= preBreakevenStopBps (-1000 bps Established, -1200 bps Micro).
+    // Audit P0-F: Unconditional protective stop — smoothed 5m buyer-flow estimates cannot veto this loss cut.
     if (
       !armedBreakeven &&
       !tier1ProfitTaken &&
       nextPeakGainBps < activeConfig.armedBreakevenThresholdBps &&
-      currentPnlBps <= (activeConfig.preBreakevenStopBps ?? -1200) &&
-      !hasStrongBuyerDominance
+      currentPnlBps <= (activeConfig.preBreakevenStopBps ?? -1200)
     ) {
       const updatedState: PositionRatchetState = {
         ...state,

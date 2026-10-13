@@ -196,11 +196,13 @@ export interface PaperPosition {
   ratchetState: PositionRatchetState;
   lastActivityMs: number;
   stagnantTicksCount: number;
+  feedOutageTicksCount?: number | undefined;
   pyramided?: boolean | undefined;
   scaleInCount?: number | undefined;
   tier1ProfitTaken?: boolean | undefined;
   tier2ProfitTaken?: boolean | undefined;
   peakGainBps?: number | undefined;
+  historicalPeakPriceSol?: number | undefined;
 }
 
 export interface ClosedTradeRecord {
@@ -217,6 +219,19 @@ export interface ClosedTradeRecord {
   readonly exitReason: string;
   readonly openedAtMs: number;
   readonly closedAtMs: number;
+  readonly finalTier?: "BASELINE" | "TIER_1" | "TIER_2" | undefined;
+}
+
+export interface UnresolvedPositionRecord {
+  readonly positionId: string;
+  readonly mintAddress: string;
+  readonly symbol?: string | undefined;
+  readonly tokensHeld: number;
+  readonly costBasisSol: number;
+  readonly lastObservedPriceSol: number;
+  readonly lastObservedAtMs: number;
+  readonly reasonForMissingData: string;
+  readonly estimatedLiquidationSol: number; // 0 for conservative valuation
 }
 
 export type DaemonStatus =
@@ -234,6 +249,7 @@ export interface PaperTradingDaemonSnapshot {
   readonly haltReason?: DaemonHaltReason | undefined;
   readonly openPositions: readonly PaperPosition[];
   readonly closedTrades: readonly ClosedTradeRecord[];
+  readonly unresolvedPositions?: readonly UnresolvedPositionRecord[] | undefined;
   readonly initialPortfolioSol: number;
   readonly currentPortfolioSol: number;
   readonly totalRealizedPnlSol: number;
@@ -268,10 +284,24 @@ export class PaperTradingDaemon {
   private currentCashSol: number;
   private readonly openPositions = new Map<string, PaperPosition>();
   private readonly closedTrades: ClosedTradeRecord[] = [];
+  private readonly unresolvedPositions: UnresolvedPositionRecord[] = [];
   private readonly exitCooldowns = new Map<string, number>();
 
   constructor(options: PaperTradingDaemonOptions) {
-    this.config = options.config;
+    const rawDrawdownBps = options.config.maxPortfolioDrawdownBps ?? -500;
+    if (
+      !Number.isFinite(rawDrawdownBps) ||
+      rawDrawdownBps === 0 ||
+      Math.abs(rawDrawdownBps) > 10_000
+    ) {
+      throw new Error(
+        `[PaperDaemon] [INVALID_CONFIG] maxPortfolioDrawdownBps must be a non-zero number between -10000 and 10000 bps (got ${rawDrawdownBps})`,
+      );
+    }
+    this.config = {
+      ...options.config,
+      maxPortfolioDrawdownBps: -Math.abs(rawDrawdownBps),
+    };
     this.scannerConfig = options.config.scannerConfig ?? CANDIDATE_SCANNER_DEFAULTS;
     this.ratchetService = options.ratchetService ?? new DynamicRatchetService();
     this.scannerEvaluator = options.scannerEvaluator ?? new CandidateScannerEvaluator();
@@ -330,7 +360,7 @@ export class PaperTradingDaemon {
     const position = this.openPositions.get(positionId);
     if (!position) return null;
 
-    // P0-06: Disallow scaling in after profit-taking has begun or if already pyramided
+    // P0-06 / P0-E: Disallow scaling in after profit-taking has begun or if already pyramided
     if (position.tier1ProfitTaken || position.tier2ProfitTaken || position.pyramided) {
       return null;
     }
@@ -346,15 +376,44 @@ export class PaperTradingDaemon {
     const now = nowTimestampMs ?? this.clock();
     const tokensToAdd = addOnCostBasisSol / spotPriceSol;
 
-    position.tokensHeld += tokensToAdd;
-    position.costBasisSol += addOnCostBasisSol;
-    position.initialTokensHeld =
-      (position.initialTokensHeld ?? position.tokensHeld - tokensToAdd) + tokensToAdd;
-    position.initialCostBasisSol =
-      (position.initialCostBasisSol ?? position.costBasisSol - addOnCostBasisSol) +
-      addOnCostBasisSol;
+    const newTokensHeld = position.tokensHeld + tokensToAdd;
+    const newCostBasisSol = position.costBasisSol + addOnCostBasisSol;
+    const blendedEntryPriceSol = newCostBasisSol / newTokensHeld;
 
-    const blendedEntryPriceSol = position.costBasisSol / position.tokensHeld;
+    // P0-E: Absolute protective stop preservation
+    // Previous absolute stop price in SOL
+    const oldStopFloorBps = position.ratchetState.currentStopFloorBps ?? 0;
+    const oldStopPriceSol = position.entryPriceSol * (1 + oldStopFloorBps / 10_000);
+
+    // Target stop price must not be lower than the previous absolute stop price,
+    // and must provide at least blended breakeven (blendedEntryPriceSol).
+    const targetStopPriceSol = Math.max(oldStopPriceSol, blendedEntryPriceSol);
+
+    // If current spot is already at or below targetStopPriceSol, scaling in would create an immediately breached stop!
+    if (spotPriceSol <= targetStopPriceSol) {
+      return null; // Reject scale-in
+    }
+
+    // Rebase stop floor bps relative to the new blended cost basis.
+    // Use Math.ceil to guarantee that integer bps quantization never lowers the absolute stop price in SOL.
+    const rebasedStopFloorBps = Math.max(
+      0,
+      Math.ceil(((targetStopPriceSol - blendedEntryPriceSol) / blendedEntryPriceSol) * 10_000),
+    );
+
+    // P0-E: Preserve absolute historical high-water price separately
+    const historicalPeakPriceSol = Math.max(
+      position.historicalPeakPriceSol ?? position.entryPriceSol,
+      position.ratchetState.peakPriceSol,
+      spotPriceSol,
+    );
+    position.historicalPeakPriceSol = historicalPeakPriceSol;
+
+    position.tokensHeld = newTokensHeld;
+    position.costBasisSol = newCostBasisSol;
+    position.initialTokensHeld = newTokensHeld;
+    position.initialCostBasisSol = newCostBasisSol;
+
     position.entryPriceSol = blendedEntryPriceSol;
     position.spotPriceSol = spotPriceSol;
     position.currentPnlBps = Math.round(
@@ -366,25 +425,56 @@ export class PaperTradingDaemon {
 
     this.currentCashSol -= addOnCostBasisSol;
 
-    // P0-07: Adjust & Rebase ratchet state against new blended cost basis
-    const rebasedPeakPriceSol = Math.max(spotPriceSol, blendedEntryPriceSol);
+    // Peak price since scale-in on blended basis starts at spotPriceSol
     const rebasedPeakGainBps = Math.max(
       0,
-      Math.round(((rebasedPeakPriceSol - blendedEntryPriceSol) / blendedEntryPriceSol) * 10_000),
+      Math.round(((spotPriceSol - blendedEntryPriceSol) / blendedEntryPriceSol) * 10_000),
     );
     const updatedRatchetState: PositionRatchetState = {
       ...position.ratchetState,
       entryPriceSol: blendedEntryPriceSol,
-      peakPriceSol: rebasedPeakPriceSol,
+      peakPriceSol: spotPriceSol,
       peakGainBps: rebasedPeakGainBps,
-      currentStopFloorBps: Math.max(0, position.ratchetState.currentStopFloorBps),
+      currentStopFloorBps: rebasedStopFloorBps,
       armedBreakeven: true,
       lastEvaluatedAtMs: now,
     };
     position.ratchetState = updatedRatchetState;
-    this.ratchetService.getStore().update(updatedRatchetState);
+    this.ratchetService.getStore().update(updatedRatchetState, { allowRebase: true });
 
     return position;
+  }
+
+  markPositionUnresolved(
+    positionId: string,
+    reasonForMissingData = "MISSING_PRICE_FEED",
+    nowTimestampMs?: number,
+  ): UnresolvedPositionRecord | null {
+    const position = this.openPositions.get(positionId);
+    if (!position) return null;
+    this.lastTickAtMs = nowTimestampMs ?? this.clock();
+
+    const unresolvedRecord: UnresolvedPositionRecord = {
+      positionId: position.positionId,
+      mintAddress: position.mintAddress,
+      tokensHeld: position.tokensHeld,
+      costBasisSol: position.costBasisSol,
+      lastObservedPriceSol: position.spotPriceSol > 0 ? position.spotPriceSol : 0,
+      lastObservedAtMs: position.lastActivityMs,
+      reasonForMissingData,
+      estimatedLiquidationSol: 0, // Conservative risk valuation
+      ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
+    };
+
+    this.unresolvedPositions.push(unresolvedRecord);
+    this.openPositions.delete(positionId);
+    this.ratchetService.getStore().delete(positionId);
+
+    if (this.status === "EXITING" && this.openPositions.size === 0) {
+      this.status = this.haltReason ? "HALTED" : "COMPLETED";
+    }
+
+    return unresolvedRecord;
   }
 
   manualExit(
@@ -396,8 +486,14 @@ export class PaperTradingDaemon {
     const position = this.openPositions.get(positionId);
     if (!position) return null;
 
-    const now = nowTimestampMs ?? this.clock();
     const exitPriceSol = currentSpotPriceSol ?? position.spotPriceSol;
+    if (exitPriceSol <= 0 || !Number.isFinite(exitPriceSol)) {
+      // P0-A: Never substitute entry price or record zero-proceeds sale. Mark as unresolved!
+      this.markPositionUnresolved(positionId, `INVALID_EXIT_PRICE_${exitPriceSol}`, nowTimestampMs);
+      return null;
+    }
+
+    const now = nowTimestampMs ?? this.clock();
     const finalProceedsSol = position.tokensHeld * exitPriceSol;
     this.currentCashSol += finalProceedsSol;
 
@@ -408,6 +504,12 @@ export class PaperTradingDaemon {
       totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
     const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
     const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
+
+    const finalTier = position.tier2ProfitTaken
+      ? "TIER_2"
+      : position.tier1ProfitTaken
+        ? "TIER_1"
+        : "BASELINE";
 
     const closedRecord: ClosedTradeRecord = {
       positionId: position.positionId,
@@ -423,6 +525,7 @@ export class PaperTradingDaemon {
       exitReason,
       openedAtMs: position.openedAtMs,
       closedAtMs: now,
+      finalTier,
       ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
     };
 
@@ -471,6 +574,7 @@ export class PaperTradingDaemon {
       ...(this.haltReason ? { haltReason: this.haltReason } : {}),
       openPositions: openPositionsArray,
       closedTrades: [...this.closedTrades],
+      unresolvedPositions: [...this.unresolvedPositions],
       initialPortfolioSol: this.config.initialPortfolioSol,
       currentPortfolioSol,
       totalRealizedPnlSol,
@@ -563,6 +667,7 @@ export class PaperTradingDaemon {
       realizedProceedsSol: 0,
       openedAtMs: now,
       spotPriceSol: entryPriceSol,
+      historicalPeakPriceSol: entryPriceSol,
       currentPnlBps: 0,
       ratchetState,
       lastActivityMs: now,
@@ -590,6 +695,12 @@ export class PaperTradingDaemon {
     const position = this.openPositions.get(positionId);
     if (!position) return null;
 
+    // P0-B: Data feed outage tripwire — an invalid spot price is an external feed outage, NOT market stagnation
+    if (marketContext.spotPriceSol <= 0 || !Number.isFinite(marketContext.spotPriceSol)) {
+      this.recordFeedOutageTick(positionId, now);
+      return null;
+    }
+
     try {
       // 1. Clock Drift Safety Tripwire
       if (Math.abs(now - marketContext.currentTimestampMs) > this.config.maxClockDriftMs) {
@@ -605,6 +716,11 @@ export class PaperTradingDaemon {
         (marketContext.recentBuysCount60s ?? 0) > 0 ||
         (marketContext.recentSellsCount60s ?? 0) > 0 ||
         !marketContext.volumeStalled3m;
+
+      position.historicalPeakPriceSol = Math.max(
+        position.historicalPeakPriceSol ?? position.entryPriceSol,
+        marketContext.spotPriceSol,
+      );
 
       if (priceChanged || hasRecentActivity) {
         position.lastActivityMs = now;
@@ -740,6 +856,12 @@ export class PaperTradingDaemon {
         const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
         const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
 
+        const finalTier = position.tier2ProfitTaken
+          ? "TIER_2"
+          : position.tier1ProfitTaken
+            ? "TIER_1"
+            : "BASELINE";
+
         const closedRecord: ClosedTradeRecord = {
           positionId: position.positionId,
           mintAddress: position.mintAddress,
@@ -756,6 +878,7 @@ export class PaperTradingDaemon {
           exitReason: result.reasonCode,
           openedAtMs: position.openedAtMs,
           closedAtMs: now,
+          finalTier,
           ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
         };
 
@@ -785,16 +908,39 @@ export class PaperTradingDaemon {
     }
   }
 
-  recordStagnantTick(positionId: string, nowTimestampMs?: number): ClosedTradeRecord | null {
+  recordFeedOutageTick(positionId: string, nowTimestampMs?: number): void {
+    const position = this.openPositions.get(positionId);
+    if (!position) return;
+    const now = nowTimestampMs ?? this.clock();
+    this.lastTickAtMs = now;
+    position.feedOutageTicksCount = (position.feedOutageTicksCount ?? 0) + 1;
+    // Feed outage does NOT update position.lastActivityMs and does NOT liquidate position at stale price!
+  }
+
+  recordStagnantTick(
+    positionId: string,
+    validSpotPriceSol?: number,
+    nowTimestampMs?: number,
+  ): ClosedTradeRecord | null {
     const position = this.openPositions.get(positionId);
     if (!position) return null;
     const now = nowTimestampMs ?? this.clock();
     this.lastTickAtMs = now;
-    position.stagnantTicksCount += 1;
 
-    // Check if inactivity has reached 3 minutes (180,000ms)
+    // P0-B: Only genuine, active price feeds qualify for market stagnancy check.
+    // An unavailable/stale price is a feed outage, NOT market stagnation.
+    const spotPrice = validSpotPriceSol ?? position.spotPriceSol;
+    if (spotPrice <= 0 || !Number.isFinite(spotPrice)) {
+      this.recordFeedOutageTick(positionId, nowTimestampMs);
+      return null;
+    }
+
+    position.stagnantTicksCount += 1;
+    position.spotPriceSol = spotPrice;
+
+    // Check if market inactivity has reached 3 minutes (180,000ms) with valid market price
     if (now - position.lastActivityMs >= 180_000) {
-      const exitPriceSol = position.spotPriceSol;
+      const exitPriceSol = spotPrice;
       const finalProceedsSol = position.tokensHeld * exitPriceSol;
       this.currentCashSol += finalProceedsSol;
 
@@ -805,6 +951,12 @@ export class PaperTradingDaemon {
         totalTokensSold > 0 ? totalProceedsSol / totalTokensSold : exitPriceSol;
       const realizedPnlSol = totalProceedsSol - totalCostBasisSol;
       const realizedPnlBps = Math.round((realizedPnlSol / totalCostBasisSol) * 10_000);
+
+      const finalTier = position.tier2ProfitTaken
+        ? "TIER_2"
+        : position.tier1ProfitTaken
+          ? "TIER_1"
+          : "BASELINE";
 
       const closedRecord: ClosedTradeRecord = {
         positionId: position.positionId,
@@ -820,6 +972,7 @@ export class PaperTradingDaemon {
         exitReason: "STAGNANCY_TIMEOUT_EXIT",
         openedAtMs: position.openedAtMs,
         closedAtMs: now,
+        finalTier,
         ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
       };
 
@@ -907,7 +1060,8 @@ export class PaperTradingDaemon {
       finalPnlSol: parseFloat(t.realizedPnlSol.toFixed(4)),
       exitReason: t.exitReason,
       finalTier:
-        t.realizedPnlBps >= 5000 ? "TIER_2" : t.realizedPnlBps >= 1500 ? "TIER_1" : "BASELINE",
+        t.finalTier ??
+        (t.realizedPnlBps >= 5000 ? "TIER_2" : t.realizedPnlBps >= 1500 ? "TIER_1" : "BASELINE"),
     }));
 
     return {

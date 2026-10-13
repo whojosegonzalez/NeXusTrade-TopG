@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -40,104 +40,11 @@ import { BACKFILLED_PAST_SESSIONS, type HistoricalSessionSummary } from "@nexust
 import { BirdeyeDiscoveryService } from "../discovery/BirdeyeDiscoveryService.js";
 import { BirdeyeBudgetTracker } from "../services/BirdeyeBudgetTracker.js";
 
-interface VirtualWalletState {
-  walletAddress: string;
-  currentBalanceSol: number;
-  initialBalanceSol: number;
-  totalSessionsCompleted: number;
-  allTimeRealizedPnlSol: number;
-  lastUpdatedMs: number;
-  settledSessionIds?: string[];
-}
-
-const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
-  walletAddress: "SimulatedVirtualWallet111111111111111111111111",
-  currentBalanceSol: 10.0,
-  initialBalanceSol: 10.0,
-  totalSessionsCompleted: 0,
-  allTimeRealizedPnlSol: 0.0,
-  lastUpdatedMs: Date.now(),
-  settledSessionIds: [],
-};
-
-function resolveVirtualWalletFile(): string {
-  const candidates = [
-    path.resolve(process.cwd(), ".tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "backend/.tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "../.tmp/virtual-wallet.json"),
-    path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  if (existsSync(path.resolve(process.cwd(), "backend/.tmp"))) {
-    return path.resolve(process.cwd(), "backend/.tmp/virtual-wallet.json");
-  }
-  return path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
-}
-
-function loadVirtualWallet(): VirtualWalletState {
-  const filePath = resolveVirtualWalletFile();
-  if (existsSync(filePath)) {
-    try {
-      const raw = readFileSync(filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (
-        typeof parsed?.currentBalanceSol === "number" &&
-        !Number.isNaN(parsed.currentBalanceSol)
-      ) {
-        return {
-          walletAddress: parsed.walletAddress || DEFAULT_VIRTUAL_WALLET.walletAddress,
-          currentBalanceSol: parsed.currentBalanceSol,
-          initialBalanceSol: parsed.initialBalanceSol ?? 10.0,
-          totalSessionsCompleted: parsed.totalSessionsCompleted ?? 0,
-          allTimeRealizedPnlSol: parsed.allTimeRealizedPnlSol ?? 0.0,
-          lastUpdatedMs: parsed.lastUpdatedMs ?? Date.now(),
-          settledSessionIds: Array.isArray(parsed.settledSessionIds)
-            ? parsed.settledSessionIds
-            : [],
-        };
-      }
-    } catch (parseErr) {
-      console.error(
-        `[PaperDaemon] Corrupt or unreadable virtual wallet at ${filePath}. Creating backup...`,
-        parseErr,
-      );
-      try {
-        const corruptBackup = `${filePath}.corrupt-${Date.now()}`;
-        writeFileSync(corruptBackup, readFileSync(filePath, "utf8"), "utf8");
-        console.warn(`[PaperDaemon] Preserved corrupt virtual wallet state at ${corruptBackup}`);
-      } catch {
-        // ignore backup error
-      }
-    }
-  }
-  return { ...DEFAULT_VIRTUAL_WALLET, settledSessionIds: [], lastUpdatedMs: Date.now() };
-}
-
-function saveVirtualWallet(wallet: VirtualWalletState): void {
-  const primaryPath = resolveVirtualWalletFile();
-  const dir = path.dirname(primaryPath);
-  mkdirSync(dir, { recursive: true });
-  const tempPath = `${primaryPath}.tmp.${Date.now()}`;
-  const payload = JSON.stringify(wallet, null, 2);
-  writeFileSync(tempPath, payload, "utf8");
-  renameSync(tempPath, primaryPath);
-
-  // Sync secondary mirror path if exists
-  const secondaryDir = existsSync("backend/.tmp")
-    ? "backend/.tmp"
-    : existsSync(".tmp")
-      ? ".tmp"
-      : null;
-  if (secondaryDir && path.resolve(secondaryDir) !== dir) {
-    try {
-      writeFileSync(path.join(secondaryDir, "virtual-wallet.json"), payload, "utf8");
-    } catch {
-      // ignore mirror error
-    }
-  }
-}
+import {
+  loadVirtualWallet,
+  saveVirtualWallet,
+  settleSessionInWallet,
+} from "../paper/VirtualWallet.js";
 
 function parseCliArgs(): PaperTradingDaemonConfig {
   const rawArgs = process.argv.slice(2).filter((arg) => arg !== "--");
@@ -186,8 +93,14 @@ function parseCliArgs(): PaperTradingDaemonConfig {
     console.log(
       "[PaperDaemon] [WALLET_RESET] Continuous virtual wallet reinitialized to 10.0000 SOL.",
     );
-  } else if (typeof rawInitial === "string" && !Number.isNaN(parseFloat(rawInitial))) {
-    initialPortfolioSol = parseFloat(rawInitial);
+  } else if (typeof rawInitial === "string") {
+    const parsedInitial = parseFloat(rawInitial);
+    if (!Number.isFinite(parsedInitial) || parsedInitial <= 0) {
+      throw new Error(
+        `[PaperDaemon] [INVALID_CONFIG] --initial-sol must be a positive finite number (got "${rawInitial}")`,
+      );
+    }
+    initialPortfolioSol = parsedInitial;
   } else {
     const vWallet = loadVirtualWallet();
     initialPortfolioSol = vWallet.currentBalanceSol;
@@ -204,12 +117,28 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   );
 
   const rawSize = values["position-size-sol"];
-  const positionSizeSol =
-    typeof rawSize === "string" ? parseFloat(rawSize) : calculatedBalancedSize;
+  let positionSizeSol = calculatedBalancedSize;
+  if (typeof rawSize === "string") {
+    const parsedSize = parseFloat(rawSize);
+    if (!Number.isFinite(parsedSize) || parsedSize <= 0) {
+      throw new Error(
+        `[PaperDaemon] [INVALID_CONFIG] --position-size-sol must be a positive finite number (got "${rawSize}")`,
+      );
+    }
+    positionSizeSol = parsedSize;
+  }
 
   const rawDrawdown = values["max-drawdown-bps"];
-  const maxPortfolioDrawdownBps =
-    typeof rawDrawdown === "string" ? parseInt(rawDrawdown, 10) : -500; // -5.0%
+  let maxPortfolioDrawdownBps = -500; // -5.0%
+  if (typeof rawDrawdown === "string") {
+    const parsed = parseInt(rawDrawdown, 10);
+    if (!Number.isFinite(parsed) || parsed === 0 || Math.abs(parsed) > 10_000) {
+      throw new Error(
+        `[PaperDaemon] [INVALID_CONFIG] --max-drawdown-bps must be a non-zero integer between -10000 and 10000 bps (got "${rawDrawdown}")`,
+      );
+    }
+    maxPortfolioDrawdownBps = -Math.abs(parsed);
+  }
 
   const rawCooldown = values["cooldown-min"];
   const cooldownMin = typeof rawCooldown === "string" ? parseFloat(rawCooldown) : 30;
@@ -352,6 +281,9 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
 async function run(): Promise<void> {
   const config = parseCliArgs();
   console.log(`[PaperDaemon] Starting Paper Trading Daemon Session: ${config.sessionId}`);
+  console.log(
+    `[PaperDaemon] [STARTUP_CONFIG] Session=${config.sessionId} | InitialPortfolio=${config.initialPortfolioSol.toFixed(4)} SOL | PositionSize=${config.positionSizeSol} SOL | MaxOpenPositions=${config.maxOpenPositions} | MaxDrawdownBps=${config.maxPortfolioDrawdownBps} bps (${(config.maxPortfolioDrawdownBps / 100).toFixed(1)}%) | Uninterrupted=${config.uninterruptedResearchMode ? "ENABLED" : "DISABLED"} | Cooldown=${((config.antiRebuyCooldownMs ?? 0) / 60000).toFixed(0)}m | Schedule=${config.tradingSchedule ? config.tradingSchedule.rawString : "NONE"}`,
+  );
   console.log(
     `[PaperDaemon] Config: Duration=${config.durationHours}h, MaxPositions=${config.maxOpenPositions}, Size=${config.positionSizeSol} SOL`,
   );
@@ -524,23 +456,27 @@ async function run(): Promise<void> {
         `[PaperDaemon] Archived session summary to .tmp/sessions/${config.sessionId}.json and updated ${pastSessionsPath}`,
       );
 
-      // 3. Update Continuous Virtual Wallet
+      // 3. Update Continuous Virtual Wallet (Idempotent settlement: P0-C)
       const snap = daemon.getSnapshot();
       const currentSol = snap.currentPortfolioSol;
-      const netSessionPnlSol = currentSol - config.initialPortfolioSol;
       const wallet = loadVirtualWallet();
-      wallet.currentBalanceSol = currentSol;
-      wallet.settledSessionIds = wallet.settledSessionIds ?? [];
-      if (!wallet.settledSessionIds.includes(config.sessionId)) {
-        wallet.settledSessionIds.push(config.sessionId);
-        wallet.allTimeRealizedPnlSol += netSessionPnlSol;
-        wallet.totalSessionsCompleted += 1;
-      }
-      wallet.lastUpdatedMs = nowMs();
-      saveVirtualWallet(wallet);
-      console.log(
-        `[PaperDaemon] Updated Continuous Virtual Wallet: Balance=${wallet.currentBalanceSol.toFixed(4)} SOL | All-Time PnL=${wallet.allTimeRealizedPnlSol >= 0 ? "+" : ""}${wallet.allTimeRealizedPnlSol.toFixed(4)} SOL | Sessions=${wallet.totalSessionsCompleted}`,
+      const settled = settleSessionInWallet(
+        wallet,
+        config.sessionId,
+        currentSol,
+        config.initialPortfolioSol,
+        nowMs(),
       );
+      if (settled) {
+        saveVirtualWallet(wallet);
+        console.log(
+          `[PaperDaemon] Updated Continuous Virtual Wallet: Balance=${wallet.currentBalanceSol.toFixed(4)} SOL | All-Time PnL=${wallet.allTimeRealizedPnlSol >= 0 ? "+" : ""}${wallet.allTimeRealizedPnlSol.toFixed(4)} SOL | Sessions=${wallet.totalSessionsCompleted}`,
+        );
+      } else {
+        console.log(
+          `[PaperDaemon] Continuous Virtual Wallet already settled for session ${config.sessionId}. Skipping duplicate balance update.`,
+        );
+      }
     } catch (archiveErr) {
       console.error("[PaperDaemon] Failed to archive session summary:", archiveErr);
     }
@@ -569,7 +505,7 @@ async function run(): Promise<void> {
   process.on("SIGINT", handleShutdown);
   process.on("SIGTERM", handleShutdown);
 
-  // Cashout Helper (Fetches live DexScreener spot prices before closing)
+  // Cashout Helper (Fetches live DexScreener spot prices before closing; handles missing feeds safely via P0-A)
   const cashoutAllPositions = async (
     reason: "SCHEDULE_WINDOW_CONCLUDED" | "SESSION_DURATION_CASHOUT" | "CIRCUIT_BREAKER_CASHOUT",
   ): Promise<void> => {
@@ -580,18 +516,43 @@ async function run(): Promise<void> {
     await Promise.all(
       openPositions.map(async (pos) => {
         try {
-          let exitPrice = pos.spotPriceSol;
+          let exitPrice = 0;
           try {
             const freshSpot = await fetchDexScreenerSpotInfo(pos.mintAddress);
             if (freshSpot && freshSpot.spotPriceSol > 0) {
               exitPrice = freshSpot.spotPriceSol;
             }
           } catch {
-            // fallback to last known spotPriceSol
+            // failed to fetch fresh price
           }
-          if (exitPrice <= 0) {
-            exitPrice = pos.entryPriceSol;
+
+          // If fresh price is not available, check if existing pos.spotPriceSol is fresh (< 300s old)
+          const isPosSpotFresh =
+            exitPrice <= 0 && pos.spotPriceSol > 0 && currentNow - pos.lastActivityMs <= 300_000;
+          if (isPosSpotFresh) {
+            exitPrice = pos.spotPriceSol;
           }
+
+          if (exitPrice <= 0 || !Number.isFinite(exitPrice)) {
+            // P0-A: Never substitute entry price or record zero-proceeds sale. Keep position unresolved!
+            daemon.markPositionUnresolved(
+              pos.positionId,
+              "MISSING_PRICE_FEED_AT_CASHOUT",
+              currentNow,
+            );
+            const timeStr = new Date(currentNow).toLocaleTimeString();
+            addActivityLog(
+              "CONTROL",
+              `⚠️ ${pos.symbol ?? pos.mintAddress.slice(0, 6)} marked UNRESOLVED at ${timeStr} (missing price feed) | 0 wallet cash credited`,
+              pos.mintAddress,
+              pos.symbol,
+            );
+            console.warn(
+              `[PaperDaemon] [UNRESOLVED_POSITION] ${pos.mintAddress} has no valid price feed at cashout. Marked unresolved with 0 SOL cash credited.`,
+            );
+            return;
+          }
+
           daemon.manualExit(pos.positionId, exitPrice, currentNow, reason);
           const timeStr = new Date(currentNow).toLocaleTimeString();
           addActivityLog(
@@ -707,20 +668,8 @@ async function run(): Promise<void> {
         for (const { pos, spotInfo } of openPosWithSpots) {
           try {
             if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
-              const stagnantClosed = daemon.recordStagnantTick(pos.positionId, currentNow);
-              if (stagnantClosed) {
-                const timeStr = new Date(currentNow).toLocaleTimeString();
-                const pnlPct = (stagnantClosed.realizedPnlBps / 100).toFixed(2);
-                addActivityLog(
-                  "SELL",
-                  `🔴 ${pos.symbol ?? pos.mintAddress.slice(0, 6)} closed at stagnancy timeout at ${timeStr} | Exit: STAGNANCY_TIMEOUT_EXIT | Realized PnL: ${stagnantClosed.realizedPnlSol.toFixed(4)} SOL (${pnlPct}%)`,
-                  pos.mintAddress,
-                  pos.symbol,
-                );
-                console.log(
-                  `[PaperDaemon] [STAGNANCY TIMEOUT EXIT] ${pos.mintAddress} | Reason: STAGNANCY_TIMEOUT_EXIT | Inactive for >= 5m | Realized PnL: ${pnlPct}%`,
-                );
-              }
+              // P0-B: Missing or failed price feed is an external data outage, NOT market stagnation
+              daemon.recordFeedOutageTick(pos.positionId, currentNow);
               continue;
             }
 
@@ -732,6 +681,10 @@ async function run(): Promise<void> {
                 ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
                 : 0;
 
+            const isVolumeStalled =
+              spotInfo.recentTransactionsCount === 0 ||
+              (spotInfo.recentBuys60s === 0 && spotInfo.recentSells60s === 0);
+
             const marketContext: MarketEvaluationContext = {
               currentTimestampMs: currentNow,
               spotPriceSol: spotInfo.spotPriceSol,
@@ -739,7 +692,7 @@ async function run(): Promise<void> {
               recentBuysCount60s: spotInfo.recentBuys60s,
               recentSellsCount60s: spotInfo.recentSells60s,
               momentum5mBps: spotInfo.momentum5mBps,
-              volumeStalled3m: false,
+              volumeStalled3m: isVolumeStalled,
               singleTickDropBps,
             };
 

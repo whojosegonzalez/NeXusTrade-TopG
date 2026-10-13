@@ -471,22 +471,22 @@ describe("DynamicRatchetService", () => {
       },
       ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
     );
-    const dip15 = service.evaluate(
+    const dip9 = service.evaluate(
       confirmed.updatedState,
       {
         ...baseContext,
-        spotPriceSol: 0.85, // -15.0%
+        spotPriceSol: 0.91, // -9.0% (above -10.0% pre-breakeven stop)
         recentBuysCount60s: 5,
         recentSellsCount60s: 2,
         currentTimestampMs: 1_000_010,
       },
       ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
     );
-    expect(dip15.action).toBe("HOLD"); // In grace period, not catastrophic stop!
+    expect(dip9.action).toBe("HOLD"); // In grace period, not catastrophic or pre-breakeven stop!
 
     // Catastrophic hard stop at -18.1%
     const hardStop = service.evaluate(
-      dip15.updatedState,
+      dip9.updatedState,
       {
         ...baseContext,
         spotPriceSol: 0.819, // -18.1% <= -18.0%
@@ -553,21 +553,21 @@ describe("DynamicRatchetService", () => {
     const store = new RatchetStateStore();
     const service = new DynamicRatchetService({}, store);
 
-    // Scenario A: Strong buyers (823 buys vs 586 sells, like SNOWBALL) at -14.0%
+    // Scenario A: P0-F unconditional cut: Strong buyers (823 buys vs 586 sells) cannot bypass -12.0% pre-breakeven stop
     const stateA = store.initPositionState("pos-flow-1", "mint-flow-1", 1.0, 1_000_000);
     const resultA = service.evaluate(
       stateA,
       {
         ...baseContext,
-        spotPriceSol: 0.86, // -14.0% = -1400 bps
+        spotPriceSol: 0.86, // -14.0% = -1400 bps <= -1200 bps
         recentBuysCount60s: 823,
-        recentSellsCount60s: 586, // 1.4x buyer dominance >= 1.25x
+        recentSellsCount60s: 586, // strong buyer dominance cannot veto pre-breakeven stop
         currentTimestampMs: 1_000_010,
       },
       MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
     );
-    expect(resultA.action).toBe("HOLD"); // Breathes through the wick!
-    expect(resultA.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+    expect(resultA.action).toBe("SELL_ALL"); // Unconditional pre-breakeven cut!
+    expect(resultA.reasonCode).toBe("UNCONFIRMED_PRE_BREAKEVEN_CUT");
 
     // Scenario B: Unabsorbed sell pressure at -14.0% (5 buys vs 20 sells) on a confirmed position
     const stateB = store.initPositionState("pos-flow-2", "mint-flow-2", 1.0, 1_000_000);
@@ -877,10 +877,11 @@ describe("DynamicRatchetService", () => {
       const service = new DynamicRatchetService({}, store);
       const state = store.initPositionState("pos-cliff-2", "mint-cliff-2", 1.0, 1_000_000);
 
-      // Price dips to 0.90 SOL (-10.0% pnl, -1000 bps single-tick drop), but buyers are absorbing (6 buys vs 4 sells)
+      // Price dips to 0.91 SOL (-9.0% pnl, -1000 bps single-tick drop), but buyers are absorbing (6 buys vs 4 sells)
+      // Above -10.0% pre-breakeven stop, testing whale dump bypass in drawdown grace
       const result = service.evaluate(state, {
         ...baseContext,
-        spotPriceSol: 0.9,
+        spotPriceSol: 0.91,
         recentBuysCount60s: 6,
         recentSellsCount60s: 4,
         singleTickDropBps: -1000,

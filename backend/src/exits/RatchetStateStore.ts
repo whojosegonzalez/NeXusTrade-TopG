@@ -35,9 +35,9 @@ export class RatchetStateStore {
     return this.states.get(positionId);
   }
 
-  update(updatedState: PositionRatchetState): void {
+  update(updatedState: PositionRatchetState, options?: { allowRebase?: boolean }): void {
     const existing = this.states.get(updatedState.positionId);
-    if (existing) {
+    if (existing && !options?.allowRebase) {
       // Enforce Monotonicity Invariant: Locked profit floor can NEVER decrease once raised above initial
       if (
         existing.currentStopFloorBps > -800 &&

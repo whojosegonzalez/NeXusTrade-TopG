@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   PaperTradingDaemon,
@@ -6,6 +9,11 @@ import {
   parseScheduleString,
   isWithinTradingSchedule,
 } from "./PaperTradingDaemon.js";
+import {
+  type VirtualWalletState,
+  loadVirtualWallet,
+  settleSessionInWallet,
+} from "./VirtualWallet.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
   type MarketEvaluationContext,
@@ -519,7 +527,7 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.closedTrades[0]?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
   });
 
-  it("forces stagnancy exit via recordStagnantTick when spot query returns null for 3 minutes", () => {
+  it("forces stagnancy exit via recordStagnantTick when valid spot price is flat for 3 minutes", () => {
     let currentClockMs = nowMs;
     const daemon = new PaperTradingDaemon({
       config: baseConfig,
@@ -530,21 +538,40 @@ describe("PaperTradingDaemon", () => {
     daemon.processScannedPool(validPool, currentClockMs);
     const pos = daemon.getSnapshot().openPositions[0]!;
 
-    // Spot queries fail for 2 minutes
+    // Market remains flat for 2 minutes with valid spot price
     currentClockMs += 120_000;
-    const closed1 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
+    const closed1 = daemon.recordStagnantTick(pos.positionId, pos.spotPriceSol, currentClockMs);
     expect(closed1).toBeNull();
     expect(daemon.getSnapshot().openPositions.length).toBe(1);
 
-    // Spot queries fail at 3 minutes mark (>= 180,000ms)
+    // Market remains flat for 3 minutes (>= 180,000ms) with valid spot price
     currentClockMs += 60_000;
-    const closed2 = daemon.recordStagnantTick(pos.positionId, currentClockMs);
+    const closed2 = daemon.recordStagnantTick(pos.positionId, pos.spotPriceSol, currentClockMs);
     expect(closed2).toBeDefined();
     expect(closed2?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
 
     const snapshot = daemon.getSnapshot();
     expect(snapshot.openPositions.length).toBe(0);
     expect(snapshot.closedTrades.length).toBe(1);
+  });
+
+  it("delegates to recordFeedOutageTick without liquidating when spot price is invalid (P0-B)", () => {
+    let currentClockMs = nowMs;
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => currentClockMs,
+    });
+    daemon.start();
+
+    daemon.processScannedPool(validPool, currentClockMs);
+    const pos = daemon.getSnapshot().openPositions[0]!;
+
+    // Outage occurs for 4 minutes (> 180,000ms)
+    currentClockMs += 240_000;
+    const closedOutage = daemon.recordStagnantTick(pos.positionId, 0, currentClockMs);
+    expect(closedOutage).toBeNull();
+    expect(pos.feedOutageTicksCount).toBe(1);
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
   });
 
   it("rejects non-positive entry price", () => {
@@ -879,6 +906,381 @@ describe("PaperTradingDaemon", () => {
       // Floor locked to breakeven (>= 0 bps)
       expect(scaled?.ratchetState.currentStopFloorBps).toBeGreaterThanOrEqual(0);
       expect(scaled?.ratchetState.armedBreakeven).toBe(true);
+    });
+  });
+
+  describe("Phase 12.93B Post-Audit P0 Regression Test Suite", () => {
+    // P0-A: Missing prices and unresolved exposure
+    it("P0-A: marks position as UNRESOLVED with zero proceeds and zero wallet credit on invalid/missing price", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+      const cashBefore = daemon.getCurrentCashSol(); // 9.0 SOL
+
+      // Missing/invalid price (0 SOL) at exit
+      const exitResult = daemon.manualExit(
+        pos.positionId,
+        0,
+        nowMs + 1000,
+        "SESSION_DURATION_CASHOUT",
+      );
+      expect(exitResult).toBeNull();
+
+      const snapshot = daemon.getSnapshot();
+      expect(snapshot.openPositions.length).toBe(0);
+      expect(snapshot.closedTrades.length).toBe(0);
+      expect(snapshot.unresolvedPositions?.length).toBe(1);
+      const unresolved = snapshot.unresolvedPositions![0]!;
+      expect(unresolved.positionId).toBe(pos.positionId);
+      expect(unresolved.costBasisSol).toBe(1.0);
+      expect(unresolved.estimatedLiquidationSol).toBe(0);
+      expect(unresolved.reasonForMissingData).toContain("INVALID_EXIT_PRICE_0");
+
+      // Virtual wallet cash is NOT credited!
+      expect(daemon.getCurrentCashSol()).toBe(cashBefore);
+    });
+
+    // P0-B: Missing prices vs market stagnation
+    it("P0-B: does not trigger stagnancy timeout exit during price feed outage lasting > 180s", () => {
+      let currentClock = nowMs;
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => currentClock });
+      daemon.start();
+      daemon.processScannedPool(validPool, currentClock, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Price feed outage for 200s (exceeding 180s timeout)
+      currentClock += 200_000;
+      daemon.recordFeedOutageTick(pos.positionId, currentClock);
+      const tickResult = daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: currentClock,
+          spotPriceSol: 0, // feed outage
+          lpIntact: true,
+          recentBuysCount60s: 0,
+          recentSellsCount60s: 0,
+          momentum5mBps: 0,
+          volumeStalled3m: false,
+        },
+        currentClock,
+      );
+
+      expect(tickResult).toBeNull();
+      const snap = daemon.getSnapshot();
+      expect(snap.openPositions.length).toBe(1);
+      expect(snap.openPositions[0]!.feedOutageTicksCount).toBeGreaterThan(0);
+      expect(snap.closedTrades.length).toBe(0);
+    });
+
+    // P0-C: Wallet persistence, corruption safety, and duplicate settlement
+    it("P0-C: fails closed on corrupted wallet JSON and preserves corrupt backup", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "wallet-test-corrupt-"));
+      const walletPath = path.join(tempDir, "virtual-wallet.json");
+      writeFileSync(walletPath, "{ corrupt json syntax ...", "utf8");
+
+      expect(() => loadVirtualWallet(walletPath)).toThrow(
+        "[PaperDaemon] [FATAL] Virtual wallet corrupted or invalid",
+      );
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("P0-C: migrates valid legacy wallet without settledSessionIds safely", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "wallet-test-legacy-"));
+      const walletPath = path.join(tempDir, "virtual-wallet.json");
+      const legacyWallet = {
+        walletAddress: "LegacyWallet11111111111111111111111111111",
+        currentBalanceSol: 12.5,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 2,
+        allTimeRealizedPnlSol: 2.5,
+        lastUpdatedMs: 1_000_000,
+      };
+      writeFileSync(walletPath, JSON.stringify(legacyWallet), "utf8");
+
+      const loaded = loadVirtualWallet(walletPath);
+      expect(loaded.currentBalanceSol).toBe(12.5);
+      expect(loaded.allTimeRealizedPnlSol).toBe(2.5);
+      expect(loaded.totalSessionsCompleted).toBe(2);
+      expect(loaded.settledSessionIds).toEqual([]);
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("P0-C: enforces idempotent settlement: duplicate session settlement is a no-op", () => {
+      const wallet: VirtualWalletState = {
+        walletAddress: "TestWallet111",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 0,
+        allTimeRealizedPnlSol: 0.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: [],
+      };
+
+      const firstSettled = settleSessionInWallet(
+        wallet,
+        "session-test-01",
+        11.2,
+        10.0,
+        nowMs + 1000,
+      );
+      expect(firstSettled).toBe(true);
+      expect(wallet.currentBalanceSol).toBe(11.2);
+      expect(wallet.allTimeRealizedPnlSol).toBe(1.2);
+      expect(wallet.totalSessionsCompleted).toBe(1);
+      expect(wallet.settledSessionIds).toEqual(["session-test-01"]);
+
+      // Re-settling same session ID must be rejected without mutating state
+      const secondSettled = settleSessionInWallet(
+        wallet,
+        "session-test-01",
+        15.0,
+        10.0,
+        nowMs + 2000,
+      );
+      expect(secondSettled).toBe(false);
+      expect(wallet.currentBalanceSol).toBe(11.2);
+      expect(wallet.allTimeRealizedPnlSol).toBe(1.2);
+      expect(wallet.totalSessionsCompleted).toBe(1);
+    });
+
+    // P0-E: Absolute protective stop and peak preservation on scale-in
+    it("P0-E: preserves historicalPeakPriceSol across scale-in", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 0.5, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Price surges to 0.0575 SOL (+15%, below +20% Tier 1), then pulls back to 0.055 SOL (+10%)
+      daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: nowMs + 1000,
+          spotPriceSol: 0.0575,
+          lpIntact: true,
+          recentBuysCount60s: 20,
+          recentSellsCount60s: 5,
+          momentum5mBps: 500,
+          volumeStalled3m: false,
+        },
+        nowMs + 1000,
+      );
+
+      const scaled = daemon.scaleInPosition(pos.positionId, 0.5, 0.055, nowMs + 2000);
+      expect(scaled).toBeDefined();
+      expect(scaled?.historicalPeakPriceSol).toBe(0.0575);
+    });
+
+    it("P0-E: absolute protective stop in SOL is never lowered after scale-in", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 0.5, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Simulate a previously locked stop floor at +10% (0.055 SOL absolute stop)
+      pos.ratchetState = { ...pos.ratchetState, currentStopFloorBps: 1000 };
+      const oldStopPriceSol = 0.05 * 1.1; // 0.055 SOL
+
+      // Spot is 0.060 SOL (+20%), scale in 0.5 SOL
+      const scaled = daemon.scaleInPosition(pos.positionId, 0.5, 0.06, nowMs + 1000);
+      expect(scaled).toBeDefined();
+
+      const blendedEntry = scaled!.entryPriceSol;
+      const newStopFloorBps = scaled!.ratchetState.currentStopFloorBps;
+      const newStopPriceSol = blendedEntry * (1 + newStopFloorBps / 10_000);
+
+      // New absolute stop price in SOL must NOT be lower than old stop price (0.055 SOL)
+      expect(newStopPriceSol).toBeGreaterThanOrEqual(oldStopPriceSol - 1e-9);
+    });
+
+    it("P0-E: rejects scale-in if spot price is <= target stop price", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 0.5, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // If stop floor was locked at +10% (0.055 SOL) and spot is 0.054 SOL (below target stop)
+      pos.ratchetState = { ...pos.ratchetState, currentStopFloorBps: 1000 };
+      const rejected = daemon.scaleInPosition(pos.positionId, 0.5, 0.054, nowMs + 1000);
+      expect(rejected).toBeNull();
+    });
+
+    it("P0-E: rejects scale-in after Tier 1 taken or while paused/exiting", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 0.5, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // 1. After Tier 1 taken
+      pos.tier1ProfitTaken = true;
+      expect(daemon.scaleInPosition(pos.positionId, 0.5, 0.06, nowMs + 1000)).toBeNull();
+      pos.tier1ProfitTaken = false;
+
+      // 2. While paused
+      daemon.pause();
+      expect(daemon.scaleInPosition(pos.positionId, 0.5, 0.06, nowMs + 1000)).toBeNull();
+      daemon.resume();
+
+      // 3. While exiting
+      daemon.startExiting();
+      expect(daemon.scaleInPosition(pos.positionId, 0.5, 0.06, nowMs + 1000)).toBeNull();
+    });
+
+    // P0-F: Cohort-calibrated unconditional pre-breakeven stops
+    it("P0-F: Established cohort cuts unconditionally at -10% pre-breakeven threshold regardless of buyers", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0, {
+        bypassScannerEvaluation: true,
+        cohort: "ESTABLISHED",
+        ratchetConfig: ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Drops to 0.0449 SOL (-10.2% pnl), with strong buyer flow (50 buys vs 10 sells)
+      const exitResult = daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: nowMs + 1000,
+          spotPriceSol: 0.0449,
+          lpIntact: true,
+          recentBuysCount60s: 50,
+          recentSellsCount60s: 10,
+          momentum5mBps: -400,
+          volumeStalled3m: false,
+        },
+        nowMs + 1000,
+      );
+
+      expect(exitResult?.action).toBe("SELL_ALL");
+      expect(exitResult?.reasonCode).toBe("UNCONFIRMED_PRE_BREAKEVEN_CUT");
+    });
+
+    it("P0-F: Micro-Cap cohort cuts unconditionally at -12% pre-breakeven threshold regardless of buyers", () => {
+      const daemon = new PaperTradingDaemon({ config: baseConfig, clock: () => nowMs });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0, {
+        bypassScannerEvaluation: true,
+        cohort: "MICRO_CAP",
+        ratchetConfig: MICRO_CAP_DYNAMIC_RATCHET_CONFIG,
+      });
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Drops to 0.0439 SOL (-12.2% pnl), with strong buyer flow (50 buys vs 10 sells)
+      const exitResult = daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: nowMs + 1000,
+          spotPriceSol: 0.0439,
+          lpIntact: true,
+          recentBuysCount60s: 50,
+          recentSellsCount60s: 10,
+          momentum5mBps: -500,
+          volumeStalled3m: false,
+        },
+        nowMs + 1000,
+      );
+
+      expect(exitResult?.action).toBe("SELL_ALL");
+      expect(exitResult?.reasonCode).toBe("UNCONFIRMED_PRE_BREAKEVEN_CUT");
+    });
+
+    // P0-G: Portfolio drawdown validation and negative basis-point semantics
+    it("P0-G: validates drawdown threshold: normalizes positive to negative and rejects zero/invalid values", () => {
+      // Positive bps input -> normalized to negative
+      const daemonPos = new PaperTradingDaemon({
+        config: { ...baseConfig, maxPortfolioDrawdownBps: 750 },
+      });
+      expect(daemonPos.getSnapshot().status).toBe("IDLE");
+
+      // Zero bps -> throws
+      expect(
+        () =>
+          new PaperTradingDaemon({
+            config: { ...baseConfig, maxPortfolioDrawdownBps: 0 },
+          }),
+      ).toThrow("[INVALID_CONFIG]");
+
+      // Out of bounds -> throws
+      expect(
+        () =>
+          new PaperTradingDaemon({
+            config: { ...baseConfig, maxPortfolioDrawdownBps: 15000 },
+          }),
+      ).toThrow("[INVALID_CONFIG]");
+    });
+
+    it("P0-G: transitions to EXITING on drawdown breach with open positions, freezing admissions", () => {
+      const daemon = new PaperTradingDaemon({
+        config: {
+          ...baseConfig,
+          initialPortfolioSol: 1.0,
+          positionSizeSol: 1.0,
+          maxPortfolioDrawdownBps: -500, // -5.0% = -0.05 SOL loss
+        },
+        clock: () => nowMs,
+      });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Position drops to 0.047 SOL (-6.0% pnl)
+      // At -6.0%, it enters drawdown grace (does not close yet, holds in grace)
+      // But portfolio is at 0.94 SOL (-6.0% drawdown <= -5.0% threshold)
+      const tickResult = daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: nowMs + 1000,
+          spotPriceSol: 0.047,
+          lpIntact: true,
+          recentBuysCount60s: 10,
+          recentSellsCount60s: 5,
+          momentum5mBps: -100,
+          volumeStalled3m: false,
+        },
+        nowMs + 1000,
+      );
+
+      expect(tickResult?.action).toBe("HOLD");
+      const snapshot = daemon.getSnapshot();
+      expect(snapshot.haltReason).toBe("PORTFOLIO_DRAWDOWN_BREACHED");
+      // Status is EXITING because open positions exist, allowing active exit management
+      expect(snapshot.status).toBe("EXITING");
+      expect(snapshot.openPositions.length).toBe(1);
+
+      // New admissions rejected while EXITING
+      expect(
+        daemon.processScannedPool(
+          {
+            ...validPool,
+            poolId: "pool-2",
+            mintAddress: "Mint2222222222222222222222222222222222222222",
+          },
+          nowMs + 2000,
+        ),
+      ).toBe(false);
+
+      // Once open position exits, daemon transitions to HALTED
+      daemon.manualExit(pos.positionId, 0.047, nowMs + 3000, "MANUAL_OPERATOR_EXIT");
+      const finalSnap = daemon.getSnapshot();
+      expect(finalSnap.openPositions.length).toBe(0);
+      expect(finalSnap.status).toBe("HALTED");
     });
   });
 });

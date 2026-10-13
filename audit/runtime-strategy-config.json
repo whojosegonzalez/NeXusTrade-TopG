@@ -1,0 +1,139 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "generatedAt": "2026-10-13T00:55:00.000Z",
+  "version": "12.93-turbo-defense-hardened",
+  "commit": "b3f73c21426a8aa283d38674c52024de41fa4a85",
+  "nodes": {
+    "windows_pc": {
+      "executionMode": "SCHEDULED_WINDOW",
+      "schedule": "07:00-18:00:PDT",
+      "timezone": "America/Los_Angeles",
+      "windowDurationHours": 11.0,
+      "endOfWindowBehavior": "SCHEDULE_WINDOW_CONCLUDED_CASHOUT",
+      "continuousWalletFile": ".tmp/virtual-wallet.json",
+      "startingBalanceSol": 8.4548,
+      "walletResetEnabled": false
+    },
+    "fedora_laptop": {
+      "executionMode": "CONTINUOUS_24_7",
+      "schedule": null,
+      "timezone": "UTC",
+      "windowDurationHours": 168.0,
+      "endOfWindowBehavior": "DURATION_ELAPSED_CASHOUT",
+      "continuousWalletFile": ".tmp/virtual-wallet.json",
+      "startingBalanceSol": 10.0,
+      "walletResetEnabled": false
+    }
+  },
+  "sizing": {
+    "establishedBaseProbeSol": 0.5,
+    "establishedMaxProbeSol": 0.65,
+    "microCapBaseProbeSol": 0.35,
+    "microCapMaxProbeSol": 0.45,
+    "walletScaleMin": 1.0,
+    "walletScaleMax": 1.25,
+    "maxOpenPositions": 3,
+    "maxCapitalExposureSol": 1.95,
+    "gasReserveSol": 0.05
+  },
+  "pyramidingScaleIn": {
+    "maxScaleInsPerPosition": 1,
+    "establishedTriggerPnlBps": 700,
+    "establishedTriggerPnlPct": 7.0,
+    "microCapTriggerPnlBps": 1000,
+    "microCapTriggerPnlPct": 10.0,
+    "establishedAddOnSizeSol": 0.5,
+    "microCapAddOnSizeSol": 0.25,
+    "minRecentBuys60s": 15,
+    "minBuySellRatio60s": 2.0,
+    "minMomentum5mBps": 400,
+    "minAvailableCashSol": 0.5,
+    "rebasing": {
+      "rebaseEntryPrice": "BLENDED_COST_BASIS",
+      "rebasePeakPrice": "MAX_SPOT_AND_BLENDED",
+      "rebasePeakGainBps": "RELATIVE_TO_BLENDED_BASIS",
+      "lockedFloorBps": 0,
+      "armedBreakeven": true
+    },
+    "restrictions": [
+      "STATUS_MUST_BE_RUNNING",
+      "DISALLOWED_IF_TIER1_PROFIT_TAKEN",
+      "DISALLOWED_IF_TIER2_PROFIT_TAKEN",
+      "DISALLOWED_IF_ALREADY_PYRAMIDED",
+      "DISALLOWED_IF_STANDBY_OR_EXITING"
+    ]
+  },
+  "dynamicRatchet": {
+    "microCap": {
+      "catastrophicFloorBps": -2000,
+      "preBreakevenStopBps": -1200,
+      "moonbagFloorBps": -200,
+      "drawdownTriggerBps": -600,
+      "drawdownRecoveryBps": -300,
+      "drawdownGracePeriodMs": 90000,
+      "scratchPnlMinBps": 50,
+      "scratchPnlMaxBps": 150,
+      "armedBreakevenThresholdBps": 1000,
+      "armedBreakevenFloorBps": 0,
+      "tier1PeakThresholdBps": 2000,
+      "tier1LockedFloorBps": 1000,
+      "tier2PeakThresholdBps": 4850,
+      "tier2LockedFloorBps": 3500
+    },
+    "established": {
+      "catastrophicFloorBps": -1800,
+      "preBreakevenStopBps": -1000,
+      "moonbagFloorBps": -200,
+      "drawdownTriggerBps": -800,
+      "drawdownRecoveryBps": -400,
+      "drawdownGracePeriodMs": 120000,
+      "scratchPnlMinBps": 50,
+      "scratchPnlMaxBps": 150,
+      "armedBreakevenThresholdBps": 1000,
+      "armedBreakevenFloorBps": 0,
+      "tier1PeakThresholdBps": 2000,
+      "tier1LockedFloorBps": 1000,
+      "tier2PeakThresholdBps": 4850,
+      "tier2LockedFloorBps": 3500
+    },
+    "trailingMoonbagBuffers": {
+      "peakAbove200Pct": { "minPeakBps": 20000, "bufferBps": 1000, "bufferPct": 10.0 },
+      "peakAbove100Pct": { "minPeakBps": 10000, "bufferBps": 1500, "bufferPct": 15.0 },
+      "peakBelow100Pct": { "minPeakBps": 0, "bufferBps": 1800, "bufferPct": 18.0 }
+    },
+    "exceptions": {
+      "preBreakevenBuyerDominanceRatio": 1.25,
+      "drawdownGraceExtensionMs": 180000,
+      "drawdownGraceExtensionRatio": 1.25
+    }
+  },
+  "portfolioRisk": {
+    "maxPortfolioDrawdownBps": 600,
+    "maxPortfolioDrawdownPct": 6.0,
+    "drawdownBreachAction": "TRANSITION_TO_EXITING_AND_MANAGE_ACTIVE_RISK",
+    "stagnancyTimeoutMs": 300000,
+    "maxConsecutiveErrors": 3,
+    "maxClockDriftMs": 5000,
+    "antiRebuyCooldownMs": 1800000
+  },
+  "quotesAndProviders": {
+    "jupiter": {
+      "windowMs": 10000,
+      "maxLiveRequestsPerWindow": 50,
+      "baseMinIntervalMs": 100,
+      "maxIntervalMs": 2000,
+      "maxLowPriorityRequestsPerWindow": 15,
+      "deferLowPriorityFirst": true,
+      "respectRetryAfter": true
+    },
+    "raydium": {
+      "rateLimitPerSecond": 10,
+      "preflightCacheTtlMs": 60000
+    },
+    "cache": {
+      "quoteCacheTtlMs": 2000,
+      "negativeCacheTtlMs": 5000,
+      "singleFlightTtlMs": 3000
+    }
+  }
+}
