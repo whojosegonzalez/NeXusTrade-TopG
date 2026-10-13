@@ -12,6 +12,7 @@ import {
 import {
   type VirtualWalletState,
   loadVirtualWallet,
+  saveVirtualWallet,
   settleSessionInWallet,
 } from "./VirtualWallet.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
@@ -1281,6 +1282,211 @@ describe("PaperTradingDaemon", () => {
       const finalSnap = daemon.getSnapshot();
       expect(finalSnap.openPositions.length).toBe(0);
       expect(finalSnap.status).toBe("HALTED");
+    });
+
+    // Phase 12.93C: P0-1, P0-2, P0-3 Regressions
+    it("P0-1: markPositionUnresolved preserves full token metadata, partial proceeds, and tier history", () => {
+      const daemon = new PaperTradingDaemon({
+        config: { ...baseConfig, initialPortfolioSol: 10.0, positionSizeSol: 1.0 },
+        clock: () => nowMs,
+      });
+      daemon.start();
+      daemon.processScannedPool(validPool, nowMs, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Take Tier 1 profit (e.g. +20% gain, sells 33% of position)
+      daemon.tickPosition(
+        pos.positionId,
+        {
+          currentTimestampMs: nowMs + 1000,
+          spotPriceSol: 0.06, // +20% gain -> trips Tier 1 (1500 bps)
+          lpIntact: true,
+          recentBuysCount60s: 15,
+          recentSellsCount60s: 2,
+          momentum5mBps: 200,
+          volumeStalled3m: false,
+        },
+        nowMs + 1000,
+      );
+
+      const posAfterT1 = daemon.getSnapshot().openPositions[0]!;
+      expect(posAfterT1.tier1ProfitTaken).toBe(true);
+      expect(posAfterT1.realizedProceedsSol).toBeGreaterThan(0);
+
+      // Now price feed disappears at scheduled cashout -> mark unresolved
+      const unresolved = daemon.markPositionUnresolved(
+        pos.positionId,
+        "PRICE_FEED_UNAVAILABLE_AT_CASHOUT",
+        nowMs + 2000,
+      );
+
+      expect(unresolved).not.toBeNull();
+      expect(unresolved?.tokensHeld).toBe(posAfterT1.tokensHeld);
+      expect(unresolved?.costBasisSol).toBe(posAfterT1.costBasisSol);
+      expect(unresolved?.initialCostBasisSol).toBe(1.0);
+      expect(unresolved?.initialTokensHeld).toBe(20.0);
+      expect(unresolved?.realizedProceedsSol).toBe(posAfterT1.realizedProceedsSol);
+      expect(unresolved?.tier1ProfitTaken).toBe(true);
+      expect(unresolved?.lastObservedPriceSol).toBe(0.06);
+
+      // Snapshot validation:
+      const snap = daemon.getSnapshot();
+      expect(snap.openPositions.length).toBe(0);
+      expect(snap.unresolvedPositions?.length).toBe(1);
+      expect(snap.unresolvedCostBasisSol).toBe(posAfterT1.costBasisSol);
+      expect(snap.currentCashSol).toBeGreaterThan(9.0); // 9.0 SOL + T1 proceeds
+      // Realized PnL strictly accounts for Tier 1 closed proceeds, does NOT book remaining tokens as -1.0 loss!
+      expect(snap.totalRealizedPnlSol).toBeGreaterThan(0);
+    });
+
+    it("P0-1: settleSessionInWallet preserves unresolved token inventory in wallet without booking unrealized loss", () => {
+      const wallet: VirtualWalletState = {
+        walletAddress: "TestWalletP01",
+        currentBalanceSol: 10.0,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0.0,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["session-0"],
+        unresolvedTokens: [],
+      };
+
+      const unresolvedMock = [
+        {
+          positionId: "pos-unresolved-1",
+          mintAddress: "MintUnresolved1111111111111111111111111111",
+          symbol: "UNRES",
+          tokensHeld: 15.0,
+          costBasisSol: 0.75,
+          initialCostBasisSol: 1.0,
+          initialTokensHeld: 20.0,
+          realizedProceedsSol: 0.35,
+          lastObservedPriceSol: 0.05,
+          lastObservedAtMs: nowMs + 1000,
+          reasonForMissingData: "MISSING_FEED_AT_CASHOUT",
+        },
+      ];
+
+      // Settle session with 9.25 SOL cash and +0.10 SOL realized profit from closed tier sales
+      const settled = settleSessionInWallet(
+        wallet,
+        "session-1",
+        9.25, // Available cash
+        10.0, // Initial capital
+        nowMs + 2000,
+        unresolvedMock,
+        0.1, // sessionRealizedPnlSol
+      );
+
+      expect(settled).toBe(true);
+      expect(wallet.currentBalanceSol).toBe(9.25); // Cash available for next session
+      expect(wallet.allTimeRealizedPnlSol).toBe(0.1); // NOT -0.75 SOL!
+      expect(wallet.unresolvedTokens?.length).toBe(1);
+      expect(wallet.unresolvedTokens![0]!.mintAddress).toBe(
+        "MintUnresolved1111111111111111111111111111",
+      );
+      expect(wallet.unresolvedTokens![0]!.tokensHeld).toBe(15.0);
+      expect(wallet.unresolvedTokens![0]!.costBasisSol).toBe(0.75);
+    });
+
+    it("P0-2: recordStagnantTick treats prices older than 30s without fresh feed as feed outage tick", () => {
+      let clockTime = nowMs;
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => clockTime,
+      });
+      daemon.start();
+      daemon.processScannedPool(validPool, clockTime, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Advance clock by 45 seconds without positive price tick
+      clockTime += 45_000;
+
+      // Calling recordStagnantTick without a fresh price parameter must reject the 45s stale spot
+      const stagnantResult = daemon.recordStagnantTick(pos.positionId, undefined, clockTime);
+      expect(stagnantResult).toBeNull();
+
+      const snap = daemon.getSnapshot();
+      expect(snap.openPositions[0]!.feedOutageTicksCount).toBe(1);
+      expect(snap.closedTrades.length).toBe(0);
+    });
+
+    it("P0-2: recordStagnantTick with fresh price evidence exits after 180s inactivity", () => {
+      let clockTime = nowMs;
+      const daemon = new PaperTradingDaemon({
+        config: baseConfig,
+        clock: () => clockTime,
+      });
+      daemon.start();
+      daemon.processScannedPool(validPool, clockTime, 0.05, 1.0);
+      const pos = daemon.getSnapshot().openPositions[0]!;
+
+      // Advance clock past 180s stagnancy threshold, supplying a fresh valid price
+      clockTime += 185_000;
+      const stagnantResult = daemon.recordStagnantTick(pos.positionId, 0.05, clockTime);
+
+      expect(stagnantResult).not.toBeNull();
+      expect(stagnantResult?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
+      expect(daemon.getSnapshot().closedTrades.length).toBe(1);
+    });
+
+    it("P0-3: round-trips wallet with unresolved tokens and prevents duplicate tokens", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "wallet-p03-"));
+      const walletPath = path.join(tempDir, "virtual-wallet.json");
+
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "RoundTripWallet",
+        currentBalanceSol: 8.5,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 1,
+        allTimeRealizedPnlSol: 0.25,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1"],
+        unresolvedTokens: [
+          {
+            positionId: "pos-rt-1",
+            mintAddress: "MintRT111",
+            symbol: "RT",
+            tokensHeld: 100,
+            costBasisSol: 1.5,
+            lastObservedPriceSol: 0.015,
+            lastObservedAtMs: nowMs,
+            reasonForMissingData: "FEED_TIMEOUT",
+            sessionId: "sess-1",
+          },
+        ],
+      };
+
+      saveVirtualWallet(initialWallet, walletPath);
+      const loaded = loadVirtualWallet(walletPath);
+
+      expect(loaded.currentBalanceSol).toBe(8.5);
+      expect(loaded.unresolvedTokens?.length).toBe(1);
+      expect(loaded.unresolvedTokens![0]!.mintAddress).toBe("MintRT111");
+
+      // Resettling with same positionId does not duplicate inventory
+      settleSessionInWallet(
+        loaded,
+        "sess-2",
+        8.5,
+        10.0,
+        nowMs + 1000,
+        [
+          {
+            positionId: "pos-rt-1", // duplicate position
+            mintAddress: "MintRT111",
+            tokensHeld: 100,
+            costBasisSol: 1.5,
+            lastObservedPriceSol: 0.015,
+            lastObservedAtMs: nowMs,
+            reasonForMissingData: "FEED_TIMEOUT",
+          },
+        ],
+        0.0,
+      );
+
+      expect(loaded.unresolvedTokens?.length).toBe(1); // deduplicated!
+      rmSync(tempDir, { recursive: true, force: true });
     });
   });
 });

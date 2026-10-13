@@ -1,6 +1,21 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+export interface UnresolvedTokenInventory {
+  readonly positionId: string;
+  readonly mintAddress: string;
+  readonly symbol?: string | undefined;
+  readonly tokensHeld: number;
+  readonly costBasisSol: number;
+  readonly initialCostBasisSol?: number | undefined;
+  readonly initialTokensHeld?: number | undefined;
+  readonly realizedProceedsSol?: number | undefined;
+  readonly lastObservedPriceSol: number;
+  readonly lastObservedAtMs: number;
+  readonly reasonForMissingData: string;
+  readonly sessionId: string;
+}
+
 export interface VirtualWalletState {
   walletAddress: string;
   currentBalanceSol: number;
@@ -9,6 +24,7 @@ export interface VirtualWalletState {
   allTimeRealizedPnlSol: number;
   lastUpdatedMs: number;
   settledSessionIds?: string[];
+  unresolvedTokens?: UnresolvedTokenInventory[];
 }
 
 export const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
@@ -19,6 +35,7 @@ export const DEFAULT_VIRTUAL_WALLET: VirtualWalletState = {
   allTimeRealizedPnlSol: 0.0,
   lastUpdatedMs: 0,
   settledSessionIds: [],
+  unresolvedTokens: [],
 };
 
 export function resolveVirtualWalletFile(customPath?: string): string {
@@ -72,6 +89,7 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
           settledSessionIds: Array.isArray(parsed.settledSessionIds)
             ? parsed.settledSessionIds
             : [], // P0-C: Safe backward-compatible migration without data loss
+          unresolvedTokens: Array.isArray(parsed.unresolvedTokens) ? parsed.unresolvedTokens : [], // P0-1: Safe backward-compatible migration for unresolved tokens
         };
       }
       throw new Error(`Invalid wallet structure or non-finite values in ${filePath}`);
@@ -92,7 +110,21 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
       );
     }
   }
-  return { ...DEFAULT_VIRTUAL_WALLET, settledSessionIds: [], lastUpdatedMs: Date.now() };
+  const pastSessionsExist =
+    existsSync(".tmp/past-sessions.json") ||
+    existsSync("backend/.tmp/past-sessions.json") ||
+    existsSync(".tmp/sessions");
+  if (pastSessionsExist) {
+    console.warn(
+      `[PaperDaemon] [WALLET_WARNING] No virtual-wallet.json found at ${filePath}, but prior session history exists. Initializing default 10.0 SOL wallet.`,
+    );
+  }
+  return {
+    ...DEFAULT_VIRTUAL_WALLET,
+    settledSessionIds: [],
+    unresolvedTokens: [],
+    lastUpdatedMs: Date.now(),
+  };
 }
 
 export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: string): void {
@@ -108,20 +140,64 @@ export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: strin
 export function settleSessionInWallet(
   wallet: VirtualWalletState,
   sessionId: string,
-  finalPortfolioSol: number,
+  finalCashSol: number,
   initialPortfolioSol: number,
   nowMsTimestamp?: number,
+  unresolvedPositions?: readonly {
+    positionId: string;
+    mintAddress: string;
+    symbol?: string | undefined;
+    tokensHeld: number;
+    costBasisSol: number;
+    initialCostBasisSol?: number | undefined;
+    initialTokensHeld?: number | undefined;
+    realizedProceedsSol?: number | undefined;
+    lastObservedPriceSol: number;
+    lastObservedAtMs: number;
+    reasonForMissingData: string;
+  }[],
+  sessionRealizedPnlSol?: number,
 ): boolean {
   wallet.settledSessionIds = wallet.settledSessionIds ?? [];
   if (wallet.settledSessionIds.includes(sessionId)) {
     return false; // Already settled: idempotent no-op
   }
-  const netSessionPnlSol = Number((finalPortfolioSol - initialPortfolioSol).toFixed(4));
   wallet.settledSessionIds.push(sessionId);
-  wallet.currentBalanceSol = Number(finalPortfolioSol.toFixed(4));
+  wallet.currentBalanceSol = Number(finalCashSol.toFixed(4));
+
+  // P0-1: Settle realized P&L strictly from closed trades.
+  // Do not book unsold unresolved tokens as realized loss!
+  const netRealizedPnlSol =
+    sessionRealizedPnlSol !== undefined
+      ? Number(sessionRealizedPnlSol.toFixed(4))
+      : Number((finalCashSol - initialPortfolioSol).toFixed(4));
   wallet.allTimeRealizedPnlSol = Number(
-    (wallet.allTimeRealizedPnlSol + netSessionPnlSol).toFixed(4),
+    (wallet.allTimeRealizedPnlSol + netRealizedPnlSol).toFixed(4),
   );
+
+  // P0-1: Record unresolved token holdings into wallet inventory so they are never lost
+  wallet.unresolvedTokens = wallet.unresolvedTokens ?? [];
+  if (unresolvedPositions && unresolvedPositions.length > 0) {
+    for (const pos of unresolvedPositions) {
+      if (!wallet.unresolvedTokens.some((t) => t.positionId === pos.positionId)) {
+        wallet.unresolvedTokens.push({
+          positionId: pos.positionId,
+          mintAddress: pos.mintAddress,
+          ...(pos.symbol ? { symbol: pos.symbol } : {}),
+          tokensHeld: pos.tokensHeld,
+          costBasisSol: pos.costBasisSol,
+          initialCostBasisSol: pos.initialCostBasisSol,
+          initialTokensHeld: pos.initialTokensHeld,
+          realizedProceedsSol: pos.realizedProceedsSol,
+          lastObservedPriceSol: pos.lastObservedPriceSol,
+          lastObservedAtMs: pos.lastObservedAtMs,
+          reasonForMissingData: pos.reasonForMissingData,
+          sessionId,
+        });
+      }
+    }
+  }
+
   wallet.totalSessionsCompleted += 1;
   wallet.lastUpdatedMs = nowMsTimestamp ?? Date.now();
   return true;

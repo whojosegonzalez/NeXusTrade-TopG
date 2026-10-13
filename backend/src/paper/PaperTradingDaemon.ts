@@ -195,6 +195,7 @@ export interface PaperPosition {
   currentPnlBps: number;
   ratchetState: PositionRatchetState;
   lastActivityMs: number;
+  lastValidPriceObservedAtMs?: number | undefined;
   stagnantTicksCount: number;
   feedOutageTicksCount?: number | undefined;
   pyramided?: boolean | undefined;
@@ -228,6 +229,11 @@ export interface UnresolvedPositionRecord {
   readonly symbol?: string | undefined;
   readonly tokensHeld: number;
   readonly costBasisSol: number;
+  readonly initialCostBasisSol?: number | undefined;
+  readonly initialTokensHeld?: number | undefined;
+  readonly realizedProceedsSol?: number | undefined;
+  readonly tier1ProfitTaken?: boolean | undefined;
+  readonly tier2ProfitTaken?: boolean | undefined;
   readonly lastObservedPriceSol: number;
   readonly lastObservedAtMs: number;
   readonly reasonForMissingData: string;
@@ -251,6 +257,8 @@ export interface PaperTradingDaemonSnapshot {
   readonly closedTrades: readonly ClosedTradeRecord[];
   readonly unresolvedPositions?: readonly UnresolvedPositionRecord[] | undefined;
   readonly initialPortfolioSol: number;
+  readonly currentCashSol?: number | undefined;
+  readonly unresolvedCostBasisSol?: number | undefined;
   readonly currentPortfolioSol: number;
   readonly totalRealizedPnlSol: number;
   readonly totalUnrealizedPnlSol: number;
@@ -422,6 +430,7 @@ export class PaperTradingDaemon {
     position.pyramided = true;
     position.scaleInCount = (position.scaleInCount ?? 0) + 1;
     position.lastActivityMs = now;
+    position.lastValidPriceObservedAtMs = now;
 
     this.currentCashSol -= addOnCostBasisSol;
 
@@ -459,8 +468,17 @@ export class PaperTradingDaemon {
       mintAddress: position.mintAddress,
       tokensHeld: position.tokensHeld,
       costBasisSol: position.costBasisSol,
+      initialCostBasisSol: position.initialCostBasisSol ?? position.costBasisSol,
+      initialTokensHeld: position.initialTokensHeld ?? position.tokensHeld,
+      realizedProceedsSol: position.realizedProceedsSol ?? 0,
+      ...(position.tier1ProfitTaken !== undefined
+        ? { tier1ProfitTaken: position.tier1ProfitTaken }
+        : {}),
+      ...(position.tier2ProfitTaken !== undefined
+        ? { tier2ProfitTaken: position.tier2ProfitTaken }
+        : {}),
       lastObservedPriceSol: position.spotPriceSol > 0 ? position.spotPriceSol : 0,
-      lastObservedAtMs: position.lastActivityMs,
+      lastObservedAtMs: position.lastValidPriceObservedAtMs ?? position.lastActivityMs,
       reasonForMissingData,
       estimatedLiquidationSol: 0, // Conservative risk valuation
       ...(position.symbol !== undefined ? { symbol: position.symbol } : {}),
@@ -557,9 +575,17 @@ export class PaperTradingDaemon {
       return acc + (realizedProceeds - costRelieved);
     }, 0);
 
+    const partialRealizedFromUnresolvedPositions = this.unresolvedPositions.reduce((acc, pos) => {
+      const initialCost = pos.initialCostBasisSol ?? pos.costBasisSol;
+      const costRelieved = initialCost - pos.costBasisSol;
+      const realizedProceeds = pos.realizedProceedsSol ?? 0;
+      return acc + (realizedProceeds - costRelieved);
+    }, 0);
+
     const totalRealizedPnlSol =
       this.closedTrades.reduce((acc, trade) => acc + trade.realizedPnlSol, 0) +
-      partialRealizedFromOpenPositions;
+      partialRealizedFromOpenPositions +
+      partialRealizedFromUnresolvedPositions;
 
     const totalPositionEquitySol = openPositionsArray.reduce(
       (acc, pos) => acc + pos.tokensHeld * pos.spotPriceSol,
@@ -567,6 +593,10 @@ export class PaperTradingDaemon {
     );
 
     const currentPortfolioSol = this.currentCashSol + totalPositionEquitySol;
+    const unresolvedCostBasisSol = this.unresolvedPositions.reduce(
+      (acc, pos) => acc + pos.costBasisSol,
+      0,
+    );
 
     return {
       sessionId: this.config.sessionId,
@@ -576,6 +606,8 @@ export class PaperTradingDaemon {
       closedTrades: [...this.closedTrades],
       unresolvedPositions: [...this.unresolvedPositions],
       initialPortfolioSol: this.config.initialPortfolioSol,
+      currentCashSol: this.currentCashSol,
+      unresolvedCostBasisSol,
       currentPortfolioSol,
       totalRealizedPnlSol,
       totalUnrealizedPnlSol,
@@ -671,6 +703,7 @@ export class PaperTradingDaemon {
       currentPnlBps: 0,
       ratchetState,
       lastActivityMs: now,
+      lastValidPriceObservedAtMs: now,
       stagnantTicksCount: 0,
       ...(pool.symbol !== undefined ? { symbol: pool.symbol } : {}),
       ...(options?.cohort !== undefined ? { cohort: options.cohort } : {}),
@@ -721,6 +754,10 @@ export class PaperTradingDaemon {
         position.historicalPeakPriceSol ?? position.entryPriceSol,
         marketContext.spotPriceSol,
       );
+
+      if (marketContext.spotPriceSol > 0 && Number.isFinite(marketContext.spotPriceSol)) {
+        position.lastValidPriceObservedAtMs = now;
+      }
 
       if (priceChanged || hasRecentActivity) {
         position.lastActivityMs = now;
@@ -927,12 +964,23 @@ export class PaperTradingDaemon {
     const now = nowTimestampMs ?? this.clock();
     this.lastTickAtMs = now;
 
-    // P0-B: Only genuine, active price feeds qualify for market stagnancy check.
-    // An unavailable/stale price is a feed outage, NOT market stagnation.
+    // P0-B & P0-2: Only genuine, fresh active price feeds qualify for market stagnancy check.
+    // An unavailable or stale price (> 30s) is a feed outage, NOT market stagnation.
     const spotPrice = validSpotPriceSol ?? position.spotPriceSol;
-    if (spotPrice <= 0 || !Number.isFinite(spotPrice)) {
+    const priceAgeMs = position.lastValidPriceObservedAtMs
+      ? now - position.lastValidPriceObservedAtMs
+      : now - position.lastActivityMs;
+    if (
+      spotPrice <= 0 ||
+      !Number.isFinite(spotPrice) ||
+      (validSpotPriceSol === undefined && priceAgeMs > 30_000)
+    ) {
       this.recordFeedOutageTick(positionId, nowTimestampMs);
       return null;
+    }
+
+    if (validSpotPriceSol !== undefined && validSpotPriceSol > 0) {
+      position.lastValidPriceObservedAtMs = now;
     }
 
     position.stagnantTicksCount += 1;

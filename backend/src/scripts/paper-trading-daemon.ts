@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -104,6 +104,16 @@ function parseCliArgs(): PaperTradingDaemonConfig {
   } else {
     const vWallet = loadVirtualWallet();
     initialPortfolioSol = vWallet.currentBalanceSol;
+    if (vWallet.unresolvedTokens && vWallet.unresolvedTokens.length > 0) {
+      console.warn(
+        `[PaperDaemon] [UNRESOLVED_INVENTORY] Continuous virtual wallet contains ${vWallet.unresolvedTokens.length} unresolved token holding(s) from prior session(s):`,
+      );
+      for (const item of vWallet.unresolvedTokens) {
+        console.warn(
+          `   - Mint: ${item.mintAddress} (${item.symbol ?? "N/A"}) | Tokens: ${item.tokensHeld} | CostBasis: ${item.costBasisSol} SOL | Session: ${item.sessionId} | Reason: ${item.reasonForMissingData}`,
+        );
+      }
+    }
   }
 
   const rawSchedule = values.schedule;
@@ -404,26 +414,22 @@ async function run(): Promise<void> {
   let archived = false;
   const archiveSession = () => {
     if (archived) return;
-    archived = true;
     try {
       if (!existsSync(".tmp/sessions")) mkdirSync(".tmp/sessions", { recursive: true });
-      const report = tracker.generateReport(
-        config.initialPortfolioSol,
-        daemon.getSnapshot().currentPortfolioSol,
-      );
+      const snap = daemon.getSnapshot();
+      const report = tracker.generateReport(config.initialPortfolioSol, snap.currentPortfolioSol);
       const summary = daemon.getHistoricalSummary({
         coinsWatchedCount: report.totalCandidatesObserved,
         missedOpportunitiesCount: report.missedWinnersCount,
       });
 
-      // 1. Write individual session JSON
-      writeFileSync(
-        `.tmp/sessions/${config.sessionId}.json`,
-        JSON.stringify(summary, null, 2),
-        "utf8",
-      );
+      // 1. Write individual session JSON atomically (P0-3)
+      const sessionFile = `.tmp/sessions/${config.sessionId}.json`;
+      const tempSessionFile = `${sessionFile}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      writeFileSync(tempSessionFile, JSON.stringify(summary, null, 2), "utf8");
+      renameSync(tempSessionFile, sessionFile);
 
-      // 2. Read, update, and write past-sessions.json
+      // 2. Read, update, and write past-sessions.json atomically (P0-3)
       let pastSessions: HistoricalSessionSummary[] = [];
       const pastSessionsPath = existsSync(".tmp/past-sessions.json")
         ? ".tmp/past-sessions.json"
@@ -451,32 +457,39 @@ async function run(): Promise<void> {
         pastSessions = [summary, ...pastSessions];
       }
 
-      writeFileSync(pastSessionsPath, JSON.stringify(pastSessions, null, 2), "utf8");
+      const tempPastSessionsPath = `${pastSessionsPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      writeFileSync(tempPastSessionsPath, JSON.stringify(pastSessions, null, 2), "utf8");
+      renameSync(tempPastSessionsPath, pastSessionsPath);
       console.log(
-        `[PaperDaemon] Archived session summary to .tmp/sessions/${config.sessionId}.json and updated ${pastSessionsPath}`,
+        `[PaperDaemon] Archived session summary to ${sessionFile} and updated ${pastSessionsPath}`,
       );
 
-      // 3. Update Continuous Virtual Wallet (Idempotent settlement: P0-C)
-      const snap = daemon.getSnapshot();
-      const currentSol = snap.currentPortfolioSol;
+      // 3. Update Continuous Virtual Wallet (Idempotent settlement: P0-C & P0-1)
+      const liquidCashSol =
+        snap.currentCashSol ??
+        snap.currentPortfolioSol -
+          snap.openPositions.reduce((acc, p) => acc + p.tokensHeld * p.spotPriceSol, 0);
       const wallet = loadVirtualWallet();
       const settled = settleSessionInWallet(
         wallet,
         config.sessionId,
-        currentSol,
+        liquidCashSol,
         config.initialPortfolioSol,
         nowMs(),
+        snap.unresolvedPositions,
+        snap.totalRealizedPnlSol,
       );
       if (settled) {
         saveVirtualWallet(wallet);
         console.log(
-          `[PaperDaemon] Updated Continuous Virtual Wallet: Balance=${wallet.currentBalanceSol.toFixed(4)} SOL | All-Time PnL=${wallet.allTimeRealizedPnlSol >= 0 ? "+" : ""}${wallet.allTimeRealizedPnlSol.toFixed(4)} SOL | Sessions=${wallet.totalSessionsCompleted}`,
+          `[PaperDaemon] Updated Continuous Virtual Wallet: Balance=${wallet.currentBalanceSol.toFixed(4)} SOL | All-Time Realized PnL=${wallet.allTimeRealizedPnlSol >= 0 ? "+" : ""}${wallet.allTimeRealizedPnlSol.toFixed(4)} SOL | Unresolved Tokens=${wallet.unresolvedTokens?.length ?? 0} | Sessions=${wallet.totalSessionsCompleted}`,
         );
       } else {
         console.log(
           `[PaperDaemon] Continuous Virtual Wallet already settled for session ${config.sessionId}. Skipping duplicate balance update.`,
         );
       }
+      archived = true;
     } catch (archiveErr) {
       console.error("[PaperDaemon] Failed to archive session summary:", archiveErr);
     }
@@ -521,34 +534,39 @@ async function run(): Promise<void> {
             const freshSpot = await fetchDexScreenerSpotInfo(pos.mintAddress);
             if (freshSpot && freshSpot.spotPriceSol > 0) {
               exitPrice = freshSpot.spotPriceSol;
+              pos.lastValidPriceObservedAtMs = currentNow;
             }
           } catch {
             // failed to fetch fresh price
           }
 
-          // If fresh price is not available, check if existing pos.spotPriceSol is fresh (< 300s old)
+          // P0-2: Require strict freshness (<= 30s) based on dedicated lastValidPriceObservedAtMs
+          const MAX_CASHOUT_PRICE_AGE_MS = 30_000;
+          const priceAgeMs = pos.lastValidPriceObservedAtMs
+            ? currentNow - pos.lastValidPriceObservedAtMs
+            : currentNow - pos.lastActivityMs;
           const isPosSpotFresh =
-            exitPrice <= 0 && pos.spotPriceSol > 0 && currentNow - pos.lastActivityMs <= 300_000;
+            exitPrice <= 0 && pos.spotPriceSol > 0 && priceAgeMs <= MAX_CASHOUT_PRICE_AGE_MS;
           if (isPosSpotFresh) {
             exitPrice = pos.spotPriceSol;
           }
 
           if (exitPrice <= 0 || !Number.isFinite(exitPrice)) {
-            // P0-A: Never substitute entry price or record zero-proceeds sale. Keep position unresolved!
-            daemon.markPositionUnresolved(
-              pos.positionId,
-              "MISSING_PRICE_FEED_AT_CASHOUT",
-              currentNow,
-            );
+            // P0-A & P0-2: Never substitute entry price or record zero-proceeds sale. Keep position unresolved!
+            const reasonForMissingData =
+              priceAgeMs > MAX_CASHOUT_PRICE_AGE_MS
+                ? `STALE_PRICE_FEED_AT_CASHOUT_${Math.round(priceAgeMs / 1000)}S_OLD`
+                : "MISSING_PRICE_FEED_AT_CASHOUT";
+            daemon.markPositionUnresolved(pos.positionId, reasonForMissingData, currentNow);
             const timeStr = new Date(currentNow).toLocaleTimeString();
             addActivityLog(
               "CONTROL",
-              `⚠️ ${pos.symbol ?? pos.mintAddress.slice(0, 6)} marked UNRESOLVED at ${timeStr} (missing price feed) | 0 wallet cash credited`,
+              `⚠️ ${pos.symbol ?? pos.mintAddress.slice(0, 6)} marked UNRESOLVED at ${timeStr} (${reasonForMissingData}) | 0 wallet cash credited`,
               pos.mintAddress,
               pos.symbol,
             );
             console.warn(
-              `[PaperDaemon] [UNRESOLVED_POSITION] ${pos.mintAddress} has no valid price feed at cashout. Marked unresolved with 0 SOL cash credited.`,
+              `[PaperDaemon] [UNRESOLVED_POSITION] ${pos.mintAddress} has no valid fresh price feed at cashout (${reasonForMissingData}). Marked unresolved with 0 SOL cash credited.`,
             );
             return;
           }
