@@ -27,6 +27,7 @@ export interface UnresolvedTokenInventory {
 
 export interface VirtualWalletState {
   walletAddress: string;
+  generationId?: string | undefined;
   currentBalanceSol: number;
   initialBalanceSol: number;
   totalSessionsCompleted: number;

@@ -88,6 +88,36 @@ export function getCanonicalReconciliationIntentPath(workspaceRoot?: string): st
   return path.resolve(getCanonicalTmpDir(workspaceRoot), "reconciliation-intent.json");
 }
 
+export function getCanonicalGenerationsDir(workspaceRoot?: string): string {
+  return path.resolve(getCanonicalTmpDir(workspaceRoot), "generations");
+}
+
+export function getCanonicalGenerationsRegistryPath(workspaceRoot?: string): string {
+  return path.resolve(getCanonicalTmpDir(workspaceRoot), "generations-registry.json");
+}
+
+export function getCanonicalGenerationDir(generationId: string, workspaceRoot?: string): string {
+  return path.resolve(getCanonicalGenerationsDir(workspaceRoot), generationId);
+}
+
+export function getGenerationWalletPath(generationId: string, workspaceRoot?: string): string {
+  return path.resolve(
+    getCanonicalGenerationDir(generationId, workspaceRoot),
+    "virtual-wallet.json",
+  );
+}
+
+export function getGenerationPastSessionsPath(
+  generationId: string,
+  workspaceRoot?: string,
+): string {
+  return path.resolve(getCanonicalGenerationDir(generationId, workspaceRoot), "past-sessions.json");
+}
+
+export function getGenerationSessionsDir(generationId: string, workspaceRoot?: string): string {
+  return path.resolve(getCanonicalGenerationDir(generationId, workspaceRoot), "sessions");
+}
+
 /**
  * Checks for divergence between canonical file and legacy backend/.tmp mirror file.
  * Throws a fatal Error if divergent content is found, if legacy exists without canonical,

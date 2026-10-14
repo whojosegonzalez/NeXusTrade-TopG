@@ -15,6 +15,7 @@ export default defineConfig({
       "src/candidate-scanner/*.test.ts",
       "src/exits/DynamicRatchetService.test.ts",
       "src/paper/PaperTradingDaemon.test.ts",
+      "src/paper/GenerationsRegistry.test.ts",
       "src/wallet/*.test.ts",
       "src/session/SessionControlIpcService.test.ts",
     ],
