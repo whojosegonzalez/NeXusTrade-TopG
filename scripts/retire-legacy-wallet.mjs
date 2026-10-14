@@ -23,6 +23,15 @@ export function copyDirRecursive(src, dest) {
 }
 
 export async function runRetirement(options = {}) {
+  if (
+    !options.workspaceRoot &&
+    !process.env.RETIREMENT_TARGET_DIR &&
+    (process.env.NODE_ENV === "test" || process.env.VITEST)
+  ) {
+    throw new Error(
+      "[Retirement] [FATAL_TEST_SAFETY] Production migration utility cannot target default workspace during automated test execution without an explicit options.workspaceRoot.",
+    );
+  }
   const workspaceRoot = path.resolve(
     options.workspaceRoot || process.env.RETIREMENT_TARGET_DIR || ".",
   );

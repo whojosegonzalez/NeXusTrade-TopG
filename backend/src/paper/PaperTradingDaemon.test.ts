@@ -3104,10 +3104,29 @@ describe("PaperTradingDaemon", () => {
       ).href;
       const { runRetirement } = await import(retirementScriptUrl);
 
-      // 1. Guard against re-execution on live workspace: returns ALREADY_COMPLETED
-      const liveResult = await runRetirement();
-      expect(liveResult.status).toBe("ALREADY_COMPLETED");
-      expect(existsSync(liveResult.canonicalMigrationRecord)).toBe(true);
+      // 1. Hermetic test of re-execution guard: create an ephemeral fixture pre-populated with a migration record
+      const guardFixtureDir = mkdtempSync(path.join(os.tmpdir(), "v12-guard-"));
+      mkdirSync(path.join(guardFixtureDir, ".tmp"), { recursive: true });
+      const fixtureMigrationRecord = path.join(
+        guardFixtureDir,
+        ".tmp",
+        "legacy-wallet-migration.json",
+      );
+      writeFileSync(
+        fixtureMigrationRecord,
+        JSON.stringify({
+          action: "RETIRE_LEGACY_ACTIVE_WALLET",
+          status: "COMPLETED",
+        }),
+        "utf8",
+      );
+      const guardResult = await runRetirement({ workspaceRoot: guardFixtureDir });
+      expect(guardResult.status).toBe("ALREADY_COMPLETED");
+      expect(guardResult.canonicalMigrationRecord).toBe(fixtureMigrationRecord);
+      rmSync(guardFixtureDir, { recursive: true, force: true });
+
+      // Architectural guard prevents un-scoped execution during test runs
+      await expect(runRetirement()).rejects.toThrow(/\[FATAL_TEST_SAFETY\]/);
 
       // 2. Fixture test: atomic wx lock and foreign lock failure
       const tempDir = mkdtempSync(path.join(os.tmpdir(), "v12-retire-"));
