@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -2943,6 +2944,341 @@ describe("PaperTradingDaemon", () => {
       expect(combinedOutput).toMatch(
         /Virtual wallet missing at .* but prior session history exists/,
       );
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    // Phase 12.93D Audit v12 Tests: V12-01 through V12-04
+    it("V12-01: Dashboard /api/wallet/reset endpoint returns 403 Forbidden with DASHBOARD_RESET_DISABLED and leaves canonical wallet untouched", async () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v12-reset-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n  - 'frontend'\n",
+        "utf8",
+      );
+
+      const canonicalWallet = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletV12Reset",
+        currentBalanceSol: 7.9259,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 7,
+        allTimeRealizedPnlSol: -2.074,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1", "sess-2"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(canonicalWallet, JSON.stringify(initialWallet, null, 2), "utf8");
+      const initialHash = createHash("sha256").update(readFileSync(canonicalWallet)).digest("hex");
+
+      const viteConfigUrl = pathToFileURL(
+        path.resolve(findWorkspaceRoot(), "frontend/vite.config.ts"),
+      ).href;
+      const { nexusDevApiPlugin } = await import(viteConfigUrl);
+      const plugin = nexusDevApiPlugin({ workspaceRoot: tempDir });
+
+      type ConnectMiddleware = (
+        req: { method?: string; url?: string },
+        res: {
+          statusCode: number;
+          setHeader: (name: string, val: string) => void;
+          end: (data?: string) => void;
+        },
+        next: () => void,
+      ) => void;
+
+      let middlewareHandler: ConnectMiddleware | null = null;
+      plugin.configureServer({
+        middlewares: {
+          use: (fn: ConnectMiddleware) => {
+            middlewareHandler = fn;
+          },
+        },
+      });
+
+      expect(middlewareHandler).not.toBeNull();
+
+      // Test 1: POST /api/wallet/reset with no process lock
+      let statusCode = 0;
+      const headers: Record<string, string> = {};
+      let responseBody = "";
+      const req = { method: "POST", url: "/api/wallet/reset" };
+      const res = {
+        set statusCode(code: number) {
+          statusCode = code;
+        },
+        get statusCode() {
+          return statusCode;
+        },
+        setHeader(name: string, val: string) {
+          headers[name] = val;
+        },
+        end(data?: string) {
+          if (data) responseBody = data;
+        },
+      };
+
+      middlewareHandler!(req, res, () => {});
+
+      expect(statusCode).toBe(403);
+      const parsedRes = JSON.parse(responseBody);
+      expect(parsedRes.ok).toBe(false);
+      expect(parsedRes.error).toBe("DASHBOARD_RESET_DISABLED");
+
+      // Verify wallet on disk is 100% unchanged
+      const afterHash = createHash("sha256").update(readFileSync(canonicalWallet)).digest("hex");
+      expect(afterHash).toBe(initialHash);
+      const readBack = JSON.parse(readFileSync(canonicalWallet, "utf8"));
+      expect(readBack.currentBalanceSol).toBe(7.9259);
+
+      // Test 2: POST /api/wallet/reset with process lock active
+      writeFileSync(
+        path.join(tempDir, ".tmp", "paper-process.lock"),
+        JSON.stringify({ pid: 99999, acquiredAtMs: Date.now() }),
+        "utf8",
+      );
+      statusCode = 0;
+      responseBody = "";
+      middlewareHandler!(req, res, () => {});
+      expect(statusCode).toBe(403);
+      expect(JSON.parse(responseBody).error).toBe("DASHBOARD_RESET_DISABLED");
+      expect(createHash("sha256").update(readFileSync(canonicalWallet)).digest("hex")).toBe(
+        initialHash,
+      );
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V12-02: Vite startup does NOT truncate or clear past-sessions.json regardless of archive existence", async () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v12-history-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n  - 'frontend'\n",
+        "utf8",
+      );
+
+      const pastSessionsFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      const sessionsData = [
+        { sessionId: "sess-morning", netPnlSol: -0.3732 },
+        { sessionId: "sess-afternoon", netPnlSol: -0.1556 },
+      ];
+      writeFileSync(pastSessionsFile, JSON.stringify(sessionsData, null, 2), "utf8");
+      const originalHash = createHash("sha256")
+        .update(readFileSync(pastSessionsFile))
+        .digest("hex");
+
+      // Ensure no past-sessions-archive-12.83.json exists
+      const archiveFile = path.join(tempDir, ".tmp", "past-sessions-archive-12.83.json");
+      expect(existsSync(archiveFile)).toBe(false);
+
+      const viteConfigUrl = pathToFileURL(
+        path.resolve(findWorkspaceRoot(), "frontend/vite.config.ts"),
+      ).href;
+      const { nexusDevApiPlugin } = await import(viteConfigUrl);
+      const plugin = nexusDevApiPlugin({ workspaceRoot: tempDir });
+
+      // Run configureServer
+      plugin.configureServer({
+        middlewares: {
+          use: () => {},
+        },
+      });
+
+      // Verify past-sessions.json was NOT truncated to []
+      expect(existsSync(pastSessionsFile)).toBe(true);
+      const afterHash = createHash("sha256").update(readFileSync(pastSessionsFile)).digest("hex");
+      expect(afterHash).toBe(originalHash);
+      const reRead = JSON.parse(readFileSync(pastSessionsFile, "utf8"));
+      expect(reRead.length).toBe(2);
+      expect(reRead[0].sessionId).toBe("sess-morning");
+      expect(existsSync(archiveFile)).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release", async () => {
+      const retirementScriptUrl = pathToFileURL(
+        path.resolve(findWorkspaceRoot(), "scripts/retire-legacy-wallet.mjs"),
+      ).href;
+      const { runRetirement } = await import(retirementScriptUrl);
+
+      // 1. Guard against re-execution on live workspace: returns ALREADY_COMPLETED
+      const liveResult = await runRetirement();
+      expect(liveResult.status).toBe("ALREADY_COMPLETED");
+      expect(existsSync(liveResult.canonicalMigrationRecord)).toBe(true);
+
+      // 2. Fixture test: atomic wx lock and foreign lock failure
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v12-retire-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend/.tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n",
+        "utf8",
+      );
+
+      const canonicalWallet = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const legacyWallet = path.join(tempDir, "backend/.tmp", "virtual-wallet.json");
+      const lockFile = path.join(tempDir, ".tmp", "paper-process.lock");
+
+      const walletPayload = {
+        walletAddress: "SimWalletRetireFixture",
+        currentBalanceSol: 7.9259,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 7,
+        allTimeRealizedPnlSol: -2.074,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(canonicalWallet, JSON.stringify(walletPayload, null, 2), "utf8");
+      writeFileSync(legacyWallet, JSON.stringify(walletPayload, null, 2), "utf8");
+
+      // Pre-create a foreign lock file
+      const foreignLock = {
+        pid: process.pid,
+        acquisitionNonce: "foreign-nonce-12345",
+        acquiredAtMs: Date.now(),
+        hostname: "foreign-host",
+        purpose: "other-daemon",
+      };
+      writeFileSync(lockFile, JSON.stringify(foreignLock, null, 2), "utf8");
+
+      // Attempting retirement must throw due to existing lock
+      await expect(runRetirement({ workspaceRoot: tempDir, isFixtureTest: true })).rejects.toThrow(
+        /Aborting: Process lock is currently held by PID/,
+      );
+
+      // Verify foreign lock file was NOT removed by finally
+      expect(existsSync(lockFile)).toBe(true);
+      expect(JSON.parse(readFileSync(lockFile, "utf8")).acquisitionNonce).toBe(
+        "foreign-nonce-12345",
+      );
+
+      // Remove foreign lock and run cleanly
+      rmSync(lockFile);
+      const successResult = await runRetirement({
+        workspaceRoot: tempDir,
+        isFixtureTest: true,
+        retiredTimestamp: "fixture-20261013",
+      });
+
+      expect(successResult.status).toBe("SUCCESS");
+      expect(existsSync(legacyWallet)).toBe(false);
+      expect(
+        existsSync(
+          path.join(tempDir, "backend/.tmp", "virtual-wallet.json.retired-fixture-20261013"),
+        ),
+      ).toBe(true);
+      // Lock released cleanly
+      expect(existsSync(lockFile)).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V12-04: Dashboard /api/wallet/virtual and /api/wallet/telemetry return explicit error status for missing or corrupted canonical wallet", async () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v12-readers-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n  - 'frontend'\n",
+        "utf8",
+      );
+
+      const viteConfigUrl = pathToFileURL(
+        path.resolve(findWorkspaceRoot(), "frontend/vite.config.ts"),
+      ).href;
+      const { nexusDevApiPlugin } = await import(viteConfigUrl);
+      const plugin = nexusDevApiPlugin({ workspaceRoot: tempDir });
+
+      type ConnectMiddleware = (
+        req: { method?: string; url?: string },
+        res: {
+          statusCode: number;
+          setHeader?: (name: string, val: string) => void;
+          end?: (data?: string) => void;
+        },
+        next: () => void,
+      ) => void;
+
+      let middlewareHandler: ConnectMiddleware | null = null;
+      plugin.configureServer({
+        middlewares: {
+          use: (fn: ConnectMiddleware) => {
+            middlewareHandler = fn;
+          },
+        },
+      });
+
+      const executeRequest = (method: string, url: string) => {
+        let statusCode = 200;
+        let responseBody = "";
+        const req = { method, url };
+        const res = {
+          set statusCode(code: number) {
+            statusCode = code;
+          },
+          get statusCode() {
+            return statusCode;
+          },
+          setHeader() {},
+          end(data?: string) {
+            if (data) responseBody += data;
+          },
+        };
+        middlewareHandler!(req, res, () => {});
+        return { statusCode, body: responseBody };
+      };
+
+      // Case A: Missing wallet WITH session history exists -> must fail with 500/503, never 10.0 SOL!
+      writeFileSync(
+        path.join(tempDir, ".tmp", "past-sessions.json"),
+        JSON.stringify([{ sessionId: "sess-prior" }]),
+        "utf8",
+      );
+      const resVirtualA = executeRequest("GET", "/api/wallet/virtual");
+      expect(resVirtualA.statusCode).toBe(500);
+      expect(JSON.parse(resVirtualA.body).error).toBe("WALLET_MISSING_WITH_HISTORY");
+
+      const resTelemetryA = executeRequest("GET", "/api/wallet/telemetry");
+      expect(resTelemetryA.statusCode).toBe(503);
+      expect(JSON.parse(resTelemetryA.body).error).toBe("WALLET_UNAVAILABLE");
+
+      // Case B: Corrupted wallet file
+      const canonicalWallet = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      writeFileSync(canonicalWallet, "{ invalid-json: ", "utf8");
+      const resVirtualB = executeRequest("GET", "/api/wallet/virtual");
+      expect(resVirtualB.statusCode).toBe(500);
+      expect(JSON.parse(resVirtualB.body).error).toBe("WALLET_CORRUPTED");
+
+      const resTelemetryB = executeRequest("GET", "/api/wallet/telemetry");
+      expect(resTelemetryB.statusCode).toBe(500);
+      expect(JSON.parse(resTelemetryB.body).error).toBe("WALLET_CORRUPTED");
+
+      // Case C: Valid canonical wallet -> returns exact 7.9259 SOL
+      const validWallet = {
+        walletAddress: "SimWalletV12Valid",
+        currentBalanceSol: 7.9259,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 7,
+        allTimeRealizedPnlSol: -2.074,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1", "sess-2"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(canonicalWallet, JSON.stringify(validWallet, null, 2), "utf8");
+
+      const resVirtualC = executeRequest("GET", "/api/wallet/virtual");
+      expect(resVirtualC.statusCode).toBe(200);
+      expect(JSON.parse(resVirtualC.body).currentBalanceSol).toBe(7.9259);
+
+      const resTelemetryC = executeRequest("GET", "/api/wallet/telemetry");
+      expect(resTelemetryC.statusCode).toBe(200);
+      const telemetryObj = JSON.parse(resTelemetryC.body);
+      expect(telemetryObj.solBalance).toBe(7.9259);
+      expect(telemetryObj.deployableSol).toBe(7.8759);
 
       rmSync(tempDir, { recursive: true, force: true });
     });

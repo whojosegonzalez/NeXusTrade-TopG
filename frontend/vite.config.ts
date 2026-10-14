@@ -1,8 +1,10 @@
+/// <reference types="vitest" />
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
-import { defineConfig, type Plugin } from "vite";
+import { type Plugin } from "vite";
+import { defineConfig } from "vitest/config";
 
 interface RawPositionRatchetState {
   peakGainBps?: number;
@@ -62,32 +64,49 @@ interface RawDaemonSnapshot {
   }>;
 }
 
-function nexusDevApiPlugin(): Plugin {
+export interface NexusDevApiPluginOptions {
+  workspaceRoot?: string;
+}
+
+export function resolveProjectRoot(startDir: string = process.cwd()): string {
+  let cur = path.resolve(startDir);
+  while (true) {
+    if (
+      fs.existsSync(path.join(cur, "pnpm-workspace.yaml")) ||
+      fs.existsSync(path.join(cur, ".git"))
+    ) {
+      return cur;
+    }
+    const pkgPath = path.resolve(cur, "package.json");
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+        if (parsed.name === "nexustrade-otis") return cur;
+      } catch {
+        // ignore
+      }
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return path.resolve(startDir);
+}
+
+export function nexusDevApiPlugin(options?: NexusDevApiPluginOptions): Plugin {
+  const projectRoot = options?.workspaceRoot ?? resolveProjectRoot();
+  const canonicalTmp = path.join(projectRoot, ".tmp");
+  const canonicalWallet = path.join(canonicalTmp, "virtual-wallet.json");
+  const canonicalPastSessions = path.join(canonicalTmp, "past-sessions.json");
+  const canonicalSessionsDir = path.join(canonicalTmp, "sessions");
+  const canonicalActiveSession = path.join(canonicalTmp, "paper-session-active.json");
+  const canonicalCommands = path.join(canonicalTmp, "session-commands.json");
+
   return {
     name: "nexus-dev-api",
     configureServer(server) {
-      // Sub-Phase 12.84: Archive past-sessions.json to past-sessions-archive-12.83.json if needed
-      const rootPastSessions = path.resolve(process.cwd(), "../.tmp/past-sessions.json");
-      const backendPastSessions = path.resolve(process.cwd(), "../backend/.tmp/past-sessions.json");
-      const localPastSessions = path.resolve(process.cwd(), ".tmp/past-sessions.json");
-      for (const p of [backendPastSessions, rootPastSessions, localPastSessions]) {
-        if (fs.existsSync(p)) {
-          const dir = path.dirname(p);
-          const archivePath = path.join(dir, "past-sessions-archive-12.83.json");
-          if (!fs.existsSync(archivePath)) {
-            try {
-              const content = fs.readFileSync(p, "utf8");
-              const parsed = JSON.parse(content);
-              if (Array.isArray(parsed) && parsed.length > 0) {
-                fs.writeFileSync(archivePath, content, "utf8");
-                fs.writeFileSync(p, "[]", "utf8");
-              }
-            } catch {
-              // Ignore
-            }
-          }
-        }
-      }
+      // NOTE: Sub-Phase 12.84 automatic past-sessions.json truncation was permanently removed
+      // per Audit v12 finding V12-P0-02 to prevent destructive index overwrites during Vite startup.
 
       server.middlewares.use((req, res, next) => {
         const url = req.url ?? "";
@@ -104,31 +123,10 @@ function nexusDevApiPlugin(): Plugin {
               const sessionId = body.sessionId ?? `session-paper-${Date.now()}`;
               const maxPositions = body.maxConcurrentPositions ?? 5;
 
-              let projectRoot = process.cwd();
-              const checkRoot = (dir: string) => {
-                const pkgPath = path.resolve(dir, "package.json");
-                if (fs.existsSync(pkgPath)) {
-                  try {
-                    const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-                    return parsed.name === "nexustrade-otis";
-                  } catch {
-                    return false;
-                  }
-                }
-                return false;
-              };
-              if (!checkRoot(projectRoot)) {
-                const parentDir = path.resolve(projectRoot, "..");
-                if (checkRoot(parentDir)) {
-                  projectRoot = parentDir;
-                }
+              if (!fs.existsSync(canonicalTmp)) {
+                fs.mkdirSync(canonicalTmp, { recursive: true });
               }
-
-              const tmpDir = path.resolve(projectRoot, ".tmp");
-              if (!fs.existsSync(tmpDir)) {
-                fs.mkdirSync(tmpDir, { recursive: true });
-              }
-              const logFile = path.resolve(tmpDir, "daemon-spawn.log");
+              const logFile = path.resolve(canonicalTmp, "daemon-spawn.log");
               const outFd = fs.openSync(logFile, "a");
 
               const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
@@ -153,7 +151,7 @@ function nexusDevApiPlugin(): Plugin {
 
               if (child.pid) {
                 fs.writeFileSync(
-                  path.resolve(tmpDir, "paper-daemon.pid"),
+                  path.resolve(canonicalTmp, "paper-daemon.pid"),
                   String(child.pid),
                   "utf8",
                 );
@@ -196,23 +194,18 @@ function nexusDevApiPlugin(): Plugin {
                 issuedAt: Date.now(),
               };
 
-              const rootTmp = path.resolve(process.cwd(), "../.tmp");
-              const localTmp = path.resolve(process.cwd(), ".tmp");
-              for (const dir of [rootTmp, localTmp]) {
-                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                const cmdFile = path.join(dir, "session-commands.json");
-                let existing: unknown[] = [];
-                if (fs.existsSync(cmdFile)) {
-                  try {
-                    const parsed = JSON.parse(fs.readFileSync(cmdFile, "utf8"));
-                    if (Array.isArray(parsed)) existing = parsed;
-                  } catch {
-                    existing = [];
-                  }
+              if (!fs.existsSync(canonicalTmp)) fs.mkdirSync(canonicalTmp, { recursive: true });
+              let existing: unknown[] = [];
+              if (fs.existsSync(canonicalCommands)) {
+                try {
+                  const parsed = JSON.parse(fs.readFileSync(canonicalCommands, "utf8"));
+                  if (Array.isArray(parsed)) existing = parsed;
+                } catch {
+                  existing = [];
                 }
-                existing.push(cmd);
-                fs.writeFileSync(cmdFile, JSON.stringify(existing, null, 2), "utf8");
               }
+              existing.push(cmd);
+              fs.writeFileSync(canonicalCommands, JSON.stringify(existing, null, 2), "utf8");
 
               res.setHeader("Content-Type", "application/json");
               res.end(JSON.stringify({ ok: true, command: cmd }));
@@ -226,16 +219,9 @@ function nexusDevApiPlugin(): Plugin {
         }
 
         if (url === "/api/session/active") {
-          const rootTmp = path.resolve(process.cwd(), "../.tmp/paper-session-active.json");
-          const backendTmp = path.resolve(
-            process.cwd(),
-            "../backend/.tmp/paper-session-active.json",
-          );
-          const localTmp = path.resolve(process.cwd(), ".tmp/paper-session-active.json");
-          const candidates = [rootTmp, backendTmp, localTmp].filter((p) => fs.existsSync(p));
-          const target = candidates[0];
+          const target = canonicalActiveSession;
 
-          if (target) {
+          if (fs.existsSync(target)) {
             try {
               const raw = JSON.parse(fs.readFileSync(target, "utf8")) as RawDaemonSnapshot;
               if (raw.netSessionPnlSol !== undefined && Array.isArray(raw.watchlist)) {
@@ -330,17 +316,9 @@ function nexusDevApiPlugin(): Plugin {
         }
 
         if (url === "/api/session/logs" || url.startsWith("/api/session/logs")) {
-          const rootTmp = path.resolve(process.cwd(), "../.tmp");
-          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp");
-          const localTmp = path.resolve(process.cwd(), ".tmp");
-
           const logCandidates = [
-            path.join(rootTmp, "paper-daemon.log"),
-            path.join(rootTmp, "daemon-spawn.log"),
-            path.join(backendTmp, "paper-daemon.log"),
-            path.join(backendTmp, "daemon-spawn.log"),
-            path.join(localTmp, "paper-daemon.log"),
-            path.join(localTmp, "daemon-spawn.log"),
+            path.join(canonicalTmp, "paper-daemon.log"),
+            path.join(canonicalTmp, "daemon-spawn.log"),
           ].filter((p) => fs.existsSync(p));
 
           logCandidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
@@ -363,115 +341,134 @@ function nexusDevApiPlugin(): Plugin {
         }
 
         if (url === "/api/wallet/virtual" && req.method === "GET") {
-          const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
-          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
-          const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
-          const target = [rootTmp, backendTmp, localTmp].find((p) => fs.existsSync(p));
-
-          const defaultWallet = {
-            walletAddress: "SimulatedVirtualWallet111111111111111111111111",
-            currentBalanceSol: 10.0,
-            initialBalanceSol: 10.0,
-            totalSessionsCompleted: 0,
-            allTimeRealizedPnlSol: 0.0,
-            lastUpdatedMs: Date.now(),
-          };
-
-          let wallet = defaultWallet;
-          if (target) {
-            try {
-              const raw = JSON.parse(fs.readFileSync(target, "utf8"));
-              if (typeof raw?.currentBalanceSol === "number") {
-                wallet = { ...defaultWallet, ...raw };
-              }
-            } catch {
-              // Fallback
+          if (!fs.existsSync(canonicalWallet)) {
+            const hasHistory =
+              fs.existsSync(canonicalPastSessions) ||
+              (fs.existsSync(canonicalSessionsDir) &&
+                fs.readdirSync(canonicalSessionsDir).length > 0);
+            if (hasHistory) {
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: "WALLET_MISSING_WITH_HISTORY",
+                  message:
+                    "Canonical virtual wallet missing at .tmp/virtual-wallet.json, but prior session history exists. Halting to prevent false 10.0 SOL baseline.",
+                }),
+              );
+              return;
             }
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: "WALLET_NOT_INITIALIZED",
+                message: "Canonical virtual wallet has not been initialized.",
+              }),
+            );
+            return;
           }
 
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify(wallet));
-          return;
+          try {
+            const raw = JSON.parse(fs.readFileSync(canonicalWallet, "utf8"));
+            if (
+              typeof raw?.currentBalanceSol !== "number" ||
+              !Number.isFinite(raw.currentBalanceSol)
+            ) {
+              throw new Error("Invalid currentBalanceSol in canonical wallet");
+            }
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(raw));
+            return;
+          } catch (err) {
+            res.statusCode = 500;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: "WALLET_CORRUPTED",
+                message: `Canonical virtual wallet at .tmp/virtual-wallet.json is corrupted: ${String(err)}`,
+              }),
+            );
+            return;
+          }
         }
 
         if (url === "/api/wallet/reset" && req.method === "POST") {
-          const defaultWallet = {
-            walletAddress: "SimulatedVirtualWallet111111111111111111111111",
-            currentBalanceSol: 10.0,
-            initialBalanceSol: 10.0,
-            totalSessionsCompleted: 0,
-            allTimeRealizedPnlSol: 0.0,
-            lastUpdatedMs: Date.now(),
-          };
-
-          const canonicalTmp = path.resolve(process.cwd(), "../.tmp");
-          if (fs.existsSync(canonicalTmp)) {
-            try {
-              fs.writeFileSync(
-                path.join(canonicalTmp, "virtual-wallet.json"),
-                JSON.stringify(defaultWallet, null, 2),
-                "utf8",
-              );
-            } catch {
-              // Ignore
-            }
-          }
-
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ ok: true, wallet: defaultWallet }));
-          return;
-        }
-
-        if (url.startsWith("/api/wallet/telemetry")) {
-          const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
-          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
-          const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
-          const target = [rootTmp, backendTmp, localTmp].find((p) => fs.existsSync(p));
-          let solBalance = 10.0;
-          if (target) {
-            try {
-              const raw = JSON.parse(fs.readFileSync(target, "utf8"));
-              if (typeof raw?.currentBalanceSol === "number") {
-                solBalance = raw.currentBalanceSol;
-              }
-            } catch {
-              // Fallback
-            }
-          }
-
+          res.statusCode = 403;
           res.setHeader("Content-Type", "application/json");
           res.end(
             JSON.stringify({
-              solBalance,
-              deployableSol: Math.max(0, parseFloat((solBalance - 0.05).toFixed(4))),
-              tokens: [],
-              signatureReady: true,
-              fetchedAt: new Date().toISOString(),
+              ok: false,
+              error: "DASHBOARD_RESET_DISABLED",
+              message:
+                "Direct wallet reset via dashboard UI is disabled to protect ledger integrity. A fresh 10 SOL research wallet generation will be initiated under explicit Phase 12.94 workflow.",
             }),
           );
           return;
         }
 
-        if (url === "/api/session/history" || url.startsWith("/api/session/history")) {
-          const rootTmp = path.resolve(process.cwd(), "../.tmp");
-          const backendTmp = path.resolve(process.cwd(), "../backend/.tmp");
-          const localTmp = path.resolve(process.cwd(), ".tmp");
+        if (url.startsWith("/api/wallet/telemetry")) {
+          if (!fs.existsSync(canonicalWallet)) {
+            res.statusCode = 503;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: "WALLET_UNAVAILABLE",
+                message: "Canonical virtual wallet is not available.",
+              }),
+            );
+            return;
+          }
 
+          try {
+            const raw = JSON.parse(fs.readFileSync(canonicalWallet, "utf8"));
+            if (
+              typeof raw?.currentBalanceSol !== "number" ||
+              !Number.isFinite(raw.currentBalanceSol)
+            ) {
+              throw new Error("Invalid balance in canonical wallet");
+            }
+            const solBalance = raw.currentBalanceSol;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                solBalance,
+                deployableSol: Math.max(0, parseFloat((solBalance - 0.05).toFixed(4))),
+                tokens: [],
+                signatureReady: true,
+                fetchedAt: new Date().toISOString(),
+              }),
+            );
+            return;
+          } catch (err) {
+            res.statusCode = 500;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: "WALLET_CORRUPTED",
+                message: `Canonical virtual wallet is corrupted: ${String(err)}`,
+              }),
+            );
+            return;
+          }
+        }
+
+        if (url === "/api/session/history" || url.startsWith("/api/session/history")) {
           const isArchiveRequest = url.includes("archive=true") || url.includes("archived=true");
           const targetFilename = isArchiveRequest
             ? "past-sessions-archive-12.83.json"
             : "past-sessions.json";
-
-          const candidates = [
-            path.join(rootTmp, targetFilename),
-            path.join(backendTmp, targetFilename),
-            path.join(localTmp, targetFilename),
-          ].filter((p) => fs.existsSync(p));
+          const targetPath = path.join(canonicalTmp, targetFilename);
 
           let sessions: unknown[] = [];
-          if (candidates.length > 0) {
+          if (fs.existsSync(targetPath)) {
             try {
-              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              const raw = JSON.parse(fs.readFileSync(targetPath, "utf8"));
               if (Array.isArray(raw)) {
                 sessions = raw;
               }
