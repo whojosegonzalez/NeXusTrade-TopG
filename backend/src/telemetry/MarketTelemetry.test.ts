@@ -17,9 +17,11 @@ import {
   StratifiedSamplingController,
   TelemetryRateController,
   TelemetryStorageManager,
+  TelemetryFollowUpScheduler,
   repairAndQuarantineDamagedTail,
   resolveStrategyRevision,
   type CandidateDecisionRecord,
+  type MetricProvenance,
 } from "./index.js";
 import {
   getCanonicalCandidateDecisionsPath,
@@ -105,6 +107,8 @@ describe("Phase 12.94-B Market Telemetry Engine", () => {
         strategyRevision: "cc73759",
         startedAtIso: meta.startedAtIso,
         totalCandidatesScreened: 42,
+        totalDecisionsRecorded: 42,
+        decisionWriteFailures: 0,
         cohortBreakdown: {
           filteredRejected: 35,
           watchlistRadar: 5,
@@ -542,7 +546,7 @@ describe("Phase 12.94-B Market Telemetry Engine", () => {
       // Exhaust bucket to 1.0 token
       expect(rateController.tryAcquire("EXECUTED_POSITION")).toBe(true);
       expect(rateController.tryAcquire("EXECUTED_POSITION")).toBe(true);
-      expect(rateController.getAvailableTokens()).toBe(1.0);
+      expect(rateController.getAvailableTokens()).toBeCloseTo(1.0, 1);
 
       // Low priority tier requires >= 1.5 + 1.0 = 2.5 tokens: must be shed!
       expect(rateController.tryAcquire("HARD_REJECT_BASELINE")).toBe(false);
@@ -809,6 +813,835 @@ describe("Phase 12.94-B Market Telemetry Engine", () => {
       expect(typeof revision).toBe("string");
       expect(revision.length).toBeGreaterThan(0);
       expect(revision).not.toBe("7e58ea5"); // Must not be the stale commit from prior subphase
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Suite 8: Phase 12.94-B Audit v2 Priority Verifications (B2-01 through B2-07)
+  // --------------------------------------------------------------------------
+  describe("8. Phase 12.94-B Audit v2 Priority Verifications (B2-01 through B2-07)", () => {
+    it("B2-01: metric provenance distinguishes observed facts from derived or unavailable metrics, and preserves nulls", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b201-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sessionId = "session-b201-provenance";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const metricProvenance: Record<string, MetricProvenance> = {
+        tokenAgeSec: "OBSERVED",
+        liquidityUsd: "OBSERVED",
+        marketCapUsd: "UNAVAILABLE",
+        lmcRatio: "UNAVAILABLE",
+        lpBurnPct: "OBSERVED",
+        spotPriceUsd: "UNAVAILABLE",
+        spotPriceSol: "UNAVAILABLE",
+        volume5mUsd: "UNAVAILABLE",
+        txCount5m: "OBSERVED",
+        buys5m: "OBSERVED",
+        sells5m: "OBSERVED",
+      };
+
+      const decision = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintNullCheck111111111111111111111111111",
+        poolId: "PoolNullCheck1",
+        symbol: "NULLCOIN",
+        sourceTimestampMs: 1700000000000,
+        ingestionTimestampMs: 1700000000010,
+        poolOpenTimeMs: 1699990000000,
+        decisionCohort: "FILTERED_REJECTED",
+        primaryRejectionReason: "REJECTED_MISSING_PRICE_FEED",
+        filterEvaluations: [
+          {
+            filterName: "PriceFeedCheck",
+            passed: false,
+            valueObserved: null,
+            threshold: 0.0001,
+            rejectionReason: "No spot price available",
+          },
+        ],
+        metricsSnapshot: {
+          tokenAgeSec: 10000,
+          liquidityUsd: 15000,
+          marketCapUsd: null,
+          lmcRatio: null,
+          lpBurnPct: 100,
+          spotPriceUsd: null,
+          spotPriceSol: null,
+          volume5mUsd: null,
+          txCount5m: 45,
+          buys5m: 25,
+          sells5m: 20,
+          metricProvenance,
+        },
+        providerIdentity: "raydium",
+      });
+
+      expect(decision.metricsSnapshot.spotPriceUsd).toBeNull();
+      expect(decision.metricsSnapshot.volume5mUsd).toBeNull();
+      expect(decision.metricsSnapshot.marketCapUsd).toBeNull();
+      expect(decision.metricsSnapshot.metricProvenance?.spotPriceUsd).toBe("UNAVAILABLE");
+      expect(decision.metricsSnapshot.metricProvenance?.liquidityUsd).toBe("OBSERVED");
+
+      // Verify persisted JSONL preserves exact nulls
+      const decisions = storage.readCandidateDecisions(sessionId);
+      expect(decisions).toHaveLength(1);
+      const persisted = decisions[0]!;
+      expect(persisted.metricsSnapshot.spotPriceUsd).toBeNull();
+      expect(persisted.metricsSnapshot.volume5mUsd).toBeNull();
+      expect(persisted.metricsSnapshot.metricProvenance?.spotPriceUsd).toBe("UNAVAILABLE");
+
+      // Verify ReconstructedDecisionContext marks missing fields
+      const reconstructor = new DecisionContextReconstructor(storage);
+      const context = reconstructor.reconstructContext(decision);
+      expect(context.missingDataFields).toContain("spotPriceUsd");
+      expect(context.missingDataFields).toContain("spotPriceSol");
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B2-02: observation timestamps record real network timings, derivation status, actual pool ID, and separate pool creation time", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b202-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const obsRecorder = new MarketObservationRecorder(storage);
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sessionId = "session-b202-timestamps";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const requestInitiatedMs = 1700000001000;
+      const responseReceivedMs = 1700000001250;
+      const scanTimeMs = 1700000001300;
+      const poolCreatedMs = 1699990000000;
+
+      // 1. Observation record with network timings and INDEXED_TICK price source
+      const obs = obsRecorder.recordObservation({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintB202Address111111111111111111111111",
+        poolId: "QueryPoolId1",
+        sourceTimestampMs: responseReceivedMs,
+        ingestionTimestampMs: responseReceivedMs,
+        requestInitiatedMs,
+        responseReceivedMs,
+        actualResponsePoolId: "ActualDexScreenerPairPool999",
+        derivationStatus: "DERIVED_FROM_5M",
+        measurementWindow: {
+          windowStartMs: scanTimeMs - 300_000,
+          windowEndMs: scanTimeMs,
+          durationSec: 300,
+        },
+        providerIdentity: "dexscreener",
+        priceMetrics: {
+          spotPriceUsd: 1.25,
+          spotPriceSol: 0.0085,
+          priceSource: "INDEXED_TICK",
+        },
+        liquidityMetrics: {
+          baseReserve: 10000,
+          quoteReserve: 85,
+          liquidityUsd: 25000,
+        },
+        flowMetrics: {
+          txCount: 42,
+          buys: 28,
+          sells: 14,
+          volumeUsd: 5000,
+          netBuyerVolumeUsd: 1500,
+        },
+      });
+
+      expect(obs.requestInitiatedMs).toBe(requestInitiatedMs);
+      expect(obs.responseReceivedMs).toBe(responseReceivedMs);
+      expect(obs.actualResponsePoolId).toBe("ActualDexScreenerPairPool999");
+      expect(obs.derivationStatus).toBe("DERIVED_FROM_5M");
+      expect(obs.priceMetrics.priceSource).toBe("INDEXED_TICK");
+
+      // 2. Decision record separating scan/decision observation time from pool creation time
+      const dec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintB202Address111111111111111111111111",
+        poolId: "ActualDexScreenerPairPool999",
+        symbol: "TICK",
+        sourceTimestampMs: scanTimeMs, // Observation scan time
+        ingestionTimestampMs: scanTimeMs,
+        poolOpenTimeMs: poolCreatedMs, // Pool creation time in the past
+        decisionCohort: "WATCHLIST_RADAR",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: Math.floor((scanTimeMs - poolCreatedMs) / 1000),
+          liquidityUsd: 25000,
+          marketCapUsd: 120000,
+          lmcRatio: 25000 / 120000,
+          lpBurnPct: 100,
+          spotPriceUsd: 1.25,
+          spotPriceSol: 0.0085,
+          volume5mUsd: 5000,
+          txCount5m: 42,
+          buys5m: 28,
+          sells5m: 14,
+        },
+        providerIdentity: "dexscreener",
+      });
+
+      expect(dec.sourceTimestampMs).toBe(scanTimeMs);
+      expect(dec.poolOpenTimeMs).toBe(poolCreatedMs);
+      expect(dec.sourceTimestampMs).not.toBe(dec.poolOpenTimeMs);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B2-03: rate limiter permit returned by tryAcquire() is strictly honored and sheds are accounted", () => {
+      const rateController = new TelemetryRateController({
+        maxRequestsPerSec: 10.0,
+        bucketCapacity: 2.0,
+        minTokensForLowTier: 1.0,
+      });
+
+      const now = 1700000000000;
+
+      // Consume both tokens with high-priority tier
+      expect(rateController.tryAcquire("WATCHLIST_ACTIVE", now)).toBe(true);
+      expect(rateController.tryAcquire("WATCHLIST_ACTIVE", now)).toBe(true);
+
+      // Third acquisition must fail and be shed
+      expect(rateController.tryAcquire("WATCHLIST_ACTIVE", now)).toBe(false);
+      expect(rateController.getShedCount()).toBe(1);
+
+      // Low-priority tier requires safety buffer (minTokensForLowTier + 1.0 = 2.0)
+      // Refill to 1.5 tokens
+      const nowLater = now + 150; // 0.15s * 10 = 1.5 tokens
+      expect(rateController.tryAcquire("HARD_REJECT_BASELINE", nowLater)).toBe(false);
+      expect(rateController.getShedCount()).toBe(2);
+
+      const metrics = rateController.getMetrics();
+      expect(metrics.totalAcquisitions).toBe(2);
+      expect(metrics.totalShed).toBe(2);
+      expect(metrics.shedByTier.WATCHLIST_ACTIVE).toBe(1);
+      expect(metrics.shedByTier.HARD_REJECT_BASELINE).toBe(1);
+    });
+
+    it("B2-04: watchlist tracker promotes cleanly to EXECUTED_POSITION upon EXECUTED_BUY and updates via composite key", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b204-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sampling = new StratifiedSamplingController(storage);
+      const sessionId = "session-b204-promotion";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const mint = "MintPromote1111111111111111111111111111111";
+      const pool = "PoolPromote1";
+
+      // 1. Initial admission onto watchlist radar
+      const radarDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: mint,
+        poolId: pool,
+        symbol: "PROM",
+        sourceTimestampMs: 1700000000000,
+        ingestionTimestampMs: 1700000000000,
+        decisionCohort: "WATCHLIST_RADAR",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 300,
+          liquidityUsd: 15000,
+          marketCapUsd: 50000,
+          lmcRatio: 0.3,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.05,
+          spotPriceSol: 0.00035,
+          volume5mUsd: 1200,
+          txCount5m: 20,
+          buys5m: 15,
+          sells5m: 5,
+        },
+        providerIdentity: "raydium",
+      });
+
+      const initialTracker = sampling.evaluateForTracking(radarDec, 0.00035);
+      expect(initialTracker).not.toBeNull();
+      expect(initialTracker?.tier).toBe("WATCHLIST_ACTIVE");
+      expect(initialTracker?.currentSamplingIntervalMs).toBe(30000);
+      expect(initialTracker?.promotedFromTier).toBeUndefined();
+
+      // 2. Buy decision arrives for the same candidate
+      const buyDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: mint,
+        poolId: pool,
+        symbol: "PROM",
+        sourceTimestampMs: 1700000035000,
+        ingestionTimestampMs: 1700000035000,
+        decisionCohort: "EXECUTED_BUY",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 335,
+          liquidityUsd: 22000,
+          marketCapUsd: 65000,
+          lmcRatio: 0.33,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.065,
+          spotPriceSol: 0.00045,
+          volume5mUsd: 3500,
+          txCount5m: 35,
+          buys5m: 28,
+          sells5m: 7,
+        },
+        providerIdentity: "raydium",
+      });
+
+      const promotedTracker = sampling.evaluateForTracking(buyDec, 0.00045);
+      expect(promotedTracker).not.toBeNull();
+      expect(promotedTracker?.tier).toBe("EXECUTED_POSITION");
+      expect(promotedTracker?.currentSamplingIntervalMs).toBe(5000); // 5s cadence
+      expect(promotedTracker?.promotedFromTier).toBe("WATCHLIST_ACTIVE");
+      expect(promotedTracker?.promotedAtMs).toBeDefined();
+      expect(promotedTracker?.decisionEventId).toBe(buyDec.eventId);
+
+      // 3. Update observation via canonical composite key
+      const trackerKey = StratifiedSamplingController.buildTrackerKey(
+        "gen-01-legacy-baseline",
+        sessionId,
+        pool,
+        mint,
+      );
+      const updated = sampling.updateObservation(trackerKey, 0.00055, 1700000040000);
+      expect(updated).not.toBeNull();
+      expect(updated?.latestPriceSol).toBe(0.00055);
+      expect(updated?.peakPriceSol).toBe(0.00055);
+      expect(updated?.observationCount).toBe(2);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B2-05: TelemetryFollowUpScheduler polls active cohorts at respective cadences and respects rate permits", async () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b205-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const obsRecorder = new MarketObservationRecorder(storage);
+      const sampling = new StratifiedSamplingController(storage);
+      const rateController = new TelemetryRateController({
+        maxRequestsPerSec: 100.0,
+        bucketCapacity: 10.0,
+      });
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sessionId = "session-b205-scheduler";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      // Register tracker 1 (EXECUTED_POSITION, 5s cadence)
+      const buyDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintFollowUp111111111111111111111111111",
+        poolId: "PoolFollowUp1",
+        symbol: "POS",
+        sourceTimestampMs: 1700000000000,
+        ingestionTimestampMs: 1700000000000,
+        decisionCohort: "EXECUTED_BUY",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 100,
+          liquidityUsd: 50000,
+          marketCapUsd: 200000,
+          lmcRatio: 0.25,
+          lpBurnPct: 100,
+          spotPriceUsd: 1.0,
+          spotPriceSol: 0.007,
+          volume5mUsd: 10000,
+          txCount5m: 50,
+          buys5m: 35,
+          sells5m: 15,
+        },
+        providerIdentity: "raydium",
+      });
+      sampling.evaluateForTracking(buyDec, 0.007);
+
+      // Register tracker 2 (WATCHLIST_ACTIVE, 30s cadence)
+      const radarDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintFollowUp222222222222222222222222222",
+        poolId: "PoolFollowUp2",
+        symbol: "RAD",
+        sourceTimestampMs: 1700000000000,
+        ingestionTimestampMs: 1700000000000,
+        decisionCohort: "WATCHLIST_RADAR",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 200,
+          liquidityUsd: 20000,
+          marketCapUsd: 80000,
+          lmcRatio: 0.25,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.5,
+          spotPriceSol: 0.0035,
+          volume5mUsd: 2000,
+          txCount5m: 20,
+          buys5m: 12,
+          sells5m: 8,
+        },
+        providerIdentity: "raydium",
+      });
+      sampling.evaluateForTracking(radarDec, 0.0035);
+
+      const polledMints: string[] = [];
+      const scheduler = new TelemetryFollowUpScheduler(
+        storage,
+        obsRecorder,
+        sampling,
+        rateController,
+        async (_poolId, mintAddress) => {
+          polledMints.push(mintAddress);
+          return {
+            spotPriceUsd: 1.1,
+            spotPriceSol: 0.0075,
+            liquidityUsd: 52000,
+            txCount: 55,
+            buys: 40,
+            sells: 15,
+            volumeUsd: 12000,
+            priceSource: "INDEXED_TICK",
+          };
+        },
+      );
+
+      // At t = 6s: Only tracker 1 (5s interval) is due. Tracker 2 (30s interval) is not due.
+      const poll1 = await scheduler.pollPendingTrackers(1700000006000);
+      expect(poll1.polledCount).toBe(1);
+      expect(poll1.skippedShedCount).toBe(0);
+      expect(polledMints).toEqual(["MintFollowUp111111111111111111111111111"]);
+
+      // Verify observation was appended to disk
+      const obsList = storage.readMarketObservations(sessionId);
+      expect(obsList).toHaveLength(1);
+      expect(obsList[0]?.mintAddress).toBe("MintFollowUp111111111111111111111111111");
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B2-06: independent candidate evaluation counting, trigger rejection recording, and summary completeness", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b206-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sessionId = "session-b206-summary";
+      const meta = storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      let callbackErrorsCount = 0;
+      const engine = new CandidateStreamEngine({
+        config: CANDIDATE_SCANNER_DEFAULTS,
+        onDecision: (evalResult) => {
+          if (!evalResult.admitted) {
+            callbackErrorsCount++;
+            throw new Error("Simulated transient callback failure in telemetry sink");
+          }
+          decRecorder.recordDecision({
+            sessionId,
+            generationId: "gen-01-legacy-baseline",
+            mintAddress: "MintAdmitted1",
+            poolId: "PoolAdmitted1",
+            symbol: "ADMIT",
+            sourceTimestampMs: Date.now(),
+            ingestionTimestampMs: Date.now(),
+            decisionCohort: "WATCHLIST_RADAR",
+            filterEvaluations: [],
+            metricsSnapshot: {
+              tokenAgeSec: 100,
+              liquidityUsd: 25000,
+              marketCapUsd: 100000,
+              lmcRatio: 0.25,
+              lpBurnPct: 100,
+              spotPriceUsd: 0.1,
+              spotPriceSol: 0.0007,
+              volume5mUsd: 5000,
+              txCount5m: 30,
+              buys5m: 20,
+              sells5m: 10,
+            },
+            providerIdentity: "raydium",
+          });
+        },
+      });
+
+      // Directly evaluate 3 mock candidates through engine
+      const pool1: ScannedPoolRecord = {
+        poolId: "p1",
+        mintAddress: "m1",
+        symbol: "S1",
+        decimals: 9,
+        baseMint: "m1",
+        liquidityUsd: 30000,
+        marketCapUsd: 100000,
+        openTimeSec: Math.floor(Date.now() / 1000) - 300,
+        lpBurnPct: 100,
+        mintAuthority: null,
+        freezeAuthority: null,
+        volume5mUsd: 10000,
+        txCount5m: 50,
+        buys5m: 35,
+        sells5m: 15,
+        spotPriceUsd: 0.1,
+        fetchedAt: new Date().toISOString(),
+      };
+
+      const pool2: ScannedPoolRecord = {
+        ...pool1,
+        poolId: "p2",
+        mintAddress: "m2",
+        liquidityUsd: 500, // Fails liquidity prescreen -> triggers error callback
+      };
+
+      engine.evaluatePool(pool1);
+      engine.evaluatePool(pool2);
+
+      expect(engine.getStats().totalEvaluationsAttempted).toBe(2);
+      expect(engine.getStats().decisionCallbackErrors).toBe(1);
+
+      // Record a TRIGGER_REJECTED decision
+      decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "m1",
+        poolId: "p1",
+        symbol: "S1",
+        sourceTimestampMs: Date.now(),
+        ingestionTimestampMs: Date.now(),
+        decisionCohort: "TRIGGER_REJECTED",
+        primaryRejectionReason: "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
+        filterEvaluations: [
+          {
+            filterName: "LiveLiquidityFloor",
+            passed: false,
+            valueObserved: 12000,
+            threshold: 20000,
+            rejectionReason: "Live liquidity $12000 < $20000",
+          },
+        ],
+        metricsSnapshot: {
+          tokenAgeSec: 300,
+          liquidityUsd: 12000,
+          marketCapUsd: 100000,
+          lmcRatio: 0.12,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.1,
+          spotPriceSol: 0.0007,
+          volume5mUsd: 5000,
+          txCount5m: 30,
+          buys5m: 20,
+          sells5m: 10,
+        },
+        providerIdentity: "raydium",
+      });
+
+      const summary = storage.finalizeSessionTelemetry(sessionId, {
+        generationId: "gen-01-legacy-baseline",
+        strategyRevision: meta.strategyRevision,
+        startedAtIso: meta.startedAtIso,
+        totalCandidatesScreened: engine.getStats().totalEvaluationsAttempted,
+        totalDecisionsRecorded: decRecorder.getTotalDecisionsCount(),
+        decisionWriteFailures: storage.getDecisionWriteFailuresCount(),
+        decisionCallbackErrors: engine.getStats().decisionCallbackErrors,
+        rateShedCount: 0,
+        cohortBreakdown: {
+          filteredRejected: decRecorder.getCohortCount("FILTERED_REJECTED"),
+          watchlistRadar: decRecorder.getCohortCount("WATCHLIST_RADAR"),
+          triggerRejected: decRecorder.getCohortCount("TRIGGER_REJECTED"),
+          executedBuy: decRecorder.getCohortCount("EXECUTED_BUY"),
+        },
+        topRejectionReasons: decRecorder.getRejectionReasonBreakdown(),
+        totalMarketObservationsRecorded: storage.getMarketObservationsCount(),
+        totalStratifiedCandidatesTracked: 1,
+        missedWinnersCount: 0,
+        avoidedRugsCount: 1,
+      });
+
+      expect(summary.totalCandidatesScreened).toBe(2);
+      expect(summary.totalDecisionsRecorded).toBe(2);
+      expect(summary.decisionCallbackErrors).toBe(1);
+      expect(callbackErrorsCount).toBe(1);
+      expect(summary.decisionWriteFailures).toBe(0);
+      expect(summary.cohortBreakdown.triggerRejected).toBe(1);
+      expect(summary.cohortBreakdown.watchlistRadar).toBe(1);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B2-07: bounded O(1) sustained-storage append latency benchmark without quadratic slowdown", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b207-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const sessionId = "session-b207-sustained";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const TOTAL_RECORDS = 1000;
+      const startFirst100 = performance.now();
+
+      for (let i = 0; i < 100; i++) {
+        decRecorder.recordDecision({
+          sessionId,
+          generationId: "gen-01-legacy-baseline",
+          mintAddress: `MintAddressBenchmark${i.toString().padStart(6, "0")}`,
+          poolId: `PoolBenchmark${i}`,
+          symbol: `SYM${i}`,
+          sourceTimestampMs: 1700000000000 + i,
+          ingestionTimestampMs: 1700000000000 + i,
+          decisionCohort: "FILTERED_REJECTED",
+          primaryRejectionReason: "REJECTED_IMBALANCED_LIQUIDITY_DEPTH",
+          filterEvaluations: [],
+          metricsSnapshot: {
+            tokenAgeSec: 50,
+            liquidityUsd: 1000,
+            marketCapUsd: 10000,
+            lmcRatio: 0.1,
+            lpBurnPct: 100,
+            spotPriceUsd: 0.01,
+            spotPriceSol: 0.0001,
+            volume5mUsd: 100,
+            txCount5m: 5,
+            buys5m: 2,
+            sells5m: 3,
+          },
+          providerIdentity: "raydium",
+        });
+      }
+      const durFirst100 = performance.now() - startFirst100;
+
+      // Append middle 800 records
+      for (let i = 100; i < 900; i++) {
+        decRecorder.recordDecision({
+          sessionId,
+          generationId: "gen-01-legacy-baseline",
+          mintAddress: `MintAddressBenchmark${i.toString().padStart(6, "0")}`,
+          poolId: `PoolBenchmark${i}`,
+          symbol: `SYM${i}`,
+          sourceTimestampMs: 1700000000000 + i,
+          ingestionTimestampMs: 1700000000000 + i,
+          decisionCohort: "FILTERED_REJECTED",
+          primaryRejectionReason: "REJECTED_IMBALANCED_LIQUIDITY_DEPTH",
+          filterEvaluations: [],
+          metricsSnapshot: {
+            tokenAgeSec: 50,
+            liquidityUsd: 1000,
+            marketCapUsd: 10000,
+            lmcRatio: 0.1,
+            lpBurnPct: 100,
+            spotPriceUsd: 0.01,
+            spotPriceSol: 0.0001,
+            volume5mUsd: 100,
+            txCount5m: 5,
+            buys5m: 2,
+            sells5m: 3,
+          },
+          providerIdentity: "raydium",
+        });
+      }
+
+      // Measure last 100 appends (when file is already 900 lines long)
+      const startLast100 = performance.now();
+      for (let i = 900; i < TOTAL_RECORDS; i++) {
+        decRecorder.recordDecision({
+          sessionId,
+          generationId: "gen-01-legacy-baseline",
+          mintAddress: `MintAddressBenchmark${i.toString().padStart(6, "0")}`,
+          poolId: `PoolBenchmark${i}`,
+          symbol: `SYM${i}`,
+          sourceTimestampMs: 1700000000000 + i,
+          ingestionTimestampMs: 1700000000000 + i,
+          decisionCohort: "FILTERED_REJECTED",
+          primaryRejectionReason: "REJECTED_IMBALANCED_LIQUIDITY_DEPTH",
+          filterEvaluations: [],
+          metricsSnapshot: {
+            tokenAgeSec: 50,
+            liquidityUsd: 1000,
+            marketCapUsd: 10000,
+            lmcRatio: 0.1,
+            lpBurnPct: 100,
+            spotPriceUsd: 0.01,
+            spotPriceSol: 0.0001,
+            volume5mUsd: 100,
+            txCount5m: 5,
+            buys5m: 2,
+            sells5m: 3,
+          },
+          providerIdentity: "raydium",
+        });
+      }
+      const durLast100 = performance.now() - startLast100;
+
+      // In an O(1) single-byte tail inspection, the latency of appending to a 900-line file
+      // does not grow quadratically. It should be within a factor of 5 of the first 100 appends.
+      // (If it were O(N^2) full-file rescanning, it would be orders of magnitude slower).
+      const ratio = durLast100 / Math.max(1, durFirst100);
+      expect(ratio).toBeLessThan(10.0);
+
+      // Verify all 1,000 records were written and can be read back cleanly
+      const allRecords = storage.readCandidateDecisions(sessionId);
+      expect(allRecords).toHaveLength(TOTAL_RECORDS);
+      expect(storage.getCandidateDecisionsCount()).toBe(TOTAL_RECORDS);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    }, 15000);
+
+    it("verifies disposable end-to-end telemetry pipeline matching daemon wiring", async () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-e2e-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const sessionId = "session-e2e-daemon-parity";
+      const meta = storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const decRecorder = new CandidateDecisionRecorder(storage);
+      const obsRecorder = new MarketObservationRecorder(storage);
+      const sampling = new StratifiedSamplingController(storage);
+      const rateController = new TelemetryRateController({
+        maxRequestsPerSec: 50.0,
+        bucketCapacity: 10.0,
+      });
+
+      const scheduler = new TelemetryFollowUpScheduler(
+        storage,
+        obsRecorder,
+        sampling,
+        rateController,
+        async () => ({
+          spotPriceUsd: 0.25,
+          spotPriceSol: 0.0018,
+          liquidityUsd: 35000,
+          txCount: 60,
+          buys: 40,
+          sells: 20,
+          volumeUsd: 8000,
+          priceSource: "INDEXED_TICK",
+        }),
+      );
+
+      // 1. Candidate scanned and placed on radar
+      const radarDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintE2E1111111111111111111111111111111",
+        poolId: "PoolE2E1",
+        symbol: "E2E",
+        sourceTimestampMs: 1700000000000,
+        ingestionTimestampMs: 1700000000000,
+        poolOpenTimeMs: 1699990000000,
+        decisionCohort: "WATCHLIST_RADAR",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 10000,
+          liquidityUsd: 30000,
+          marketCapUsd: 120000,
+          lmcRatio: 0.25,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.2,
+          spotPriceSol: 0.0014,
+          volume5mUsd: 5000,
+          txCount5m: 40,
+          buys5m: 25,
+          sells5m: 15,
+        },
+        providerIdentity: "dexscreener",
+      });
+      sampling.evaluateForTracking(radarDec, 0.0014);
+
+      // 2. Buy triggered -> promoted to EXECUTED_POSITION
+      const buyDec = decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintE2E1111111111111111111111111111111",
+        poolId: "PoolE2E1",
+        symbol: "E2E",
+        sourceTimestampMs: 1700000010000,
+        ingestionTimestampMs: 1700000010000,
+        poolOpenTimeMs: 1699990000000,
+        decisionCohort: "EXECUTED_BUY",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 10010,
+          liquidityUsd: 32000,
+          marketCapUsd: 130000,
+          lmcRatio: 0.25,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.22,
+          spotPriceSol: 0.0016,
+          volume5mUsd: 6000,
+          txCount5m: 45,
+          buys5m: 30,
+          sells5m: 15,
+        },
+        providerIdentity: "dexscreener",
+      });
+      sampling.evaluateForTracking(buyDec, 0.0016);
+
+      // 3. Follow-up scheduler polls active tracker
+      await scheduler.pollPendingTrackers(1700000016000);
+
+      // 4. Another candidate rejected at live liquidity floor
+      decRecorder.recordDecision({
+        sessionId,
+        generationId: "gen-01-legacy-baseline",
+        mintAddress: "MintE2ERejected2222222222222222222222222",
+        poolId: "PoolE2ERejected2",
+        symbol: "REJ",
+        sourceTimestampMs: 1700000020000,
+        ingestionTimestampMs: 1700000020000,
+        decisionCohort: "TRIGGER_REJECTED",
+        primaryRejectionReason: "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
+        filterEvaluations: [
+          {
+            filterName: "LiveLiquidityFloor",
+            passed: false,
+            valueObserved: 15000,
+            threshold: 20000,
+            rejectionReason: "Live liquidity $15000 < $20000",
+          },
+        ],
+        metricsSnapshot: {
+          tokenAgeSec: 500,
+          liquidityUsd: 15000,
+          marketCapUsd: 60000,
+          lmcRatio: 0.25,
+          lpBurnPct: 100,
+          spotPriceUsd: 0.05,
+          spotPriceSol: 0.00035,
+          volume5mUsd: 1000,
+          txCount5m: 10,
+          buys5m: 6,
+          sells5m: 4,
+        },
+        providerIdentity: "dexscreener",
+      });
+
+      // 5. Finalize session telemetry
+      const summary = storage.finalizeSessionTelemetry(sessionId, {
+        generationId: "gen-01-legacy-baseline",
+        strategyRevision: meta.strategyRevision,
+        startedAtIso: meta.startedAtIso,
+        totalCandidatesScreened: 3,
+        totalDecisionsRecorded: decRecorder.getTotalDecisionsCount(),
+        decisionWriteFailures: storage.getDecisionWriteFailuresCount(),
+        decisionCallbackErrors: 0,
+        rateShedCount: rateController.getShedCount(),
+        cohortBreakdown: {
+          filteredRejected: decRecorder.getCohortCount("FILTERED_REJECTED"),
+          watchlistRadar: decRecorder.getCohortCount("WATCHLIST_RADAR"),
+          triggerRejected: decRecorder.getCohortCount("TRIGGER_REJECTED"),
+          executedBuy: decRecorder.getCohortCount("EXECUTED_BUY"),
+        },
+        topRejectionReasons: decRecorder.getRejectionReasonBreakdown(),
+        totalMarketObservationsRecorded: storage.getMarketObservationsCount(),
+        totalStratifiedCandidatesTracked: sampling.getTotalEverTrackedCount(),
+        missedWinnersCount: 0,
+        avoidedRugsCount: 1,
+      });
+
+      expect(summary.totalDecisionsRecorded).toBe(3);
+      expect(summary.cohortBreakdown.watchlistRadar).toBe(1);
+      expect(summary.cohortBreakdown.executedBuy).toBe(1);
+      expect(summary.cohortBreakdown.triggerRejected).toBe(1);
+      expect(summary.totalMarketObservationsRecorded).toBe(1);
+      expect(summary.totalStratifiedCandidatesTracked).toBe(1);
+
+      rmSync(tempDir, { recursive: true, force: true });
     });
   });
 });

@@ -11,6 +11,8 @@ export type DecisionCohort =
   | "TRIGGER_REJECTED"
   | "EXECUTED_BUY";
 
+export type MetricProvenance = "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE";
+
 export interface FilterEvaluationDetail {
   readonly filterName: string;
   readonly passed: boolean;
@@ -20,17 +22,18 @@ export interface FilterEvaluationDetail {
 }
 
 export interface CandidateMetricsSnapshot {
-  readonly tokenAgeSec: number;
-  readonly liquidityUsd: number;
-  readonly marketCapUsd: number;
-  readonly lmcRatio: number;
-  readonly lpBurnPct: number;
-  readonly spotPriceUsd: number;
+  readonly tokenAgeSec: number | null;
+  readonly liquidityUsd: number | null;
+  readonly marketCapUsd: number | null;
+  readonly lmcRatio: number | null;
+  readonly lpBurnPct: number | null;
+  readonly spotPriceUsd: number | null;
   readonly spotPriceSol?: number | null | undefined;
-  readonly volume5mUsd: number;
-  readonly txCount5m: number;
-  readonly buys5m: number;
-  readonly sells5m: number;
+  readonly volume5mUsd: number | null;
+  readonly txCount5m: number | null;
+  readonly buys5m: number | null;
+  readonly sells5m: number | null;
+  readonly metricProvenance?: Partial<Record<string, MetricProvenance>> | undefined;
 }
 
 export interface CandidateDecisionRecord {
@@ -43,6 +46,7 @@ export interface CandidateDecisionRecord {
   readonly sourceTimestampMs: number;
   readonly ingestionTimestampMs: number;
   readonly decisionTimestampMs: number;
+  readonly poolOpenTimeMs?: number | undefined;
   readonly strategyRevision: string;
   readonly decisionCohort: DecisionCohort;
   readonly primaryRejectionReason?: string | undefined;
@@ -68,9 +72,13 @@ export interface MarketObservationRecord {
   readonly poolId: string;
   readonly sourceTimestampMs: number;
   readonly ingestionTimestampMs: number;
+  readonly requestInitiatedMs?: number | undefined;
+  readonly responseReceivedMs?: number | undefined;
   readonly dataFreshnessMs: number;
   readonly measurementWindow: MeasurementWindow;
+  readonly derivationStatus?: "RAW" | "DERIVED_FROM_5M" | "DERIVED_FROM_1H" | undefined;
   readonly providerIdentity: string;
+  readonly actualResponsePoolId?: string | undefined;
   readonly priceMetrics: {
     readonly spotPriceUsd: number | null;
     readonly spotPriceSol: number | null;
@@ -130,6 +138,7 @@ export interface StratifiedSamplingRecord {
   readonly selectionReason?: string | undefined;
   readonly trackingStartedMs: number;
   readonly trackingExpiresMs: number;
+  readonly lastObservationMs?: number | undefined;
   readonly currentSamplingIntervalMs: number;
   readonly observationCount: number;
   readonly initialPriceSol: number;
@@ -139,6 +148,8 @@ export interface StratifiedSamplingRecord {
   readonly maxDrawdownPct: number;
   readonly latestPriceSol: number;
   readonly status: StratifiedSamplingStatus;
+  readonly promotedFromTier?: StratificationTier | undefined;
+  readonly promotedAtMs?: number | undefined;
 }
 
 export interface SessionTelemetryMeta {
@@ -161,6 +172,10 @@ export interface SessionTelemetrySummary {
   readonly startedAtIso: string;
   readonly closedAtIso: string;
   readonly totalCandidatesScreened: number;
+  readonly totalDecisionsRecorded: number;
+  readonly decisionWriteFailures: number;
+  readonly decisionCallbackErrors?: number | undefined;
+  readonly rateShedCount?: number | undefined;
   readonly cohortBreakdown: {
     readonly filteredRejected: number;
     readonly watchlistRadar: number;

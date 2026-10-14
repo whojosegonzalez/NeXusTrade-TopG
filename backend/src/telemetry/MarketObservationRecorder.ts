@@ -14,8 +14,12 @@ export interface RecordObservationInput {
   readonly poolId: string;
   readonly sourceTimestampMs: number;
   readonly ingestionTimestampMs?: number | undefined;
+  readonly requestInitiatedMs?: number | undefined;
+  readonly responseReceivedMs?: number | undefined;
   readonly measurementWindow: MeasurementWindow;
+  readonly derivationStatus?: "RAW" | "DERIVED_FROM_5M" | "DERIVED_FROM_1H" | undefined;
   readonly providerIdentity: string;
+  readonly actualResponsePoolId?: string | undefined;
   readonly priceMetrics: {
     readonly spotPriceUsd: number | null;
     readonly spotPriceSol: number | null;
@@ -53,7 +57,8 @@ export class MarketObservationRecorder {
   }
 
   public recordObservation(input: RecordObservationInput): MarketObservationRecord {
-    const ingestionTimestampMs = input.ingestionTimestampMs ?? Date.now();
+    const ingestionTimestampMs =
+      input.ingestionTimestampMs ?? input.responseReceivedMs ?? Date.now();
     const observationId = crypto.randomUUID();
 
     // 1. Validate Measurement Window Boundaries
@@ -85,9 +90,13 @@ export class MarketObservationRecorder {
       poolId: input.poolId,
       sourceTimestampMs: input.sourceTimestampMs,
       ingestionTimestampMs,
+      requestInitiatedMs: input.requestInitiatedMs,
+      responseReceivedMs: input.responseReceivedMs,
       dataFreshnessMs,
       measurementWindow: input.measurementWindow,
+      derivationStatus: input.derivationStatus ?? "RAW",
       providerIdentity: input.providerIdentity,
+      actualResponsePoolId: input.actualResponsePoolId ?? input.poolId,
       priceMetrics: input.priceMetrics,
       liquidityMetrics: input.liquidityMetrics,
       flowMetrics: input.flowMetrics,

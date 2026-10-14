@@ -102,4 +102,8 @@ export class TelemetryRateController {
       shedByTier: { ...this.metrics.shedByTier },
     };
   }
+
+  public getShedCount(): number {
+    return this.metrics.totalShed;
+  }
 }

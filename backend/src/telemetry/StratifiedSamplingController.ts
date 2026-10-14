@@ -35,6 +35,7 @@ export class StratifiedSamplingController {
   private readonly sessionSeed: string;
   // Keyed by composite key: `${generationId}:${sessionId}:${poolId}:${mintAddress}`
   private readonly activeTrackers = new Map<string, StratifiedSamplingRecord>();
+  private totalEverTrackedCount = 0;
 
   constructor(
     storage: TelemetryStorageManager,
@@ -46,13 +47,27 @@ export class StratifiedSamplingController {
     this.config = { ...DEFAULT_SAMPLING_CONFIG, ...config };
   }
 
-  private buildTrackerKey(
+  public static buildTrackerKey(
     generationId: string,
     sessionId: string,
     poolId: string,
     mintAddress: string,
   ): string {
     return `${generationId}:${sessionId}:${poolId}:${mintAddress}`;
+  }
+
+  public buildTrackerKey(
+    generationId: string,
+    sessionId: string,
+    poolId: string,
+    mintAddress: string,
+  ): string {
+    return StratifiedSamplingController.buildTrackerKey(
+      generationId,
+      sessionId,
+      poolId,
+      mintAddress,
+    );
   }
 
   public classifyTier(decision: CandidateDecisionRecord): StratificationTier {
@@ -63,17 +78,19 @@ export class StratifiedSamplingController {
       return "WATCHLIST_ACTIVE";
     }
 
+    const liqUsd = decision.metricsSnapshot.liquidityUsd ?? 0;
+    const txCount = decision.metricsSnapshot.txCount5m ?? 0;
+
     // Exclude complete spam (zero / negligible liquidity)
-    if (decision.metricsSnapshot.liquidityUsd < this.config.minLiquidityForTrackingUsd) {
+    if (liqUsd < this.config.minLiquidityForTrackingUsd) {
       return "EXCLUDED_SPAM";
     }
 
     // Near-miss detection: check if candidate failed by a narrow margin
     const isNearMiss =
-      (decision.primaryRejectionReason === "REJECTED_NET_SELLER_DOMINANCE" &&
-        decision.metricsSnapshot.liquidityUsd >= 5000) ||
+      (decision.primaryRejectionReason === "REJECTED_NET_SELLER_DOMINANCE" && liqUsd >= 5000) ||
       (decision.primaryRejectionReason === "REJECTED_INSUFFICIENT_TRANSACTION_COUNT" &&
-        decision.metricsSnapshot.txCount5m >= 10);
+        txCount >= 10);
 
     if (isNearMiss) {
       return "NEAR_MISS_CANDIDATE";
@@ -93,8 +110,28 @@ export class StratifiedSamplingController {
       decision.mintAddress,
     );
 
-    if (this.activeTrackers.has(key)) {
-      return this.activeTrackers.get(key)!;
+    const existing = this.activeTrackers.get(key);
+    if (existing) {
+      // B2-04: Promote existing WATCHLIST_ACTIVE tracker to EXECUTED_POSITION upon EXECUTED_BUY decision
+      if (decision.decisionCohort === "EXECUTED_BUY" && existing.tier !== "EXECUTED_POSITION") {
+        const now = decision.sourceTimestampMs || Date.now();
+        const promoted: StratifiedSamplingRecord = {
+          ...existing,
+          decisionEventId: decision.eventId,
+          tier: "EXECUTED_POSITION",
+          samplingProbability: 1.0,
+          effectiveInclusionProbability: 1.0,
+          currentSamplingIntervalMs: 5000, // 5-second mandatory follow-up cadence
+          promotedFromTier: existing.tier,
+          promotedAtMs: now,
+          lastObservationMs: now,
+          status: "TRACKING_ACTIVE",
+        };
+        this.activeTrackers.set(key, promoted);
+        this.storage.appendStratifiedSample(promoted);
+        return promoted;
+      }
+      return existing;
     }
 
     const tier = this.classifyTier(decision);
@@ -124,7 +161,7 @@ export class StratifiedSamplingController {
         break;
     }
 
-    const now = Date.now();
+    const now = decision.sourceTimestampMs || Date.now();
     const trackingId = crypto.randomUUID();
     const trackingExpiresMs = now + this.config.maxTrackingDurationMs;
 
@@ -145,6 +182,7 @@ export class StratifiedSamplingController {
         selectionReason: "EXCLUDED_SPAM_BELOW_MIN_LIQUIDITY",
         trackingStartedMs: now,
         trackingExpiresMs,
+        lastObservationMs: now,
         currentSamplingIntervalMs: 0,
         observationCount: 0,
         initialPriceSol,
@@ -192,6 +230,7 @@ export class StratifiedSamplingController {
           selectionReason: "CAPACITY_EXCEEDED",
           trackingStartedMs: now,
           trackingExpiresMs,
+          lastObservationMs: now,
           currentSamplingIntervalMs: 0,
           observationCount: 0,
           initialPriceSol,
@@ -228,6 +267,7 @@ export class StratifiedSamplingController {
         selectionReason: "DETERMINISTIC_SAMPLE_NOT_SELECTED",
         trackingStartedMs: now,
         trackingExpiresMs,
+        lastObservationMs: now,
         currentSamplingIntervalMs: 0,
         observationCount: 0,
         initialPriceSol,
@@ -257,6 +297,7 @@ export class StratifiedSamplingController {
       selectionReason: "SELECTED_FOR_TRACKING",
       trackingStartedMs: now,
       trackingExpiresMs,
+      lastObservationMs: now,
       currentSamplingIntervalMs: tier === "EXECUTED_POSITION" ? 5000 : 30000,
       observationCount: 1,
       initialPriceSol,
@@ -269,19 +310,20 @@ export class StratifiedSamplingController {
     };
 
     this.activeTrackers.set(key, record);
+    this.totalEverTrackedCount++;
     this.storage.appendStratifiedSample(record);
     return record;
   }
 
   public updateObservation(
-    identifier: string, // mintAddress or composite key
+    identifier: string, // composite tracker key or mintAddress
     currentPriceSol: number,
     nowMs: number = Date.now(),
   ): StratifiedSamplingRecord | undefined {
     let key = identifier;
     let tracker = this.activeTrackers.get(key);
 
-    // If identifier is just mintAddress, find matching tracker
+    // If identifier is not found directly, check composite match
     if (!tracker) {
       for (const [k, v] of this.activeTrackers.entries()) {
         if (k.endsWith(`:${identifier}`) || v.mintAddress === identifier) {
@@ -298,6 +340,7 @@ export class StratifiedSamplingController {
       const expired: StratifiedSamplingRecord = {
         ...tracker,
         status: "EXPIRED",
+        lastObservationMs: nowMs,
         latestPriceSol: currentPriceSol,
       };
       this.activeTrackers.delete(key);
@@ -334,6 +377,7 @@ export class StratifiedSamplingController {
     const updated: StratifiedSamplingRecord = {
       ...tracker,
       observationCount: tracker.observationCount + 1,
+      lastObservationMs: nowMs,
       currentSamplingIntervalMs: nextInterval,
       peakPriceSol: Number(peakPrice.toFixed(8)),
       peakGainPct: Number(peakGainPct.toFixed(2)),
@@ -362,5 +406,9 @@ export class StratifiedSamplingController {
       }
     }
     return tracker;
+  }
+
+  public getTotalEverTrackedCount(): number {
+    return this.totalEverTrackedCount;
   }
 }

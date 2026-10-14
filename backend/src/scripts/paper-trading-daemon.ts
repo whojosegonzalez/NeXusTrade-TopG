@@ -76,6 +76,8 @@ import {
   MarketObservationRecorder,
   StratifiedSamplingController,
   TelemetryRateController,
+  TelemetryFollowUpScheduler,
+  type MetricProvenance,
 } from "../telemetry/index.js";
 
 export interface ParsedDaemonCliArgs {
@@ -212,17 +214,23 @@ interface DexScreenerSpotInfo {
   readonly recentTransactionsCount: number;
   readonly momentum5mBps: number;
   readonly priceChange1hPct: number;
+  readonly requestInitiatedMs?: number | undefined;
+  readonly responseReceivedMs?: number | undefined;
+  readonly actualResponsePoolId?: string | undefined;
 }
 
 async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreenerSpotInfo | null> {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mintAddress)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
+  const requestInitiatedMs = Date.now();
   try {
     const res = await fetch(url, { signal: controller.signal });
+    const responseReceivedMs = Date.now();
     if (!res.ok) return null;
     const body = (await res.json()) as {
       pairs?: Array<{
+        pairAddress?: string;
         quoteToken?: { symbol?: string; address?: string };
         priceNative?: string;
         priceUsd?: string;
@@ -296,6 +304,9 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
       recentTransactionsCount: buys5m + sells5m,
       momentum5mBps,
       priceChange1hPct,
+      requestInitiatedMs,
+      responseReceivedMs,
+      actualResponsePoolId: solPair.pairAddress ?? undefined,
     };
   } catch {
     return null;
@@ -501,12 +512,46 @@ export async function run(): Promise<void> {
     const telemetryObservations = new MarketObservationRecorder(telemetryStorage);
     const telemetrySampling = new StratifiedSamplingController(telemetryStorage);
     const telemetryRate = new TelemetryRateController();
+    const telemetryFollowUp = new TelemetryFollowUpScheduler(
+      telemetryStorage,
+      telemetryObservations,
+      telemetrySampling,
+      telemetryRate,
+      async (_poolId: string, mintAddress: string) => {
+        const spot = await fetchDexScreenerSpotInfo(mintAddress);
+        if (!spot) return null;
+        return {
+          spotPriceUsd: spot.spotPriceUsd,
+          spotPriceSol: spot.spotPriceSol,
+          liquidityUsd: spot.liquidityUsd,
+          txCount: spot.recentTransactionsCount,
+          buys: spot.recentBuys60s,
+          sells: spot.recentSells60s,
+          volumeUsd: 0,
+          priceSource: "INDEXED_TICK",
+          actualPoolId: spot.actualResponsePoolId,
+        };
+      },
+    );
 
     const streamEngine = new CandidateStreamEngine({
       config: config.scannerConfig ?? CANDIDATE_SCANNER_DEFAULTS,
       onDecision: (evalResult, pool) => {
         try {
           const nowSec = Math.floor(Date.now() / 1000);
+          const currentNow = Date.now();
+          const metricProvenance: Record<string, MetricProvenance> = {
+            tokenAgeSec: pool.openTimeSec > 0 ? "OBSERVED" : "UNAVAILABLE",
+            liquidityUsd: pool.liquidityUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+            marketCapUsd: pool.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+            lmcRatio: pool.marketCapUsd > 0 && pool.liquidityUsd > 0 ? "DERIVED" : "UNAVAILABLE",
+            lpBurnPct: pool.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            spotPriceUsd: pool.spotPriceUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+            volume5mUsd: pool.volume5mUsd !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            txCount5m: pool.txCount5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            buys5m: pool.buys5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            sells5m: pool.sells5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
+          };
           const metricsSnapshot = {
             tokenAgeSec: pool.openTimeSec > 0 ? Math.max(0, nowSec - pool.openTimeSec) : 0,
             liquidityUsd: pool.liquidityUsd,
@@ -518,6 +563,7 @@ export async function run(): Promise<void> {
             txCount5m: pool.txCount5m,
             buys5m: pool.buys5m,
             sells5m: pool.sells5m,
+            metricProvenance,
           };
           const filterEvaluations = evalResult.filterEvaluations.map((f) => ({
             filterName: f.filterName,
@@ -532,8 +578,9 @@ export async function run(): Promise<void> {
             mintAddress: pool.mintAddress,
             poolId: pool.poolId,
             symbol: pool.symbol,
-            sourceTimestampMs: pool.openTimeSec > 0 ? pool.openTimeSec * 1000 : Date.now(),
-            ingestionTimestampMs: Date.now(),
+            sourceTimestampMs: currentNow,
+            ingestionTimestampMs: currentNow,
+            poolOpenTimeMs: pool.openTimeSec > 0 ? pool.openTimeSec * 1000 : undefined,
             decisionCohort: evalResult.admitted ? "WATCHLIST_RADAR" : "FILTERED_REJECTED",
             primaryRejectionReason: evalResult.primaryRejectionReason,
             filterEvaluations,
@@ -576,6 +623,87 @@ export async function run(): Promise<void> {
     } catch (probeErr) {
       console.warn("[PaperDaemon] Failed to probe Smart Money:", probeErr);
     }
+
+    const recordTriggerRejection = (
+      candidate: {
+        poolId: string;
+        mintAddress: string;
+        symbol: string;
+        liquidityUsd: number;
+        marketCapUsd: number;
+        assetAgeSeconds: number;
+        lpBurnPct?: number;
+        volume5mUsd?: number;
+        buys5m: number;
+        sells5m: number;
+        lmcRatio: number;
+      },
+      reason: string,
+      spotSol: number,
+      spotUsd: number,
+      liqUsd: number,
+      recentBuys60s: number,
+      recentSells60s: number,
+      filterName: string = "BuyGate",
+      currentTimestampMs: number = nowMs(),
+    ) => {
+      tracker.recordCandidate(candidate, "FILTERED_REJECTED", spotSol, currentTimestampMs, reason);
+      try {
+        telemetryDecisions.recordDecision({
+          sessionId,
+          generationId: "gen-01-legacy-baseline",
+          mintAddress: candidate.mintAddress,
+          poolId: candidate.poolId,
+          symbol: candidate.symbol,
+          sourceTimestampMs: currentTimestampMs,
+          ingestionTimestampMs: currentTimestampMs,
+          poolOpenTimeMs:
+            candidate.assetAgeSeconds > 0
+              ? currentTimestampMs - candidate.assetAgeSeconds * 1000
+              : undefined,
+          decisionCohort: "TRIGGER_REJECTED",
+          primaryRejectionReason: reason,
+          filterEvaluations: [
+            {
+              filterName,
+              passed: false,
+              valueObserved: null,
+              threshold: null,
+              rejectionReason: reason,
+            },
+          ],
+          metricsSnapshot: {
+            tokenAgeSec: candidate.assetAgeSeconds,
+            liquidityUsd: liqUsd,
+            marketCapUsd: candidate.marketCapUsd,
+            lmcRatio: candidate.lmcRatio,
+            lpBurnPct: candidate.lpBurnPct ?? 100,
+            spotPriceUsd: spotUsd > 0 ? spotUsd : null,
+            spotPriceSol: spotSol > 0 ? spotSol : null,
+            volume5mUsd: candidate.volume5mUsd ?? null,
+            txCount5m: recentBuys60s + recentSells60s,
+            buys5m: recentBuys60s * 5,
+            sells5m: recentSells60s * 5,
+            metricProvenance: {
+              tokenAgeSec: "OBSERVED",
+              liquidityUsd: liqUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+              marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+              lmcRatio: "DERIVED",
+              lpBurnPct: "OBSERVED",
+              spotPriceUsd: spotUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+              spotPriceSol: spotSol > 0 ? "OBSERVED" : "UNAVAILABLE",
+              volume5mUsd: "OBSERVED",
+              txCount5m: "OBSERVED",
+              buys5m: "DERIVED",
+              sells5m: "DERIVED",
+            },
+          },
+          providerIdentity: candidate.poolId.startsWith("dexscreener") ? "dexscreener" : "raydium",
+        });
+      } catch (tErr) {
+        console.warn("[PaperDaemon] Telemetry trigger rejection recording error:", tErr);
+      }
+    };
 
     interface ActivityLogRecord {
       timestamp: number;
@@ -1337,57 +1465,71 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  telemetryRate.tryAcquire("WATCHLIST_ACTIVE");
                   const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
                   if (spotInfo && spotInfo.spotPriceSol && spotInfo.spotPriceSol > 0) {
-                    try {
-                      telemetryObservations.recordObservation({
-                        sessionId,
-                        generationId: "gen-01-legacy-baseline",
-                        mintAddress: candidate.mintAddress,
-                        poolId: candidate.poolId,
-                        sourceTimestampMs: currentNow,
-                        ingestionTimestampMs: currentNow,
-                        measurementWindow: {
-                          windowStartMs: currentNow - 60000,
-                          windowEndMs: currentNow,
-                          durationSec: 60,
-                        },
-                        providerIdentity: "dexscreener",
-                        priceMetrics: {
-                          spotPriceUsd: spotInfo.spotPriceUsd,
-                          spotPriceSol: spotInfo.spotPriceSol,
-                          priceSource: "ROUTE_QUOTE",
-                        },
-                        liquidityMetrics: {
-                          baseReserve: 0,
-                          quoteReserve: 0,
-                          liquidityUsd: spotInfo.liquidityUsd,
-                        },
-                        flowMetrics: {
-                          txCount: spotInfo.recentBuys60s + spotInfo.recentSells60s,
-                          buys: spotInfo.recentBuys60s,
-                          sells: spotInfo.recentSells60s,
-                          volumeUsd: 0,
-                          netBuyerVolumeUsd: 0,
-                        },
-                      });
-                      telemetrySampling.updateObservation(
-                        candidate.mintAddress,
-                        spotInfo.spotPriceSol,
-                        currentNow,
-                      );
-                    } catch (obsErr) {
-                      console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
+                    if (telemetryRate.tryAcquire("WATCHLIST_ACTIVE", currentNow)) {
+                      try {
+                        telemetryObservations.recordObservation({
+                          sessionId,
+                          generationId: "gen-01-legacy-baseline",
+                          mintAddress: candidate.mintAddress,
+                          poolId: candidate.poolId,
+                          sourceTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
+                          ingestionTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
+                          requestInitiatedMs: spotInfo.requestInitiatedMs,
+                          responseReceivedMs: spotInfo.responseReceivedMs,
+                          actualResponsePoolId: spotInfo.actualResponsePoolId,
+                          derivationStatus: "DERIVED_FROM_5M",
+                          measurementWindow: {
+                            windowStartMs: currentNow - 300_000,
+                            windowEndMs: currentNow,
+                            durationSec: 300,
+                          },
+                          providerIdentity: "dexscreener",
+                          priceMetrics: {
+                            spotPriceUsd: spotInfo.spotPriceUsd,
+                            spotPriceSol: spotInfo.spotPriceSol,
+                            priceSource: "INDEXED_TICK",
+                          },
+                          liquidityMetrics: {
+                            baseReserve: 0,
+                            quoteReserve: 0,
+                            liquidityUsd: spotInfo.liquidityUsd,
+                          },
+                          flowMetrics: {
+                            txCount: spotInfo.recentTransactionsCount,
+                            buys: spotInfo.recentBuys60s,
+                            sells: spotInfo.recentSells60s,
+                            volumeUsd: 0,
+                            netBuyerVolumeUsd: 0,
+                          },
+                        });
+                        telemetrySampling.updateObservation(
+                          StratifiedSamplingController.buildTrackerKey(
+                            "gen-01-legacy-baseline",
+                            sessionId,
+                            candidate.poolId,
+                            candidate.mintAddress,
+                          ),
+                          spotInfo.spotPriceSol,
+                          currentNow,
+                        );
+                      } catch (obsErr) {
+                        console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
+                      }
                     }
                   }
                   if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
-                      candidate.liquidityUsd,
-                      currentNow,
                       "REJECTED_NO_ACTIVE_DEX_PAIR",
+                      0,
+                      0,
+                      candidate.liquidityUsd,
+                      0,
+                      0,
+                      "DexPairActive",
+                      currentNow,
                     );
                     continue;
                   }
@@ -1420,12 +1562,16 @@ export async function run(): Promise<void> {
                       armedPullbackCandidates.delete(candidate.mintAddress);
                     }
                     watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
-                      spotInfo.spotPriceSol,
-                      currentNow,
                       "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
+                      spotInfo.spotPriceSol,
+                      spotInfo.spotPriceUsd,
+                      spotInfo.liquidityUsd,
+                      spotInfo.recentBuys60s,
+                      spotInfo.recentSells60s,
+                      "LiveLiquidityFloor",
+                      currentNow,
                     );
                     console.log(
                       `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${spotInfo.liquidityUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
@@ -1451,12 +1597,16 @@ export async function run(): Promise<void> {
                     if (armedPullbackCandidates.has(candidate.mintAddress)) {
                       armedPullbackCandidates.delete(candidate.mintAddress);
                     }
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
+                      fullGateResult.rejectionReason ?? "REJECTED_BUY_GATE_UNTRIGGERED",
                       spotInfo.spotPriceSol,
+                      spotInfo.spotPriceUsd,
+                      spotInfo.liquidityUsd,
+                      spotInfo.recentBuys60s,
+                      spotInfo.recentSells60s,
+                      "BuyGateService",
                       currentNow,
-                      fullGateResult.rejectionReason,
                     );
                     continue;
                   }
@@ -1532,12 +1682,16 @@ export async function run(): Promise<void> {
                     const rejectReason = isEstablished
                       ? "REJECTED_EXCESSIVE_PULLBACK"
                       : "REJECTED_PULLBACK_CRATERED";
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
-                      spotInfo.spotPriceSol,
-                      currentNow,
                       rejectReason,
+                      spotInfo.spotPriceSol,
+                      spotInfo.spotPriceUsd,
+                      spotInfo.liquidityUsd,
+                      spotInfo.recentBuys60s,
+                      spotInfo.recentSells60s,
+                      "RetestCraterDrop",
+                      currentNow,
                     );
                     console.log(
                       `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
@@ -1558,12 +1712,16 @@ export async function run(): Promise<void> {
                   ) {
                     armedPullbackCandidates.delete(candidate.mintAddress);
                     watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
-                      spotInfo.spotPriceSol,
-                      currentNow,
                       "REJECTED_IN_FLIGHT_SELLER_SURGE",
+                      spotInfo.spotPriceSol,
+                      spotInfo.spotPriceUsd,
+                      spotInfo.liquidityUsd,
+                      spotInfo.recentBuys60s,
+                      spotInfo.recentSells60s,
+                      "RetestSellerSurge",
+                      currentNow,
                     );
                     console.log(
                       `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
@@ -1581,12 +1739,16 @@ export async function run(): Promise<void> {
                   if (currentNow - updatedArmed.armedAtMs > maxExpiryMs) {
                     armedPullbackCandidates.delete(candidate.mintAddress);
                     watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    tracker.recordCandidate(
+                    recordTriggerRejection(
                       candidate,
-                      "FILTERED_REJECTED",
-                      spotInfo.spotPriceSol,
-                      currentNow,
                       "REJECTED_PULLBACK_EXPIRED",
+                      spotInfo.spotPriceSol,
+                      spotInfo.spotPriceUsd,
+                      spotInfo.liquidityUsd,
+                      spotInfo.recentBuys60s,
+                      spotInfo.recentSells60s,
+                      "RetestTimeout",
+                      currentNow,
                     );
                     console.log(
                       `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
@@ -1746,6 +1908,12 @@ export async function run(): Promise<void> {
                         symbol: candidate.symbol,
                         sourceTimestampMs: currentNow,
                         ingestionTimestampMs: currentNow,
+                        poolOpenTimeMs:
+                          poolRecord.openTimeSec > 0
+                            ? poolRecord.openTimeSec * 1000
+                            : candidate.assetAgeSeconds > 0
+                              ? currentNow - candidate.assetAgeSeconds * 1000
+                              : undefined,
                         decisionCohort: "EXECUTED_BUY",
                         filterEvaluations: [],
                         metricsSnapshot: {
@@ -1760,6 +1928,19 @@ export async function run(): Promise<void> {
                           txCount5m: candidate.buys5m + candidate.sells5m,
                           buys5m: candidate.buys5m,
                           sells5m: candidate.sells5m,
+                          metricProvenance: {
+                            tokenAgeSec: "OBSERVED",
+                            liquidityUsd: "OBSERVED",
+                            marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+                            lmcRatio: "DERIVED",
+                            lpBurnPct: "OBSERVED",
+                            spotPriceUsd: "OBSERVED",
+                            spotPriceSol: "OBSERVED",
+                            volume5mUsd: "OBSERVED",
+                            txCount5m: "OBSERVED",
+                            buys5m: "OBSERVED",
+                            sells5m: "OBSERVED",
+                          },
                         },
                         providerIdentity: candidate.poolId.startsWith("dexscreener")
                           ? "dexscreener"
@@ -1834,6 +2015,13 @@ export async function run(): Promise<void> {
           }
         }
 
+        // 3b. Telemetry Follow-Up Scheduler for Stratified Trackers
+        try {
+          await telemetryFollowUp.pollPendingTrackers(currentNow);
+        } catch (followUpErr) {
+          console.warn("[PaperDaemon] Telemetry follow-up polling error:", followUpErr);
+        }
+
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     };
@@ -1870,9 +2058,11 @@ export async function run(): Promise<void> {
         generationId: "gen-01-legacy-baseline",
         strategyRevision: telemetryMeta.strategyRevision,
         startedAtIso: telemetryMeta.startedAtIso,
-        totalCandidatesScreened:
-          telemetryDecisions.getCohortCount("FILTERED_REJECTED") +
-          telemetryDecisions.getCohortCount("WATCHLIST_RADAR"),
+        totalCandidatesScreened: streamEngine.getStats().totalEvaluationsAttempted,
+        totalDecisionsRecorded: telemetryDecisions.getTotalDecisionsCount(),
+        decisionWriteFailures: telemetryStorage.getDecisionWriteFailuresCount(),
+        decisionCallbackErrors: streamEngine.getStats().decisionCallbackErrors,
+        rateShedCount: telemetryRate.getShedCount(),
         cohortBreakdown: {
           filteredRejected: telemetryDecisions.getCohortCount("FILTERED_REJECTED"),
           watchlistRadar: telemetryDecisions.getCohortCount("WATCHLIST_RADAR"),
@@ -1880,8 +2070,8 @@ export async function run(): Promise<void> {
           executedBuy: telemetryDecisions.getCohortCount("EXECUTED_BUY"),
         },
         topRejectionReasons: telemetryDecisions.getRejectionReasonBreakdown(),
-        totalMarketObservationsRecorded: 0,
-        totalStratifiedCandidatesTracked: telemetrySampling.getActiveTrackers().length,
+        totalMarketObservationsRecorded: telemetryStorage.getMarketObservationsCount(),
+        totalStratifiedCandidatesTracked: telemetrySampling.getTotalEverTrackedCount(),
         missedWinnersCount: finalReport.missedWinnersCount,
         avoidedRugsCount: finalReport.avoidedRugsCount,
       });

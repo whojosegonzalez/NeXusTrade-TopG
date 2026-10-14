@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   fsyncSync,
@@ -30,7 +31,7 @@ import type {
 import { resolveStrategyRevision } from "./RevisionHelper.js";
 
 /**
- * Validates and repairs crash-damaged JSONL file boundaries.
+ * Validates and repairs crash-damaged JSONL file boundaries on startup / recovery.
  * If a malformed trailing line or unterminated tail is found at the very end of the file,
  * it quarantines the damaged tail to `<filePath>.corrupt-<timestamp>` and restores a valid
  * newline-terminated append boundary.
@@ -112,34 +113,43 @@ export function repairAndQuarantineDamagedTail<T>(filePath: string): T[] {
   return validRecords;
 }
 
-function appendJsonLine(filePath: string, obj: unknown): void {
-  const dir = path.dirname(filePath);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-
-  // Ensure file append boundary is safe and unbroken before writing
-  repairAndQuarantineDamagedTail(filePath);
-
-  const line = JSON.stringify(obj) + "\n";
-  const fd = openSync(filePath, "a");
-  try {
-    writeFileSync(fd, line, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function readJsonLines<T>(filePath: string): T[] {
-  return repairAndQuarantineDamagedTail<T>(filePath);
-}
-
 export class TelemetryStorageManager {
   private readonly workspaceRoot?: string | undefined;
+  private readonly verifiedFiles = new Set<string>();
+  private marketObservationsCount = 0;
+  private candidateDecisionsCount = 0;
+  private decisionWriteFailuresCount = 0;
 
   constructor(workspaceRoot?: string | undefined) {
     this.workspaceRoot = workspaceRoot;
+  }
+
+  /**
+   * Performs locked/bounded recovery of a file's boundary.
+   * Full scan and quarantine runs only once per file during startup / recovery.
+   */
+  public recoverFileBoundary<T>(filePath: string): T[] {
+    const records = repairAndQuarantineDamagedTail<T>(filePath);
+    this.verifiedFiles.add(filePath);
+    return records;
+  }
+
+  /**
+   * Fast, bounded O(1) append path.
+   * Validates startup integrity once, then ensures trailing newline via single-byte inspection.
+   */
+  private appendJsonLineFast(filePath: string, obj: unknown): void {
+    const dir = path.dirname(filePath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+
+    // Run startup recovery once per file to ensure trailing newline and repair corrupt tails
+    if (!this.verifiedFiles.has(filePath)) {
+      this.recoverFileBoundary(filePath);
+    }
+
+    appendFileSync(filePath, JSON.stringify(obj) + "\n", "utf8");
   }
 
   public initSessionTelemetry(
@@ -152,6 +162,11 @@ export class TelemetryStorageManager {
     if (!existsSync(sessionDir)) {
       mkdirSync(sessionDir, { recursive: true });
     }
+
+    // Recover files for this session on initialization
+    this.recoverFileBoundary(getCanonicalCandidateDecisionsPath(sessionId, this.workspaceRoot));
+    this.recoverFileBoundary(getCanonicalMarketObservationsPath(sessionId, this.workspaceRoot));
+    this.recoverFileBoundary(getCanonicalStratifiedSamplesPath(sessionId, this.workspaceRoot));
 
     const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     if (existsSync(metaPath)) {
@@ -208,37 +223,60 @@ export class TelemetryStorageManager {
   public appendCandidateDecision(record: CandidateDecisionRecord): void {
     validateSessionId(record.sessionId);
     const filePath = getCanonicalCandidateDecisionsPath(record.sessionId, this.workspaceRoot);
-    appendJsonLine(filePath, record);
+    try {
+      this.appendJsonLineFast(filePath, record);
+      this.candidateDecisionsCount++;
+    } catch (err) {
+      this.decisionWriteFailuresCount++;
+      throw err;
+    }
   }
 
   public appendMarketObservation(record: MarketObservationRecord): void {
     validateSessionId(record.sessionId);
     const filePath = getCanonicalMarketObservationsPath(record.sessionId, this.workspaceRoot);
-    appendJsonLine(filePath, record);
+    this.appendJsonLineFast(filePath, record);
+    this.marketObservationsCount++;
   }
 
   public appendStratifiedSample(record: StratifiedSamplingRecord): void {
     validateSessionId(record.sessionId);
     const filePath = getCanonicalStratifiedSamplesPath(record.sessionId, this.workspaceRoot);
-    appendJsonLine(filePath, record);
+    this.appendJsonLineFast(filePath, record);
   }
 
   public readCandidateDecisions(sessionId: string): CandidateDecisionRecord[] {
     validateSessionId(sessionId);
     const filePath = getCanonicalCandidateDecisionsPath(sessionId, this.workspaceRoot);
-    return readJsonLines<CandidateDecisionRecord>(filePath);
+    return repairAndQuarantineDamagedTail<CandidateDecisionRecord>(filePath);
   }
 
   public readMarketObservations(sessionId: string): MarketObservationRecord[] {
     validateSessionId(sessionId);
     const filePath = getCanonicalMarketObservationsPath(sessionId, this.workspaceRoot);
-    return readJsonLines<MarketObservationRecord>(filePath);
+    return repairAndQuarantineDamagedTail<MarketObservationRecord>(filePath);
   }
 
   public readStratifiedSamples(sessionId: string): StratifiedSamplingRecord[] {
     validateSessionId(sessionId);
     const filePath = getCanonicalStratifiedSamplesPath(sessionId, this.workspaceRoot);
-    return readJsonLines<StratifiedSamplingRecord>(filePath);
+    return repairAndQuarantineDamagedTail<StratifiedSamplingRecord>(filePath);
+  }
+
+  public getCandidateDecisionsCount(): number {
+    return this.candidateDecisionsCount;
+  }
+
+  public getMarketObservationsCount(): number {
+    return this.marketObservationsCount;
+  }
+
+  public getDecisionWriteFailures(): number {
+    return this.decisionWriteFailuresCount;
+  }
+
+  public getDecisionWriteFailuresCount(): number {
+    return this.decisionWriteFailuresCount;
   }
 
   public finalizeSessionTelemetry(
@@ -247,16 +285,50 @@ export class TelemetryStorageManager {
   ): SessionTelemetrySummary {
     validateSessionId(sessionId);
     const summaryPath = getCanonicalSessionTelemetrySummaryPath(sessionId, this.workspaceRoot);
+    const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     const closedAtIso = new Date().toISOString();
+
+    // Verify session metadata exists and matches generation
+    if (existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
+        if (meta.generationId !== summaryData.generationId) {
+          throw new Error(
+            `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Cannot finalize session "${sessionId}" with generation "${summaryData.generationId}" when metadata belongs to "${meta.generationId}".`,
+          );
+        }
+      } catch (metaErr) {
+        if (
+          metaErr instanceof Error &&
+          metaErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH")
+        ) {
+          throw metaErr;
+        }
+      }
+    }
 
     if (existsSync(summaryPath)) {
       try {
         const existing = JSON.parse(readFileSync(summaryPath, "utf8")) as SessionTelemetrySummary;
-        if (existing.generationId === summaryData.generationId) {
-          // Idempotent finalization: return existing record
+        if (existing.generationId !== summaryData.generationId) {
+          throw new Error(
+            `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Session summary already exists under generation "${existing.generationId}", cannot overwrite with "${summaryData.generationId}".`,
+          );
+        }
+        // Idempotent return if already finalized with identical core counts
+        if (
+          existing.totalCandidatesScreened === summaryData.totalCandidatesScreened &&
+          existing.totalDecisionsRecorded === summaryData.totalDecisionsRecorded
+        ) {
           return existing;
         }
-      } catch {
+      } catch (parseErr) {
+        if (
+          parseErr instanceof Error &&
+          parseErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH")
+        ) {
+          throw parseErr;
+        }
         // Malformed summary on disk: quarantine before proceeding
         const quarantinePath = `${summaryPath}.corrupt-${Date.now()}`;
         renameSync(summaryPath, quarantinePath);
@@ -280,7 +352,6 @@ export class TelemetryStorageManager {
     renameSync(tempPath, summaryPath);
 
     // Update meta.json with closedAtIso
-    const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     if (existsSync(metaPath)) {
       const currentMeta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
       const updatedMeta: SessionTelemetryMeta = {

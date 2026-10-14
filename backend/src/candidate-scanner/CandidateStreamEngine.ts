@@ -42,7 +42,10 @@ export class CandidateStreamEngine {
     | undefined;
   private readonly seenMints = new Set<string>();
 
-  public readonly stats: CandidateScannerStreamStats = {
+  public readonly stats: CandidateScannerStreamStats & {
+    totalEvaluationsAttempted: number;
+    decisionCallbackErrors: number;
+  } = {
     scannedPools: 0,
     admittedCandidates: 0,
     rejectedMaturity: 0,
@@ -50,7 +53,13 @@ export class CandidateStreamEngine {
     rejectedRug: 0,
     rejectedWashTrade: 0,
     errors: 0,
+    totalEvaluationsAttempted: 0,
+    decisionCallbackErrors: 0,
   };
+
+  public getStats() {
+    return this.stats;
+  }
 
   private isRunning = false;
   private timerId: NodeJS.Timeout | null = null;
@@ -596,6 +605,55 @@ export class CandidateStreamEngine {
     return combined;
   }
 
+  public evaluatePool(
+    pool: ScannedPoolRecord,
+    nowSec: number = Math.floor(Date.now() / 1000),
+  ): CandidateScannerEvaluationResult {
+    this.stats.scannedPools++;
+    this.stats.totalEvaluationsAttempted++;
+    const evalResult = this.evaluator.evaluate(pool, this.config, nowSec);
+
+    if (this.onDecision) {
+      try {
+        this.onDecision(evalResult, pool);
+      } catch (err) {
+        this.stats.decisionCallbackErrors++;
+        console.error("[CandidateStreamEngine] onDecision error:", err);
+      }
+    }
+
+    if (evalResult.admitted && evalResult.candidate) {
+      this.stats.admittedCandidates++;
+      this.seenMints.add(pool.mintAddress);
+      if (this.onCandidate) {
+        this.onCandidate(evalResult.candidate);
+      }
+    } else {
+      switch (evalResult.primaryRejectionReason) {
+        case "REJECTED_OUTSIDE_MATURITY_WINDOW":
+          this.stats.rejectedMaturity++;
+          break;
+        case "REJECTED_IMBALANCED_LIQUIDITY_DEPTH":
+          this.stats.rejectedLmc++;
+          break;
+        case "REJECTED_UNLOCKED_LP_RISK":
+        case "REJECTED_ACTIVE_MINT_AUTHORITY":
+        case "REJECTED_ACTIVE_FREEZE_AUTHORITY":
+          this.stats.rejectedRug++;
+          break;
+        case "REJECTED_INSUFFICIENT_TRANSACTION_COUNT":
+        case "REJECTED_WASH_TRADE_SIZE_ANOMALY":
+        case "REJECTED_NET_SELLER_DOMINANCE":
+          this.stats.rejectedWashTrade++;
+          break;
+        default:
+          break;
+      }
+    }
+
+    return evalResult;
+  }
+
   public async scanOnce(
     nowSec: number = Math.floor(Date.now() / 1000),
   ): Promise<readonly CandidateScannerEvaluationResult[]> {
@@ -610,51 +668,10 @@ export class CandidateStreamEngine {
     const results: CandidateScannerEvaluationResult[] = [];
 
     for (const pool of poolRecords) {
-      this.stats.scannedPools++;
-
       if (this.seenMints.has(pool.mintAddress)) {
         continue;
       }
-
-      const evalResult = this.evaluator.evaluate(pool, this.config, nowSec);
-      results.push(evalResult);
-
-      if (this.onDecision) {
-        try {
-          this.onDecision(evalResult, pool);
-        } catch (err) {
-          console.warn("[CandidateStreamEngine] onDecision error:", err);
-        }
-      }
-
-      if (evalResult.admitted && evalResult.candidate) {
-        this.stats.admittedCandidates++;
-        this.seenMints.add(pool.mintAddress);
-        if (this.onCandidate) {
-          this.onCandidate(evalResult.candidate);
-        }
-      } else {
-        switch (evalResult.primaryRejectionReason) {
-          case "REJECTED_OUTSIDE_MATURITY_WINDOW":
-            this.stats.rejectedMaturity++;
-            break;
-          case "REJECTED_IMBALANCED_LIQUIDITY_DEPTH":
-            this.stats.rejectedLmc++;
-            break;
-          case "REJECTED_UNLOCKED_LP_RISK":
-          case "REJECTED_ACTIVE_MINT_AUTHORITY":
-          case "REJECTED_ACTIVE_FREEZE_AUTHORITY":
-            this.stats.rejectedRug++;
-            break;
-          case "REJECTED_INSUFFICIENT_TRANSACTION_COUNT":
-          case "REJECTED_WASH_TRADE_SIZE_ANOMALY":
-          case "REJECTED_NET_SELLER_DOMINANCE":
-            this.stats.rejectedWashTrade++;
-            break;
-          default:
-            break;
-        }
-      }
+      results.push(this.evaluatePool(pool, nowSec));
     }
 
     return results;

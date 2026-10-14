@@ -118,6 +118,9 @@ export class DecisionContextReconstructor {
     if (latestSpotPriceSol === null) {
       missingSet.add("spotPriceSol");
     }
+    if (latestSpotPriceUsd === null) {
+      missingSet.add("spotPriceUsd");
+    }
 
     // Compute data quality score (0.0 to 1.0)
     let qualityScore = 1.0;

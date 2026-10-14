@@ -16,6 +16,7 @@ export interface RecordDecisionInput {
   readonly symbol: string;
   readonly sourceTimestampMs: number;
   readonly ingestionTimestampMs: number;
+  readonly poolOpenTimeMs?: number | undefined;
   readonly decisionCohort: DecisionCohort;
   readonly primaryRejectionReason?: string | undefined;
   readonly filterEvaluations: readonly FilterEvaluationDetail[];
@@ -47,6 +48,7 @@ export class CandidateDecisionRecorder {
       sourceTimestampMs: input.sourceTimestampMs,
       ingestionTimestampMs: input.ingestionTimestampMs,
       decisionTimestampMs,
+      poolOpenTimeMs: input.poolOpenTimeMs,
       strategyRevision: resolveStrategyRevision(),
       decisionCohort: input.decisionCohort,
       primaryRejectionReason: input.primaryRejectionReason,
@@ -72,6 +74,14 @@ export class CandidateDecisionRecorder {
 
   public getCohortCount(cohort: DecisionCohort): number {
     return this.countsByCohort.get(cohort) ?? 0;
+  }
+
+  public getTotalDecisionsCount(): number {
+    let total = 0;
+    for (const v of this.countsByCohort.values()) {
+      total += v;
+    }
+    return total;
   }
 
   public getCohortBreakdown(): Record<DecisionCohort, number> {
