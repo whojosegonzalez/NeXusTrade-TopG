@@ -223,6 +223,70 @@ describe("Phase 12.94-A GenerationsRegistry & Path Confinement", () => {
 
       rmSync(tempDir, { recursive: true, force: true });
     });
+
+    it("never overwrites or replaces an existing multi-generation registry on repeat bootstrap (V2-02)", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "gen-test2-no-overwrite-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+
+      const registryPath = getCanonicalGenerationsRegistryPath(tempDir);
+      const multiGenRegistry: GenerationsRegistry = {
+        version: 1,
+        activeGenerationId: "gen-02-quote-aware",
+        generations: {
+          [GEN_01_BASELINE_ID]: {
+            generationId: GEN_01_BASELINE_ID,
+            label: "Phase 12.93 Baseline Continuous Wallet (Frozen)",
+            status: "ARCHIVED",
+            createdAtIso: "2026-10-13T17:00:00.000Z",
+            archivedAtIso: "2026-10-14T00:00:00.000Z",
+            initialBalanceSol: 10.0,
+            currentBalanceSol: 7.9259,
+            totalSessionsCompleted: 7,
+            lifetimeRealizedPnlSol: -2.074,
+            baselineSnapshotSha256: GEN_01_BASELINE_HASH,
+            walletSnapshotSha256: GEN_01_BASELINE_HASH,
+            settledSessionIds: ["session-1"],
+            unresolvedTokensCount: 0,
+            note: "Preserved Gen 1 baseline",
+          },
+          "gen-02-quote-aware": {
+            generationId: "gen-02-quote-aware",
+            label: "Generation 2 Quote-Aware",
+            status: "ACTIVE",
+            createdAtIso: "2026-10-14T00:00:00.000Z",
+            initialBalanceSol: 10.0,
+            currentBalanceSol: 10.0,
+            totalSessionsCompleted: 0,
+            lifetimeRealizedPnlSol: 0.0,
+            baselineSnapshotSha256:
+              "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            walletSnapshotSha256:
+              "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            settledSessionIds: [],
+            unresolvedTokensCount: 0,
+            note: "Active Gen 2 research lineage",
+          },
+        },
+        updatedAtIso: "2026-10-14T00:00:00.000Z",
+      };
+
+      // Write multi-gen registry directly
+      saveGenerationsRegistry(multiGenRegistry, tempDir);
+      const originalBytes = readFileSync(registryPath, "utf8");
+
+      // Attempt repeat bootstrap
+      const result = bootstrapGenerationsRegistry({ workspaceRoot: tempDir });
+
+      // Must return existing multi-gen registry without modifying disk content
+      expect(result.activeGenerationId).toBe("gen-02-quote-aware");
+      expect(result.generations["gen-02-quote-aware"]).toBeDefined();
+      expect(result.generations[GEN_01_BASELINE_ID]?.status).toBe("ARCHIVED");
+
+      const afterBytes = readFileSync(registryPath, "utf8");
+      expect(afterBytes).toBe(originalBytes);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -398,6 +462,33 @@ describe("Phase 12.94-A GenerationsRegistry & Path Confinement", () => {
           expectedGenerationId: "gen-02-quote-aware",
         }),
       ).toThrow(/\[GENERATION_MISMATCH\].*untagged.*expected 'gen-02-quote-aware'/);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("fails closed with FATAL_WALLET_MISSING when generation wallet is missing and creates zero files (V2-01)", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "gen-test4-missing-wallet-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+
+      const missingWalletPath = path.join(
+        tempDir,
+        ".tmp",
+        "generations",
+        "gen-02-quote-aware",
+        "virtual-wallet.json",
+      );
+      expect(existsSync(missingWalletPath)).toBe(false);
+
+      expect(() =>
+        loadVirtualWallet(missingWalletPath, {
+          expectedGenerationId: "gen-02-quote-aware",
+        }),
+      ).toThrow(
+        /\[VirtualWallet\] \[FATAL_WALLET_MISSING\].*Virtual wallet missing.*expected generation 'gen-02-quote-aware'/,
+      );
+
+      // Verify no default 10 SOL wallet file was created on disk
+      expect(existsSync(missingWalletPath)).toBe(false);
 
       rmSync(tempDir, { recursive: true, force: true });
     });

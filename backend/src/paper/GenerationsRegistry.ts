@@ -394,7 +394,6 @@ export function loadGenerationsRegistry(workspaceRoot?: string): GenerationsRegi
 
 export interface BootstrapRegistryOptions {
   workspaceRoot?: string;
-  force?: boolean;
   expectedBaselineHash?: string;
   lockHandle?: ProcessLockHandle;
 }
@@ -404,6 +403,11 @@ export interface BootstrapRegistryOptions {
  * Verifies canonical wallet, checks baseline hash, enforces process lock,
  * and writes the initial Generation 1 registry.
  * Strictly idempotent: safe to call repeatedly.
+ *
+ * SAFETY GUARANTEE (V2-02):
+ * - Rechecks registry existence AFTER acquiring exclusive process lock.
+ * - NEVER overwrites or resets an existing registry.
+ * - Destructive reinitialization is prohibited.
  */
 export function bootstrapGenerationsRegistry(
   options?: BootstrapRegistryOptions,
@@ -411,12 +415,7 @@ export function bootstrapGenerationsRegistry(
   const workspaceRoot = options?.workspaceRoot;
   const registryPath = getCanonicalGenerationsRegistryPath(workspaceRoot);
 
-  // Idempotency: if already initialized and not forced, return valid registry
-  if (existsSync(registryPath) && !options?.force) {
-    return loadGenerationsRegistry(workspaceRoot);
-  }
-
-  // Acquire exclusive process lock if not supplied by caller
+  // Acquire exclusive process lock before any state inspection or writes
   let lockHandle = options?.lockHandle;
   let ownsLock = false;
   if (!lockHandle) {
@@ -429,6 +428,11 @@ export function bootstrapGenerationsRegistry(
   }
 
   try {
+    // Recheck registry existence AFTER acquiring the lock to eliminate check-before-lock races (V2-02)
+    if (existsSync(registryPath)) {
+      return loadGenerationsRegistry(workspaceRoot);
+    }
+
     const canonicalWallet = getCanonicalWalletPath(workspaceRoot);
     const gen1Meta = buildGeneration1Metadata(canonicalWallet, options?.expectedBaselineHash);
 
@@ -452,6 +456,12 @@ export function bootstrapGenerationsRegistry(
 
 /**
  * Saves registry atomically with schema validation and fsync durability.
+ *
+ * DEFERRED GATE (Subphase 12.94-E / V2-03):
+ * General live registry mutations during multi-generation lifecycle (activation, cutover, archiving)
+ * MUST enforce verified exclusive process lock ownership, transition intent logging, and crash recovery.
+ * In Subphase 12.94-A, saveGenerationsRegistry is invoked strictly during locked bootstrap and
+ * isolated test fixtures; autonomous live mutations remain prohibited.
  */
 export function saveGenerationsRegistry(
   registry: GenerationsRegistry,

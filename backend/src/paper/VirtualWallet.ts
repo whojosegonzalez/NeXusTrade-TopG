@@ -165,6 +165,15 @@ export function loadVirtualWallet(
       );
     }
   }
+
+  // V2-01: When an explicit generation identity is expected, a missing wallet must fail closed immediately.
+  if (options?.expectedGenerationId) {
+    const validExpected = validateGenerationId(options.expectedGenerationId);
+    throw new Error(
+      `[VirtualWallet] [FATAL_WALLET_MISSING] Virtual wallet missing at ${filePath} for expected generation '${validExpected}'. Refusing to return default unprovisioned wallet.`,
+    );
+  }
+
   const root = findWorkspaceRoot();
   const pastSessionsExist = customPath
     ? existsSync(path.join(path.dirname(customPath), "past-sessions.json")) ||
