@@ -147,6 +147,22 @@ export class CandidateStreamEngine {
         const buys5m = 18;
         const sells5m = 12;
 
+        const metricProvenance: Record<
+          string,
+          "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE"
+        > = {
+          tokenAgeSec: openTimeSec > 0 ? "OBSERVED" : "UNAVAILABLE",
+          liquidityUsd: liquidityUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+          marketCapUsd: "DERIVED",
+          lmcRatio: "DERIVED",
+          lpBurnPct: typeof p.burnPercent === "number" ? "OBSERVED" : "PLACEHOLDER",
+          spotPriceUsd: spotPriceUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+          volume5mUsd: dayVol > 0 ? "DERIVED" : "PLACEHOLDER",
+          txCount5m: "PLACEHOLDER",
+          buys5m: "PLACEHOLDER",
+          sells5m: "PLACEHOLDER",
+        };
+
         records.push({
           poolId: p.id,
           mintAddress: targetMint.address,
@@ -165,6 +181,7 @@ export class CandidateStreamEngine {
           sells5m,
           spotPriceUsd,
           fetchedAt: nowIso,
+          metricProvenance,
         });
       }
 
@@ -226,37 +243,65 @@ export class CandidateStreamEngine {
 
       const liquidityUsd =
         typeof primaryPair.liquidity?.usd === "number" ? primaryPair.liquidity.usd : 0;
-      const spotPriceUsd = primaryPair.priceUsd
-        ? parseFloat(primaryPair.priceUsd)
-        : primaryPair.priceNative
-          ? parseFloat(primaryPair.priceNative) * 140
-          : 0;
+      const spotPriceUsd = primaryPair.priceUsd ? parseFloat(primaryPair.priceUsd) : 0;
+      const parsedSpotPriceSol = primaryPair.priceNative
+        ? parseFloat(primaryPair.priceNative)
+        : null;
+      const spotPriceSol =
+        parsedSpotPriceSol !== null && Number.isFinite(parsedSpotPriceSol) && parsedSpotPriceSol > 0
+          ? parsedSpotPriceSol
+          : null;
 
       // Discard ghost tokens with zero liquidity or missing/non-positive price
       if (liquidityUsd <= 0 || !Number.isFinite(spotPriceUsd) || spotPriceUsd <= 0) {
         return null;
       }
 
-      const marketCapUsd =
-        typeof primaryPair.marketCap === "number" && primaryPair.marketCap > 0
-          ? primaryPair.marketCap
-          : typeof primaryPair.fdv === "number" && primaryPair.fdv > 0
-            ? primaryPair.fdv
-            : liquidityUsd * 4.5;
+      const isMarketCapObserved =
+        typeof primaryPair.marketCap === "number" && primaryPair.marketCap > 0;
+      const isMarketCapFdv =
+        !isMarketCapObserved && typeof primaryPair.fdv === "number" && primaryPair.fdv > 0;
+      const marketCapUsd = isMarketCapObserved
+        ? primaryPair.marketCap!
+        : isMarketCapFdv
+          ? primaryPair.fdv!
+          : liquidityUsd * 4.5;
 
       const nowSec = Math.floor(Date.now() / 1000);
-      const openTimeSec = primaryPair.pairCreatedAt
-        ? Math.floor(primaryPair.pairCreatedAt / 1000)
+      const isOpenTimeObserved = !!primaryPair.pairCreatedAt;
+      const openTimeSec = isOpenTimeObserved
+        ? Math.floor(primaryPair.pairCreatedAt! / 1000)
         : nowSec - 450;
 
-      const volume5mUsd = typeof primaryPair.volume?.m5 === "number" ? primaryPair.volume.m5 : 0;
-      const buys5m = primaryPair.txns?.m5?.buys ?? 0;
-      const sells5m = primaryPair.txns?.m5?.sells ?? 0;
+      const hasVolume5m = typeof primaryPair.volume?.m5 === "number";
+      const volume5mUsd = hasVolume5m ? primaryPair.volume!.m5! : 0;
+
+      const hasBuys5m = primaryPair.txns?.m5?.buys !== undefined;
+      const hasSells5m = primaryPair.txns?.m5?.sells !== undefined;
+      const buys5m = hasBuys5m ? primaryPair.txns!.m5!.buys! : 0;
+      const sells5m = hasSells5m ? primaryPair.txns!.m5!.sells! : 0;
       const txCount5m = buys5m + sells5m;
 
       const symbol = primaryPair.baseToken?.symbol?.trim() || "UNKNOWN";
       const baseMint =
         primaryPair.quoteToken?.address ?? "So11111111111111111111111111111111111111112";
+
+      const metricProvenance: Record<
+        string,
+        "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE"
+      > = {
+        tokenAgeSec: isOpenTimeObserved ? "OBSERVED" : "PLACEHOLDER",
+        liquidityUsd: "OBSERVED",
+        marketCapUsd: isMarketCapObserved ? "OBSERVED" : "DERIVED",
+        lmcRatio: "DERIVED",
+        lpBurnPct: "PLACEHOLDER",
+        spotPriceUsd: primaryPair.priceUsd ? "OBSERVED" : "UNAVAILABLE",
+        spotPriceSol: spotPriceSol !== null ? "OBSERVED" : "UNAVAILABLE",
+        volume5mUsd: hasVolume5m ? "OBSERVED" : "UNAVAILABLE",
+        txCount5m: hasBuys5m || hasSells5m ? "OBSERVED" : "UNAVAILABLE",
+        buys5m: hasBuys5m ? "OBSERVED" : "UNAVAILABLE",
+        sells5m: hasSells5m ? "OBSERVED" : "UNAVAILABLE",
+      };
 
       return {
         poolId: primaryPair.pairAddress
@@ -277,7 +322,9 @@ export class CandidateStreamEngine {
         buys5m,
         sells5m,
         spotPriceUsd,
+        spotPriceSol,
         fetchedAt: new Date().toISOString(),
+        metricProvenance,
       };
     } catch {
       return null;
@@ -456,6 +503,22 @@ export class CandidateStreamEngine {
         const buys5m = 18;
         const sells5m = 12;
 
+        const metricProvenance: Record<
+          string,
+          "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE"
+        > = {
+          tokenAgeSec: openTimeSec > 0 ? "OBSERVED" : "UNAVAILABLE",
+          liquidityUsd: liquidityUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+          marketCapUsd: "DERIVED",
+          lmcRatio: "DERIVED",
+          lpBurnPct: typeof p.burnPercent === "number" ? "OBSERVED" : "PLACEHOLDER",
+          spotPriceUsd: spotPriceUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+          volume5mUsd: dayVol > 0 ? "DERIVED" : "PLACEHOLDER",
+          txCount5m: "PLACEHOLDER",
+          buys5m: "PLACEHOLDER",
+          sells5m: "PLACEHOLDER",
+        };
+
         records.push({
           poolId: p.id,
           mintAddress: targetMint.address,
@@ -474,6 +537,7 @@ export class CandidateStreamEngine {
           sells5m,
           spotPriceUsd,
           fetchedAt: nowIso,
+          metricProvenance,
         });
       }
 

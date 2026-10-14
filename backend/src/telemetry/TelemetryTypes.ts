@@ -76,7 +76,12 @@ export interface MarketObservationRecord {
   readonly responseReceivedMs?: number | undefined;
   readonly dataFreshnessMs: number;
   readonly measurementWindow: MeasurementWindow;
-  readonly derivationStatus?: "RAW" | "DERIVED_FROM_5M" | "DERIVED_FROM_1H" | undefined;
+  readonly derivationStatus?:
+    | "RAW"
+    | "DERIVED_FROM_5M"
+    | "DERIVED_FROM_1H"
+    | "DIRECT_OBSERVATION"
+    | undefined;
   readonly providerIdentity: string;
   readonly actualResponsePoolId?: string | undefined;
   readonly priceMetrics: {
@@ -85,16 +90,16 @@ export interface MarketObservationRecord {
     readonly priceSource: PriceSourceType;
   };
   readonly liquidityMetrics: {
-    readonly baseReserve: number;
-    readonly quoteReserve: number;
-    readonly liquidityUsd: number;
+    readonly baseReserve: number | null;
+    readonly quoteReserve: number | null;
+    readonly liquidityUsd: number | null;
   };
   readonly flowMetrics: {
-    readonly txCount: number;
-    readonly buys: number;
-    readonly sells: number;
-    readonly volumeUsd: number;
-    readonly netBuyerVolumeUsd: number;
+    readonly txCount: number | null;
+    readonly buys: number | null;
+    readonly sells: number | null;
+    readonly volumeUsd: number | null;
+    readonly netBuyerVolumeUsd: number | null;
   };
   readonly holderMetrics?:
     | {
@@ -141,12 +146,12 @@ export interface StratifiedSamplingRecord {
   readonly lastObservationMs?: number | undefined;
   readonly currentSamplingIntervalMs: number;
   readonly observationCount: number;
-  readonly initialPriceSol: number;
-  readonly peakPriceSol: number;
+  readonly initialPriceSol: number | null;
+  readonly peakPriceSol: number | null;
   readonly peakGainPct: number;
-  readonly troughPriceSol: number;
+  readonly troughPriceSol: number | null;
   readonly maxDrawdownPct: number;
-  readonly latestPriceSol: number;
+  readonly latestPriceSol: number | null;
   readonly status: StratifiedSamplingStatus;
   readonly promotedFromTier?: StratificationTier | undefined;
   readonly promotedAtMs?: number | undefined;
@@ -172,6 +177,9 @@ export interface SessionTelemetrySummary {
   readonly startedAtIso: string;
   readonly closedAtIso: string;
   readonly totalCandidatesScreened: number;
+  readonly totalScannerDecisionsRecorded?: number | undefined;
+  readonly totalTriggerDecisionsRecorded?: number | undefined;
+  readonly totalExecutedBuyDecisionsRecorded?: number | undefined;
   readonly totalDecisionsRecorded: number;
   readonly decisionWriteFailures: number;
   readonly decisionCallbackErrors?: number | undefined;

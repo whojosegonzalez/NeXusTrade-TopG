@@ -72,6 +72,39 @@ export class CandidateDecisionRecorder {
     return record;
   }
 
+  public syncFromStorage(sessionId: string): void {
+    const records = this.storage.readCandidateDecisions(sessionId);
+    this.countsByCohort.clear();
+    this.countsByReason.clear();
+    for (const rec of records) {
+      this.countsByCohort.set(
+        rec.decisionCohort,
+        (this.countsByCohort.get(rec.decisionCohort) ?? 0) + 1,
+      );
+      if (rec.primaryRejectionReason) {
+        this.countsByReason.set(
+          rec.primaryRejectionReason,
+          (this.countsByReason.get(rec.primaryRejectionReason) ?? 0) + 1,
+        );
+      }
+    }
+  }
+
+  public getScannerDecisionsCount(): number {
+    return (
+      (this.countsByCohort.get("FILTERED_REJECTED") ?? 0) +
+      (this.countsByCohort.get("WATCHLIST_RADAR") ?? 0)
+    );
+  }
+
+  public getTriggerDecisionsCount(): number {
+    return this.countsByCohort.get("TRIGGER_REJECTED") ?? 0;
+  }
+
+  public getExecutedBuyDecisionsCount(): number {
+    return this.countsByCohort.get("EXECUTED_BUY") ?? 0;
+  }
+
   public getCohortCount(cohort: DecisionCohort): number {
     return this.countsByCohort.get(cohort) ?? 0;
   }

@@ -17,7 +17,12 @@ export interface RecordObservationInput {
   readonly requestInitiatedMs?: number | undefined;
   readonly responseReceivedMs?: number | undefined;
   readonly measurementWindow: MeasurementWindow;
-  readonly derivationStatus?: "RAW" | "DERIVED_FROM_5M" | "DERIVED_FROM_1H" | undefined;
+  readonly derivationStatus?:
+    | "RAW"
+    | "DERIVED_FROM_5M"
+    | "DERIVED_FROM_1H"
+    | "DIRECT_OBSERVATION"
+    | undefined;
   readonly providerIdentity: string;
   readonly actualResponsePoolId?: string | undefined;
   readonly priceMetrics: {
@@ -26,16 +31,16 @@ export interface RecordObservationInput {
     readonly priceSource: PriceSourceType;
   };
   readonly liquidityMetrics: {
-    readonly baseReserve: number;
-    readonly quoteReserve: number;
-    readonly liquidityUsd: number;
+    readonly baseReserve: number | null;
+    readonly quoteReserve: number | null;
+    readonly liquidityUsd: number | null;
   };
   readonly flowMetrics: {
-    readonly txCount: number;
-    readonly buys: number;
-    readonly sells: number;
-    readonly volumeUsd: number;
-    readonly netBuyerVolumeUsd: number;
+    readonly txCount: number | null;
+    readonly buys: number | null;
+    readonly sells: number | null;
+    readonly volumeUsd: number | null;
+    readonly netBuyerVolumeUsd: number | null;
   };
   readonly holderMetrics?:
     | {

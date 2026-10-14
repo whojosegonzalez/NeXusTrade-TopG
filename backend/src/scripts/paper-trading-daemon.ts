@@ -52,7 +52,6 @@ import {
   loadVirtualWallet,
   saveVirtualWallet,
   settleSessionInWallet,
-  type VirtualWalletState,
 } from "../paper/VirtualWallet.js";
 import { acquireProcessLock, releaseProcessLock } from "../paper/ProcessLock.js";
 import {
@@ -68,7 +67,6 @@ import {
   getCanonicalPastSessionsPath,
   getCanonicalSessionFilePath,
   getCanonicalSessionsDir,
-  getCanonicalWalletPath,
 } from "../paper/CanonicalPaths.js";
 import {
   TelemetryStorageManager,
@@ -124,6 +122,12 @@ export function parseCliArgs(args: string[] = process.argv.slice(2)): ParsedDaem
   if (dryRun && resetWallet) {
     throw new Error(
       `[PaperDaemon] [INVALID_CONFIG] Conflicting arguments: --dry-run cannot be combined with --reset-wallet.`,
+    );
+  }
+
+  if (resetWallet) {
+    throw new Error(
+      `[PaperDaemon] [FATAL_OPERATION_DISABLED] --reset-wallet is permanently disabled to protect continuous wallet balance continuity across generations. Use canonical wallet migration or generation registry procedures.`,
     );
   }
 
@@ -202,11 +206,28 @@ export function parseCliArgs(args: string[] = process.argv.slice(2)): ParsedDaem
   };
 }
 
+interface DexScreenerRawProviderMetrics {
+  readonly volume5mUsd: number | null;
+  readonly volume1hUsd: number | null;
+  readonly buys5m: number | null;
+  readonly sells5m: number | null;
+  readonly txCount5m: number | null;
+  readonly buys1h: number | null;
+  readonly sells1h: number | null;
+  readonly baseReserve: number | null;
+  readonly quoteReserve: number | null;
+  readonly liquidityUsd: number | null;
+  readonly measurementWindowSec: number;
+  readonly derivationStatus: "DIRECT" | "DERIVED_FROM_1H";
+}
+
 interface DexScreenerSpotInfo {
   readonly spotPriceSol: number;
-  readonly spotPriceUsd: number;
-  readonly liquiditySol: number;
-  readonly liquidityUsd: number;
+  readonly spotPriceUsd: number | null;
+  readonly liquiditySol: number | null;
+  readonly liquidityUsd: number | null;
+  readonly baseReserve: number | null;
+  readonly quoteReserve: number | null;
   readonly buyVolume5mSol: number;
   readonly sellVolume5mSol: number;
   readonly recentBuys60s: number;
@@ -214,12 +235,17 @@ interface DexScreenerSpotInfo {
   readonly recentTransactionsCount: number;
   readonly momentum5mBps: number;
   readonly priceChange1hPct: number;
-  readonly requestInitiatedMs?: number | undefined;
-  readonly responseReceivedMs?: number | undefined;
+  readonly requestInitiatedMs: number;
+  readonly responseReceivedMs: number;
+  readonly sourceTimestampMs: number;
   readonly actualResponsePoolId?: string | undefined;
+  readonly rawProviderMetrics: DexScreenerRawProviderMetrics;
 }
 
-async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreenerSpotInfo | null> {
+async function fetchDexScreenerSpotInfo(
+  mintAddress: string,
+  expectedPoolId?: string,
+): Promise<DexScreenerSpotInfo | null> {
   const url = `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mintAddress)}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
@@ -234,8 +260,8 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
         quoteToken?: { symbol?: string; address?: string };
         priceNative?: string;
         priceUsd?: string;
-        liquidity?: { usd?: number; quote?: number };
-        volume?: { m5?: number };
+        liquidity?: { usd?: number; quote?: number; base?: number };
+        volume?: { m5?: number; h1?: number };
         txns?: {
           m5?: { buys?: number; sells?: number };
           h1?: { buys?: number; sells?: number };
@@ -255,37 +281,67 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
 
     if (validSolPairs.length === 0) return null;
 
-    // Sort by highest USD liquidity to guarantee canonical pool
-    validSolPairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
-    const solPair = validSolPairs[0];
+    // If expectedPoolId is provided, attempt to locate the exact tracked pool
+    let solPair = validSolPairs[0];
+    if (expectedPoolId) {
+      const normExpected = expectedPoolId.replace(/^dexscreener-/, "");
+      const matched = validSolPairs.find(
+        (p) => p.pairAddress === normExpected || p.pairAddress === expectedPoolId,
+      );
+      if (matched) {
+        solPair = matched;
+      }
+    } else {
+      // Otherwise sort by highest USD liquidity
+      validSolPairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+      solPair = validSolPairs[0];
+    }
+
     if (!solPair?.priceNative) return null;
 
     const spotPriceSol = parseFloat(solPair.priceNative);
     if (!Number.isFinite(spotPriceSol) || spotPriceSol <= 0) return null;
 
-    const spotPriceUsd = solPair.priceUsd ? parseFloat(solPair.priceUsd) : 0;
-    const liquidityUsd = solPair.liquidity?.usd ?? 0;
-    const liquiditySol =
-      solPair.liquidity?.quote ?? (solPair.liquidity?.usd ? solPair.liquidity.usd / 140 : 100);
-    const m5Vol = solPair.volume?.m5 ?? 0;
+    const spotPriceUsd = solPair.priceUsd ? parseFloat(solPair.priceUsd) : null;
+    const liquidityUsd = typeof solPair.liquidity?.usd === "number" ? solPair.liquidity.usd : null;
+    const baseReserve = typeof solPair.liquidity?.base === "number" ? solPair.liquidity.base : null;
+    const quoteReserve =
+      typeof solPair.liquidity?.quote === "number" ? solPair.liquidity.quote : null;
+
+    // Raw provider metrics
+    const hasM5Txns = solPair.txns?.m5?.buys !== undefined || solPair.txns?.m5?.sells !== undefined;
+    const buys5m = solPair.txns?.m5?.buys ?? null;
+    const sells5m = solPair.txns?.m5?.sells ?? null;
+    const txCount5m = buys5m !== null && sells5m !== null ? buys5m + sells5m : null;
+    const volume5mUsd = typeof solPair.volume?.m5 === "number" ? solPair.volume.m5 : null;
+    const volume1hUsd = typeof solPair.volume?.h1 === "number" ? solPair.volume.h1 : null;
+    const buys1h = solPair.txns?.h1?.buys ?? null;
+    const sells1h = solPair.txns?.h1?.sells ?? null;
+    const measurementWindowSec = hasM5Txns || volume5mUsd !== null ? 300 : 3600;
+    const derivationStatus: "DIRECT" | "DERIVED_FROM_1H" = hasM5Txns ? "DIRECT" : "DERIVED_FROM_1H";
+
+    const rawProviderMetrics: DexScreenerRawProviderMetrics = {
+      volume5mUsd,
+      volume1hUsd,
+      buys5m,
+      sells5m,
+      txCount5m,
+      buys1h,
+      sells1h,
+      baseReserve,
+      quoteReserve,
+      liquidityUsd,
+      measurementWindowSec,
+      derivationStatus,
+    };
+
+    // Strategy-internal estimates (preserved strictly for internal trading thresholds):
+    const liquiditySol = quoteReserve ?? (liquidityUsd ? liquidityUsd / 140 : 100);
+    const m5Vol = volume5mUsd ?? 0;
     const buyVolSol = (m5Vol / 140) * 0.6;
     const sellVolSol = (m5Vol / 140) * 0.4;
-    // Phase 12.91 Deliverable 3: 3-Tier Defensive Real-Flow Defaults (Zero Phantom Buyers)
-    // Tier 1: Real 5m counts. Tier 2: 1h counts scaled down (/ 12). Tier 3: 0/0 conservative defaults.
-    const buys5m =
-      solPair.txns?.m5?.buys !== undefined
-        ? solPair.txns.m5.buys
-        : solPair.txns?.h1?.buys !== undefined
-          ? Math.round(solPair.txns.h1.buys / 12)
-          : 0;
-    const sells5m =
-      solPair.txns?.m5?.sells !== undefined
-        ? solPair.txns.m5.sells
-        : solPair.txns?.h1?.sells !== undefined
-          ? Math.round(solPair.txns.h1.sells / 12)
-          : 0;
-    const recentBuys60s = Math.round(buys5m / 5);
-    const recentSells60s = Math.round(sells5m / 5);
+    const recentBuys60s = Math.round((buys5m ?? (buys1h ? Math.round(buys1h / 12) : 0)) / 5);
+    const recentSells60s = Math.round((sells5m ?? (sells1h ? Math.round(sells1h / 12) : 0)) / 5);
     const momentum5mBps = solPair.priceChange?.m5 ? Math.round(solPair.priceChange.m5 * 100) : 0;
     const priceChange1hPct =
       solPair.priceChange?.h1 !== undefined && Number.isFinite(solPair.priceChange.h1)
@@ -297,16 +353,20 @@ async function fetchDexScreenerSpotInfo(mintAddress: string): Promise<DexScreene
       spotPriceUsd,
       liquiditySol,
       liquidityUsd,
+      baseReserve,
+      quoteReserve,
       buyVolume5mSol: buyVolSol,
       sellVolume5mSol: sellVolSol,
       recentBuys60s,
       recentSells60s,
-      recentTransactionsCount: buys5m + sells5m,
+      recentTransactionsCount: (buys5m ?? 0) + (sells5m ?? 0),
       momentum5mBps,
       priceChange1hPct,
       requestInitiatedMs,
       responseReceivedMs,
+      sourceTimestampMs: responseReceivedMs,
       actualResponsePoolId: solPair.pairAddress ?? undefined,
+      rawProviderMetrics,
     };
   } catch {
     return null;
@@ -373,31 +433,10 @@ export async function run(): Promise<void> {
   });
 
   try {
-    // Perform wallet reset strictly under exclusive lock if requested (E8-02)
+    // Destructive wallet reset is permanently disabled to protect canonical wallet lineage (7.9259 SOL)
     if (args.resetWallet) {
-      const walletPath = getCanonicalWalletPath();
-      if (existsSync(walletPath)) {
-        const backupPath = `${walletPath}.reset-${Date.now()}`;
-        try {
-          copyFileSync(walletPath, backupPath);
-          console.log(`[PaperDaemon] [WALLET_BACKUP] Prior wallet backed up to ${backupPath}`);
-        } catch (err) {
-          console.warn(`[PaperDaemon] [WALLET_BACKUP_WARN] Failed to create backup:`, err);
-        }
-      }
-      const vWallet: VirtualWalletState = {
-        walletAddress: "SimulatedVirtualWallet111111111111111111111111",
-        currentBalanceSol: 10.0,
-        initialBalanceSol: 10.0,
-        totalSessionsCompleted: 0,
-        allTimeRealizedPnlSol: 0.0,
-        lastUpdatedMs: Date.now(),
-        settledSessionIds: [],
-        unresolvedTokens: [],
-      };
-      saveVirtualWallet(vWallet);
-      console.log(
-        "[PaperDaemon] [WALLET_RESET] Continuous virtual wallet reinitialized to 10.0000 SOL.",
+      throw new Error(
+        `[PaperDaemon] [FATAL_OPERATION_DISABLED] Destructive wallet reset via --reset-wallet is permanently disabled to protect canonical wallet lineage (7.9259 SOL). Generation lifecycle migrations must be orchestrated via explicit generation management tooling.`,
       );
     }
 
@@ -509,6 +548,7 @@ export async function run(): Promise<void> {
       vWallet.currentBalanceSol,
     );
     const telemetryDecisions = new CandidateDecisionRecorder(telemetryStorage);
+    telemetryDecisions.syncFromStorage(sessionId);
     const telemetryObservations = new MarketObservationRecorder(telemetryStorage);
     const telemetrySampling = new StratifiedSamplingController(telemetryStorage);
     const telemetryRate = new TelemetryRateController();
@@ -517,19 +557,23 @@ export async function run(): Promise<void> {
       telemetryObservations,
       telemetrySampling,
       telemetryRate,
-      async (_poolId: string, mintAddress: string) => {
-        const spot = await fetchDexScreenerSpotInfo(mintAddress);
+      async (poolId: string, mintAddress: string) => {
+        const spot = await fetchDexScreenerSpotInfo(mintAddress, poolId);
         if (!spot) return null;
         return {
           spotPriceUsd: spot.spotPriceUsd,
           spotPriceSol: spot.spotPriceSol,
-          liquidityUsd: spot.liquidityUsd,
-          txCount: spot.recentTransactionsCount,
-          buys: spot.recentBuys60s,
-          sells: spot.recentSells60s,
-          volumeUsd: 0,
+          liquidityUsd: spot.rawProviderMetrics.liquidityUsd,
+          baseReserve: spot.rawProviderMetrics.baseReserve,
+          quoteReserve: spot.rawProviderMetrics.quoteReserve,
+          txCount: spot.rawProviderMetrics.txCount5m,
+          buys: spot.rawProviderMetrics.buys5m,
+          sells: spot.rawProviderMetrics.sells5m,
+          volumeUsd: spot.rawProviderMetrics.volume5mUsd,
           priceSource: "INDEXED_TICK",
           actualPoolId: spot.actualResponsePoolId,
+          measurementWindowSec: spot.rawProviderMetrics.measurementWindowSec,
+          timestampMs: spot.sourceTimestampMs,
         };
       },
     );
@@ -547,10 +591,15 @@ export async function run(): Promise<void> {
             lmcRatio: pool.marketCapUsd > 0 && pool.liquidityUsd > 0 ? "DERIVED" : "UNAVAILABLE",
             lpBurnPct: pool.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
             spotPriceUsd: pool.spotPriceUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+            spotPriceSol:
+              pool.spotPriceSol !== undefined && pool.spotPriceSol !== null && pool.spotPriceSol > 0
+                ? "OBSERVED"
+                : "UNAVAILABLE",
             volume5mUsd: pool.volume5mUsd !== undefined ? "OBSERVED" : "UNAVAILABLE",
             txCount5m: pool.txCount5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
             buys5m: pool.buys5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
             sells5m: pool.sells5m !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            ...(pool.metricProvenance ?? {}),
           };
           const metricsSnapshot = {
             tokenAgeSec: pool.openTimeSec > 0 ? Math.max(0, nowSec - pool.openTimeSec) : 0,
@@ -559,6 +608,7 @@ export async function run(): Promise<void> {
             lmcRatio: pool.marketCapUsd > 0 ? pool.liquidityUsd / pool.marketCapUsd : 0,
             lpBurnPct: pool.lpBurnPct,
             spotPriceUsd: pool.spotPriceUsd,
+            spotPriceSol: pool.spotPriceSol ?? null,
             volume5mUsd: pool.volume5mUsd,
             txCount5m: pool.txCount5m,
             buys5m: pool.buys5m,
@@ -587,8 +637,7 @@ export async function run(): Promise<void> {
             metricsSnapshot,
             providerIdentity: pool.poolId.startsWith("dexscreener") ? "dexscreener" : "raydium",
           });
-          const solPrice = pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
-          telemetrySampling.evaluateForTracking(decRecord, solPrice);
+          telemetrySampling.evaluateForTracking(decRecord, pool.spotPriceSol ?? null);
         } catch (err) {
           console.warn("[PaperDaemon] Telemetry decision recording error:", err);
         }
@@ -639,16 +688,32 @@ export async function run(): Promise<void> {
         lmcRatio: number;
       },
       reason: string,
-      spotSol: number,
-      spotUsd: number,
-      liqUsd: number,
-      recentBuys60s: number,
-      recentSells60s: number,
+      spotSol: number | null,
+      spotUsd: number | null,
+      liqUsd: number | null,
+      recentBuys60s: number | null,
+      recentSells60s: number | null,
       filterName: string = "BuyGate",
       currentTimestampMs: number = nowMs(),
+      spotInfo?: DexScreenerSpotInfo | null,
     ) => {
-      tracker.recordCandidate(candidate, "FILTERED_REJECTED", spotSol, currentTimestampMs, reason);
+      tracker.recordCandidate(
+        candidate,
+        "FILTERED_REJECTED",
+        spotSol ?? 0,
+        currentTimestampMs,
+        reason,
+      );
       try {
+        const raw = spotInfo?.rawProviderMetrics;
+        const observedTxCount5m = raw?.txCount5m ?? null;
+        const observedBuys5m = raw?.buys5m ?? null;
+        const observedSells5m = raw?.sells5m ?? null;
+        const observedVolume5mUsd = raw?.volume5mUsd ?? candidate.volume5mUsd ?? null;
+        const observedLiqUsd = raw?.liquidityUsd ?? (liqUsd && liqUsd > 0 ? liqUsd : null);
+        const observedSpotUsd = spotUsd && spotUsd > 0 ? spotUsd : null;
+        const observedSpotSol = spotSol && spotSol > 0 ? spotSol : null;
+
         telemetryDecisions.recordDecision({
           sessionId,
           generationId: "gen-01-legacy-baseline",
@@ -674,28 +739,29 @@ export async function run(): Promise<void> {
           ],
           metricsSnapshot: {
             tokenAgeSec: candidate.assetAgeSeconds,
-            liquidityUsd: liqUsd,
+            liquidityUsd: observedLiqUsd,
             marketCapUsd: candidate.marketCapUsd,
             lmcRatio: candidate.lmcRatio,
             lpBurnPct: candidate.lpBurnPct ?? 100,
-            spotPriceUsd: spotUsd > 0 ? spotUsd : null,
-            spotPriceSol: spotSol > 0 ? spotSol : null,
-            volume5mUsd: candidate.volume5mUsd ?? null,
-            txCount5m: recentBuys60s + recentSells60s,
-            buys5m: recentBuys60s * 5,
-            sells5m: recentSells60s * 5,
+            spotPriceUsd: observedSpotUsd,
+            spotPriceSol: observedSpotSol,
+            volume5mUsd: observedVolume5mUsd,
+            txCount5m: observedTxCount5m,
+            buys5m: observedBuys5m,
+            sells5m: observedSells5m,
             metricProvenance: {
-              tokenAgeSec: "OBSERVED",
-              liquidityUsd: liqUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+              tokenAgeSec: candidate.assetAgeSeconds > 0 ? "OBSERVED" : "UNAVAILABLE",
+              liquidityUsd: observedLiqUsd !== null ? "OBSERVED" : "UNAVAILABLE",
               marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
-              lmcRatio: "DERIVED",
-              lpBurnPct: "OBSERVED",
-              spotPriceUsd: spotUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
-              spotPriceSol: spotSol > 0 ? "OBSERVED" : "UNAVAILABLE",
-              volume5mUsd: "OBSERVED",
-              txCount5m: "OBSERVED",
-              buys5m: "DERIVED",
-              sells5m: "DERIVED",
+              lmcRatio:
+                candidate.marketCapUsd > 0 && observedLiqUsd !== null ? "DERIVED" : "UNAVAILABLE",
+              lpBurnPct: candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
+              spotPriceUsd: observedSpotUsd !== null ? "OBSERVED" : "UNAVAILABLE",
+              spotPriceSol: observedSpotSol !== null ? "OBSERVED" : "UNAVAILABLE",
+              volume5mUsd: observedVolume5mUsd !== null ? "OBSERVED" : "UNAVAILABLE",
+              txCount5m: observedTxCount5m !== null ? "OBSERVED" : "UNAVAILABLE",
+              buys5m: observedBuys5m !== null ? "OBSERVED" : "UNAVAILABLE",
+              sells5m: observedSells5m !== null ? "OBSERVED" : "UNAVAILABLE",
             },
           },
           providerIdentity: candidate.poolId.startsWith("dexscreener") ? "dexscreener" : "raydium",
@@ -1150,7 +1216,9 @@ export async function run(): Promise<void> {
               if (result?.action === "SELL_ALL") {
                 const timeStr = new Date(currentNow).toLocaleTimeString();
                 const usdPrice = (
-                  spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+                  spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                    ? spotInfo.spotPriceUsd
+                    : spotInfo.spotPriceSol * 150
                 ).toFixed(6);
                 const pnlPct = (result.diagnostics.currentPnlBps / 100).toFixed(2);
                 const closedTrade = daemon
@@ -1168,7 +1236,9 @@ export async function run(): Promise<void> {
                 );
               } else if (result?.action === "SELL_PARTIAL_50") {
                 const usdPrice = (
-                  spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+                  spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                    ? spotInfo.spotPriceUsd
+                    : spotInfo.spotPriceSol * 150
                 ).toFixed(6);
                 addActivityLog(
                   "RATCHET",
@@ -1181,7 +1251,9 @@ export async function run(): Promise<void> {
                 );
               } else if (result?.action === "SELL_PARTIAL_25") {
                 const usdPrice = (
-                  spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : spotInfo.spotPriceSol * 150
+                  spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                    ? spotInfo.spotPriceUsd
+                    : spotInfo.spotPriceSol * 150
                 ).toFixed(6);
                 const peakGainPct = (result.diagnostics.peakGainBps ?? 0) / 10000;
                 const trailBufferPct = peakGainPct >= 2.0 ? 10 : peakGainPct >= 1.0 ? 15 : 18;
@@ -1319,8 +1391,7 @@ export async function run(): Promise<void> {
             // A. Ingest into Watchlist Service
             for (const pool of rawPools) {
               const admitted = watchlistService.admitOrUpdate(pool, currentNowSec);
-              const initialSolPrice =
-                pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
+              const initialSolPrice = pool.spotPriceSol ?? 0;
               if (admitted) {
                 if (admitted.status === "DROPPED") {
                   tracker.recordCandidate(
@@ -1381,28 +1452,84 @@ export async function run(): Promise<void> {
                         currentNow,
                         "FAILED_BIRDEYE_ENRICHMENT",
                       );
+                      telemetryDecisions.recordDecision({
+                        sessionId,
+                        generationId: "gen-01-legacy-baseline",
+                        mintAddress: token.address,
+                        poolId: `birdeye-trending-${token.address.slice(0, 8)}`,
+                        symbol: token.symbol ?? "UNKNOWN",
+                        sourceTimestampMs: currentNow,
+                        ingestionTimestampMs: currentNow,
+                        decisionCohort: "FILTERED_REJECTED",
+                        primaryRejectionReason: "FAILED_BIRDEYE_ENRICHMENT",
+                        filterEvaluations: [
+                          {
+                            filterName: "DexScreenerEnrichment",
+                            passed: false,
+                            valueObserved: null,
+                            threshold: null,
+                            rejectionReason: "FAILED_BIRDEYE_ENRICHMENT",
+                          },
+                        ],
+                        metricsSnapshot: {
+                          tokenAgeSec: 0,
+                          liquidityUsd: token.liquidity ?? null,
+                          marketCapUsd: null,
+                          lmcRatio: null,
+                          lpBurnPct: null,
+                          spotPriceUsd: token.price ?? null,
+                          spotPriceSol: null,
+                          volume5mUsd: null,
+                          txCount5m: null,
+                          buys5m: null,
+                          sells5m: null,
+                          metricProvenance: {
+                            tokenAgeSec: "UNAVAILABLE",
+                            liquidityUsd: token.liquidity ? "OBSERVED" : "UNAVAILABLE",
+                            marketCapUsd: "UNAVAILABLE",
+                            lmcRatio: "UNAVAILABLE",
+                            lpBurnPct: "UNAVAILABLE",
+                            spotPriceUsd: token.price ? "OBSERVED" : "UNAVAILABLE",
+                            spotPriceSol: "UNAVAILABLE",
+                            volume5mUsd: "UNAVAILABLE",
+                            txCount5m: "UNAVAILABLE",
+                            buys5m: "UNAVAILABLE",
+                            sells5m: "UNAVAILABLE",
+                          },
+                        },
+                        providerIdentity: "birdeye",
+                      });
                       continue;
                     }
 
-                    const admitted = watchlistService.admitOrUpdate(dexRecord, currentNowSec);
-                    if (admitted) {
-                      streamEngine.markMintSeen(token.address);
-                      if (admitted.status === "DROPPED") {
+                    streamEngine.markMintSeen(token.address);
+                    const evalResult = streamEngine.evaluatePool(dexRecord, currentNowSec);
+                    if (evalResult.admitted) {
+                      const admitted = watchlistService.admitOrUpdate(dexRecord, currentNowSec);
+                      if (admitted && admitted.status !== "DROPPED") {
                         tracker.recordCandidate(
                           dexRecord,
-                          "FILTERED_REJECTED",
-                          dexRecord.spotPriceUsd,
+                          "WATCHLIST_RADAR",
+                          dexRecord.spotPriceSol ?? dexRecord.spotPriceUsd,
                           currentNow,
-                          admitted.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
                         );
                       } else {
                         tracker.recordCandidate(
                           dexRecord,
-                          "WATCHLIST_RADAR",
-                          dexRecord.spotPriceUsd,
+                          "FILTERED_REJECTED",
+                          dexRecord.spotPriceSol ?? dexRecord.spotPriceUsd,
                           currentNow,
+                          admitted?.rejectionReason ?? "EXPIRED_WATCHLIST_AGE",
                         );
                       }
+                    } else {
+                      tracker.recordCandidate(
+                        dexRecord,
+                        "FILTERED_REJECTED",
+                        dexRecord.spotPriceSol ?? dexRecord.spotPriceUsd,
+                        currentNow,
+                        evalResult.primaryRejectionReason,
+                      );
                     }
                   }
                 }
@@ -1465,25 +1592,39 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
+                  const spotInfo = await fetchDexScreenerSpotInfo(
+                    candidate.mintAddress,
+                    candidate.poolId,
+                  );
                   if (spotInfo && spotInfo.spotPriceSol && spotInfo.spotPriceSol > 0) {
-                    if (telemetryRate.tryAcquire("WATCHLIST_ACTIVE", currentNow)) {
-                      try {
+                    try {
+                      const normalize = (id: string) =>
+                        id.replace(/^dexscreener-/, "").toLowerCase();
+                      const isPoolMatch =
+                        !spotInfo.actualResponsePoolId ||
+                        normalize(spotInfo.actualResponsePoolId) === normalize(candidate.poolId);
+
+                      if (isPoolMatch) {
                         telemetryObservations.recordObservation({
                           sessionId,
                           generationId: "gen-01-legacy-baseline",
                           mintAddress: candidate.mintAddress,
                           poolId: candidate.poolId,
-                          sourceTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
+                          sourceTimestampMs: spotInfo.sourceTimestampMs,
                           ingestionTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
                           requestInitiatedMs: spotInfo.requestInitiatedMs,
                           responseReceivedMs: spotInfo.responseReceivedMs,
                           actualResponsePoolId: spotInfo.actualResponsePoolId,
-                          derivationStatus: "DERIVED_FROM_5M",
+                          derivationStatus:
+                            spotInfo.rawProviderMetrics.txCount5m !== null
+                              ? "DIRECT_OBSERVATION"
+                              : "DERIVED_FROM_5M",
                           measurementWindow: {
-                            windowStartMs: currentNow - 300_000,
-                            windowEndMs: currentNow,
-                            durationSec: 300,
+                            windowStartMs:
+                              spotInfo.sourceTimestampMs -
+                              spotInfo.rawProviderMetrics.measurementWindowSec * 1000,
+                            windowEndMs: spotInfo.sourceTimestampMs,
+                            durationSec: spotInfo.rawProviderMetrics.measurementWindowSec,
                           },
                           providerIdentity: "dexscreener",
                           priceMetrics: {
@@ -1492,16 +1633,16 @@ export async function run(): Promise<void> {
                             priceSource: "INDEXED_TICK",
                           },
                           liquidityMetrics: {
-                            baseReserve: 0,
-                            quoteReserve: 0,
-                            liquidityUsd: spotInfo.liquidityUsd,
+                            baseReserve: spotInfo.rawProviderMetrics.baseReserve,
+                            quoteReserve: spotInfo.rawProviderMetrics.quoteReserve,
+                            liquidityUsd: spotInfo.rawProviderMetrics.liquidityUsd,
                           },
                           flowMetrics: {
-                            txCount: spotInfo.recentTransactionsCount,
-                            buys: spotInfo.recentBuys60s,
-                            sells: spotInfo.recentSells60s,
-                            volumeUsd: 0,
-                            netBuyerVolumeUsd: 0,
+                            txCount: spotInfo.rawProviderMetrics.txCount5m,
+                            buys: spotInfo.rawProviderMetrics.buys5m,
+                            sells: spotInfo.rawProviderMetrics.sells5m,
+                            volumeUsd: spotInfo.rawProviderMetrics.volume5mUsd,
+                            netBuyerVolumeUsd: null,
                           },
                         });
                         telemetrySampling.updateObservation(
@@ -1514,22 +1655,23 @@ export async function run(): Promise<void> {
                           spotInfo.spotPriceSol,
                           currentNow,
                         );
-                      } catch (obsErr) {
-                        console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
                       }
+                    } catch (obsErr) {
+                      console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
                     }
                   }
                   if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
                     recordTriggerRejection(
                       candidate,
                       "REJECTED_NO_ACTIVE_DEX_PAIR",
-                      0,
-                      0,
+                      null,
+                      null,
                       candidate.liquidityUsd,
-                      0,
-                      0,
+                      null,
+                      null,
                       "DexPairActive",
                       currentNow,
+                      null,
                     );
                     continue;
                   }
@@ -1557,7 +1699,8 @@ export async function run(): Promise<void> {
                       ? 30000
                       : 50000
                     : 20000;
-                  if (spotInfo.liquidityUsd < requiredLiveLiq) {
+                  const liveLiqUsd = spotInfo.liquidityUsd ?? 0;
+                  if (liveLiqUsd < requiredLiveLiq) {
                     if (armedPullbackCandidates.has(candidate.mintAddress)) {
                       armedPullbackCandidates.delete(candidate.mintAddress);
                     }
@@ -1567,14 +1710,15 @@ export async function run(): Promise<void> {
                       "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
-                      spotInfo.liquidityUsd,
+                      liveLiqUsd,
                       spotInfo.recentBuys60s,
                       spotInfo.recentSells60s,
                       "LiveLiquidityFloor",
                       currentNow,
+                      spotInfo,
                     );
                     console.log(
-                      `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${spotInfo.liquidityUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
+                      `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${liveLiqUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
                     );
                     continue;
                   }
@@ -1602,11 +1746,12 @@ export async function run(): Promise<void> {
                       fullGateResult.rejectionReason ?? "REJECTED_BUY_GATE_UNTRIGGERED",
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
-                      spotInfo.liquidityUsd,
+                      liveLiqUsd,
                       spotInfo.recentBuys60s,
                       spotInfo.recentSells60s,
                       "BuyGateService",
                       currentNow,
+                      spotInfo,
                     );
                     continue;
                   }
@@ -1620,9 +1765,9 @@ export async function run(): Promise<void> {
                     candidate.assetAgeSeconds <= 7200;
                   const isEstablished =
                     ((candidate.liquidityUsd >= 50000 &&
-                      spotInfo.liquidityUsd >= 50000 &&
+                      liveLiqUsd >= 50000 &&
                       candidate.assetAgeSeconds >= 1800) ||
-                      (isCandidateViral && spotInfo.liquidityUsd >= 30000)) &&
+                      (isCandidateViral && liveLiqUsd >= 30000)) &&
                     candidate.assetAgeSeconds <= 7200 &&
                     rugMetrics?.holdersCount !== undefined &&
                     rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
@@ -1634,7 +1779,7 @@ export async function run(): Promise<void> {
                       mintAddress: candidate.mintAddress,
                       armedAtMs: currentNow,
                       peakPriceSol: spotInfo.spotPriceSol,
-                      peakPriceUsd: spotInfo.spotPriceUsd,
+                      peakPriceUsd: spotInfo.spotPriceUsd ?? 0,
                       ticksObserved: 1,
                     });
                     const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
@@ -1642,7 +1787,7 @@ export async function run(): Promise<void> {
                       ? "4-8% pullback or consolidation"
                       : "10-18% pullback or consolidation";
                     console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${spotInfo.spotPriceUsd.toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
+                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${(spotInfo.spotPriceUsd ?? 0).toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
                     );
                     addActivityLog(
                       "INFO",
@@ -1657,7 +1802,7 @@ export async function run(): Promise<void> {
                   const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
                   const newPeakUsd =
                     spotInfo.spotPriceSol >= armed.peakPriceSol
-                      ? spotInfo.spotPriceUsd
+                      ? (spotInfo.spotPriceUsd ?? armed.peakPriceUsd)
                       : armed.peakPriceUsd;
                   const updatedArmed: ArmedPullbackState = {
                     ...armed,
@@ -1692,6 +1837,7 @@ export async function run(): Promise<void> {
                       spotInfo.recentSells60s,
                       "RetestCraterDrop",
                       currentNow,
+                      spotInfo,
                     );
                     console.log(
                       `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
@@ -1722,6 +1868,7 @@ export async function run(): Promise<void> {
                       spotInfo.recentSells60s,
                       "RetestSellerSurge",
                       currentNow,
+                      spotInfo,
                     );
                     console.log(
                       `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
@@ -1749,6 +1896,7 @@ export async function run(): Promise<void> {
                       spotInfo.recentSells60s,
                       "RetestTimeout",
                       currentNow,
+                      spotInfo,
                     );
                     console.log(
                       `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
@@ -1808,34 +1956,33 @@ export async function run(): Promise<void> {
                   armedPullbackCandidates.delete(candidate.mintAddress);
 
                   const entryPriceSol = spotInfo.spotPriceSol;
-                  let poolRecord: ScannedPoolRecord | undefined = rawPools.find(
+                  const foundPoolRecord = rawPools.find(
                     (p) => p.mintAddress === candidate.mintAddress,
                   );
 
-                  if (!poolRecord) {
-                    poolRecord = {
-                      poolId: candidate.poolId,
-                      mintAddress: candidate.mintAddress,
-                      symbol: candidate.symbol,
-                      decimals: 9,
-                      baseMint: candidate.mintAddress,
-                      liquidityUsd: candidate.liquidityUsd,
-                      marketCapUsd: candidate.marketCapUsd,
-                      openTimeSec: Math.floor(currentNow / 1000) - candidate.assetAgeSeconds,
-                      lpBurnPct: candidate.lpBurnPct ?? 100,
-                      mintAuthority: null,
-                      freezeAuthority: null,
-                      volume5mUsd: candidate.volume5mUsd,
-                      txCount5m: candidate.buys5m + candidate.sells5m,
-                      buys5m: candidate.buys5m,
-                      sells5m: candidate.sells5m,
-                      spotPriceUsd:
-                        spotInfo.spotPriceUsd > 0
-                          ? spotInfo.spotPriceUsd
-                          : spotInfo.spotPriceSol * 150,
-                      fetchedAt: new Date(currentNow).toISOString(),
-                    };
-                  }
+                  const targetPoolRecord: ScannedPoolRecord = foundPoolRecord ?? {
+                    poolId: candidate.poolId,
+                    mintAddress: candidate.mintAddress,
+                    symbol: candidate.symbol,
+                    decimals: 9,
+                    baseMint: candidate.mintAddress,
+                    liquidityUsd: candidate.liquidityUsd,
+                    marketCapUsd: candidate.marketCapUsd,
+                    openTimeSec: Math.floor(currentNow / 1000) - candidate.assetAgeSeconds,
+                    lpBurnPct: candidate.lpBurnPct ?? 100,
+                    mintAuthority: null,
+                    freezeAuthority: null,
+                    volume5mUsd: candidate.volume5mUsd ?? 0,
+                    txCount5m: candidate.buys5m + candidate.sells5m,
+                    buys5m: candidate.buys5m,
+                    sells5m: candidate.sells5m,
+                    spotPriceUsd:
+                      spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                        ? spotInfo.spotPriceUsd
+                        : spotInfo.spotPriceSol * 150,
+                    spotPriceSol: spotInfo.spotPriceSol,
+                    fetchedAt: new Date(currentNow).toISOString(),
+                  };
 
                   const cohort: CohortTier = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
                   const ratchetConfig = isEstablished
@@ -1886,7 +2033,7 @@ export async function run(): Promise<void> {
                   );
 
                   const bought = daemon.processScannedPool(
-                    poolRecord,
+                    targetPoolRecord,
                     currentNow,
                     entryPriceSol,
                     dynamicSize,
@@ -1909,8 +2056,8 @@ export async function run(): Promise<void> {
                         sourceTimestampMs: currentNow,
                         ingestionTimestampMs: currentNow,
                         poolOpenTimeMs:
-                          poolRecord.openTimeSec > 0
-                            ? poolRecord.openTimeSec * 1000
+                          targetPoolRecord.openTimeSec > 0
+                            ? targetPoolRecord.openTimeSec * 1000
                             : candidate.assetAgeSeconds > 0
                               ? currentNow - candidate.assetAgeSeconds * 1000
                               : undefined,
@@ -1918,28 +2065,56 @@ export async function run(): Promise<void> {
                         filterEvaluations: [],
                         metricsSnapshot: {
                           tokenAgeSec: candidate.assetAgeSeconds,
-                          liquidityUsd: candidate.liquidityUsd,
+                          liquidityUsd:
+                            spotInfo.rawProviderMetrics.liquidityUsd ?? candidate.liquidityUsd,
                           marketCapUsd: candidate.marketCapUsd,
                           lmcRatio: candidate.lmcRatio,
                           lpBurnPct: candidate.lpBurnPct ?? 100,
-                          spotPriceUsd: spotInfo.spotPriceUsd,
+                          spotPriceUsd:
+                            spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                              ? spotInfo.spotPriceUsd
+                              : null,
                           spotPriceSol: entryPriceSol,
-                          volume5mUsd: candidate.volume5mUsd,
-                          txCount5m: candidate.buys5m + candidate.sells5m,
-                          buys5m: candidate.buys5m,
-                          sells5m: candidate.sells5m,
+                          volume5mUsd:
+                            spotInfo.rawProviderMetrics.volume5mUsd ??
+                            candidate.volume5mUsd ??
+                            null,
+                          txCount5m: spotInfo.rawProviderMetrics.txCount5m ?? null,
+                          buys5m: spotInfo.rawProviderMetrics.buys5m ?? null,
+                          sells5m: spotInfo.rawProviderMetrics.sells5m ?? null,
                           metricProvenance: {
-                            tokenAgeSec: "OBSERVED",
-                            liquidityUsd: "OBSERVED",
+                            tokenAgeSec: candidate.assetAgeSeconds > 0 ? "OBSERVED" : "UNAVAILABLE",
+                            liquidityUsd:
+                              (spotInfo.rawProviderMetrics.liquidityUsd ?? candidate.liquidityUsd) >
+                              0
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
                             marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
-                            lmcRatio: "DERIVED",
-                            lpBurnPct: "OBSERVED",
-                            spotPriceUsd: "OBSERVED",
-                            spotPriceSol: "OBSERVED",
-                            volume5mUsd: "OBSERVED",
-                            txCount5m: "OBSERVED",
-                            buys5m: "OBSERVED",
-                            sells5m: "OBSERVED",
+                            lmcRatio: candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE",
+                            lpBurnPct:
+                              candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
+                            spotPriceUsd:
+                              spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
+                            spotPriceSol: entryPriceSol > 0 ? "OBSERVED" : "UNAVAILABLE",
+                            volume5mUsd:
+                              (spotInfo.rawProviderMetrics.volume5mUsd ?? candidate.volume5mUsd) !==
+                              null
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
+                            txCount5m:
+                              spotInfo.rawProviderMetrics.txCount5m !== null
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
+                            buys5m:
+                              spotInfo.rawProviderMetrics.buys5m !== null
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
+                            sells5m:
+                              spotInfo.rawProviderMetrics.sells5m !== null
+                                ? "OBSERVED"
+                                : "UNAVAILABLE",
                           },
                         },
                         providerIdentity: candidate.poolId.startsWith("dexscreener")
@@ -1952,7 +2127,9 @@ export async function run(): Promise<void> {
                     }
                     const timeStr = new Date(currentNow).toLocaleTimeString();
                     const usdStr = (
-                      spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : entryPriceSol * 150
+                      spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
+                        ? spotInfo.spotPriceUsd
+                        : entryPriceSol * 150
                     ).toFixed(6);
                     const solStr = entryPriceSol.toFixed(6);
                     addActivityLog(
@@ -2059,6 +2236,9 @@ export async function run(): Promise<void> {
         strategyRevision: telemetryMeta.strategyRevision,
         startedAtIso: telemetryMeta.startedAtIso,
         totalCandidatesScreened: streamEngine.getStats().totalEvaluationsAttempted,
+        totalScannerDecisionsRecorded: telemetryDecisions.getScannerDecisionsCount(),
+        totalTriggerDecisionsRecorded: telemetryDecisions.getTriggerDecisionsCount(),
+        totalExecutedBuyDecisionsRecorded: telemetryDecisions.getExecutedBuyDecisionsCount(),
         totalDecisionsRecorded: telemetryDecisions.getTotalDecisionsCount(),
         decisionWriteFailures: telemetryStorage.getDecisionWriteFailuresCount(),
         decisionCallbackErrors: streamEngine.getStats().decisionCallbackErrors,

@@ -101,8 +101,13 @@ export class StratifiedSamplingController {
 
   public evaluateForTracking(
     decision: CandidateDecisionRecord,
-    initialPriceSol: number,
+    initialPriceSol?: number | null,
   ): StratifiedSamplingRecord | null {
+    const effectiveInitialPriceSol =
+      initialPriceSol !== undefined
+        ? initialPriceSol
+        : (decision.metricsSnapshot.spotPriceSol ?? null);
+
     const key = this.buildTrackerKey(
       decision.generationId,
       decision.sessionId,
@@ -185,12 +190,12 @@ export class StratifiedSamplingController {
         lastObservationMs: now,
         currentSamplingIntervalMs: 0,
         observationCount: 0,
-        initialPriceSol,
-        peakPriceSol: initialPriceSol,
+        initialPriceSol: effectiveInitialPriceSol,
+        peakPriceSol: effectiveInitialPriceSol,
         peakGainPct: 0.0,
-        troughPriceSol: initialPriceSol,
+        troughPriceSol: effectiveInitialPriceSol,
         maxDrawdownPct: 0.0,
-        latestPriceSol: initialPriceSol,
+        latestPriceSol: effectiveInitialPriceSol,
         status: "EXCLUDED_SPAM",
       };
       this.storage.appendStratifiedSample(spamRecord);
@@ -233,12 +238,12 @@ export class StratifiedSamplingController {
           lastObservationMs: now,
           currentSamplingIntervalMs: 0,
           observationCount: 0,
-          initialPriceSol,
-          peakPriceSol: initialPriceSol,
+          initialPriceSol: effectiveInitialPriceSol,
+          peakPriceSol: effectiveInitialPriceSol,
           peakGainPct: 0.0,
-          troughPriceSol: initialPriceSol,
+          troughPriceSol: effectiveInitialPriceSol,
           maxDrawdownPct: 0.0,
-          latestPriceSol: initialPriceSol,
+          latestPriceSol: effectiveInitialPriceSol,
           status: "DROPPED_CAPACITY",
         };
         this.storage.appendStratifiedSample(dropRecord);
@@ -270,12 +275,12 @@ export class StratifiedSamplingController {
         lastObservationMs: now,
         currentSamplingIntervalMs: 0,
         observationCount: 0,
-        initialPriceSol,
-        peakPriceSol: initialPriceSol,
+        initialPriceSol: effectiveInitialPriceSol,
+        peakPriceSol: effectiveInitialPriceSol,
         peakGainPct: 0.0,
-        troughPriceSol: initialPriceSol,
+        troughPriceSol: effectiveInitialPriceSol,
         maxDrawdownPct: 0.0,
-        latestPriceSol: initialPriceSol,
+        latestPriceSol: effectiveInitialPriceSol,
         status: "NOT_SELECTED",
       };
       this.storage.appendStratifiedSample(notSelectedRecord);
@@ -300,12 +305,12 @@ export class StratifiedSamplingController {
       lastObservationMs: now,
       currentSamplingIntervalMs: tier === "EXECUTED_POSITION" ? 5000 : 30000,
       observationCount: 1,
-      initialPriceSol,
-      peakPriceSol: initialPriceSol,
+      initialPriceSol: effectiveInitialPriceSol,
+      peakPriceSol: effectiveInitialPriceSol,
       peakGainPct: 0.0,
-      troughPriceSol: initialPriceSol,
+      troughPriceSol: effectiveInitialPriceSol,
       maxDrawdownPct: 0.0,
-      latestPriceSol: initialPriceSol,
+      latestPriceSol: effectiveInitialPriceSol,
       status: "TRACKING_ACTIVE",
     };
 
@@ -348,16 +353,17 @@ export class StratifiedSamplingController {
       return expired;
     }
 
-    const peakPrice = Math.max(tracker.peakPriceSol, currentPriceSol);
+    const initialPrice = tracker.initialPriceSol ?? currentPriceSol;
+    const peakPrice =
+      tracker.peakPriceSol !== null
+        ? Math.max(tracker.peakPriceSol, currentPriceSol)
+        : currentPriceSol;
     const troughPrice =
-      tracker.troughPriceSol > 0
+      tracker.troughPriceSol !== null && tracker.troughPriceSol > 0
         ? Math.min(tracker.troughPriceSol, currentPriceSol)
         : currentPriceSol;
 
-    const peakGainPct =
-      tracker.initialPriceSol > 0
-        ? ((peakPrice - tracker.initialPriceSol) / tracker.initialPriceSol) * 100
-        : 0;
+    const peakGainPct = initialPrice > 0 ? ((peakPrice - initialPrice) / initialPrice) * 100 : 0;
 
     const currentDrawdownPct =
       peakPrice > 0 ? ((peakPrice - currentPriceSol) / peakPrice) * 100 : 0;
@@ -379,6 +385,7 @@ export class StratifiedSamplingController {
       observationCount: tracker.observationCount + 1,
       lastObservationMs: nowMs,
       currentSamplingIntervalMs: nextInterval,
+      initialPriceSol: initialPrice,
       peakPriceSol: Number(peakPrice.toFixed(8)),
       peakGainPct: Number(peakGainPct.toFixed(2)),
       troughPriceSol: Number(troughPrice.toFixed(8)),

@@ -27,7 +27,11 @@ export interface ScannedPoolRecord {
   readonly buys5m: number;
   readonly sells5m: number;
   readonly spotPriceUsd: number;
+  readonly spotPriceSol?: number | null | undefined;
   readonly fetchedAt: string;
+  readonly metricProvenance?:
+    | Record<string, "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE">
+    | undefined;
 }
 
 export interface CandidateScannerFilterEvaluation {

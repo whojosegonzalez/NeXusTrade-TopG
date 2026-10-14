@@ -163,9 +163,17 @@ export class TelemetryStorageManager {
       mkdirSync(sessionDir, { recursive: true });
     }
 
-    // Recover files for this session on initialization
-    this.recoverFileBoundary(getCanonicalCandidateDecisionsPath(sessionId, this.workspaceRoot));
-    this.recoverFileBoundary(getCanonicalMarketObservationsPath(sessionId, this.workspaceRoot));
+    // Recover files for this session on initialization and restore durable counters
+    const existingDecisions = this.recoverFileBoundary<CandidateDecisionRecord>(
+      getCanonicalCandidateDecisionsPath(sessionId, this.workspaceRoot),
+    );
+    this.candidateDecisionsCount = existingDecisions.length;
+
+    const existingObservations = this.recoverFileBoundary<MarketObservationRecord>(
+      getCanonicalMarketObservationsPath(sessionId, this.workspaceRoot),
+    );
+    this.marketObservationsCount = existingObservations.length;
+
     this.recoverFileBoundary(getCanonicalStratifiedSamplesPath(sessionId, this.workspaceRoot));
 
     const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
@@ -304,6 +312,15 @@ export class TelemetryStorageManager {
         ) {
           throw metaErr;
         }
+        const quarantinePath = `${metaPath}.corrupt-${Date.now()}`;
+        try {
+          renameSync(metaPath, quarantinePath);
+        } catch {
+          // ignore rename failure
+        }
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_CORRUPT_SESSION_META] Cannot finalize session "${sessionId}" with corrupted metadata: ${String(metaErr)}`,
+        );
       }
     }
 
@@ -322,10 +339,14 @@ export class TelemetryStorageManager {
         ) {
           return existing;
         }
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_SESSION_ALREADY_FINALIZED] Session "${sessionId}" already has a finalized summary with distinct counts (existing decisions: ${existing.totalDecisionsRecorded}, new: ${summaryData.totalDecisionsRecorded}). Cannot destructively overwrite a finalized session summary.`,
+        );
       } catch (parseErr) {
         if (
           parseErr instanceof Error &&
-          parseErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH")
+          (parseErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH") ||
+            parseErr.message.includes("FATAL_SESSION_ALREADY_FINALIZED"))
         ) {
           throw parseErr;
         }
