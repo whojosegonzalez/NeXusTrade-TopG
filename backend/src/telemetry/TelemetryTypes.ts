@@ -113,6 +113,29 @@ export interface MarketObservationRecord {
   readonly clockSkewWarning?: string | undefined;
 }
 
+/**
+ * Normalizes and verifies whether a provider's actual response pool ID matches
+ * an expected tracked pool ID (strips 'dexscreener-' prefix, trims, lowercases).
+ * Fails closed (returns false) if actualResponsePoolId is missing, empty, or not a string.
+ */
+export function isVerifiedMatchingPool(
+  actualResponsePoolId: string | null | undefined,
+  expectedPoolId: string,
+): boolean {
+  if (!actualResponsePoolId || typeof actualResponsePoolId !== "string") {
+    return false;
+  }
+  const normActual = actualResponsePoolId
+    .trim()
+    .toLowerCase()
+    .replace(/^dexscreener-/, "");
+  const normExpected = expectedPoolId
+    .trim()
+    .toLowerCase()
+    .replace(/^dexscreener-/, "");
+  return normActual.length > 0 && normActual === normExpected;
+}
+
 export type StratificationTier =
   | "EXECUTED_POSITION"
   | "WATCHLIST_ACTIVE"

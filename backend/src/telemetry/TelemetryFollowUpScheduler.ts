@@ -2,7 +2,11 @@ import type { TelemetryStorageManager } from "./TelemetryStorageManager.js";
 import type { MarketObservationRecorder } from "./MarketObservationRecorder.js";
 import type { StratifiedSamplingController } from "./StratifiedSamplingController.js";
 import type { TelemetryRateController } from "./TelemetryRateController.js";
-import type { PriceSourceType, StratificationTier } from "./TelemetryTypes.js";
+import {
+  isVerifiedMatchingPool,
+  type PriceSourceType,
+  type StratificationTier,
+} from "./TelemetryTypes.js";
 
 export interface FollowUpObservationResult {
   spotPriceUsd: number | null;
@@ -105,21 +109,18 @@ export class TelemetryFollowUpScheduler {
       const responseReceivedMs = Date.now();
       if (!res) continue;
 
-      // Cross-pool contamination check & fail-closed missing pool identity (B3-03 & B4-02):
+      // Cross-pool contamination check & fail-closed missing pool identity (B3-03, B4-02 & B5-01):
       // Require verifiable provider pool identity matching the tracked pool
-      if (!res.actualPoolId) {
-        console.warn(
-          `[TelemetryFollowUpScheduler] Discarding observation: missing provider pool identity for ${tracker.mintAddress} (expected ${tracker.poolId}).`,
-        );
-        continue;
-      }
-
-      const normActual = res.actualPoolId.replace(/^dexscreener-/, "");
-      const normTracked = tracker.poolId.replace(/^dexscreener-/, "");
-      if (normActual !== normTracked) {
-        console.warn(
-          `[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for ${tracker.mintAddress}. Tracked=${tracker.poolId}, Actual=${res.actualPoolId}`,
-        );
+      if (!isVerifiedMatchingPool(res.actualPoolId, tracker.poolId)) {
+        if (!res.actualPoolId) {
+          console.warn(
+            `[TelemetryFollowUpScheduler] Discarding observation: missing provider pool identity for ${tracker.mintAddress} (expected ${tracker.poolId}).`,
+          );
+        } else {
+          console.warn(
+            `[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for ${tracker.mintAddress}. Tracked=${tracker.poolId}, Actual=${res.actualPoolId}`,
+          );
+        }
         continue;
       }
 

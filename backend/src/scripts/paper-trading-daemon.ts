@@ -75,6 +75,7 @@ import {
   StratifiedSamplingController,
   TelemetryRateController,
   TelemetryFollowUpScheduler,
+  isVerifiedMatchingPool,
   type MetricProvenance,
 } from "../telemetry/index.js";
 
@@ -373,6 +374,101 @@ async function fetchDexScreenerSpotInfo(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export interface PreliminaryBuyTriggerObservationCandidate {
+  readonly mintAddress: string;
+  readonly poolId: string;
+}
+
+export interface PreliminaryBuyTriggerObservationSpotInfo {
+  readonly spotPriceSol: number | null;
+  readonly spotPriceUsd: number | null;
+  readonly sourceTimestampMs: number;
+  readonly requestInitiatedMs?: number | undefined;
+  readonly responseReceivedMs?: number | undefined;
+  readonly actualResponsePoolId?: string | undefined;
+  readonly rawProviderMetrics: DexScreenerRawProviderMetrics;
+}
+
+export function recordPreliminaryBuyTriggerObservation(
+  candidate: PreliminaryBuyTriggerObservationCandidate,
+  spotInfo: PreliminaryBuyTriggerObservationSpotInfo,
+  sessionId: string,
+  generationId: string,
+  currentNow: number,
+  telemetryObservations: MarketObservationRecorder,
+  telemetrySampling: StratifiedSamplingController,
+): boolean {
+  if (!spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+    return false;
+  }
+
+  // Cross-pool contamination check & fail-closed pool identity verification (B5-01):
+  // Discard observation and reject sampling update without a verified matching provider pool ID.
+  const isPoolMatch = isVerifiedMatchingPool(spotInfo.actualResponsePoolId, candidate.poolId);
+  if (!isPoolMatch) {
+    if (!spotInfo.actualResponsePoolId) {
+      console.warn(
+        `[PaperDaemon] Discarding telemetry observation: missing provider pool identity for ${candidate.mintAddress} (expected ${candidate.poolId}).`,
+      );
+    } else {
+      console.warn(
+        `[PaperDaemon] Discarding telemetry observation: pool mismatch for ${candidate.mintAddress}. Tracked=${candidate.poolId}, Actual=${spotInfo.actualResponsePoolId}`,
+      );
+    }
+    return false;
+  }
+
+  telemetryObservations.recordObservation({
+    sessionId,
+    generationId,
+    mintAddress: candidate.mintAddress,
+    poolId: candidate.poolId,
+    sourceTimestampMs: spotInfo.sourceTimestampMs,
+    ingestionTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
+    requestInitiatedMs: spotInfo.requestInitiatedMs,
+    responseReceivedMs: spotInfo.responseReceivedMs,
+    actualResponsePoolId: spotInfo.actualResponsePoolId,
+    derivationStatus:
+      spotInfo.rawProviderMetrics.txCount5m !== null ? "DIRECT_OBSERVATION" : "DERIVED_FROM_5M",
+    measurementWindow: {
+      windowStartMs:
+        spotInfo.sourceTimestampMs - spotInfo.rawProviderMetrics.measurementWindowSec * 1000,
+      windowEndMs: spotInfo.sourceTimestampMs,
+      durationSec: spotInfo.rawProviderMetrics.measurementWindowSec,
+    },
+    providerIdentity: "dexscreener",
+    priceMetrics: {
+      spotPriceUsd: spotInfo.spotPriceUsd,
+      spotPriceSol: spotInfo.spotPriceSol,
+      priceSource: "INDEXED_TICK",
+    },
+    liquidityMetrics: {
+      baseReserve: spotInfo.rawProviderMetrics.baseReserve,
+      quoteReserve: spotInfo.rawProviderMetrics.quoteReserve,
+      liquidityUsd: spotInfo.rawProviderMetrics.liquidityUsd,
+    },
+    flowMetrics: {
+      txCount: spotInfo.rawProviderMetrics.txCount5m,
+      buys: spotInfo.rawProviderMetrics.buys5m,
+      sells: spotInfo.rawProviderMetrics.sells5m,
+      volumeUsd: spotInfo.rawProviderMetrics.volume5mUsd,
+      netBuyerVolumeUsd: null,
+    },
+  });
+
+  telemetrySampling.updateObservation(
+    StratifiedSamplingController.buildTrackerKey(
+      generationId,
+      sessionId,
+      candidate.poolId,
+      candidate.mintAddress,
+    ),
+    spotInfo.spotPriceSol,
+    currentNow,
+  );
+  return true;
 }
 
 export {
@@ -1646,64 +1742,15 @@ export async function run(): Promise<void> {
                   );
                   if (spotInfo && spotInfo.spotPriceSol && spotInfo.spotPriceSol > 0) {
                     try {
-                      const normalize = (id: string) =>
-                        id.replace(/^dexscreener-/, "").toLowerCase();
-                      const isPoolMatch =
-                        !spotInfo.actualResponsePoolId ||
-                        normalize(spotInfo.actualResponsePoolId) === normalize(candidate.poolId);
-
-                      if (isPoolMatch) {
-                        telemetryObservations.recordObservation({
-                          sessionId,
-                          generationId: "gen-01-legacy-baseline",
-                          mintAddress: candidate.mintAddress,
-                          poolId: candidate.poolId,
-                          sourceTimestampMs: spotInfo.sourceTimestampMs,
-                          ingestionTimestampMs: spotInfo.responseReceivedMs ?? currentNow,
-                          requestInitiatedMs: spotInfo.requestInitiatedMs,
-                          responseReceivedMs: spotInfo.responseReceivedMs,
-                          actualResponsePoolId: spotInfo.actualResponsePoolId,
-                          derivationStatus:
-                            spotInfo.rawProviderMetrics.txCount5m !== null
-                              ? "DIRECT_OBSERVATION"
-                              : "DERIVED_FROM_5M",
-                          measurementWindow: {
-                            windowStartMs:
-                              spotInfo.sourceTimestampMs -
-                              spotInfo.rawProviderMetrics.measurementWindowSec * 1000,
-                            windowEndMs: spotInfo.sourceTimestampMs,
-                            durationSec: spotInfo.rawProviderMetrics.measurementWindowSec,
-                          },
-                          providerIdentity: "dexscreener",
-                          priceMetrics: {
-                            spotPriceUsd: spotInfo.spotPriceUsd,
-                            spotPriceSol: spotInfo.spotPriceSol,
-                            priceSource: "INDEXED_TICK",
-                          },
-                          liquidityMetrics: {
-                            baseReserve: spotInfo.rawProviderMetrics.baseReserve,
-                            quoteReserve: spotInfo.rawProviderMetrics.quoteReserve,
-                            liquidityUsd: spotInfo.rawProviderMetrics.liquidityUsd,
-                          },
-                          flowMetrics: {
-                            txCount: spotInfo.rawProviderMetrics.txCount5m,
-                            buys: spotInfo.rawProviderMetrics.buys5m,
-                            sells: spotInfo.rawProviderMetrics.sells5m,
-                            volumeUsd: spotInfo.rawProviderMetrics.volume5mUsd,
-                            netBuyerVolumeUsd: null,
-                          },
-                        });
-                        telemetrySampling.updateObservation(
-                          StratifiedSamplingController.buildTrackerKey(
-                            "gen-01-legacy-baseline",
-                            sessionId,
-                            candidate.poolId,
-                            candidate.mintAddress,
-                          ),
-                          spotInfo.spotPriceSol,
-                          currentNow,
-                        );
-                      }
+                      recordPreliminaryBuyTriggerObservation(
+                        candidate,
+                        spotInfo,
+                        sessionId,
+                        "gen-01-legacy-baseline",
+                        currentNow,
+                        telemetryObservations,
+                        telemetrySampling,
+                      );
                     } catch (obsErr) {
                       console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
                     }

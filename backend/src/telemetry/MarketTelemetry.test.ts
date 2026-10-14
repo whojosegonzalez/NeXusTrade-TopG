@@ -20,6 +20,7 @@ import {
   TelemetryFollowUpScheduler,
   repairAndQuarantineDamagedTail,
   resolveStrategyRevision,
+  isVerifiedMatchingPool,
   type CandidateDecisionRecord,
   type MetricProvenance,
   type FollowUpObservationResult,
@@ -38,7 +39,10 @@ import { CandidateScannerEvaluator } from "../candidate-scanner/CandidateScanner
 import { CandidateWatchlistService } from "../candidate-scanner/CandidateWatchlistService.js";
 import { CANDIDATE_SCANNER_DEFAULTS } from "../candidate-scanner/CandidateScannerConfig.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
-import { parseCliArgs } from "../scripts/paper-trading-daemon.js";
+import {
+  parseCliArgs,
+  recordPreliminaryBuyTriggerObservation,
+} from "../scripts/paper-trading-daemon.js";
 
 describe("Phase 12.94-B Market Telemetry Engine", () => {
   // --------------------------------------------------------------------------
@@ -2553,6 +2557,314 @@ describe("Phase 12.94-B Market Telemetry Engine", () => {
           totalStratifiedCandidatesTracked: 3,
           missedWinnersCount: 1,
           avoidedRugsCount: 2,
+        });
+      }).toThrow(/\[FATAL_SESSION_ALREADY_FINALIZED\]/);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Suite 11: Phase 12.94-B Audit v5 Focus Verifications (B5-01 through B5-03)
+  // --------------------------------------------------------------------------
+  describe("11. Phase 12.94-B Audit v5 Focus Verifications (B5-01 through B5-03)", () => {
+    it("B5-01: daemon buy-trigger telemetry recording enforces verified matching pool ID", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b501-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const obsRecorder = new MarketObservationRecorder(storage);
+      const sampling = new StratifiedSamplingController(storage);
+      const sessionId = "session-b501-daemon-pool-id";
+      storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+
+      const candidate = {
+        mintAddress: "MintDaemonMatch11111111111111111111111111",
+        poolId: "pool-alpha",
+      };
+
+      // Set up sampling tracker for candidate
+      sampling.evaluateForTracking(
+        {
+          eventId: "ev-daemon-tgt-1",
+          sessionId,
+          generationId: "gen-01-legacy-baseline",
+          mintAddress: candidate.mintAddress,
+          poolId: candidate.poolId,
+          symbol: "TGT",
+          decisionCohort: "EXECUTED_BUY",
+          sourceTimestampMs: 1700000000000,
+          ingestionTimestampMs: 1700000000000,
+          decisionTimestampMs: 1700000000000,
+          strategyRevision: "phase-12.94b",
+          missingFields: [],
+          filterEvaluations: [],
+          metricsSnapshot: {
+            tokenAgeSec: 100,
+            liquidityUsd: 50000,
+            marketCapUsd: 200000,
+            lmcRatio: 0.25,
+            lpBurnPct: 100,
+            spotPriceUsd: 0.1,
+            spotPriceSol: 0.0007,
+            volume5mUsd: 5000,
+            txCount5m: 50,
+            buys5m: 30,
+            sells5m: 20,
+          },
+          providerIdentity: "dexscreener",
+        },
+        0.0007,
+      );
+
+      const baseRawMetrics = {
+        volume5mUsd: 5000,
+        volume1hUsd: 25000,
+        buys5m: 30,
+        sells5m: 20,
+        txCount5m: 50,
+        buys1h: 150,
+        sells1h: 100,
+        baseReserve: 100000,
+        quoteReserve: 70,
+        liquidityUsd: 50000,
+        measurementWindowSec: 300,
+        derivationStatus: "DIRECT" as const,
+      };
+
+      // Fixture 1: Matching pool ID (normalized match: dexscreener-pool-alpha vs pool-alpha)
+      // -> Observation recorded, sampling trajectory updated, returns true
+      const success = recordPreliminaryBuyTriggerObservation(
+        candidate,
+        {
+          spotPriceSol: 0.00075,
+          spotPriceUsd: 0.11,
+          sourceTimestampMs: 1700000010000,
+          requestInitiatedMs: 1700000009500,
+          responseReceivedMs: 1700000010000,
+          actualResponsePoolId: "dexscreener-pool-alpha",
+          rawProviderMetrics: baseRawMetrics,
+        },
+        sessionId,
+        "gen-01-legacy-baseline",
+        1700000010000,
+        obsRecorder,
+        sampling,
+      );
+
+      expect(success).toBe(true);
+      expect(storage.getMarketObservationsCount()).toBe(1);
+      const observations = storage.readMarketObservations(sessionId);
+      expect(observations).toHaveLength(1);
+      expect(observations[0]?.actualResponsePoolId).toBe("dexscreener-pool-alpha");
+      expect(observations[0]?.poolId).toBe("pool-alpha");
+
+      const trackerKey = StratifiedSamplingController.buildTrackerKey(
+        "gen-01-legacy-baseline",
+        sessionId,
+        candidate.poolId,
+        candidate.mintAddress,
+      );
+      const tracker = sampling.getActiveTracker(trackerKey);
+      expect(tracker).toBeDefined();
+      expect(tracker?.observationCount).toBe(2); // Initial observation + 1 update
+      expect(tracker?.latestPriceSol).toBe(0.00075);
+
+      // Fixture 2: Missing pool ID (undefined)
+      // -> Fails closed: rejected, observation discarded, sampling unchanged, returns false
+      const failMissing = recordPreliminaryBuyTriggerObservation(
+        candidate,
+        {
+          spotPriceSol: 0.0008,
+          spotPriceUsd: 0.12,
+          sourceTimestampMs: 1700000020000,
+          requestInitiatedMs: 1700000019500,
+          responseReceivedMs: 1700000020000,
+          actualResponsePoolId: undefined, // Missing!
+          rawProviderMetrics: baseRawMetrics,
+        },
+        sessionId,
+        "gen-01-legacy-baseline",
+        1700000020000,
+        obsRecorder,
+        sampling,
+      );
+
+      expect(failMissing).toBe(false);
+      expect(storage.getMarketObservationsCount()).toBe(1); // Unchanged!
+      expect(sampling.getActiveTracker(trackerKey)?.observationCount).toBe(2); // Unchanged!
+
+      // Fixture 3: Mismatched pool ID (different pool address)
+      // -> Fails closed: rejected, observation discarded, sampling unchanged, returns false
+      const failMismatch = recordPreliminaryBuyTriggerObservation(
+        candidate,
+        {
+          spotPriceSol: 0.00085,
+          spotPriceUsd: 0.13,
+          sourceTimestampMs: 1700000030000,
+          requestInitiatedMs: 1700000029500,
+          responseReceivedMs: 1700000030000,
+          actualResponsePoolId: "dexscreener-different-pool-999", // Mismatch!
+          rawProviderMetrics: baseRawMetrics,
+        },
+        sessionId,
+        "gen-01-legacy-baseline",
+        1700000030000,
+        obsRecorder,
+        sampling,
+      );
+
+      expect(failMismatch).toBe(false);
+      expect(storage.getMarketObservationsCount()).toBe(1); // Unchanged!
+      expect(sampling.getActiveTracker(trackerKey)?.observationCount).toBe(2); // Unchanged!
+
+      // Direct unit test of isVerifiedMatchingPool helper
+      expect(isVerifiedMatchingPool("dexscreener-abc", "abc")).toBe(true);
+      expect(isVerifiedMatchingPool("ABC", "abc")).toBe(true);
+      expect(isVerifiedMatchingPool("dexscreener-ABC", "dexscreener-abc")).toBe(true);
+      expect(isVerifiedMatchingPool("  dexscreener-pool-1  ", "pool-1")).toBe(true);
+      expect(isVerifiedMatchingPool(undefined, "abc")).toBe(false);
+      expect(isVerifiedMatchingPool(null, "abc")).toBe(false);
+      expect(isVerifiedMatchingPool("", "abc")).toBe(false);
+      expect(isVerifiedMatchingPool("dexscreener-xyz", "abc")).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("B5-02 & B5-03: interrupted-session finalization fail-closed & semantic equivalence", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "telemetry-b502-"));
+      const storage = new TelemetryStorageManager(tempDir);
+      const sessionId = "session-b502-interrupted-test";
+
+      const baseSummaryData = {
+        generationId: "gen-01-legacy-baseline",
+        strategyRevision: "phase-12.94b",
+        startedAtIso: "2026-10-14T00:00:00.000Z",
+        totalCandidatesScreened: 30,
+        totalDecisionsRecorded: 15,
+        totalScannerDecisionsRecorded: 10,
+        totalTriggerDecisionsRecorded: 4,
+        totalExecutedBuyDecisionsRecorded: 1,
+        decisionWriteFailures: 0,
+        cohortBreakdown: {
+          filteredRejected: 8,
+          watchlistRadar: 2,
+          triggerRejected: 4,
+          executedBuy: 1,
+        },
+        topRejectionReasons: {
+          REJECTED_MOMENTUM_STALLED: 3,
+          REJECTED_LOW_LIQUIDITY: 1,
+        },
+        totalMarketObservationsRecorded: 10,
+        totalStratifiedCandidatesTracked: 4,
+        missedWinnersCount: 1,
+        avoidedRugsCount: 2,
+      };
+
+      // 1. Missing session-meta.json throws FATAL_MISSING_SESSION_META
+      expect(() => {
+        storage.finalizeSessionTelemetry("non-existent-session-id", baseSummaryData);
+      }).toThrow(/\[FATAL_MISSING_SESSION_META\]/);
+
+      // 2. Initialize session and simulate crash-restart into INTERRUPTED state
+      const meta1 = storage.initSessionTelemetry(sessionId, "gen-01-legacy-baseline", 7.9259);
+      expect(meta1.sessionStatus).toBe("ACTIVE");
+
+      const storageReopened = new TelemetryStorageManager(tempDir);
+      const metaInterrupted = storageReopened.initSessionTelemetry(
+        sessionId,
+        "gen-01-legacy-baseline",
+        7.9259,
+      );
+      expect(metaInterrupted.sessionStatus).toBe("INTERRUPTED");
+      expect(metaInterrupted.isInterruptedSession).toBe(true);
+
+      // 3. Caller override fail-closed: attempting to pass isCompleteSession: true on interrupted session throws
+      expect(() => {
+        storageReopened.finalizeSessionTelemetry(sessionId, {
+          ...baseSummaryData,
+          startedAtIso: metaInterrupted.startedAtIso,
+          strategyRevision: metaInterrupted.strategyRevision,
+          isCompleteSession: true, // Malicious / inconsistent caller override!
+        });
+      }).toThrow(/\[FATAL_INVALID_COMPLETENESS_OVERRIDE\]/);
+
+      // Attempting to pass isInterruptedSession: false also throws
+      expect(() => {
+        storageReopened.finalizeSessionTelemetry(sessionId, {
+          ...baseSummaryData,
+          startedAtIso: metaInterrupted.startedAtIso,
+          strategyRevision: metaInterrupted.strategyRevision,
+          isInterruptedSession: false, // Malicious / inconsistent caller override!
+        });
+      }).toThrow(/\[FATAL_INVALID_COMPLETENESS_OVERRIDE\]/);
+
+      // 4. Authoritative derivation: finalization authoritatively marks isCompleteSession: false, isInterruptedSession: true
+      const finalizedInterrupted = storageReopened.finalizeSessionTelemetry(sessionId, {
+        ...baseSummaryData,
+        startedAtIso: metaInterrupted.startedAtIso,
+        strategyRevision: metaInterrupted.strategyRevision,
+      });
+
+      expect(finalizedInterrupted.isCompleteSession).toBe(false);
+      expect(finalizedInterrupted.isInterruptedSession).toBe(true);
+
+      // 5. Semantic equivalence & idempotency: identical fields return existing summary cleanly
+      const idempotentCall = storageReopened.finalizeSessionTelemetry(sessionId, {
+        ...baseSummaryData,
+        startedAtIso: metaInterrupted.startedAtIso,
+        strategyRevision: metaInterrupted.strategyRevision,
+        // Key-order invariance for topRejectionReasons:
+        topRejectionReasons: {
+          REJECTED_LOW_LIQUIDITY: 1,
+          REJECTED_MOMENTUM_STALLED: 3,
+        },
+      });
+      expect(idempotentCall).toEqual(finalizedInterrupted);
+
+      // 6. Conflicting topRejectionReasons distribution (same primary count, different distribution) throws FATAL_SESSION_ALREADY_FINALIZED
+      expect(() => {
+        storageReopened.finalizeSessionTelemetry(sessionId, {
+          ...baseSummaryData,
+          startedAtIso: metaInterrupted.startedAtIso,
+          strategyRevision: metaInterrupted.strategyRevision,
+          topRejectionReasons: {
+            REJECTED_MOMENTUM_STALLED: 4, // Different distribution!
+          },
+        });
+      }).toThrow(/\[FATAL_SESSION_ALREADY_FINALIZED\]/);
+
+      // 7. Conflicting startedAtIso throws FATAL_SESSION_ALREADY_FINALIZED
+      expect(() => {
+        storageReopened.finalizeSessionTelemetry(sessionId, {
+          ...baseSummaryData,
+          startedAtIso: "1999-01-01T00:00:00.000Z", // Conflicting startedAtIso!
+          strategyRevision: metaInterrupted.strategyRevision,
+        });
+      }).toThrow(/\[FATAL_SESSION_ALREADY_FINALIZED\]/);
+
+      // 8. Conflicting completeness flag on clean complete session
+      const cleanSessionId = "session-b502-clean-test";
+      const cleanMeta = storage.initSessionTelemetry(
+        cleanSessionId,
+        "gen-01-legacy-baseline",
+        7.9259,
+      );
+      const cleanSummary = storage.finalizeSessionTelemetry(cleanSessionId, {
+        ...baseSummaryData,
+        startedAtIso: cleanMeta.startedAtIso,
+        strategyRevision: cleanMeta.strategyRevision,
+      });
+      expect(cleanSummary.isCompleteSession).toBe(true);
+      expect(cleanSummary.isInterruptedSession).toBe(false);
+
+      // Re-finalizing clean session claiming it was interrupted throws FATAL_SESSION_ALREADY_FINALIZED
+      expect(() => {
+        storage.finalizeSessionTelemetry(cleanSessionId, {
+          ...baseSummaryData,
+          startedAtIso: cleanMeta.startedAtIso,
+          strategyRevision: cleanMeta.strategyRevision,
+          isCompleteSession: false,
+          isInterruptedSession: true,
         });
       }).toThrow(/\[FATAL_SESSION_ALREADY_FINALIZED\]/);
 

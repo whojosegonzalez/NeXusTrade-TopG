@@ -317,6 +317,9 @@ export class TelemetryStorageManager {
     if (
       existing.generationId !== candidate.generationId ||
       existing.strategyRevision !== candidate.strategyRevision ||
+      existing.startedAtIso !== candidate.startedAtIso ||
+      Boolean(existing.isCompleteSession) !== Boolean(candidate.isCompleteSession) ||
+      Boolean(existing.isInterruptedSession) !== Boolean(candidate.isInterruptedSession) ||
       existing.totalCandidatesScreened !== candidate.totalCandidatesScreened ||
       existing.totalDecisionsRecorded !== candidate.totalDecisionsRecorded ||
       existing.totalMarketObservationsRecorded !== candidate.totalMarketObservationsRecorded ||
@@ -348,6 +351,23 @@ export class TelemetryStorageManager {
       }
     }
 
+    const existingRejections = existing.topRejectionReasons ?? {};
+    const candidateRejections = candidate.topRejectionReasons ?? {};
+    const existingKeys = Object.keys(existingRejections).sort();
+    const candidateKeys = Object.keys(candidateRejections).sort();
+    if (existingKeys.length !== candidateKeys.length) {
+      return false;
+    }
+    for (let i = 0; i < existingKeys.length; i++) {
+      const key = existingKeys[i]!;
+      if (key !== candidateKeys[i]) {
+        return false;
+      }
+      if (existingRejections[key] !== candidateRejections[key]) {
+        return false;
+      }
+    }
+
     return true;
   }
 
@@ -360,49 +380,76 @@ export class TelemetryStorageManager {
     const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     const closedAtIso = new Date().toISOString();
 
-    // Verify session metadata exists and matches generation
-    if (existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
-        if (meta.generationId !== summaryData.generationId) {
-          throw new Error(
-            `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Cannot finalize session "${sessionId}" with generation "${summaryData.generationId}" when metadata belongs to "${meta.generationId}".`,
-          );
-        }
-      } catch (metaErr) {
-        if (
-          metaErr instanceof Error &&
-          metaErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH")
-        ) {
-          throw metaErr;
-        }
-        const quarantinePath = `${metaPath}.corrupt-${Date.now()}`;
-        try {
-          renameSync(metaPath, quarantinePath);
-        } catch {
-          // ignore rename failure
-        }
+    // 1. Authoritative session metadata validation (B5-02)
+    if (!existsSync(metaPath)) {
+      throw new Error(
+        `[TelemetryStorageManager] [FATAL_MISSING_SESSION_META] Cannot finalize session "${sessionId}": session-meta.json does not exist.`,
+      );
+    }
+
+    let meta: SessionTelemetryMeta;
+    try {
+      meta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
+      if (meta.generationId !== summaryData.generationId) {
         throw new Error(
-          `[TelemetryStorageManager] [FATAL_CORRUPT_SESSION_META] Cannot finalize session "${sessionId}" with corrupted metadata: ${String(metaErr)}`,
+          `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Cannot finalize session "${sessionId}" with generation "${summaryData.generationId}" when metadata belongs to "${meta.generationId}".`,
+        );
+      }
+    } catch (metaErr) {
+      if (
+        metaErr instanceof Error &&
+        metaErr.message.includes("FATAL_SESSION_GENERATION_MISMATCH")
+      ) {
+        throw metaErr;
+      }
+      const quarantinePath = `${metaPath}.corrupt-${Date.now()}`;
+      try {
+        renameSync(metaPath, quarantinePath);
+      } catch {
+        // ignore rename failure
+      }
+      throw new Error(
+        `[TelemetryStorageManager] [FATAL_CORRUPT_SESSION_META] Cannot finalize session "${sessionId}" with corrupted metadata: ${String(metaErr)}`,
+      );
+    }
+
+    // 2. Derive interruption/completeness authoritatively from persisted metadata (B5-02)
+    const isPersistedInterrupted = Boolean(meta.isInterruptedSession);
+    if (isPersistedInterrupted) {
+      if (summaryData.isCompleteSession === true || summaryData.isInterruptedSession === false) {
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_INVALID_COMPLETENESS_OVERRIDE] Cannot finalize interrupted session "${sessionId}" with isCompleteSession=true or isInterruptedSession=false. Persisted session metadata authoritatively marks this session as INTERRUPTED.`,
         );
       }
     }
 
+    const isInterruptedSession =
+      isPersistedInterrupted ||
+      summaryData.isInterruptedSession === true ||
+      summaryData.isCompleteSession === false;
+    const isCompleteSession = !isInterruptedSession;
+
+    const candidateSummary: Omit<SessionTelemetrySummary, "sessionId" | "closedAtIso"> = {
+      ...summaryData,
+      isCompleteSession,
+      isInterruptedSession,
+    };
+
+    // 3. Robust finalization check (B4-03, B5-02 & B5-03):
+    // Verify canonical complete summary matches, including observations, execution, follow-up, cohorts, completeness, and rejection distributions.
     if (existsSync(summaryPath)) {
       try {
         const existing = JSON.parse(readFileSync(summaryPath, "utf8")) as SessionTelemetrySummary;
-        if (existing.generationId !== summaryData.generationId) {
+        if (existing.generationId !== candidateSummary.generationId) {
           throw new Error(
-            `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Session summary already exists under generation "${existing.generationId}", cannot overwrite with "${summaryData.generationId}".`,
+            `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Session summary already exists under generation "${existing.generationId}", cannot overwrite with "${candidateSummary.generationId}".`,
           );
         }
-        // Robust finalization check (B4-03):
-        // Verify canonical complete summary matches, including observation, execution, follow-up, and cohort counts.
-        if (this.isSummaryMatching(existing, summaryData)) {
+        if (this.isSummaryMatching(existing, candidateSummary)) {
           return existing;
         }
         throw new Error(
-          `[TelemetryStorageManager] [FATAL_SESSION_ALREADY_FINALIZED] Session "${sessionId}" already has a finalized summary with conflicting metrics or cohort totals. Cannot destructively overwrite a finalized session summary.`,
+          `[TelemetryStorageManager] [FATAL_SESSION_ALREADY_FINALIZED] Session "${sessionId}" already has a finalized summary with conflicting metrics, rejection distribution, or completeness. Cannot destructively overwrite a finalized session summary.`,
         );
       } catch (parseErr) {
         if (
@@ -418,24 +465,10 @@ export class TelemetryStorageManager {
       }
     }
 
-    let isInterrupted = false;
-    if (existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
-        if (meta.isInterruptedSession) {
-          isInterrupted = true;
-        }
-      } catch {
-        // ignore
-      }
-    }
-
     const summary: SessionTelemetrySummary = {
-      ...summaryData,
+      ...candidateSummary,
       sessionId,
       closedAtIso,
-      isCompleteSession: summaryData.isCompleteSession ?? !isInterrupted,
-      isInterruptedSession: summaryData.isInterruptedSession ?? isInterrupted,
     };
 
     const tempPath = `${summaryPath}.${crypto.randomUUID()}.tmp`;
@@ -448,28 +481,22 @@ export class TelemetryStorageManager {
     }
     renameSync(tempPath, summaryPath);
 
-    // Update meta.json with closedAtIso and final sessionStatus
-    if (existsSync(metaPath)) {
-      try {
-        const currentMeta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
-        const updatedMeta: SessionTelemetryMeta = {
-          ...currentMeta,
-          closedAtIso,
-          sessionStatus: currentMeta.isInterruptedSession ? "INTERRUPTED" : "FINALIZED",
-        };
-        const tempMetaPath = `${metaPath}.${crypto.randomUUID()}.tmp`;
-        const metaFd = openSync(tempMetaPath, "w");
-        try {
-          writeFileSync(metaFd, JSON.stringify(updatedMeta, null, 2), "utf8");
-          fsyncSync(metaFd);
-        } finally {
-          closeSync(metaFd);
-        }
-        renameSync(tempMetaPath, metaPath);
-      } catch {
-        // ignore
-      }
+    // 4. Update meta.json with closedAtIso and final sessionStatus (B5-02: fail closed, do not silently swallow failures)
+    const updatedMeta: SessionTelemetryMeta = {
+      ...meta,
+      closedAtIso,
+      sessionStatus: isInterruptedSession ? "INTERRUPTED" : "FINALIZED",
+      isInterruptedSession,
+    };
+    const tempMetaPath = `${metaPath}.${crypto.randomUUID()}.tmp`;
+    const metaFd = openSync(tempMetaPath, "w");
+    try {
+      writeFileSync(metaFd, JSON.stringify(updatedMeta, null, 2), "utf8");
+      fsyncSync(metaFd);
+    } finally {
+      closeSync(metaFd);
     }
+    renameSync(tempMetaPath, metaPath);
 
     return summary;
   }
