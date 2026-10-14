@@ -232,8 +232,7 @@ function nexusDevApiPlugin(): Plugin {
             "../backend/.tmp/paper-session-active.json",
           );
           const localTmp = path.resolve(process.cwd(), ".tmp/paper-session-active.json");
-          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
-          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const candidates = [rootTmp, backendTmp, localTmp].filter((p) => fs.existsSync(p));
           const target = candidates[0];
 
           if (target) {
@@ -367,8 +366,7 @@ function nexusDevApiPlugin(): Plugin {
           const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
           const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
           const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
-          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
-          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const target = [rootTmp, backendTmp, localTmp].find((p) => fs.existsSync(p));
 
           const defaultWallet = {
             walletAddress: "SimulatedVirtualWallet111111111111111111111111",
@@ -380,9 +378,9 @@ function nexusDevApiPlugin(): Plugin {
           };
 
           let wallet = defaultWallet;
-          if (candidates.length > 0) {
+          if (target) {
             try {
-              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              const raw = JSON.parse(fs.readFileSync(target, "utf8"));
               if (typeof raw?.currentBalanceSol === "number") {
                 wallet = { ...defaultWallet, ...raw };
               }
@@ -406,23 +404,16 @@ function nexusDevApiPlugin(): Plugin {
             lastUpdatedMs: Date.now(),
           };
 
-          const targetDirs = [
-            path.resolve(process.cwd(), "../.tmp"),
-            path.resolve(process.cwd(), "../backend/.tmp"),
-            path.resolve(process.cwd(), ".tmp"),
-          ];
-
-          for (const dir of targetDirs) {
-            if (fs.existsSync(dir)) {
-              try {
-                fs.writeFileSync(
-                  path.join(dir, "virtual-wallet.json"),
-                  JSON.stringify(defaultWallet, null, 2),
-                  "utf8",
-                );
-              } catch {
-                // Ignore
-              }
+          const canonicalTmp = path.resolve(process.cwd(), "../.tmp");
+          if (fs.existsSync(canonicalTmp)) {
+            try {
+              fs.writeFileSync(
+                path.join(canonicalTmp, "virtual-wallet.json"),
+                JSON.stringify(defaultWallet, null, 2),
+                "utf8",
+              );
+            } catch {
+              // Ignore
             }
           }
 
@@ -435,12 +426,11 @@ function nexusDevApiPlugin(): Plugin {
           const rootTmp = path.resolve(process.cwd(), "../.tmp/virtual-wallet.json");
           const backendTmp = path.resolve(process.cwd(), "../backend/.tmp/virtual-wallet.json");
           const localTmp = path.resolve(process.cwd(), ".tmp/virtual-wallet.json");
-          const candidates = [backendTmp, rootTmp, localTmp].filter((p) => fs.existsSync(p));
-          candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+          const target = [rootTmp, backendTmp, localTmp].find((p) => fs.existsSync(p));
           let solBalance = 10.0;
-          if (candidates.length > 0) {
+          if (target) {
             try {
-              const raw = JSON.parse(fs.readFileSync(candidates[0], "utf8"));
+              const raw = JSON.parse(fs.readFileSync(target, "utf8"));
               if (typeof raw?.currentBalanceSol === "number") {
                 solBalance = raw.currentBalanceSol;
               }
@@ -473,8 +463,8 @@ function nexusDevApiPlugin(): Plugin {
             : "past-sessions.json";
 
           const candidates = [
-            path.join(backendTmp, targetFilename),
             path.join(rootTmp, targetFilename),
+            path.join(backendTmp, targetFilename),
             path.join(localTmp, targetFilename),
           ].filter((p) => fs.existsSync(p));
 

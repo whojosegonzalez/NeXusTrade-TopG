@@ -5,8 +5,13 @@ import { existsSync, readFileSync } from "node:fs";
  * Finds the authoritative repository / workspace root by walking up from startDir.
  * Looks for pnpm-workspace.yaml, .git, or root package.json with name 'nexustrade-otis'.
  */
-export function findWorkspaceRoot(startDir: string = process.cwd()): string {
+export function findWorkspaceRoot(
+  startDir: string = process.cwd(),
+  failIfNotFound: boolean = true,
+  stopAtDir?: string,
+): string {
   let cur = path.resolve(startDir);
+  const stopResolved = stopAtDir ? path.resolve(stopAtDir) : undefined;
   while (true) {
     if (existsSync(path.join(cur, "pnpm-workspace.yaml")) || existsSync(path.join(cur, ".git"))) {
       return cur;
@@ -22,9 +27,15 @@ export function findWorkspaceRoot(startDir: string = process.cwd()): string {
         // ignore parse error
       }
     }
+    if (stopResolved && cur === stopResolved) break;
     const parent = path.dirname(cur);
     if (parent === cur) break;
     cur = parent;
+  }
+  if (failIfNotFound) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_ROOT] Could not locate workspace root marker (pnpm-workspace.yaml, .git, or nexustrade-otis package.json) walking up from ${startDir}. Execution halted to prevent unanchored state writes.`,
+    );
   }
   return path.resolve(startDir);
 }

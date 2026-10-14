@@ -5,6 +5,7 @@ import type {
   SessionControlCommand,
   SessionControlAction,
 } from "@nexustrade/shared";
+import { getCanonicalTmpDir } from "../paper/CanonicalPaths.js";
 
 export interface SessionControlIpcServiceOptions {
   readonly tmpDir?: string;
@@ -18,7 +19,7 @@ export class SessionControlIpcService {
   private readonly commandFilePath: string;
 
   constructor(options: SessionControlIpcServiceOptions = {}) {
-    this.tmpDir = options.tmpDir ?? path.resolve(process.cwd(), ".tmp");
+    this.tmpDir = options.tmpDir ?? getCanonicalTmpDir();
     this.activeStateFilePath = path.join(
       this.tmpDir,
       options.activeStateFileName ?? "paper-session-active.json",

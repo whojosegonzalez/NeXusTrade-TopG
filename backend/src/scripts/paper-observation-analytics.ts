@@ -1,10 +1,15 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { CounterfactualOpportunityReport } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
+import { getCanonicalObservationReportPath } from "../paper/CanonicalPaths.js";
 
 function runAnalytics(): void {
-  const reportPath = ".tmp/session-paper-observation-report.json";
+  const canonicalPath = getCanonicalObservationReportPath();
+  const fallbackPath = ".tmp/session-paper-observation-report.json";
+  const reportPath = existsSync(canonicalPath) ? canonicalPath : fallbackPath;
   if (!existsSync(reportPath)) {
-    console.error(`[Analytics] No observation report found at ${reportPath}.`);
+    console.error(
+      `[Analytics] No observation report found at ${canonicalPath} (or ${fallbackPath}).`,
+    );
     console.error(
       `[Analytics] Run a paper trading session first via: pnpm daemon:paper --duration-hours=4`,
     );

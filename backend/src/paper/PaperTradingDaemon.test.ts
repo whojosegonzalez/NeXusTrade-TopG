@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -23,7 +33,7 @@ import {
   ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
 } from "../exits/DynamicRatchetTypes.js";
 import { recoverSettlementJournal, type SettlementJournalEntry } from "./SettlementJournal.js";
-import { checkLegacyConflict } from "./CanonicalPaths.js";
+import { checkLegacyConflict, findWorkspaceRoot } from "./CanonicalPaths.js";
 import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
 import { parseCliArgs } from "../scripts/paper-trading-daemon.js";
 import {
@@ -2715,6 +2725,224 @@ describe("PaperTradingDaemon", () => {
       recoverInterruptedIntent(tempDir);
       expect(existsSync(intentFile)).toBe(false);
       expect(existsSync(auditFile)).toBe(true);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V11-01: Lifecycle regression: equal root+legacy -> retire legacy -> canonical settlement -> next startup loads updated canonical balance without conflict", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v11-lifecycle-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend/.tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n",
+        "utf8",
+      );
+
+      const canonicalWallet = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const legacyWallet = path.join(tempDir, "backend/.tmp", "virtual-wallet.json");
+
+      const initialWallet: VirtualWalletState = {
+        walletAddress: "SimWalletV11Lifecycle",
+        currentBalanceSol: 7.9259,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 7,
+        allTimeRealizedPnlSol: -2.074,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1", "sess-2"],
+        unresolvedTokens: [],
+      };
+
+      // 1. Both root and legacy exist and match
+      writeFileSync(canonicalWallet, JSON.stringify(initialWallet, null, 2), "utf8");
+      writeFileSync(legacyWallet, JSON.stringify(initialWallet, null, 2), "utf8");
+      expect(() => {
+        checkLegacyConflict(
+          canonicalWallet,
+          "backend/.tmp/virtual-wallet.json",
+          "virtual wallet",
+          tempDir,
+        );
+      }).not.toThrow();
+
+      // 2. Controlled retirement: rename legacy wallet to .retired-...
+      const retiredLegacyWallet = path.join(
+        tempDir,
+        "backend/.tmp",
+        "virtual-wallet.json.retired-20261013-1700",
+      );
+      renameSync(legacyWallet, retiredLegacyWallet);
+      expect(existsSync(legacyWallet)).toBe(false);
+      expect(existsSync(retiredLegacyWallet)).toBe(true);
+
+      // 3. Next session settles into canonical wallet ONLY (e.g. cash changes to 7.8000 SOL)
+      const updatedWallet: VirtualWalletState = {
+        ...initialWallet,
+        currentBalanceSol: 7.8,
+        totalSessionsCompleted: 8,
+        allTimeRealizedPnlSol: -2.2,
+        settledSessionIds: [...initialWallet.settledSessionIds!, "sess-3"],
+      };
+      saveVirtualWallet(updatedWallet, canonicalWallet);
+
+      // 4. Next startup verifies no FATAL_CONFLICT occurs and loads updated canonical balance
+      expect(() => {
+        checkLegacyConflict(
+          canonicalWallet,
+          "backend/.tmp/virtual-wallet.json",
+          "virtual wallet",
+          tempDir,
+        );
+      }).not.toThrow();
+
+      const loaded = loadVirtualWallet(canonicalWallet);
+      expect(loaded.currentBalanceSol).toBe(7.8);
+      expect(loaded.totalSessionsCompleted).toBe(8);
+      expect(loaded.allTimeRealizedPnlSol).toBe(-2.2);
+
+      // 5. Verify no legacy active wallet was recreated
+      expect(existsSync(legacyWallet)).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V11-02: Recovery regression: journal recovery succeeds after legacy retirement and does not recreate legacy wallet", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v11-recovery-"));
+      mkdirSync(path.join(tempDir, ".tmp", "sessions"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend/.tmp"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n",
+        "utf8",
+      );
+
+      const canonicalWallet = path.join(tempDir, ".tmp", "virtual-wallet.json");
+      const retiredLegacyWallet = path.join(
+        tempDir,
+        "backend/.tmp",
+        "virtual-wallet.json.retired-20261013-1700",
+      );
+      const canonicalJournal = path.join(tempDir, ".tmp", "settlement-journal.json");
+
+      const baseWallet: VirtualWalletState = {
+        walletAddress: "SimWalletV11Recovery",
+        currentBalanceSol: 7.9259,
+        initialBalanceSol: 10.0,
+        totalSessionsCompleted: 7,
+        allTimeRealizedPnlSol: -2.074,
+        lastUpdatedMs: nowMs,
+        settledSessionIds: ["sess-1"],
+        unresolvedTokens: [],
+      };
+      writeFileSync(canonicalWallet, JSON.stringify(baseWallet, null, 2), "utf8");
+      writeFileSync(retiredLegacyWallet, JSON.stringify(baseWallet, null, 2), "utf8");
+
+      const journalEntry: SettlementJournalEntry = {
+        sessionId: "sess-v11-recovery",
+        stage: "PAST_SESSIONS_WRITTEN",
+        startedAtMs: nowMs,
+        sessionSummary: {
+          sessionId: "sess-v11-recovery",
+          startedAt: new Date(nowMs).toISOString(),
+          endedAt: new Date(nowMs + 60000).toISOString(),
+          durationMinutes: 1,
+          startingCapitalSol: 7.9259,
+          endingCapitalSol: 7.75,
+          netPnlSol: -0.1759,
+          netPnlPct: -2.22,
+          totalTrades: 1,
+          buysCount: 1,
+          sellsCount: 1,
+          winsCount: 0,
+          lossesCount: 1,
+          scratchesCount: 0,
+          winRatePct: 0,
+          coinsWatchedCount: 0,
+          missedOpportunitiesCount: 0,
+          trades: [],
+        },
+        liquidCashSol: 7.75,
+        initialPortfolioSol: 7.9259,
+        reconciledPositionIds: [],
+        sessionNewRealizedPnlSol: -0.1759,
+      };
+      writeFileSync(canonicalJournal, JSON.stringify(journalEntry, null, 2), "utf8");
+
+      // Recover journal
+      const res = recoverSettlementJournal({ workspaceRoot: tempDir });
+      expect(res.recovered).toBe(true);
+      expect(existsSync(canonicalJournal)).toBe(false);
+
+      // Verify canonical wallet was updated
+      const recoveredWallet = JSON.parse(
+        readFileSync(canonicalWallet, "utf8"),
+      ) as VirtualWalletState;
+      expect(recoveredWallet.currentBalanceSol).toBe(7.75);
+      expect(recoveredWallet.totalSessionsCompleted).toBe(8);
+
+      // Verify active legacy wallet was NOT recreated
+      expect(existsSync(path.join(tempDir, "backend/.tmp", "virtual-wallet.json"))).toBe(false);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V11-03: findWorkspaceRoot fails closed if no workspace marker exists walking up", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v11-no-marker-"));
+
+      expect(() => {
+        findWorkspaceRoot(tempDir, true, tempDir);
+      }).toThrow(/\[CanonicalPaths\] \[FATAL_ROOT\] Could not locate workspace root marker/);
+
+      // With failIfNotFound: false, it returns tempDir
+      expect(findWorkspaceRoot(tempDir, false, tempDir)).toBe(path.resolve(tempDir));
+
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("V11-04: CWD-independent missing-wallet check fails closed when executed from backend/ subfolder without custom wallet path", () => {
+      const tempDir = mkdtempSync(path.join(os.tmpdir(), "v11-cwd-check-"));
+      mkdirSync(path.join(tempDir, ".tmp"), { recursive: true });
+      mkdirSync(path.join(tempDir, "backend"), { recursive: true });
+      writeFileSync(
+        path.join(tempDir, "pnpm-workspace.yaml"),
+        "packages:\n  - 'backend'\n",
+        "utf8",
+      );
+
+      // History exists in tempDir/.tmp
+      const historyFile = path.join(tempDir, ".tmp", "past-sessions.json");
+      writeFileSync(
+        historyFile,
+        JSON.stringify([{ sessionId: "sess-v11-prior" }], null, 2),
+        "utf8",
+      );
+
+      // No virtual-wallet.json exists in tempDir/.tmp
+      expect(existsSync(path.join(tempDir, ".tmp", "virtual-wallet.json"))).toBe(false);
+
+      // Spawn child process with cwd: path.join(tempDir, "backend")
+      const tsxCli = path.resolve(findWorkspaceRoot(), "backend/node_modules/tsx/dist/cli.mjs");
+      const walletModuleUrl = pathToFileURL(
+        path.resolve(findWorkspaceRoot(), "backend/src/paper/VirtualWallet.ts"),
+      ).href;
+      const scriptCode = `
+        import { loadVirtualWallet } from '${walletModuleUrl}';
+        loadVirtualWallet();
+      `;
+      const result = spawnSync(
+        process.execPath,
+        [tsxCli, "--input-type=module", "-e", scriptCode],
+        {
+          cwd: path.join(tempDir, "backend"),
+          encoding: "utf8",
+        },
+      );
+
+      expect(result.status).not.toBe(0);
+      const combinedOutput = (result.stdout || "") + (result.stderr || "");
+      expect(combinedOutput).toMatch(
+        /Virtual wallet missing at .* but prior session history exists/,
+      );
 
       rmSync(tempDir, { recursive: true, force: true });
     });
