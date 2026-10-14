@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import {
   findWorkspaceRoot,
@@ -7,6 +16,7 @@ import {
   getCanonicalSessionsDir,
   getCanonicalJournalPath,
   checkLegacyConflict,
+  validateGenerationId,
 } from "./CanonicalPaths.js";
 
 export interface UnresolvedTokenInventory {
@@ -57,7 +67,14 @@ export function checkLegacyWalletConflict(canonicalPath: string): void {
   checkLegacyConflict(canonicalPath, "backend/.tmp/virtual-wallet.json", "virtual wallet");
 }
 
-export function loadVirtualWallet(customPath?: string): VirtualWalletState {
+export interface LoadVirtualWalletOptions {
+  expectedGenerationId?: string | undefined;
+}
+
+export function loadVirtualWallet(
+  customPath?: string,
+  options?: LoadVirtualWalletOptions,
+): VirtualWalletState {
   const filePath = resolveVirtualWalletFile(customPath);
   if (!customPath) {
     checkLegacyWalletConflict(filePath);
@@ -77,8 +94,34 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
         typeof parsed.totalSessionsCompleted === "number" &&
         Number.isFinite(parsed.totalSessionsCompleted)
       ) {
+        const rawGenId =
+          typeof parsed.generationId === "string" && parsed.generationId.trim().length > 0
+            ? parsed.generationId.trim()
+            : undefined;
+
+        if (rawGenId) {
+          validateGenerationId(rawGenId);
+        }
+
+        if (options?.expectedGenerationId) {
+          const expected = validateGenerationId(options.expectedGenerationId);
+          if (!rawGenId) {
+            // Legacy Generation 1 backward-compatibility: allow untagged wallet ONLY if expected is gen-01-legacy-baseline
+            if (expected !== "gen-01-legacy-baseline") {
+              throw new Error(
+                `[VirtualWallet] [GENERATION_MISMATCH] Wallet at ${filePath} is untagged (missing generationId), but expected '${expected}'. Aborting to prevent cross-generation corruption.`,
+              );
+            }
+          } else if (rawGenId !== expected) {
+            throw new Error(
+              `[VirtualWallet] [GENERATION_MISMATCH] Wallet at ${filePath} has generationId '${rawGenId}', but expected '${expected}'. Aborting to prevent cross-generation corruption.`,
+            );
+          }
+        }
+
         return {
           walletAddress: parsed.walletAddress || DEFAULT_VIRTUAL_WALLET.walletAddress,
+          ...(rawGenId ? { generationId: rawGenId } : {}),
           currentBalanceSol: parsed.currentBalanceSol,
           initialBalanceSol:
             typeof parsed.initialBalanceSol === "number" &&
@@ -99,6 +142,13 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
       }
       throw new Error(`Invalid wallet structure or non-finite values in ${filePath}`);
     } catch (parseErr) {
+      if (
+        parseErr instanceof Error &&
+        (parseErr.message.includes("[GENERATION_MISMATCH]") ||
+          parseErr.message.includes("[FATAL_PATH]"))
+      ) {
+        throw parseErr;
+      }
       console.error(
         `[PaperDaemon] Corrupt or unreadable virtual wallet at ${filePath}. Creating backup and failing closed...`,
         parseErr,
@@ -139,12 +189,21 @@ export function loadVirtualWallet(customPath?: string): VirtualWalletState {
 }
 
 export function saveVirtualWallet(wallet: VirtualWalletState, customPath?: string): void {
+  if (wallet.generationId) {
+    validateGenerationId(wallet.generationId);
+  }
   const primaryPath = resolveVirtualWalletFile(customPath);
   const dir = path.dirname(primaryPath);
   mkdirSync(dir, { recursive: true });
   const tempPath = `${primaryPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
   const payload = JSON.stringify(wallet, null, 2);
-  writeFileSync(tempPath, payload, "utf8");
+  const fd = openSync(tempPath, "w");
+  try {
+    writeFileSync(fd, payload, "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tempPath, primaryPath);
 }
 

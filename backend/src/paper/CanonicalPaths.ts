@@ -88,6 +88,35 @@ export function getCanonicalReconciliationIntentPath(workspaceRoot?: string): st
   return path.resolve(getCanonicalTmpDir(workspaceRoot), "reconciliation-intent.json");
 }
 
+/**
+ * Enforces canonical, portable single-segment generation identifier format.
+ * Rejects path traversal, slashes, backslashes, colons, percent-encoding, and non-conforming IDs.
+ */
+export function validateGenerationId(generationId: string): string {
+  if (typeof generationId !== "string" || generationId.length === 0) {
+    throw new Error(`[CanonicalPaths] [FATAL_PATH] Generation ID must be a non-empty string.`);
+  }
+  if (
+    generationId.includes("/") ||
+    generationId.includes("\\") ||
+    generationId.includes("..") ||
+    generationId.includes(":") ||
+    generationId.includes("%")
+  ) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Generation ID '${generationId}' contains forbidden characters or path separators. Path traversal rejected.`,
+    );
+  }
+  // Portable single-segment identifier: 1-64 lowercase alphanumeric and internal hyphens
+  const VALID_GEN_ID_REGEX = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+  if (!VALID_GEN_ID_REGEX.test(generationId)) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Invalid generation ID '${generationId}'. Generation IDs must be 1-64 lowercase alphanumeric characters and internal hyphens (regex: /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/).`,
+    );
+  }
+  return generationId;
+}
+
 export function getCanonicalGenerationsDir(workspaceRoot?: string): string {
   return path.resolve(getCanonicalTmpDir(workspaceRoot), "generations");
 }
@@ -97,7 +126,16 @@ export function getCanonicalGenerationsRegistryPath(workspaceRoot?: string): str
 }
 
 export function getCanonicalGenerationDir(generationId: string, workspaceRoot?: string): string {
-  return path.resolve(getCanonicalGenerationsDir(workspaceRoot), generationId);
+  const validId = validateGenerationId(generationId);
+  const baseDir = getCanonicalGenerationsDir(workspaceRoot);
+  const resolvedDir = path.resolve(baseDir, validId);
+  const rel = path.relative(baseDir, resolvedDir);
+  if (rel.startsWith("..") || path.isAbsolute(rel) || rel === "" || rel !== validId) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Generation dir '${resolvedDir}' escapes canonical generations base '${baseDir}'.`,
+    );
+  }
+  return resolvedDir;
 }
 
 export function getGenerationWalletPath(generationId: string, workspaceRoot?: string): string {
