@@ -27,9 +27,89 @@ import type {
   SessionTelemetrySummary,
   StratifiedSamplingRecord,
 } from "./TelemetryTypes.js";
+import { resolveStrategyRevision } from "./RevisionHelper.js";
 
-function getStrategyRevision(): string {
-  return process.env.GIT_COMMIT || "7e58ea5";
+/**
+ * Validates and repairs crash-damaged JSONL file boundaries.
+ * If a malformed trailing line or unterminated tail is found at the very end of the file,
+ * it quarantines the damaged tail to `<filePath>.corrupt-<timestamp>` and restores a valid
+ * newline-terminated append boundary.
+ *
+ * If malformed content is found interior (followed by valid lines), it throws [FATAL_CORRUPT_LINE]
+ * to fail closed against corrupt history.
+ */
+export function repairAndQuarantineDamagedTail<T>(filePath: string): T[] {
+  if (!existsSync(filePath)) return [];
+
+  const rawBytes = readFileSync(filePath);
+  if (rawBytes.length === 0) return [];
+
+  const rawContent = rawBytes.toString("utf8");
+  const rawLines = rawContent.split("\n");
+  const validRecords: T[] = [];
+  const validLineStrings: string[] = [];
+  let damagedTailDetected = false;
+  let damagedTailContent = "";
+  let damagedTailLineIndex = -1;
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const raw = rawLines[i]!.trim();
+    if (raw.length === 0) continue;
+
+    try {
+      const parsed = JSON.parse(raw) as T;
+      if (damagedTailDetected) {
+        // A valid line appeared AFTER a corrupt line -> Interior corruption!
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_CORRUPT_LINE] Malformed interior line in ${filePath}:${damagedTailLineIndex + 1}. History cannot be silently truncated.`,
+        );
+      }
+      validRecords.push(parsed);
+      validLineStrings.push(JSON.stringify(parsed));
+    } catch (err) {
+      if (damagedTailDetected) {
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_CORRUPT_LINE] Multiple malformed lines in ${filePath}:${i + 1}: ${String(err)}`,
+        );
+      }
+
+      // Check if this error is at the tail (all remaining lines are empty/whitespace)
+      const remainingLines = rawLines.slice(i + 1).filter((l) => l.trim().length > 0);
+      if (remainingLines.length === 0) {
+        damagedTailDetected = true;
+        damagedTailContent = raw;
+        damagedTailLineIndex = i;
+      } else {
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_CORRUPT_LINE] Malformed interior line in ${filePath}:${i + 1}: ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  // If damaged tail detected, quarantine it and restore clean append boundary
+  if (damagedTailDetected) {
+    const timestamp = Date.now();
+    const quarantinePath = `${filePath}.corrupt-${timestamp}`;
+    writeFileSync(quarantinePath, damagedTailContent, "utf8");
+    console.warn(
+      `[TelemetryStorageManager] Quarantined damaged tail from ${filePath}:${damagedTailLineIndex + 1} to ${quarantinePath}`,
+    );
+
+    // Rewrite file cleanly with valid lines followed by newline
+    const cleanContent = validLineStrings.length > 0 ? validLineStrings.join("\n") + "\n" : "";
+    const tempCleanPath = `${filePath}.${crypto.randomUUID()}.tmp`;
+    writeFileSync(tempCleanPath, cleanContent, "utf8");
+    renameSync(tempCleanPath, filePath);
+  } else if (!rawContent.endsWith("\n") && rawContent.length > 0) {
+    // If the file was not newline-terminated, append a newline to ensure safe subsequent appends
+    const fixedContent = rawContent + "\n";
+    const tempCleanPath = `${filePath}.${crypto.randomUUID()}.tmp`;
+    writeFileSync(tempCleanPath, fixedContent, "utf8");
+    renameSync(tempCleanPath, filePath);
+  }
+
+  return validRecords;
 }
 
 function appendJsonLine(filePath: string, obj: unknown): void {
@@ -37,6 +117,9 @@ function appendJsonLine(filePath: string, obj: unknown): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+
+  // Ensure file append boundary is safe and unbroken before writing
+  repairAndQuarantineDamagedTail(filePath);
 
   const line = JSON.stringify(obj) + "\n";
   const fd = openSync(filePath, "a");
@@ -49,32 +132,7 @@ function appendJsonLine(filePath: string, obj: unknown): void {
 }
 
 function readJsonLines<T>(filePath: string): T[] {
-  if (!existsSync(filePath)) return [];
-
-  const content = readFileSync(filePath, "utf8");
-  const lines = content.split("\n");
-  const records: T[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i]!.trim();
-    if (raw.length === 0) continue;
-    try {
-      records.push(JSON.parse(raw) as T);
-    } catch (err) {
-      // If trailing partial line from crash, warn and skip
-      if (i === lines.length - 1 || i === lines.length - 2) {
-        console.warn(
-          `[TelemetryStorageManager] Skipping partial trailing line at ${filePath}:${i + 1}: ${String(err)}`,
-        );
-      } else {
-        throw new Error(
-          `[TelemetryStorageManager] [FATAL_CORRUPT_LINE] Malformed line in ${filePath}:${i + 1}: ${String(err)}`,
-        );
-      }
-    }
-  }
-
-  return records;
+  return repairAndQuarantineDamagedTail<T>(filePath);
 }
 
 export class TelemetryStorageManager {
@@ -97,17 +155,35 @@ export class TelemetryStorageManager {
 
     const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     if (existsSync(metaPath)) {
+      let existingMeta: SessionTelemetryMeta;
       try {
-        return JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
-      } catch {
-        // Fall through to rewrite if corrupt
+        existingMeta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
+      } catch (err) {
+        const quarantinePath = `${metaPath}.corrupt-${Date.now()}`;
+        try {
+          renameSync(metaPath, quarantinePath);
+        } catch {
+          // ignore rename failure
+        }
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_CORRUPT_SESSION_META] Corrupted session metadata in ${metaPath}; quarantined to ${quarantinePath}: ${String(err)}`,
+        );
       }
+
+      // Prohibit session ID reuse with a different generation ID
+      if (existingMeta.generationId !== generationId) {
+        throw new Error(
+          `[TelemetryStorageManager] [FATAL_SESSION_GENERATION_MISMATCH] Session "${sessionId}" is already registered to generation "${existingMeta.generationId}", cannot re-bind to "${generationId}".`,
+        );
+      }
+
+      return existingMeta;
     }
 
     const meta: SessionTelemetryMeta = {
       sessionId,
       generationId,
-      strategyRevision: getStrategyRevision(),
+      strategyRevision: resolveStrategyRevision(),
       startedAtIso: new Date().toISOString(),
       initialWalletBalanceSol: initialBalanceSol,
       environment: {
@@ -173,6 +249,20 @@ export class TelemetryStorageManager {
     const summaryPath = getCanonicalSessionTelemetrySummaryPath(sessionId, this.workspaceRoot);
     const closedAtIso = new Date().toISOString();
 
+    if (existsSync(summaryPath)) {
+      try {
+        const existing = JSON.parse(readFileSync(summaryPath, "utf8")) as SessionTelemetrySummary;
+        if (existing.generationId === summaryData.generationId) {
+          // Idempotent finalization: return existing record
+          return existing;
+        }
+      } catch {
+        // Malformed summary on disk: quarantine before proceeding
+        const quarantinePath = `${summaryPath}.corrupt-${Date.now()}`;
+        renameSync(summaryPath, quarantinePath);
+      }
+    }
+
     const summary: SessionTelemetrySummary = {
       ...summaryData,
       sessionId,
@@ -192,24 +282,20 @@ export class TelemetryStorageManager {
     // Update meta.json with closedAtIso
     const metaPath = getCanonicalSessionMetaPath(sessionId, this.workspaceRoot);
     if (existsSync(metaPath)) {
+      const currentMeta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
+      const updatedMeta: SessionTelemetryMeta = {
+        ...currentMeta,
+        closedAtIso,
+      };
+      const tempMetaPath = `${metaPath}.${crypto.randomUUID()}.tmp`;
+      const metaFd = openSync(tempMetaPath, "w");
       try {
-        const currentMeta = JSON.parse(readFileSync(metaPath, "utf8")) as SessionTelemetryMeta;
-        const updatedMeta: SessionTelemetryMeta = {
-          ...currentMeta,
-          closedAtIso,
-        };
-        const tempMetaPath = `${metaPath}.${crypto.randomUUID()}.tmp`;
-        const metaFd = openSync(tempMetaPath, "w");
-        try {
-          writeFileSync(metaFd, JSON.stringify(updatedMeta, null, 2), "utf8");
-          fsyncSync(metaFd);
-        } finally {
-          closeSync(metaFd);
-        }
-        renameSync(tempMetaPath, metaPath);
-      } catch {
-        // ignore meta update error
+        writeFileSync(metaFd, JSON.stringify(updatedMeta, null, 2), "utf8");
+        fsyncSync(metaFd);
+      } finally {
+        closeSync(metaFd);
       }
+      renameSync(tempMetaPath, metaPath);
     }
 
     return summary;

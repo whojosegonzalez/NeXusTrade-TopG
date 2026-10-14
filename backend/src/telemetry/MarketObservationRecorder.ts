@@ -5,10 +5,7 @@ import type {
   PriceSourceType,
 } from "./TelemetryTypes.js";
 import type { TelemetryStorageManager } from "./TelemetryStorageManager.js";
-
-function getStrategyRevision(): string {
-  return process.env.GIT_COMMIT || "7e58ea5";
-}
+import { resolveStrategyRevision } from "./RevisionHelper.js";
 
 export interface RecordObservationInput {
   readonly sessionId: string;
@@ -16,11 +13,12 @@ export interface RecordObservationInput {
   readonly mintAddress: string;
   readonly poolId: string;
   readonly sourceTimestampMs: number;
+  readonly ingestionTimestampMs?: number | undefined;
   readonly measurementWindow: MeasurementWindow;
   readonly providerIdentity: string;
   readonly priceMetrics: {
-    readonly spotPriceUsd: number;
-    readonly spotPriceSol: number;
+    readonly spotPriceUsd: number | null;
+    readonly spotPriceSol: number | null;
     readonly priceSource: PriceSourceType;
   };
   readonly liquidityMetrics: {
@@ -55,8 +53,28 @@ export class MarketObservationRecorder {
   }
 
   public recordObservation(input: RecordObservationInput): MarketObservationRecord {
-    const ingestionTimestampMs = Date.now();
+    const ingestionTimestampMs = input.ingestionTimestampMs ?? Date.now();
     const observationId = crypto.randomUUID();
+
+    // 1. Validate Measurement Window Boundaries
+    const { windowStartMs, windowEndMs } = input.measurementWindow;
+    if (windowStartMs > windowEndMs) {
+      throw new Error(
+        `[MarketObservationRecorder] [FATAL_INVALID_MEASUREMENT_WINDOW] windowStartMs (${windowStartMs}) must be <= windowEndMs (${windowEndMs}).`,
+      );
+    }
+    if (windowEndMs > input.sourceTimestampMs + 5000) {
+      throw new Error(
+        `[MarketObservationRecorder] [FATAL_INVALID_MEASUREMENT_WINDOW] windowEndMs (${windowEndMs}) cannot exceed sourceTimestampMs (${input.sourceTimestampMs}) by more than clock tolerance.`,
+      );
+    }
+
+    // 2. Validate Clock Skew & Freshness
+    let clockSkewWarning: string | undefined;
+    if (input.sourceTimestampMs > ingestionTimestampMs + 5000) {
+      clockSkewWarning = `[WARN_CLOCK_SKEW_FUTURE_SOURCE] sourceTimestampMs (${input.sourceTimestampMs}) is ahead of ingestion clock (${ingestionTimestampMs})`;
+    }
+
     const dataFreshnessMs = Math.max(0, ingestionTimestampMs - input.sourceTimestampMs);
 
     const record: MarketObservationRecord = {
@@ -75,23 +93,38 @@ export class MarketObservationRecorder {
       flowMetrics: input.flowMetrics,
       holderMetrics: input.holderMetrics,
       missingFields: input.missingFields ?? [],
-      strategyRevision: getStrategyRevision(),
+      strategyRevision: resolveStrategyRevision(),
+      clockSkewWarning,
     };
 
     this.storage.appendMarketObservation(record);
 
-    // Update in-memory ring buffer
-    const list = this.recentObservations.get(input.mintAddress) ?? [];
+    // Update in-memory ring buffer (keyed by pool:mint to avoid multi-pool collision)
+    const key = `${input.poolId}:${input.mintAddress}`;
+    const list = this.recentObservations.get(key) ?? [];
     list.push(record);
     if (list.length > this.maxCachedPerMint) {
       list.shift();
     }
-    this.recentObservations.set(input.mintAddress, list);
+    this.recentObservations.set(key, list);
 
     return record;
   }
 
-  public getCachedObservations(mintAddress: string): readonly MarketObservationRecord[] {
-    return this.recentObservations.get(mintAddress) ?? [];
+  public getCachedObservations(
+    mintAddress: string,
+    poolId?: string,
+  ): readonly MarketObservationRecord[] {
+    if (poolId) {
+      return this.recentObservations.get(`${poolId}:${mintAddress}`) ?? [];
+    }
+    // Return all observations matching mint
+    const results: MarketObservationRecord[] = [];
+    for (const [k, v] of this.recentObservations.entries()) {
+      if (k.endsWith(`:${mintAddress}`)) {
+        results.push(...v);
+      }
+    }
+    return results;
   }
 }

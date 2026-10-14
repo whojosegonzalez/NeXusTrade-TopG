@@ -6,10 +6,7 @@ import type {
   FilterEvaluationDetail,
 } from "./TelemetryTypes.js";
 import type { TelemetryStorageManager } from "./TelemetryStorageManager.js";
-
-function getStrategyRevision(): string {
-  return process.env.GIT_COMMIT || "7e58ea5";
-}
+import { resolveStrategyRevision } from "./RevisionHelper.js";
 
 export interface RecordDecisionInput {
   readonly sessionId: string;
@@ -50,7 +47,7 @@ export class CandidateDecisionRecorder {
       sourceTimestampMs: input.sourceTimestampMs,
       ingestionTimestampMs: input.ingestionTimestampMs,
       decisionTimestampMs,
-      strategyRevision: getStrategyRevision(),
+      strategyRevision: resolveStrategyRevision(),
       decisionCohort: input.decisionCohort,
       primaryRejectionReason: input.primaryRejectionReason,
       filterEvaluations: input.filterEvaluations,

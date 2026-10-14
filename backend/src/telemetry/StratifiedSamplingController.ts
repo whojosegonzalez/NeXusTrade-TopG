@@ -33,6 +33,7 @@ export class StratifiedSamplingController {
   private readonly storage: TelemetryStorageManager;
   private readonly config: SamplingRuleConfig;
   private readonly sessionSeed: string;
+  // Keyed by composite key: `${generationId}:${sessionId}:${poolId}:${mintAddress}`
   private readonly activeTrackers = new Map<string, StratifiedSamplingRecord>();
 
   constructor(
@@ -45,6 +46,15 @@ export class StratifiedSamplingController {
     this.config = { ...DEFAULT_SAMPLING_CONFIG, ...config };
   }
 
+  private buildTrackerKey(
+    generationId: string,
+    sessionId: string,
+    poolId: string,
+    mintAddress: string,
+  ): string {
+    return `${generationId}:${sessionId}:${poolId}:${mintAddress}`;
+  }
+
   public classifyTier(decision: CandidateDecisionRecord): StratificationTier {
     if (decision.decisionCohort === "EXECUTED_BUY") {
       return "EXECUTED_POSITION";
@@ -53,13 +63,12 @@ export class StratifiedSamplingController {
       return "WATCHLIST_ACTIVE";
     }
 
-    // Exclude complete spam
+    // Exclude complete spam (zero / negligible liquidity)
     if (decision.metricsSnapshot.liquidityUsd < this.config.minLiquidityForTrackingUsd) {
       return "EXCLUDED_SPAM";
     }
 
     // Near-miss detection: check if candidate failed by a narrow margin
-    // e.g. Failed net buyer flow but had healthy LP (> $5,000) or high tx count (> 15)
     const isNearMiss =
       (decision.primaryRejectionReason === "REJECTED_NET_SELLER_DOMINANCE" &&
         decision.metricsSnapshot.liquidityUsd >= 5000) ||
@@ -77,50 +86,161 @@ export class StratifiedSamplingController {
     decision: CandidateDecisionRecord,
     initialPriceSol: number,
   ): StratifiedSamplingRecord | null {
-    if (this.activeTrackers.has(decision.mintAddress)) {
-      return this.activeTrackers.get(decision.mintAddress)!;
-    }
+    const key = this.buildTrackerKey(
+      decision.generationId,
+      decision.sessionId,
+      decision.poolId,
+      decision.mintAddress,
+    );
 
-    if (this.activeTrackers.size >= this.config.maxConcurrentTracked) {
-      return null; // Concurrency budget reached
+    if (this.activeTrackers.has(key)) {
+      return this.activeTrackers.get(key)!;
     }
 
     const tier = this.classifyTier(decision);
-    let probability = 0;
+    let stratumProbability = 0;
+    let ipwEstimable = false;
 
     switch (tier) {
       case "EXECUTED_POSITION":
-        probability = 1.0;
+        stratumProbability = 1.0;
+        ipwEstimable = true;
         break;
       case "WATCHLIST_ACTIVE":
-        probability = 1.0;
+        stratumProbability = 1.0;
+        ipwEstimable = true;
         break;
       case "NEAR_MISS_CANDIDATE":
-        probability = this.config.nearMissSamplingRate;
+        stratumProbability = this.config.nearMissSamplingRate;
+        ipwEstimable = true;
         break;
       case "HARD_REJECT_BASELINE":
-        probability = this.config.baselineSamplingRate;
+        stratumProbability = this.config.baselineSamplingRate;
+        ipwEstimable = true;
         break;
       case "EXCLUDED_SPAM":
-        probability = 0.0;
+        stratumProbability = 0.0;
+        ipwEstimable = false; // p=0 stratum cannot be estimated via IPW
         break;
-    }
-
-    if (probability <= 0) {
-      return null;
-    }
-
-    // Deterministic selection using sessionSeed
-    const u = computeDeterministicUniform(this.sessionSeed, decision.mintAddress);
-    const isSelected = u < probability;
-
-    if (!isSelected) {
-      return null;
     }
 
     const now = Date.now();
     const trackingId = crypto.randomUUID();
     const trackingExpiresMs = now + this.config.maxTrackingDurationMs;
+
+    // Handle Excluded Spam: record drop event and return null
+    if (tier === "EXCLUDED_SPAM") {
+      const spamRecord: StratifiedSamplingRecord = {
+        trackingId,
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        decisionEventId: decision.eventId,
+        tier,
+        samplingProbability: 0.0,
+        effectiveInclusionProbability: 0.0,
+        ipwEstimable: false,
+        selectionSeed: this.sessionSeed,
+        selectionReason: "EXCLUDED_SPAM_BELOW_MIN_LIQUIDITY",
+        trackingStartedMs: now,
+        trackingExpiresMs,
+        currentSamplingIntervalMs: 0,
+        observationCount: 0,
+        initialPriceSol,
+        peakPriceSol: initialPriceSol,
+        peakGainPct: 0.0,
+        troughPriceSol: initialPriceSol,
+        maxDrawdownPct: 0.0,
+        latestPriceSol: initialPriceSol,
+        status: "EXCLUDED_SPAM",
+      };
+      this.storage.appendStratifiedSample(spamRecord);
+      return null;
+    }
+
+    // Capacity Handling:
+    // EXECUTED_POSITION is mandatory (100% guarantee). It bypasses or preempts capacity.
+    const isCapacityFull = this.activeTrackers.size >= this.config.maxConcurrentTracked;
+    if (isCapacityFull && tier !== "EXECUTED_POSITION") {
+      // Try to evict a lower-priority baseline tracker if this is a high-priority watchlist item
+      let evicted = false;
+      if (tier === "WATCHLIST_ACTIVE") {
+        for (const [existingKey, existingTracker] of this.activeTrackers.entries()) {
+          if (existingTracker.tier === "HARD_REJECT_BASELINE") {
+            this.activeTrackers.delete(existingKey);
+            evicted = true;
+            break;
+          }
+        }
+      }
+
+      if (!evicted) {
+        // Record capacity drop outcome
+        const dropRecord: StratifiedSamplingRecord = {
+          trackingId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          decisionEventId: decision.eventId,
+          tier,
+          samplingProbability: stratumProbability,
+          effectiveInclusionProbability: 0.0,
+          ipwEstimable: false,
+          selectionSeed: this.sessionSeed,
+          selectionReason: "CAPACITY_EXCEEDED",
+          trackingStartedMs: now,
+          trackingExpiresMs,
+          currentSamplingIntervalMs: 0,
+          observationCount: 0,
+          initialPriceSol,
+          peakPriceSol: initialPriceSol,
+          peakGainPct: 0.0,
+          troughPriceSol: initialPriceSol,
+          maxDrawdownPct: 0.0,
+          latestPriceSol: initialPriceSol,
+          status: "DROPPED_CAPACITY",
+        };
+        this.storage.appendStratifiedSample(dropRecord);
+        return null;
+      }
+    }
+
+    // Deterministic selection using sessionSeed
+    const u = computeDeterministicUniform(this.sessionSeed, decision.mintAddress);
+    const isSelected = stratumProbability >= 1.0 || u < stratumProbability;
+
+    if (!isSelected) {
+      // Record not-selected outcome with effective inclusion probability preserved for IPW
+      const notSelectedRecord: StratifiedSamplingRecord = {
+        trackingId,
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        decisionEventId: decision.eventId,
+        tier,
+        samplingProbability: stratumProbability,
+        effectiveInclusionProbability: stratumProbability,
+        ipwEstimable: true,
+        selectionSeed: this.sessionSeed,
+        selectionReason: "DETERMINISTIC_SAMPLE_NOT_SELECTED",
+        trackingStartedMs: now,
+        trackingExpiresMs,
+        currentSamplingIntervalMs: 0,
+        observationCount: 0,
+        initialPriceSol,
+        peakPriceSol: initialPriceSol,
+        peakGainPct: 0.0,
+        troughPriceSol: initialPriceSol,
+        maxDrawdownPct: 0.0,
+        latestPriceSol: initialPriceSol,
+        status: "NOT_SELECTED",
+      };
+      this.storage.appendStratifiedSample(notSelectedRecord);
+      return null;
+    }
 
     const record: StratifiedSamplingRecord = {
       trackingId,
@@ -130,8 +250,11 @@ export class StratifiedSamplingController {
       poolId: decision.poolId,
       decisionEventId: decision.eventId,
       tier,
-      samplingProbability: probability,
+      samplingProbability: stratumProbability,
+      effectiveInclusionProbability: stratumProbability,
+      ipwEstimable,
       selectionSeed: this.sessionSeed,
+      selectionReason: "SELECTED_FOR_TRACKING",
       trackingStartedMs: now,
       trackingExpiresMs,
       currentSamplingIntervalMs: tier === "EXECUTED_POSITION" ? 5000 : 30000,
@@ -145,17 +268,30 @@ export class StratifiedSamplingController {
       status: "TRACKING_ACTIVE",
     };
 
-    this.activeTrackers.set(decision.mintAddress, record);
+    this.activeTrackers.set(key, record);
     this.storage.appendStratifiedSample(record);
     return record;
   }
 
   public updateObservation(
-    mintAddress: string,
+    identifier: string, // mintAddress or composite key
     currentPriceSol: number,
     nowMs: number = Date.now(),
   ): StratifiedSamplingRecord | undefined {
-    const tracker = this.activeTrackers.get(mintAddress);
+    let key = identifier;
+    let tracker = this.activeTrackers.get(key);
+
+    // If identifier is just mintAddress, find matching tracker
+    if (!tracker) {
+      for (const [k, v] of this.activeTrackers.entries()) {
+        if (k.endsWith(`:${identifier}`) || v.mintAddress === identifier) {
+          key = k;
+          tracker = v;
+          break;
+        }
+      }
+    }
+
     if (!tracker) return undefined;
 
     if (nowMs >= tracker.trackingExpiresMs) {
@@ -164,7 +300,7 @@ export class StratifiedSamplingController {
         status: "EXPIRED",
         latestPriceSol: currentPriceSol,
       };
-      this.activeTrackers.delete(mintAddress);
+      this.activeTrackers.delete(key);
       this.storage.appendStratifiedSample(expired);
       return expired;
     }
@@ -180,7 +316,6 @@ export class StratifiedSamplingController {
         ? ((peakPrice - tracker.initialPriceSol) / tracker.initialPriceSol) * 100
         : 0;
 
-    // Drawdown is measured from running peak to current/subsequent price
     const currentDrawdownPct =
       peakPrice > 0 ? ((peakPrice - currentPriceSol) / peakPrice) * 100 : 0;
     const maxDrawdownPct = Math.max(tracker.maxDrawdownPct, currentDrawdownPct);
@@ -207,7 +342,7 @@ export class StratifiedSamplingController {
       latestPriceSol: Number(currentPriceSol.toFixed(8)),
     };
 
-    this.activeTrackers.set(mintAddress, updated);
+    this.activeTrackers.set(key, updated);
     this.storage.appendStratifiedSample(updated);
     return updated;
   }
@@ -216,7 +351,16 @@ export class StratifiedSamplingController {
     return Array.from(this.activeTrackers.values());
   }
 
-  public getActiveTracker(mintAddress: string): StratifiedSamplingRecord | undefined {
-    return this.activeTrackers.get(mintAddress);
+  public getActiveTracker(identifier: string): StratifiedSamplingRecord | undefined {
+    let tracker = this.activeTrackers.get(identifier);
+    if (!tracker) {
+      for (const [k, v] of this.activeTrackers.entries()) {
+        if (k.endsWith(`:${identifier}`) || v.mintAddress === identifier) {
+          tracker = v;
+          break;
+        }
+      }
+    }
+    return tracker;
   }
 }

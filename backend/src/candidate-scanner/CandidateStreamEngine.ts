@@ -24,6 +24,9 @@ export interface CandidateStreamEngineOptions {
   readonly fetchFn?: typeof fetch | undefined;
   readonly evaluator?: CandidateScannerEvaluator | undefined;
   readonly onCandidate?: ((candidate: CandidateScannerCandidate) => void) | undefined;
+  readonly onDecision?:
+    | ((evalResult: CandidateScannerEvaluationResult, pool: ScannedPoolRecord) => void)
+    | undefined;
 }
 
 export class CandidateStreamEngine {
@@ -34,6 +37,9 @@ export class CandidateStreamEngine {
   private readonly fetchImpl: typeof fetch;
   private readonly evaluator: CandidateScannerEvaluator;
   private readonly onCandidate: ((candidate: CandidateScannerCandidate) => void) | undefined;
+  private readonly onDecision:
+    | ((evalResult: CandidateScannerEvaluationResult, pool: ScannedPoolRecord) => void)
+    | undefined;
   private readonly seenMints = new Set<string>();
 
   public readonly stats: CandidateScannerStreamStats = {
@@ -57,6 +63,7 @@ export class CandidateStreamEngine {
     this.fetchImpl = options.fetchFn ?? fetch;
     this.evaluator = options.evaluator ?? new CandidateScannerEvaluator();
     this.onCandidate = options.onCandidate;
+    this.onDecision = options.onDecision;
   }
 
   public getSeenMintCount(): number {
@@ -611,6 +618,14 @@ export class CandidateStreamEngine {
 
       const evalResult = this.evaluator.evaluate(pool, this.config, nowSec);
       results.push(evalResult);
+
+      if (this.onDecision) {
+        try {
+          this.onDecision(evalResult, pool);
+        } catch (err) {
+          console.warn("[CandidateStreamEngine] onDecision error:", err);
+        }
+      }
 
       if (evalResult.admitted && evalResult.candidate) {
         this.stats.admittedCandidates++;

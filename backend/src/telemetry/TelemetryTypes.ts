@@ -2,7 +2,7 @@
  * Phase 12.94-B Market Telemetry Engine: Core Types and Schemas
  *
  * Implements immutable candidate discovery and decision logging, point-in-time
- * market observations, stratified counterfactual tracking, and decision context reconstruction.
+ * market observations, stratified counterfactual tracking, and zero-lookahead decision context reconstruction.
  */
 
 export type DecisionCohort =
@@ -26,6 +26,7 @@ export interface CandidateMetricsSnapshot {
   readonly lmcRatio: number;
   readonly lpBurnPct: number;
   readonly spotPriceUsd: number;
+  readonly spotPriceSol?: number | null | undefined;
   readonly volume5mUsd: number;
   readonly txCount5m: number;
   readonly buys5m: number;
@@ -71,8 +72,8 @@ export interface MarketObservationRecord {
   readonly measurementWindow: MeasurementWindow;
   readonly providerIdentity: string;
   readonly priceMetrics: {
-    readonly spotPriceUsd: number;
-    readonly spotPriceSol: number;
+    readonly spotPriceUsd: number | null;
+    readonly spotPriceSol: number | null;
     readonly priceSource: PriceSourceType;
   };
   readonly liquidityMetrics: {
@@ -96,6 +97,7 @@ export interface MarketObservationRecord {
     | undefined;
   readonly missingFields: readonly string[];
   readonly strategyRevision: string;
+  readonly clockSkewWarning?: string | undefined;
 }
 
 export type StratificationTier =
@@ -103,6 +105,14 @@ export type StratificationTier =
   | "WATCHLIST_ACTIVE"
   | "NEAR_MISS_CANDIDATE"
   | "HARD_REJECT_BASELINE"
+  | "EXCLUDED_SPAM";
+
+export type StratifiedSamplingStatus =
+  | "TRACKING_ACTIVE"
+  | "EXPIRED"
+  | "TERMINATED_EARLY"
+  | "NOT_SELECTED"
+  | "DROPPED_CAPACITY"
   | "EXCLUDED_SPAM";
 
 export interface StratifiedSamplingRecord {
@@ -114,7 +124,10 @@ export interface StratifiedSamplingRecord {
   readonly decisionEventId: string;
   readonly tier: StratificationTier;
   readonly samplingProbability: number;
+  readonly effectiveInclusionProbability: number;
+  readonly ipwEstimable: boolean;
   readonly selectionSeed: string;
+  readonly selectionReason?: string | undefined;
   readonly trackingStartedMs: number;
   readonly trackingExpiresMs: number;
   readonly currentSamplingIntervalMs: number;
@@ -125,7 +138,7 @@ export interface StratifiedSamplingRecord {
   readonly troughPriceSol: number;
   readonly maxDrawdownPct: number;
   readonly latestPriceSol: number;
-  readonly status: "TRACKING_ACTIVE" | "EXPIRED" | "TERMINATED_EARLY";
+  readonly status: StratifiedSamplingStatus;
 }
 
 export interface SessionTelemetryMeta {
@@ -166,10 +179,21 @@ export interface ReconstructedDecisionContext {
   readonly preDecisionWindow: readonly MarketObservationRecord[];
   readonly inTradeWindow?: readonly MarketObservationRecord[] | undefined;
   readonly postExitWindow?: readonly MarketObservationRecord[] | undefined;
+  /**
+   * Reconstructed order book / market state at point-in-time decision.
+   * Price units are strictly maintained without cross-currency coercion.
+   */
   readonly reconstructedOrderBook: {
-    readonly estimatedSpotSol: number;
-    readonly bestAvailableLiquidityUsd: number;
-    readonly observedPriceImpactBps: number;
+    readonly estimatedSpotSol: number | null;
+    readonly bestAvailableLiquidityUsd: number | null;
+    readonly observedPriceImpactBps: number | null;
+  };
+  readonly reconstructedMarketState: {
+    readonly latestSpotPriceSol: number | null;
+    readonly latestSpotPriceUsd: number | null;
+    readonly bestAvailableLiquidityUsd: number | null;
+    readonly estimatedPriceImpactBps: number | null;
+    readonly priceSource: PriceSourceType | "DECISION_SNAPSHOT" | "UNKNOWN";
   };
   readonly dataQualityScore: number;
   readonly missingDataFields: readonly string[];

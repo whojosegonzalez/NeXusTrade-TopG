@@ -1,6 +1,7 @@
 import type {
   CandidateDecisionRecord,
   MarketObservationRecord,
+  PriceSourceType,
   ReconstructedDecisionContext,
 } from "./TelemetryTypes.js";
 import type { TelemetryStorageManager } from "./TelemetryStorageManager.js";
@@ -19,14 +20,35 @@ export class DecisionContextReconstructor {
   ): ReconstructedDecisionContext {
     const allObservations = this.storage.readMarketObservations(decision.sessionId);
 
-    // Strictly filter to observations that occurred ON OR BEFORE the decision (Zero Look-Ahead)
-    const priorObservations = allObservations.filter(
-      (obs) =>
-        obs.mintAddress === decision.mintAddress &&
-        obs.sourceTimestampMs <= decision.sourceTimestampMs,
-    );
+    // Decision cutoff timestamp: the exact time when the decision was computed
+    const decisionCutoffMs = decision.decisionTimestampMs || decision.ingestionTimestampMs;
 
-    // Sort chronologically
+    // Strictly filter to observations that satisfy genuine Point-in-Time availability:
+    // 1. Same generation, session, pool, and mint identity
+    // 2. Source timestamp occurred on or before decision source timestamp
+    // 3. Ingestion timestamp occurred on or before decision cutoff (No late-arriving observations!)
+    // 4. Measurement window must have fully closed on or before decision source timestamp
+    const priorObservations = allObservations.filter((obs) => {
+      if (obs.generationId !== decision.generationId) return false;
+      if (obs.sessionId !== decision.sessionId) return false;
+      if (obs.poolId !== decision.poolId) return false;
+      if (obs.mintAddress !== decision.mintAddress) return false;
+
+      // Event source timing
+      if (obs.sourceTimestampMs > decision.sourceTimestampMs) return false;
+
+      // Actual ingestion availability timing (prevent lookahead from late arrivals)
+      if (obs.ingestionTimestampMs > decisionCutoffMs) return false;
+
+      // Closed measurement window (prevent aggregated window from leaking future ticks)
+      if (obs.measurementWindow && obs.measurementWindow.windowEndMs > decision.sourceTimestampMs) {
+        return false;
+      }
+
+      return true;
+    });
+
+    // Sort chronologically by source timestamp
     priorObservations.sort((a, b) => a.sourceTimestampMs - b.sourceTimestampMs);
 
     const windowStartMs = decision.sourceTimestampMs - lookbackDurationMs;
@@ -41,6 +63,9 @@ export class DecisionContextReconstructor {
       inTradeWindow = allObservations
         .filter(
           (obs) =>
+            obs.generationId === decision.generationId &&
+            obs.sessionId === decision.sessionId &&
+            obs.poolId === decision.poolId &&
             obs.mintAddress === decision.mintAddress &&
             obs.sourceTimestampMs >= tradeWindow.entryMs &&
             obs.sourceTimestampMs <= tradeWindow.exitMs,
@@ -51,6 +76,9 @@ export class DecisionContextReconstructor {
       postExitWindow = allObservations
         .filter(
           (obs) =>
+            obs.generationId === decision.generationId &&
+            obs.sessionId === decision.sessionId &&
+            obs.poolId === decision.poolId &&
             obs.mintAddress === decision.mintAddress &&
             obs.sourceTimestampMs > tradeWindow.exitMs &&
             obs.sourceTimestampMs <= postExitEndMs,
@@ -58,21 +86,27 @@ export class DecisionContextReconstructor {
         .sort((a, b) => a.sourceTimestampMs - b.sourceTimestampMs);
     }
 
-    // Reconstruct order book snapshot at decision point
+    // Reconstruct market state at decision point without cross-currency coercion
     const latestPreObs = preDecisionWindow[preDecisionWindow.length - 1];
-    const estimatedSpotSol = latestPreObs
-      ? latestPreObs.priceMetrics.spotPriceSol
-      : decision.metricsSnapshot.spotPriceUsd;
 
-    const bestAvailableLiquidityUsd = latestPreObs
-      ? latestPreObs.liquidityMetrics.liquidityUsd
-      : decision.metricsSnapshot.liquidityUsd;
+    const latestSpotPriceSol: number | null =
+      latestPreObs?.priceMetrics?.spotPriceSol ?? decision.metricsSnapshot.spotPriceSol ?? null;
 
-    // Price impact heuristic: for standard 0.5 SOL order size vs LP depth
-    const observedPriceImpactBps =
-      bestAvailableLiquidityUsd > 0
+    const latestSpotPriceUsd: number | null =
+      latestPreObs?.priceMetrics?.spotPriceUsd ?? decision.metricsSnapshot.spotPriceUsd ?? null;
+
+    const bestAvailableLiquidityUsd: number | null =
+      latestPreObs?.liquidityMetrics?.liquidityUsd ?? decision.metricsSnapshot.liquidityUsd ?? null;
+
+    // Price impact is an ESTIMATE, not an observed execution fill
+    const estimatedPriceImpactBps: number | null =
+      bestAvailableLiquidityUsd && bestAvailableLiquidityUsd > 0
         ? Math.min(10000, Number(((100 / bestAvailableLiquidityUsd) * 10000).toFixed(2)))
-        : 9999;
+        : null;
+
+    const priceSource: PriceSourceType | "DECISION_SNAPSHOT" | "UNKNOWN" = latestPreObs
+      ? latestPreObs.priceMetrics.priceSource
+      : "DECISION_SNAPSHOT";
 
     // Collect all missing fields noted across pre-decision window
     const missingSet = new Set<string>(decision.missingFields);
@@ -80,6 +114,9 @@ export class DecisionContextReconstructor {
       for (const f of obs.missingFields) {
         missingSet.add(f);
       }
+    }
+    if (latestSpotPriceSol === null) {
+      missingSet.add("spotPriceSol");
     }
 
     // Compute data quality score (0.0 to 1.0)
@@ -94,16 +131,25 @@ export class DecisionContextReconstructor {
     }
     qualityScore = Math.max(0.0, Number(qualityScore.toFixed(2)));
 
+    const reconstructedMarketState = {
+      latestSpotPriceSol,
+      latestSpotPriceUsd,
+      bestAvailableLiquidityUsd,
+      estimatedPriceImpactBps,
+      priceSource,
+    };
+
     return {
       decisionRecord: decision,
       preDecisionWindow,
       inTradeWindow,
       postExitWindow,
       reconstructedOrderBook: {
-        estimatedSpotSol,
+        estimatedSpotSol: latestSpotPriceSol,
         bestAvailableLiquidityUsd,
-        observedPriceImpactBps,
+        observedPriceImpactBps: estimatedPriceImpactBps,
       },
+      reconstructedMarketState,
       dataQualityScore: qualityScore,
       missingDataFields: Array.from(missingSet),
     };

@@ -70,6 +70,13 @@ import {
   getCanonicalSessionsDir,
   getCanonicalWalletPath,
 } from "../paper/CanonicalPaths.js";
+import {
+  TelemetryStorageManager,
+  CandidateDecisionRecorder,
+  MarketObservationRecorder,
+  StratifiedSamplingController,
+  TelemetryRateController,
+} from "../telemetry/index.js";
 
 export interface ParsedDaemonCliArgs {
   sessionId?: string | undefined;
@@ -484,8 +491,61 @@ export async function run(): Promise<void> {
     });
     daemon.start();
 
+    const telemetryStorage = new TelemetryStorageManager();
+    const telemetryMeta = telemetryStorage.initSessionTelemetry(
+      sessionId,
+      "gen-01-legacy-baseline",
+      vWallet.currentBalanceSol,
+    );
+    const telemetryDecisions = new CandidateDecisionRecorder(telemetryStorage);
+    const telemetryObservations = new MarketObservationRecorder(telemetryStorage);
+    const telemetrySampling = new StratifiedSamplingController(telemetryStorage);
+    const telemetryRate = new TelemetryRateController();
+
     const streamEngine = new CandidateStreamEngine({
       config: config.scannerConfig ?? CANDIDATE_SCANNER_DEFAULTS,
+      onDecision: (evalResult, pool) => {
+        try {
+          const nowSec = Math.floor(Date.now() / 1000);
+          const metricsSnapshot = {
+            tokenAgeSec: pool.openTimeSec > 0 ? Math.max(0, nowSec - pool.openTimeSec) : 0,
+            liquidityUsd: pool.liquidityUsd,
+            marketCapUsd: pool.marketCapUsd,
+            lmcRatio: pool.marketCapUsd > 0 ? pool.liquidityUsd / pool.marketCapUsd : 0,
+            lpBurnPct: pool.lpBurnPct,
+            spotPriceUsd: pool.spotPriceUsd,
+            volume5mUsd: pool.volume5mUsd,
+            txCount5m: pool.txCount5m,
+            buys5m: pool.buys5m,
+            sells5m: pool.sells5m,
+          };
+          const filterEvaluations = evalResult.filterEvaluations.map((f) => ({
+            filterName: f.filterName,
+            passed: f.passed,
+            valueObserved: null,
+            threshold: null,
+            rejectionReason: f.reason,
+          }));
+          const decRecord = telemetryDecisions.recordDecision({
+            sessionId,
+            generationId: "gen-01-legacy-baseline",
+            mintAddress: pool.mintAddress,
+            poolId: pool.poolId,
+            symbol: pool.symbol,
+            sourceTimestampMs: pool.openTimeSec > 0 ? pool.openTimeSec * 1000 : Date.now(),
+            ingestionTimestampMs: Date.now(),
+            decisionCohort: evalResult.admitted ? "WATCHLIST_RADAR" : "FILTERED_REJECTED",
+            primaryRejectionReason: evalResult.primaryRejectionReason,
+            filterEvaluations,
+            metricsSnapshot,
+            providerIdentity: pool.poolId.startsWith("dexscreener") ? "dexscreener" : "raydium",
+          });
+          const solPrice = pool.spotPriceUsd && pool.spotPriceUsd > 0 ? pool.spotPriceUsd / 140 : 0;
+          telemetrySampling.evaluateForTracking(decRecord, solPrice);
+        } catch (err) {
+          console.warn("[PaperDaemon] Telemetry decision recording error:", err);
+        }
+      },
     });
 
     const watchlistService = new CandidateWatchlistService({
@@ -1277,7 +1337,50 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
+                  telemetryRate.tryAcquire("WATCHLIST_ACTIVE");
                   const spotInfo = await fetchDexScreenerSpotInfo(candidate.mintAddress);
+                  if (spotInfo && spotInfo.spotPriceSol && spotInfo.spotPriceSol > 0) {
+                    try {
+                      telemetryObservations.recordObservation({
+                        sessionId,
+                        generationId: "gen-01-legacy-baseline",
+                        mintAddress: candidate.mintAddress,
+                        poolId: candidate.poolId,
+                        sourceTimestampMs: currentNow,
+                        ingestionTimestampMs: currentNow,
+                        measurementWindow: {
+                          windowStartMs: currentNow - 60000,
+                          windowEndMs: currentNow,
+                          durationSec: 60,
+                        },
+                        providerIdentity: "dexscreener",
+                        priceMetrics: {
+                          spotPriceUsd: spotInfo.spotPriceUsd,
+                          spotPriceSol: spotInfo.spotPriceSol,
+                          priceSource: "ROUTE_QUOTE",
+                        },
+                        liquidityMetrics: {
+                          baseReserve: 0,
+                          quoteReserve: 0,
+                          liquidityUsd: spotInfo.liquidityUsd,
+                        },
+                        flowMetrics: {
+                          txCount: spotInfo.recentBuys60s + spotInfo.recentSells60s,
+                          buys: spotInfo.recentBuys60s,
+                          sells: spotInfo.recentSells60s,
+                          volumeUsd: 0,
+                          netBuyerVolumeUsd: 0,
+                        },
+                      });
+                      telemetrySampling.updateObservation(
+                        candidate.mintAddress,
+                        spotInfo.spotPriceSol,
+                        currentNow,
+                      );
+                    } catch (obsErr) {
+                      console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
+                    }
+                  }
                   if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
                     tracker.recordCandidate(
                       candidate,
@@ -1634,6 +1737,38 @@ export async function run(): Promise<void> {
                   if (bought) {
                     watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
                     tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
+                    try {
+                      const dec = telemetryDecisions.recordDecision({
+                        sessionId,
+                        generationId: "gen-01-legacy-baseline",
+                        mintAddress: candidate.mintAddress,
+                        poolId: candidate.poolId,
+                        symbol: candidate.symbol,
+                        sourceTimestampMs: currentNow,
+                        ingestionTimestampMs: currentNow,
+                        decisionCohort: "EXECUTED_BUY",
+                        filterEvaluations: [],
+                        metricsSnapshot: {
+                          tokenAgeSec: candidate.assetAgeSeconds,
+                          liquidityUsd: candidate.liquidityUsd,
+                          marketCapUsd: candidate.marketCapUsd,
+                          lmcRatio: candidate.lmcRatio,
+                          lpBurnPct: candidate.lpBurnPct ?? 100,
+                          spotPriceUsd: spotInfo.spotPriceUsd,
+                          spotPriceSol: entryPriceSol,
+                          volume5mUsd: candidate.volume5mUsd,
+                          txCount5m: candidate.buys5m + candidate.sells5m,
+                          buys5m: candidate.buys5m,
+                          sells5m: candidate.sells5m,
+                        },
+                        providerIdentity: candidate.poolId.startsWith("dexscreener")
+                          ? "dexscreener"
+                          : "raydium",
+                      });
+                      telemetrySampling.evaluateForTracking(dec, entryPriceSol);
+                    } catch (tErr) {
+                      console.warn("[PaperDaemon] Telemetry buy recording error:", tErr);
+                    }
                     const timeStr = new Date(currentNow).toLocaleTimeString();
                     const usdStr = (
                       spotInfo.spotPriceUsd > 0 ? spotInfo.spotPriceUsd : entryPriceSol * 150
@@ -1729,6 +1864,31 @@ export async function run(): Promise<void> {
     console.log(
       `[PaperDaemon] Final Report: Observed=${finalReport.totalCandidatesObserved}, Executed=${finalReport.executedBuysCount}, MissedWinners=${finalReport.missedWinnersCount}, AvoidedRugs=${finalReport.avoidedRugsCount}`,
     );
+
+    try {
+      telemetryStorage.finalizeSessionTelemetry(sessionId, {
+        generationId: "gen-01-legacy-baseline",
+        strategyRevision: telemetryMeta.strategyRevision,
+        startedAtIso: telemetryMeta.startedAtIso,
+        totalCandidatesScreened:
+          telemetryDecisions.getCohortCount("FILTERED_REJECTED") +
+          telemetryDecisions.getCohortCount("WATCHLIST_RADAR"),
+        cohortBreakdown: {
+          filteredRejected: telemetryDecisions.getCohortCount("FILTERED_REJECTED"),
+          watchlistRadar: telemetryDecisions.getCohortCount("WATCHLIST_RADAR"),
+          triggerRejected: telemetryDecisions.getCohortCount("TRIGGER_REJECTED"),
+          executedBuy: telemetryDecisions.getCohortCount("EXECUTED_BUY"),
+        },
+        topRejectionReasons: telemetryDecisions.getRejectionReasonBreakdown(),
+        totalMarketObservationsRecorded: 0,
+        totalStratifiedCandidatesTracked: telemetrySampling.getActiveTrackers().length,
+        missedWinnersCount: finalReport.missedWinnersCount,
+        avoidedRugsCount: finalReport.avoidedRugsCount,
+      });
+      console.log(`[PaperDaemon] Telemetry session summary finalized for ${sessionId}`);
+    } catch (telemetryErr) {
+      console.warn("[PaperDaemon] Failed to finalize session telemetry summary:", telemetryErr);
+    }
   } catch (finalArchiveErr) {
     console.error(
       "[PaperDaemon] [FATAL] Persistence, archive, or runtime error in session:",
