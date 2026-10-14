@@ -17,6 +17,7 @@ export default defineConfig({
       "src/paper/PaperTradingDaemon.test.ts",
       "src/paper/GenerationsRegistry.test.ts",
       "src/telemetry/*.test.ts",
+      "src/execution/*.test.ts",
       "src/wallet/*.test.ts",
       "src/session/SessionControlIpcService.test.ts",
     ],

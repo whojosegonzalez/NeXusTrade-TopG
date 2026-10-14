@@ -188,6 +188,20 @@ export function getCanonicalSessionMetaPath(sessionId: string, workspaceRoot?: s
   );
 }
 
+export function getCanonicalExecutionQuotesPath(sessionId: string, workspaceRoot?: string): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "execution-quotes.jsonl",
+  );
+}
+
+export function getCanonicalSimulatedFillsPath(sessionId: string, workspaceRoot?: string): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "simulated-fills.jsonl",
+  );
+}
+
 /**
  * Enforces canonical, portable single-segment generation identifier format.
  * Rejects path traversal, slashes, backslashes, colons, percent-encoding, and non-conforming IDs.
