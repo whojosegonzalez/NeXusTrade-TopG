@@ -1,0 +1,96 @@
+import crypto from "node:crypto";
+import type {
+  CandidateDecisionRecord,
+  CandidateMetricsSnapshot,
+  DecisionCohort,
+  FilterEvaluationDetail,
+} from "./TelemetryTypes.js";
+import type { TelemetryStorageManager } from "./TelemetryStorageManager.js";
+
+function getStrategyRevision(): string {
+  return process.env.GIT_COMMIT || "7e58ea5";
+}
+
+export interface RecordDecisionInput {
+  readonly sessionId: string;
+  readonly generationId: string;
+  readonly mintAddress: string;
+  readonly poolId: string;
+  readonly symbol: string;
+  readonly sourceTimestampMs: number;
+  readonly ingestionTimestampMs: number;
+  readonly decisionCohort: DecisionCohort;
+  readonly primaryRejectionReason?: string | undefined;
+  readonly filterEvaluations: readonly FilterEvaluationDetail[];
+  readonly metricsSnapshot: CandidateMetricsSnapshot;
+  readonly missingFields?: readonly string[] | undefined;
+  readonly providerIdentity: string;
+}
+
+export class CandidateDecisionRecorder {
+  private readonly storage: TelemetryStorageManager;
+  private readonly countsByCohort = new Map<DecisionCohort, number>();
+  private readonly countsByReason = new Map<string, number>();
+
+  constructor(storage: TelemetryStorageManager) {
+    this.storage = storage;
+  }
+
+  public recordDecision(input: RecordDecisionInput): CandidateDecisionRecord {
+    const decisionTimestampMs = Date.now();
+    const eventId = crypto.randomUUID();
+
+    const record: CandidateDecisionRecord = {
+      eventId,
+      sessionId: input.sessionId,
+      generationId: input.generationId,
+      mintAddress: input.mintAddress,
+      poolId: input.poolId,
+      symbol: input.symbol,
+      sourceTimestampMs: input.sourceTimestampMs,
+      ingestionTimestampMs: input.ingestionTimestampMs,
+      decisionTimestampMs,
+      strategyRevision: getStrategyRevision(),
+      decisionCohort: input.decisionCohort,
+      primaryRejectionReason: input.primaryRejectionReason,
+      filterEvaluations: input.filterEvaluations,
+      metricsSnapshot: input.metricsSnapshot,
+      missingFields: input.missingFields ?? [],
+      providerIdentity: input.providerIdentity,
+    };
+
+    this.storage.appendCandidateDecision(record);
+
+    // Track statistics
+    const currentCohortCount = this.countsByCohort.get(input.decisionCohort) ?? 0;
+    this.countsByCohort.set(input.decisionCohort, currentCohortCount + 1);
+
+    if (input.primaryRejectionReason) {
+      const currentReasonCount = this.countsByReason.get(input.primaryRejectionReason) ?? 0;
+      this.countsByReason.set(input.primaryRejectionReason, currentReasonCount + 1);
+    }
+
+    return record;
+  }
+
+  public getCohortCount(cohort: DecisionCohort): number {
+    return this.countsByCohort.get(cohort) ?? 0;
+  }
+
+  public getCohortBreakdown(): Record<DecisionCohort, number> {
+    return {
+      FILTERED_REJECTED: this.countsByCohort.get("FILTERED_REJECTED") ?? 0,
+      WATCHLIST_RADAR: this.countsByCohort.get("WATCHLIST_RADAR") ?? 0,
+      TRIGGER_REJECTED: this.countsByCohort.get("TRIGGER_REJECTED") ?? 0,
+      EXECUTED_BUY: this.countsByCohort.get("EXECUTED_BUY") ?? 0,
+    };
+  }
+
+  public getRejectionReasonBreakdown(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [k, v] of this.countsByReason.entries()) {
+      out[k] = v;
+    }
+    return out;
+  }
+}

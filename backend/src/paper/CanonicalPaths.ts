@@ -89,6 +89,106 @@ export function getCanonicalReconciliationIntentPath(workspaceRoot?: string): st
 }
 
 /**
+ * Enforces canonical, safe session identifier format.
+ * Rejects path traversal, slashes, backslashes, colons, percent-encoding, and non-conforming IDs.
+ */
+export function validateSessionId(sessionId: string): string {
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw new Error(`[CanonicalPaths] [FATAL_PATH] Session ID must be a non-empty string.`);
+  }
+  if (
+    sessionId.includes("/") ||
+    sessionId.includes("\\") ||
+    sessionId.includes("..") ||
+    sessionId.includes(":") ||
+    sessionId.includes("%")
+  ) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Session ID '${sessionId}' contains forbidden characters or path separators. Path traversal rejected.`,
+    );
+  }
+  const VALID_SESSION_ID_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+  if (!VALID_SESSION_ID_REGEX.test(sessionId)) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Invalid session ID '${sessionId}'. Session IDs must be 1-128 alphanumeric characters, dots, underscores, or hyphens.`,
+    );
+  }
+  return sessionId;
+}
+
+export function getCanonicalTelemetryDir(workspaceRoot?: string): string {
+  return path.resolve(getCanonicalTmpDir(workspaceRoot), "telemetry");
+}
+
+export function getCanonicalTelemetryRegistryPath(workspaceRoot?: string): string {
+  return path.resolve(getCanonicalTelemetryDir(workspaceRoot), "registry.json");
+}
+
+export function getCanonicalTelemetrySessionsDir(workspaceRoot?: string): string {
+  return path.resolve(getCanonicalTelemetryDir(workspaceRoot), "sessions");
+}
+
+export function getCanonicalTelemetrySessionDir(sessionId: string, workspaceRoot?: string): string {
+  const validId = validateSessionId(sessionId);
+  const baseDir = getCanonicalTelemetrySessionsDir(workspaceRoot);
+  const resolvedDir = path.resolve(baseDir, validId);
+  const rel = path.relative(baseDir, resolvedDir);
+  if (rel.startsWith("..") || path.isAbsolute(rel) || rel === "" || rel !== validId) {
+    throw new Error(
+      `[CanonicalPaths] [FATAL_PATH] Telemetry session dir '${resolvedDir}' escapes canonical telemetry sessions base '${baseDir}'.`,
+    );
+  }
+  return resolvedDir;
+}
+
+export function getCanonicalCandidateDecisionsPath(
+  sessionId: string,
+  workspaceRoot?: string,
+): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "candidate-decisions.jsonl",
+  );
+}
+
+export function getCanonicalMarketObservationsPath(
+  sessionId: string,
+  workspaceRoot?: string,
+): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "market-observations.jsonl",
+  );
+}
+
+export function getCanonicalStratifiedSamplesPath(
+  sessionId: string,
+  workspaceRoot?: string,
+): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "stratified-samples.jsonl",
+  );
+}
+
+export function getCanonicalSessionTelemetrySummaryPath(
+  sessionId: string,
+  workspaceRoot?: string,
+): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "session-summary.json",
+  );
+}
+
+export function getCanonicalSessionMetaPath(sessionId: string, workspaceRoot?: string): string {
+  return path.resolve(
+    getCanonicalTelemetrySessionDir(sessionId, workspaceRoot),
+    "session-meta.json",
+  );
+}
+
+/**
  * Enforces canonical, portable single-segment generation identifier format.
  * Rejects path traversal, slashes, backslashes, colons, percent-encoding, and non-conforming IDs.
  */
