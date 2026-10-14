@@ -82,6 +82,7 @@ export class CandidateWatchlistService {
         status: updatedStatus,
         rejectionReason,
         lastEvaluatedAt: nowIso,
+        metricProvenance: pool.metricProvenance ?? existing.metricProvenance,
       };
 
       this.items.set(pool.poolId, updated);
@@ -134,6 +135,7 @@ export class CandidateWatchlistService {
       status: "WATCHING",
       discoveredAt: nowIso,
       lastEvaluatedAt: nowIso,
+      metricProvenance: pool.metricProvenance,
     };
 
     this.items.set(pool.poolId, newItem);

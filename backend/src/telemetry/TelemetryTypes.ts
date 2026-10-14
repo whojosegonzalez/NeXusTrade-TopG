@@ -168,6 +168,9 @@ export interface SessionTelemetryMeta {
     readonly platform: string;
     readonly nodeVersion: string;
   };
+  readonly sessionStatus?: "ACTIVE" | "INTERRUPTED" | "FINALIZED" | undefined;
+  readonly isInterruptedSession?: boolean | undefined;
+  readonly resumedFromPriorCrash?: boolean | undefined;
 }
 
 export interface SessionTelemetrySummary {
@@ -195,6 +198,8 @@ export interface SessionTelemetrySummary {
   readonly totalStratifiedCandidatesTracked: number;
   readonly missedWinnersCount: number;
   readonly avoidedRugsCount: number;
+  readonly isCompleteSession?: boolean | undefined;
+  readonly isInterruptedSession?: boolean | undefined;
 }
 
 export interface ReconstructedDecisionContext {

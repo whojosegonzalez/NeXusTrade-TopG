@@ -101,7 +101,7 @@ export class MarketObservationRecorder {
       measurementWindow: input.measurementWindow,
       derivationStatus: input.derivationStatus ?? "RAW",
       providerIdentity: input.providerIdentity,
-      actualResponsePoolId: input.actualResponsePoolId ?? input.poolId,
+      actualResponsePoolId: input.actualResponsePoolId,
       priceMetrics: input.priceMetrics,
       liquidityMetrics: input.liquidityMetrics,
       flowMetrics: input.flowMetrics,

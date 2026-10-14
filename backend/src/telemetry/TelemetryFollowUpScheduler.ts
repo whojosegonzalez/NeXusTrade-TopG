@@ -105,17 +105,22 @@ export class TelemetryFollowUpScheduler {
       const responseReceivedMs = Date.now();
       if (!res) continue;
 
-      // Cross-pool contamination check (B3-03):
-      // Discard observation if response pool does not match the tracked pool
-      if (res.actualPoolId) {
-        const normActual = res.actualPoolId.replace(/^dexscreener-/, "");
-        const normTracked = tracker.poolId.replace(/^dexscreener-/, "");
-        if (normActual !== normTracked) {
-          console.warn(
-            `[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for ${tracker.mintAddress}. Tracked=${tracker.poolId}, Actual=${res.actualPoolId}`,
-          );
-          continue;
-        }
+      // Cross-pool contamination check & fail-closed missing pool identity (B3-03 & B4-02):
+      // Require verifiable provider pool identity matching the tracked pool
+      if (!res.actualPoolId) {
+        console.warn(
+          `[TelemetryFollowUpScheduler] Discarding observation: missing provider pool identity for ${tracker.mintAddress} (expected ${tracker.poolId}).`,
+        );
+        continue;
+      }
+
+      const normActual = res.actualPoolId.replace(/^dexscreener-/, "");
+      const normTracked = tracker.poolId.replace(/^dexscreener-/, "");
+      if (normActual !== normTracked) {
+        console.warn(
+          `[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for ${tracker.mintAddress}. Tracked=${tracker.poolId}, Actual=${res.actualPoolId}`,
+        );
+        continue;
       }
 
       const key = this.samplingController.buildTrackerKey(
@@ -160,7 +165,7 @@ export class TelemetryFollowUpScheduler {
         },
         derivationStatus: res.derivationStatus ?? "DERIVED_FROM_5M",
         providerIdentity: "followup_scheduler",
-        actualResponsePoolId: res.actualPoolId ?? tracker.poolId,
+        actualResponsePoolId: res.actualPoolId,
         priceMetrics: {
           spotPriceUsd: res.spotPriceUsd,
           spotPriceSol: res.spotPriceSol,

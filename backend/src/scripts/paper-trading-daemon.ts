@@ -686,6 +686,7 @@ export async function run(): Promise<void> {
         buys5m: number;
         sells5m: number;
         lmcRatio: number;
+        metricProvenance?: Record<string, MetricProvenance> | undefined;
       },
       reason: string,
       spotSol: number | null,
@@ -706,13 +707,61 @@ export async function run(): Promise<void> {
       );
       try {
         const raw = spotInfo?.rawProviderMetrics;
-        const observedTxCount5m = raw?.txCount5m ?? null;
-        const observedBuys5m = raw?.buys5m ?? null;
-        const observedSells5m = raw?.sells5m ?? null;
-        const observedVolume5mUsd = raw?.volume5mUsd ?? candidate.volume5mUsd ?? null;
-        const observedLiqUsd = raw?.liquidityUsd ?? (liqUsd && liqUsd > 0 ? liqUsd : null);
+        const candProv = candidate.metricProvenance ?? {};
+
+        const hasObservedTxCount = raw?.txCount5m !== null && raw?.txCount5m !== undefined;
+        const observedTxCount5m = hasObservedTxCount ? raw!.txCount5m : null;
+        const provTxCount: MetricProvenance = hasObservedTxCount
+          ? "OBSERVED"
+          : (candProv.txCount5m ?? "UNAVAILABLE");
+
+        const hasObservedBuys = raw?.buys5m !== null && raw?.buys5m !== undefined;
+        const observedBuys5m = hasObservedBuys ? raw!.buys5m : null;
+        const provBuys: MetricProvenance = hasObservedBuys
+          ? "OBSERVED"
+          : (candProv.buys5m ?? "UNAVAILABLE");
+
+        const hasObservedSells = raw?.sells5m !== null && raw?.sells5m !== undefined;
+        const observedSells5m = hasObservedSells ? raw!.sells5m : null;
+        const provSells: MetricProvenance = hasObservedSells
+          ? "OBSERVED"
+          : (candProv.sells5m ?? "UNAVAILABLE");
+
+        const hasObservedVolume = raw?.volume5mUsd !== null && raw?.volume5mUsd !== undefined;
+        const observedVolume5mUsd = hasObservedVolume
+          ? raw!.volume5mUsd
+          : (candidate.volume5mUsd ?? null);
+        const provVolume: MetricProvenance = hasObservedVolume
+          ? "OBSERVED"
+          : (candProv.volume5mUsd ??
+            (candidate.volume5mUsd !== undefined ? "DERIVED" : "UNAVAILABLE"));
+
+        const hasObservedLiq = raw?.liquidityUsd !== null && raw?.liquidityUsd !== undefined;
+        const observedLiqUsd = hasObservedLiq
+          ? raw!.liquidityUsd
+          : liqUsd && liqUsd > 0
+            ? liqUsd
+            : candidate.liquidityUsd > 0
+              ? candidate.liquidityUsd
+              : null;
+        const provLiq: MetricProvenance = hasObservedLiq
+          ? "OBSERVED"
+          : (candProv.liquidityUsd ?? (observedLiqUsd !== null ? "OBSERVED" : "UNAVAILABLE"));
+
+        const provMcap: MetricProvenance =
+          candProv.marketCapUsd ?? (candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE");
+
+        const provLpBurn: MetricProvenance =
+          candProv.lpBurnPct ?? (candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE");
+
         const observedSpotUsd = spotUsd && spotUsd > 0 ? spotUsd : null;
         const observedSpotSol = spotSol && spotSol > 0 ? spotSol : null;
+        const provSpotUsd: MetricProvenance = observedSpotUsd !== null ? "OBSERVED" : "UNAVAILABLE";
+        const provSpotSol: MetricProvenance = observedSpotSol !== null ? "OBSERVED" : "UNAVAILABLE";
+        const provTokenAge: MetricProvenance =
+          candidate.assetAgeSeconds > 0 ? (candProv.tokenAgeSec ?? "OBSERVED") : "UNAVAILABLE";
+        const provLmcRatio: MetricProvenance =
+          candidate.marketCapUsd > 0 && observedLiqUsd !== null ? "DERIVED" : "UNAVAILABLE";
 
         telemetryDecisions.recordDecision({
           sessionId,
@@ -750,18 +799,17 @@ export async function run(): Promise<void> {
             buys5m: observedBuys5m,
             sells5m: observedSells5m,
             metricProvenance: {
-              tokenAgeSec: candidate.assetAgeSeconds > 0 ? "OBSERVED" : "UNAVAILABLE",
-              liquidityUsd: observedLiqUsd !== null ? "OBSERVED" : "UNAVAILABLE",
-              marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
-              lmcRatio:
-                candidate.marketCapUsd > 0 && observedLiqUsd !== null ? "DERIVED" : "UNAVAILABLE",
-              lpBurnPct: candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
-              spotPriceUsd: observedSpotUsd !== null ? "OBSERVED" : "UNAVAILABLE",
-              spotPriceSol: observedSpotSol !== null ? "OBSERVED" : "UNAVAILABLE",
-              volume5mUsd: observedVolume5mUsd !== null ? "OBSERVED" : "UNAVAILABLE",
-              txCount5m: observedTxCount5m !== null ? "OBSERVED" : "UNAVAILABLE",
-              buys5m: observedBuys5m !== null ? "OBSERVED" : "UNAVAILABLE",
-              sells5m: observedSells5m !== null ? "OBSERVED" : "UNAVAILABLE",
+              tokenAgeSec: provTokenAge,
+              liquidityUsd: provLiq,
+              marketCapUsd: provMcap,
+              lmcRatio: provLmcRatio,
+              lpBurnPct: provLpBurn,
+              spotPriceUsd: provSpotUsd,
+              spotPriceSol: provSpotSol,
+              volume5mUsd: provVolume,
+              txCount5m: provTxCount,
+              buys5m: provBuys,
+              sells5m: provSells,
             },
           },
           providerIdentity: candidate.poolId.startsWith("dexscreener") ? "dexscreener" : "raydium",
@@ -2066,7 +2114,8 @@ export async function run(): Promise<void> {
                         metricsSnapshot: {
                           tokenAgeSec: candidate.assetAgeSeconds,
                           liquidityUsd:
-                            spotInfo.rawProviderMetrics.liquidityUsd ?? candidate.liquidityUsd,
+                            spotInfo.rawProviderMetrics.liquidityUsd ??
+                            (candidate.liquidityUsd > 0 ? candidate.liquidityUsd : null),
                           marketCapUsd: candidate.marketCapUsd,
                           lmcRatio: candidate.lmcRatio,
                           lpBurnPct: candidate.lpBurnPct ?? 100,
@@ -2083,38 +2132,51 @@ export async function run(): Promise<void> {
                           buys5m: spotInfo.rawProviderMetrics.buys5m ?? null,
                           sells5m: spotInfo.rawProviderMetrics.sells5m ?? null,
                           metricProvenance: {
-                            tokenAgeSec: candidate.assetAgeSeconds > 0 ? "OBSERVED" : "UNAVAILABLE",
-                            liquidityUsd:
-                              (spotInfo.rawProviderMetrics.liquidityUsd ?? candidate.liquidityUsd) >
-                              0
-                                ? "OBSERVED"
+                            tokenAgeSec:
+                              candidate.assetAgeSeconds > 0
+                                ? (candidate.metricProvenance?.tokenAgeSec ?? "OBSERVED")
                                 : "UNAVAILABLE",
-                            marketCapUsd: candidate.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
+                            liquidityUsd:
+                              spotInfo.rawProviderMetrics.liquidityUsd !== null &&
+                              spotInfo.rawProviderMetrics.liquidityUsd !== undefined
+                                ? "OBSERVED"
+                                : (candidate.metricProvenance?.liquidityUsd ??
+                                  (candidate.liquidityUsd > 0 ? "OBSERVED" : "UNAVAILABLE")),
+                            marketCapUsd:
+                              candidate.metricProvenance?.marketCapUsd ??
+                              (candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE"),
                             lmcRatio: candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE",
                             lpBurnPct:
-                              candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
+                              candidate.metricProvenance?.lpBurnPct ??
+                              (candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE"),
                             spotPriceUsd:
                               spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
                                 ? "OBSERVED"
                                 : "UNAVAILABLE",
                             spotPriceSol: entryPriceSol > 0 ? "OBSERVED" : "UNAVAILABLE",
                             volume5mUsd:
-                              (spotInfo.rawProviderMetrics.volume5mUsd ?? candidate.volume5mUsd) !==
-                              null
+                              spotInfo.rawProviderMetrics.volume5mUsd !== null &&
+                              spotInfo.rawProviderMetrics.volume5mUsd !== undefined
                                 ? "OBSERVED"
-                                : "UNAVAILABLE",
+                                : (candidate.metricProvenance?.volume5mUsd ??
+                                  (candidate.volume5mUsd !== undefined
+                                    ? "DERIVED"
+                                    : "UNAVAILABLE")),
                             txCount5m:
-                              spotInfo.rawProviderMetrics.txCount5m !== null
+                              spotInfo.rawProviderMetrics.txCount5m !== null &&
+                              spotInfo.rawProviderMetrics.txCount5m !== undefined
                                 ? "OBSERVED"
-                                : "UNAVAILABLE",
+                                : (candidate.metricProvenance?.txCount5m ?? "UNAVAILABLE"),
                             buys5m:
-                              spotInfo.rawProviderMetrics.buys5m !== null
+                              spotInfo.rawProviderMetrics.buys5m !== null &&
+                              spotInfo.rawProviderMetrics.buys5m !== undefined
                                 ? "OBSERVED"
-                                : "UNAVAILABLE",
+                                : (candidate.metricProvenance?.buys5m ?? "UNAVAILABLE"),
                             sells5m:
-                              spotInfo.rawProviderMetrics.sells5m !== null
+                              spotInfo.rawProviderMetrics.sells5m !== null &&
+                              spotInfo.rawProviderMetrics.sells5m !== undefined
                                 ? "OBSERVED"
-                                : "UNAVAILABLE",
+                                : (candidate.metricProvenance?.sells5m ?? "UNAVAILABLE"),
                           },
                         },
                         providerIdentity: candidate.poolId.startsWith("dexscreener")
@@ -2254,6 +2316,8 @@ export async function run(): Promise<void> {
         totalStratifiedCandidatesTracked: telemetrySampling.getTotalEverTrackedCount(),
         missedWinnersCount: finalReport.missedWinnersCount,
         avoidedRugsCount: finalReport.avoidedRugsCount,
+        isCompleteSession: !telemetryMeta.isInterruptedSession,
+        isInterruptedSession: !!telemetryMeta.isInterruptedSession,
       });
       console.log(`[PaperDaemon] Telemetry session summary finalized for ${sessionId}`);
     } catch (telemetryErr) {

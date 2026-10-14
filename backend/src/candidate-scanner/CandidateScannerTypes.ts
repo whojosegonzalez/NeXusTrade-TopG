@@ -53,6 +53,9 @@ export interface CandidateScannerCandidate {
   readonly lpBurnPct: number;
   readonly spotPriceUsd: number;
   readonly filterEvaluations: readonly CandidateScannerFilterEvaluation[];
+  readonly metricProvenance?:
+    | Record<string, "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE">
+    | undefined;
 }
 
 export interface CandidateScannerEvaluationResult {

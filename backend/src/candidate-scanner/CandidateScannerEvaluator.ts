@@ -95,6 +95,7 @@ export class CandidateScannerEvaluator {
       lpBurnPct: pool.lpBurnPct,
       spotPriceUsd: pool.spotPriceUsd,
       filterEvaluations,
+      metricProvenance: pool.metricProvenance,
     };
 
     return {

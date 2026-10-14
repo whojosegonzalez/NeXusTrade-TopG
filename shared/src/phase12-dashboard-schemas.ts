@@ -82,6 +82,9 @@ export const watchlistCandidateItemSchema = z.object({
   rejectionReason: z.string().optional(),
   discoveredAt: z.string(),
   lastEvaluatedAt: z.string(),
+  metricProvenance: z
+    .record(z.enum(["OBSERVED", "DERIVED", "PLACEHOLDER", "UNAVAILABLE"]))
+    .optional(),
 });
 
 export type WatchlistCandidateItem = z.infer<typeof watchlistCandidateItemSchema>;
