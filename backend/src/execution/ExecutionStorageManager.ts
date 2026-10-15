@@ -5,9 +5,12 @@
  * - execution-quotes.jsonl
  * - simulated-fills.jsonl
  *
- * Provides authoritative cross-file session finalization verification:
- * - verifySessionCrossFileConsistency() enforces generation identity, session identity,
- *   interrupted session flags, and observation/decision accounting coherence across files.
+ * Guarantees:
+ * 1. Startup / Pre-Append Crash Recovery: executes repairAndQuarantineDamagedTail()
+ *    before appending, preventing damaged tails from becoming corrupt interior lines.
+ * 2. Fail-Closed Cross-File Reconciliation: enforces that missing JSONL files with
+ *    positive summary counts, mismatched session/generation IDs, or orphaned fill references
+ *    strictly fail verification.
  */
 
 import {
@@ -48,6 +51,7 @@ export class ExecutionStorageManager {
 
   /**
    * Appends an executable quote record to canonical execution-quotes.jsonl.
+   * Performs crash-tail quarantine repair before appending.
    */
   public recordQuote(quote: ExecutableQuoteRecord): void {
     const validSessionId = validateSessionId(quote.sessionId);
@@ -57,20 +61,18 @@ export class ExecutionStorageManager {
     }
 
     const quotesPath = getCanonicalExecutionQuotesPath(validSessionId, this.workspaceRoot);
+    // 1. Crash recovery repair before append
+    repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
+
+    // 2. Durable append with fsync
     this.appendSyncWithFsync(quotesPath, JSON.stringify(quote));
   }
 
   /**
    * Appends a simulated fill record to canonical simulated-fills.jsonl for a given session.
+   * Performs crash-tail quarantine repair before appending.
    */
   public recordFill(sessionId: string, fill: SimulatedFillRecord): void {
-    this.recordFillForSession(sessionId, fill);
-  }
-
-  /**
-   * Appends a simulated fill record explicitly with sessionId.
-   */
-  public recordFillForSession(sessionId: string, fill: SimulatedFillRecord): void {
     const validSessionId = validateSessionId(sessionId);
     const sessionDir = getCanonicalTelemetrySessionDir(validSessionId, this.workspaceRoot);
     if (!existsSync(sessionDir)) {
@@ -78,6 +80,10 @@ export class ExecutionStorageManager {
     }
 
     const fillsPath = getCanonicalSimulatedFillsPath(validSessionId, this.workspaceRoot);
+    // 1. Crash recovery repair before append
+    repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
+
+    // 2. Durable append with fsync
     this.appendSyncWithFsync(fillsPath, JSON.stringify(fill));
   }
 
@@ -212,16 +218,27 @@ export function verifySessionCrossFileConsistency(
     };
   }
 
-  // 6. Candidate Decisions Accounting Check
+  // 6. Candidate Decisions Accounting Check (Fail Closed on Missing File with Positive Summary)
   const decisionsPath = path.join(sessionDir, "candidate-decisions.jsonl");
+  const expectedDecisionsCount = summary.totalDecisionsRecorded ?? 0;
+
+  if (expectedDecisionsCount > 0 && !existsSync(decisionsPath)) {
+    return {
+      valid: false,
+      reason: `Missing candidate-decisions.jsonl when summary reports ${expectedDecisionsCount} total decisions`,
+    };
+  }
+
   if (existsSync(decisionsPath)) {
     try {
       const records = repairAndQuarantineDamagedTail<CandidateDecisionRecord>(decisionsPath);
-      const expectedCount = summary.totalDecisionsRecorded;
-      if (expectedCount !== undefined && records.length !== expectedCount) {
+      if (
+        summary.totalDecisionsRecorded !== undefined &&
+        records.length !== summary.totalDecisionsRecorded
+      ) {
         return {
           valid: false,
-          reason: `Decisions count mismatch: persisted records=${records.length} vs summary totalDecisionsRecorded=${expectedCount}`,
+          reason: `Decisions count mismatch: persisted records=${records.length} vs summary totalDecisionsRecorded=${summary.totalDecisionsRecorded}`,
         };
       }
     } catch (err) {
@@ -232,16 +249,24 @@ export function verifySessionCrossFileConsistency(
     }
   }
 
-  // 7. Market Observations Accounting Check
+  // 7. Market Observations Accounting Check (Fail Closed on Missing File with Positive Summary)
   const obsPath = path.join(sessionDir, "market-observations.jsonl");
+  const expectedObsCount = summary.totalMarketObservationsRecorded ?? 0;
+
+  if (expectedObsCount > 0 && !existsSync(obsPath)) {
+    return {
+      valid: false,
+      reason: `Missing market-observations.jsonl when summary reports ${expectedObsCount} total observations`,
+    };
+  }
+
   if (existsSync(obsPath)) {
     try {
       const records = repairAndQuarantineDamagedTail<MarketObservationRecord>(obsPath);
-      const expectedCount = summary.totalMarketObservationsRecorded;
-      if (expectedCount !== undefined && records.length !== expectedCount) {
+      if (records.length !== expectedObsCount) {
         return {
           valid: false,
-          reason: `Observations count mismatch: persisted records=${records.length} vs summary totalMarketObservationsRecorded=${expectedCount}`,
+          reason: `Observations count mismatch: persisted records=${records.length} vs summary totalMarketObservationsRecorded=${expectedObsCount}`,
         };
       }
     } catch (err) {
@@ -252,11 +277,28 @@ export function verifySessionCrossFileConsistency(
     }
   }
 
-  // 8. Execution Quotes & Fills Integrity Check
+  // 8. Execution Quotes & Fills Integrity and Referential Check
   const quotesPath = path.join(sessionDir, "execution-quotes.jsonl");
+  const quoteIdSet = new Set<string>();
+
   if (existsSync(quotesPath)) {
     try {
-      repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
+      const quoteRecords = repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
+      for (const q of quoteRecords) {
+        if (q.sessionId !== summary.sessionId) {
+          return {
+            valid: false,
+            reason: `Quote record '${q.quoteId}' has mismatched session ID '${q.sessionId}' (expected '${summary.sessionId}')`,
+          };
+        }
+        if (q.generationId !== summary.generationId) {
+          return {
+            valid: false,
+            reason: `Quote record '${q.quoteId}' has mismatched generation ID '${q.generationId}' (expected '${summary.generationId}')`,
+          };
+        }
+        quoteIdSet.add(q.quoteId);
+      }
     } catch (err) {
       return {
         valid: false,
@@ -268,7 +310,17 @@ export function verifySessionCrossFileConsistency(
   const fillsPath = path.join(sessionDir, "simulated-fills.jsonl");
   if (existsSync(fillsPath)) {
     try {
-      repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
+      const fillRecords = repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
+      if (existsSync(quotesPath)) {
+        for (const f of fillRecords) {
+          if (!quoteIdSet.has(f.quoteId)) {
+            return {
+              valid: false,
+              reason: `Simulated fill '${f.fillId}' references non-existent quote ID '${f.quoteId}'`,
+            };
+          }
+        }
+      }
     } catch (err) {
       return {
         valid: false,

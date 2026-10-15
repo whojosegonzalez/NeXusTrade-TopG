@@ -1,9 +1,15 @@
 /**
  * Phase 12.94-C: Capital Scaling & Capacity Curve Analyzer
  *
- * Implements multi-size capital sweeps across 0.1, 0.5, 2.0, and 10.0 SOL tiers
- * to evaluate liquidity capacity, price impact scaling, fee drag, optimal allocation (S*),
- * and the Alpha Extinction Threshold (S_extinct).
+ * Implements state-conserving AMM round-trip execution sweeps across
+ * 0.1, 0.5, 2.0, and 10.0 SOL tiers:
+ * - Accurately updates pool reserve state after buying:
+ *     R'_{sol} = R_{sol} + S_in,  R'_{token} = R_{token} - T_bought
+ * - Coherently models exogenous price shocks (R''_{sol} = R'_{sol} * sqrt(M), R''_{token} = R'_{token} / sqrt(M))
+ *   and liquidity withdrawals / independent observed exit reserves
+ * - Sells tokens back into the coherent post-buy reserve state
+ * - Deducts out-of-pocket network fees once; does not double-count pool-internal LP fees
+ * - Computes Optimal Size (S*) and the Alpha Extinction Threshold (S_extinct)
  */
 
 import type { CapacityCurveResult, CapacityTierSweep } from "./ExecutionTypes.js";
@@ -17,6 +23,7 @@ import {
   calculateExitFees,
   DEFAULT_RAYDIUM_AMM_FEE_RATE,
   LAMPORTS_PER_SOL,
+  validateFeeRate,
 } from "./ExecutionFeeModel.js";
 
 export const DEFAULT_CAPITAL_TIERS_SOL: readonly number[] = [0.1, 0.5, 2.0, 10.0];
@@ -33,6 +40,16 @@ export interface AnalyzeCapacityCurveParams {
    * E.g., 1.5 tests viability if the token moved +50% at peak.
    */
   readonly exitPriceMultiplier?: number | undefined;
+  /**
+   * Optional liquidity withdrawal ratio (0.0 to 0.99) between entry and exit.
+   * E.g. 0.25 means 25% of pool liquidity was withdrawn by other market participants.
+   */
+  readonly reserveWithdrawalRatio?: number | undefined;
+  /**
+   * Optional independently observed exit reserves from a later telemetry observation.
+   */
+  readonly observedExitReserveSol?: number | undefined;
+  readonly observedExitReserveTokens?: number | undefined;
   readonly dexFeeRate?: number | undefined;
   readonly priorityFeeMicroLamports?: number | undefined;
   readonly computeUnits?: number | undefined;
@@ -40,13 +57,16 @@ export interface AnalyzeCapacityCurveParams {
 }
 
 /**
- * Analyzes the capital capacity curve across multiple trade sizes.
+ * Analyzes the capital capacity curve across multiple trade sizes using
+ * state-conserving AMM reserve transitions.
  */
 export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): CapacityCurveResult {
   const decimals = validateMintDecimals(params.tokenDecimals);
   const tiers = params.capitalTiersSol ?? DEFAULT_CAPITAL_TIERS_SOL;
-  const exitMultiplier = params.exitPriceMultiplier ?? 1.0;
-  const dexFeeRate = params.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE;
+  const exitMultiplier = Math.max(0.0001, params.exitPriceMultiplier ?? 1.0);
+  const withdrawalRatio = Math.max(0, Math.min(0.99, params.reserveWithdrawalRatio ?? 0));
+  const withdrawalFactor = 1 - withdrawalRatio;
+  const dexFeeRate = validateFeeRate(params.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
 
   const sweeps: CapacityTierSweep[] = [];
 
@@ -62,9 +82,10 @@ export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): Capaci
       microLamportsPerCu: params.priorityFeeMicroLamports,
     });
 
-    const totalEntryCostSol = tierSizeSol + entryFees.totalFeeSol;
+    // Out-of-pocket cash cost = trade size + external network fees (LP fee is inside the curve)
+    const totalEntryCostSol = tierSizeSol + entryFees.externalNetworkFeeSol;
 
-    // 1. Buy Quote
+    // 1. Buy Quote on Initial Pool Reserves (R_sol,0, R_token,0)
     const buyQuote = calculateAmmBuyQuote({
       inputSol: tierSizeSol,
       baseReserveTokens: params.baseReserveTokens,
@@ -76,15 +97,32 @@ export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): Capaci
     const tokensReceived = buyQuote.tokensGross;
     const effectivePriceSol = buyQuote.effectivePriceSol;
 
-    // 2. Simulated Exit Leg
-    // Adjust reserves for exit leg based on exitMultiplier (if token appreciated, quoteReserve increased)
-    const adjustedQuoteReserveSol = params.quoteReserveSol * exitMultiplier;
-    const adjustedBaseReserveTokens = params.baseReserveTokens;
+    // 2. Coherent Post-Buy Pool Reserve State (R_sol,1, R_token,1)
+    // SOL was added to pool, tokens were withdrawn from pool
+    const postBuyReserveSol = params.quoteReserveSol + tierSizeSol;
+    const postBuyReserveTokens = Math.max(0.000001, params.baseReserveTokens - tokensReceived);
 
+    // 3. Exogenous Market Price Movement / Reserve Shift Scenario
+    let exitReserveSol: number;
+    let exitReserveTokens: number;
+
+    if (
+      params.observedExitReserveSol !== undefined &&
+      params.observedExitReserveTokens !== undefined
+    ) {
+      exitReserveSol = params.observedExitReserveSol;
+      exitReserveTokens = params.observedExitReserveTokens;
+    } else {
+      const sqrtM = Math.sqrt(exitMultiplier);
+      exitReserveSol = postBuyReserveSol * sqrtM * withdrawalFactor;
+      exitReserveTokens = (postBuyReserveTokens / sqrtM) * withdrawalFactor;
+    }
+
+    // 4. Sell Leg Executed on Coherent Exit Pool Reserves
     const sellQuote = calculateAmmSellQuote({
       inputTokens: tokensReceived,
-      baseReserveTokens: adjustedBaseReserveTokens,
-      quoteReserveSol: adjustedQuoteReserveSol,
+      baseReserveTokens: exitReserveTokens,
+      quoteReserveSol: exitReserveSol,
       tokenDecimals: decimals,
       dexFeeRate,
     });
@@ -100,25 +138,30 @@ export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): Capaci
       microLamportsPerCu: params.priorityFeeMicroLamports,
     });
 
-    const netExitProceedsSol = Math.max(0, grossExitProceedsSol - exitFees.totalFeeSol);
+    // Net exit cash proceeds: gross proceeds minus external network fee
+    const netExitProceedsSol = Math.max(0, grossExitProceedsSol - exitFees.externalNetworkFeeSol);
     const netPnlSol = netExitProceedsSol - totalEntryCostSol;
     const netReturnPct = (netPnlSol / totalEntryCostSol) * 100;
 
-    const totalFeeSol = entryFees.totalFeeSol + exitFees.totalFeeSol;
+    const totalExternalFeeSol = entryFees.externalNetworkFeeSol + exitFees.externalNetworkFeeSol;
     const priceImpactBps = Math.round((buyQuote.priceImpactPct + sellQuote.priceImpactPct) * 10000);
-    const totalFeeDragBps = Math.round((totalFeeSol / tierSizeSol) * 10000);
+    const externalFeeDragBps = Math.round((totalExternalFeeSol / tierSizeSol) * 10000);
+    const poolInternalFeeBps = Math.round(2 * dexFeeRate * 10000); // 2 legs of LP fee
     const isViable = netReturnPct > 0;
 
     sweeps.push({
       tierSizeSol,
       tokensReceived,
       effectivePriceSol,
+      postBuyReserveSol,
+      postBuyReserveTokens,
       grossExitProceedsSol,
       netExitProceedsSol,
       netPnlSol,
       netReturnPct,
       priceImpactBps,
-      totalFeeDragBps,
+      externalFeeDragBps,
+      poolInternalFeeBps,
       isViable,
     });
   }
@@ -157,7 +200,7 @@ export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): Capaci
     }
   }
 
-  // Viable if baseline tier (0.50 SOL) or any standard tier is viable
+  // Baseline tier (0.50 SOL) viability check
   const baselineSweep = sweeps.find((s) => Math.abs(s.tierSizeSol - 0.5) < 0.01) ?? sweeps[0];
   const isEconomicallyViable = baselineSweep ? baselineSweep.isViable : false;
 

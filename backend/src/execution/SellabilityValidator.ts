@@ -7,7 +7,11 @@
  * - Detects honeypots, transfer restrictions, freeze authority (UNSELLABLE_TRANSFER_RESTRICTION)
  * - Detects liquidity pull rugs (UNSELLABLE_LIQUIDITY_DRAINED)
  * - Detects catastrophic price impact (UNSELLABLE_EXCESSIVE_IMPACT)
- * - Enforces -100% total loss P&L accounting whenever an unsellable failure state occurs
+ *
+ * Clarified Financial Accounting:
+ * Distinguishes confirmed on-chain liquidation (realized P&L) from conservative
+ * mark-to-market valuation impairment (write-down stress metric).
+ * A failed execution preserves unsold inventory and does NOT fabricate a 100% realized sale.
  */
 
 import type { SellabilityStatus } from "./ExecutionTypes.js";
@@ -130,13 +134,11 @@ export function evaluateSellability(
 }
 
 /**
- * Computes realized net PnL and percentage return.
- * Strictly enforces -100% total loss whenever unsellable failure states occur.
+ * Computes realized net PnL and percentage return upon CONFIRMED liquidation.
  */
 export function computeRealizedExitReturn(
   entryNetCostSol: number,
   exitNetProceedsSol: number,
-  sellabilityStatus: SellabilityStatus,
 ): {
   readonly netPnlSol: number;
   readonly netReturnPct: number;
@@ -147,25 +149,55 @@ export function computeRealizedExitReturn(
     );
   }
 
-  const isUnsellable =
+  const netPnlSol = Math.round((exitNetProceedsSol - entryNetCostSol) * 1e9) / 1e9;
+  const netReturnPct =
+    Math.round(((exitNetProceedsSol - entryNetCostSol) / entryNetCostSol) * 10000) / 100;
+
+  return {
+    netPnlSol,
+    netReturnPct,
+  };
+}
+
+/**
+ * Estimates conservative mark-to-market valuation impairment for risk analysis.
+ * For unliquidatable inventory, marks holding value as 0 SOL (-100% write-down)
+ * without claiming an on-chain liquidation took place.
+ */
+export function estimateConservativeValuation(
+  entryCostSol: number,
+  sellabilityStatus: SellabilityStatus,
+  grossProceedsEstimateSol?: number,
+): {
+  readonly estimatedValueSol: number;
+  readonly writeDownPct: number;
+  readonly isImpaired: boolean;
+} {
+  if (entryCostSol <= 0) {
+    throw new Error("[SellabilityValidator] Entry cost must be strictly positive.");
+  }
+
+  const isImpaired =
     sellabilityStatus === "UNSELLABLE_NO_ROUTE" ||
     sellabilityStatus === "UNSELLABLE_TRANSFER_RESTRICTION" ||
     sellabilityStatus === "UNSELLABLE_LIQUIDITY_DRAINED" ||
     sellabilityStatus === "UNSELLABLE_EXCESSIVE_IMPACT" ||
     sellabilityStatus === "UNSELLABLE_SLIPPAGE_EXCEEDED";
 
-  if (isUnsellable) {
+  if (isImpaired) {
     return {
-      netPnlSol: -entryNetCostSol,
-      netReturnPct: -100.0,
+      estimatedValueSol: 0,
+      writeDownPct: 100.0,
+      isImpaired: true,
     };
   }
 
-  const netPnlSol = exitNetProceedsSol - entryNetCostSol;
-  const netReturnPct = (netPnlSol / entryNetCostSol) * 100;
+  const estimatedValue = grossProceedsEstimateSol ?? entryCostSol;
+  const writeDownPct = Math.max(0, ((entryCostSol - estimatedValue) / entryCostSol) * 100);
 
   return {
-    netPnlSol,
-    netReturnPct,
+    estimatedValueSol: estimatedValue,
+    writeDownPct,
+    isImpaired: false,
   };
 }

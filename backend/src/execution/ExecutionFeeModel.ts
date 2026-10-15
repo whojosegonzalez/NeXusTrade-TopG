@@ -2,10 +2,14 @@
  * Phase 12.94-C: Execution Fee Modeling
  *
  * Implements granular fee modeling for Solana transaction execution:
- * - Base signature fee (5,000 lamports)
+ * - Base signature network fee (5,000 lamports)
  * - Dynamic priority fees based on Compute Units (CU) and compute unit price (micro-lamports)
- * - DEX liquidity provider swap fees (e.g. 25 bps for Raydium V4)
+ * - Separation of pool-internal AMM swap fees (embedded in curve) vs external out-of-pocket fees
  * - Associated Token Account (ATA) rent creation (2,039,280 lamports) and close rebate
+ *
+ * Mathematically sound accounting:
+ * Pool LP fees are internalized in AMM quote outputs and are NOT debited separately
+ * from wallet cash balance.
  */
 
 import type { ExecutionFeeBreakdown } from "./ExecutionTypes.js";
@@ -24,17 +28,42 @@ export interface ComputePriorityFeeOptions {
 }
 
 /**
+ * Validates that an economic parameter is a non-negative finite number.
+ */
+function validateNonNegativeNumber(value: number, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `[ExecutionFeeModel] [INVALID_PARAM] ${fieldName} must be a non-negative finite number, received: ${String(value)}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates that a fee rate is between 0 and 1 inclusive.
+ */
+export function validateFeeRate(rate: number): number {
+  if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > 1) {
+    throw new Error(
+      `[ExecutionFeeModel] [INVALID_FEE_RATE] Fee rate must be a finite number between 0 and 1, received: ${String(rate)}`,
+    );
+  }
+  return rate;
+}
+
+/**
  * Computes priority fee in lamports: (computeUnits * microLamportsPerCu) / 1,000,000.
  */
 export function computePriorityFeeLamports(options?: ComputePriorityFeeOptions): number {
-  const cu = Math.max(
-    0,
-    Math.min(MAX_COMPUTE_UNITS, options?.computeUnits ?? DEFAULT_COMPUTE_UNITS),
-  );
-  const microLamports = Math.max(
-    0,
-    options?.microLamportsPerCu ?? DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS_PER_CU,
-  );
+  const rawCu = options?.computeUnits ?? DEFAULT_COMPUTE_UNITS;
+  const rawMicroLamports =
+    options?.microLamportsPerCu ?? DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS_PER_CU;
+
+  validateNonNegativeNumber(rawCu, "computeUnits");
+  validateNonNegativeNumber(rawMicroLamports, "microLamportsPerCu");
+
+  const cu = Math.max(0, Math.min(MAX_COMPUTE_UNITS, Math.floor(rawCu)));
+  const microLamports = Math.floor(rawMicroLamports);
   return Math.round((cu * microLamports) / 1_000_000);
 }
 
@@ -48,33 +77,42 @@ export interface EntryFeeCalculationOptions {
 
 /**
  * Calculates complete fee breakdown for an entry (SOL -> Token) trade.
+ * Note: dexFeeLamports is recorded as poolInternalFeeLamports (informational only);
+ * it is NOT debited from out-of-pocket wallet cash because it is already deducted in AMM output.
  */
 export function calculateEntryFees(options: EntryFeeCalculationOptions): ExecutionFeeBreakdown {
-  if (options.sizeLamports < 0) {
-    throw new Error("[ExecutionFeeModel] Size in lamports cannot be negative.");
-  }
-  const baseFeeLamports = BASE_NETWORK_FEE_LAMPORTS;
+  validateNonNegativeNumber(options.sizeLamports, "sizeLamports");
+  const dexFeeRate = validateFeeRate(options.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
+
+  const baseNetworkFeeLamports = BASE_NETWORK_FEE_LAMPORTS;
   const priorityFeeLamports = computePriorityFeeLamports({
     computeUnits: options.computeUnits,
     microLamportsPerCu: options.microLamportsPerCu,
   });
-  const dexFeeRate = options.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE;
-  const dexFeeLamports = Math.round(options.sizeLamports * dexFeeRate);
-  const ataCreationRentLamports = options.isNewAta ? ATA_RENT_EXEMPT_LAMPORTS : 0;
-  const ataRebateLamports = 0;
 
-  const totalFeeLamports =
-    baseFeeLamports + priorityFeeLamports + dexFeeLamports + ataCreationRentLamports;
-  const totalFeeSol = totalFeeLamports / LAMPORTS_PER_SOL;
+  const externalNetworkFeeLamports = baseNetworkFeeLamports + priorityFeeLamports;
+  const externalNetworkFeeSol = externalNetworkFeeLamports / LAMPORTS_PER_SOL;
+
+  const poolInternalFeeLamports = Math.round(options.sizeLamports * dexFeeRate);
+  const poolInternalFeeSol = poolInternalFeeLamports / LAMPORTS_PER_SOL;
+
+  const ataRentDepositLamports = options.isNewAta ? ATA_RENT_EXEMPT_LAMPORTS : 0;
+  const ataRentRefundLamports = 0;
+
+  const totalOutOfPocketFeeLamports = externalNetworkFeeLamports + ataRentDepositLamports;
+  const totalOutOfPocketFeeSol = totalOutOfPocketFeeLamports / LAMPORTS_PER_SOL;
 
   return {
-    baseFeeLamports,
+    baseNetworkFeeLamports,
     priorityFeeLamports,
-    dexFeeLamports,
-    ataCreationRentLamports,
-    ataRebateLamports,
-    totalFeeLamports,
-    totalFeeSol,
+    externalNetworkFeeLamports,
+    externalNetworkFeeSol,
+    poolInternalFeeLamports,
+    poolInternalFeeSol,
+    ataRentDepositLamports,
+    ataRentRefundLamports,
+    totalOutOfPocketFeeLamports,
+    totalOutOfPocketFeeSol,
   };
 }
 
@@ -88,35 +126,45 @@ export interface ExitFeeCalculationOptions {
 
 /**
  * Calculates complete fee breakdown for an exit (Token -> SOL) trade.
- * Note: If closeAta is true, rent exemption is rebated, reducing the net fee drag.
+ * Note: dexFeeLamports is recorded as poolInternalFeeLamports (informational only);
+ * it is NOT debited from out-of-pocket wallet cash.
+ * If closeAta is true, the ATA rent deposit is refunded, reducing out-of-pocket cost.
  */
 export function calculateExitFees(options: ExitFeeCalculationOptions): ExecutionFeeBreakdown {
-  if (options.grossSolProceedsLamports < 0) {
-    throw new Error("[ExecutionFeeModel] Gross proceeds in lamports cannot be negative.");
-  }
-  const baseFeeLamports = BASE_NETWORK_FEE_LAMPORTS;
+  validateNonNegativeNumber(options.grossSolProceedsLamports, "grossSolProceedsLamports");
+  const dexFeeRate = validateFeeRate(options.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
+
+  const baseNetworkFeeLamports = BASE_NETWORK_FEE_LAMPORTS;
   const priorityFeeLamports = computePriorityFeeLamports({
     computeUnits: options.computeUnits,
     microLamportsPerCu: options.microLamportsPerCu,
   });
-  const dexFeeRate = options.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE;
-  const dexFeeLamports = Math.round(options.grossSolProceedsLamports * dexFeeRate);
-  const ataCreationRentLamports = 0;
-  const ataRebateLamports = options.closeAta ? ATA_RENT_EXEMPT_LAMPORTS : 0;
 
-  const totalFeeLamports = Math.max(
+  const externalNetworkFeeLamports = baseNetworkFeeLamports + priorityFeeLamports;
+  const externalNetworkFeeSol = externalNetworkFeeLamports / LAMPORTS_PER_SOL;
+
+  const poolInternalFeeLamports = Math.round(options.grossSolProceedsLamports * dexFeeRate);
+  const poolInternalFeeSol = poolInternalFeeLamports / LAMPORTS_PER_SOL;
+
+  const ataRentDepositLamports = 0;
+  const ataRentRefundLamports = options.closeAta ? ATA_RENT_EXEMPT_LAMPORTS : 0;
+
+  const totalOutOfPocketFeeLamports = Math.max(
     0,
-    baseFeeLamports + priorityFeeLamports + dexFeeLamports - ataRebateLamports,
+    externalNetworkFeeLamports - ataRentRefundLamports,
   );
-  const totalFeeSol = totalFeeLamports / LAMPORTS_PER_SOL;
+  const totalOutOfPocketFeeSol = totalOutOfPocketFeeLamports / LAMPORTS_PER_SOL;
 
   return {
-    baseFeeLamports,
+    baseNetworkFeeLamports,
     priorityFeeLamports,
-    dexFeeLamports,
-    ataCreationRentLamports,
-    ataRebateLamports,
-    totalFeeLamports,
-    totalFeeSol,
+    externalNetworkFeeLamports,
+    externalNetworkFeeSol,
+    poolInternalFeeLamports,
+    poolInternalFeeSol,
+    ataRentDepositLamports,
+    ataRentRefundLamports,
+    totalOutOfPocketFeeLamports,
+    totalOutOfPocketFeeSol,
   };
 }
