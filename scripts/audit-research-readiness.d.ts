@@ -1,3 +1,6 @@
+export const MAX_INGESTION_LAG_MS: number;
+export const MAX_DATA_FRESHNESS_MS: number;
+
 export function isVerifiedMatchingPool(
   actualResponsePoolId: string | null | undefined,
   expectedPoolId: string,

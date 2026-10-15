@@ -413,9 +413,13 @@ export function evaluateResearchEligibility(
       rejectionReasons.push(`UNSUPPORTED_ROUTE_TYPE: ${q.routeType}`);
     }
 
-    if (!isFiniteNum(q.quoteInitiatedMs) || !isFiniteNum(q.quoteReceivedMs)) {
+    if (
+      !isFiniteNum(q.quoteInitiatedMs) ||
+      !isFiniteNum(q.quoteReceivedMs) ||
+      !isFiniteNum(q.validUntilMs)
+    ) {
       rejectionReasons.push(
-        `INVALID_OR_NONFINITE_QUOTE_TIMESTAMPS: quoteInitiatedMs=${q.quoteInitiatedMs}, quoteReceivedMs=${q.quoteReceivedMs}`,
+        `INVALID_OR_NONFINITE_QUOTE_TIMESTAMPS: quoteInitiatedMs=${q.quoteInitiatedMs}, quoteReceivedMs=${q.quoteReceivedMs}, validUntilMs=${q.validUntilMs}`,
       );
     } else {
       if (
@@ -429,6 +433,11 @@ export function evaluateResearchEligibility(
       if (q.quoteReceivedMs < q.quoteInitiatedMs) {
         rejectionReasons.push(
           `QUOTE_CAUSAL_TIME_INVERSION: quote receipt (${q.quoteReceivedMs}) preceded quote initiation (${q.quoteInitiatedMs})`,
+        );
+      }
+      if (q.validUntilMs < q.quoteReceivedMs) {
+        rejectionReasons.push(
+          `QUOTE_EXPIRATION_PRECEDES_RECEIPT: quote validUntilMs (${q.validUntilMs}) preceded quoteReceivedMs (${q.quoteReceivedMs})`,
         );
       }
     }
@@ -456,7 +465,12 @@ export function evaluateResearchEligibility(
       );
     }
 
-    if (record.quote) {
+    // Every included fill must reference one valid matching quote, regardless of evaluation mode
+    if (!record.quote) {
+      rejectionReasons.push(
+        `ORPHAN_FILL_WITHOUT_QUOTE: fill references quoteId=${f.quoteId} but record lacks a matching quote`,
+      );
+    } else {
       const q = record.quote;
       if (f.quoteId !== q.quoteId) {
         rejectionReasons.push(
@@ -486,11 +500,11 @@ export function evaluateResearchEligibility(
           `FILL_PRECEDED_QUOTE_RECEIPT: fill timestamp ${f.fillTimestampMs} preceded quote receipt ${q.quoteReceivedMs}`,
         );
       }
-      if (
-        isFiniteNum(f.fillTimestampMs) &&
-        isFiniteNum(q.validUntilMs) &&
-        f.fillTimestampMs > q.validUntilMs
-      ) {
+      if (!isFiniteNum(q.validUntilMs)) {
+        rejectionReasons.push(
+          `FILL_AGAINST_INVALID_QUOTE_EXPIRY: fill references quote with invalid or nonfinite validUntilMs (${q.validUntilMs})`,
+        );
+      } else if (isFiniteNum(f.fillTimestampMs) && f.fillTimestampMs > q.validUntilMs) {
         rejectionReasons.push(
           `FILL_EXPIRED_QUOTE: fill timestamp ${f.fillTimestampMs} exceeded quote validity bound ${q.validUntilMs}`,
         );

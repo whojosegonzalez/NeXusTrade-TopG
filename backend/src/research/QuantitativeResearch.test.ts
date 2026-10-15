@@ -29,7 +29,11 @@ import {
   determineSessionStatus,
   evaluateResearchEligibility,
 } from "./ResearchEligibilityGate.js";
-import type { JoinedResearchRecord } from "./ResearchTypes.js";
+import type {
+  DecisionFeatureVector,
+  JoinedResearchRecord,
+  ProvenanceFeature,
+} from "./ResearchTypes.js";
 // @ts-expect-error - audit-research-readiness is an executable ESM script outside backend/src
 import { runReadinessAudit } from "../../../scripts/audit-research-readiness.mjs";
 
@@ -171,6 +175,32 @@ function createMockObservation(
     },
     missingFields: [],
     strategyRevision: "strategy-v1",
+    ...overrides,
+  };
+}
+
+function createMockFeatures(overrides: Partial<DecisionFeatureVector> = {}): DecisionFeatureVector {
+  const dummyFeature = (val: number | null = null): ProvenanceFeature<number> => ({
+    value: val,
+    provenance: val !== null ? "OBSERVED" : "UNAVAILABLE",
+    isAvailable: val !== null,
+  });
+  return {
+    tokenAgeSec: dummyFeature(100),
+    liquidityUsd: dummyFeature(50000),
+    marketCapUsd: dummyFeature(100000),
+    lmcRatio: dummyFeature(0.5),
+    lpBurnPct: dummyFeature(95.0),
+    spotPriceUsd: dummyFeature(0.001),
+    spotPriceSol: dummyFeature(0.00001),
+    volume5mUsd: dummyFeature(25000),
+    txCount5m: dummyFeature(50),
+    buys5m: dummyFeature(35),
+    sells5m: dummyFeature(15),
+    baseReserve: dummyFeature(1000),
+    quoteReserve: dummyFeature(50),
+    top10ConcentrationPct: dummyFeature(20),
+    devHoldingPct: dummyFeature(5),
     ...overrides,
   };
 }
@@ -1966,6 +1996,569 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
       expect(auditResult.h4Feasible).toBe(true);
 
       fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+  });
+
+  describe("D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds", () => {
+    it("RF-D1C3.1: D1C3-01: future-only developer-holding observation produces h3Feasible: false and eligibleH3DecisionsCount: 0 on candidate decision at time t", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-h3-future-"));
+      const tempTelemetryDir = path.join(tempDir, "telemetry", "sessions");
+      const sessionDir = path.join(tempTelemetryDir, "future-obs-session");
+      fs.mkdirSync(sessionDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(sessionDir, "session-meta.json"),
+        JSON.stringify(createMockMeta({ sessionId: "future-obs-session" })),
+      );
+      fs.writeFileSync(
+        path.join(sessionDir, "session-summary.json"),
+        JSON.stringify(createMockSummary({ sessionId: "future-obs-session" })),
+      );
+
+      // Candidate decision at t = 1,000,000 with lpBurnPct = 95
+      const decision = createMockDecision({
+        sessionId: "future-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Future111111111111111111111111111",
+        poolId: "pool-amm-future",
+        sourceTimestampMs: 999_000,
+        ingestionTimestampMs: 999_500,
+        decisionTimestampMs: 1_000_000,
+        metricsSnapshot: {
+          tokenAgeSec: 100,
+          liquidityUsd: 50000,
+          marketCapUsd: 100000,
+          lmcRatio: 0.5,
+          lpBurnPct: 95.0,
+          spotPriceUsd: 0.001,
+          spotPriceSol: 0.00001,
+          volume5mUsd: 25000,
+          txCount5m: 50,
+          buys5m: 35,
+          sells5m: 15,
+          metricProvenance: {
+            lpBurnPct: "OBSERVED",
+            volume5mUsd: "OBSERVED",
+            buys5m: "OBSERVED",
+            sells5m: "OBSERVED",
+          },
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "candidate-decisions.jsonl"),
+        JSON.stringify(decision) + "\n",
+      );
+
+      // Matching developer-holding observation 60 seconds AFTER the decision (source = 1,060,000, ingestion = 1,060,100)
+      const futureObs = createMockObservation({
+        sessionId: "future-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Future111111111111111111111111111",
+        poolId: "pool-amm-future",
+        actualResponsePoolId: "pool-amm-future",
+        sourceTimestampMs: 1_060_000,
+        ingestionTimestampMs: 1_060_100,
+        responseReceivedMs: 1_060_100,
+        holderMetrics: {
+          devHoldingPct: 21.0,
+          top10ConcentrationPct: 30.0,
+          totalHolders: 100,
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "market-observations.jsonl"),
+        JSON.stringify(futureObs) + "\n",
+      );
+
+      const auditResult = runReadinessAudit({
+        rootDir: tempDir,
+        telemetrySessionsDir: tempTelemetryDir,
+        legacySessionsDir: path.join(tempDir, "sessions"),
+        reportOutputPath: path.join(tempDir, "REPORT.md"),
+      });
+
+      // Must NOT declare H3 feasible from future-only observation!
+      expect(auditResult.eligibleH3DecisionsCount).toBe(0);
+      expect(auditResult.h3Feasible).toBe(false);
+
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("RF-D1C3.2: D1C3-01: pre-decision developer-holding observation within freshness window qualifies candidate decision for H3", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-h3-pre-"));
+      const tempTelemetryDir = path.join(tempDir, "telemetry", "sessions");
+      const sessionDir = path.join(tempTelemetryDir, "pre-obs-session");
+      fs.mkdirSync(sessionDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(sessionDir, "session-meta.json"),
+        JSON.stringify(createMockMeta({ sessionId: "pre-obs-session" })),
+      );
+      fs.writeFileSync(
+        path.join(sessionDir, "session-summary.json"),
+        JSON.stringify(createMockSummary({ sessionId: "pre-obs-session" })),
+      );
+
+      // Candidate decision at t = 1,000,000 with lpBurnPct = 95
+      const decision = createMockDecision({
+        sessionId: "pre-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Pre11111111111111111111111111111",
+        poolId: "pool-amm-pre",
+        sourceTimestampMs: 999_000,
+        ingestionTimestampMs: 999_500,
+        decisionTimestampMs: 1_000_000,
+        metricsSnapshot: {
+          tokenAgeSec: 100,
+          liquidityUsd: 50000,
+          marketCapUsd: 100000,
+          lmcRatio: 0.5,
+          lpBurnPct: 95.0,
+          spotPriceUsd: 0.001,
+          spotPriceSol: 0.00001,
+          volume5mUsd: 25000,
+          txCount5m: 50,
+          buys5m: 35,
+          sells5m: 15,
+          metricProvenance: {
+            lpBurnPct: "OBSERVED",
+            volume5mUsd: "OBSERVED",
+            buys5m: "OBSERVED",
+            sells5m: "OBSERVED",
+          },
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "candidate-decisions.jsonl"),
+        JSON.stringify(decision) + "\n",
+      );
+
+      // Valid pre-decision developer-holding observation at t = 990,000 (10s before decision, within freshness window)
+      const preObs = createMockObservation({
+        sessionId: "pre-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Pre11111111111111111111111111111",
+        poolId: "pool-amm-pre",
+        actualResponsePoolId: "pool-amm-pre",
+        sourceTimestampMs: 990_000,
+        ingestionTimestampMs: 990_100,
+        responseReceivedMs: 990_100,
+        holderMetrics: {
+          devHoldingPct: 21.0,
+          top10ConcentrationPct: 30.0,
+          totalHolders: 100,
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "market-observations.jsonl"),
+        JSON.stringify(preObs) + "\n",
+      );
+
+      const auditResult = runReadinessAudit({
+        rootDir: tempDir,
+        telemetrySessionsDir: tempTelemetryDir,
+        legacySessionsDir: path.join(tempDir, "sessions"),
+        reportOutputPath: path.join(tempDir, "REPORT.md"),
+      });
+
+      // Must qualify candidate decision for H3
+      expect(auditResult.eligibleH3DecisionsCount).toBe(1);
+      expect(auditResult.h3Feasible).toBe(true);
+
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("RF-D1C3.3: D1C3-01: stale pre-decision developer-holding observation exceeding freshness limit fails closed", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-h3-stale-"));
+      const tempTelemetryDir = path.join(tempDir, "telemetry", "sessions");
+      const sessionDir = path.join(tempTelemetryDir, "stale-obs-session");
+      fs.mkdirSync(sessionDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(sessionDir, "session-meta.json"),
+        JSON.stringify(createMockMeta({ sessionId: "stale-obs-session" })),
+      );
+      fs.writeFileSync(
+        path.join(sessionDir, "session-summary.json"),
+        JSON.stringify(createMockSummary({ sessionId: "stale-obs-session" })),
+      );
+
+      // Candidate decision at t = 1,000,000 with lpBurnPct = 95
+      const decision = createMockDecision({
+        sessionId: "stale-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Stale1111111111111111111111111111",
+        poolId: "pool-amm-stale",
+        sourceTimestampMs: 999_000,
+        ingestionTimestampMs: 999_500,
+        decisionTimestampMs: 1_000_000,
+        metricsSnapshot: {
+          tokenAgeSec: 100,
+          liquidityUsd: 50000,
+          marketCapUsd: 100000,
+          lmcRatio: 0.5,
+          lpBurnPct: 95.0,
+          spotPriceUsd: 0.001,
+          spotPriceSol: 0.00001,
+          volume5mUsd: 25000,
+          txCount5m: 50,
+          buys5m: 35,
+          sells5m: 15,
+          metricProvenance: {
+            lpBurnPct: "OBSERVED",
+            volume5mUsd: "OBSERVED",
+            buys5m: "OBSERVED",
+            sells5m: "OBSERVED",
+          },
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "candidate-decisions.jsonl"),
+        JSON.stringify(decision) + "\n",
+      );
+
+      // Stale observation at t = 700,000 (300 seconds before decision, exceeds 180s MAX_DATA_FRESHNESS_MS)
+      const staleObs = createMockObservation({
+        sessionId: "stale-obs-session",
+        generationId: "gen-1",
+        mintAddress: "TokenMintH3Stale1111111111111111111111111111",
+        poolId: "pool-amm-stale",
+        actualResponsePoolId: "pool-amm-stale",
+        sourceTimestampMs: 700_000,
+        ingestionTimestampMs: 700_100,
+        responseReceivedMs: 700_100,
+        holderMetrics: {
+          devHoldingPct: 21.0,
+          top10ConcentrationPct: 30.0,
+          totalHolders: 100,
+        },
+      });
+      fs.writeFileSync(
+        path.join(sessionDir, "market-observations.jsonl"),
+        JSON.stringify(staleObs) + "\n",
+      );
+
+      const auditResult = runReadinessAudit({
+        rootDir: tempDir,
+        telemetrySessionsDir: tempTelemetryDir,
+        legacySessionsDir: path.join(tempDir, "sessions"),
+        reportOutputPath: path.join(tempDir, "REPORT.md"),
+      });
+
+      // Stale observation must fail closed
+      expect(auditResult.eligibleH3DecisionsCount).toBe(0);
+      expect(auditResult.h3Feasible).toBe(false);
+
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("RF-D1C3.4: D1C3-02: rejects quote with validUntilMs = NaN with attached fill in both evaluation modes", () => {
+      const decision = createMockDecision({
+        sourceTimestampMs: 1000,
+        ingestionTimestampMs: 1100,
+        decisionTimestampMs: 1200,
+      });
+
+      const nanQuote: ExecutableQuoteRecord = {
+        quoteId: "quote-nan-expiry",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        inputMint: WSOL_MINT,
+        outputMint: decision.mintAddress,
+        inAmountRaw: "100000000",
+        inAmountUi: 0.1,
+        expectedOutAmountRaw: "1000000000",
+        expectedOutAmountUi: 1000,
+        minimumOutAmountRaw: "990000000",
+        minimumOutAmountUi: 990,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1300,
+        quoteReceivedMs: 1500,
+        contextSlot: 100,
+        validUntilMs: NaN, // ADVERSARIAL NaN EXPIRY!
+      };
+
+      const fill: SimulatedFillRecord = {
+        fillId: "fill-attached-1",
+        quoteId: nanQuote.quoteId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.1,
+        filledSizeSol: 0.1,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.0001,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 2_039_280,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1600,
+        fillSlot: 101,
+        executionDelayMs: 100,
+      };
+
+      // 1. In OBSERVATIONAL_ONLY mode:
+      const obsGateResult = evaluateResearchEligibility(
+        {
+          joinId: "join-nan-1",
+          decisionEventId: decision.eventId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          symbol: "TEST",
+          decisionTimestampMs: decision.decisionTimestampMs,
+          sourceTimestampMs: decision.sourceTimestampMs,
+          ingestionTimestampMs: decision.ingestionTimestampMs,
+          strategyRevision: "strategy-v1",
+          decisionCohort: "EXECUTED_BUY",
+          evaluationMode: "OBSERVATIONAL_ONLY",
+          sessionStatus: "FINALIZED",
+          trajectoryLinkStatus: "EXPLICIT_LINK",
+          features: createMockFeatures(),
+          forwardObservations: [],
+          quote: nanQuote,
+          fill,
+        },
+        { mode: "OBSERVATIONAL_ONLY" },
+      );
+
+      expect(obsGateResult.isEligible).toBe(false);
+      expect(
+        obsGateResult.rejectionReasons.some((r) =>
+          r.includes("INVALID_OR_NONFINITE_QUOTE_TIMESTAMPS"),
+        ),
+      ).toBe(true);
+
+      // 2. In SYNTHETIC_REPLAY mode:
+      const replayGateResult = evaluateResearchEligibility(
+        {
+          joinId: "join-nan-2",
+          decisionEventId: decision.eventId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          symbol: "TEST",
+          decisionTimestampMs: decision.decisionTimestampMs,
+          sourceTimestampMs: decision.sourceTimestampMs,
+          ingestionTimestampMs: decision.ingestionTimestampMs,
+          strategyRevision: "strategy-v1",
+          decisionCohort: "EXECUTED_BUY",
+          evaluationMode: "SYNTHETIC_REPLAY",
+          sessionStatus: "FINALIZED",
+          trajectoryLinkStatus: "EXPLICIT_LINK",
+          features: createMockFeatures({
+            baseReserve: { isAvailable: true, value: 1000, provenance: "OBSERVED" },
+            quoteReserve: { isAvailable: true, value: 50, provenance: "OBSERVED" },
+          }),
+          forwardObservations: [],
+          quote: nanQuote,
+          fill,
+        },
+        { mode: "SYNTHETIC_REPLAY" },
+      );
+
+      expect(replayGateResult.isEligible).toBe(false);
+      expect(
+        replayGateResult.rejectionReasons.some((r) =>
+          r.includes("INVALID_OR_NONFINITE_QUOTE_TIMESTAMPS"),
+        ),
+      ).toBe(true);
+    });
+
+    it("RF-D1C3.5: D1C3-02: rejects orphan fill without matching quote in OBSERVATIONAL_ONLY mode", () => {
+      const decision = createMockDecision({
+        sourceTimestampMs: 1000,
+        ingestionTimestampMs: 1100,
+        decisionTimestampMs: 1200,
+      });
+
+      const orphanFill: SimulatedFillRecord = {
+        fillId: "fill-orphan-1",
+        quoteId: "quote-missing-never-seen",
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.1,
+        filledSizeSol: 0.1,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.0001,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 2_039_280,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1600,
+        fillSlot: 101,
+        executionDelayMs: 100,
+      };
+
+      const result = evaluateResearchEligibility(
+        {
+          joinId: "join-orphan-1",
+          decisionEventId: decision.eventId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          symbol: "TEST",
+          decisionTimestampMs: decision.decisionTimestampMs,
+          sourceTimestampMs: decision.sourceTimestampMs,
+          ingestionTimestampMs: decision.ingestionTimestampMs,
+          strategyRevision: "strategy-v1",
+          decisionCohort: "EXECUTED_BUY",
+          evaluationMode: "OBSERVATIONAL_ONLY",
+          sessionStatus: "FINALIZED",
+          trajectoryLinkStatus: "EXPLICIT_LINK",
+          features: createMockFeatures(),
+          forwardObservations: [],
+          quote: undefined, // NO QUOTE!
+          fill: orphanFill,
+        },
+        { mode: "OBSERVATIONAL_ONLY" },
+      );
+
+      expect(result.isEligible).toBe(false);
+      expect(result.rejectionReasons.some((r) => r.includes("ORPHAN_FILL_WITHOUT_QUOTE"))).toBe(
+        true,
+      );
+    });
+
+    it("RF-D1C3.6: D1C3-02: rejects quote where validUntilMs precedes quoteReceivedMs", () => {
+      const decision = createMockDecision({
+        sourceTimestampMs: 1000,
+        ingestionTimestampMs: 1100,
+        decisionTimestampMs: 1200,
+      });
+
+      const invertedExpiryQuote: ExecutableQuoteRecord = {
+        quoteId: "quote-inverted-expiry",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        inputMint: WSOL_MINT,
+        outputMint: decision.mintAddress,
+        inAmountRaw: "100000000",
+        inAmountUi: 0.1,
+        expectedOutAmountRaw: "1000000000",
+        expectedOutAmountUi: 1000,
+        minimumOutAmountRaw: "990000000",
+        minimumOutAmountUi: 990,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1200,
+        quoteReceivedMs: 1500, // Received at 1500
+        contextSlot: 100,
+        validUntilMs: 1400, // Expired at 1400 (< 1500!)
+      };
+
+      const result = evaluateResearchEligibility(
+        {
+          joinId: "join-inverted-1",
+          decisionEventId: decision.eventId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          symbol: "TEST",
+          decisionTimestampMs: decision.decisionTimestampMs,
+          sourceTimestampMs: decision.sourceTimestampMs,
+          ingestionTimestampMs: decision.ingestionTimestampMs,
+          strategyRevision: "strategy-v1",
+          decisionCohort: "EXECUTED_BUY",
+          evaluationMode: "SYNTHETIC_REPLAY",
+          sessionStatus: "FINALIZED",
+          trajectoryLinkStatus: "EXPLICIT_LINK",
+          features: createMockFeatures({
+            baseReserve: { isAvailable: true, value: 1000, provenance: "OBSERVED" },
+            quoteReserve: { isAvailable: true, value: 50, provenance: "OBSERVED" },
+          }),
+          forwardObservations: [],
+          quote: invertedExpiryQuote,
+        },
+        { mode: "SYNTHETIC_REPLAY" },
+      );
+
+      expect(result.isEligible).toBe(false);
+      expect(
+        result.rejectionReasons.some((r) => r.includes("QUOTE_EXPIRATION_PRECEDES_RECEIPT")),
+      ).toBe(true);
+    });
+
+    it("RF-D1C3.7: D1C3-02: observational-only decision without any quote or fill remains eligible", () => {
+      const decision = createMockDecision({
+        sourceTimestampMs: 1000,
+        ingestionTimestampMs: 1100,
+        decisionTimestampMs: 1200,
+      });
+
+      const result = evaluateResearchEligibility(
+        {
+          joinId: "join-obs-only-1",
+          decisionEventId: decision.eventId,
+          sessionId: decision.sessionId,
+          generationId: decision.generationId,
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          symbol: "TEST",
+          decisionTimestampMs: decision.decisionTimestampMs,
+          sourceTimestampMs: decision.sourceTimestampMs,
+          ingestionTimestampMs: decision.ingestionTimestampMs,
+          strategyRevision: "strategy-v1",
+          decisionCohort: "EXECUTED_BUY",
+          evaluationMode: "OBSERVATIONAL_ONLY",
+          sessionStatus: "FINALIZED",
+          trajectoryLinkStatus: "UNIQUELY_INFERRED",
+          features: createMockFeatures(),
+          forwardObservations: [],
+          quote: undefined, // NO QUOTE
+          fill: undefined, // NO FILL
+        },
+        { mode: "OBSERVATIONAL_ONLY" },
+      );
+
+      expect(result.isEligible).toBe(true);
+      expect(result.rejectionReasons).toHaveLength(0);
     });
   });
 });

@@ -20,6 +20,9 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export const MAX_INGESTION_LAG_MS = 120_000; // 2 minutes
+export const MAX_DATA_FRESHNESS_MS = 180_000; // 3 minutes
+
 /**
  * Positive pool verification helper matching the runtime engine.
  * Ensures the candidate response pool matches the expected pool identity.
@@ -358,6 +361,9 @@ export function runReadinessAudit(customOptions = {}) {
               obs.sourceTimestampMs <= tDec &&
               obs.ingestionTimestampMs <= tDec &&
               recv <= tDec &&
+              tDec - obs.sourceTimestampMs >= 0 &&
+              tDec - obs.sourceTimestampMs <= MAX_DATA_FRESHNESS_MS &&
+              obs.ingestionTimestampMs - obs.sourceTimestampMs <= MAX_INGESTION_LAG_MS &&
               typeof obs.liquidityMetrics?.baseReserve === "number" &&
               Number.isFinite(obs.liquidityMetrics.baseReserve) &&
               obs.liquidityMetrics.baseReserve > 0 &&
@@ -409,6 +415,7 @@ export function runReadinessAudit(customOptions = {}) {
 
             if (hasLpBurn) {
               const matchingDevHoldingObs = sessionObservationsList.find((obs) => {
+                const recv = obs.responseReceivedMs ?? obs.ingestionTimestampMs;
                 return (
                   obs.sessionId === dec.sessionId &&
                   obs.generationId === dec.generationId &&
@@ -419,7 +426,15 @@ export function runReadinessAudit(customOptions = {}) {
                   Number.isFinite(obs.sourceTimestampMs) &&
                   typeof obs.ingestionTimestampMs === "number" &&
                   Number.isFinite(obs.ingestionTimestampMs) &&
+                  typeof recv === "number" &&
+                  Number.isFinite(recv) &&
                   obs.sourceTimestampMs <= obs.ingestionTimestampMs &&
+                  obs.sourceTimestampMs <= tDec &&
+                  obs.ingestionTimestampMs <= tDec &&
+                  recv <= tDec &&
+                  tDec - obs.sourceTimestampMs >= 0 &&
+                  tDec - obs.sourceTimestampMs <= MAX_DATA_FRESHNESS_MS &&
+                  obs.ingestionTimestampMs - obs.sourceTimestampMs <= MAX_INGESTION_LAG_MS &&
                   typeof obs.holderMetrics?.devHoldingPct === "number" &&
                   Number.isFinite(obs.holderMetrics.devHoldingPct) &&
                   obs.holderMetrics.devHoldingPct >= 0
