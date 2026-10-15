@@ -1,6 +1,6 @@
 # NeXusTrade — Research Input Readiness & Lineage Report
 
-**Audit Date:** 2026-10-15T05:19:39.375Z<br/>
+**Audit Date:** 2026-10-15T05:56:38.101Z<br/>
 **Status:** **INSUFFICIENT_EVIDENCE (NO_PERSISTED_TELEMETRY_SESSIONS)**<br/>
 **Milestone:** Phase 12.94-D Milestone D.1 — Telemetry Data Feasibility & Lineage Audit
 
@@ -20,26 +20,27 @@ In strict compliance with Independent Architecture Review v1 (Finding D-01 and D
 
 ## 2. Session & Decision Denominators
 
-| Metric                                  | Count | Notes                                               |
-| :-------------------------------------- | :---- | :-------------------------------------------------- |
-| **Total Telemetry Sessions Found**      | 0     | In `.tmp/telemetry/sessions`                        |
-| • Finalized Sessions                    | 0     | Passed atomicity & completeness checks              |
-| • Interrupted Sessions                  | 0     | Excluded from primary alpha cohorts                 |
-| • Unfinalized / Active Sessions         | 0     | Excluded (incomplete finalization)                  |
-| **Total Candidate Decisions**           | 0     | Total decisions across all cohorts                  |
-| • `FILTERED_REJECTED`                   | 0     | Initial scanner filter rejections                   |
-| • `WATCHLIST_RADAR`                     | 0     | Admitted to watchlist tracking                      |
-| • `TRIGGER_REJECTED`                    | 0     | Evaluated at trigger, rejected                      |
-| • `EXECUTED_BUY`                        | 0     | Executed buy decisions                              |
-| **Total Market Observations**           | 0     | Follow-up observation records                       |
-| • Observations with Verified Pool ID    | 0     | Verified via `isVerifiedMatchingPool`               |
-| • Observations with Valid AMM Reserves  | 0     | Verified pool observations with base/quote reserves |
-| • Usable Pre-Decision Reserve Snapshots | 0     | Verified pre-decision point-in-time AMM reserves    |
-| **Total Executable Quotes (12.94-C)**   | 0     | Standalone 12.94-C execution quotes on disk         |
-| **Total Simulated Fills (12.94-C)**     | 0     | Standalone 12.94-C simulated fills on disk          |
-| **Total Stratified Sampling Records**   | 0     | Tracked sampling trajectory records                 |
-| **Total Malformed / Corrupted Records** | 0     | Invalid JSON records quarantined                    |
-| **Legacy Pre-12.94 Sessions**           | 2     | In `.tmp/sessions` (pre-telemetry format)           |
+| Metric                                    | Count | Notes                                                |
+| :---------------------------------------- | :---- | :--------------------------------------------------- |
+| **Total Telemetry Sessions Found**        | 0     | In `.tmp/telemetry/sessions`                         |
+| • Finalized Sessions                      | 0     | Passed affirmative finality & completeness checks    |
+| • Interrupted Sessions                    | 0     | Excluded from primary alpha cohorts                  |
+| • Unfinalized / Active Sessions           | 0     | Excluded (incomplete finalization)                   |
+| **Total Candidate Decisions**             | 0     | Total decisions across all cohorts                   |
+| • `FILTERED_REJECTED`                     | 0     | Initial scanner filter rejections                    |
+| • `WATCHLIST_RADAR`                       | 0     | Admitted to watchlist tracking                       |
+| • `TRIGGER_REJECTED`                      | 0     | Evaluated at trigger, rejected                       |
+| • `EXECUTED_BUY`                          | 0     | Executed buy decisions                               |
+| **Finalized Research-Eligible Decisions** | 0     | Causally valid in authoritatively finalized sessions |
+| **Total Market Observations**             | 0     | Follow-up observation records                        |
+| • Observations with Verified Pool ID      | 0     | Verified via `isVerifiedMatchingPool`                |
+| • Observations with Valid AMM Reserves    | 0     | Verified pool observations with base/quote reserves  |
+| • Usable Pre-Decision Reserve Snapshots   | 0     | Verified pre-decision point-in-time AMM reserves     |
+| **Total Executable Quotes (12.94-C)**     | 0     | Standalone 12.94-C execution quotes on disk          |
+| **Total Simulated Fills (12.94-C)**       | 0     | Standalone 12.94-C simulated fills on disk           |
+| **Total Stratified Sampling Records**     | 0     | Tracked sampling trajectory records                  |
+| **Total Malformed / Corrupted Records**   | 0     | Invalid JSON records quarantined                     |
+| **Legacy Pre-12.94 Sessions**             | 2     | In `.tmp/sessions` (pre-telemetry format)            |
 
 ---
 
@@ -66,12 +67,12 @@ In strict compliance with Independent Architecture Review v1 (Finding D-01 and D
 
 ## 4. Evaluation Feasibility Assessment for Hypotheses H1–H4
 
-| Hypothesis                                | Required Features                                            | Current Data Feasibility | Reason Code if Ineligible             |
-| :---------------------------------------- | :----------------------------------------------------------- | :----------------------- | :------------------------------------ |
-| **H1: Liquidity Depth & Price Impact**    | Pre-decision quoteReserve, baseReserve, tradeSize            | INELIGIBLE               | NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT |
-| **H2: Order Flow Momentum**               | buys5m, sells5m, volume5mUsd (co-occurring on same decision) | INELIGIBLE               | FIELD_NOT_COLLECTED_IN_GENERATION     |
-| **H3: Structural Safety & Concentration** | lpBurnPct, devHoldingPct                                     | INELIGIBLE               | PROVIDER_RESPONSE_OMITTED_FIELD       |
-| **H4: Dynamic Capacity Sizing**           | Capacity curve grid on point-in-time reserves                | INELIGIBLE               | NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT |
+| Hypothesis                                | Required Features                                                 | Raw Feature Coverage         | Eligible-Cohort Decisions | Current Data Feasibility | Reason Code if Ineligible             |
+| :---------------------------------------- | :---------------------------------------------------------------- | :--------------------------- | :------------------------ | :----------------------- | :------------------------------------ |
+| **H1: Liquidity Depth & Price Impact**    | Pre-decision quoteReserve, baseReserve, tradeSize                 | 0 valid reserve obs          | 0                         | INELIGIBLE               | NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT |
+| **H2: Order Flow Momentum**               | buys5m, sells5m, volume5mUsd (co-occurring on same decision)      | 0 raw co-occurring decisions | 0                         | INELIGIBLE               | FIELD_NOT_COLLECTED_IN_GENERATION     |
+| **H3: Structural Safety & Concentration** | lpBurnPct on decision AND devHoldingPct on matching candidate obs | 0 lpBurn decs, 0 devHold obs | 0                         | INELIGIBLE               | PROVIDER_RESPONSE_OMITTED_FIELD       |
+| **H4: Dynamic Capacity Sizing**           | Capacity curve grid on point-in-time reserves                     | 0 valid reserve obs          | 0                         | INELIGIBLE               | NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT |
 
 ---
 

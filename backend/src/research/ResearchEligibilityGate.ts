@@ -42,27 +42,56 @@ export function determineSessionStatus(
   meta?: SessionTelemetryMeta | null,
   summary?: SessionTelemetrySummary | null,
 ): "FINALIZED" | "INTERRUPTED" | "UNFINALIZED" {
+  // Check for affirmative interruption signals in either record
+  const isInterrupted =
+    Boolean(meta?.isInterruptedSession) ||
+    meta?.sessionStatus === "INTERRUPTED" ||
+    Boolean(meta?.resumedFromPriorCrash) ||
+    Boolean((meta as unknown as { interruptedReason?: string })?.interruptedReason) ||
+    Boolean(summary?.isInterruptedSession) ||
+    summary?.isCompleteSession === false;
+
+  if (isInterrupted) {
+    return "INTERRUPTED";
+  }
+
+  // Both metadata and summary must be present for an authoritative finalized session
   if (!meta || !summary) {
-    if (meta?.isInterruptedSession || meta?.sessionStatus === "INTERRUPTED") {
-      return "INTERRUPTED";
-    }
     return "UNFINALIZED";
   }
+
+  // Cross-file identity consistency checks
   if (meta.sessionId !== summary.sessionId) return "UNFINALIZED";
   if (meta.generationId !== summary.generationId) return "UNFINALIZED";
-  if (meta.strategyRevision !== summary.strategyRevision) return "UNFINALIZED";
+  if (
+    meta.strategyRevision &&
+    summary.strategyRevision &&
+    meta.strategyRevision !== summary.strategyRevision
+  ) {
+    return "UNFINALIZED";
+  }
+  if (meta.startedAtIso && summary.startedAtIso && meta.startedAtIso !== summary.startedAtIso) {
+    return "UNFINALIZED";
+  }
+  if (meta.closedAtIso && summary.closedAtIso && meta.closedAtIso !== summary.closedAtIso) {
+    return "UNFINALIZED";
+  }
 
-  const isInterrupted =
-    Boolean(meta.isInterruptedSession) ||
-    meta.sessionStatus === "INTERRUPTED" ||
-    Boolean(summary.isInterruptedSession);
+  // Affirmative finalization requirements:
+  // 1. meta must authoritatively state FINALIZED and non-interrupted
+  // 2. summary must state complete session and have populated closedAtIso
+  const isMetaFinalized = meta.sessionStatus === "FINALIZED" && meta.isInterruptedSession === false;
+  const isSummaryComplete =
+    summary.isCompleteSession === true &&
+    summary.isInterruptedSession === false &&
+    typeof summary.closedAtIso === "string" &&
+    summary.closedAtIso.trim().length > 0;
 
-  if (isInterrupted) return "INTERRUPTED";
-
-  if (summary.isCompleteSession === true && summary.closedAtIso) {
+  if (isMetaFinalized && isSummaryComplete) {
     return "FINALIZED";
   }
 
+  // Any non-finalized or contradictory pair fails closed as UNFINALIZED
   return "UNFINALIZED";
 }
 
@@ -277,37 +306,70 @@ export function evaluateResearchEligibility(
     );
   }
 
-  // Gate 4: Temporal Ingestion Lag, Clock Skew, and Decision-Time Ordering
-  if (record.ingestionTimestampMs > record.decisionTimestampMs) {
+  // Gate 4: Mandatory Timestamps, Ingestion Lag, and Decision-Time Ordering
+  const isFiniteNum = (val: unknown): val is number =>
+    typeof val === "number" && Number.isFinite(val);
+
+  if (
+    !isFiniteNum(record.decisionTimestampMs) ||
+    !isFiniteNum(record.sourceTimestampMs) ||
+    !isFiniteNum(record.ingestionTimestampMs)
+  ) {
     rejectionReasons.push(
-      `DECISION_LOOKAHEAD_LEAKAGE: decision ingestion (${record.ingestionTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
+      `INVALID_OR_NONFINITE_MANDATORY_TIMESTAMPS: decisionTimestampMs=${record.decisionTimestampMs}, sourceTimestampMs=${record.sourceTimestampMs}, ingestionTimestampMs=${record.ingestionTimestampMs}`,
     );
-  }
-  if (record.sourceTimestampMs > record.decisionTimestampMs) {
-    rejectionReasons.push(
-      `DECISION_LOOKAHEAD_LEAKAGE: decision source (${record.sourceTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
-    );
+  } else {
+    if (record.ingestionTimestampMs > record.decisionTimestampMs) {
+      rejectionReasons.push(
+        `DECISION_LOOKAHEAD_LEAKAGE: decision ingestion (${record.ingestionTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
+      );
+    }
+    if (record.sourceTimestampMs > record.decisionTimestampMs) {
+      rejectionReasons.push(
+        `DECISION_LOOKAHEAD_LEAKAGE: decision source (${record.sourceTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
+      );
+    }
+
+    const ingestionLag = record.ingestionTimestampMs - record.sourceTimestampMs;
+    if (ingestionLag < 0) {
+      rejectionReasons.push(
+        `IMPOSSIBLE_TIMESTAMP_ORDERING: negative ingestion lag (${ingestionLag}ms)`,
+      );
+    } else if (ingestionLag > maxIngestionLag) {
+      rejectionReasons.push(
+        `EXCESSIVE_INGESTION_LAG: ${ingestionLag}ms exceeds limit ${maxIngestionLag}ms`,
+      );
+    }
+
+    const clockSkew = Math.abs(record.ingestionTimestampMs - record.decisionTimestampMs);
+    if (clockSkew > maxClockSkew && Math.abs(ingestionLag) > maxClockSkew) {
+      warnings.push(`POSSIBLE_CLOCK_SKEW: lag=${ingestionLag}ms`);
+    }
   }
 
-  const ingestionLag = record.ingestionTimestampMs - record.sourceTimestampMs;
-  if (ingestionLag < 0) {
-    rejectionReasons.push(
-      `IMPOSSIBLE_TIMESTAMP_ORDERING: negative ingestion lag (${ingestionLag}ms)`,
-    );
-  } else if (ingestionLag > maxIngestionLag) {
-    rejectionReasons.push(
-      `EXCESSIVE_INGESTION_LAG: ${ingestionLag}ms exceeds limit ${maxIngestionLag}ms`,
-    );
-  }
-
-  const clockSkew = Math.abs(record.ingestionTimestampMs - record.decisionTimestampMs);
-  if (clockSkew > maxClockSkew && Math.abs(ingestionLag) > maxClockSkew) {
-    warnings.push(`POSSIBLE_CLOCK_SKEW: lag=${ingestionLag}ms`);
-  }
-
-  // Gate 5: Forward Observation Quality (Fail Closed on missing or mismatched pool ID and stale observations)
+  // Gate 5: Forward Observation Quality and Causality (Fail Closed on missing or mismatched pool ID and stale observations)
   for (let i = 0; i < record.forwardObservations.length; i++) {
     const obs = record.forwardObservations[i]!;
+
+    if (!isFiniteNum(obs.sourceTimestampMs) || !isFiniteNum(obs.ingestionTimestampMs)) {
+      rejectionReasons.push(
+        `FORWARD_OBSERVATION_INVALID_TIMESTAMPS: obs[${i}] has nonfinite timestamp(s)`,
+      );
+    } else {
+      if (obs.sourceTimestampMs > obs.ingestionTimestampMs) {
+        rejectionReasons.push(
+          `FORWARD_OBSERVATION_IMPOSSIBLE_TIMESTAMPS: obs[${i}] source (${obs.sourceTimestampMs}) > ingestion (${obs.ingestionTimestampMs})`,
+        );
+      }
+      if (
+        isFiniteNum(record.decisionTimestampMs) &&
+        obs.sourceTimestampMs < record.decisionTimestampMs
+      ) {
+        rejectionReasons.push(
+          `FORWARD_OBSERVATION_PRECEDES_DECISION: obs[${i}] source (${obs.sourceTimestampMs}) preceded decision (${record.decisionTimestampMs})`,
+        );
+      }
+    }
 
     // Positive pool verification: missing OR mismatched pool ID fails closed!
     if (!isVerifiedMatchingPool(obs.actualResponsePoolId, record.poolId)) {
@@ -331,11 +393,108 @@ export function evaluateResearchEligibility(
         `FORWARD_OBSERVATION_STALE: obs[${i}] freshness=${obs.dataFreshnessMs}ms exceeds limit ${maxFreshness}ms`,
       );
     }
+  }
 
-    if (obs.sourceTimestampMs > obs.ingestionTimestampMs) {
+  // Quote causality and identity verification (if quote is present)
+  if (record.quote) {
+    const q = record.quote;
+    if (
+      q.sessionId !== record.sessionId ||
+      q.generationId !== record.generationId ||
+      q.mintAddress !== record.mintAddress ||
+      q.poolId !== record.poolId ||
+      q.decisionEventId !== record.decisionEventId
+    ) {
       rejectionReasons.push(
-        `FORWARD_OBSERVATION_IMPOSSIBLE_TIMESTAMPS: obs[${i}] source (${obs.sourceTimestampMs}) > ingestion (${obs.ingestionTimestampMs})`,
+        `QUOTE_IDENTITY_MISMATCH: quote does not match decision composite identity`,
       );
+    }
+    if (q.routeType !== "DIRECT_TRACKED_POOL") {
+      rejectionReasons.push(`UNSUPPORTED_ROUTE_TYPE: ${q.routeType}`);
+    }
+
+    if (!isFiniteNum(q.quoteInitiatedMs) || !isFiniteNum(q.quoteReceivedMs)) {
+      rejectionReasons.push(
+        `INVALID_OR_NONFINITE_QUOTE_TIMESTAMPS: quoteInitiatedMs=${q.quoteInitiatedMs}, quoteReceivedMs=${q.quoteReceivedMs}`,
+      );
+    } else {
+      if (
+        isFiniteNum(record.decisionTimestampMs) &&
+        q.quoteInitiatedMs < record.decisionTimestampMs
+      ) {
+        rejectionReasons.push(
+          `QUOTE_PRECEDES_DECISION: quote initiation (${q.quoteInitiatedMs}) preceded decision (${record.decisionTimestampMs})`,
+        );
+      }
+      if (q.quoteReceivedMs < q.quoteInitiatedMs) {
+        rejectionReasons.push(
+          `QUOTE_CAUSAL_TIME_INVERSION: quote receipt (${q.quoteReceivedMs}) preceded quote initiation (${q.quoteInitiatedMs})`,
+        );
+      }
+    }
+  }
+
+  // Fill causality and referential integrity (if fill is present)
+  if (record.fill) {
+    const f = record.fill;
+    if (!isFiniteNum(f.fillTimestampMs)) {
+      rejectionReasons.push(
+        `INVALID_OR_NONFINITE_FILL_TIMESTAMP: fillTimestampMs=${f.fillTimestampMs}`,
+      );
+    }
+
+    const extF = f as unknown as { sessionId?: string; generationId?: string };
+    if (
+      (extF.sessionId && extF.sessionId !== record.sessionId) ||
+      (extF.generationId && extF.generationId !== record.generationId) ||
+      f.mintAddress !== record.mintAddress ||
+      f.poolId !== record.poolId ||
+      f.decisionEventId !== record.decisionEventId
+    ) {
+      rejectionReasons.push(
+        `FILL_IDENTITY_MISMATCH: fill does not match decision composite identity`,
+      );
+    }
+
+    if (record.quote) {
+      const q = record.quote;
+      if (f.quoteId !== q.quoteId) {
+        rejectionReasons.push(
+          `FILL_QUOTE_ID_MISMATCH: fill.quoteId=${f.quoteId}, quote.quoteId=${q.quoteId}`,
+        );
+      }
+      if (f.side !== q.side) {
+        rejectionReasons.push(`FILL_SIDE_MISMATCH: fill.side=${f.side}, quote.side=${q.side}`);
+      }
+
+      // Fill causality against quote: must not precede initiation or receipt, and must not exceed validity
+      if (
+        isFiniteNum(f.fillTimestampMs) &&
+        isFiniteNum(q.quoteInitiatedMs) &&
+        f.fillTimestampMs < q.quoteInitiatedMs
+      ) {
+        rejectionReasons.push(
+          `FILL_CAUSAL_TIME_INVERSION: fill timestamp ${f.fillTimestampMs} preceded quote initiation ${q.quoteInitiatedMs}`,
+        );
+      }
+      if (
+        isFiniteNum(f.fillTimestampMs) &&
+        isFiniteNum(q.quoteReceivedMs) &&
+        f.fillTimestampMs < q.quoteReceivedMs
+      ) {
+        rejectionReasons.push(
+          `FILL_PRECEDED_QUOTE_RECEIPT: fill timestamp ${f.fillTimestampMs} preceded quote receipt ${q.quoteReceivedMs}`,
+        );
+      }
+      if (
+        isFiniteNum(f.fillTimestampMs) &&
+        isFiniteNum(q.validUntilMs) &&
+        f.fillTimestampMs > q.validUntilMs
+      ) {
+        rejectionReasons.push(
+          `FILL_EXPIRED_QUOTE: fill timestamp ${f.fillTimestampMs} exceeded quote validity bound ${q.validUntilMs}`,
+        );
+      }
     }
   }
 
@@ -361,53 +520,6 @@ export function evaluateResearchEligibility(
       rejectionReasons.push(
         "SYNTHETIC_REPLAY_MISSING_QUOTE: synthetic replay requires an executable quote record",
       );
-    } else {
-      const q = record.quote;
-      if (
-        q.sessionId !== record.sessionId ||
-        q.generationId !== record.generationId ||
-        q.mintAddress !== record.mintAddress ||
-        q.poolId !== record.poolId ||
-        q.decisionEventId !== record.decisionEventId
-      ) {
-        rejectionReasons.push(
-          `QUOTE_IDENTITY_MISMATCH: quote does not match decision composite identity`,
-        );
-      }
-      if (q.routeType !== "DIRECT_TRACKED_POOL") {
-        rejectionReasons.push(`UNSUPPORTED_ROUTE_TYPE: ${q.routeType}`);
-      }
-    }
-
-    // Verify fill referential integrity and causal ordering if fill is linked
-    if (record.fill && record.quote) {
-      const f = record.fill;
-      const q = record.quote;
-      if (f.quoteId !== q.quoteId) {
-        rejectionReasons.push(
-          `FILL_QUOTE_ID_MISMATCH: fill.quoteId=${f.quoteId}, quote.quoteId=${q.quoteId}`,
-        );
-      }
-      const extF = f as unknown as { sessionId?: string; generationId?: string };
-      if (
-        (extF.sessionId && extF.sessionId !== record.sessionId) ||
-        (extF.generationId && extF.generationId !== record.generationId) ||
-        f.mintAddress !== record.mintAddress ||
-        f.poolId !== record.poolId ||
-        f.decisionEventId !== record.decisionEventId
-      ) {
-        rejectionReasons.push(
-          `FILL_IDENTITY_MISMATCH: fill does not match decision composite identity`,
-        );
-      }
-      if (f.side !== q.side) {
-        rejectionReasons.push(`FILL_SIDE_MISMATCH: fill.side=${f.side}, quote.side=${q.side}`);
-      }
-      if (f.fillTimestampMs < q.quoteInitiatedMs) {
-        rejectionReasons.push(
-          `FILL_CAUSAL_TIME_INVERSION: fill timestamp ${f.fillTimestampMs} preceded quote initiation ${q.quoteInitiatedMs}`,
-        );
-      }
     }
 
     // Submarginal dust exit warning / disqualification

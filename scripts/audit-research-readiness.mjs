@@ -1,11 +1,16 @@
-#!/usr/bin/env node
 /**
- * Phase 12.94-D: Research Input Readiness & Lineage Audit Script
+ * Phase 12.94-D Milestone D.1: Research Input Readiness & Lineage Audit Script
  *
- * Scans canonical telemetry directories and historical session logs on disk.
- * Generates audit/RESEARCH_INPUT_READINESS_REPORT.md reporting full denominators,
- * feature availability distributions, verified pool coverage, sampling metadata,
- * ambiguous trajectories, and an honest readiness assessment without fabricating data.
+ * Scans disk locations (.tmp/telemetry/sessions and .tmp/sessions) to audit
+ * data feasibility, lineage mapping, feature completeness, and cohort eligibility
+ * for Hypotheses H1–H4 without data fabrication.
+ *
+ * In accordance with Phase 12.94-D.1 Closure Audit v2 (Findings D1C-01 and D1C-03):
+ * 1. Authoritative session finality requires affirmative, mutually consistent meta
+ *    and summary records; contradictory pairs fail closed as UNFINALIZED or INTERRUPTED.
+ * 2. Hypothesis feasibility strictly evaluates co-occurring, valid features on the
+ *    SAME decision, restricted to authoritatively finalized sessions and verified identities.
+ * 3. Raw field coverage is cleanly separated from eligible-cohort decisions.
  */
 
 import fs from "node:fs";
@@ -14,20 +19,16 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const defaultRootDir = path.resolve(__dirname, "..");
 
 /**
- * Normalizes and verifies whether a provider's actual response pool ID matches
- * an expected tracked pool ID (strips 'dexscreener-' prefix, trims, lowercases).
- * Fails closed (returns false) if actualResponsePoolId is missing, empty, or not a string.
+ * Positive pool verification helper matching the runtime engine.
+ * Ensures the candidate response pool matches the expected pool identity.
  */
 export function isVerifiedMatchingPool(actualResponsePoolId, expectedPoolId) {
-  if (
-    !actualResponsePoolId ||
-    typeof actualResponsePoolId !== "string" ||
-    !expectedPoolId ||
-    typeof expectedPoolId !== "string"
-  ) {
+  if (!actualResponsePoolId || typeof actualResponsePoolId !== "string") {
+    return false;
+  }
+  if (!expectedPoolId || typeof expectedPoolId !== "string") {
     return false;
   }
   const normActual = actualResponsePoolId
@@ -41,8 +42,11 @@ export function isVerifiedMatchingPool(actualResponsePoolId, expectedPoolId) {
   return normActual.length > 0 && normActual === normExpected;
 }
 
+/**
+ * Executes the complete input readiness audit across disk telemetry locations.
+ */
 export function runReadinessAudit(customOptions = {}) {
-  const rootDir = customOptions.rootDir ?? defaultRootDir;
+  const rootDir = customOptions.rootDir ?? path.resolve(__dirname, "..");
   const telemetrySessionsDir =
     customOptions.telemetrySessionsDir ?? path.resolve(rootDir, ".tmp", "telemetry", "sessions");
   const legacySessionsDir =
@@ -72,11 +76,16 @@ export function runReadinessAudit(customOptions = {}) {
   let totalObservations = 0;
   let observationsWithVerifiedPool = 0;
   let observationsWithReserveSnapshot = 0;
-  let observationsWithDevHolding = 0;
+  let rawObservationsWithDevHolding = 0;
 
-  let decisionsWithUsablePreDecisionReserves = 0;
-  let decisionsWithCoOccurringH2Features = 0;
-  let decisionsWithLpBurn = 0;
+  let rawDecisionsWithCoOccurringH2Features = 0;
+  let rawDecisionsWithLpBurn = 0;
+
+  let finalizedEligibleDecisionsCount = 0;
+  let eligibleH1DecisionsCount = 0;
+  let eligibleH2DecisionsCount = 0;
+  let eligibleH3DecisionsCount = 0;
+  let eligibleH4DecisionsCount = 0;
 
   let totalQuotesFound = 0;
   let totalFillsFound = 0;
@@ -142,12 +151,15 @@ export function runReadinessAudit(customOptions = {}) {
         }
       }
 
-      // Check session finality using authoritative meta + summary cross-file consistency
+      // Check authoritative session finality using mutually consistent meta + summary
       let status = "UNFINALIZED";
       const isInterrupted =
         Boolean(meta?.isInterruptedSession) ||
         meta?.sessionStatus === "INTERRUPTED" ||
-        Boolean(summary?.isInterruptedSession);
+        Boolean(meta?.resumedFromPriorCrash) ||
+        Boolean(meta?.interruptedReason) ||
+        Boolean(summary?.isInterruptedSession) ||
+        summary?.isCompleteSession === false;
 
       if (isInterrupted) {
         status = "INTERRUPTED";
@@ -155,11 +167,22 @@ export function runReadinessAudit(customOptions = {}) {
       } else if (
         meta &&
         summary &&
+        meta.sessionStatus === "FINALIZED" &&
+        meta.isInterruptedSession === false &&
+        !meta.interruptedReason &&
+        summary.isCompleteSession === true &&
+        summary.isInterruptedSession === false &&
+        typeof summary.closedAtIso === "string" &&
+        summary.closedAtIso.trim().length > 0 &&
         meta.sessionId === summary.sessionId &&
         meta.generationId === summary.generationId &&
-        meta.strategyRevision === summary.strategyRevision &&
-        summary.isCompleteSession === true &&
-        summary.closedAtIso
+        (!meta.strategyRevision ||
+          !summary.strategyRevision ||
+          meta.strategyRevision === summary.strategyRevision) &&
+        (!meta.startedAtIso ||
+          !summary.startedAtIso ||
+          meta.startedAtIso === summary.startedAtIso) &&
+        (!meta.closedAtIso || !summary.closedAtIso || meta.closedAtIso === summary.closedAtIso)
       ) {
         status = "FINALIZED";
         finalizedSessionsCount++;
@@ -201,7 +224,7 @@ export function runReadinessAudit(customOptions = {}) {
                 }
               }
 
-              // Check H2 co-occurrence on the same candidate decision
+              // Track raw H2 feature co-occurrence across all decisions
               const hasBuys =
                 ms.buys5m != null &&
                 Number.isFinite(ms.buys5m) &&
@@ -221,10 +244,10 @@ export function runReadinessAudit(customOptions = {}) {
                 p["volume5mUsd"] !== "PLACEHOLDER" &&
                 p["volume5mUsd"] !== "UNAVAILABLE";
               if (hasBuys && hasSells && hasVol) {
-                decisionsWithCoOccurringH2Features++;
+                rawDecisionsWithCoOccurringH2Features++;
               }
 
-              // Check H3 lpBurn on decision
+              // Track raw H3 lpBurn on decision
               const hasLpBurn =
                 ms.lpBurnPct != null &&
                 Number.isFinite(ms.lpBurnPct) &&
@@ -232,7 +255,7 @@ export function runReadinessAudit(customOptions = {}) {
                 p["lpBurnPct"] !== "PLACEHOLDER" &&
                 p["lpBurnPct"] !== "UNAVAILABLE";
               if (hasLpBurn) {
-                decisionsWithLpBurn++;
+                rawDecisionsWithLpBurn++;
               }
             }
           } catch {
@@ -275,10 +298,11 @@ export function runReadinessAudit(customOptions = {}) {
             }
             if (
               obs.holderMetrics?.devHoldingPct != null &&
-              Number.isFinite(obs.holderMetrics.devHoldingPct)
+              Number.isFinite(obs.holderMetrics.devHoldingPct) &&
+              obs.holderMetrics.devHoldingPct >= 0
             ) {
               featureCounts.devHoldingPct++;
-              observationsWithDevHolding++;
+              rawObservationsWithDevHolding++;
             }
           } catch {
             malformedObservationsCount++;
@@ -286,23 +310,127 @@ export function runReadinessAudit(customOptions = {}) {
         }
       }
 
-      // Check pre-decision reserve feasibility for candidate decisions in this session
-      for (const dec of sessionDecisionsList) {
-        const tDec = dec.decisionTimestampMs;
-        const matchingPreDecisionObs = sessionObservationsList.find((obs) => {
-          const recv = obs.responseReceivedMs ?? obs.ingestionTimestampMs;
-          return (
-            obs.poolId === dec.poolId &&
-            isVerifiedMatchingPool(obs.actualResponsePoolId, dec.poolId) &&
-            obs.sourceTimestampMs <= tDec &&
-            obs.ingestionTimestampMs <= tDec &&
-            recv <= tDec &&
-            obs.liquidityMetrics?.baseReserve > 0 &&
-            obs.liquidityMetrics?.quoteReserve > 0
-          );
-        });
-        if (matchingPreDecisionObs) {
-          decisionsWithUsablePreDecisionReserves++;
+      // Candidate decision cohort evaluation (only decisions in authoritatively FINALIZED sessions qualify)
+      if (status === "FINALIZED") {
+        for (const dec of sessionDecisionsList) {
+          const tDec = dec.decisionTimestampMs;
+          const tSrc = dec.sourceTimestampMs;
+          const tIng = dec.ingestionTimestampMs;
+
+          // Baseline decision validity: finite timestamps, non-negative lag, anti-lookahead
+          const isValidDecision =
+            typeof tDec === "number" &&
+            Number.isFinite(tDec) &&
+            typeof tSrc === "number" &&
+            Number.isFinite(tSrc) &&
+            typeof tIng === "number" &&
+            Number.isFinite(tIng) &&
+            tSrc <= tIng &&
+            tSrc <= tDec &&
+            tIng <= tDec &&
+            typeof dec.sessionId === "string" &&
+            typeof dec.generationId === "string" &&
+            typeof dec.mintAddress === "string" &&
+            typeof dec.poolId === "string";
+
+          if (!isValidDecision) {
+            continue;
+          }
+
+          finalizedEligibleDecisionsCount++;
+
+          // H1 & H4 Check: Pre-decision reserve snapshot strictly matching THIS decision
+          const matchingPreDecisionObs = sessionObservationsList.find((obs) => {
+            const recv = obs.responseReceivedMs ?? obs.ingestionTimestampMs;
+            return (
+              obs.sessionId === dec.sessionId &&
+              obs.generationId === dec.generationId &&
+              obs.mintAddress === dec.mintAddress &&
+              obs.poolId === dec.poolId &&
+              isVerifiedMatchingPool(obs.actualResponsePoolId, dec.poolId) &&
+              typeof obs.sourceTimestampMs === "number" &&
+              Number.isFinite(obs.sourceTimestampMs) &&
+              typeof obs.ingestionTimestampMs === "number" &&
+              Number.isFinite(obs.ingestionTimestampMs) &&
+              typeof recv === "number" &&
+              Number.isFinite(recv) &&
+              obs.sourceTimestampMs <= obs.ingestionTimestampMs &&
+              obs.sourceTimestampMs <= tDec &&
+              obs.ingestionTimestampMs <= tDec &&
+              recv <= tDec &&
+              typeof obs.liquidityMetrics?.baseReserve === "number" &&
+              Number.isFinite(obs.liquidityMetrics.baseReserve) &&
+              obs.liquidityMetrics.baseReserve > 0 &&
+              typeof obs.liquidityMetrics?.quoteReserve === "number" &&
+              Number.isFinite(obs.liquidityMetrics.quoteReserve) &&
+              obs.liquidityMetrics.quoteReserve > 0
+            );
+          });
+
+          if (matchingPreDecisionObs) {
+            eligibleH1DecisionsCount++;
+            eligibleH4DecisionsCount++;
+          }
+
+          // H2 Check: Decision-level feature co-occurrence on THIS decision
+          if (dec.metricsSnapshot) {
+            const ms = dec.metricsSnapshot;
+            const p = ms.metricProvenance ?? {};
+            const hasBuys =
+              ms.buys5m != null &&
+              Number.isFinite(ms.buys5m) &&
+              ms.buys5m >= 0 &&
+              p["buys5m"] !== "PLACEHOLDER" &&
+              p["buys5m"] !== "UNAVAILABLE";
+            const hasSells =
+              ms.sells5m != null &&
+              Number.isFinite(ms.sells5m) &&
+              ms.sells5m >= 0 &&
+              p["sells5m"] !== "PLACEHOLDER" &&
+              p["sells5m"] !== "UNAVAILABLE";
+            const hasVol =
+              ms.volume5mUsd != null &&
+              Number.isFinite(ms.volume5mUsd) &&
+              ms.volume5mUsd >= 0 &&
+              p["volume5mUsd"] !== "PLACEHOLDER" &&
+              p["volume5mUsd"] !== "UNAVAILABLE";
+
+            if (hasBuys && hasSells && hasVol) {
+              eligibleH2DecisionsCount++;
+            }
+
+            // H3 Check: lpBurnPct on THIS decision AND devHoldingPct on matching observation for THIS candidate
+            const hasLpBurn =
+              ms.lpBurnPct != null &&
+              Number.isFinite(ms.lpBurnPct) &&
+              ms.lpBurnPct >= 0 &&
+              p["lpBurnPct"] !== "PLACEHOLDER" &&
+              p["lpBurnPct"] !== "UNAVAILABLE";
+
+            if (hasLpBurn) {
+              const matchingDevHoldingObs = sessionObservationsList.find((obs) => {
+                return (
+                  obs.sessionId === dec.sessionId &&
+                  obs.generationId === dec.generationId &&
+                  obs.mintAddress === dec.mintAddress &&
+                  obs.poolId === dec.poolId &&
+                  isVerifiedMatchingPool(obs.actualResponsePoolId, dec.poolId) &&
+                  typeof obs.sourceTimestampMs === "number" &&
+                  Number.isFinite(obs.sourceTimestampMs) &&
+                  typeof obs.ingestionTimestampMs === "number" &&
+                  Number.isFinite(obs.ingestionTimestampMs) &&
+                  obs.sourceTimestampMs <= obs.ingestionTimestampMs &&
+                  typeof obs.holderMetrics?.devHoldingPct === "number" &&
+                  Number.isFinite(obs.holderMetrics.devHoldingPct) &&
+                  obs.holderMetrics.devHoldingPct >= 0
+                );
+              });
+
+              if (matchingDevHoldingObs) {
+                eligibleH3DecisionsCount++;
+              }
+            }
+          }
         }
       }
 
@@ -393,15 +521,17 @@ export function runReadinessAudit(customOptions = {}) {
     overallReadinessStatus = "INSUFFICIENT_EVIDENCE (NO_CANDIDATE_DECISIONS)";
   } else if (finalizedSessionsCount === 0) {
     overallReadinessStatus = "INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)";
+  } else if (finalizedEligibleDecisionsCount === 0) {
+    overallReadinessStatus = "INSUFFICIENT_EVIDENCE (NO_ELIGIBLE_FINALIZED_DECISIONS)";
   } else if (totalDecisions < 100) {
     overallReadinessStatus = "INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)";
   }
 
-  // Hypothesis feasibility strictly requires verified, co-occurring data
-  const h1Feasible = decisionsWithUsablePreDecisionReserves > 0;
-  const h2Feasible = decisionsWithCoOccurringH2Features > 0;
-  const h3Feasible = decisionsWithLpBurn > 0 && observationsWithDevHolding > 0;
-  const h4Feasible = decisionsWithUsablePreDecisionReserves > 0;
+  // Hypothesis feasibility strictly requires verified, co-occurring data on eligible decisions
+  const h1Feasible = eligibleH1DecisionsCount > 0;
+  const h2Feasible = eligibleH2DecisionsCount > 0;
+  const h3Feasible = eligibleH3DecisionsCount > 0;
+  const h4Feasible = eligibleH4DecisionsCount > 0;
 
   // 4. Generate Markdown report
   const report = `# NeXusTrade — Research Input Readiness & Lineage Report
@@ -425,26 +555,27 @@ In strict compliance with Independent Architecture Review v1 (Finding D-01 and D
 
 ## 2. Session & Decision Denominators
 
-| Metric                                  | Count | Notes                                               |
-| :-------------------------------------- | :---- | :-------------------------------------------------- |
-| **Total Telemetry Sessions Found**      | ${totalSessionsFound} | In \`.tmp/telemetry/sessions\`                      |
-| • Finalized Sessions                    | ${finalizedSessionsCount} | Passed atomicity & completeness checks              |
-| • Interrupted Sessions                  | ${interruptedSessionsCount} | Excluded from primary alpha cohorts                 |
-| • Unfinalized / Active Sessions         | ${unfinalizedSessionsCount} | Excluded (incomplete finalization)                  |
-| **Total Candidate Decisions**           | ${totalDecisions} | Total decisions across all cohorts                  |
-| • \`FILTERED_REJECTED\`                   | ${decisionsByCohort.FILTERED_REJECTED} | Initial scanner filter rejections                   |
-| • \`WATCHLIST_RADAR\`                     | ${decisionsByCohort.WATCHLIST_RADAR} | Admitted to watchlist tracking                      |
-| • \`TRIGGER_REJECTED\`                    | ${decisionsByCohort.TRIGGER_REJECTED} | Evaluated at trigger, rejected                      |
-| • \`EXECUTED_BUY\`                        | ${decisionsByCohort.EXECUTED_BUY} | Executed buy decisions                              |
-| **Total Market Observations**           | ${totalObservations} | Follow-up observation records                       |
-| • Observations with Verified Pool ID    | ${observationsWithVerifiedPool} | Verified via \`isVerifiedMatchingPool\`               |
-| • Observations with Valid AMM Reserves  | ${observationsWithReserveSnapshot} | Verified pool observations with base/quote reserves |
-| • Usable Pre-Decision Reserve Snapshots | ${decisionsWithUsablePreDecisionReserves} | Verified pre-decision point-in-time AMM reserves    |
-| **Total Executable Quotes (12.94-C)**   | ${totalQuotesFound} | Standalone 12.94-C execution quotes on disk         |
-| **Total Simulated Fills (12.94-C)**     | ${totalFillsFound} | Standalone 12.94-C simulated fills on disk          |
-| **Total Stratified Sampling Records**   | ${totalSamplingRecords} | Tracked sampling trajectory records                 |
-| **Total Malformed / Corrupted Records** | ${totalMalformedRecordsCount} | Invalid JSON records quarantined                    |
-| **Legacy Pre-12.94 Sessions**           | ${legacySessions.length} | In \`.tmp/sessions\` (pre-telemetry format)         |
+| Metric                                      | Count | Notes                                                 |
+| :------------------------------------------ | :---- | :---------------------------------------------------- |
+| **Total Telemetry Sessions Found**          | ${totalSessionsFound} | In \`.tmp/telemetry/sessions\`                        |
+| • Finalized Sessions                        | ${finalizedSessionsCount} | Passed affirmative finality & completeness checks     |
+| • Interrupted Sessions                      | ${interruptedSessionsCount} | Excluded from primary alpha cohorts                   |
+| • Unfinalized / Active Sessions             | ${unfinalizedSessionsCount} | Excluded (incomplete finalization)                    |
+| **Total Candidate Decisions**               | ${totalDecisions} | Total decisions across all cohorts                    |
+| • \`FILTERED_REJECTED\`                       | ${decisionsByCohort.FILTERED_REJECTED} | Initial scanner filter rejections                     |
+| • \`WATCHLIST_RADAR\`                         | ${decisionsByCohort.WATCHLIST_RADAR} | Admitted to watchlist tracking                        |
+| • \`TRIGGER_REJECTED\`                        | ${decisionsByCohort.TRIGGER_REJECTED} | Evaluated at trigger, rejected                        |
+| • \`EXECUTED_BUY\`                            | ${decisionsByCohort.EXECUTED_BUY} | Executed buy decisions                                |
+| **Finalized Research-Eligible Decisions**   | ${finalizedEligibleDecisionsCount} | Causally valid in authoritatively finalized sessions  |
+| **Total Market Observations**               | ${totalObservations} | Follow-up observation records                         |
+| • Observations with Verified Pool ID        | ${observationsWithVerifiedPool} | Verified via \`isVerifiedMatchingPool\`                 |
+| • Observations with Valid AMM Reserves      | ${observationsWithReserveSnapshot} | Verified pool observations with base/quote reserves   |
+| • Usable Pre-Decision Reserve Snapshots     | ${eligibleH1DecisionsCount} | Verified pre-decision point-in-time AMM reserves      |
+| **Total Executable Quotes (12.94-C)**       | ${totalQuotesFound} | Standalone 12.94-C execution quotes on disk           |
+| **Total Simulated Fills (12.94-C)**         | ${totalFillsFound} | Standalone 12.94-C simulated fills on disk            |
+| **Total Stratified Sampling Records**       | ${totalSamplingRecords} | Tracked sampling trajectory records                   |
+| **Total Malformed / Corrupted Records**     | ${totalMalformedRecordsCount} | Invalid JSON records quarantined                      |
+| **Legacy Pre-12.94 Sessions**               | ${legacySessions.length} | In \`.tmp/sessions\` (pre-telemetry format)           |
 
 ---
 
@@ -471,12 +602,12 @@ In strict compliance with Independent Architecture Review v1 (Finding D-01 and D
 
 ## 4. Evaluation Feasibility Assessment for Hypotheses H1–H4
 
-| Hypothesis                                | Required Features                                            | Current Data Feasibility | Reason Code if Ineligible             |
-| :---------------------------------------- | :----------------------------------------------------------- | :----------------------- | :------------------------------------ |
-| **H1: Liquidity Depth & Price Impact**    | Pre-decision quoteReserve, baseReserve, tradeSize            | ${h1Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h1Feasible ? "Eligible for synthetic replay" : "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"} |
-| **H2: Order Flow Momentum**               | buys5m, sells5m, volume5mUsd (co-occurring on same decision) | ${h2Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h2Feasible ? "Eligible for observational analysis" : "FIELD_NOT_COLLECTED_IN_GENERATION"} |
-| **H3: Structural Safety & Concentration** | lpBurnPct, devHoldingPct                                     | ${h3Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h3Feasible ? "Eligible" : "PROVIDER_RESPONSE_OMITTED_FIELD"} |
-| **H4: Dynamic Capacity Sizing**           | Capacity curve grid on point-in-time reserves                | ${h4Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h4Feasible ? "Eligible" : "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"} |
+| Hypothesis                                | Required Features                                                  | Raw Feature Coverage                                                         | Eligible-Cohort Decisions      | Current Data Feasibility                  | Reason Code if Ineligible                                   |
+| :---------------------------------------- | :----------------------------------------------------------------- | :--------------------------------------------------------------------------- | :----------------------------- | :---------------------------------------- | :---------------------------------------------------------- |
+| **H1: Liquidity Depth & Price Impact**    | Pre-decision quoteReserve, baseReserve, tradeSize                  | ${observationsWithReserveSnapshot} valid reserve obs                         | ${eligibleH1DecisionsCount}    | ${h1Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h1Feasible ? "Eligible for synthetic replay" : "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"} |
+| **H2: Order Flow Momentum**               | buys5m, sells5m, volume5mUsd (co-occurring on same decision)       | ${rawDecisionsWithCoOccurringH2Features} raw co-occurring decisions          | ${eligibleH2DecisionsCount}    | ${h2Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h2Feasible ? "Eligible for observational analysis" : "FIELD_NOT_COLLECTED_IN_GENERATION"} |
+| **H3: Structural Safety & Concentration** | lpBurnPct on decision AND devHoldingPct on matching candidate obs | ${rawDecisionsWithLpBurn} lpBurn decs, ${rawObservationsWithDevHolding} devHold obs | ${eligibleH3DecisionsCount}    | ${h3Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h3Feasible ? "Eligible" : "PROVIDER_RESPONSE_OMITTED_FIELD"}                              |
+| **H4: Dynamic Capacity Sizing**           | Capacity curve grid on point-in-time reserves                      | ${observationsWithReserveSnapshot} valid reserve obs                         | ${eligibleH4DecisionsCount}    | ${h4Feasible ? "FEASIBLE" : "INELIGIBLE"} | ${h4Feasible ? "Eligible" : "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"}                        |
 
 ---
 
@@ -502,7 +633,12 @@ In strict compliance with Independent Architecture Review v1 (Finding D-01 and D
     totalObservations,
     observationsWithVerifiedPool,
     observationsWithReserveSnapshot,
-    decisionsWithUsablePreDecisionReserves,
+    decisionsWithUsablePreDecisionReserves: eligibleH1DecisionsCount,
+    finalizedEligibleDecisionsCount,
+    eligibleH1DecisionsCount,
+    eligibleH2DecisionsCount,
+    eligibleH3DecisionsCount,
+    eligibleH4DecisionsCount,
     totalQuotesFound,
     totalFillsFound,
     totalSamplingRecords,

@@ -120,7 +120,7 @@ export function extractDecisionFeatures(
   // Strict temporal causality verification for decision-time features
   let decisionFeatureUnavailability: UnavailabilityReason | undefined;
   if (!Number.isFinite(tDec) || !Number.isFinite(tSrc) || !Number.isFinite(tIng)) {
-    decisionFeatureUnavailability = "PROVIDER_RESPONSE_OMITTED_FIELD";
+    decisionFeatureUnavailability = "INVALID_OR_NONFINITE_MANDATORY_TIMESTAMPS";
   } else if (tIng > tDec || tSrc > tDec) {
     // Lookahead leakage: decision-time snapshot ingested or sourced AFTER decision time!
     decisionFeatureUnavailability = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
@@ -444,6 +444,10 @@ export class TelemetryExecutionJoinEngine {
           obs.mintAddress === decision.mintAddress &&
           obs.poolId === decision.poolId &&
           isVerifiedMatchingPool(obs.actualResponsePoolId, decision.poolId) &&
+          Number.isFinite(obs.sourceTimestampMs) &&
+          Number.isFinite(obs.ingestionTimestampMs) &&
+          Number.isFinite(recv) &&
+          Number.isFinite(decision.decisionTimestampMs) &&
           obs.sourceTimestampMs <= decision.decisionTimestampMs &&
           obs.ingestionTimestampMs <= decision.decisionTimestampMs &&
           recv <= decision.decisionTimestampMs &&

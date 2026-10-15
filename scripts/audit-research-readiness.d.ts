@@ -12,6 +12,11 @@ export interface ReadinessAuditResult {
   readonly totalObservations: number;
   readonly observationsWithVerifiedPool: number;
   readonly decisionsWithUsablePreDecisionReserves: number;
+  readonly finalizedEligibleDecisionsCount: number;
+  readonly eligibleH1DecisionsCount: number;
+  readonly eligibleH2DecisionsCount: number;
+  readonly eligibleH3DecisionsCount: number;
+  readonly eligibleH4DecisionsCount: number;
   readonly totalQuotesFound: number;
   readonly totalFillsFound: number;
   readonly totalSamplingRecords: number;
