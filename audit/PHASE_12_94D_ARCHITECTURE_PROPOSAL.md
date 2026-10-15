@@ -1,557 +1,507 @@
-# NeXusTrade — Phase 12.94-D Architecture & Research Proposal
+# NeXusTrade — Phase 12.94-D Architecture & Research Proposal (v2)
 
-## Rigorous Quantitative Strategy Research: Telemetry-Execution Reconciliation, Hypothesis Testing, Anti-Bias Protocols & Generation 2 Acceptance Gates
+## Rigorous Quantitative Strategy Research: Data Feasibility, Point-in-Time Reconciliation, Falsifiable Hypotheses, Anti-Bias Protocols & Generation 2 Governance
 
-**Status:** PROPOSAL / ARCHITECTURE & RESEARCH DESIGN ONLY  
+**Status:** REVISED PROPOSAL (v2) / ARCHITECTURE & RESEARCH DESIGN ONLY  
+**Review Reference:** Addressing Independent Review v1 Findings D-01 through D-07  
 **Prerequisites:**
 
 - Phase 12.93D (CLOSED)
 - Phase 12.94-A (CLOSED under `7e58ea5`)
 - Phase 12.94-B (CLOSED under `c37f91e`)
 - Phase 12.94-C (CLOSED under `2541d5b` / `c5931ca` / `7faf705`)  
-  **Operational Authorization:** Architecture research and planning only. Zero implementation code, zero Windows PAPER trading restarts, zero real-SOL trading, and zero Generation 2 activation until this proposal is independently reviewed and formally approved.
+  **Operational Authorization:** Architecture research and planning only. Zero implementation code, zero Windows PAPER trading restarts, zero real-SOL trading, zero live network daemons, and zero Generation 2 activation until this revised proposal is independently reviewed and formally approved.
 
 ---
 
-### Executive Summary & Problem Statement
+### Executive Summary & Review v1 Response Matrix
 
-Phase 12.94-B established an audit-accepted **Market Telemetry Engine** capturing zero-lookahead decision context, stratified counterfactual tracking, and verified pool identities. Phase 12.94-C subsequently established a **Quote-Aware Execution Realism Subsystem** that models bidirectional constant-product AMM reserves, price impact, fee structures, sellability constraints, and capital capacity curves.
+Phase 12.94-B established an audit-accepted **Market Telemetry Engine** capturing zero-lookahead decision contexts, stratified counterfactual tracking, and verified pool identities. Phase 12.94-C subsequently established a **Quote-Aware Execution Realism Subsystem** as a standalone conservative AMM research model.
 
-However, having observational telemetry (12.94-B) and execution modeling (12.94-C) as separate engines is insufficient to determine whether NeXusTrade possesses a **statistically defensible, genuinely profitable trading edge**. Naive quantitative research in decentralized finance is plagued by severe statistical failure modes:
+In Independent Architecture Review v1 (`NeXusTrade_Phase_12_94D_Architecture_Independent_Review_v1.md`), the auditor conditionally approved the overall research direction while identifying seven critical methodological, financial, and data-lineage blockers (D-01 through D-07). This revised proposal addresses each finding in full:
 
-1. **Theoretical vs. Realized Return Divergence**: Strategy reports often cite indexed spot price appreciation (+150%) on low-liquidity tokens where real-world AMM price impact and sellability reduce executable return to -40%.
-2. **Lookahead & Information Leakage**: Computing signals from full-session averages, future block observations, or non-causal pool states inflates backtested performance.
-3. **Survivorship & Honeypot Bias**: Silently dropping tokens that become untradeable, freeze transfers, or pull liquidity creates an illusion of high win rates.
-4. **Overfitting & Multiple Testing Snooping**: Evaluating dozens of filter variations without adjusting significance thresholds (p-hacking) guarantees discovering spurious "profitable" rules.
-5. **Capacity Blindness**: A strategy that appears profitable with 0.05 SOL allocation can suffer complete alpha extinction at 0.5 SOL or 2.0 SOL.
-6. **Simulated vs. Executable Disconnect**: Conflating synthetic AMM simulations (Tier 2/4) with live DEX routing quotes (Tier 3) leads to false confidence prior to capital deployment.
-
-The objective of **Phase 12.94-D** is to architect a **Rigorous Quantitative Strategy Research Pipeline** that:
-
-- Reconciles 12.94-B decision telemetry with 12.94-C execution models using strict point-in-time relational joins.
-- Eliminates numerical edge cases identified in Audit v3 (prequantization rounding and signed cash-flow clipping).
-- Implements formal statistical hypothesis testing with multiple-testing corrections (Deflated Sharpe Ratio, False Discovery Rate).
-- Enforces chronological walk-forward out-of-sample validation and market regime stress testing.
-- Establishes mathematical acceptance gates that must be satisfied before Generation 2 can ever be created or activated.
+| Review Finding                            | Primary Issue Identified                                                                                                                                                                                                                  | Implemented Architecture Revision                                                                                                                                                                                                                                                                                                                                                                                                                           | Section Reference |
+| :---------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------- |
+| **D-01 (Feasibility & Provenance)**       | Assuming historical 12.94-B sessions already contain 12.94-C quotes/fills; assuming optional telemetry fields exist for all records; danger of silent zero-imputation.                                                                    | Defined two operational modes: _(i) Observational-Only_ and _(ii) Synthetic Replay_ (with explicit `SYNTHETIC_REPLAY` origin and verified point-in-time reserve snapshots). Created a comprehensive field-by-field Availability & Lineage Matrix mapping exact current field names, nullable fields, and explicit unavailability reason codes. Prohibited zero-imputation. Added Milestone D.1 Readiness Audit.                                             | **Section 1**     |
+| **D-02 (Temporal Causality)**             | Overly rigid linear timeline ($t_{\text{decision}} \le t_{\text{quote}} \le t_{\text{fill}} \le t_{\text{obs}}$); failure to support non-traded/rejected decisions, multiple decisions per pool, or observations preceding delayed fills. | Replaced global chain with **Event-Specific Causal Partial Ordering**. Enforced strict Feature Availability Boundary ($\max(t_f^{\text{source}}, t_f^{\text{recv}}) \le t_{\text{decision}}$); post-decision observations contribute _only_ to forward labels. Specified trajectory linkage, interval matching, deduplication, and purging/embargo rules for overlapping horizons.                                                                          | **Section 2**     |
+| **D-03 (Censoring & Failure Accounting)** | 12.94-B follow-ups are stratified samples, not complete censuses; risk of improving performance by dropping untradeable or bad tokens; conflating conservative impairment with realized losses.                                           | Established full funnel denominator accounting (Screened $\to$ Eligible $\to$ Tracked $\to$ Quoted $\to$ Filled $\to$ Sellable $\to$ Observed). Preserved design inclusion probabilities and stratum labels. Explicitly decoupled _Realized Cash P&L_, _Marked-to-Model P&L_, _Capital Tied Up_, and _Unrealized Impairment Write-Downs_. Preserved signed negative cash deltas on dust exits.                                                              | **Section 3**     |
+| **D-04 (Financial Mathematics)**          | Unstable $R_{\text{synthetic}} / R_{\text{theoretical}}$ ratio; dimensionally invalid square-root sizing formula ($\sqrt{k \cdot \text{tolerance}}$); non-additive gap claims.                                                            | Replaced ratio with well-defined metric bundle: _Net SOL Expectancy_, _Return Degradation (pp)_, _Fillability Coverage_, and _Execution Drag Ratio_ (strictly where gross return $>0$). Replaced square-root sizing with constrained optimization over `CapacityCurveAnalyzer` grid. Formalized exact continuous portfolio cash and inventory balance equations. Labeled all cutoffs as preregistered research proposals.                                   | **Section 4**     |
+| **D-05 (Statistical Validity)**           | Unclear unit of analysis; undefined crypto annualization; incomplete DSR formula; conflating $p$-values with FDR $q$-values; claiming significance "proves" edge.                                                                         | Defined primary unit as **Daily Portfolio Return Series** from continuous marked equity curve (including no-trade days and inventory). Specified 24/7 annualization ($\sqrt{365}$). Implemented full DSR estimator with trial variance $V[\{\widehat{SR}_k\}]$. Defined trial registry, pre-registered testing families, and required sample minimums ($\ge 100$ decisions, $\ge 30$ days, $\ge 15$ tokens). Added explicit `INSUFFICIENT_EVIDENCE` status. | **Section 5**     |
+| **D-06 (Tier 3 & Gen2 Governance)**       | Conflating Tier 3 quotes with fills; proposing live daemon polling during Phase D; broken acceptance table; conflating paper wallet creation with live capital deployment.                                                                | Clarified Tier 3 as contemporaneous indicative quotes (not fills). Deferred all live network polling daemons; Phase D specifies interfaces only. Established **Four-Stage Tiered Governance** separating research viability, PAPER Gen2 wallet creation, PAPER execution, and live capital. Fixed acceptance table with complete schema and `NOT_EVALUATED` states.                                                                                         | **Section 6**     |
+| **D-07 (Revised Milestones & Oracles)**   | Unrealistic sequencing; missing data feasibility in D.1; tests duplicating implementation math.                                                                                                                                           | Re-sequenced milestones: D.1 begins with **Input Feasibility & Lineage Audit** and invariant gating. D.2 evaluates hypotheses on _verified available data_. D.3 implements equity-process accounting and statistical tests. D.4 produces Tier 3 specification and evidence package. Defined independent test oracles (academic reference tables, hand-calculated waterfalls).                                                                               | **Section 7**     |
 
 ---
 
-### Residual Audit Guidance Incorporation (From Phase 12.94-C Final Acceptance)
+## 1. Data Feasibility Inventory & Honest Source Provenance (Finding D-01)
 
-The Phase 12.94-C Final Independent Acceptance Report (`NeXusTrade_Phase_12_94C_Commit_2541d5b_Final_Independent_Acceptance.md`) recorded two explicit numerical limitations to be resolved or research-gated in Phase 12.94-D:
+### 1.1 Dual Operational Modes
 
-1. **Atomic input rounding and price/source consistency:**
-   - _Auditor Finding:_ When numeric inputs are converted to atomic units via `.toFixed(decimals)`, floating-point inputs can price off unrounded numbers before serializing to atomic integers, creating discrepancies on tiny trade sizes.
-   - _Phase 12.94-D Resolution:_ The research pipeline establishes a **Strict Pre-Quantization Invariant**: All input amounts must be quantized to atomic units _first_; pricing functions accept strictly prequantized atomic quantities (e.g. `inAmountRaw`), with all downstream cash flows derived from integer arithmetic or exact UI projections. Trade sizes below minimum executable atomic thresholds are fail-closed rejected.
+Historical Phase 12.94-B telemetry sessions on disk contain candidate decisions and stratified market observations, but **do not** contain `execution-quotes.jsonl` or `simulated-fills.jsonl` because Phase 12.94-C was authored and verified as a standalone conservative AMM library.
 
-2. **Signed cash-flow handling on fee-dominated dust exits:**
-   - _Auditor Finding:_ In `simulateFill`, `netProceedsSol = Math.max(0, grossProceedsSol - feeBreakdown.totalOutOfPocketFeeSol)` clips negative net proceeds to 0 when gross SOL proceeds are less than out-of-pocket transaction fees, creating a potential positive bias on dust exits.
-   - _Phase 12.94-D Resolution:_ The research pipeline implements a **Dual-Protection Protocol**:
-     - _Signed Net Cash Movement:_ Realized net cash flow is computed as a signed quantity: $\Delta \text{Cash} = \text{GrossProceeds} - \text{NetworkFees} - \text{PriorityFees} + \text{RentRefund}$. If fees exceed proceeds, $\Delta \text{Cash} < 0$.
-     - _Dust Exclusion Gate:_ Any trade where $\text{GrossProceeds} \le \text{ExternalFees}$ is flagged with `EXECUTION_DEFICIT_SUBMARGINAL` and excluded from profitable strategy-research cohorts.
-
----
-
-## 1. Point-in-Time Telemetry-Execution Join Architecture
-
-Phase 12.94-D joins data across four distinct storage layers produced by Subphases 12.94-B and 12.94-C:
-
-```
-[Candidate Decisions]               [Executable Quotes]                [Simulated Fills]
- (12.94-B telemetry)                 (12.94-C execution)                (12.94-C execution)
- candidate-decisions.jsonl           execution-quotes.jsonl             simulated-fills.jsonl
-         │                                   │                                  │
-         │  eventId = decisionEventId        │   quoteId = quoteId              │
-         └───────────────────────────────────┼──────────────────────────────────┘
-                                             │
-                                             ▼
-                                [Point-in-Time Join Engine]
-                                (TelemetryExecutionJoinEngine)
-                                             ▲
-                                             │
-                                             │  mintAddress + poolId
-                                             │  (sourceTimestampMs >= decisionTimestampMs)
-                                             │
-                              [Market Observation Trajectories]
-                                     (12.94-B telemetry)
-                                  market-observations.jsonl
-```
-
-### 1.1 Relational Join Keys & Identity Hierarchy
-
-To eliminate cross-session ambiguity and route drift, records are joined using a strict 5-tuple composite key:
-
-$$\text{JoinKey} = \langle \text{sessionId}, \text{generationId}, \text{mintAddress}, \text{poolId}, \text{decisionEventId} \rangle$$
-
-1. **Decision to Quote Linkage**:
-   - `ExecutableQuoteRecord.decisionEventId === CandidateDecisionRecord.eventId`
-   - `ExecutableQuoteRecord.sessionId === CandidateDecisionRecord.sessionId`
-   - `ExecutableQuoteRecord.generationId === CandidateDecisionRecord.generationId`
-   - `ExecutableQuoteRecord.mintAddress === CandidateDecisionRecord.mintAddress`
-   - `ExecutableQuoteRecord.poolId === CandidateDecisionRecord.poolId`
-
-2. **Quote to Fill Linkage**:
-   - `SimulatedFillRecord.quoteId === ExecutableQuoteRecord.quoteId`
-   - `SimulatedFillRecord.decisionEventId === ExecutableQuoteRecord.decisionEventId`
-   - `SimulatedFillRecord.side === ExecutableQuoteRecord.side`
-   - `SimulatedFillRecord.poolId === ExecutableQuoteRecord.poolId`
-
-3. **Decision to Trajectory Linkage**:
-   - Observations for a candidate must share identical `mintAddress` and `poolId`.
-   - Verified matching pool ID is strictly enforced: `isVerifiedMatchingPool(actualResponsePoolId, poolId) === true`.
-   - Chronological monotonicity: `MarketObservationRecord.sourceTimestampMs >= CandidateDecisionRecord.decisionTimestampMs`.
-
-### 1.2 Temporal Causality Invariants
-
-To mathematically eliminate lookahead bias, the join engine enforces strict temporal monotonicity:
-
-$$t_{\text{discovery}} \le t_{\text{decision}} \le t_{\text{quote\_init}} \le t_{\text{quote\_recv}} \le t_{\text{fill}} \le t_{\text{obs\_1}} < t_{\text{obs\_2}} < \dots < t_{\text{obs\_N}}$$
-
-Any joined record violating this sequence is flagged with `LOOKAHEAD_VIOLATION_DETECTED` and rejected from research evaluation.
-
----
-
-## 2. Return Semantics & The Three-Tier Return Framework
-
-Naive backtests compute returns from ticker quotes. Phase 12.94-D formally establishes the **Three-Tier Return Framework** to quantify exactly how much theoretical profit is lost to market friction:
+To ensure absolute research integrity without fabricating historical records, Phase 12.94-D defines two distinct operational evaluation modes:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Tier 1: Theoretical Spot Return (R_theoretical)                       │
-│  - Computed from indexed ticker prices (DexScreener / Birdeye)          │
-│  - Assumes infinite liquidity, zero spread, zero impact, zero gas      │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │  - Slippage & AMM Impact Drag
+│ Mode A: Observational-Only Evaluation                                  │
+│ - Ingests historical CandidateDecisionRecord & MarketObservationRecord │
+│ - Evaluates filter efficacy, trajectory persistence, and spot returns  │
+│ - Zero execution quotes or fills are inferred or assumed to exist      │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Tier 2: Synthetic Execution Return (R_synthetic)                      │
-│  - Computed from 12.94-C constant-product AMM reserves & fee model     │
-│  - Deducts LP swap fee (0.25%), depth impact, Solana gas, & ATA rent   │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │  - Live Route & Liquidity Validation
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│  Tier 3: Genuinely Executable Quoted Return (R_executable)             │
-│  - Computed from real-time DEX routing aggregator quotes (Jupiter/Ray) │
-│  - Includes multi-hop paths, dynamic priority fees, & live commitment   │
+│ Mode B: Synthetic AMM Replay Evaluation                                │
+│ - Requires verified, time-stamped base/quote reserves in observation   │
+│ - Generates deterministic quotes & simulated fills at decision time    │
+│ - Origin is explicitly tagged: providerIdentity: "SYNTHETIC_REPLAY"    │
+│ - Price tier is explicitly tagged: priceTier: "TIER_2_POOL_RESERVE"   │
+│ - Fails closed if entry or exit reserves are unavailable               │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.1 Mathematical Return Definitions
+### 1.2 Field-by-Field Availability & Lineage Matrix
 
-For an entry decision at $t_0$ and an exit/observation at $t_1$:
+The table below maps the exact current property names across `TelemetryTypes.ts` (12.94-B) and `ExecutionTypes.ts` (12.94-C), establishing their verified availability, provenance class, source provider, sampling cadence, timestamp, pool verification, and decision-time causality:
 
-1. **Theoretical Spot Return ($R_{\text{theoretical}}$)**:
-   $$R_{\text{theoretical}} = \frac{P_{\text{spot}}(t_1) - P_{\text{spot}}(t_0)}{P_{\text{spot}}(t_0)}$$
+| Target Property        | Source Schema & Field                               | Provenance Class   | Source Provider    | Sampling Cadence                | Field Timestamp       | Verified Pool?               | Causal at Decision?    | Missingness / Notes                          |
+| :--------------------- | :-------------------------------------------------- | :----------------- | :----------------- | :------------------------------ | :-------------------- | :--------------------------- | :--------------------- | :------------------------------------------- |
+| **Decision ID**        | `CandidateDecisionRecord.eventId`                   | `OBSERVED`         | Internal Daemon    | Event-driven                    | `decisionTimestampMs` | Yes (`poolId`)               | Yes                    | Primary decision identifier                  |
+| **Session ID**         | `CandidateDecisionRecord.sessionId`                 | `OBSERVED`         | Internal Daemon    | Event-driven                    | `decisionTimestampMs` | N/A                          | Yes                    | Foreign key to session metadata              |
+| **Token Mint**         | `CandidateDecisionRecord.mintAddress`               | `OBSERVED`         | Candidate Scanner  | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | SPL mint address                             |
+| **Tracked Pool**       | `CandidateDecisionRecord.poolId`                    | `OBSERVED`         | Candidate Scanner  | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | Primary AMM pair address                     |
+| **Decision Cohort**    | `CandidateDecisionRecord.decisionCohort`            | `OBSERVED`         | Internal Daemon    | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | `FILTERED_REJECTED`, `WATCHLIST_RADAR`, etc. |
+| **Token Age**          | `metricsSnapshot.tokenAgeSec`                       | `DERIVED`          | Scanner / RPC      | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | Nullable if pair open time unknown           |
+| **Liquidity USD**      | `metricsSnapshot.liquidityUsd`                      | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable on provider omission                |
+| **Market Cap USD**     | `metricsSnapshot.marketCapUsd`                      | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable on provider omission                |
+| **L/MC Ratio**         | `metricsSnapshot.lmcRatio`                          | `DERIVED`          | Scanner Calc       | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | Nullable if cap or liq is null               |
+| **LP Burn %**          | `metricsSnapshot.lpBurnPct`                         | `OBSERVED`         | On-Chain / DAS     | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | **Frequently null** in DexScreener paths     |
+| **Spot Price USD**     | `metricsSnapshot.spotPriceUsd`                      | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable on provider omission                |
+| **5m Volume USD**      | `metricsSnapshot.volume5mUsd`                       | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable in some Raydium paths               |
+| **5m Tx Count**        | `metricsSnapshot.txCount5m`                         | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable if transaction stats omitted        |
+| **5m Buys / Sells**    | `metricsSnapshot.buys5m / sells5m`                  | `OBSERVED`         | DexScreener / Ray  | Event-driven                    | `sourceTimestampMs`   | Yes                          | Yes                    | Nullable if transaction stats omitted        |
+| **Metric Provenance**  | `metricsSnapshot.metricProvenance`                  | `OBSERVED`         | 12.94-B Provenance | Event-driven                    | `decisionTimestampMs` | Yes                          | Yes                    | Maps provenance per metric                   |
+| **Follow-Up Spot**     | `MarketObservationRecord.priceMetrics.spotPriceSol` | `OBSERVED`         | DexScreener / Ray  | Scheduled (1m, 5m, 15m)         | `sourceTimestampMs`   | Yes (`actualResponsePoolId`) | **No (Forward Label)** | Strict forward observation                   |
+| **Pool Base Reserve**  | `liquidityMetrics.baseReserve`                      | `OBSERVED`         | Raydium / DexSc    | Scheduled                       | `sourceTimestampMs`   | Yes (`actualResponsePoolId`) | **No (Forward Label)** | **Nullable in REST DexScreener**             |
+| **Pool Quote Reserve** | `liquidityMetrics.quoteReserve`                     | `OBSERVED`         | Raydium / DexSc    | Scheduled                       | `sourceTimestampMs`   | Yes (`actualResponsePoolId`) | **No (Forward Label)** | **Nullable in REST DexScreener**             |
+| **Top-10 Conc. %**     | `holderMetrics?.top10ConcentrationPct`              | `OBSERVED`         | DAS / RPC          | Scheduled / Optional            | `sourceTimestampMs`   | Yes                          | Yes / Forward          | **Optional / Unavailable** in base HTTP      |
+| **Dev Holding %**      | `holderMetrics?.devHoldingPct`                      | `OBSERVED`         | DAS / RPC          | Scheduled / Optional            | `sourceTimestampMs`   | Yes                          | Yes / Forward          | **Optional / Unavailable** in base HTTP      |
+| **Execution Quote**    | `ExecutableQuoteRecord.*`                           | `SYNTHETIC_REPLAY` | 12.94-C Engine     | Replay at $t_{\text{decision}}$ | `quoteInitiatedMs`    | Yes                          | Yes                    | Generated only when reserves exist           |
+| **Simulated Fill**     | `SimulatedFillRecord.*`                             | `SYNTHETIC_REPLAY` | 12.94-C Engine     | Replay at $t_{\text{fill}}$     | `fillTimestampMs`     | Yes                          | **No (Outcome)**       | Modeled with arrival delay & fee drag        |
 
-2. **Synthetic Execution Net Return ($R_{\text{synthetic}}$)**:
-   $$R_{\text{synthetic}} = \frac{\text{NetProceeds}_{\text{sim}}(t_1) - \text{TotalOutlay}_{\text{sim}}(t_0)}{\text{TotalOutlay}_{\text{sim}}(t_0)}$$
-   where:
-   $$\text{TotalOutlay}_{\text{sim}}(t_0) = \text{InAmountSol} + \text{ExternalNetworkFeeSol}(t_0) + \text{AtaRentDepositSol}$$
-   $$\text{NetProceeds}_{\text{sim}}(t_1) = \text{GrossProceedsSol}(t_1) - \text{ExternalNetworkFeeSol}(t_1) + \text{AtaRentRefundSol}$$
+### 1.3 Provenance-Bearing Feature Representation & Anti-Imputation Rules
 
-3. **Execution Reality Gap Decomposition**:
-   $$\text{ExecutionGap} = R_{\text{theoretical}} - R_{\text{synthetic}} = \Delta_{\text{impact}} + \Delta_{\text{fees}} + \Delta_{\text{slippage}}$$
-   - $\Delta_{\text{impact}}$: Bid/ask depth degradation due to pool reserve depletion.
-   - $\Delta_{\text{fees}}$: Solana base gas, priority fees, ATA rent, and DEX LP fees.
-   - $\Delta_{\text{slippage}}$: Adverse execution delay movement between trigger and block inclusion.
+To guarantee that missing data is never silently defaulted to zero or mistaken for an observed measurement, all extracted features in Phase 12.94-D use a formal provenance-bearing wrapper:
 
-### 2.2 Impairment & Liquidation Accounting
+```typescript
+export type ProvenanceClass = "OBSERVED" | "DERIVED" | "SYNTHETIC_REPLAY" | "UNAVAILABLE";
 
-The research pipeline respects the 12.94-C execution taxonomy:
+export type UnavailabilityReason =
+  | "FIELD_NOT_COLLECTED_IN_GENERATION"
+  | "PROVIDER_RESPONSE_OMITTED_FIELD"
+  | "POOL_IDENTITY_MISMATCH_DISCARDED"
+  | "STALE_SAMPLE_DISCARDED"
+  | "RESERVE_QUANTITY_ZERO_OR_NONFINITE"
+  | "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT";
 
-- **`FILLED`**: Confirmed simulated exit; calculates realized P&L.
-- **`PREFLIGHT_SIMULATION_REJECTED`** (e.g. `UNSELLABLE_EXCESSIVE_IMPACT`): Zero gas charged; inventory remains 100% intact; evaluated with conservative impairment write-down (up to 100% loss).
-- **`SUBMITTED_TRANSACTION_FAILED`** (e.g. `UNSELLABLE_LIQUIDITY_DRAINED`): Base + priority fee charged; inventory unsold; evaluated as 100% capital loss.
-- **`SLIPPAGE_BREACH_REJECTED`**: Zero gas charged; inventory retained; exit aborted.
+export interface ProvenanceFeature<T = number> {
+  readonly value: T | null;
+  readonly provenance: ProvenanceClass;
+  readonly isAvailable: boolean;
+  readonly unavailabilityReason?: UnavailabilityReason;
+  readonly sourceTimestampMs?: number;
+}
+```
+
+**Anti-Imputation Rules**:
+
+1. If `lpBurnPct` is missing from the record, it must have `value: null`, `provenance: "UNAVAILABLE"`, and `unavailabilityReason: "PROVIDER_RESPONSE_OMITTED_FIELD"`. It **must not** be imputed as `0`, `100`, or the sample mean.
+2. If `baseReserve` or `quoteReserve` is missing at decision time, `Synthetic Replay` is barred; the record can only be evaluated in `Observational-Only` mode.
+3. Any quantitative hypothesis requiring an unavailable feature must classify the candidate as `INELIGIBLE_MISSING_FEATURE` and report it in the research denominator.
+
+### 1.4 Milestone D.1 Input Readiness & Lineage Report
+
+Prior to running any strategy research, Milestone D.1 executes an automated audit across all available disk records producing a formal **Input Readiness & Coverage Report**:
+
+- Total candidate decisions across sessions, broken down by `decisionCohort`.
+- Exact availability percentages for every feature in the Lineage Matrix.
+- Number of decisions with verified point-in-time reserve pairs enabling `Synthetic Replay`.
+- Distribution of observation follow-up durations ($+1\text{m}, +5\text{m}, +15\text{m}, +60\text{m}$).
+- Proportion of records eligible for each proposed hypothesis ($H_1$ through $H_{\text{composite}}$).
 
 ---
 
-## 3. Fail-Closed Research Eligibility & Data Quality Gating
+## 2. Event-Specific Causal Ordering & Trajectory Multiplicity (Finding D-02)
 
-Before any joined observation is ingested into quantitative models, it must pass the **Fail-Closed Research Eligibility Pipeline**:
+### 2.1 Event-Specific Causal Partial Ordering
+
+The previous assumption of a single universal linear chain ($t_{\text{decision}} \le t_{\text{quote}} \le t_{\text{fill}} \le t_{\text{obs}}$) is replaced by an **Event-Specific Causal Partial Ordering**:
 
 ```mermaid
 flowchart TD
-    Raw["Raw Joined Telemetry Record"] --> G1{"Gate 1: Session Finality & Atomicity"}
-    G1 -- Reject --> Q["Quarantine / Audit Log"]
-    G1 -- Pass --> G2{"Gate 2: Pool Identity Match"}
-    G2 -- Reject --> Q
-    G2 -- Pass --> G3{"Gate 3: Staleness & Clock Skew"}
-    G3 -- Reject --> Q
-    G3 -- Pass --> G4{"Gate 4: Route Integrity"}
-    G4 -- Reject --> Q
-    G4 -- Pass --> G5{"Gate 5: Numerical & Cash-Flow Validity"}
-    G5 -- Reject --> Q
-    G5 -- Pass --> G6{"Gate 6: Sellability & Honeypot Check"}
-    G6 -- Reject --> Q
-    G6 -- Pass --> Accepted["Accepted Research Cohort"]
+    subgraph Traded Decision Path
+        D1["Decision Event (t_decision)"] --> Q1["Quote Request (t_quote_init)"]
+        Q1 --> QR1["Quote Received (t_quote_recv)"]
+        QR1 --> F1["Simulated Fill (t_fill = t_recv + delay)"]
+        F1 --> O1_1["Follow-Up Obs 1 (t_obs_1)"]
+        O1_1 --> O1_2["Follow-Up Obs 2 (t_obs_2)"]
+    end
+
+    subgraph Non-Traded / Rejected Path
+        D2["Decision Event (t_decision)"] --> R2["Decision: TRIGGER_REJECTED"]
+        R2 --> NQ2["No Quote Requested / Preflight Discard"]
+        R2 --> O2_1["Stratified Counterfactual Obs 1 (t_obs_1)"]
+        O2_1 --> O2_2["Stratified Counterfactual Obs 2 (t_obs_2)"]
+    end
 ```
 
-### 3.1 Formal Gating Rules
+### 2.2 Strict Feature Availability Boundary
 
-1. **Gate 1 — Session Finality & Atomicity**:
-   Evaluates `verifySessionCrossFileConsistency(meta, summary)`. Must have `isCompleteSession === true` and `isInterruptedSession === false`. Interrupted sessions are rejected from primary alpha evaluations.
+To eliminate lookahead bias:
 
-2. **Gate 2 — Verified Matching Pool Identity**:
-   Must satisfy `isVerifiedMatchingPool(actualResponsePoolId, trackedPoolId) === true`. Observations with missing provider pool IDs, mismatched IDs, or synthetic placeholders fail closed.
+1. **Decision Features ($X$)**:
+   $$\forall \text{ feature } f \in X(D), \quad \max(t_f^{\text{source}}, t_f^{\text{ingest}}, t_f^{\text{recv}}) \le t_{\text{decision}}$$
+   If a provider response was initiated at $t_{\text{init}} < t_{\text{decision}}$ but received at $t_{\text{recv}} > t_{\text{decision}}$, it is **barred from the decision feature vector** because the information was not yet physically in the system when the decision was rendered.
+2. **Outcome Valuation ($Y$)**:
+   An outcome valuation at horizon $\Delta t$ (e.g. 15 minutes) evaluates observations where:
+   $$t_{\text{obs}}^{\text{source}} \in [t_{\text{decision}} + \Delta t - \epsilon, \quad t_{\text{decision}} + \Delta t + \epsilon]$$
+   Post-decision observations can **never** feed backward into decision features.
 
-3. **Gate 3 — Staleness & Clock Skew Limits**:
-   - Ingestion latency: $t_{\text{ingestion}} - t_{\text{source}} \le 120{,}000\text{ ms}$ (2 minutes).
-   - Clock skew: $|t_{\text{system}} - t_{\text{source}}| \le 30{,}000\text{ ms}$.
-   - Telemetry follow-up observation freshness: `dataFreshnessMs <= 180,000 ms`.
+### 2.3 Trajectory Multiplicity, Linkage & Disambiguation
 
-4. **Gate 4 — Single-Hop Route Integrity**:
-   - `routeType === "DIRECT_TRACKED_POOL"`.
-   - Records with `MULTI_HOP` or `CROSS_POOL_DIVERGENCE` are rejected from single-pool constant-product alpha models.
+In high-frequency decentralized markets, multiple decisions occur for the same token mint and liquidity pool across time. To eliminate ambiguous linkages:
 
-5. **Gate 5 — Numerical & Cash-Flow Validity (Audit v3 Deferred Invariants)**:
-   - _Prequantization check:_ Raw atomic units must be non-zero and derived from canonical prequantized inputs.
-   - _Dust cash-flow check:_ If $\text{GrossProceedsSol} \le \text{ExternalNetworkFeeSol}$, record is flagged as `SUBMARGINAL_DUST` and barred from positive-return claims.
-   - _Mathematical validity:_ No `NaN`, `null`, `Infinity`, or negative values for reserves, liquidity, or prices.
+1. **Unambiguous Trajectory Binding**:
+   Every follow-up observation in 12.94-B is bound to an initiating decision via:
+   $$\text{TrajectoryBinding} = \langle \text{sessionId}, \text{initiatingEventId}, \text{mintAddress}, \text{poolId}, \text{nominalHorizonSec} \rangle$$
+2. **Interleaved Follow-Up Disambiguation**:
+   If decision $D_2$ occurs on the same pool 3 minutes after $D_1$:
+   - Observations occurring between $t(D_1)$ and $t(D_2)$ represent valid forward outcome data for $D_1$, and can serve as historical feature inputs for $D_2$.
+   - Observations occurring after $t(D_2)$ are partitioned based on their explicit `initiatingEventId`. If unlinked, observations are assigned to the most recent preceding decision whose nominal horizon window encompasses the observation timestamp.
+3. **Deduplication & Tie-Handling**:
+   If multiple observations fall within a single nominal horizon window, the observation with the minimum absolute distance $|t_{\text{obs}}^{\text{source}} - (t_{\text{decision}} + \Delta t)|$ is deterministically selected. Tied distances break deterministically by choosing the observation with the earlier `ingestionTimestampMs`.
 
-6. **Gate 6 — Sellability & Honeypot Gating**:
-   - Tokens with status `UNSELLABLE_NO_ROUTE`, `UNSELLABLE_TRANSFER_RESTRICTION`, or `UNSELLABLE_LIQUIDITY_DRAINED` are treated as total loss (100% write-down) and never omitted from counterfactual risk analysis.
+### 2.4 Purging and Embargo in Time-Series Cross-Validation
+
+To prevent information leakage across chronological folds:
+
+- **Purging**: When an in-sample training fold ends at $t_{\text{split}}$, all training observations whose forward outcome evaluation horizon extends beyond $t_{\text{split}}$ are purged.
+- **Embargo**: When a test fold precedes a training fold (or vice versa in rolling schemes), an embargo window $\Delta_{\text{embargo}} = 48\text{ hours}$ is enforced between the test period and training data to eliminate autoregressive contamination.
+- **Token-Level Grouping**: All decisions and follow-ups for a specific `mintAddress` are clustered into a single fold to prevent cross-fold memory leakage.
 
 ---
 
-## 4. Quantitative Hypothesis Formulation & Feature Architecture
+## 3. Censoring, Stratified Sampling & Failure Accounting (Finding D-03)
 
-To avoid unstructured curve-fitting, Phase 12.94-D defines a structured **Quantitative Feature Architecture** and five explicit, falsifiable **Quantitative Hypotheses**.
+### 3.1 Stratified Sampling & Horvitz-Thompson Weighting
 
-### 4.1 Feature Taxonomy (Computed Strictly at $t \le t_{\text{decision}}$)
+Phase 12.94-B follow-ups are collected via a **stratified sampling controller**, not an exhaustive population census:
 
-| Feature Category         | Symbol               | Formulation                                                                    | Economic Rationale                                  |
-| :----------------------- | :------------------- | :----------------------------------------------------------------------------- | :-------------------------------------------------- |
-| **Liquidity Depth**      | $R_{\text{sol}}$     | Pool quote reserve in SOL                                                      | Measures absolute capital buffer                    |
-| **Liquidity-to-Cap**     | $LMC$                | $\text{LiquidityUsd} / \text{MarketCapUsd}$                                    | Detects inflated FDV with paper-thin liquidity      |
-| **Price Impact @ S**     | $\delta(S)$          | Modeled price impact % at size $S \in \{0.1, 0.5, 1.0\}\text{ SOL}$            | Quantifies immediate entry/exit friction            |
-| **Capacity Slope**       | $\kappa$             | $\frac{\partial \text{Impact}}{\partial \text{TradeSize}}$ from Capacity Curve | Measures vulnerability to size scaling              |
-| **Order Flow Imbalance** | $OFI_{5m}$           | $(V_{\text{buy}} - V_{\text{sell}}) / (V_{\text{buy}} + V_{\text{sell}})$      | Detects aggressive buyer accumulation               |
-| **Buyer Ratio**          | $BR_{5m}$            | $N_{\text{buys}} / N_{\text{sells}}$                                           | Distinguishes retail wave from solitary wash trades |
-| **Pool Age**             | $\tau_{\text{pool}}$ | $(t_{\text{decision}} - t_{\text{poolOpen}}) / 60{,}000$                       | Separates initial sniper chaos from stable momentum |
-| **Dev Holding**          | $H_{\text{dev}}$     | Developer wallet holding %                                                     | Primary rug-pull risk indicator                     |
-| **LP Burn Ratio**        | $LP_{\text{burn}}$   | LP token burn / permanent lock %                                               | Pool rug-pull protection                            |
+- `EXECUTED_POSITION`: Sampled at 100% ($p_i = 1.0$).
+- `WATCHLIST_ACTIVE`: Sampled at high priority ($p_i \approx 0.50$).
+- `NEAR_MISS_CANDIDATE`: Sampled at medium priority ($p_i \approx 0.10$).
+- `HARD_REJECT_BASELINE`: Sampled at low baseline rate ($p_i \approx 0.01$).
+- `EXCLUDED_SPAM`: Omitted ($p_i = 0.0$).
 
-### 4.2 Falsifiable Trading Hypotheses
+**Statistical Weighting Rules**:
 
-Each hypothesis is evaluated against the null hypothesis $H_0$ (legacy Generation 1 unstratified breakout):
+1. When reporting **population-level metrics** (e.g. market-wide opportunity rates), samples must be weighted by inverse selection probability using the Horvitz-Thompson estimator:
+   $$\widehat{\mu}_Y = \frac{\sum_{i=1}^n \frac{y_i}{p_i}}{\sum_{i=1}^n \frac{1}{p_i}}$$
+2. Where inclusion probabilities are unrecorded, variable, or rate-limited, results must be explicitly reported within unweighted strata as **Stratified Exploratory Cohorts** and never claimed as an unbiased market census.
+3. Censoring events (`TERMINATED_EARLY`, `EXPIRED`, `NOT_SELECTED`, `RATE_LIMITED_OMISSION`) must be tracked and reported in denominator counts.
 
-- **Hypothesis $H_1$ (Liquidity Depth & Low Price-Impact Alpha)**:  
-  _Premise:_ Restricting entries to tokens where modeled round-trip price impact $\delta(0.5\text{ SOL}) \le 3.5\%$ and $R_{\text{sol}} \ge 25\text{ SOL}$ eliminates $>80\%$ of execution drag without reducing gross win rate.  
-  _Test Criterion:_ $R_{\text{synthetic}}(H_1) - R_{\text{synthetic}}(H_0) > 0$ with $p < 0.01$.
+### 3.2 Full Funnel Denominator Accounting
 
-- **Hypothesis $H_2$ (Order Flow Momentum & Buyer Dominance)**:  
-  _Premise:_ Momentum signals conditioned on high buyer participation ($BR_{5m} \ge 2.0$ and $OFI_{5m} \ge 0.40$) demonstrate superior post-entry price continuation over tokens driven by low-count whale transactions.  
-  _Test Criterion:_ Mean 15-minute post-entry return is positive and statistically greater than $H_0$.
+Strategy performance must never be inflated by silently dropping difficult, illiquid, or unquoted tokens. Phase 12.94-D enforces strict **Funnel Denominator Invariance**:
 
-- **Hypothesis $H_3$ (Structural Safety & Concentration Filtering)**:  
-  _Premise:_ Requiring $LP_{\text{burn}} \ge 90\%$ and $H_{\text{dev}} \le 5.0\%$ reduces honeypot/liquidity-drain incidence from $>15\%$ to $<2\%$, directly improving portfolio tail risk (Conditional Value at Risk).  
-  _Test Criterion:_ 99% Expected Shortfall reduction $>50\%$ compared to baseline.
+$$\text{Screened} \xrightarrow{N_1} \text{Eligible} \xrightarrow{N_2} \text{Tracked} \xrightarrow{N_3} \text{Quote Attempted} \xrightarrow{N_4} \text{Quote Obtained} \xrightarrow{N_5} \text{Fill Simulated} \xrightarrow{N_6} \text{Sellable} \xrightarrow{N_7} \text{Outcome Observed}$$
 
-- **Hypothesis $H_4$ (Dynamic Capacity Sizing)**:  
-  _Premise:_ Sizing positions dynamically via $S^* = \min(S_{\text{max}}, \sqrt{k \cdot \text{tolerance}})$ maximizes net SOL expectancy compared to fixed 0.1 SOL allocations.  
-  _Test Criterion:_ Aggregate net SOL profit is higher under capacity-scaled sizing while maintaining Sharpe $\ge 1.5$.
+Every evaluation report must publish the complete denominator waterfall:
 
-- **Hypothesis $H_{\text{composite}}$ (Multi-Factor Scoring Engine)**:  
-  _Premise:_ A linear or rank-based composite score combining $H_1$ through $H_4$ outperforms any individual factor in risk-adjusted out-of-sample performance.
+- $N_{\text{screened}}$: Total candidates discovered by scanners.
+- $N_{\text{filtered}}$: Rejected by initial strategy filter rules.
+- $N_{\text{watchlist}}$: Admitted to watchlist radar.
+- $N_{\text{trigger\_reject}}$: Rejected at trigger threshold evaluation.
+- $N_{\text{quote\_fail}}$: Quote attempted but failed (e.g. no route, subatomic input).
+- $N_{\text{fill\_fail}}$: Fill attempted but rejected (e.g. slippage breach, preflight price impact).
+- $N_{\text{unsellable}}$: Acquired position that became unliquidatable (honeypot, liquidity drain).
+- $N_{\text{censored}}$: Follow-up expired, session interrupted, or provider omitted.
+- $N_{\text{evaluated}}$: Complete outcome observed.
+
+### 3.3 Financial State Taxonomy
+
+To prevent conflating paper valuations with realized wallet cash:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. Realized Cash P&L (SOL)                                             │
+│ - Confirmed on-chain simulated liquidation (executionOutcome: FILLED)  │
+│ - RealizedNetPnl = GrossSolProceeds - OutOfPocketNetworkFees           │
+│                    - PriorityFees - AtaRentDeposits + AtaRentRefunds   │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 2. Marked-to-Model P&L (SOL)                                           │
+│ - Open, unsold inventory valued at conservative AMM bid quote          │
+│ - MarkedPnl = CurrentEstimatedBidProceeds - InitialTotalOutlaySol      │
+│ - Reflects holding-period fluctuations without wallet cash debit/credit│
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 3. Capital Tied Up (SOL)                                               │
+│ - Initial purchase cost of held tokens + outstanding ATA rent deposits │
+│ - Represents capital at risk unavailable for new allocations           │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 4. Unrealized Impairment Stress Write-Down (SOL)                       │
+│ - Conservative valuation stress for illiquid, trapped, or rugged tokens│
+│ - UNSELLABLE_NO_ROUTE / UNSELLABLE_LIQUIDITY_DRAINED = 100% write-down  │
+│ - Recorded as a risk metric; does NOT generate a false liquidation     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.4 Preservation of Negative Dust Cash Deltas
+
+When a position is liquidated for gross proceeds less than external transaction fees ($\text{GrossProceedsSol} < \text{ExternalFeesSol}$):
+
+- `simulateFill` records a **signed negative net cash flow**:
+  $$\Delta \text{Cash} = \text{GrossProceedsSol} - \text{ExternalFeesSol} < 0$$
+- This negative cash delta is preserved in portfolio equity and total realized P&L.
+- Submarginal dust exits are flagged as `EXECUTION_DEFICIT_SUBMARGINAL` and barred from positive-return rankings, but **must never be dropped from the total portfolio P&L denominator**.
 
 ---
 
-## 5. Statistical Methodology & Anti-Bias Framework
+## 4. Financial Mathematics, Constrained Capacity & Return Metrics (Finding D-04)
 
-To ensure that research results represent true alpha rather than statistical noise or data mining artifacts, Phase 12.94-D enforces strict anti-bias protocols:
+### 4.1 Replacement of Unstable Return Ratio with Defined Metric Bundle
 
-```
-[Full Telemetry Dataset] ──► [Chronological Train / Out-of-Sample Split]
-                                      │
-                 ┌────────────────────┴────────────────────┐
-                 ▼                                         ▼
-        [In-Sample Training]                      [Out-of-Sample Test]
-        - Hypothesis exploration                  - Single-pass evaluation
-        - Factor weight estimation                - No parameter re-tuning
-        - Quantile threshold fitting              - Strict chronological holdout
-                 │                                         │
-                 ▼                                         ▼
-        [Multiple Testing Adjustment]             [Statistical Validation]
-        - Deflated Sharpe Ratio (DSR)             - Stationary Block Bootstrap
-        - Benjamini-Hochberg FDR Control          - 95% Confidence Intervals
-        - Minimum Backtest Length (MinBTL)        - Drawdown & Regime Analysis
-```
+The proposed ratio $R_{\text{synthetic}} / R_{\text{theoretical}}$ is mathematically degenerate when $R_{\text{theoretical}} \to 0$ and reverses meaning when returns are negative. Phase 12.94-D permanently replaces this ratio with a **Well-Defined Return & Degradation Bundle**:
 
-### 5.1 Multiple Testing Corrections: Deflated Sharpe Ratio & FDR Control
+1. **Net SOL Expectancy ($\mathbb{E}[\Delta \text{SOL}_{\text{net}}]$)**:
+   The primary economic performance metric:
+   $$\mathbb{E}[\Delta \text{SOL}_{\text{net}}] = \frac{1}{N_{\text{total\_intents}}} \sum_{i=1}^{N_{\text{total\_intents}}} \text{NetRealizedPnlSol}_i$$
+   Evaluated over all trade intents (including preflight rejections, failed fills, and fees).
 
-When evaluating $K$ variations of a strategy, the probability of finding a high Sharpe ratio purely by chance approaches 1.0 (Bailey & López de Prado, 2014).
+2. **Return Degradation in Percentage Points ($\Delta R_{\text{pp}}$)**:
+   Well-defined across all return signs:
+   $$\Delta R_{\text{pp}} = R_{\text{theoretical}} - R_{\text{synthetic}}$$
+   Measures exactly how many percentage points of profit are consumed by execution friction.
 
-1. **Deflated Sharpe Ratio (DSR)**:
-   The DSR adjusts the estimated Sharpe ratio $\widehat{SR}$ for the number of independent trials $K$, the variance of trials $V[\{\widehat{SR}_k\}]$, sample skewness $\hat{\gamma}_3$, and sample kurtosis $\hat{\gamma}_4$:
+3. **Execution Drag Ratio ($\text{DragRatio}_{\text{pos}}$)**:
+   Defined **strictly** for trades with positive gross opportunity ($R_{\text{theoretical}} > 0$):
+   $$\text{DragRatio}_{\text{pos}} = \frac{\text{TotalExecutionFrictionSol}}{\text{GrossTheoreticalProfitSol}} = \frac{\text{ImpactSol} + \text{FeesSol} + \text{SlippageSol}}{\text{GrossTheoreticalProfitSol}}$$
+   For losing trades ($R_{\text{theoretical}} \le 0$), this metric is recorded as `NON_APPLICABLE_LOSS_TRADE`.
 
-   $$DSR = \Phi \left( \frac{(\widehat{SR} - SR^*) \sqrt{T - 1}}{\sqrt{1 - \hat{\gamma}_3 \widehat{SR} + \frac{\hat{\gamma}_4 - 1}{4} \widehat{SR}^2}} \right)$$
+4. **Fillability & Cohort Coverage**:
+   $$\text{FillabilityRate} = \frac{N_{\text{filled}}}{N_{\text{quote\_attempted}}}, \quad \text{CohortCoverage} = \frac{N_{\text{evaluated}}}{N_{\text{cohort\_total}}}$$
 
-   where $SR^*$ is the expected maximum Sharpe ratio under the null hypothesis:
-   $$SR^* \approx \sqrt{2 \ln K} + \frac{\gamma}{\sqrt{2 \ln K}}$$
-   Any hypothesis failing to achieve $DSR \ge 0.95$ ($p < 0.05$) is rejected as a probable overfitting artifact.
+### 4.2 Dimensionally Correct Capacity Optimization
 
-2. **False Discovery Rate (FDR) via Benjamini-Hochberg**:
-   For all tested factor combinations, p-values are sorted $p_{(1)} \le p_{(2)} \le \dots \le p_{(m)}$. A hypothesis is declared statistically significant only if:
-   $$p_{(i)} \le \frac{i}{m} \cdot \alpha_{\text{FDR}}, \quad \alpha_{\text{FDR}} = 0.05$$
+The previous formula $S^* = \min(S_{\text{max}}, \sqrt{k \cdot \text{tolerance}})$ had invalid units ($\sqrt{\text{SOL} \cdot \text{Tokens}}$). Phase 12.94-D replaces it with a **Constrained Capacity Optimization** over the discrete sizing grid already implemented in `CapacityCurveAnalyzer`:
 
-3. **Minimum Backtest Length (MinBTL)**:
-   $$\text{MinBTL} = 1 + \left(1 - \hat{\gamma}_3 \widehat{SR} + \frac{\hat{\gamma}_4 - 1}{4} \widehat{SR}^2\right) \left(\frac{Z_\alpha}{\widehat{SR}}\right)^2$$
-   If the active observation window $T < \text{MinBTL}$, results are classified as preliminary and insufficient for strategy selection.
+$$\max_{S \in \mathcal{S}} \quad \mathbb{E}\left[ \text{NetProceeds}(S, R_{\text{sol}}(t_0), R_{\text{token}}(t_0), \Delta t) - S - \text{TotalOutOfPocketFees}(S) \right]$$
 
-### 5.2 Chronological Out-of-Sample Testing & Regime Analysis
+subject to:
+$$S \le S_{\text{max\_wallet}}, \quad \text{PriceImpactBps}(S) \le \text{MaxImpactToleranceBps}, \quad \text{SellabilityStatus}(S) = \text{FULLY\_SELLABLE}$$
 
-- **Walk-Forward Analysis (WFA)**: Time series data is partitioned chronologically into expanding training windows and non-overlapping out-of-sample forward test windows. Random k-fold cross-validation is strictly forbidden.
-- **Regime Stress Testing**: Strategy hypotheses are evaluated across three distinct market regimes:
-  1. _Trend / Expansion Regime:_ SOL/USD rising, aggregate DEX volume in top quartile.
-  2. _Chop / Contraction Regime:_ SOL/USD ranging, declining volume, low liquidity depth.
-  3. _High Congestion / Priority Fee Shock Regime:_ Solana compute unit prices spiked $>5\times$ baseline.
+where $\mathcal{S} = \{0.05, 0.10, 0.25, 0.50, 1.00, 2.00, 5.00\}\text{ SOL}$.
 
-### 5.3 Resampling & Confidence Estimation
+- All calculations evaluate strictly against point-in-time entry reserves $R_{\text{sol}}(t_0)$, never future reserves.
+- If no size $S \in \mathcal{S}$ yields positive expected net return after impact and fees, the capacity engine outputs $S^* = 0\text{ SOL}$ (`ZERO_CAPACITY_UNPROFITABLE`).
 
-- **Politis-Romano Stationary Block Bootstrap**: To preserve time-series autocorrelation and volatility clustering, confidence intervals are constructed using block resampling with geometric block lengths (mean block size = 10 trades).
-- All reported metrics must display **95% empirical bootstrap confidence intervals**: $[\text{Metric}_{2.5\%}, \text{Metric}_{97.5\%}]$.
+### 4.3 Exact Continuous Portfolio Balance Equations
+
+Continuous portfolio equity is governed by exact conservation laws:
+
+$$\text{Cash}(t) = \text{Cash}(0) - \sum_{i \in \text{Buys}} \text{OutlaySol}_i + \sum_{j \in \text{Sells}} \text{GrossProceedsSol}_j - \sum_{k \in \text{Submissions}} \text{ExternalNetworkFeeSol}_k - \sum_{m \in \text{OpenATA}} \text{AtaRentDepositSol}_m + \sum_{n \in \text{CloseATA}} \text{AtaRentRefundSol}_n$$
+
+$$\text{Inventory}_m(t) = \sum_{i \in \text{Buys}(m)} \text{TokensFilled}_{i,m} - \sum_{j \in \text{Sells}(m)} \text{TokensSold}_{j,m}$$
+
+$$\text{PortfolioEquity}(t) = \text{Cash}(t) + \sum_{m} \text{Inventory}_m(t) \cdot P_{\text{conservative\_bid}}(m, t) + \text{ActiveAtaRentSol}(t)$$
+
+### 4.4 Preregistration of Numerical Targets
+
+All specific numerical thresholds proposed in this document (such as 3.5% price impact, 2.0 buyer ratio, 90% LP burn, 1.50 Sharpe ratio, and 18% maximum drawdown) are formally categorized as **Preregistered Research Parameters**. They represent falsifiable hypotheses and target evaluation benchmarks, **not established facts or guaranteed outcomes**.
 
 ---
 
-## 6. Live Tier 3 Quote-Validation Dependency & Generation 2 Acceptance Gates
+## 5. Statistical Validity, Portfolio Equity Process & Evidence Sufficiency (Finding D-05)
 
-### 6.1 The Tier 3 Live Quote-Validation Dependency
+### 5.1 Unit of Analysis & Continuous Portfolio Equity Process
 
-A foundational architectural requirement of Phase 12.94-D is establishing that **no simulated AMM model (Tier 2/Tier 4) can authorize live production capital deployment on its own**.
+To avoid the severe statistical biases of isolated trade-level averages (which ignore holding periods, concurrent capital lockup, and cash drag), the primary statistical unit of analysis is the **Timestamped Daily Portfolio Return Series**:
 
-```
-[12.94-D Quantitative Research] ──► Selects Best Validated Hypothesis (H*)
-                                                │
-                                                ▼
-[MANDATORY PREREQUISITE] ────────► [Tier 3 Shadow Quote-Validation Daemon]
-                                   - Live Jupiter / Raydium API quotes
-                                   - Real-world route discovery & latency
-                                   - Dynamic fee auction tracking
-                                   - Zero real SOL deployed
-                                                │
-                                                ▼
-[Evidence Acceptance Gates] ─────► Must Pass All 7 Gates Concurrently
-                                                │
-                                                ▼
-[Phase 12.94-E Authorization] ───► Generation 2 Paper Trading Creation / Activation
-```
+$$r_t = \frac{V_{\text{portfolio}}(t) - V_{\text{portfolio}}(t-1)}{V_{\text{portfolio}}(t-1)}$$
 
-Before claiming that PAPER results represent truly executable market opportunities, a **Tier 3 Shadow Quoting Daemon** must be deployed to concurrently poll live routing endpoints for every signal generated, verifying that:
+where $V_{\text{portfolio}}(t)$ is the continuous marked portfolio valuation evaluated at 00:00:00 UTC daily.
 
-1. A valid route actually exists on-chain at the trigger instant ($t_{\text{latency}} \le 800\text{ms}$).
-2. The live quoted output matches the synthetic AMM estimate within a tight tolerance ($|\Delta P| \le 1.5\%$).
-3. The token is not blacklisted, taxed, or frozen by the routing aggregator.
+- Days with zero trading activity are explicitly included as $r_t = 0.0$ (reflecting cash drag).
+- Open positions are marked using conservative AMM reserve bids.
+- Annualization for 24/7/365 Decentralized Cryptocurrency Markets:
+  $$SR_{\text{annualized}} = \sqrt{365} \cdot \frac{\bar{r}_{\text{daily}} - r_{f,\text{daily}}}{\hat{\sigma}_{\text{daily}}}$$
+  (where $r_f = 0$ for SOL-denominated capital).
+- **Degenerate Sample Protection**: If active calendar days $T < 30$ or variance $\hat{\sigma}^2 = 0$, Sharpe calculation is refused and marked `INSUFFICIENT_SAMPLE_SIZE`.
 
-### 6.2 Formal Evidence Acceptance Gates for Generation 2 Evaluation
+### 5.2 Research Experiment Registry & Complete Deflated Sharpe Ratio Estimator
 
-The creation and activation of Generation 2 (deferred to Subphase 12.94-E) is blocked until the strategy research pipeline produces an **Evidence Package** satisfying all seven formal acceptance gates:
+To prevent p-hacking and multiple-testing snooping, Phase 12.94-D establishes an immutable **Research Experiment Registry**:
 
-| Gate     | Acceptance Metric            | Threshold Requirement                                    | Economic / Statistical Rationale                      |
-| :------- | :--------------------------- | :------------------------------------------------------- | :---------------------------------------------------- | ---------- | ------------------------------------------------- |
-| **G2-1** | **Out-of-Sample Net Sharpe** | $SR_{\text{OOS}} \ge 1.50$ (annualized)                  | Ensures robust risk-adjusted return net of all fees   |
-| **G2-2** | **Statistical Significance** | $p < 0.01$ (with Benjamini-Hochberg FDR)                 | Proves edge is not random data snooping               |
-| **G2-3** | **Deflated Sharpe Ratio**    | $DSR \ge 0.95$                                           | Corrects for multiple hypothesis testing              |
-| **G2-4** | **Execution Reality Ratio**  | $R_{\text{synthetic}} / R_{\text{theoretical}} \ge 0.35$ | Verifies returns survive real-world market friction   |
-| **G2-5** | **Maximum Drawdown**         | $\text{MaxDD}_{\text{OOS}} \le 18.0\%$                   | Protects capital preservation boundaries              |
-| **G2-6** | **Capital Capacity Floor**   | $S^* \ge 0.50\text{ SOL}$ with positive alpha            | Confirms strategy can absorb practical position sizes |
-| **G2-7** | **Tier 3 Route Concordance** | Quoted fillability $\ge 85\%$, $                         | \Delta P                                              | \le 1.5\%$ | Validates route executability in live DEX markets |
+- Every tested hypothesis, parameter combination, filter cutoff, and sizing rule is assigned a unique `experimentId` and recorded in `research-experiment-registry.jsonl`.
+- The total number of registered trials $K$ and their estimated variance $V[\{\widehat{SR}_k\}]$ are tracked continuously.
 
-Failure of any single gate results in immediate rejection of the candidate hypothesis and maintains the existing Generation 1 baseline.
+**Complete Deflated Sharpe Ratio (DSR) Formulation (Bailey & López de Prado, 2014)**:
+$$DSR = \Phi \left( \frac{(\widehat{SR} - SR^*) \sqrt{T - 1}}{\sqrt{1 - \hat{\gamma}_3 \widehat{SR} + \frac{\hat{\gamma}_4 - 1}{4} \widehat{SR}^2}} \right)$$
 
----
+where:
 
-## 7. Data Contracts & TypeScript Schemas
+- $\widehat{SR}$ is the unannualized (daily) sample Sharpe ratio.
+- $T$ is the number of daily return observations.
+- $\hat{\gamma}_3$ is the sample skewness of daily returns.
+- $\hat{\gamma}_4$ is the sample kurtosis of daily returns.
+- $SR^*$ is the expected maximum Sharpe ratio under the null hypothesis of no true alpha:
+  $$SR^* = \sqrt{V[\{\widehat{SR}_k\}]} \cdot \left( (1 - \gamma) \Phi^{-1}\left(1 - \frac{1}{K}\right) + \gamma \Phi^{-1}\left(1 - \frac{1}{K \cdot e}\right) \right)$$
+  where $\gamma \approx 0.57721566$ is the Euler-Mascheroni constant, and $V[\{\widehat{SR}_k\}]$ is the empirical variance across all $K$ registered strategy trials.
 
-Phase 12.94-D introduces formal TypeScript data contracts in `backend/src/research/`:
+A candidate strategy passes multiple-testing validation only if $DSR \ge 0.95$ (statistically significant at $p < 0.05$ after correcting for $K$ trials).
 
-### 7.1 Joined Research Record Schema
+### 5.3 Hypothesis Testing, P-Values vs. Adjusted Q-Values, and Language Precision
 
-```typescript
-export interface JoinedResearchRecord {
-  readonly joinId: string;
-  readonly sessionId: string;
-  readonly generationId: string;
-  readonly decisionEventId: string;
-  readonly quoteId?: string;
-  readonly fillId?: string;
-  readonly mintAddress: string;
-  readonly poolId: string;
-  readonly symbol: string;
+- **Raw Hypothesis Test**: Each individual factor is evaluated against the null $H_0: \mathbb{E}[\Delta \text{SOL}] \le 0$ using a two-tailed Welch's t-test at nominal significance $\alpha_{\text{raw}} = 0.01$.
+- **False Discovery Rate (FDR) Control**: Across a family of $M$ tested hypothesis variants, p-values are ranked $p_{(1)} \le p_{(2)} \le \dots \le p_{(M)}$. The Benjamini-Hochberg critical threshold is computed:
+  $$p_{(i)} \le \frac{i}{M} \cdot q^*, \quad q^* = 0.05$$
+  The adjusted q-value is reported alongside the raw p-value.
+- **Language Precision**: Statistical significance **rejects the null hypothesis of zero edge under specific model assumptions**. It **never proves future profitability** or guarantees positive execution in live markets.
 
-  // Chronological timestamps
-  readonly discoveryTimestampMs: number;
-  readonly decisionTimestampMs: number;
-  readonly quoteInitiatedMs?: number;
-  readonly fillTimestampMs?: number;
+### 5.4 Minimum Evidence Thresholds & Indeterminate Outcomes
 
-  // Cohort & Decisions
-  readonly decisionCohort: DecisionCohort;
-  readonly strategyRevision: string;
+To prevent drawing conclusions from tiny or degenerate samples, evaluations must satisfy:
 
-  // Three-Tier Return Quantities
-  readonly spotPriceEntrySol: number;
-  readonly spotPriceExitSol?: number;
-  readonly theoreticalReturnPct?: number;
+1. $N_{\text{decisions}} \ge 100$ independent candidate events.
+2. $N_{\text{days}} \ge 30$ active calendar trading days.
+3. $N_{\text{tokens}} \ge 15$ distinct SPL mints.
+4. $N_{\text{regimes}} \ge 2$ distinct macro market regimes.
 
-  readonly syntheticInAmountSol?: number;
-  readonly syntheticGrossProceedsSol?: number;
-  readonly syntheticNetProceedsSol?: number;
-  readonly syntheticReturnPct?: number;
-
-  readonly executionOutcome?: ExecutionOutcome;
-  readonly sellabilityStatus?: SellabilityStatus;
-  readonly networkFeesLamports?: number;
-
-  // Feature Vector
-  readonly featureVector: QuantitativeFeatureVector;
-
-  // Data Quality & Gating
-  readonly eligibilityStatus: "ELIGIBLE" | "QUARANTINED" | "REJECTED";
-  readonly disqualificationReasons: readonly string[];
-}
-```
-
-### 7.2 Feature Vector Schema
-
-```typescript
-export interface QuantitativeFeatureVector {
-  // Liquidity & Depth
-  readonly quoteReserveSol: number;
-  readonly baseReserveTokens: number;
-  readonly liquidityUsd: number;
-  readonly lmcRatio: number;
-  readonly priceImpactBpsAt01Sol: number;
-  readonly priceImpactBpsAt05Sol: number;
-  readonly priceImpactBpsAt10Sol: number;
-  readonly capacitySlopeKappa: number;
-
-  // Order Flow & Volume
-  readonly buyCount5m: number;
-  readonly sellCount5m: number;
-  readonly buyerRatio5m: number;
-  readonly volume5mUsd: number;
-  readonly netBuyerVolumeUsd: number;
-  readonly orderFlowImbalance5m: number;
-
-  // Structure & Safety
-  readonly poolAgeMinutes: number;
-  readonly devHoldingPct: number;
-  readonly lpBurnPct: number;
-  readonly top10ConcentrationPct: number;
-}
-```
-
-### 7.3 Hypothesis Evaluation Result Schema
-
-```typescript
-export interface HypothesisEvaluationResult {
-  readonly hypothesisId: string;
-  readonly description: string;
-  readonly inSampleMetrics: PerformanceMetricsBlock;
-  readonly outOfSampleMetrics: PerformanceMetricsBlock;
-  readonly deflatedSharpeRatio: number;
-  readonly pValueRaw: number;
-  readonly pValueAdjustedFdr: number;
-  readonly isStatisticallySignificant: boolean;
-  readonly minimumBacktestLengthDays: number;
-  readonly actualBacktestLengthDays: number;
-  readonly executionRealityRatio: number; // R_synthetic / R_theoretical
-  readonly capacityBreakEvenSol: number;
-  readonly acceptanceGateResults: Record<string, boolean>;
-  readonly passesAllGates: boolean;
-}
-```
+If any threshold is not satisfied, the engine outputs:
+$$\text{Status: } \mathbf{INSUFFICIENT\_EVIDENCE} \quad (\text{or } \mathbf{NOT\_EVALUATED})$$
+Binary PASS/FAIL decisions are strictly barred on insufficient data.
 
 ---
 
-## 8. Verification & Test Plan
+## 6. Tier 3 Indicative Quoting & Four-Stage Generation 2 Governance (Finding D-06)
 
-Phase 12.94-D establishes a dedicated test suite `backend/src/research/QuantitativeResearch.test.ts` covering:
+### 6.1 Indicative Quoting Boundary & Decoupling
 
-1. **RF-D1: Point-in-Time Join Integrity & Temporal Causality**
-   - Correctly joins 12.94-B candidate decisions with 12.94-C quotes and fills via composite 5-tuple key.
-   - Fails closed on lookahead violations ($t_{\text{decision}} > t_{\text{quote}}$).
-   - Rejects mismatched sessions, generations, mints, or pool IDs.
+A Tier 3 DEX aggregator response (e.g. from Jupiter or Raydium REST APIs) represents a **contemporaneous indicative executable-route quote**, **NOT** an on-chain transaction fill (Tier 5) and **NOT** a consensus guarantee:
 
-2. **RF-D2: Fail-Closed Eligibility Gating (Audit v3 Invariants)**
-   - Rejects unfinalized or interrupted sessions (`verifySessionCrossFileConsistency`).
-   - Rejects missing, mismatched, or synthetic placeholder pool IDs.
-   - Rejects stale telemetry ($>120\text{s}$ ingestion lag).
-   - Enforces prequantized atomic input consistency (no float-to-atomic drift).
-   - Correctly debits signed negative cash flow when fees exceed proceeds; flags submarginal dust exits.
+- Live on-chain execution is subject to latency races, MEV sandwiching, block inclusion failure, and dynamic priority fee spikes.
+- Phase 12.94-D produces **research specifications and simulation interfaces only**.
+- **No live network-polling daemons or background workers will be deployed or activated in Phase 12.94-D.** Any future live shadow-quoting deployment requires separate explicit operator authorization.
 
-3. **RF-D3: Three-Tier Return Decomposition**
-   - Correctly computes $R_{\text{theoretical}}$, $R_{\text{synthetic}}$, and Execution Reality Gap.
-   - Preserves 100% unsold inventory on preflight rejections (`UNSELLABLE_EXCESSIVE_IMPACT`).
-   - Assigns full impairment write-downs to drained/untradeable positions without dropping them from the sample.
+### 6.2 Four-Stage Tiered Governance & Acceptance Framework
 
-4. **RF-D4: Statistical Methodology & Multiple Testing Adjustments**
-   - Verifies Deflated Sharpe Ratio calculation against benchmark academic tables (Bailey & López de Prado).
-   - Verifies Benjamini-Hochberg FDR p-value adjustments across synthetic multi-test arrays.
-   - Verifies Stationary Block Bootstrap confidence interval generation.
+To ensure that research findings are never conflated with live trading authorization:
 
-5. **RF-D5: Walk-Forward Chronological Partitioning**
-   - Verifies strict chronological splitting (no data leakage between training and testing windows).
-   - Verifies regime segmentation (expansion vs. contraction vs. congested).
+```
+[Stage 1: Strategy Research Viability (Phase 12.94-D)]
+- Standalone synthetic AMM research on historical & replayed data
+- Output: Formal Evidence Package & Hypothesis Evaluation Report
+- ZERO live quotes, ZERO paper trades, ZERO real capital
+                  │
+                  ▼ (Requires Independent Auditor Approval)
+[Stage 2: Experimental PAPER Gen2 Wallet Creation (Phase 12.94-E Auth)]
+- Separate operator authorization to provision a NEW, isolated virtual wallet
+- Existing 7.9259 SOL Gen 1 wallet remains PERMANENTLY IMMUTABLE
+- ZERO real capital
+                  │
+                  ▼ (Requires Explicit Operator Start Command)
+[Stage 3: Controlled PAPER Observation (Phase 12.94-E Execution)]
+- Paper trading daemon started with Gen 2 strategy configuration
+- Live Tier 3 shadow route validation enabled (non-blocking)
+- ZERO real capital
+                  │
+                  ▼ (Future / Separate Governance)
+[Stage 4: Production Capital Deployment (Out of Scope)]
+- Requires multi-week live paper profitability and separate formal review
+```
 
-6. **RF-D6: Generation 2 Acceptance Gate Evaluation**
-   - Evaluates all 7 acceptance gates concurrently.
-   - Successfully approves a synthetic high-alpha, low-impact strategy.
-   - Fails closed when any individual gate (e.g. $DSR < 0.95$ or $\text{MaxDD} > 18\%$) is violated.
+### 6.3 Corrected Generation 2 Research Readiness Acceptance Table
+
+The table below replaces the malformed table from proposal v1, establishing a complete, consistent schema for all proposed research readiness gates:
+
+| Gate ID  | Metric Name                        | Preregistered Benchmark Target                                     | Unit of Analysis               | Minimum Sample Requirement          | Exact Calculation Formula                                                        | Status if Data Missing          |
+| :------- | :--------------------------------- | :----------------------------------------------------------------- | :----------------------------- | :---------------------------------- | :------------------------------------------------------------------------------- | :------------------------------ | ------------------------------------------------- | -------------------------- |
+| **G2-1** | **Out-of-Sample Net Sharpe**       | $SR_{\text{OOS}} \ge 1.50$                                         | Daily portfolio returns        | $T \ge 30$ days, $N \ge 100$ trades | $\sqrt{365} \cdot \frac{\bar{r}_{\text{daily}}}{\hat{\sigma}_{\text{daily}}}$    | `INSUFFICIENT_EVIDENCE`         |
+| **G2-2** | **Statistical Significance**       | Adjusted $q \le 0.05$                                              | All tested hypotheses          | $M \ge 5$ registered trials         | Benjamini-Hochberg FDR ranking on Welch's t-test                                 | `INSUFFICIENT_EVIDENCE`         |
+| **G2-3** | **Deflated Sharpe Ratio**          | $DSR \ge 0.95$                                                     | Daily portfolio returns        | $T \ge 30$ days, $K$ trials         | Bailey & López de Prado (2014) closed-form DSR                                   | `INSUFFICIENT_EVIDENCE`         |
+| **G2-4** | **Return Degradation Floor**       | $\Delta R_{\text{pp}} \le 25.0\text{ pp}$                          | Trade-level return deltas      | $N \ge 50$ executable quotes        | $\frac{1}{N} \sum (R_{\text{theoretical}} - R_{\text{synthetic}})$               | `NOT_EVALUATED`                 |
+| **G2-5** | **Maximum Out-of-Sample Drawdown** | $\text{MaxDD}_{\text{OOS}} \le 18.0\%$                             | Daily portfolio equity curve   | $T \ge 30$ days continuous          | $\max_{t} \left[ \frac{\max_{s \le t} V(s) - V(t)}{\max_{s \le t} V(s)} \right]$ | `INSUFFICIENT_EVIDENCE`         |
+| **G2-6** | **Capital Capacity Floor**         | $S^* \ge 0.50\text{ SOL}$ with $\mathbb{E}[\Delta \text{SOL}] > 0$ | Capacity curve grid evaluation | $\ge 20$ eligible liquidity pools   | Constrained optimization over `CapacityCurveAnalyzer`                            | `NOT_EVALUATED`                 |
+| **G2-7** | **Tier 3 Route Concordance**       | Fillability $\ge 85\%$, $                                          | \Delta P                       | \le 1.5\%$                          | Live shadow quote comparison                                                     | $\ge 50$ contemporaneous quotes | Concurrent shadow quote comparison (Future Stage) | `NOT_EVALUATED (DEFERRED)` |
 
 ---
 
-## 9. Implementation Sequence & Milestone Plan
+## 7. Revised Implementation Sequence & Milestone D.1 Scope (Finding D-07)
 
-Implementation of Phase 12.94-D will be strictly bounded and executed in four sequential milestones:
+### 7.1 Sequenced Milestone Roadmap
+
+Implementation of Phase 12.94-D is sequenced strictly by **verified data availability**:
 
 ```
-[Milestone D.1] ──► Telemetry-Execution Joiner & Research Eligibility Gates
-                     (Point-in-time relational join, temporal checks, audit invariant fixes)
+[Milestone D.1] ──► Input Feasibility, Lineage Mapping & Invariant Gating
+                     - Audit existing disk records; produce Lineage & Coverage Report
+                     - Implement Event-Specific Causal Joiner & Provenance Wrapper
+                     - Implement Fail-Closed Eligibility Gates (Audit v3 prequantization & signed dust)
+                     - Scope: Data contracts & deterministic offline joiner ONLY
                            │
-                           ▼
-[Milestone D.2] ──► Feature Engineering & Quantitative Hypothesis Engine
-                     (Liquidity depth, order flow, safety features, H1-H4 signal evaluation)
+                           ▼ (Independent Review & Approval Gate)
+[Milestone D.2] ──► Feature Engineering & Available-Data Hypothesis Testing
+                     - Implement feature extractors restricted to VERIFIED AVAILABLE fields
+                     - Evaluate H1 through H_composite; report feature missingness
+                     - Constrained capacity curve sizing optimization
                            │
-                           ▼
-[Milestone D.3] ──► Statistical Evaluation & Walk-Forward Validation Suite
-                     (Deflated Sharpe, FDR control, block bootstrap, regime analysis)
+                           ▼ (Independent Review & Approval Gate)
+[Milestone D.3] ──► Portfolio Equity Accounting & Statistical Validation
+                     - Implement continuous daily equity curve, marked valuation, cash tracking
+                     - Deflated Sharpe Ratio, Benjamini-Hochberg FDR, MinBTL
+                     - Purged & embargoed chronological walk-forward cross-validation
                            │
-                           ▼
-[Milestone D.4] ──► Tier 3 Quoting Specification & Gen 2 Acceptance Gate Package
-                     (Shadow validator interface, formal gate verifier, evidence report)
+                           ▼ (Independent Review & Approval Gate)
+[Milestone D.4] ──► Tier 3 Interface Specification & Research Evidence Package
+                     - Author interface specification for future Tier 3 shadow validator
+                     - Generate comprehensive Research Evidence Package & Governance Audit
 ```
 
-1. **Milestone D.1: Telemetry-Execution Join & Eligibility Gating Engine**
-   - Implement `TelemetryExecutionJoinEngine.ts` and `ResearchEligibilityGate.ts`.
-   - Implement prequantization check and signed dust cash-flow accounting.
-   - Verify with RF-D1 and RF-D2 test fixtures.
+### 7.2 Bounded Scope for Milestone D.1 Only
 
-2. **Milestone D.2: Feature Engineering & Hypothesis Testing Engine**
-   - Implement `QuantitativeFeatureExtractor.ts` and `HypothesisEvaluator.ts`.
-   - Formalize feature vector extraction and evaluate hypotheses $H_1$ through $H_{\text{composite}}$.
-   - Verify with RF-D3 test fixtures.
+Milestone D.1 is strictly bounded to data contracts, feasibility auditing, and causal join logic. **Zero strategy modifications or trading code will be written**:
 
-3. **Milestone D.3: Statistical Methodology & Walk-Forward Engine**
-   - Implement `StatisticalSignificanceCalculator.ts` (DSR, FDR, MinBTL) and `WalkForwardAnalyzer.ts`.
-   - Implement block bootstrap confidence interval estimation.
-   - Verify with RF-D4 and RF-D5 test fixtures.
-
-4. **Milestone D.4: Tier 3 Shadow Specification & Evidence Package**
-   - Implement `Tier3ShadowQuotingContract.ts` and `Gen2AcceptanceGateEvaluator.ts`.
-   - Run complete test suite and static analysis.
-   - Produce formal evidence package for independent auditor review.
+1. **Input Feasibility Audit**:
+   - Write a standalone script/service `scripts/audit-research-readiness.mjs` that scans all historical telemetry files on disk, computes field availability distributions, and outputs `audit/RESEARCH_INPUT_READINESS_REPORT.md`.
+2. **Data Contracts & Provenance Wrappers**:
+   - Define `ProvenanceFeature<T>`, `JoinedResearchRecord`, and `ResearchEligibilityResult` in `backend/src/research/ResearchTypes.ts`.
+3. **Event-Specific Causal Joiner (`TelemetryExecutionJoinEngine`)**:
+   - Implements event-specific causal ordering, trajectory window binding, deduplication, and tie-breaking.
+   - Enforces the Feature Availability Boundary ($\max(t_f^{\text{source}}, t_f^{\text{recv}}) \le t_{\text{decision}}$).
+4. **Fail-Closed Eligibility Gating (`ResearchEligibilityGate`)**:
+   - Implements Gates 1 through 6: session finality, pool identity verification, staleness checks, route integrity, prequantized atomic input validation, and signed dust cash-flow preservation.
+5. **Deterministic Adversarial Test Suite (`QuantitativeResearch.test.ts` — RF-D1 & RF-D2)**:
+   - Evaluated against independent mathematical test oracles.
+   - Fixture with B telemetry and NO C quotes runs cleanly, reporting coverage without fabricating prices.
+   - Fixture with interleaved decisions on the same pool produces correct causal separation.
+   - Fixture with dust exits preserves signed negative cash flows.
 
 ---
 
-## 10. Operational Constraints & Boundaries Summary
+## 8. Operational Constraints & Boundaries Summary
 
 - **Phases 12.93D, 12.94-A, 12.94-B, and 12.94-C remain CLOSED.**
-- **Generation 1 Virtual Wallet:** Balance remains exactly **`7.9259 SOL`** with canonical SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`.
+- **Generation 1 Virtual Wallet:** Balance remains exactly **`7.9259 SOL`** with canonical historical SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`.
 - **Background Processes:** Exactly **0** Windows paper trading daemons running.
 - **Fedora Endurance Experiment:** Untouched and isolated.
 - **Trading Strategies:** Strategy parameters, exit rules, triggers, and position sizes remain unchanged.
-- **Generation 2:** Uncreated and unactivated until formal acceptance of Phase 12.94-D.
+- **Generation 2:** Uncreated and unactivated.
 - **Real-Money Trading:** Strictly disabled.
+- **Scope Restriction:** Planning only. **Zero code implementation is authorized until this revised proposal is approved.**
