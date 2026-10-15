@@ -1,16 +1,22 @@
 /**
  * Phase 12.94-D Milestone D.1 Test Suite: Quantitative Research Engine
  *
- * Verifies event-specific causal data joins, trajectory ambiguity handling,
+ * Verifies event-specific causal data joins, trajectory ambiguity and attribution handling,
  * anti-lookahead feature boundaries, provenance preservation, fail-closed eligibility
- * gating, exact signed dust cash-flow accounting, and zero-imputation invariants.
+ * gating, exact signed BUY/SELL financial accounting, composite identity joins,
+ * duplicate quarantine, session finality, and readiness audit validity.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { describe, expect, it } from "vitest";
 import type {
   CandidateDecisionRecord,
   CandidateMetricsSnapshot,
   MarketObservationRecord,
+  SessionTelemetryMeta,
+  SessionTelemetrySummary,
   StratifiedSamplingRecord,
 } from "../telemetry/TelemetryTypes.js";
 import type { ExecutableQuoteRecord, SimulatedFillRecord } from "../execution/ExecutionTypes.js";
@@ -20,11 +26,61 @@ import {
 } from "./TelemetryExecutionJoinEngine.js";
 import {
   computeResearchFinancialAccounting,
+  determineSessionStatus,
   evaluateResearchEligibility,
 } from "./ResearchEligibilityGate.js";
 import type { JoinedResearchRecord } from "./ResearchTypes.js";
+// @ts-expect-error - audit-research-readiness is an executable ESM script outside backend/src
+import { runReadinessAudit } from "../../../scripts/audit-research-readiness.mjs";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+function createMockMeta(overrides: Partial<SessionTelemetryMeta> = {}): SessionTelemetryMeta {
+  return {
+    sessionId: "session-test-1",
+    generationId: "gen-1",
+    strategyRevision: "strategy-v1",
+    startedAtIso: "2026-10-15T00:00:00.000Z",
+    closedAtIso: "2026-10-15T01:00:00.000Z",
+    initialWalletBalanceSol: 7.9259,
+    environment: {
+      platform: "win32",
+      nodeVersion: "v20.0.0",
+    },
+    sessionStatus: "FINALIZED",
+    isInterruptedSession: false,
+    ...overrides,
+  };
+}
+
+function createMockSummary(
+  overrides: Partial<SessionTelemetrySummary> = {},
+): SessionTelemetrySummary {
+  return {
+    sessionId: "session-test-1",
+    generationId: "gen-1",
+    strategyRevision: "strategy-v1",
+    startedAtIso: "2026-10-15T00:00:00.000Z",
+    closedAtIso: "2026-10-15T01:00:00.000Z",
+    totalCandidatesScreened: 10,
+    totalDecisionsRecorded: 1,
+    decisionWriteFailures: 0,
+    cohortBreakdown: {
+      filteredRejected: 0,
+      watchlistRadar: 0,
+      triggerRejected: 0,
+      executedBuy: 1,
+    },
+    topRejectionReasons: {},
+    totalMarketObservationsRecorded: 1,
+    totalStratifiedCandidatesTracked: 1,
+    missedWinnersCount: 0,
+    avoidedRugsCount: 0,
+    isCompleteSession: true,
+    isInterruptedSession: false,
+    ...overrides,
+  };
+}
 
 function createMockDecision(
   overrides: Partial<CandidateDecisionRecord> = {},
@@ -120,45 +176,179 @@ function createMockObservation(
 }
 
 describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
-  describe("RF-D1: Point-in-Time Join Integrity & Temporal Causality", () => {
-    it("RF-D1.1: handles empty dataset and empty sessions without error", () => {
-      const joiner = new TelemetryExecutionJoinEngine();
-      const results = joiner.joinTelemetryAndExecution({
-        decisions: [],
-        observations: [],
-      });
-      expect(results).toHaveLength(0);
-    });
-
-    it("RF-D1.2: joins B-only telemetry in OBSERVATIONAL_ONLY mode with zero quotes and zero fabrication", () => {
+  describe("D1-AUD-01: Observation Attribution & Positive Pool Identity Verification", () => {
+    it("RF-D1.1: distinguishes UNIQUELY_INFERRED from EXPLICIT_LINK on forward observations", () => {
       const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
       const decision = createMockDecision();
-      const obs = createMockObservation();
+      const meta = createMockMeta();
+      const summary = createMockSummary();
 
+      // Case A: Unlinked observation (no initiatingEventId) -> UNIQUELY_INFERRED
+      const unlinkedObs = createMockObservation();
+      const resA = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [unlinkedObs],
+        sessionMeta: meta,
+        sessionSummary: summary,
+      });
+
+      expect(resA).toHaveLength(1);
+      expect(resA[0]!.trajectoryLinkStatus).toBe("UNIQUELY_INFERRED");
+      expect(resA[0]!.eligibility.isEligible).toBe(true);
+      expect(resA[0]!.eligibility.warnings).toContain(
+        "TRAJECTORY_UNIQUELY_INFERRED: outcome linked by unique pool candidate without explicit initiating ID",
+      );
+
+      // Case B: Explicitly linked observation (has initiatingEventId) -> EXPLICIT_LINK
+      const explicitObs = {
+        ...createMockObservation(),
+        initiatingEventId: decision.eventId,
+      };
+      const resB = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [explicitObs as unknown as MarketObservationRecord],
+        sessionMeta: meta,
+        sessionSummary: summary,
+      });
+
+      expect(resB).toHaveLength(1);
+      expect(resB[0]!.trajectoryLinkStatus).toBe("EXPLICIT_LINK");
+      expect(resB[0]!.eligibility.isEligible).toBe(true);
+    });
+
+    it("RF-D1.2: fails closed when forward observation has missing actualResponsePoolId", () => {
+      const decision = createMockDecision();
+      const obsMissingPool = createMockObservation({
+        actualResponsePoolId: undefined, // Missing!
+      });
+
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
       const results = joiner.joinTelemetryAndExecution({
         decisions: [decision],
-        observations: [obs],
+        observations: [obsMissingPool],
+        sessionMeta: createMockMeta(),
+        sessionSummary: createMockSummary(),
       });
 
       expect(results).toHaveLength(1);
-      const record = results[0]!;
-      expect(record.decisionEventId).toBe(decision.eventId);
-      expect(record.evaluationMode).toBe("OBSERVATIONAL_ONLY");
-      expect(record.trajectoryLinkStatus).toBe("EXPLICIT_LINK");
-      expect(record.forwardObservations).toHaveLength(1);
-      expect(record.quote).toBeUndefined();
-      expect(record.fill).toBeUndefined();
-      expect(record.eligibility.isEligible).toBe(true);
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(
+        results[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("FORWARD_OBSERVATION_POOL_UNVERIFIED"),
+        ),
+      ).toBe(true);
     });
 
-    it("RF-D1.3: preserves metric provenance and never zero-imputes placeholder or unavailable fields", () => {
+    it("RF-D1.3: rejects pre-decision snapshot with wrong actualResponsePoolId and discards reserves", () => {
+      const decision = createMockDecision({
+        decisionTimestampMs: 1792000001000,
+      });
+
+      // Pre-decision observation with wrong pool ID!
+      const wrongPoolPreDecisionObs = createMockObservation({
+        poolId: decision.poolId,
+        actualResponsePoolId: "mismatched-pool-beta", // WRONG POOL!
+        sourceTimestampMs: 1792000000500,
+        ingestionTimestampMs: 1792000000800,
+        responseReceivedMs: 1792000000800,
+      });
+
+      const features = extractDecisionFeatures(decision, wrongPoolPreDecisionObs);
+      expect(features.baseReserve.isAvailable).toBe(false);
+      expect(features.baseReserve.unavailabilityReason).toBe("POOL_IDENTITY_MISMATCH_DISCARDED");
+      expect(features.quoteReserve.isAvailable).toBe(false);
+
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "SYNTHETIC_REPLAY" });
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [wrongPoolPreDecisionObs],
+        sessionMeta: createMockMeta(),
+        sessionSummary: createMockSummary(),
+        mode: "SYNTHETIC_REPLAY",
+      });
+
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(
+        results[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"),
+        ),
+      ).toBe(true);
+    });
+
+    it("RF-D1.4: groups observations and decisions with generationId to prevent cross-generation conflation", () => {
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
+      const decGen1 = createMockDecision({
+        eventId: "dec-gen-1",
+        generationId: "gen-1",
+        decisionTimestampMs: 1792000001000,
+      });
+      const decGen2 = createMockDecision({
+        eventId: "dec-gen-2",
+        generationId: "gen-2", // DIFFERENT GENERATION!
+        decisionTimestampMs: 1792000002000,
+      });
+
+      const obsGen1 = createMockObservation({
+        generationId: "gen-1",
+        sourceTimestampMs: 1792000060000,
+      });
+
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [decGen1, decGen2],
+        observations: [obsGen1],
+        allowUnfinalizedSession: true,
+      });
+
+      expect(results).toHaveLength(2);
+      // Gen 1 has the observation
+      expect(results[0]!.generationId).toBe("gen-1");
+      expect(results[0]!.trajectoryLinkStatus).toBe("UNIQUELY_INFERRED");
+      expect(results[0]!.forwardObservations).toHaveLength(1);
+
+      // Gen 2 must NOT conflate Gen 1's observation!
+      expect(results[1]!.generationId).toBe("gen-2");
+      expect(results[1]!.trajectoryLinkStatus).toBe("NO_OBSERVATIONS_FOUND");
+      expect(results[1]!.forwardObservations).toHaveLength(0);
+    });
+
+    it("RF-D1.5: flags AMBIGUOUS_TRAJECTORY and fails closed when multiple decisions share a pool without explicit link", () => {
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
+      const dec1 = createMockDecision({
+        eventId: "dec-same-1",
+        decisionTimestampMs: 1792000001000,
+      });
+      const dec2 = createMockDecision({
+        eventId: "dec-same-2",
+        decisionTimestampMs: 1792000005000, // 4 seconds later on same pool
+      });
+      const obs = createMockObservation({
+        sourceTimestampMs: 1792000060000,
+      });
+
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [dec1, dec2],
+        observations: [obs],
+        sessionMeta: createMockMeta(),
+        sessionSummary: createMockSummary({ totalDecisionsRecorded: 2 }),
+      });
+
+      expect(results).toHaveLength(2);
+      expect(results[0]!.trajectoryLinkStatus).toBe("AMBIGUOUS_TRAJECTORY");
+      expect(results[1]!.trajectoryLinkStatus).toBe("AMBIGUOUS_TRAJECTORY");
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(results[0]!.eligibility.rejectionReasons).toContain(
+        "AMBIGUOUS_TRAJECTORY_MULTIPLE_DECISIONS: multiple decisions share this pool without explicit link",
+      );
+    });
+
+    it("RF-D1.6: preserves metric provenance and never zero-imputes placeholder or unavailable fields", () => {
       const decision = createMockDecision({
         metricsSnapshot: {
           tokenAgeSec: null,
           liquidityUsd: 0,
           marketCapUsd: 100_000,
           lmcRatio: null,
-          lpBurnPct: null, // missing field
+          lpBurnPct: null,
           spotPriceUsd: 0.0001,
           spotPriceSol: null,
           volume5mUsd: null,
@@ -190,120 +380,257 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT",
       );
     });
+  });
 
-    it("RF-D1.4: flags AMBIGUOUS_TRAJECTORY when multiple decisions share a pool without explicit link", () => {
-      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
-      const dec1 = createMockDecision({
-        eventId: "dec-1",
-        decisionTimestampMs: 1792000001000,
-      });
-      const dec2 = createMockDecision({
-        eventId: "dec-2",
-        decisionTimestampMs: 1792000010000, // 9 seconds later on the same pool
-      });
-      const obs = createMockObservation({
-        sourceTimestampMs: 1792000060000,
-      });
-
-      const results = joiner.joinTelemetryAndExecution({
-        decisions: [dec1, dec2],
-        observations: [obs],
-      });
-
-      expect(results).toHaveLength(2);
-      expect(results[0]!.trajectoryLinkStatus).toBe("AMBIGUOUS_TRAJECTORY");
-      expect(results[1]!.trajectoryLinkStatus).toBe("AMBIGUOUS_TRAJECTORY");
-
-      // By default, ambiguous trajectories fail closed in eligibility check
-      expect(results[0]!.eligibility.isEligible).toBe(false);
-      expect(results[0]!.eligibility.rejectionReasons).toContain(
-        "AMBIGUOUS_TRAJECTORY_MULTIPLE_DECISIONS",
-      );
-    });
-
-    it("RF-D1.5: enforces Feature Availability Boundary and rejects late-received observation from features", () => {
-      const decision = createMockDecision({
-        decisionTimestampMs: 1792000001000,
-      });
-
-      // An observation whose source time is before decision, but whose receipt time is AFTER decision!
-      const lateObs = createMockObservation({
-        sourceTimestampMs: 1792000000500, // before decision
-        ingestionTimestampMs: 1792000002000, // 1000ms AFTER decision!
-        responseReceivedMs: 1792000002000,
-      });
-
-      const features = extractDecisionFeatures(decision, lateObs);
-
-      // Must be quarantined to prevent lookahead leakage!
-      expect(features.baseReserve.isAvailable).toBe(false);
-      expect(features.baseReserve.unavailabilityReason).toBe("LATE_RECEIPT_LOOKAHEAD_PREVENTION");
-    });
-
-    it("RF-D1.6: rejects synthetic replay when reserve snapshot is missing or post-dates decision", () => {
+  describe("D1-AUD-02: Composite Joins, Duplicate Quarantine & Session Finality", () => {
+    it("RF-D2.1: rejects cross-session quote linkage and verifies composite identity", () => {
       const joiner = new TelemetryExecutionJoinEngine({ mode: "SYNTHETIC_REPLAY" });
       const decision = createMockDecision({
-        decisionTimestampMs: 1792000001000,
+        sessionId: "session-valid",
+        eventId: "dec-target-1",
       });
-      // Observation is strictly after decision (forward label only)
-      const forwardObs = createMockObservation({
-        sourceTimestampMs: 1792000060000,
-        ingestionTimestampMs: 1792000060500,
-      });
+
+      // Quote has the target decisionEventId, but sessionId is 'EVIL'!
+      const crossSessionQuote: ExecutableQuoteRecord = {
+        quoteId: "quote-evil-1",
+        sessionId: "session-EVIL", // CROSS-SESSION!
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        inputMint: WSOL_MINT,
+        outputMint: decision.mintAddress,
+        inAmountRaw: "100000000",
+        inAmountUi: 0.1,
+        expectedOutAmountRaw: "1000000000",
+        expectedOutAmountUi: 1000,
+        minimumOutAmountRaw: "990000000",
+        minimumOutAmountUi: 990,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1792000001000,
+        quoteReceivedMs: 1792000001050,
+        contextSlot: 100,
+        validUntilMs: 1792000011000,
+      };
 
       const results = joiner.joinTelemetryAndExecution({
         decisions: [decision],
-        observations: [forwardObs],
+        observations: [],
+        quotes: [crossSessionQuote],
+        allowUnfinalizedSession: true,
         mode: "SYNTHETIC_REPLAY",
       });
 
       expect(results).toHaveLength(1);
-      const record = results[0]!;
-      expect(record.evaluationMode).toBe("SYNTHETIC_REPLAY");
-      // Fails closed: cannot replay execution without causal entry reserves
-      expect(record.eligibility.isEligible).toBe(false);
+      // Quote must NOT be attached to the valid decision!
+      expect(results[0]!.quote).toBeUndefined();
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(results[0]!.eligibility.rejectionReasons).toContain(
+        "SYNTHETIC_REPLAY_MISSING_QUOTE: synthetic replay requires an executable quote record",
+      );
+    });
+
+    it("RF-D2.2: quarantines duplicate quote identities instead of silently overwriting", () => {
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
+      const decision = createMockDecision({ eventId: "dec-dup-1" });
+
+      const quoteA: ExecutableQuoteRecord = {
+        quoteId: "quote-A",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        inputMint: WSOL_MINT,
+        outputMint: decision.mintAddress,
+        inAmountRaw: "100000000",
+        inAmountUi: 0.1,
+        expectedOutAmountRaw: "1000000000",
+        expectedOutAmountUi: 1000,
+        minimumOutAmountRaw: "990000000",
+        minimumOutAmountUi: 990,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1792000001000,
+        quoteReceivedMs: 1792000001050,
+        contextSlot: 100,
+        validUntilMs: 1792000011000,
+      };
+
+      const quoteB: ExecutableQuoteRecord = {
+        ...quoteA,
+        quoteId: "quote-B-DUPLICATE",
+      };
+
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [],
+        quotes: [quoteA, quoteB], // DUPLICATE ON SAME COMPOSITE KEY!
+        allowUnfinalizedSession: true,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.isDuplicateQuarantined).toBe(true);
+      expect(results[0]!.quote).toBeUndefined(); // Quarantined
+      expect(results[0]!.eligibility.isEligible).toBe(false);
       expect(
-        record.eligibility.rejectionReasons.some((r) =>
-          r.includes("NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"),
+        results[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("DUPLICATE_IDENTITY_QUARANTINED"),
         ),
       ).toBe(true);
     });
-  });
 
-  describe("RF-D2: Fail-Closed Eligibility Gating & Exact Financial Accounting", () => {
-    it("RF-D2.1: fails closed when forward observation has mismatched pool ID", () => {
-      const record: Omit<JoinedResearchRecord, "eligibility"> = {
-        joinId: "join-test",
-        sessionId: "session-test-1",
-        generationId: "gen-1",
-        decisionEventId: "dec-1",
-        mintAddress: "TokenMint111111111111111111111111111111111111",
-        poolId: "pool-tracked-alpha",
-        symbol: "TEST",
-        decisionTimestampMs: 1792000001000,
-        sourceTimestampMs: 1792000000000,
-        ingestionTimestampMs: 1792000000500,
-        decisionCohort: "EXECUTED_BUY",
-        strategyRevision: "strategy-v1",
-        evaluationMode: "OBSERVATIONAL_ONLY",
-        trajectoryLinkStatus: "EXPLICIT_LINK",
-        features: extractDecisionFeatures(createMockDecision()),
-        forwardObservations: [
-          createMockObservation({
-            poolId: "pool-tracked-alpha",
-            actualResponsePoolId: "mismatched-pool-beta", // POOL MISMATCH!
-          }),
-        ],
-      };
+    it("RF-D2.3: enforces session finality and rejects unfinalized or interrupted sessions", () => {
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
+      const decision = createMockDecision();
 
-      const result = evaluateResearchEligibility(record);
-      expect(result.isEligible).toBe(false);
+      // Case 1: No session metadata provided -> fails closed
+      const res1 = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [],
+      });
+      expect(res1[0]!.eligibility.isEligible).toBe(false);
       expect(
-        result.rejectionReasons.some((r) => r.includes("FORWARD_OBSERVATION_POOL_MISMATCH")),
+        res1[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("SESSION_INTERRUPTED_OR_UNFINALIZED"),
+        ),
+      ).toBe(true);
+
+      // Case 2: Interrupted session -> fails closed
+      const interruptedMeta = createMockMeta({ isInterruptedSession: true });
+      const interruptedSummary = createMockSummary({
+        isInterruptedSession: true,
+        isCompleteSession: false,
+      });
+      const res2 = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [],
+        sessionMeta: interruptedMeta,
+        sessionSummary: interruptedSummary,
+      });
+      expect(res2[0]!.sessionStatus).toBe("INTERRUPTED");
+      expect(res2[0]!.eligibility.isEligible).toBe(false);
+
+      // Case 3: Exploratory override -> allows unfinalized session with warning
+      const res3 = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [],
+        allowUnfinalizedSession: true,
+      });
+      expect(res3[0]!.eligibility.isEligible).toBe(true);
+      expect(
+        res3[0]!.eligibility.warnings.some((w) =>
+          w.includes("OBSERVATIONAL_EXPLORATION_UNFINALIZED_SESSION"),
+        ),
       ).toBe(true);
     });
 
-    it("RF-D2.2: links exact StratifiedSamplingRecord and preserves sampling probability metadata", () => {
+    it("RF-D2.4: verifies full shared composite identities and causal order across quote and fill in SYNTHETIC_REPLAY", () => {
+      const decision = createMockDecision();
+      const preObs = createMockObservation({
+        sourceTimestampMs: 1792000000500,
+        ingestionTimestampMs: 1792000000800,
+        responseReceivedMs: 1792000000800,
+      });
+
+      const validQuote: ExecutableQuoteRecord = {
+        quoteId: "quote-1",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        inputMint: WSOL_MINT,
+        outputMint: decision.mintAddress,
+        inAmountRaw: "100000000",
+        inAmountUi: 0.1,
+        expectedOutAmountRaw: "1000000000",
+        expectedOutAmountUi: 1000,
+        minimumOutAmountRaw: "990000000",
+        minimumOutAmountUi: 990,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1792000001000,
+        quoteReceivedMs: 1792000001050,
+        contextSlot: 100,
+        validUntilMs: 1792000011000,
+      };
+
+      // Fill whose timestamp is BEFORE quote initiated time (causal time inversion!)
+      const invertedFill: SimulatedFillRecord = {
+        fillId: "fill-inverted",
+        quoteId: validQuote.quoteId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.1,
+        filledSizeSol: 0.1,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.0001,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 0,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000000900, // BEFORE quote initiation (1792000001000)!
+        fillSlot: 100,
+        executionDelayMs: 50,
+      };
+
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "SYNTHETIC_REPLAY" });
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [preObs],
+        quotes: [validQuote],
+        fills: [invertedFill],
+        sessionMeta: createMockMeta(),
+        sessionSummary: createMockSummary(),
+        mode: "SYNTHETIC_REPLAY",
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(
+        results[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("FILL_CAUSAL_TIME_INVERSION"),
+        ),
+      ).toBe(true);
+    });
+
+    it("RF-D2.5: links exact StratifiedSamplingRecord and preserves sampling probability metadata", () => {
       const joiner = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
       const decision = createMockDecision({ eventId: "dec-strat-1" });
       const samplingRecord: StratifiedSamplingRecord = {
@@ -335,6 +662,7 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         decisions: [decision],
         observations: [],
         samplingRecords: [samplingRecord],
+        allowUnfinalizedSession: true,
       });
 
       expect(results).toHaveLength(1);
@@ -347,103 +675,27 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
       expect(meta!.ipwEstimable).toBe(true);
     });
 
-    it("RF-D2.3: computes exact signed negative cash flow on fee-dominated dust exits without double-debiting priority fees", () => {
-      // Mock a sell fill returning 1 lamport gross proceeds and 15,000 lamports network fee (5000 base + 10000 priority)
-      const mockSellFill: SimulatedFillRecord = {
-        fillId: "fill-dust-1",
-        quoteId: "quote-dust-1",
-        decisionEventId: "dec-1",
-        mintAddress: "TokenMint111111111111111111111111111111111111",
-        poolId: "pool-amm-1",
-        priceTier: "TIER_4_SIMULATED_FILL",
-        providerIdentity: "synthetic_amm_reserve",
-        side: "SELL",
-        executionOutcome: "FILLED",
-        attemptedSizeSol: 0.001,
-        filledSizeSol: 0.0, // 12.94-C zero-clipped
-        attemptedTokens: 1000,
-        filledTokens: 1000,
-        remainingTokens: 0,
-        effectivePriceSol: 0.000000001,
-        grossProceedsSol: 0.000000001, // 1 lamport gross
-        netProceedsSol: 0.0, // 12.94-C clamped
-        priceImpactBps: 50,
-        maxSlippageBps: 200,
-        realizedSlippageBps: 10,
-        networkFeeLamports: 15_000, // external fee = 15,000 lamports (base + priority)
-        priorityFeeLamports: 10_000, // component already inside networkFeeLamports
-        ataRentDepositLamports: 0,
-        ataRentRefundLamports: 0,
-        sellabilityStatus: "FULLY_SELLABLE",
-        fillTimestampMs: 1792000060000,
-        fillSlot: 100,
-        executionDelayMs: 250,
-      };
+    it("RF-D2.6: quarantines duplicate fill records on the same quote composite key", () => {
+      const joiner = new TelemetryExecutionJoinEngine({ mode: "SYNTHETIC_REPLAY" });
+      const decision = createMockDecision({ eventId: "dec-dup-fill" });
+      const preObs = createMockObservation({
+        sourceTimestampMs: 1792000000500,
+        ingestionTimestampMs: 1792000000800,
+        responseReceivedMs: 1792000000800,
+      });
 
-      const accounting = computeResearchFinancialAccounting(mockSellFill);
-
-      // External network fee is 15,000 lamports = 0.000015 SOL
-      expect(accounting.externalNetworkFeeLamports).toBe(15_000);
-      expect(accounting.externalNetworkFeeSol).toBe(0.000015);
-      expect(accounting.priorityFeeLamports).toBe(10_000);
-
-      // Signed net cash movement: 1 lamport - 15,000 lamports = -14,999 lamports = -0.000014999 SOL
-      // Priority fee is NOT subtracted a second time!
-      expect(accounting.signedNetCashFlowSol).toBeCloseTo(-0.000014999, 9);
-      expect(accounting.isSubmarginalDust).toBe(true);
-      expect(accounting.financialState).toBe("REALIZED_LIQUIDATION");
-    });
-
-    it("RF-D2.4: preserves full unsold inventory and zero network gas on PREFLIGHT_SIMULATION_REJECTED", () => {
-      const mockPreflightRejectFill: SimulatedFillRecord = {
-        fillId: "fill-preflight-1",
-        quoteId: "quote-1",
-        decisionEventId: "dec-1",
-        mintAddress: "TokenMint111111111111111111111111111111111111",
-        poolId: "pool-amm-1",
-        priceTier: "TIER_4_SIMULATED_FILL",
-        providerIdentity: "synthetic_amm_reserve",
-        side: "SELL",
-        executionOutcome: "PREFLIGHT_SIMULATION_REJECTED",
-        attemptedSizeSol: 0.5,
-        filledSizeSol: 0,
-        attemptedTokens: 50_000,
-        filledTokens: 0,
-        remainingTokens: 50_000, // 100% inventory preserved!
-        effectivePriceSol: 0,
-        grossProceedsSol: 0,
-        netProceedsSol: 0,
-        priceImpactBps: 3500,
-        maxSlippageBps: 500,
-        realizedSlippageBps: 0,
-        networkFeeLamports: 0, // Preflight simulation charges zero gas
-        priorityFeeLamports: 0,
-        sellabilityStatus: "UNSELLABLE_EXCESSIVE_IMPACT",
-        conservativeWriteDownSol: 0.5,
-        fillTimestampMs: 1792000060000,
-        fillSlot: 101,
-        executionDelayMs: 50,
-      };
-
-      const accounting = computeResearchFinancialAccounting(mockPreflightRejectFill);
-      expect(accounting.financialState).toBe("PREFLIGHT_REJECTION");
-      expect(accounting.signedNetCashFlowSol).toBe(0);
-      expect(accounting.unrealizedImpairmentSol).toBe(0.5);
-    });
-
-    it("RF-D2.5: rejects synthetic replay on unsupported MULTI_HOP or CROSS_POOL_DIVERGENCE quotes", () => {
-      const mockMultiHopQuote: ExecutableQuoteRecord = {
-        quoteId: "quote-multihop-1",
-        sessionId: "session-test-1",
-        generationId: "gen-1",
-        decisionEventId: "dec-1",
-        mintAddress: "TokenMint111111111111111111111111111111111111",
-        poolId: "pool-amm-1",
+      const quote: ExecutableQuoteRecord = {
+        quoteId: "quote-fill-dup",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
         priceTier: "TIER_2_POOL_RESERVE",
         providerIdentity: "synthetic_amm_reserve",
         side: "BUY",
         inputMint: WSOL_MINT,
-        outputMint: "TokenMint111111111111111111111111111111111111",
+        outputMint: decision.mintAddress,
         inAmountRaw: "100000000",
         inAmountUi: 0.1,
         expectedOutAmountRaw: "1000000000",
@@ -454,13 +706,163 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         maxSlippageBps: 100,
         poolInternalFeeLamports: 250_000,
         poolInternalFeeSol: 0.00025,
-        routeType: "MULTI_HOP", // MULTI-HOP!
+        routeType: "DIRECT_TRACKED_POOL",
         routePlan: [],
         quoteInitiatedMs: 1792000001000,
         quoteReceivedMs: 1792000001050,
         contextSlot: 100,
         validUntilMs: 1792000011000,
       };
+
+      const fillA: SimulatedFillRecord = {
+        fillId: "fill-A",
+        quoteId: quote.quoteId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.1,
+        filledSizeSol: 0.1,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.0001,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 0,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000001100,
+        fillSlot: 100,
+        executionDelayMs: 50,
+      };
+
+      const fillB: SimulatedFillRecord = {
+        ...fillA,
+        fillId: "fill-B-DUPLICATE",
+      };
+
+      const results = joiner.joinTelemetryAndExecution({
+        decisions: [decision],
+        observations: [preObs],
+        quotes: [quote],
+        fills: [fillA, fillB], // DUPLICATE FILL!
+        sessionMeta: createMockMeta(),
+        sessionSummary: createMockSummary(),
+        mode: "SYNTHETIC_REPLAY",
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.isDuplicateQuarantined).toBe(true);
+      expect(results[0]!.fill).toBeUndefined(); // Quarantined
+      expect(results[0]!.eligibility.isEligible).toBe(false);
+      expect(
+        results[0]!.eligibility.rejectionReasons.some((r) =>
+          r.includes("DUPLICATE_IDENTITY_QUARANTINED"),
+        ),
+      ).toBe(true);
+    });
+
+    it("RF-D2.7: determines session status correctly from meta and summary", () => {
+      expect(determineSessionStatus(null, null)).toBe("UNFINALIZED");
+      expect(
+        determineSessionStatus(createMockMeta({ isInterruptedSession: true }), createMockSummary()),
+      ).toBe("INTERRUPTED");
+      expect(determineSessionStatus(createMockMeta(), createMockSummary())).toBe("FINALIZED");
+    });
+  });
+
+  describe("D1-AUD-03: Temporal Causality & Anti-Lookahead Boundaries", () => {
+    it("RF-D3.1: rejects decision lookahead when ingestionTimestampMs > decisionTimestampMs", () => {
+      const decision = createMockDecision({
+        decisionTimestampMs: 1792000001000,
+        sourceTimestampMs: 1792000000000,
+        ingestionTimestampMs: 1792000002000, // 1000ms AFTER decision!
+      });
+
+      const features = extractDecisionFeatures(decision);
+      // All decision features must be marked unavailable
+      expect(features.liquidityUsd.isAvailable).toBe(false);
+      expect(features.liquidityUsd.unavailabilityReason).toBe("LATE_RECEIPT_LOOKAHEAD_PREVENTION");
+      expect(features.marketCapUsd.isAvailable).toBe(false);
+
+      const record: Omit<JoinedResearchRecord, "eligibility"> = {
+        joinId: "join-test",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        symbol: decision.symbol,
+        decisionTimestampMs: decision.decisionTimestampMs,
+        sourceTimestampMs: decision.sourceTimestampMs,
+        ingestionTimestampMs: decision.ingestionTimestampMs,
+        decisionCohort: decision.decisionCohort,
+        strategyRevision: decision.strategyRevision,
+        evaluationMode: "OBSERVATIONAL_ONLY",
+        trajectoryLinkStatus: "NO_OBSERVATIONS_FOUND",
+        sessionStatus: "FINALIZED",
+        features,
+        forwardObservations: [],
+      };
+
+      const eligibility = evaluateResearchEligibility(record, { allowUnfinalizedSession: true });
+      expect(eligibility.isEligible).toBe(false);
+      expect(
+        eligibility.rejectionReasons.some((r) => r.includes("DECISION_LOOKAHEAD_LEAKAGE")),
+      ).toBe(true);
+    });
+
+    it("RF-D3.2: rejects decision with impossible negative ingestion lag", () => {
+      const decision = createMockDecision({
+        sourceTimestampMs: 1792000005000,
+        ingestionTimestampMs: 1792000001000, // -4000ms lag! Inverted timestamps!
+        decisionTimestampMs: 1792000006000,
+      });
+
+      const features = extractDecisionFeatures(decision);
+      expect(features.liquidityUsd.isAvailable).toBe(false);
+      expect(features.liquidityUsd.unavailabilityReason).toBe("IMPOSSIBLE_TIMESTAMP_ORDERING");
+
+      const record: Omit<JoinedResearchRecord, "eligibility"> = {
+        joinId: "join-test",
+        sessionId: decision.sessionId,
+        generationId: decision.generationId,
+        decisionEventId: decision.eventId,
+        mintAddress: decision.mintAddress,
+        poolId: decision.poolId,
+        symbol: decision.symbol,
+        decisionTimestampMs: decision.decisionTimestampMs,
+        sourceTimestampMs: decision.sourceTimestampMs,
+        ingestionTimestampMs: decision.ingestionTimestampMs,
+        decisionCohort: decision.decisionCohort,
+        strategyRevision: decision.strategyRevision,
+        evaluationMode: "OBSERVATIONAL_ONLY",
+        trajectoryLinkStatus: "NO_OBSERVATIONS_FOUND",
+        sessionStatus: "FINALIZED",
+        features,
+        forwardObservations: [],
+      };
+
+      const eligibility = evaluateResearchEligibility(record, { allowUnfinalizedSession: true });
+      expect(eligibility.isEligible).toBe(false);
+      expect(
+        eligibility.rejectionReasons.some((r) => r.includes("IMPOSSIBLE_TIMESTAMP_ORDERING")),
+      ).toBe(true);
+    });
+
+    it("RF-D3.3: fails closed on stale forward observation exceeding MAX_DATA_FRESHNESS", () => {
+      const staleObs = createMockObservation({
+        dataFreshnessMs: 250_000, // 250s exceeds 180s limit!
+      });
 
       const record: Omit<JoinedResearchRecord, "eligibility"> = {
         joinId: "join-test",
@@ -475,16 +877,401 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         ingestionTimestampMs: 1792000000500,
         decisionCohort: "EXECUTED_BUY",
         strategyRevision: "strategy-v1",
-        evaluationMode: "SYNTHETIC_REPLAY",
-        trajectoryLinkStatus: "EXPLICIT_LINK",
+        evaluationMode: "OBSERVATIONAL_ONLY",
+        trajectoryLinkStatus: "UNIQUELY_INFERRED",
+        sessionStatus: "FINALIZED",
         features: extractDecisionFeatures(createMockDecision()),
-        quote: mockMultiHopQuote,
-        forwardObservations: [],
+        forwardObservations: [staleObs],
       };
 
-      const result = evaluateResearchEligibility(record, { mode: "SYNTHETIC_REPLAY" });
+      const result = evaluateResearchEligibility(record, { allowUnfinalizedSession: true });
       expect(result.isEligible).toBe(false);
-      expect(result.rejectionReasons).toContain("UNSUPPORTED_ROUTE_TYPE: MULTI_HOP");
+      expect(result.rejectionReasons.some((r) => r.includes("FORWARD_OBSERVATION_STALE"))).toBe(
+        true,
+      );
+    });
+  });
+
+  describe("D1-AUD-04: BUY/SELL Financial Accounting Symmetry", () => {
+    it("RF-D4.1: computes signed negative cash flow and OPEN_POSITION state on successful BUY", () => {
+      const mockBuyFill: SimulatedFillRecord = {
+        fillId: "fill-buy-1",
+        quoteId: "quote-buy-1",
+        decisionEventId: "dec-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.5,
+        filledSizeSol: 0.5,
+        attemptedTokens: 500_000,
+        filledTokens: 500_000,
+        remainingTokens: 500_000,
+        effectivePriceSol: 0.000001,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: 25,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 5,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 2_039_280,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000001100,
+        fillSlot: 100,
+        executionDelayMs: 100,
+      };
+
+      const accounting = computeResearchFinancialAccounting(mockBuyFill);
+
+      expect(accounting.side).toBe("BUY");
+      expect(accounting.financialState).toBe("OPEN_POSITION");
+      // 0.5 SOL = 500,000,000 lamports. Total debit = 500,000,000 + 15,000 + 2,039,280 = 502,054,280 lamports
+      expect(accounting.signedNetCashFlowLamports).toBe(-502054280n);
+      expect(accounting.signedNetCashFlowSol).toBeCloseTo(-0.50205428, 8);
+      expect(accounting.capitalTiedUpSol).toBeCloseTo(0.50203928, 8);
+    });
+
+    it("RF-D4.2: computes zero cash debit on PREFLIGHT_SIMULATION_REJECTED BUY", () => {
+      const mockPreflightBuyFill: SimulatedFillRecord = {
+        fillId: "fill-buy-reject",
+        quoteId: "quote-1",
+        decisionEventId: "dec-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "PREFLIGHT_SIMULATION_REJECTED",
+        attemptedSizeSol: 0.5,
+        filledSizeSol: 0,
+        attemptedTokens: 500_000,
+        filledTokens: 0,
+        remainingTokens: 0,
+        effectivePriceSol: 0,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: 0,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 0,
+        networkFeeLamports: 0,
+        priorityFeeLamports: 0,
+        sellabilityStatus: "UNSELLABLE_NO_ROUTE",
+        fillTimestampMs: 1792000001100,
+        fillSlot: 100,
+        executionDelayMs: 50,
+      };
+
+      const accounting = computeResearchFinancialAccounting(mockPreflightBuyFill);
+      expect(accounting.financialState).toBe("PREFLIGHT_REJECTION");
+      expect(accounting.signedNetCashFlowLamports).toBe(0n);
+      expect(accounting.signedNetCashFlowSol).toBe(0);
+    });
+
+    it("RF-D4.3: does not infer SELL cost basis from token quantity", () => {
+      const mockSellFill: SimulatedFillRecord = {
+        fillId: "fill-sell-1",
+        quoteId: "quote-sell-1",
+        decisionEventId: "dec-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "SELL",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0,
+        filledSizeSol: 0,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.0001,
+        grossProceedsSol: 0.1,
+        netProceedsSol: 0.1,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 0,
+        ataRentRefundLamports: 2_039_280,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000060000,
+        fillSlot: 101,
+        executionDelayMs: 100,
+      };
+
+      const quote: ExecutableQuoteRecord = {
+        quoteId: "quote-sell-1",
+        sessionId: "session-test-1",
+        generationId: "gen-1",
+        decisionEventId: "dec-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_2_POOL_RESERVE",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "SELL",
+        inputMint: "TokenMint111111111111111111111111111111111111",
+        outputMint: WSOL_MINT,
+        inAmountRaw: "1000000000",
+        inAmountUi: 1000, // 1000 TOKENS!
+        expectedOutAmountRaw: "100000000",
+        expectedOutAmountUi: 0.1,
+        minimumOutAmountRaw: "99000000",
+        minimumOutAmountUi: 0.099,
+        priceImpactPct: 0.01,
+        maxSlippageBps: 100,
+        poolInternalFeeLamports: 250_000,
+        poolInternalFeeSol: 0.00025,
+        routeType: "DIRECT_TRACKED_POOL",
+        routePlan: [],
+        quoteInitiatedMs: 1792000060000,
+        quoteReceivedMs: 1792000060050,
+        contextSlot: 101,
+        validUntilMs: 1792000070000,
+      };
+
+      // Called without initialTotalOutlaySol option
+      const accounting = computeResearchFinancialAccounting(mockSellFill, quote);
+      expect(accounting.side).toBe("SELL");
+      // capitalTiedUpSol must be undefined, NEVER 1000 SOL!
+      expect(accounting.capitalTiedUpSol).toBeUndefined();
+    });
+
+    it("RF-D4.4: executes complete Buy / Hold / Sell cash-and-inventory waterfall", () => {
+      // 1. BUY: 0.1 SOL outlay, 15k fee, 2,039,280 ATA deposit -> 100,000 tokens
+      const buyFill: SimulatedFillRecord = {
+        fillId: "fill-buy",
+        quoteId: "quote-buy",
+        decisionEventId: "dec-buy",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "BUY",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.1,
+        filledSizeSol: 0.1,
+        attemptedTokens: 100_000,
+        filledTokens: 100_000,
+        remainingTokens: 100_000,
+        effectivePriceSol: 0.000001,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: 10,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 2,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 2_039_280,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000001000,
+        fillSlot: 100,
+        executionDelayMs: 50,
+      };
+
+      const buyAccounting = computeResearchFinancialAccounting(buyFill);
+      expect(buyAccounting.financialState).toBe("OPEN_POSITION");
+      expect(buyAccounting.signedNetCashFlowSol).toBeCloseTo(-0.10205428, 8);
+
+      // 2. SELL: sell all 100,000 tokens for 0.15 SOL gross, 15k fee, ATA refund credit 2,039,280 lamports
+      const sellFill: SimulatedFillRecord = {
+        fillId: "fill-sell",
+        quoteId: "quote-sell",
+        decisionEventId: "dec-sell",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "SELL",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0,
+        filledSizeSol: 0,
+        attemptedTokens: 100_000,
+        filledTokens: 100_000,
+        remainingTokens: 0, // 100% liquidated
+        effectivePriceSol: 0.0000015,
+        grossProceedsSol: 0.15,
+        netProceedsSol: 0.15,
+        priceImpactBps: 15,
+        maxSlippageBps: 100,
+        realizedSlippageBps: 3,
+        networkFeeLamports: 15_000,
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 0,
+        ataRentRefundLamports: 2_039_280, // ATA REFUND CREDIT!
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000060000,
+        fillSlot: 105,
+        executionDelayMs: 50,
+      };
+
+      const sellAccounting = computeResearchFinancialAccounting(sellFill, undefined, {
+        initialTotalOutlaySol: Math.abs(buyAccounting.signedNetCashFlowSol),
+      });
+
+      expect(sellAccounting.financialState).toBe("REALIZED_LIQUIDATION");
+      // Gross 0.15 SOL = 150,000,000 lamports - 15,000 lamports fee + 2,039,280 lamports ATA refund = +152,024,280 lamports
+      expect(sellAccounting.signedNetCashFlowLamports).toBe(152024280n);
+      expect(sellAccounting.signedNetCashFlowSol).toBeCloseTo(0.15202428, 8);
+
+      // Total round-trip cash movement: -0.10205428 + 0.15202428 = +0.04997000 SOL
+      const roundTripSol = buyAccounting.signedNetCashFlowSol + sellAccounting.signedNetCashFlowSol;
+      expect(roundTripSol).toBeCloseTo(0.04997, 8);
+    });
+
+    it("RF-D4.5: preserves signed negative cash flow in atomic lamports on fee-dominated dust exits", () => {
+      const mockDustFill: SimulatedFillRecord = {
+        fillId: "fill-dust-1",
+        quoteId: "quote-dust-1",
+        decisionEventId: "dec-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: "synthetic_amm_reserve",
+        side: "SELL",
+        executionOutcome: "FILLED",
+        attemptedSizeSol: 0.001,
+        filledSizeSol: 0.0,
+        attemptedTokens: 1000,
+        filledTokens: 1000,
+        remainingTokens: 0,
+        effectivePriceSol: 0.000000001,
+        grossProceedsSol: 0.000000001, // 1 lamport gross proceeds
+        netProceedsSol: 0.0,
+        priceImpactBps: 50,
+        maxSlippageBps: 200,
+        realizedSlippageBps: 10,
+        networkFeeLamports: 15_000, // 15,000 lamports fee
+        priorityFeeLamports: 10_000,
+        ataRentDepositLamports: 0,
+        ataRentRefundLamports: 0,
+        sellabilityStatus: "FULLY_SELLABLE",
+        fillTimestampMs: 1792000060000,
+        fillSlot: 100,
+        executionDelayMs: 250,
+      };
+
+      const accounting = computeResearchFinancialAccounting(mockDustFill);
+
+      expect(accounting.isSubmarginalDust).toBe(true);
+      expect(accounting.financialState).toBe("REALIZED_LIQUIDATION");
+      // 1 lamport - 15,000 lamports = -14,999 lamports
+      expect(accounting.signedNetCashFlowLamports).toBe(-14999n);
+      expect(accounting.signedNetCashFlowSol).toBeCloseTo(-0.000014999, 9);
+    });
+  });
+
+  describe("D1-AUD-05: Readiness Audit Validity on Synthetic Filesystem Fixture", () => {
+    it("RF-D5.1: does not falsely claim feasibility on placeholder or unverified data in audit script", () => {
+      // Recreate auditor's exact reproduction scenario in an isolated temporary directory
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-readiness-test-"));
+      const tempTelemetryDir = path.join(tempDir, "telemetry", "sessions");
+      const tempLegacyDir = path.join(tempDir, "sessions");
+      const sessionDir = path.join(tempTelemetryDir, "test-session-1");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.mkdirSync(tempLegacyDir, { recursive: true });
+
+      const reportPath = path.join(tempDir, "AUDIT_REPORT.md");
+
+      // 1. Candidate decision with liquidityUsd = 0 (PLACEHOLDER), buys5m = 10 (no sells or volume)
+      const decisionRecord: CandidateDecisionRecord = {
+        eventId: "dec-1",
+        sessionId: "test-session-1",
+        generationId: "gen-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        symbol: "TEST",
+        sourceTimestampMs: 1792000000000,
+        ingestionTimestampMs: 1792000000500,
+        decisionTimestampMs: 1792000001000,
+        strategyRevision: "strategy-v1",
+        decisionCohort: "EXECUTED_BUY",
+        filterEvaluations: [],
+        metricsSnapshot: {
+          tokenAgeSec: 100,
+          liquidityUsd: 0,
+          marketCapUsd: 10_000,
+          lmcRatio: 0.1,
+          lpBurnPct: null,
+          spotPriceUsd: 0.0001,
+          spotPriceSol: 0.000001,
+          volume5mUsd: null, // MISSING
+          txCount5m: null,
+          buys5m: 10,
+          sells5m: null, // MISSING (no co-occurrence)
+          metricProvenance: {
+            liquidityUsd: "PLACEHOLDER", // PLACEHOLDER!
+          },
+        },
+        missingFields: [],
+        providerIdentity: "dexscreener",
+      };
+      fs.writeFileSync(
+        path.join(sessionDir, "candidate-decisions.jsonl"),
+        JSON.stringify(decisionRecord) + "\n",
+      );
+
+      // 2. Mismatched-pool FUTURE reserve observation (should NOT trigger H1 or verified pool)
+      const futureObs = {
+        observationId: "obs-future",
+        sessionId: "test-session-1",
+        generationId: "gen-1",
+        mintAddress: "TokenMint111111111111111111111111111111111111",
+        poolId: "pool-amm-1",
+        actualResponsePoolId: "mismatched-pool-999", // MISMATCHED POOL!
+        sourceTimestampMs: 1792000060000, // FUTURE (post-decision)
+        ingestionTimestampMs: 1792000060200,
+        responseReceivedMs: 1792000060200,
+        dataFreshnessMs: 500,
+        liquidityMetrics: {
+          baseReserve: 100000,
+          quoteReserve: 10,
+          liquidityUsd: 5000,
+        },
+        missingFields: [],
+        strategyRevision: "strategy-v1",
+      };
+      fs.writeFileSync(
+        path.join(sessionDir, "market-observations.jsonl"),
+        JSON.stringify(futureObs) + "\n",
+      );
+
+      // 3. Deliberately malformed fill line
+      fs.writeFileSync(
+        path.join(sessionDir, "simulated-fills.jsonl"),
+        "{ invalid json corruption line\n",
+      );
+
+      // Run readiness audit against this fixture
+      const auditResult = runReadinessAudit({
+        rootDir: tempDir,
+        telemetrySessionsDir: tempTelemetryDir,
+        legacySessionsDir: tempLegacyDir,
+        reportOutputPath: reportPath,
+      });
+
+      // Assertions matching Auditor D1-AUD-05 requirements:
+      // 1. PLACEHOLDER liquidityUsd is NOT counted as available
+      // 2. observationsWithVerifiedPool is 0
+      expect(auditResult.observationsWithVerifiedPool).toBe(0);
+      // 3. decisionsWithUsablePreDecisionReserves is 0
+      expect(auditResult.decisionsWithUsablePreDecisionReserves).toBe(0);
+      // 4. H1, H2, H3, H4 are all INELIGIBLE (no false FEASIBLE claims!)
+      expect(auditResult.h1Feasible).toBe(false);
+      expect(auditResult.h2Feasible).toBe(false);
+      expect(auditResult.h3Feasible).toBe(false);
+      expect(auditResult.h4Feasible).toBe(false);
+      // 5. Malformed record is recorded
+      expect(auditResult.totalMalformedRecordsCount).toBe(1);
+      // 6. Overall status remains INSUFFICIENT_EVIDENCE
+      expect(auditResult.overallReadinessStatus).toContain("INSUFFICIENT_EVIDENCE");
+
+      // Clean up fixture
+      fs.rmSync(tempDir, { recursive: true, force: true });
     });
   });
 });

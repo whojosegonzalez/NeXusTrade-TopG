@@ -45,6 +45,8 @@ export type UnavailabilityReason =
   | "RESERVE_QUANTITY_ZERO_OR_NONFINITE"
   | "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT"
   | "LATE_RECEIPT_LOOKAHEAD_PREVENTION"
+  | "IMPOSSIBLE_TIMESTAMP_ORDERING"
+  | "DUPLICATE_IDENTITY_QUARANTINED"
   | "SESSION_INTERRUPTED_OR_UNFINALIZED"
   | "AMBIGUOUS_TRAJECTORY_MULTIPLE_DECISIONS";
 
@@ -66,6 +68,7 @@ export interface ProvenanceFeature<T = number> {
  */
 export type TrajectoryLinkStatus =
   | "EXPLICIT_LINK"
+  | "UNIQUELY_INFERRED"
   | "AMBIGUOUS_TRAJECTORY"
   | "UNLINKED_ORPHAN"
   | "NO_OBSERVATIONS_FOUND";
@@ -105,9 +108,12 @@ export interface ResearchSamplingMetadata {
 
 /**
  * Offline research financial accounting.
- * Computes exact signed cash movements and distinguishes realized from marked-to-model outcomes.
+ * Computes exact signed cash movements in atomic lamports and SOL,
+ * distinguishes BUY inventory acquisitions from SELL liquidations,
+ * and preserves signed cash flow on fee-dominated dust exits.
  */
 export interface ResearchFinancialAccounting {
+  readonly side: "BUY" | "SELL";
   readonly executionOutcome: ExecutionOutcome;
   readonly sellabilityStatus: SellabilityStatus;
   readonly attemptedSizeSol: number;
@@ -123,16 +129,21 @@ export interface ResearchFinancialAccounting {
   readonly ataRentDepositLamports: number;
   readonly ataRentRefundLamports: number;
   /**
-   * Exact signed net cash flow in SOL from the transaction:
-   * GrossProceeds - ExternalNetworkFees - AtaRentDeposits + AtaRentRefunds.
-   * Can be negative if fees exceed gross proceeds.
+   * Authoritative signed net cash movement in atomic lamports:
+   * For BUY: -buyOutlayLamports - externalNetworkFeeLamports - ataDepositLamports + ataRefundLamports
+   * For SELL: grossProceedsLamports - externalNetworkFeeLamports - ataDepositLamports + ataRefundLamports
+   */
+  readonly signedNetCashFlowLamports: bigint;
+  /**
+   * Signed net cash flow in SOL (derived from signedNetCashFlowLamports / 1e9).
    */
   readonly signedNetCashFlowSol: number;
   readonly isSubmarginalDust: boolean;
   readonly markedToModelPnlSol?: number | undefined;
-  readonly capitalTiedUpSol: number;
+  readonly capitalTiedUpSol?: number | undefined;
   readonly unrealizedImpairmentSol: number;
   readonly financialState:
+    | "OPEN_POSITION"
     | "REALIZED_LIQUIDATION"
     | "UNREALIZED_HOLDING"
     | "PREFLIGHT_REJECTION"
@@ -179,6 +190,10 @@ export interface JoinedResearchRecord {
 
   // Sampling & Design Metadata
   readonly samplingMetadata?: ResearchSamplingMetadata | undefined;
+
+  // Session Finalization & Deduplication State
+  readonly sessionStatus?: "FINALIZED" | "INTERRUPTED" | "UNFINALIZED" | undefined;
+  readonly isDuplicateQuarantined?: boolean | undefined;
 
   // Offline Financial Accounting (if quote/fill modeled)
   readonly financialAccounting?: ResearchFinancialAccounting | undefined;

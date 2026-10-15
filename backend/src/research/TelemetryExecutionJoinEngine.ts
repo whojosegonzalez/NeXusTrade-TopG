@@ -2,14 +2,18 @@
  * Phase 12.94-D: Telemetry-Execution Point-in-Time Join Engine
  *
  * Implements event-specific causal data joining, deterministic ambiguity handling,
- * anti-lookahead feature boundary enforcement, and mode-aware research linking.
+ * anti-lookahead feature boundary enforcement, composite identity verification,
+ * duplicate record quarantining, and mode-aware research linking.
  */
 
-import type {
-  CandidateDecisionRecord,
-  MarketObservationRecord,
-  MetricProvenance,
-  StratifiedSamplingRecord,
+import {
+  isVerifiedMatchingPool,
+  type CandidateDecisionRecord,
+  type MarketObservationRecord,
+  type MetricProvenance,
+  type SessionTelemetryMeta,
+  type SessionTelemetrySummary,
+  type StratifiedSamplingRecord,
 } from "../telemetry/TelemetryTypes.js";
 import type { ExecutableQuoteRecord, SimulatedFillRecord } from "../execution/ExecutionTypes.js";
 import type {
@@ -20,9 +24,11 @@ import type {
   ResearchEvaluationMode,
   ResearchSamplingMetadata,
   TrajectoryLinkStatus,
+  UnavailabilityReason,
 } from "./ResearchTypes.js";
 import {
   computeResearchFinancialAccounting,
+  determineSessionStatus,
   evaluateResearchEligibility,
 } from "./ResearchEligibilityGate.js";
 
@@ -40,7 +46,19 @@ function createProvenanceFeature(
   sourceTimestampMs: number | undefined,
   receiptTimestampMs: number | undefined,
   fallbackProvenance: ProvenanceClass = "OBSERVED",
+  unavailabilityOverride?: UnavailabilityReason | undefined,
 ): ProvenanceFeature<number> {
+  if (unavailabilityOverride) {
+    return {
+      value: null,
+      provenance: "UNAVAILABLE",
+      isAvailable: false,
+      unavailabilityReason: unavailabilityOverride,
+      sourceTimestampMs,
+      receiptTimestampMs,
+    };
+  }
+
   if (fieldProvenance === "PLACEHOLDER") {
     return {
       value: value ?? null,
@@ -86,6 +104,8 @@ function createProvenanceFeature(
 /**
  * Extracts the complete decision-time feature vector from a decision record and
  * any strictly causal pre-decision observation.
+ * Enforces strict temporal ordering: all decision features require max(t_src, t_ing) <= t_dec
+ * and non-negative ingestion lag (t_ing >= t_src).
  */
 export function extractDecisionFeatures(
   decision: CandidateDecisionRecord,
@@ -97,12 +117,25 @@ export function extractDecisionFeatures(
   const tSrc = decision.sourceTimestampMs;
   const tIng = decision.ingestionTimestampMs;
 
+  // Strict temporal causality verification for decision-time features
+  let decisionFeatureUnavailability: UnavailabilityReason | undefined;
+  if (!Number.isFinite(tDec) || !Number.isFinite(tSrc) || !Number.isFinite(tIng)) {
+    decisionFeatureUnavailability = "PROVIDER_RESPONSE_OMITTED_FIELD";
+  } else if (tIng > tDec || tSrc > tDec) {
+    // Lookahead leakage: decision-time snapshot ingested or sourced AFTER decision time!
+    decisionFeatureUnavailability = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+  } else if (tIng < tSrc) {
+    // Impossible negative ingestion lag
+    decisionFeatureUnavailability = "IMPOSSIBLE_TIMESTAMP_ORDERING";
+  }
+
   const tokenAgeSec = createProvenanceFeature(
     s.tokenAgeSec,
     p["tokenAgeSec"],
     tSrc,
     tIng,
     "DERIVED",
+    decisionFeatureUnavailability,
   );
   const liquidityUsd = createProvenanceFeature(
     s.liquidityUsd,
@@ -110,6 +143,7 @@ export function extractDecisionFeatures(
     tSrc,
     tIng,
     "OBSERVED",
+    decisionFeatureUnavailability,
   );
   const marketCapUsd = createProvenanceFeature(
     s.marketCapUsd,
@@ -117,15 +151,31 @@ export function extractDecisionFeatures(
     tSrc,
     tIng,
     "OBSERVED",
+    decisionFeatureUnavailability,
   );
-  const lmcRatio = createProvenanceFeature(s.lmcRatio, p["lmcRatio"], tSrc, tIng, "DERIVED");
-  const lpBurnPct = createProvenanceFeature(s.lpBurnPct, p["lpBurnPct"], tSrc, tIng, "OBSERVED");
+  const lmcRatio = createProvenanceFeature(
+    s.lmcRatio,
+    p["lmcRatio"],
+    tSrc,
+    tIng,
+    "DERIVED",
+    decisionFeatureUnavailability,
+  );
+  const lpBurnPct = createProvenanceFeature(
+    s.lpBurnPct,
+    p["lpBurnPct"],
+    tSrc,
+    tIng,
+    "OBSERVED",
+    decisionFeatureUnavailability,
+  );
   const spotPriceUsd = createProvenanceFeature(
     s.spotPriceUsd,
     p["spotPriceUsd"],
     tSrc,
     tIng,
     "OBSERVED",
+    decisionFeatureUnavailability,
   );
   const spotPriceSol = createProvenanceFeature(
     s.spotPriceSol,
@@ -133,6 +183,7 @@ export function extractDecisionFeatures(
     tSrc,
     tIng,
     "OBSERVED",
+    decisionFeatureUnavailability,
   );
   const volume5mUsd = createProvenanceFeature(
     s.volume5mUsd,
@@ -140,23 +191,61 @@ export function extractDecisionFeatures(
     tSrc,
     tIng,
     "OBSERVED",
+    decisionFeatureUnavailability,
   );
-  const txCount5m = createProvenanceFeature(s.txCount5m, p["txCount5m"], tSrc, tIng, "OBSERVED");
-  const buys5m = createProvenanceFeature(s.buys5m, p["buys5m"], tSrc, tIng, "OBSERVED");
-  const sells5m = createProvenanceFeature(s.sells5m, p["sells5m"], tSrc, tIng, "OBSERVED");
+  const txCount5m = createProvenanceFeature(
+    s.txCount5m,
+    p["txCount5m"],
+    tSrc,
+    tIng,
+    "OBSERVED",
+    decisionFeatureUnavailability,
+  );
+  const buys5m = createProvenanceFeature(
+    s.buys5m,
+    p["buys5m"],
+    tSrc,
+    tIng,
+    "OBSERVED",
+    decisionFeatureUnavailability,
+  );
+  const sells5m = createProvenanceFeature(
+    s.sells5m,
+    p["sells5m"],
+    tSrc,
+    tIng,
+    "OBSERVED",
+    decisionFeatureUnavailability,
+  );
 
-  // Pre-decision reserve extraction: MUST satisfy max(source, ingest, recv) <= decisionTimestampMs
+  // Pre-decision reserve extraction:
+  // MUST satisfy: verified matching pool AND max(source, ingest, recv) <= decisionTimestampMs
   let baseReserve: ProvenanceFeature<number>;
   let quoteReserve: ProvenanceFeature<number>;
   let top10ConcentrationPct: ProvenanceFeature<number>;
   let devHoldingPct: ProvenanceFeature<number>;
 
-  if (
+  const obsRecv = preDecisionObs
+    ? (preDecisionObs.responseReceivedMs ?? preDecisionObs.ingestionTimestampMs)
+    : undefined;
+
+  const isPreDecisionValid =
     preDecisionObs &&
+    preDecisionObs.sessionId === decision.sessionId &&
+    preDecisionObs.generationId === decision.generationId &&
+    preDecisionObs.mintAddress === decision.mintAddress &&
+    preDecisionObs.poolId === decision.poolId &&
+    isVerifiedMatchingPool(preDecisionObs.actualResponsePoolId, decision.poolId) &&
+    Number.isFinite(preDecisionObs.sourceTimestampMs) &&
     preDecisionObs.sourceTimestampMs <= tDec &&
+    Number.isFinite(preDecisionObs.ingestionTimestampMs) &&
     preDecisionObs.ingestionTimestampMs <= tDec &&
-    (!preDecisionObs.responseReceivedMs || preDecisionObs.responseReceivedMs <= tDec)
-  ) {
+    preDecisionObs.sourceTimestampMs <= preDecisionObs.ingestionTimestampMs &&
+    obsRecv !== undefined &&
+    Number.isFinite(obsRecv) &&
+    obsRecv <= tDec;
+
+  if (isPreDecisionValid) {
     baseReserve = createProvenanceFeature(
       preDecisionObs.liquidityMetrics.baseReserve,
       undefined,
@@ -186,10 +275,19 @@ export function extractDecisionFeatures(
       "OBSERVED",
     );
   } else {
-    const reason =
-      preDecisionObs && preDecisionObs.ingestionTimestampMs > tDec
-        ? "LATE_RECEIPT_LOOKAHEAD_PREVENTION"
-        : "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT";
+    let reason: UnavailabilityReason = "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT";
+    if (preDecisionObs) {
+      if (!isVerifiedMatchingPool(preDecisionObs.actualResponsePoolId, decision.poolId)) {
+        reason = "POOL_IDENTITY_MISMATCH_DISCARDED";
+      } else if (
+        preDecisionObs.ingestionTimestampMs > tDec ||
+        (obsRecv !== undefined && obsRecv > tDec)
+      ) {
+        reason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+      } else if (preDecisionObs.sourceTimestampMs > preDecisionObs.ingestionTimestampMs) {
+        reason = "IMPOSSIBLE_TIMESTAMP_ORDERING";
+      }
+    }
 
     baseReserve = {
       value: null,
@@ -249,7 +347,8 @@ export class TelemetryExecutionJoinEngine {
 
   /**
    * Joins candidate decisions with observations, quotes, fills, and sampling records.
-   * Deterministically handles trajectory ambiguity across repeated decisions for the same pool.
+   * Deterministically handles trajectory ambiguity across repeated decisions for the same pool,
+   * enforces composite identity joins, and quarantines duplicate records.
    */
   public joinTelemetryAndExecution(params: {
     readonly decisions: readonly CandidateDecisionRecord[];
@@ -257,6 +356,11 @@ export class TelemetryExecutionJoinEngine {
     readonly quotes?: readonly ExecutableQuoteRecord[] | undefined;
     readonly fills?: readonly SimulatedFillRecord[] | undefined;
     readonly samplingRecords?: readonly StratifiedSamplingRecord[] | undefined;
+    readonly sessionMeta?: SessionTelemetryMeta | undefined;
+    readonly sessionSummary?: SessionTelemetrySummary | undefined;
+    readonly sessionsMetaMap?: ReadonlyMap<string, SessionTelemetryMeta> | undefined;
+    readonly sessionsSummaryMap?: ReadonlyMap<string, SessionTelemetrySummary> | undefined;
+    readonly allowUnfinalizedSession?: boolean | undefined;
     readonly mode?: ResearchEvaluationMode | undefined;
   }): readonly JoinedResearchRecord[] {
     const mode = params.mode ?? this.defaultMode;
@@ -265,37 +369,59 @@ export class TelemetryExecutionJoinEngine {
     const samplingRecords = params.samplingRecords ?? [];
     const observations = params.observations;
 
-    // Index quotes by decisionEventId
-    const quotesByDecisionId = new Map<string, ExecutableQuoteRecord>();
+    // Index quotes by composite identity: (sessionId, generationId, mintAddress, poolId, decisionEventId)
+    // Detect duplicate identities and quarantine them instead of silently overwriting.
+    const quotesByCompositeKey = new Map<string, ExecutableQuoteRecord>();
+    const duplicateQuoteKeys = new Set<string>();
     for (const q of quotes) {
-      quotesByDecisionId.set(q.decisionEventId, q);
+      const key = `${q.sessionId}::${q.generationId}::${q.mintAddress}::${q.poolId}::${q.decisionEventId}`;
+      if (quotesByCompositeKey.has(key)) {
+        duplicateQuoteKeys.add(key);
+      } else {
+        quotesByCompositeKey.set(key, q);
+      }
     }
 
-    // Index fills by quoteId
-    const fillsByQuoteId = new Map<string, SimulatedFillRecord>();
+    // Index fills by composite quote identity: (mintAddress, poolId, quoteId) and optional session/generation
+    const fillsByCompositeKey = new Map<string, SimulatedFillRecord>();
+    const duplicateFillKeys = new Set<string>();
     for (const f of fills) {
-      fillsByQuoteId.set(f.quoteId, f);
+      const extF = f as unknown as { sessionId?: string; generationId?: string };
+      const sess = extF.sessionId ?? "";
+      const gen = extF.generationId ?? "";
+      const key = `${sess}::${gen}::${f.mintAddress}::${f.poolId}::${f.quoteId}`;
+      if (fillsByCompositeKey.has(key)) {
+        duplicateFillKeys.add(key);
+      } else {
+        fillsByCompositeKey.set(key, f);
+      }
     }
 
-    // Index sampling records by decisionEventId
-    const samplingByDecisionId = new Map<string, StratifiedSamplingRecord>();
+    // Index sampling records by composite identity: (sessionId, generationId, mintAddress, poolId, decisionEventId)
+    const samplingByCompositeKey = new Map<string, StratifiedSamplingRecord>();
+    const duplicateSamplingKeys = new Set<string>();
     for (const s of samplingRecords) {
-      samplingByDecisionId.set(s.decisionEventId, s);
+      const key = `${s.sessionId}::${s.generationId}::${s.mintAddress}::${s.poolId}::${s.decisionEventId}`;
+      if (samplingByCompositeKey.has(key)) {
+        duplicateSamplingKeys.add(key);
+      } else {
+        samplingByCompositeKey.set(key, s);
+      }
     }
 
-    // Group decisions by (sessionId, mintAddress, poolId) to detect same-pool decision multiplicity
+    // Group decisions by (sessionId, generationId, mintAddress, poolId) to detect same-pool decision multiplicity
     const decisionsByPool = new Map<string, CandidateDecisionRecord[]>();
     for (const d of params.decisions) {
-      const key = `${d.sessionId}::${d.mintAddress}::${d.poolId}`;
+      const key = `${d.sessionId}::${d.generationId}::${d.mintAddress}::${d.poolId}`;
       const list = decisionsByPool.get(key) ?? [];
       list.push(d);
       decisionsByPool.set(key, list);
     }
 
-    // Group observations by (sessionId, mintAddress, poolId)
+    // Group observations by (sessionId, generationId, mintAddress, poolId)
     const observationsByPool = new Map<string, MarketObservationRecord[]>();
     for (const o of observations) {
-      const key = `${o.sessionId}::${o.mintAddress}::${o.poolId}`;
+      const key = `${o.sessionId}::${o.generationId}::${o.mintAddress}::${o.poolId}`;
       const list = observationsByPool.get(key) ?? [];
       list.push(o);
       observationsByPool.set(key, list);
@@ -304,17 +430,24 @@ export class TelemetryExecutionJoinEngine {
     const results: JoinedResearchRecord[] = [];
 
     for (const decision of params.decisions) {
-      const poolKey = `${decision.sessionId}::${decision.mintAddress}::${decision.poolId}`;
+      const poolKey = `${decision.sessionId}::${decision.generationId}::${decision.mintAddress}::${decision.poolId}`;
       const samePoolDecisions = decisionsByPool.get(poolKey) ?? [decision];
       const poolObservations = observationsByPool.get(poolKey) ?? [];
 
-      // Find causal pre-decision observation (strictly max(source, ingest, recv) <= decisionTimestampMs)
+      // Find causal pre-decision observation (strictly verified pool and max(source, ingest, recv) <= decisionTimestampMs)
       let preDecisionObs: MarketObservationRecord | undefined;
       for (const obs of poolObservations) {
         const recv = obs.responseReceivedMs ?? obs.ingestionTimestampMs;
         if (
+          obs.sessionId === decision.sessionId &&
+          obs.generationId === decision.generationId &&
+          obs.mintAddress === decision.mintAddress &&
+          obs.poolId === decision.poolId &&
+          isVerifiedMatchingPool(obs.actualResponsePoolId, decision.poolId) &&
           obs.sourceTimestampMs <= decision.decisionTimestampMs &&
-          recv <= decision.decisionTimestampMs
+          obs.ingestionTimestampMs <= decision.decisionTimestampMs &&
+          recv <= decision.decisionTimestampMs &&
+          obs.sourceTimestampMs <= obs.ingestionTimestampMs
         ) {
           if (!preDecisionObs || obs.sourceTimestampMs > preDecisionObs.sourceTimestampMs) {
             preDecisionObs = obs;
@@ -329,20 +462,29 @@ export class TelemetryExecutionJoinEngine {
       let trajectoryLinkStatus: TrajectoryLinkStatus = "NO_OBSERVATIONS_FOUND";
       let forwardObservations: MarketObservationRecord[] = [];
 
-      // Filter observations strictly occurring after decision
+      // Filter observations strictly occurring at or after decision
       const afterDecisionObs = poolObservations.filter(
-        (o) => o.sourceTimestampMs >= decision.decisionTimestampMs,
+        (o) =>
+          o.sessionId === decision.sessionId &&
+          o.generationId === decision.generationId &&
+          o.mintAddress === decision.mintAddress &&
+          o.poolId === decision.poolId &&
+          o.sourceTimestampMs >= decision.decisionTimestampMs,
       );
 
       if (samePoolDecisions.length > 1) {
         // Multiple decisions for this same pool in this session!
-        // Auditor Requirement D-02:
-        // "MarketObservationRecord does not expose initiatingEventId. Never infer a unique parent decision
-        // for ambiguous same-pool observations. Overlapping trajectories must be classified as AMBIGUOUS_TRAJECTORY."
+        // Never infer a unique parent decision for ambiguous same-pool observations.
         trajectoryLinkStatus = "AMBIGUOUS_TRAJECTORY";
         forwardObservations = afterDecisionObs; // Retained for inspection, but flagged ambiguous!
       } else if (afterDecisionObs.length > 0) {
-        trajectoryLinkStatus = "EXPLICIT_LINK";
+        // Single decision on this pool.
+        // Check if there is an explicit initiating event link
+        const hasExplicitLink = afterDecisionObs.some(
+          (o) =>
+            (o as unknown as { initiatingEventId?: string }).initiatingEventId === decision.eventId,
+        );
+        trajectoryLinkStatus = hasExplicitLink ? "EXPLICIT_LINK" : "UNIQUELY_INFERRED";
         forwardObservations = afterDecisionObs.sort(
           (a, b) => a.sourceTimestampMs - b.sourceTimestampMs,
         );
@@ -351,12 +493,28 @@ export class TelemetryExecutionJoinEngine {
         forwardObservations = [];
       }
 
-      // Link Quote & Fill
-      const quote = quotesByDecisionId.get(decision.eventId);
-      const fill = quote ? fillsByQuoteId.get(quote.quoteId) : undefined;
+      // Link Quote & Fill with composite key & quarantine check
+      const decCompositeKey = `${decision.sessionId}::${decision.generationId}::${decision.mintAddress}::${decision.poolId}::${decision.eventId}`;
+      const isQuoteDuplicate = duplicateQuoteKeys.has(decCompositeKey);
+      const quote = isQuoteDuplicate ? undefined : quotesByCompositeKey.get(decCompositeKey);
+
+      let fill: SimulatedFillRecord | undefined;
+      let isFillDuplicate = false;
+      if (quote) {
+        const fCompositeKey = `${decision.sessionId}::${decision.generationId}::${decision.mintAddress}::${decision.poolId}::${quote.quoteId}`;
+        const fFallbackKey = `::::${decision.mintAddress}::${decision.poolId}::${quote.quoteId}`;
+        isFillDuplicate =
+          duplicateFillKeys.has(fCompositeKey) || duplicateFillKeys.has(fFallbackKey);
+        fill = isFillDuplicate
+          ? undefined
+          : (fillsByCompositeKey.get(fCompositeKey) ?? fillsByCompositeKey.get(fFallbackKey));
+      }
 
       // Link Sampling Metadata
-      const sampling = samplingByDecisionId.get(decision.eventId);
+      const isSamplingDuplicate = duplicateSamplingKeys.has(decCompositeKey);
+      const sampling = isSamplingDuplicate
+        ? undefined
+        : samplingByCompositeKey.get(decCompositeKey);
       let samplingMetadata: ResearchSamplingMetadata | undefined;
       if (sampling) {
         samplingMetadata = {
@@ -368,6 +526,17 @@ export class TelemetryExecutionJoinEngine {
           status: sampling.status,
         };
       }
+
+      const isDuplicateQuarantined = isQuoteDuplicate || isFillDuplicate || isSamplingDuplicate;
+
+      // Determine session finalization status
+      const sessionMeta = params.sessionsMetaMap?.get(decision.sessionId) ?? params.sessionMeta;
+      const sessionSummary =
+        params.sessionsSummaryMap?.get(decision.sessionId) ?? params.sessionSummary;
+      const sessionStatus =
+        sessionMeta || sessionSummary
+          ? determineSessionStatus(sessionMeta, sessionSummary)
+          : undefined;
 
       // Compute Financial Accounting if a fill is linked
       const financialAccounting = fill
@@ -394,11 +563,18 @@ export class TelemetryExecutionJoinEngine {
         fill,
         forwardObservations,
         samplingMetadata,
+        sessionStatus,
+        isDuplicateQuarantined,
         financialAccounting,
       };
 
       // Evaluate eligibility
-      const eligibility = evaluateResearchEligibility(recordWithoutEligibility, { mode });
+      const eligibility = evaluateResearchEligibility(recordWithoutEligibility, {
+        mode,
+        allowUnfinalizedSession: params.allowUnfinalizedSession,
+        sessionMeta,
+        sessionSummary,
+      });
 
       results.push({
         ...recordWithoutEligibility,

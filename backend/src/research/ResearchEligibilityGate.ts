@@ -6,7 +6,11 @@
  * or numerically ungrounded records without dropping them from full research denominators.
  */
 
-import { isVerifiedMatchingPool } from "../telemetry/TelemetryTypes.js";
+import {
+  isVerifiedMatchingPool,
+  type SessionTelemetryMeta,
+  type SessionTelemetrySummary,
+} from "../telemetry/TelemetryTypes.js";
 import type {
   JoinedResearchRecord,
   ResearchEligibilityResult,
@@ -26,12 +30,46 @@ export interface EligibilityGateOptions {
   readonly maxClockSkewMs?: number | undefined;
   readonly maxDataFreshnessMs?: number | undefined;
   readonly allowAmbiguousTrajectories?: boolean | undefined;
+  readonly allowUnfinalizedSession?: boolean | undefined;
+  readonly sessionMeta?: SessionTelemetryMeta | undefined;
+  readonly sessionSummary?: SessionTelemetrySummary | undefined;
+}
+
+/**
+ * Determines session finalization status from authoritative 12.94-B metadata and summary.
+ */
+export function determineSessionStatus(
+  meta?: SessionTelemetryMeta | null,
+  summary?: SessionTelemetrySummary | null,
+): "FINALIZED" | "INTERRUPTED" | "UNFINALIZED" {
+  if (!meta || !summary) {
+    if (meta?.isInterruptedSession || meta?.sessionStatus === "INTERRUPTED") {
+      return "INTERRUPTED";
+    }
+    return "UNFINALIZED";
+  }
+  if (meta.sessionId !== summary.sessionId) return "UNFINALIZED";
+  if (meta.generationId !== summary.generationId) return "UNFINALIZED";
+  if (meta.strategyRevision !== summary.strategyRevision) return "UNFINALIZED";
+
+  const isInterrupted =
+    Boolean(meta.isInterruptedSession) ||
+    meta.sessionStatus === "INTERRUPTED" ||
+    Boolean(summary.isInterruptedSession);
+
+  if (isInterrupted) return "INTERRUPTED";
+
+  if (summary.isCompleteSession === true && summary.closedAtIso) {
+    return "FINALIZED";
+  }
+
+  return "UNFINALIZED";
 }
 
 /**
  * Computes exact offline research financial accounting for a simulated fill.
- * Correctly preserves signed negative cash flow on fee-dominated dust exits
- * without double-debiting priority fees.
+ * Distinguishes BUY inventory acquisitions from SELL liquidations,
+ * tracks authoritative atomic lamport balance changes, and avoids double-debiting priority fees.
  */
 export function computeResearchFinancialAccounting(
   fill: SimulatedFillRecord,
@@ -41,43 +79,123 @@ export function computeResearchFinancialAccounting(
     readonly conservativeBidPriceSol?: number | undefined;
   } = {},
 ): ResearchFinancialAccounting {
-  const grossSolProceeds = fill.grossProceedsSol ?? 0;
+  const isBuy = fill.side === "BUY";
   const externalNetworkFeeLamports = fill.networkFeeLamports;
   const externalNetworkFeeSol = externalNetworkFeeLamports / LAMPORTS_PER_SOL;
   const priorityFeeLamports = fill.priorityFeeLamports;
   const ataRentDepositLamports = fill.ataRentDepositLamports ?? 0;
-  const ataRentDepositSol = ataRentDepositLamports / LAMPORTS_PER_SOL;
   const ataRentRefundLamports = fill.ataRentRefundLamports ?? 0;
-  const ataRentRefundSol = ataRentRefundLamports / LAMPORTS_PER_SOL;
 
-  // Signed net cash movement: GrossProceeds - ExternalFees - AtaDeposits + AtaRefunds
-  // externalNetworkFeeLamports already includes base and priority; priority is NOT subtracted again.
-  const signedNetCashFlowSol =
-    grossSolProceeds - externalNetworkFeeSol - ataRentDepositSol + ataRentRefundSol;
+  if (isBuy) {
+    // BUY Cash Accounting
+    const outlaySol =
+      fill.filledSizeSol > 0
+        ? fill.filledSizeSol
+        : quote
+          ? quote.inAmountUi
+          : fill.attemptedSizeSol;
+    const buyOutlayLamports = BigInt(Math.round(outlaySol * LAMPORTS_PER_SOL));
+    const netFeeLamports = BigInt(externalNetworkFeeLamports);
+    const ataDepositLamports = BigInt(ataRentDepositLamports);
+    const ataRefundLamports = BigInt(ataRentRefundLamports);
+
+    let signedNetCashFlowLamports = 0n;
+    let signedNetCashFlowSol = 0;
+    let financialState: ResearchFinancialAccounting["financialState"] = "OPEN_POSITION";
+
+    if (fill.executionOutcome === "PREFLIGHT_SIMULATION_REJECTED") {
+      financialState = "PREFLIGHT_REJECTION";
+      // Simulation rejection does not broadcast to cluster; zero gas debited
+      signedNetCashFlowLamports = 0n;
+      signedNetCashFlowSol = 0;
+    } else if (fill.executionOutcome === "SUBMITTED_TRANSACTION_FAILED") {
+      financialState = "SUBMITTED_FAILURE";
+      // On-chain failure: debits external fees and ATA deposit
+      signedNetCashFlowLamports = -netFeeLamports - ataDepositLamports + ataRefundLamports;
+      signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+    } else {
+      financialState =
+        fill.filledTokens > 0 || fill.remainingTokens > 0 ? "OPEN_POSITION" : "PREFLIGHT_REJECTION";
+      // Authoritative signed cash movement: -BuyOutlay - Fees - ATADeposit + ATARefund
+      signedNetCashFlowLamports =
+        -buyOutlayLamports - netFeeLamports - ataDepositLamports + ataRefundLamports;
+      signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+    }
+
+    const capitalTiedUpSol =
+      outlaySol + (Number(ataDepositLamports) - Number(ataRefundLamports)) / LAMPORTS_PER_SOL;
+    const unrealizedImpairmentSol = fill.conservativeWriteDownSol ?? 0;
+
+    return {
+      side: "BUY",
+      executionOutcome: fill.executionOutcome,
+      sellabilityStatus: fill.sellabilityStatus,
+      attemptedSizeSol: fill.attemptedSizeSol,
+      filledSizeSol: fill.filledSizeSol,
+      grossSolProceeds: 0,
+      externalNetworkFeeLamports,
+      externalNetworkFeeSol,
+      priorityFeeLamports,
+      ataRentDepositLamports,
+      ataRentRefundLamports,
+      signedNetCashFlowLamports,
+      signedNetCashFlowSol,
+      isSubmarginalDust: false,
+      capitalTiedUpSol,
+      unrealizedImpairmentSol,
+      financialState,
+    };
+  }
+
+  // SELL Cash Accounting
+  const grossSolProceeds = fill.grossProceedsSol ?? 0;
+  const grossProceedsLamports = BigInt(Math.round(grossSolProceeds * LAMPORTS_PER_SOL));
+  const netFeeLamports = BigInt(externalNetworkFeeLamports);
+  const ataDepositLamports = BigInt(ataRentDepositLamports);
+  const ataRefundLamports = BigInt(ataRentRefundLamports);
+
+  let signedNetCashFlowLamports = 0n;
+  let signedNetCashFlowSol = 0;
+  let financialState: ResearchFinancialAccounting["financialState"] = "REALIZED_LIQUIDATION";
+
+  if (fill.executionOutcome === "PREFLIGHT_SIMULATION_REJECTED") {
+    financialState = "PREFLIGHT_REJECTION";
+    signedNetCashFlowLamports = 0n;
+    signedNetCashFlowSol = 0;
+  } else if (fill.executionOutcome === "SUBMITTED_TRANSACTION_FAILED") {
+    financialState = "SUBMITTED_FAILURE";
+    signedNetCashFlowLamports = -netFeeLamports - ataDepositLamports + ataRefundLamports;
+    signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+  } else if (fill.remainingTokens > 0 && fill.filledTokens === 0) {
+    financialState = "UNREALIZED_HOLDING";
+    signedNetCashFlowLamports =
+      grossProceedsLamports - netFeeLamports - ataDepositLamports + ataRefundLamports;
+    signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+  } else if (fill.sellabilityStatus.startsWith("UNSELLABLE_")) {
+    financialState = "IMPAIRMENT_WRITE_DOWN";
+    signedNetCashFlowLamports =
+      grossProceedsLamports - netFeeLamports - ataDepositLamports + ataRefundLamports;
+    signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+  } else {
+    financialState = "REALIZED_LIQUIDATION";
+    signedNetCashFlowLamports =
+      grossProceedsLamports - netFeeLamports - ataDepositLamports + ataRefundLamports;
+    signedNetCashFlowSol = Number(signedNetCashFlowLamports) / LAMPORTS_PER_SOL;
+  }
 
   const isSubmarginalDust = grossSolProceeds > 0 && grossSolProceeds <= externalNetworkFeeSol;
 
-  let financialState: ResearchFinancialAccounting["financialState"] = "REALIZED_LIQUIDATION";
-  if (fill.executionOutcome === "PREFLIGHT_SIMULATION_REJECTED") {
-    financialState = "PREFLIGHT_REJECTION";
-  } else if (fill.executionOutcome === "SUBMITTED_TRANSACTION_FAILED") {
-    financialState = "SUBMITTED_FAILURE";
-  } else if (fill.remainingTokens > 0 && fill.filledTokens === 0) {
-    financialState = "UNREALIZED_HOLDING";
-  } else if (fill.sellabilityStatus.startsWith("UNSELLABLE_")) {
-    financialState = "IMPAIRMENT_WRITE_DOWN";
-  }
-
-  const capitalTiedUpSol =
-    options.initialTotalOutlaySol ?? (quote ? quote.inAmountUi + ataRentDepositSol : 0);
+  // Capital tied up for SELL MUST come from linked buy outlay, NEVER token units!
+  const capitalTiedUpSol = options.initialTotalOutlaySol ?? undefined;
   const unrealizedImpairmentSol = fill.conservativeWriteDownSol ?? 0;
 
   const markedToModelPnlSol =
-    options.conservativeBidPriceSol !== undefined
-      ? fill.remainingTokens * options.conservativeBidPriceSol - capitalTiedUpSol
+    options.conservativeBidPriceSol !== undefined && capitalTiedUpSol !== undefined
+      ? fill.remainingTokens * options.conservativeBidPriceSol + grossSolProceeds - capitalTiedUpSol
       : undefined;
 
   return {
+    side: "SELL",
     executionOutcome: fill.executionOutcome,
     sellabilityStatus: fill.sellabilityStatus,
     attemptedSizeSol: fill.attemptedSizeSol,
@@ -88,6 +206,7 @@ export function computeResearchFinancialAccounting(
     priorityFeeLamports,
     ataRentDepositLamports,
     ataRentRefundLamports,
+    signedNetCashFlowLamports,
     signedNetCashFlowSol,
     isSubmarginalDust,
     markedToModelPnlSol,
@@ -113,71 +232,180 @@ export function evaluateResearchEligibility(
   const rejectionReasons: string[] = [];
   const warnings: string[] = [];
 
-  // Gate 1: Trajectory Ambiguity
-  if (record.trajectoryLinkStatus === "AMBIGUOUS_TRAJECTORY" && !allowAmbiguous) {
-    rejectionReasons.push("AMBIGUOUS_TRAJECTORY_MULTIPLE_DECISIONS");
-  } else if (record.trajectoryLinkStatus === "AMBIGUOUS_TRAJECTORY") {
-    warnings.push("AMBIGUOUS_TRAJECTORY_OBSERVATIONS_SHARED");
+  // Gate 1: Duplicate Identity Quarantine
+  if (record.isDuplicateQuarantined) {
+    rejectionReasons.push(
+      "DUPLICATE_IDENTITY_QUARANTINED: composite key collision detected in quotes, fills, or sampling records",
+    );
   }
 
-  // Gate 2: Temporal Ingestion Lag and Clock Skew
+  // Gate 2: Session Finalization Check
+  const effectiveSessionStatus =
+    record.sessionStatus ??
+    (options.sessionMeta && options.sessionSummary
+      ? determineSessionStatus(options.sessionMeta, options.sessionSummary)
+      : "UNFINALIZED");
+
+  if (effectiveSessionStatus !== "FINALIZED") {
+    if (options.allowUnfinalizedSession) {
+      warnings.push(
+        `OBSERVATIONAL_EXPLORATION_UNFINALIZED_SESSION: proceeding under exploratory override (status: ${effectiveSessionStatus})`,
+      );
+    } else {
+      rejectionReasons.push(
+        `SESSION_INTERRUPTED_OR_UNFINALIZED: session is ${effectiveSessionStatus}, lacks verified complete finalization`,
+      );
+    }
+  }
+
+  // Gate 3: Trajectory Link Status
+  if (record.trajectoryLinkStatus === "AMBIGUOUS_TRAJECTORY") {
+    if (allowAmbiguous) {
+      warnings.push("AMBIGUOUS_TRAJECTORY_OBSERVATIONS_SHARED");
+    } else {
+      rejectionReasons.push(
+        "AMBIGUOUS_TRAJECTORY_MULTIPLE_DECISIONS: multiple decisions share this pool without explicit link",
+      );
+    }
+  } else if (record.trajectoryLinkStatus === "UNLINKED_ORPHAN") {
+    rejectionReasons.push(
+      "UNLINKED_ORPHAN_OBSERVATIONS: observations could not be causally attributed",
+    );
+  } else if (record.trajectoryLinkStatus === "UNIQUELY_INFERRED") {
+    warnings.push(
+      "TRAJECTORY_UNIQUELY_INFERRED: outcome linked by unique pool candidate without explicit initiating ID",
+    );
+  }
+
+  // Gate 4: Temporal Ingestion Lag, Clock Skew, and Decision-Time Ordering
+  if (record.ingestionTimestampMs > record.decisionTimestampMs) {
+    rejectionReasons.push(
+      `DECISION_LOOKAHEAD_LEAKAGE: decision ingestion (${record.ingestionTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
+    );
+  }
+  if (record.sourceTimestampMs > record.decisionTimestampMs) {
+    rejectionReasons.push(
+      `DECISION_LOOKAHEAD_LEAKAGE: decision source (${record.sourceTimestampMs}) occurred after decision (${record.decisionTimestampMs})`,
+    );
+  }
+
   const ingestionLag = record.ingestionTimestampMs - record.sourceTimestampMs;
-  if (ingestionLag > maxIngestionLag) {
+  if (ingestionLag < 0) {
+    rejectionReasons.push(
+      `IMPOSSIBLE_TIMESTAMP_ORDERING: negative ingestion lag (${ingestionLag}ms)`,
+    );
+  } else if (ingestionLag > maxIngestionLag) {
     rejectionReasons.push(
       `EXCESSIVE_INGESTION_LAG: ${ingestionLag}ms exceeds limit ${maxIngestionLag}ms`,
     );
   }
+
   const clockSkew = Math.abs(record.ingestionTimestampMs - record.decisionTimestampMs);
   if (clockSkew > maxClockSkew && Math.abs(ingestionLag) > maxClockSkew) {
     warnings.push(`POSSIBLE_CLOCK_SKEW: lag=${ingestionLag}ms`);
   }
 
-  // Gate 3: Forward Observation Quality
+  // Gate 5: Forward Observation Quality (Fail Closed on missing or mismatched pool ID and stale observations)
   for (let i = 0; i < record.forwardObservations.length; i++) {
     const obs = record.forwardObservations[i]!;
-    if (
-      obs.actualResponsePoolId &&
-      !isVerifiedMatchingPool(obs.actualResponsePoolId, record.poolId)
-    ) {
+
+    // Positive pool verification: missing OR mismatched pool ID fails closed!
+    if (!isVerifiedMatchingPool(obs.actualResponsePoolId, record.poolId)) {
       rejectionReasons.push(
-        `FORWARD_OBSERVATION_POOL_MISMATCH: obs[${i}] actual=${obs.actualResponsePoolId}, expected=${record.poolId}`,
+        `FORWARD_OBSERVATION_POOL_UNVERIFIED: obs[${i}] actual=${obs.actualResponsePoolId ?? "MISSING"}, expected=${record.poolId}`,
       );
     }
+
+    if (
+      obs.sessionId !== record.sessionId ||
+      obs.generationId !== record.generationId ||
+      obs.mintAddress !== record.mintAddress
+    ) {
+      rejectionReasons.push(
+        `FORWARD_OBSERVATION_IDENTITY_MISMATCH: obs[${i}] session/gen/mint does not match record composite key`,
+      );
+    }
+
     if (obs.dataFreshnessMs > maxFreshness) {
-      warnings.push(`FORWARD_OBSERVATION_STALE: obs[${i}] freshness=${obs.dataFreshnessMs}ms`);
+      rejectionReasons.push(
+        `FORWARD_OBSERVATION_STALE: obs[${i}] freshness=${obs.dataFreshnessMs}ms exceeds limit ${maxFreshness}ms`,
+      );
+    }
+
+    if (obs.sourceTimestampMs > obs.ingestionTimestampMs) {
+      rejectionReasons.push(
+        `FORWARD_OBSERVATION_IMPOSSIBLE_TIMESTAMPS: obs[${i}] source (${obs.sourceTimestampMs}) > ingestion (${obs.ingestionTimestampMs})`,
+      );
     }
   }
 
-  // Gate 4: Synthetic Replay Specific Checks
+  // Gate 6: Synthetic Replay Specific Checks
   if (mode === "SYNTHETIC_REPLAY") {
     // Requires verified pre-decision point-in-time reserve snapshot
     const baseReserve = record.features.baseReserve;
     const quoteReserve = record.features.quoteReserve;
 
     if (!baseReserve.isAvailable || baseReserve.value === null || baseReserve.value <= 0) {
-      rejectionReasons.push("NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT: baseReserve missing or zero");
+      rejectionReasons.push(
+        "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT: baseReserve missing, zero, or unverified",
+      );
     }
     if (!quoteReserve.isAvailable || quoteReserve.value === null || quoteReserve.value <= 0) {
-      rejectionReasons.push("NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT: quoteReserve missing or zero");
+      rejectionReasons.push(
+        "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT: quoteReserve missing, zero, or unverified",
+      );
     }
 
-    // Verify quote route integrity if a quote is linked
-    if (record.quote) {
-      if (record.quote.routeType !== "DIRECT_TRACKED_POOL") {
-        rejectionReasons.push(`UNSUPPORTED_ROUTE_TYPE: ${record.quote.routeType}`);
-      }
-      if (record.quote.poolId !== record.poolId) {
+    // Explicitly require quote in synthetic replay
+    if (!record.quote) {
+      rejectionReasons.push(
+        "SYNTHETIC_REPLAY_MISSING_QUOTE: synthetic replay requires an executable quote record",
+      );
+    } else {
+      const q = record.quote;
+      if (
+        q.sessionId !== record.sessionId ||
+        q.generationId !== record.generationId ||
+        q.mintAddress !== record.mintAddress ||
+        q.poolId !== record.poolId ||
+        q.decisionEventId !== record.decisionEventId
+      ) {
         rejectionReasons.push(
-          `QUOTE_POOL_MISMATCH: quote=${record.quote.poolId}, decision=${record.poolId}`,
+          `QUOTE_IDENTITY_MISMATCH: quote does not match decision composite identity`,
         );
       }
+      if (q.routeType !== "DIRECT_TRACKED_POOL") {
+        rejectionReasons.push(`UNSUPPORTED_ROUTE_TYPE: ${q.routeType}`);
+      }
     }
 
-    // Verify fill referential integrity if fill is linked
+    // Verify fill referential integrity and causal ordering if fill is linked
     if (record.fill && record.quote) {
-      if (record.fill.quoteId !== record.quote.quoteId) {
+      const f = record.fill;
+      const q = record.quote;
+      if (f.quoteId !== q.quoteId) {
         rejectionReasons.push(
-          `FILL_QUOTE_ID_MISMATCH: fill.quoteId=${record.fill.quoteId}, quote.quoteId=${record.quote.quoteId}`,
+          `FILL_QUOTE_ID_MISMATCH: fill.quoteId=${f.quoteId}, quote.quoteId=${q.quoteId}`,
+        );
+      }
+      const extF = f as unknown as { sessionId?: string; generationId?: string };
+      if (
+        (extF.sessionId && extF.sessionId !== record.sessionId) ||
+        (extF.generationId && extF.generationId !== record.generationId) ||
+        f.mintAddress !== record.mintAddress ||
+        f.poolId !== record.poolId ||
+        f.decisionEventId !== record.decisionEventId
+      ) {
+        rejectionReasons.push(
+          `FILL_IDENTITY_MISMATCH: fill does not match decision composite identity`,
+        );
+      }
+      if (f.side !== q.side) {
+        rejectionReasons.push(`FILL_SIDE_MISMATCH: fill.side=${f.side}, quote.side=${q.side}`);
+      }
+      if (f.fillTimestampMs < q.quoteInitiatedMs) {
+        rejectionReasons.push(
+          `FILL_CAUSAL_TIME_INVERSION: fill timestamp ${f.fillTimestampMs} preceded quote initiation ${q.quoteInitiatedMs}`,
         );
       }
     }
