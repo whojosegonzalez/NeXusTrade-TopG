@@ -130,8 +130,8 @@ export function toAtomicUnitsString(amount: number | string, decimals: number): 
         `[QuoteExecutionEngine] [INVALID_AMOUNT] Invalid numeric amount: ${String(amount)}`,
       );
     }
-    // Convert number to fixed decimal string
-    str = amount.toFixed(Math.min(18, Math.max(decimals, 8)));
+    // Convert number to fixed decimal string at target mint decimals
+    str = amount.toFixed(decimals);
     if (!CANONICAL_DECIMAL_REGEX.test(str)) {
       throw new Error(
         `[QuoteExecutionEngine] [INVALID_AMOUNT] Numeric amount produced non-canonical decimal string: '${str}'`,
@@ -157,6 +157,14 @@ export function toAtomicUnitsString(amount: number | string, decimals: number): 
   const fracBig = decimals > 0 ? BigInt(fracPart) : 0n;
   const multiplier = 10n ** BigInt(decimals);
   const total = wholeBig * multiplier + fracBig;
+
+  const isPositive = typeof amount === "number" ? amount > 0 : !/^[0.]*$/.test(str);
+  if (isPositive && total === 0n) {
+    throw new Error(
+      `[QuoteExecutionEngine] [SUBATOMIC_AMOUNT] Amount '${typeof amount === "string" ? amount : String(amount)}' is below minimum atomic precision (0 raw units for ${decimals} decimals)`,
+    );
+  }
+
   return total.toString();
 }
 
@@ -502,9 +510,25 @@ export function createDeterministicAmmQuote(
 
     const inAmountRaw = toAtomicUnitsString(params.tradeSizeSolOrTokens, 9);
     const expectedOutAmountRaw = toAtomicUnitsString(buyResult.tokensGross, decimals);
-    const minimumOutAmountRaw = toAtomicUnitsString(buyResult.tokensMinimum, decimals);
+    const minGross = Math.max(0, buyResult.tokensMinimum);
+    const minimumOutAmountRaw = toAtomicUnitsString(minGross, decimals);
 
-    const poolInternalFeeSol = params.tradeSizeSolOrTokens * dexFeeRate;
+    if (BigInt(inAmountRaw) <= 0n) {
+      throw new Error(
+        `[QuoteExecutionEngine] [SUBATOMIC_AMOUNT] Buy quote input SOL (${params.tradeSizeSolOrTokens}) truncates to 0 lamports`,
+      );
+    }
+    if (BigInt(expectedOutAmountRaw) <= 0n) {
+      throw new Error(
+        `[QuoteExecutionEngine] [SUBATOMIC_AMOUNT] Buy quote expected output tokens (${buyResult.tokensGross}) truncates to 0 atomic units`,
+      );
+    }
+
+    const inAmountUi = atomicToUiNumber(inAmountRaw, 9);
+    const expectedOutAmountUi = atomicToUiNumber(expectedOutAmountRaw, decimals);
+    const minimumOutAmountUi = atomicToUiNumber(minimumOutAmountRaw, decimals);
+
+    const poolInternalFeeSol = inAmountUi * dexFeeRate;
     const poolInternalFeeLamports = Math.round(poolInternalFeeSol * LAMPORTS_PER_SOL);
 
     return {
@@ -520,11 +544,11 @@ export function createDeterministicAmmQuote(
       inputMint: WSOL_MINT,
       outputMint: params.mintAddress,
       inAmountRaw,
-      inAmountUi: params.tradeSizeSolOrTokens,
+      inAmountUi,
       expectedOutAmountRaw,
-      expectedOutAmountUi: buyResult.tokensGross,
+      expectedOutAmountUi,
       minimumOutAmountRaw,
-      minimumOutAmountUi: buyResult.tokensMinimum,
+      minimumOutAmountUi,
       priceImpactPct: buyResult.priceImpactPct,
       maxSlippageBps,
       poolInternalFeeLamports,
@@ -548,9 +572,25 @@ export function createDeterministicAmmQuote(
 
     const inAmountRaw = toAtomicUnitsString(params.tradeSizeSolOrTokens, decimals);
     const expectedOutAmountRaw = toAtomicUnitsString(sellResult.solGross, 9);
-    const minimumOutAmountRaw = toAtomicUnitsString(sellResult.solMinimum, 9);
+    const minGross = Math.max(0, sellResult.solMinimum);
+    const minimumOutAmountRaw = toAtomicUnitsString(minGross, 9);
 
-    const poolInternalFeeSol = sellResult.solGross * dexFeeRate;
+    if (BigInt(inAmountRaw) <= 0n) {
+      throw new Error(
+        `[QuoteExecutionEngine] [SUBATOMIC_AMOUNT] Sell quote input tokens (${params.tradeSizeSolOrTokens}) truncates to 0 atomic units`,
+      );
+    }
+    if (BigInt(expectedOutAmountRaw) <= 0n) {
+      throw new Error(
+        `[QuoteExecutionEngine] [SUBATOMIC_AMOUNT] Sell quote expected output SOL (${sellResult.solGross}) truncates to 0 lamports`,
+      );
+    }
+
+    const inAmountUi = atomicToUiNumber(inAmountRaw, decimals);
+    const expectedOutAmountUi = atomicToUiNumber(expectedOutAmountRaw, 9);
+    const minimumOutAmountUi = atomicToUiNumber(minimumOutAmountRaw, 9);
+
+    const poolInternalFeeSol = expectedOutAmountUi * dexFeeRate;
     const poolInternalFeeLamports = Math.round(poolInternalFeeSol * LAMPORTS_PER_SOL);
 
     return {
@@ -566,11 +606,11 @@ export function createDeterministicAmmQuote(
       inputMint: params.mintAddress,
       outputMint: WSOL_MINT,
       inAmountRaw,
-      inAmountUi: params.tradeSizeSolOrTokens,
+      inAmountUi,
       expectedOutAmountRaw,
-      expectedOutAmountUi: sellResult.solGross,
+      expectedOutAmountUi,
       minimumOutAmountRaw,
-      minimumOutAmountUi: sellResult.solMinimum,
+      minimumOutAmountUi,
       priceImpactPct: sellResult.priceImpactPct,
       maxSlippageBps,
       poolInternalFeeLamports,
@@ -684,8 +724,16 @@ export function simulateFill(
       microLamportsPerCu: options.priorityFeeMicroLamports,
     });
 
-    // Check slippage breach
-    if (arrivalSlippageBps > quote.maxSlippageBps) {
+    const filledTokens = quote.expectedOutAmountUi * (1 - arrivalSlippageBps / 10000);
+    const effectivePriceSol = filledTokens > 0 ? quote.inAmountUi / filledTokens : 0;
+
+    // Check slippage breach or zero/non-finite token consideration
+    if (
+      arrivalSlippageBps > quote.maxSlippageBps ||
+      filledTokens <= 0 ||
+      !Number.isFinite(effectivePriceSol) ||
+      effectivePriceSol <= 0
+    ) {
       return {
         fillId,
         quoteId: quote.quoteId,
@@ -713,9 +761,6 @@ export function simulateFill(
         executionDelayMs,
       };
     }
-
-    const filledTokens = quote.expectedOutAmountUi * (1 - arrivalSlippageBps / 10000);
-    const effectivePriceSol = quote.inAmountUi / filledTokens;
 
     return {
       fillId,
@@ -823,7 +868,40 @@ export function simulateFill(
       };
     }
 
-    // 3. Failed Execution: Submitted Transaction Failed On-Chain (Pool Liquidity Collapse)
+    // 3. Failed Execution: Preflight Catastrophic Price Impact (UNSELLABLE_EXCESSIVE_IMPACT)
+    if (status === "UNSELLABLE_EXCESSIVE_IMPACT") {
+      return {
+        fillId,
+        quoteId: quote.quoteId,
+        decisionEventId: quote.decisionEventId,
+        mintAddress: quote.mintAddress,
+        poolId: quote.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: quote.providerIdentity,
+        side: "SELL",
+        executionOutcome: "PREFLIGHT_SIMULATION_REJECTED",
+        attemptedSizeSol: quote.expectedOutAmountUi,
+        filledSizeSol: 0,
+        attemptedTokens,
+        filledTokens: 0,
+        remainingTokens: attemptedTokens, // Inventory preserved!
+        effectivePriceSol: 0,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: Math.round(quote.priceImpactPct * 10000),
+        maxSlippageBps: quote.maxSlippageBps,
+        realizedSlippageBps: 0,
+        networkFeeLamports: 0, // Preflight rejects before submission
+        priorityFeeLamports: 0,
+        sellabilityStatus: status,
+        conservativeWriteDownSol: options.priorEntryCostSol ?? quote.expectedOutAmountUi,
+        fillTimestampMs,
+        fillSlot,
+        executionDelayMs,
+      };
+    }
+
+    // 4. Failed Execution: Submitted Transaction Failed On-Chain (Pool Liquidity Collapse)
     if (status === "UNSELLABLE_LIQUIDITY_DRAINED") {
       return {
         fillId,
@@ -856,8 +934,48 @@ export function simulateFill(
       };
     }
 
-    // 4. Failed Execution: Slippage Breach
-    if (arrivalSlippageBps > quote.maxSlippageBps || status === "UNSELLABLE_SLIPPAGE_EXCEEDED") {
+    // 5. Catch-all for any other unsellable status
+    if (status.startsWith("UNSELLABLE_") && status !== "UNSELLABLE_SLIPPAGE_EXCEEDED") {
+      return {
+        fillId,
+        quoteId: quote.quoteId,
+        decisionEventId: quote.decisionEventId,
+        mintAddress: quote.mintAddress,
+        poolId: quote.poolId,
+        priceTier: "TIER_4_SIMULATED_FILL",
+        providerIdentity: quote.providerIdentity,
+        side: "SELL",
+        executionOutcome: "PREFLIGHT_SIMULATION_REJECTED",
+        attemptedSizeSol: quote.expectedOutAmountUi,
+        filledSizeSol: 0,
+        attemptedTokens,
+        filledTokens: 0,
+        remainingTokens: attemptedTokens,
+        effectivePriceSol: 0,
+        grossProceedsSol: 0,
+        netProceedsSol: 0,
+        priceImpactBps: Math.round(quote.priceImpactPct * 10000),
+        maxSlippageBps: quote.maxSlippageBps,
+        realizedSlippageBps: 0,
+        networkFeeLamports: 0,
+        priorityFeeLamports: 0,
+        sellabilityStatus: status,
+        conservativeWriteDownSol: options.priorEntryCostSol ?? quote.expectedOutAmountUi,
+        fillTimestampMs,
+        fillSlot,
+        executionDelayMs,
+      };
+    }
+
+    const grossProceedsSol = quote.expectedOutAmountUi * (1 - arrivalSlippageBps / 10000);
+
+    // 6. Failed Execution: Slippage Breach or Zero Output Proceeds
+    if (
+      arrivalSlippageBps > quote.maxSlippageBps ||
+      status === "UNSELLABLE_SLIPPAGE_EXCEEDED" ||
+      grossProceedsSol <= 0 ||
+      !Number.isFinite(grossProceedsSol)
+    ) {
       return {
         fillId,
         quoteId: quote.quoteId,
@@ -888,8 +1006,7 @@ export function simulateFill(
       };
     }
 
-    // 5. Successful Liquidation (FILLED)
-    const grossProceedsSol = quote.expectedOutAmountUi * (1 - arrivalSlippageBps / 10000);
+    // 7. Successful Liquidation (FILLED)
     const netProceedsSol = Math.max(0, grossProceedsSol - feeBreakdown.totalOutOfPocketFeeSol);
     const effectivePriceSol = attemptedTokens > 0 ? grossProceedsSol / attemptedTokens : 0;
     const realizedPnlSol =
@@ -922,7 +1039,8 @@ export function simulateFill(
       priorityFeeLamports: feeBreakdown.priorityFeeLamports,
       ataRentDepositLamports: feeBreakdown.ataRentDepositLamports,
       ataRentRefundLamports: feeBreakdown.ataRentRefundLamports,
-      sellabilityStatus: status,
+      sellabilityStatus:
+        status === "HIGH_IMPACT_IMPAIRED" ? "HIGH_IMPACT_IMPAIRED" : "FULLY_SELLABLE",
       realizedPnlSol,
       fillTimestampMs,
       fillSlot,

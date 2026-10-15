@@ -362,6 +362,101 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
         "FULLY_SELLABLE",
       );
     });
+
+    it("rejects 100% adverse arrival slippage on BUY without creating zero-output fill or infinite price (Finding C3-02 Reproduction A)", () => {
+      const quote = createDeterministicAmmQuote({
+        sessionId: "session-rf3-100slip",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf3-100slip",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "BUY",
+        tradeSizeSolOrTokens: 0.5,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+        maxSlippageBps: 10000, // 100% permitted slippage
+      });
+
+      // Simulate with 100% adverse arrival slippage (10000 bps)
+      const fill = simulateFill(quote, {
+        decisionTimestampMs: 10_000,
+        decisionSlot: 100,
+        arrivalSlippageBps: 10000,
+      });
+
+      expect(fill.executionOutcome).toBe("SLIPPAGE_BREACH_REJECTED");
+      expect(fill.filledTokens).toBe(0);
+      expect(fill.effectivePriceSol).toBe(0);
+      expect(Number.isFinite(fill.effectivePriceSol)).toBe(true);
+      expect(fill.sellabilityStatus).toBe("UNSELLABLE_SLIPPAGE_EXCEEDED");
+      expect(fill.networkFeeLamports).toBe(0);
+    });
+
+    it("preserves unsold inventory and applies preflight rejection on UNSELLABLE_EXCESSIVE_IMPACT (Finding C3-02 Reproduction B)", () => {
+      const quote = createDeterministicAmmQuote({
+        sessionId: "session-rf3-excessive-impact",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf3-excessive-impact",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "SELL",
+        tradeSizeSolOrTokens: 5000,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      const fill = simulateFill(quote, {
+        decisionTimestampMs: 10_000,
+        decisionSlot: 100,
+        sellabilityStatus: "UNSELLABLE_EXCESSIVE_IMPACT",
+        priorEntryCostSol: 0.5,
+      });
+
+      expect(fill.executionOutcome).toBe("PREFLIGHT_SIMULATION_REJECTED");
+      expect(fill.filledTokens).toBe(0);
+      expect(fill.remainingTokens).toBe(5000); // Unsold inventory strictly preserved!
+      expect(fill.grossProceedsSol).toBe(0);
+      expect(fill.netProceedsSol).toBe(0);
+      expect(fill.networkFeeLamports).toBe(0); // Preflight abort does not submit on-chain
+      expect(fill.sellabilityStatus).toBe("UNSELLABLE_EXCESSIVE_IMPACT");
+      expect(fill.conservativeWriteDownSol).toBe(0.5);
+    });
+
+    it("permits HIGH_IMPACT_IMPAIRED sell execution as an impaired liquidation with preserved status (Finding C3-02)", () => {
+      const quote = createDeterministicAmmQuote({
+        sessionId: "session-rf3-high-impact-fill",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf3-high-impact-fill",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "SELL",
+        tradeSizeSolOrTokens: 5000,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      const fill = simulateFill(quote, {
+        decisionTimestampMs: 10_000,
+        decisionSlot: 100,
+        sellabilityStatus: "HIGH_IMPACT_IMPAIRED",
+      });
+
+      expect(fill.executionOutcome).toBe("FILLED");
+      expect(fill.filledTokens).toBe(5000);
+      expect(fill.remainingTokens).toBe(0);
+      expect(fill.sellabilityStatus).toBe("HIGH_IMPACT_IMPAIRED");
+      expect(fill.grossProceedsSol).toBeGreaterThan(0);
+      expect(fill.effectivePriceSol).toBeGreaterThan(0);
+    });
   });
 
   describe("RF-4: Complete Route Mint & Sequence Continuity (Finding C4)", () => {
@@ -880,6 +975,100 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
           tokenDecimals: TOKEN_DECIMALS,
         }),
       ).toThrow(/INVALID_PARAM/);
+    });
+
+    it("rejects subatomic BUY quote input that truncates to zero lamports (Finding C3-01 Reproduction A)", () => {
+      // 0.0000000001 SOL = 0.1 lamport (subatomic on Solana's 9-decimal lamport system)
+      expect(() =>
+        createDeterministicAmmQuote({
+          sessionId: "session-rf6-subatomic-buy",
+          generationId: "gen-1",
+          decisionEventId: "ev-rf6-subatomic-buy",
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          side: "BUY",
+          tradeSizeSolOrTokens: 0.0000000001,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          quoteInitiatedMs: 10_000,
+          contextSlot: 100,
+        }),
+      ).toThrow(/SUBATOMIC_AMOUNT/);
+    });
+
+    it("rejects subatomic SELL quote input that truncates to zero atomic tokens (Finding C3-01 Reproduction B)", () => {
+      // 0.00000001 tokens = 0.01 atomic units for a 6-decimal token (subatomic)
+      expect(() =>
+        createDeterministicAmmQuote({
+          sessionId: "session-rf6-subatomic-sell",
+          generationId: "gen-1",
+          decisionEventId: "ev-rf6-subatomic-sell",
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          side: "SELL",
+          tradeSizeSolOrTokens: 0.00000001,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          quoteInitiatedMs: 10_000,
+          contextSlot: 100,
+        }),
+      ).toThrow(/SUBATOMIC_AMOUNT/);
+    });
+
+    it("verifies bijective correspondence between raw atomic strings and UI amounts without contradiction (Finding C3-01)", () => {
+      // Valid BUY quote
+      const buyQuote = createDeterministicAmmQuote({
+        sessionId: "session-rf6-bijective-buy",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf6-bijective-buy",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "BUY",
+        tradeSizeSolOrTokens: 0.5,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      expect(BigInt(buyQuote.inAmountRaw)).toBeGreaterThan(0n);
+      expect(buyQuote.inAmountUi).toBe(atomicToUiNumber(buyQuote.inAmountRaw, 9));
+      expect(BigInt(buyQuote.expectedOutAmountRaw)).toBeGreaterThan(0n);
+      expect(buyQuote.expectedOutAmountUi).toBe(
+        atomicToUiNumber(buyQuote.expectedOutAmountRaw, TOKEN_DECIMALS),
+      );
+      expect(BigInt(buyQuote.minimumOutAmountRaw)).toBeGreaterThan(0n);
+      expect(buyQuote.minimumOutAmountUi).toBe(
+        atomicToUiNumber(buyQuote.minimumOutAmountRaw, TOKEN_DECIMALS),
+      );
+
+      // Valid SELL quote
+      const sellQuote = createDeterministicAmmQuote({
+        sessionId: "session-rf6-bijective-sell",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf6-bijective-sell",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "SELL",
+        tradeSizeSolOrTokens: 5000,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      expect(BigInt(sellQuote.inAmountRaw)).toBeGreaterThan(0n);
+      expect(sellQuote.inAmountUi).toBe(atomicToUiNumber(sellQuote.inAmountRaw, TOKEN_DECIMALS));
+      expect(BigInt(sellQuote.expectedOutAmountRaw)).toBeGreaterThan(0n);
+      expect(sellQuote.expectedOutAmountUi).toBe(
+        atomicToUiNumber(sellQuote.expectedOutAmountRaw, 9),
+      );
+      expect(BigInt(sellQuote.minimumOutAmountRaw)).toBeGreaterThan(0n);
+      expect(sellQuote.minimumOutAmountUi).toBe(atomicToUiNumber(sellQuote.minimumOutAmountRaw, 9));
     });
   });
 
