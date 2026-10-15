@@ -1,0 +1,38 @@
+{
+  "sessionId": "session-paper-12.90-day1.5",
+  "startedAt": "2026-10-11T00:02:38.170Z",
+  "endedAt": "2026-10-11T02:02:39.347Z",
+  "durationMinutes": 120,
+  "startingCapitalSol": 9.512400125856947,
+  "endingCapitalSol": 9.6216,
+  "netPnlSol": 0.1092,
+  "netPnlPct": 1.15,
+  "totalTrades": 1,
+  "buysCount": 1,
+  "sellsCount": 1,
+  "winsCount": 1,
+  "lossesCount": 0,
+  "scratchesCount": 0,
+  "winRatePct": 100,
+  "coinsWatchedCount": 30,
+  "missedOpportunitiesCount": 14,
+  "trades": [
+    {
+      "tradeId": "pos-3Y9QZ7TR3WUD1ZDsrjWe2uNAdXESZEBo2XacPw7Vpump-1791678149758",
+      "poolId": "pool-3Y9QZ7TR",
+      "mintAddress": "3Y9QZ7TR3WUD1ZDsrjWe2uNAdXESZEBo2XacPw7Vpump",
+      "symbol": "3Y9QZ7",
+      "entryPriceSol": 0.000004671053033164614,
+      "exitPriceSol": 0.000005010999999999999,
+      "sizeSol": 1,
+      "enteredAt": "2026-10-11T00:22:29.758Z",
+      "exitedAt": "2026-10-11T00:26:14.910Z",
+      "holdDurationSeconds": 225,
+      "peakGainBps": 1092,
+      "finalPnlBps": 1092,
+      "finalPnlSol": 0.1092,
+      "exitReason": "RATCHET_TIER_1_BREACH",
+      "finalTier": "BASELINE"
+    }
+  ]
+}

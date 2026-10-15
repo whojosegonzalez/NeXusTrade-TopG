@@ -1,0 +1,20 @@
+{
+  "sessionId": "session-paper-12.87-01",
+  "startedAt": "2026-10-01T01:57:52.880Z",
+  "endedAt": "2026-10-01T01:57:52.880Z",
+  "durationMinutes": 1,
+  "startingCapitalSol": 10.875754718736589,
+  "endingCapitalSol": 10.8758,
+  "netPnlSol": 0,
+  "netPnlPct": 0,
+  "totalTrades": 0,
+  "buysCount": 0,
+  "sellsCount": 0,
+  "winsCount": 0,
+  "lossesCount": 0,
+  "scratchesCount": 0,
+  "winRatePct": 0,
+  "coinsWatchedCount": 93,
+  "missedOpportunitiesCount": 0,
+  "trades": []
+}

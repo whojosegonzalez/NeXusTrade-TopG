@@ -1,0 +1,251 @@
+{
+  "generatedAt": "2026-10-13T22:39:07.964Z",
+  "totalCandidatesObserved": 41,
+  "executedBuysCount": 2,
+  "watchlistRadarCount": 4,
+  "filteredRejectedCount": 35,
+  "missedWinnersCount": 20,
+  "avoidedRugsCount": 4,
+  "portfolioStartSol": 8.0815,
+  "portfolioCurrentSol": 7.925865397361086,
+  "portfolioRealizedPnlSol": -0.15563460263891393,
+  "missedWinners": [
+    {
+      "symbol": "FLOYD",
+      "mintAddress": "Gjd3JUbNG2C3n5Ww98SfPxyWaqvDk2BkiKongGwEpump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "EXCEEDED_MAX_ESTABLISHED_AGE_2H",
+      "initialPriceSol": 0.000006186428571428571,
+      "peakPriceSol": 0.001069,
+      "peakGainPct": 17179.76,
+      "durationMinutes": 77
+    },
+    {
+      "symbol": "ceal",
+      "mintAddress": "HhzB1ZQfmjK1NuMQAaFiXBEWZ1Zri98xtVG1De6Epump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "EXCEEDED_MAX_WATCHLIST_AGE_60M",
+      "initialPriceSol": 0.0000010228571428571429,
+      "peakPriceSol": 0.0001444,
+      "peakGainPct": 14017.32,
+      "durationMinutes": 65
+    },
+    {
+      "symbol": "BOME",
+      "mintAddress": "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 5.3412635850845975e-8,
+      "peakPriceSol": 0.000007466,
+      "peakGainPct": 13877.97,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "HATCH",
+      "mintAddress": "BKyNf5bEzJoVwvmghMfSvcNTpgLwapFz9VYkT78epump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+      "initialPriceSol": 2.5992857142857144e-7,
+      "peakPriceSol": 0.0000273,
+      "peakGainPct": 10402.89,
+      "durationMinutes": 33
+    },
+    {
+      "symbol": "mians",
+      "mintAddress": "BPWzNz2eY4Y5pVxGEf93V5BNfj5xdr6xKn9s92bUpump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+      "initialPriceSol": 2.0971428571428573e-7,
+      "peakPriceSol": 0.000004581,
+      "peakGainPct": 2084.4,
+      "durationMinutes": 67
+    },
+    {
+      "symbol": "CATESEM",
+      "mintAddress": "EkNTepoK82LoNErKteeyj1iJ86aPWDUcZKjmAY8mpump",
+      "cohort": "WATCHLIST_RADAR",
+      "initialPriceSol": 2.835e-7,
+      "peakPriceSol": 6.289285714285715e-7,
+      "peakGainPct": 121.84,
+      "durationMinutes": 13
+    },
+    {
+      "symbol": "PEDRO",
+      "mintAddress": "FY6CZ5JZMYcKfboBYKqqBVkhbknfjUELqAFiq2Qupump",
+      "cohort": "WATCHLIST_RADAR",
+      "initialPriceSol": 9.12142857142857e-7,
+      "peakPriceSol": 0.0000018907142857142855,
+      "peakGainPct": 107.28,
+      "durationMinutes": 32
+    },
+    {
+      "symbol": "wizardcat",
+      "mintAddress": "4GPXDygw6Ye7Y14usEefHM42GJXXsbCnBhkb4N84pump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 3.577142857142857e-7,
+      "peakPriceSol": 6.399285714285715e-7,
+      "peakGainPct": 78.89,
+      "durationMinutes": 16
+    },
+    {
+      "symbol": "GLITCH",
+      "mintAddress": "GZxVWTF6dze5Pw61g5oXxub7kYK2e4UzBpUwqVnMpump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 1.4864285714285714e-7,
+      "peakPriceSol": 2.657857142857143e-7,
+      "peakGainPct": 78.81,
+      "durationMinutes": 12
+    },
+    {
+      "symbol": "CARDS",
+      "mintAddress": "CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.001965120206484005,
+      "peakPriceSol": 0.002605,
+      "peakGainPct": 32.56,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "USD1",
+      "mintAddress": "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.0071387365654198235,
+      "peakPriceSol": 0.009359,
+      "peakGainPct": 31.1,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "GOOGLx",
+      "mintAddress": "XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 2.535582703905559,
+      "peakPriceSol": 3.3198,
+      "peakGainPct": 30.93,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "NVDAx",
+      "mintAddress": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 1.6382312532869991,
+      "peakPriceSol": 2.1446,
+      "peakGainPct": 30.91,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "CRCLx",
+      "mintAddress": "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.6037483031155624,
+      "peakPriceSol": 0.7898,
+      "peakGainPct": 30.82,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "SPCX",
+      "mintAddress": "SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 1.1203626449517854,
+      "peakPriceSol": 1.4655,
+      "peakGainPct": 30.81,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "METAx",
+      "mintAddress": "Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 5.475572224771249,
+      "peakPriceSol": 7.1536,
+      "peakGainPct": 30.65,
+      "durationMinutes": 78
+    },
+    {
+      "symbol": "WILDCAT",
+      "mintAddress": "AU11rdYp4oMN3k2zorp14d7VUn4aZETuMcQ4VZtJWcJH",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.0071085714285714285,
+      "peakPriceSol": 0.009239,
+      "peakGainPct": 29.97,
+      "durationMinutes": 73
+    },
+    {
+      "symbol": "METY",
+      "mintAddress": "6xFKa6tmiT3uwyBHZtVgnsDYCiC5KtaRhawGYoF77T22",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 1.1364285714285713e-7,
+      "peakPriceSol": 1.4535714285714285e-7,
+      "peakGainPct": 27.91,
+      "durationMinutes": 10
+    },
+    {
+      "symbol": "KOL",
+      "mintAddress": "A2xYfGhZ55h7n2GzzJNtyL31osqwJKnQsPj98pttpump",
+      "cohort": "WATCHLIST_RADAR",
+      "initialPriceSol": 6.753571428571428e-7,
+      "peakPriceSol": 8.414285714285714e-7,
+      "peakGainPct": 24.59,
+      "durationMinutes": 14
+    },
+    {
+      "symbol": "YILONGMA",
+      "mintAddress": "GU5NkUVLzmJQxJKuho5dG4d1owChpcSQnhARrjYQpump",
+      "cohort": "FILTERED_REJECTED",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.000002272142857142857,
+      "peakPriceSol": 0.0000026392857142857143,
+      "peakGainPct": 16.16,
+      "durationMinutes": 75
+    }
+  ],
+  "avoidedRugs": [
+    {
+      "symbol": "RAY",
+      "mintAddress": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+      "rejectionReason": "FAILED_BASELINE_SCANNER_PRESCREEN",
+      "initialPriceSol": 0.3719515431416688,
+      "lowestPriceSol": 0.01911,
+      "maxLossPct": -94.86
+    },
+    {
+      "symbol": "mians",
+      "mintAddress": "BPWzNz2eY4Y5pVxGEf93V5BNfj5xdr6xKn9s92bUpump",
+      "rejectionReason": "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+      "initialPriceSol": 2.0971428571428573e-7,
+      "lowestPriceSol": 2.8492857142857146e-8,
+      "maxLossPct": -86.41
+    },
+    {
+      "symbol": "HATCH",
+      "mintAddress": "BKyNf5bEzJoVwvmghMfSvcNTpgLwapFz9VYkT78epump",
+      "rejectionReason": "EXCEEDED_MAX_WATCHLIST_AGE_20M",
+      "initialPriceSol": 2.5992857142857144e-7,
+      "lowestPriceSol": 1.37e-7,
+      "maxLossPct": -47.29
+    },
+    {
+      "symbol": "FLOYD",
+      "mintAddress": "Gjd3JUbNG2C3n5Ww98SfPxyWaqvDk2BkiKongGwEpump",
+      "rejectionReason": "EXCEEDED_MAX_ESTABLISHED_AGE_2H",
+      "initialPriceSol": 0.000006186428571428571,
+      "lowestPriceSol": 0.000004127857142857143,
+      "maxLossPct": -33.28
+    }
+  ],
+  "rejectionReasonBreakdown": {
+    "FAILED_BASELINE_SCANNER_PRESCREEN": 29,
+    "EXCEEDED_MAX_ESTABLISHED_AGE_2H": 1,
+    "EXCEEDED_MAX_WATCHLIST_AGE_20M": 3,
+    "EXCEEDED_MAX_WATCHLIST_AGE_60M": 2
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "sessionId": "session-paper-20261013194008",
+  "status": "HALTED",
+  "haltReason": "DRY_RUN_TERMINATED_BY_OPERATOR",
+  "openPositions": [],
+  "closedTrades": [
+    {
+      "positionId": "pos-FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump-1791920509457",
+      "mintAddress": "FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump",
+      "entryPriceSol": 0.000002779,
+      "exitPriceSol": 0.00000216,
+      "costBasisSol": 0.5,
+      "proceedsSol": 0.3886290032385751,
+      "realizedPnlSol": -0.11137099676142492,
+      "realizedPnlBps": -2227,
+      "peakGainBps": 0,
+      "exitReason": "CATASTROPHIC_HARD_STOP",
+      "openedAtMs": 1791920509457,
+      "closedAtMs": 1791920575101,
+      "finalTier": "BASELINE",
+      "symbol": "VRAXGUY"
+    }
+  ],
+  "unresolvedPositions": [],
+  "initialPortfolioSol": 8.0815,
+  "currentCashSol": 7.970129003238576,
+  "unresolvedCostBasisSol": 0,
+  "currentPortfolioSol": 7.970129003238576,
+  "totalRealizedPnlSol": -0.11137099676142492,
+  "sessionNewRealizedPnlSol": -0.111371,
+  "totalUnrealizedPnlSol": 0,
+  "maxOpenPositions": 5,
+  "consecutiveErrorCount": 0,
+  "startedAtMs": 1791920408774,
+  "lastTickAtMs": 1791920830256,
+  "durationHours": 4,
+  "watchlist": [
+    {
+      "poolId": "dexscreener-CzZHkHVRdV7r7bEKrP6WeUMxoc4Z5GYhigB2PK8MCnHj",
+      "mintAddress": "FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump",
+      "symbol": "VRAXGUY",
+      "liquidityUsd": 62758.24,
+      "marketCapUsd": 445076,
+      "lmcRatio": 0.141005670941592,
+      "lpBurnPct": 100,
+      "assetAgeSeconds": 2148,
+      "volume5mUsd": 236170.1,
+      "buys5m": 543,
+      "sells5m": 522,
+      "buyToSellRatio": 1.0402298850574712,
+      "status": "BUY_TRIGGERED",
+      "discoveredAt": "2026-10-13T19:40:26.000Z",
+      "lastEvaluatedAt": "2026-10-13T19:46:41.000Z"
+    }
+  ],
+  "recentActivityLogs": [
+    {
+      "timestamp": 1791920575135,
+      "type": "SELL",
+      "message": "🔴 VRAXGUY closed at $0.000232 at 12:42:55 PM | Exit: CATASTROPHIC_HARD_STOP | Realized PnL: -0.1114 SOL (-22.27%)",
+      "symbol": "VRAXGUY",
+      "mintAddress": "FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump"
+    },
+    {
+      "timestamp": 1791920510534,
+      "type": "BUY",
+      "message": "🟢 VRAXGUY bought at $0.000299 (0.000003 SOL) at 12:41:49 PM | Size: 0.5 SOL [ESTABLISHED]",
+      "symbol": "VRAXGUY",
+      "mintAddress": "FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump"
+    },
+    {
+      "timestamp": 1791920500819,
+      "type": "INFO",
+      "message": "🎯 Armed VRAXGUY at peak 0.000003 SOL [ESTABLISHED]. Awaiting retest/pullback...",
+      "symbol": "VRAXGUY",
+      "mintAddress": "FToVFniKy6H791uFYehBtLY8euRCbbi2pfDzL6Hopump"
+    }
+  ]
+}

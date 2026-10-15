@@ -1,0 +1,13 @@
+{
+  "walletAddress": "SimulatedVirtualWallet111111111111111111111111",
+  "currentBalanceSol": 7.9259,
+  "initialBalanceSol": 10,
+  "totalSessionsCompleted": 7,
+  "allTimeRealizedPnlSol": -2.074,
+  "lastUpdatedMs": 1791931147970,
+  "settledSessionIds": [
+    "session-paper-12.93-pc-day4",
+    "session-paper-12.93-pc-afternoon"
+  ],
+  "unresolvedTokens": []
+}

@@ -1,0 +1,55 @@
+{
+  "generatedAt": "2026-10-13T23:35:41.892Z",
+  "backupRoot": "data/backups/post-afternoon-session-20261013",
+  "backups": {
+    "backend_tmp": {
+      "paper-session-active.json": {
+        "sizeBytes": 11453,
+        "sha256": "0828a12123cafd7dd6cbae0f8b137fe509cef072fe9de8f673d5aab1f7fa878f",
+        "lastModified": "2026-10-13T22:39:07.964Z"
+      },
+      "past-sessions.json": {
+        "sizeBytes": 81562,
+        "sha256": "545f618f429035d02a8f7125ace3adb056a85a4dc0bd6ba2ea9ecfb7c6242753",
+        "lastModified": "2026-10-13T22:39:07.968Z"
+      },
+      "session-paper-12.93-pc-afternoon.json": {
+        "sizeBytes": 1699,
+        "sha256": "a9d3128dd18f652aa32ada25030874691115e04574ba7dd16436c3ba6e2bb6fa",
+        "lastModified": "2026-10-13T22:39:07.967Z"
+      },
+      "session-paper-12.93-pc-day4.json": {
+        "sizeBytes": 3525,
+        "sha256": "e87fd79d07df5f28918fafbf8f214281f7531131db68612e7ca6cefa32379ef0",
+        "lastModified": "2026-10-13T19:00:01.404Z"
+      },
+      "session-paper-observation-report.json": {
+        "sizeBytes": 8437,
+        "sha256": "9c1ef5ca8ec980e0f9da14eabdc4bff9d98ccfa56a10e146f177e8e52d3cb835",
+        "lastModified": "2026-10-13T22:39:07.965Z"
+      },
+      "virtual-wallet.json": {
+        "sizeBytes": 359,
+        "sha256": "7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9",
+        "lastModified": "2026-10-13T22:39:07.971Z"
+      }
+    },
+    "root_tmp": {
+      "paper-session-active.json": {
+        "sizeBytes": 22528,
+        "sha256": "d8667c89b31675eca7ed7bad8f770ed8049f92b30f52de003c451ce6928bdf4a",
+        "lastModified": "2026-10-13T19:00:01.403Z"
+      },
+      "past-sessions.json": {
+        "sizeBytes": 79751,
+        "sha256": "869d97c5e7ea5152d64f43d9fca9783290aa78cf83551f79dc379f32f1cfece8",
+        "lastModified": "2026-10-13T19:00:01.405Z"
+      },
+      "virtual-wallet.json": {
+        "sizeBytes": 359,
+        "sha256": "7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9",
+        "lastModified": "2026-10-13T22:39:07.971Z"
+      }
+    }
+  }
+}

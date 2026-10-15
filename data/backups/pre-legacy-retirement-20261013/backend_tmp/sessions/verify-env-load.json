@@ -1,0 +1,20 @@
+{
+  "sessionId": "verify-env-load",
+  "startedAt": "2026-09-29T16:16:38.074Z",
+  "endedAt": "2026-09-29T16:16:38.074Z",
+  "durationMinutes": 1,
+  "startingCapitalSol": 10,
+  "endingCapitalSol": 10,
+  "netPnlSol": 0,
+  "netPnlPct": 0,
+  "totalTrades": 0,
+  "buysCount": 0,
+  "sellsCount": 0,
+  "winsCount": 0,
+  "lossesCount": 0,
+  "scratchesCount": 0,
+  "winRatePct": 0,
+  "coinsWatchedCount": 17,
+  "missedOpportunitiesCount": 0,
+  "trades": []
+}
