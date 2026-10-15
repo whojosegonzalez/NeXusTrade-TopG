@@ -18,6 +18,7 @@ export default defineConfig({
       "src/paper/GenerationsRegistry.test.ts",
       "src/telemetry/*.test.ts",
       "src/execution/*.test.ts",
+      "src/research/QuantitativeResearch.test.ts",
       "src/wallet/*.test.ts",
       "src/session/SessionControlIpcService.test.ts",
     ],
