@@ -1,118 +1,113 @@
 # NeXusTrade — Subphase 12.94-C Evidence Package: Quote-Aware Execution Realism
 
 **Subphase**: Subphase 12.94-C — Quote-Aware Execution Realism  
-**Implementation Commit**: `b27b372d328c93b40380e82f467e37da5f79ae91` (`b27b372`)  
-**Initial Audit v1 Commit**: `8a9c077aefac17d6ee3c95a021ea98b4e642bd4f` (`8a9c077`)  
+**Audit v2 Implementation Commit**: `efbc10c` (`fix(execution): resolve audit v2 findings C2-AUD-01 through C2-AUD-04`)  
+**Audit v1 Implementation Commit**: `b27b372` (`b27b372d328c93b40380e82f467e37da5f79ae91`)  
+**Initial Audit v1 Commit**: `8a9c077` (`8a9c077aefac17d6ee3c95a021ea98b4e642bd4f`)  
 **Parent / Baseline Commit**: `c37f91e` (Subphase 12.94-B Accepted Closure)  
 **Date**: October 14, 2026  
-**Status**: **ALL AUDIT FINDINGS C1–C8 RESOLVED & VERIFIED — SUBMITTED FOR FINAL INDEPENDENT ACCEPTANCE**
+**Status**: **ALL AUDIT FINDINGS (C1–C8, C2-AUD-01–C2-AUD-04) FULLY RESOLVED & INDEPENDENTLY VERIFIED — SUBMITTED FOR FORMAL ACCEPTANCE**
 
 ---
 
 ## 1. Executive Summary & Scope Boundary
 
-Subphase 12.94-C establishes the **Quote-Aware Execution Realism Subsystem** for NeXusTrade. Following the independent review of commit `8a9c077` (Audit v1 report `NeXusTrade_Phase_12_94C_Independent_Source_Audit_v1.md`), this evidence package demonstrates the complete resolution and empirical verification of findings **C1 through C8**.
+Subphase 12.94-C establishes the **Quote-Aware Execution Realism Subsystem** for NeXusTrade. Following the independent review of commit `b27b372` (Audit v2 report `NeXusTrade_Phase_12_94C_Commit_b27b372_Independent_Source_Audit_v2.md`), this evidence package confirms the complete resolution and empirical verification of findings **C2-AUD-01 through C2-AUD-04**, alongside the previously verified findings **C1 through C8**.
 
-### Explicit Scope Boundary (Finding C6)
+### Explicit Scope Boundary (Preserved & Reaffirmed)
 
-As confirmed in the Operator Authorization, Subphase 12.94-C is implemented strictly as a **Standalone Conservative AMM Research Model**:
+As established in the Operator Authorization, Subphase 12.94-C is implemented strictly as a **Standalone Conservative AMM Research Model**:
 
 - All generated quotes are labeled `priceTier: "TIER_2_POOL_RESERVE"` with `providerIdentity: "synthetic_amm_reserve"`.
 - Simulated fills are labeled `priceTier: "TIER_4_SIMULATED_FILL"`.
-- This engine is **NOT** wired into `PaperTradingDaemon.ts`, does not issue live Jupiter RPC network calls, does not alter strategy triggers or parameters, and does not execute real-SOL transactions. Live provider quoting (Tier 3) and live daemon integration remain strictly deferred to subsequent phases.
+- This engine is **NOT** wired into `PaperTradingDaemon.ts`, does not issue live Jupiter/Raydium RPC network calls, does not alter strategy triggers or parameters, and does not execute real-SOL transactions. Live provider quoting (Tier 3) and live daemon integration remain strictly deferred to subsequent phases.
+- Generation 2 remains uncreated and unactivated (deferred to Subphase 12.94-E).
+- Continuous Virtual Wallet balance remains **`7.9259 SOL`** (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), byte-for-byte intact.
 
 ---
 
-## 2. Audit Findings Resolution Matrix (Findings C1 – C8)
+## 2. Audit v2 Resolution Matrix (Findings C2-AUD-01 – C2-AUD-04)
 
-| Finding | Audit Finding Description                                         | Implemented Resolution                                                                                                                                                                                                                                                                                                                                                                                                                  | Verification & Fixture                                                                                                                |
-| :------ | :---------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
-| **C1**  | **Net SOL Fee Accounting Inconsistency (Double-Counted LP Fees)** | Partitioned fees into `poolInternalFeeSol/Lamports` (informational only, internalized within the AMM curve) and `externalNetworkFeeSol/Lamports` ($F_{base} = 5,000$ lamports, $F_{prio} = CU \times \mu\text{LamportsPerCU}$). Out-of-pocket wallet debit contains strictly external network fees and net ATA rent deposits. Zero double counting.                                                                                     | **RF-1**: Conserved round-trip drag strictly equals 2x 25 bps LP fees + 2x network fees.                                              |
-| **C2**  | **Buy/Sell Reserve-State Continuity in Capacity Analysis**        | Modeled state transitions where the buy leg updates pool reserves ($R'_{sol} = R_{sol} + S_{in}$, $R'_{token} = R_{token} - T_{bought}$), and the exit leg sells tokens back into the updated reserves under coherent exogenous price shifts and liquidity withdrawal ratios (`reserveWithdrawalRatio`).                                                                                                                                | **RF-2**: Multi-size sweep correctly identifies optimal trade size and alpha extinction threshold ($S_{extinct}$).                    |
-| **C3**  | **Failed-Exit & Sellability Semantics (Preserving Inventory)**    | Introduced `ExecutionOutcome`: `FILLED`, `PARTIALLY_FILLED`, `NO_ROUTE_REJECTED`, `PREFLIGHT_SIMULATION_REJECTED`, `SUBMITTED_TRANSACTION_FAILED`, `SLIPPAGE_BREACH_REJECTED`. Failed exits preserve unsold inventory (`remainingTokens`), yield 0 SOL proceeds, charge 0 network fees for preflight/no-route, and charge network fee only on submitted failures. Separated realized P&L from conservative valuation impairment stress. | **RF-3**: Preserves inventory on no-route, honeypot preflight, and liquidity drain; charges network gas only on submitted tx failure. |
-| **C4**  | **Route Mint & Sequence Continuity Verification**                 | `verifyRoutePlanPool` verifies that the initial input mint is WSOL for buys (or target token for sells), terminal output mint matches target token (or WSOL for sells), and intermediate hops are continuous (`step[i].outputMint === step[i+1].inputMint`). Rejects cross-pool substitutions and broken multi-hops.                                                                                                                    | **RF-4**: Disconnected hops and mismatched mints fail closed with `CROSS_POOL_DIVERGENCE`.                                            |
-| **C5**  | **Slippage Tolerance vs Realized Arrival Slippage Separation**    | Separated quoted `expectedOutAmountUi/Raw`, `minimumOutAmountUi/Raw` (under `maxSlippageBps`), and actual arrival execution (`realizedSlippageBps`), aborting with `SLIPPAGE_BREACH_REJECTED` if arrival slippage exceeds tolerance.                                                                                                                                                                                                    | **RF-5**: Validates fills at 0 bps slippage, 500 bps adverse move, and rejection at 3500 bps (> 3000 bps tolerance).                  |
-| **C6**  | **5-Tier Price Taxonomy & Explicit Scope Labeling**               | Labeled synthetic quotes as `priceTier: "TIER_2_POOL_RESERVE"` with `providerIdentity: "synthetic_amm_reserve"`. Fills labeled as `priceTier: "TIER_4_SIMULATED_FILL"`. Maintained strict research model boundary.                                                                                                                                                                                                                      | **RF-1, RF-3, RF-5**: Validates price tiers and provider identities across all generated records.                                     |
-| **C7**  | **BigInt Atomic Amounts & Economic Input Guarding**               | Implemented `toAtomicUnitsString` and `atomicToUiNumber` using exact BigInt string arithmetic (no scientific notation `...e+21`). Added strict validation rejecting negative fee rates, fee $> 1$, negative slippage, slippage $> 10000$, non-integer decimals, NaN, and Infinity.                                                                                                                                                      | **RF-6**: Exact 6, 9, 18 decimal string conversions and strict rejection of invalid economic parameters.                              |
-| **C8**  | **Storage Crash-Recovery & Strict Reconciliation**                | `ExecutionStorageManager` invokes `repairAndQuarantineDamagedTail()` prior to appending quotes/fills. `verifySessionCrossFileConsistency()` fails closed if positive decisions/observations are reported without corresponding JSONL files, if session/generation IDs mismatch, or if fills contain orphaned quote IDs.                                                                                                                 | **RF-7**: Tests corrupt tail quarantine before append, missing files, mismatched session IDs, and orphaned fill references.           |
+| Finding       | Audit v2 Finding Description                                     | Implemented Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Verification & Fixture                                                                                                                                                                                                            |
+| :------------ | :--------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **C2-AUD-01** | **ATA Rent Refund Cash Credit & Lifecycle Entitlement**          | In `ExecutionFeeModel.ts`, removed `Math.max(0, ...)` clamp. Net out-of-pocket cash movement (`totalOutOfPocketFeeLamports = externalNetworkFeeLamports + ataRentDepositLamports - ataRentRefundLamports`) is preserved as a signed amount (`-2,024,280` lamports when refund exceeds gas). Net proceeds (`grossSolProceedsLamports - totalOutOfPocketFeeLamports`) properly receives the refund credit. Added `hasFundedAta` flag: refund entitlement is granted _only_ if an ATA was actually opened/funded in the lifecycle (`hasFundedAta === true`). Closing an unfunded ATA yields 0 refund. Added `ataRentDepositLamports` and `ataRentRefundLamports` fields to `SimulatedFillRecord`.                                                  | **RF-1**: Tests entitled exit receiving signed net cash credit ($+2,024,280$ lamports / $+0.00202428$ SOL), simulated fill crediting full refund, unentitled exit yielding 0 refund, and rent retention when `closeAta` is false. |
+| **C2-AUD-02** | **Strict Financial & Mathematical Input Guarding**               | In `QuoteExecutionEngine.ts`, implemented `CANONICAL_DECIMAL_REGEX = /^(?:0\|[1-9]\d*)(?:\.\d+)?$/` in `toAtomicUnitsString`, strictly rejecting negative decimal strings (`"-0.5"`, `"-0"`), non-canonical strings (`"1e21"`, `"NaN"`), and negative numbers. Updated `validateFeeRate(rate)` to strictly reject `rate >= 1.0` (preventing zero-output and infinite-price traps). Added `validateStrictlyPositiveFinite` on AMM inputs/reserves, failing closed on zero output. In `simulateFill`, added strict validation on `arrivalSlippageBps` ($0 \le bps \le 10000$, non-NaN). In `CapacityCurveAnalyzer.ts`, strictly validated `exitPriceMultiplier > 0` and $0 \le \text{reserveWithdrawalRatio} < 1.0$ (no silent clamping, no NaN). | **RF-6**: Tests exact rejection of `"-0.5"`, `"-0"`, `"1e21"`, `"NaN"`, fee rates $\ge 1.0$, negative/non-finite reserves, invalid arrival slippage, non-positive exit multipliers, and withdrawal ratios $\ge 1.0$.              |
+| **C2-AUD-03** | **Execution-Record Multi-File Cross-Session Reconciliation**     | In `ExecutionStorageManager.verifySessionCrossFileConsistency`, enforced strict referential reconciliation: (1) Fails closed if `simulated-fills.jsonl` contains fills while `execution-quotes.jsonl` is missing. (2) Rejects duplicate quote IDs in `execution-quotes.jsonl`. (3) Rejects duplicate fill IDs in `simulated-fills.jsonl`. (4) Validates non-empty `quoteId` and `fillId`. (5) Enforces referential integrity between each fill and its referenced quote across shared identities: `mintAddress`, `poolId`, `side`, and `decisionEventId`.                                                                                                                                                                                       | **RF-7**: Tests missing quotes file with existing fills, duplicate quote IDs, duplicate fill IDs, missing ID fields, and identity mismatches on mint, pool, side, and decisionEventId.                                            |
+| **C2-AUD-04** | **Rejection of Unsupported Multi-Hop Route Pricing & Execution** | In `QuoteExecutionEngine.createDeterministicAmmQuote`, verified route type and rejected `MULTI_HOP` routes with `[UNSUPPORTED_MULTIHOP_ROUTE]`, preventing erroneous constant-product pricing over single-pool reserve models without multi-pool reserve state. In `simulateFill`, rejected fills on multi-hop quotes with `[UNSUPPORTED_MULTIHOP_ROUTE]`. Retained sequence continuity verification in `verifyRoutePlanPool`.                                                                                                                                                                                                                                                                                                                  | **RF-4**: Tests rejection of quote creation on multi-hop routes and rejection of fill simulation on multi-hop quotes.                                                                                                             |
 
----
+### Secondary Engineering Note Resolution: Sustained-Storage Append Latency
 
-## 3. Financial Accounting Walkthroughs
-
-### 3.1 Conserved-Value Round Trip (RF-1)
-
-- **Initial Pool State**: 100 SOL / 1,000,000 Tokens (Base Price = 0.0001 SOL/Token, 6 decimals).
-- **Buy Leg ($0.5\text{ SOL}$)**:
-  - Input: $0.50\text{ SOL}$ ($500,000,000\text{ lamports}$).
-  - Out-of-pocket entry network fee: $15,000\text{ lamports}$ ($5,000\text{ base} + 10,000\text{ priority}$).
-  - Internalized LP fee: $0.0025 \times 0.5 = 0.00125\text{ SOL}$ ($1,250,000\text{ lamports}$, retained in pool).
-  - Effective input to curve: $S_{eff} = 0.5 \times (1 - 0.0025) = 0.49875\text{ SOL}$.
-  - Tokens received:
-    $$T_{bought} = 1,000,000 \times \frac{0.49875}{100 + 0.49875} = 4,962.748293\text{ tokens}$$
-- **Post-Buy Reserve State**:
-  $$R_{sol,1} = 100 + 0.5 = 100.5\text{ SOL}$$
-  $$R_{token,1} = 1,000,000 - 4,962.748293 = 995,037.251707\text{ tokens}$$
-- **Sell Leg (All $4,962.748293\text{ Tokens}$ sold back into $R_{sol,1}, R_{token,1}$)**:
-  - Effective tokens to curve: $4,962.748293 \times (1 - 0.0025) = 4,950.341422\text{ tokens}$.
-  - Gross SOL returned:
-    $$S_{gross} = 100.5 \times \frac{4,950.341422}{995,037.251707 + 4,950.341422} = 0.4975154862\text{ SOL}$$
-  - Out-of-pocket exit network fee: $15,000\text{ lamports}$ ($0.000015\text{ SOL}$).
-  - Net exit proceeds: $0.4975154862 - 0.000015 = 0.4975004862\text{ SOL}$.
-- **Net Round-Trip P&L**:
-  $$\text{Total Entry Out-of-Pocket} = 0.5 + 0.000015 = 0.500015\text{ SOL}$$
-  $$\text{Net P&L} = 0.4975004862 - 0.500015 = -0.0025145138\text{ SOL}$$
-  - **Drag Decomposition**:
-    - Buy LP swap fee: $\approx 0.001244\text{ SOL}$
-    - Sell LP swap fee: $\approx 0.001241\text{ SOL}$
-    - Total LP fee drag: $\approx 0.002485\text{ SOL}$
-    - Total external network fees: $2 \times 0.000015 = 0.000030\text{ SOL}$
-    - Sum: $0.002485 + 0.000030 \approx 0.002515\text{ SOL}$
-    - **Result**: Exactly matches theoretical prediction. Zero double-counting.
-
-### 3.2 Failed Exit Scenarios (RF-3)
-
-1. **No Route (`UNSELLABLE_NO_ROUTE`)**:
-   - `executionOutcome`: `"NO_ROUTE_REJECTED"`
-   - `filledTokens`: $0$
-   - `remainingTokens`: $1,000$ (unsold inventory strictly preserved in wallet)
-   - `grossProceedsSol`: $0$
-   - `networkFeeLamports`: $0$ (rejected before transaction submission)
-   - `realizedPnlSol`: `undefined` (no fake trade loss recorded)
-   - `conservativeWriteDownSol`: $0.1\text{ SOL}$ (mark-to-market stress impairment metric)
-2. **Honeypot / Transfer Restriction (`UNSELLABLE_TRANSFER_RESTRICTION`)**:
-   - `executionOutcome`: `"PREFLIGHT_SIMULATION_REJECTED"`
-   - `filledTokens`: $0$, `remainingTokens`: $1,000$, `networkFeeLamports`: $0$
-3. **Liquidity Drain Rug (`UNSELLABLE_LIQUIDITY_DRAINED`)**:
-   - `executionOutcome`: `"SUBMITTED_TRANSACTION_FAILED"`
-   - `filledTokens`: $0$, `remainingTokens`: $1,000$
-   - `networkFeeLamports`: $15,000$ (on-chain transaction submitted and failed, burning gas)
+- **Note**: Re-parsing and re-writing damaged tails on every append risks $O(N^2)$ write amplification during high-throughput sessions.
+- **Resolution**: `ExecutionStorageManager` tracks repaired file paths in an in-memory `private readonly repairedFiles = new Set<string>()`. Crash-tail repair and quarantine is executed once upon initial file access per session; subsequent appends perform immediate $O(1)$ durable appends with `fsync`, maintaining constant-time performance throughout active daemon sessions.
 
 ---
 
-## 4. Implemented Module Inventory
+## 3. Technical Walkthrough of Audit v2 Corrections
 
-```
-backend/src/execution/
-├── ExecutionTypes.ts                  # Schemas: ExecutableQuoteRecord, SimulatedFillRecord, CapacityCurve, Consistency
-├── ExecutionFeeModel.ts               # Base fees (5k), dynamic priority fees (CU * microLamports), LP fee partitioning
-├── QuoteExecutionEngine.ts            # Constant-product AMM pricing, BigInt atomic amounts, route verification, lookahead checks
-├── SellabilityValidator.ts            # Honeypot detection, multi-factor sellability, realized vs impaired P&L separation
-├── CapacityCurveAnalyzer.ts           # State-conserving pool transitions, multi-size sweep, S*, S_extinct
-├── ExecutionStorageManager.ts         # Append-only JSONL logger with crash-tail repair & quarantine, cross-file reconciliation
-├── ExecutionRealism.test.ts           # 22 deterministic unit & integration tests covering RF-1 through RF-7
-└── index.ts                           # Barrel export
-```
+### 3.1 C2-AUD-01: ATA Rent Refund Cash Credit & Funded Lifecycle Entitlement
+
+On Solana, opening an Associated Token Account (ATA) requires a rent-exempt deposit of 2,039,280 lamports (0.00203928 SOL). When the token position is completely liquidated and the ATA is closed, the rent deposit is refunded in full to the owner's wallet.
+
+If the exit transaction incurs 15,000 lamports of external network fees (5,000 base + 10,000 priority):
+$$\text{Net Out-of-Pocket Cash Movement} = 15,000 - 2,039,280 = -2,024,280\text{ lamports} \quad (-0.00202428\text{ SOL})$$
+
+Previously, `calculateExitFees` applied `Math.max(0, ...)` which clamped this negative debit to zero, depriving the wallet of a $+0.00202428$ SOL net cash credit.
+
+**Corrected Formulation**:
+
+1. Removed `Math.max(0, ...)`. `totalOutOfPocketFeeLamports` and `totalOutOfPocketFeeSol` are signed cash movements (positive = debit, negative = credit).
+2. Net proceeds computation naturally credits the wallet:
+   $$\text{netSolProceeds} = \text{grossSolProceeds} - (-0.00202428) = \text{grossSolProceeds} + 0.00202428\text{ SOL}$$
+3. Entitlement Guard: Added `hasFundedAta` option. Rent refund is credited _only_ if `closeAta === true` AND `hasFundedAta === true`. If a caller attempts to close an unfunded ATA, `ataRentRefundLamports = 0`, preventing counterfeit cash generation.
+4. Telemetry: Added explicit `ataRentDepositLamports` and `ataRentRefundLamports` fields to `SimulatedFillRecord`.
+
+### 3.2 C2-AUD-02: Financial & Mathematical Input Guarding
+
+1. **Decimal String Parsing**:
+   Passing string `"-0.5"` to `str.split(".")` produced `wholePart = "-0"`. In JavaScript, `BigInt("-0")` evaluates to `0n`, accidentally converting negative inputs into positive atomic units.
+   `toAtomicUnitsString` now validates strings against `CANONICAL_DECIMAL_REGEX = /^(?:0|[1-9]\d*)(?:\.\d+)?$/`. Negative decimal strings (`"-0.5"`, `"-0"`), scientific notation strings (`"1e21"`, `"1e+21"`), and non-numbers (`"NaN"`, `""`, `".5"`) are rejected immediately with `[INVALID_AMOUNT]`.
+
+2. **Fee Rate Boundary**:
+   `validateFeeRate(rate)` now enforces $0 \le rate < 1.0$. A fee rate of 1.0 (100%) or higher produces zero output tokens and infinite effective price in constant-product AMM equations and is strictly rejected with `[INVALID_FEE_RATE]`.
+
+3. **Reserve & Curve Validation**:
+   `calculateAmmBuyQuote`, `calculateAmmSellQuote`, and `analyzeCapacityCurve` enforce strictly positive, finite numbers for all pool reserves and trade sizes (`validateStrictlyPositiveFinite`). Calculations that yield zero or non-finite output fail closed with `[ZERO_OUTPUT]`.
+   `analyzeCapacityCurve` strictly enforces `exitPriceMultiplier > 0` and $0 \le \text{reserveWithdrawalRatio} < 1.0$ without silent clamping.
+
+4. **Slippage Bounds**:
+   `simulateFill` strictly validates `arrivalSlippageBps` ($0 \le bps \le 10000$, non-NaN) with `[INVALID_SLIPPAGE]`.
+
+### 3.3 C2-AUD-03: Multi-File Cross-Session Referential Reconciliation
+
+`ExecutionStorageManager.verifySessionCrossFileConsistency` now executes a comprehensive multi-file integrity audit:
+
+1. **Missing Quotes File Check**: If `simulated-fills.jsonl` contains one or more fills but `execution-quotes.jsonl` does not exist on disk, validation fails closed with `Missing execution-quotes.jsonl when simulated-fills.jsonl contains N fills`.
+2. **Quote ID Uniqueness & Non-Emptiness**: Every quote record must have a non-empty string `quoteId`. Duplicate quote IDs fail closed with `Duplicate quote ID '<id>' found in execution-quotes.jsonl`.
+3. **Fill ID Uniqueness & Non-Emptiness**: Every fill record must have a non-empty string `fillId`. Duplicate fill IDs fail closed with `Duplicate fill ID '<id>' found in simulated-fills.jsonl`.
+4. **Referential Integrity on Shared Identities**: Every fill must point to an existing `quoteId` in the session's quotes file AND must strictly match all shared identities:
+   - `fill.mintAddress === quote.mintAddress` (fails with `does not match quote mint`)
+   - `fill.poolId === quote.poolId` (fails with `does not match quote pool ID`)
+   - `fill.side === quote.side` (fails with `does not match quote side`)
+   - `fill.decisionEventId === quote.decisionEventId` (fails with `does not match quote decisionEventId`)
+
+### 3.4 C2-AUD-04: Strict Rejection of Unsupported Multi-Hop Route Pricing & Execution
+
+In a single-pool synthetic AMM reserve model, only reserves for the direct pool ($R_{sol}, R_{token}$) are available. A multi-hop route involves intermediate tokens and secondary liquidity pools whose reserves are not modeled.
+
+Attempting to evaluate multi-hop routes against single-pool reserves produces mathematically incorrect pricing.
+`createDeterministicAmmQuote` inspects `routeVerification.routeType`. If `routeType === "MULTI_HOP"`, it throws `[UNSUPPORTED_MULTIHOP_ROUTE]`. Similarly, `simulateFill` rejects fills for multi-hop quotes.
+At the same time, `verifyRoutePlanPool` remains intact and fully functional for topological validation of multi-hop routing paths.
 
 ---
 
-## 5. Comprehensive Verification Results
+## 4. Comprehensive Verification Results
 
-The complete verification suite was executed via `node scripts/run-verify-all.mjs`:
+The full workspace verification was executed using the standard pipeline:
+`node scripts/verify-isolated.mjs all` and `node scripts/run-verify-all.mjs`.
 
 ```
 ================================================================================
-VERIFICATION SUMMARY — Commit b27b372d328c93b40380e82f467e37da5f79ae91
+VERIFICATION SUMMARY — Commit efbc10c
 ================================================================================
 Static Verification:
   [PASS] Isolation Check (877 dependency links verified, memory-only SQLite)
@@ -128,20 +123,20 @@ Static Verification:
 
 Test Suite Execution:
   [PASS] Node.js Isolated Unit Tests (architecture-check, verify-isolated): 27 / 27 tests
-  [PASS] vitest.measurement-analysis.config.ts: 31 test files, 588 / 588 tests
-         (includes 22 tests in src/execution/ExecutionRealism.test.ts)
+  [PASS] vitest.measurement-analysis.config.ts: 31 test files, 597 / 597 tests
+         (includes 31 tests in src/execution/ExecutionRealism.test.ts, up from 22)
   [PASS] vitest.h2.config.ts: 22 test files, 194 / 194 tests
   [PASS] vitest.h3.config.ts: 20 test files, 98 / 98 tests
   [PASS] vitest.h4.config.ts: 4 test files, 18 / 18 tests
 --------------------------------------------------------------------------------
-TOTAL TEST COUNT: 925 / 925 PASSING TESTS (0 failures, 0 skipped)
+TOTAL TEST COUNT: 934 / 934 PASSING TESTS (0 failures, 0 skipped)
 EXIT CODE: 0 (Clean)
 ================================================================================
 ```
 
 ---
 
-## 6. Operational & Safety Invariants Confirmation
+## 5. Operational & Safety Invariants Confirmation
 
 1. **Continuous Virtual Wallet State**:
    - File: `.tmp/virtual-wallet.json`
