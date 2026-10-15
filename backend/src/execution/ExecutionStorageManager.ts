@@ -44,6 +44,7 @@ import type {
 
 export class ExecutionStorageManager {
   private readonly workspaceRoot?: string | undefined;
+  private readonly repairedFiles = new Set<string>();
 
   constructor(workspaceRoot?: string) {
     this.workspaceRoot = workspaceRoot;
@@ -51,7 +52,7 @@ export class ExecutionStorageManager {
 
   /**
    * Appends an executable quote record to canonical execution-quotes.jsonl.
-   * Performs crash-tail quarantine repair before appending.
+   * Performs crash-tail quarantine repair before appending on first access.
    */
   public recordQuote(quote: ExecutableQuoteRecord): void {
     const validSessionId = validateSessionId(quote.sessionId);
@@ -61,8 +62,11 @@ export class ExecutionStorageManager {
     }
 
     const quotesPath = getCanonicalExecutionQuotesPath(validSessionId, this.workspaceRoot);
-    // 1. Crash recovery repair before append
-    repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
+    // 1. Crash recovery repair on initial access before append
+    if (!this.repairedFiles.has(quotesPath)) {
+      repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
+      this.repairedFiles.add(quotesPath);
+    }
 
     // 2. Durable append with fsync
     this.appendSyncWithFsync(quotesPath, JSON.stringify(quote));
@@ -70,7 +74,7 @@ export class ExecutionStorageManager {
 
   /**
    * Appends a simulated fill record to canonical simulated-fills.jsonl for a given session.
-   * Performs crash-tail quarantine repair before appending.
+   * Performs crash-tail quarantine repair before appending on first access.
    */
   public recordFill(sessionId: string, fill: SimulatedFillRecord): void {
     const validSessionId = validateSessionId(sessionId);
@@ -80,8 +84,11 @@ export class ExecutionStorageManager {
     }
 
     const fillsPath = getCanonicalSimulatedFillsPath(validSessionId, this.workspaceRoot);
-    // 1. Crash recovery repair before append
-    repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
+    // 1. Crash recovery repair on initial access before append
+    if (!this.repairedFiles.has(fillsPath)) {
+      repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
+      this.repairedFiles.add(fillsPath);
+    }
 
     // 2. Durable append with fsync
     this.appendSyncWithFsync(fillsPath, JSON.stringify(fill));
@@ -279,12 +286,25 @@ export function verifySessionCrossFileConsistency(
 
   // 8. Execution Quotes & Fills Integrity and Referential Check
   const quotesPath = path.join(sessionDir, "execution-quotes.jsonl");
-  const quoteIdSet = new Set<string>();
+  const fillsPath = path.join(sessionDir, "simulated-fills.jsonl");
+  const quotesById = new Map<string, ExecutableQuoteRecord>();
 
   if (existsSync(quotesPath)) {
     try {
       const quoteRecords = repairAndQuarantineDamagedTail<ExecutableQuoteRecord>(quotesPath);
       for (const q of quoteRecords) {
+        if (!q.quoteId || typeof q.quoteId !== "string") {
+          return {
+            valid: false,
+            reason: `Execution quote record missing required quoteId`,
+          };
+        }
+        if (quotesById.has(q.quoteId)) {
+          return {
+            valid: false,
+            reason: `Duplicate quote ID '${q.quoteId}' found in execution-quotes.jsonl`,
+          };
+        }
         if (q.sessionId !== summary.sessionId) {
           return {
             valid: false,
@@ -297,7 +317,7 @@ export function verifySessionCrossFileConsistency(
             reason: `Quote record '${q.quoteId}' has mismatched generation ID '${q.generationId}' (expected '${summary.generationId}')`,
           };
         }
-        quoteIdSet.add(q.quoteId);
+        quotesById.set(q.quoteId, q);
       }
     } catch (err) {
       return {
@@ -307,18 +327,65 @@ export function verifySessionCrossFileConsistency(
     }
   }
 
-  const fillsPath = path.join(sessionDir, "simulated-fills.jsonl");
   if (existsSync(fillsPath)) {
     try {
       const fillRecords = repairAndQuarantineDamagedTail<SimulatedFillRecord>(fillsPath);
-      if (existsSync(quotesPath)) {
-        for (const f of fillRecords) {
-          if (!quoteIdSet.has(f.quoteId)) {
-            return {
-              valid: false,
-              reason: `Simulated fill '${f.fillId}' references non-existent quote ID '${f.quoteId}'`,
-            };
-          }
+      if (fillRecords.length > 0 && !existsSync(quotesPath)) {
+        return {
+          valid: false,
+          reason: `Missing execution-quotes.jsonl when simulated-fills.jsonl contains ${fillRecords.length} fills`,
+        };
+      }
+
+      const fillIdSet = new Set<string>();
+
+      for (const f of fillRecords) {
+        if (!f.fillId || typeof f.fillId !== "string") {
+          return {
+            valid: false,
+            reason: `Simulated fill record missing required fillId`,
+          };
+        }
+        if (fillIdSet.has(f.fillId)) {
+          return {
+            valid: false,
+            reason: `Duplicate fill ID '${f.fillId}' found in simulated-fills.jsonl`,
+          };
+        }
+        fillIdSet.add(f.fillId);
+
+        const referencedQuote = quotesById.get(f.quoteId);
+        if (!referencedQuote) {
+          return {
+            valid: false,
+            reason: `Simulated fill '${f.fillId}' references non-existent quote ID '${f.quoteId}'`,
+          };
+        }
+
+        // Shared identity referential checks (mint, pool, side, decisionEventId)
+        if (f.mintAddress !== referencedQuote.mintAddress) {
+          return {
+            valid: false,
+            reason: `Simulated fill '${f.fillId}' mint '${f.mintAddress}' does not match quote mint '${referencedQuote.mintAddress}'`,
+          };
+        }
+        if (f.poolId !== referencedQuote.poolId) {
+          return {
+            valid: false,
+            reason: `Simulated fill '${f.fillId}' pool ID '${f.poolId}' does not match quote pool ID '${referencedQuote.poolId}'`,
+          };
+        }
+        if (f.side !== referencedQuote.side) {
+          return {
+            valid: false,
+            reason: `Simulated fill '${f.fillId}' side '${f.side}' does not match quote side '${referencedQuote.side}'`,
+          };
+        }
+        if (f.decisionEventId !== referencedQuote.decisionEventId) {
+          return {
+            valid: false,
+            reason: `Simulated fill '${f.fillId}' decisionEventId '${f.decisionEventId}' does not match quote decisionEventId '${referencedQuote.decisionEventId}'`,
+          };
         }
       }
     } catch (err) {

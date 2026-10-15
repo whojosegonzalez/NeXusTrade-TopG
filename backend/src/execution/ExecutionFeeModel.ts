@@ -31,7 +31,7 @@ export interface ComputePriorityFeeOptions {
  * Validates that an economic parameter is a non-negative finite number.
  */
 function validateNonNegativeNumber(value: number, fieldName: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+  if (typeof value !== "number" || !Number.isFinite(value) || Number.isNaN(value) || value < 0) {
     throw new Error(
       `[ExecutionFeeModel] [INVALID_PARAM] ${fieldName} must be a non-negative finite number, received: ${String(value)}`,
     );
@@ -40,12 +40,19 @@ function validateNonNegativeNumber(value: number, fieldName: string): number {
 }
 
 /**
- * Validates that a fee rate is between 0 and 1 inclusive.
+ * Validates that a fee rate is between 0 and 1 exclusive of 1.
+ * Rates >= 1 cause zero effective output or infinite effective price and are rejected.
  */
 export function validateFeeRate(rate: number): number {
-  if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > 1) {
+  if (
+    typeof rate !== "number" ||
+    !Number.isFinite(rate) ||
+    Number.isNaN(rate) ||
+    rate < 0 ||
+    rate >= 1
+  ) {
     throw new Error(
-      `[ExecutionFeeModel] [INVALID_FEE_RATE] Fee rate must be a finite number between 0 and 1, received: ${String(rate)}`,
+      `[ExecutionFeeModel] [INVALID_FEE_RATE] Fee rate must be a finite number between 0 (inclusive) and 1 (exclusive), received: ${String(rate)}`,
     );
   }
   return rate;
@@ -120,6 +127,12 @@ export interface ExitFeeCalculationOptions {
   readonly grossSolProceedsLamports: number;
   readonly dexFeeRate?: number | undefined;
   readonly closeAta?: boolean | undefined;
+  /**
+   * Indicates whether an ATA was actually opened and funded for this token.
+   * Required for rent refund rebate eligibility. If closeAta is requested without
+   * prior funding, refund entitlement is absent (0 lamports).
+   */
+  readonly hasFundedAta?: boolean | undefined;
   readonly computeUnits?: number | undefined;
   readonly microLamportsPerCu?: number | undefined;
 }
@@ -128,7 +141,8 @@ export interface ExitFeeCalculationOptions {
  * Calculates complete fee breakdown for an exit (Token -> SOL) trade.
  * Note: dexFeeLamports is recorded as poolInternalFeeLamports (informational only);
  * it is NOT debited from out-of-pocket wallet cash.
- * If closeAta is true, the ATA rent deposit is refunded, reducing out-of-pocket cost.
+ * If closeAta is true and hasFundedAta is true, the ATA rent deposit is refunded,
+ * producing a signed net cash credit if the refund exceeds external network fees.
  */
 export function calculateExitFees(options: ExitFeeCalculationOptions): ExecutionFeeBreakdown {
   validateNonNegativeNumber(options.grossSolProceedsLamports, "grossSolProceedsLamports");
@@ -147,12 +161,16 @@ export function calculateExitFees(options: ExitFeeCalculationOptions): Execution
   const poolInternalFeeSol = poolInternalFeeLamports / LAMPORTS_PER_SOL;
 
   const ataRentDepositLamports = 0;
-  const ataRentRefundLamports = options.closeAta ? ATA_RENT_EXEMPT_LAMPORTS : 0;
+  // Rebate eligibility requires BOTH closeAta === true AND an established funded ATA (hasFundedAta === true)
+  // If closeAta is requested without prior funded status, refund entitlement is absent (0 lamports).
+  const isEligibleForRefund = options.closeAta === true && options.hasFundedAta === true;
+  const ataRentRefundLamports = isEligibleForRefund ? ATA_RENT_EXEMPT_LAMPORTS : 0;
 
-  const totalOutOfPocketFeeLamports = Math.max(
-    0,
-    externalNetworkFeeLamports - ataRentRefundLamports,
-  );
+  // Signed net out-of-pocket cash movement:
+  // Positive = wallet cash debited (fees paid)
+  // Negative = wallet cash credited (rent refund exceeds external network fees)
+  const totalOutOfPocketFeeLamports =
+    externalNetworkFeeLamports + ataRentDepositLamports - ataRentRefundLamports;
   const totalOutOfPocketFeeSol = totalOutOfPocketFeeLamports / LAMPORTS_PER_SOL;
 
   return {

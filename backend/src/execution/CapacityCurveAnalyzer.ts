@@ -17,6 +17,7 @@ import {
   calculateAmmBuyQuote,
   calculateAmmSellQuote,
   validateMintDecimals,
+  validateStrictlyPositiveFinite,
 } from "./QuoteExecutionEngine.js";
 import {
   calculateEntryFees,
@@ -62,9 +63,56 @@ export interface AnalyzeCapacityCurveParams {
  */
 export function analyzeCapacityCurve(params: AnalyzeCapacityCurveParams): CapacityCurveResult {
   const decimals = validateMintDecimals(params.tokenDecimals);
+  validateStrictlyPositiveFinite(params.quoteReserveSol, "quoteReserveSol");
+  validateStrictlyPositiveFinite(params.baseReserveTokens, "baseReserveTokens");
+
+  if (params.exitPriceMultiplier !== undefined) {
+    if (
+      typeof params.exitPriceMultiplier !== "number" ||
+      !Number.isFinite(params.exitPriceMultiplier) ||
+      Number.isNaN(params.exitPriceMultiplier) ||
+      params.exitPriceMultiplier <= 0
+    ) {
+      throw new Error(
+        `[CapacityCurveAnalyzer] [INVALID_PARAM] exitPriceMultiplier must be a strictly positive finite number, received: ${String(params.exitPriceMultiplier)}`,
+      );
+    }
+  }
+  const exitMultiplier = params.exitPriceMultiplier ?? 1.0;
+
+  if (params.reserveWithdrawalRatio !== undefined) {
+    if (
+      typeof params.reserveWithdrawalRatio !== "number" ||
+      !Number.isFinite(params.reserveWithdrawalRatio) ||
+      Number.isNaN(params.reserveWithdrawalRatio) ||
+      params.reserveWithdrawalRatio < 0 ||
+      params.reserveWithdrawalRatio >= 1.0
+    ) {
+      throw new Error(
+        `[CapacityCurveAnalyzer] [INVALID_PARAM] reserveWithdrawalRatio must be a finite number between 0 (inclusive) and 1 (exclusive), received: ${String(params.reserveWithdrawalRatio)}`,
+      );
+    }
+  }
+  const withdrawalRatio = params.reserveWithdrawalRatio ?? 0;
+
+  if (params.observedExitReserveSol !== undefined) {
+    validateStrictlyPositiveFinite(params.observedExitReserveSol, "observedExitReserveSol");
+  }
+  if (params.observedExitReserveTokens !== undefined) {
+    validateStrictlyPositiveFinite(params.observedExitReserveTokens, "observedExitReserveTokens");
+  }
+  if (params.capitalTiersSol !== undefined) {
+    if (!Array.isArray(params.capitalTiersSol) || params.capitalTiersSol.length === 0) {
+      throw new Error(
+        `[CapacityCurveAnalyzer] [INVALID_PARAM] capitalTiersSol must be a non-empty array of positive numbers`,
+      );
+    }
+    for (const t of params.capitalTiersSol) {
+      validateStrictlyPositiveFinite(t, "capitalTier");
+    }
+  }
+
   const tiers = params.capitalTiersSol ?? DEFAULT_CAPITAL_TIERS_SOL;
-  const exitMultiplier = Math.max(0.0001, params.exitPriceMultiplier ?? 1.0);
-  const withdrawalRatio = Math.max(0, Math.min(0.99, params.reserveWithdrawalRatio ?? 0));
   const withdrawalFactor = 1 - withdrawalRatio;
   const dexFeeRate = validateFeeRate(params.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
 

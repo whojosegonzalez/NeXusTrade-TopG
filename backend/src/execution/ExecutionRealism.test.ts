@@ -129,6 +129,68 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
         computePriorityFeeLamports({ computeUnits: 200_000, microLamportsPerCu: 50_000 }),
       ).toBe(10_000);
     });
+
+    it("preserves full ATA rent refund as signed wallet cash credit and requires funded lifecycle entitlement (Finding C2-AUD-01)", () => {
+      // 1. Entitled refund: closeAta=true and hasFundedAta=true
+      const exitFeesWithRefund = calculateExitFees({
+        grossSolProceedsLamports: 100_000_000, // 0.1 SOL
+        dexFeeRate: 0.0025,
+        closeAta: true,
+        hasFundedAta: true,
+        computeUnits: DEFAULT_COMPUTE_UNITS,
+        microLamportsPerCu: DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS_PER_CU,
+      });
+
+      expect(exitFeesWithRefund.externalNetworkFeeLamports).toBe(15_000);
+      expect(exitFeesWithRefund.ataRentRefundLamports).toBe(2_039_280);
+      // Assert: Not clamped to 0! Full net cash credit = 15,000 - 2,039,280 = -2,024,280 lamports
+      expect(exitFeesWithRefund.totalOutOfPocketFeeLamports).toBe(-2_024_280);
+      expect(exitFeesWithRefund.totalOutOfPocketFeeSol).toBeCloseTo(-0.00202428, 8);
+
+      // 2. Unentitled refund: closeAta=true but hasFundedAta=false
+      const unentitledExitFees = calculateExitFees({
+        grossSolProceedsLamports: 100_000_000,
+        dexFeeRate: 0.0025,
+        closeAta: true,
+        hasFundedAta: false,
+        computeUnits: DEFAULT_COMPUTE_UNITS,
+        microLamportsPerCu: DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS_PER_CU,
+      });
+
+      expect(unentitledExitFees.ataRentRefundLamports).toBe(0);
+      expect(unentitledExitFees.totalOutOfPocketFeeLamports).toBe(15_000);
+
+      // 3. Simulated sell fill receives full rent refund credit
+      const sellQuote = createDeterministicAmmQuote({
+        sessionId: "session-rf1-rent",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf1-rent",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "SELL",
+        tradeSizeSolOrTokens: 1000,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      const fillWithRefund = simulateFill(sellQuote, {
+        decisionTimestampMs: 10_000,
+        decisionSlot: 100,
+        closeAta: true,
+        hasFundedAta: true,
+      });
+
+      expect(fillWithRefund.executionOutcome).toBe("FILLED");
+      expect(fillWithRefund.ataRentRefundLamports).toBe(2_039_280);
+      // Net proceeds = gross proceeds - signedOutOfPocketFees = grossProceeds - (-0.00202428) = gross + 0.00202428
+      expect(fillWithRefund.netProceedsSol!).toBeCloseTo(
+        fillWithRefund.grossProceedsSol! + 0.00202428,
+        6,
+      );
+    });
   });
 
   describe("RF-2: State-Conserving Pool Transition in Capacity Analysis (Finding C2)", () => {
@@ -407,6 +469,69 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
       expect(res.valid).toBe(true);
       expect(res.routeType).toBe("MULTI_HOP");
     });
+
+    it("rejects pricing and execution of multi-hop routes in single-pool synthetic AMM model (Finding C2-AUD-04)", () => {
+      const INTERMEDIATE_MINT = "IntermediateToken11111111111111111111111111";
+      const validMultiHop: readonly RoutePlanStep[] = [
+        {
+          ammKey: "Hop1Pool11111111111111111111111111111111111",
+          label: "Raydium",
+          inputMint: WSOL_MINT,
+          outputMint: INTERMEDIATE_MINT,
+          feePct: 0.0025,
+        },
+        {
+          ammKey: TEST_POOL_ID,
+          label: "Raydium",
+          inputMint: INTERMEDIATE_MINT,
+          outputMint: TEST_MINT,
+          feePct: 0.0025,
+        },
+      ];
+
+      // 1. Rejects quote creation on multi-hop route
+      expect(() =>
+        createDeterministicAmmQuote({
+          sessionId: "session-rf4-multihop",
+          generationId: "gen-1",
+          decisionEventId: "ev-rf4-multihop",
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          side: "BUY",
+          tradeSizeSolOrTokens: 0.5,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          quoteInitiatedMs: 10_000,
+          contextSlot: 100,
+          simulatedRoutePlan: validMultiHop,
+        }),
+      ).toThrow(/UNSUPPORTED_MULTIHOP_ROUTE/);
+
+      // 2. Rejects fill simulation on multi-hop quote
+      const singleQuote = createDeterministicAmmQuote({
+        sessionId: "session-rf4-multihop2",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf4-multihop2",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "BUY",
+        tradeSizeSolOrTokens: 0.5,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      const multiHopQuote = { ...singleQuote, routeType: "MULTI_HOP" as const };
+      expect(() =>
+        simulateFill(multiHopQuote, {
+          decisionTimestampMs: 10_000,
+          decisionSlot: 100,
+        }),
+      ).toThrow(/UNSUPPORTED_MULTIHOP_ROUTE/);
+    });
   });
 
   describe("RF-5: Slippage Tolerance vs Realized Arrival Slippage (Finding C5)", () => {
@@ -490,7 +615,7 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
     });
   });
 
-  describe("RF-6: BigInt Atomic Units & Economic Input Guarding (Finding C7)", () => {
+  describe("RF-6: BigInt Atomic Units & Economic Input Guarding (Findings C7 & C2-AUD-02)", () => {
     it("converts 6, 9, and 18-decimal amounts to exact integer strings without scientific notation", () => {
       // 6 decimals
       expect(toAtomicUnitsString(4962.748293, 6)).toBe("4962748293");
@@ -508,11 +633,41 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
       expect(atomicToUiNumber("4962748293", 6)).toBeCloseTo(4962.748293, 6);
     });
 
-    it("rejects invalid economic parameters (negative fees, negative slippage, NaN, Infinity)", () => {
+    it("strictly rejects negative, scientific notation, and non-canonical decimal strings in toAtomicUnitsString", () => {
+      // Negative numbers and strings
+      expect(() => toAtomicUnitsString(-0.5, 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("-0.5", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("-0", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("-100.25", 9)).toThrow(/INVALID_AMOUNT/);
+
+      // Scientific notation strings
+      expect(() => toAtomicUnitsString("1e21", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("1e+21", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("2.5e-4", 9)).toThrow(/INVALID_AMOUNT/);
+
+      // Non-numeric or non-canonical strings
+      expect(() => toAtomicUnitsString("NaN", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString(NaN, 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString(Infinity, 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("abc", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString("", 9)).toThrow(/INVALID_AMOUNT/);
+      expect(() => toAtomicUnitsString(".5", 9)).toThrow(/INVALID_AMOUNT/);
+
+      // Valid representations
+      expect(toAtomicUnitsString("0", 9)).toBe("0");
+      expect(toAtomicUnitsString("0.0", 9)).toBe("0");
+      expect(toAtomicUnitsString("0.5", 9)).toBe("500000000");
+    });
+
+    it("rejects invalid economic parameters (negative fees, fee rate >= 1.0, negative slippage, NaN, Infinity)", () => {
+      // Fee rate strictly 0 <= rate < 1.0
       expect(() => validateFeeRate(-0.01)).toThrow(/INVALID_FEE_RATE/);
+      expect(() => validateFeeRate(1.0)).toThrow(/INVALID_FEE_RATE/);
       expect(() => validateFeeRate(1.05)).toThrow(/INVALID_FEE_RATE/);
       expect(() => validateFeeRate(NaN)).toThrow(/INVALID_FEE_RATE/);
       expect(() => validateFeeRate(Infinity)).toThrow(/INVALID_FEE_RATE/);
+      expect(validateFeeRate(0.9999)).toBe(0.9999);
+      expect(validateFeeRate(0)).toBe(0);
 
       expect(() => validateSlippageBps(-1)).toThrow(/INVALID_SLIPPAGE/);
       expect(() => validateSlippageBps(10001)).toThrow(/INVALID_SLIPPAGE/);
@@ -522,9 +677,213 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
       expect(() => validateMintDecimals(19)).toThrow(/INVALID_DECIMALS/);
       expect(() => validateMintDecimals(6.5)).toThrow(/INVALID_DECIMALS/);
     });
+
+    it("rejects non-finite and negative reserves in AMM calculations and quote execution", () => {
+      // calculateAmmBuyQuote
+      expect(() =>
+        calculateAmmBuyQuote({
+          inputSol: 0,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+      expect(() =>
+        calculateAmmBuyQuote({
+          inputSol: 0.5,
+          quoteReserveSol: -10,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+      expect(() =>
+        calculateAmmBuyQuote({
+          inputSol: 0.5,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          baseReserveTokens: NaN,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+      expect(() =>
+        calculateAmmBuyQuote({
+          inputSol: 0.5,
+          quoteReserveSol: Infinity,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      // calculateAmmSellQuote
+      expect(() =>
+        calculateAmmSellQuote({
+          inputTokens: 0,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+      expect(() =>
+        calculateAmmSellQuote({
+          inputTokens: 5000,
+          quoteReserveSol: NaN,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+      expect(() =>
+        calculateAmmSellQuote({
+          inputTokens: 5000,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          baseReserveTokens: -1,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      // simulateFill with non-finite arrival slippage
+      const validQuote = createDeterministicAmmQuote({
+        sessionId: "session-rf6-slip",
+        generationId: "gen-1",
+        decisionEventId: "ev-rf6-slip",
+        mintAddress: TEST_MINT,
+        poolId: TEST_POOL_ID,
+        side: "BUY",
+        tradeSizeSolOrTokens: 0.5,
+        baseReserveTokens: BASE_RESERVE_TOKENS,
+        quoteReserveSol: QUOTE_RESERVE_SOL,
+        tokenDecimals: TOKEN_DECIMALS,
+        quoteInitiatedMs: 10_000,
+        contextSlot: 100,
+      });
+
+      expect(() =>
+        simulateFill(validQuote, {
+          decisionTimestampMs: 10_000,
+          decisionSlot: 100,
+          arrivalSlippageBps: NaN,
+        }),
+      ).toThrow(/INVALID_SLIPPAGE/);
+
+      expect(() =>
+        simulateFill(validQuote, {
+          decisionTimestampMs: 10_000,
+          decisionSlot: 100,
+          arrivalSlippageBps: -10,
+        }),
+      ).toThrow(/INVALID_SLIPPAGE/);
+
+      expect(() =>
+        simulateFill(validQuote, {
+          decisionTimestampMs: 10_000,
+          decisionSlot: 100,
+          arrivalSlippageBps: 10001,
+        }),
+      ).toThrow(/INVALID_SLIPPAGE/);
+    });
+
+    it("rejects non-finite, negative, or out-of-range parameters in CapacityCurveAnalyzer", () => {
+      // exitPriceMultiplier <= 0 or NaN
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          exitPriceMultiplier: 0,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          exitPriceMultiplier: -0.5,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          exitPriceMultiplier: NaN,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      // reserveWithdrawalRatio < 0 or >= 1.0 or NaN
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          reserveWithdrawalRatio: -0.1,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          reserveWithdrawalRatio: 1.0,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          reserveWithdrawalRatio: 1.25,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+          reserveWithdrawalRatio: NaN,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      // quoteReserveSol / baseReserveTokens invalid
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: BASE_RESERVE_TOKENS,
+          quoteReserveSol: 0,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+
+      expect(() =>
+        analyzeCapacityCurve({
+          mintAddress: TEST_MINT,
+          poolId: TEST_POOL_ID,
+          baseReserveTokens: NaN,
+          quoteReserveSol: QUOTE_RESERVE_SOL,
+          tokenDecimals: TOKEN_DECIMALS,
+        }),
+      ).toThrow(/INVALID_PARAM/);
+    });
   });
 
-  describe("RF-7: Crash Repair-Before-Append & Strict Reconciliation (Finding C8)", () => {
+  describe("RF-7: Crash Repair-Before-Append & Strict Reconciliation (Findings C8 & C2-AUD-03)", () => {
     it("quarantines crash-damaged tail before appending and recovers clean boundary", () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-crash-append-"));
       try {
@@ -753,11 +1112,327 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
       }
     });
 
-    it("verifies clean consistent session files pass validation", () => {
+    it("fails closed when simulated-fills.jsonl exists but execution-quotes.jsonl is missing (Finding C2-AUD-03)", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-missing-quotes-"));
+      try {
+        const sessionId = "session-rf7-missing-quotes";
+        const meta = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          initialWalletBalanceSol: 7.9259,
+          environment: { platform: "win32", nodeVersion: "v22" },
+        };
+        const summary = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          closedAtIso: "2026-10-14T11:00:00.000Z",
+          totalCandidatesScreened: 0,
+          totalDecisionsRecorded: 0,
+          decisionWriteFailures: 0,
+          cohortBreakdown: {
+            filteredRejected: 0,
+            watchlistRadar: 0,
+            triggerRejected: 0,
+            executedBuy: 0,
+          },
+          topRejectionReasons: {},
+          totalMarketObservationsRecorded: 0,
+          totalStratifiedCandidatesTracked: 0,
+          missedWinnersCount: 0,
+          avoidedRugsCount: 0,
+        };
+
+        fs.writeFileSync(path.join(tempDir, "session-meta.json"), JSON.stringify(meta), "utf8");
+        fs.writeFileSync(
+          path.join(tempDir, "session-summary.json"),
+          JSON.stringify(summary),
+          "utf8",
+        );
+
+        // Fills exist, but execution-quotes.jsonl does NOT exist!
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({ fillId: "fill-1", quoteId: "q-1" }) + "\n",
+          "utf8",
+        );
+
+        const res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain(
+          "Missing execution-quotes.jsonl when simulated-fills.jsonl contains 1 fills",
+        );
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed on duplicate quote ID in execution-quotes.jsonl (Finding C2-AUD-03)", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-dup-quote-"));
+      try {
+        const sessionId = "session-rf7-dup-quote";
+        const meta = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          initialWalletBalanceSol: 7.9259,
+          environment: { platform: "win32", nodeVersion: "v22" },
+        };
+        const summary = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          closedAtIso: "2026-10-14T11:00:00.000Z",
+          totalCandidatesScreened: 0,
+          totalDecisionsRecorded: 0,
+          decisionWriteFailures: 0,
+          cohortBreakdown: {
+            filteredRejected: 0,
+            watchlistRadar: 0,
+            triggerRejected: 0,
+            executedBuy: 0,
+          },
+          topRejectionReasons: {},
+          totalMarketObservationsRecorded: 0,
+          totalStratifiedCandidatesTracked: 0,
+          missedWinnersCount: 0,
+          avoidedRugsCount: 0,
+        };
+
+        fs.writeFileSync(path.join(tempDir, "session-meta.json"), JSON.stringify(meta), "utf8");
+        fs.writeFileSync(
+          path.join(tempDir, "session-summary.json"),
+          JSON.stringify(summary),
+          "utf8",
+        );
+
+        // Duplicate quoteId "q-dup"
+        fs.writeFileSync(
+          path.join(tempDir, "execution-quotes.jsonl"),
+          JSON.stringify({ quoteId: "q-dup", sessionId, generationId: "gen-1" }) +
+            "\n" +
+            JSON.stringify({ quoteId: "q-dup", sessionId, generationId: "gen-1" }) +
+            "\n",
+          "utf8",
+        );
+
+        const res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("Duplicate quote ID 'q-dup'");
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed on duplicate fill ID in simulated-fills.jsonl (Finding C2-AUD-03)", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-dup-fill-"));
+      try {
+        const sessionId = "session-rf7-dup-fill";
+        const meta = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          initialWalletBalanceSol: 7.9259,
+          environment: { platform: "win32", nodeVersion: "v22" },
+        };
+        const summary = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          closedAtIso: "2026-10-14T11:00:00.000Z",
+          totalCandidatesScreened: 0,
+          totalDecisionsRecorded: 0,
+          decisionWriteFailures: 0,
+          cohortBreakdown: {
+            filteredRejected: 0,
+            watchlistRadar: 0,
+            triggerRejected: 0,
+            executedBuy: 0,
+          },
+          topRejectionReasons: {},
+          totalMarketObservationsRecorded: 0,
+          totalStratifiedCandidatesTracked: 0,
+          missedWinnersCount: 0,
+          avoidedRugsCount: 0,
+        };
+
+        fs.writeFileSync(path.join(tempDir, "session-meta.json"), JSON.stringify(meta), "utf8");
+        fs.writeFileSync(
+          path.join(tempDir, "session-summary.json"),
+          JSON.stringify(summary),
+          "utf8",
+        );
+
+        // Two distinct quotes
+        fs.writeFileSync(
+          path.join(tempDir, "execution-quotes.jsonl"),
+          JSON.stringify({ quoteId: "q-1", sessionId, generationId: "gen-1" }) +
+            "\n" +
+            JSON.stringify({ quoteId: "q-2", sessionId, generationId: "gen-1" }) +
+            "\n",
+          "utf8",
+        );
+
+        // Duplicate fillId "fill-dup"
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({ fillId: "fill-dup", quoteId: "q-1" }) +
+            "\n" +
+            JSON.stringify({ fillId: "fill-dup", quoteId: "q-2" }) +
+            "\n",
+          "utf8",
+        );
+
+        const res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("Duplicate fill ID 'fill-dup'");
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed when fill and quote mismatch on shared identities (mint, pool, side, decisionEventId) (Finding C2-AUD-03)", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-identity-mismatch-"));
+      try {
+        const sessionId = "session-rf7-identity-mismatch";
+        const meta = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          initialWalletBalanceSol: 7.9259,
+          environment: { platform: "win32", nodeVersion: "v22" },
+        };
+        const summary = {
+          sessionId,
+          generationId: "gen-1",
+          strategyRevision: "rev-12.94c",
+          startedAtIso: "2026-10-14T10:00:00.000Z",
+          closedAtIso: "2026-10-14T11:00:00.000Z",
+          totalCandidatesScreened: 0,
+          totalDecisionsRecorded: 0,
+          decisionWriteFailures: 0,
+          cohortBreakdown: {
+            filteredRejected: 0,
+            watchlistRadar: 0,
+            triggerRejected: 0,
+            executedBuy: 0,
+          },
+          topRejectionReasons: {},
+          totalMarketObservationsRecorded: 0,
+          totalStratifiedCandidatesTracked: 0,
+          missedWinnersCount: 0,
+          avoidedRugsCount: 0,
+        };
+
+        fs.writeFileSync(path.join(tempDir, "session-meta.json"), JSON.stringify(meta), "utf8");
+        fs.writeFileSync(
+          path.join(tempDir, "session-summary.json"),
+          JSON.stringify(summary),
+          "utf8",
+        );
+
+        const baseQuote = {
+          quoteId: "q-mismatch",
+          sessionId,
+          generationId: "gen-1",
+          mintAddress: "MintOriginal1111111111111111111111111111111",
+          poolId: "PoolOriginal1111111111111111111111111111111",
+          side: "BUY",
+          decisionEventId: "ev-original",
+        };
+
+        fs.writeFileSync(
+          path.join(tempDir, "execution-quotes.jsonl"),
+          JSON.stringify(baseQuote) + "\n",
+          "utf8",
+        );
+
+        // 1. Mismatched mint
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({
+            fillId: "fill-mismatch-mint",
+            quoteId: "q-mismatch",
+            mintAddress: "MintDivergent222222222222222222222222222222",
+            poolId: baseQuote.poolId,
+            side: baseQuote.side,
+            decisionEventId: baseQuote.decisionEventId,
+          }) + "\n",
+          "utf8",
+        );
+        let res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("does not match quote mint");
+
+        // 2. Mismatched pool
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({
+            fillId: "fill-mismatch-pool",
+            quoteId: "q-mismatch",
+            mintAddress: baseQuote.mintAddress,
+            poolId: "PoolDivergent222222222222222222222222222222",
+            side: baseQuote.side,
+            decisionEventId: baseQuote.decisionEventId,
+          }) + "\n",
+          "utf8",
+        );
+        res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("does not match quote pool ID");
+
+        // 3. Mismatched side
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({
+            fillId: "fill-mismatch-side",
+            quoteId: "q-mismatch",
+            mintAddress: baseQuote.mintAddress,
+            poolId: baseQuote.poolId,
+            side: "SELL",
+            decisionEventId: baseQuote.decisionEventId,
+          }) + "\n",
+          "utf8",
+        );
+        res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("does not match quote side");
+
+        // 4. Mismatched decisionEventId
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({
+            fillId: "fill-mismatch-ev",
+            quoteId: "q-mismatch",
+            mintAddress: baseQuote.mintAddress,
+            poolId: baseQuote.poolId,
+            side: baseQuote.side,
+            decisionEventId: "ev-divergent",
+          }) + "\n",
+          "utf8",
+        );
+        res = verifySessionCrossFileConsistency(tempDir);
+        expect(res.valid).toBe(false);
+        expect(res.reason).toContain("does not match quote decisionEventId");
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("verifies clean consistent session files with matched quotes and fills pass validation", () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf7-clean-"));
       try {
+        const sessionId = "session-rf7-clean";
         const meta = {
-          sessionId: "session-rf7-clean",
+          sessionId,
           generationId: "gen-1",
           strategyRevision: "rev-12.94c",
           startedAtIso: "2026-10-14T10:00:00.000Z",
@@ -766,7 +1441,7 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
           isInterruptedSession: false,
         };
         const summary = {
-          sessionId: "session-rf7-clean",
+          sessionId,
           generationId: "gen-1",
           strategyRevision: "rev-12.94c",
           startedAtIso: "2026-10-14T10:00:00.000Z",
@@ -797,7 +1472,34 @@ describe("Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)", ()
         );
         fs.writeFileSync(
           path.join(tempDir, "candidate-decisions.jsonl"),
-          JSON.stringify({ eventId: "ev-1", sessionId: "session-rf7-clean" }) + "\n",
+          JSON.stringify({ eventId: "ev-1", sessionId }) + "\n",
+          "utf8",
+        );
+
+        // Matched quote and fill
+        fs.writeFileSync(
+          path.join(tempDir, "execution-quotes.jsonl"),
+          JSON.stringify({
+            quoteId: "q-1",
+            sessionId,
+            generationId: "gen-1",
+            mintAddress: TEST_MINT,
+            poolId: TEST_POOL_ID,
+            side: "BUY",
+            decisionEventId: "ev-1",
+          }) + "\n",
+          "utf8",
+        );
+        fs.writeFileSync(
+          path.join(tempDir, "simulated-fills.jsonl"),
+          JSON.stringify({
+            fillId: "fill-1",
+            quoteId: "q-1",
+            mintAddress: TEST_MINT,
+            poolId: TEST_POOL_ID,
+            side: "BUY",
+            decisionEventId: "ev-1",
+          }) + "\n",
           "utf8",
         );
 

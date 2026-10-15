@@ -73,29 +73,74 @@ export function validateSlippageBps(slippageBps: number): number {
 }
 
 /**
+ * Validates that an economic parameter is a finite, strictly positive number (> 0 and not NaN).
+ */
+export function validateStrictlyPositiveFinite(val: unknown, name: string): number {
+  if (typeof val !== "number" || !Number.isFinite(val) || Number.isNaN(val) || val <= 0) {
+    throw new Error(
+      `[QuoteExecutionEngine] [INVALID_PARAM] ${name} must be a strictly positive finite number, received: ${String(val)}`,
+    );
+  }
+  return val;
+}
+
+/**
+ * Validates that a parameter is a finite, non-negative number (>= 0 and not NaN).
+ */
+export function validateNonNegativeFinite(val: unknown, name: string): number {
+  if (
+    typeof val !== "number" ||
+    !Number.isFinite(val) ||
+    Number.isNaN(val) ||
+    val < 0 ||
+    Object.is(val, -0)
+  ) {
+    throw new Error(
+      `[QuoteExecutionEngine] [INVALID_PARAM] ${name} must be a non-negative finite number, received: ${String(val)}`,
+    );
+  }
+  return val;
+}
+
+/**
+ * Canonical nonnegative decimal string regex:
+ * Matches "0", "0.xxx", or integer > 0 with optional decimal digits.
+ * Rejects negative signs, leading zeros (like 007), scientific notation (1e21, 1e+21), NaN, Infinity.
+ */
+export const CANONICAL_DECIMAL_REGEX = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+
+/**
  * Converts a UI amount or numeric string to an exact integer atomic-units string
- * using BigInt arithmetic, preventing scientific notation and float overflow.
+ * using BigInt arithmetic, strictly rejecting non-canonical, negative, or scientific notation strings.
  */
 export function toAtomicUnitsString(amount: number | string, decimals: number): string {
   validateMintDecimals(decimals);
   let str: string;
+
   if (typeof amount === "string") {
     str = amount.trim();
-  } else {
-    if (!Number.isFinite(amount) || amount < 0) {
-      throw new Error(`[QuoteExecutionEngine] Invalid amount: ${String(amount)}`);
+    if (!CANONICAL_DECIMAL_REGEX.test(str)) {
+      throw new Error(
+        `[QuoteExecutionEngine] [INVALID_AMOUNT] Invalid non-canonical decimal string: '${amount}'`,
+      );
     }
-    // Convert to fixed string with up to 18 decimals to avoid scientific notation
+  } else if (typeof amount === "number") {
+    if (!Number.isFinite(amount) || Number.isNaN(amount) || amount < 0 || Object.is(amount, -0)) {
+      throw new Error(
+        `[QuoteExecutionEngine] [INVALID_AMOUNT] Invalid numeric amount: ${String(amount)}`,
+      );
+    }
+    // Convert number to fixed decimal string
     str = amount.toFixed(Math.min(18, Math.max(decimals, 8)));
-  }
-
-  // Remove scientific notation if present in string
-  if (str.includes("e") || str.includes("E")) {
-    const num = Number(str);
-    if (!Number.isFinite(num) || num < 0) {
-      throw new Error(`[QuoteExecutionEngine] Invalid scientific notation string: ${str}`);
+    if (!CANONICAL_DECIMAL_REGEX.test(str)) {
+      throw new Error(
+        `[QuoteExecutionEngine] [INVALID_AMOUNT] Numeric amount produced non-canonical decimal string: '${str}'`,
+      );
     }
-    str = num.toFixed(decimals);
+  } else {
+    throw new Error(
+      `[QuoteExecutionEngine] [INVALID_AMOUNT] Amount must be a number or string, received: ${typeof amount}`,
+    );
   }
 
   const parts = str.split(".");
@@ -295,13 +340,19 @@ export function calculateAmmBuyQuote(params: AmmBuyQuoteParams): {
   const rFee = validateFeeRate(params.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
   const maxSlippageBps = validateSlippageBps(params.maxSlippageBps ?? 25);
 
-  if (params.inputSol <= 0 || params.quoteReserveSol <= 0 || params.baseReserveTokens <= 0) {
-    throw new Error("[QuoteExecutionEngine] Reserves and trade size must be strictly positive.");
-  }
+  validateStrictlyPositiveFinite(params.inputSol, "inputSol");
+  validateStrictlyPositiveFinite(params.quoteReserveSol, "quoteReserveSol");
+  validateStrictlyPositiveFinite(params.baseReserveTokens, "baseReserveTokens");
 
   const effectiveInputSol = params.inputSol * (1 - rFee);
   const tokensGross =
     params.baseReserveTokens * (effectiveInputSol / (params.quoteReserveSol + effectiveInputSol));
+
+  if (!Number.isFinite(tokensGross) || tokensGross <= 0) {
+    throw new Error(
+      `[QuoteExecutionEngine] [ZERO_OUTPUT] Constant-product calculation yielded zero or non-finite output tokens: ${tokensGross}`,
+    );
+  }
 
   const priceImpactPct = params.inputSol / (params.quoteReserveSol + params.inputSol);
   const tokensMinimum = tokensGross * (1 - maxSlippageBps / 10000);
@@ -338,14 +389,20 @@ export function calculateAmmSellQuote(params: AmmSellQuoteParams): {
   const rFee = validateFeeRate(params.dexFeeRate ?? DEFAULT_RAYDIUM_AMM_FEE_RATE);
   const maxSlippageBps = validateSlippageBps(params.maxSlippageBps ?? 25);
 
-  if (params.inputTokens <= 0 || params.quoteReserveSol <= 0 || params.baseReserveTokens <= 0) {
-    throw new Error("[QuoteExecutionEngine] Reserves and input tokens must be strictly positive.");
-  }
+  validateStrictlyPositiveFinite(params.inputTokens, "inputTokens");
+  validateStrictlyPositiveFinite(params.quoteReserveSol, "quoteReserveSol");
+  validateStrictlyPositiveFinite(params.baseReserveTokens, "baseReserveTokens");
 
   const effectiveInputTokens = params.inputTokens * (1 - rFee);
   const solGross =
     params.quoteReserveSol *
     (effectiveInputTokens / (params.baseReserveTokens + effectiveInputTokens));
+
+  if (!Number.isFinite(solGross) || solGross <= 0) {
+    throw new Error(
+      `[QuoteExecutionEngine] [ZERO_OUTPUT] Constant-product calculation yielded zero or non-finite output SOL: ${solGross}`,
+    );
+  }
 
   const priceImpactPct = params.inputTokens / (params.baseReserveTokens + params.inputTokens);
   const solMinimum = solGross * (1 - maxSlippageBps / 10000);
@@ -386,6 +443,16 @@ export interface CreateDeterministicAmmQuoteParams {
 export function createDeterministicAmmQuote(
   params: CreateDeterministicAmmQuoteParams,
 ): ExecutableQuoteRecord {
+  validateStrictlyPositiveFinite(params.tradeSizeSolOrTokens, "tradeSizeSolOrTokens");
+  validateNonNegativeFinite(params.quoteInitiatedMs, "quoteInitiatedMs");
+  validateNonNegativeFinite(params.contextSlot, "contextSlot");
+  if (params.quoteLatencyMs !== undefined) {
+    validateNonNegativeFinite(params.quoteLatencyMs, "quoteLatencyMs");
+  }
+  if (params.ttlMs !== undefined) {
+    validateStrictlyPositiveFinite(params.ttlMs, "ttlMs");
+  }
+
   const quoteId = `quote-${crypto.randomUUID()}`;
   const latency = params.quoteLatencyMs ?? 25;
   const quoteReceivedMs = params.quoteInitiatedMs + latency;
@@ -410,6 +477,18 @@ export function createDeterministicAmmQuote(
     side: params.side,
     targetMintAddress: params.mintAddress,
   });
+
+  if (!routeVerification.valid) {
+    throw new Error(
+      `[QuoteExecutionEngine] [ROUTE_VERIFICATION_FAILED] ${routeVerification.reason}`,
+    );
+  }
+
+  if (routeVerification.routeType === "MULTI_HOP") {
+    throw new Error(
+      `[QuoteExecutionEngine] [UNSUPPORTED_MULTIHOP_ROUTE] Multi-hop routes (${defaultRoutePlan.length} hops) cannot be accurately priced with single-pool synthetic AMM reserve math. Route pricing rejected.`,
+    );
+  }
 
   if (params.side === "BUY") {
     const buyResult = calculateAmmBuyQuote({
@@ -514,6 +593,11 @@ export interface SimulateFillOptions {
   readonly computeUnits?: number | undefined;
   readonly isNewAta?: boolean | undefined;
   readonly closeAta?: boolean | undefined;
+  /**
+   * Indicates whether an ATA was actually opened and funded for this token.
+   * Required for rent refund rebate eligibility.
+   */
+  readonly hasFundedAta?: boolean | undefined;
   readonly sellabilityStatus?: SellabilityStatus | undefined;
   /**
    * Simulated price degradation in bps experienced during execution delay.
@@ -555,6 +639,13 @@ export function simulateFill(
     );
   }
 
+  // Reject unsupported multi-hop route fills
+  if (quote.routeType === "MULTI_HOP") {
+    throw new Error(
+      `[QuoteExecutionEngine] [UNSUPPORTED_MULTIHOP_ROUTE] Cannot fill quote with multi-hop route on single-pool synthetic model.`,
+    );
+  }
+
   // 3. Execution Latency & Expiration
   const executionDelayMs = options.executionDelayMs ?? 150;
   const fillTimestampMs = quote.quoteReceivedMs + executionDelayMs;
@@ -564,10 +655,25 @@ export function simulateFill(
     );
   }
 
+  // Validate finite non-negative arrival slippage
+  if (options.arrivalSlippageBps !== undefined) {
+    if (
+      typeof options.arrivalSlippageBps !== "number" ||
+      !Number.isFinite(options.arrivalSlippageBps) ||
+      Number.isNaN(options.arrivalSlippageBps) ||
+      options.arrivalSlippageBps < 0 ||
+      options.arrivalSlippageBps > 10000
+    ) {
+      throw new Error(
+        `[QuoteExecutionEngine] [INVALID_SLIPPAGE] arrivalSlippageBps must be a finite number between 0 and 10000, received: ${String(options.arrivalSlippageBps)}`,
+      );
+    }
+  }
+
   const fillSlot = quote.contextSlot + Math.max(1, Math.floor(executionDelayMs / 400));
   const fillId = `fill-${crypto.randomUUID()}`;
   const status: SellabilityStatus = options.sellabilityStatus ?? "FULLY_SELLABLE";
-  const arrivalSlippageBps = Math.max(0, options.arrivalSlippageBps ?? 0);
+  const arrivalSlippageBps = options.arrivalSlippageBps ?? 0;
 
   if (quote.side === "BUY") {
     const feeBreakdown = calculateEntryFees({
@@ -632,6 +738,8 @@ export function simulateFill(
       realizedSlippageBps: arrivalSlippageBps,
       networkFeeLamports: feeBreakdown.externalNetworkFeeLamports,
       priorityFeeLamports: feeBreakdown.priorityFeeLamports,
+      ataRentDepositLamports: feeBreakdown.ataRentDepositLamports,
+      ataRentRefundLamports: feeBreakdown.ataRentRefundLamports,
       sellabilityStatus: "FULLY_SELLABLE",
       fillTimestampMs,
       fillSlot,
@@ -644,6 +752,7 @@ export function simulateFill(
       grossSolProceedsLamports: Number(quote.expectedOutAmountRaw),
       dexFeeRate: quote.poolInternalFeeLamports / Number(quote.expectedOutAmountRaw),
       closeAta: options.closeAta,
+      hasFundedAta: options.hasFundedAta,
       computeUnits: options.computeUnits,
       microLamportsPerCu: options.priorityFeeMicroLamports,
     });
@@ -811,6 +920,8 @@ export function simulateFill(
       realizedSlippageBps: arrivalSlippageBps,
       networkFeeLamports: feeBreakdown.externalNetworkFeeLamports,
       priorityFeeLamports: feeBreakdown.priorityFeeLamports,
+      ataRentDepositLamports: feeBreakdown.ataRentDepositLamports,
+      ataRentRefundLamports: feeBreakdown.ataRentRefundLamports,
       sellabilityStatus: status,
       realizedPnlSol,
       fillTimestampMs,

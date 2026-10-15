@@ -118,6 +118,14 @@ export interface SimulatedFillRecord {
    */
   readonly networkFeeLamports: number;
   readonly priorityFeeLamports: number;
+  /**
+   * Explicit ATA rent creation deposit in lamports (if a new ATA was opened).
+   */
+  readonly ataRentDepositLamports?: number | undefined;
+  /**
+   * Explicit ATA rent refund in lamports (if an established funded ATA was closed).
+   */
+  readonly ataRentRefundLamports?: number | undefined;
   readonly sellabilityStatus: SellabilityStatus;
   /**
    * Conservative valuation stress write-down (risk metric, not a realized liquidation).
@@ -146,7 +154,10 @@ export interface ExecutionFeeBreakdown {
   readonly ataRentDepositLamports: number;
   readonly ataRentRefundLamports: number;
   /**
-   * Total out-of-pocket cash debit: external network fees + ATA rent deposit - ATA rent refund.
+   * Signed net out-of-pocket cash movement:
+   * (externalNetworkFeeLamports + ataRentDepositLamports - ataRentRefundLamports).
+   * Positive = net cash debit paid by wallet.
+   * Negative = net cash credit received by wallet (when rent refund exceeds network fees).
    */
   readonly totalOutOfPocketFeeLamports: number;
   readonly totalOutOfPocketFeeSol: number;
