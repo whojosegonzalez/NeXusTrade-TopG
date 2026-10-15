@@ -36,6 +36,20 @@ import type {
 } from "./ResearchTypes.js";
 // @ts-expect-error - audit-research-readiness is an executable ESM script outside backend/src
 import { runReadinessAudit } from "../../../scripts/audit-research-readiness.mjs";
+import {
+  createShadowEvaluationRecord,
+  validateShadowEvaluationRecord,
+} from "./ShadowEvaluationContract.js";
+import { validateClockMonotonicity } from "./ClockMonotonicityValidator.js";
+import {
+  computeHajekMean,
+  computeHorvitzThompsonTotal,
+  computeTwoWayClusterCovariance,
+  computeAmmRoundTripWaterfall,
+} from "./StatisticalOracles.js";
+import { parseFedoraArchiveDirectory } from "./FedoraArchiveParser.js";
+// @ts-expect-error - audit-windows-legacy-inventory is an executable ESM script outside backend/src
+import { inspectWindowsLegacySessions } from "../../../scripts/audit-windows-legacy-inventory.mjs";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -2559,6 +2573,380 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
 
       expect(result.isEligible).toBe(true);
       expect(result.rejectionReasons).toHaveLength(0);
+    });
+  });
+
+  describe("Phase 12.94-D Milestone D.2.1 Offline Foundations & Verification Fixtures", () => {
+    describe("D2.1-DELIV-1: Windows Legacy-Data Inventory & Provenance Manifest", () => {
+      it("RF-D21.1: inspects Windows legacy sessions and confirms honest INSUFFICIENT_EVIDENCE status", () => {
+        const inventory = inspectWindowsLegacySessions();
+        expect(inventory.telemetrySessionsFoundCount).toBe(0);
+        expect(inventory.canonicalTelemetryStatus).toContain("INSUFFICIENT_EVIDENCE");
+        expect(inventory.legacySessionsCount).toBe(2);
+        expect(inventory.walletStatus?.currentBalanceSol).toBe(7.9259);
+        expect(inventory.walletStatus?.sha256).toBe(
+          "7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9",
+        );
+        expect(inventory.fedoraRunStatus).toContain("REPORTED_NOT_INSPECTED");
+
+        // Verify that each legacy session has known missing quantitative features
+        for (const session of inventory.legacySessionInventories) {
+          expect(session.missingQuantitativeFeatures.length).toBeGreaterThan(0);
+          expect(session.hypothesisFeasibility.h1LiquidityDepth).toContain("INELIGIBLE");
+          expect(session.hypothesisFeasibility.h2OrderFlowMomentum).toContain("INELIGIBLE");
+          expect(session.hypothesisFeasibility.h3StructuralSafety).toContain("INELIGIBLE");
+          expect(session.hypothesisFeasibility.h4DynamicCapacitySizing).toContain("INELIGIBLE");
+        }
+      });
+    });
+
+    describe("D2.1-DELIV-2: Shadow Evaluation Research Sidecar Contracts", () => {
+      it("RF-D21.2: creates and validates a schema 1.0.0 ShadowEvaluationRecord preserving original decision cohort", () => {
+        const decision = createMockDecision({
+          decisionCohort: "WATCHLIST_RADAR",
+        });
+
+        const record = createShadowEvaluationRecord({
+          decision,
+          qualificationResult: {
+            shadowTriggerQualified: true,
+            qualificationReason: "MET_MOMENTUM_AND_SAFETY_CRITERIA",
+            simulatedTargetSizeSol: 0.1,
+            executionFeasible: true,
+          },
+          hostMonotonicElapsedMs: 142.5,
+          observedReserveSnapshot: {
+            baseReserve: 1000000,
+            quoteReserve: 50,
+            sourceTimestampMs: decision.sourceTimestampMs,
+          },
+        });
+
+        expect(record.schemaVersion).toBe("1.0.0");
+        expect(record.decisionEventId).toBe(decision.eventId);
+        expect(record.evaluationTimestampMs).toBe(decision.decisionTimestampMs);
+        expect(record.hostMonotonicElapsedMs).toBe(142.5);
+        expect(record.qualificationResult.shadowTriggerQualified).toBe(true);
+        expect(record.qualificationResult.executionFeasible).toBe(true);
+
+        const validated = validateShadowEvaluationRecord(record);
+        expect(validated.evaluationId).toBe(record.evaluationId);
+
+        // Crucial invariant: original decision cohort remains WATCHLIST_RADAR (never EXECUTED_BUY)
+        expect(decision.decisionCohort).toBe("WATCHLIST_RADAR");
+      });
+
+      it("RF-D21.3: rejects invalid or corrupt shadow evaluation records fail-closed", () => {
+        expect(() => validateShadowEvaluationRecord(null)).toThrow("non-null object");
+        expect(() => validateShadowEvaluationRecord({ schemaVersion: "2.0.0" })).toThrow(
+          "schemaVersion",
+        );
+        expect(() =>
+          validateShadowEvaluationRecord({
+            schemaVersion: "1.0.0",
+            evaluationId: "",
+          }),
+        ).toThrow("evaluationId");
+        expect(() =>
+          validateShadowEvaluationRecord({
+            schemaVersion: "1.0.0",
+            evaluationId: "shd-1",
+            decisionEventId: "dec-1",
+            sessionId: "ses-1",
+            generationId: "gen-1",
+            mintAddress: "mint-1",
+            poolId: "pool-1",
+            evaluationTimestampMs: NaN,
+          }),
+        ).toThrow("evaluationTimestampMs");
+      });
+    });
+
+    describe("D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01)", () => {
+      it("RF-D21.4: accepts causally monotonic timestamps within allowed skew", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 10000,
+          ingestionTimestampMs: 10050,
+          responseReceivedMs: 10080,
+          decisionTimestampMs: 10100,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(true);
+        expect(result.isQuarantined).toBe(false);
+        expect(result.quarantineReasons).toHaveLength(0);
+        expect(result.measuredSkewMs).toBe(-50); // provider slightly before ingestion
+      });
+
+      it("RF-D21.5: D2-PREREQ-01: responseReceivedMs < sourceTimestampMs is quarantined under IMPOSSIBLE_TIMESTAMP_ORDERING", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 990000,
+          ingestionTimestampMs: 990100,
+          responseReceivedMs: 980000, // Inverted: received before source!
+          decisionTimestampMs: 1000000,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(result.unavailabilityReason).toBe("IMPOSSIBLE_TIMESTAMP_ORDERING");
+        expect(
+          result.quarantineReasons.some((r) => r.includes("IMPOSSIBLE_TIMESTAMP_ORDERING")),
+        ).toBe(true);
+      });
+
+      it("RF-D21.6: forward clock skew exceeding 5000ms is quarantined", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 20000, // 8000ms ahead of ingestion!
+          ingestionTimestampMs: 12000,
+          responseReceivedMs: 20500,
+          decisionTimestampMs: 21000,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(result.unavailabilityReason).toBe("IMPOSSIBLE_TIMESTAMP_ORDERING");
+        expect(
+          result.quarantineReasons.some((r) => r.includes("EXCESSIVE_FORWARD_CLOCK_SKEW")),
+        ).toBe(true);
+      });
+
+      it("RF-D21.7: lookahead leakage where sourceTimestampMs > decisionTimestampMs is quarantined", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 15000, // after decision!
+          ingestionTimestampMs: 15050,
+          responseReceivedMs: 15100,
+          decisionTimestampMs: 12000,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(result.unavailabilityReason).toBe("LATE_RECEIPT_LOOKAHEAD_PREVENTION");
+      });
+
+      it("RF-D21.8: source timestamp derived solely from HTTP Date header fails closed", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 10000,
+          ingestionTimestampMs: 10050,
+          responseReceivedMs: 10100,
+          decisionTimestampMs: 10200,
+          isDerivedFromHttpDateHeaderOnly: true,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(
+          result.quarantineReasons.some((r) => r.includes("HTTP_HEADER_TIMESTAMP_INSUFFICIENT")),
+        ).toBe(true);
+      });
+
+      it("RF-D21.9: readiness scanner H3 matcher rejects adversarial fixture with recv < source", () => {
+        const tempBase = fs.mkdtempSync(path.join(os.tmpdir(), "audit-d21-h3-"));
+        const sessionDir = path.join(tempBase, "session-h3-d21");
+        fs.mkdirSync(sessionDir, { recursive: true });
+
+        const meta = createMockMeta({ sessionId: "session-h3-d21" });
+        const summary = createMockSummary({ sessionId: "session-h3-d21" });
+
+        // Decision with valid lpBurnPct at t = 1000000
+        const decision = createMockDecision({
+          sessionId: "session-h3-d21",
+          decisionTimestampMs: 1000000,
+          metricsSnapshot: {
+            tokenAgeSec: 3600,
+            liquidityUsd: 50000,
+            marketCapUsd: 200000,
+            lmcRatio: 0.25,
+            lpBurnPct: 100, // Valid LP burn
+            spotPriceUsd: 0.05,
+            spotPriceSol: 0.00025,
+            volume5mUsd: 1000,
+            txCount5m: 10,
+            buys5m: 6,
+            sells5m: 4,
+            metricProvenance: {
+              tokenAgeSec: "DERIVED",
+              liquidityUsd: "OBSERVED",
+              marketCapUsd: "OBSERVED",
+              lmcRatio: "DERIVED",
+              lpBurnPct: "OBSERVED",
+              spotPriceUsd: "OBSERVED",
+              spotPriceSol: "OBSERVED",
+              volume5mUsd: "OBSERVED",
+              txCount5m: "OBSERVED",
+              buys5m: "OBSERVED",
+              sells5m: "OBSERVED",
+            },
+          },
+        });
+
+        // Adversarial observation: source=990000, ingestion=990100, recv=980000 (recv < source!)
+        const adversarialObs = createMockObservation({
+          sessionId: "session-h3-d21",
+          sourceTimestampMs: 990000,
+          ingestionTimestampMs: 990100,
+          responseReceivedMs: 980000,
+          holderMetrics: {
+            top10ConcentrationPct: 20,
+            devHoldingPct: 5,
+            totalHolders: 150,
+          },
+        });
+
+        fs.writeFileSync(path.join(sessionDir, "session-meta.json"), JSON.stringify(meta));
+        fs.writeFileSync(path.join(sessionDir, "session-summary.json"), JSON.stringify(summary));
+        fs.writeFileSync(
+          path.join(sessionDir, "candidate-decisions.jsonl"),
+          JSON.stringify(decision) + "\n",
+        );
+        fs.writeFileSync(
+          path.join(sessionDir, "market-observations.jsonl"),
+          JSON.stringify(adversarialObs) + "\n",
+        );
+
+        const audit = runReadinessAudit({
+          rootDir: tempBase,
+          telemetrySessionsDir: tempBase,
+          legacySessionsDir: path.join(tempBase, "sessions"),
+          reportOutputPath: path.join(tempBase, "REPORT.md"),
+        });
+        expect(audit.h3Feasible).toBe(false);
+        expect(audit.eligibleH3DecisionsCount).toBe(0);
+
+        fs.rmSync(tempBase, { recursive: true, force: true });
+      });
+    });
+
+    describe("D2.1-DELIV-4: Statistical & Mathematical Reference Oracles", () => {
+      it("RF-D21.10: computes exact Hájek mean and Kish effective sample size with hand-calculated reference", () => {
+        // Values: [10, 20, 30], Probs: [0.5, 0.25, 0.1]
+        // Weights: 1/0.5 = 2, 1/0.25 = 4, 1/0.1 = 10
+        // Weighted sum: 10*2 + 20*4 + 30*10 = 20 + 80 + 300 = 400
+        // Sum weights: 2 + 4 + 10 = 16
+        // Hajek mean: 400 / 16 = 25.0
+        // Kish ESS: 16^2 / (2^2 + 4^2 + 10^2) = 256 / (4 + 16 + 100) = 256 / 120 = 2.1333333333333333
+        const result = computeHajekMean([10, 20, 30], [0.5, 0.25, 0.1]);
+
+        expect(result.estimate).toBeCloseTo(25.0, 10);
+        expect(result.sumWeights).toBeCloseTo(16.0, 10);
+        expect(result.effectiveSampleSize).toBeCloseTo(256 / 120, 10);
+
+        const total = computeHorvitzThompsonTotal([10, 20, 30], [0.5, 0.25, 0.1]);
+        expect(total).toBeCloseTo(400.0, 10);
+      });
+
+      it("RF-D21.11: computes Cameron-Gelbach-Miller two-way cluster-robust covariance with small cluster safeguard", () => {
+        const residuals = [0.1, -0.2, 0.15, -0.05];
+        const X = [
+          [1, 0.5],
+          [1, 0.8],
+          [1, 0.2],
+          [1, 0.9],
+        ];
+        const sessions = ["ses-1", "ses-1", "ses-2", "ses-2"];
+        const mints = ["mint-A", "mint-B", "mint-A", "mint-B"];
+
+        const result = computeTwoWayClusterCovariance(residuals, X, sessions, mints);
+
+        expect(result.vcovMatrix).toHaveLength(2);
+        expect(result.standardErrors).toHaveLength(2);
+        expect(result.standardErrors[0]).toBeGreaterThan(0);
+        expect(result.standardErrors[1]).toBeGreaterThan(0);
+        expect(result.numClustersSession).toBe(2);
+        expect(result.numClustersMint).toBe(2);
+        expect(result.isSmallClusterWarning).toBe(true);
+        expect(result.smallClusterNote).toContain("Small cluster count");
+      });
+
+      it("RF-D21.12: stateful constant-product AMM execution waterfall deducts LP fee inside swap and loses on flat zero-alpha market", () => {
+        // Pool: 1,000,000 tokens, 100 SOL. Buy size: 1.0 SOL. LP fee: 25 bps. Network fee: 0.0001 SOL per leg.
+        const result = computeAmmRoundTripWaterfall({
+          initialBaseReserve: 1000000,
+          initialQuoteReserveSol: 100,
+          buySizeSol: 1.0,
+          lpFeeBps: 25,
+          networkFeeSol: 0.0001,
+          ataRentSol: 0.002,
+          priceMultiplier: 1.0, // Flat market (zero alpha)
+        });
+
+        // 1. In a flat zero-alpha market, net cash return must be strictly negative due to LP fees + gas
+        expect(result.netCashDeltaSol).toBeLessThan(0);
+        expect(result.netCashReturnPct).toBeLessThan(0);
+
+        // 2. Total network fees are 2 * 0.0001 = 0.0002 SOL
+        expect(result.totalNetworkFeesSol).toBe(0.0002);
+
+        // 3. ATA rent is neutral across closed round trip (deposit refunded)
+        expect(result.ataRentNetSol).toBe(0);
+
+        // 4. Exact swap proceeds check: proceeds < outlay
+        expect(result.solProceedsSell).toBeLessThan(1.0);
+
+        // 5. Net return is approx -0.52% (25 bps on buy + 25 bps on sell + network fees)
+        expect(result.netCashReturnPct).toBeCloseTo(-0.52, 1);
+      });
+    });
+
+    describe("D2.1-DELIV-5: Read-Only Fedora Archive Parser", () => {
+      it("RF-D21.13: returns REPORTED_NOT_INSPECTED when staging directory does not exist", () => {
+        const missingDir = path.join(os.tmpdir(), "nonexistent-fedora-staging-dir-12345");
+        const result = parseFedoraArchiveDirectory(missingDir);
+
+        expect(result.status).toBe("REPORTED_NOT_INSPECTED");
+        expect(result.filesAuditedCount).toBe(0);
+        expect(result.sessionsAuditedCount).toBe(0);
+        expect(result.operationalNotice).toContain("STRICTLY OFFLINE");
+      });
+
+      it("RF-D21.14: parses staged isolated legacy session and classifies H1-H4 features as UNAVAILABLE", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-staging-"));
+        const mockFedoraSession = {
+          sessionId: "session-fedora-168h-test",
+          startedAt: "2026-10-07T00:00:00.000Z",
+          endedAt: "2026-10-14T00:00:00.000Z",
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 9.2,
+          netPnlSol: -0.8,
+          trades: [
+            {
+              tradeId: "trade-fedora-1",
+              mintAddress: "FedoraMint1111111111111111111111111111111111",
+              symbol: "FED",
+              entryPriceSol: 0.001,
+              exitPriceSol: 0.0009,
+              sizeSol: 0.5,
+              enteredAt: "2026-10-08T12:00:00.000Z",
+              exitedAt: "2026-10-08T12:15:00.000Z",
+              finalPnlSol: -0.05,
+              exitReason: "TRAILING_STOP",
+            },
+          ],
+        };
+
+        fs.writeFileSync(
+          path.join(tempStaging, "session-fedora-168h-test.json"),
+          JSON.stringify(mockFedoraSession),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+        expect(result.status).toBe("ARCHIVE_CONFIRMED_PARSED");
+        expect(result.filesAuditedCount).toBe(1);
+        expect(result.sessionsAuditedCount).toBe(1);
+
+        const session = result.sessions[0]!;
+        expect(session.sessionId).toBe("session-fedora-168h-test");
+        expect(session.netPnlSol).toBe(-0.8);
+        expect(session.totalTrades).toBe(1);
+        expect(session.sha256).toHaveLength(64);
+
+        // Feature provenance check:
+        expect(session.fieldProvenance.netPnlSol).toBe("OBSERVED");
+        expect(session.fieldProvenance.baseReserve).toBe("UNAVAILABLE");
+        expect(session.fieldProvenance.quoteReserve).toBe("UNAVAILABLE");
+        expect(session.fieldProvenance.buys5m).toBe("UNAVAILABLE");
+        expect(session.fieldProvenance.devHoldingPct).toBe("UNAVAILABLE");
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
     });
   });
 });

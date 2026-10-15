@@ -14,33 +14,33 @@ node.exe scripts/check-secrets.mjs
 Secret check passed.
 git diff --check
 node.exe --test scripts/architecture-check.test.mjs scripts/verify-isolated.test.mjs
-✔ output guard rejects redirected ancestors before creating directories (6.8773ms)
-✔ allowed cycles terminate and type-only edges are classified separately (20.5947ms)
-✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_short-hash (11.0581ms)
-✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_peer-long-layout (9.469ms)
-✔ type package permission does not allow runtime imports or other sources (19.0297ms)
-✔ type package permission rejects unresolved packages and local alias substitutions (14.5976ms)
-✔ rejects forbidden edge import "./forbidden.js"; (6.6342ms)
-✔ rejects forbidden edge export * from "./forbidden.js"; (6.8446ms)
-✔ rejects forbidden edge import "@local/forbidden"; (6.2608ms)
-✔ rejects transitive barrel routes and returns nonzero CLI status (13.6388ms)
-✔ rejects capability import("./allowed.js") (7.5291ms)
-✔ rejects capability import(name) (6.2763ms)
-✔ rejects capability require("x") (3.9189ms)
-✔ rejects capability import loader = require("x"); (3.9309ms)
-✔ rejects capability process["env"] (3.9209ms)
-✔ rejects capability globalThis["fetch"]("x") (4.8679ms)
-✔ rejects capability new Function("return 1") (4.1484ms)
-✔ rejects capability Date.now() (3.5491ms)
-✔ rejects capability setTimeout(()=>{},1) (5.5319ms)
-✔ unresolved runtime and unreviewed type dependencies fail explicitly (11.7366ms)
-✔ renamed filesystem writes cannot pass a named read API allowance (7.3794ms)
-✔ an audited package name still requires successful module resolution (8.1005ms)
-✔ rejects redirected source before reading its target (8.6249ms)
-✔ isolated plan contains exactly the four audited suites and no operational command (1.446ms)
-✔ first child failure stops subsequent commands with nonzero status (2.1772ms)
-✔ spawn errors and signals fail closed (2.474ms)
-✔ invalid modes fail before execution (0.3858ms)
+✔ output guard rejects redirected ancestors before creating directories (6.4333ms)
+✔ allowed cycles terminate and type-only edges are classified separately (14.9862ms)
+✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_short-hash (8.4498ms)
+✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_peer-long-layout (6.4009ms)
+✔ type package permission does not allow runtime imports or other sources (13.9368ms)
+✔ type package permission rejects unresolved packages and local alias substitutions (9.0834ms)
+✔ rejects forbidden edge import "./forbidden.js"; (6.4226ms)
+✔ rejects forbidden edge export * from "./forbidden.js"; (3.7494ms)
+✔ rejects forbidden edge import "@local/forbidden"; (3.3539ms)
+✔ rejects transitive barrel routes and returns nonzero CLI status (4.4405ms)
+✔ rejects capability import("./allowed.js") (3.0766ms)
+✔ rejects capability import(name) (2.9067ms)
+✔ rejects capability require("x") (2.7551ms)
+✔ rejects capability import loader = require("x"); (2.9411ms)
+✔ rejects capability process["env"] (2.7641ms)
+✔ rejects capability globalThis["fetch"]("x") (2.768ms)
+✔ rejects capability new Function("return 1") (2.8064ms)
+✔ rejects capability Date.now() (2.8515ms)
+✔ rejects capability setTimeout(()=>{},1) (3.308ms)
+✔ unresolved runtime and unreviewed type dependencies fail explicitly (7.3614ms)
+✔ renamed filesystem writes cannot pass a named read API allowance (3.2568ms)
+✔ an audited package name still requires successful module resolution (3.7837ms)
+✔ rejects redirected source before reading its target (5.0115ms)
+✔ isolated plan contains exactly the four audited suites and no operational command (1.3174ms)
+✔ first child failure stops subsequent commands with nonzero status (1.9125ms)
+✔ spawn errors and signals fail closed (1.8201ms)
+✔ invalid modes fail before execution (0.3416ms)
 ℹ tests 27
 ℹ suites 0
 ℹ pass 27
@@ -48,15 +48,87 @@ node.exe --test scripts/architecture-check.test.mjs scripts/verify-isolated.test
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 519.6791
+ℹ duration_ms 373.3326
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.measurement-analysis.config.ts
 
  RUN  v4.1.11 U:/Projects/TopG/backend
 
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts (115 tests) 4022ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts (7 tests) 1764ms
-     ✓ emits only json stdout on successful synthetic analysis  933ms
-     ✓ emits only markdown stdout on successful synthetic analysis  742ms
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1-AUD-05: Readiness Audit Validity on Synthetic Filesystem Fixture > RF-D5.1: does not falsely claim feasibility on placeholder or unverified data in audit script
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\AUDIT_REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.10: two-session cross-token fixture: does not declare H3 feasible when features are on different tokens
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.11: unfinalized session fixture: does not declare H2 feasible when session is unfinalized
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.12: cross-generation reserve attribution fixture: does not attribute reserves from another generation
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.13: valid candidate decision with all features matching declares hypotheses feasible
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.1: D1C3-01: future-only developer-holding observation produces h3Feasible: false and eligibleH3DecisionsCount: 0 on candidate decision at time t
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.2: D1C3-01: pre-decision developer-holding observation within freshness window qualifies candidate decision for H3
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.3: D1C3-01: stale pre-decision developer-holding observation exceeding freshness limit fails closed
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > Phase 12.94-D Milestone D.2.1 Offline Foundations & Verification Fixtures > D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01) > RF-D21.9: readiness scanner H3 matcher rejects adversarial fixture with recv < source
+[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_ELIGIBLE_FINALIZED_DECISIONS)
+
+ ✓ src/research/QuantitativeResearch.test.ts (55 tests) 50ms
+ ✓ src/candidate-scanner/BuyGateTriggerService.test.ts (46 tests) 26ms
+ ✓ src/candidate-scanner/CandidateScannerConfig.test.ts (5 tests) 3ms
+ ✓ src/candidate-scanner/CandidateScannerEvaluator.test.ts (11 tests) 5ms
+ ✓ src/candidate-scanner/CandidateStreamEngine.test.ts (6 tests) 24ms
+ ✓ src/candidate-scanner/CandidateWatchlistService.test.ts (9 tests) 5ms
+ ✓ src/candidate-scanner/CounterfactualOpportunityTracker.test.ts (4 tests) 4ms
+stderr | src/execution/ExecutionRealism.test.ts > Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined) > RF-7: Crash Repair-Before-Append & Strict Reconciliation (Findings C8 & C2-AUD-03) > quarantines crash-damaged tail before appending and recovers clean boundary
+[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\rf7-crash-append-qkW6iY\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl:2 to U:\Projects\TopG\.tmp\isolated\rf7-crash-append-qkW6iY\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl.corrupt-1792106146086
+
+ ✓ src/execution/ExecutionRealism.test.ts (37 tests) 42ms
+ ✓ src/exits/DynamicRatchetService.test.ts (36 tests) 11ms
+ ✓ src/paper/GenerationsRegistry.test.ts (23 tests) 145ms
 stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > SubPhase12_90: Chrono-Regime Gating and Schedule Parser > rejects invalid schedule formats or out of bounds values
 [PaperDaemon] Invalid --schedule format: "invalid". Expected HH:MM-HH:MM[:TZ] (e.g. 07:00-17:30:PDT)
 [PaperDaemon] Invalid hour/minute in --schedule: "25:00-17:00:PDT"
@@ -64,7 +136,7 @@ stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > SubPhase12_
 [PaperDaemon] Invalid hour/minute in --schedule: "07:00-24:00:PDT"
 
 stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-C: fails closed on corrupted wallet JSON and preserves corrupt backup
-[PaperDaemon] Corrupt or unreadable virtual wallet at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-vwpYKC\virtual-wallet.json. Creating backup and failing closed... SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)
+[PaperDaemon] Corrupt or unreadable virtual wallet at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-7p23jv\virtual-wallet.json. Creating backup and failing closed... SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)
     at JSON.parse (<anonymous>)
     at loadVirtualWallet (U:/Projects/TopG/backend/src/paper/VirtualWallet.ts:86:27)
     at U:/Projects/TopG/backend/src/paper/PaperTradingDaemon.test.ts:1003:20
@@ -75,10 +147,10 @@ stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93
     at Proxy.<anonymous> (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+expect@4.1.11/node_modules/@vitest/expect/dist/index.js:1552:16)
     at Proxy.<anonymous> (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+expect@4.1.11/node_modules/@vitest/expect/dist/index.js:1156:15)
     at Proxy.methodWrapper (file:///U:/Projects/TopG/node_modules/.pnpm/chai@6.2.2/node_modules/chai/index.js:1700:25)
-[PaperDaemon] Preserved corrupt virtual wallet state at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-vwpYKC\virtual-wallet.json.corrupt-1792047410200
+[PaperDaemon] Preserved corrupt virtual wallet state at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-7p23jv\virtual-wallet.json.corrupt-1792106147124
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage STARTED
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\real-recovery-STARTED-R4VYq5\.tmp\sessions\sess-recovery-real-1.json
+[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\real-recovery-STARTED-yicG3a\.tmp\sessions\sess-recovery-real-1.json
 [SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-recovery-real-1
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-recovery-real-1. New Balance: 10.5 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
@@ -108,13 +180,13 @@ stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93
 [SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage WALLET_SETTLED. Replaying remaining settlement operations...
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\corrupt-history-recovery-test-x0Khmo\.tmp\sessions\sess-recovery-corrupt-1.json
+[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\corrupt-history-recovery-test-QUjbvQ\.tmp\sessions\sess-recovery-corrupt-1.json
 
 stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
 [SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-corrupt-1 at stage STARTED. Replaying remaining settlement operations...
 
 stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-04: ProcessLock acquires exclusive lock, blocks active PID, reclaims stale dead PID, and releases cleanly
-[ProcessLock] [STALE_LOCK] Owning process with PID 99999999 is no longer active in the OS. Safely reclaiming stale lock at U:\Projects\TopG\.tmp\isolated\process-lock-test-IXSCJS\test-process.lock.
+[ProcessLock] [STALE_LOCK] Owning process with PID 99999999 is no longer active in the OS. Safely reclaiming stale lock at U:\Projects\TopG\.tmp\isolated\process-lock-test-RHFn1I\test-process.lock.
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-03: Startup capital derives from recovered wallet balance
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-prior-crashed. New Balance: 9.5 SOL
@@ -131,11 +203,11 @@ stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93
 [Reconcile] [RECOVERY] Detected interrupted reconciliation intent (rec-intent-audit-recovery-1, Operation: SIMULATED_SALE, Position: pos-missing-1). Checking wallet state...
 
 stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-07: ProcessLock ownership verified via acquisition nonce and refuses to delete foreign/corrupt lock
-[ProcessLock] Warning: Refusing to release lock at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-AlD3oo\test-nonce.lock: lock belongs to a different process/handle (Expected PID 46764 nonce 4db13ed8-8977-40e9-beeb-c2d1b3a204d0, found PID 46764 nonce foreign-nonce-different-process).
-[ProcessLock] [FATAL] Corrupted or unreadable lock file detected during release at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-AlD3oo\test-nonce.lock: SyntaxError: Unexpected token 'i', "invalid { "... is not valid JSON. Refusing to unlink unknown lock.
+[ProcessLock] Warning: Refusing to release lock at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-9xuuAG\test-nonce.lock: lock belongs to a different process/handle (Expected PID 3712 nonce 9abfa13b-1646-45f6-be52-1a38b08a5160, found PID 3712 nonce foreign-nonce-different-process).
+[ProcessLock] [FATAL] Corrupted or unreadable lock file detected during release at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-9xuuAG\test-nonce.lock: SyntaxError: Unexpected token 'i', "invalid { "... is not valid JSON. Refusing to unlink unknown lock.
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\v10-journal-recovery-CtILck\.tmp\sessions\sess-v10-recovery.json
+[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\v10-journal-recovery-2C128i\.tmp\sessions\sess-v10-recovery.json
 [SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-v10-recovery
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-v10-recovery. New Balance: 10 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-v10-recovery fully recovered and cleaned.
@@ -159,27 +231,47 @@ stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
 [Retirement] Initiating controlled legacy wallet retirement...
-[Retirement] Notice: Legacy wallet retirement has already been completed and verified. Canonical ledger is active at U:\Projects\TopG\.tmp\isolated\v12-guard-SKSBUr\.tmp\virtual-wallet.json. Re-execution blocked to protect ledger integrity.
+[Retirement] Notice: Legacy wallet retirement has already been completed and verified. Canonical ledger is active at U:\Projects\TopG\.tmp\isolated\v12-guard-Nod0vo\.tmp\virtual-wallet.json. Re-execution blocked to protect ledger integrity.
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
 [Retirement] Initiating controlled legacy wallet retirement...
 
 stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
 [Retirement] Initiating controlled legacy wallet retirement...
-[Retirement] Acquired exclusive process lock (PID: 46764, Nonce: 1714ab0a-cab7-4ebf-a25f-3e50caf0a1d4).
+[Retirement] Acquired exclusive process lock (PID: 3712, Nonce: c674a634-6d78-4c9f-90a3-e09e1593b388).
 [Retirement] Canonical Wallet SHA-256: 57dac5eda8e9c82cee508bcd877712a0a78abe86d2bbf0623d865ed920836908
 [Retirement] Legacy Wallet SHA-256:    57dac5eda8e9c82cee508bcd877712a0a78abe86d2bbf0623d865ed920836908
 [Retirement] Hashes and balances verified identical (7.9259 SOL, 7 sessions).
-[Retirement] Pre-retirement backups created in U:\Projects\TopG\.tmp\isolated\v12-retire-DB8jEv\backups\pre-retirement
-[Retirement] Renamed legacy wallet to U:\Projects\TopG\.tmp\isolated\v12-retire-DB8jEv\backend\.tmp\virtual-wallet.json.retired-fixture-20261013
+[Retirement] Pre-retirement backups created in U:\Projects\TopG\.tmp\isolated\v12-retire-1sQ7rD\backups\pre-retirement
+[Retirement] Renamed legacy wallet to U:\Projects\TopG\.tmp\isolated\v12-retire-1sQ7rD\backend\.tmp\virtual-wallet.json.retired-fixture-20261013
 [Retirement] Migration record written to canonical and backend .tmp/legacy-wallet-migration.json
 [Retirement] Released process lock cleanly.
 
- ✓ src/paper/PaperTradingDaemon.test.ts (77 tests) 961ms
-       ✓ V11-04: CWD-independent missing-wallet check fails closed when executed from backend/ subfolder without custom wallet path  411ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts (77 tests) 1002ms
+ ✓ src/paper/PaperTradingDaemon.test.ts (77 tests) 722ms
+       ✓ V11-04: CWD-independent missing-wallet check fails closed when executed from backend/ subfolder without custom wallet path  316ms
+ ✓ src/research-formulation-b-analysis/FormulationBAnalysis.test.ts (8 tests) 33ms
+ ✓ src/research-formulation-b-analysis/FormulationBAnalysisCli.test.ts (7 tests) 14ms
+ ✓ src/research-formulation-b-analysis/FormulationBAnalysisGates.test.ts (2 tests) 5ms
+ ✓ src/research-formulation-b-analysis/FormulationBAnalysisIntegrity.test.ts (7 tests) 26ms
+ ✓ src/research-formulation-b-analysis/FormulationBAnalysisQuantile.test.ts (6 tests) 4ms
+ ✓ src/research-formulation-b-collection/FormulationBCollectionCli.test.ts (3 tests) 24ms
+ ✓ src/research-formulation-b-collection/FormulationBCollectionConfig.test.ts (7 tests) 4ms
+ ✓ src/research-formulation-b-collection/FormulationBCollectionRunner.test.ts (3 tests) 28ms
+ ✓ src/research-formulation-b-collection/FormulationBHttpProviderClient.test.ts (5 tests) 53ms
+ ✓ src/research-formulation-b-collection/FormulationBMomentumCapture.test.ts (3 tests) 5ms
+ ✓ src/research-formulation-b-collection/FormulationBOutcomeQueue.test.ts (4 tests) 4ms
+ ✓ src/research-formulation-b-collection/FormulationBSafetyMonitor.test.ts (7 tests) 6ms
+ ✓ src/research-formulation-b-collection/FormulationBTokenDiscovery.test.ts (2 tests) 4ms
+ ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts (77 tests) 674ms
+ ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts (7 tests) 1292ms
+     ✓ emits only json stdout on successful synthetic analysis  661ms
+     ✓ emits only markdown stdout on successful synthetic analysis  565ms
+ ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts (22 tests) 152ms
+ ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts (26 tests) 262ms
+ ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts (115 tests) 2926ms
+ ✓ src/session/SessionControlIpcService.test.ts (2 tests) 6ms
 stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 2. Telemetry Storage Manager Durability, Quarantine & Boundary Repair > B-AUD-03: quarantines crash-damaged JSONL tail, restores clean boundary, and safely appends and rereads
-[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-CIwdXV\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl:2 to U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-CIwdXV\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl.corrupt-1792047412962
+[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-zcU9Nz\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl:2 to U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-zcU9Nz\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl.corrupt-1792106157573
 
 stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 8. Phase 12.94-B Audit v2 Priority Verifications (B2-01 through B2-07) > B2-06: independent candidate evaluation counting, trigger rejection recording, and summary completeness
 [CandidateStreamEngine] onDecision error: Error: Simulated transient callback failure in telemetry sink
@@ -207,188 +299,104 @@ stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry 
 [PaperDaemon] Discarding telemetry observation: missing provider pool identity for MintDaemonMatch11111111111111111111111111 (expected pool-alpha).
 [PaperDaemon] Discarding telemetry observation: pool mismatch for MintDaemonMatch11111111111111111111111111. Tracked=pool-alpha, Actual=dexscreener-different-pool-999
 
- ✓ src/telemetry/MarketTelemetry.test.ts (33 tests) 705ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts (26 tests) 368ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts (22 tests) 208ms
- ✓ src/paper/GenerationsRegistry.test.ts (23 tests) 110ms
-stderr | src/execution/ExecutionRealism.test.ts > Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined) > RF-7: Crash Repair-Before-Append & Strict Reconciliation (Findings C8 & C2-AUD-03) > quarantines crash-damaged tail before appending and recovers clean boundary
-[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\rf7-crash-append-hJqcT2\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl:2 to U:\Projects\TopG\.tmp\isolated\rf7-crash-append-hJqcT2\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl.corrupt-1792047415776
-
- ✓ src/execution/ExecutionRealism.test.ts (37 tests) 52ms
- ✓ src/research-formulation-b-collection/FormulationBHttpProviderClient.test.ts (5 tests) 56ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisIntegrity.test.ts (7 tests) 42ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysis.test.ts (8 tests) 57ms
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1-AUD-05: Readiness Audit Validity on Synthetic Filesystem Fixture > RF-D5.1: does not falsely claim feasibility on placeholder or unverified data in audit script
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-rD4LC3\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-rD4LC3\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-rD4LC3\AUDIT_REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.10: two-session cross-token fixture: does not declare H3 feasible when features are on different tokens
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-h4xSRB\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-h4xSRB\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-test-h4xSRB\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.11: unfinalized session fixture: does not declare H2 feasible when session is unfinalized
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-pe6IEv\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-pe6IEv\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h2-test-pe6IEv\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.12: cross-generation reserve attribution fixture: does not attribute reserves from another generation
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-ohR550\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-ohR550\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-gen-test-ohR550\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.13: valid candidate decision with all features matching declares hypotheses feasible
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-Dk2eYR\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-Dk2eYR\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-valid-test-Dk2eYR\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.1: D1C3-01: future-only developer-holding observation produces h3Feasible: false and eligibleH3DecisionsCount: 0 on candidate decision at time t
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-84oP0p\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-84oP0p\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-future-84oP0p\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.2: D1C3-01: pre-decision developer-holding observation within freshness window qualifies candidate decision for H3
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-c7yfpr\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-c7yfpr\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-c7yfpr\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.3: D1C3-01: stale pre-decision developer-holding observation exceeding freshness limit fails closed
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-55ICQ3\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-55ICQ3\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-55ICQ3\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
- ✓ src/research/QuantitativeResearch.test.ts (41 tests) 66ms
- ✓ src/candidate-scanner/BuyGateTriggerService.test.ts (46 tests) 48ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionRunner.test.ts (3 tests) 39ms
- ✓ src/candidate-scanner/CandidateStreamEngine.test.ts (6 tests) 40ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionCli.test.ts (3 tests) 28ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisCli.test.ts (7 tests) 20ms
- ✓ src/exits/DynamicRatchetService.test.ts (36 tests) 14ms
- ✓ src/candidate-scanner/CandidateWatchlistService.test.ts (9 tests) 6ms
- ✓ src/research-formulation-b-collection/FormulationBSafetyMonitor.test.ts (7 tests) 8ms
- ✓ src/session/SessionControlIpcService.test.ts (2 tests) 9ms
- ✓ src/candidate-scanner/CandidateScannerEvaluator.test.ts (11 tests) 7ms
- ✓ src/research-formulation-b-collection/FormulationBMomentumCapture.test.ts (3 tests) 7ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisGates.test.ts (2 tests) 7ms
- ✓ src/research-formulation-b-collection/FormulationBTokenDiscovery.test.ts (2 tests) 6ms
- ✓ src/candidate-scanner/CounterfactualOpportunityTracker.test.ts (4 tests) 6ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionConfig.test.ts (7 tests) 7ms
- ✓ src/research-formulation-b-collection/FormulationBOutcomeQueue.test.ts (4 tests) 6ms
- ✓ src/wallet/WalletTelemetryService.test.ts (3 tests) 6ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisQuantile.test.ts (6 tests) 6ms
- ✓ src/candidate-scanner/CandidateScannerConfig.test.ts (5 tests) 5ms
+ ✓ src/telemetry/MarketTelemetry.test.ts (33 tests) 547ms
+ ✓ src/wallet/WalletTelemetryService.test.ts (3 tests) 4ms
 
  Test Files  32 passed (32)
-      Tests  644 passed (644)
-   Start at  23:56:42
-   Duration  19.60s (transform 1.27s, setup 0ms, import 2.62s, tests 9.69s, environment 4ms)
+      Tests  658 passed (658)
+   Start at  16:15:44
+   Duration  13.94s (transform 976ms, setup 0ms, import 1.90s, tests 7.11s, environment 3ms)
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h2.config.ts
 
  RUN  v4.1.11 U:/Projects/TopG/backend
 
- ✓ src/db/h2/H2Recovery.test.ts (15 tests) 18360ms
-     ✓ recovers SELL after worker exits registered  1686ms
-     ✓ recovers SELL after worker exits inside-commit  1481ms
-     ✓ recovers SELL after worker exits after-commit  1486ms
-     ✓ serializes duplicate SELL intent into one close and one replay  1016ms
-     ✓ preserves both credits and realized P/L for independent concurrent SELLs  1012ms
-     ✓ serializes duplicate BUY intents into one commit and one replay  1065ms
-     ✓ serializes two BUYs competing for mint  1050ms
-     ✓ serializes two BUYs competing for cash  1024ms
-     ✓ prevents two distinct operations from closing one position  1019ms
-     ✓ preserves aggregate deltas for a concurrent BUY and SELL  993ms
-     ✓ recovers BUY after worker exits registered  1490ms
-     ✓ recovers BUY after worker exits inside-commit  1573ms
-     ✓ recovers BUY after worker exits after-commit  1488ms
-     ✓ merges racing radar records for pair null  1010ms
-     ✓ merges racing radar records for pair pair-a  965ms
- ✓ src/db/h2/H2Sell.test.ts (19 tests) 1437ms
- ✓ src/db/h2/H2Buy.test.ts (16 tests) 1125ms
- ✓ src/db/h2/H2Schema.test.ts (24 tests) 1034ms
- ✓ src/exits/ExitManagerRunner.test.ts (9 tests) 590ms
- ✓ src/db/h2/H2Reconciliation.test.ts (12 tests) 879ms
- ✓ src/db/h2/H2Transactions.test.ts (9 tests) 821ms
-     ✓ normalizes missing pairs and keeps distinct pairs separate  327ms
- ✓ src/paper/PaperSellRunner.test.ts (8 tests) 563ms
- ✓ src/paper/PaperRunner.test.ts (8 tests) 690ms
- ✓ src/db/repositories/repositories.test.ts (5 tests) 356ms
- ✓ src/db/h2/H2Operations.test.ts (5 tests) 331ms
- ✓ src/session/SessionManagerRunner.test.ts (5 tests) 325ms
- ✓ src/db/h2/H2Baseline.test.ts (5 tests) 262ms
- ✓ src/db/h2/H2Boundary.test.ts (2 tests) 208ms
- ✓ src/db/connection.test.ts (3 tests) 390ms
- ✓ src/db/h2/H2Migrations.test.ts (15 tests) 160ms
- ✓ src/db/h2/H2AccountingCharacterization.test.ts (3 tests) 136ms
- ✓ src/paper/PaperOperationIdentity.test.ts (12 tests) 13ms
- ✓ src/paper/PaperExchangeConfig.test.ts (4 tests) 6ms
+ ✓ src/db/h2/H2Recovery.test.ts (15 tests) 16454ms
+     ✓ recovers SELL after worker exits registered  1383ms
+     ✓ recovers SELL after worker exits inside-commit  1660ms
+     ✓ recovers SELL after worker exits after-commit  1432ms
+     ✓ serializes duplicate SELL intent into one close and one replay  831ms
+     ✓ preserves both credits and realized P/L for independent concurrent SELLs  819ms
+     ✓ serializes duplicate BUY intents into one commit and one replay  874ms
+     ✓ serializes two BUYs competing for mint  852ms
+     ✓ serializes two BUYs competing for cash  820ms
+     ✓ prevents two distinct operations from closing one position  877ms
+     ✓ preserves aggregate deltas for a concurrent BUY and SELL  825ms
+     ✓ recovers BUY after worker exits registered  1451ms
+     ✓ recovers BUY after worker exits inside-commit  1491ms
+     ✓ recovers BUY after worker exits after-commit  1433ms
+     ✓ merges racing radar records for pair null  805ms
+     ✓ merges racing radar records for pair pair-a  901ms
+ ✓ src/db/h2/H2Sell.test.ts (19 tests) 1135ms
+ ✓ src/db/h2/H2Buy.test.ts (16 tests) 922ms
+ ✓ src/db/h2/H2Schema.test.ts (24 tests) 1092ms
+     ✓ rejects invalid sessions.updated_at_ms  316ms
+ ✓ src/db/h2/H2Reconciliation.test.ts (12 tests) 694ms
+ ✓ src/db/h2/H2Transactions.test.ts (9 tests) 461ms
+ ✓ src/paper/PaperRunner.test.ts (8 tests) 433ms
+ ✓ src/exits/ExitManagerRunner.test.ts (9 tests) 505ms
+ ✓ src/paper/PaperSellRunner.test.ts (8 tests) 847ms
+     ✓ creates a SELL order, SELL fill, closes the position, restores cash, stores P/L, and returns TokenRadar to WATCHING  421ms
+ ✓ src/db/connection.test.ts (3 tests) 162ms
+ ✓ src/db/repositories/repositories.test.ts (5 tests) 286ms
+ ✓ src/db/h2/H2Operations.test.ts (5 tests) 287ms
+ ✓ src/session/SessionManagerRunner.test.ts (5 tests) 288ms
+ ✓ src/db/h2/H2Baseline.test.ts (5 tests) 219ms
+ ✓ src/db/h2/H2Boundary.test.ts (2 tests) 136ms
+ ✓ src/db/h2/H2Migrations.test.ts (15 tests) 134ms
+ ✓ src/db/h2/H2AccountingCharacterization.test.ts (3 tests) 121ms
+ ✓ src/paper/PaperOperationIdentity.test.ts (12 tests) 9ms
+ ✓ src/paper/PaperExchangeConfig.test.ts (4 tests) 4ms
+ ✓ src/paper/PaperSellConfig.test.ts (5 tests) 4ms
+ ✓ src/session/SessionManagerConfig.test.ts (4 tests) 5ms
  ✓ src/exits/ExitManagerConfig.test.ts (6 tests) 5ms
- ✓ src/paper/PaperSellConfig.test.ts (5 tests) 6ms
- ✓ src/session/SessionManagerConfig.test.ts (4 tests) 6ms
 
  Test Files  22 passed (22)
       Tests  194 passed (194)
-   Start at  23:57:03
-   Duration  43.14s (transform 1.04s, setup 452ms, import 10.10s, tests 27.70s, environment 2ms)
+   Start at  16:15:58
+   Duration  35.29s (transform 804ms, setup 311ms, import 7.37s, tests 24.20s, environment 2ms)
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h3.config.ts
 
  RUN  v4.1.11 U:/Projects/TopG/backend
 
- ✓ src/providers/h3/H3Boundary.test.ts (2 tests) 163ms
- ✓ src/providers/ProviderHealthService.test.ts (1 test) 92ms
- ✓ src/providers/h3/H3HttpControls.test.ts (18 tests) 45ms
- ✓ src/providers/raydium/RaydiumAdapter.test.ts (4 tests) 38ms
- ✓ src/providers/h3/H3RegistryOwnership.test.ts (2 tests) 34ms
- ✓ src/providers/h3/H3TimeBudget.test.ts (5 tests) 36ms
- ✓ src/providers/helius/HeliusAdapter.test.ts (2 tests) 28ms
- ✓ src/providers/http/ProviderHttpClient.test.ts (3 tests) 27ms
- ✓ src/providers/birdeye/BirdeyeAdapter.test.ts (2 tests) 34ms
- ✓ src/providers/quotes/QuoteBudgetPlanner.test.ts (4 tests) 14ms
- ✓ src/providers/h3/H3Adversarial.test.ts (17 tests) 14ms
- ✓ src/providers/quotes/QuoteProviderRouter.test.ts (6 tests) 15ms
- ✓ src/providers/h3/H3Controls.test.ts (14 tests) 11ms
- ✓ src/providers/jupiter/JupiterDemandController.test.ts (5 tests) 13ms
- ✓ src/providers/ProviderRegistry.test.ts (7 tests) 13ms
- ✓ src/providers/das/DasMetadataAdapter.test.ts (1 test) 14ms
- ✓ src/providers/config/providerConfig.test.ts (2 tests) 6ms
- ✓ src/providers/http/providerRateLimiter.test.ts (1 test) 3ms
+ ✓ src/providers/h3/H3Boundary.test.ts (2 tests) 103ms
+ ✓ src/providers/ProviderHealthService.test.ts (1 test) 64ms
+ ✓ src/providers/h3/H3HttpControls.test.ts (18 tests) 33ms
+ ✓ src/providers/raydium/RaydiumAdapter.test.ts (4 tests) 24ms
+ ✓ src/providers/h3/H3TimeBudget.test.ts (5 tests) 26ms
+ ✓ src/providers/h3/H3RegistryOwnership.test.ts (2 tests) 25ms
+ ✓ src/providers/birdeye/BirdeyeAdapter.test.ts (2 tests) 20ms
+ ✓ src/providers/helius/HeliusAdapter.test.ts (2 tests) 22ms
+ ✓ src/providers/http/ProviderHttpClient.test.ts (3 tests) 21ms
+ ✓ src/providers/quotes/QuoteProviderRouter.test.ts (6 tests) 8ms
+ ✓ src/providers/h3/H3Adversarial.test.ts (17 tests) 11ms
+ ✓ src/providers/das/DasMetadataAdapter.test.ts (1 test) 6ms
+ ✓ src/providers/quotes/QuoteBudgetPlanner.test.ts (4 tests) 11ms
+ ✓ src/providers/ProviderRegistry.test.ts (7 tests) 7ms
+ ✓ src/providers/jupiter/JupiterDemandController.test.ts (5 tests) 8ms
+ ✓ src/providers/h3/H3Controls.test.ts (14 tests) 8ms
+ ✓ src/providers/config/providerConfig.test.ts (2 tests) 5ms
  ✓ src/providers/solana-rpc/SolanaRpcAdapter.test.ts (1 test) 4ms
+ ✓ src/providers/http/providerRateLimiter.test.ts (1 test) 3ms
  ✓ src/providers/h3/H3Admission.test.ts (1 test) 3ms
 
  Test Files  20 passed (20)
       Tests  98 passed (98)
-   Start at  23:57:46
-   Duration  7.70s (transform 998ms, setup 417ms, import 2.33s, tests 606ms, environment 3ms)
+   Start at  16:16:34
+   Duration  5.36s (transform 650ms, setup 291ms, import 1.54s, tests 412ms, environment 2ms)
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h4.config.ts
 
  RUN  v4.1.11 U:/Projects/TopG/backend
 
- ✓ src/analytics/AnalyticsReportService.test.ts (3 tests) 217ms
- ✓ src/analytics/h4/H4Readers.test.ts (12 tests) 6ms
- ✓ src/analytics/h4/H4Boundary.test.ts (2 tests) 4ms
+ ✓ src/analytics/AnalyticsReportService.test.ts (3 tests) 404ms
+ ✓ src/analytics/h4/H4Readers.test.ts (12 tests) 5ms
+ ✓ src/analytics/h4/H4Boundary.test.ts (2 tests) 3ms
  ✓ src/analytics/h4/H4ReadFacade.test.ts (1 test) 2ms
 
  Test Files  4 passed (4)
       Tests  18 passed (18)
-   Start at  23:57:55
-   Duration  1.98s (transform 397ms, setup 102ms, import 880ms, tests 229ms, environment 0ms)
+   Start at  16:16:40
+   Duration  1.85s (transform 328ms, setup 83ms, import 730ms, tests 416ms, environment 0ms)
 

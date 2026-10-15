@@ -427,8 +427,8 @@ export function runReadinessAudit(customOptions = {}) {
                   typeof obs.ingestionTimestampMs === "number" &&
                   Number.isFinite(obs.ingestionTimestampMs) &&
                   typeof recv === "number" &&
-                  Number.isFinite(recv) &&
                   obs.sourceTimestampMs <= obs.ingestionTimestampMs &&
+                  recv >= obs.sourceTimestampMs &&
                   obs.sourceTimestampMs <= tDec &&
                   obs.ingestionTimestampMs <= tDec &&
                   recv <= tDec &&

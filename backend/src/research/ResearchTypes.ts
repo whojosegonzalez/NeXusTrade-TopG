@@ -18,6 +18,7 @@ import type {
   SellabilityStatus,
   SimulatedFillRecord,
 } from "../execution/ExecutionTypes.js";
+import type { ShadowEvaluationRecord } from "./ShadowEvaluationTypes.js";
 
 /**
  * High-level evaluation mode for quantitative strategy research.
@@ -198,6 +199,9 @@ export interface JoinedResearchRecord {
 
   // Offline Financial Accounting (if quote/fill modeled)
   readonly financialAccounting?: ResearchFinancialAccounting | undefined;
+
+  // Optional Research Shadow Evaluation Sidecar (Milestone D.2)
+  readonly shadowEvaluation?: ShadowEvaluationRecord | undefined;
 
   // Research Eligibility
   readonly eligibility: ResearchEligibilityResult;
