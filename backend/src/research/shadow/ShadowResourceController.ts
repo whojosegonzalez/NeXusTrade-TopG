@@ -241,25 +241,33 @@ export function validatePathConfinement(
 export class ShadowResourceController {
   private readonly clock: IVirtualClock;
   private readonly maxSessionDiskBytes: number;
+  private readonly maxEmergencyMetadataBytes: number;
   private readonly maxRssBytes: number;
   private readonly killSwitchPath: string;
   private currentDiskBytesWritten: number = 0;
+  private emergencyBytesWritten: number = 0;
   private memoryUsageOverride?: number | undefined;
 
   constructor(options: {
     clock: IVirtualClock;
     maxSessionDiskBytes?: number | undefined;
+    maxEmergencyMetadataBytes?: number | undefined;
     maxRssBytes?: number | undefined;
     killSwitchPath?: string | undefined;
   }) {
     this.clock = options.clock;
-    this.maxSessionDiskBytes = options.maxSessionDiskBytes ?? 50 * 1024 * 1024; // 50 MB
+    this.maxSessionDiskBytes = options.maxSessionDiskBytes ?? 50 * 1024 * 1024; // 50 MB (operational payload quota)
+    this.maxEmergencyMetadataBytes = options.maxEmergencyMetadataBytes ?? 2048; // 2,048 bytes (emergency abort metadata budget) (D22C-04)
     this.maxRssBytes = options.maxRssBytes ?? 256 * 1024 * 1024; // 256 MB
     this.killSwitchPath = path.resolve(options.killSwitchPath ?? ".tmp/SHADOW_KILL_SWITCH");
   }
 
   public getMaxDiskBytes(): number {
     return this.maxSessionDiskBytes;
+  }
+
+  public getMaxEmergencyMetadataBytes(): number {
+    return this.maxEmergencyMetadataBytes;
   }
 
   public checkWriteAdmission(bytesToWrite: number): void {
@@ -270,12 +278,32 @@ export class ShadowResourceController {
     }
   }
 
-  public recordBytesWritten(bytes: number): void {
-    this.currentDiskBytesWritten += bytes;
+  public checkEmergencyWriteAdmission(bytesToWrite: number): void {
+    if (this.emergencyBytesWritten + bytesToWrite > this.maxEmergencyMetadataBytes) {
+      throw new Error(
+        `[ShadowResourceController] [EMERGENCY_QUOTA_EXCEEDED] Emergency write of ${bytesToWrite} bytes exceeds emergency metadata allowance (current: ${this.emergencyBytesWritten}, max: ${this.maxEmergencyMetadataBytes}).`,
+      );
+    }
+  }
+
+  public recordBytesWritten(bytes: number, isEmergency: boolean = false): void {
+    if (isEmergency) {
+      this.emergencyBytesWritten += bytes;
+    } else {
+      this.currentDiskBytesWritten += bytes;
+    }
   }
 
   public getBytesWritten(): number {
     return this.currentDiskBytesWritten;
+  }
+
+  public getEmergencyBytesWritten(): number {
+    return this.emergencyBytesWritten;
+  }
+
+  public getTotalBytesWritten(): number {
+    return this.currentDiskBytesWritten + this.emergencyBytesWritten;
   }
 
   public setMemoryUsageOverride(bytes?: number): void {

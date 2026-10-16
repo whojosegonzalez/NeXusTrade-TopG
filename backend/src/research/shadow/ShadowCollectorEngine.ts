@@ -23,6 +23,7 @@ import type {
 import {
   createShadowEvaluationRecord,
   validateShadowEvaluationEligibility,
+  validateShadowEvaluationRecord,
 } from "../ShadowEvaluationContract.js";
 import { validateClockMonotonicity } from "../ClockMonotonicityValidator.js";
 import type {
@@ -42,6 +43,70 @@ import {
   validateSessionId,
   VirtualTokenBucket,
 } from "./ShadowResourceController.js";
+
+/**
+ * Validates the minimal schema and identity requirements for CandidateDecisionRecord (D22C-03).
+ */
+export function isValidCandidateDecisionRecord(
+  obj: unknown,
+  expectedSessionId?: string,
+): obj is CandidateDecisionRecord {
+  if (!obj || typeof obj !== "object") return false;
+  const d = obj as Record<string, unknown>;
+  if (typeof d.eventId !== "string" || d.eventId.trim().length === 0) return false;
+  if (typeof d.sessionId !== "string" || d.sessionId.trim().length === 0) return false;
+  if (expectedSessionId && d.sessionId !== expectedSessionId) return false;
+  if (typeof d.generationId !== "string" || d.generationId.trim().length === 0) return false;
+  if (typeof d.mintAddress !== "string" || d.mintAddress.trim().length === 0) return false;
+  if (typeof d.poolId !== "string" || d.poolId.trim().length === 0) return false;
+  if (
+    typeof d.decisionTimestampMs !== "number" ||
+    !Number.isFinite(d.decisionTimestampMs) ||
+    d.decisionTimestampMs <= 0
+  ) {
+    return false;
+  }
+  if (
+    !["FILTERED_REJECTED", "WATCHLIST_RADAR", "TRIGGER_REJECTED", "EXECUTED_BUY"].includes(
+      d.decisionCohort as string,
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Validates the minimal schema and identity requirements for MarketObservationRecord (D22C-03).
+ */
+export function isValidMarketObservationRecord(
+  obj: unknown,
+  expectedSessionId?: string,
+): obj is MarketObservationRecord {
+  if (!obj || typeof obj !== "object") return false;
+  const o = obj as Record<string, unknown>;
+  if (typeof o.observationId !== "string" || o.observationId.trim().length === 0) return false;
+  if (typeof o.sessionId !== "string" || o.sessionId.trim().length === 0) return false;
+  if (expectedSessionId && o.sessionId !== expectedSessionId) return false;
+  if (typeof o.generationId !== "string" || o.generationId.trim().length === 0) return false;
+  if (typeof o.mintAddress !== "string" || o.mintAddress.trim().length === 0) return false;
+  if (typeof o.poolId !== "string" || o.poolId.trim().length === 0) return false;
+  if (
+    typeof o.sourceTimestampMs !== "number" ||
+    !Number.isFinite(o.sourceTimestampMs) ||
+    o.sourceTimestampMs <= 0
+  ) {
+    return false;
+  }
+  if (
+    typeof o.ingestionTimestampMs !== "number" ||
+    !Number.isFinite(o.ingestionTimestampMs) ||
+    o.ingestionTimestampMs <= 0
+  ) {
+    return false;
+  }
+  return true;
+}
 
 export class ShadowCollectorEngine {
   public state: CollectorLifecycleState = "IDLE";
@@ -123,6 +188,7 @@ export class ShadowCollectorEngine {
     this.resourceController = new ShadowResourceController({
       clock: this.clock,
       maxSessionDiskBytes: this.config.maxSessionDiskBytes,
+      maxEmergencyMetadataBytes: this.config.maxEmergencyMetadataBytes,
       maxRssBytes: this.config.maxRssBytes,
       killSwitchPath: this.config.killSwitchPath,
     });
@@ -279,21 +345,29 @@ export class ShadowCollectorEngine {
         );
       }
 
-      // Validate clock causality on reserves snapshot
-      const clockValidation = validateClockMonotonicity({
+      // D22C-02: Validate decision-time clock causality against decision.decisionTimestampMs
+      const decisionClockValidation = validateClockMonotonicity({
+        sourceTimestampMs: reserves.sourceTimestampMs,
+        ingestionTimestampMs: reserves.ingestionTimestampMs,
+        responseReceivedMs: reserves.responseReceivedMs,
+        decisionTimestampMs: decision.decisionTimestampMs,
+      });
+
+      // Also validate evaluation-time clock causality (evalTime >= responseReceivedMs)
+      const evalClockValidation = validateClockMonotonicity({
         sourceTimestampMs: reserves.sourceTimestampMs,
         ingestionTimestampMs: reserves.ingestionTimestampMs,
         responseReceivedMs: reserves.responseReceivedMs,
         decisionTimestampMs: evalTime,
       });
 
-      // D22-S03: Verified pool, vault, and causal reserve provenance
+      // D22-S03 & D22C-02: Verified pool, vault, and causal reserve provenance
       let unavailabilityReason: UnavailabilityReason | undefined;
       let reservesEligible = false;
 
-      if (!clockValidation.isCausallyMonotonic || clockValidation.isQuarantined) {
+      if (!evalClockValidation.isCausallyMonotonic || evalClockValidation.isQuarantined) {
         unavailabilityReason =
-          clockValidation.unavailabilityReason ?? "IMPOSSIBLE_TIMESTAMP_ORDERING";
+          evalClockValidation.unavailabilityReason ?? "IMPOSSIBLE_TIMESTAMP_ORDERING";
       } else if (reserves.poolId !== decision.poolId) {
         unavailabilityReason = "POOL_IDENTITY_MISMATCH_DISCARDED";
       } else if (reserves.isVerifiedPool !== true) {
@@ -316,10 +390,16 @@ export class ShadowCollectorEngine {
         reserves.quoteReserve <= 0
       ) {
         unavailabilityReason = "RESERVE_QUANTITY_ZERO_OR_NONFINITE";
-      } else if (reserves.sourceTimestampMs > decision.decisionTimestampMs) {
-        // D22-S03: Post-decision reserve cannot qualify decision-time execution feasibility
+      } else if (
+        !decisionClockValidation.isCausallyMonotonic ||
+        decisionClockValidation.isQuarantined ||
+        reserves.sourceTimestampMs > decision.decisionTimestampMs ||
+        reserves.ingestionTimestampMs > decision.decisionTimestampMs ||
+        reserves.responseReceivedMs > decision.decisionTimestampMs
+      ) {
+        // D22C-02: Snapshot was not available at decision time (source, ingestion, or receipt after decision)
         unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
-      } else if (reserves.sourceTimestampMs > evalTime) {
+      } else if (reserves.sourceTimestampMs > evalTime || reserves.responseReceivedMs > evalTime) {
         unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
       } else {
         reservesEligible = true;
@@ -481,13 +561,16 @@ export class ShadowCollectorEngine {
       throw err;
     }
     fs.appendFileSync(filePath, line, "utf8");
-    this.resourceController.recordBytesWritten(bytes);
+    this.resourceController.recordBytesWritten(bytes, false);
   }
 
-  private writeAtomicJson(filePath: string, data: unknown, skipAdmissionCheck = false): void {
+  private writeAtomicJson(filePath: string, data: unknown, isEmergency = false): void {
     const content = JSON.stringify(data, null, 2);
     const bytes = Buffer.byteLength(content, "utf8");
-    if (!skipAdmissionCheck) {
+    if (isEmergency) {
+      // D22C-04: Emergency writes (meta, summary, diagnostics) are admitted against the dedicated emergency allowance
+      this.resourceController.checkEmergencyWriteAdmission(bytes);
+    } else {
       try {
         this.resourceController.checkWriteAdmission(bytes);
       } catch (err) {
@@ -505,11 +588,11 @@ export class ShadowCollectorEngine {
     );
     fs.writeFileSync(tempPath, content, "utf8");
     fs.renameSync(tempPath, filePath);
-    this.resourceController.recordBytesWritten(bytes);
+    this.resourceController.recordBytesWritten(bytes, isEmergency);
   }
 
   /**
-   * Graceful drain sequence writing finalized dual-file consensus (D22-A01, D22-A06, D22-S04).
+   * Graceful drain sequence writing finalized dual-file consensus (D22-A01, D22-A06, D22-S04, D22C-03).
    */
   public async drain(): Promise<SessionDrainSummary> {
     if (this.state !== "COLLECTING") {
@@ -528,24 +611,99 @@ export class ShadowCollectorEngine {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    // D22-S04: Reconcile actual persisted on-disk lines before claiming FINALIZED
-    const countDiskLines = (filePath: string): number => {
-      if (!fs.existsSync(filePath)) return 0;
+    // D22C-03: Parse, schema-validate, and verify identity/count of all on-disk records before claiming FINALIZED
+    const readAndValidateStream = <T>(
+      filePath: string,
+      validator: (item: unknown) => boolean,
+      getId: (item: T) => string,
+    ): { count: number; ids: Set<string>; error?: string | undefined } => {
+      if (!fs.existsSync(filePath)) return { count: 0, ids: new Set() };
       const raw = fs.readFileSync(filePath, "utf8");
-      return raw.split("\n").filter((l) => l.trim().length > 0).length;
+      const lines = raw.split("\n");
+      const ids = new Set<string>();
+      let validCount = 0;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return {
+            count: validCount,
+            ids,
+            error: `RECONCILIATION_PARSE_ERROR: '${path.basename(filePath)}' line ${i + 1} is not valid JSON.`,
+          };
+        }
+
+        if (!validator(parsed)) {
+          return {
+            count: validCount,
+            ids,
+            error: `RECONCILIATION_SCHEMA_INVALID: '${path.basename(filePath)}' line ${i + 1} failed schema or session-id validation.`,
+          };
+        }
+
+        const id = getId(parsed as T);
+        if (ids.has(id)) {
+          return {
+            count: validCount,
+            ids,
+            error: `RECONCILIATION_DUPLICATE_ID: '${path.basename(filePath)}' contains duplicate ID '${id}'.`,
+          };
+        }
+        ids.add(id);
+        validCount++;
+      }
+
+      return { count: validCount, ids };
     };
 
-    const actualDecisions = countDiskLines(this.decisionsPath);
-    const actualObservations = countDiskLines(this.observationsPath);
-    const actualEvaluations = countDiskLines(this.evaluationsPath);
+    const decisionsCheck = readAndValidateStream<CandidateDecisionRecord>(
+      this.decisionsPath,
+      (item) => isValidCandidateDecisionRecord(item, this.config.sessionId),
+      (item) => item.eventId,
+    );
+    if (decisionsCheck.error) {
+      return this.abort(decisionsCheck.error);
+    }
+
+    const observationsCheck = readAndValidateStream<MarketObservationRecord>(
+      this.observationsPath,
+      (item) => isValidMarketObservationRecord(item, this.config.sessionId),
+      (item) => item.observationId,
+    );
+    if (observationsCheck.error) {
+      return this.abort(observationsCheck.error);
+    }
+
+    const evaluationsCheck = readAndValidateStream<ShadowEvaluationRecord>(
+      this.evaluationsPath,
+      (item) => {
+        try {
+          const rec = validateShadowEvaluationRecord(item);
+          return rec.sessionId === this.config.sessionId;
+        } catch {
+          return false;
+        }
+      },
+      (item) => item.evaluationId,
+    );
+    if (evaluationsCheck.error) {
+      return this.abort(evaluationsCheck.error);
+    }
 
     if (
-      actualDecisions !== this.decisions.size ||
-      actualObservations !== this.observations.length ||
-      actualEvaluations !== this.evaluations.size
+      decisionsCheck.count !== this.decisions.size ||
+      observationsCheck.count !== this.observations.length ||
+      evaluationsCheck.count !== this.evaluations.size
     ) {
       return this.abort(
-        `RECONCILIATION_MISMATCH: decisions disk=${actualDecisions}/mem=${this.decisions.size}, observations disk=${actualObservations}/mem=${this.observations.length}, evaluations disk=${actualEvaluations}/mem=${this.evaluations.size}`,
+        `RECONCILIATION_MISMATCH: decisions disk=${decisionsCheck.count}/mem=${this.decisions.size}, observations disk=${observationsCheck.count}/mem=${this.observations.length}, evaluations disk=${evaluationsCheck.count}/mem=${this.evaluations.size}`,
       );
     }
 
@@ -708,8 +866,8 @@ export class ShadowCollectorEngine {
   }
 
   /**
-   * Recovers a session directory after an unclean crash, quarantines torn JSONL lines,
-   * repairs active streams, and updates on-disk finality metadata (D22-A06, D22-S05).
+   * Recovers a session directory after an unclean crash, quarantines torn/schema-invalid lines,
+   * repairs active streams, checks identity/count consensus, and updates on-disk finality metadata (D22-A06, D22-S05, D22C-03).
    */
   public static recoverSessionDirectory(sessionDir: string): CrashRecoveryResult {
     const metaPath = path.join(sessionDir, "session-meta.json");
@@ -719,50 +877,10 @@ export class ShadowCollectorEngine {
     const evaluationsPath = path.join(sessionDir, "shadow-evaluations.jsonl");
 
     let totalTornCount = 0;
+    let totalSchemaInvalidCount = 0;
     const repairedFiles: string[] = [];
     const quarantinedFiles: string[] = [];
-
-    const repairJsonlStream = (filePath: string): number => {
-      if (!fs.existsSync(filePath)) return 0;
-      const raw = fs.readFileSync(filePath, "utf8");
-      const lines = raw.split("\n");
-      const validLines: string[] = [];
-      let fileTornCount = 0;
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line) continue;
-        const trimmed = line.trim();
-        if (trimmed.length === 0) continue;
-        try {
-          JSON.parse(trimmed);
-          validLines.push(trimmed);
-        } catch {
-          fileTornCount++;
-        }
-      }
-
-      if (fileTornCount > 0) {
-        totalTornCount += fileTornCount;
-        // Quarantine corrupt original stream
-        const corruptPath = `${filePath}.corrupt-${Date.now()}`;
-        fs.copyFileSync(filePath, corruptPath);
-        quarantinedFiles.push(path.basename(corruptPath));
-
-        // Stage repaired file with valid lines only
-        const tempPath = `${filePath}.repaired-${Date.now()}`;
-        const repairedContent = validLines.length > 0 ? validLines.join("\n") + "\n" : "";
-        fs.writeFileSync(tempPath, repairedContent, "utf8");
-        fs.renameSync(tempPath, filePath);
-        repairedFiles.push(path.basename(filePath));
-      }
-
-      return validLines.length;
-    };
-
-    const validDecisions = repairJsonlStream(decisionsPath);
-    const validObservations = repairJsonlStream(observationsPath);
-    const validEvaluations = repairJsonlStream(evaluationsPath);
+    const failureReasons: string[] = [];
 
     const hasMeta = fs.existsSync(metaPath);
     const hasSummary = fs.existsSync(summaryPath);
@@ -775,32 +893,160 @@ export class ShadowCollectorEngine {
         meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
       } catch {
         meta = null;
+        failureReasons.push("UNPARSEABLE_SESSION_META");
       }
+    } else {
+      failureReasons.push("MISSING_SESSION_META");
     }
+
     if (hasSummary) {
       try {
         summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
       } catch {
         summary = null;
+        failureReasons.push("UNPARSEABLE_SESSION_SUMMARY");
+      }
+    } else {
+      failureReasons.push("MISSING_SESSION_SUMMARY");
+    }
+
+    const declaredSessionId = meta?.sessionId ?? summary?.sessionId ?? path.basename(sessionDir);
+
+    // D22C-03: Deep validation and repair of JSONL streams (syntax, schema, session identity, unique IDs)
+    const repairAndValidateStream = <T>(
+      filePath: string,
+      validator: (item: unknown) => boolean,
+      getId: (item: T) => string,
+    ): { validRecords: T[]; validIds: Set<string> } => {
+      if (!fs.existsSync(filePath)) return { validRecords: [], validIds: new Set() };
+      const raw = fs.readFileSync(filePath, "utf8");
+      const lines = raw.split("\n");
+      const validLines: string[] = [];
+      const validRecords: T[] = [];
+      const validIds = new Set<string>();
+      let fileCorruptCount = 0;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          totalTornCount++;
+          fileCorruptCount++;
+          failureReasons.push(`SYNTAX_ERROR_${path.basename(filePath)}_LINE_${i + 1}`);
+          continue;
+        }
+
+        if (!validator(parsed)) {
+          totalSchemaInvalidCount++;
+          fileCorruptCount++;
+          failureReasons.push(`SCHEMA_OR_SESSION_INVALID_${path.basename(filePath)}_LINE_${i + 1}`);
+          continue;
+        }
+
+        const id = getId(parsed as T);
+        if (validIds.has(id)) {
+          totalSchemaInvalidCount++;
+          fileCorruptCount++;
+          failureReasons.push(`DUPLICATE_ID_${id}_IN_${path.basename(filePath)}`);
+          continue;
+        }
+
+        validIds.add(id);
+        validRecords.push(parsed as T);
+        validLines.push(trimmed);
+      }
+
+      if (fileCorruptCount > 0) {
+        const corruptPath = `${filePath}.corrupt-${Date.now()}`;
+        fs.copyFileSync(filePath, corruptPath);
+        quarantinedFiles.push(path.basename(corruptPath));
+
+        const tempPath = `${filePath}.repaired-${Date.now()}`;
+        const repairedContent = validLines.length > 0 ? validLines.join("\n") + "\n" : "";
+        fs.writeFileSync(tempPath, repairedContent, "utf8");
+        fs.renameSync(tempPath, filePath);
+        repairedFiles.push(path.basename(filePath));
+      }
+
+      return { validRecords, validIds };
+    };
+
+    const decisionsResult = repairAndValidateStream<CandidateDecisionRecord>(
+      decisionsPath,
+      (item) => isValidCandidateDecisionRecord(item, declaredSessionId),
+      (item) => item.eventId,
+    );
+
+    const observationsResult = repairAndValidateStream<MarketObservationRecord>(
+      observationsPath,
+      (item) => isValidMarketObservationRecord(item, declaredSessionId),
+      (item) => item.observationId,
+    );
+
+    const evaluationsResult = repairAndValidateStream<ShadowEvaluationRecord>(
+      evaluationsPath,
+      (item) => {
+        try {
+          const rec = validateShadowEvaluationRecord(item);
+          return rec.sessionId === declaredSessionId;
+        } catch {
+          return false;
+        }
+      },
+      (item) => item.evaluationId,
+    );
+
+    const validDecisions = decisionsResult.validRecords.length;
+    const validObservations = observationsResult.validRecords.length;
+    const validEvaluations = evaluationsResult.validRecords.length;
+
+    // Verify foreign keys: all evaluations must point to a valid decision in this session
+    for (const ev of evaluationsResult.validRecords) {
+      if (!decisionsResult.validIds.has(ev.decisionEventId)) {
+        failureReasons.push(`ORPHAN_EVALUATION_${ev.evaluationId}_DECISION_${ev.decisionEventId}`);
       }
     }
 
-    // Determine authoritative recovered status
-    let status: "INTERRUPTED" | "FINALIZED" | "CORRUPTED" = "INTERRUPTED";
+    // Check count consensus against summary
+    if (summary !== null) {
+      if (summary.totalDecisionsRecorded !== validDecisions) {
+        failureReasons.push(
+          `DECISIONS_COUNT_MISMATCH: summary=${summary.totalDecisionsRecorded}, validOnDisk=${validDecisions}`,
+        );
+      }
+      if (summary.totalMarketObservationsRecorded !== validObservations) {
+        failureReasons.push(
+          `OBSERVATIONS_COUNT_MISMATCH: summary=${summary.totalMarketObservationsRecorded}, validOnDisk=${validObservations}`,
+        );
+      }
+    }
+
+    // Determine authoritative recovered status (D22C-03)
     const isCleanFinalized =
       totalTornCount === 0 &&
+      totalSchemaInvalidCount === 0 &&
+      failureReasons.length === 0 &&
       meta !== null &&
       summary !== null &&
       meta.sessionStatus === "FINALIZED" &&
       meta.isInterruptedSession === false &&
       summary.isCompleteSession === true &&
-      summary.isInterruptedSession === false;
+      summary.isInterruptedSession === false &&
+      summary.totalDecisionsRecorded === validDecisions &&
+      summary.totalMarketObservationsRecorded === validObservations;
+
+    let status: "INTERRUPTED" | "FINALIZED" | "CORRUPTED" = "INTERRUPTED";
 
     if (isCleanFinalized) {
       status = "FINALIZED";
     } else {
       status = "INTERRUPTED";
-      // D22-S05: Persist mutually consistent INTERRUPTED on-disk metadata
       const recoveryTimestampIso = new Date().toISOString();
       const updatedMeta: SessionTelemetryMeta = {
         sessionId: meta?.sessionId ?? path.basename(sessionDir),
@@ -863,6 +1109,8 @@ export class ShadowCollectorEngine {
           validObservationsCount: validObservations,
           validEvaluationsCount: validEvaluations,
           tornLinesQuarantinedCount: totalTornCount,
+          schemaInvalidLinesQuarantinedCount: totalSchemaInvalidCount,
+          failureReasons,
           repairedFiles,
           quarantinedFiles,
         },
@@ -880,6 +1128,8 @@ export class ShadowCollectorEngine {
       validObservationsCount: validObservations,
       validEvaluationsCount: validEvaluations,
       tornLinesQuarantinedCount: totalTornCount,
+      schemaInvalidLinesQuarantinedCount: totalSchemaInvalidCount,
+      failureReasons,
       repairedFiles,
       quarantinedFiles,
       diagnosticsFileWritten: true,

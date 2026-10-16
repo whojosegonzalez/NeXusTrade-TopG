@@ -47,24 +47,37 @@ export class DeterministicVirtualClock implements IVirtualClock {
 }
 
 /**
- * Branded symbol identifying approved offline mock providers for Milestone D.2.2 (D22-S02).
+ * Unexported module-scoped registry of genuinely instantiated offline mock providers (D22C-01).
+ * Genuinely unforgeable by external callers; plain objects, symbol branding, or subclass overrides fail closed.
+ */
+const approvedMockInstances = new WeakSet<object>();
+
+/**
+ * Branded symbol identifying offline mock providers for Milestone D.2.2.
+ * Exported for negative-testing verification only (D22C-01).
  */
 export const MOCK_PROVIDER_BRAND = Symbol.for("NeXusTrade.OfflineMockMarketDataProvider.v1");
 
 /**
- * Validates that an injected provider is an approved offline mock instance (D22-S02).
+ * Validates that an injected provider is a genuinely approved offline mock instance (D22C-01).
+ * Plain objects, forged symbol brandings, and tampered method prototypes fail closed.
  */
 export function isApprovedMockProvider(provider: unknown): provider is MockMarketDataProvider {
   if (!provider || typeof provider !== "object") return false;
-  const p = provider as Record<string | symbol, unknown>;
-  return (
-    p instanceof MockMarketDataProvider ||
-    (p[MOCK_PROVIDER_BRAND] === true &&
-      p.isMockProvider === true &&
-      typeof p.providerId === "string" &&
-      p.providerId.startsWith("mock_") &&
-      p.capabilityStatus === "UNVERIFIED_DESIGN_EXPECTATION")
-  );
+  if (!(provider instanceof MockMarketDataProvider)) return false;
+  if (!approvedMockInstances.has(provider)) return false;
+
+  // Strict prototype method identity check: methods must not be hijacked or overridden
+  const p = provider as MockMarketDataProvider;
+  if (
+    p.getPoolReserves !== MockMarketDataProvider.prototype.getPoolReserves ||
+    p.getTokenMetrics !== MockMarketDataProvider.prototype.getTokenMetrics ||
+    p.getDeveloperHoldings !== MockMarketDataProvider.prototype.getDeveloperHoldings
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -108,6 +121,7 @@ export class MockMarketDataProvider implements IMarketDataProvider {
     capabilityStatus?: ProviderCapabilityStatus;
     simulatedRoundTripMs?: number;
   }) {
+    approvedMockInstances.add(this);
     this.providerId = options?.providerId ?? "mock_offline_market_provider";
     this.clock = options?.clock ?? new DeterministicVirtualClock();
     this.capabilityStatus = options?.capabilityStatus ?? "UNVERIFIED_DESIGN_EXPECTATION";
@@ -243,8 +257,8 @@ export class MockMarketDataProvider implements IMarketDataProvider {
       baseReserve: this.omittedFields.has("baseReserve") ? null : (base?.baseReserve ?? 1_000_000),
       quoteReserve: this.omittedFields.has("quoteReserve") ? null : (base?.quoteReserve ?? 50),
       sourceTimestampMs,
-      ingestionTimestampMs: requestInitiatedMs,
-      responseReceivedMs,
+      ingestionTimestampMs: base?.ingestionTimestampMs ?? requestInitiatedMs,
+      responseReceivedMs: base?.responseReceivedMs ?? responseReceivedMs,
       isVerifiedPool:
         this.verifiedPoolOverride !== undefined
           ? this.verifiedPoolOverride
@@ -276,8 +290,8 @@ export class MockMarketDataProvider implements IMarketDataProvider {
       sells5m: this.omittedFields.has("sells5m") ? null : (base?.sells5m ?? 12),
       txCount5m: this.omittedFields.has("txCount5m") ? null : (base?.txCount5m ?? 54),
       sourceTimestampMs,
-      ingestionTimestampMs: requestInitiatedMs,
-      responseReceivedMs,
+      ingestionTimestampMs: base?.ingestionTimestampMs ?? requestInitiatedMs,
+      responseReceivedMs: base?.responseReceivedMs ?? responseReceivedMs,
     };
   }
 
@@ -309,8 +323,8 @@ export class MockMarketDataProvider implements IMarketDataProvider {
         : (base?.devWalletAddress ?? "DevWallet111111111111111111111111111111111"),
       isVerifiedDevWallet: !isUnknownAuthority,
       sourceTimestampMs,
-      ingestionTimestampMs: requestInitiatedMs,
-      responseReceivedMs,
+      ingestionTimestampMs: base?.ingestionTimestampMs ?? requestInitiatedMs,
+      responseReceivedMs: base?.responseReceivedMs ?? responseReceivedMs,
     };
   }
 }

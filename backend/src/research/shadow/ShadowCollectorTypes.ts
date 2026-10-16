@@ -131,7 +131,8 @@ export interface ShadowCollectorConfig {
    * Path confinement rejects any location inside canonical repositories or protected paths.
    */
   readonly outputRootDir: string;
-  readonly maxSessionDiskBytes?: number | undefined; // Default 50 MB
+  readonly maxSessionDiskBytes?: number | undefined; // Default 50 MB (operational payload quota)
+  readonly maxEmergencyMetadataBytes?: number | undefined; // Default 2,048 bytes (bounded allowance for abort/diagnostic metadata) (D22C-04)
   readonly maxRingBufferRecords?: number | undefined; // Default 1000 records
   readonly maxRssBytes?: number | undefined; // Default 256 MB
   readonly killSwitchPath?: string | undefined; // Optional custom kill switch trigger
@@ -172,6 +173,8 @@ export interface CrashRecoveryResult {
   readonly validObservationsCount: number;
   readonly validEvaluationsCount: number;
   readonly tornLinesQuarantinedCount: number;
+  readonly schemaInvalidLinesQuarantinedCount?: number | undefined;
+  readonly failureReasons?: readonly string[] | undefined;
   readonly repairedFiles: readonly string[];
   readonly quarantinedFiles: readonly string[];
   readonly diagnosticsFileWritten: boolean;

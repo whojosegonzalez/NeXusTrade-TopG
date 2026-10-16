@@ -949,9 +949,9 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
           poolId: "pool-amm-correct",
           baseReserve: 1_000_000,
           quoteReserve: 50,
-          sourceTimestampMs: 1_792_000_000_000, // Exact decision time
-          ingestionTimestampMs: 1_792_000_000_010,
-          responseReceivedMs: 1_792_000_000_020,
+          sourceTimestampMs: 1_791_999_999_950,
+          ingestionTimestampMs: 1_791_999_999_980,
+          responseReceivedMs: 1_792_000_000_000, // Exact decision time
           isVerifiedPool: true,
           vaultA: "vault-base-valid",
           vaultB: "vault-quote-valid",
@@ -1162,7 +1162,9 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
           poolId: "pool-retry-amm",
           baseReserve: 1_000_000,
           quoteReserve: 50,
-          sourceTimestampMs: 1_792_000_000_000,
+          sourceTimestampMs: 1_791_999_999_900,
+          ingestionTimestampMs: 1_791_999_999_950,
+          responseReceivedMs: 1_792_000_000_000,
           isVerifiedPool: true,
           vaultA: "vault-a",
           vaultB: "vault-b",
@@ -1223,6 +1225,442 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
         expect(secondRecovery.recoveredStatus).toBe("INTERRUPTED");
         expect(secondRecovery.tornLinesQuarantinedCount).toBe(0);
         expect(secondRecovery.validDecisionsCount).toBe(1);
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+    });
+
+    describe("Phase 12.94-D.2.2 Closure Audit v2 Regression Suites (D22C-01 through D22C-04)", () => {
+      // D22C-01: Close the mock-provider attestation bypass
+      it("D22C-01: fails closed on forged symbol brands, plain objects with mock_ names, and tampered method prototypes", () => {
+        // 1. Plain object with the correct exported MOCK_PROVIDER_BRAND symbol and boolean values
+        const forgedSymbolProvider = {
+          [MOCK_PROVIDER_BRAND]: true,
+          isMockProvider: true,
+          providerId: "mock_forged_symbol_provider",
+          capabilityStatus: "UNVERIFIED_DESIGN_EXPECTATION",
+          getPoolReserves: async () => ({
+            poolId: "pool-1",
+            baseReserve: 1000,
+            quoteReserve: 10,
+            sourceTimestampMs: 1_792_000_000_000,
+            ingestionTimestampMs: 1_792_000_000_000,
+            responseReceivedMs: 1_792_000_000_000,
+            isVerifiedPool: true,
+            vaultA: "vault-a",
+            vaultB: "vault-b",
+          }),
+          getTokenMetrics: async () => ({
+            mintAddress: "mint-1",
+            volume5mUsd: 1000,
+            buys5m: 5,
+            sells5m: 5,
+            sourceTimestampMs: 1_792_000_000_000,
+            ingestionTimestampMs: 1_792_000_000_000,
+            responseReceivedMs: 1_792_000_000_000,
+          }),
+          getDeveloperHoldings: async () => ({
+            mintAddress: "mint-1",
+            devHoldingPct: 1,
+            lpBurnPct: 100,
+            sourceTimestampMs: 1_792_000_000_000,
+            ingestionTimestampMs: 1_792_000_000_000,
+            responseReceivedMs: 1_792_000_000_000,
+          }),
+        };
+
+        expect(isApprovedMockProvider(forgedSymbolProvider)).toBe(false);
+
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-c01-test-"));
+        expect(
+          () =>
+            new ShadowCollectorEngine({
+              config: {
+                sessionId: "session-c01-1",
+                generationId: "gen-1",
+                strategyRevision: "rev-1",
+                outputRootDir: fixtureRoot,
+              },
+              provider: forgedSymbolProvider as unknown as IMarketDataProvider,
+            }),
+        ).toThrow("PROHIBITED_LIVE_PROVIDER_ATTEMPT");
+
+        // 2. Object with mock_ name and compliant interface cannot execute callback
+        let callbackExecuted = false;
+        const mockNamedCompliant = {
+          providerId: "mock_live_helius_adapter",
+          capabilityStatus: "UNVERIFIED_DESIGN_EXPECTATION" as const,
+          getPoolReserves: async () => {
+            callbackExecuted = true;
+            throw new Error("Live adapter must never be called");
+          },
+          getTokenMetrics: async () => {
+            callbackExecuted = true;
+            throw new Error("Live adapter must never be called");
+          },
+          getDeveloperHoldings: async () => {
+            callbackExecuted = true;
+            throw new Error("Live adapter must never be called");
+          },
+        };
+
+        expect(isApprovedMockProvider(mockNamedCompliant)).toBe(false);
+        expect(
+          () =>
+            new ShadowCollectorEngine({
+              config: {
+                sessionId: "session-c01-2",
+                generationId: "gen-1",
+                strategyRevision: "rev-1",
+                outputRootDir: fixtureRoot,
+              },
+              provider: mockNamedCompliant as unknown as IMarketDataProvider,
+            }),
+        ).toThrow("PROHIBITED_LIVE_PROVIDER_ATTEMPT");
+        expect(callbackExecuted).toBe(false);
+
+        // 3. Genuine instance but method prototype tampered with
+        const genuineProvider = new MockMarketDataProvider();
+        expect(isApprovedMockProvider(genuineProvider)).toBe(true);
+        // Tamper with method on instance
+        (genuineProvider as unknown as { getPoolReserves: unknown }).getPoolReserves = async () => {
+          callbackExecuted = true;
+          return {} as unknown;
+        };
+        expect(isApprovedMockProvider(genuineProvider)).toBe(false);
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22C-02: Require source, ingestion, and receipt availability at or before decision time
+      it("D22C-02: differentiates decision-time reserve eligibility from post-decision forward observation", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-c02-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+        const provider = new MockMarketDataProvider({ clock });
+
+        const engine = new ShadowCollectorEngine({
+          config: {
+            sessionId: "session-c02-test",
+            generationId: "gen-1",
+            strategyRevision: "rev-12.94-d22",
+            outputRootDir: fixtureRoot,
+          },
+          provider,
+          clock,
+        });
+
+        await engine.start();
+
+        const decisionTime = 1_792_000_000_000;
+        const decision = createMockDecisionFixture({
+          sessionId: "session-c02-test",
+          eventId: "dec-c02-1",
+          poolId: "pool-c02-amm",
+          decisionTimestampMs: decisionTime,
+        });
+        engine.ingestCandidateDecision(decision);
+
+        // Scenario A: Old source timestamp (1_791_999_999_000, 1s before decision), but queried at 1_792_000_060_000 (60s later)
+        // Simulated response receipt is late relative to decision time
+        provider.setReservesResponse("pool-c02-amm", {
+          poolId: "pool-c02-amm",
+          baseReserve: 1_000_000,
+          quoteReserve: 50,
+          sourceTimestampMs: decisionTime - 1000, // 1s before decision
+          ingestionTimestampMs: decisionTime + 60_000, // 60s AFTER decision
+          responseReceivedMs: decisionTime + 60_000, // 60s AFTER decision
+          isVerifiedPool: true,
+          vaultA: "vault-a",
+          vaultB: "vault-b",
+        });
+
+        clock.advanceBy(60_000); // Clock at 1_792_000_060_000
+        const lateEval = await engine.evaluateShadowCandidate({
+          decisionEventId: "dec-c02-1",
+          evaluationTimestampMs: decisionTime + 60_000,
+        });
+
+        // Must fail decision-time execution feasibility with LATE_RECEIPT_LOOKAHEAD_PREVENTION
+        expect(lateEval.qualificationResult.executionFeasible).toBe(false);
+        expect(lateEval.qualificationResult.unavailabilityReason).toBe(
+          "LATE_RECEIPT_LOOKAHEAD_PREVENTION",
+        );
+        expect(lateEval.observedReserveSnapshot).toBeUndefined();
+
+        // Scenario B: Fully pre-decision observed reserve (source <= decision, ingestion <= decision, receipt <= decision)
+        provider.setReservesResponse("pool-c02-amm", {
+          poolId: "pool-c02-amm",
+          baseReserve: 1_000_000,
+          quoteReserve: 50,
+          sourceTimestampMs: decisionTime - 1000,
+          ingestionTimestampMs: decisionTime - 500,
+          responseReceivedMs: decisionTime - 200,
+          isVerifiedPool: true,
+          vaultA: "vault-a",
+          vaultB: "vault-b",
+        });
+
+        const preDecisionEval = await engine.evaluateShadowCandidate({
+          decisionEventId: "dec-c02-1",
+          evaluationTimestampMs: decisionTime + 65_000,
+        });
+
+        expect(preDecisionEval.qualificationResult.executionFeasible).toBe(true);
+        expect(preDecisionEval.qualificationResult.unavailabilityReason).toBeUndefined();
+        expect(preDecisionEval.observedReserveSnapshot).toBeDefined();
+        expect(preDecisionEval.observedReserveSnapshot?.baseReserve).toBe(1_000_000);
+        expect(preDecisionEval.observedReserveSnapshot?.quoteReserve).toBe(50);
+        expect(preDecisionEval.observedReserveSnapshot?.sourceTimestampMs).toBe(
+          decisionTime - 1000,
+        );
+
+        // Scenario C: Forward observations preserved separately in market-observations.jsonl
+        const forwardObs: MarketObservationRecord = {
+          observationId: "obs-forward-1",
+          sessionId: "session-c02-test",
+          generationId: "gen-1",
+          mintAddress: decision.mintAddress,
+          poolId: decision.poolId,
+          sourceTimestampMs: decisionTime + 60_000,
+          ingestionTimestampMs: decisionTime + 60_050,
+          responseReceivedMs: decisionTime + 60_100,
+          dataFreshnessMs: 50,
+          measurementWindow: {
+            windowStartMs: decisionTime,
+            windowEndMs: decisionTime + 60_000,
+            durationSec: 60,
+          },
+          strategyRevision: "rev-12.94-d22",
+          missingFields: [],
+          providerIdentity: "mock_offline_market_provider",
+          priceMetrics: {
+            spotPriceUsd: 0.0012,
+            spotPriceSol: 0.000008,
+            priceSource: "POOL_RESERVE",
+          },
+          liquidityMetrics: {
+            baseReserve: 950_000,
+            quoteReserve: 55,
+            liquidityUsd: 55_000,
+          },
+          flowMetrics: {
+            txCount: 15,
+            buys: 10,
+            sells: 5,
+            volumeUsd: 5000,
+            netBuyerVolumeUsd: 2500,
+          },
+        };
+
+        engine.recordForwardObservation(forwardObs);
+        const drainSummary = await engine.drain();
+        expect(drainSummary.finalStatus).toBe("FINALIZED");
+        expect(drainSummary.flushedDecisionsCount).toBe(1);
+        expect(drainSummary.flushedObservationsCount).toBe(1);
+        expect(drainSummary.flushedEvaluationsCount).toBe(2);
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22C-03: Finality and recovery validate JSON syntax, schema, identity, and count consensus
+      it("D22C-03: drain fails-closed on corrupt replacement and recoverSessionDirectory rejects schema-invalid/count-mismatched streams", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-c03-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+        const provider = new MockMarketDataProvider({ clock });
+
+        // Reproduction 1: Start session, write 1 valid candidate, overwrite with 'definitely not json\n' -> drain() returns INTERRUPTED
+        const engine1 = new ShadowCollectorEngine({
+          config: {
+            sessionId: "session-c03-reprod1",
+            generationId: "gen-1",
+            strategyRevision: "rev-1",
+            outputRootDir: fixtureRoot,
+          },
+          provider,
+          clock,
+        });
+
+        await engine1.start();
+        const decision1 = createMockDecisionFixture({
+          sessionId: "session-c03-reprod1",
+          eventId: "dec-rep-1",
+          decisionTimestampMs: 1_792_000_000_000,
+        });
+        engine1.ingestCandidateDecision(decision1);
+
+        const decisionsPath1 = path.join(
+          fixtureRoot,
+          "session-c03-reprod1",
+          "candidate-decisions.jsonl",
+        );
+        // Overwrite sole line with non-JSON text of equal line count (1 line)
+        fs.writeFileSync(decisionsPath1, "definitely not json\n", "utf8");
+
+        const drain1 = await engine1.drain();
+        expect(drain1.finalStatus).toBe("INTERRUPTED");
+        expect(drain1.interruptionReason).toContain("RECONCILIATION_PARSE_ERROR");
+
+        const metaAfterDrain1 = JSON.parse(
+          fs.readFileSync(
+            path.join(fixtureRoot, "session-c03-reprod1", "session-meta.json"),
+            "utf8",
+          ),
+        ) as SessionTelemetryMeta;
+        expect(metaAfterDrain1.sessionStatus).toBe("INTERRUPTED");
+        expect(metaAfterDrain1.isInterruptedSession).toBe(true);
+
+        // Reproduction 2: Construct session with '{}' in candidate-decisions.jsonl and declared totalDecisionsRecorded: 999
+        // recoverSessionDirectory() must refuse FINALIZED, quarantine corrupt file, update meta to INTERRUPTED, and record diagnostics
+        const sessionDir2 = path.join(fixtureRoot, "session-c03-reprod2");
+        fs.mkdirSync(sessionDir2, { recursive: true });
+
+        fs.writeFileSync(path.join(sessionDir2, "candidate-decisions.jsonl"), "{}\n", "utf8");
+
+        const bogusMeta: SessionTelemetryMeta = {
+          sessionId: "session-c03-reprod2",
+          generationId: "gen-1",
+          strategyRevision: "rev-1",
+          startedAtIso: new Date().toISOString(),
+          closedAtIso: new Date().toISOString(),
+          initialWalletBalanceSol: 7.9259,
+          environment: { platform: "mock_offline_harness", nodeVersion: process.version },
+          sessionStatus: "FINALIZED",
+          isInterruptedSession: false,
+        };
+        const bogusSummary: SessionTelemetrySummary = {
+          sessionId: "session-c03-reprod2",
+          generationId: "gen-1",
+          strategyRevision: "rev-1",
+          startedAtIso: bogusMeta.startedAtIso,
+          closedAtIso: bogusMeta.closedAtIso!,
+          totalCandidatesScreened: 999,
+          totalDecisionsRecorded: 999,
+          decisionWriteFailures: 0,
+          cohortBreakdown: {
+            filteredRejected: 0,
+            watchlistRadar: 999,
+            triggerRejected: 0,
+            executedBuy: 0,
+          },
+          topRejectionReasons: {},
+          totalMarketObservationsRecorded: 0,
+          totalStratifiedCandidatesTracked: 0,
+          missedWinnersCount: 0,
+          avoidedRugsCount: 0,
+          isCompleteSession: true,
+          isInterruptedSession: false,
+        };
+
+        fs.writeFileSync(
+          path.join(sessionDir2, "session-meta.json"),
+          JSON.stringify(bogusMeta, null, 2),
+          "utf8",
+        );
+        fs.writeFileSync(
+          path.join(sessionDir2, "session-summary.json"),
+          JSON.stringify(bogusSummary, null, 2),
+          "utf8",
+        );
+
+        const recovery2 = ShadowCollectorEngine.recoverSessionDirectory(sessionDir2);
+        expect(recovery2.recoveredStatus).toBe("INTERRUPTED");
+        expect(recovery2.validDecisionsCount).toBe(0); // '{}' is rejected as schema-invalid
+        expect(recovery2.schemaInvalidLinesQuarantinedCount).toBe(1);
+        expect(recovery2.quarantinedFiles.length).toBeGreaterThan(0);
+        expect(recovery2.failureReasons).toContain(
+          "DECISIONS_COUNT_MISMATCH: summary=999, validOnDisk=0",
+        );
+
+        const metaAfterRecovery2 = JSON.parse(
+          fs.readFileSync(path.join(sessionDir2, "session-meta.json"), "utf8"),
+        ) as SessionTelemetryMeta;
+        const summaryAfterRecovery2 = JSON.parse(
+          fs.readFileSync(path.join(sessionDir2, "session-summary.json"), "utf8"),
+        ) as SessionTelemetrySummary;
+        expect(metaAfterRecovery2.sessionStatus).toBe("INTERRUPTED");
+        expect(metaAfterRecovery2.isInterruptedSession).toBe(true);
+        expect(summaryAfterRecovery2.isCompleteSession).toBe(false);
+        expect(summaryAfterRecovery2.isInterruptedSession).toBe(true);
+        expect(summaryAfterRecovery2.totalDecisionsRecorded).toBe(0);
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22C-04: Dual-bounded quota policy: operational payload quota + emergency metadata budget
+      it("D22C-04: enforces dual-bounded storage quota with explicit emergency metadata allowance and hard ceilings", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-c04-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+        const provider = new MockMarketDataProvider({ clock });
+
+        // Session with 500 bytes operational quota and 2048 bytes emergency metadata budget
+        const engine = new ShadowCollectorEngine({
+          config: {
+            sessionId: "session-c04-quota",
+            generationId: "gen-1",
+            strategyRevision: "rev-1",
+            outputRootDir: fixtureRoot,
+            maxSessionDiskBytes: 500, // 500 bytes operational payload quota
+            maxEmergencyMetadataBytes: 2048, // 2,048 bytes emergency metadata allowance
+          },
+          provider,
+          clock,
+        });
+
+        // start() writes initial session-meta.json (~360 bytes), fits in 500 bytes
+        await engine.start();
+
+        const sessionDir = path.join(fixtureRoot, "session-c04-quota");
+        expect(fs.existsSync(sessionDir)).toBe(true);
+
+        // Appending a candidate decision (~400 bytes) trips the 500-byte operational quota (360 + 400 = 760 > 500)
+        const decision = createMockDecisionFixture({
+          sessionId: "session-c04-quota",
+          eventId: "dec-quota-1",
+        });
+
+        expect(() => engine.ingestCandidateDecision(decision)).toThrow("STORAGE_QUOTA_EXCEEDED");
+        expect(engine.state).toBe("TERMINATED");
+
+        // Measure actual disk usage of all files in session directory
+        const files = fs.readdirSync(sessionDir);
+        let totalDiskBytes = 0;
+        let operationalBytes = 0;
+        let emergencyBytes = 0;
+
+        for (const file of files) {
+          const filePath = path.join(sessionDir, file);
+          const stat = fs.statSync(filePath);
+          totalDiskBytes += stat.size;
+          if (file.endsWith(".jsonl")) {
+            operationalBytes += stat.size;
+          } else {
+            emergencyBytes += stat.size;
+          }
+        }
+
+        // 1. Operational data files never exceeded maxSessionDiskBytes (500)
+        expect(operationalBytes).toBeLessThanOrEqual(500);
+
+        // 2. Emergency metadata files never exceeded maxEmergencyMetadataBytes (2048)
+        expect(emergencyBytes).toBeLessThanOrEqual(2048);
+
+        // 3. Total directory disk usage strictly bounded by maxSessionDiskBytes + maxEmergencyMetadataBytes (2548)
+        expect(totalDiskBytes).toBeLessThanOrEqual(500 + 2048);
+
+        // 4. Emergency files exist and correctly reflect INTERRUPTED
+        const meta = JSON.parse(
+          fs.readFileSync(path.join(sessionDir, "session-meta.json"), "utf8"),
+        ) as SessionTelemetryMeta;
+        const summary = JSON.parse(
+          fs.readFileSync(path.join(sessionDir, "session-summary.json"), "utf8"),
+        ) as SessionTelemetrySummary;
+        const diagnostics = JSON.parse(
+          fs.readFileSync(path.join(sessionDir, "session-diagnostics.json"), "utf8"),
+        ) as Record<string, unknown>;
+
+        expect(meta.sessionStatus).toBe("INTERRUPTED");
+        expect(summary.isCompleteSession).toBe(false);
+        expect(diagnostics.interruptionReason).toBe("STORAGE_QUOTA_EXCEEDED");
 
         fs.rmSync(fixtureRoot, { recursive: true, force: true });
       });
