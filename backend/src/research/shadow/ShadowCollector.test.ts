@@ -1752,6 +1752,59 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
         fs.rmSync(fixtureRoot, { recursive: true, force: true });
       });
 
+      // D22R4-01: Protect original mock-provider method implementations against post-construction prototype tampering
+      it("D22R4-01: protects original mock-provider method implementations against post-construction prototype tampering", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-r401-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+        const provider = new MockMarketDataProvider({ clock });
+        const engine = new ShadowCollectorEngine({
+          config: {
+            sessionId: "session-r401-proto-tamper",
+            generationId: "gen-1",
+            strategyRevision: "rev-1",
+            outputRootDir: fixtureRoot,
+          },
+          provider,
+          clock,
+        });
+        await engine.start();
+        const decision = createMockDecisionFixture({
+          sessionId: "session-r401-proto-tamper",
+          eventId: "dec-r401-proto-1",
+        });
+        engine.ingestCandidateDecision(decision);
+
+        let protoCallbackExecuted = false;
+        const originalPrototypeGetPoolReserves = MockMarketDataProvider.prototype.getPoolReserves;
+        try {
+          MockMarketDataProvider.prototype.getPoolReserves = async function () {
+            protoCallbackExecuted = true;
+            return {
+              poolId: "pool-amm-1",
+              baseReserve: 50_000,
+              quoteReserve: 25_000,
+              sourceTimestampMs: clock.now(),
+              ingestionTimestampMs: clock.now(),
+              responseReceivedMs: clock.now(),
+            };
+          };
+
+          // Attestation detects the class prototype replacement
+          expect(isApprovedMockProvider(provider)).toBe(false);
+
+          // evaluateShadowCandidate must fail closed at call time and NOT execute the substituted callback
+          await expect(
+            engine.evaluateShadowCandidate({ decisionEventId: decision.eventId }),
+          ).rejects.toThrow("[PROHIBITED_LIVE_PROVIDER_ATTEMPT]");
+
+          expect(protoCallbackExecuted).toBe(false);
+        } finally {
+          MockMarketDataProvider.prototype.getPoolReserves = originalPrototypeGetPoolReserves;
+        }
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
       // D22R-02: Persisted evidence integrity, canonical schemas, composite foreign keys, and dual-file consensus
       it("D22R-02: drain and recovery enforce exact identity sets, complete schemas, foreign keys, and dual-file consensus", async () => {
         const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-r02-test-"));
@@ -1970,6 +2023,246 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
           expect(metaDAfter.isInterruptedSession).toBe(true);
           expect(summaryDAfter.isCompleteSession).toBe(false);
           expect(summaryDAfter.isInterruptedSession).toBe(true);
+        }
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22R4-02: Reconcile complete persisted research payloads against immutable append-time snapshots
+      it("D22R4-02: reconciles complete persisted research payloads against immutable append-time snapshots", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-r402-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+
+        // --- Case 1: Tampered candidate market metrics on disk ---
+        {
+          const providerE = new MockMarketDataProvider({ clock });
+          const engineE = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-tampered-metrics",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerE,
+            clock,
+          });
+          await engineE.start();
+          const decisionE = createMockDecisionFixture({
+            sessionId: "session-r02-tampered-metrics",
+            eventId: "dec-tampered-metrics-1",
+          });
+          engineE.ingestCandidateDecision(decisionE);
+
+          // Overwrite on-disk JSONL line with liquidityUsd = 999_999_999 while keeping eventId, timestamps, etc.
+          const decisionsPathE = path.join(
+            fixtureRoot,
+            "session-r02-tampered-metrics",
+            "candidate-decisions.jsonl",
+          );
+          const originalLine = JSON.parse(fs.readFileSync(decisionsPathE, "utf8").trim());
+          const tamperedLine = {
+            ...originalLine,
+            metricsSnapshot: {
+              ...originalLine.metricsSnapshot,
+              liquidityUsd: 999_999_999,
+            },
+          };
+          fs.writeFileSync(decisionsPathE, JSON.stringify(tamperedLine) + "\n", "utf8");
+
+          const drainSummaryE = await engineE.drain();
+          expect(drainSummaryE.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryE.isCompleteSession).toBe(false);
+          expect(drainSummaryE.interruptionReason).toContain("RECONCILIATION_IDENTITY_MISMATCH");
+
+          const metaE = JSON.parse(
+            fs.readFileSync(
+              path.join(fixtureRoot, "session-r02-tampered-metrics", "session-meta.json"),
+              "utf8",
+            ),
+          ) as SessionTelemetryMeta;
+          expect(metaE.sessionStatus).toBe("INTERRUPTED");
+        }
+
+        // --- Reproduction F (D22R4-02): In-memory object mutation after ingestion cannot rewrite reference baseline ---
+        {
+          const providerF = new MockMarketDataProvider({ clock });
+          const engineF = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-mem-mutation",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerF,
+            clock,
+          });
+          await engineF.start();
+          const decisionF = createMockDecisionFixture({
+            sessionId: "session-r02-mem-mutation",
+            eventId: "dec-mem-mutation-1",
+          });
+          engineF.ingestCandidateDecision(decisionF);
+
+          // Mutate the original in-memory object held by caller after ingestion
+          (decisionF.metricsSnapshot as { liquidityUsd: number }).liquidityUsd = 999_999_999;
+
+          // The persisted file and engine baseline should match each other (50,000), so drain completes FINALIZED
+          const drainSummaryF = await engineF.drain();
+          expect(drainSummaryF.finalStatus).toBe("FINALIZED");
+          expect(drainSummaryF.isCompleteSession).toBe(true);
+
+          const metaF = JSON.parse(
+            fs.readFileSync(
+              path.join(fixtureRoot, "session-r02-mem-mutation", "session-meta.json"),
+              "utf8",
+            ),
+          ) as SessionTelemetryMeta;
+          expect(metaF.sessionStatus).toBe("FINALIZED");
+        }
+
+        // --- Reproduction G (D22R4-02): Tampered evaluation reserve quantities on disk ---
+        {
+          const providerG = new MockMarketDataProvider({ clock });
+          const engineG = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-tampered-reserves",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerG,
+            clock,
+          });
+          await engineG.start();
+          const decisionG = createMockDecisionFixture({
+            sessionId: "session-r02-tampered-reserves",
+            eventId: "dec-reserves-1",
+            decisionTimestampMs: clock.now(),
+          });
+          engineG.ingestCandidateDecision(decisionG);
+
+          const evalRecord = await engineG.evaluateShadowCandidate({
+            decisionEventId: decisionG.eventId,
+          });
+          expect(evalRecord.qualificationResult.executionFeasible).toBe(true);
+
+          // Tamper on-disk evaluation: alter observedReserveSnapshot.baseReserve to 999,999,999
+          const evalsPathG = path.join(
+            fixtureRoot,
+            "session-r02-tampered-reserves",
+            "shadow-evaluations.jsonl",
+          );
+          const originalEval = JSON.parse(fs.readFileSync(evalsPathG, "utf8").trim());
+          const tamperedEval = {
+            ...originalEval,
+            observedReserveSnapshot: {
+              ...originalEval.observedReserveSnapshot,
+              baseReserve: 999_999_999,
+            },
+          };
+          fs.writeFileSync(evalsPathG, JSON.stringify(tamperedEval) + "\n", "utf8");
+
+          const drainSummaryG = await engineG.drain();
+          expect(drainSummaryG.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryG.isCompleteSession).toBe(false);
+          expect(drainSummaryG.interruptionReason).toContain("RECONCILIATION_IDENTITY_MISMATCH");
+
+          const metaG = JSON.parse(
+            fs.readFileSync(
+              path.join(fixtureRoot, "session-r02-tampered-reserves", "session-meta.json"),
+              "utf8",
+            ),
+          ) as SessionTelemetryMeta;
+          expect(metaG.sessionStatus).toBe("INTERRUPTED");
+        }
+
+        // --- Reproduction H (D22R4-02): Tampered observation market metrics on disk ---
+        {
+          const providerH = new MockMarketDataProvider({ clock });
+          const engineH = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-tampered-obs",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerH,
+            clock,
+          });
+          await engineH.start();
+          const decisionH = createMockDecisionFixture({
+            sessionId: "session-r02-tampered-obs",
+            eventId: "dec-obs-1",
+            decisionTimestampMs: clock.now(),
+          });
+          engineH.ingestCandidateDecision(decisionH);
+
+          const obsH: MarketObservationRecord = {
+            observationId: "obs-tamper-1",
+            sessionId: "session-r02-tampered-obs",
+            generationId: "gen-1",
+            mintAddress: decisionH.mintAddress,
+            poolId: decisionH.poolId,
+            sourceTimestampMs: decisionH.decisionTimestampMs + 10,
+            ingestionTimestampMs: decisionH.decisionTimestampMs + 20,
+            responseReceivedMs: decisionH.decisionTimestampMs + 30,
+            dataFreshnessMs: 20,
+            strategyRevision: "rev-1",
+            providerIdentity: "mock_offline_market_provider",
+            priceMetrics: {
+              spotPriceUsd: 1.5,
+              spotPriceSol: 0.01,
+              priceSource: "POOL_RESERVE",
+            },
+            liquidityMetrics: {
+              liquidityUsd: 45_000,
+              baseReserve: 100_000,
+              quoteReserve: 50_000,
+            },
+            flowMetrics: {
+              volumeUsd: 500,
+              txCount: 7,
+              buys: 5,
+              sells: 2,
+              netBuyerVolumeUsd: 300,
+            },
+            measurementWindow: {
+              windowStartMs: decisionH.decisionTimestampMs,
+              windowEndMs: decisionH.decisionTimestampMs + 10,
+              durationSec: 0.01,
+            },
+            missingFields: [],
+          };
+          engineH.recordForwardObservation(obsH);
+
+          // Tamper on-disk observation: change liquidityUsd to 999,999,999
+          const obsPathH = path.join(
+            fixtureRoot,
+            "session-r02-tampered-obs",
+            "market-observations.jsonl",
+          );
+          const originalObs = JSON.parse(fs.readFileSync(obsPathH, "utf8").trim());
+          const tamperedObs = {
+            ...originalObs,
+            liquidityMetrics: {
+              ...originalObs.liquidityMetrics,
+              liquidityUsd: 999_999_999,
+            },
+          };
+          fs.writeFileSync(obsPathH, JSON.stringify(tamperedObs) + "\n", "utf8");
+
+          const drainSummaryH = await engineH.drain();
+          expect(drainSummaryH.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryH.isCompleteSession).toBe(false);
+          expect(drainSummaryH.interruptionReason).toContain("RECONCILIATION_IDENTITY_MISMATCH");
+
+          const metaH = JSON.parse(
+            fs.readFileSync(
+              path.join(fixtureRoot, "session-r02-tampered-obs", "session-meta.json"),
+              "utf8",
+            ),
+          ) as SessionTelemetryMeta;
+          expect(metaH.sessionStatus).toBe("INTERRUPTED");
         }
 
         fs.rmSync(fixtureRoot, { recursive: true, force: true });

@@ -59,31 +59,6 @@ const approvedMockInstances = new WeakSet<object>();
 export const MOCK_PROVIDER_BRAND = Symbol.for("NeXusTrade.OfflineMockMarketDataProvider.v1");
 
 /**
- * Validates that an injected provider is a genuinely approved offline mock instance (D22C-01, D22R-01).
- * Plain objects, forged symbol brandings, subclass overrides, and tampered method prototypes fail closed.
- */
-export function isApprovedMockProvider(provider: unknown): provider is MockMarketDataProvider {
-  if (!provider || typeof provider !== "object") return false;
-  if (provider.constructor !== MockMarketDataProvider) return false;
-  if (Object.getPrototypeOf(provider) !== MockMarketDataProvider.prototype) return false;
-  if (!approvedMockInstances.has(provider)) return false;
-
-  // Strict prototype method and internal helper identity checks: methods must not be hijacked or overridden (D22R-01)
-  const p = provider as MockMarketDataProvider;
-  if (
-    p.getPoolReserves !== MockMarketDataProvider.prototype.getPoolReserves ||
-    p.getTokenMetrics !== MockMarketDataProvider.prototype.getTokenMetrics ||
-    p.getDeveloperHoldings !== MockMarketDataProvider.prototype.getDeveloperHoldings ||
-    (p as unknown as Record<string, unknown>).checkFailureInjection !==
-      (MockMarketDataProvider.prototype as unknown as Record<string, unknown>).checkFailureInjection
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
  * Deterministic offline mock provider with programmable failure modes.
  */
 export class MockMarketDataProvider implements IMarketDataProvider {
@@ -336,4 +311,45 @@ export class MockMarketDataProvider implements IMarketDataProvider {
       responseReceivedMs: base?.responseReceivedMs ?? responseReceivedMs,
     };
   }
+}
+
+/**
+ * Unexported immutable canonical method references captured at module evaluation time (D22R4-01).
+ * Used to verify that neither instance properties nor the shared class prototype have been replaced post-construction.
+ */
+const CANONICAL_GET_POOL_RESERVES = MockMarketDataProvider.prototype.getPoolReserves;
+const CANONICAL_GET_TOKEN_METRICS = MockMarketDataProvider.prototype.getTokenMetrics;
+const CANONICAL_GET_DEVELOPER_HOLDINGS = MockMarketDataProvider.prototype.getDeveloperHoldings;
+const CANONICAL_CHECK_FAILURE_INJECTION = (
+  MockMarketDataProvider.prototype as unknown as Record<string, unknown>
+).checkFailureInjection;
+
+/**
+ * Validates that an injected provider is a genuinely approved offline mock instance (D22C-01, D22R-01, D22R4-01).
+ * Plain objects, forged symbol brandings, subclass overrides, and tampered method prototypes fail closed.
+ */
+export function isApprovedMockProvider(provider: unknown): provider is MockMarketDataProvider {
+  if (!provider || typeof provider !== "object") return false;
+  if (provider.constructor !== MockMarketDataProvider) return false;
+  if (Object.getPrototypeOf(provider) !== MockMarketDataProvider.prototype) return false;
+  if (!approvedMockInstances.has(provider)) return false;
+
+  // D22R-01 & D22R4-01: Both instance and current class prototype must strictly match canonical immutable references captured at module load time
+  const p = provider as MockMarketDataProvider;
+  if (
+    p.getPoolReserves !== CANONICAL_GET_POOL_RESERVES ||
+    MockMarketDataProvider.prototype.getPoolReserves !== CANONICAL_GET_POOL_RESERVES ||
+    p.getTokenMetrics !== CANONICAL_GET_TOKEN_METRICS ||
+    MockMarketDataProvider.prototype.getTokenMetrics !== CANONICAL_GET_TOKEN_METRICS ||
+    p.getDeveloperHoldings !== CANONICAL_GET_DEVELOPER_HOLDINGS ||
+    MockMarketDataProvider.prototype.getDeveloperHoldings !== CANONICAL_GET_DEVELOPER_HOLDINGS ||
+    (p as unknown as Record<string, unknown>).checkFailureInjection !==
+      CANONICAL_CHECK_FAILURE_INJECTION ||
+    (MockMarketDataProvider.prototype as unknown as Record<string, unknown>)
+      .checkFailureInjection !== CANONICAL_CHECK_FAILURE_INJECTION
+  ) {
+    return false;
+  }
+
+  return true;
 }

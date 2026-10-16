@@ -178,6 +178,45 @@ export function isValidMarketObservationRecord(
   return true;
 }
 
+/**
+ * Deep equality check for serialized research records (D22R4-02).
+ * Verifies complete recursive payloads (nested financial metrics, snapshots, filter arrays, reserves).
+ */
+export function deepEqualRecords(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || typeof a !== "object" || b === null || typeof b !== "object") return false;
+
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const arrA = a as unknown[];
+    const arrB = b as unknown[];
+    if (arrA.length !== arrB.length) return false;
+    for (let i = 0; i < arrA.length; i++) {
+      if (!deepEqualRecords(arrA[i], arrB[i])) return false;
+    }
+    return true;
+  }
+
+  const objA = a as Record<string, unknown>;
+  const objB = b as Record<string, unknown>;
+
+  const keysA = Object.keys(objA).filter((k) => objA[k] !== undefined);
+  const keysB = Object.keys(objB).filter((k) => objB[k] !== undefined);
+
+  if (keysA.length !== keysB.length) return false;
+
+  for (const k of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(objB, k) || objB[k] === undefined) {
+      return false;
+    }
+    if (!deepEqualRecords(objA[k], objB[k])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export class ShadowCollectorEngine {
   public state: CollectorLifecycleState = "IDLE";
   private readonly config: ShadowCollectorConfig;
@@ -359,9 +398,10 @@ export class ShadowCollectorEngine {
       );
     }
 
-    // Cohort preservation: Ensure candidate is recorded as given, never mutated to EXECUTED_BUY
-    this.appendJsonLine(this.decisionsPath, decision);
-    this.decisions.set(decision.eventId, decision);
+    // Cohort preservation & D22R4-02: Ensure candidate is recorded as given, capturing immutable append-time baseline
+    const appendSnapshot = JSON.parse(JSON.stringify(decision)) as CandidateDecisionRecord;
+    this.appendJsonLine(this.decisionsPath, appendSnapshot);
+    this.decisions.set(appendSnapshot.eventId, appendSnapshot);
   }
 
   /**
@@ -542,8 +582,10 @@ export class ShadowCollectorEngine {
       // Check state again before writing (in case drain was triggered during async wait)
       this.assertState("COLLECTING");
 
-      this.appendJsonLine(this.evaluationsPath, record);
-      this.evaluations.set(record.evaluationId, record);
+      // D22R4-02: Capture immutable append-time baseline via deep clone
+      const appendSnapshot = JSON.parse(JSON.stringify(record)) as ShadowEvaluationRecord;
+      this.appendJsonLine(this.evaluationsPath, appendSnapshot);
+      this.evaluations.set(appendSnapshot.evaluationId, appendSnapshot);
 
       return record;
     } finally {
@@ -616,8 +658,10 @@ export class ShadowCollectorEngine {
       );
     }
 
-    this.appendJsonLine(this.observationsPath, observation);
-    this.observations.push(observation);
+    // D22R4-02: Capture immutable append-time baseline via deep clone
+    const appendSnapshot = JSON.parse(JSON.stringify(observation)) as MarketObservationRecord;
+    this.appendJsonLine(this.observationsPath, appendSnapshot);
+    this.observations.push(appendSnapshot);
   }
 
   private checkResourceLimits(): void {
@@ -789,21 +833,9 @@ export class ShadowCollectorEngine {
         );
       }
       const mem = this.decisions.get(d.eventId)!;
-      if (
-        mem.mintAddress !== d.mintAddress ||
-        mem.poolId !== d.poolId ||
-        mem.sessionId !== d.sessionId ||
-        mem.generationId !== d.generationId ||
-        mem.symbol !== d.symbol ||
-        mem.decisionTimestampMs !== d.decisionTimestampMs ||
-        mem.sourceTimestampMs !== d.sourceTimestampMs ||
-        mem.ingestionTimestampMs !== d.ingestionTimestampMs ||
-        mem.strategyRevision !== d.strategyRevision ||
-        mem.decisionCohort !== d.decisionCohort ||
-        mem.providerIdentity !== d.providerIdentity
-      ) {
+      if (!deepEqualRecords(d, mem)) {
         return this.abort(
-          `RECONCILIATION_IDENTITY_MISMATCH: Persisted decision '${d.eventId}' content does not match in-memory record (post-append tampering detected).`,
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted decision '${d.eventId}' content does not match append-time record (tampered metrics or payload detected).`,
         );
       }
     }
@@ -838,19 +870,9 @@ export class ShadowCollectorEngine {
         );
       }
       const mem = memObsMap.get(o.observationId)!;
-      if (
-        mem.mintAddress !== o.mintAddress ||
-        mem.poolId !== o.poolId ||
-        mem.sessionId !== o.sessionId ||
-        mem.generationId !== o.generationId ||
-        mem.sourceTimestampMs !== o.sourceTimestampMs ||
-        mem.ingestionTimestampMs !== o.ingestionTimestampMs ||
-        mem.dataFreshnessMs !== o.dataFreshnessMs ||
-        mem.strategyRevision !== o.strategyRevision ||
-        mem.providerIdentity !== o.providerIdentity
-      ) {
+      if (!deepEqualRecords(o, mem)) {
         return this.abort(
-          `RECONCILIATION_IDENTITY_MISMATCH: Persisted observation '${o.observationId}' content does not match in-memory record.`,
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted observation '${o.observationId}' content does not match append-time record (tampered metrics or payload detected).`,
         );
       }
     }
@@ -908,17 +930,9 @@ export class ShadowCollectorEngine {
         );
       }
       const mem = this.evaluations.get(ev.evaluationId)!;
-      if (
-        mem.decisionEventId !== ev.decisionEventId ||
-        mem.mintAddress !== ev.mintAddress ||
-        mem.poolId !== ev.poolId ||
-        mem.sessionId !== ev.sessionId ||
-        mem.generationId !== ev.generationId ||
-        mem.evaluationTimestampMs !== ev.evaluationTimestampMs ||
-        mem.qualificationResult?.executionFeasible !== ev.qualificationResult?.executionFeasible
-      ) {
+      if (!deepEqualRecords(ev, mem)) {
         return this.abort(
-          `RECONCILIATION_IDENTITY_MISMATCH: Persisted evaluation '${ev.evaluationId}' content does not match in-memory evaluation.`,
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted evaluation '${ev.evaluationId}' content does not match append-time record (tampered reserves or qualification payload detected).`,
         );
       }
     }
