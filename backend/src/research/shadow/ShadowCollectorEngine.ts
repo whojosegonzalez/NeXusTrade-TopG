@@ -45,7 +45,7 @@ import {
 } from "./ShadowResourceController.js";
 
 /**
- * Validates the minimal schema and identity requirements for CandidateDecisionRecord (D22C-03).
+ * Validates the full canonical schema and identity requirements for CandidateDecisionRecord (D22C-03, D22R-02).
  */
 export function isValidCandidateDecisionRecord(
   obj: unknown,
@@ -59,6 +59,21 @@ export function isValidCandidateDecisionRecord(
   if (typeof d.generationId !== "string" || d.generationId.trim().length === 0) return false;
   if (typeof d.mintAddress !== "string" || d.mintAddress.trim().length === 0) return false;
   if (typeof d.poolId !== "string" || d.poolId.trim().length === 0) return false;
+  if (typeof d.symbol !== "string" || d.symbol.trim().length === 0) return false;
+  if (
+    typeof d.sourceTimestampMs !== "number" ||
+    !Number.isFinite(d.sourceTimestampMs) ||
+    d.sourceTimestampMs <= 0
+  ) {
+    return false;
+  }
+  if (
+    typeof d.ingestionTimestampMs !== "number" ||
+    !Number.isFinite(d.ingestionTimestampMs) ||
+    d.ingestionTimestampMs <= 0
+  ) {
+    return false;
+  }
   if (
     typeof d.decisionTimestampMs !== "number" ||
     !Number.isFinite(d.decisionTimestampMs) ||
@@ -66,6 +81,15 @@ export function isValidCandidateDecisionRecord(
   ) {
     return false;
   }
+  // Causal chronological ordering: source <= ingestion <= decision
+  if (
+    d.sourceTimestampMs > d.ingestionTimestampMs ||
+    d.ingestionTimestampMs > d.decisionTimestampMs
+  ) {
+    return false;
+  }
+  if (typeof d.strategyRevision !== "string" || d.strategyRevision.trim().length === 0)
+    return false;
   if (
     !["FILTERED_REJECTED", "WATCHLIST_RADAR", "TRIGGER_REJECTED", "EXECUTED_BUY"].includes(
       d.decisionCohort as string,
@@ -73,11 +97,17 @@ export function isValidCandidateDecisionRecord(
   ) {
     return false;
   }
+  if (!Array.isArray(d.filterEvaluations)) return false;
+  if (typeof d.metricsSnapshot !== "object" || d.metricsSnapshot === null) return false;
+  if (!Array.isArray(d.missingFields)) return false;
+  if (typeof d.providerIdentity !== "string" || d.providerIdentity.trim().length === 0)
+    return false;
+
   return true;
 }
 
 /**
- * Validates the minimal schema and identity requirements for MarketObservationRecord (D22C-03).
+ * Validates the full canonical schema and identity requirements for MarketObservationRecord (D22C-03, D22R-02).
  */
 export function isValidMarketObservationRecord(
   obj: unknown,
@@ -105,6 +135,46 @@ export function isValidMarketObservationRecord(
   ) {
     return false;
   }
+  // Causal chronological ordering: source <= ingestion
+  if (o.sourceTimestampMs > o.ingestionTimestampMs) {
+    return false;
+  }
+  if (
+    typeof o.dataFreshnessMs !== "number" ||
+    !Number.isFinite(o.dataFreshnessMs) ||
+    o.dataFreshnessMs < 0
+  ) {
+    return false;
+  }
+  if (typeof o.measurementWindow !== "object" || o.measurementWindow === null) return false;
+  const mw = o.measurementWindow as Record<string, unknown>;
+  if (
+    typeof mw.windowStartMs !== "number" ||
+    !Number.isFinite(mw.windowStartMs) ||
+    typeof mw.windowEndMs !== "number" ||
+    !Number.isFinite(mw.windowEndMs) ||
+    typeof mw.durationSec !== "number" ||
+    !Number.isFinite(mw.durationSec) ||
+    mw.windowStartMs > mw.windowEndMs
+  ) {
+    return false;
+  }
+  if (typeof o.strategyRevision !== "string" || o.strategyRevision.trim().length === 0)
+    return false;
+  if (typeof o.providerIdentity !== "string" || o.providerIdentity.trim().length === 0)
+    return false;
+  if (typeof o.priceMetrics !== "object" || o.priceMetrics === null) return false;
+  const pm = o.priceMetrics as Record<string, unknown>;
+  if (
+    typeof pm.priceSource !== "string" ||
+    !["POOL_RESERVE", "ROUTE_QUOTE", "INDEXED_TICK"].includes(pm.priceSource)
+  ) {
+    return false;
+  }
+  if (typeof o.liquidityMetrics !== "object" || o.liquidityMetrics === null) return false;
+  if (typeof o.flowMetrics !== "object" || o.flowMetrics === null) return false;
+  if (!Array.isArray(o.missingFields)) return false;
+
   return true;
 }
 
@@ -274,6 +344,14 @@ export class ShadowCollectorEngine {
       );
     }
 
+    // D22R-02: Full canonical schema validation on candidate ingestion
+    const candidateObj = decision as unknown as Record<string, unknown>;
+    if (!isValidCandidateDecisionRecord(decision, this.config.sessionId)) {
+      throw new Error(
+        `[ShadowCollectorEngine] [INVALID_CANDIDATE_DECISION_SCHEMA] Candidate decision '${candidateObj?.eventId}' failed canonical schema validation.`,
+      );
+    }
+
     // D22-S04: Reject duplicate eventId BEFORE appending to JSONL
     if (this.decisions.has(decision.eventId)) {
       throw new Error(
@@ -316,12 +394,24 @@ export class ShadowCollectorEngine {
         );
       }
 
+      // D22R-01: Call-time mock-only provider boundary enforcement
+      if (!isApprovedMockProvider(this.provider)) {
+        throw new Error(
+          `[ShadowCollectorEngine] [PROHIBITED_LIVE_PROVIDER_ATTEMPT] [MOCK_PROVIDER_TAMPERED] Provider failed mock-only call-time attestation. Post-construction method substitution or unauthorized helper override detected.`,
+        );
+      }
+
       // D22-S05: Fetch pool reserves with backoff retry on 429/503
       let reserves: PointInTimeReserves;
       let attempt = 0;
       const maxRetries = this.config.rateLimits?.maxRetryAttempts ?? 2;
       while (true) {
         try {
+          if (!isApprovedMockProvider(this.provider)) {
+            throw new Error(
+              `[ShadowCollectorEngine] [PROHIBITED_LIVE_PROVIDER_ATTEMPT] [MOCK_PROVIDER_TAMPERED] Provider failed mock-only call-time attestation.`,
+            );
+          }
           reserves = await this.provider.getPoolReserves(decision.poolId);
           break;
         } catch (err: unknown) {
@@ -481,6 +571,14 @@ export class ShadowCollectorEngine {
       );
     }
 
+    // D22R-02: Full canonical schema validation on observation recording
+    const obsObj = observation as unknown as Record<string, unknown>;
+    if (!isValidMarketObservationRecord(observation, this.config.sessionId)) {
+      throw new Error(
+        `[ShadowCollectorEngine] [INVALID_MARKET_OBSERVATION_SCHEMA] Observation '${obsObj?.observationId}' failed canonical schema validation.`,
+      );
+    }
+
     // D22-S04: Must match an ingested decision for pool and mint
     const matchingDecision = Array.from(this.decisions.values()).find(
       (d) => d.poolId === observation.poolId && d.mintAddress === observation.mintAddress,
@@ -611,16 +709,17 @@ export class ShadowCollectorEngine {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    // D22C-03: Parse, schema-validate, and verify identity/count of all on-disk records before claiming FINALIZED
+    // D22C-03 & D22R-02: Parse, full-schema validate, and verify exact identity/count/foreign-keys of all on-disk records before claiming FINALIZED
     const readAndValidateStream = <T>(
       filePath: string,
       validator: (item: unknown) => boolean,
       getId: (item: T) => string,
-    ): { count: number; ids: Set<string>; error?: string | undefined } => {
-      if (!fs.existsSync(filePath)) return { count: 0, ids: new Set() };
+    ): { count: number; ids: Set<string>; records: T[]; error?: string | undefined } => {
+      if (!fs.existsSync(filePath)) return { count: 0, ids: new Set(), records: [] };
       const raw = fs.readFileSync(filePath, "utf8");
       const lines = raw.split("\n");
       const ids = new Set<string>();
+      const records: T[] = [];
       let validCount = 0;
 
       for (let i = 0; i < lines.length; i++) {
@@ -636,6 +735,7 @@ export class ShadowCollectorEngine {
           return {
             count: validCount,
             ids,
+            records,
             error: `RECONCILIATION_PARSE_ERROR: '${path.basename(filePath)}' line ${i + 1} is not valid JSON.`,
           };
         }
@@ -644,6 +744,7 @@ export class ShadowCollectorEngine {
           return {
             count: validCount,
             ids,
+            records,
             error: `RECONCILIATION_SCHEMA_INVALID: '${path.basename(filePath)}' line ${i + 1} failed schema or session-id validation.`,
           };
         }
@@ -653,14 +754,16 @@ export class ShadowCollectorEngine {
           return {
             count: validCount,
             ids,
+            records,
             error: `RECONCILIATION_DUPLICATE_ID: '${path.basename(filePath)}' contains duplicate ID '${id}'.`,
           };
         }
         ids.add(id);
+        records.push(parsed as T);
         validCount++;
       }
 
-      return { count: validCount, ids };
+      return { count: validCount, ids, records };
     };
 
     const decisionsCheck = readAndValidateStream<CandidateDecisionRecord>(
@@ -672,6 +775,46 @@ export class ShadowCollectorEngine {
       return this.abort(decisionsCheck.error);
     }
 
+    if (decisionsCheck.count !== this.decisions.size) {
+      return this.abort(
+        `RECONCILIATION_COUNT_MISMATCH: decisions disk=${decisionsCheck.count}/mem=${this.decisions.size}`,
+      );
+    }
+
+    // D22R-02 Reproduction A: Verify exact 1:1 decision identity and content matching against in-memory records
+    for (const d of decisionsCheck.records) {
+      if (!this.decisions.has(d.eventId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted decision ID '${d.eventId}' was not recorded by in-memory session.`,
+        );
+      }
+      const mem = this.decisions.get(d.eventId)!;
+      if (
+        mem.mintAddress !== d.mintAddress ||
+        mem.poolId !== d.poolId ||
+        mem.sessionId !== d.sessionId ||
+        mem.generationId !== d.generationId ||
+        mem.symbol !== d.symbol ||
+        mem.decisionTimestampMs !== d.decisionTimestampMs ||
+        mem.sourceTimestampMs !== d.sourceTimestampMs ||
+        mem.ingestionTimestampMs !== d.ingestionTimestampMs ||
+        mem.strategyRevision !== d.strategyRevision ||
+        mem.decisionCohort !== d.decisionCohort ||
+        mem.providerIdentity !== d.providerIdentity
+      ) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted decision '${d.eventId}' content does not match in-memory record (post-append tampering detected).`,
+        );
+      }
+    }
+    for (const memId of this.decisions.keys()) {
+      if (!decisionsCheck.ids.has(memId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: In-memory decision '${memId}' is missing from persisted records.`,
+        );
+      }
+    }
+
     const observationsCheck = readAndValidateStream<MarketObservationRecord>(
       this.observationsPath,
       (item) => isValidMarketObservationRecord(item, this.config.sessionId),
@@ -679,6 +822,44 @@ export class ShadowCollectorEngine {
     );
     if (observationsCheck.error) {
       return this.abort(observationsCheck.error);
+    }
+
+    if (observationsCheck.count !== this.observations.length) {
+      return this.abort(
+        `RECONCILIATION_COUNT_MISMATCH: observations disk=${observationsCheck.count}/mem=${this.observations.length}`,
+      );
+    }
+
+    const memObsMap = new Map(this.observations.map((o) => [o.observationId, o]));
+    for (const o of observationsCheck.records) {
+      if (!memObsMap.has(o.observationId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted observation ID '${o.observationId}' was not recorded by in-memory session.`,
+        );
+      }
+      const mem = memObsMap.get(o.observationId)!;
+      if (
+        mem.mintAddress !== o.mintAddress ||
+        mem.poolId !== o.poolId ||
+        mem.sessionId !== o.sessionId ||
+        mem.generationId !== o.generationId ||
+        mem.sourceTimestampMs !== o.sourceTimestampMs ||
+        mem.ingestionTimestampMs !== o.ingestionTimestampMs ||
+        mem.dataFreshnessMs !== o.dataFreshnessMs ||
+        mem.strategyRevision !== o.strategyRevision ||
+        mem.providerIdentity !== o.providerIdentity
+      ) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted observation '${o.observationId}' content does not match in-memory record.`,
+        );
+      }
+    }
+    for (const memId of memObsMap.keys()) {
+      if (!observationsCheck.ids.has(memId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: In-memory observation '${memId}' is missing from persisted records.`,
+        );
+      }
     }
 
     const evaluationsCheck = readAndValidateStream<ShadowEvaluationRecord>(
@@ -697,14 +878,56 @@ export class ShadowCollectorEngine {
       return this.abort(evaluationsCheck.error);
     }
 
-    if (
-      decisionsCheck.count !== this.decisions.size ||
-      observationsCheck.count !== this.observations.length ||
-      evaluationsCheck.count !== this.evaluations.size
-    ) {
+    if (evaluationsCheck.count !== this.evaluations.size) {
       return this.abort(
-        `RECONCILIATION_MISMATCH: decisions disk=${decisionsCheck.count}/mem=${this.decisions.size}, observations disk=${observationsCheck.count}/mem=${this.observations.length}, evaluations disk=${evaluationsCheck.count}/mem=${this.evaluations.size}`,
+        `RECONCILIATION_COUNT_MISMATCH: evaluations disk=${evaluationsCheck.count}/mem=${this.evaluations.size}`,
       );
+    }
+
+    // D22R-02 Reproduction C: Verify 1:N composite foreign keys and orphan prevention in drain path
+    for (const ev of evaluationsCheck.records) {
+      if (!this.evaluations.has(ev.evaluationId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted evaluation ID '${ev.evaluationId}' was not recorded by in-memory session.`,
+        );
+      }
+      if (!decisionsCheck.ids.has(ev.decisionEventId)) {
+        return this.abort(
+          `RECONCILIATION_ORPHAN_EVALUATION: Persisted evaluation '${ev.evaluationId}' references non-existent decision '${ev.decisionEventId}'.`,
+        );
+      }
+      const refDec = this.decisions.get(ev.decisionEventId)!;
+      if (
+        refDec.sessionId !== ev.sessionId ||
+        refDec.generationId !== ev.generationId ||
+        refDec.mintAddress !== ev.mintAddress ||
+        refDec.poolId !== ev.poolId
+      ) {
+        return this.abort(
+          `RECONCILIATION_FOREIGN_KEY_MISMATCH: Persisted evaluation '${ev.evaluationId}' composite foreign key does not match referenced decision '${ev.decisionEventId}'.`,
+        );
+      }
+      const mem = this.evaluations.get(ev.evaluationId)!;
+      if (
+        mem.decisionEventId !== ev.decisionEventId ||
+        mem.mintAddress !== ev.mintAddress ||
+        mem.poolId !== ev.poolId ||
+        mem.sessionId !== ev.sessionId ||
+        mem.generationId !== ev.generationId ||
+        mem.evaluationTimestampMs !== ev.evaluationTimestampMs ||
+        mem.qualificationResult?.executionFeasible !== ev.qualificationResult?.executionFeasible
+      ) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: Persisted evaluation '${ev.evaluationId}' content does not match in-memory evaluation.`,
+        );
+      }
+    }
+    for (const memId of this.evaluations.keys()) {
+      if (!evaluationsCheck.ids.has(memId)) {
+        return this.abort(
+          `RECONCILIATION_IDENTITY_MISMATCH: In-memory evaluation '${memId}' is missing from persisted records.`,
+        );
+      }
     }
 
     this.closedAtIso = new Date(this.clock.now()).toISOString();
@@ -989,12 +1212,27 @@ export class ShadowCollectorEngine {
       (item) => item.observationId,
     );
 
+    // D22R-02 Reproduction C: Evaluations must validate schema, link to valid decision in this session, and match composite FK
     const evaluationsResult = repairAndValidateStream<ShadowEvaluationRecord>(
       evaluationsPath,
       (item) => {
         try {
           const rec = validateShadowEvaluationRecord(item);
-          return rec.sessionId === declaredSessionId;
+          if (rec.sessionId !== declaredSessionId) return false;
+          if (!decisionsResult.validIds.has(rec.decisionEventId)) return false;
+          const refDec = decisionsResult.validRecords.find(
+            (d) => d.eventId === rec.decisionEventId,
+          );
+          if (!refDec) return false;
+          if (
+            refDec.sessionId !== rec.sessionId ||
+            refDec.generationId !== rec.generationId ||
+            refDec.mintAddress !== rec.mintAddress ||
+            refDec.poolId !== rec.poolId
+          ) {
+            return false;
+          }
+          return true;
         } catch {
           return false;
         }
@@ -1013,8 +1251,53 @@ export class ShadowCollectorEngine {
       }
     }
 
-    // Check count consensus against summary
-    if (summary !== null) {
+    // D22R-02 Reproduction D: Strict Dual-File Metadata-Summary Consensus Checks
+    if (meta !== null && summary !== null) {
+      if (meta.sessionId !== summary.sessionId) {
+        failureReasons.push(
+          `METADATA_SUMMARY_SESSION_ID_MISMATCH: meta=${meta.sessionId}, summary=${summary.sessionId}`,
+        );
+      }
+      if (meta.generationId !== summary.generationId) {
+        failureReasons.push(
+          `METADATA_SUMMARY_GENERATION_ID_MISMATCH: meta=${meta.generationId}, summary=${summary.generationId}`,
+        );
+      }
+      if (meta.strategyRevision !== summary.strategyRevision) {
+        failureReasons.push(
+          `METADATA_SUMMARY_STRATEGY_REVISION_MISMATCH: meta=${meta.strategyRevision}, summary=${summary.strategyRevision}`,
+        );
+      }
+      if (meta.startedAtIso !== summary.startedAtIso) {
+        failureReasons.push(
+          `METADATA_SUMMARY_STARTED_AT_MISMATCH: meta=${meta.startedAtIso}, summary=${summary.startedAtIso}`,
+        );
+      }
+      if (meta.closedAtIso !== summary.closedAtIso) {
+        failureReasons.push(
+          `METADATA_SUMMARY_CLOSED_AT_MISMATCH: meta=${meta.closedAtIso}, summary=${summary.closedAtIso}`,
+        );
+      }
+      if (
+        meta.sessionStatus !== "FINALIZED" ||
+        meta.isInterruptedSession !== false ||
+        summary.isCompleteSession !== true ||
+        summary.isInterruptedSession !== false
+      ) {
+        failureReasons.push(
+          `METADATA_SUMMARY_STATUS_MISMATCH: metaStatus=${meta.sessionStatus}, metaInterrupted=${meta.isInterruptedSession}, summaryComplete=${summary.isCompleteSession}, summaryInterrupted=${summary.isInterruptedSession}`,
+        );
+      }
+      const breakdownSum =
+        (summary.cohortBreakdown?.filteredRejected ?? 0) +
+        (summary.cohortBreakdown?.watchlistRadar ?? 0) +
+        (summary.cohortBreakdown?.triggerRejected ?? 0) +
+        (summary.cohortBreakdown?.executedBuy ?? 0);
+      if (breakdownSum !== summary.totalDecisionsRecorded) {
+        failureReasons.push(
+          `COHORT_BREAKDOWN_SUM_MISMATCH: breakdownSum=${breakdownSum}, totalDecisionsRecorded=${summary.totalDecisionsRecorded}`,
+        );
+      }
       if (summary.totalDecisionsRecorded !== validDecisions) {
         failureReasons.push(
           `DECISIONS_COUNT_MISMATCH: summary=${summary.totalDecisionsRecorded}, validOnDisk=${validDecisions}`,
@@ -1025,9 +1308,31 @@ export class ShadowCollectorEngine {
           `OBSERVATIONS_COUNT_MISMATCH: summary=${summary.totalMarketObservationsRecorded}, validOnDisk=${validObservations}`,
         );
       }
+      const actualCohorts = {
+        filteredRejected: 0,
+        watchlistRadar: 0,
+        triggerRejected: 0,
+        executedBuy: 0,
+      };
+      for (const dec of decisionsResult.validRecords) {
+        if (dec.decisionCohort === "FILTERED_REJECTED") actualCohorts.filteredRejected++;
+        else if (dec.decisionCohort === "WATCHLIST_RADAR") actualCohorts.watchlistRadar++;
+        else if (dec.decisionCohort === "TRIGGER_REJECTED") actualCohorts.triggerRejected++;
+        else if (dec.decisionCohort === "EXECUTED_BUY") actualCohorts.executedBuy++;
+      }
+      if (
+        actualCohorts.filteredRejected !== (summary.cohortBreakdown?.filteredRejected ?? 0) ||
+        actualCohorts.watchlistRadar !== (summary.cohortBreakdown?.watchlistRadar ?? 0) ||
+        actualCohorts.triggerRejected !== (summary.cohortBreakdown?.triggerRejected ?? 0) ||
+        actualCohorts.executedBuy !== (summary.cohortBreakdown?.executedBuy ?? 0)
+      ) {
+        failureReasons.push(
+          `COHORT_BREAKDOWN_MISMATCH_WITH_RECORDS: disk=${JSON.stringify(actualCohorts)}, summary=${JSON.stringify(summary.cohortBreakdown)}`,
+        );
+      }
     }
 
-    // Determine authoritative recovered status (D22C-03)
+    // Determine authoritative recovered status (D22C-03, D22R-02)
     const isCleanFinalized =
       totalTornCount === 0 &&
       totalSchemaInvalidCount === 0 &&
@@ -1078,7 +1383,11 @@ export class ShadowCollectorEngine {
           triggerRejected: 0,
           executedBuy: 0,
         },
-        topRejectionReasons: summary?.topRejectionReasons ?? {},
+        topRejectionReasons: {
+          CRASH_RECOVERY_INTERRUPTED: 1,
+          ...(failureReasons.length > 0 ? { [failureReasons[0]!]: 1 } : {}),
+          ...(summary?.topRejectionReasons ?? {}),
+        },
         totalMarketObservationsRecorded: validObservations,
         totalStratifiedCandidatesTracked: 0,
         missedWinnersCount: 0,

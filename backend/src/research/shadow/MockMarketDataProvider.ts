@@ -47,7 +47,7 @@ export class DeterministicVirtualClock implements IVirtualClock {
 }
 
 /**
- * Unexported module-scoped registry of genuinely instantiated offline mock providers (D22C-01).
+ * Unexported module-scoped registry of genuinely instantiated offline mock providers (D22C-01, D22R-01).
  * Genuinely unforgeable by external callers; plain objects, symbol branding, or subclass overrides fail closed.
  */
 const approvedMockInstances = new WeakSet<object>();
@@ -59,20 +59,23 @@ const approvedMockInstances = new WeakSet<object>();
 export const MOCK_PROVIDER_BRAND = Symbol.for("NeXusTrade.OfflineMockMarketDataProvider.v1");
 
 /**
- * Validates that an injected provider is a genuinely approved offline mock instance (D22C-01).
- * Plain objects, forged symbol brandings, and tampered method prototypes fail closed.
+ * Validates that an injected provider is a genuinely approved offline mock instance (D22C-01, D22R-01).
+ * Plain objects, forged symbol brandings, subclass overrides, and tampered method prototypes fail closed.
  */
 export function isApprovedMockProvider(provider: unknown): provider is MockMarketDataProvider {
   if (!provider || typeof provider !== "object") return false;
-  if (!(provider instanceof MockMarketDataProvider)) return false;
+  if (provider.constructor !== MockMarketDataProvider) return false;
+  if (Object.getPrototypeOf(provider) !== MockMarketDataProvider.prototype) return false;
   if (!approvedMockInstances.has(provider)) return false;
 
-  // Strict prototype method identity check: methods must not be hijacked or overridden
+  // Strict prototype method and internal helper identity checks: methods must not be hijacked or overridden (D22R-01)
   const p = provider as MockMarketDataProvider;
   if (
     p.getPoolReserves !== MockMarketDataProvider.prototype.getPoolReserves ||
     p.getTokenMetrics !== MockMarketDataProvider.prototype.getTokenMetrics ||
-    p.getDeveloperHoldings !== MockMarketDataProvider.prototype.getDeveloperHoldings
+    p.getDeveloperHoldings !== MockMarketDataProvider.prototype.getDeveloperHoldings ||
+    (p as unknown as Record<string, unknown>).checkFailureInjection !==
+      (MockMarketDataProvider.prototype as unknown as Record<string, unknown>).checkFailureInjection
   ) {
     return false;
   }
@@ -121,6 +124,12 @@ export class MockMarketDataProvider implements IMarketDataProvider {
     capabilityStatus?: ProviderCapabilityStatus;
     simulatedRoundTripMs?: number;
   }) {
+    // D22R-01: Prohibit subclassing of MockMarketDataProvider
+    if (new.target !== MockMarketDataProvider) {
+      throw new Error(
+        `[MockMarketDataProvider] [PROHIBITED_SUBCLASS_ATTEMPT] Subclassing MockMarketDataProvider is strictly prohibited in Milestone D.2.2.`,
+      );
+    }
     approvedMockInstances.add(this);
     this.providerId = options?.providerId ?? "mock_offline_market_provider";
     this.clock = options?.clock ?? new DeterministicVirtualClock();

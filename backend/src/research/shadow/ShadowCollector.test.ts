@@ -38,6 +38,18 @@ import { determineSessionStatus } from "../ResearchEligibilityGate.js";
 function createMockDecisionFixture(
   overrides?: Partial<CandidateDecisionRecord>,
 ): CandidateDecisionRecord {
+  const decisionTime = overrides?.decisionTimestampMs ?? 1_792_000_000_100;
+  const ingestionTime =
+    overrides?.ingestionTimestampMs ??
+    (overrides?.decisionTimestampMs !== undefined
+      ? Math.min(decisionTime, decisionTime - 10)
+      : 1_792_000_000_050);
+  const sourceTime =
+    overrides?.sourceTimestampMs ??
+    (overrides?.decisionTimestampMs !== undefined
+      ? Math.min(ingestionTime, ingestionTime - 10)
+      : 1_792_000_000_000);
+
   return {
     eventId: overrides?.eventId ?? "dec-mock-1",
     sessionId: overrides?.sessionId ?? "session-shadow-test-1",
@@ -45,13 +57,13 @@ function createMockDecisionFixture(
     mintAddress: overrides?.mintAddress ?? "TokenMint111111111111111111111111111111111111",
     poolId: overrides?.poolId ?? "pool-amm-1",
     symbol: overrides?.symbol ?? "SHD",
-    sourceTimestampMs: overrides?.sourceTimestampMs ?? 1_792_000_000_000,
-    ingestionTimestampMs: overrides?.ingestionTimestampMs ?? 1_792_000_000_050,
-    decisionTimestampMs: overrides?.decisionTimestampMs ?? 1_792_000_000_100,
+    sourceTimestampMs: sourceTime,
+    ingestionTimestampMs: ingestionTime,
+    decisionTimestampMs: decisionTime,
     strategyRevision: overrides?.strategyRevision ?? "rev-12.94-d22",
     decisionCohort: overrides?.decisionCohort ?? "WATCHLIST_RADAR",
-    filterEvaluations: [],
-    metricsSnapshot: {
+    filterEvaluations: overrides?.filterEvaluations ?? [],
+    metricsSnapshot: overrides?.metricsSnapshot ?? {
       tokenAgeSec: 3600,
       liquidityUsd: 50_000,
       marketCapUsd: 150_000,
@@ -63,8 +75,8 @@ function createMockDecisionFixture(
       buys5m: 35,
       sells5m: 10,
     },
-    missingFields: [],
-    providerIdentity: "mock_offline_market_provider",
+    missingFields: overrides?.missingFields ?? [],
+    providerIdentity: overrides?.providerIdentity ?? "mock_offline_market_provider",
   };
 }
 
@@ -1661,6 +1673,304 @@ describe("Phase 12.94-D Milestone D.2.2: Passive Shadow Collector & Offline Mock
         expect(meta.sessionStatus).toBe("INTERRUPTED");
         expect(summary.isCompleteSession).toBe(false);
         expect(diagnostics.interruptionReason).toBe("STORAGE_QUOTA_EXCEEDED");
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22R-01: Continuous call-time mock-only boundary enforcement and subclass lockdown
+      it("D22R-01: enforces mock-only behavior throughout collector operation, rejecting post-construction method tampering and subclass overrides", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-r01-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+        const provider = new MockMarketDataProvider({ clock });
+
+        const engine = new ShadowCollectorEngine({
+          config: {
+            sessionId: "session-r01-tamper",
+            generationId: "gen-1",
+            strategyRevision: "rev-1",
+            outputRootDir: fixtureRoot,
+          },
+          provider,
+          clock,
+        });
+
+        await engine.start();
+        const decision = createMockDecisionFixture({
+          sessionId: "session-r01-tamper",
+          eventId: "dec-r01-1",
+        });
+        engine.ingestCandidateDecision(decision);
+
+        // Reproduction A: Genuine provider modified AFTER engine construction
+        let callbackExecuted = false;
+        (provider as unknown as Record<string, unknown>).getPoolReserves = async (
+          poolId: string,
+        ) => {
+          callbackExecuted = true;
+          return MockMarketDataProvider.prototype.getPoolReserves.call(provider, poolId);
+        };
+
+        // isApprovedMockProvider detects the method replacement
+        expect(isApprovedMockProvider(provider)).toBe(false);
+
+        // evaluateShadowCandidate must fail closed at call time and NOT execute the substituted callback
+        await expect(
+          engine.evaluateShadowCandidate({ decisionEventId: decision.eventId }),
+        ).rejects.toThrow("[PROHIBITED_LIVE_PROVIDER_ATTEMPT]");
+
+        expect(callbackExecuted).toBe(false);
+
+        // Reproduction B: Subclass attempting to override methods or internal helpers
+        class TamperedProviderSubclass extends MockMarketDataProvider {
+          public override async getPoolReserves(poolId: string) {
+            return MockMarketDataProvider.prototype.getPoolReserves.call(this, poolId);
+          }
+        }
+        expect(() => new TamperedProviderSubclass()).toThrow("[PROHIBITED_SUBCLASS_ATTEMPT]");
+
+        // Internal helper override check on genuine instance fails attestation
+        const genuineProvider = new MockMarketDataProvider({ clock });
+        (genuineProvider as unknown as Record<string, unknown>).checkFailureInjection = () => {};
+        expect(isApprovedMockProvider(genuineProvider)).toBe(false);
+
+        // Forged prototype without instantiation fails closed
+        const forged = Object.create(MockMarketDataProvider.prototype);
+        expect(isApprovedMockProvider(forged)).toBe(false);
+        expect(
+          () =>
+            new ShadowCollectorEngine({
+              config: {
+                sessionId: "session-r01-forged",
+                generationId: "gen-1",
+                strategyRevision: "rev-1",
+                outputRootDir: fixtureRoot,
+              },
+              provider: forged,
+            }),
+        ).toThrow("[PROHIBITED_LIVE_PROVIDER_ATTEMPT]");
+
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      });
+
+      // D22R-02: Persisted evidence integrity, canonical schemas, composite foreign keys, and dual-file consensus
+      it("D22R-02: drain and recovery enforce exact identity sets, complete schemas, foreign keys, and dual-file consensus", async () => {
+        const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shadow-r02-test-"));
+        const clock = new DeterministicVirtualClock(1_792_000_000_000);
+
+        // --- Reproduction A: Equal-count identity swap ---
+        {
+          const providerA = new MockMarketDataProvider({ clock });
+          const engineA = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-swap",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerA,
+            clock,
+          });
+          await engineA.start();
+          const decisionA = createMockDecisionFixture({
+            sessionId: "session-r02-swap",
+            eventId: "dec-original-1",
+          });
+          engineA.ingestCandidateDecision(decisionA);
+
+          // Tamper on disk: swap eventId to dec-FAKE-SWAPPED while preserving count (1 record)
+          const decisionsPathA = path.join(
+            fixtureRoot,
+            "session-r02-swap",
+            "candidate-decisions.jsonl",
+          );
+          const swappedDecision = { ...decisionA, eventId: "dec-FAKE-SWAPPED" };
+          fs.writeFileSync(decisionsPathA, JSON.stringify(swappedDecision) + "\n", "utf8");
+
+          const drainSummaryA = await engineA.drain();
+          expect(drainSummaryA.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryA.isCompleteSession).toBe(false);
+          expect(drainSummaryA.interruptionReason).toContain("RECONCILIATION_IDENTITY_MISMATCH");
+
+          const metaA = JSON.parse(
+            fs.readFileSync(
+              path.join(fixtureRoot, "session-r02-swap", "session-meta.json"),
+              "utf8",
+            ),
+          ) as SessionTelemetryMeta;
+          expect(metaA.sessionStatus).toBe("INTERRUPTED");
+          expect(metaA.isInterruptedSession).toBe(true);
+        }
+
+        // --- Reproduction B: Incomplete canonical schema ---
+        {
+          const providerB = new MockMarketDataProvider({ clock });
+          const engineB = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-schema",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerB,
+            clock,
+          });
+          await engineB.start();
+          const decisionB = createMockDecisionFixture({
+            sessionId: "session-r02-schema",
+            eventId: "dec-schema-1",
+          });
+          engineB.ingestCandidateDecision(decisionB);
+
+          // Overwrite with minimal 7-field record missing canonical fields
+          const decisionsPathB = path.join(
+            fixtureRoot,
+            "session-r02-schema",
+            "candidate-decisions.jsonl",
+          );
+          const minimalRecord = {
+            eventId: "dec-schema-1",
+            sessionId: "session-r02-schema",
+            generationId: "gen-1",
+            mintAddress: "TokenMint111111111111111111111111111111111111",
+            poolId: "pool-amm-1",
+            decisionTimestampMs: 1_792_000_000_100,
+            decisionCohort: "WATCHLIST_RADAR",
+          };
+          fs.writeFileSync(decisionsPathB, JSON.stringify(minimalRecord) + "\n", "utf8");
+
+          const drainSummaryB = await engineB.drain();
+          expect(drainSummaryB.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryB.isCompleteSession).toBe(false);
+          expect(drainSummaryB.interruptionReason).toContain("RECONCILIATION_SCHEMA_INVALID");
+
+          // Also test that recoverSessionDirectory rejects the incomplete record
+          const recoveryB = ShadowCollectorEngine.recoverSessionDirectory(
+            path.join(fixtureRoot, "session-r02-schema"),
+          );
+          expect(recoveryB.recoveredStatus).toBe("INTERRUPTED");
+          expect(recoveryB.validDecisionsCount).toBe(0);
+          expect(recoveryB.schemaInvalidLinesQuarantinedCount).toBe(1);
+        }
+
+        // --- Reproduction C: Orphan evaluation after tampering ---
+        {
+          const providerC = new MockMarketDataProvider({ clock });
+          const engineC = new ShadowCollectorEngine({
+            config: {
+              sessionId: "session-r02-orphan",
+              generationId: "gen-1",
+              strategyRevision: "rev-1",
+              outputRootDir: fixtureRoot,
+            },
+            provider: providerC,
+            clock,
+          });
+          await engineC.start();
+          const decisionC = createMockDecisionFixture({
+            sessionId: "session-r02-orphan",
+            eventId: "dec-orphan-parent",
+            decisionTimestampMs: clock.now(),
+          });
+          engineC.ingestCandidateDecision(decisionC);
+          await engineC.evaluateShadowCandidate({ decisionEventId: decisionC.eventId });
+
+          // Tamper with on-disk evaluation: change decisionEventId to "phantom"
+          const evalsPathC = path.join(
+            fixtureRoot,
+            "session-r02-orphan",
+            "shadow-evaluations.jsonl",
+          );
+          const originalEval = JSON.parse(fs.readFileSync(evalsPathC, "utf8").trim());
+          const tamperedEval = { ...originalEval, decisionEventId: "phantom-decision-id" };
+          fs.writeFileSync(evalsPathC, JSON.stringify(tamperedEval) + "\n", "utf8");
+
+          const drainSummaryC = await engineC.drain();
+          expect(drainSummaryC.finalStatus).toBe("INTERRUPTED");
+          expect(drainSummaryC.isCompleteSession).toBe(false);
+          expect(drainSummaryC.interruptionReason).toContain("RECONCILIATION_ORPHAN_EVALUATION");
+
+          // Recovery also detects and quarantines the orphan evaluation
+          const recoveryC = ShadowCollectorEngine.recoverSessionDirectory(
+            path.join(fixtureRoot, "session-r02-orphan"),
+          );
+          expect(recoveryC.recoveredStatus).toBe("INTERRUPTED");
+          expect(recoveryC.validEvaluationsCount).toBe(0);
+          expect(recoveryC.schemaInvalidLinesQuarantinedCount).toBeGreaterThanOrEqual(1);
+        }
+
+        // --- Reproduction D: Contradictory dual-file identity ---
+        {
+          const sessionDirD = path.join(fixtureRoot, "session-r02-contradiction");
+          fs.mkdirSync(sessionDirD, { recursive: true });
+
+          const contradictoryMeta: SessionTelemetryMeta = {
+            sessionId: "session-r02-contradiction",
+            generationId: "gen-1",
+            strategyRevision: "rev-1",
+            startedAtIso: "2026-10-16T00:00:00.000Z",
+            closedAtIso: "2026-10-16T00:05:00.000Z",
+            initialWalletBalanceSol: 7.9259,
+            environment: { platform: "mock_offline_harness", nodeVersion: process.version },
+            sessionStatus: "FINALIZED",
+            isInterruptedSession: false,
+          };
+
+          const contradictorySummary: SessionTelemetrySummary = {
+            sessionId: "session-r02-contradiction",
+            generationId: "different-gen", // Contradicts meta.generationId ("gen-1")
+            strategyRevision: "rev-1",
+            startedAtIso: "2026-10-16T00:00:00.000Z",
+            closedAtIso: "2026-10-16T00:05:00.000Z",
+            totalCandidatesScreened: 0,
+            totalDecisionsRecorded: 0,
+            decisionWriteFailures: 0,
+            cohortBreakdown: {
+              filteredRejected: 0,
+              watchlistRadar: 0,
+              triggerRejected: 0,
+              executedBuy: 0,
+            },
+            topRejectionReasons: {},
+            totalMarketObservationsRecorded: 0,
+            totalStratifiedCandidatesTracked: 0,
+            missedWinnersCount: 0,
+            avoidedRugsCount: 0,
+            isCompleteSession: true,
+            isInterruptedSession: false,
+          };
+
+          fs.writeFileSync(
+            path.join(sessionDirD, "session-meta.json"),
+            JSON.stringify(contradictoryMeta, null, 2),
+            "utf8",
+          );
+          fs.writeFileSync(
+            path.join(sessionDirD, "session-summary.json"),
+            JSON.stringify(contradictorySummary, null, 2),
+            "utf8",
+          );
+
+          const recoveryD = ShadowCollectorEngine.recoverSessionDirectory(sessionDirD);
+          expect(recoveryD.recoveredStatus).toBe("INTERRUPTED");
+          expect(
+            recoveryD.failureReasons?.some((r) =>
+              r.includes("METADATA_SUMMARY_GENERATION_ID_MISMATCH"),
+            ),
+          ).toBe(true);
+          expect(recoveryD.diagnosticsFileWritten).toBe(true);
+
+          const metaDAfter = JSON.parse(
+            fs.readFileSync(path.join(sessionDirD, "session-meta.json"), "utf8"),
+          ) as SessionTelemetryMeta;
+          const summaryDAfter = JSON.parse(
+            fs.readFileSync(path.join(sessionDirD, "session-summary.json"), "utf8"),
+          ) as SessionTelemetrySummary;
+
+          expect(metaDAfter.sessionStatus).toBe("INTERRUPTED");
+          expect(metaDAfter.isInterruptedSession).toBe(true);
+          expect(summaryDAfter.isCompleteSession).toBe(false);
+          expect(summaryDAfter.isInterruptedSession).toBe(true);
+        }
 
         fs.rmSync(fixtureRoot, { recursive: true, force: true });
       });
