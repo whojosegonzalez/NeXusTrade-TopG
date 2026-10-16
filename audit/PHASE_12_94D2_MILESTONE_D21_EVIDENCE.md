@@ -2,8 +2,8 @@
 
 ## Offline Research Foundations: Legacy Inventory, Shadow Sidecar Contracts, Clock Monotonicity (D2-PREREQ-01), Statistical Oracles & Fedora Parser
 
-**Milestone Status:** IMPLEMENTED, CORRECTED & VERIFIED (OFFLINE SCOPE ONLY)<br/>
-**Correction Scope:** Strictly addressing residual findings **D21C-01 and D21C-02** from Independent Closure Audit v2 (`NeXusTrade_Phase_12_94D21_Commit_2d8d93a_Independent_Closure_Audit_v2.md`), following the verified resolution of D21-AUD-01 through D21-AUD-05.<br/>
+**Milestone Status:** FORMALLY ACCEPTED AND CLOSED (commit `da9436c`; independent acceptance `NeXusTrade_Phase_12_94D21_Commit_da9436c_Final_Independent_Acceptance.md`)<br/>
+**Closure Scope:** Bounded offline research foundations: legacy inventory, shadow sidecar contracts, clock monotonicity (D2-PREREQ-01), statistical reference oracles, and staged Fedora archive parser.<br/>
 **Operational Scope:** STRICTLY OFFLINE — Zero live network data collection, zero shadow harvester execution, zero connections to remote Fedora host, zero PAPER trading daemon restarts, zero wallet balance mutations, and zero Generation 2 activation.
 **Prerequisites Closed & Accepted:**
 
@@ -13,6 +13,7 @@
 - Phase 12.94-C (CLOSED under `2541d5b` / `c5931ca` / `7faf705`)
 - Phase 12.94-D.1 (FORMALLY ACCEPTED under `86abf6f`)
 - Phase 12.94-D.2 Architecture Addendum v1 (APPROVED under `9a707bf`)
+- Phase 12.94-D.2.1 (FORMALLY ACCEPTED under commit `da9436c`)
 
 ---
 
@@ -67,7 +68,9 @@ All audit findings from both Independent Source Audit v1 and Closure Audit v2 ha
 
 ## 4. Next Steps & Explicit Authorization Gates
 
-Milestone D.2.1 is fully corrected, hardened, and ready for independent re-review:
+Milestone D.2.1 is FORMALLY ACCEPTED AND CLOSED:
 
-- **Milestone D.2.2** (Harvester Interface Design & Mock Harness) remains **UNAUTHORIZED** until Milestone D.2.1 receives formal independent acceptance.
-- **Live Shadow Collection** remains strictly blocked pending a separate operational decision defining rate budgets, duration, and safety kill switches.
+- **Milestone D.2.1:** CLOSED under commit `da9436c` (independent acceptance `NeXusTrade_Phase_12_94D21_Commit_da9436c_Final_Independent_Acceptance.md`).
+- **Milestone D.2.2 Planning:** AUTHORIZED for design and planning proposal only (`audit/PHASE_12_94D2_MILESTONE_D22_PROPOSAL.md`).
+- **Milestone D.2.2 Source Implementation:** Strictly UNAUTHORIZED until the D.2.2 architecture proposal is reviewed and approved by the independent auditor.
+- **Live Shadow Collection & Generation 2:** Strictly blocked pending future operational authorizations; real-SOL trading and Tier 3 live polling remain disabled.
