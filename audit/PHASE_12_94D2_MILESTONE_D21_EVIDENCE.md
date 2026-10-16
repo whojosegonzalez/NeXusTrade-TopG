@@ -1,10 +1,10 @@
-# NeXusTrade — Phase 12.94-D Milestone D.2.1 Evidence Report
+# NeXusTrade — Phase 12.94-D Milestone D.2.1 Evidence Report (Post-Audit v1 Resolution)
 
 ## Offline Research Foundations: Legacy Inventory, Shadow Sidecar Contracts, Clock Monotonicity (D2-PREREQ-01), Statistical Oracles & Fedora Parser
 
-**Milestone Status:** IMPLEMENTED & VERIFIED (OFFLINE SCOPE ONLY)  
-**Operational Scope:** STRICTLY OFFLINE — Zero live network data collection, zero shadow harvester execution, zero connections to remote Fedora laptop, zero PAPER trading daemon restarts, zero wallet balance mutations, and zero Generation 2 activation.  
-**Review Reference:** Addressing all mandatory Milestone D.2.1 requirements from Independent Architecture Approval of commit `9a707bf`.  
+**Milestone Status:** IMPLEMENTED, CORRECTED & VERIFIED (OFFLINE SCOPE ONLY)<br/>
+**Correction Scope:** Strictly addressing findings **D21-AUD-01 through D21-AUD-05** from Independent Source Audit v1 (`NeXusTrade_Phase_12_94D21_Commit_8407f6b_Independent_Source_Audit_v1.md`).<br/>
+**Operational Scope:** STRICTLY OFFLINE — Zero live network data collection, zero shadow harvester execution, zero connections to remote Fedora host, zero PAPER trading daemon restarts, zero wallet balance mutations, and zero Generation 2 activation.
 **Prerequisites Closed & Accepted:**
 
 - Phase 12.93D (CLOSED)
@@ -18,14 +18,14 @@
 
 ## 1. Executive Summary & Verification Results
 
-Milestone D.2.1 establishes the offline data-readiness, causal-clock validation, and statistical foundation required before any genuine empirical telemetry collection can be considered. All 5 authorized deliverables have been implemented, tested, and verified against deterministic regression fixtures:
+All five findings from Independent Source Audit v1 (D21-AUD-01 through D21-AUD-05) have been corrected and verified against deterministic adversarial unit tests:
 
-- **Isolated Test Suite Result**: **995/995 passing tests** across 5 test suites:
-  - Node.js isolated test runner: **27/27 passed**
-  - Measurement-Analysis test suite: **658/658 passed** (including 55 research tests, +14 new D.2.1 regression fixtures)
-  - H2 Database test suite: **194/194 passed**
-  - H3 Provider test suite: **98/98 passed**
-  - H4 Analytics test suite: **18/18 passed**
+- **Isolated Test Suite Result**: **1,006/1,006 passing tests** across 5 test suites (+11 new targeted adversarial regression tests, 66 quantitative-research tests total):
+  - Node.js isolated test runner (`scripts/architecture-check.test.mjs`, `scripts/verify-isolated.test.mjs`): **27/27 passed**
+  - Measurement-Analysis test suite (`backend/vitest.measurement-analysis.config.ts`): **669/669 passed** (including 66 quantitative research tests: 41 D.1 + 14 D.2.1 initial + 11 new D.2.1 adversarial regression fixtures)
+  - H2 Database test suite (`backend/vitest.h2.config.ts`): **194/194 passed**
+  - H3 Provider test suite (`backend/vitest.h3.config.ts`): **98/98 passed**
+  - H4 Analytics test suite (`backend/vitest.h4.config.ts`): **18/18 passed**
 - **Static Verification**:
   - `check-isolation.mjs`: PASSED (877 dependency links verified; memory-only SQLite 3.53.2).
   - `architecture-check.mjs`: PASSED (77 protected module visits verified).
@@ -34,80 +34,23 @@ Milestone D.2.1 establishes the offline data-readiness, causal-clock validation,
   - `prettier`: PASSED (0 formatting issues).
   - `check-secrets.mjs`: PASSED.
   - `git diff --check`: PASSED.
-- **Permanent Raw Log**: Full console output preserved at [`audit/verify-isolated-all.log`](file:///u:/Projects/TopG/audit/verify-isolated-all.log) (36,400 bytes).
+- **Permanent Raw Log**: Full console output preserved at [`audit/verify-isolated-all.log`](file:///u:/Projects/TopG/audit/verify-isolated-all.log) (44,619 bytes).
 
 ---
 
-## 2. Deliverable Completion Matrix
+## 2. Audit Findings Resolution Matrix (D21-AUD-01 through D21-AUD-05)
 
-| Deliverable ID   | Component Description                              | Source Modules & Artifacts                                                                                                                                                                                                                                    | Verification Status                                                                                                                                                                                                                                              |
-| :--------------- | :------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **D2.1-DELIV-1** | **Windows Legacy Inventory & Manifest**            | [`scripts/audit-windows-legacy-inventory.mjs`](file:///u:/Projects/TopG/scripts/audit-windows-legacy-inventory.mjs)<br/>[`audit/WINDOWS_LEGACY_DATA_INVENTORY.md`](file:///u:/Projects/TopG/audit/WINDOWS_LEGACY_DATA_INVENTORY.md)                           | **VERIFIED** — Audited 2 legacy sessions (7 trades, 7.9259 SOL, SHA-256 verified); 0 telemetry sessions on Windows confirmed (`INSUFFICIENT_EVIDENCE`).                                                                                                          |
-| **D2.1-DELIV-2** | **Shadow Evaluation Sidecar Contract**             | [`backend/src/research/ShadowEvaluationTypes.ts`](file:///u:/Projects/TopG/backend/src/research/ShadowEvaluationTypes.ts)<br/>[`backend/src/research/ShadowEvaluationContract.ts`](file:///u:/Projects/TopG/backend/src/research/ShadowEvaluationContract.ts) | **VERIFIED** — Schema 1.0.0 sidecar stream (`shadow-evaluations.jsonl`) implemented without mutating 12.94-B `DecisionCohort` enums. Isolated monotonic latency from UTC epoch joining.                                                                          |
-| **D2.1-DELIV-3** | **Clock Monotonicity & Quarantine (D2-PREREQ-01)** | [`backend/src/research/ClockMonotonicityValidator.ts`](file:///u:/Projects/TopG/backend/src/research/ClockMonotonicityValidator.ts)<br/>[`scripts/audit-research-readiness.mjs`](file:///u:/Projects/TopG/scripts/audit-research-readiness.mjs)               | **VERIFIED** — Enforces `responseReceivedMs >= sourceTimestampMs`, source <= ingestion <= recv <= decision, forward skew limit (5000ms), and header-only inference rejection.                                                                                    |
-| **D2.1-DELIV-4** | **Statistical & Financial Reference Oracles**      | [`backend/src/research/StatisticalOracles.ts`](file:///u:/Projects/TopG/backend/src/research/StatisticalOracles.ts)                                                                                                                                           | **VERIFIED** — Hájek weighted mean and Kish ESS; Cameron-Gelbach-Miller two-way clustering ($V_{\text{session}} + V_{\text{mint}} - V_{\text{session} \cap \text{mint}}$); Phase 12.94-C stateful AMM execution waterfall with single internal LP fee deduction. |
-| **D2.1-DELIV-5** | **Read-Only Fedora Archive Parser**                | [`backend/src/research/FedoraArchiveParser.ts`](file:///u:/Projects/TopG/backend/src/research/FedoraArchiveParser.ts)                                                                                                                                         | **VERIFIED** — Offline parser for staged Fedora files; reports `REPORTED_NOT_INSPECTED` when unstaged; extracts trades and classifies H1–H4 as `UNAVAILABLE` without remote connections.                                                                         |
-
----
-
-## 3. Detailed Verification Breakdown
-
-### 3.1 D2.1-DELIV-1: Windows Legacy-Data Inventory & Manifest
-
-- Executed `scripts/audit-windows-legacy-inventory.mjs` against canonical filesystem paths.
-- **Session 1**: `.tmp/sessions/session-paper-12.93-pc-afternoon.json`
-  - SHA-256: `A9D3128DD18F652AA32ADA25030874691115E04574BA7DD16436C3BA6E2BB6FA`
-  - 2 executed trades (NEIL, SEALCAT), net P&L: `-0.1556 SOL`.
-- **Session 2**: `.tmp/sessions/session-paper-12.93-pc-day4.json`
-  - SHA-256: `E87FD79D07DF5F28918FAFBF8F214281F7531131DB68612E7CA6CEFA32379EF0`
-  - 5 executed trades (hellop, DOGCART, KACY, CATGPT, DOPEUS), net P&L: `-0.3732 SOL`.
-- **Finding**: Pre-telemetry format lacks point-in-time AMM reserves, orderbook depth, 5m buys/sells, developer holdings, and rejected candidate streams. All legacy sessions are classified as **`INELIGIBLE`** for H1–H4 alpha evaluation.
-- Canonical telemetry directory (`.tmp/telemetry/sessions/`) contains **0 sessions**, confirming honest `INSUFFICIENT_EVIDENCE` status.
-
-### 3.2 D2.1-DELIV-2: Shadow Evaluation Research Sidecar Contract
-
-- Implemented `ShadowEvaluationRecord` schema version `1.0.0`:
-  - Contains distinct `evaluationId`, `decisionEventId`, `sessionId`, `generationId`, `mintAddress`, `poolId`.
-  - Uses `evaluationTimestampMs` (UTC epoch milliseconds) for causal event joining.
-  - Records `hostMonotonicElapsedMs` separately for local timing profiling; prevents cross-clock comparisons.
-  - `qualificationResult` records `shadowTriggerQualified: boolean`, `qualificationReason: string`, `simulatedTargetSizeSol: number`, `executionFeasible: boolean`.
-- **Closed Schema Preservation**: Candidate decisions retain their canonical 12.94-B cohorts (`WATCHLIST_RADAR` or `TRIGGER_REJECTED`). Shadow qualification is strictly a research signal and is **never** recorded as `EXECUTED_BUY`.
-
-### 3.3 D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01)
-
-- Implemented `validateClockMonotonicity` in `ClockMonotonicityValidator.ts`.
-- Validated via deterministic unit tests:
-  - Valid sequence (`source <= ingestion <= recv <= decision`): Accepted.
-  - Adversarial inverted receipt (`recv < source`): Quarantined under `IMPOSSIBLE_TIMESTAMP_ORDERING`.
-  - Inverted host receipt (`ingestion > recv`): Quarantined under `IMPOSSIBLE_TIMESTAMP_ORDERING`.
-  - Forward clock skew (`source - ingestion > 5000ms`): Quarantined under `IMPOSSIBLE_TIMESTAMP_ORDERING`.
-  - Future feature lookahead (`source > decision` or `recv > decision`): Quarantined under `LATE_RECEIPT_LOOKAHEAD_PREVENTION`.
-  - HTTP `Date` header inference: Quarantined under `INVALID_OR_NONFINITE_MANDATORY_TIMESTAMPS`.
-- **Readiness Scanner Integration**: Updated `scripts/audit-research-readiness.mjs` line 431 to enforce `recv >= obs.sourceTimestampMs`. Verified that the auditor's adversarial fixture (`source=990000`, `recv=980000`) fails closed with `h3Feasible: false` and `eligibleH3DecisionsCount: 0`.
-
-### 3.4 D2.1-DELIV-4: Statistical & Financial Reference Oracles
-
-- **Hájek & Horvitz-Thompson Estimators**:
-  - Implemented `computeHajekMean` and `computeHorvitzThompsonTotal`.
-  - Deterministic reference test case: Values `[10, 20, 30]`, inclusion probabilities `[0.5, 0.25, 0.1]` (weights `[2, 4, 10]`) -> Hájek mean `= 25.0`, Kish ESS `= 2.1333`, Horvitz-Thompson total `= 400.0`. Exactly matches hand calculations.
-- **Cameron-Gelbach-Miller Two-Way Cluster Covariance**:
-  - Implemented true inclusion-exclusion estimator: $\mathbb{V}_{\text{two-way}} = \mathbb{V}_{\text{session}} + \mathbb{V}_{\text{mint}} - \mathbb{V}_{\text{session} \cap \text{mint}}$.
-  - Validated 2-parameter regression covariance on residuals.
-  - Small-cluster safeguard: Emits `isSmallClusterWarning: true` and logs warning when unique session count $< 30$.
-- **Authoritative Phase 12.94-C AMM Execution Waterfall**:
-  - Implemented `computeAmmRoundTripWaterfall` using exact constant-product swap equations ($(x_0 + \Delta x_{\text{net}})(y_0 - \Delta y) \ge x_0 y_0$).
-  - LP fee (25 bps) deducted inside swap pricing exactly once; zero duplicate fee debits from cash.
-  - Deterministic test case on flat zero-alpha market (`priceMultiplier = 1.0`): Yields strictly negative net return ($\approx -0.52\%$) due to 2x 25 bps LP fee + network fees. ATA rent deposit and refund cancel out cleanly ($0.00$ net rent).
-
-### 3.5 D2.1-DELIV-5: Read-Only Fedora Archive Parser
-
-- Implemented `parseFedoraArchiveDirectory` in `FedoraArchiveParser.ts`.
-- When target staging directory does not exist: Returns status `REPORTED_NOT_INSPECTED`, zero parsed files, and operational notice confirming zero remote connections.
-- In isolated test sandbox with mock legacy session JSON: Extracts trade timestamps, realized P&L, SHA-256 checksums, and explicitly tags AMM reserves, 5m flow, and dev holdings as `UNAVAILABLE` (`FIELD_NOT_COLLECTED_IN_GENERATION`).
+| Finding ID     | Severity | File Modified                                                                                                                                                                                                                                                 | Root Cause                                                                                                                                                                                                                              | Implemented Source Correction                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Adversarial Verification Test                                                                                                                                                                                                                                                                                                                                   |
+| :------------- | :------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **D21-AUD-01** | HIGH     | [`backend/src/research/ClockMonotonicityValidator.ts`](file:///u:/Projects/TopG/backend/src/research/ClockMonotonicityValidator.ts)                                                                                                                           | Accepted negative ingestion lag (`source > ingestion`) as `isCausallyMonotonic: true` when skew was $\le 5000\text{ms}$; defaulted missing `responseReceivedMs` to ingestion time.                                                      | 1. Enforced strict causal monotonicity: `sourceTimestampMs <= ingestionTimestampMs <= responseReceivedMs <= decisionTimestampMs`.<br/>2. If `sourceTimestampMs > ingestionTimestampMs` (negative lag): marked `isCausallyMonotonic: false`, quarantined under `TOLERATED_CLOCK_SKEW_QUARANTINE` (for $\le 5000\text{ms}$) or `EXCESSIVE_CLOCK_SKEW_REJECTED` (for $> 5000\text{ms}$).<br/>3. Explicit receipt evidence required: if `responseReceivedMs === undefined`, marked `isCausallyMonotonic: false`, quarantined under `MISSING_RECEIPT_EVIDENCE`.                                                                                                                            | `RF-D21.5b`: Auditor reproduction case (`source=2000, ingestion=1000, recv=2100`) quarantined with `isCausallyMonotonic: false, measuredIngestionLag: -1000ms`.<br/>`RF-D21.5c`: Boundary tests for 1ms, 4999ms, 5000ms, and 5001ms.<br/>`RF-D21.5d`: Missing receipt fails closed.                                                                             |
+| **D21-AUD-02** | HIGH     | [`backend/src/research/FedoraArchiveParser.ts`](file:///u:/Projects/TopG/backend/src/research/FedoraArchiveParser.ts)                                                                                                                                         | Accepted arbitrary JSON files; defaulted missing financial amounts to zero; allowed `NaN` strings; marked missing fields `OBSERVED`.                                                                                                    | 1. Implemented strict schema validation `validateFedoraSessionPayload`: requires canonical session prefix (`session-fedora-` or `session-paper-`), valid ISO timestamps, coherent start/end times, strictly positive starting capital, non-negative ending capital, finite net PnL, and valid trade objects.<br/>2. Malformed or unrelated JSON files are quarantined in `quarantinedFiles` with explicit reasons and counted in `malformedOrUnrelatedFilesCount`.<br/>3. Zero-defaulting eliminated: missing fields are `UNAVAILABLE` (`FIELD_NOT_COLLECTED_IN_GENERATION`).<br/>4. Status `ARCHIVE_CONFIRMED_PARSED` emitted ONLY when at least 1 session is validly parsed.        | `RF-D21.14b`: Auditor reproduction case with `{"foo":"bar"}` and `{"sessionId":"fake","trades":[{"sizeSol":"NaN"}],"netPnlSol":"INVALID"}` produces `status: REPORTED_NOT_INSPECTED`, `sessionsAuditedCount: 0`, and 2 quarantined records.<br/>`RF-D21.14c`: Rejects incomplete session / negative capital fail-closed.                                        |
+| **D21-AUD-03** | HIGH     | [`backend/src/research/StatisticalOracles.ts`](file:///u:/Projects/TopG/backend/src/research/StatisticalOracles.ts)                                                                                                                                           | Turned non-finite/negative diagonal covariance into `standardError: 0`; extreme inclusion probabilities in Hájek estimator caused weight overflow to `Infinity` and `NaN` mean/ESS.                                                     | 1. In `computeTwoWayClusterCovariance`: validated all residuals, session IDs, mint addresses, and design matrix entries are finite. If diagonal variance is non-finite or non-positive ($\le 0$), throws fail-closed Error rather than manufacturing zero standard errors.<br/>2. In `computeHajekMean` and `computeHorvitzThompsonTotal`: enforced `MIN_SUPPORTED_INCLUSION_PROBABILITY = 1e-15`; validated finite terms and intermediate weighted sums; throws on overflow or non-finite outputs.                                                                                                                                                                                   | `RF-D21.10b`: Auditor reproduction case `computeHajekMean([10, 20], [Number.MIN_VALUE, 0.5])` throws fail-closed error.<br/>`RF-D21.11b`: Auditor reproduction case `computeTwoWayClusterCovariance([1, NaN, 1], ...)` throws fail-closed error.<br/>`RF-D21.10c`: `computeHorvitzThompsonTotal` rejects extreme/non-finite inputs.                             |
+| **D21-AUD-04** | HIGH     | [`backend/src/research/StatisticalOracles.ts`](file:///u:/Projects/TopG/backend/src/research/StatisticalOracles.ts)                                                                                                                                           | Only checked `<= 0` on sizes/reserves; no validation on LP fees, network fees, ATA rent, or price multiplier; `networkFeeSol: -1` fabricated fictitious profits (+2 SOL).                                                               | 1. Validated all input parameters fail-closed: `initialBaseReserve > 0`, `initialQuoteReserveSol > 0`, `buySizeSol > 0`, `lpFeeBps >= 0 && lpFeeBps <= 10000`, `networkFeeSol >= 0`, `ataRentSol >= 0`, `priceMultiplier > 0` (all finite numbers).<br/>2. Enforced finite positive swap consideration and reserves.<br/>3. Explicitly documented helper in JSDoc as a **bounded, floating-point round-trip test oracle**, not an atomic-exact substitute for the Phase 12.94-C execution state machine.                                                                                                                                                                              | `RF-D21.12b`: Auditor reproduction cases reject `networkFeeSol: -1`, `lpFeeBps: NaN`, `priceMultiplier: -1`, `buySizeSol: 0`, and `initialBaseReserve: 0` fail-closed with explicit error messages.                                                                                                                                                             |
+| **D21-AUD-05** | HIGH     | [`backend/src/research/ShadowEvaluationContract.ts`](file:///u:/Projects/TopG/backend/src/research/ShadowEvaluationContract.ts)<br/>[`backend/src/research/ShadowEvaluationTypes.ts`](file:///u:/Projects/TopG/backend/src/research/ShadowEvaluationTypes.ts) | Syntactic validator allowed `executionFeasible: true` when reserve snapshot had zero reserves or a future source timestamp (`sourceTimestampMs > evaluationTimestampMs`); no semantic foreign-key validator against canonical decision. | 1. In `validateShadowEvaluationRecord`: if `executionFeasible: true`, requires `observedReserveSnapshot` with strictly positive reserves (`baseReserve > 0, quoteReserve > 0`) and pre-evaluation timestamp (`sourceTimestampMs <= evaluationTimestampMs`); throws fail-closed otherwise.<br/>2. In `createShadowEvaluationRecord`: enforces identical feasibility invariants at construction.<br/>3. Implemented `validateShadowEvaluationEligibility`: validates composite foreign-key identity (`decisionEventId, sessionId, generationId, mintAddress, poolId`), chronological ordering (`evaluationTimestampMs >= decisionTimestampMs`), and pre-decision reserves availability. | `RF-D21.3b`: Auditor reproduction case (eval at 1000 with zero reserves at source 999999999) throws fail-closed error in `validateShadowEvaluationRecord`.<br/>`RF-D21.3c`: `validateShadowEvaluationEligibility` verifies composite foreign-key match, chronology, and reserves availability fail-closed, while preserving canonical cohort `WATCHLIST_RADAR`. |
 
 ---
 
-## 4. Operational Invariant Verification
+## 3. Operational Invariant Verification
 
 | Invariant Dimension             | Verified State            | Cryptographic & System Evidence                                                                                          |
 | :------------------------------ | :------------------------ | :----------------------------------------------------------------------------------------------------------------------- |
@@ -120,9 +63,9 @@ Milestone D.2.1 establishes the offline data-readiness, causal-clock validation,
 
 ---
 
-## 5. Next Steps & Explicit Authorization Gates
+## 4. Next Steps & Explicit Authorization Gates
 
-Milestone D.2.1 is complete and ready for independent source review. In accordance with the governance charter:
+Milestone D.2.1 is fully corrected, hardened, and ready for independent re-review:
 
 - **Milestone D.2.2** (Harvester Interface Design & Mock Harness) remains **UNAUTHORIZED** until Milestone D.2.1 receives formal independent acceptance.
 - **Live Shadow Collection** remains strictly blocked pending a separate operational decision defining rate budgets, duration, and safety kill switches.

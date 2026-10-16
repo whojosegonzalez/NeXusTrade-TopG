@@ -32,9 +32,19 @@ export interface ClockEvaluationInput {
   readonly hostMonotonicElapsedMs?: number | undefined;
 }
 
+export type ClockCausalAttestation =
+  | "PROVED_MONOTONIC"
+  | "TOLERATED_CLOCK_SKEW_QUARANTINE"
+  | "EXCESSIVE_CLOCK_SKEW_REJECTED"
+  | "IMPOSSIBLE_ORDERING_REJECTED"
+  | "MISSING_RECEIPT_EVIDENCE"
+  | "LOOKAHEAD_LEAKAGE_REJECTED"
+  | "NON_FINITE_TIMESTAMPS";
+
 export interface ClockValidationResult {
   readonly isCausallyMonotonic: boolean;
   readonly isQuarantined: boolean;
+  readonly attestationStatus: ClockCausalAttestation;
   readonly unavailabilityReason?: UnavailabilityReason | undefined;
   readonly quarantineReasons: readonly string[];
   readonly measuredSkewMs: number;
@@ -66,6 +76,7 @@ export function validateClockMonotonicity(input: ClockEvaluationInput): ClockVal
     return {
       isCausallyMonotonic: false,
       isQuarantined: true,
+      attestationStatus: "NON_FINITE_TIMESTAMPS",
       unavailabilityReason: "INVALID_OR_NONFINITE_MANDATORY_TIMESTAMPS",
       quarantineReasons: reasons,
       measuredSkewMs: 0,
@@ -73,40 +84,51 @@ export function validateClockMonotonicity(input: ClockEvaluationInput): ClockVal
     };
   }
 
-  const recv = input.responseReceivedMs ?? input.ingestionTimestampMs;
   const measuredIngestionLag = input.ingestionTimestampMs - input.sourceTimestampMs;
   const measuredSkew = input.sourceTimestampMs - input.ingestionTimestampMs; // positive if provider clock ahead
-  const transitLatency = recv - input.sourceTimestampMs;
+  const hasReceiptEvidence = input.responseReceivedMs !== undefined;
+  const recv = input.responseReceivedMs;
+  const transitLatency = recv !== undefined ? recv - input.sourceTimestampMs : undefined;
 
-  // 2. HTTP Date Header Inference Safeguard
+  // 2. Receipt Evidence Requirement: Chronological proof requires explicit responseReceivedMs
+  if (!hasReceiptEvidence) {
+    reasons.push(
+      "MISSING_RECEIPT_EVIDENCE: responseReceivedMs is required for verified causal ordering; cannot attest receipt chronology",
+    );
+  }
+
+  // 3. HTTP Date Header Inference Safeguard
   if (input.isDerivedFromHttpDateHeaderOnly === true) {
     reasons.push(
       "HTTP_HEADER_TIMESTAMP_INSUFFICIENT: Market event timestamp cannot be inferred from HTTP response header alone",
     );
   }
 
-  // 3. Monotonic Causal Ordering Invariants (D2-PREREQ-01)
-  // Rule A: responseReceivedMs >= sourceTimestampMs (Core D2-PREREQ-01 requirement)
-  if (recv < input.sourceTimestampMs) {
+  // 4. Monotonic Causal Ordering Invariants (D2-PREREQ-01)
+  // Rule A: responseReceivedMs >= sourceTimestampMs (cannot receive response before external event occurred)
+  if (recv !== undefined && recv < input.sourceTimestampMs) {
     reasons.push(
       `IMPOSSIBLE_TIMESTAMP_ORDERING: responseReceivedMs (${recv}) precedes sourceTimestampMs (${input.sourceTimestampMs})`,
     );
   }
 
-  // Rule B: sourceTimestampMs <= ingestionTimestampMs (within allowed skew)
+  // Rule B: Cross-Clock Skew & Monotonicity
+  // Under D2-PREREQ-01, provider source timestamp ahead of ingestion (measuredSkew > 0, negative lag)
+  // is cross-clock uncertainty. It is NEVER proved monotonic data.
   if (measuredSkew > MAX_ALLOWED_FORWARD_CLOCK_SKEW_MS) {
     reasons.push(
       `EXCESSIVE_FORWARD_CLOCK_SKEW: provider source timestamp is ${measuredSkew}ms ahead of ingestion (max ${MAX_ALLOWED_FORWARD_CLOCK_SKEW_MS}ms)`,
     );
+  } else if (measuredSkew > 0) {
+    reasons.push(
+      `CLOCK_SKEW_QUARANTINE: provider source timestamp is ${measuredSkew}ms ahead of ingestion (negative ingestion lag ${measuredIngestionLag}ms); cross-clock uncertainty quarantined`,
+    );
   }
 
   // Rule C: ingestionTimestampMs <= responseReceivedMs
-  if (
-    input.responseReceivedMs !== undefined &&
-    input.ingestionTimestampMs > input.responseReceivedMs
-  ) {
+  if (recv !== undefined && input.ingestionTimestampMs > recv) {
     reasons.push(
-      `INVERTED_HOST_RECEIPT_ORDERING: ingestionTimestampMs (${input.ingestionTimestampMs}) > responseReceivedMs (${input.responseReceivedMs})`,
+      `INVERTED_HOST_RECEIPT_ORDERING: ingestionTimestampMs (${input.ingestionTimestampMs}) > responseReceivedMs (${recv})`,
     );
   }
 
@@ -125,7 +147,7 @@ export function validateClockMonotonicity(input: ClockEvaluationInput): ClockVal
   }
 
   // Rule F: responseReceivedMs <= decisionTimestampMs
-  if (recv > input.decisionTimestampMs) {
+  if (recv !== undefined && recv > input.decisionTimestampMs) {
     reasons.push(
       `LATE_RESPONSE_RECEIPT_LOOKAHEAD: responseReceivedMs (${recv}) > decisionTimestampMs (${input.decisionTimestampMs})`,
     );
@@ -140,22 +162,35 @@ export function validateClockMonotonicity(input: ClockEvaluationInput): ClockVal
 
   const isQuarantined = reasons.length > 0;
   let unavailabilityReason: UnavailabilityReason | undefined;
+  let attestationStatus: ClockCausalAttestation = "PROVED_MONOTONIC";
 
   if (isQuarantined) {
-    if (
+    if (reasons.some((r) => r.startsWith("EXCESSIVE_FORWARD_CLOCK_SKEW"))) {
+      attestationStatus = "EXCESSIVE_CLOCK_SKEW_REJECTED";
+      unavailabilityReason = "IMPOSSIBLE_TIMESTAMP_ORDERING";
+    } else if (reasons.some((r) => r.startsWith("CLOCK_SKEW_QUARANTINE"))) {
+      attestationStatus = "TOLERATED_CLOCK_SKEW_QUARANTINE";
+      unavailabilityReason = "IMPOSSIBLE_TIMESTAMP_ORDERING";
+    } else if (
       reasons.some(
         (r) =>
           r.startsWith("IMPOSSIBLE_TIMESTAMP_ORDERING") ||
-          r.startsWith("EXCESSIVE_FORWARD_CLOCK_SKEW") ||
           r.startsWith("INVERTED_HOST_RECEIPT_ORDERING"),
       )
     ) {
+      attestationStatus = "IMPOSSIBLE_ORDERING_REJECTED";
       unavailabilityReason = "IMPOSSIBLE_TIMESTAMP_ORDERING";
     } else if (reasons.some((r) => r.includes("LOOKAHEAD"))) {
+      attestationStatus = "LOOKAHEAD_LEAKAGE_REJECTED";
       unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+    } else if (reasons.some((r) => r.startsWith("MISSING_RECEIPT_EVIDENCE"))) {
+      attestationStatus = "MISSING_RECEIPT_EVIDENCE";
+      unavailabilityReason = "PROVIDER_RESPONSE_OMITTED_FIELD";
     } else if (reasons.some((r) => r.startsWith("EXCESSIVE_INGESTION_LAG"))) {
+      attestationStatus = "IMPOSSIBLE_ORDERING_REJECTED";
       unavailabilityReason = "STALE_SAMPLE_DISCARDED";
     } else {
+      attestationStatus = "IMPOSSIBLE_ORDERING_REJECTED";
       unavailabilityReason = "INVALID_OR_NONFINITE_MANDATORY_TIMESTAMPS";
     }
   }
@@ -163,6 +198,7 @@ export function validateClockMonotonicity(input: ClockEvaluationInput): ClockVal
   return {
     isCausallyMonotonic: !isQuarantined,
     isQuarantined,
+    attestationStatus,
     unavailabilityReason,
     quarantineReasons: reasons,
     measuredSkewMs: measuredSkew,

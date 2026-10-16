@@ -7,6 +7,7 @@
 
 import type { CandidateDecisionRecord } from "../telemetry/TelemetryTypes.js";
 import type {
+  ShadowEligibilityResult,
   ShadowEvaluationRecord,
   ShadowQualificationResult,
   ShadowReserveSnapshot,
@@ -21,6 +22,27 @@ export function createShadowEvaluationRecord(params: {
 }): ShadowEvaluationRecord {
   const evalTimestamp = params.evaluationTimestampMs ?? params.decision.decisionTimestampMs;
   const evaluationId = `shd-${params.decision.eventId}-${evalTimestamp}`;
+
+  if (params.qualificationResult.executionFeasible === true) {
+    if (!params.observedReserveSnapshot) {
+      throw new Error(
+        "[ShadowEvaluationContract] createShadowEvaluationRecord: executionFeasible cannot be true without observedReserveSnapshot.",
+      );
+    }
+    if (
+      params.observedReserveSnapshot.baseReserve <= 0 ||
+      params.observedReserveSnapshot.quoteReserve <= 0
+    ) {
+      throw new Error(
+        `[ShadowEvaluationContract] createShadowEvaluationRecord: executionFeasible requires strictly positive baseReserve and quoteReserve (got base: ${params.observedReserveSnapshot.baseReserve}, quote: ${params.observedReserveSnapshot.quoteReserve}).`,
+      );
+    }
+    if (params.observedReserveSnapshot.sourceTimestampMs > evalTimestamp) {
+      throw new Error(
+        `[ShadowEvaluationContract] createShadowEvaluationRecord: observedReserveSnapshot sourceTimestampMs (${params.observedReserveSnapshot.sourceTimestampMs}) cannot be after evaluationTimestampMs (${evalTimestamp}). Future reserve lookahead is forbidden.`,
+      );
+    }
+  }
 
   return {
     schemaVersion: "1.0.0",
@@ -131,6 +153,7 @@ export function validateShadowEvaluationRecord(data: unknown): ShadowEvaluationR
   }
 
   // Validate optional reserve snapshot
+  let rsRecord: Record<string, unknown> | undefined;
   if (r.observedReserveSnapshot !== undefined) {
     if (typeof r.observedReserveSnapshot !== "object" || r.observedReserveSnapshot === null) {
       throw new Error(
@@ -138,6 +161,7 @@ export function validateShadowEvaluationRecord(data: unknown): ShadowEvaluationR
       );
     }
     const rs = r.observedReserveSnapshot as Record<string, unknown>;
+    rsRecord = rs;
     if (
       typeof rs.baseReserve !== "number" ||
       !Number.isFinite(rs.baseReserve) ||
@@ -167,5 +191,121 @@ export function validateShadowEvaluationRecord(data: unknown): ShadowEvaluationR
     }
   }
 
+  // Validate executionFeasible integrity against reserves snapshot
+  if (qr.executionFeasible === true) {
+    if (!rsRecord) {
+      throw new Error(
+        "[ShadowEvaluationContract] executionFeasible cannot be true without an observedReserveSnapshot.",
+      );
+    }
+    const base = rsRecord.baseReserve as number;
+    const quote = rsRecord.quoteReserve as number;
+    const sourceMs = rsRecord.sourceTimestampMs as number;
+    if (base <= 0 || quote <= 0) {
+      throw new Error(
+        `[ShadowEvaluationContract] executionFeasible requires strictly positive baseReserve and quoteReserve (got base: ${base}, quote: ${quote}).`,
+      );
+    }
+    if (sourceMs > (r.evaluationTimestampMs as number)) {
+      throw new Error(
+        `[ShadowEvaluationContract] observedReserveSnapshot sourceTimestampMs (${sourceMs}) cannot be after evaluationTimestampMs (${r.evaluationTimestampMs as number}). Future reserve lookahead is forbidden.`,
+      );
+    }
+  }
+
   return r as unknown as ShadowEvaluationRecord;
+}
+
+export function validateShadowEvaluationEligibility(
+  record: ShadowEvaluationRecord,
+  decision: CandidateDecisionRecord,
+): ShadowEligibilityResult {
+  const rejectionReasons: string[] = [];
+
+  // 1. Foreign-Key Composite Identity Check
+  if (record.decisionEventId !== decision.eventId) {
+    rejectionReasons.push(
+      `COMPOSITE_FOREIGN_KEY_MISMATCH: decisionEventId (${record.decisionEventId}) does not match decision eventId (${decision.eventId})`,
+    );
+  }
+  if (record.sessionId !== decision.sessionId) {
+    rejectionReasons.push(
+      `COMPOSITE_FOREIGN_KEY_MISMATCH: sessionId (${record.sessionId}) does not match decision sessionId (${decision.sessionId})`,
+    );
+  }
+  if (record.generationId !== decision.generationId) {
+    rejectionReasons.push(
+      `COMPOSITE_FOREIGN_KEY_MISMATCH: generationId (${record.generationId}) does not match decision generationId (${decision.generationId})`,
+    );
+  }
+  if (record.mintAddress !== decision.mintAddress) {
+    rejectionReasons.push(
+      `COMPOSITE_FOREIGN_KEY_MISMATCH: mintAddress (${record.mintAddress}) does not match decision mintAddress (${decision.mintAddress})`,
+    );
+  }
+  if (record.poolId !== decision.poolId) {
+    rejectionReasons.push(
+      `COMPOSITE_FOREIGN_KEY_MISMATCH: poolId (${record.poolId}) does not match decision poolId (${decision.poolId})`,
+    );
+  }
+
+  // 2. Chronological Ordering
+  if (record.evaluationTimestampMs < decision.decisionTimestampMs) {
+    rejectionReasons.push(
+      `EVALUATION_PRECEDES_DECISION: evaluationTimestampMs (${record.evaluationTimestampMs}) precedes decisionTimestampMs (${decision.decisionTimestampMs})`,
+    );
+  }
+
+  // 3. Execution Feasibility Verification
+  let executionFeasible = record.qualificationResult.executionFeasible;
+  let unavailabilityReason = record.qualificationResult.unavailabilityReason;
+
+  if (executionFeasible) {
+    if (!record.observedReserveSnapshot) {
+      rejectionReasons.push(
+        "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT: executionFeasible is claimed but observedReserveSnapshot is missing",
+      );
+      executionFeasible = false;
+      unavailabilityReason = "NO_INDEPENDENT_POINT_IN_TIME_SNAPSHOT";
+    } else {
+      const snap = record.observedReserveSnapshot;
+      if (snap.baseReserve <= 0 || snap.quoteReserve <= 0) {
+        rejectionReasons.push(
+          `RESERVE_QUANTITY_ZERO_OR_NONFINITE: non-positive reserves in snapshot (base: ${snap.baseReserve}, quote: ${snap.quoteReserve})`,
+        );
+        executionFeasible = false;
+        unavailabilityReason = "RESERVE_QUANTITY_ZERO_OR_NONFINITE";
+      }
+      if (snap.sourceTimestampMs > record.evaluationTimestampMs) {
+        rejectionReasons.push(
+          `FUTURE_RESERVE_SNAPSHOT: snapshot sourceTimestampMs (${snap.sourceTimestampMs}) is after evaluationTimestampMs (${record.evaluationTimestampMs})`,
+        );
+        executionFeasible = false;
+        unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+      }
+      if (snap.sourceTimestampMs > decision.decisionTimestampMs) {
+        rejectionReasons.push(
+          `FUTURE_RESERVE_SNAPSHOT_DECISION: snapshot sourceTimestampMs (${snap.sourceTimestampMs}) is after decisionTimestampMs (${decision.decisionTimestampMs})`,
+        );
+        executionFeasible = false;
+        unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+      }
+    }
+  }
+
+  const isEligible = rejectionReasons.length === 0;
+  if (!isEligible && unavailabilityReason === undefined) {
+    if (rejectionReasons.some((r) => r.includes("COMPOSITE_FOREIGN_KEY_MISMATCH"))) {
+      unavailabilityReason = "POOL_IDENTITY_MISMATCH_DISCARDED";
+    } else if (rejectionReasons.some((r) => r.includes("EVALUATION_PRECEDES_DECISION"))) {
+      unavailabilityReason = "IMPOSSIBLE_TIMESTAMP_ORDERING";
+    }
+  }
+
+  return {
+    isEligible,
+    executionFeasible,
+    rejectionReasons,
+    unavailabilityReason,
+  };
 }

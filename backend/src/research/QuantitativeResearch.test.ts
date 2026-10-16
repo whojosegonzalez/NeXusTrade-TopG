@@ -39,6 +39,7 @@ import { runReadinessAudit } from "../../../scripts/audit-research-readiness.mjs
 import {
   createShadowEvaluationRecord,
   validateShadowEvaluationRecord,
+  validateShadowEvaluationEligibility,
 } from "./ShadowEvaluationContract.js";
 import { validateClockMonotonicity } from "./ClockMonotonicityValidator.js";
 import {
@@ -2660,6 +2661,129 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
           }),
         ).toThrow("evaluationTimestampMs");
       });
+
+      it("RF-D21.3b: D21-AUD-05: rejects executionFeasible: true with zero, non-finite, or future reserve snapshots", () => {
+        // Auditor reproduction: evaluation at 1000 with executionFeasible: true and zero reserves with future sourceTimestampMs (999999999)
+        const corruptRecord = {
+          schemaVersion: "1.0.0",
+          evaluationId: "shd-test-1",
+          decisionEventId: "dec-test-1",
+          sessionId: "ses-test-1",
+          generationId: "gen-1",
+          mintAddress: "TokenMint111111111111111111111111111111111111",
+          poolId: "pool-1",
+          evaluationTimestampMs: 1000,
+          qualificationResult: {
+            shadowTriggerQualified: true,
+            qualificationReason: "MET_MOMENTUM_CRITERIA",
+            simulatedTargetSizeSol: 0.1,
+            executionFeasible: true,
+          },
+          observedReserveSnapshot: {
+            baseReserve: 0,
+            quoteReserve: 0,
+            sourceTimestampMs: 999999999,
+          },
+        };
+
+        // 1. Syntactic validator throws fail-closed on zero reserves
+        expect(() => validateShadowEvaluationRecord(corruptRecord)).toThrow(
+          "executionFeasible requires strictly positive baseReserve and quoteReserve",
+        );
+
+        // 2. Syntactic validator throws fail-closed on future reserve snapshot even if reserves were positive
+        const futureReserveRecord = {
+          ...corruptRecord,
+          observedReserveSnapshot: {
+            baseReserve: 100000,
+            quoteReserve: 50,
+            sourceTimestampMs: 999999999, // Future: 999999999 > 1000!
+          },
+        };
+        expect(() => validateShadowEvaluationRecord(futureReserveRecord)).toThrow(
+          "cannot be after evaluationTimestampMs",
+        );
+
+        // 3. Syntactic validator throws fail-closed if executionFeasible: true without observedReserveSnapshot
+        const missingSnapshotRecord = {
+          ...corruptRecord,
+          observedReserveSnapshot: undefined,
+        };
+        expect(() => validateShadowEvaluationRecord(missingSnapshotRecord)).toThrow(
+          "executionFeasible cannot be true without an observedReserveSnapshot",
+        );
+      });
+
+      it("RF-D21.3c: D21-AUD-05: validateShadowEvaluationEligibility validates composite foreign-key identity and chronology fail-closed", () => {
+        const canonicalDecision = createMockDecision({
+          eventId: "dec-canonical-1",
+          sessionId: "session-paper-d21",
+          generationId: "gen-1",
+          mintAddress: "TokenMint111111111111111111111111111111111111",
+          poolId: "pool-amm-1",
+          decisionTimestampMs: 1000000,
+          decisionCohort: "WATCHLIST_RADAR",
+        });
+
+        // Valid shadow record matching canonical decision
+        const validRecord = createShadowEvaluationRecord({
+          decision: canonicalDecision,
+          qualificationResult: {
+            shadowTriggerQualified: true,
+            qualificationReason: "MET_MOMENTUM_CRITERIA",
+            simulatedTargetSizeSol: 0.1,
+            executionFeasible: true,
+          },
+          evaluationTimestampMs: 1000000,
+          observedReserveSnapshot: {
+            baseReserve: 500000,
+            quoteReserve: 25,
+            sourceTimestampMs: 999500, // Pre-decision
+          },
+        });
+
+        const validEligibility = validateShadowEvaluationEligibility(
+          validRecord,
+          canonicalDecision,
+        );
+        expect(validEligibility.isEligible).toBe(true);
+        expect(validEligibility.executionFeasible).toBe(true);
+        expect(validEligibility.rejectionReasons).toHaveLength(0);
+
+        // Conflict 1: Mismatched poolId fails closed
+        const mismatchedPoolRecord = {
+          ...validRecord,
+          poolId: "mismatched-pool-id",
+        };
+        const poolEligibility = validateShadowEvaluationEligibility(
+          mismatchedPoolRecord,
+          canonicalDecision,
+        );
+        expect(poolEligibility.isEligible).toBe(false);
+        expect(poolEligibility.unavailabilityReason).toBe("POOL_IDENTITY_MISMATCH_DISCARDED");
+        expect(
+          poolEligibility.rejectionReasons.some((r) =>
+            r.includes("COMPOSITE_FOREIGN_KEY_MISMATCH"),
+          ),
+        ).toBe(true);
+
+        // Conflict 2: Evaluation timestamp precedes decision timestamp
+        const timeInvertedRecord = {
+          ...validRecord,
+          evaluationTimestampMs: 900000, // Before decision (1000000)
+        };
+        const timeEligibility = validateShadowEvaluationEligibility(
+          timeInvertedRecord,
+          canonicalDecision,
+        );
+        expect(timeEligibility.isEligible).toBe(false);
+        expect(
+          timeEligibility.rejectionReasons.some((r) => r.includes("EVALUATION_PRECEDES_DECISION")),
+        ).toBe(true);
+
+        // Cohort Preservation Invariant: canonicalDecision.decisionCohort remains WATCHLIST_RADAR
+        expect(canonicalDecision.decisionCohort).toBe("WATCHLIST_RADAR");
+      });
     });
 
     describe("D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01)", () => {
@@ -2691,6 +2815,94 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         expect(
           result.quarantineReasons.some((r) => r.includes("IMPOSSIBLE_TIMESTAMP_ORDERING")),
         ).toBe(true);
+      });
+
+      it("RF-D21.5b: D21-AUD-01: rejects inverted source/ingestion time as causally monotonic", () => {
+        // Exact Auditor reproduction case:
+        // sourceTimestampMs: 2000, ingestionTimestampMs: 1000, responseReceivedMs: 2100, decisionTimestampMs: 2200
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 2000,
+          ingestionTimestampMs: 1000,
+          responseReceivedMs: 2100,
+          decisionTimestampMs: 2200,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(result.attestationStatus).toBe("TOLERATED_CLOCK_SKEW_QUARANTINE");
+        expect(result.unavailabilityReason).toBe("IMPOSSIBLE_TIMESTAMP_ORDERING");
+        expect(result.measuredSkewMs).toBe(1000);
+        expect(result.measuredIngestionLagMs).toBe(-1000);
+        expect(result.quarantineReasons.some((r) => r.includes("CLOCK_SKEW_QUARANTINE"))).toBe(
+          true,
+        );
+      });
+
+      it("RF-D21.5c: D21-AUD-01: boundary regressions for provider source timestamp ahead of ingestion", () => {
+        // Case 1: 1ms skew (source ahead by 1ms)
+        const res1 = validateClockMonotonicity({
+          sourceTimestampMs: 1001,
+          ingestionTimestampMs: 1000,
+          responseReceivedMs: 1050,
+          decisionTimestampMs: 1100,
+        });
+        expect(res1.isCausallyMonotonic).toBe(false);
+        expect(res1.isQuarantined).toBe(true);
+        expect(res1.attestationStatus).toBe("TOLERATED_CLOCK_SKEW_QUARANTINE");
+        expect(res1.measuredSkewMs).toBe(1);
+
+        // Case 2: 4999ms skew (source ahead by 4999ms)
+        const res4999 = validateClockMonotonicity({
+          sourceTimestampMs: 5999,
+          ingestionTimestampMs: 1000,
+          responseReceivedMs: 6000,
+          decisionTimestampMs: 6100,
+        });
+        expect(res4999.isCausallyMonotonic).toBe(false);
+        expect(res4999.isQuarantined).toBe(true);
+        expect(res4999.attestationStatus).toBe("TOLERATED_CLOCK_SKEW_QUARANTINE");
+        expect(res4999.measuredSkewMs).toBe(4999);
+
+        // Case 3: 5000ms boundary skew
+        const res5000 = validateClockMonotonicity({
+          sourceTimestampMs: 6000,
+          ingestionTimestampMs: 1000,
+          responseReceivedMs: 6000,
+          decisionTimestampMs: 6100,
+        });
+        expect(res5000.isCausallyMonotonic).toBe(false);
+        expect(res5000.isQuarantined).toBe(true);
+        expect(res5000.attestationStatus).toBe("TOLERATED_CLOCK_SKEW_QUARANTINE");
+        expect(res5000.measuredSkewMs).toBe(5000);
+
+        // Case 4: 5001ms over-limit skew (exceeds MAX_ALLOWED_FORWARD_CLOCK_SKEW_MS)
+        const res5001 = validateClockMonotonicity({
+          sourceTimestampMs: 6001,
+          ingestionTimestampMs: 1000,
+          responseReceivedMs: 6050,
+          decisionTimestampMs: 6100,
+        });
+        expect(res5001.isCausallyMonotonic).toBe(false);
+        expect(res5001.isQuarantined).toBe(true);
+        expect(res5001.attestationStatus).toBe("EXCESSIVE_CLOCK_SKEW_REJECTED");
+        expect(res5001.measuredSkewMs).toBe(5001);
+      });
+
+      it("RF-D21.5d: D21-AUD-01: missing receipt evidence (responseReceivedMs: undefined) fails closed", () => {
+        const result = validateClockMonotonicity({
+          sourceTimestampMs: 1000,
+          ingestionTimestampMs: 1050,
+          responseReceivedMs: undefined, // Missing receipt evidence!
+          decisionTimestampMs: 1100,
+        });
+
+        expect(result.isCausallyMonotonic).toBe(false);
+        expect(result.isQuarantined).toBe(true);
+        expect(result.attestationStatus).toBe("MISSING_RECEIPT_EVIDENCE");
+        expect(result.unavailabilityReason).toBe("PROVIDER_RESPONSE_OMITTED_FIELD");
+        expect(result.quarantineReasons.some((r) => r.includes("MISSING_RECEIPT_EVIDENCE"))).toBe(
+          true,
+        );
       });
 
       it("RF-D21.6: forward clock skew exceeding 5000ms is quarantined", () => {
@@ -2833,6 +3045,26 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         expect(total).toBeCloseTo(400.0, 10);
       });
 
+      it("RF-D21.10b: D21-AUD-03: computeHajekMean throws fail-closed error on extreme/overflowing inclusion probability", () => {
+        // Exact Auditor reproduction case:
+        // computeHajekMean([10, 20], [Number.MIN_VALUE, 0.5])
+        expect(() => computeHajekMean([10, 20], [Number.MIN_VALUE, 0.5])).toThrow(
+          "below minimum supported threshold",
+        );
+
+        // Also rejects non-finite sample values
+        expect(() => computeHajekMean([10, NaN], [0.5, 0.5])).toThrow("invalid non-finite value");
+      });
+
+      it("RF-D21.10c: D21-AUD-03: computeHorvitzThompsonTotal throws fail-closed error on extreme or non-finite inputs", () => {
+        expect(() => computeHorvitzThompsonTotal([10, 20], [Number.MIN_VALUE, 0.5])).toThrow(
+          "below minimum supported threshold",
+        );
+        expect(() => computeHorvitzThompsonTotal([10, Infinity], [0.5, 0.5])).toThrow(
+          "invalid non-finite value",
+        );
+      });
+
       it("RF-D21.11: computes Cameron-Gelbach-Miller two-way cluster-robust covariance with small cluster safeguard", () => {
         const residuals = [0.1, -0.2, 0.15, -0.05];
         const X = [
@@ -2854,6 +3086,37 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         expect(result.numClustersMint).toBe(2);
         expect(result.isSmallClusterWarning).toBe(true);
         expect(result.smallClusterNote).toContain("Small cluster count");
+      });
+
+      it("RF-D21.11b: D21-AUD-03: computeTwoWayClusterCovariance rejects non-finite residuals/design matrix fail-closed", () => {
+        // Exact Auditor reproduction case:
+        // computeTwoWayClusterCovariance([1, NaN, 1], [[1, 0], [1, 1], [1, 2]], ["s1", "s2", "s3"], ["m1", "m2", "m3"])
+        expect(() =>
+          computeTwoWayClusterCovariance(
+            [1, NaN, 1],
+            [
+              [1, 0],
+              [1, 1],
+              [1, 2],
+            ],
+            ["s1", "s2", "s3"],
+            ["m1", "m2", "m3"],
+          ),
+        ).toThrow("non-finite residual at index 1: NaN");
+
+        // Design matrix non-finite
+        expect(() =>
+          computeTwoWayClusterCovariance(
+            [1, 2, 1],
+            [
+              [1, 0],
+              [NaN, 1],
+              [1, 2],
+            ],
+            ["s1", "s2", "s3"],
+            ["m1", "m2", "m3"],
+          ),
+        ).toThrow("non-finite entry at X[1][0]: NaN");
       });
 
       it("RF-D21.12: stateful constant-product AMM execution waterfall deducts LP fee inside swap and loses on flat zero-alpha market", () => {
@@ -2883,6 +3146,57 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
 
         // 5. Net return is approx -0.52% (25 bps on buy + 25 bps on sell + network fees)
         expect(result.netCashReturnPct).toBeCloseTo(-0.52, 1);
+      });
+
+      it("RF-D21.12b: D21-AUD-04: computeAmmRoundTripWaterfall rejects negative network fees and invalid parameters fail-closed", () => {
+        const baseParams = {
+          initialBaseReserve: 1000000,
+          initialQuoteReserveSol: 50,
+          buySizeSol: 0.5,
+          lpFeeBps: 25,
+          networkFeeSol: 0.000015,
+          ataRentSol: 0.002,
+          priceMultiplier: 1.0,
+        };
+
+        // Auditor reproduction: networkFeeSol: -1 (fictitious profit)
+        expect(() =>
+          computeAmmRoundTripWaterfall({
+            ...baseParams,
+            networkFeeSol: -1,
+          }),
+        ).toThrow("networkFeeSol must be a non-negative finite number");
+
+        // Auditor reproduction: lpFeeBps: NaN
+        expect(() =>
+          computeAmmRoundTripWaterfall({
+            ...baseParams,
+            lpFeeBps: NaN,
+          }),
+        ).toThrow("lpFeeBps must be a finite number between 0 and 10000");
+
+        // Auditor reproduction: priceMultiplier: -1
+        expect(() =>
+          computeAmmRoundTripWaterfall({
+            ...baseParams,
+            priceMultiplier: -1,
+          }),
+        ).toThrow("priceMultiplier must be a positive finite number");
+
+        // Zero or non-positive reserves / buy sizes
+        expect(() =>
+          computeAmmRoundTripWaterfall({
+            ...baseParams,
+            buySizeSol: 0,
+          }),
+        ).toThrow("buySizeSol must be a positive finite number");
+
+        expect(() =>
+          computeAmmRoundTripWaterfall({
+            ...baseParams,
+            initialBaseReserve: 0,
+          }),
+        ).toThrow("initialBaseReserve must be a positive finite number");
       });
     });
 
@@ -2944,6 +3258,65 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         expect(session.fieldProvenance.quoteReserve).toBe("UNAVAILABLE");
         expect(session.fieldProvenance.buys5m).toBe("UNAVAILABLE");
         expect(session.fieldProvenance.devHoldingPct).toBe("UNAVAILABLE");
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
+
+      it("RF-D21.14b: D21-AUD-02: parseFedoraArchiveDirectory quarantines unrelated and malformed JSON fail-closed", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-quarantine-"));
+
+        // Exact Auditor reproduction case:
+        // File 1: unrelated JSON {"foo":"bar"}
+        fs.writeFileSync(path.join(tempStaging, "unrelated.json"), JSON.stringify({ foo: "bar" }));
+
+        // File 2: malformed session {"sessionId":"fake","trades":[{"sizeSol":"NaN"}],"netPnlSol":"INVALID"}
+        fs.writeFileSync(
+          path.join(tempStaging, "malformed.json"),
+          JSON.stringify({
+            sessionId: "fake",
+            trades: [{ sizeSol: "NaN" }],
+            netPnlSol: "INVALID",
+          }),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+
+        // Crucial invariant: never mark ARCHIVE_CONFIRMED_PARSED for arbitrary or malformed JSON
+        expect(result.status).toBe("REPORTED_NOT_INSPECTED");
+        expect(result.filesAuditedCount).toBe(2);
+        expect(result.sessionsAuditedCount).toBe(0);
+        expect(result.malformedOrUnrelatedFilesCount).toBe(2);
+        expect(result.quarantinedFiles).toHaveLength(2);
+        expect(result.sessions).toHaveLength(0);
+
+        // Rejection reasons are recorded
+        expect(result.quarantinedFiles[0]!.rejectionReason).toContain("sessionId");
+        expect(result.quarantinedFiles[1]!.rejectionReason).toContain("sessionId");
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
+
+      it("RF-D21.14c: D21-AUD-02: rejects incomplete session or non-finite financial capital fail-closed", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-incomplete-"));
+
+        // Incomplete session: valid sessionId prefix but missing mandatory endedAt and negative capital
+        fs.writeFileSync(
+          path.join(tempStaging, "incomplete.json"),
+          JSON.stringify({
+            sessionId: "session-fedora-broken",
+            startedAt: "2026-10-07T00:00:00.000Z",
+            startingCapitalSol: -10.0,
+            endingCapitalSol: 9.2,
+            netPnlSol: -0.8,
+            trades: [],
+          }),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+        expect(result.status).toBe("REPORTED_NOT_INSPECTED");
+        expect(result.sessionsAuditedCount).toBe(0);
+        expect(result.malformedOrUnrelatedFilesCount).toBe(1);
+        expect(result.quarantinedFiles[0]!.rejectionReason).toContain("endedAt");
 
         fs.rmSync(tempStaging, { recursive: true, force: true });
       });

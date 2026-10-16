@@ -83,3 +83,13 @@ export interface ShadowEvaluationRecord {
    */
   readonly observedReserveSnapshot?: ShadowReserveSnapshot | undefined;
 }
+
+/**
+ * Result of validating a shadow evaluation record against its canonical decision and economic eligibility.
+ */
+export interface ShadowEligibilityResult {
+  readonly isEligible: boolean;
+  readonly executionFeasible: boolean;
+  readonly rejectionReasons: readonly string[];
+  readonly unavailabilityReason?: UnavailabilityReason | undefined;
+}

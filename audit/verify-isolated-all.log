@@ -14,33 +14,33 @@ node.exe scripts/check-secrets.mjs
 Secret check passed.
 git diff --check
 node.exe --test scripts/architecture-check.test.mjs scripts/verify-isolated.test.mjs
-✔ output guard rejects redirected ancestors before creating directories (6.4333ms)
-✔ allowed cycles terminate and type-only edges are classified separately (14.9862ms)
-✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_short-hash (8.4498ms)
-✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_peer-long-layout (6.4009ms)
-✔ type package permission does not allow runtime imports or other sources (13.9368ms)
-✔ type package permission rejects unresolved packages and local alias substitutions (9.0834ms)
-✔ rejects forbidden edge import "./forbidden.js"; (6.4226ms)
-✔ rejects forbidden edge export * from "./forbidden.js"; (3.7494ms)
-✔ rejects forbidden edge import "@local/forbidden"; (3.3539ms)
-✔ rejects transitive barrel routes and returns nonzero CLI status (4.4405ms)
-✔ rejects capability import("./allowed.js") (3.0766ms)
-✔ rejects capability import(name) (2.9067ms)
-✔ rejects capability require("x") (2.7551ms)
-✔ rejects capability import loader = require("x"); (2.9411ms)
-✔ rejects capability process["env"] (2.7641ms)
-✔ rejects capability globalThis["fetch"]("x") (2.768ms)
-✔ rejects capability new Function("return 1") (2.8064ms)
-✔ rejects capability Date.now() (2.8515ms)
-✔ rejects capability setTimeout(()=>{},1) (3.308ms)
-✔ unresolved runtime and unreviewed type dependencies fail explicitly (7.3614ms)
-✔ renamed filesystem writes cannot pass a named read API allowance (3.2568ms)
-✔ an audited package name still requires successful module resolution (3.7837ms)
-✔ rejects redirected source before reading its target (5.0115ms)
-✔ isolated plan contains exactly the four audited suites and no operational command (1.3174ms)
-✔ first child failure stops subsequent commands with nonzero status (1.9125ms)
-✔ spawn errors and signals fail closed (1.8201ms)
-✔ invalid modes fail before execution (0.3416ms)
+✔ output guard rejects redirected ancestors before creating directories (4.5646ms)
+✔ allowed cycles terminate and type-only edges are classified separately (14.1359ms)
+✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_short-hash (7.8161ms)
+✔ type package permissions ignore pnpm storage layout: fixture-package@1.0.0_peer-long-layout (6.3608ms)
+✔ type package permission does not allow runtime imports or other sources (12.3372ms)
+✔ type package permission rejects unresolved packages and local alias substitutions (8.3182ms)
+✔ rejects forbidden edge import "./forbidden.js"; (3.6772ms)
+✔ rejects forbidden edge export * from "./forbidden.js"; (3.7644ms)
+✔ rejects forbidden edge import "@local/forbidden"; (4.7472ms)
+✔ rejects transitive barrel routes and returns nonzero CLI status (6.8697ms)
+✔ rejects capability import("./allowed.js") (4.1077ms)
+✔ rejects capability import(name) (3.0257ms)
+✔ rejects capability require("x") (3.0229ms)
+✔ rejects capability import loader = require("x"); (2.9245ms)
+✔ rejects capability process["env"] (3.2671ms)
+✔ rejects capability globalThis["fetch"]("x") (2.684ms)
+✔ rejects capability new Function("return 1") (3.297ms)
+✔ rejects capability Date.now() (2.8683ms)
+✔ rejects capability setTimeout(()=>{},1) (3.7145ms)
+✔ unresolved runtime and unreviewed type dependencies fail explicitly (7.8502ms)
+✔ renamed filesystem writes cannot pass a named read API allowance (3.4529ms)
+✔ an audited package name still requires successful module resolution (3.9952ms)
+✔ rejects redirected source before reading its target (5.424ms)
+✔ isolated plan contains exactly the four audited suites and no operational command (1.2854ms)
+✔ first child failure stops subsequent commands with nonzero status (1.9115ms)
+✔ spawn errors and signals fail closed (1.7078ms)
+✔ invalid modes fail before execution (0.3227ms)
 ℹ tests 27
 ℹ suites 0
 ℹ pass 27
@@ -48,355 +48,354 @@ node.exe --test scripts/architecture-check.test.mjs scripts/verify-isolated.test
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 373.3326
+ℹ duration_ms 356.3805
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.measurement-analysis.config.ts
 
- RUN  v4.1.11 U:/Projects/TopG/backend
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mU:/Projects/TopG/backend[39m
 
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1-AUD-05: Readiness Audit Validity on Synthetic Filesystem Fixture > RF-D5.1: does not falsely claim feasibility on placeholder or unverified data in audit script
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-aU1fSn\AUDIT_REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.10: two-session cross-token fixture: does not declare H3 feasible when features are on different tokens
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-test-avDCOT\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.11: unfinalized session fixture: does not declare H2 feasible when session is unfinalized
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h2-test-zvJXie\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.12: cross-generation reserve attribution fixture: does not attribute reserves from another generation
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-gen-test-4MUNDl\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility > RF-D1C.13: valid candidate decision with all features matching declares hypotheses feasible
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-valid-test-GEYO7y\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.1: D1C3-01: future-only developer-holding observation produces h3Feasible: false and eligibleH3DecisionsCount: 0 on candidate decision at time t
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-future-DJ3vnW\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.2: D1C3-01: pre-decision developer-holding observation within freshness window qualifies candidate decision for H3
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-0hobzo\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > D1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds > RF-D1C3.3: D1C3-01: stale pre-decision developer-holding observation exceeding freshness limit fails closed
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\telemetry\sessions
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-Re4CyG\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
-
-stdout | src/research/QuantitativeResearch.test.ts > Phase 12.94-D Milestone D.1: Quantitative Research Engine > Phase 12.94-D Milestone D.2.1 Offline Foundations & Verification Fixtures > D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01) > RF-D21.9: readiness scanner H3 matcher rejects adversarial fixture with recv < source
-[AuditResearchReadiness] Scanning disk locations...
-  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu
-  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu\sessions
-[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-Zc8jwu\REPORT.md
-  Readiness Status: INSUFFICIENT_EVIDENCE (NO_ELIGIBLE_FINALIZED_DECISIONS)
-
- ✓ src/research/QuantitativeResearch.test.ts (55 tests) 50ms
- ✓ src/candidate-scanner/BuyGateTriggerService.test.ts (46 tests) 26ms
- ✓ src/candidate-scanner/CandidateScannerConfig.test.ts (5 tests) 3ms
- ✓ src/candidate-scanner/CandidateScannerEvaluator.test.ts (11 tests) 5ms
- ✓ src/candidate-scanner/CandidateStreamEngine.test.ts (6 tests) 24ms
- ✓ src/candidate-scanner/CandidateWatchlistService.test.ts (9 tests) 5ms
- ✓ src/candidate-scanner/CounterfactualOpportunityTracker.test.ts (4 tests) 4ms
-stderr | src/execution/ExecutionRealism.test.ts > Phase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined) > RF-7: Crash Repair-Before-Append & Strict Reconciliation (Findings C8 & C2-AUD-03) > quarantines crash-damaged tail before appending and recovers clean boundary
-[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\rf7-crash-append-qkW6iY\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl:2 to U:\Projects\TopG\.tmp\isolated\rf7-crash-append-qkW6iY\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl.corrupt-1792106146086
-
- ✓ src/execution/ExecutionRealism.test.ts (37 tests) 42ms
- ✓ src/exits/DynamicRatchetService.test.ts (36 tests) 11ms
- ✓ src/paper/GenerationsRegistry.test.ts (23 tests) 145ms
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > SubPhase12_90: Chrono-Regime Gating and Schedule Parser > rejects invalid schedule formats or out of bounds values
-[PaperDaemon] Invalid --schedule format: "invalid". Expected HH:MM-HH:MM[:TZ] (e.g. 07:00-17:30:PDT)
+ [32m✓[39m src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts [2m([22m[2m115 tests[22m[2m)[22m[33m 2912[2mms[22m[39m
+ [32m✓[39m src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts [2m([22m[2m7 tests[22m[2m)[22m[33m 1336[2mms[22m[39m
+     [33m[2m✓[22m[39m emits only json stdout on successful synthetic analysis [33m 693[2mms[22m[39m
+     [33m[2m✓[22m[39m emits only markdown stdout on successful synthetic analysis [33m 576[2mms[22m[39m
+ [32m✓[39m src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts [2m([22m[2m77 tests[22m[2m)[22m[33m 689[2mms[22m[39m
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mSubPhase12_90: Chrono-Regime Gating and Schedule Parser[2m > [22m[2mrejects invalid schedule formats or out of bounds values
+[22m[39m[PaperDaemon] Invalid --schedule format: "invalid". Expected HH:MM-HH:MM[:TZ] (e.g. 07:00-17:30:PDT)
 [PaperDaemon] Invalid hour/minute in --schedule: "25:00-17:00:PDT"
 [PaperDaemon] Invalid hour/minute in --schedule: "07:65-17:00:PDT"
 [PaperDaemon] Invalid hour/minute in --schedule: "07:00-24:00:PDT"
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-C: fails closed on corrupted wallet JSON and preserves corrupt backup
-[PaperDaemon] Corrupt or unreadable virtual wallet at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-7p23jv\virtual-wallet.json. Creating backup and failing closed... SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mP0-C: fails closed on corrupted wallet JSON and preserves corrupt backup
+[22m[39m[PaperDaemon] Corrupt or unreadable virtual wallet at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-0VqVpg\virtual-wallet.json. Creating backup and failing closed... SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)
     at JSON.parse (<anonymous>)
     at loadVirtualWallet (U:/Projects/TopG/backend/src/paper/VirtualWallet.ts:86:27)
     at U:/Projects/TopG/backend/src/paper/PaperTradingDaemon.test.ts:1003:20
-    at Proxy.assertThrows (file:///U:/Projects/TopG/node_modules/.pnpm/chai@6.2.2/node_modules/chai/index.js:2798:5)
-    at Proxy.methodWrapper (file:///U:/Projects/TopG/node_modules/.pnpm/chai@6.2.2/node_modules/chai/index.js:1700:25)
-    at Proxy.<anonymous> (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+expect@4.1.11/node_modules/@vitest/expect/dist/index.js:1216:12)
-    at Proxy.overwritingMethodWrapper (file:///U:/Projects/TopG/node_modules/.pnpm/chai@6.2.2/node_modules/chai/index.js:1750:33)
-    at Proxy.<anonymous> (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+expect@4.1.11/node_modules/@vitest/expect/dist/index.js:1552:16)
-    at Proxy.<anonymous> (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+expect@4.1.11/node_modules/@vitest/expect/dist/index.js:1156:15)
-    at Proxy.methodWrapper (file:///U:/Projects/TopG/node_modules/.pnpm/chai@6.2.2/node_modules/chai/index.js:1700:25)
-[PaperDaemon] Preserved corrupt virtual wallet state at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-7p23jv\virtual-wallet.json.corrupt-1792106147124
+    at Proxy.assertThrows [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/chai@6.2.2/node_modules/[4mchai[24m/index.js:2798:5[90m)[39m
+    at Proxy.methodWrapper [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/chai@6.2.2/node_modules/[4mchai[24m/index.js:1700:25[90m)[39m
+    at Proxy.<anonymous> [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+expect@4.1.11/node_modules/[4m@vitest/expect[24m/dist/index.js:1216:12[90m)[39m
+    at Proxy.overwritingMethodWrapper [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/chai@6.2.2/node_modules/[4mchai[24m/index.js:1750:33[90m)[39m
+    at Proxy.<anonymous> [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+expect@4.1.11/node_modules/[4m@vitest/expect[24m/dist/index.js:1552:16[90m)[39m
+    at Proxy.<anonymous> [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+expect@4.1.11/node_modules/[4m@vitest/expect[24m/dist/index.js:1156:15[90m)[39m
+    at Proxy.methodWrapper [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/chai@6.2.2/node_modules/[4mchai[24m/index.js:1700:25[90m)[39m
+[PaperDaemon] Preserved corrupt virtual wallet state at U:\Projects\TopG\.tmp\isolated\wallet-test-corrupt-0VqVpg\virtual-wallet.json.corrupt-1792109149061
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage STARTED
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\real-recovery-STARTED-yicG3a\.tmp\sessions\sess-recovery-real-1.json
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage STARTED
+[22m[39m[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\real-recovery-STARTED-ga9IlB\.tmp\sessions\sess-recovery-real-1.json
 [SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-recovery-real-1
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-recovery-real-1. New Balance: 10.5 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage STARTED
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage STARTED. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage STARTED
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage STARTED. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage SESSION_FILE_WRITTEN
-[SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-recovery-real-1
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage SESSION_FILE_WRITTEN
+[22m[39m[SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-recovery-real-1
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-recovery-real-1. New Balance: 10.5 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage SESSION_FILE_WRITTEN
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage SESSION_FILE_WRITTEN. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage SESSION_FILE_WRITTEN
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage SESSION_FILE_WRITTEN. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage PAST_SESSIONS_WRITTEN
-[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-recovery-real-1. New Balance: 10.5 SOL
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage PAST_SESSIONS_WRITTEN
+[22m[39m[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-recovery-real-1. New Balance: 10.5 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage PAST_SESSIONS_WRITTEN
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage PAST_SESSIONS_WRITTEN
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage WALLET_SETTLED
-[SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage WALLET_SETTLED
+[22m[39m[SettlementJournal] [RECOVERY] Settlement journal for session sess-recovery-real-1 fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-08: recoverSettlementJournal executes real production routine from stage WALLET_SETTLED
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage WALLET_SETTLED. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-08: recoverSettlementJournal executes real production routine from stage WALLET_SETTLED
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-real-1 at stage WALLET_SETTLED. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\corrupt-history-recovery-test-QUjbvQ\.tmp\sessions\sess-recovery-corrupt-1.json
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mP0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
+[22m[39m[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\corrupt-history-recovery-test-2CTvye\.tmp\sessions\sess-recovery-corrupt-1.json
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-corrupt-1 at stage STARTED. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mP0-E7-02: recoverSettlementJournal fails closed and creates backup on corrupted past-sessions.json without overwriting history
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-recovery-corrupt-1 at stage STARTED. Replaying remaining settlement operations...
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > P0-E7-04: ProcessLock acquires exclusive lock, blocks active PID, reclaims stale dead PID, and releases cleanly
-[ProcessLock] [STALE_LOCK] Owning process with PID 99999999 is no longer active in the OS. Safely reclaiming stale lock at U:\Projects\TopG\.tmp\isolated\process-lock-test-RHFn1I\test-process.lock.
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mP0-E7-04: ProcessLock acquires exclusive lock, blocks active PID, reclaims stale dead PID, and releases cleanly
+[22m[39m[ProcessLock] [STALE_LOCK] Owning process with PID 99999999 is no longer active in the OS. Safely reclaiming stale lock at U:\Projects\TopG\.tmp\isolated\process-lock-test-ly2Klz\test-process.lock.
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-03: Startup capital derives from recovered wallet balance
-[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-prior-crashed. New Balance: 9.5 SOL
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-03: Startup capital derives from recovered wallet balance
+[22m[39m[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-prior-crashed. New Balance: 9.5 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-prior-crashed fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-03: Startup capital derives from recovered wallet balance
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-prior-crashed at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-03: Startup capital derives from recovered wallet balance
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-prior-crashed at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-06: recoverInterruptedIntent recovers and appends missing audit record before deleting intent
-[Reconcile] [RECOVERY] Operation rec-intent-audit-recovery-1 was already applied in virtual wallet. Verifying audit log durability...
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-06: recoverInterruptedIntent recovers and appends missing audit record before deleting intent
+[22m[39m[Reconcile] [RECOVERY] Operation rec-intent-audit-recovery-1 was already applied in virtual wallet. Verifying audit log durability...
 [Reconcile] [RECOVERY] Appending missing audit log entry for recovered intent rec-intent-audit-recovery-1
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-06: recoverInterruptedIntent recovers and appends missing audit record before deleting intent
-[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (rec-intent-audit-recovery-1, Operation: SIMULATED_SALE, Position: pos-missing-1). Checking wallet state...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-06: recoverInterruptedIntent recovers and appends missing audit record before deleting intent
+[22m[39m[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (rec-intent-audit-recovery-1, Operation: SIMULATED_SALE, Position: pos-missing-1). Checking wallet state...
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > E8-07: ProcessLock ownership verified via acquisition nonce and refuses to delete foreign/corrupt lock
-[ProcessLock] Warning: Refusing to release lock at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-9xuuAG\test-nonce.lock: lock belongs to a different process/handle (Expected PID 3712 nonce 9abfa13b-1646-45f6-be52-1a38b08a5160, found PID 3712 nonce foreign-nonce-different-process).
-[ProcessLock] [FATAL] Corrupted or unreadable lock file detected during release at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-9xuuAG\test-nonce.lock: SyntaxError: Unexpected token 'i', "invalid { "... is not valid JSON. Refusing to unlink unknown lock.
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mE8-07: ProcessLock ownership verified via acquisition nonce and refuses to delete foreign/corrupt lock
+[22m[39m[ProcessLock] Warning: Refusing to release lock at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-sHhRGf\test-nonce.lock: lock belongs to a different process/handle (Expected PID 8320 nonce d3988916-dab8-4d5c-91f9-cc43874d73a9, found PID 8320 nonce foreign-nonce-different-process).
+[ProcessLock] [FATAL] Corrupted or unreadable lock file detected during release at U:\Projects\TopG\.tmp\isolated\process-lock-nonce-test-sHhRGf\test-nonce.lock: SyntaxError: Unexpected token 'i', "invalid { "... is not valid JSON. Refusing to unlink unknown lock.
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root
-[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\v10-journal-recovery-2C128i\.tmp\sessions\sess-v10-recovery.json
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root
+[22m[39m[SettlementJournal] [RECOVERY] Replayed individual session file: U:\Projects\TopG\.tmp\isolated\v10-journal-recovery-sBHb5c\.tmp\sessions\sess-v10-recovery.json
 [SettlementJournal] [RECOVERY] Replayed past-sessions.json index update for session sess-v10-recovery
 [SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-v10-recovery. New Balance: 10 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-v10-recovery fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-v10-recovery at stage STARTED. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV10-P0-2: Legacy settlement journal fails closed and recovery strictly targets canonical root
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-v10-recovery at stage STARTED. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V10-P1-5: WRITE_DOWN recovery verifies write-down state and is fully deterministic
-[Reconcile] [RECOVERY] Operation rec-intent-wd-applied was already applied in virtual wallet. Verifying audit log durability...
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV10-P1-5: WRITE_DOWN recovery verifies write-down state and is fully deterministic
+[22m[39m[Reconcile] [RECOVERY] Operation rec-intent-wd-applied was already applied in virtual wallet. Verifying audit log durability...
 [Reconcile] [RECOVERY] Appending missing audit log entry for recovered intent rec-intent-wd-applied
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V10-P1-5: WRITE_DOWN recovery verifies write-down state and is fully deterministic
-[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (rec-intent-wd-applied, Operation: WRITE_DOWN, Position: pos-wd-1). Checking wallet state...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV10-P1-5: WRITE_DOWN recovery verifies write-down state and is fully deterministic
+[22m[39m[Reconcile] [RECOVERY] Detected interrupted reconciliation intent (rec-intent-wd-applied, Operation: WRITE_DOWN, Position: pos-wd-1). Checking wallet state...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V11-02: Recovery regression: journal recovery succeeds after legacy retirement and does not recreate legacy wallet
-[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-v11-recovery. New Balance: 7.75 SOL
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV11-02: Recovery regression: journal recovery succeeds after legacy retirement and does not recreate legacy wallet
+[22m[39m[SettlementJournal] [RECOVERY] Replayed virtual wallet settlement for session sess-v11-recovery. New Balance: 7.75 SOL
 [SettlementJournal] [RECOVERY] Settlement journal for session sess-v11-recovery fully recovered and cleaned.
 
-stderr | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V11-02: Recovery regression: journal recovery succeeds after legacy retirement and does not recreate legacy wallet
-[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-v11-recovery at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
+[90mstderr[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV11-02: Recovery regression: journal recovery succeeds after legacy retirement and does not recreate legacy wallet
+[22m[39m[SettlementJournal] [RECOVERY] Detected uncommitted settlement journal for session sess-v11-recovery at stage PAST_SESSIONS_WRITTEN. Replaying remaining settlement operations...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
-[Retirement] Initiating controlled legacy wallet retirement...
-[Retirement] Notice: Legacy wallet retirement has already been completed and verified. Canonical ledger is active at U:\Projects\TopG\.tmp\isolated\v12-guard-Nod0vo\.tmp\virtual-wallet.json. Re-execution blocked to protect ledger integrity.
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
+[22m[39m[Retirement] Initiating controlled legacy wallet retirement...
+[Retirement] Notice: Legacy wallet retirement has already been completed and verified. Canonical ledger is active at U:\Projects\TopG\.tmp\isolated\v12-guard-iYt7Xq\.tmp\virtual-wallet.json. Re-execution blocked to protect ledger integrity.
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
-[Retirement] Initiating controlled legacy wallet retirement...
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
+[22m[39m[Retirement] Initiating controlled legacy wallet retirement...
 
-stdout | src/paper/PaperTradingDaemon.test.ts > PaperTradingDaemon > Phase 12.93B Post-Audit P0 Regression Test Suite > V12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
-[Retirement] Initiating controlled legacy wallet retirement...
-[Retirement] Acquired exclusive process lock (PID: 3712, Nonce: c674a634-6d78-4c9f-90a3-e09e1593b388).
+[90mstdout[2m | src/paper/PaperTradingDaemon.test.ts[2m > [22m[2mPaperTradingDaemon[2m > [22m[2mPhase 12.93B Post-Audit P0 Regression Test Suite[2m > [22m[2mV12-03: Hardened legacy-wallet retirement utility acquires wx lock with nonce, guards live workspace, and prevents foreign lock release
+[22m[39m[Retirement] Initiating controlled legacy wallet retirement...
+[Retirement] Acquired exclusive process lock (PID: 8320, Nonce: 77b7a7a7-1497-4f3c-bbb5-eea1dfc7e73f).
 [Retirement] Canonical Wallet SHA-256: 57dac5eda8e9c82cee508bcd877712a0a78abe86d2bbf0623d865ed920836908
 [Retirement] Legacy Wallet SHA-256:    57dac5eda8e9c82cee508bcd877712a0a78abe86d2bbf0623d865ed920836908
 [Retirement] Hashes and balances verified identical (7.9259 SOL, 7 sessions).
-[Retirement] Pre-retirement backups created in U:\Projects\TopG\.tmp\isolated\v12-retire-1sQ7rD\backups\pre-retirement
-[Retirement] Renamed legacy wallet to U:\Projects\TopG\.tmp\isolated\v12-retire-1sQ7rD\backend\.tmp\virtual-wallet.json.retired-fixture-20261013
+[Retirement] Pre-retirement backups created in U:\Projects\TopG\.tmp\isolated\v12-retire-rd6s4w\backups\pre-retirement
+[Retirement] Renamed legacy wallet to U:\Projects\TopG\.tmp\isolated\v12-retire-rd6s4w\backend\.tmp\virtual-wallet.json.retired-fixture-20261013
 [Retirement] Migration record written to canonical and backend .tmp/legacy-wallet-migration.json
 [Retirement] Released process lock cleanly.
 
- ✓ src/paper/PaperTradingDaemon.test.ts (77 tests) 722ms
-       ✓ V11-04: CWD-independent missing-wallet check fails closed when executed from backend/ subfolder without custom wallet path  316ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysis.test.ts (8 tests) 33ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisCli.test.ts (7 tests) 14ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisGates.test.ts (2 tests) 5ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisIntegrity.test.ts (7 tests) 26ms
- ✓ src/research-formulation-b-analysis/FormulationBAnalysisQuantile.test.ts (6 tests) 4ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionCli.test.ts (3 tests) 24ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionConfig.test.ts (7 tests) 4ms
- ✓ src/research-formulation-b-collection/FormulationBCollectionRunner.test.ts (3 tests) 28ms
- ✓ src/research-formulation-b-collection/FormulationBHttpProviderClient.test.ts (5 tests) 53ms
- ✓ src/research-formulation-b-collection/FormulationBMomentumCapture.test.ts (3 tests) 5ms
- ✓ src/research-formulation-b-collection/FormulationBOutcomeQueue.test.ts (4 tests) 4ms
- ✓ src/research-formulation-b-collection/FormulationBSafetyMonitor.test.ts (7 tests) 6ms
- ✓ src/research-formulation-b-collection/FormulationBTokenDiscovery.test.ts (2 tests) 4ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysis.test.ts (77 tests) 674ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisCli.test.ts (7 tests) 1292ms
-     ✓ emits only json stdout on successful synthetic analysis  661ms
-     ✓ emits only markdown stdout on successful synthetic analysis  565ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts (22 tests) 152ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts (26 tests) 262ms
- ✓ src/research-measurement-cohort-analysis/MeasurementCohortAnalysisIntegrity.test.ts (115 tests) 2926ms
- ✓ src/session/SessionControlIpcService.test.ts (2 tests) 6ms
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 2. Telemetry Storage Manager Durability, Quarantine & Boundary Repair > B-AUD-03: quarantines crash-damaged JSONL tail, restores clean boundary, and safely appends and rereads
-[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-zcU9Nz\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl:2 to U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-zcU9Nz\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl.corrupt-1792106157573
+ [32m✓[39m src/paper/PaperTradingDaemon.test.ts [2m([22m[2m77 tests[22m[2m)[22m[33m 911[2mms[22m[39m
+       [33m[2m✓[22m[39m V11-04: CWD-independent missing-wallet check fails closed when executed from backend/ subfolder without custom wallet path [33m 489[2mms[22m[39m
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m2. Telemetry Storage Manager Durability, Quarantine & Boundary Repair[2m > [22m[2mB-AUD-03: quarantines crash-damaged JSONL tail, restores clean boundary, and safely appends and rereads
+[22m[39m[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-jxbLBy\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl:2 to U:\Projects\TopG\.tmp\isolated\telemetry-crash-tail-jxbLBy\.tmp\telemetry\sessions\session-crash-tail-test\candidate-decisions.jsonl.corrupt-1792109150269
 
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 8. Phase 12.94-B Audit v2 Priority Verifications (B2-01 through B2-07) > B2-06: independent candidate evaluation counting, trigger rejection recording, and summary completeness
-[CandidateStreamEngine] onDecision error: Error: Simulated transient callback failure in telemetry sink
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m8. Phase 12.94-B Audit v2 Priority Verifications (B2-01 through B2-07)[2m > [22m[2mB2-06: independent candidate evaluation counting, trigger rejection recording, and summary completeness
+[22m[39m[CandidateStreamEngine] onDecision error: Error: Simulated transient callback failure in telemetry sink
     at CandidateStreamEngine.onDecision (U:/Projects/TopG/backend/src/telemetry/MarketTelemetry.test.ts:1246:19)
     at CandidateStreamEngine.evaluatePool (U:/Projects/TopG/backend/src/candidate-scanner/CandidateStreamEngine.ts:682:14)
     at U:/Projects/TopG/backend/src/telemetry/MarketTelemetry.test.ts:1305:14
-    at file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:302:11
-    at file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:26
-    at file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2326:20
+    at [90mfile:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+runner@4.1.11/node_modules/[4m@vitest/runner[24m/dist/chunk-artifact.js:302:11
+    at [90mfile:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+runner@4.1.11/node_modules/[4m@vitest/runner[24m/dist/chunk-artifact.js:1903:26
+    at [90mfile:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+runner@4.1.11/node_modules/[4m@vitest/runner[24m/dist/chunk-artifact.js:2326:20
     at new Promise (<anonymous>)
-    at runWithCancel (file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2323:10)
-    at file:///U:/Projects/TopG/node_modules/.pnpm/@vitest+runner@4.1.11/node_modules/@vitest/runner/dist/chunk-artifact.js:2305:20
+    at runWithCancel [90m(file:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+runner@4.1.11/node_modules/[4m@vitest/runner[24m/dist/chunk-artifact.js:2323:10[90m)[39m
+    at [90mfile:///U:/Projects/TopG/[39mnode_modules/[4m.pnpm[24m/@vitest+runner@4.1.11/node_modules/[4m@vitest/runner[24m/dist/chunk-artifact.js:2305:20
     at new Promise (<anonymous>)
 
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 9. Phase 12.94-B Audit v3 Focus Verifications (B3-01 through B3-04) > B3-03: follow-up observations reject cross-pool quotes, preserve true measurement window, and record nulls for unobserved fields
-[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for MintAlpha1111111111111111111111111111111111. Tracked=pool-alpha, Actual=different-pool-999
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m9. Phase 12.94-B Audit v3 Focus Verifications (B3-01 through B3-04)[2m > [22m[2mB3-03: follow-up observations reject cross-pool quotes, preserve true measurement window, and record nulls for unobserved fields
+[22m[39m[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for MintAlpha1111111111111111111111111111111111. Tracked=pool-alpha, Actual=different-pool-999
 
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 10. Phase 12.94-B Audit v4 Focus Verifications (B4-01 through B4-03) > B4-02: fail closed on missing or mismatched pool identity (fixtures for matching, mismatched, and missing provider pool IDs)
-[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for MintPoolTest1111111111111111111111111111111. Tracked=dexscreener-target-pool-1, Actual=different-untracked-pool-999
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m10. Phase 12.94-B Audit v4 Focus Verifications (B4-01 through B4-03)[2m > [22m[2mB4-02: fail closed on missing or mismatched pool identity (fixtures for matching, mismatched, and missing provider pool IDs)
+[22m[39m[TelemetryFollowUpScheduler] Discarding observation: pool mismatch for MintPoolTest1111111111111111111111111111111. Tracked=dexscreener-target-pool-1, Actual=different-untracked-pool-999
 
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 10. Phase 12.94-B Audit v4 Focus Verifications (B4-01 through B4-03) > B4-02: fail closed on missing or mismatched pool identity (fixtures for matching, mismatched, and missing provider pool IDs)
-[TelemetryFollowUpScheduler] Discarding observation: missing provider pool identity for MintPoolTest1111111111111111111111111111111 (expected dexscreener-target-pool-1).
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m10. Phase 12.94-B Audit v4 Focus Verifications (B4-01 through B4-03)[2m > [22m[2mB4-02: fail closed on missing or mismatched pool identity (fixtures for matching, mismatched, and missing provider pool IDs)
+[22m[39m[TelemetryFollowUpScheduler] Discarding observation: missing provider pool identity for MintPoolTest1111111111111111111111111111111 (expected dexscreener-target-pool-1).
 
-stderr | src/telemetry/MarketTelemetry.test.ts > Phase 12.94-B Market Telemetry Engine > 11. Phase 12.94-B Audit v5 Focus Verifications (B5-01 through B5-03) > B5-01: daemon buy-trigger telemetry recording enforces verified matching pool ID
-[PaperDaemon] Discarding telemetry observation: missing provider pool identity for MintDaemonMatch11111111111111111111111111 (expected pool-alpha).
+[90mstderr[2m | src/telemetry/MarketTelemetry.test.ts[2m > [22m[2mPhase 12.94-B Market Telemetry Engine[2m > [22m[2m11. Phase 12.94-B Audit v5 Focus Verifications (B5-01 through B5-03)[2m > [22m[2mB5-01: daemon buy-trigger telemetry recording enforces verified matching pool ID
+[22m[39m[PaperDaemon] Discarding telemetry observation: missing provider pool identity for MintDaemonMatch11111111111111111111111111 (expected pool-alpha).
 [PaperDaemon] Discarding telemetry observation: pool mismatch for MintDaemonMatch11111111111111111111111111. Tracked=pool-alpha, Actual=dexscreener-different-pool-999
 
- ✓ src/telemetry/MarketTelemetry.test.ts (33 tests) 547ms
- ✓ src/wallet/WalletTelemetryService.test.ts (3 tests) 4ms
+ [32m✓[39m src/telemetry/MarketTelemetry.test.ts [2m([22m[2m33 tests[22m[2m)[22m[33m 816[2mms[22m[39m
+ [32m✓[39m src/research-measurement-cohort-analysis/MeasurementCohortAnalysisGates.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 259[2mms[22m[39m
+ [32m✓[39m src/paper/GenerationsRegistry.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 81[2mms[22m[39m
+ [32m✓[39m src/research-measurement-cohort-analysis/MeasurementCohortAnalysisDependencies.test.ts [2m([22m[2m22 tests[22m[2m)[22m[32m 153[2mms[22m[39m
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1-AUD-05: Readiness Audit Validity on Synthetic Filesystem Fixture[2m > [22m[2mRF-D5.1: does not falsely claim feasibility on placeholder or unverified data in audit script
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-kZz3nh\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-kZz3nh\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-readiness-test-kZz3nh\AUDIT_REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
 
- Test Files  32 passed (32)
-      Tests  658 passed (658)
-   Start at  16:15:44
-   Duration  13.94s (transform 976ms, setup 0ms, import 1.90s, tests 7.11s, environment 3ms)
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility[2m > [22m[2mRF-D1C.10: two-session cross-token fixture: does not declare H3 feasible when features are on different tokens
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-v88JH1\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-test-v88JH1\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-test-v88JH1\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility[2m > [22m[2mRF-D1C.11: unfinalized session fixture: does not declare H2 feasible when session is unfinalized
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-XAFg4f\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h2-test-XAFg4f\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h2-test-XAFg4f\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_FINALIZED_SESSIONS)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility[2m > [22m[2mRF-D1C.12: cross-generation reserve attribution fixture: does not attribute reserves from another generation
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-kUOyi7\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-gen-test-kUOyi7\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-gen-test-kUOyi7\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C-03: Per-Decision Hypothesis Feasibility & Cohort Eligibility[2m > [22m[2mRF-D1C.13: valid candidate decision with all features matching declares hypotheses feasible
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-evGAnZ\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-valid-test-evGAnZ\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-valid-test-evGAnZ\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds[2m > [22m[2mRF-D1C3.1: D1C3-01: future-only developer-holding observation produces h3Feasible: false and eligibleH3DecisionsCount: 0 on candidate decision at time t
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-OCD7hv\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-future-OCD7hv\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-future-OCD7hv\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds[2m > [22m[2mRF-D1C3.2: D1C3-01: pre-decision developer-holding observation within freshness window qualifies candidate decision for H3
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-ixAZBI\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-ixAZBI\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-pre-ixAZBI\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mD1C3-01 & D1C3-02: Point-in-Time H3 Readiness & Fail-Closed Quote/Fill Bounds[2m > [22m[2mRF-D1C3.3: D1C3-01: stale pre-decision developer-holding observation exceeding freshness limit fails closed
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-0iBSHx\telemetry\sessions
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-0iBSHx\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-h3-stale-0iBSHx\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (SUBMARGINAL_DECISION_COUNT)
+
+[90mstdout[2m | src/research/QuantitativeResearch.test.ts[2m > [22m[2mPhase 12.94-D Milestone D.1: Quantitative Research Engine[2m > [22m[2mPhase 12.94-D Milestone D.2.1 Offline Foundations & Verification Fixtures[2m > [22m[2mD2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01)[2m > [22m[2mRF-D21.9: readiness scanner H3 matcher rejects adversarial fixture with recv < source
+[22m[39m[AuditResearchReadiness] Scanning disk locations...
+  Telemetry Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-DN9gjV
+  Legacy Sessions Dir: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-DN9gjV\sessions
+[AuditResearchReadiness] Report written to: U:\Projects\TopG\.tmp\isolated\audit-d21-h3-DN9gjV\REPORT.md
+  Readiness Status: INSUFFICIENT_EVIDENCE (NO_ELIGIBLE_FINALIZED_DECISIONS)
+
+ [32m✓[39m src/research/QuantitativeResearch.test.ts [2m([22m[2m66 tests[22m[2m)[22m[32m 56[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBHttpProviderClient.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 59[2mms[22m[39m
+[90mstderr[2m | src/execution/ExecutionRealism.test.ts[2m > [22m[2mPhase 12.94-C: Quote-Aware Execution Realism Test Suite (Refined)[2m > [22m[2mRF-7: Crash Repair-Before-Append & Strict Reconciliation (Findings C8 & C2-AUD-03)[2m > [22m[2mquarantines crash-damaged tail before appending and recovers clean boundary
+[22m[39m[TelemetryStorageManager] Quarantined damaged tail from U:\Projects\TopG\.tmp\isolated\rf7-crash-append-bI7O7X\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl:2 to U:\Projects\TopG\.tmp\isolated\rf7-crash-append-bI7O7X\.tmp\telemetry\sessions\session-rf7-crash\execution-quotes.jsonl.corrupt-1792109153072
+
+ [32m✓[39m src/execution/ExecutionRealism.test.ts [2m([22m[2m37 tests[22m[2m)[22m[32m 42[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-analysis/FormulationBAnalysis.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/BuyGateTriggerService.test.ts [2m([22m[2m46 tests[22m[2m)[22m[32m 31[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBCollectionRunner.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-analysis/FormulationBAnalysisIntegrity.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/CandidateStreamEngine.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBCollectionCli.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 24[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-analysis/FormulationBAnalysisCli.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+ [32m✓[39m src/exits/DynamicRatchetService.test.ts [2m([22m[2m36 tests[22m[2m)[22m[32m 11[2mms[22m[39m
+ [32m✓[39m src/session/SessionControlIpcService.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBSafetyMonitor.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/CandidateScannerEvaluator.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-analysis/FormulationBAnalysisGates.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/CandidateWatchlistService.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBMomentumCapture.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/CounterfactualOpportunityTracker.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBOutcomeQueue.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/wallet/WalletTelemetryService.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-analysis/FormulationBAnalysisQuantile.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBTokenDiscovery.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/research-formulation-b-collection/FormulationBCollectionConfig.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/candidate-scanner/CandidateScannerConfig.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m32 passed[39m[22m[90m (32)[39m
+[2m      Tests [22m [1m[32m669 passed[39m[22m[90m (669)[39m
+[2m   Start at [22m 17:05:42
+[2m   Duration [22m 14.28s[2m (transform 849ms, setup 0ms, import 1.77s, tests 7.56s, environment 3ms)[22m
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h2.config.ts
 
- RUN  v4.1.11 U:/Projects/TopG/backend
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mU:/Projects/TopG/backend[39m
 
- ✓ src/db/h2/H2Recovery.test.ts (15 tests) 16454ms
-     ✓ recovers SELL after worker exits registered  1383ms
-     ✓ recovers SELL after worker exits inside-commit  1660ms
-     ✓ recovers SELL after worker exits after-commit  1432ms
-     ✓ serializes duplicate SELL intent into one close and one replay  831ms
-     ✓ preserves both credits and realized P/L for independent concurrent SELLs  819ms
-     ✓ serializes duplicate BUY intents into one commit and one replay  874ms
-     ✓ serializes two BUYs competing for mint  852ms
-     ✓ serializes two BUYs competing for cash  820ms
-     ✓ prevents two distinct operations from closing one position  877ms
-     ✓ preserves aggregate deltas for a concurrent BUY and SELL  825ms
-     ✓ recovers BUY after worker exits registered  1451ms
-     ✓ recovers BUY after worker exits inside-commit  1491ms
-     ✓ recovers BUY after worker exits after-commit  1433ms
-     ✓ merges racing radar records for pair null  805ms
-     ✓ merges racing radar records for pair pair-a  901ms
- ✓ src/db/h2/H2Sell.test.ts (19 tests) 1135ms
- ✓ src/db/h2/H2Buy.test.ts (16 tests) 922ms
- ✓ src/db/h2/H2Schema.test.ts (24 tests) 1092ms
-     ✓ rejects invalid sessions.updated_at_ms  316ms
- ✓ src/db/h2/H2Reconciliation.test.ts (12 tests) 694ms
- ✓ src/db/h2/H2Transactions.test.ts (9 tests) 461ms
- ✓ src/paper/PaperRunner.test.ts (8 tests) 433ms
- ✓ src/exits/ExitManagerRunner.test.ts (9 tests) 505ms
- ✓ src/paper/PaperSellRunner.test.ts (8 tests) 847ms
-     ✓ creates a SELL order, SELL fill, closes the position, restores cash, stores P/L, and returns TokenRadar to WATCHING  421ms
- ✓ src/db/connection.test.ts (3 tests) 162ms
- ✓ src/db/repositories/repositories.test.ts (5 tests) 286ms
- ✓ src/db/h2/H2Operations.test.ts (5 tests) 287ms
- ✓ src/session/SessionManagerRunner.test.ts (5 tests) 288ms
- ✓ src/db/h2/H2Baseline.test.ts (5 tests) 219ms
- ✓ src/db/h2/H2Boundary.test.ts (2 tests) 136ms
- ✓ src/db/h2/H2Migrations.test.ts (15 tests) 134ms
- ✓ src/db/h2/H2AccountingCharacterization.test.ts (3 tests) 121ms
- ✓ src/paper/PaperOperationIdentity.test.ts (12 tests) 9ms
- ✓ src/paper/PaperExchangeConfig.test.ts (4 tests) 4ms
- ✓ src/paper/PaperSellConfig.test.ts (5 tests) 4ms
- ✓ src/session/SessionManagerConfig.test.ts (4 tests) 5ms
- ✓ src/exits/ExitManagerConfig.test.ts (6 tests) 5ms
+ [32m✓[39m src/db/h2/H2Recovery.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 13127[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers SELL after worker exits registered [33m 1393[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers SELL after worker exits inside-commit [33m 1185[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers SELL after worker exits after-commit [33m 1159[2mms[22m[39m
+     [33m[2m✓[22m[39m serializes duplicate SELL intent into one close and one replay [33m 645[2mms[22m[39m
+     [33m[2m✓[22m[39m preserves both credits and realized P/L for independent concurrent SELLs [33m 656[2mms[22m[39m
+     [33m[2m✓[22m[39m serializes duplicate BUY intents into one commit and one replay [33m 633[2mms[22m[39m
+     [33m[2m✓[22m[39m serializes two BUYs competing for mint [33m 636[2mms[22m[39m
+     [33m[2m✓[22m[39m serializes two BUYs competing for cash [33m 650[2mms[22m[39m
+     [33m[2m✓[22m[39m prevents two distinct operations from closing one position [33m 664[2mms[22m[39m
+     [33m[2m✓[22m[39m preserves aggregate deltas for a concurrent BUY and SELL [33m 678[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers BUY after worker exits registered [33m 1169[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers BUY after worker exits inside-commit [33m 1198[2mms[22m[39m
+     [33m[2m✓[22m[39m recovers BUY after worker exits after-commit [33m 1189[2mms[22m[39m
+     [33m[2m✓[22m[39m merges racing radar records for pair null [33m 644[2mms[22m[39m
+     [33m[2m✓[22m[39m merges racing radar records for pair pair-a [33m 627[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Sell.test.ts [2m([22m[2m19 tests[22m[2m)[22m[33m 1128[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Reconciliation.test.ts [2m([22m[2m12 tests[22m[2m)[22m[33m 942[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Buy.test.ts [2m([22m[2m16 tests[22m[2m)[22m[33m 915[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Schema.test.ts [2m([22m[2m24 tests[22m[2m)[22m[33m 846[2mms[22m[39m
+ [32m✓[39m src/exits/ExitManagerRunner.test.ts [2m([22m[2m9 tests[22m[2m)[22m[33m 512[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Transactions.test.ts [2m([22m[2m9 tests[22m[2m)[22m[33m 703[2mms[22m[39m
+ [32m✓[39m src/paper/PaperSellRunner.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 469[2mms[22m[39m
+ [32m✓[39m src/paper/PaperRunner.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 434[2mms[22m[39m
+ [32m✓[39m src/db/repositories/repositories.test.ts [2m([22m[2m5 tests[22m[2m)[22m[33m 413[2mms[22m[39m
+ [32m✓[39m src/session/SessionManagerRunner.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 277[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Operations.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 289[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Baseline.test.ts [2m([22m[2m5 tests[22m[2m)[22m[33m 507[2mms[22m[39m
+     [33m[2m✓[22m[39m H-01 rolls back a BUY when the cash write fails [33m 337[2mms[22m[39m
+ [32m✓[39m src/db/connection.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 165[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Boundary.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 135[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2Migrations.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 123[2mms[22m[39m
+ [32m✓[39m src/db/h2/H2AccountingCharacterization.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 125[2mms[22m[39m
+ [32m✓[39m src/paper/PaperOperationIdentity.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/exits/ExitManagerConfig.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/paper/PaperSellConfig.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/paper/PaperExchangeConfig.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/session/SessionManagerConfig.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 5[2mms[22m[39m
 
- Test Files  22 passed (22)
-      Tests  194 passed (194)
-   Start at  16:15:58
-   Duration  35.29s (transform 804ms, setup 311ms, import 7.37s, tests 24.20s, environment 2ms)
+[2m Test Files [22m [1m[32m22 passed[39m[22m[90m (22)[39m
+[2m      Tests [22m [1m[32m194 passed[39m[22m[90m (194)[39m
+[2m   Start at [22m 17:05:57
+[2m   Duration [22m 31.99s[2m (transform 673ms, setup 314ms, import 7.16s, tests 21.14s, environment 2ms)[22m
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h3.config.ts
 
- RUN  v4.1.11 U:/Projects/TopG/backend
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mU:/Projects/TopG/backend[39m
 
- ✓ src/providers/h3/H3Boundary.test.ts (2 tests) 103ms
- ✓ src/providers/ProviderHealthService.test.ts (1 test) 64ms
- ✓ src/providers/h3/H3HttpControls.test.ts (18 tests) 33ms
- ✓ src/providers/raydium/RaydiumAdapter.test.ts (4 tests) 24ms
- ✓ src/providers/h3/H3TimeBudget.test.ts (5 tests) 26ms
- ✓ src/providers/h3/H3RegistryOwnership.test.ts (2 tests) 25ms
- ✓ src/providers/birdeye/BirdeyeAdapter.test.ts (2 tests) 20ms
- ✓ src/providers/helius/HeliusAdapter.test.ts (2 tests) 22ms
- ✓ src/providers/http/ProviderHttpClient.test.ts (3 tests) 21ms
- ✓ src/providers/quotes/QuoteProviderRouter.test.ts (6 tests) 8ms
- ✓ src/providers/h3/H3Adversarial.test.ts (17 tests) 11ms
- ✓ src/providers/das/DasMetadataAdapter.test.ts (1 test) 6ms
- ✓ src/providers/quotes/QuoteBudgetPlanner.test.ts (4 tests) 11ms
- ✓ src/providers/ProviderRegistry.test.ts (7 tests) 7ms
- ✓ src/providers/jupiter/JupiterDemandController.test.ts (5 tests) 8ms
- ✓ src/providers/h3/H3Controls.test.ts (14 tests) 8ms
- ✓ src/providers/config/providerConfig.test.ts (2 tests) 5ms
- ✓ src/providers/solana-rpc/SolanaRpcAdapter.test.ts (1 test) 4ms
- ✓ src/providers/http/providerRateLimiter.test.ts (1 test) 3ms
- ✓ src/providers/h3/H3Admission.test.ts (1 test) 3ms
+ [32m✓[39m src/providers/h3/H3Boundary.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 108[2mms[22m[39m
+ [32m✓[39m src/providers/ProviderHealthService.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 66[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3HttpControls.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3TimeBudget.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3RegistryOwnership.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m src/providers/raydium/RaydiumAdapter.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m src/providers/helius/HeliusAdapter.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m src/providers/http/ProviderHttpClient.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m src/providers/birdeye/BirdeyeAdapter.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 20[2mms[22m[39m
+ [32m✓[39m src/providers/quotes/QuoteBudgetPlanner.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3Adversarial.test.ts [2m([22m[2m17 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/providers/jupiter/JupiterDemandController.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3Controls.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m src/providers/quotes/QuoteProviderRouter.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/providers/ProviderRegistry.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/providers/das/DasMetadataAdapter.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/providers/config/providerConfig.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/providers/solana-rpc/SolanaRpcAdapter.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/providers/http/providerRateLimiter.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/providers/h3/H3Admission.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 3[2mms[22m[39m
 
- Test Files  20 passed (20)
-      Tests  98 passed (98)
-   Start at  16:16:34
-   Duration  5.36s (transform 650ms, setup 291ms, import 1.54s, tests 412ms, environment 2ms)
+[2m Test Files [22m [1m[32m20 passed[39m[22m[90m (20)[39m
+[2m      Tests [22m [1m[32m98 passed[39m[22m[90m (98)[39m
+[2m   Start at [22m 17:06:30
+[2m   Duration [22m 5.37s[2m (transform 652ms, setup 283ms, import 1.60s, tests 422ms, environment 2ms)[22m
 
 node.exe node_modules/vitest/vitest.mjs run --config backend/vitest.h4.config.ts
 
- RUN  v4.1.11 U:/Projects/TopG/backend
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mU:/Projects/TopG/backend[39m
 
- ✓ src/analytics/AnalyticsReportService.test.ts (3 tests) 404ms
- ✓ src/analytics/h4/H4Readers.test.ts (12 tests) 5ms
- ✓ src/analytics/h4/H4Boundary.test.ts (2 tests) 3ms
- ✓ src/analytics/h4/H4ReadFacade.test.ts (1 test) 2ms
+ [32m✓[39m src/analytics/AnalyticsReportService.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 200[2mms[22m[39m
+ [32m✓[39m src/analytics/h4/H4Readers.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/analytics/h4/H4Boundary.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/analytics/h4/H4ReadFacade.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 2[2mms[22m[39m
 
- Test Files  4 passed (4)
-      Tests  18 passed (18)
-   Start at  16:16:40
-   Duration  1.85s (transform 328ms, setup 83ms, import 730ms, tests 416ms, environment 0ms)
+[2m Test Files [22m [1m[32m4 passed[39m[22m[90m (4)[39m
+[2m      Tests [22m [1m[32m18 passed[39m[22m[90m (18)[39m
+[2m   Start at [22m 17:06:35
+[2m   Duration [22m 1.64s[2m (transform 328ms, setup 85ms, import 722ms, tests 211ms, environment 0ms)[22m
 
