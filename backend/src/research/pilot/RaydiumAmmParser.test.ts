@@ -20,6 +20,7 @@ import {
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
   createAuthoritativeSplVaultBuffer,
+  decodeBase58To32Bytes,
   FIXTURE_BASE_VAULT,
   FIXTURE_MEME_MINT,
   FIXTURE_POOL_ADDRESS,
@@ -126,6 +127,76 @@ describe("RaydiumAmmParser - D23P-01 / D23P-02", () => {
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.category).toBe("INVALID_DECIMALS");
+    });
+
+    it("D23F-01: independently decodes Raydium secondary layout using hardcoded literal byte indices", () => {
+      // Build a 752-byte buffer with hardcoded literal offsets without referencing RAYDIUM_V4_OFFSETS
+      const raw = Buffer.alloc(752);
+      // Status at 0
+      raw.writeBigUInt64LE(1n, 0);
+      // Base decimals at 32, quote decimals at 40
+      raw.writeBigUInt64LE(6n, 32);
+      raw.writeBigUInt64LE(9n, 40);
+      // baseNeedTakePnl at 192 (u64)
+      raw.writeBigUInt64LE(123456n, 192);
+      // quoteNeedTakePnl at 200 (u64)
+      raw.writeBigUInt64LE(654321n, 200);
+      // quoteTotalPnl at 208 (u64)
+      raw.writeBigUInt64LE(111222n, 208);
+      // baseTotalPnl at 216 (u64)
+      raw.writeBigUInt64LE(333444n, 216);
+      // baseVault at 336 (32 bytes)
+      raw.set(decodeBase58To32Bytes(FIXTURE_BASE_VAULT), 336);
+      // quoteVault at 368 (32 bytes)
+      raw.set(decodeBase58To32Bytes(FIXTURE_QUOTE_VAULT), 368);
+      // baseMint at 400 (32 bytes)
+      raw.set(decodeBase58To32Bytes(FIXTURE_MEME_MINT), 400);
+      // quoteMint at 432 (32 bytes)
+      raw.set(decodeBase58To32Bytes(FIXTURE_WSOL_MINT), 432);
+      // lpMint at 464 (32 bytes)
+      const lpMint58 = "So11111111111111111111111111111111111111113";
+      raw.set(decodeBase58To32Bytes(lpMint58), 464);
+      // openOrders at 496 (32 bytes)
+      const openOrders58 = "So11111111111111111111111111111111111111114";
+      raw.set(decodeBase58To32Bytes(openOrders58), 496);
+      // marketId at 528 (32 bytes)
+      const marketId58 = "So11111111111111111111111111111111111111115";
+      raw.set(decodeBase58To32Bytes(marketId58), 528);
+
+      const parsed = parseRaydiumAmmV4Account(raw, FIXTURE_POOL_ADDRESS, RAYDIUM_AMM_V4_PROGRAM_ID);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+
+      expect(parsed.state.baseNeedTakePnl).toBe(123456n);
+      expect(parsed.state.quoteNeedTakePnl).toBe(654321n);
+      expect(parsed.state.quoteTotalPnl).toBe(111222n);
+      expect(parsed.state.baseTotalPnl).toBe(333444n);
+      expect(parsed.state.lpMint).toBe(lpMint58);
+      expect(parsed.state.openOrders).toBe(openOrders58);
+      expect(parsed.state.marketId).toBe(marketId58);
+      expect(parsed.state.baseVault).toBe(FIXTURE_BASE_VAULT);
+      expect(parsed.state.quoteVault).toBe(FIXTURE_QUOTE_VAULT);
+    });
+
+    it("D23F-01: rejects missing or unauthorized owner program strictly", () => {
+      const buffer = createAuthoritativeRaydiumAmmV4Buffer();
+      // Empty string owner
+      const resEmpty = parseRaydiumAmmV4Account(buffer, FIXTURE_POOL_ADDRESS, "");
+      expect(resEmpty.ok).toBe(false);
+      if (!resEmpty.ok) {
+        expect(resEmpty.category).toBe("UNAUTHORIZED_OWNER_PROGRAM");
+      }
+
+      // Wrong program owner
+      const resWrong = parseRaydiumAmmV4Account(
+        buffer,
+        FIXTURE_POOL_ADDRESS,
+        "Wrong11111111111111111111111111111111111111",
+      );
+      expect(resWrong.ok).toBe(false);
+      if (!resWrong.ok) {
+        expect(resWrong.category).toBe("UNAUTHORIZED_OWNER_PROGRAM");
+      }
     });
   });
 

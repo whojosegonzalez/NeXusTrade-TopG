@@ -23,8 +23,21 @@ export const D23_STRATEGY_REVISION = "12.94-d2.3-pilot-v1";
 export const D23_OBSERVATIONAL_PROVIDER = "dexscreener_public_v1:OBSERVATIONAL";
 
 /**
+ * Synthetic fallback timestamp (0 epoch ms) used strictly for compatibility with
+ * canonical schemas requiring a numeric sourceTimestampMs when the provider
+ * does not attest an on-chain/block timestamp (D23F-04).
+ * Downstream eligibility rules detect this and prevent it from being construed
+ * as an attested market update.
+ */
+export const SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS = 0;
+
+function isFiniteNumber(val: unknown): val is number {
+  return typeof val === "number" && Number.isFinite(val);
+}
+
+/**
  * Translates a D.2.3 Screened Candidate into a canonical CandidateDecisionRecord.
- * Strictly maintains the 5-tuple composite key and observational provenance (D23P-03).
+ * Strictly maintains the 5-tuple composite key and observational provenance (D23P-03, D23F-04).
  */
 export function toCanonicalCandidateDecision(
   candidate: D23ScreenedCandidate,
@@ -32,13 +45,29 @@ export function toCanonicalCandidateDecision(
 ): CandidateDecisionRecord {
   const missingFields = [...candidate.missingFields];
 
-  // If source update timestamp was not attested by the provider, truthfully document it
-  const sourceTimestampMs =
-    candidate.sourceTimestampMs !== null ? candidate.sourceTimestampMs : candidate.decisionEpochMs;
+  // D23F-04: Truthful source timestamp handling. Never misstate unavailable source time as decisionEpochMs.
+  const hasAttestedSourceTime =
+    candidate.sourceTimestampMs !== null && isFiniteNumber(candidate.sourceTimestampMs);
+  const sourceTimestampMs = hasAttestedSourceTime
+    ? candidate.sourceTimestampMs
+    : SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS;
 
-  if (candidate.sourceTimestampMs === null && !missingFields.includes("sourceTimestampMs")) {
+  if (!hasAttestedSourceTime && !missingFields.includes("sourceTimestampMs")) {
     missingFields.push("sourceTimestampMs");
   }
+
+  const spotPriceSol = isFiniteNumber(observation?.reserveAccounting?.spotPriceSol)
+    ? observation.reserveAccounting.spotPriceSol
+    : null;
+  const volume5mUsd = isFiniteNumber(observation?.flowMetrics?.volume5mUsd)
+    ? observation.flowMetrics.volume5mUsd
+    : null;
+  const buys5m = isFiniteNumber(observation?.flowMetrics?.buys5m)
+    ? observation.flowMetrics.buys5m
+    : null;
+  const sells5m = isFiniteNumber(observation?.flowMetrics?.sells5m)
+    ? observation.flowMetrics.sells5m
+    : null;
 
   const metricsSnapshot: CandidateMetricsSnapshot = {
     tokenAgeSec: null,
@@ -47,17 +76,23 @@ export function toCanonicalCandidateDecision(
     lmcRatio: null,
     lpBurnPct: null,
     spotPriceUsd: null,
-    spotPriceSol: observation?.reserveAccounting?.spotPriceSol ?? null,
-    volume5mUsd: observation?.flowMetrics.volume5mUsd ?? null,
+    spotPriceSol,
+    volume5mUsd,
     txCount5m: null,
-    buys5m: observation?.flowMetrics.buys5m ?? null,
-    sells5m: observation?.flowMetrics.sells5m ?? null,
+    buys5m,
+    sells5m,
     metricProvenance: {
-      spotPriceSol:
-        observation?.reserveAccounting?.spotPriceSol !== null ? "OBSERVED" : "UNAVAILABLE",
-      volume5mUsd: observation?.flowMetrics.volume5mUsd !== null ? "OBSERVED" : "UNAVAILABLE",
-      buys5m: observation?.flowMetrics.buys5m !== null ? "OBSERVED" : "UNAVAILABLE",
-      sells5m: observation?.flowMetrics.sells5m !== null ? "OBSERVED" : "UNAVAILABLE",
+      tokenAgeSec: "UNAVAILABLE",
+      liquidityUsd: "UNAVAILABLE",
+      marketCapUsd: "UNAVAILABLE",
+      lmcRatio: "UNAVAILABLE",
+      lpBurnPct: "UNAVAILABLE",
+      spotPriceUsd: "UNAVAILABLE",
+      spotPriceSol: spotPriceSol !== null ? "OBSERVED" : "UNAVAILABLE",
+      volume5mUsd: volume5mUsd !== null ? "OBSERVED" : "UNAVAILABLE",
+      txCount5m: "UNAVAILABLE",
+      buys5m: buys5m !== null ? "OBSERVED" : "UNAVAILABLE",
+      sells5m: sells5m !== null ? "OBSERVED" : "UNAVAILABLE",
     },
   };
 
@@ -155,14 +190,20 @@ export function toCanonicalMarketObservation(
   const reserveAcct = observation.reserveAccounting;
   const missingFields = [...observation.missingFields];
 
-  const sourceTimestampMs =
-    observation.sourceReportedTimeMs !== null
-      ? observation.sourceReportedTimeMs
-      : observation.receiptEpochMs;
+  // D23F-04: Truthful source timestamp handling. Never fill missing source time with receipt time.
+  const hasAttestedSourceTime =
+    observation.sourceReportedTimeMs !== null && isFiniteNumber(observation.sourceReportedTimeMs);
+  const sourceTimestampMs = hasAttestedSourceTime
+    ? observation.sourceReportedTimeMs
+    : SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS;
 
-  if (observation.sourceReportedTimeMs === null && !missingFields.includes("sourceTimestampMs")) {
+  if (!hasAttestedSourceTime && !missingFields.includes("sourceTimestampMs")) {
     missingFields.push("sourceTimestampMs");
   }
+
+  const dataFreshnessMs = hasAttestedSourceTime
+    ? Math.max(0, observation.receiptEpochMs - sourceTimestampMs)
+    : Number.MAX_SAFE_INTEGER;
 
   return {
     observationId: observation.observationId,
@@ -174,7 +215,7 @@ export function toCanonicalMarketObservation(
     ingestionTimestampMs: observation.receiptEpochMs,
     requestInitiatedMs: observation.requestEpochMs,
     responseReceivedMs: observation.receiptEpochMs,
-    dataFreshnessMs: Math.max(0, observation.receiptEpochMs - sourceTimestampMs),
+    dataFreshnessMs,
     measurementWindow: {
       windowStartMs: Math.max(0, observation.receiptEpochMs - 300_000),
       windowEndMs: observation.receiptEpochMs,
@@ -185,20 +226,33 @@ export function toCanonicalMarketObservation(
     actualResponsePoolId: observation.actualResponsePoolId,
     priceMetrics: {
       spotPriceUsd: null,
-      spotPriceSol: reserveAcct?.spotPriceSol ?? null,
+      spotPriceSol:
+        reserveAcct && isFiniteNumber(reserveAcct.spotPriceSol) ? reserveAcct.spotPriceSol : null,
       priceSource: "POOL_RESERVE",
     },
     liquidityMetrics: {
-      baseReserve: reserveAcct ? reserveAcct.tokenReserveDecimal : null,
-      quoteReserve: reserveAcct ? reserveAcct.solReserveDecimal : null,
+      baseReserve:
+        reserveAcct && isFiniteNumber(reserveAcct.tokenReserveDecimal)
+          ? reserveAcct.tokenReserveDecimal
+          : null,
+      quoteReserve:
+        reserveAcct && isFiniteNumber(reserveAcct.solReserveDecimal)
+          ? reserveAcct.solReserveDecimal
+          : null,
       liquidityUsd: null,
     },
     flowMetrics: {
       txCount: null,
-      buys: observation.flowMetrics.buys5m,
-      sells: observation.flowMetrics.sells5m,
-      volumeUsd: observation.flowMetrics.volume5mUsd,
-      netBuyerVolumeUsd: observation.flowMetrics.netBuyerVolumeUsd,
+      buys: isFiniteNumber(observation.flowMetrics?.buys5m) ? observation.flowMetrics.buys5m : null,
+      sells: isFiniteNumber(observation.flowMetrics?.sells5m)
+        ? observation.flowMetrics.sells5m
+        : null,
+      volumeUsd: isFiniteNumber(observation.flowMetrics?.volume5mUsd)
+        ? observation.flowMetrics.volume5mUsd
+        : null,
+      netBuyerVolumeUsd: isFiniteNumber(observation.flowMetrics?.netBuyerVolumeUsd)
+        ? observation.flowMetrics.netBuyerVolumeUsd
+        : null,
     },
     missingFields,
     strategyRevision,

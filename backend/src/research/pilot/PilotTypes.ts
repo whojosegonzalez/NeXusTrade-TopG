@@ -48,6 +48,7 @@ export interface D23RaydiumAmmV4State {
   readonly quoteVault: string; // 32-byte pubkey in base58
   readonly baseMint: string; // 32-byte pubkey in base58
   readonly quoteMint: string; // 32-byte pubkey in base58
+  readonly lpMint?: string | undefined; // 32-byte pubkey in base58
   readonly openOrders?: string | undefined; // 32-byte pubkey in base58
   readonly marketId?: string | undefined; // 32-byte pubkey in base58
   readonly marketProgramId?: string | undefined; // 32-byte pubkey in base58
@@ -228,10 +229,12 @@ export interface PilotCollectorConfig {
   readonly generationId: string;
   readonly strategyRevision: string;
   readonly outputRootDir: string;
+  readonly allowedRootDir?: string | undefined;
   readonly targetCandidates?: number | undefined; // Default 100
   readonly targetPools?: number | undefined; // Default 20
   readonly maxDurationSec?: number | undefined; // Default 7200s (2h)
   readonly maxDiskBytes?: number | undefined; // Default 20 MB (20 * 1024 * 1024)
+  readonly maxEmergencyDiskBytes?: number | undefined; // Default 4096 bytes (emergency metadata allowance)
   readonly maxRssBytes?: number | undefined; // Default 256 MB (256 * 1024 * 1024)
   readonly maxConsecutiveErrors?: number | undefined; // Default 5
   readonly candidatePollIntervalMs?: number | undefined; // Default 60,000ms

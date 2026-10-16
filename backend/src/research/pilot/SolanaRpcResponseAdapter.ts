@@ -7,6 +7,8 @@
  */
 
 import {
+  RAYDIUM_AMM_V4_PROGRAM_ID,
+  SPL_TOKEN_PROGRAM_ID,
   parseRaydiumAmmV4Account,
   parseSplTokenVaultAccount,
   type RaydiumAmmParseResult,
@@ -67,7 +69,15 @@ export function parseSolanaRpcPoolAccountResponse(
     };
   }
 
-  const owner = typeof value.owner === "string" ? value.owner.trim() : "";
+  if (typeof value.owner !== "string" || value.owner.trim() !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+    return {
+      ok: false,
+      slot,
+      poolState: null,
+      error: `[UNAUTHORIZED_POOL_OWNER] Pool account owner '${value.owner}' does not match canonical Raydium AMM v4 program '${RAYDIUM_AMM_V4_PROGRAM_ID}'`,
+    };
+  }
+  const owner = value.owner.trim();
   const data = value.data;
 
   let buffer: Buffer | null = null;
@@ -171,8 +181,32 @@ export function parseSolanaRpcMultipleVaultsResponse(
     };
   }
 
-  const baseOwner = typeof baseAccountRaw.owner === "string" ? baseAccountRaw.owner.trim() : "";
-  const quoteOwner = typeof quoteAccountRaw.owner === "string" ? quoteAccountRaw.owner.trim() : "";
+  if (
+    typeof baseAccountRaw.owner !== "string" ||
+    baseAccountRaw.owner.trim() !== SPL_TOKEN_PROGRAM_ID
+  ) {
+    return {
+      ok: false,
+      slot,
+      balances: null,
+      error: `[UNAUTHORIZED_VAULT_OWNER] Base vault account owner '${baseAccountRaw.owner}' does not match canonical SPL Token program '${SPL_TOKEN_PROGRAM_ID}'`,
+    };
+  }
+
+  if (
+    typeof quoteAccountRaw.owner !== "string" ||
+    quoteAccountRaw.owner.trim() !== SPL_TOKEN_PROGRAM_ID
+  ) {
+    return {
+      ok: false,
+      slot,
+      balances: null,
+      error: `[UNAUTHORIZED_VAULT_OWNER] Quote vault account owner '${quoteAccountRaw.owner}' does not match canonical SPL Token program '${SPL_TOKEN_PROGRAM_ID}'`,
+    };
+  }
+
+  const baseOwner = baseAccountRaw.owner.trim();
+  const quoteOwner = quoteAccountRaw.owner.trim();
 
   const baseParse: SplVaultParseResult = parseSplTokenVaultAccount(
     baseBuffer,

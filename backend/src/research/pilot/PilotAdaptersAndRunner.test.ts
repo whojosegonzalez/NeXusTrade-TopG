@@ -27,10 +27,12 @@ import {
 import {
   D23_OBSERVATIONAL_PROVIDER,
   D23_STRATEGY_REVISION,
+  SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS,
   toCanonicalCandidateDecision,
   toCanonicalMarketObservation,
   toCanonicalShadowEvaluation,
 } from "./PilotSchemaBridge.js";
+import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
 import {
   generateSessionExportManifest,
   verifySessionExportManifest,
@@ -48,6 +50,71 @@ import {
 import type { D23ObservationRecord, D23ScreenedCandidate } from "./PilotTypes.js";
 
 describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
+  const mockCompositeId = {
+    decisionEventId: "evt-test-001",
+    sessionId: "session-pilot-test-01",
+    generationId: "gen1-pilot",
+    mintAddress: FIXTURE_MEME_MINT,
+    poolId: FIXTURE_POOL_ADDRESS,
+  };
+
+  const mockCandidate: D23ScreenedCandidate = {
+    compositeId: mockCompositeId,
+    symbol: "MEME",
+    decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+    decisionCohort: "WATCHLIST_RADAR",
+    selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+    decisionEpochMs: 1791940001250,
+    requestEpochMs: 1791940001000,
+    receiptEpochMs: 1791940001200,
+    sourceTimestampMs: null,
+    passedEligibility: true,
+    filterEvaluations: [
+      { filterName: "MIN_LIQUIDITY_USD", passed: true, observed: 25000, threshold: 5000 },
+    ],
+    rejectionReasons: [],
+    missingFields: ["sourceTimestampMs"],
+    providerIdentity: D23_OBSERVATIONAL_PROVIDER,
+  };
+
+  const mockObservation: D23ObservationRecord = {
+    observationId: "obs-test-001",
+    compositeId: mockCompositeId,
+    requestEpochMs: 1791940001000,
+    receiptEpochMs: 1791940001200,
+    sourceReportedTimeMs: null,
+    hostMonotonicElapsedMs: 200,
+    onChainSlot: 290001125,
+    slotDiscrepancy: false,
+    provenance: "D23_OBSERVATIONAL_SCREENING",
+    providerIdentity: "solana_rpc_public_v1",
+    actualResponsePoolId: FIXTURE_POOL_ADDRESS,
+    isMatchingPool: true,
+    reserveAccounting: {
+      mode: "VAULT_ONLY_PROXY",
+      tokenMint: FIXTURE_MEME_MINT,
+      solMint: FIXTURE_WSOL_MINT,
+      tokenReserveRaw: 75_000_000_000_000n,
+      solReserveRaw: 100_000_000_000n,
+      tokenDecimals: 6,
+      solDecimals: 9,
+      tokenReserveDecimal: 75_000_000,
+      solReserveDecimal: 100,
+      spotPriceSol: 100 / 75_000_000,
+      orientation: "TOKEN_BASE_SOL_QUOTE",
+      effectiveReservesAvailable: false,
+      executionFeasible: false,
+      unavailabilityReason: "VAULT_ONLY_RESERVES_INSUFFICIENT_FOR_FEASIBILITY",
+    },
+    flowMetrics: {
+      volume5mUsd: 1250,
+      buys5m: 15,
+      sells5m: 8,
+      netBuyerVolumeUsd: 350,
+    },
+    missingFields: ["sourceTimestampMs"],
+  };
+
   describe("DexScreener Response Adapter", () => {
     it("parses latest token profiles and filters for valid Solana base58 mints", () => {
       const mockProfiles = [
@@ -194,6 +261,74 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(check2.slotDiscrepancy).toBe(false);
       expect(check2.slotDelta).toBe(0);
     });
+
+    it("rejects RPC pool responses missing owner or with non-matching owner (D23F-01)", () => {
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+
+      // Missing owner property
+      const responseMissingOwner = {
+        jsonrpc: "2.0",
+        result: {
+          context: { slot: 290001122 },
+          value: {
+            data: [poolBuffer.toString("base64"), "base64"],
+            lamports: 5000000,
+          },
+        },
+        id: 1,
+      };
+      const res1 = parseSolanaRpcPoolAccountResponse(responseMissingOwner, FIXTURE_POOL_ADDRESS);
+      expect(res1.ok).toBe(false);
+      expect(res1.error).toContain("UNAUTHORIZED_POOL_OWNER");
+
+      // Non-matching owner program
+      const responseWrongOwner = {
+        jsonrpc: "2.0",
+        result: {
+          context: { slot: 290001122 },
+          value: {
+            data: [poolBuffer.toString("base64"), "base64"],
+            owner: SPL_TOKEN_PROGRAM_ID, // wrong program
+            lamports: 5000000,
+          },
+        },
+        id: 1,
+      };
+      const res2 = parseSolanaRpcPoolAccountResponse(responseWrongOwner, FIXTURE_POOL_ADDRESS);
+      expect(res2.ok).toBe(false);
+      expect(res2.error).toContain("UNAUTHORIZED_POOL_OWNER");
+    });
+
+    it("rejects RPC multiple vaults responses with non-matching owner (D23F-01)", () => {
+      const baseBuffer = createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT });
+      const quoteBuffer = createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT });
+
+      const mockRpcResponseWrongOwner = {
+        jsonrpc: "2.0",
+        result: {
+          context: { slot: 290001125 },
+          value: [
+            {
+              data: [baseBuffer.toString("base64"), "base64"],
+              owner: RAYDIUM_AMM_V4_PROGRAM_ID, // Raydium instead of SPL Token
+            },
+            {
+              data: [quoteBuffer.toString("base64"), "base64"],
+              owner: SPL_TOKEN_PROGRAM_ID,
+            },
+          ],
+        },
+        id: 2,
+      };
+
+      const result = parseSolanaRpcMultipleVaultsResponse(
+        mockRpcResponseWrongOwner,
+        [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+        [FIXTURE_MEME_MINT, FIXTURE_WSOL_MINT],
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("UNAUTHORIZED_VAULT_OWNER");
+    });
   });
 
   describe("Dual-Domain Clock & Causal Monotonicity (D23P-03)", () => {
@@ -227,71 +362,6 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
   });
 
   describe("Pilot Schema Bridge (D23P-03)", () => {
-    const mockCompositeId = {
-      decisionEventId: "evt-test-001",
-      sessionId: "session-pilot-test-01",
-      generationId: "gen1-pilot",
-      mintAddress: FIXTURE_MEME_MINT,
-      poolId: FIXTURE_POOL_ADDRESS,
-    };
-
-    const mockCandidate: D23ScreenedCandidate = {
-      compositeId: mockCompositeId,
-      symbol: "MEME",
-      decisionType: "CANDIDATE_DISCOVERY_PROFILE",
-      decisionCohort: "WATCHLIST_RADAR",
-      selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
-      decisionEpochMs: 1791940001250,
-      requestEpochMs: 1791940001000,
-      receiptEpochMs: 1791940001200,
-      sourceTimestampMs: null,
-      passedEligibility: true,
-      filterEvaluations: [
-        { filterName: "MIN_LIQUIDITY_USD", passed: true, observed: 25000, threshold: 5000 },
-      ],
-      rejectionReasons: [],
-      missingFields: ["sourceTimestampMs"],
-      providerIdentity: D23_OBSERVATIONAL_PROVIDER,
-    };
-
-    const mockObservation: D23ObservationRecord = {
-      observationId: "obs-test-001",
-      compositeId: mockCompositeId,
-      requestEpochMs: 1791940001000,
-      receiptEpochMs: 1791940001200,
-      sourceReportedTimeMs: null,
-      hostMonotonicElapsedMs: 200,
-      onChainSlot: 290001125,
-      slotDiscrepancy: false,
-      provenance: "D23_OBSERVATIONAL_SCREENING",
-      providerIdentity: "solana_rpc_public_v1",
-      actualResponsePoolId: FIXTURE_POOL_ADDRESS,
-      isMatchingPool: true,
-      reserveAccounting: {
-        mode: "VAULT_ONLY_PROXY",
-        tokenMint: FIXTURE_MEME_MINT,
-        solMint: FIXTURE_WSOL_MINT,
-        tokenReserveRaw: 75_000_000_000_000n,
-        solReserveRaw: 100_000_000_000n,
-        tokenDecimals: 6,
-        solDecimals: 9,
-        tokenReserveDecimal: 75_000_000,
-        solReserveDecimal: 100,
-        spotPriceSol: 100 / 75_000_000,
-        orientation: "TOKEN_BASE_SOL_QUOTE",
-        effectiveReservesAvailable: false,
-        executionFeasible: false,
-        unavailabilityReason: "VAULT_ONLY_RESERVES_INSUFFICIENT_FOR_FEASIBILITY",
-      },
-      flowMetrics: {
-        volume5mUsd: 1250,
-        buys5m: 15,
-        sells5m: 8,
-        netBuyerVolumeUsd: 350,
-      },
-      missingFields: ["sourceTimestampMs"],
-    };
-
     it("translates candidate to CandidateDecisionRecord with accepted 5-tuple", () => {
       const canonical = toCanonicalCandidateDecision(mockCandidate, mockObservation);
       expect(canonical.eventId).toBe("evt-test-001");
@@ -329,6 +399,54 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(obs.flowMetrics.volumeUsd).toBe(1250);
       expect(obs.flowMetrics.buys).toBe(15);
       expect(obs.flowMetrics.sells).toBe(8);
+    });
+
+    it("truthfully handles unavailable sourceTimestampMs with sentinel 0 and missingFields (D23F-04)", () => {
+      const candidateWithoutTime: D23ScreenedCandidate = {
+        ...mockCandidate,
+        sourceTimestampMs: null,
+      };
+      const canonical = toCanonicalCandidateDecision(candidateWithoutTime, mockObservation);
+      expect(canonical.sourceTimestampMs).toBe(SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS);
+      expect(canonical.sourceTimestampMs).toBe(0);
+      expect(canonical.missingFields).toContain("sourceTimestampMs");
+
+      const observationWithoutTime: D23ObservationRecord = {
+        ...mockObservation,
+        sourceReportedTimeMs: null,
+      };
+      const canonicalObs = toCanonicalMarketObservation(observationWithoutTime);
+      expect(canonicalObs.sourceTimestampMs).toBe(SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS);
+      expect(canonicalObs.sourceTimestampMs).toBe(0);
+      expect(canonicalObs.dataFreshnessMs).toBe(Number.MAX_SAFE_INTEGER);
+    });
+
+    it("marks all absent or non-finite metrics as UNAVAILABLE in metricProvenance (D23F-04)", () => {
+      const observationWithNan: D23ObservationRecord = {
+        ...mockObservation,
+        reserveAccounting: {
+          ...mockObservation.reserveAccounting!,
+          tokenReserveDecimal: NaN,
+          solReserveDecimal: undefined as unknown as number,
+          spotPriceSol: NaN,
+        },
+        flowMetrics: {
+          volume5mUsd: NaN,
+          buys5m: 0,
+          sells5m: 0,
+          netBuyerVolumeUsd: 0,
+        },
+      };
+
+      const canonical = toCanonicalCandidateDecision(mockCandidate, observationWithNan);
+      expect(canonical.metricsSnapshot.metricProvenance?.spotPriceSol).toBe("UNAVAILABLE");
+      expect(canonical.metricsSnapshot.metricProvenance?.volume5mUsd).toBe("UNAVAILABLE");
+      expect(canonical.metricsSnapshot.metricProvenance?.tokenAgeSec).toBe("UNAVAILABLE");
+      expect(canonical.metricsSnapshot.metricProvenance?.liquidityUsd).toBe("UNAVAILABLE");
+
+      const canonicalObs = toCanonicalMarketObservation(observationWithNan);
+      expect(canonicalObs.priceMetrics.spotPriceSol).toBeNull();
+      expect(canonicalObs.flowMetrics.volumeUsd).toBeNull();
     });
   });
 
@@ -477,6 +595,309 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
         const meta = JSON.parse(metaContent);
         expect(meta.status).toBe("INTERRUPTED");
         expect(meta.interruptionReason).toBe("RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION");
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects relative path traversal and invalid characters in sessionId (D23F-02)", () => {
+      expect(() => {
+        new PilotCollectorRunner({
+          sessionId: "../traversal-attempt",
+          generationId: "gen1",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: os.tmpdir(),
+        });
+      }).toThrow(/SESSION_ID_CONTAINS_PATH_SEPARATORS_OR_TRAVERSAL/);
+
+      expect(() => {
+        new PilotCollectorRunner({
+          sessionId: "invalid/slash",
+          generationId: "gen1",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: os.tmpdir(),
+        });
+      }).toThrow(/SESSION_ID_CONTAINS_PATH_SEPARATORS_OR_TRAVERSAL/);
+
+      expect(() => {
+        new PilotCollectorRunner({
+          sessionId: "invalid*chars!",
+          generationId: "gen1",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: os.tmpdir(),
+        });
+      }).toThrow(/SESSION_ID_INVALID_CHARACTERS/);
+    });
+
+    it("enforces path confinement to allowed root directory (D23F-02)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-confinement-${Date.now()}`);
+      const allowedDir = path.join(testDir, "allowed");
+      const outsideDir = path.join(testDir, "outside");
+      await fs.mkdir(allowedDir, { recursive: true });
+      await fs.mkdir(outsideDir, { recursive: true });
+
+      try {
+        expect(() => {
+          new PilotCollectorRunner({
+            sessionId: "test-confined-01",
+            generationId: "gen1",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: outsideDir,
+            allowedRootDir: allowedDir,
+          });
+        }).toThrow(/PATH_CONFINEMENT_VIOLATION/);
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("enforces prospective file admission and bounds quota breach with emergency metadata (D23F-02)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-quota-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const runner = new PilotCollectorRunner({
+          sessionId: "test-quota-01",
+          generationId: "gen1-runner",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: testDir,
+          maxDiskBytes: 500, // Very small quota to trigger breach
+          maxEmergencyDiskBytes: 4096,
+        });
+
+        await runner.initialize();
+        expect(runner.getStatus()).toBe("ACTIVE");
+
+        const sampleCandidate: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "test-quota-01",
+            generationId: "gen1-runner",
+          },
+        };
+
+        // Recording a candidate will write ~1-2 KB to jsonl, which exceeds 500 bytes prospective quota
+        await expect(runner.recordScreenedCandidate(sampleCandidate)).rejects.toThrow(
+          /STORAGE_QUOTA_EXCEEDED/,
+        );
+
+        expect(runner.getStatus()).toBe("INTERRUPTED");
+        expect(runner.getInterruptionReason()).toContain("STORAGE_QUOTA_EXCEEDED");
+
+        // Verify emergency metadata was written and total session directory size is within bounds
+        const sessionPath = runner.getSessionDirectory();
+        const metaPath = path.join(sessionPath, "session-meta.json");
+        const metaStats = await fs.stat(metaPath);
+        expect(metaStats.size).toBeLessThanOrEqual(4096);
+
+        const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
+        expect(meta.sessionStatus).toBe("INTERRUPTED");
+        expect(meta.isInterruptedSession).toBe(true);
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects duplicate decisionEventId before writing to disk (D23F-03)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-dup-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const runner = new PilotCollectorRunner({
+          sessionId: "session-dup-test-01",
+          generationId: "gen1-pilot",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: testDir,
+          targetCandidates: 10,
+        });
+        await runner.initialize();
+
+        const candidateToRecord: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "session-dup-test-01",
+            generationId: "gen1-pilot",
+            decisionEventId: "evt-dup-01",
+          },
+        };
+
+        await runner.recordScreenedCandidate(candidateToRecord);
+
+        // Attempting to record same decisionEventId must be rejected
+        await expect(runner.recordScreenedCandidate(candidateToRecord)).rejects.toThrow(
+          /DUPLICATE_DECISION_ID/,
+        );
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects foreign session and generation attribution before writing to disk (D23F-03)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-foreign-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const runner = new PilotCollectorRunner({
+          sessionId: "session-local-01",
+          generationId: "gen1-local",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: testDir,
+        });
+        await runner.initialize();
+
+        // Foreign sessionId candidate
+        const foreignCandidate: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "session-foreign-99",
+            generationId: "gen1-local",
+          },
+        };
+        await expect(runner.recordScreenedCandidate(foreignCandidate)).rejects.toThrow(
+          /FOREIGN_SESSION_ATTRIBUTION/,
+        );
+
+        // Foreign generationId candidate
+        const foreignGenCandidate: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "session-local-01",
+            generationId: "gen2-foreign",
+          },
+        };
+        await expect(runner.recordScreenedCandidate(foreignGenCandidate)).rejects.toThrow(
+          /FOREIGN_GENERATION_ATTRIBUTION/,
+        );
+
+        // Valid local candidate
+        const localCandidate: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "session-local-01",
+            generationId: "gen1-local",
+          },
+        };
+
+        // Foreign sessionId observation
+        const foreignSessionObservation: D23ObservationRecord = {
+          ...mockObservation,
+          compositeId: {
+            ...mockObservation.compositeId,
+            sessionId: "session-foreign-99",
+            generationId: "gen1-local",
+          },
+        };
+        await expect(
+          runner.recordScreenedCandidate(localCandidate, foreignSessionObservation),
+        ).rejects.toThrow(/FOREIGN_SESSION_ATTRIBUTION/);
+
+        // Foreign generationId observation
+        const foreignGenObservation: D23ObservationRecord = {
+          ...mockObservation,
+          compositeId: {
+            ...mockObservation.compositeId,
+            sessionId: "session-local-01",
+            generationId: "gen2-foreign",
+          },
+        };
+        await expect(
+          runner.recordScreenedCandidate(localCandidate, foreignGenObservation),
+        ).rejects.toThrow(/FOREIGN_GENERATION_ATTRIBUTION/);
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed and marks INTERRUPTED when on-disk metric is modified before finalization (D23F-03)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-tamper-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const runner = new PilotCollectorRunner({
+          sessionId: "session-tamper-01",
+          generationId: "gen1-pilot",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: testDir,
+          targetCandidates: 10,
+        });
+        await runner.initialize();
+
+        const candidateToRecord: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: {
+            ...mockCandidate.compositeId,
+            sessionId: "session-tamper-01",
+            generationId: "gen1-pilot",
+            decisionEventId: "evt-tamper-01",
+          },
+        };
+
+        await runner.recordScreenedCandidate(candidateToRecord);
+
+        // Tamper with the persisted decision record on disk before finalization
+        const decisionsPath = path.join(runner.getSessionDirectory(), "candidate-decisions.jsonl");
+        const originalContent = await fs.readFile(decisionsPath, "utf8");
+        const tamperedContent = originalContent.replace('"WATCHLIST_RADAR"', '"EXECUTE_BUY"');
+        await fs.writeFile(decisionsPath, tamperedContent, "utf8");
+
+        // Attempting to finalize must fail reconciliation and switch to INTERRUPTED
+        await expect(runner.finalize("FINALIZED")).rejects.toThrow(
+          /RECONCILIATION_IDENTITY_MISMATCH/,
+        );
+
+        expect(runner.getStatus()).toBe("INTERRUPTED");
+        expect(runner.getInterruptionReason()).toContain("RECONCILIATION_IDENTITY_MISMATCH");
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("downgrades an already FINALIZED session to INTERRUPTED when recovering a corrupted archive (D23F-03)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-downgrade-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const sessionPath = path.join(testDir, "test-session-corrupt-finalized");
+        await fs.mkdir(sessionPath, { recursive: true });
+
+        // Session was previously marked FINALIZED
+        await fs.writeFile(
+          path.join(sessionPath, "session-meta.json"),
+          JSON.stringify(
+            { sessionId: "test-session-corrupt-finalized", sessionStatus: "FINALIZED" },
+            null,
+            2,
+          ),
+        );
+        await fs.writeFile(
+          path.join(sessionPath, "session-summary.json"),
+          JSON.stringify(
+            { sessionId: "test-session-corrupt-finalized", isCompleteSession: true },
+            null,
+            2,
+          ),
+        );
+        // But jsonl archive has a torn line
+        await fs.writeFile(
+          path.join(sessionPath, "candidate-decisions.jsonl"),
+          '{"eventId":"valid-01"}\n{"corrupt_torn_chunk\n',
+        );
+
+        const recovery = await PilotCollectorRunner.recoverSession(sessionPath);
+        expect(recovery.recovered).toBe(true);
+        expect(recovery.status).toBe("INTERRUPTED");
+        expect(recovery.tornLinesIsolated).toBe(1);
+
+        const metaContent = await fs.readFile(path.join(sessionPath, "session-meta.json"), "utf8");
+        const meta = JSON.parse(metaContent);
+        expect(meta.sessionStatus).toBe("INTERRUPTED");
+        expect(meta.status).toBe("INTERRUPTED");
+        expect(meta.interruptionReason).toBe("CORRUPTED_FINALIZED_ARCHIVE_QUARANTINED");
       } finally {
         await fs.rm(testDir, { recursive: true, force: true });
       }

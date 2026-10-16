@@ -21,23 +21,24 @@ export const RAYDIUM_AMM_V4_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFS
 export const SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Correct Offsets per Raydium SDK liquidityStateV4Layout (D23P-01)
+// Correct Offsets per Raydium SDK liquidityStateV4Layout (D23P-01, D23F-01)
 export const RAYDIUM_V4_OFFSETS = {
   STATUS: 0,
   BASE_DECIMAL: 32, // u64 little-endian (offset 32..40)
   QUOTE_DECIMAL: 40, // u64 little-endian (offset 40..48)
+  BASE_NEED_TAKE_PNL: 192, // u64 little-endian (offset 192..200)
+  QUOTE_NEED_TAKE_PNL: 200, // u64 little-endian (offset 200..208)
+  QUOTE_TOTAL_PNL: 208, // u64 little-endian (offset 208..216)
+  BASE_TOTAL_PNL: 216, // u64 little-endian (offset 216..224)
   BASE_VAULT: 336, // 32-byte pubkey (offset 336..368)
   QUOTE_VAULT: 368, // 32-byte pubkey (offset 368..400)
   BASE_MINT: 400, // 32-byte pubkey (offset 400..432)
   QUOTE_MINT: 432, // 32-byte pubkey (offset 432..464)
-  OPEN_ORDERS: 464, // 32-byte pubkey (offset 464..496)
-  MARKET_ID: 496, // 32-byte pubkey (offset 496..528)
-  MARKET_PROGRAM_ID: 528, // 32-byte pubkey (offset 528..560)
-  TARGET_ORDERS: 560, // 32-byte pubkey (offset 560..592)
-  BASE_NEED_TAKE_PNL: 640, // u64 little-endian (offset 640..648)
-  QUOTE_NEED_TAKE_PNL: 648, // u64 little-endian (offset 648..656)
-  BASE_TOTAL_PNL: 656, // u64 little-endian (offset 656..664)
-  QUOTE_TOTAL_PNL: 664, // u64 little-endian (offset 664..672)
+  LP_MINT: 464, // 32-byte pubkey (offset 464..496)
+  OPEN_ORDERS: 496, // 32-byte pubkey (offset 496..528)
+  MARKET_ID: 528, // 32-byte pubkey (offset 528..560)
+  MARKET_PROGRAM_ID: 560, // 32-byte pubkey (offset 560..592)
+  TARGET_ORDERS: 592, // 32-byte pubkey (offset 592..624)
 } as const;
 
 export const SPL_VAULT_LAYOUT_LENGTH = 165;
@@ -108,11 +109,11 @@ export function parseRaydiumAmmV4Account(
     };
   }
 
-  if (ownerProgramId && ownerProgramId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+  if (ownerProgramId !== undefined && ownerProgramId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
     return {
       ok: false,
       category: "UNAUTHORIZED_OWNER_PROGRAM",
-      message: `Account owner ${ownerProgramId} does not match canonical Raydium AMM v4 program ${RAYDIUM_AMM_V4_PROGRAM_ID}`,
+      message: `Account owner ${ownerProgramId || "MISSING"} does not match canonical Raydium AMM v4 program ${RAYDIUM_AMM_V4_PROGRAM_ID}`,
     };
   }
 
@@ -147,6 +148,7 @@ export function parseRaydiumAmmV4Account(
       RAYDIUM_V4_OFFSETS.QUOTE_MINT,
       RAYDIUM_V4_OFFSETS.QUOTE_MINT + 32,
     );
+    const lpMintBytes = data.subarray(RAYDIUM_V4_OFFSETS.LP_MINT, RAYDIUM_V4_OFFSETS.LP_MINT + 32);
     const openOrdersBytes = data.subarray(
       RAYDIUM_V4_OFFSETS.OPEN_ORDERS,
       RAYDIUM_V4_OFFSETS.OPEN_ORDERS + 32,
@@ -155,13 +157,24 @@ export function parseRaydiumAmmV4Account(
       RAYDIUM_V4_OFFSETS.MARKET_ID,
       RAYDIUM_V4_OFFSETS.MARKET_ID + 32,
     );
+    const marketProgramIdBytes = data.subarray(
+      RAYDIUM_V4_OFFSETS.MARKET_PROGRAM_ID,
+      RAYDIUM_V4_OFFSETS.MARKET_PROGRAM_ID + 32,
+    );
+    const targetOrdersBytes = data.subarray(
+      RAYDIUM_V4_OFFSETS.TARGET_ORDERS,
+      RAYDIUM_V4_OFFSETS.TARGET_ORDERS + 32,
+    );
 
     const baseVault = encodeBase58(baseVaultBytes);
     const quoteVault = encodeBase58(quoteVaultBytes);
     const baseMint = encodeBase58(baseMintBytes);
     const quoteMint = encodeBase58(quoteMintBytes);
+    const lpMint = encodeBase58(lpMintBytes);
     const openOrders = encodeBase58(openOrdersBytes);
     const marketId = encodeBase58(marketIdBytes);
+    const marketProgramId = encodeBase58(marketProgramIdBytes);
+    const targetOrders = encodeBase58(targetOrdersBytes);
 
     if (
       !isCanonicalSolanaBase58(baseVault) ||
@@ -178,6 +191,8 @@ export function parseRaydiumAmmV4Account(
 
     const baseNeedTakePnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.BASE_NEED_TAKE_PNL, true);
     const quoteNeedTakePnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.QUOTE_NEED_TAKE_PNL, true);
+    const quoteTotalPnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.QUOTE_TOTAL_PNL, true);
+    const baseTotalPnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.BASE_TOTAL_PNL, true);
 
     let orientation: RaydiumPairOrientation = "NON_SOL_PAIR";
     if (quoteMint === WSOL_MINT) {
@@ -194,10 +209,15 @@ export function parseRaydiumAmmV4Account(
       quoteVault,
       baseMint,
       quoteMint,
+      lpMint,
       openOrders,
       marketId,
+      marketProgramId,
+      targetOrders,
       baseNeedTakePnl,
       quoteNeedTakePnl,
+      quoteTotalPnl,
+      baseTotalPnl,
       poolAddress,
       programId: RAYDIUM_AMM_V4_PROGRAM_ID,
       ...(accountSlot !== undefined ? { accountSlot } : {}),
@@ -235,11 +255,11 @@ export function parseSplTokenVaultAccount(
     };
   }
 
-  if (ownerProgramId && ownerProgramId !== SPL_TOKEN_PROGRAM_ID) {
+  if (ownerProgramId !== undefined && ownerProgramId !== SPL_TOKEN_PROGRAM_ID) {
     return {
       ok: false,
       category: "UNAUTHORIZED_VAULT_OWNER",
-      message: `Token vault owner ${ownerProgramId} does not match canonical SPL Token Program ${SPL_TOKEN_PROGRAM_ID}`,
+      message: `Token vault owner ${ownerProgramId || "MISSING"} does not match canonical SPL Token Program ${SPL_TOKEN_PROGRAM_ID}`,
     };
   }
 

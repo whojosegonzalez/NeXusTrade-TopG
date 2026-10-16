@@ -90,18 +90,26 @@ export function createAuthoritativeRaydiumAmmV4Buffer(options: RaydiumFixtureOpt
   buffer.writeBigUInt64LE(baseDec, RAYDIUM_V4_OFFSETS.BASE_DECIMAL);
   buffer.writeBigUInt64LE(quoteDec, RAYDIUM_V4_OFFSETS.QUOTE_DECIMAL);
 
+  buffer.writeBigUInt64LE(options.baseNeedTakePnl ?? 0n, RAYDIUM_V4_OFFSETS.BASE_NEED_TAKE_PNL);
+  buffer.writeBigUInt64LE(options.quoteNeedTakePnl ?? 0n, RAYDIUM_V4_OFFSETS.QUOTE_NEED_TAKE_PNL);
+  buffer.writeBigUInt64LE(0n, RAYDIUM_V4_OFFSETS.QUOTE_TOTAL_PNL);
+  buffer.writeBigUInt64LE(0n, RAYDIUM_V4_OFFSETS.BASE_TOTAL_PNL);
+
   const baseVaultBytes = decodeBase58To32Bytes(options.baseVaultBase58 ?? FIXTURE_BASE_VAULT);
   const quoteVaultBytes = decodeBase58To32Bytes(options.quoteVaultBase58 ?? FIXTURE_QUOTE_VAULT);
   const baseMintBytes = decodeBase58To32Bytes(options.baseMintBase58 ?? FIXTURE_MEME_MINT);
   const quoteMintBytes = decodeBase58To32Bytes(options.quoteMintBase58 ?? FIXTURE_WSOL_MINT);
+  const lpMintBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111113");
+  const openOrdersBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111114");
+  const marketIdBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111115");
 
   buffer.set(baseVaultBytes, RAYDIUM_V4_OFFSETS.BASE_VAULT);
   buffer.set(quoteVaultBytes, RAYDIUM_V4_OFFSETS.QUOTE_VAULT);
   buffer.set(baseMintBytes, RAYDIUM_V4_OFFSETS.BASE_MINT);
   buffer.set(quoteMintBytes, RAYDIUM_V4_OFFSETS.QUOTE_MINT);
-
-  buffer.writeBigUInt64LE(options.baseNeedTakePnl ?? 0n, RAYDIUM_V4_OFFSETS.BASE_NEED_TAKE_PNL);
-  buffer.writeBigUInt64LE(options.quoteNeedTakePnl ?? 0n, RAYDIUM_V4_OFFSETS.QUOTE_NEED_TAKE_PNL);
+  buffer.set(lpMintBytes, RAYDIUM_V4_OFFSETS.LP_MINT);
+  buffer.set(openOrdersBytes, RAYDIUM_V4_OFFSETS.OPEN_ORDERS);
+  buffer.set(marketIdBytes, RAYDIUM_V4_OFFSETS.MARKET_ID);
 
   return buffer;
 }
