@@ -16,9 +16,9 @@ import type {
 export function createShadowEvaluationRecord(params: {
   decision: CandidateDecisionRecord;
   qualificationResult: ShadowQualificationResult;
-  evaluationTimestampMs?: number;
-  hostMonotonicElapsedMs?: number;
-  observedReserveSnapshot?: ShadowReserveSnapshot;
+  evaluationTimestampMs?: number | undefined;
+  hostMonotonicElapsedMs?: number | undefined;
+  observedReserveSnapshot?: ShadowReserveSnapshot | undefined;
 }): ShadowEvaluationRecord {
   const evalTimestamp = params.evaluationTimestampMs ?? params.decision.decisionTimestampMs;
   const evaluationId = `shd-${params.decision.eventId}-${evalTimestamp}`;

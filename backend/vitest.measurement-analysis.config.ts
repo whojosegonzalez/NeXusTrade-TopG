@@ -19,6 +19,7 @@ export default defineConfig({
       "src/telemetry/*.test.ts",
       "src/execution/*.test.ts",
       "src/research/QuantitativeResearch.test.ts",
+      "src/research/shadow/*.test.ts",
       "src/wallet/*.test.ts",
       "src/session/SessionControlIpcService.test.ts",
     ],
