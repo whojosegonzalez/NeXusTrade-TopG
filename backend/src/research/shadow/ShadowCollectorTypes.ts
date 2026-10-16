@@ -172,7 +172,28 @@ export interface CrashRecoveryResult {
   readonly validObservationsCount: number;
   readonly validEvaluationsCount: number;
   readonly tornLinesQuarantinedCount: number;
+  readonly repairedFiles: readonly string[];
+  readonly quarantinedFiles: readonly string[];
   readonly diagnosticsFileWritten: boolean;
+}
+
+/**
+ * Path confinement verification options.
+ */
+export interface PathConfinementOptions {
+  readonly repoRootDir?: string | undefined;
+  readonly forbiddenPaths?: readonly string[] | undefined;
+  readonly allowedRoot?: string | undefined;
+}
+
+/**
+ * Session ID validation result.
+ */
+export interface SessionIdValidationResult {
+  readonly isValid: boolean;
+  readonly sanitizedSessionId?: string | undefined;
+  readonly error?: string | undefined;
+  readonly rejectionReason?: string | undefined;
 }
 
 /**

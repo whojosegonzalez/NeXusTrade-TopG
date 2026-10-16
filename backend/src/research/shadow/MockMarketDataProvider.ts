@@ -47,9 +47,32 @@ export class DeterministicVirtualClock implements IVirtualClock {
 }
 
 /**
+ * Branded symbol identifying approved offline mock providers for Milestone D.2.2 (D22-S02).
+ */
+export const MOCK_PROVIDER_BRAND = Symbol.for("NeXusTrade.OfflineMockMarketDataProvider.v1");
+
+/**
+ * Validates that an injected provider is an approved offline mock instance (D22-S02).
+ */
+export function isApprovedMockProvider(provider: unknown): provider is MockMarketDataProvider {
+  if (!provider || typeof provider !== "object") return false;
+  const p = provider as Record<string | symbol, unknown>;
+  return (
+    p instanceof MockMarketDataProvider ||
+    (p[MOCK_PROVIDER_BRAND] === true &&
+      p.isMockProvider === true &&
+      typeof p.providerId === "string" &&
+      p.providerId.startsWith("mock_") &&
+      p.capabilityStatus === "UNVERIFIED_DESIGN_EXPECTATION")
+  );
+}
+
+/**
  * Deterministic offline mock provider with programmable failure modes.
  */
 export class MockMarketDataProvider implements IMarketDataProvider {
+  public readonly [MOCK_PROVIDER_BRAND] = true as const;
+  public readonly isMockProvider = true as const;
   public readonly providerId: string;
   public readonly capabilityStatus: ProviderCapabilityStatus;
   private readonly clock: IVirtualClock;
@@ -67,7 +90,10 @@ export class MockMarketDataProvider implements IMarketDataProvider {
   private clockSkewMs: number = 0;
   private poolMismatchOverride?: string | undefined;
   private unverifiedVaultOverride?: boolean | undefined;
+  private verifiedPoolOverride?: boolean | undefined;
   private unknownDevAuthorityOverride?: boolean | undefined;
+  private vaultAOverride?: string | null | undefined;
+  private vaultBOverride?: string | null | undefined;
 
   // Telemetry metrics
   public totalReservesRequests: number = 0;
@@ -142,8 +168,17 @@ export class MockMarketDataProvider implements IMarketDataProvider {
     this.unverifiedVaultOverride = unverified;
   }
 
+  public setVerifiedPoolOverride(verified?: boolean): void {
+    this.verifiedPoolOverride = verified;
+  }
+
   public setUnknownDevAuthorityOverride(unknown?: boolean): void {
     this.unknownDevAuthorityOverride = unknown;
+  }
+
+  public setVaultOverride(vaultA?: string | null, vaultB?: string | null): void {
+    this.vaultAOverride = vaultA;
+    this.vaultBOverride = vaultB;
   }
 
   private checkFailureInjection(endpoint: "reserves" | "metrics" | "holdings"): void {
@@ -189,6 +224,20 @@ export class MockMarketDataProvider implements IMarketDataProvider {
 
     const sourceTimestampMs = base?.sourceTimestampMs ?? requestInitiatedMs - 20 + this.clockSkewMs;
 
+    const vaultA =
+      this.vaultAOverride !== undefined
+        ? (this.vaultAOverride ?? undefined)
+        : this.unverifiedVaultOverride
+          ? undefined
+          : (base?.vaultA ?? "VaultBase1111111111111111111111111111111111");
+
+    const vaultB =
+      this.vaultBOverride !== undefined
+        ? (this.vaultBOverride ?? undefined)
+        : this.unverifiedVaultOverride
+          ? undefined
+          : (base?.vaultB ?? "VaultQuote111111111111111111111111111111111");
+
     return {
       poolId: effectivePoolId,
       baseReserve: this.omittedFields.has("baseReserve") ? null : (base?.baseReserve ?? 1_000_000),
@@ -196,13 +245,14 @@ export class MockMarketDataProvider implements IMarketDataProvider {
       sourceTimestampMs,
       ingestionTimestampMs: requestInitiatedMs,
       responseReceivedMs,
-      isVerifiedPool: this.unverifiedVaultOverride ? false : (base?.isVerifiedPool ?? true),
-      vaultA: this.unverifiedVaultOverride
-        ? undefined
-        : (base?.vaultA ?? "VaultBase1111111111111111111111111111111111"),
-      vaultB: this.unverifiedVaultOverride
-        ? undefined
-        : (base?.vaultB ?? "VaultQuote111111111111111111111111111111111"),
+      isVerifiedPool:
+        this.verifiedPoolOverride !== undefined
+          ? this.verifiedPoolOverride
+          : this.unverifiedVaultOverride
+            ? false
+            : (base?.isVerifiedPool ?? true),
+      vaultA,
+      vaultB,
     };
   }
 

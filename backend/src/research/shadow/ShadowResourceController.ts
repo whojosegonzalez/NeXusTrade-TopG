@@ -7,7 +7,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import type { IVirtualClock, PathConfinementResult } from "./ShadowCollectorTypes.js";
+import type {
+  IVirtualClock,
+  PathConfinementOptions,
+  PathConfinementResult,
+  SessionIdValidationResult,
+} from "./ShadowCollectorTypes.js";
 
 /**
  * Token bucket rate limiter tied to virtual time.
@@ -72,20 +77,69 @@ export class DeterministicBackoffCalculator {
     const deterministicJitter = (attempt * 37) % 50; // Reproducible pseudo-jitter
     return Math.min(this.maxMs, exp + deterministicJitter);
   }
+
+  public getDelayMs(attempt: number): number {
+    const delay = this.computeBackoffMs(attempt);
+    return delay > 0 ? delay : this.baseMs;
+  }
 }
 
 /**
- * Verifies strict path confinement against forbidden canonical directories (D22-A01, D22-A05).
+ * Validates a session ID to prevent path traversal or special characters (D22-S01).
+ */
+export function validateSessionId(sessionId: string): SessionIdValidationResult {
+  if (typeof sessionId !== "string" || sessionId.trim().length === 0) {
+    const error = "SESSION_ID_EMPTY";
+    return { isValid: false, error, rejectionReason: error };
+  }
+  // Strictly disallow traversal sequences, separators, and forbidden filesystem chars
+  if (
+    sessionId.includes("..") ||
+    sessionId.includes("/") ||
+    sessionId.includes("\\") ||
+    sessionId.includes(":") ||
+    sessionId.includes("\0")
+  ) {
+    const error = "SESSION_ID_CONTAINS_PATH_SEPARATORS_OR_TRAVERSAL";
+    return { isValid: false, error, rejectionReason: error };
+  }
+  // Disallow excessively long IDs (> 100 chars)
+  if (sessionId.length > 100) {
+    const error = "SESSION_ID_EXCEEDS_MAX_LENGTH";
+    return { isValid: false, error, rejectionReason: error };
+  }
+  // Enforce strict alphanumeric, underscore, hyphen, dot format
+  if (!/^[a-zA-Z0-9_\-.]+$/.test(sessionId)) {
+    const error = "SESSION_ID_INVALID_CHARACTERS";
+    return { isValid: false, error, rejectionReason: error };
+  }
+  return { isValid: true, sanitizedSessionId: sessionId };
+}
+
+/**
+ * Verifies strict path confinement against forbidden canonical directories and allowed roots (D22-A01, D22-S01).
  */
 export function validatePathConfinement(
   targetPath: string,
-  options?: {
-    repoRootDir?: string;
-    forbiddenPaths?: string[];
-  },
+  options?: PathConfinementOptions,
 ): PathConfinementResult {
   const repoRoot = path.resolve(options?.repoRootDir ?? process.cwd());
   const normalizedTarget = path.resolve(targetPath);
+
+  // 1. If allowedRoot is provided, target must be inside allowedRoot
+  if (options?.allowedRoot) {
+    const normalizedAllowed = path.resolve(options.allowedRoot);
+    if (
+      normalizedTarget !== normalizedAllowed &&
+      !normalizedTarget.startsWith(normalizedAllowed + path.sep)
+    ) {
+      return {
+        isConfinementValid: false,
+        resolvedPath: normalizedTarget,
+        rejectionReason: `PATH_CONFINEMENT_VIOLATION: Target path '${normalizedTarget}' escapes allowed root '${normalizedAllowed}'.`,
+      };
+    }
+  }
 
   // Default forbidden paths that mock collector MUST NEVER write to:
   const forbidden = (
@@ -99,7 +153,7 @@ export function validatePathConfinement(
     ]
   ).map((p) => path.resolve(p));
 
-  // 1. Check for directory traversal tricks (e.g. resolving into forbidden root)
+  // 2. Direct check of normalized target against forbidden paths
   for (const f of forbidden) {
     if (normalizedTarget === f || normalizedTarget.startsWith(f + path.sep)) {
       return {
@@ -110,21 +164,68 @@ export function validatePathConfinement(
     }
   }
 
-  // 2. Check if the target is a symlink or contains a symlink in its ancestry pointing to forbidden paths
-  if (fs.existsSync(normalizedTarget)) {
+  // 3. Symlink / Reparse inspection:
+  // Walk upwards from normalizedTarget to find the closest existing ancestor directory
+  let closestExisting = normalizedTarget;
+  const missingSegments: string[] = [];
+  while (!fs.existsSync(closestExisting)) {
+    const parent = path.dirname(closestExisting);
+    if (parent === closestExisting) break; // reached filesystem root
+    missingSegments.unshift(path.basename(closestExisting));
+    closestExisting = parent;
+  }
+
+  if (fs.existsSync(closestExisting)) {
     try {
-      const real = fs.realpathSync(normalizedTarget);
+      const realAncestor = fs.realpathSync(closestExisting);
+      const effectiveTarget =
+        missingSegments.length > 0 ? path.resolve(realAncestor, ...missingSegments) : realAncestor;
+
+      // Check realAncestor and effectiveTarget against forbidden paths
       for (const f of forbidden) {
-        if (real === f || real.startsWith(f + path.sep)) {
+        if (
+          realAncestor === f ||
+          realAncestor.startsWith(f + path.sep) ||
+          effectiveTarget === f ||
+          effectiveTarget.startsWith(f + path.sep)
+        ) {
           return {
             isConfinementValid: false,
-            resolvedPath: real,
-            rejectionReason: `SYMLINK_CONFINEMENT_VIOLATION: Real path '${real}' resolves inside forbidden path '${f}'.`,
+            resolvedPath: effectiveTarget,
+            rejectionReason: `SYMLINK_CONFINEMENT_VIOLATION: Real path '${effectiveTarget}' resolves inside forbidden path '${f}'.`,
           };
         }
       }
-    } catch {
-      // Ignored if cannot resolve realpath
+
+      // If allowedRoot was specified, verify both realAncestor and effectiveTarget remain inside real allowedRoot
+      if (options?.allowedRoot) {
+        const normalizedAllowed = path.resolve(options.allowedRoot);
+        const realAllowed = fs.existsSync(normalizedAllowed)
+          ? fs.realpathSync(normalizedAllowed)
+          : normalizedAllowed;
+
+        if (
+          effectiveTarget !== realAllowed &&
+          !effectiveTarget.startsWith(realAllowed + path.sep)
+        ) {
+          return {
+            isConfinementValid: false,
+            resolvedPath: effectiveTarget,
+            rejectionReason: `SYMLINK_CONFINEMENT_VIOLATION: Real target '${effectiveTarget}' escapes allowed root '${realAllowed}'.`,
+          };
+        }
+      }
+
+      return {
+        isConfinementValid: true,
+        resolvedPath: effectiveTarget,
+      };
+    } catch (err: unknown) {
+      return {
+        isConfinementValid: false,
+        resolvedPath: normalizedTarget,
+        rejectionReason: `PATH_RESOLUTION_ERROR: Unable to resolve real path for '${closestExisting}': ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -155,6 +256,18 @@ export class ShadowResourceController {
     this.maxSessionDiskBytes = options.maxSessionDiskBytes ?? 50 * 1024 * 1024; // 50 MB
     this.maxRssBytes = options.maxRssBytes ?? 256 * 1024 * 1024; // 256 MB
     this.killSwitchPath = path.resolve(options.killSwitchPath ?? ".tmp/SHADOW_KILL_SWITCH");
+  }
+
+  public getMaxDiskBytes(): number {
+    return this.maxSessionDiskBytes;
+  }
+
+  public checkWriteAdmission(bytesToWrite: number): void {
+    if (this.currentDiskBytesWritten + bytesToWrite > this.maxSessionDiskBytes) {
+      throw new Error(
+        `[ShadowResourceController] [STORAGE_QUOTA_EXCEEDED] Projected write of ${bytesToWrite} bytes exceeds storage quota limit (current: ${this.currentDiskBytesWritten}, max: ${this.maxSessionDiskBytes}).`,
+      );
+    }
   }
 
   public recordBytesWritten(bytes: number): void {

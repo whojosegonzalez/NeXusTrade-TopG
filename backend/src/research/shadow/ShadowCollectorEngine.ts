@@ -14,25 +14,32 @@ import type {
   SessionTelemetryMeta,
   SessionTelemetrySummary,
 } from "../../telemetry/TelemetryTypes.js";
+import type { UnavailabilityReason } from "../ResearchTypes.js";
 import type {
   ShadowEvaluationRecord,
   ShadowQualificationResult,
   ShadowReserveSnapshot,
 } from "../ShadowEvaluationTypes.js";
-import { createShadowEvaluationRecord } from "../ShadowEvaluationContract.js";
+import {
+  createShadowEvaluationRecord,
+  validateShadowEvaluationEligibility,
+} from "../ShadowEvaluationContract.js";
 import { validateClockMonotonicity } from "../ClockMonotonicityValidator.js";
 import type {
   CollectorLifecycleState,
   CrashRecoveryResult,
   IMarketDataProvider,
   IVirtualClock,
+  PointInTimeReserves,
   SessionDrainSummary,
   ShadowCollectorConfig,
 } from "./ShadowCollectorTypes.js";
-import { DeterministicVirtualClock } from "./MockMarketDataProvider.js";
+import { DeterministicVirtualClock, isApprovedMockProvider } from "./MockMarketDataProvider.js";
 import {
+  DeterministicBackoffCalculator,
   ShadowResourceController,
   validatePathConfinement,
+  validateSessionId,
   VirtualTokenBucket,
 } from "./ShadowResourceController.js";
 
@@ -43,6 +50,9 @@ export class ShadowCollectorEngine {
   private readonly clock: IVirtualClock;
   private readonly resourceController: ShadowResourceController;
   private readonly rateLimiter: VirtualTokenBucket;
+  private readonly backoffCalculator: DeterministicBackoffCalculator;
+
+  private inFlightOps: number = 0;
 
   private readonly sessionDir: string;
   private readonly metaPath: string;
@@ -60,32 +70,50 @@ export class ShadowCollectorEngine {
   private readonly evaluations: Map<string, ShadowEvaluationRecord> = new Map();
   private readonly observations: MarketObservationRecord[] = [];
 
-  // Ring buffer for pending unwritten records
-  private readonly pendingWrites: Array<{ file: string; data: string }> = [];
-
   constructor(options: {
     config: ShadowCollectorConfig;
     provider: IMarketDataProvider;
     clock?: IVirtualClock | undefined;
   }) {
-    if (!options.provider) {
+    // D22-S02: Explicit runtime mock-only provider boundary enforcement
+    if (!options.provider || !isApprovedMockProvider(options.provider)) {
       throw new Error(
-        "[ShadowCollectorEngine] [FAIL_CLOSED] An explicit IMarketDataProvider implementation is required.",
+        `[ShadowCollectorEngine] [PROHIBITED_LIVE_PROVIDER_ATTEMPT] [MOCK_PROVIDER_REQUIRED] Provider must be an approved offline MockMarketDataProvider (got '${(options.provider as unknown as Record<string, unknown>)?.providerId ?? typeof options.provider}'). Alternate or live provider adapters are strictly prohibited in Milestone D.2.2.`,
       );
     }
+
+    // D22-S01: Enforce strict session ID validation
+    const sessionValidation = validateSessionId(options.config.sessionId);
+    if (!sessionValidation.isValid) {
+      throw new Error(
+        `[ShadowCollectorEngine] [INVALID_SESSION_ID] Session ID '${options.config.sessionId}' is invalid: ${sessionValidation.error}`,
+      );
+    }
+
+    if (!options.config.outputRootDir || options.config.outputRootDir.trim().length === 0) {
+      throw new Error(
+        "[ShadowCollectorEngine] [INVALID_OUTPUT_ROOT] outputRootDir must be a non-empty path.",
+      );
+    }
+
     this.config = options.config;
     this.provider = options.provider;
     this.clock = options.clock ?? new DeterministicVirtualClock();
 
-    // 1. Enforce strict output path confinement (D22-A01, D22-A05)
-    const confinement = validatePathConfinement(this.config.outputRootDir);
+    // D22-S01: Safe resolution of the complete session path and symlink-aware verification before write
+    const resolvedOutputRoot = path.resolve(this.config.outputRootDir);
+    const targetSessionDir = path.resolve(resolvedOutputRoot, this.config.sessionId);
+
+    const confinement = validatePathConfinement(targetSessionDir, {
+      allowedRoot: resolvedOutputRoot,
+    });
     if (!confinement.isConfinementValid) {
       throw new Error(
-        `[ShadowCollectorEngine] [PATH_CONFINEMENT_FAILED] ${confinement.rejectionReason}`,
+        `[ShadowCollectorEngine] [PATH_CONFINEMENT_VIOLATION] Output path confinement rejected: ${confinement.rejectionReason}`,
       );
     }
 
-    this.sessionDir = path.join(path.resolve(this.config.outputRootDir), this.config.sessionId);
+    this.sessionDir = confinement.resolvedPath;
     this.metaPath = path.join(this.sessionDir, "session-meta.json");
     this.summaryPath = path.join(this.sessionDir, "session-summary.json");
     this.decisionsPath = path.join(this.sessionDir, "candidate-decisions.jsonl");
@@ -106,6 +134,10 @@ export class ShadowCollectorEngine {
       refillRatePerSecond: maxRps,
       clock: this.clock,
     });
+
+    this.backoffCalculator = new DeterministicBackoffCalculator({
+      baseMs: this.config.rateLimits?.retryBackoffBaseMs ?? 50,
+    });
   }
 
   public async start(): Promise<void> {
@@ -121,10 +153,9 @@ export class ShadowCollectorEngine {
       );
     }
 
-    fs.mkdirSync(this.sessionDir, { recursive: true });
     this.startedAtIso = new Date(this.clock.now()).toISOString();
 
-    // Write initial ACTIVE session-meta.json
+    // Prepare initial ACTIVE session-meta.json
     const initialMeta: SessionTelemetryMeta = {
       sessionId: this.config.sessionId,
       generationId: this.config.generationId,
@@ -139,30 +170,58 @@ export class ShadowCollectorEngine {
       isInterruptedSession: false,
     };
 
+    const metaContent = JSON.stringify(initialMeta, null, 2);
+    const metaBytes = Buffer.byteLength(metaContent, "utf8");
+
+    // D22-S05: Preflight admission check for metadata write
+    try {
+      this.resourceController.checkWriteAdmission(metaBytes);
+    } catch (err: unknown) {
+      this.state = "TERMINATED";
+      this.interruptionReason = "STORAGE_QUOTA_EXCEEDED";
+      throw err;
+    }
+
+    // Ensure session directory exists
+    fs.mkdirSync(this.sessionDir, { recursive: true });
+
     this.writeAtomicJson(this.metaPath, initialMeta);
     this.state = "COLLECTING";
   }
 
   /**
-   * Ingests an existing candidate decision from a deterministic fixture (D22-A02).
+   * Ingests an existing candidate decision from a deterministic fixture (D22-A02, D22-S04).
    */
   public ingestCandidateDecision(decision: CandidateDecisionRecord): void {
     this.assertState("COLLECTING");
     this.checkResourceLimits();
 
+    // D22-S04: Attribution validation
     if (decision.sessionId !== this.config.sessionId) {
       throw new Error(
-        `[ShadowCollectorEngine] Decision sessionId '${decision.sessionId}' does not match collector sessionId '${this.config.sessionId}'.`,
+        `[ShadowCollectorEngine] [FOREIGN_DECISION_ATTRIBUTION] Candidate decision sessionId '${decision.sessionId}' does not match collector sessionId '${this.config.sessionId}'.`,
+      );
+    }
+    if (decision.generationId !== this.config.generationId) {
+      throw new Error(
+        `[ShadowCollectorEngine] [FOREIGN_DECISION_ATTRIBUTION] Candidate decision generationId '${decision.generationId}' does not match collector generationId '${this.config.generationId}'.`,
+      );
+    }
+
+    // D22-S04: Reject duplicate eventId BEFORE appending to JSONL
+    if (this.decisions.has(decision.eventId)) {
+      throw new Error(
+        `[ShadowCollectorEngine] [DUPLICATE_DECISION_ID] Candidate decision '${decision.eventId}' is already ingested in this session.`,
       );
     }
 
     // Cohort preservation: Ensure candidate is recorded as given, never mutated to EXECUTED_BUY
-    this.decisions.set(decision.eventId, decision);
     this.appendJsonLine(this.decisionsPath, decision);
+    this.decisions.set(decision.eventId, decision);
   }
 
   /**
-   * Evaluates and records a shadow qualification sidecar record (D22-A02, D22-A03).
+   * Evaluates and records a shadow qualification sidecar record (D22-A02, D22-A03, D22-S03).
    * Supports 1:N evaluations per decision across different time horizons.
    */
   public async evaluateShadowCandidate(params: {
@@ -173,113 +232,214 @@ export class ShadowCollectorEngine {
     this.assertState("COLLECTING");
     this.checkResourceLimits();
 
-    const decision = this.decisions.get(params.decisionEventId);
-    if (!decision) {
-      throw new Error(
-        `[ShadowCollectorEngine] [ORPHAN_DECISION_QUARANTINED] Decision '${params.decisionEventId}' not found in active session.`,
-      );
-    }
+    this.inFlightOps++;
+    try {
+      const decision = this.decisions.get(params.decisionEventId);
+      if (!decision) {
+        throw new Error(
+          `[ShadowCollectorEngine] [ORPHAN_DECISION_QUARANTINED] [ORPHAN_DECISION_REJECTED] Decision '${params.decisionEventId}' not found in active session.`,
+        );
+      }
 
-    const evalTime = params.evaluationTimestampMs ?? this.clock.now();
+      const monotonicElapsed = this.clock.monotonicNow();
 
-    // Causal chronology check: Evaluation must be at or after decision time (D22-A03)
-    if (evalTime < decision.decisionTimestampMs) {
-      throw new Error(
-        `[ShadowCollectorEngine] [EVALUATION_PRECEDES_DECISION] Evaluation timestamp (${evalTime}) precedes decision timestamp (${decision.decisionTimestampMs}).`,
-      );
-    }
+      // Rate-limited provider poll
+      if (!this.rateLimiter.tryConsume(1)) {
+        throw new Error(
+          "[ShadowCollectorEngine] [RATE_LIMIT_EXCEEDED] Rate limit tokens exhausted.",
+        );
+      }
 
-    const monotonicElapsed = this.clock.monotonicNow();
+      // D22-S05: Fetch pool reserves with backoff retry on 429/503
+      let reserves: PointInTimeReserves;
+      let attempt = 0;
+      const maxRetries = this.config.rateLimits?.maxRetryAttempts ?? 2;
+      while (true) {
+        try {
+          reserves = await this.provider.getPoolReserves(decision.poolId);
+          break;
+        } catch (err: unknown) {
+          const e = err as { status?: number };
+          if ((e?.status === 429 || e?.status === 503) && attempt < maxRetries) {
+            attempt++;
+            const backoffMs = this.backoffCalculator.getDelayMs(attempt);
+            this.clock.advanceBy(backoffMs);
+            continue;
+          }
+          throw err;
+        }
+      }
 
-    // Rate-limited provider poll
-    if (!this.rateLimiter.tryConsume(1)) {
-      throw new Error("[ShadowCollectorEngine] [RATE_LIMIT_EXCEEDED] Rate limit tokens exhausted.");
-    }
+      const evalTime = params.evaluationTimestampMs ?? this.clock.now();
 
-    // Fetch pool reserves from mock provider
-    const reserves = await this.provider.getPoolReserves(decision.poolId);
+      // Causal chronology check: Evaluation must be at or after decision time (D22-A03)
+      if (evalTime < decision.decisionTimestampMs) {
+        throw new Error(
+          `[ShadowCollectorEngine] [EVALUATION_PRECEDES_DECISION] Evaluation timestamp (${evalTime}) precedes decision timestamp (${decision.decisionTimestampMs}).`,
+        );
+      }
 
-    // Validate clock causality on reserves snapshot
-    const clockValidation = validateClockMonotonicity({
-      sourceTimestampMs: reserves.sourceTimestampMs,
-      ingestionTimestampMs: reserves.ingestionTimestampMs,
-      responseReceivedMs: reserves.responseReceivedMs,
-      decisionTimestampMs: evalTime,
-    });
-
-    // Check if reserves are eligible for execution modeling
-    const reservesEligible =
-      clockValidation.isCausallyMonotonic &&
-      !clockValidation.isQuarantined &&
-      reserves.isVerifiedPool !== false &&
-      reserves.baseReserve !== null &&
-      reserves.baseReserve > 0 &&
-      reserves.quoteReserve !== null &&
-      reserves.quoteReserve > 0 &&
-      reserves.sourceTimestampMs <= evalTime;
-
-    let snapshot: ShadowReserveSnapshot | undefined;
-    if (reservesEligible && reserves.baseReserve !== null && reserves.quoteReserve !== null) {
-      snapshot = {
-        baseReserve: reserves.baseReserve,
-        quoteReserve: reserves.quoteReserve,
+      // Validate clock causality on reserves snapshot
+      const clockValidation = validateClockMonotonicity({
         sourceTimestampMs: reserves.sourceTimestampMs,
+        ingestionTimestampMs: reserves.ingestionTimestampMs,
+        responseReceivedMs: reserves.responseReceivedMs,
+        decisionTimestampMs: evalTime,
+      });
+
+      // D22-S03: Verified pool, vault, and causal reserve provenance
+      let unavailabilityReason: UnavailabilityReason | undefined;
+      let reservesEligible = false;
+
+      if (!clockValidation.isCausallyMonotonic || clockValidation.isQuarantined) {
+        unavailabilityReason =
+          clockValidation.unavailabilityReason ?? "IMPOSSIBLE_TIMESTAMP_ORDERING";
+      } else if (reserves.poolId !== decision.poolId) {
+        unavailabilityReason = "POOL_IDENTITY_MISMATCH_DISCARDED";
+      } else if (reserves.isVerifiedPool !== true) {
+        unavailabilityReason = "POOL_IDENTITY_MISMATCH_DISCARDED";
+      } else if (
+        !reserves.vaultA ||
+        !reserves.vaultB ||
+        typeof reserves.vaultA !== "string" ||
+        typeof reserves.vaultB !== "string" ||
+        reserves.vaultA.trim().length === 0 ||
+        reserves.vaultB.trim().length === 0
+      ) {
+        unavailabilityReason = "POOL_IDENTITY_MISMATCH_DISCARDED";
+      } else if (
+        reserves.baseReserve === null ||
+        reserves.quoteReserve === null ||
+        !Number.isFinite(reserves.baseReserve) ||
+        !Number.isFinite(reserves.quoteReserve) ||
+        reserves.baseReserve <= 0 ||
+        reserves.quoteReserve <= 0
+      ) {
+        unavailabilityReason = "RESERVE_QUANTITY_ZERO_OR_NONFINITE";
+      } else if (reserves.sourceTimestampMs > decision.decisionTimestampMs) {
+        // D22-S03: Post-decision reserve cannot qualify decision-time execution feasibility
+        unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+      } else if (reserves.sourceTimestampMs > evalTime) {
+        unavailabilityReason = "LATE_RECEIPT_LOOKAHEAD_PREVENTION";
+      } else {
+        reservesEligible = true;
+      }
+
+      let snapshot: ShadowReserveSnapshot | undefined;
+      if (reservesEligible && reserves.baseReserve !== null && reserves.quoteReserve !== null) {
+        snapshot = {
+          baseReserve: reserves.baseReserve,
+          quoteReserve: reserves.quoteReserve,
+          sourceTimestampMs: reserves.sourceTimestampMs,
+        };
+      }
+
+      const qualificationResult: ShadowQualificationResult = {
+        shadowTriggerQualified: decision.decisionCohort === "WATCHLIST_RADAR",
+        qualificationReason:
+          decision.decisionCohort === "WATCHLIST_RADAR"
+            ? "MET_SHADOW_WATCHLIST_CRITERIA"
+            : "DECISION_COHORT_NOT_WATCHLIST",
+        simulatedTargetSizeSol: params.targetSizeSol ?? 0.1,
+        executionFeasible: reservesEligible,
+        unavailabilityReason,
       };
+
+      // Construct unified record via factory (ensuring parity with validator)
+      const record = createShadowEvaluationRecord({
+        decision,
+        qualificationResult,
+        evaluationTimestampMs: evalTime,
+        hostMonotonicElapsedMs: monotonicElapsed,
+        ...(snapshot ? { observedReserveSnapshot: snapshot } : {}),
+      });
+
+      // D22-S03: Parity check against accepted D.2.1 eligibility contract
+      const eligibility = validateShadowEvaluationEligibility(record, decision);
+      if (record.qualificationResult.executionFeasible && !eligibility.executionFeasible) {
+        throw new Error(
+          `[ShadowCollectorEngine] [ELIGIBILITY_PARITY_ERROR] Record declared executionFeasible but failed D.2.1 eligibility check: ${eligibility.rejectionReasons.join("; ")}`,
+        );
+      }
+
+      // D22-S04: Enforce 1:N unique evaluation ID and avoid collision
+      if (this.evaluations.has(record.evaluationId)) {
+        throw new Error(
+          `[ShadowCollectorEngine] [DUPLICATE_EVALUATION_ID] Evaluation '${record.evaluationId}' already recorded.`,
+        );
+      }
+
+      // Check state again before writing (in case drain was triggered during async wait)
+      this.assertState("COLLECTING");
+
+      this.appendJsonLine(this.evaluationsPath, record);
+      this.evaluations.set(record.evaluationId, record);
+
+      return record;
+    } finally {
+      this.inFlightOps--;
     }
-
-    const qualificationResult: ShadowQualificationResult = {
-      shadowTriggerQualified: decision.decisionCohort === "WATCHLIST_RADAR",
-      qualificationReason:
-        decision.decisionCohort === "WATCHLIST_RADAR"
-          ? "MET_SHADOW_WATCHLIST_CRITERIA"
-          : "DECISION_COHORT_NOT_WATCHLIST",
-      simulatedTargetSizeSol: params.targetSizeSol ?? 0.1,
-      executionFeasible: reservesEligible,
-      unavailabilityReason: reservesEligible
-        ? undefined
-        : (clockValidation.unavailabilityReason ??
-          (reserves.baseReserve === null ||
-          reserves.quoteReserve === null ||
-          reserves.baseReserve <= 0 ||
-          reserves.quoteReserve <= 0
-            ? "RESERVE_QUANTITY_ZERO_OR_NONFINITE"
-            : !reserves.isVerifiedPool
-              ? "POOL_IDENTITY_MISMATCH_DISCARDED"
-              : "RESERVE_QUANTITY_ZERO_OR_NONFINITE")),
-    };
-
-    // Construct unified record via factory (ensuring parity with validator)
-    const record = createShadowEvaluationRecord({
-      decision,
-      qualificationResult,
-      evaluationTimestampMs: evalTime,
-      hostMonotonicElapsedMs: monotonicElapsed,
-      ...(snapshot ? { observedReserveSnapshot: snapshot } : {}),
-    });
-
-    // Enforce 1:N unique evaluation ID and avoid collision
-    if (this.evaluations.has(record.evaluationId)) {
-      throw new Error(
-        `[ShadowCollectorEngine] [DUPLICATE_EVALUATION_ID] Evaluation '${record.evaluationId}' already recorded.`,
-      );
-    }
-
-    this.evaluations.set(record.evaluationId, record);
-    this.appendJsonLine(this.evaluationsPath, record);
-
-    return record;
   }
 
   /**
-   * Records a forward, post-decision market observation (D22-A03).
+   * Records a forward, post-decision market observation (D22-A03, D22-S04).
    * Retained as outcome/diagnostic without contaminating decision-time features.
    */
   public recordForwardObservation(observation: MarketObservationRecord): void {
     this.assertState("COLLECTING");
     this.checkResourceLimits();
 
-    this.observations.push(observation);
+    // D22-S04: Attribution validation
+    if (observation.sessionId !== this.config.sessionId) {
+      throw new Error(
+        `[ShadowCollectorEngine] [FOREIGN_OBSERVATION_ATTRIBUTION] Observation sessionId '${observation.sessionId}' does not match collector sessionId '${this.config.sessionId}'.`,
+      );
+    }
+    if (observation.generationId !== this.config.generationId) {
+      throw new Error(
+        `[ShadowCollectorEngine] [FOREIGN_OBSERVATION_ATTRIBUTION] Observation generationId '${observation.generationId}' does not match collector generationId '${this.config.generationId}'.`,
+      );
+    }
+
+    // D22-S04: Must match an ingested decision for pool and mint
+    const matchingDecision = Array.from(this.decisions.values()).find(
+      (d) => d.poolId === observation.poolId && d.mintAddress === observation.mintAddress,
+    );
+    if (!matchingDecision) {
+      throw new Error(
+        `[ShadowCollectorEngine] [FOREIGN_OBSERVATION_ATTRIBUTION] [ORPHAN_OBSERVATION_REJECTED] Forward observation '${observation.observationId}' (pool: '${observation.poolId}', mint: '${observation.mintAddress}') has no matching candidate decision in session.`,
+      );
+    }
+
+    // D22-S04: Temporal causality check
+    if (observation.sourceTimestampMs < matchingDecision.decisionTimestampMs) {
+      throw new Error(
+        `[ShadowCollectorEngine] [OBSERVATION_PRECEDES_DECISION] [PRE_DECISION_FORWARD_OBSERVATION] Forward observation source time (${observation.sourceTimestampMs}) precedes matching decision time (${matchingDecision.decisionTimestampMs}).`,
+      );
+    }
+    if (observation.ingestionTimestampMs < observation.sourceTimestampMs) {
+      throw new Error(
+        `[ShadowCollectorEngine] [IMPOSSIBLE_TIMESTAMP_ORDERING] Observation ingestion time (${observation.ingestionTimestampMs}) precedes source time (${observation.sourceTimestampMs}).`,
+      );
+    }
+    if (
+      observation.responseReceivedMs !== undefined &&
+      observation.responseReceivedMs < observation.ingestionTimestampMs
+    ) {
+      throw new Error(
+        `[ShadowCollectorEngine] [IMPOSSIBLE_TIMESTAMP_ORDERING] Observation response receipt time (${observation.responseReceivedMs}) precedes ingestion time (${observation.ingestionTimestampMs}).`,
+      );
+    }
+
+    // D22-S04: Duplicate observation ID check
+    if (this.observations.some((o) => o.observationId === observation.observationId)) {
+      throw new Error(
+        `[ShadowCollectorEngine] [DUPLICATE_OBSERVATION_ID] Observation '${observation.observationId}' already recorded.`,
+      );
+    }
+
     this.appendJsonLine(this.observationsPath, observation);
+    this.observations.push(observation);
   }
 
   private checkResourceLimits(): void {
@@ -313,18 +473,43 @@ export class ShadowCollectorEngine {
 
   private appendJsonLine(filePath: string, data: unknown): void {
     const line = JSON.stringify(data) + "\n";
+    const bytes = Buffer.byteLength(line, "utf8");
+    try {
+      this.resourceController.checkWriteAdmission(bytes);
+    } catch (err) {
+      this.abort("STORAGE_QUOTA_EXCEEDED");
+      throw err;
+    }
     fs.appendFileSync(filePath, line, "utf8");
-    this.resourceController.recordBytesWritten(Buffer.byteLength(line, "utf8"));
+    this.resourceController.recordBytesWritten(bytes);
   }
 
-  private writeAtomicJson(filePath: string, data: unknown): void {
+  private writeAtomicJson(filePath: string, data: unknown, skipAdmissionCheck = false): void {
     const content = JSON.stringify(data, null, 2);
-    fs.writeFileSync(filePath, content, "utf8");
-    this.resourceController.recordBytesWritten(Buffer.byteLength(content, "utf8"));
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (!skipAdmissionCheck) {
+      try {
+        this.resourceController.checkWriteAdmission(bytes);
+      } catch (err) {
+        this.abort("STORAGE_QUOTA_EXCEEDED");
+        throw err;
+      }
+    }
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const tempPath = path.join(
+      dir,
+      `.tmp.${path.basename(filePath)}.${Date.now()}.${Math.random().toString(36).slice(2)}`,
+    );
+    fs.writeFileSync(tempPath, content, "utf8");
+    fs.renameSync(tempPath, filePath);
+    this.resourceController.recordBytesWritten(bytes);
   }
 
   /**
-   * Graceful drain sequence writing finalized dual-file consensus (D22-A01, D22-A06).
+   * Graceful drain sequence writing finalized dual-file consensus (D22-A01, D22-A06, D22-S04).
    */
   public async drain(): Promise<SessionDrainSummary> {
     if (this.state !== "COLLECTING") {
@@ -332,6 +517,38 @@ export class ShadowCollectorEngine {
     }
 
     this.state = "DRAINING";
+
+    // D22-S04: Await or cancel all in-flight operations before finalizing
+    const drainTimeoutMs = this.config.drainTimeoutMs ?? 5000;
+    const startWaitMs = Date.now();
+    while (this.inFlightOps > 0) {
+      if (Date.now() - startWaitMs > drainTimeoutMs) {
+        return this.abort("DRAIN_TIMEOUT_IN_FLIGHT_OPERATIONS");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    // D22-S04: Reconcile actual persisted on-disk lines before claiming FINALIZED
+    const countDiskLines = (filePath: string): number => {
+      if (!fs.existsSync(filePath)) return 0;
+      const raw = fs.readFileSync(filePath, "utf8");
+      return raw.split("\n").filter((l) => l.trim().length > 0).length;
+    };
+
+    const actualDecisions = countDiskLines(this.decisionsPath);
+    const actualObservations = countDiskLines(this.observationsPath);
+    const actualEvaluations = countDiskLines(this.evaluationsPath);
+
+    if (
+      actualDecisions !== this.decisions.size ||
+      actualObservations !== this.observations.length ||
+      actualEvaluations !== this.evaluations.size
+    ) {
+      return this.abort(
+        `RECONCILIATION_MISMATCH: decisions disk=${actualDecisions}/mem=${this.decisions.size}, observations disk=${actualObservations}/mem=${this.observations.length}, evaluations disk=${actualEvaluations}/mem=${this.evaluations.size}`,
+      );
+    }
+
     this.closedAtIso = new Date(this.clock.now()).toISOString();
 
     const finalMeta: SessionTelemetryMeta = {
@@ -378,6 +595,15 @@ export class ShadowCollectorEngine {
       isCompleteSession: true,
       isInterruptedSession: false,
     };
+
+    // D22-S05: Preflight admission check for final metadata
+    const metaBytes = Buffer.byteLength(JSON.stringify(finalMeta, null, 2), "utf8");
+    const summaryBytes = Buffer.byteLength(JSON.stringify(finalSummary, null, 2), "utf8");
+    try {
+      this.resourceController.checkWriteAdmission(metaBytes + summaryBytes);
+    } catch {
+      return this.abort("STORAGE_QUOTA_EXCEEDED");
+    }
 
     this.writeAtomicJson(this.metaPath, finalMeta);
     this.writeAtomicJson(this.summaryPath, finalSummary);
@@ -443,18 +669,30 @@ export class ShadowCollectorEngine {
       isInterruptedSession: true,
     };
 
-    this.writeAtomicJson(this.metaPath, interruptedMeta);
-    this.writeAtomicJson(this.summaryPath, interruptedSummary);
+    try {
+      this.writeAtomicJson(this.metaPath, interruptedMeta, true);
+      this.writeAtomicJson(this.summaryPath, interruptedSummary, true);
+    } catch {
+      // Best-effort write on abort if filesystem fails
+    }
 
     // Write crash diagnostics sidecar
     const diagnosticsPath = path.join(this.sessionDir, "session-diagnostics.json");
-    this.writeAtomicJson(diagnosticsPath, {
-      interruptedAtIso: this.closedAtIso,
-      interruptionReason: reason,
-      flushedDecisionsCount: this.decisions.size,
-      flushedObservationsCount: this.observations.length,
-      flushedEvaluationsCount: this.evaluations.size,
-    });
+    try {
+      this.writeAtomicJson(
+        diagnosticsPath,
+        {
+          interruptedAtIso: this.closedAtIso,
+          interruptionReason: reason,
+          flushedDecisionsCount: this.decisions.size,
+          flushedObservationsCount: this.observations.length,
+          flushedEvaluationsCount: this.evaluations.size,
+        },
+        true,
+      );
+    } catch {
+      // Best-effort
+    }
 
     return {
       sessionId: this.config.sessionId,
@@ -470,7 +708,8 @@ export class ShadowCollectorEngine {
   }
 
   /**
-   * Recovers a session directory after an unclean crash, handling torn JSONL lines (D22-A06).
+   * Recovers a session directory after an unclean crash, quarantines torn JSONL lines,
+   * repairs active streams, and updates on-disk finality metadata (D22-A06, D22-S05).
    */
   public static recoverSessionDirectory(sessionDir: string): CrashRecoveryResult {
     const metaPath = path.join(sessionDir, "session-meta.json");
@@ -479,40 +718,143 @@ export class ShadowCollectorEngine {
     const observationsPath = path.join(sessionDir, "market-observations.jsonl");
     const evaluationsPath = path.join(sessionDir, "shadow-evaluations.jsonl");
 
-    let tornCount = 0;
-    const countValidLines = (filePath: string): number => {
+    let totalTornCount = 0;
+    const repairedFiles: string[] = [];
+    const quarantinedFiles: string[] = [];
+
+    const repairJsonlStream = (filePath: string): number => {
       if (!fs.existsSync(filePath)) return 0;
       const raw = fs.readFileSync(filePath, "utf8");
       const lines = raw.split("\n");
-      let valid = 0;
-      for (const line of lines) {
+      const validLines: string[] = [];
+      let fileTornCount = 0;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
         const trimmed = line.trim();
         if (trimmed.length === 0) continue;
         try {
           JSON.parse(trimmed);
-          valid++;
+          validLines.push(trimmed);
         } catch {
-          tornCount++; // Torn / truncated line detected
+          fileTornCount++;
         }
       }
-      return valid;
+
+      if (fileTornCount > 0) {
+        totalTornCount += fileTornCount;
+        // Quarantine corrupt original stream
+        const corruptPath = `${filePath}.corrupt-${Date.now()}`;
+        fs.copyFileSync(filePath, corruptPath);
+        quarantinedFiles.push(path.basename(corruptPath));
+
+        // Stage repaired file with valid lines only
+        const tempPath = `${filePath}.repaired-${Date.now()}`;
+        const repairedContent = validLines.length > 0 ? validLines.join("\n") + "\n" : "";
+        fs.writeFileSync(tempPath, repairedContent, "utf8");
+        fs.renameSync(tempPath, filePath);
+        repairedFiles.push(path.basename(filePath));
+      }
+
+      return validLines.length;
     };
 
-    const validDecisions = countValidLines(decisionsPath);
-    const validObservations = countValidLines(observationsPath);
-    const validEvaluations = countValidLines(evaluationsPath);
+    const validDecisions = repairJsonlStream(decisionsPath);
+    const validObservations = repairJsonlStream(observationsPath);
+    const validEvaluations = repairJsonlStream(evaluationsPath);
 
     const hasMeta = fs.existsSync(metaPath);
     const hasSummary = fs.existsSync(summaryPath);
 
+    let meta: SessionTelemetryMeta | null = null;
+    let summary: SessionTelemetrySummary | null = null;
+
+    if (hasMeta) {
+      try {
+        meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+      } catch {
+        meta = null;
+      }
+    }
+    if (hasSummary) {
+      try {
+        summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+      } catch {
+        summary = null;
+      }
+    }
+
+    // Determine authoritative recovered status
     let status: "INTERRUPTED" | "FINALIZED" | "CORRUPTED" = "INTERRUPTED";
-    if (!hasMeta || !hasSummary || tornCount > 0) {
+    const isCleanFinalized =
+      totalTornCount === 0 &&
+      meta !== null &&
+      summary !== null &&
+      meta.sessionStatus === "FINALIZED" &&
+      meta.isInterruptedSession === false &&
+      summary.isCompleteSession === true &&
+      summary.isInterruptedSession === false;
+
+    if (isCleanFinalized) {
+      status = "FINALIZED";
+    } else {
       status = "INTERRUPTED";
+      // D22-S05: Persist mutually consistent INTERRUPTED on-disk metadata
+      const recoveryTimestampIso = new Date().toISOString();
+      const updatedMeta: SessionTelemetryMeta = {
+        sessionId: meta?.sessionId ?? path.basename(sessionDir),
+        generationId: meta?.generationId ?? "gen-1",
+        strategyRevision: meta?.strategyRevision ?? "unknown",
+        startedAtIso: meta?.startedAtIso ?? recoveryTimestampIso,
+        closedAtIso: recoveryTimestampIso,
+        initialWalletBalanceSol: meta?.initialWalletBalanceSol ?? 7.9259,
+        environment: meta?.environment ?? {
+          platform: "mock_offline_harness",
+          nodeVersion: process.version,
+        },
+        sessionStatus: "INTERRUPTED",
+        isInterruptedSession: true,
+      };
+
+      const updatedSummary: SessionTelemetrySummary = {
+        sessionId: summary?.sessionId ?? path.basename(sessionDir),
+        generationId: summary?.generationId ?? "gen-1",
+        strategyRevision: summary?.strategyRevision ?? "unknown",
+        startedAtIso: summary?.startedAtIso ?? recoveryTimestampIso,
+        closedAtIso: recoveryTimestampIso,
+        totalCandidatesScreened: validDecisions,
+        totalDecisionsRecorded: validDecisions,
+        decisionWriteFailures: 0,
+        cohortBreakdown: summary?.cohortBreakdown ?? {
+          filteredRejected: 0,
+          watchlistRadar: validDecisions,
+          triggerRejected: 0,
+          executedBuy: 0,
+        },
+        topRejectionReasons: summary?.topRejectionReasons ?? {},
+        totalMarketObservationsRecorded: validObservations,
+        totalStratifiedCandidatesTracked: 0,
+        missedWinnersCount: 0,
+        avoidedRugsCount: 0,
+        isCompleteSession: false,
+        isInterruptedSession: true,
+      };
+
+      // Atomically write updated meta and summary
+      const writeAtomic = (p: string, obj: unknown) => {
+        const tmp = path.join(path.dirname(p), `.tmp.${path.basename(p)}.${Date.now()}`);
+        fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
+        fs.renameSync(tmp, p);
+      };
+      writeAtomic(metaPath, updatedMeta);
+      writeAtomic(summaryPath, updatedSummary);
     }
 
     const diagnosticsPath = path.join(sessionDir, "session-diagnostics.json");
+    const diagTmp = path.join(sessionDir, `.tmp.session-diagnostics.${Date.now()}`);
     fs.writeFileSync(
-      diagnosticsPath,
+      diagTmp,
       JSON.stringify(
         {
           recoveryTimestampIso: new Date().toISOString(),
@@ -520,13 +862,16 @@ export class ShadowCollectorEngine {
           validDecisionsCount: validDecisions,
           validObservationsCount: validObservations,
           validEvaluationsCount: validEvaluations,
-          tornLinesQuarantinedCount: tornCount,
+          tornLinesQuarantinedCount: totalTornCount,
+          repairedFiles,
+          quarantinedFiles,
         },
         null,
         2,
       ),
       "utf8",
     );
+    fs.renameSync(diagTmp, diagnosticsPath);
 
     return {
       sessionId: path.basename(sessionDir),
@@ -534,7 +879,9 @@ export class ShadowCollectorEngine {
       validDecisionsCount: validDecisions,
       validObservationsCount: validObservations,
       validEvaluationsCount: validEvaluations,
-      tornLinesQuarantinedCount: tornCount,
+      tornLinesQuarantinedCount: totalTornCount,
+      repairedFiles,
+      quarantinedFiles,
       diagnosticsFileWritten: true,
     };
   }
