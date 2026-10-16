@@ -2784,6 +2784,152 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         // Cohort Preservation Invariant: canonicalDecision.decisionCohort remains WATCHLIST_RADAR
         expect(canonicalDecision.decisionCohort).toBe("WATCHLIST_RADAR");
       });
+
+      it("RF-D21.3d: D21C-01: createShadowEvaluationRecord factory strictly validates non-finite reserves and timestamps fail-closed", () => {
+        const canonicalDecision = createMockDecision({
+          eventId: "dec-canonical-fac-1",
+          sessionId: "session-paper-d21",
+          generationId: "gen-1",
+          mintAddress: "TokenMint111111111111111111111111111111111111",
+          poolId: "pool-amm-1",
+          decisionTimestampMs: 2000,
+        });
+
+        const baseQualResult = {
+          shadowTriggerQualified: true,
+          qualificationReason: "MET_MOMENTUM_CRITERIA",
+          simulatedTargetSizeSol: 0.1,
+          executionFeasible: true,
+        };
+
+        // Auditor reproduction case 1: baseReserve: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            observedReserveSnapshot: {
+              baseReserve: NaN,
+              quoteReserve: 100,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("observedReserveSnapshot.baseReserve must be a non-negative finite number");
+
+        // Auditor reproduction case 2: baseReserve: Infinity
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            observedReserveSnapshot: {
+              baseReserve: Infinity,
+              quoteReserve: 100,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("observedReserveSnapshot.baseReserve must be a non-negative finite number");
+
+        // quoteReserve: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            observedReserveSnapshot: {
+              baseReserve: 500000,
+              quoteReserve: NaN,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("observedReserveSnapshot.quoteReserve must be a non-negative finite number");
+
+        // quoteReserve: Infinity
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            observedReserveSnapshot: {
+              baseReserve: 500000,
+              quoteReserve: Infinity,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("observedReserveSnapshot.quoteReserve must be a non-negative finite number");
+
+        // Auditor reproduction case 3: sourceTimestampMs: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            observedReserveSnapshot: {
+              baseReserve: 500000,
+              quoteReserve: 100,
+              sourceTimestampMs: NaN,
+            },
+          }),
+        ).toThrow("observedReserveSnapshot.sourceTimestampMs must be a positive finite number");
+
+        // Auditor reproduction case 4: executionFeasible: false, evaluationTimestampMs: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: {
+              ...baseQualResult,
+              executionFeasible: false,
+            },
+            evaluationTimestampMs: NaN,
+          }),
+        ).toThrow("evaluationTimestampMs must be a positive finite number");
+
+        // executionFeasible: true, evaluationTimestampMs: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: NaN,
+            observedReserveSnapshot: {
+              baseReserve: 500000,
+              quoteReserve: 100,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("evaluationTimestampMs must be a positive finite number");
+
+        // hostMonotonicElapsedMs: NaN
+        expect(() =>
+          createShadowEvaluationRecord({
+            decision: canonicalDecision,
+            qualificationResult: baseQualResult,
+            evaluationTimestampMs: 2100,
+            hostMonotonicElapsedMs: NaN,
+            observedReserveSnapshot: {
+              baseReserve: 500000,
+              quoteReserve: 100,
+              sourceTimestampMs: 1900,
+            },
+          }),
+        ).toThrow("hostMonotonicElapsedMs, if present, must be a non-negative finite number");
+
+        // Valid observational-only record (executionFeasible: false, no snapshot) returns valid record
+        const obsRecord = createShadowEvaluationRecord({
+          decision: canonicalDecision,
+          qualificationResult: {
+            shadowTriggerQualified: false,
+            qualificationReason: "FAILED_VOLUME_CRITERIA",
+            simulatedTargetSizeSol: 0,
+            executionFeasible: false,
+          },
+          evaluationTimestampMs: 2100,
+        });
+
+        expect(obsRecord.schemaVersion).toBe("1.0.0");
+        expect(obsRecord.evaluationTimestampMs).toBe(2100);
+        expect(obsRecord.qualificationResult.executionFeasible).toBe(false);
+        expect(obsRecord.observedReserveSnapshot).toBeUndefined();
+      });
     });
 
     describe("D2.1-DELIV-3: Clock Monotonicity & Quarantine Validator (D2-PREREQ-01)", () => {
@@ -3317,6 +3463,146 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         expect(result.sessionsAuditedCount).toBe(0);
         expect(result.malformedOrUnrelatedFilesCount).toBe(1);
         expect(result.quarantinedFiles[0]!.rejectionReason).toContain("endedAt");
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
+
+      it("RF-D21.14d: D21C-02: parseFedoraArchiveDirectory rejects trades whose entry/exit chronology falls outside session interval", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-out-of-window-"));
+
+        // Exact Auditor reproduction case:
+        // Session interval: 2026-10-01T00:00:00.000Z to 2026-10-01T01:00:00.000Z
+        // Trade interval:   2026-10-02T00:10:00.000Z to 2026-10-02T00:20:00.000Z (next day!)
+        const outOfWindowSession = {
+          sessionId: "session-fedora-out-of-window",
+          startedAt: "2026-10-01T00:00:00.000Z",
+          endedAt: "2026-10-01T01:00:00.000Z",
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 9.5,
+          netPnlSol: -0.5,
+          trades: [
+            {
+              tradeId: "trade-next-day",
+              mintAddress: "NextDayMint11111111111111111111111111111111",
+              symbol: "NEXT",
+              entryPriceSol: 0.001,
+              exitPriceSol: 0.0005,
+              sizeSol: 0.5,
+              enteredAt: "2026-10-02T00:10:00.000Z", // Next day!
+              exitedAt: "2026-10-02T00:20:00.000Z",
+              finalPnlSol: -0.25,
+              exitReason: "STOP_LOSS",
+            },
+          ],
+        };
+
+        fs.writeFileSync(
+          path.join(tempStaging, "out-of-window.json"),
+          JSON.stringify(outOfWindowSession),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+        expect(result.status).toBe("REPORTED_NOT_INSPECTED");
+        expect(result.sessionsAuditedCount).toBe(0);
+        expect(result.malformedOrUnrelatedFilesCount).toBe(1);
+        expect(result.quarantinedFiles[0]!.rejectionReason).toContain(
+          "chronology lies outside session interval",
+        );
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
+
+      it("RF-D21.14e: D21C-02: parseFedoraArchiveDirectory flags financially contradictory session/trade P&L as UNRECONCILED with auditable reconciliation items", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-unreconciled-"));
+
+        // Exact Auditor reproduction case:
+        // Session: start 10 SOL, end 10 SOL, declared netPnlSol = 0
+        // Trade: 1 trade with netPnlSol = +0.5 SOL
+        const contradictorySession = {
+          sessionId: "session-fedora-unreconciled-pnl",
+          startedAt: "2026-10-01T00:00:00.000Z",
+          endedAt: "2026-10-01T01:00:00.000Z",
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 10.0,
+          netPnlSol: 0.0,
+          trades: [
+            {
+              tradeId: "trade-contradictory-1",
+              mintAddress: "ContradictoryMint11111111111111111111111111",
+              symbol: "CONTRA",
+              entryPriceSol: 0.001,
+              exitPriceSol: 0.002,
+              sizeSol: 0.5,
+              enteredAt: "2026-10-01T00:10:00.000Z",
+              exitedAt: "2026-10-01T00:20:00.000Z",
+              finalPnlSol: 0.5,
+              exitReason: "TAKE_PROFIT",
+            },
+          ],
+        };
+
+        fs.writeFileSync(
+          path.join(tempStaging, "contradictory.json"),
+          JSON.stringify(contradictorySession),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+        // Valid archive is parsed (not rejected solely due to settlement/accounting discrepancy)
+        expect(result.status).toBe("ARCHIVE_CONFIRMED_PARSED");
+        expect(result.sessionsAuditedCount).toBe(1);
+
+        const session = result.sessions[0]!;
+        // Distinct UNRECONCILED status emitted
+        expect(session.reconciliationStatus).toBe("UNRECONCILED");
+        expect(session.financialReconciliation.status).toBe("UNRECONCILED");
+        expect(session.financialReconciliation.tradePnlDiscrepancySol).toBe(0.5);
+        expect(session.reconciliationWarnings.length).toBeGreaterThan(0);
+        expect(session.reconciliationWarnings.some((w) => w.includes("TRADE_PNL_MISMATCH"))).toBe(
+          true,
+        );
+
+        fs.rmSync(tempStaging, { recursive: true, force: true });
+      });
+
+      it("RF-D21.14f: D21C-02: parseFedoraArchiveDirectory correctly classifies valid zero-trade sessions with unavailable trade-level fields", () => {
+        const tempStaging = fs.mkdtempSync(path.join(os.tmpdir(), "fedora-zero-trades-"));
+
+        // Valid zero-trade session:
+        const zeroTradeSession = {
+          sessionId: "session-fedora-zero-trades",
+          startedAt: "2026-10-01T00:00:00.000Z",
+          endedAt: "2026-10-01T01:00:00.000Z",
+          startingCapitalSol: 10.0,
+          endingCapitalSol: 10.0,
+          netPnlSol: 0.0,
+          trades: [],
+        };
+
+        fs.writeFileSync(
+          path.join(tempStaging, "zero-trades.json"),
+          JSON.stringify(zeroTradeSession),
+        );
+
+        const result = parseFedoraArchiveDirectory(tempStaging);
+        expect(result.status).toBe("ARCHIVE_CONFIRMED_PARSED");
+        expect(result.sessionsAuditedCount).toBe(1);
+
+        const session = result.sessions[0]!;
+        expect(session.totalTrades).toBe(0);
+        expect(session.trades).toHaveLength(0);
+        expect(session.reconciliationStatus).toBe("RECONCILED");
+        expect(session.reconciliationWarnings).toHaveLength(0);
+
+        // Session-level netPnl is OBSERVED
+        expect(session.fieldProvenance.netPnlSol).toBe("OBSERVED");
+
+        // CRITICAL INVARIANT: Trade-level fields must NOT be fabricated as OBSERVED for zero-trade sessions
+        expect(session.fieldProvenance.tradeTimestamps).toBe("UNAVAILABLE");
+        expect(session.fieldProvenance.solSize).toBe("UNAVAILABLE");
+        expect(session.unavailabilityReasons.tradeTimestamps).toBe(
+          "FIELD_NOT_COLLECTED_IN_GENERATION",
+        );
+        expect(session.unavailabilityReasons.solSize).toBe("FIELD_NOT_COLLECTED_IN_GENERATION");
 
         fs.rmSync(tempStaging, { recursive: true, force: true });
       });

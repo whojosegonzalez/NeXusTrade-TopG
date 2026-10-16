@@ -30,6 +30,20 @@ export interface FedoraQuarantinedFile {
   readonly rejectionReason: string;
 }
 
+export type FedoraFinancialReconciliationStatus = "RECONCILED" | "UNRECONCILED" | "NOT_VERIFIED";
+
+export interface FedoraFinancialReconciliation {
+  readonly status: FedoraFinancialReconciliationStatus;
+  readonly startingCapitalSol: number;
+  readonly endingCapitalSol: number;
+  readonly capitalDeltaSol: number;
+  readonly declaredSessionPnlSol: number;
+  readonly aggregateTradesPnlSol: number;
+  readonly capitalDeltaDiscrepancySol: number;
+  readonly tradePnlDiscrepancySol: number;
+  readonly reconciliationItems: readonly string[];
+}
+
 export interface FedoraSessionRecord {
   readonly sessionId: string;
   readonly archiveFileName: string;
@@ -41,6 +55,9 @@ export interface FedoraSessionRecord {
   readonly netPnlSol: number;
   readonly totalTrades: number;
   readonly trades: readonly FedoraTradeRecord[];
+  readonly reconciliationStatus: FedoraFinancialReconciliationStatus;
+  readonly financialReconciliation: FedoraFinancialReconciliation;
+  readonly reconciliationWarnings: readonly string[];
   readonly fieldProvenance: Record<string, ProvenanceClass>;
   readonly unavailabilityReasons: Record<string, UnavailabilityReason>;
 }
@@ -205,6 +222,12 @@ function validateFedoraSessionPayload(
     if (tradeExitedMs < tradeEnteredMs) {
       return { isValid: false, reason: `trades[${idx}].exitedAt precedes enteredAt` };
     }
+    if (tradeEnteredMs < startMs || tradeExitedMs > endMs) {
+      return {
+        isValid: false,
+        reason: `trades[${idx}] chronology lies outside session interval: trade window [${tradeEnteredAt}, ${tradeExitedAt}] (${tradeEnteredMs}..${tradeExitedMs}) falls outside session window [${rawStartedAt}, ${rawEndedAt}] (${startMs}..${endMs})`,
+      };
+    }
 
     const tradePnl = t.finalPnlSol ?? t.netPnlSol;
     if (typeof tradePnl !== "number" || !Number.isFinite(tradePnl)) {
@@ -305,6 +328,94 @@ export function parseFedoraArchiveDirectory(stagingDir: string): FedoraArchiveAu
     }
 
     const data = validation.data;
+
+    // Financial reconciliation under legacy session accounting contract:
+    const capitalDeltaSol = Number((data.endingCapitalSol - data.startingCapitalSol).toFixed(9));
+    const declaredSessionPnlSol = Number(data.netPnlSol.toFixed(9));
+    const aggregateTradesPnlSol = Number(
+      data.trades.reduce((acc, t) => acc + t.netPnlSol, 0).toFixed(9),
+    );
+
+    const EPSILON = 1e-6;
+    const capitalDeltaDiscrepancySol = Number(
+      Math.abs(capitalDeltaSol - declaredSessionPnlSol).toFixed(9),
+    );
+    const tradePnlDiscrepancySol = Number(
+      Math.abs(aggregateTradesPnlSol - declaredSessionPnlSol).toFixed(9),
+    );
+
+    const capitalMatchesSessionPnl = capitalDeltaDiscrepancySol < EPSILON;
+    const tradesMatchSessionPnl = data.trades.length === 0 || tradePnlDiscrepancySol < EPSILON;
+    const tradesMatchCapitalDelta =
+      data.trades.length === 0 || Math.abs(aggregateTradesPnlSol - capitalDeltaSol) < EPSILON;
+
+    const isFullyReconciled =
+      capitalMatchesSessionPnl && tradesMatchSessionPnl && tradesMatchCapitalDelta;
+
+    const reconciliationStatus: FedoraFinancialReconciliationStatus = isFullyReconciled
+      ? "RECONCILED"
+      : "UNRECONCILED";
+
+    const reconciliationItems: string[] = [];
+    if (!capitalMatchesSessionPnl) {
+      reconciliationItems.push(
+        `CAPITAL_DELTA_MISMATCH: endingCapitalSol (${data.endingCapitalSol}) - startingCapitalSol (${data.startingCapitalSol}) = ${capitalDeltaSol} SOL differs from declared netPnlSol (${declaredSessionPnlSol} SOL) by ${capitalDeltaDiscrepancySol} SOL.`,
+      );
+    }
+    if (!tradesMatchSessionPnl) {
+      reconciliationItems.push(
+        `TRADE_PNL_MISMATCH: sum of ${data.trades.length} trade PnLs (${aggregateTradesPnlSol} SOL) differs from declared session netPnlSol (${declaredSessionPnlSol} SOL) by ${tradePnlDiscrepancySol} SOL.`,
+      );
+    }
+    if (!tradesMatchCapitalDelta && data.trades.length > 0) {
+      const diff = Number(Math.abs(aggregateTradesPnlSol - capitalDeltaSol).toFixed(9));
+      reconciliationItems.push(
+        `TRADE_TO_CAPITAL_MISMATCH: sum of trade PnLs (${aggregateTradesPnlSol} SOL) differs from capital delta (${capitalDeltaSol} SOL) by ${diff} SOL.`,
+      );
+    }
+
+    const financialReconciliation: FedoraFinancialReconciliation = {
+      status: reconciliationStatus,
+      startingCapitalSol: data.startingCapitalSol,
+      endingCapitalSol: data.endingCapitalSol,
+      capitalDeltaSol,
+      declaredSessionPnlSol,
+      aggregateTradesPnlSol,
+      capitalDeltaDiscrepancySol,
+      tradePnlDiscrepancySol,
+      reconciliationItems,
+    };
+
+    const hasTrades = data.trades.length > 0;
+
+    const fieldProvenance: Record<string, ProvenanceClass> = {
+      netPnlSol: "OBSERVED",
+      tradeTimestamps: hasTrades ? "OBSERVED" : "UNAVAILABLE",
+      solSize: hasTrades ? "OBSERVED" : "UNAVAILABLE",
+      baseReserve: "UNAVAILABLE",
+      quoteReserve: "UNAVAILABLE",
+      volume5mUsd: "UNAVAILABLE",
+      buys5m: "UNAVAILABLE",
+      sells5m: "UNAVAILABLE",
+      devHoldingPct: "UNAVAILABLE",
+      lpBurnPct: "UNAVAILABLE",
+    };
+
+    const unavailabilityReasons: Record<string, UnavailabilityReason> = {
+      baseReserve: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      quoteReserve: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      volume5mUsd: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      buys5m: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      sells5m: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      devHoldingPct: "FIELD_NOT_COLLECTED_IN_GENERATION",
+      lpBurnPct: "FIELD_NOT_COLLECTED_IN_GENERATION",
+    };
+
+    if (!hasTrades) {
+      unavailabilityReasons.tradeTimestamps = "FIELD_NOT_COLLECTED_IN_GENERATION";
+      unavailabilityReasons.solSize = "FIELD_NOT_COLLECTED_IN_GENERATION";
+    }
+
     parsedSessions.push({
       sessionId: data.sessionId,
       archiveFileName: fileName,
@@ -316,27 +427,11 @@ export function parseFedoraArchiveDirectory(stagingDir: string): FedoraArchiveAu
       netPnlSol: data.netPnlSol,
       totalTrades: data.trades.length,
       trades: data.trades,
-      fieldProvenance: {
-        netPnlSol: "OBSERVED",
-        tradeTimestamps: "OBSERVED",
-        solSize: "OBSERVED",
-        baseReserve: "UNAVAILABLE",
-        quoteReserve: "UNAVAILABLE",
-        volume5mUsd: "UNAVAILABLE",
-        buys5m: "UNAVAILABLE",
-        sells5m: "UNAVAILABLE",
-        devHoldingPct: "UNAVAILABLE",
-        lpBurnPct: "UNAVAILABLE",
-      },
-      unavailabilityReasons: {
-        baseReserve: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        quoteReserve: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        volume5mUsd: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        buys5m: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        sells5m: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        devHoldingPct: "FIELD_NOT_COLLECTED_IN_GENERATION",
-        lpBurnPct: "FIELD_NOT_COLLECTED_IN_GENERATION",
-      },
+      reconciliationStatus,
+      financialReconciliation,
+      reconciliationWarnings: reconciliationItems,
+      fieldProvenance,
+      unavailabilityReasons,
     });
   }
 

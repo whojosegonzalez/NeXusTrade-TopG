@@ -23,29 +23,8 @@ export function createShadowEvaluationRecord(params: {
   const evalTimestamp = params.evaluationTimestampMs ?? params.decision.decisionTimestampMs;
   const evaluationId = `shd-${params.decision.eventId}-${evalTimestamp}`;
 
-  if (params.qualificationResult.executionFeasible === true) {
-    if (!params.observedReserveSnapshot) {
-      throw new Error(
-        "[ShadowEvaluationContract] createShadowEvaluationRecord: executionFeasible cannot be true without observedReserveSnapshot.",
-      );
-    }
-    if (
-      params.observedReserveSnapshot.baseReserve <= 0 ||
-      params.observedReserveSnapshot.quoteReserve <= 0
-    ) {
-      throw new Error(
-        `[ShadowEvaluationContract] createShadowEvaluationRecord: executionFeasible requires strictly positive baseReserve and quoteReserve (got base: ${params.observedReserveSnapshot.baseReserve}, quote: ${params.observedReserveSnapshot.quoteReserve}).`,
-      );
-    }
-    if (params.observedReserveSnapshot.sourceTimestampMs > evalTimestamp) {
-      throw new Error(
-        `[ShadowEvaluationContract] createShadowEvaluationRecord: observedReserveSnapshot sourceTimestampMs (${params.observedReserveSnapshot.sourceTimestampMs}) cannot be after evaluationTimestampMs (${evalTimestamp}). Future reserve lookahead is forbidden.`,
-      );
-    }
-  }
-
-  return {
-    schemaVersion: "1.0.0",
+  const candidateRecord = {
+    schemaVersion: "1.0.0" as const,
     evaluationId,
     decisionEventId: params.decision.eventId,
     sessionId: params.decision.sessionId,
@@ -57,6 +36,8 @@ export function createShadowEvaluationRecord(params: {
     qualificationResult: params.qualificationResult,
     observedReserveSnapshot: params.observedReserveSnapshot,
   };
+
+  return validateShadowEvaluationRecord(candidateRecord);
 }
 
 export function validateShadowEvaluationRecord(data: unknown): ShadowEvaluationRecord {
@@ -201,7 +182,7 @@ export function validateShadowEvaluationRecord(data: unknown): ShadowEvaluationR
     const base = rsRecord.baseReserve as number;
     const quote = rsRecord.quoteReserve as number;
     const sourceMs = rsRecord.sourceTimestampMs as number;
-    if (base <= 0 || quote <= 0) {
+    if (!Number.isFinite(base) || base <= 0 || !Number.isFinite(quote) || quote <= 0) {
       throw new Error(
         `[ShadowEvaluationContract] executionFeasible requires strictly positive baseReserve and quoteReserve (got base: ${base}, quote: ${quote}).`,
       );
