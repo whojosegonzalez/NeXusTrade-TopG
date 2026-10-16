@@ -1,0 +1,485 @@
+/**
+ * Phase 12.94-D Milestone D.2.3: Pilot Adapters, Clock, Schema Bridge, Manifest & Runner Tests
+ *
+ * Verifies DexScreener parsing, Solana RPC slot coherence, dual-domain clock causality (D23P-03),
+ * canonical 5-tuple schema bridging, SHA-256 export manifest verification (D23P-04),
+ * and runner lifecycle state transitions (ACTIVE, FINALIZED, INTERRUPTED).
+ */
+
+import { describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import {
+  parseDexScreenerPairsResponse,
+  parseDexScreenerTokenProfiles,
+} from "./DexScreenerResponseAdapter.js";
+import {
+  detectSlotDiscrepancy,
+  parseSolanaRpcMultipleVaultsResponse,
+  parseSolanaRpcPoolAccountResponse,
+} from "./SolanaRpcResponseAdapter.js";
+import {
+  computeMonotonicElapsed,
+  DeterministicPilotClock,
+  validateCausalEpochOrdering,
+} from "./PilotClock.js";
+import {
+  D23_OBSERVATIONAL_PROVIDER,
+  D23_STRATEGY_REVISION,
+  toCanonicalCandidateDecision,
+  toCanonicalMarketObservation,
+  toCanonicalShadowEvaluation,
+} from "./PilotSchemaBridge.js";
+import {
+  generateSessionExportManifest,
+  verifySessionExportManifest,
+} from "./PilotExportManifest.js";
+import { PilotCollectorRunner } from "./PilotCollectorRunner.js";
+import {
+  createAuthoritativeRaydiumAmmV4Buffer,
+  createAuthoritativeSplVaultBuffer,
+  FIXTURE_BASE_VAULT,
+  FIXTURE_MEME_MINT,
+  FIXTURE_POOL_ADDRESS,
+  FIXTURE_QUOTE_VAULT,
+  FIXTURE_WSOL_MINT,
+} from "./fixtures/AuthoritativeRaydiumFixtures.js";
+import type { D23ObservationRecord, D23ScreenedCandidate } from "./PilotTypes.js";
+
+describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
+  describe("DexScreener Response Adapter", () => {
+    it("parses latest token profiles and filters for valid Solana base58 mints", () => {
+      const mockProfiles = [
+        {
+          chainId: "solana",
+          tokenAddress: FIXTURE_MEME_MINT,
+          url: "https://dexscreener.com/solana/" + FIXTURE_MEME_MINT,
+          description: "Meme token profile",
+        },
+        {
+          chainId: "ethereum",
+          tokenAddress: "0x1234567890abcdef1234567890abcdef12345678",
+        },
+        {
+          chainId: "solana",
+          tokenAddress: "InvalidNonBase58O0Il",
+        },
+      ];
+
+      const result = parseDexScreenerTokenProfiles(mockProfiles);
+      expect(result.ok).toBe(true);
+      expect(result.candidates.length).toBe(1);
+      const candidate0 = result.candidates[0];
+      expect(candidate0).toBeDefined();
+      if (!candidate0) return;
+      expect(candidate0.tokenAddress).toBe(FIXTURE_MEME_MINT);
+      expect(candidate0.selectionBias).toBe("DEXSCREENER_PROMOTIONAL_PROFILE");
+      expect(result.nonSolanaProfilesSkipped).toBe(1);
+      expect(result.invalidAddressProfilesSkipped).toBe(1);
+    });
+
+    it("parses pairs response and matches primary Raydium AMM candidate", () => {
+      const mockPairsResponse = {
+        pairs: [
+          {
+            chainId: "solana",
+            dexId: "raydium",
+            pairAddress: FIXTURE_POOL_ADDRESS,
+            baseToken: { address: FIXTURE_MEME_MINT, symbol: "MEME" },
+            quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+            priceUsd: "0.000015",
+            priceNative: "0.0000001",
+            liquidity: { usd: 25000 },
+            volume: { m5: 1250 },
+            txns: { m5: { buys: 15, sells: 8 } },
+            pairCreatedAt: 1791000000000,
+          },
+        ],
+      };
+
+      const result = parseDexScreenerPairsResponse(mockPairsResponse, FIXTURE_MEME_MINT);
+      expect(result.ok).toBe(true);
+      expect(result.matchingRaydiumPair).not.toBeNull();
+      if (!result.matchingRaydiumPair) return;
+
+      expect(result.matchingRaydiumPair.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      expect(result.matchingRaydiumPair.isRaydiumAmmCandidate).toBe(true);
+      expect(result.matchingRaydiumPair.buys5m).toBe(15);
+      expect(result.matchingRaydiumPair.sells5m).toBe(8);
+      expect(result.matchingRaydiumPair.volume5mUsd).toBe(1250);
+      // pairCreatedAt is preserved as historical birth time, never as current source timestamp (D23-A02)
+      expect(result.matchingRaydiumPair.pairCreatedAtMs).toBe(1791000000000);
+      expect(result.matchingRaydiumPair.sourceReportedTimeMs).toBeNull();
+      expect(result.matchingRaydiumPair.missingFields).toContain("baseReserve");
+      expect(result.matchingRaydiumPair.missingFields).toContain("quoteReserve");
+    });
+  });
+
+  describe("Solana RPC Response Adapter", () => {
+    it("parses getAccountInfo response with context slot and Raydium pool state", () => {
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer({
+        baseMintBase58: FIXTURE_MEME_MINT,
+        quoteMintBase58: FIXTURE_WSOL_MINT,
+      });
+
+      const mockRpcResponse = {
+        jsonrpc: "2.0",
+        result: {
+          context: { slot: 290001122 },
+          value: {
+            data: [poolBuffer.toString("base64"), "base64"],
+            owner: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+            lamports: 5000000,
+          },
+        },
+        id: 1,
+      };
+
+      const result = parseSolanaRpcPoolAccountResponse(mockRpcResponse, FIXTURE_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      expect(result.slot).toBe(290001122);
+      expect(result.poolState?.baseMint).toBe(FIXTURE_MEME_MINT);
+      expect(result.poolState?.quoteMint).toBe(FIXTURE_WSOL_MINT);
+    });
+
+    it("parses getMultipleAccounts response verifying shared slot coherence (D23P-02)", () => {
+      const baseBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        rawAmount: 75_000_000_000_000n,
+      });
+      const quoteBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpcResponse = {
+        jsonrpc: "2.0",
+        result: {
+          context: { slot: 290001125 },
+          value: [
+            {
+              data: [baseBuffer.toString("base64"), "base64"],
+              owner: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            },
+            {
+              data: [quoteBuffer.toString("base64"), "base64"],
+              owner: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            },
+          ],
+        },
+        id: 2,
+      };
+
+      const result = parseSolanaRpcMultipleVaultsResponse(
+        mockRpcResponse,
+        [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+        [FIXTURE_MEME_MINT, FIXTURE_WSOL_MINT],
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.slot).toBe(290001125);
+      expect(result.balances?.baseVaultRaw).toBe(75_000_000_000_000n);
+      expect(result.balances?.quoteVaultRaw).toBe(100_000_000_000n);
+      expect(result.balances?.slotDiscrepancy).toBe(false);
+      expect(result.balances?.slotDelta).toBe(0);
+    });
+
+    it("detects cross-request slot discrepancies accurately (D23P-02)", () => {
+      const check1 = detectSlotDiscrepancy(290001120, 290001125);
+      expect(check1.slotDiscrepancy).toBe(true);
+      expect(check1.slotDelta).toBe(5);
+
+      const check2 = detectSlotDiscrepancy(290001120, 290001120);
+      expect(check2.slotDiscrepancy).toBe(false);
+      expect(check2.slotDelta).toBe(0);
+    });
+  });
+
+  describe("Dual-Domain Clock & Causal Monotonicity (D23P-03)", () => {
+    it("enforces causal epoch sequence: requestEpoch <= receiptEpoch <= decisionEpoch", () => {
+      const valid = validateCausalEpochOrdering(1791940001000, 1791940001200, 1791940001250);
+      expect(valid.valid).toBe(true);
+
+      const lookahead = validateCausalEpochOrdering(1791940001000, 1791940001300, 1791940001200);
+      expect(lookahead.valid).toBe(false);
+      expect(lookahead.violationReason).toContain("LOOKAHEAD_VIOLATION");
+
+      const invertedReq = validateCausalEpochOrdering(1791940001500, 1791940001200, 1791940001600);
+      expect(invertedReq.valid).toBe(false);
+      expect(invertedReq.violationReason).toContain("REQUEST_AFTER_RECEIPT");
+    });
+
+    it("computes elapsed time strictly in the host monotonic domain", () => {
+      const elapsed = computeMonotonicElapsed(1234.5, 1250.7);
+      expect(elapsed).toBeCloseTo(16.2);
+    });
+
+    it("operates deterministically with DeterministicPilotClock", () => {
+      const clock = new DeterministicPilotClock(1791940000000, 500);
+      expect(clock.getEpochNow()).toBe(1791940000000);
+      expect(clock.getMonotonicNow()).toBe(500);
+
+      clock.advanceBy(250);
+      expect(clock.getEpochNow()).toBe(1791940000250);
+      expect(clock.getMonotonicNow()).toBe(750);
+    });
+  });
+
+  describe("Pilot Schema Bridge (D23P-03)", () => {
+    const mockCompositeId = {
+      decisionEventId: "evt-test-001",
+      sessionId: "session-pilot-test-01",
+      generationId: "gen1-pilot",
+      mintAddress: FIXTURE_MEME_MINT,
+      poolId: FIXTURE_POOL_ADDRESS,
+    };
+
+    const mockCandidate: D23ScreenedCandidate = {
+      compositeId: mockCompositeId,
+      symbol: "MEME",
+      decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+      decisionCohort: "WATCHLIST_RADAR",
+      selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+      decisionEpochMs: 1791940001250,
+      requestEpochMs: 1791940001000,
+      receiptEpochMs: 1791940001200,
+      sourceTimestampMs: null,
+      passedEligibility: true,
+      filterEvaluations: [
+        { filterName: "MIN_LIQUIDITY_USD", passed: true, observed: 25000, threshold: 5000 },
+      ],
+      rejectionReasons: [],
+      missingFields: ["sourceTimestampMs"],
+      providerIdentity: D23_OBSERVATIONAL_PROVIDER,
+    };
+
+    const mockObservation: D23ObservationRecord = {
+      observationId: "obs-test-001",
+      compositeId: mockCompositeId,
+      requestEpochMs: 1791940001000,
+      receiptEpochMs: 1791940001200,
+      sourceReportedTimeMs: null,
+      hostMonotonicElapsedMs: 200,
+      onChainSlot: 290001125,
+      slotDiscrepancy: false,
+      provenance: "D23_OBSERVATIONAL_SCREENING",
+      providerIdentity: "solana_rpc_public_v1",
+      actualResponsePoolId: FIXTURE_POOL_ADDRESS,
+      isMatchingPool: true,
+      reserveAccounting: {
+        mode: "VAULT_ONLY_PROXY",
+        tokenMint: FIXTURE_MEME_MINT,
+        solMint: FIXTURE_WSOL_MINT,
+        tokenReserveRaw: 75_000_000_000_000n,
+        solReserveRaw: 100_000_000_000n,
+        tokenDecimals: 6,
+        solDecimals: 9,
+        tokenReserveDecimal: 75_000_000,
+        solReserveDecimal: 100,
+        spotPriceSol: 100 / 75_000_000,
+        orientation: "TOKEN_BASE_SOL_QUOTE",
+        effectiveReservesAvailable: false,
+        executionFeasible: false,
+        unavailabilityReason: "VAULT_ONLY_RESERVES_INSUFFICIENT_FOR_FEASIBILITY",
+      },
+      flowMetrics: {
+        volume5mUsd: 1250,
+        buys5m: 15,
+        sells5m: 8,
+        netBuyerVolumeUsd: 350,
+      },
+      missingFields: ["sourceTimestampMs"],
+    };
+
+    it("translates candidate to CandidateDecisionRecord with accepted 5-tuple", () => {
+      const canonical = toCanonicalCandidateDecision(mockCandidate, mockObservation);
+      expect(canonical.eventId).toBe("evt-test-001");
+      expect(canonical.sessionId).toBe("session-pilot-test-01");
+      expect(canonical.generationId).toBe("gen1-pilot");
+      expect(canonical.mintAddress).toBe(FIXTURE_MEME_MINT);
+      expect(canonical.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      expect(canonical.decisionCohort).toBe("WATCHLIST_RADAR");
+      expect(canonical.strategyRevision).toBe(D23_STRATEGY_REVISION);
+      expect(canonical.providerIdentity).toBe(D23_OBSERVATIONAL_PROVIDER);
+      expect(canonical.missingFields).toContain("sourceTimestampMs");
+    });
+
+    it("translates to ShadowEvaluationRecord with 5-tuple and observational qualification", () => {
+      const shadow = toCanonicalShadowEvaluation(mockCandidate, mockObservation);
+      expect(shadow.decisionEventId).toBe("evt-test-001");
+      expect(shadow.sessionId).toBe("session-pilot-test-01");
+      expect(shadow.generationId).toBe("gen1-pilot");
+      expect(shadow.mintAddress).toBe(FIXTURE_MEME_MINT);
+      expect(shadow.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      expect(shadow.qualificationResult.shadowTriggerQualified).toBe(false); // Observational only
+      expect(shadow.qualificationResult.qualificationReason).toBe(
+        "PASSED_PASSIVE_OBSERVATIONAL_CRITERIA",
+      );
+      expect(shadow.qualificationResult.executionFeasible).toBe(false); // Vault-only proxy is false
+      expect(shadow.observedReserveSnapshot).toBeUndefined(); // null source time = no snapshot
+    });
+
+    it("translates to MarketObservationRecord", () => {
+      const obs = toCanonicalMarketObservation(mockObservation);
+      expect(obs.observationId).toBe("obs-test-001");
+      expect(obs.sessionId).toBe("session-pilot-test-01");
+      expect(obs.liquidityMetrics.baseReserve).toBe(75_000_000);
+      expect(obs.liquidityMetrics.quoteReserve).toBe(100);
+      expect(obs.flowMetrics.volumeUsd).toBe(1250);
+      expect(obs.flowMetrics.buys).toBe(15);
+      expect(obs.flowMetrics.sells).toBe(8);
+    });
+  });
+
+  describe("Dataset Export Manifest (D23P-04)", () => {
+    it("generates and verifies SHA-256 export manifest successfully", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-manifest-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        await fs.writeFile(path.join(testDir, "session-meta.json"), '{"status":"FINALIZED"}\n');
+        await fs.writeFile(
+          path.join(testDir, "candidate-decisions.jsonl"),
+          '{"eventId":"e1"}\n{"eventId":"e2"}\n',
+        );
+
+        const manifest = await generateSessionExportManifest(
+          testDir,
+          "session-manifest-01",
+          "gen1-test",
+        );
+
+        expect(manifest.files.length).toBe(2);
+        expect(manifest.manifestDigestSha256.length).toBe(64);
+
+        const verifyResult = await verifySessionExportManifest(testDir);
+        expect(verifyResult.valid).toBe(true);
+        expect(verifyResult.mismatchedFiles.length).toBe(0);
+        expect(verifyResult.missingFiles.length).toBe(0);
+        expect(verifyResult.extraFiles.length).toBe(0);
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("detects corrupted file contents during manifest verification", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-manifest-corrupt-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        await fs.writeFile(path.join(testDir, "session-meta.json"), '{"status":"FINALIZED"}\n');
+        await generateSessionExportManifest(testDir, "session-01", "gen1");
+
+        // Tamper with file content post-export
+        await fs.writeFile(path.join(testDir, "session-meta.json"), '{"status":"TAMPERED"}\n');
+
+        const verifyResult = await verifySessionExportManifest(testDir);
+        expect(verifyResult.valid).toBe(false);
+        expect(verifyResult.mismatchedFiles).toContain("session-meta.json");
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("Pilot Collector Runner Lifecycle & Recovery", () => {
+    it("executes lifecycle, enforces quotas, and finalizes with dual-file consensus", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-runner-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const runner = new PilotCollectorRunner({
+          sessionId: "test-session-runner-01",
+          generationId: "gen1-runner",
+          strategyRevision: D23_STRATEGY_REVISION,
+          outputRootDir: testDir,
+          targetCandidates: 2,
+          targetPools: 1,
+        });
+
+        await runner.initialize();
+        expect(runner.getStatus()).toBe("ACTIVE");
+
+        const mockCandidate: D23ScreenedCandidate = {
+          compositeId: {
+            decisionEventId: "evt-01",
+            sessionId: "test-session-runner-01",
+            generationId: "gen1-runner",
+            mintAddress: FIXTURE_MEME_MINT,
+            poolId: FIXTURE_POOL_ADDRESS,
+          },
+          symbol: "MEME",
+          decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+          decisionCohort: "WATCHLIST_RADAR",
+          selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+          decisionEpochMs: 1791940001000,
+          requestEpochMs: 1791940000800,
+          receiptEpochMs: 1791940000950,
+          sourceTimestampMs: null,
+          passedEligibility: true,
+          filterEvaluations: [],
+          rejectionReasons: [],
+          missingFields: ["sourceTimestampMs"],
+          providerIdentity: D23_OBSERVATIONAL_PROVIDER,
+        };
+
+        await runner.recordScreenedCandidate(mockCandidate);
+        expect(runner.getStatus()).toBe("ACTIVE");
+
+        // Second candidate reaches target (targetCandidates = 2, uniquePools = 1)
+        const mockCandidate2: D23ScreenedCandidate = {
+          ...mockCandidate,
+          compositeId: { ...mockCandidate.compositeId, decisionEventId: "evt-02" },
+        };
+        await runner.recordScreenedCandidate(mockCandidate2);
+
+        expect(runner.getStatus()).toBe("FINALIZED");
+        const stats = runner.getStats();
+        expect(stats.candidates).toBe(2);
+        expect(stats.radar).toBe(2);
+        expect(stats.pools).toBe(1);
+
+        // Verify manifest was automatically generated upon finalization
+        const sessionPath = runner.getSessionDirectory();
+        const manifestVerify = await verifySessionExportManifest(sessionPath);
+        expect(manifestVerify.valid).toBe(true);
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("recovers an unfinalized session by repairing status to INTERRUPTED (D23P-04)", async () => {
+      const testDir = path.join(os.tmpdir(), `nexustrade-test-recovery-${Date.now()}`);
+      await fs.mkdir(testDir, { recursive: true });
+
+      try {
+        const sessionPath = path.join(testDir, "test-session-unfinalized");
+        await fs.mkdir(sessionPath, { recursive: true });
+
+        // Simulate active unfinalized session meta and torn jsonl line
+        await fs.writeFile(
+          path.join(sessionPath, "session-meta.json"),
+          JSON.stringify({ sessionId: "test-session-unfinalized", status: "ACTIVE" }, null, 2),
+        );
+        await fs.writeFile(
+          path.join(sessionPath, "candidate-decisions.jsonl"),
+          '{"eventId":"valid-01"}\n{"incomplete-torn-line\n',
+        );
+
+        const recovery = await PilotCollectorRunner.recoverSession(sessionPath);
+        expect(recovery.recovered).toBe(true);
+        expect(recovery.status).toBe("INTERRUPTED");
+        expect(recovery.tornLinesIsolated).toBe(1);
+
+        // Re-read meta
+        const metaContent = await fs.readFile(path.join(sessionPath, "session-meta.json"), "utf8");
+        const meta = JSON.parse(metaContent);
+        expect(meta.status).toBe("INTERRUPTED");
+        expect(meta.interruptionReason).toBe("RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION");
+      } finally {
+        await fs.rm(testDir, { recursive: true, force: true });
+      }
+    });
+  });
+});
