@@ -2,11 +2,13 @@
 
 ## Controlled Empirical Market Data Pilot (PLANNING ONLY)
 
-**Document Version:** 1.0.0  
-**Status:** PROPOSED FOR INDEPENDENT ARCHITECTURE REVIEW (PLANNING ONLY)  
+**Document Version:** 1.0.0 (Governed by Addendum v1.1.0)  
+**Status:** DIRECTIONALLY APPROVED — REFINED VIA ADDENDUM V1 (PLANNING ONLY)  
 **Implementation Status:** STRICTLY UNAUTHORIZED — Design, Specification & Governance Scope Only  
 **Author:** Antigravity  
 **Date:** October 16, 2026  
+**Governing Addendum:** [`audit/PHASE_12_94D2_MILESTONE_D23_ADDENDUM.md`](./PHASE_12_94D2_MILESTONE_D23_ADDENDUM.md)  
+**Independent Audit Review:** [`audit/PHASE_12_94D23_COMMIT_38B0F96_INDEPENDENT_PROPOSAL_REVIEW.md`](./PHASE_12_94D23_COMMIT_38B0F96_INDEPENDENT_PROPOSAL_REVIEW.md)  
 **Prerequisites Closed & Accepted:**
 
 - Phase 12.93D (CLOSED)
