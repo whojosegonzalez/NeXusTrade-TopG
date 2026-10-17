@@ -81,7 +81,27 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let outputDir = defaultDir;
 
   for (const arg of args) {
-    if (arg === "--network=enabled") {
+    if (arg === "--help" || arg === "-h") {
+      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4)
+Usage: node backend/dist/research/pilot/PilotLiveCollectorCli.js [options]
+
+Required:
+  --network=enabled                Explicit authorization required to perform read-only network collection
+
+Options:
+  --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
+  --poll-interval-sec=<n>          DexScreener discovery polling interval in seconds (default: 30)
+  --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
+  --target-candidates=<n>          Target number of candidates to screen before stopping (default: 100)
+  --target-yield=<n>               Diagnostic target yield requirement (default: 15)
+  --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 20)
+  --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
+  --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
+  --forward-observations=true|false  Enable forward outcome observations at +1m, +5m, +15m (default: true)
+  --help, -h                       Display this help text
+`);
+      process.exit(0);
+    } else if (arg === "--network=enabled") {
       network = "enabled";
     } else if (arg === "--network=disabled") {
       network = "disabled";
@@ -208,6 +228,7 @@ export class PilotLiveCollectorSession {
     if (this.config.enableForwardObservations) {
       this.forwardTracker = new ForwardOutcomeObservationTracker({
         sessionDir,
+        maxPendingTargets: Math.max(300, this.config.targetCandidates * 3),
       });
     }
 

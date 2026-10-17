@@ -405,6 +405,157 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       const record = JSON.parse(await fs.readFile(fwdFile, "utf8"));
       expect(record.actualObservationEpochMs).toBeGreaterThanOrEqual(beforeCall + 40);
     });
+
+    it("handles 60-candidate burst with 180 scheduled targets under default capacity without outcome loss (D24R2-01)", async () => {
+      const testDir = await makeTestDir("burst-60-default");
+      const tracker = new ForwardOutcomeObservationTracker({
+        sessionDir: testDir,
+      });
+
+      for (let i = 0; i < 60; i++) {
+        const mint = `Mint${String(i).padStart(40, "0")}`;
+        const pool = `Pool${String(i).padStart(40, "0")}`;
+        const candidate: D23ScreenedCandidate = {
+          compositeId: {
+            sessionId: "sess-burst-60",
+            generationId: "gen1",
+            poolId: pool,
+            mintAddress: mint,
+            decisionEventId: `dec-burst-${i}`,
+          },
+          symbol: `TKN${i}`,
+          decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+          decisionCohort: "WATCHLIST_RADAR",
+          selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+          decisionEpochMs: 1_000_000 + i * 1000,
+          requestEpochMs: 1_000_000 + i * 1000 - 10,
+          receiptEpochMs: 1_000_000 + i * 1000 - 5,
+          sourceTimestampMs: null,
+          passedEligibility: true,
+          filterEvaluations: [],
+          rejectionReasons: [],
+          missingFields: [],
+          providerIdentity: "dexscreener_mock",
+        };
+        const obs: D23ObservationRecord = {
+          observationId: `obs-burst-${i}`,
+          compositeId: candidate.compositeId,
+          requestEpochMs: candidate.requestEpochMs,
+          receiptEpochMs: candidate.receiptEpochMs,
+          sourceReportedTimeMs: null,
+          hostMonotonicElapsedMs: 5,
+          onChainSlot: 1000 + i,
+          slotDiscrepancy: false,
+          provenance: "D23_OBSERVATIONAL_SCREENING",
+          providerIdentity: "solana_rpc_mock",
+          actualResponsePoolId: pool,
+          isMatchingPool: true,
+          reserveAccounting: null,
+          flowMetrics: { volume5mUsd: 100, buys5m: 1, sells5m: 0, netBuyerVolumeUsd: null },
+          missingFields: [],
+        };
+        tracker.registerCandidateForForwardObservation(candidate, obs);
+      }
+
+      // Expected: 60 candidates * 3 intervals = 180 targets
+      expect(tracker.getTotalScheduledCount()).toBe(180);
+      expect(tracker.getPendingTargetsCount()).toBe(180);
+      expect(tracker.getTotalRecordedCount()).toBe(0);
+
+      // Censor remaining pending targets upon session stop
+      const censored = tracker.censorRemainingPendingTargets(
+        "WINDOW_TRUNCATED",
+        "session duration elapsed",
+      );
+      expect(censored).toBe(180);
+
+      const summary = tracker.writeForwardSummary();
+      expect(summary.totalScheduled).toBe(180);
+      expect(summary.totalRecorded).toBe(180);
+      expect(summary.totalTruncated).toBe(180);
+      expect(summary.totalCensoredCapacity).toBe(0);
+      expect(summary.remainingPending).toBe(0);
+
+      // Verify each interval has exactly 60
+      expect(summary.byInterval["60"]?.scheduled).toBe(60);
+      expect(summary.byInterval["300"]?.scheduled).toBe(60);
+      expect(summary.byInterval["900"]?.scheduled).toBe(60);
+    });
+
+    it("handles 60-candidate burst under constrained capacity (150) by explicitly censoring overflowing intervals without silent drops (D24R2-01)", async () => {
+      const testDir = await makeTestDir("burst-60-overflow");
+      const tracker = new ForwardOutcomeObservationTracker({
+        sessionDir: testDir,
+        maxPendingTargets: 150, // Constrained capacity
+      });
+
+      for (let i = 0; i < 60; i++) {
+        const mint = `Mint${String(i).padStart(40, "0")}`;
+        const pool = `Pool${String(i).padStart(40, "0")}`;
+        const candidate: D23ScreenedCandidate = {
+          compositeId: {
+            sessionId: "sess-overflow-60",
+            generationId: "gen1",
+            poolId: pool,
+            mintAddress: mint,
+            decisionEventId: `dec-overflow-${i}`,
+          },
+          symbol: `TKN${i}`,
+          decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+          decisionCohort: "WATCHLIST_RADAR",
+          selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+          decisionEpochMs: 1_000_000 + i * 1000,
+          requestEpochMs: 1_000_000 + i * 1000 - 10,
+          receiptEpochMs: 1_000_000 + i * 1000 - 5,
+          sourceTimestampMs: null,
+          passedEligibility: true,
+          filterEvaluations: [],
+          rejectionReasons: [],
+          missingFields: [],
+          providerIdentity: "dexscreener_mock",
+        };
+        const obs: D23ObservationRecord = {
+          observationId: `obs-overflow-${i}`,
+          compositeId: candidate.compositeId,
+          requestEpochMs: candidate.requestEpochMs,
+          receiptEpochMs: candidate.receiptEpochMs,
+          sourceReportedTimeMs: null,
+          hostMonotonicElapsedMs: 5,
+          onChainSlot: 1000 + i,
+          slotDiscrepancy: false,
+          provenance: "D23_OBSERVATIONAL_SCREENING",
+          providerIdentity: "solana_rpc_mock",
+          actualResponsePoolId: pool,
+          isMatchingPool: true,
+          reserveAccounting: null,
+          flowMetrics: { volume5mUsd: 100, buys5m: 1, sells5m: 0, netBuyerVolumeUsd: null },
+          missingFields: [],
+        };
+        tracker.registerCandidateForForwardObservation(candidate, obs);
+      }
+
+      // 180 total expected intervals: 150 pending in queue + 30 overflowed and recorded immediately
+      expect(tracker.getTotalScheduledCount()).toBe(180);
+      expect(tracker.getPendingTargetsCount()).toBe(150);
+      expect(tracker.getTotalRecordedCount()).toBe(30);
+
+      // Censor remaining pending targets upon session stop
+      const censored = tracker.censorRemainingPendingTargets(
+        "WINDOW_TRUNCATED",
+        "session duration elapsed",
+      );
+      expect(censored).toBe(150);
+
+      const summary = tracker.writeForwardSummary();
+      expect(summary.totalScheduled).toBe(180);
+      expect(summary.totalRecorded).toBe(180);
+      expect(summary.totalTruncated).toBe(150);
+      expect(summary.totalCensoredCapacity).toBe(30);
+      expect(summary.remainingPending).toBe(0);
+
+      // The invariant holds: totalScheduled = totalRecorded = totalTruncated + totalCensoredCapacity
+      expect(summary.totalRecorded).toBe(summary.totalTruncated + summary.totalCensoredCapacity);
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -674,10 +825,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(remainingContent).toBe("CRITICAL_HISTORICAL_DATA");
     });
 
-    it("rejects import when destination directory already exists unless allowOverwrite=true", async () => {
-      const sourceBase = await makeTestDir("valid-source");
-      const importBase = await makeTestDir("dup-target");
-
+    async function createValidFinalizedSession(outputDir: string): Promise<string> {
       const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
       const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
         mintBase58: FIXTURE_MEME_MINT,
@@ -778,7 +926,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
       const runner = new LiveCollectorRunner({
         network: "enabled",
-        outputDir: sourceBase,
+        outputDir,
         durationSec: 1,
         targetCandidates: 1,
         targetDiagnosticYield: 15,
@@ -791,14 +939,22 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       });
 
       const sessionResult = await runner.run();
-      const sessionFolderName = path.basename(sessionResult.sessionDir);
+      return sessionResult.sessionDir;
+    }
+
+    it("rejects import when destination directory already exists unless allowOverwrite=true", async () => {
+      const sourceBase = await makeTestDir("valid-source");
+      const importBase = await makeTestDir("dup-target");
+
+      const sessionDir = await createValidFinalizedSession(sourceBase);
+      const sessionFolderName = path.basename(sessionDir);
 
       // Pre-create target dir
       const existingTargetDir = path.join(importBase, sessionFolderName);
       await fs.mkdir(existingTargetDir, { recursive: true });
 
       // Attempt import without allowOverwrite
-      const importResult1 = await importAndVerifyPilotSession(sessionResult.sessionDir, {
+      const importResult1 = await importAndVerifyPilotSession(sessionDir, {
         importRootDir: importBase,
         allowOverwrite: false,
       });
@@ -806,7 +962,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(importResult1.error).toContain("[IMPORT_DESTINATION_EXISTS]");
 
       // Attempt import with allowOverwrite=true succeeds
-      const importResult2 = await importAndVerifyPilotSession(sessionResult.sessionDir, {
+      const importResult2 = await importAndVerifyPilotSession(sessionDir, {
         importRootDir: importBase,
         allowOverwrite: true,
       });
@@ -822,6 +978,149 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
           importRootDir: path.resolve(".tmp/telemetry/sessions"),
         }),
       ).rejects.toThrow("[PROTECTED_PATH_VIOLATION]");
+    });
+
+    it("rejects import when canonical manifest digest is missing or corrupted (D24R2-02)", async () => {
+      const sourceBase = await makeTestDir("src-bad-digest");
+      const importBase = await makeTestDir("import-bad-digest");
+
+      const sessionDir = await createValidFinalizedSession(sourceBase);
+      const manifestPath = path.join(sessionDir, "manifest.json");
+      const manifestObj = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+
+      // Tamper: remove manifestDigestSha256
+      delete manifestObj.manifestDigestSha256;
+      await fs.writeFile(manifestPath, JSON.stringify(manifestObj, null, 2), "utf8");
+
+      // Verify canonical verifySessionExportManifest fails
+      const checkRes = await verifySessionExportManifest(sessionDir);
+      expect(checkRes.valid).toBe(false);
+      expect(checkRes.mismatchedFiles).toContain("manifest.json");
+      expect(checkRes.errorDetails).toContain("Manifest internal digest mismatch");
+
+      // Verify importAndVerifyPilotSession fails
+      const importRes = await importAndVerifyPilotSession(sessionDir, {
+        importRootDir: importBase,
+      });
+      expect(importRes.ok).toBe(false);
+      expect(importRes.error).toContain("[SOURCE_MANIFEST_INVALID]");
+
+      // Verify scripts/import-pilot-archive.mjs exits nonzero
+      const cliRes = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/import-pilot-archive.mjs"),
+          `--source=${sessionDir}`,
+          `--target-root=${importBase}`,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(cliRes.status).toBe(1);
+      expect(cliRes.stderr).toContain("Manifest internal digest mismatch");
+    });
+
+    it("safely restores existing destination via rollback if staging publish fails during overwrite (D24R2-02)", async () => {
+      const sourceBase = await makeTestDir("src-rollback");
+      const importBase = await makeTestDir("import-rollback");
+
+      const sessionDir = await createValidFinalizedSession(sourceBase);
+      const sessionFolderName = path.basename(sessionDir);
+      const existingTargetDir = path.join(importBase, sessionFolderName);
+
+      // Pre-populate existing destination with DO_NOT_DELETE.txt
+      await fs.mkdir(existingTargetDir, { recursive: true });
+      const sentinelFile = path.join(existingTargetDir, "DO_NOT_DELETE.txt");
+      await fs.writeFile(sentinelFile, "PRESERVE_THIS_CRITICAL_CONTENT", "utf8");
+
+      // Inject failure during staging publish by mocking renameSync to throw and copyFileSync to throw
+      const origRenameSync = fsSync.renameSync;
+      const origCopyFileSync = fsSync.copyFileSync;
+
+      let injectedFailure = false;
+      fsSync.renameSync = (oldPath: fsSync.PathLike, newPath: fsSync.PathLike) => {
+        // If renaming stagingDir to targetSessionDir, throw to trigger fallback
+        if (String(oldPath).includes(".staging-") && String(newPath) === existingTargetDir) {
+          throw new Error("INJECTED_RENAME_FAILURE");
+        }
+        return origRenameSync(oldPath, newPath);
+      };
+
+      fsSync.copyFileSync = (src: fsSync.PathLike, dest: fsSync.PathLike, flags?: number) => {
+        // If copying from stagingDir to targetSessionDir, throw to simulate complete publish failure
+        if (String(src).includes(".staging-") && String(dest).includes(sessionFolderName)) {
+          injectedFailure = true;
+          throw new Error("INJECTED_COPY_FAILURE");
+        }
+        return origCopyFileSync(src, dest, flags);
+      };
+
+      try {
+        const importRes = await importAndVerifyPilotSession(sessionDir, {
+          importRootDir: importBase,
+          allowOverwrite: true,
+        });
+
+        expect(importRes.ok).toBe(false);
+        expect(importRes.error).toContain("[PUBLISH_FAILED_ROLLED_BACK]");
+        expect(injectedFailure).toBe(true);
+
+        // Verify DO_NOT_DELETE.txt was rolled back and is completely intact!
+        expect(fsSync.existsSync(sentinelFile)).toBe(true);
+        const restoredContent = await fs.readFile(sentinelFile, "utf8");
+        expect(restoredContent).toBe("PRESERVE_THIS_CRITICAL_CONTENT");
+      } finally {
+        fsSync.renameSync = origRenameSync;
+        fsSync.copyFileSync = origCopyFileSync;
+      }
+    });
+
+    it("scripts/import-pilot-archive.mjs truthfully reports compatibility audit and skips when flag passed (D24R2-02)", async () => {
+      const sourceBase = await makeTestDir("src-compat-cli");
+      const importBase = await makeTestDir("import-compat-cli");
+
+      const sessionDir = await createValidFinalizedSession(sourceBase);
+
+      // 1. Run import CLI with --no-compatibility
+      const cliResNoCompat = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/import-pilot-archive.mjs"),
+          `--source=${sessionDir}`,
+          `--target-root=${importBase}`,
+          "--no-compatibility",
+        ],
+        { encoding: "utf8" },
+      );
+      expect(cliResNoCompat.status).toBe(0);
+      expect(cliResNoCompat.stdout).toContain("Compatibility Audit: SKIPPED (--no-compatibility)");
+      expect(cliResNoCompat.stdout).toContain("VALID (Canonical SHA-256 Digest Verified)");
+
+      // 2. Run import CLI without --overwrite on existing target -> exits 1
+      const cliResDup = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/import-pilot-archive.mjs"),
+          `--source=${sessionDir}`,
+          `--target-root=${importBase}`,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(cliResDup.status).toBe(1);
+      expect(cliResDup.stderr).toContain("[IMPORT_DESTINATION_EXISTS]");
+      expect(cliResDup.stderr).toContain("already exists");
+
+      // 3. Run import CLI with unknown argument -> exits 1
+      const cliResUnknown = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/import-pilot-archive.mjs"),
+          `--source=${sessionDir}`,
+          "--bogus-argument",
+        ],
+        { encoding: "utf8" },
+      );
+      expect(cliResUnknown.status).toBe(1);
+      expect(cliResUnknown.stderr).toContain("Unrecognized CLI argument: '--bogus-argument'");
     });
   });
 

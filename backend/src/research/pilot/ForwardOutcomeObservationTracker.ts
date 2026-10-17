@@ -27,6 +27,7 @@ export type ForwardObservationStatus =
   | "RPC_UNAVAILABLE"
   | "WINDOW_TRUNCATED"
   | "CENSORED_TERMINAL_INTERRUPT"
+  | "CENSORED_CAPACITY_EXCEEDED"
   | "POOL_DRAINED_OR_CLOSED";
 
 export interface ForwardOutcomeObservationRecord {
@@ -58,6 +59,7 @@ export interface ForwardOutcomeSummary {
   readonly totalRpcUnavailable: number;
   readonly totalTruncated: number;
   readonly totalCensoredInterrupt: number;
+  readonly totalCensoredCapacity: number;
   readonly remainingPending: number;
   readonly byInterval: Record<
     string,
@@ -98,6 +100,7 @@ export class ForwardOutcomeObservationTracker {
     RPC_UNAVAILABLE: 0,
     WINDOW_TRUNCATED: 0,
     CENSORED_TERMINAL_INTERRUPT: 0,
+    CENSORED_CAPACITY_EXCEEDED: 0,
     POOL_DRAINED_OR_CLOSED: 0,
   };
   private readonly intervalStats = new Map<
@@ -122,7 +125,7 @@ export class ForwardOutcomeObservationTracker {
     this.forwardFilePath = path.join(this.sessionDir, "forward-observations.jsonl");
     this.summaryFilePath = path.join(this.sessionDir, "forward-summary.json");
     this.targetIntervalsSec = options.targetIntervalsSec ?? DEFAULT_FORWARD_INTERVALS_SEC;
-    this.maxPendingTargets = options.maxPendingTargets ?? 150;
+    this.maxPendingTargets = options.maxPendingTargets ?? 300;
 
     for (const sec of this.targetIntervalsSec) {
       this.intervalStats.set(sec, {
@@ -151,6 +154,8 @@ export class ForwardOutcomeObservationTracker {
 
   /**
    * Schedules follow-up observation intervals for a newly screened candidate.
+   * D24R2-01: Ensures zero silent outcome loss. Intervals exceeding capacity are
+   * explicitly recorded as censored with full accounting.
    */
   public registerCandidateForForwardObservation(
     candidate: D23ScreenedCandidate,
@@ -167,7 +172,43 @@ export class ForwardOutcomeObservationTracker {
 
     for (const intervalSec of this.targetIntervalsSec) {
       if (this.pendingTargets.length >= this.maxPendingTargets) {
-        break; // Bounded ceiling to prevent memory buildup
+        // Explicitly account for capacity-exceeded interval as censored instead of silently dropping (D24R2-01)
+        this.totalScheduled++;
+        const currentStats = this.intervalStats.get(intervalSec);
+        if (currentStats) {
+          currentStats.scheduled++;
+        } else {
+          this.intervalStats.set(intervalSec, {
+            scheduled: 1,
+            active: 0,
+            drained: 0,
+            closed: 0,
+            rpcUnavailable: 0,
+            truncated: 0,
+            censored: 0,
+          });
+        }
+
+        const capacityRecord: ForwardOutcomeObservationRecord = {
+          forwardObservationId: `fwd-obs-${candidate.compositeId.mintAddress.slice(0, 8)}-${intervalSec}s-${decisionTime}`,
+          baselineDecisionEventId: candidate.compositeId.decisionEventId,
+          sessionId: candidate.compositeId.sessionId,
+          generationId: candidate.compositeId.generationId,
+          mintAddress: candidate.compositeId.mintAddress,
+          poolId: candidate.compositeId.poolId,
+          targetIntervalSec: intervalSec,
+          scheduledDueEpochMs: decisionTime + intervalSec * 1000,
+          actualObservationEpochMs: decisionTime,
+          elapsedSinceDecisionMs: 0,
+          isPoolActive: false,
+          spotPriceSol: null,
+          baseReserveDecimal: null,
+          quoteReserveDecimal: null,
+          observationStatus: "CENSORED_CAPACITY_EXCEEDED",
+          censorReason: `PENDING_QUEUE_CAPACITY_EXCEEDED: maxPendingTargets (${this.maxPendingTargets}) reached`,
+        };
+        this.appendRecord(capacityRecord);
+        continue;
       }
 
       this.pendingTargets.push({
@@ -430,6 +471,7 @@ export class ForwardOutcomeObservationTracker {
       totalRpcUnavailable: this.statusCounts.RPC_UNAVAILABLE,
       totalTruncated: this.statusCounts.WINDOW_TRUNCATED,
       totalCensoredInterrupt: this.statusCounts.CENSORED_TERMINAL_INTERRUPT,
+      totalCensoredCapacity: this.statusCounts.CENSORED_CAPACITY_EXCEEDED,
       remainingPending: this.pendingTargets.length,
       byInterval: byIntervalObj,
     };
@@ -452,7 +494,12 @@ export class ForwardOutcomeObservationTracker {
       else if (record.observationStatus === "POOL_CLOSED_CONFIRMED") intervalStat.closed++;
       else if (record.observationStatus === "RPC_UNAVAILABLE") intervalStat.rpcUnavailable++;
       else if (record.observationStatus === "WINDOW_TRUNCATED") intervalStat.truncated++;
-      else if (record.observationStatus === "CENSORED_TERMINAL_INTERRUPT") intervalStat.censored++;
+      else if (
+        record.observationStatus === "CENSORED_TERMINAL_INTERRUPT" ||
+        record.observationStatus === "CENSORED_CAPACITY_EXCEEDED"
+      ) {
+        intervalStat.censored++;
+      }
     }
   }
 }

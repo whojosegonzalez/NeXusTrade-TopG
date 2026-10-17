@@ -180,15 +180,18 @@ Use `PilotArchiveImporter` or `scripts/import-pilot-archive.mjs` to safely impor
 # Execute isolated Windows import and verification script (non-destructive by default)
 node scripts/import-pilot-archive.mjs --source="D:/Staging/pilot-sess-1792215300000"
 
-# Optional --overwrite flag authorizes replacing an existing same-named imported session
+# Optional --overwrite flag authorizes replacing an existing same-named imported session via safe backup-and-rollback
 node scripts/import-pilot-archive.mjs --source="D:/Staging/pilot-sess-1792215300000" --overwrite
+
+# Optional --no-compatibility flag skips D.1 hypothesis feasibility and readiness audit
+node scripts/import-pilot-archive.mjs --source="D:/Staging/pilot-sess-1792215300000" --no-compatibility
 ```
 
-The importer:
+The importer enforces strict, non-destructive safety guarantees:
 
-1. Rejects collision if destination session directory already exists, unless `--overwrite` is explicitly passed.
-2. Verifies SHA-256 hashes against `manifest.json` on the source archive before any files are copied or moved.
-3. Copies files into an isolated temporary staging directory (`.tmp/pilot-imports/sessions/.staging-...`).
-4. Re-verifies manifest integrity and executes crash recovery verification in staging, ensuring status remains `FINALIZED` with 0 torn lines.
-5. Atomically publishes the verified session into `.tmp/pilot-imports/sessions/<session-id>/`.
-6. Audits compatibility with Phase 12.94-D.1 research readiness gates without mutating historical `.tmp/telemetry/sessions/`.
+1. **Collision Protection:** Rejects import if the destination session directory already exists. Unique session directory names are required by default.
+2. **Failure-Safe Overwrite:** When `--overwrite` is explicitly provided, existing destination directories are backed up to a temporary `.backup-...` directory prior to publishing. If publishing fails, the previous destination dataset is automatically restored in full from backup, preventing data loss.
+3. **Canonical Manifest Verification:** Computes all file SHA-256 hashes and validates the canonical `manifestDigestSha256` of `manifest.json`.
+4. **Staging & Crash Recovery Verification:** Copies files into a disposable staging directory (`.staging-...`) and executes canonical crash recovery verification, requiring status to be `FINALIZED` with 0 torn lines and no post-recovery manifest mutation.
+5. **Safe Publication:** Publishes verified staging files to `.tmp/pilot-imports/sessions/<session-id>/`.
+6. **Research Compatibility:** Audits compatibility against D.1 research readiness gates (unless skipped via `--no-compatibility`) without mutating historical `.tmp/telemetry/sessions/`.

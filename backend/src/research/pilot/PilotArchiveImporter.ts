@@ -203,27 +203,95 @@ export async function importAndVerifyPilotSession(
       }
     }
 
-    // 6. Atomically publish verified staging directory to final target directory
+    // 6. Safe publish verified staging directory to final target directory with failure-safe rollback (D24R2-02)
+    let backupDir: string | null = null;
     if (targetExists) {
-      fsSync.rmSync(targetSessionDir, { recursive: true, force: true });
+      backupDir = path.join(
+        importRootDir,
+        `.backup-${sessionFolderName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      );
+      try {
+        fsSync.renameSync(targetSessionDir, backupDir);
+      } catch {
+        // Fallback copy to backup if rename fails
+        fsSync.mkdirSync(backupDir, { recursive: true });
+        for (const ent of fsSync.readdirSync(targetSessionDir, { withFileTypes: true })) {
+          if (ent.isFile()) {
+            fsSync.copyFileSync(
+              path.join(targetSessionDir, ent.name),
+              path.join(backupDir, ent.name),
+            );
+          }
+        }
+        fsSync.rmSync(targetSessionDir, { recursive: true, force: true });
+      }
     }
 
     try {
-      fsSync.renameSync(stagingDir, targetSessionDir);
-      stagingPublished = true;
-    } catch {
-      // Fallback copy if cross-device link occurs
-      fsSync.mkdirSync(targetSessionDir, { recursive: true });
-      const stagedEntries = fsSync.readdirSync(stagingDir, { withFileTypes: true });
-      for (const ent of stagedEntries) {
-        if (ent.isFile()) {
-          fsSync.copyFileSync(
-            path.join(stagingDir, ent.name),
-            path.join(targetSessionDir, ent.name),
-          );
+      try {
+        fsSync.renameSync(stagingDir, targetSessionDir);
+        stagingPublished = true;
+      } catch {
+        // Fallback copy if cross-device link occurs
+        fsSync.mkdirSync(targetSessionDir, { recursive: true });
+        const stagedEntries = fsSync.readdirSync(stagingDir, { withFileTypes: true });
+        for (const ent of stagedEntries) {
+          if (ent.isFile()) {
+            fsSync.copyFileSync(
+              path.join(stagingDir, ent.name),
+              path.join(targetSessionDir, ent.name),
+            );
+          }
+        }
+        stagingPublished = true;
+      }
+
+      // Publish succeeded: safely clean up temporary backup directory
+      if (backupDir && fsSync.existsSync(backupDir)) {
+        try {
+          fsSync.rmSync(backupDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup
         }
       }
-      stagingPublished = true;
+    } catch (publishErr) {
+      // D24R2-02: PUBLISH FAILED! ROLL BACK PREVIOUS DATASET FROM BACKUP TO PREVENT DATA LOSS!
+      if (fsSync.existsSync(targetSessionDir)) {
+        try {
+          fsSync.rmSync(targetSessionDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup failure during rollback
+        }
+      }
+      if (backupDir && fsSync.existsSync(backupDir)) {
+        try {
+          fsSync.renameSync(backupDir, targetSessionDir);
+        } catch {
+          fsSync.mkdirSync(targetSessionDir, { recursive: true });
+          for (const ent of fsSync.readdirSync(backupDir, { withFileTypes: true })) {
+            if (ent.isFile()) {
+              fsSync.copyFileSync(
+                path.join(backupDir, ent.name),
+                path.join(targetSessionDir, ent.name),
+              );
+            }
+          }
+          try {
+            fsSync.rmSync(backupDir, { recursive: true, force: true });
+          } catch {
+            // ignore cleanup failure during rollback
+          }
+        }
+      }
+
+      return {
+        ok: false,
+        importedSessionDir: targetSessionDir,
+        manifestResult: stagingManifestResult,
+        recoveryResult,
+        compatibilityReport: null,
+        error: `[PUBLISH_FAILED_ROLLED_BACK] Staging publish failed: ${publishErr instanceof Error ? publishErr.message : String(publishErr)}. Existing destination was safely restored from backup.`,
+      };
     }
 
     let compatibilityReport: PilotSessionCompatibilityReport | null = null;
