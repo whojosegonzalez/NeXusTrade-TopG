@@ -44,6 +44,8 @@ import {
 } from "./PilotCollectorRunner.js";
 // @ts-expect-error D.1 readiness audit script is authored as .mjs with sibling .d.ts
 import { runReadinessAudit } from "../../../../scripts/audit-research-readiness.mjs";
+import { evaluateResearchEligibility } from "../ResearchEligibilityGate.js";
+import { TelemetryExecutionJoinEngine } from "../TelemetryExecutionJoinEngine.js";
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
   createAuthoritativeSplVaultBuffer,
@@ -1381,6 +1383,381 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
           expect(auditResult.unfinalizedSessionsCount).toBe(0);
           expect(auditResult.totalDecisions).toBe(1);
           expect(auditResult.totalObservations).toBe(1);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("Phase 12.94-D.2.3 Closure Audit v3 Regressions (D23C3-01 through D23C3-04)", () => {
+      it("D23C3-01: seals write queue during finalization: distinct-ID concurrency respects terminal boundary and manifest matches archive", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c3-01-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-distinct-concurrency-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          const candA: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-distinct-concurrency-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-distinct-cand-a",
+            },
+          };
+          const candB: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-distinct-concurrency-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-distinct-cand-b",
+            },
+          };
+
+          // Issue two concurrent, distinct-ID decisions through Promise.allSettled
+          const results = await Promise.allSettled([
+            runner.recordScreenedCandidate(candA),
+            runner.recordScreenedCandidate(candB),
+          ]);
+
+          // Exactly one must fulfill and reach targetCandidates=1; the other must be rejected by terminal boundary
+          const fulfilled = results.filter((r) => r.status === "fulfilled");
+          const rejected = results.filter((r) => r.status === "rejected");
+          expect(fulfilled.length).toBe(1);
+          expect(rejected.length).toBe(1);
+
+          const rejectionError = (rejected[0] as PromiseRejectedResult).reason;
+          expect(String(rejectionError)).toContain("WRITE_AFTER_TERMINAL_BOUNDARY");
+
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          // Verify actual JSONL counts equal both summary and manifest
+          const sessionDir = runner.getSessionDirectory();
+          const decisionsContent = await fs.readFile(
+            path.join(sessionDir, "candidate-decisions.jsonl"),
+            "utf8",
+          );
+          const decisionLines = decisionsContent.split("\n").filter((l) => l.trim().length > 0);
+          expect(decisionLines.length).toBe(1);
+
+          const summaryContent = await fs.readFile(
+            path.join(sessionDir, "session-summary.json"),
+            "utf8",
+          );
+          const summary = JSON.parse(summaryContent);
+          expect(summary.totalCandidatesScreened).toBe(1);
+          expect(summary.totalDecisionsRecorded).toBe(1);
+
+          // Manifest must verify valid against actual files on disk
+          const manifestVerification = await verifySessionExportManifest(sessionDir);
+          expect(manifestVerification.valid).toBe(true);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("D23C3-02: recovery downgrades to INTERRUPTED on orphan shadow evaluation even when transfer manifest is recomputed", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c3-02-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-orphan-eval-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          await runner.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "session-orphan-eval-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-clean-01",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "session-orphan-eval-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-clean-01",
+              },
+            },
+          );
+
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          const sessionDir = runner.getSessionDirectory();
+
+          // 1. Modify the saved evaluation's decisionEventId to "phantom" while keeping sessionId, generationId, line count
+          const evalPath = path.join(sessionDir, "shadow-evaluations.jsonl");
+          const evalsRaw = await fs.readFile(evalPath, "utf8");
+          const evalLine = JSON.parse(evalsRaw.trim());
+          evalLine.decisionEventId = "phantom-decision-event-id";
+          await fs.writeFile(evalPath, JSON.stringify(evalLine) + "\n", "utf8");
+
+          // 2. Recompute the transfer manifest so file SHA-256 hashes are technically valid
+          await generateSessionExportManifest(
+            sessionDir,
+            "session-orphan-eval-01",
+            "gen1-pilot",
+            Date.now(),
+          );
+          const manifestCheck = await verifySessionExportManifest(sessionDir);
+          expect(manifestCheck.valid).toBe(true);
+
+          // 3. Invoke recoverSession(): complete 5-part foreign key check must detect orphan evaluation and fail closed
+          const recovery = await PilotCollectorRunner.recoverSession(sessionDir);
+          expect(recovery.status).toBe("INTERRUPTED");
+          expect(recovery.recovered).toBe(true);
+          expect(
+            recovery.diagnostics.some((d) => d.includes("orphan") || d.includes("phantom")),
+          ).toBe(true);
+
+          const repairedMeta = JSON.parse(
+            await fs.readFile(path.join(sessionDir, "session-meta.json"), "utf8"),
+          );
+          expect(repairedMeta.sessionStatus).toBe("INTERRUPTED");
+          expect(repairedMeta.interruptionReason).toBe("ORPHAN_EVALUATION_RECORD");
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("D23C3-03: verifies actual-response pool identity at ingestion and rejects mismatched or case-altered pool IDs", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c3-03-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-actual-pool-check-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 10,
+            targetPools: 10,
+          });
+          await runner.initialize();
+
+          const canonicalPoolId = "So11111111111111111111111111111111111111112";
+
+          // 1. Observation with matching composite poolId, but unrelated actualResponsePoolId and isMatchingPool=false
+          const unrelatedObs: D23ObservationRecord = {
+            ...mockObservation,
+            actualResponsePoolId: "DifferentPoolPublicKey111111111111111111111111",
+            isMatchingPool: false,
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-unrelated-pool",
+            },
+          };
+          const cand1: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-unrelated-pool",
+            },
+          };
+
+          await expect(runner.recordScreenedCandidate(cand1, unrelatedObs)).rejects.toThrow(
+            /ACTUAL_RESPONSE_POOL_MISMATCH|UNVERIFIED_MATCHING_POOL/,
+          );
+
+          // 2. Case-only mismatch on Solana public key (Solana base58 addresses are case-sensitive)
+          const lowerCasedPoolId = canonicalPoolId.toLowerCase();
+          const caseMismatchedObs: D23ObservationRecord = {
+            ...mockObservation,
+            actualResponsePoolId: lowerCasedPoolId,
+            isMatchingPool: true,
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-case-mismatched-pool",
+            },
+          };
+          const cand2: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-case-mismatched-pool",
+            },
+          };
+
+          await expect(runner.recordScreenedCandidate(cand2, caseMismatchedObs)).rejects.toThrow(
+            /ACTUAL_RESPONSE_POOL_MISMATCH|COMPOSITE_FOREIGN_KEY_MISMATCH/,
+          );
+
+          // 3. Observation with matching actualResponsePoolId but isMatchingPool=false
+          const unverifiedObs: D23ObservationRecord = {
+            ...mockObservation,
+            actualResponsePoolId: canonicalPoolId,
+            isMatchingPool: false,
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-unverified-flag",
+            },
+          };
+          const cand3: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-actual-pool-check-01",
+              poolId: canonicalPoolId,
+              decisionEventId: "evt-unverified-flag",
+            },
+          };
+
+          await expect(runner.recordScreenedCandidate(cand3, unverifiedObs)).rejects.toThrow(
+            /UNVERIFIED_MATCHING_POOL/,
+          );
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("D23C3-04: end-to-end compatibility test: reconciles D.1 readiness output with downstream eligibility and pilot classification", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c3-04-${Date.now()}`);
+        const sessionsParentDir = path.join(testDir, "telemetry-sessions");
+        const emptyLegacyDir = path.join(testDir, "empty-legacy-sessions");
+        await fs.mkdir(sessionsParentDir, { recursive: true });
+        await fs.mkdir(emptyLegacyDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-pilot-h2-reconciliation-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          // Finalize an unmodified pilot observation with real-valued 5-minute flow fields,
+          // but source timestamp explicitly unknown (sourceTimestampMs=0, missingFields includes sourceTimestampMs)
+          const exploratoryObservation: D23ObservationRecord = {
+            ...mockObservation,
+            sourceReportedTimeMs: null, // explicitly unknown upstream source time
+            missingFields: ["sourceTimestampMs"],
+            flowMetrics: {
+              volume5mUsd: 250_000,
+              buys5m: 140,
+              sells5m: 90,
+              netBuyerVolumeUsd: 35_000,
+            },
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-pilot-h2-reconciliation-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-pilot-reconciliation-01",
+            },
+          };
+
+          const exploratoryCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            sourceTimestampMs: null, // explicitly unknown source time
+            missingFields: ["sourceTimestampMs"],
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-pilot-h2-reconciliation-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-pilot-reconciliation-01",
+            },
+          };
+
+          await runner.recordScreenedCandidate(exploratoryCandidate, exploratoryObservation);
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          const sessionDir = runner.getSessionDirectory();
+
+          // 1. D.1 readiness audit output: checks co-occurring flow fields and reports eligibleH2DecisionsCount=1
+          const d1Readiness = runReadinessAudit({
+            telemetrySessionsDir: sessionsParentDir,
+            legacySessionsDir: emptyLegacyDir,
+            reportOutputPath: path.join(sessionDir, "D1_AUDIT.md"),
+          });
+          expect(d1Readiness.finalizedSessionsCount).toBe(1);
+          expect(d1Readiness.eligibleH2DecisionsCount).toBe(1);
+
+          // 2. Direct downstream TelemetryExecutionJoinEngine + ResearchEligibilityGate evaluation
+          const decPath = path.join(sessionDir, "candidate-decisions.jsonl");
+          const obsPath = path.join(sessionDir, "market-observations.jsonl");
+          const decRecord = JSON.parse((await fs.readFile(decPath, "utf8")).trim());
+          const obsRecord = JSON.parse((await fs.readFile(obsPath, "utf8")).trim());
+
+          const joinEngine = new TelemetryExecutionJoinEngine({ mode: "OBSERVATIONAL_ONLY" });
+          const joined = joinEngine.joinTelemetryAndExecution({
+            decisions: [decRecord],
+            observations: [obsRecord],
+            mode: "OBSERVATIONAL_ONLY",
+          });
+          expect(joined.length).toBe(1);
+
+          const gateResult = evaluateResearchEligibility(joined[0]!, {
+            mode: "OBSERVATIONAL_ONLY",
+          });
+          // Gate rejects because sourceTimestampMs=0 causes excessive ingestion lag!
+          expect(gateResult.isEligible).toBe(false);
+          expect(
+            gateResult.rejectionReasons.some((r) => r.includes("EXCESSIVE_INGESTION_LAG")),
+          ).toBe(true);
+
+          // 3. Pilot compatibility audit reconciles D.1 readiness output with downstream eligibility
+          const compReport = await PilotCollectorRunner.auditSessionCompatibility(sessionDir, {
+            legacySessionsDir: emptyLegacyDir,
+          });
+
+          expect(compReport.d1ReadinessMetrics.eligibleH2DecisionsCount).toBe(1);
+          expect(compReport.downstreamGateMetrics.authoritativeH2EligibleCount).toBe(0);
+          expect(compReport.pilotEvidenceClassification.receiptTimeExploratoryH2Count).toBe(1);
+          expect(compReport.pilotEvidenceClassification.authoritativeD1EligibleCount).toBe(0);
+          expect(compReport.pilotEvidenceClassification.primaryClassification).toBe(
+            "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
+          );
+          expect(compReport.reconciliation.status).toBe("RECONCILED_WITH_CAVEAT");
+          expect(compReport.reconciliation.caveatNotice).toContain(
+            "receipt-time exploratory / source-time unverified",
+          );
+          expect(compReport.reconciliation.caveatNotice).toContain(
+            "NOT authoritatively qualified D.1 H2 evidence",
+          );
+
+          // 4. Check summary on disk recorded researchClassification
+          const summary = JSON.parse(
+            await fs.readFile(path.join(sessionDir, "session-summary.json"), "utf8"),
+          );
+          expect(summary.researchClassification?.classification).toBe(
+            "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
+          );
+          expect(summary.researchClassification?.exploratoryReceiptTimeH2DecisionsCount).toBe(1);
         } finally {
           await fs.rm(testDir, { recursive: true, force: true });
         }

@@ -45,6 +45,10 @@ import type {
   SessionTelemetrySummary,
 } from "../../telemetry/TelemetryTypes.js";
 import type { ShadowEvaluationRecord } from "../ShadowEvaluationTypes.js";
+import {
+  auditPilotSessionCompatibility,
+  type PilotSessionCompatibilityReport,
+} from "./PilotResearchCompatibility.js";
 
 export interface MockPilotDataSource {
   fetchLatestProfiles(): Promise<unknown>;
@@ -343,6 +347,38 @@ export function validateCandidateCausality(
         error: `[COMPOSITE_FOREIGN_KEY_MISMATCH] Observation poolId '${observation.compositeId.poolId}' does not match candidate poolId '${candidate.compositeId.poolId}'.`,
       };
     }
+
+    // D23C3-03: Validate actualResponsePoolId as an exact case-sensitive match to intended pool and verified matching flag
+    if (
+      typeof observation.actualResponsePoolId !== "string" ||
+      observation.actualResponsePoolId.trim().length === 0
+    ) {
+      return {
+        valid: false,
+        error: `[ACTUAL_RESPONSE_POOL_MISMATCH] Observation actualResponsePoolId is missing or empty.`,
+      };
+    }
+
+    if (observation.actualResponsePoolId !== candidate.compositeId.poolId) {
+      return {
+        valid: false,
+        error: `[ACTUAL_RESPONSE_POOL_MISMATCH] Observation actualResponsePoolId '${observation.actualResponsePoolId}' does not exactly match intended candidate poolId '${candidate.compositeId.poolId}'.`,
+      };
+    }
+
+    if (observation.actualResponsePoolId !== observation.compositeId.poolId) {
+      return {
+        valid: false,
+        error: `[COMPOSITE_FOREIGN_KEY_MISMATCH] Observation actualResponsePoolId '${observation.actualResponsePoolId}' does not match observation composite poolId '${observation.compositeId.poolId}'.`,
+      };
+    }
+
+    if (observation.isMatchingPool !== true) {
+      return {
+        valid: false,
+        error: `[UNVERIFIED_MATCHING_POOL] Observation isMatchingPool flag is false (provider response pool unverified).`,
+      };
+    }
   }
 
   return { valid: true };
@@ -385,6 +421,7 @@ export class PilotCollectorRunner {
   private readonly dataSource?: MockPilotDataSource | undefined;
 
   private status: CanonicalSessionStatus = "ACTIVE";
+  private isClosing: boolean = false;
   private startEpochMs: number = 0;
   private operationalBytesWritten: number = 0;
   private emergencyBytesWritten: number = 0;
@@ -503,9 +540,9 @@ export class PilotCollectorRunner {
     candidate: D23ScreenedCandidate,
     observation?: D23ObservationRecord | undefined,
   ): Promise<void> {
-    if (this.status !== "ACTIVE") {
+    if (this.status !== "ACTIVE" || this.isClosing) {
       throw new Error(
-        `[PilotCollectorRunner] Cannot record candidate in session state ${this.status}`,
+        `[PilotCollectorRunner] Cannot record candidate in session state ${this.status} (closing=${this.isClosing})`,
       );
     }
 
@@ -605,11 +642,20 @@ export class PilotCollectorRunner {
 
     // 6. Serialize async append and state mutations via writeMutex (D23R-03)
     const writeOp = async () => {
+      // D23C3-01: Terminal boundary seal - reject queued write if runner has finalized or interrupted
+      if (this.status !== "ACTIVE") {
+        this.seenDecisionEventIds.delete(eventId);
+        throw new Error(
+          `[PilotCollectorRunner] [WRITE_AFTER_TERMINAL_BOUNDARY] Cannot write candidate '${eventId}': session status is ${this.status}`,
+        );
+      }
+
       try {
         this.checkWriteAdmission(totalProjectedBytes, false);
       } catch (err: unknown) {
         // Fail closed: immediately transition status to INTERRUPTED and write emergency metadata (D23F-02)
         this.status = "INTERRUPTED";
+        this.isClosing = true;
         const reason = err instanceof Error ? err.message : String(err);
         this.interruptionReason = reason.includes("STORAGE_QUOTA_EXCEEDED")
           ? "STORAGE_QUOTA_EXCEEDED"
@@ -789,9 +835,23 @@ export class PilotCollectorRunner {
     targetStatus: "FINALIZED" | "INTERRUPTED",
     interruptionReason?: string | undefined,
   ): Promise<void> {
-    // Drain all in-flight writes before setting finality (D23R-03)
-    await this.writeMutex;
-    await this.finalizeInternal(targetStatus, interruptionReason);
+    if (this.status !== "ACTIVE" || this.isClosing) {
+      return;
+    }
+    // D23C3-01: Immediately mark isClosing so new candidate admissions fail closed
+    this.isClosing = true;
+
+    // Drain all in-flight writes that entered before finalize was called
+    const finalOp = async () => {
+      await this.finalizeInternal(targetStatus, interruptionReason);
+    };
+    const prev = this.writeMutex;
+    const curr = prev.then(finalOp, finalOp);
+    this.writeMutex = curr.then(
+      () => {},
+      () => {},
+    );
+    await curr;
   }
 
   private async finalizeInternal(
@@ -801,6 +861,8 @@ export class PilotCollectorRunner {
     if (this.status !== "ACTIVE") {
       return;
     }
+    // D23C3-01: Seal closing boundary so in-flight writes cannot proceed
+    this.isClosing = true;
 
     // Before finalization, reconcile all persisted evidence against append baseline (D23F-03)
     if (targetStatus === "FINALIZED") {
@@ -837,33 +899,86 @@ export class PilotCollectorRunner {
 
     await this.writeSessionMeta(meta, false);
 
-    const summary: SessionTelemetrySummary = {
-      sessionId: this.config.sessionId,
-      generationId: this.config.generationId,
-      strategyRevision: this.config.strategyRevision,
-      startedAtIso: new Date(this.startEpochMs).toISOString(),
-      closedAtIso: new Date(endEpochMs).toISOString(),
-      totalCandidatesScreened: this.totalCandidatesScreened,
-      totalDecisionsRecorded: this.totalCandidatesScreened,
-      decisionWriteFailures: 0,
-      cohortBreakdown: {
-        filteredRejected: this.totalFilteredRejected,
-        watchlistRadar: this.totalWatchlistRadar,
-        triggerRejected: 0,
-        executedBuy: 0,
-      },
-      topRejectionReasons: interruptionReason ? { [interruptionReason]: 1 } : {},
-      totalMarketObservationsRecorded: this.totalObservationsRecorded,
-      totalStratifiedCandidatesTracked: 0,
-      missedWinnersCount: 0,
-      avoidedRugsCount: 0,
-      isCompleteSession: targetStatus === "FINALIZED",
-      isInterruptedSession: targetStatus === "INTERRUPTED",
-    };
+    // D23C3-04: Evaluate exploratory flow observations without provider source time
+    let exploratoryReceiptTimeFlowDecisions = 0;
+    for (const dec of this.decisionsBaseline.values()) {
+      const ms = dec.metricsSnapshot;
+      const hasFlow =
+        ms?.volume5mUsd !== null &&
+        ms?.volume5mUsd !== undefined &&
+        ms?.buys5m !== null &&
+        ms?.buys5m !== undefined &&
+        ms?.sells5m !== null &&
+        ms?.sells5m !== undefined;
+      const hasSourceTime =
+        dec.sourceTimestampMs !== null &&
+        dec.sourceTimestampMs !== undefined &&
+        dec.sourceTimestampMs > 0 &&
+        !dec.missingFields?.includes("sourceTimestampMs");
+      if (hasFlow && !hasSourceTime) {
+        exploratoryReceiptTimeFlowDecisions++;
+      }
+    }
+
+    const summary: SessionTelemetrySummary & { researchClassification?: Record<string, unknown> } =
+      {
+        sessionId: this.config.sessionId,
+        generationId: this.config.generationId,
+        strategyRevision: this.config.strategyRevision,
+        startedAtIso: new Date(this.startEpochMs).toISOString(),
+        closedAtIso: new Date(endEpochMs).toISOString(),
+        totalCandidatesScreened: this.totalCandidatesScreened,
+        totalDecisionsRecorded: this.totalCandidatesScreened,
+        decisionWriteFailures: 0,
+        cohortBreakdown: {
+          filteredRejected: this.totalFilteredRejected,
+          watchlistRadar: this.totalWatchlistRadar,
+          triggerRejected: 0,
+          executedBuy: 0,
+        },
+        topRejectionReasons: interruptionReason ? { [interruptionReason]: 1 } : {},
+        totalMarketObservationsRecorded: this.totalObservationsRecorded,
+        totalStratifiedCandidatesTracked: 0,
+        missedWinnersCount: 0,
+        avoidedRugsCount: 0,
+        isCompleteSession: targetStatus === "FINALIZED",
+        isInterruptedSession: targetStatus === "INTERRUPTED",
+        ...(exploratoryReceiptTimeFlowDecisions > 0
+          ? {
+              researchClassification: {
+                classification: "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
+                exploratoryReceiptTimeH2DecisionsCount: exploratoryReceiptTimeFlowDecisions,
+                authoritativeD1H2DecisionsCount: 0,
+                reconciliationNotice:
+                  "Observed 5-minute flow metrics at receipt time without provider source timestamp attestation (sourceTimestampMs=0). Classified as receipt-time exploratory / source-time unverified, NOT authoritatively qualified D.1 H2 evidence.",
+              },
+            }
+          : {}),
+      };
 
     await this.writeSessionSummary(summary, false);
 
     if (targetStatus === "FINALIZED") {
+      if (exploratoryReceiptTimeFlowDecisions > 0) {
+        const compatibilityRecord = {
+          sessionId: this.config.sessionId,
+          generationId: this.config.generationId,
+          strategyRevision: this.config.strategyRevision,
+          totalCandidatesScreened: this.totalCandidatesScreened,
+          exploratoryReceiptTimeH2DecisionsCount: exploratoryReceiptTimeFlowDecisions,
+          authoritativeD1H2DecisionsCount: 0,
+          classification: "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
+          reconciliationStatus: "RECONCILED_WITH_CAVEAT",
+          caveatNotice:
+            "Observed 5-minute flow metrics at receipt time without provider source timestamp attestation (sourceTimestampMs=0). Classified as receipt-time exploratory / source-time unverified, NOT authoritatively qualified D.1 H2 evidence.",
+        };
+        await fs.writeFile(
+          path.join(this.sessionDir, "pilot-research-compatibility.json"),
+          JSON.stringify(compatibilityRecord, null, 2),
+          "utf8",
+        );
+      }
+
       await generateSessionExportManifest(
         this.sessionDir,
         this.config.sessionId,
@@ -1109,9 +1224,21 @@ export class PilotCollectorRunner {
         }
       }
 
-      // 3. Persisted record linkage / foreign keys (D23R-02)
+      // 3. Persisted record linkage, complete 5-part foreign keys, and unique identities (D23R-02, D23C3-02)
       if (!mustInterrupt) {
+        // A. Validate decision records and build identity map
+        const decisionsMap = new Map<string, CandidateDecisionRecord>();
+        const seenDecisionEventIds = new Set<string>();
+
         for (const dec of decisions) {
+          if (seenDecisionEventIds.has(dec.eventId)) {
+            mustInterrupt = true;
+            interruptionReason = "DUPLICATE_PERSISTED_DECISION_ID";
+            diagnostics.push(`Duplicate candidate decision eventId detected: '${dec.eventId}'`);
+            break;
+          }
+          seenDecisionEventIds.add(dec.eventId);
+
           if (
             dec.sessionId !== meta.sessionId ||
             dec.generationId !== meta.generationId ||
@@ -1124,25 +1251,120 @@ export class PilotCollectorRunner {
             );
             break;
           }
+          decisionsMap.set(dec.eventId, dec);
         }
-        for (const ev of evaluations) {
-          if (ev.sessionId !== meta.sessionId || ev.generationId !== meta.generationId) {
-            mustInterrupt = true;
-            interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
-            diagnostics.push(
-              `Shadow evaluation record '${ev.evaluationId}' contradicts session identity: sessionId=${ev.sessionId}, generationId=${ev.generationId}`,
-            );
-            break;
+
+        // B. Validate complete five-part evaluation-to-decision relationship and unique evaluation identities (D23C3-02)
+        if (!mustInterrupt) {
+          const seenEvaluationIds = new Set<string>();
+          const seenEvaluatedDecisionIds = new Set<string>();
+
+          for (const ev of evaluations) {
+            if (seenEvaluationIds.has(ev.evaluationId)) {
+              mustInterrupt = true;
+              interruptionReason = "DUPLICATE_PERSISTED_EVALUATION_ID";
+              diagnostics.push(
+                `Duplicate shadow evaluation evaluationId detected: '${ev.evaluationId}'`,
+              );
+              break;
+            }
+            seenEvaluationIds.add(ev.evaluationId);
+
+            if (seenEvaluatedDecisionIds.has(ev.decisionEventId)) {
+              mustInterrupt = true;
+              interruptionReason = "DUPLICATE_DECISION_EVALUATION";
+              diagnostics.push(
+                `Multiple shadow evaluations link to the same decisionEventId: '${ev.decisionEventId}'`,
+              );
+              break;
+            }
+            seenEvaluatedDecisionIds.add(ev.decisionEventId);
+
+            // Complete five-part foreign key check against candidate decisions:
+            // 1) decisionEventId must exist in persisted decisions (orphan evaluation check)
+            const parentDec = decisionsMap.get(ev.decisionEventId);
+            if (!parentDec) {
+              mustInterrupt = true;
+              interruptionReason = "ORPHAN_EVALUATION_RECORD";
+              diagnostics.push(
+                `Shadow evaluation '${ev.evaluationId}' is an orphan: references non-existent decisionEventId '${ev.decisionEventId}'`,
+              );
+              break;
+            }
+
+            // 2) sessionId, 3) generationId, 4) mintAddress, 5) poolId
+            if (
+              ev.sessionId !== parentDec.sessionId ||
+              ev.generationId !== parentDec.generationId ||
+              ev.mintAddress !== parentDec.mintAddress ||
+              ev.poolId !== parentDec.poolId
+            ) {
+              mustInterrupt = true;
+              interruptionReason = "EVALUATION_DECISION_IDENTITY_MISMATCH";
+              diagnostics.push(
+                `Shadow evaluation '${ev.evaluationId}' contradicts parent decision '${parentDec.eventId}' composite identity: ` +
+                  `ev(session=${ev.sessionId}, gen=${ev.generationId}, mint=${ev.mintAddress}, pool=${ev.poolId}) vs ` +
+                  `dec(session=${parentDec.sessionId}, gen=${parentDec.generationId}, mint=${parentDec.mintAddress}, pool=${parentDec.poolId})`,
+              );
+              break;
+            }
+
+            if (ev.sessionId !== meta.sessionId || ev.generationId !== meta.generationId) {
+              mustInterrupt = true;
+              interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
+              diagnostics.push(
+                `Shadow evaluation record '${ev.evaluationId}' contradicts session identity: sessionId=${ev.sessionId}, generationId=${ev.generationId}`,
+              );
+              break;
+            }
           }
         }
-        for (const obs of observations) {
-          if (obs.sessionId !== meta.sessionId || obs.generationId !== meta.generationId) {
-            mustInterrupt = true;
-            interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
-            diagnostics.push(
-              `Market observation record '${obs.observationId}' contradicts session identity: sessionId=${obs.sessionId}, generationId=${obs.generationId}`,
+
+        // C. Validate market observations and observation linkage (D23C3-02, D23C3-03)
+        if (!mustInterrupt) {
+          const seenObservationIds = new Set<string>();
+          for (const obs of observations) {
+            if (seenObservationIds.has(obs.observationId)) {
+              mustInterrupt = true;
+              interruptionReason = "DUPLICATE_PERSISTED_OBSERVATION_ID";
+              diagnostics.push(
+                `Duplicate market observation observationId detected: '${obs.observationId}'`,
+              );
+              break;
+            }
+            seenObservationIds.add(obs.observationId);
+
+            if (obs.sessionId !== meta.sessionId || obs.generationId !== meta.generationId) {
+              mustInterrupt = true;
+              interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
+              diagnostics.push(
+                `Market observation record '${obs.observationId}' contradicts session identity: sessionId=${obs.sessionId}, generationId=${obs.generationId}`,
+              );
+              break;
+            }
+
+            // Check that observation pool & mint match a candidate decision in the session
+            const matchesDec = decisions.some(
+              (d) => d.poolId === obs.poolId && d.mintAddress === obs.mintAddress,
             );
-            break;
+            if (!matchesDec && decisions.length > 0) {
+              mustInterrupt = true;
+              interruptionReason = "ORPHAN_OBSERVATION_RECORD";
+              diagnostics.push(
+                `Market observation '${obs.observationId}' does not match any candidate decision pool/mint in session`,
+              );
+              break;
+            }
+
+            // If actualResponsePoolId is present, verify exact case-sensitive match (D23C3-03)
+            if (obs.actualResponsePoolId && obs.actualResponsePoolId !== obs.poolId) {
+              mustInterrupt = true;
+              interruptionReason = "OBSERVATION_POOL_IDENTITY_MISMATCH";
+              diagnostics.push(
+                `Market observation '${obs.observationId}' actualResponsePoolId '${obs.actualResponsePoolId}' does not match poolId '${obs.poolId}'`,
+              );
+              break;
+            }
           }
         }
       }
@@ -1307,5 +1529,12 @@ export class PilotCollectorRunner {
       emergencyBytesWritten: this.emergencyBytesWritten,
       bytesWritten: this.operationalBytesWritten + this.emergencyBytesWritten,
     };
+  }
+
+  public static async auditSessionCompatibility(
+    sessionDir: string,
+    options?: { legacySessionsDir?: string | undefined; reportOutputPath?: string | undefined },
+  ): Promise<PilotSessionCompatibilityReport> {
+    return auditPilotSessionCompatibility(sessionDir, options);
   }
 }
