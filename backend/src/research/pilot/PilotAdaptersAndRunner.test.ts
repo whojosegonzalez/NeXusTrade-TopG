@@ -1702,7 +1702,7 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
           const d1Readiness = runReadinessAudit({
             telemetrySessionsDir: sessionsParentDir,
             legacySessionsDir: emptyLegacyDir,
-            reportOutputPath: path.join(sessionDir, "D1_AUDIT.md"),
+            reportOutputPath: path.join(testDir, "D1_AUDIT.md"),
           });
           expect(d1Readiness.finalizedSessionsCount).toBe(1);
           expect(d1Readiness.eligibleH2DecisionsCount).toBe(1);
@@ -1758,6 +1758,254 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
             "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
           );
           expect(summary.researchClassification?.exploratoryReceiptTimeH2DecisionsCount).toBe(1);
+
+          // 5. Transfer manifest must remain valid after compatibility audit
+          const manifestVerification = await verifySessionExportManifest(sessionDir);
+          expect(manifestVerification.valid).toBe(true);
+          expect(manifestVerification.extraFiles).toEqual([]);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("Phase 12.94-D.2.3 Closure Review v4 Regressions (D23C4-01)", () => {
+      it("D23C4-01A: default auditSessionCompatibility call is strictly read-only and preserves transfer manifest validity", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c4-01a-${Date.now()}`);
+        const sessionsParentDir = path.join(testDir, "telemetry-sessions");
+        await fs.mkdir(sessionsParentDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-readonly-audit-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          await runner.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "session-readonly-audit-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-readonly-01",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "session-readonly-audit-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-readonly-01",
+              },
+            },
+          );
+
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+          const sessionDir = runner.getSessionDirectory();
+
+          // Manifest is valid immediately following finalization
+          const manifestBefore = await verifySessionExportManifest(sessionDir);
+          expect(manifestBefore.valid).toBe(true);
+          expect(manifestBefore.extraFiles).toEqual([]);
+
+          // Invoke compatibility audit with default options (no explicit reportOutputPath provided)
+          const compReport = await PilotCollectorRunner.auditSessionCompatibility(sessionDir);
+          expect(compReport.sessionId).toBe("session-readonly-audit-01");
+
+          // Manifest MUST remain valid, with NO extra markdown/sidecar files created in sessionDir
+          const manifestAfter = await verifySessionExportManifest(sessionDir);
+          expect(manifestAfter.valid).toBe(true);
+          expect(manifestAfter.extraFiles).toEqual([]);
+          expect(manifestAfter.missingFiles).toEqual([]);
+          expect(manifestAfter.mismatchedFiles).toEqual([]);
+
+          // Recovery must succeed and remain FINALIZED (not degraded to INTERRUPTED)
+          const recovery = await PilotCollectorRunner.recoverSession(sessionDir);
+          expect(recovery.status).toBe("FINALIZED");
+          expect(recovery.recovered).toBe(true);
+          expect(recovery.diagnostics).toEqual([]);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("D23C4-01B: sibling-session isolation cleanly separates session metrics from aggregate parent-scope totals", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c4-01b-${Date.now()}`);
+        const sessionsParentDir = path.join(testDir, "telemetry-sessions");
+        await fs.mkdir(sessionsParentDir, { recursive: true });
+
+        try {
+          // Session 1: session-sibling-alpha
+          const runner1 = new PilotCollectorRunner({
+            sessionId: "session-sibling-alpha",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner1.initialize();
+          await runner1.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "session-sibling-alpha",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-sibling-alpha",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "session-sibling-alpha",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-sibling-alpha",
+              },
+            },
+          );
+          await runner1.finalize("FINALIZED");
+
+          // Session 2: session-sibling-beta in the SAME parent directory
+          const runner2 = new PilotCollectorRunner({
+            sessionId: "session-sibling-beta",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner2.initialize();
+          await runner2.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "session-sibling-beta",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-sibling-beta",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "session-sibling-beta",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-sibling-beta",
+              },
+            },
+          );
+          await runner2.finalize("FINALIZED");
+
+          // Audit session alpha
+          const sessionDir1 = runner1.getSessionDirectory();
+          const report1 = await PilotCollectorRunner.auditSessionCompatibility(sessionDir1);
+
+          expect(report1.sessionId).toBe("session-sibling-alpha");
+          // Session-scoped metrics must count ONLY session-sibling-alpha (1 session, 1 eligible H2 decision)
+          expect(report1.d1ReadinessMetrics.totalSessionsFound).toBe(1);
+          expect(report1.d1ReadinessMetrics.finalizedSessionsCount).toBe(1);
+          expect(report1.d1ReadinessMetrics.eligibleH2DecisionsCount).toBe(1);
+          expect(report1.downstreamGateMetrics.evaluatedDecisionsCount).toBe(1);
+
+          // Parent-scope aggregate metrics must be explicitly separated and show both sibling sessions
+          expect(report1.aggregateParentScopeMetrics).toBeDefined();
+          expect(report1.aggregateParentScopeMetrics?.totalSessionsFound).toBe(2);
+          expect(report1.aggregateParentScopeMetrics?.finalizedSessionsCount).toBe(2);
+          expect(report1.aggregateParentScopeMetrics?.eligibleH2DecisionsCount).toBe(2);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("D23C4-01C: candidate without flow measurements does not increment authoritativeH2EligibleCount", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d23c4-01c-${Date.now()}`);
+        const sessionsParentDir = path.join(testDir, "telemetry-sessions");
+        await fs.mkdir(sessionsParentDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-no-flow-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          // Candidate has attested source timestamp (sourceTimestampMs > 0, synced with ingestion)
+          // BUT has NO flow measurements (buys5m, sells5m, volume5mUsd are unavailable)
+          const now = Date.now();
+          const noFlowObservation: D23ObservationRecord = {
+            ...mockObservation,
+            sourceReportedTimeMs: now - 500,
+            requestEpochMs: now - 500,
+            receiptEpochMs: now - 200,
+            missingFields: [],
+            flowMetrics: {
+              volume5mUsd: null,
+              buys5m: null,
+              sells5m: null,
+              netBuyerVolumeUsd: null,
+            },
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-no-flow-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-no-flow-01",
+            },
+          };
+
+          const noFlowCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            sourceTimestampMs: now - 500,
+            requestEpochMs: now - 500,
+            receiptEpochMs: now - 200,
+            decisionEpochMs: now,
+            missingFields: [],
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-no-flow-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-no-flow-01",
+            },
+          };
+
+          await runner.recordScreenedCandidate(noFlowCandidate, noFlowObservation);
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          const sessionDir = runner.getSessionDirectory();
+          const report = await PilotCollectorRunner.auditSessionCompatibility(sessionDir);
+
+          // General decision eligibility passed
+          expect(report.downstreamGateMetrics.authoritativeDecisionCount).toBe(1);
+          expect(report.pilotEvidenceClassification.authoritativeD1EligibleCount).toBe(1);
+          expect(report.recordDetails[0]?.isAuthoritativeD1Eligible).toBe(true);
+
+          // BUT H2 hypothesis qualification MUST be 0 because flow features are missing
+          expect(report.recordDetails[0]?.isAuthoritativeH2Eligible).toBe(false);
+          expect(report.recordDetails[0]?.hasObservedFlowMetrics).toBe(false);
+          expect(report.downstreamGateMetrics.authoritativeH2EligibleCount).toBe(0);
+          expect(report.pilotEvidenceClassification.authoritativeH2EligibleCount).toBe(0);
+          expect(report.d1ReadinessMetrics.eligibleH2DecisionsCount).toBe(0);
+
+          // Reconciliation status reflects insufficient H2 evidence
+          expect(report.reconciliation.status).toBe("INSUFFICIENT_EVIDENCE");
+          expect(report.reconciliation.caveatNotice).toContain(
+            "Insufficient evidence: no decisions qualified for authoritative or exploratory H2 research",
+          );
         } finally {
           await fs.rm(testDir, { recursive: true, force: true });
         }

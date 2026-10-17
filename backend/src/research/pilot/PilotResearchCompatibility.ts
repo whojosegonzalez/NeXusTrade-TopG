@@ -13,6 +13,7 @@
  */
 
 import fsSync from "node:fs";
+import os from "node:os";
 import path from "node:path";
 // prettier-ignore
 // @ts-expect-error D.1 readiness audit script is authored as .mjs with sibling .d.ts
@@ -63,7 +64,10 @@ export interface PilotRecordCompatibilityResult {
   readonly eventId: string;
   readonly classification: PilotResearchEvidenceClass;
   readonly isAuthoritativeD1Eligible: boolean;
+  readonly isAuthoritativeH2Eligible: boolean;
+  readonly isAuthoritativeH1Eligible: boolean;
   readonly isReceiptTimeExploratory: boolean;
+  readonly hasObservedFlowMetrics: boolean;
   readonly d1DownstreamGateEligible: boolean;
   readonly d1DownstreamRejectionReasons: readonly string[];
   readonly classificationReason: string;
@@ -72,6 +76,9 @@ export interface PilotRecordCompatibilityResult {
 export interface PilotSessionCompatibilityReport {
   readonly sessionId: string;
   readonly sessionStatus: string;
+  /**
+   * Session-scoped D.1 readiness metrics, audited strictly for THIS session in isolation (D23C4-01B).
+   */
   readonly d1ReadinessMetrics: {
     readonly totalSessionsFound: number;
     readonly finalizedSessionsCount: number;
@@ -81,14 +88,32 @@ export interface PilotSessionCompatibilityReport {
     readonly eligibleH3DecisionsCount: number;
     readonly eligibleH4DecisionsCount: number;
   };
+  /**
+   * Aggregate parent-directory D.1 readiness metrics across all sibling sessions in the parent directory.
+   * Explicitly separated from session-scoped metrics (D23C4-01B).
+   */
+  readonly aggregateParentScopeMetrics?:
+    | {
+        readonly parentDir: string;
+        readonly totalSessionsFound: number;
+        readonly finalizedSessionsCount: number;
+        readonly finalizedEligibleDecisionsCount: number;
+        readonly eligibleH1DecisionsCount: number;
+        readonly eligibleH2DecisionsCount: number;
+        readonly eligibleH3DecisionsCount: number;
+        readonly eligibleH4DecisionsCount: number;
+      }
+    | undefined;
   readonly downstreamGateMetrics: {
     readonly evaluatedDecisionsCount: number;
+    readonly authoritativeDecisionCount: number;
     readonly authoritativeH1EligibleCount: number;
     readonly authoritativeH2EligibleCount: number;
     readonly rejectedDecisionsCount: number;
   };
   readonly pilotEvidenceClassification: {
     readonly authoritativeD1EligibleCount: number;
+    readonly authoritativeH2EligibleCount: number;
     readonly receiptTimeExploratoryH2Count: number;
     readonly ineligibleCount: number;
     readonly primaryClassification: PilotResearchEvidenceClass;
@@ -133,8 +158,51 @@ export function hasObservedFlowMetrics(decision: CandidateDecisionRecord): boole
 }
 
 /**
+ * Evaluates whether an observation provides valid pre-decision reserves for H1/H4 hypothesis evaluation.
+ */
+export function hasUsablePreDecisionReserves(
+  decision: CandidateDecisionRecord,
+  observation?: MarketObservationRecord | undefined,
+): boolean {
+  if (!observation) return false;
+  const recv = observation.responseReceivedMs ?? observation.ingestionTimestampMs;
+  const tDec = decision.decisionTimestampMs;
+  if (!observation.liquidityMetrics) return false;
+  const { baseReserve, quoteReserve } = observation.liquidityMetrics;
+  if (typeof baseReserve !== "number" || !Number.isFinite(baseReserve) || baseReserve <= 0) {
+    return false;
+  }
+  if (typeof quoteReserve !== "number" || !Number.isFinite(quoteReserve) || quoteReserve <= 0) {
+    return false;
+  }
+  if (
+    typeof observation.sourceTimestampMs !== "number" ||
+    !Number.isFinite(observation.sourceTimestampMs) ||
+    observation.sourceTimestampMs <= 0
+  ) {
+    return false;
+  }
+  if (
+    typeof observation.ingestionTimestampMs !== "number" ||
+    !Number.isFinite(observation.ingestionTimestampMs)
+  ) {
+    return false;
+  }
+  if (typeof recv !== "number" || !Number.isFinite(recv)) {
+    return false;
+  }
+  if (observation.sourceTimestampMs > observation.ingestionTimestampMs) return false;
+  if (observation.sourceTimestampMs > tDec) return false;
+  if (observation.ingestionTimestampMs > tDec) return false;
+  if (recv > tDec) return false;
+  if (tDec - observation.sourceTimestampMs > 180_000) return false; // MAX_DATA_FRESHNESS_MS
+  if (observation.ingestionTimestampMs - observation.sourceTimestampMs > 120_000) return false; // MAX_INGESTION_LAG_MS
+  return true;
+}
+
+/**
  * Classifies a pilot candidate decision record for research eligibility, reconciling
- * D.1 readiness observations with downstream ResearchEligibilityGate criteria (D23C3-04).
+ * D.1 readiness observations with downstream ResearchEligibilityGate criteria (D23C3-04 & D23C4-01C).
  */
 export function classifyPilotDecisionCompatibility(
   decision: CandidateDecisionRecord,
@@ -158,7 +226,10 @@ export function classifyPilotDecisionCompatibility(
       eventId: decision.eventId,
       classification: "INELIGIBLE_RESEARCH_RECORD",
       isAuthoritativeD1Eligible: false,
+      isAuthoritativeH2Eligible: false,
+      isAuthoritativeH1Eligible: false,
       isReceiptTimeExploratory: false,
+      hasObservedFlowMetrics: hasObservedFlowMetrics(decision),
       d1DownstreamGateEligible: false,
       d1DownstreamRejectionReasons: ["JOIN_FAILED: Record could not be joined causally"],
       classificationReason: "Candidate decision failed point-in-time causal join.",
@@ -184,18 +255,24 @@ export function classifyPilotDecisionCompatibility(
     !decision.missingFields?.includes("sourceTimestampMs");
 
   const hasFlow = hasObservedFlowMetrics(decision);
+  const hasReserves = hasUsablePreDecisionReserves(decision, observation);
 
-  // 3. Classify evidence tier
+  // 3. Classify evidence tier (D23C4-01C: separate general decision eligibility from H2 flow qualification)
   if (d1DownstreamGateEligible && hasAttestedSourceTime) {
+    const isH2Eligible = hasFlow;
     return {
       eventId: decision.eventId,
       classification: "AUTHORITATIVE_D1_ELIGIBLE",
       isAuthoritativeD1Eligible: true,
+      isAuthoritativeH2Eligible: isH2Eligible,
+      isAuthoritativeH1Eligible: hasReserves,
       isReceiptTimeExploratory: false,
+      hasObservedFlowMetrics: hasFlow,
       d1DownstreamGateEligible: true,
       d1DownstreamRejectionReasons: [],
-      classificationReason:
-        "Decision satisfies full downstream research eligibility with verified point-in-time source attestation.",
+      classificationReason: isH2Eligible
+        ? "Decision satisfies full downstream research eligibility with verified point-in-time source attestation and co-occurring 5-minute flow metrics."
+        : "Decision satisfies general downstream research eligibility with verified point-in-time source attestation, but lacks co-occurring H2 flow metrics (buys5m, sells5m, volume5mUsd); not qualified for H2 hypothesis analysis.",
     };
   }
 
@@ -204,7 +281,10 @@ export function classifyPilotDecisionCompatibility(
       eventId: decision.eventId,
       classification: "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED",
       isAuthoritativeD1Eligible: false,
+      isAuthoritativeH2Eligible: false,
+      isAuthoritativeH1Eligible: false,
       isReceiptTimeExploratory: true,
+      hasObservedFlowMetrics: true,
       d1DownstreamGateEligible: false,
       d1DownstreamRejectionReasons,
       classificationReason:
@@ -216,7 +296,10 @@ export function classifyPilotDecisionCompatibility(
     eventId: decision.eventId,
     classification: "INELIGIBLE_RESEARCH_RECORD",
     isAuthoritativeD1Eligible: false,
+    isAuthoritativeH2Eligible: false,
+    isAuthoritativeH1Eligible: false,
     isReceiptTimeExploratory: false,
+    hasObservedFlowMetrics: hasFlow,
     d1DownstreamGateEligible: false,
     d1DownstreamRejectionReasons,
     classificationReason:
@@ -226,9 +309,14 @@ export function classifyPilotDecisionCompatibility(
 }
 
 /**
- * Performs an end-to-end audit and reconciliation of a pilot session directory (D23C3-04).
- * Reads the directory, executes D.1 runReadinessAudit, evaluates downstream eligibility,
- * and outputs a reconciled compatibility report with explicit caveats.
+ * Performs an end-to-end audit and reconciliation of a pilot session directory.
+ * Reads the directory, executes D.1 runReadinessAudit in an isolated temporary staging environment,
+ * evaluates downstream eligibility, and outputs a reconciled compatibility report with explicit caveats.
+ *
+ * Guarantees:
+ * - Read-only with respect to sealed session directories (D23C4-01A: never mutates sessionDir).
+ * - Session-scoped D.1 metrics cleanly separated from aggregate parent-scope metrics (D23C4-01B).
+ * - Authoritative H2 requires co-occurring flow metrics (D23C4-01C).
  */
 export async function auditPilotSessionCompatibility(
   sessionDir: string,
@@ -291,17 +379,107 @@ export async function auditPilotSessionCompatibility(
     }
   }
 
-  // 1. Run D.1 readiness audit on parent directory
-  const parentTelemetryDir = path.dirname(sessionDir);
-  const d1Readiness: ReadinessAuditResult = runReadinessAudit({
-    telemetrySessionsDir: parentTelemetryDir,
-    legacySessionsDir: options?.legacySessionsDir ?? path.join(parentTelemetryDir, "empty-legacy"),
-    reportOutputPath: options?.reportOutputPath ?? path.join(sessionDir, "READINESS_AUDIT.md"),
-  });
+  // 1. Stage the session into an isolated read-only staging directory in os.tmpdir()
+  // Upholds two critical architectural boundaries:
+  // (a) Read-only guarantee: sessionDir is NEVER mutated or written to by default.
+  // (b) True session scope: D.1 scanner runs in isolation, avoiding sibling session inflation.
+  const stageRootDir = fsSync.mkdtempSync(path.join(os.tmpdir(), "nexustrade-pilot-d1-stage-"));
+  const stageTelemetrySessionsDir = path.join(stageRootDir, "telemetry-sessions");
+  const stageLegacySessionsDir =
+    options?.legacySessionsDir ?? path.join(stageRootDir, "empty-legacy");
+  fsSync.mkdirSync(stageTelemetrySessionsDir, { recursive: true });
+  fsSync.mkdirSync(stageLegacySessionsDir, { recursive: true });
 
-  // 2. Classify individual decisions against downstream gate
+  const sessionFolderName = path.basename(sessionDir);
+  const stagedSessionDir = path.join(stageTelemetrySessionsDir, sessionFolderName);
+  fsSync.mkdirSync(stagedSessionDir, { recursive: true });
+
+  if (fsSync.existsSync(sessionDir)) {
+    const entries = fsSync.readdirSync(sessionDir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (ent.isFile()) {
+        fsSync.copyFileSync(path.join(sessionDir, ent.name), path.join(stagedSessionDir, ent.name));
+      }
+    }
+  }
+
+  // Determine report path: default to an isolated path in stageRootDir so sessionDir is never modified.
+  // If caller provided reportOutputPath, ensure it is outside sessionDir.
+  const defaultReportPath = path.join(stageRootDir, "READINESS_AUDIT.md");
+  let effectiveReportPath = options?.reportOutputPath ?? defaultReportPath;
+  if (path.resolve(effectiveReportPath).startsWith(path.resolve(sessionDir))) {
+    effectiveReportPath = defaultReportPath;
+  }
+
+  let sessionD1Result: ReadinessAuditResult;
+  let aggregateParentScopeMetrics:
+    | {
+        readonly parentDir: string;
+        readonly totalSessionsFound: number;
+        readonly finalizedSessionsCount: number;
+        readonly finalizedEligibleDecisionsCount: number;
+        readonly eligibleH1DecisionsCount: number;
+        readonly eligibleH2DecisionsCount: number;
+        readonly eligibleH3DecisionsCount: number;
+        readonly eligibleH4DecisionsCount: number;
+      }
+    | undefined = undefined;
+
+  try {
+    sessionD1Result = runReadinessAudit({
+      telemetrySessionsDir: stageTelemetrySessionsDir,
+      legacySessionsDir: stageLegacySessionsDir,
+      reportOutputPath: effectiveReportPath,
+    });
+
+    // Check parent directory for sibling sessions (D23C4-01B)
+    const parentTelemetryDir = path.dirname(sessionDir);
+    if (fsSync.existsSync(parentTelemetryDir)) {
+      try {
+        const parentEntries = fsSync.readdirSync(parentTelemetryDir, { withFileTypes: true });
+        const dirCount = parentEntries.filter((e) => e.isDirectory()).length;
+        if (dirCount > 1) {
+          const parentReportPath = path.join(stageRootDir, "PARENT_READINESS_AUDIT.md");
+          const parentD1Result: ReadinessAuditResult = runReadinessAudit({
+            telemetrySessionsDir: parentTelemetryDir,
+            legacySessionsDir: stageLegacySessionsDir,
+            reportOutputPath: parentReportPath,
+          });
+          aggregateParentScopeMetrics = {
+            parentDir: parentTelemetryDir,
+            totalSessionsFound: parentD1Result.totalSessionsFound,
+            finalizedSessionsCount: parentD1Result.finalizedSessionsCount,
+            finalizedEligibleDecisionsCount: parentD1Result.finalizedEligibleDecisionsCount,
+            eligibleH1DecisionsCount: parentD1Result.eligibleH1DecisionsCount,
+            eligibleH2DecisionsCount: parentD1Result.eligibleH2DecisionsCount,
+            eligibleH3DecisionsCount: parentD1Result.eligibleH3DecisionsCount,
+            eligibleH4DecisionsCount: parentD1Result.eligibleH4DecisionsCount,
+          };
+        }
+      } catch {
+        // Best-effort parent aggregate scan
+      }
+    }
+  } finally {
+    // Clean up temporary staged directories
+    try {
+      if (fsSync.existsSync(stageTelemetrySessionsDir)) {
+        fsSync.rmSync(stageTelemetrySessionsDir, { recursive: true, force: true });
+      }
+      if (fsSync.existsSync(stageLegacySessionsDir) && !options?.legacySessionsDir) {
+        fsSync.rmSync(stageLegacySessionsDir, { recursive: true, force: true });
+      }
+      if (!options?.reportOutputPath && fsSync.existsSync(stageRootDir)) {
+        fsSync.rmSync(stageRootDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Ignore cleanup error
+    }
+  }
+
+  // 2. Classify individual decisions against downstream gate (D23C4-01C)
   const recordDetails: PilotRecordCompatibilityResult[] = [];
-  const authoritativeH1EligibleCount = 0;
+  let authoritativeH1EligibleCount = 0;
   let authoritativeH2EligibleCount = 0;
   let receiptTimeExploratoryH2Count = 0;
   let authoritativeD1EligibleCount = 0;
@@ -320,7 +498,12 @@ export async function auditPilotSessionCompatibility(
 
     if (comp.isAuthoritativeD1Eligible) {
       authoritativeD1EligibleCount++;
-      authoritativeH2EligibleCount++;
+      if (comp.isAuthoritativeH1Eligible) {
+        authoritativeH1EligibleCount++;
+      }
+      if (comp.isAuthoritativeH2Eligible) {
+        authoritativeH2EligibleCount++;
+      }
     } else if (comp.isReceiptTimeExploratory) {
       receiptTimeExploratoryH2Count++;
       rejectedDecisionsCount++;
@@ -337,7 +520,7 @@ export async function auditPilotSessionCompatibility(
         : "INELIGIBLE_RESEARCH_RECORD";
 
   const isReconciledWithCaveat =
-    d1Readiness.eligibleH2DecisionsCount > 0 &&
+    sessionD1Result.eligibleH2DecisionsCount > 0 &&
     authoritativeH2EligibleCount === 0 &&
     receiptTimeExploratoryH2Count > 0;
 
@@ -348,31 +531,34 @@ export async function auditPilotSessionCompatibility(
       : "INSUFFICIENT_EVIDENCE";
 
   const caveatNotice = isReconciledWithCaveat
-    ? `CAVEAT: D.1 readiness scanner reports eligibleH2DecisionsCount=${d1Readiness.eligibleH2DecisionsCount} based on raw field availability. However, downstream ResearchEligibilityGate rejects records with sourceTimestampMs=0 for EXCESSIVE_INGESTION_LAG. These records are strictly receipt-time exploratory / source-time unverified, NOT authoritatively qualified D.1 H2 evidence.`
+    ? `CAVEAT: Session-scoped D.1 readiness scanner reports eligibleH2DecisionsCount=${sessionD1Result.eligibleH2DecisionsCount} based on raw field availability. However, downstream ResearchEligibilityGate rejects records with sourceTimestampMs=0 for EXCESSIVE_INGESTION_LAG. These records are strictly receipt-time exploratory / source-time unverified, NOT authoritatively qualified D.1 H2 evidence.`
     : authoritativeH2EligibleCount > 0
-      ? "All eligible decisions satisfy downstream causal and source timestamp attestation criteria."
-      : "Insufficient evidence: no decisions qualified for authoritative or exploratory research.";
+      ? "All eligible decisions satisfy downstream causal and source timestamp attestation criteria with co-occurring H2 flow metrics."
+      : "Insufficient evidence: no decisions qualified for authoritative or exploratory H2 research.";
 
   return {
     sessionId: meta?.sessionId ?? path.basename(sessionDir),
     sessionStatus: meta?.sessionStatus ?? "UNKNOWN",
     d1ReadinessMetrics: {
-      totalSessionsFound: d1Readiness.totalSessionsFound,
-      finalizedSessionsCount: d1Readiness.finalizedSessionsCount,
-      finalizedEligibleDecisionsCount: d1Readiness.finalizedEligibleDecisionsCount,
-      eligibleH1DecisionsCount: d1Readiness.eligibleH1DecisionsCount,
-      eligibleH2DecisionsCount: d1Readiness.eligibleH2DecisionsCount,
-      eligibleH3DecisionsCount: d1Readiness.eligibleH3DecisionsCount,
-      eligibleH4DecisionsCount: d1Readiness.eligibleH4DecisionsCount,
+      totalSessionsFound: sessionD1Result.totalSessionsFound,
+      finalizedSessionsCount: sessionD1Result.finalizedSessionsCount,
+      finalizedEligibleDecisionsCount: sessionD1Result.finalizedEligibleDecisionsCount,
+      eligibleH1DecisionsCount: sessionD1Result.eligibleH1DecisionsCount,
+      eligibleH2DecisionsCount: sessionD1Result.eligibleH2DecisionsCount,
+      eligibleH3DecisionsCount: sessionD1Result.eligibleH3DecisionsCount,
+      eligibleH4DecisionsCount: sessionD1Result.eligibleH4DecisionsCount,
     },
+    aggregateParentScopeMetrics,
     downstreamGateMetrics: {
       evaluatedDecisionsCount: decisions.length,
+      authoritativeDecisionCount: authoritativeD1EligibleCount,
       authoritativeH1EligibleCount,
       authoritativeH2EligibleCount,
       rejectedDecisionsCount,
     },
     pilotEvidenceClassification: {
       authoritativeD1EligibleCount,
+      authoritativeH2EligibleCount,
       receiptTimeExploratoryH2Count,
       ineligibleCount: rejectedDecisionsCount - receiptTimeExploratoryH2Count,
       primaryClassification,

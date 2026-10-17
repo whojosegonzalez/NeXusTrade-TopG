@@ -52,6 +52,24 @@ The following 4 targeted regression tests were added to [`backend/src/research/p
 4. **D23C3-04 End-to-End Pilot Compatibility & Reconciliation Audit:**
    - `D23C3-04: end-to-end compatibility test: reconciles D.1 readiness output with downstream eligibility and pilot classification`: Finalizes a pilot session with real-valued 5-minute flow metrics and `sourceTimestampMs=0`. Asserts D.1 `runReadinessAudit()` reports `eligibleH2DecisionsCount=1`, downstream join engine + gate rejects with `EXCESSIVE_INGESTION_LAG`, and `PilotCollectorRunner.auditSessionCompatibility()` reconciles them with `primaryClassification: "RECEIPT_TIME_EXPLORATORY_SOURCE_UNVERIFIED"`, `reconciliation.status: "RECONCILED_WITH_CAVEAT"`, and an explicit caveat notice without altering locked D.1 code.
 
+### 3.5 Phase 12.94-D.2.3 Focused Closure Review v4 Adversarial Regressions (D23C4-01)
+
+1. **D23C4-01A Read-Only Compatibility Audit & Manifest Preservation:**
+   - `D23C4-01A: default auditSessionCompatibility call is strictly read-only and preserves transfer manifest validity`: Proves that invoking `PilotCollectorRunner.auditSessionCompatibility(sessionDir)` with default options stages session data into an isolated temporary staging environment outside `sessionDir`.
+   - Asserts `verifySessionExportManifest(sessionDir).valid === true` before and after audit invocation, ensuring zero extraneous markdown or sidecar files are written into the sealed archive.
+   - Confirms subsequent `recoverSession(sessionDir)` succeeds in `FINALIZED` status with 0 diagnostics.
+
+2. **D23C4-01B Sibling-Session Isolation & Aggregate Parent Scope Separation:**
+   - `D23C4-01B: sibling-session isolation cleanly separates session metrics from aggregate parent-scope totals`: Runs two independent finalized sessions (`session-sibling-alpha` and `session-sibling-beta`) sharing a common parent directory.
+   - Asserts `report.d1ReadinessMetrics.totalSessionsFound === 1` and `report.d1ReadinessMetrics.eligibleH2DecisionsCount === 1` for `session-sibling-alpha` (pure session scope).
+   - Asserts `report.aggregateParentScopeMetrics` is explicitly populated and separated, recording `totalSessionsFound: 2` and `eligibleH2DecisionsCount: 2`.
+
+3. **D23C4-01C Flow Feature Gating for Authoritative H2 Eligibility:**
+   - `D23C4-01C: candidate without flow measurements does not increment authoritativeH2EligibleCount`: Screens a candidate with an attested source timestamp (`sourceTimestampMs > 0`) that passes general downstream research eligibility, but lacks contemporaneous flow measurements (`buys5m: null`, `sells5m: null`, `volume5mUsd: null`).
+   - Asserts `report.downstreamGateMetrics.authoritativeDecisionCount === 1` and `report.recordDetails[0].isAuthoritativeD1Eligible === true`.
+   - Asserts `report.downstreamGateMetrics.authoritativeH2EligibleCount === 0`, `report.pilotEvidenceClassification.authoritativeH2EligibleCount === 0`, `report.d1ReadinessMetrics.eligibleH2DecisionsCount === 0`, and `report.recordDetails[0].isAuthoritativeH2Eligible === false`.
+   - Confirms `reconciliation.status === "INSUFFICIENT_EVIDENCE"` for H2 hypothesis evaluation.
+
 ---
 
 ## 4. Repository Verification & Test Accounting
@@ -68,17 +86,17 @@ The entire repository verification suite was executed via `node scripts/verify-i
 | **Secrets Scan**                   | `scripts/check-secrets.mjs`                       | All files       | **PASSED**                            |
 | **Git Diff Boundary**              | `git diff --check`                                | Working tree    | **PASSED**                            |
 | **Node Test Runner**               | `node --test`                                     | 27 tests        | **PASSED (27/27)**                    |
-| **Vitest: Measurement & Analysis** | `vitest.measurement-analysis.config.ts`           | 755 tests       | **PASSED (35 files, +4 pilot tests)** |
+| **Vitest: Measurement & Analysis** | `vitest.measurement-analysis.config.ts`           | 758 tests       | **PASSED (35 files, +7 pilot tests)** |
 | **Vitest: H2 Database**            | `vitest.h2.config.ts`                             | 194 tests       | **PASSED (22 files)**                 |
 | **Vitest: H3 Providers**           | `vitest.h3.config.ts`                             | 98 tests        | **PASSED (20 files)**                 |
 | **Vitest: H4 Analytics**           | `vitest.h4.config.ts`                             | 18 tests        | **PASSED (4 files)**                  |
-| **Total Passing Tests**            | **Node (27) + Vitest (1,065)**                    | **1,092 tests** | **100% PASSED (Exit Code: 0)**        |
+| **Total Passing Tests**            | **Node (27) + Vitest (1,068)**                    | **1,095 tests** | **100% PASSED (Exit Code: 0)**        |
 
 ### Reconciliation of Test Accounting
 
-- **Prior reported count in commit `708d47c`:** 1,061 Vitest tests (751 + 194 + 98 + 18) + 27 Node tests = **1,088 total tests**.
-- **Current count in this commit:** 1,065 Vitest tests (755 + 194 + 98 + 18) + 27 Node tests = **1,092 total tests**.
-- **Net change:** +4 tests added to `backend/src/research/pilot/PilotAdaptersAndRunner.test.ts` (expanded from 37 to 41 tests). All 1,092 tests passed cleanly.
+- **Prior reported count in commit `589355b`:** 1,065 Vitest tests (755 + 194 + 98 + 18) + 27 Node tests = **1,092 total tests**.
+- **Current count in this commit:** 1,068 Vitest tests (758 + 194 + 98 + 18) + 27 Node tests = **1,095 total tests**.
+- **Net change:** +3 tests added to `backend/src/research/pilot/PilotAdaptersAndRunner.test.ts` (expanded from 41 to 44 tests). All 1,095 tests passed cleanly.
 
 ---
 
