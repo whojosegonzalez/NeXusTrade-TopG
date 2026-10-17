@@ -37,7 +37,13 @@ import {
   generateSessionExportManifest,
   verifySessionExportManifest,
 } from "./PilotExportManifest.js";
-import { PilotCollectorRunner } from "./PilotCollectorRunner.js";
+import {
+  PilotCollectorRunner,
+  validateCandidateCausality,
+  validatePathConfinement,
+} from "./PilotCollectorRunner.js";
+// @ts-expect-error D.1 readiness audit script is authored as .mjs with sibling .d.ts
+import { runReadinessAudit } from "../../../../scripts/audit-research-readiness.mjs";
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
   createAuthoritativeSplVaultBuffer,
@@ -901,6 +907,484 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       } finally {
         await fs.rm(testDir, { recursive: true, force: true });
       }
+    });
+
+    // =========================================================================
+    // Focused Re-audit v2 Targeted Adversarial Tests (D23R-01 through D23R-04)
+    // =========================================================================
+
+    describe("Temporal Causality, Source Timestamp & Eligibility Enforcement (D23R-01)", () => {
+      it("directly validates candidate causality helper (D23R-01)", () => {
+        const validResult = validateCandidateCausality(mockCandidate, mockObservation);
+        expect(validResult.valid).toBe(true);
+
+        const invalidResult = validateCandidateCausality({
+          ...mockCandidate,
+          requestEpochMs: mockCandidate.receiptEpochMs + 100,
+        });
+        expect(invalidResult.valid).toBe(false);
+        expect(invalidResult.error).toContain("REQUEST_AFTER_RECEIPT");
+      });
+
+      it("rejects candidate when receiptEpochMs > decisionEpochMs (lookahead violation)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-causal-lookahead-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-causal-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+          });
+          await runner.initialize();
+
+          const lookaheadCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-causal-01",
+              decisionEventId: "evt-lookahead-01",
+            },
+            requestEpochMs: 1791940001000,
+            receiptEpochMs: 1791940001300, // Response after decision!
+            decisionEpochMs: 1791940001200,
+          };
+
+          await expect(runner.recordScreenedCandidate(lookaheadCandidate)).rejects.toThrow(
+            /LOOKAHEAD_VIOLATION/,
+          );
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("rejects candidate when sourceTimestampMs > decisionEpochMs (future source time)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-causal-source-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-causal-02",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+          });
+          await runner.initialize();
+
+          const futureSourceCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-causal-02",
+              decisionEventId: "evt-source-future-01",
+            },
+            requestEpochMs: 1791940001000,
+            receiptEpochMs: 1791940001200,
+            decisionEpochMs: 1791940001250,
+            sourceTimestampMs: 1791940001300, // Future provider source time!
+          };
+
+          await expect(runner.recordScreenedCandidate(futureSourceCandidate)).rejects.toThrow(
+            /FUTURE_SOURCE_TIMESTAMP_LOOKAHEAD/,
+          );
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("rejects candidate when requestEpochMs > receiptEpochMs (inverted causality)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-causal-inverted-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-causal-03",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+          });
+          await runner.initialize();
+
+          const invertedReqCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-causal-03",
+              decisionEventId: "evt-inverted-req-01",
+            },
+            requestEpochMs: 1791940001500, // Request after receipt!
+            receiptEpochMs: 1791940001200,
+            decisionEpochMs: 1791940001600,
+          };
+
+          await expect(runner.recordScreenedCandidate(invertedReqCandidate)).rejects.toThrow(
+            /REQUEST_AFTER_RECEIPT/,
+          );
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("rejects observation with mismatched mint address or late observation receipt (D23R-01)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-obs-mismatch-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-causal-04",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+          });
+          await runner.initialize();
+
+          const validCandidate: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-causal-04",
+              decisionEventId: "evt-obs-mismatch-01",
+            },
+          };
+
+          // Mismatched mint address
+          const mismatchedMintObs: D23ObservationRecord = {
+            ...mockObservation,
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-causal-04",
+              decisionEventId: "evt-obs-mismatch-01",
+              mintAddress: "So11111111111111111111111111111111111111112", // Mismatched!
+            },
+          };
+
+          await expect(
+            runner.recordScreenedCandidate(validCandidate, mismatchedMintObs),
+          ).rejects.toThrow(/COMPOSITE_FOREIGN_KEY_MISMATCH/);
+
+          // Observation receipt after candidate decision
+          const lateObs: D23ObservationRecord = {
+            ...mockObservation,
+            compositeId: {
+              ...mockObservation.compositeId,
+              sessionId: "session-causal-04",
+              decisionEventId: "evt-obs-mismatch-01",
+            },
+            receiptEpochMs: validCandidate.decisionEpochMs + 100, // After decision!
+          };
+
+          await expect(runner.recordScreenedCandidate(validCandidate, lateObs)).rejects.toThrow(
+            /OBSERVATION_LOOKAHEAD/,
+          );
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("Recovery Cross-File Identity Consensus & Record Counts (D23R-02)", () => {
+      it("downgrades FINALIZED session to INTERRUPTED on generationId contradiction even with valid manifest (D23R-02)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-rec-contra-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const sessionPath = path.join(testDir, "test-session-consensus-contra");
+          await fs.mkdir(sessionPath, { recursive: true });
+
+          // 1. Create a valid finalized session
+          const runner = new PilotCollectorRunner({
+            sessionId: "test-session-consensus-contra",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+          await runner.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "test-session-consensus-contra",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-consensus-01",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "test-session-consensus-contra",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-consensus-01",
+              },
+            },
+          );
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          // 2. Tamper session-summary.json generationId to "gen2-contradiction"
+          const summaryPath = path.join(sessionPath, "session-summary.json");
+          const summaryContent = await fs.readFile(summaryPath, "utf8");
+          const summaryJson = JSON.parse(summaryContent);
+          summaryJson.generationId = "gen2-contradiction";
+          await fs.writeFile(summaryPath, JSON.stringify(summaryJson, null, 2), "utf8");
+
+          // 3. Regenerate export manifest so file hashes match
+          await generateSessionExportManifest(
+            sessionPath,
+            "test-session-consensus-contra",
+            "gen1-pilot",
+            Date.now(),
+          );
+
+          // 4. Recover session - must detect identity contradiction and fail closed to INTERRUPTED
+          const recovery = await PilotCollectorRunner.recoverSession(sessionPath);
+          expect(recovery.recovered).toBe(true);
+          expect(recovery.status).toBe("INTERRUPTED");
+
+          const repairedMeta = JSON.parse(
+            await fs.readFile(path.join(sessionPath, "session-meta.json"), "utf8"),
+          );
+          expect(repairedMeta.sessionStatus).toBe("INTERRUPTED");
+          expect(repairedMeta.status).toBe("INTERRUPTED");
+          expect(repairedMeta.interruptionReason).toBe("METADATA_SUMMARY_IDENTITY_CONTRADICTION");
+
+          const repairedSummary = JSON.parse(
+            await fs.readFile(path.join(sessionPath, "session-summary.json"), "utf8"),
+          );
+          expect(repairedSummary.status).toBe("INTERRUPTED");
+          expect(repairedSummary.isCompleteSession).toBe(false);
+          expect(repairedSummary.isInterruptedSession).toBe(true);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("downgrades FINALIZED session to INTERRUPTED when decision count contradicts summary (D23R-02)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-rec-count-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const sessionPath = path.join(testDir, "test-session-count-contra");
+          await fs.mkdir(sessionPath, { recursive: true });
+
+          const runner = new PilotCollectorRunner({
+            sessionId: "test-session-count-contra",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+          await runner.recordScreenedCandidate({
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "test-session-count-contra",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-count-01",
+            },
+          });
+          await runner.finalize("FINALIZED");
+
+          // Tamper summary to claim 5 decisions instead of 1
+          const summaryPath = path.join(sessionPath, "session-summary.json");
+          const summaryJson = JSON.parse(await fs.readFile(summaryPath, "utf8"));
+          summaryJson.totalCandidatesScreened = 5;
+          summaryJson.totalDecisionsRecorded = 5;
+          await fs.writeFile(summaryPath, JSON.stringify(summaryJson, null, 2), "utf8");
+
+          const recovery = await PilotCollectorRunner.recoverSession(sessionPath);
+          expect(recovery.status).toBe("INTERRUPTED");
+          expect(
+            recovery.diagnostics.some(
+              (d) =>
+                d.includes("RECORD_COUNT_SUMMARY_CONTRADICTION") ||
+                d.includes("Candidate decisions count"),
+            ),
+          ).toBe(true);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("Concurrent Duplicate Admission & Drain Synchronization (D23R-03)", () => {
+      it("prevents concurrent duplicate event IDs: exactly one write succeeds, exactly one duplicate rejected (D23R-03)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-concurrent-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-concurrent-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: testDir,
+            targetCandidates: 10,
+          });
+          await runner.initialize();
+
+          const candidateE1: D23ScreenedCandidate = {
+            ...mockCandidate,
+            compositeId: {
+              ...mockCandidate.compositeId,
+              sessionId: "session-concurrent-01",
+              generationId: "gen1-pilot",
+              decisionEventId: "evt-concurrent-duplicate-e1",
+            },
+          };
+
+          // Concurrent execution of identical candidate event ID
+          const results = await Promise.allSettled([
+            runner.recordScreenedCandidate(candidateE1),
+            runner.recordScreenedCandidate(candidateE1),
+          ]);
+
+          const fulfilled = results.filter((r) => r.status === "fulfilled");
+          const rejected = results.filter((r) => r.status === "rejected");
+
+          expect(fulfilled.length).toBe(1);
+          expect(rejected.length).toBe(1);
+
+          const rejectionReason = (rejected[0] as PromiseRejectedResult).reason;
+          expect(String(rejectionReason)).toContain("DUPLICATE_DECISION_ID");
+
+          // Verify exactly 1 line written to candidate-decisions.jsonl
+          const decisionsPath = path.join(
+            runner.getSessionDirectory(),
+            "candidate-decisions.jsonl",
+          );
+          const content = await fs.readFile(decisionsPath, "utf8");
+          const lines = content.split("\n").filter((l) => l.trim().length > 0);
+          expect(lines.length).toBe(1);
+
+          // Verify finalization succeeds cleanly without duplicate mismatch
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("Symlink & Path Confinement Protection (D23R-04)", () => {
+      it("rejects outputRootDir symlink redirecting into protected telemetry directory (D23R-04)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-symlink-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          // Create simulated protected repository structure in disposable test directory
+          const fakeProtectedDir = path.join(
+            testDir,
+            "fake-project",
+            ".tmp",
+            "telemetry",
+            "sessions",
+          );
+          await fs.mkdir(fakeProtectedDir, { recursive: true });
+
+          const redirectedSymlink = path.join(testDir, "redirected");
+          await fs.symlink(
+            fakeProtectedDir,
+            redirectedSymlink,
+            process.platform === "win32" ? "junction" : "dir",
+          );
+
+          // Attempting to configure redirected output root must be rejected
+          expect(() => {
+            validatePathConfinement(path.join(redirectedSymlink, "new-session"), redirectedSymlink);
+          }).toThrow(/PATH_CONFINEMENT_VIOLATION/);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+
+      it("enforces allowedRootDir when configured (D23R-04)", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-allowed-root-${Date.now()}`);
+        await fs.mkdir(testDir, { recursive: true });
+        try {
+          const allowedRoot = path.join(testDir, "allowed-pilot-root");
+          const outsideRoot = path.join(testDir, "outside-pilot-root");
+          await fs.mkdir(allowedRoot, { recursive: true });
+          await fs.mkdir(outsideRoot, { recursive: true });
+
+          // Inside allowed root -> succeeds
+          expect(() => {
+            validatePathConfinement(path.join(allowedRoot, "session-01"), allowedRoot, allowedRoot);
+          }).not.toThrow();
+
+          // Outside allowed root -> throws
+          expect(() => {
+            validatePathConfinement(path.join(outsideRoot, "session-01"), outsideRoot, allowedRoot);
+          }).toThrow(/PATH_CONFINEMENT_VIOLATION/);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe("D.1 Research Readiness Read-Only Interoperability", () => {
+      it("successfully reads and verifies an exported pilot session with runReadinessAudit", async () => {
+        const testDir = path.join(os.tmpdir(), `nexustrade-test-d1-interop-${Date.now()}`);
+        const sessionsParentDir = path.join(testDir, "telemetry-sessions");
+        const emptyLegacyDir = path.join(testDir, "empty-legacy-sessions");
+        const reportOutputDir = path.join(testDir, "audit-report.md");
+        await fs.mkdir(sessionsParentDir, { recursive: true });
+        await fs.mkdir(emptyLegacyDir, { recursive: true });
+
+        try {
+          const runner = new PilotCollectorRunner({
+            sessionId: "session-d1-interop-01",
+            generationId: "gen1-pilot",
+            strategyRevision: D23_STRATEGY_REVISION,
+            outputRootDir: sessionsParentDir,
+            targetCandidates: 1,
+            targetPools: 1,
+          });
+          await runner.initialize();
+
+          await runner.recordScreenedCandidate(
+            {
+              ...mockCandidate,
+              compositeId: {
+                ...mockCandidate.compositeId,
+                sessionId: "session-d1-interop-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-d1-interop-01",
+              },
+            },
+            {
+              ...mockObservation,
+              compositeId: {
+                ...mockObservation.compositeId,
+                sessionId: "session-d1-interop-01",
+                generationId: "gen1-pilot",
+                decisionEventId: "evt-d1-interop-01",
+              },
+            },
+          );
+
+          await runner.finalize("FINALIZED");
+          expect(runner.getStatus()).toBe("FINALIZED");
+
+          // Execute D.1 runReadinessAudit pointing to isolated test directories
+          const auditResult = runReadinessAudit({
+            rootDir: testDir,
+            telemetrySessionsDir: sessionsParentDir,
+            legacySessionsDir: emptyLegacyDir,
+            reportOutputPath: reportOutputDir,
+          });
+
+          expect(auditResult.totalSessionsFound).toBe(1);
+          expect(auditResult.finalizedSessionsCount).toBe(1);
+          expect(auditResult.interruptedSessionsCount).toBe(0);
+          expect(auditResult.unfinalizedSessionsCount).toBe(0);
+          expect(auditResult.totalDecisions).toBe(1);
+          expect(auditResult.totalObservations).toBe(1);
+        } finally {
+          await fs.rm(testDir, { recursive: true, force: true });
+        }
+      });
     });
   });
 });

@@ -18,7 +18,7 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
-import { SystemPilotClock, type IPilotClock } from "./PilotClock.js";
+import { SystemPilotClock, type IPilotClock, validateCausalEpochOrdering } from "./PilotClock.js";
 import {
   toCanonicalCandidateDecision,
   toCanonicalMarketObservation,
@@ -95,13 +95,18 @@ export function validateSessionId(sessionId: string): { isValid: boolean; error?
 }
 
 /**
- * Verifies strict path confinement against forbidden canonical directories and allowed roots (D23F-02).
+ * Verifies strict path confinement against forbidden canonical directories and allowed roots (D23F-02, D23R-04).
+ * Checks both lexical and canonical realpath of target, output root, and allowed root against protected directories.
  */
-export function validatePathConfinement(targetPath: string, outputRootDir: string): void {
+export function validatePathConfinement(
+  targetPath: string,
+  outputRootDir: string,
+  allowedRootDir?: string | undefined,
+): void {
   const normalizedRoot = path.resolve(outputRootDir);
   const normalizedTarget = path.resolve(targetPath);
 
-  // 1. Session path must be directly inside outputRootDir
+  // 1. Session path must be directly inside outputRootDir lexically
   if (
     normalizedTarget !== normalizedRoot &&
     !normalizedTarget.startsWith(normalizedRoot + path.sep)
@@ -111,9 +116,10 @@ export function validatePathConfinement(targetPath: string, outputRootDir: strin
     );
   }
 
-  // 2. Default forbidden repository areas that pilot MUST NEVER write to
+  // 2. Helper to detect protected repository paths (both segment patterns and specific repo paths)
   const repoRoot = path.resolve(process.cwd());
-  const forbidden = [
+  const repoRootReal = fsSync.existsSync(repoRoot) ? fsSync.realpathSync(repoRoot) : repoRoot;
+  const repoForbidden = [
     path.join(repoRoot, ".tmp", "telemetry"),
     path.join(repoRoot, ".tmp", "sessions"),
     path.join(repoRoot, ".tmp", "virtual-wallet.json"),
@@ -122,32 +128,224 @@ export function validatePathConfinement(targetPath: string, outputRootDir: strin
     path.join(repoRoot, "shared"),
     path.join(repoRoot, "audit"),
     path.join(repoRoot, "scripts"),
-  ].map((p) => path.resolve(p));
+  ];
 
-  for (const f of forbidden) {
-    if (normalizedTarget === f || normalizedTarget.startsWith(f + path.sep)) {
+  const checkProtectedPath = (candidatePath: string): { isProtected: boolean; reason?: string } => {
+    const norm = path.resolve(candidatePath);
+    const normSlash = norm.replace(/\\/g, "/");
+
+    // Segment checks: completely prevent writes into telemetry or sessions directories
+    if (normSlash.includes("/.tmp/telemetry") || normSlash.endsWith("/.tmp/telemetry")) {
+      return { isProtected: true, reason: "telemetry directory (.tmp/telemetry)" };
+    }
+    if (normSlash.includes("/.tmp/sessions") || normSlash.endsWith("/.tmp/sessions")) {
+      return { isProtected: true, reason: "sessions directory (.tmp/sessions)" };
+    }
+    if (
+      normSlash.includes("/.tmp/virtual-wallet.json") ||
+      normSlash.endsWith("/.tmp/virtual-wallet.json")
+    ) {
+      return { isProtected: true, reason: "virtual wallet file (.tmp/virtual-wallet.json)" };
+    }
+
+    // Repository protected folders (lexical, realpath, and canonical relative)
+    for (const f of repoForbidden) {
+      const fNorm = path.resolve(f);
+      if (norm === fNorm || norm.startsWith(fNorm + path.sep)) {
+        return { isProtected: true, reason: `repository protected path '${fNorm}'` };
+      }
+      if (fsSync.existsSync(fNorm)) {
+        const fReal = fsSync.realpathSync(fNorm);
+        if (norm === fReal || norm.startsWith(fReal + path.sep)) {
+          return { isProtected: true, reason: `repository real protected path '${fReal}'` };
+        }
+      }
+      const relToReal = path.resolve(repoRootReal, path.relative(repoRoot, f));
+      if (norm === relToReal || norm.startsWith(relToReal + path.sep)) {
+        return { isProtected: true, reason: `repository real protected path '${relToReal}'` };
+      }
+    }
+
+    return { isProtected: false };
+  };
+
+  // Check lexical target & root
+  const lexTargetCheck = checkProtectedPath(normalizedTarget);
+  if (lexTargetCheck.isProtected) {
+    throw new Error(
+      `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Target path '${normalizedTarget}' resolves inside forbidden path '${lexTargetCheck.reason}'.`,
+    );
+  }
+  const lexRootCheck = checkProtectedPath(normalizedRoot);
+  if (lexRootCheck.isProtected) {
+    throw new Error(
+      `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Output root '${normalizedRoot}' resolves inside forbidden path '${lexRootCheck.reason}'.`,
+    );
+  }
+
+  // 3. Symlink / realpath inspection of target, root, and allowed root (D23R-04)
+  let closestTarget = normalizedTarget;
+  while (!fsSync.existsSync(closestTarget) && closestTarget !== path.dirname(closestTarget)) {
+    closestTarget = path.dirname(closestTarget);
+  }
+  let closestRoot = normalizedRoot;
+  while (!fsSync.existsSync(closestRoot) && closestRoot !== path.dirname(closestRoot)) {
+    closestRoot = path.dirname(closestRoot);
+  }
+
+  const realTarget = fsSync.existsSync(closestTarget)
+    ? fsSync.realpathSync(closestTarget)
+    : closestTarget;
+  const realRoot = fsSync.existsSync(closestRoot) ? fsSync.realpathSync(closestRoot) : closestRoot;
+
+  // Real paths must not resolve inside any protected directories
+  const realTargetCheck = checkProtectedPath(realTarget);
+  if (realTargetCheck.isProtected) {
+    throw new Error(
+      `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Real target path '${realTarget}' resolves inside forbidden path '${realTargetCheck.reason}'.`,
+    );
+  }
+  const realRootCheck = checkProtectedPath(realRoot);
+  if (realRootCheck.isProtected) {
+    throw new Error(
+      `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Real output root '${realRoot}' resolves inside forbidden path '${realRootCheck.reason}'.`,
+    );
+  }
+
+  // Real target must remain inside real root
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+    throw new Error(
+      `[PilotCollectorRunner] [SYMLINK_CONFINEMENT_VIOLATION] Real directory '${realTarget}' escapes allowed real root '${realRoot}'.`,
+    );
+  }
+
+  // If allowedRootDir is configured, both realRoot and realTarget must remain inside it
+  if (allowedRootDir) {
+    const normalizedAllowed = path.resolve(allowedRootDir);
+    let closestAllowed = normalizedAllowed;
+    while (!fsSync.existsSync(closestAllowed) && closestAllowed !== path.dirname(closestAllowed)) {
+      closestAllowed = path.dirname(closestAllowed);
+    }
+    const realAllowed = fsSync.existsSync(closestAllowed)
+      ? fsSync.realpathSync(closestAllowed)
+      : closestAllowed;
+
+    if (realRoot !== realAllowed && !realRoot.startsWith(realAllowed + path.sep)) {
       throw new Error(
-        `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Target path '${normalizedTarget}' resolves inside forbidden path '${f}'.`,
+        `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Real output root '${realRoot}' escapes configured allowed root '${realAllowed}'.`,
+      );
+    }
+    if (realTarget !== realAllowed && !realTarget.startsWith(realAllowed + path.sep)) {
+      throw new Error(
+        `[PilotCollectorRunner] [PATH_CONFINEMENT_VIOLATION] Real target path '${realTarget}' escapes configured allowed root '${realAllowed}'.`,
       );
     }
   }
+}
 
-  // 3. Symlink / realpath inspection of closest existing ancestor
-  let closest = normalizedTarget;
-  while (!fsSync.existsSync(closest) && closest !== path.dirname(closest)) {
-    closest = path.dirname(closest);
+/**
+ * Validates temporal causality, source timestamp bounds, and observation clock/identity agreement (D23R-01).
+ */
+export function validateCandidateCausality(
+  candidate: D23ScreenedCandidate,
+  observation?: D23ObservationRecord | undefined,
+): { valid: boolean; error?: string } {
+  // 1. Candidate epoch ordering: request <= receipt <= decision
+  const candidateOrdering = validateCausalEpochOrdering(
+    candidate.requestEpochMs,
+    candidate.receiptEpochMs,
+    candidate.decisionEpochMs,
+  );
+  if (!candidateOrdering.valid) {
+    return {
+      valid: false,
+      error: `[CAUSAL_VIOLATION] CANDIDATE_EPOCH_ORDERING: ${candidateOrdering.violationReason}`,
+    };
   }
-  if (fsSync.existsSync(closest)) {
-    const realClosest = fsSync.realpathSync(closest);
-    const realRoot = fsSync.existsSync(normalizedRoot)
-      ? fsSync.realpathSync(normalizedRoot)
-      : normalizedRoot;
-    if (realClosest !== realRoot && !realClosest.startsWith(realRoot + path.sep)) {
-      throw new Error(
-        `[PilotCollectorRunner] [SYMLINK_CONFINEMENT_VIOLATION] Real directory '${realClosest}' escapes allowed real root '${realRoot}'.`,
-      );
+
+  // 2. Candidate sourceTimestampMs (if attested: not null and not 0)
+  if (candidate.sourceTimestampMs !== null && candidate.sourceTimestampMs !== 0) {
+    if (!Number.isFinite(candidate.sourceTimestampMs) || candidate.sourceTimestampMs <= 0) {
+      return {
+        valid: false,
+        error: `[CAUSAL_VIOLATION] INVALID_SOURCE_TIMESTAMP_NON_FINITE: candidate sourceTimestampMs (${candidate.sourceTimestampMs}) is invalid`,
+      };
+    }
+    if (candidate.sourceTimestampMs > candidate.decisionEpochMs) {
+      return {
+        valid: false,
+        error: `[CAUSAL_VIOLATION] FUTURE_SOURCE_TIMESTAMP_LOOKAHEAD: candidate sourceTimestampMs (${candidate.sourceTimestampMs}) > decisionEpochMs (${candidate.decisionEpochMs})`,
+      };
+    }
+    if (candidate.sourceTimestampMs > candidate.receiptEpochMs) {
+      return {
+        valid: false,
+        error: `[CAUSAL_VIOLATION] SOURCE_AFTER_RECEIPT: candidate sourceTimestampMs (${candidate.sourceTimestampMs}) > receiptEpochMs (${candidate.receiptEpochMs})`,
+      };
     }
   }
+
+  // 3. Observation causality and clock/identity agreement
+  if (observation) {
+    if (observation.receiptEpochMs > candidate.decisionEpochMs) {
+      return {
+        valid: false,
+        error: `[CAUSAL_VIOLATION] OBSERVATION_LOOKAHEAD: observation receiptEpochMs (${observation.receiptEpochMs}) > candidate decisionEpochMs (${candidate.decisionEpochMs})`,
+      };
+    }
+
+    const obsOrdering = validateCausalEpochOrdering(
+      observation.requestEpochMs,
+      observation.receiptEpochMs,
+      candidate.decisionEpochMs,
+    );
+    if (!obsOrdering.valid) {
+      return {
+        valid: false,
+        error: `[CAUSAL_VIOLATION] OBSERVATION_EPOCH_ORDERING: ${obsOrdering.violationReason}`,
+      };
+    }
+
+    if (observation.sourceReportedTimeMs !== null && observation.sourceReportedTimeMs !== 0) {
+      if (
+        !Number.isFinite(observation.sourceReportedTimeMs) ||
+        observation.sourceReportedTimeMs <= 0
+      ) {
+        return {
+          valid: false,
+          error: `[CAUSAL_VIOLATION] INVALID_OBSERVATION_SOURCE_TIMESTAMP_NON_FINITE: observation sourceReportedTimeMs (${observation.sourceReportedTimeMs}) is invalid`,
+        };
+      }
+      if (observation.sourceReportedTimeMs > candidate.decisionEpochMs) {
+        return {
+          valid: false,
+          error: `[CAUSAL_VIOLATION] FUTURE_SOURCE_TIMESTAMP_LOOKAHEAD: observation sourceReportedTimeMs (${observation.sourceReportedTimeMs}) > candidate decisionEpochMs (${candidate.decisionEpochMs})`,
+        };
+      }
+      if (observation.sourceReportedTimeMs > observation.receiptEpochMs) {
+        return {
+          valid: false,
+          error: `[CAUSAL_VIOLATION] SOURCE_AFTER_RECEIPT: observation sourceReportedTimeMs (${observation.sourceReportedTimeMs}) > receiptEpochMs (${observation.receiptEpochMs})`,
+        };
+      }
+    }
+
+    if (observation.compositeId.mintAddress !== candidate.compositeId.mintAddress) {
+      return {
+        valid: false,
+        error: `[COMPOSITE_FOREIGN_KEY_MISMATCH] Observation mintAddress '${observation.compositeId.mintAddress}' does not match candidate mintAddress '${candidate.compositeId.mintAddress}'.`,
+      };
+    }
+
+    if (observation.compositeId.poolId !== candidate.compositeId.poolId) {
+      return {
+        valid: false,
+        error: `[COMPOSITE_FOREIGN_KEY_MISMATCH] Observation poolId '${observation.compositeId.poolId}' does not match candidate poolId '${candidate.compositeId.poolId}'.`,
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -205,6 +403,7 @@ export class PilotCollectorRunner {
   private readonly decisionsBaseline = new Map<string, CandidateDecisionRecord>();
   private readonly evaluationsBaseline = new Map<string, ShadowEvaluationRecord>();
   private readonly observationsBaseline: MarketObservationRecord[] = [];
+  private writeMutex: Promise<void> = Promise.resolve();
 
   constructor(
     config: PilotCollectorConfig,
@@ -238,8 +437,7 @@ export class PilotCollectorRunner {
     this.dataSource = dataSource;
     this.clock = clock;
     this.sessionDir = path.resolve(this.config.outputRootDir, this.config.sessionId);
-    const rootToEnforce = this.config.allowedRootDir ?? this.config.outputRootDir;
-    validatePathConfinement(this.sessionDir, rootToEnforce);
+    validatePathConfinement(this.sessionDir, this.config.outputRootDir, this.config.allowedRootDir);
   }
 
   /**
@@ -311,127 +509,167 @@ export class PilotCollectorRunner {
       );
     }
 
-    // 1. Session and generation attribution check (D23F-03)
-    if (candidate.compositeId.sessionId !== this.config.sessionId) {
+    const eventId = candidate.compositeId.decisionEventId;
+
+    // Reject duplicate decision IDs and reserve synchronously before ANY await (D23F-03, D23R-03)
+    if (this.seenDecisionEventIds.has(eventId)) {
       throw new Error(
-        `[PilotCollectorRunner] [FOREIGN_SESSION_ATTRIBUTION] Candidate sessionId '${candidate.compositeId.sessionId}' does not match runner sessionId '${this.config.sessionId}'.`,
+        `[PilotCollectorRunner] [DUPLICATE_DECISION_ID] Candidate decision '${eventId}' has already been recorded in this session.`,
       );
     }
-    if (candidate.compositeId.generationId !== this.config.generationId) {
-      throw new Error(
-        `[PilotCollectorRunner] [FOREIGN_GENERATION_ATTRIBUTION] Candidate generationId '${candidate.compositeId.generationId}' does not match runner generationId '${this.config.generationId}'.`,
-      );
-    }
+    this.seenDecisionEventIds.add(eventId);
 
-    // 2. Reject duplicate decision IDs (D23F-03)
-    if (this.seenDecisionEventIds.has(candidate.compositeId.decisionEventId)) {
-      throw new Error(
-        `[PilotCollectorRunner] [DUPLICATE_DECISION_ID] Candidate decision '${candidate.compositeId.decisionEventId}' has already been recorded in this session.`,
-      );
-    }
-
-    // 3. Foreign key consistency between candidate and observation (D23F-03)
-    if (observation) {
-      if (observation.compositeId.decisionEventId !== candidate.compositeId.decisionEventId) {
-        throw new Error(
-          `[PilotCollectorRunner] [COMPOSITE_FOREIGN_KEY_MISMATCH] Observation decisionEventId '${observation.compositeId.decisionEventId}' does not match candidate decisionEventId '${candidate.compositeId.decisionEventId}'.`,
-        );
-      }
-      if (observation.compositeId.sessionId !== this.config.sessionId) {
-        throw new Error(
-          `[PilotCollectorRunner] [FOREIGN_SESSION_ATTRIBUTION] Observation sessionId '${observation.compositeId.sessionId}' does not match runner sessionId '${this.config.sessionId}'.`,
-        );
-      }
-      if (observation.compositeId.generationId !== this.config.generationId) {
-        throw new Error(
-          `[PilotCollectorRunner] [FOREIGN_GENERATION_ATTRIBUTION] Observation generationId '${observation.compositeId.generationId}' does not match runner generationId '${this.config.generationId}'.`,
-        );
-      }
-      if (observation.compositeId.poolId !== candidate.compositeId.poolId) {
-        throw new Error(
-          `[PilotCollectorRunner] [COMPOSITE_FOREIGN_KEY_MISMATCH] Observation poolId '${observation.compositeId.poolId}' does not match candidate poolId '${candidate.compositeId.poolId}'.`,
-        );
-      }
-    }
-
-    // 4. Translate canonical records and enforce downstream contract validation
-    const canonicalCandidate = toCanonicalCandidateDecision(candidate, observation);
-    const canonicalEvaluation = toCanonicalShadowEvaluation(candidate, observation);
-    validateShadowEvaluationRecord(canonicalEvaluation);
-    validateShadowEvaluationEligibility(canonicalEvaluation, canonicalCandidate);
-
+    let canonicalCandidate: CandidateDecisionRecord;
+    let canonicalEvaluation: ShadowEvaluationRecord;
     let canonicalObs: MarketObservationRecord | null = null;
-    if (observation) {
-      canonicalObs = toCanonicalMarketObservation(observation, this.config.strategyRevision);
-    }
-
-    // 5. Prospective file admission: check projected bytes before writing ANY record (D23F-02)
-    const candidateLine = JSON.stringify(canonicalCandidate) + "\n";
-    const evalLine = JSON.stringify(canonicalEvaluation) + "\n";
-    const obsLine = canonicalObs ? JSON.stringify(canonicalObs) + "\n" : "";
-
-    const candidateBytes = Buffer.byteLength(candidateLine, "utf8");
-    const evalBytes = Buffer.byteLength(evalLine, "utf8");
-    const obsBytes = obsLine ? Buffer.byteLength(obsLine, "utf8") : 0;
-    const totalProjectedBytes = candidateBytes + evalBytes + obsBytes;
+    let candidateLine: string;
+    let evalLine: string;
+    let obsLine: string;
+    let totalProjectedBytes: number;
 
     try {
-      this.checkWriteAdmission(totalProjectedBytes, false);
-    } catch (err: unknown) {
-      // Fail closed: immediately transition status to INTERRUPTED and write emergency metadata (D23F-02)
-      this.status = "INTERRUPTED";
-      const reason = err instanceof Error ? err.message : String(err);
-      this.interruptionReason = reason.includes("STORAGE_QUOTA_EXCEEDED")
-        ? "STORAGE_QUOTA_EXCEEDED"
-        : reason;
-      await this.writeEmergencyInterruptedMetadata(this.interruptionReason);
+      // 1. Session and generation attribution check (D23F-03)
+      if (candidate.compositeId.sessionId !== this.config.sessionId) {
+        throw new Error(
+          `[PilotCollectorRunner] [FOREIGN_SESSION_ATTRIBUTION] Candidate sessionId '${candidate.compositeId.sessionId}' does not match runner sessionId '${this.config.sessionId}'.`,
+        );
+      }
+      if (candidate.compositeId.generationId !== this.config.generationId) {
+        throw new Error(
+          `[PilotCollectorRunner] [FOREIGN_GENERATION_ATTRIBUTION] Candidate generationId '${candidate.compositeId.generationId}' does not match runner generationId '${this.config.generationId}'.`,
+        );
+      }
+
+      // 2. Foreign key consistency between candidate and observation (D23F-03)
+      if (observation) {
+        if (observation.compositeId.decisionEventId !== candidate.compositeId.decisionEventId) {
+          throw new Error(
+            `[PilotCollectorRunner] [COMPOSITE_FOREIGN_KEY_MISMATCH] Observation decisionEventId '${observation.compositeId.decisionEventId}' does not match candidate decisionEventId '${candidate.compositeId.decisionEventId}'.`,
+          );
+        }
+        if (observation.compositeId.sessionId !== this.config.sessionId) {
+          throw new Error(
+            `[PilotCollectorRunner] [FOREIGN_SESSION_ATTRIBUTION] Observation sessionId '${observation.compositeId.sessionId}' does not match runner sessionId '${this.config.sessionId}'.`,
+          );
+        }
+        if (observation.compositeId.generationId !== this.config.generationId) {
+          throw new Error(
+            `[PilotCollectorRunner] [FOREIGN_GENERATION_ATTRIBUTION] Observation generationId '${observation.compositeId.generationId}' does not match runner generationId '${this.config.generationId}'.`,
+          );
+        }
+        if (observation.compositeId.poolId !== candidate.compositeId.poolId) {
+          throw new Error(
+            `[PilotCollectorRunner] [COMPOSITE_FOREIGN_KEY_MISMATCH] Observation poolId '${observation.compositeId.poolId}' does not match candidate poolId '${candidate.compositeId.poolId}'.`,
+          );
+        }
+      }
+
+      // 3. Enforce temporal causality, source time bounds, and clock/identity matching (D23R-01)
+      const causality = validateCandidateCausality(candidate, observation);
+      if (!causality.valid) {
+        throw new Error(`[PilotCollectorRunner] ${causality.error}`);
+      }
+
+      // 4. Translate canonical records and enforce downstream contract and eligibility validation (D23R-01)
+      canonicalCandidate = toCanonicalCandidateDecision(candidate, observation);
+      canonicalEvaluation = toCanonicalShadowEvaluation(candidate, observation);
+      validateShadowEvaluationRecord(canonicalEvaluation);
+      const eligibility = validateShadowEvaluationEligibility(
+        canonicalEvaluation,
+        canonicalCandidate,
+      );
+      if (!eligibility.isEligible) {
+        throw new Error(
+          `[PilotCollectorRunner] [INELIGIBLE_CANDIDATE] Candidate failed shadow evaluation eligibility: ${eligibility.rejectionReasons.join(", ")}`,
+        );
+      }
+
+      if (observation) {
+        canonicalObs = toCanonicalMarketObservation(observation, this.config.strategyRevision);
+      }
+
+      // 5. Prospective file admission: check projected bytes before writing ANY record (D23F-02)
+      candidateLine = JSON.stringify(canonicalCandidate) + "\n";
+      evalLine = JSON.stringify(canonicalEvaluation) + "\n";
+      obsLine = canonicalObs ? JSON.stringify(canonicalObs) + "\n" : "";
+
+      const candidateBytes = Buffer.byteLength(candidateLine, "utf8");
+      const evalBytes = Buffer.byteLength(evalLine, "utf8");
+      const obsBytes = obsLine ? Buffer.byteLength(obsLine, "utf8") : 0;
+      totalProjectedBytes = candidateBytes + evalBytes + obsBytes;
+    } catch (err) {
+      // Synchronous validation error before disk queue: cancel synchronous reservation (D23R-03)
+      this.seenDecisionEventIds.delete(eventId);
       throw err;
     }
 
-    // 6. Append records to disk
-    await this.appendFile("candidate-decisions.jsonl", candidateLine);
-    await this.appendFile("shadow-evaluations.jsonl", evalLine);
-    if (obsLine) {
-      await this.appendFile("market-observations.jsonl", obsLine);
-    }
+    // 6. Serialize async append and state mutations via writeMutex (D23R-03)
+    const writeOp = async () => {
+      try {
+        this.checkWriteAdmission(totalProjectedBytes, false);
+      } catch (err: unknown) {
+        // Fail closed: immediately transition status to INTERRUPTED and write emergency metadata (D23F-02)
+        this.status = "INTERRUPTED";
+        const reason = err instanceof Error ? err.message : String(err);
+        this.interruptionReason = reason.includes("STORAGE_QUOTA_EXCEEDED")
+          ? "STORAGE_QUOTA_EXCEEDED"
+          : reason;
+        await this.writeEmergencyInterruptedMetadata(this.interruptionReason);
+        throw err;
+      }
 
-    // 7. Record immutable append snapshots for pre-finalization deep reconciliation (D23F-03)
-    this.decisionsBaseline.set(
-      canonicalCandidate.eventId,
-      JSON.parse(JSON.stringify(canonicalCandidate)),
+      // Append records to disk
+      await this.appendFile("candidate-decisions.jsonl", candidateLine);
+      await this.appendFile("shadow-evaluations.jsonl", evalLine);
+      if (obsLine) {
+        await this.appendFile("market-observations.jsonl", obsLine);
+      }
+
+      // Record immutable append snapshots for pre-finalization deep reconciliation (D23F-03)
+      this.decisionsBaseline.set(
+        canonicalCandidate.eventId,
+        JSON.parse(JSON.stringify(canonicalCandidate)),
+      );
+      this.evaluationsBaseline.set(
+        canonicalEvaluation.evaluationId,
+        JSON.parse(JSON.stringify(canonicalEvaluation)),
+      );
+      if (canonicalObs) {
+        this.observationsBaseline.push(JSON.parse(JSON.stringify(canonicalObs)));
+      }
+
+      // Update counters
+      this.totalCandidatesScreened += 1;
+      if (candidate.decisionCohort === "WATCHLIST_RADAR") {
+        this.totalWatchlistRadar += 1;
+      } else {
+        this.totalFilteredRejected += 1;
+      }
+      if (candidate.compositeId.poolId) {
+        this.uniquePoolsSeen.add(candidate.compositeId.poolId);
+      }
+      this.totalEvaluationsRecorded += 1;
+      if (canonicalObs) {
+        this.totalObservationsRecorded += 1;
+      }
+      this.consecutiveErrors = 0;
+
+      // Check target stopping conditions
+      if (
+        this.totalCandidatesScreened >= this.config.targetCandidates &&
+        this.uniquePoolsSeen.size >= this.config.targetPools
+      ) {
+        await this.finalizeInternal("FINALIZED");
+      }
+    };
+
+    const previousMutex = this.writeMutex;
+    const currentOp = previousMutex.then(writeOp, writeOp);
+    this.writeMutex = currentOp.then(
+      () => {},
+      () => {},
     );
-    this.evaluationsBaseline.set(
-      canonicalEvaluation.evaluationId,
-      JSON.parse(JSON.stringify(canonicalEvaluation)),
-    );
-    if (canonicalObs) {
-      this.observationsBaseline.push(JSON.parse(JSON.stringify(canonicalObs)));
-    }
-    this.seenDecisionEventIds.add(candidate.compositeId.decisionEventId);
-
-    // 8. Update counters
-    this.totalCandidatesScreened += 1;
-    if (candidate.decisionCohort === "WATCHLIST_RADAR") {
-      this.totalWatchlistRadar += 1;
-    } else {
-      this.totalFilteredRejected += 1;
-    }
-    if (candidate.compositeId.poolId) {
-      this.uniquePoolsSeen.add(candidate.compositeId.poolId);
-    }
-    this.totalEvaluationsRecorded += 1;
-    if (canonicalObs) {
-      this.totalObservationsRecorded += 1;
-    }
-    this.consecutiveErrors = 0;
-
-    // 9. Check target stopping conditions
-    if (
-      this.totalCandidatesScreened >= this.config.targetCandidates &&
-      this.uniquePoolsSeen.size >= this.config.targetPools
-    ) {
-      await this.finalize("FINALIZED");
-    }
+    await currentOp;
   }
 
   public async recordError(error: Error | string): Promise<void> {
@@ -548,6 +786,15 @@ export class PilotCollectorRunner {
   }
 
   public async finalize(
+    targetStatus: "FINALIZED" | "INTERRUPTED",
+    interruptionReason?: string | undefined,
+  ): Promise<void> {
+    // Drain all in-flight writes before setting finality (D23R-03)
+    await this.writeMutex;
+    await this.finalizeInternal(targetStatus, interruptionReason);
+  }
+
+  private async finalizeInternal(
     targetStatus: "FINALIZED" | "INTERRUPTED",
     interruptionReason?: string | undefined,
   ): Promise<void> {
@@ -706,13 +953,17 @@ export class PilotCollectorRunner {
       diagnostics.push(`Missing or unreadable session-summary.json: ${String(err)}`);
     }
 
-    // Clean any torn lines in jsonl files
+    // Clean any torn lines in jsonl files and collect parsed records (D23F-03, D23R-02)
+    const decisions: CandidateDecisionRecord[] = [];
+    const evaluations: ShadowEvaluationRecord[] = [];
+    const observations: MarketObservationRecord[] = [];
+
     const jsonlFiles = [
-      "candidate-decisions.jsonl",
-      "shadow-evaluations.jsonl",
-      "market-observations.jsonl",
+      { name: "candidate-decisions.jsonl", list: decisions },
+      { name: "shadow-evaluations.jsonl", list: evaluations },
+      { name: "market-observations.jsonl", list: observations },
     ];
-    for (const file of jsonlFiles) {
+    for (const { name: file, list } of jsonlFiles) {
       const filePath = path.join(sessionDir, file);
       try {
         const content = await fs.readFile(filePath, "utf8");
@@ -723,8 +974,9 @@ export class PilotCollectorRunner {
         for (const line of lines) {
           if (!line.trim()) continue;
           try {
-            JSON.parse(line);
+            const parsed = JSON.parse(line);
             validLines.push(line);
+            list.push(parsed);
           } catch {
             corruptLines.push(line);
           }
@@ -745,34 +997,170 @@ export class PilotCollectorRunner {
       }
     }
 
-    // D23F-03: If torn lines were isolated, an archive that previously claimed FINALIZED
-    // is damaged and MUST be downgraded and repaired to INTERRUPTED.
     const priorStatus =
       meta?.sessionStatus ?? (meta as unknown as Record<string, unknown> | null)?.status;
 
-    let mustInterrupt =
-      !meta ||
-      priorStatus !== "FINALIZED" ||
-      tornLinesIsolated > 0 ||
-      summary?.isCompleteSession !== true;
+    let mustInterrupt = false;
+    let interruptionReason = "RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION";
 
-    if (!mustInterrupt) {
-      // Check export manifest if session was supposedly finalized
-      const manifestVerification = await verifySessionExportManifest(sessionDir);
-      if (!manifestVerification.valid) {
+    if (!meta || !summary) {
+      mustInterrupt = true;
+      interruptionReason = "RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION";
+      diagnostics.push("Session lacks valid session-meta.json or session-summary.json");
+    } else if (tornLinesIsolated > 0) {
+      mustInterrupt = true;
+      interruptionReason =
+        priorStatus === "FINALIZED"
+          ? "CORRUPTED_FINALIZED_ARCHIVE_QUARANTINED"
+          : "RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION";
+      diagnostics.push(`Isolated ${tornLinesIsolated} torn/corrupted line(s) in persisted files`);
+    } else if (priorStatus !== "FINALIZED" || summary.isCompleteSession !== true) {
+      mustInterrupt = true;
+      interruptionReason = "RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION";
+      diagnostics.push(
+        `Session status was not finalized (meta status: ${priorStatus}, summary complete: ${summary.isCompleteSession})`,
+      );
+    } else {
+      // 1. Cross-file metadata and summary consensus checks (D23R-02)
+      if (meta.sessionId !== summary.sessionId) {
         mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
         diagnostics.push(
-          `Manifest verification failed during recovery: ${manifestVerification.errorDetails ?? "corrupted/mismatched files"}`,
+          `Metadata sessionId (${meta.sessionId}) contradicts summary sessionId (${summary.sessionId})`,
         );
+      } else if (meta.generationId !== summary.generationId) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push(
+          `Metadata generationId (${meta.generationId}) contradicts summary generationId (${summary.generationId})`,
+        );
+      } else if (
+        meta.strategyRevision &&
+        summary.strategyRevision &&
+        meta.strategyRevision !== summary.strategyRevision
+      ) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push(
+          `Metadata strategyRevision (${meta.strategyRevision}) contradicts summary strategyRevision (${summary.strategyRevision})`,
+        );
+      } else if (
+        meta.startedAtIso &&
+        summary.startedAtIso &&
+        meta.startedAtIso !== summary.startedAtIso
+      ) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push(
+          `Metadata startedAtIso (${meta.startedAtIso}) contradicts summary startedAtIso (${summary.startedAtIso})`,
+        );
+      } else if (
+        meta.closedAtIso &&
+        summary.closedAtIso &&
+        meta.closedAtIso !== summary.closedAtIso
+      ) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push(
+          `Metadata closedAtIso (${meta.closedAtIso}) contradicts summary closedAtIso (${summary.closedAtIso})`,
+        );
+      } else if (
+        meta.startedAtIso &&
+        meta.closedAtIso &&
+        Date.parse(meta.startedAtIso) > Date.parse(meta.closedAtIso)
+      ) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push(
+          `Metadata startedAtIso (${meta.startedAtIso}) is chronologically after closedAtIso (${meta.closedAtIso})`,
+        );
+      } else if (meta.isInterruptedSession || summary.isInterruptedSession) {
+        mustInterrupt = true;
+        interruptionReason = "METADATA_SUMMARY_IDENTITY_CONTRADICTION";
+        diagnostics.push("Session flag claims finalized but has affirmative interruption flags");
+      }
+
+      // 2. Persisted record count consensus against summary (D23R-02)
+      if (!mustInterrupt) {
+        if (decisions.length !== summary.totalCandidatesScreened) {
+          mustInterrupt = true;
+          interruptionReason = "RECORD_COUNT_SUMMARY_CONTRADICTION";
+          diagnostics.push(
+            `Candidate decisions count (${decisions.length}) does not match summary totalCandidatesScreened (${summary.totalCandidatesScreened})`,
+          );
+        } else if (decisions.length !== summary.totalDecisionsRecorded) {
+          mustInterrupt = true;
+          interruptionReason = "RECORD_COUNT_SUMMARY_CONTRADICTION";
+          diagnostics.push(
+            `Candidate decisions count (${decisions.length}) does not match summary totalDecisionsRecorded (${summary.totalDecisionsRecorded})`,
+          );
+        } else if (evaluations.length !== summary.totalCandidatesScreened) {
+          mustInterrupt = true;
+          interruptionReason = "RECORD_COUNT_SUMMARY_CONTRADICTION";
+          diagnostics.push(
+            `Shadow evaluations count (${evaluations.length}) does not match summary totalCandidatesScreened (${summary.totalCandidatesScreened})`,
+          );
+        } else if (observations.length !== summary.totalMarketObservationsRecorded) {
+          mustInterrupt = true;
+          interruptionReason = "RECORD_COUNT_SUMMARY_CONTRADICTION";
+          diagnostics.push(
+            `Market observations count (${observations.length}) does not match summary totalMarketObservationsRecorded (${summary.totalMarketObservationsRecorded})`,
+          );
+        }
+      }
+
+      // 3. Persisted record linkage / foreign keys (D23R-02)
+      if (!mustInterrupt) {
+        for (const dec of decisions) {
+          if (
+            dec.sessionId !== meta.sessionId ||
+            dec.generationId !== meta.generationId ||
+            (meta.strategyRevision && dec.strategyRevision !== meta.strategyRevision)
+          ) {
+            mustInterrupt = true;
+            interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
+            diagnostics.push(
+              `Decision record '${dec.eventId}' contradicts session identity: sessionId=${dec.sessionId}, generationId=${dec.generationId}, strategyRevision=${dec.strategyRevision}`,
+            );
+            break;
+          }
+        }
+        for (const ev of evaluations) {
+          if (ev.sessionId !== meta.sessionId || ev.generationId !== meta.generationId) {
+            mustInterrupt = true;
+            interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
+            diagnostics.push(
+              `Shadow evaluation record '${ev.evaluationId}' contradicts session identity: sessionId=${ev.sessionId}, generationId=${ev.generationId}`,
+            );
+            break;
+          }
+        }
+        for (const obs of observations) {
+          if (obs.sessionId !== meta.sessionId || obs.generationId !== meta.generationId) {
+            mustInterrupt = true;
+            interruptionReason = "PERSISTED_RECORD_FOREIGN_KEY_CONTRADICTION";
+            diagnostics.push(
+              `Market observation record '${obs.observationId}' contradicts session identity: sessionId=${obs.sessionId}, generationId=${obs.generationId}`,
+            );
+            break;
+          }
+        }
+      }
+
+      // 4. Export manifest verification (D23P-04 / D23R-02)
+      if (!mustInterrupt) {
+        const manifestVerification = await verifySessionExportManifest(sessionDir);
+        if (!manifestVerification.valid) {
+          mustInterrupt = true;
+          interruptionReason = "EXPORT_MANIFEST_VERIFICATION_FAILED";
+          diagnostics.push(
+            `Manifest verification failed during recovery: ${manifestVerification.errorDetails ?? "corrupted/mismatched files"}`,
+          );
+        }
       }
     }
 
     if (mustInterrupt) {
-      const interruptionReason =
-        priorStatus === "FINALIZED" && tornLinesIsolated > 0
-          ? "CORRUPTED_FINALIZED_ARCHIVE_QUARANTINED"
-          : "RECOVERED_FROM_UNGRACEFUL_PROCESS_INTERRUPTION";
-
       const repairedMeta: Record<string, unknown> = {
         sessionId: meta?.sessionId ?? path.basename(sessionDir),
         generationId: meta?.generationId ?? "unknown",
@@ -789,6 +1177,7 @@ export class PilotCollectorRunner {
         isInterruptedSession: true,
         resumedFromPriorCrash: true,
         interruptionReason,
+        recoveryDiagnostics: diagnostics,
       };
       await fs.writeFile(metaPath, JSON.stringify(repairedMeta, null, 2), "utf8");
 
@@ -798,8 +1187,8 @@ export class PilotCollectorRunner {
         strategyRevision: summary?.strategyRevision ?? meta?.strategyRevision ?? "unknown",
         startedAtIso: summary?.startedAtIso ?? meta?.startedAtIso ?? new Date().toISOString(),
         closedAtIso: new Date().toISOString(),
-        totalCandidatesScreened: summary?.totalCandidatesScreened ?? 0,
-        totalDecisionsRecorded: summary?.totalDecisionsRecorded ?? 0,
+        totalCandidatesScreened: decisions.length,
+        totalDecisionsRecorded: decisions.length,
         decisionWriteFailures: summary?.decisionWriteFailures ?? 0,
         cohortBreakdown: summary?.cohortBreakdown ?? {
           filteredRejected: 0,
@@ -808,7 +1197,7 @@ export class PilotCollectorRunner {
           executedBuy: 0,
         },
         topRejectionReasons: { [interruptionReason]: 1 },
-        totalMarketObservationsRecorded: summary?.totalMarketObservationsRecorded ?? 0,
+        totalMarketObservationsRecorded: observations.length,
         totalStratifiedCandidatesTracked: 0,
         missedWinnersCount: 0,
         avoidedRugsCount: 0,
