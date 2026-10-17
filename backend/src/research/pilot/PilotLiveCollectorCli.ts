@@ -94,7 +94,7 @@ Options:
   --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
   --target-candidates=<n>          Target number of candidates to screen before stopping (default: 100)
   --target-yield=<n>               Diagnostic target yield requirement (default: 15)
-  --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 20)
+  --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 256)
   --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
   --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
   --forward-observations=true|false  Enable forward outcome observations at +1m, +5m, +15m (default: true)
