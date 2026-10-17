@@ -30,5 +30,7 @@ jobs:
         run: npm install --prefix .tmp/h4-tooling --ignore-scripts --no-package-lock pnpm@11.8.0
       - name: Install locked dependencies with explicit peer setting
         run: node .tmp/h4-tooling/node_modules/pnpm/bin/pnpm.mjs install --frozen-lockfile --config.auto-install-peers=true --config.manage-package-manager-versions=false --store-dir .tmp/pnpm-store
+      - name: Build pilot CLI executable distribution
+        run: node scripts/build-pilot-cli.mjs
       - name: Verify synthetic source and fixtures
         run: node scripts/verify-isolated.mjs

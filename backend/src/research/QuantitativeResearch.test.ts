@@ -2583,12 +2583,23 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
         const inventory = inspectWindowsLegacySessions();
         expect(inventory.telemetrySessionsFoundCount).toBe(0);
         expect(inventory.canonicalTelemetryStatus).toContain("INSUFFICIENT_EVIDENCE");
+        expect(inventory.fedoraRunStatus).toContain("REPORTED_NOT_INSPECTED");
+
+        if (inventory.legacySessionsCount === 0) {
+          // Portable CI environment: Clean checkout runner lacks uncommitted local operator .tmp/sessions.
+          // Confirms honest INSUFFICIENT_EVIDENCE status with 0 legacy sessions and null wallet status.
+          expect(inventory.legacySessionsCount).toBe(0);
+          expect(inventory.legacySessionInventories).toHaveLength(0);
+          expect(inventory.walletStatus).toBeNull();
+          return;
+        }
+
+        // Historical environment: Authorized local operator evidence is present (.tmp/sessions, .tmp/virtual-wallet.json)
         expect(inventory.legacySessionsCount).toBe(2);
         expect(inventory.walletStatus?.currentBalanceSol).toBe(7.9259);
         expect(inventory.walletStatus?.sha256).toBe(
           "7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9",
         );
-        expect(inventory.fedoraRunStatus).toContain("REPORTED_NOT_INSPECTED");
 
         // Verify that each legacy session has known missing quantitative features
         for (const session of inventory.legacySessionInventories) {
@@ -2597,6 +2608,23 @@ describe("Phase 12.94-D Milestone D.1: Quantitative Research Engine", () => {
           expect(session.hypothesisFeasibility.h2OrderFlowMomentum).toContain("INELIGIBLE");
           expect(session.hypothesisFeasibility.h3StructuralSafety).toContain("INELIGIBLE");
           expect(session.hypothesisFeasibility.h4DynamicCapacitySizing).toContain("INELIGIBLE");
+        }
+      });
+
+      it("RF-D21.1-PORTABLE: verifies portable empty-inventory behavior on a clean workspace root", () => {
+        const emptyTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-empty-inventory-"));
+        try {
+          const inventory = inspectWindowsLegacySessions(emptyTempDir);
+          expect(inventory.telemetrySessionsFoundCount).toBe(0);
+          expect(inventory.canonicalTelemetryStatus).toBe(
+            "INSUFFICIENT_EVIDENCE (NO_PERSISTED_TELEMETRY_SESSIONS)",
+          );
+          expect(inventory.legacySessionsCount).toBe(0);
+          expect(inventory.legacySessionInventories).toEqual([]);
+          expect(inventory.walletStatus).toBeNull();
+          expect(inventory.fedoraRunStatus).toContain("REPORTED_NOT_INSPECTED");
+        } finally {
+          fs.rmSync(emptyTempDir, { recursive: true, force: true });
         }
       });
     });
