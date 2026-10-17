@@ -9,6 +9,7 @@
  * - Only allowlists 'getAccountInfo' and 'getMultipleAccounts'.
  * - Throws immediately on any forbidden method (e.g. sendTransaction, simulateTransaction).
  * - Zero wallet keys, zero signing, zero trading daemon dependencies.
+ * - Enforces per-request outbound budget at the transport boundary (D24F-05).
  * - Injectable transport for 100% offline deterministic testing.
  */
 
@@ -123,122 +124,133 @@ export class SolanaRpcLiveObservationClient {
       };
     }
 
-    this.enforceRateBudget();
-
     const requestEpochMs = Date.now();
 
-    // 1. Fetch Pool Account Info
-    const poolPayload = await this.executeRpcCall("getAccountInfo", [
-      params.poolAddress,
-      { encoding: "base64", commitment: "confirmed" },
-    ]);
+    try {
+      // 1. Fetch Pool Account Info
+      const poolPayload = await this.executeRpcCall("getAccountInfo", [
+        params.poolAddress,
+        { encoding: "base64", commitment: "confirmed" },
+      ]);
 
-    const poolResult: SolanaRpcPoolResult = parseSolanaRpcPoolAccountResponse(
-      poolPayload,
-      params.poolAddress,
-    );
+      const poolResult: SolanaRpcPoolResult = parseSolanaRpcPoolAccountResponse(
+        poolPayload,
+        params.poolAddress,
+      );
 
-    if (!poolResult.ok || !poolResult.poolState) {
-      return {
-        ok: false,
-        observation: null,
-        poolSlot: poolResult.slot,
-        vaultSlot: null,
-        slotDiscrepancy: false,
-        reserveAccounting: null,
-        error: poolResult.error ?? "Failed to decode Raydium pool account",
+      if (!poolResult.ok || !poolResult.poolState) {
+        return {
+          ok: false,
+          observation: null,
+          poolSlot: poolResult.slot,
+          vaultSlot: null,
+          slotDiscrepancy: false,
+          reserveAccounting: null,
+          error: poolResult.error ?? "Failed to decode Raydium pool account",
+        };
+      }
+
+      const poolState = poolResult.poolState;
+      if (poolState.programId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+        return {
+          ok: false,
+          observation: null,
+          poolSlot: poolResult.slot,
+          vaultSlot: null,
+          slotDiscrepancy: false,
+          reserveAccounting: null,
+          error: `[UNAUTHORIZED_PROGRAM_ID] Pool program ID '${poolState.programId}' is not Raydium AMM v4`,
+        };
+      }
+
+      // 2. Fetch Vault Accounts Info
+      const vaultsPayload = await this.executeRpcCall("getMultipleAccounts", [
+        [poolState.baseVault, poolState.quoteVault],
+        { encoding: "base64", commitment: "confirmed" },
+      ]);
+
+      const vaultsResult: SolanaRpcVaultsResult = parseSolanaRpcMultipleVaultsResponse(
+        vaultsPayload,
+        [poolState.baseVault, poolState.quoteVault],
+        [poolState.baseMint, poolState.quoteMint],
+      );
+
+      if (!vaultsResult.ok || !vaultsResult.balances) {
+        return {
+          ok: false,
+          observation: null,
+          poolSlot: poolResult.slot,
+          vaultSlot: vaultsResult.slot,
+          slotDiscrepancy: false,
+          reserveAccounting: null,
+          error: vaultsResult.error ?? "Failed to decode pool vault balances",
+        };
+      }
+
+      const balances = vaultsResult.balances;
+      const reserveAccounting = computeReserveAccounting(
+        poolState,
+        balances.baseVaultRaw,
+        balances.quoteVaultRaw,
+        "VAULT_ONLY_PROXY",
+      );
+
+      const receiptEpochMs = Date.now();
+      const hostMonotonicElapsedMs = receiptEpochMs - requestEpochMs;
+
+      const slotDiscrepancy = Boolean(
+        poolResult.slot !== null &&
+        vaultsResult.slot !== null &&
+        Math.abs(poolResult.slot - vaultsResult.slot) > 2,
+      );
+
+      const observation: D23ObservationRecord = {
+        observationId: `obs-rpc-${params.poolAddress.slice(0, 8)}-${receiptEpochMs}`,
+        compositeId: params.compositeId,
+        requestEpochMs,
+        receiptEpochMs,
+        sourceReportedTimeMs: null, // Nullable: Solana RPC getAccountInfo does not attest block timestamp
+        hostMonotonicElapsedMs,
+        onChainSlot: vaultsResult.slot ?? poolResult.slot,
+        slotDiscrepancy,
+        provenance: "D23_OBSERVATIONAL_SCREENING",
+        providerIdentity: `solana_rpc:${new URL(this.rpcUrl).hostname}`,
+        actualResponsePoolId: params.poolAddress,
+        isMatchingPool: true,
+        reserveAccounting,
+        flowMetrics: params.flowMetrics ?? {
+          volume5mUsd: null,
+          buys5m: null,
+          sells5m: null,
+          netBuyerVolumeUsd: null,
+        },
+        missingFields: ["sourceTimestampMs"],
       };
-    }
 
-    const poolState = poolResult.poolState;
-    if (poolState.programId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
       return {
-        ok: false,
-        observation: null,
-        poolSlot: poolResult.slot,
-        vaultSlot: null,
-        slotDiscrepancy: false,
-        reserveAccounting: null,
-        error: `[UNAUTHORIZED_PROGRAM_ID] Pool program ID '${poolState.programId}' is not Raydium AMM v4`,
-      };
-    }
-
-    // 2. Fetch Vault Accounts Info
-    const vaultsPayload = await this.executeRpcCall("getMultipleAccounts", [
-      [poolState.baseVault, poolState.quoteVault],
-      { encoding: "base64", commitment: "confirmed" },
-    ]);
-
-    const vaultsResult: SolanaRpcVaultsResult = parseSolanaRpcMultipleVaultsResponse(
-      vaultsPayload,
-      [poolState.baseVault, poolState.quoteVault],
-      [poolState.baseMint, poolState.quoteMint],
-    );
-
-    if (!vaultsResult.ok || !vaultsResult.balances) {
-      return {
-        ok: false,
-        observation: null,
+        ok: true,
+        observation,
         poolSlot: poolResult.slot,
         vaultSlot: vaultsResult.slot,
+        slotDiscrepancy,
+        reserveAccounting,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        observation: null,
+        poolSlot: null,
+        vaultSlot: null,
         slotDiscrepancy: false,
         reserveAccounting: null,
-        error: vaultsResult.error ?? "Failed to decode pool vault balances",
+        error: err instanceof Error ? err.message : String(err),
       };
     }
-
-    const balances = vaultsResult.balances;
-    const reserveAccounting = computeReserveAccounting(
-      poolState,
-      balances.baseVaultRaw,
-      balances.quoteVaultRaw,
-      "VAULT_ONLY_PROXY",
-    );
-
-    const receiptEpochMs = Date.now();
-    const hostMonotonicElapsedMs = receiptEpochMs - requestEpochMs;
-
-    const slotDiscrepancy = Boolean(
-      poolResult.slot !== null &&
-      vaultsResult.slot !== null &&
-      Math.abs(poolResult.slot - vaultsResult.slot) > 2,
-    );
-
-    const observation: D23ObservationRecord = {
-      observationId: `obs-rpc-${params.poolAddress.slice(0, 8)}-${receiptEpochMs}`,
-      compositeId: params.compositeId,
-      requestEpochMs,
-      receiptEpochMs,
-      sourceReportedTimeMs: null, // Nullable: Solana RPC getAccountInfo does not attest block timestamp
-      hostMonotonicElapsedMs,
-      onChainSlot: vaultsResult.slot ?? poolResult.slot,
-      slotDiscrepancy,
-      provenance: "D23_OBSERVATIONAL_SCREENING",
-      providerIdentity: `solana_rpc:${new URL(this.rpcUrl).hostname}`,
-      actualResponsePoolId: params.poolAddress,
-      isMatchingPool: true,
-      reserveAccounting,
-      flowMetrics: params.flowMetrics ?? {
-        volume5mUsd: null,
-        buys5m: null,
-        sells5m: null,
-        netBuyerVolumeUsd: null,
-      },
-      missingFields: ["sourceTimestampMs"],
-    };
-
-    return {
-      ok: true,
-      observation,
-      poolSlot: poolResult.slot,
-      vaultSlot: vaultsResult.slot,
-      slotDiscrepancy,
-      reserveAccounting,
-    };
   }
 
   /**
    * Executes an allowlisted Solana JSON-RPC 2.0 call.
+   * Enforces outbound request budget at the transport boundary for every call (D24F-05).
    */
   public async executeRpcCall(method: string, params: unknown[]): Promise<unknown> {
     if (!ALLOWLISTED_RPC_METHODS.has(method)) {
@@ -246,6 +258,16 @@ export class SolanaRpcLiveObservationClient {
         `[FORBIDDEN_RPC_METHOD] Method '${method}' is not permitted. Only read-only methods [getAccountInfo, getMultipleAccounts] are authorized.`,
       );
     }
+
+    const now = Date.now();
+    if (now < this.retryAfterUntilEpochMs) {
+      throw new Error(
+        `[RPC_THROTTLED] Solana RPC rate-limited until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`,
+      );
+    }
+
+    // D24F-05: Enforce rate budget on EVERY outbound RPC call
+    this.enforceRateBudget();
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.httpTimeoutMs);
@@ -261,6 +283,11 @@ export class SolanaRpcLiveObservationClient {
       return await this.transport.post(this.rpcUrl, rpcBody, {
         signal: controller.signal,
       });
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("429")) {
+        this.retryAfterUntilEpochMs = Date.now() + 10_000;
+      }
+      throw err;
     } finally {
       clearTimeout(timeout);
     }

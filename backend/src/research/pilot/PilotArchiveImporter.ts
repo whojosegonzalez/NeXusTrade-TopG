@@ -7,8 +7,10 @@
  * Safety & Isolation:
  * - Never imports directly into historical '.tmp/telemetry/sessions/'.
  * - Uses an isolated import root: '.tmp/pilot-imports/sessions/'.
- * - Verifies SHA-256 transfer manifest BEFORE allowing any recovery or analysis.
- * - Prevents mutating repairs on invalid, tampered, or corrupted archives.
+ * - Verifies SHA-256 transfer manifest BEFORE allowing any recovery or staging.
+ * - Non-destructive: Rejects existing destination directories by default (D24F-04).
+ * - Stages imports in disposable temporary directory; atomically publishes only verified archives.
+ * - Requires verified finalized recovery status with 0 torn lines before approval.
  */
 
 import fsSync from "node:fs";
@@ -30,6 +32,13 @@ export interface PilotSessionRecoveryResult {
   readonly diagnostics: string[];
 }
 
+export interface PilotImportOptions {
+  readonly importRootDir?: string | undefined;
+  readonly runRecovery?: boolean | undefined;
+  readonly runCompatibilityAudit?: boolean | undefined;
+  readonly allowOverwrite?: boolean | undefined;
+}
+
 export interface PilotImportResult {
   readonly ok: boolean;
   readonly importedSessionDir: string;
@@ -42,67 +51,200 @@ export interface PilotImportResult {
 /**
  * Imports a pilot session directory into an isolated Windows research import directory,
  * verifying SHA-256 manifest integrity before permitting recovery or compatibility audits.
+ * Staged non-destructively to prevent clobbering existing research data.
  */
 export async function importAndVerifyPilotSession(
   sourceSessionDir: string,
-  options?: {
-    importRootDir?: string | undefined;
-    runRecovery?: boolean | undefined;
-    runCompatibilityAudit?: boolean | undefined;
-  },
+  options?: PilotImportOptions,
 ): Promise<PilotImportResult> {
   const importRootDir = options?.importRootDir ?? path.resolve(DEFAULT_WINDOWS_IMPORT_ROOT);
+
+  // Protected paths check (D24F-04)
+  const resolvedImportRoot = path.resolve(importRootDir);
+  const resolvedHistoricalTelemetry = path.resolve(".tmp/telemetry/sessions");
+  if (resolvedImportRoot.startsWith(resolvedHistoricalTelemetry)) {
+    throw new Error(
+      `[PROTECTED_PATH_VIOLATION] Import root cannot resolve inside historical telemetry: '${resolvedImportRoot}'`,
+    );
+  }
+
   fsSync.mkdirSync(importRootDir, { recursive: true });
 
   const sessionFolderName = path.basename(sourceSessionDir);
   const targetSessionDir = path.join(importRootDir, sessionFolderName);
 
-  // If importing from external path to target directory, copy files safely
-  if (path.resolve(sourceSessionDir) !== path.resolve(targetSessionDir)) {
-    if (fsSync.existsSync(targetSessionDir)) {
-      fsSync.rmSync(targetSessionDir, { recursive: true, force: true });
-    }
-    fsSync.mkdirSync(targetSessionDir, { recursive: true });
-
-    const entries = fsSync.readdirSync(sourceSessionDir, { withFileTypes: true });
-    for (const ent of entries) {
-      if (ent.isFile()) {
-        fsSync.copyFileSync(
-          path.join(sourceSessionDir, ent.name),
-          path.join(targetSessionDir, ent.name),
-        );
-      }
-    }
-  }
-
-  // 1. Mandatory Manifest Integrity Verification
-  const manifestResult = await verifySessionExportManifest(targetSessionDir);
-  if (!manifestResult.valid) {
+  // 1. Destination Collision Protection: Reject existing destination unless explicitly permitted
+  const targetExists = fsSync.existsSync(targetSessionDir);
+  if (targetExists && !options?.allowOverwrite) {
     return {
       ok: false,
       importedSessionDir: targetSessionDir,
-      manifestResult,
+      manifestResult: {
+        valid: false,
+        missingFiles: [],
+        mismatchedFiles: [],
+        extraFiles: [],
+        errorDetails: `[IMPORT_DESTINATION_EXISTS] Destination directory '${targetSessionDir}' already exists. Overwriting existing imports is prohibited by default.`,
+      },
       recoveryResult: null,
       compatibilityReport: null,
-      error: `[MANIFEST_VERIFICATION_FAILED] Imported session failed manifest integrity: missing=${manifestResult.missingFiles.join(",")}, extra=${manifestResult.extraFiles.join(",")}, mismatched=${manifestResult.mismatchedFiles.join(",")}`,
+      error: `[IMPORT_DESTINATION_EXISTS] Destination directory '${targetSessionDir}' already exists. Overwrite prohibited without explicit allowOverwrite option.`,
     };
   }
 
-  let recoveryResult: PilotSessionRecoveryResult | null = null;
-  if (options?.runRecovery !== false) {
-    recoveryResult = await PilotCollectorRunner.recoverSession(targetSessionDir);
+  // 2. Mandatory Source Manifest Verification BEFORE touching target or staging
+  const sourceManifestResult = await verifySessionExportManifest(sourceSessionDir);
+  if (!sourceManifestResult.valid) {
+    return {
+      ok: false,
+      importedSessionDir: targetSessionDir,
+      manifestResult: sourceManifestResult,
+      recoveryResult: null,
+      compatibilityReport: null,
+      error: `[SOURCE_MANIFEST_INVALID] Source directory failed manifest verification: missing=${sourceManifestResult.missingFiles.join(",")}, extra=${sourceManifestResult.extraFiles.join(",")}, mismatched=${sourceManifestResult.mismatchedFiles.join(",")}`,
+    };
   }
 
-  let compatibilityReport: PilotSessionCompatibilityReport | null = null;
-  if (options?.runCompatibilityAudit) {
-    compatibilityReport = await auditPilotSessionCompatibility(targetSessionDir);
+  // If source and target are identical directory, run in-place
+  if (path.resolve(sourceSessionDir) === path.resolve(targetSessionDir)) {
+    let recoveryResult: PilotSessionRecoveryResult | null = null;
+    if (options?.runRecovery !== false) {
+      recoveryResult = await PilotCollectorRunner.recoverSession(targetSessionDir);
+      if (
+        !recoveryResult.recovered ||
+        recoveryResult.status !== "FINALIZED" ||
+        recoveryResult.tornLinesIsolated > 0
+      ) {
+        return {
+          ok: false,
+          importedSessionDir: targetSessionDir,
+          manifestResult: sourceManifestResult,
+          recoveryResult,
+          compatibilityReport: null,
+          error: `[RECOVERY_FAILED] In-place recovery resulted in non-finalized or corrupted status: ${recoveryResult.status}, tornLines=${recoveryResult.tornLinesIsolated}`,
+        };
+      }
+    }
+
+    let compatibilityReport: PilotSessionCompatibilityReport | null = null;
+    if (options?.runCompatibilityAudit) {
+      compatibilityReport = await auditPilotSessionCompatibility(targetSessionDir);
+    }
+
+    return {
+      ok: true,
+      importedSessionDir: targetSessionDir,
+      manifestResult: sourceManifestResult,
+      recoveryResult,
+      compatibilityReport,
+    };
   }
 
-  return {
-    ok: true,
-    importedSessionDir: targetSessionDir,
-    manifestResult,
-    recoveryResult,
-    compatibilityReport,
-  };
+  // 3. Stage import in isolated temporary staging directory
+  const stagingDir = path.join(
+    importRootDir,
+    `.staging-${sessionFolderName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  );
+  fsSync.mkdirSync(stagingDir, { recursive: true });
+
+  let stagingPublished = false;
+
+  try {
+    const entries = fsSync.readdirSync(sourceSessionDir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (ent.isFile()) {
+        fsSync.copyFileSync(path.join(sourceSessionDir, ent.name), path.join(stagingDir, ent.name));
+      }
+    }
+
+    // 4. Verify Staging Manifest Integrity
+    const stagingManifestResult = await verifySessionExportManifest(stagingDir);
+    if (!stagingManifestResult.valid) {
+      return {
+        ok: false,
+        importedSessionDir: targetSessionDir,
+        manifestResult: stagingManifestResult,
+        recoveryResult: null,
+        compatibilityReport: null,
+        error: `[STAGING_MANIFEST_INVALID] Staging directory failed manifest verification`,
+      };
+    }
+
+    // 5. Run Recovery on Staging Dataset and require verified FINALIZED status
+    let recoveryResult: PilotSessionRecoveryResult | null = null;
+    if (options?.runRecovery !== false) {
+      recoveryResult = await PilotCollectorRunner.recoverSession(stagingDir);
+      if (
+        !recoveryResult.recovered ||
+        recoveryResult.status !== "FINALIZED" ||
+        recoveryResult.tornLinesIsolated > 0
+      ) {
+        return {
+          ok: false,
+          importedSessionDir: targetSessionDir,
+          manifestResult: stagingManifestResult,
+          recoveryResult,
+          compatibilityReport: null,
+          error: `[RECOVERY_FAILED] Session recovery in staging resulted in non-finalized or corrupted status: ${recoveryResult.status}, tornLines=${recoveryResult.tornLinesIsolated}`,
+        };
+      }
+
+      // Re-verify manifest after recovery to ensure recovery did not corrupt or mutate files
+      const postRecoveryManifest = await verifySessionExportManifest(stagingDir);
+      if (!postRecoveryManifest.valid) {
+        return {
+          ok: false,
+          importedSessionDir: targetSessionDir,
+          manifestResult: postRecoveryManifest,
+          recoveryResult,
+          compatibilityReport: null,
+          error: `[RECOVERY_MUTATED_MANIFEST] Session recovery mutated files violating export manifest`,
+        };
+      }
+    }
+
+    // 6. Atomically publish verified staging directory to final target directory
+    if (targetExists) {
+      fsSync.rmSync(targetSessionDir, { recursive: true, force: true });
+    }
+
+    try {
+      fsSync.renameSync(stagingDir, targetSessionDir);
+      stagingPublished = true;
+    } catch {
+      // Fallback copy if cross-device link occurs
+      fsSync.mkdirSync(targetSessionDir, { recursive: true });
+      const stagedEntries = fsSync.readdirSync(stagingDir, { withFileTypes: true });
+      for (const ent of stagedEntries) {
+        if (ent.isFile()) {
+          fsSync.copyFileSync(
+            path.join(stagingDir, ent.name),
+            path.join(targetSessionDir, ent.name),
+          );
+        }
+      }
+      stagingPublished = true;
+    }
+
+    let compatibilityReport: PilotSessionCompatibilityReport | null = null;
+    if (options?.runCompatibilityAudit) {
+      compatibilityReport = await auditPilotSessionCompatibility(targetSessionDir);
+    }
+
+    return {
+      ok: true,
+      importedSessionDir: targetSessionDir,
+      manifestResult: stagingManifestResult,
+      recoveryResult,
+      compatibilityReport,
+    };
+  } finally {
+    if (!stagingPublished && fsSync.existsSync(stagingDir)) {
+      try {
+        fsSync.rmSync(stagingDir, { recursive: true, force: true });
+      } catch {
+        // cleanup ignore
+      }
+    }
+  }
 }

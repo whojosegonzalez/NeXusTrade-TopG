@@ -14,6 +14,7 @@
 
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PilotCollectorRunner } from "./PilotCollectorRunner.js";
 import {
   DexScreenerLiveDiscoveryClient,
@@ -44,6 +45,21 @@ export interface PilotLiveCollectorConfig {
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
 }
 
+function parsePositiveInt(flagName: string, valueStr: string): number {
+  if (!/^\d+$/.test(valueStr)) {
+    throw new Error(
+      `[INVALID_ARGUMENT] Option '${flagName}' must be a positive integer, got '${valueStr}'`,
+    );
+  }
+  const parsed = parseInt(valueStr, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `[INVALID_ARGUMENT] Option '${flagName}' must be greater than 0, got '${parsed}'`,
+    );
+  }
+  return parsed;
+}
+
 export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   const args = argv.slice(2);
   let network: "enabled" | "disabled" = "disabled";
@@ -52,7 +68,8 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let durationSec = 7200; // 2 hours
   let targetCandidates = 100;
   let targetDiagnosticYield = 15;
-  let maxMb = 256; // 256 MB accepted RSS limit
+  let maxMb = 256; // 256 MB accepted operational storage limit
+  let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
@@ -69,24 +86,49 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
     } else if (arg === "--network=disabled") {
       network = "disabled";
     } else if (arg.startsWith("--rpc-url=")) {
-      rpcUrl = arg.slice("--rpc-url=".length);
+      const val = arg.slice("--rpc-url=".length).trim();
+      if (!val) {
+        throw new Error("[INVALID_ARGUMENT] Option '--rpc-url' requires a non-empty URL");
+      }
+      rpcUrl = val;
     } else if (arg.startsWith("--poll-interval-sec=")) {
-      pollIntervalSec = Math.max(5, parseInt(arg.slice("--poll-interval-sec=".length), 10));
+      pollIntervalSec = parsePositiveInt(
+        "--poll-interval-sec",
+        arg.slice("--poll-interval-sec=".length),
+      );
     } else if (arg.startsWith("--duration-sec=")) {
-      durationSec = Math.max(1, parseInt(arg.slice("--duration-sec=".length), 10));
+      durationSec = parsePositiveInt("--duration-sec", arg.slice("--duration-sec=".length));
     } else if (arg.startsWith("--target-candidates=")) {
-      targetCandidates = Math.max(1, parseInt(arg.slice("--target-candidates=".length), 10));
+      targetCandidates = parsePositiveInt(
+        "--target-candidates",
+        arg.slice("--target-candidates=".length),
+      );
+    } else if (arg.startsWith("--target-yield=")) {
+      targetDiagnosticYield = parsePositiveInt(
+        "--target-yield",
+        arg.slice("--target-yield=".length),
+      );
     } else if (arg.startsWith("--target-diagnostic-yield=")) {
-      targetDiagnosticYield = Math.max(
-        1,
-        parseInt(arg.slice("--target-diagnostic-yield=".length), 10),
+      targetDiagnosticYield = parsePositiveInt(
+        "--target-diagnostic-yield",
+        arg.slice("--target-diagnostic-yield=".length),
       );
     } else if (arg.startsWith("--max-mb=")) {
-      maxMb = Math.max(64, parseInt(arg.slice("--max-mb=".length), 10));
+      maxMb = parsePositiveInt("--max-mb", arg.slice("--max-mb=".length));
+    } else if (arg.startsWith("--max-rss-mb=")) {
+      maxRssMb = parsePositiveInt("--max-rss-mb", arg.slice("--max-rss-mb=".length));
     } else if (arg.startsWith("--output-dir=")) {
-      outputDir = path.resolve(arg.slice("--output-dir=".length));
-    } else if (arg === "--disable-forward-observations") {
+      const val = arg.slice("--output-dir=".length).trim();
+      if (!val) {
+        throw new Error("[INVALID_ARGUMENT] Option '--output-dir' requires a non-empty path");
+      }
+      outputDir = path.resolve(val);
+    } else if (arg === "--forward-observations=true") {
+      enableForwardObservations = true;
+    } else if (arg === "--forward-observations=false" || arg === "--disable-forward-observations") {
       enableForwardObservations = false;
+    } else {
+      throw new Error(`[INVALID_ARGUMENT] Unknown CLI option: '${arg}'`);
     }
   }
 
@@ -98,6 +140,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
     targetCandidates,
     targetDiagnosticYield,
     maxMb,
+    maxRssMb,
     outputDir,
     enableForwardObservations,
   };
@@ -135,14 +178,18 @@ export class PilotLiveCollectorSession {
     const sessionId = `pilot-sess-${Date.now()}`;
     const generationId = "gen1-pilot";
 
+    // D24F-02: Pass MAX_SAFE_INTEGER so D.2.3 runner never auto-finalizes prematurely.
+    // D.2.4 explicitly manages discovery stopping and forward-drain-or-censor before sealing.
     this.runner = new PilotCollectorRunner({
       sessionId,
       generationId,
       strategyRevision: D23_STRATEGY_REVISION,
       outputRootDir: this.config.outputDir,
-      targetCandidates: this.config.targetCandidates,
-      targetPools: this.config.targetCandidates,
+      targetCandidates: Number.MAX_SAFE_INTEGER,
+      targetPools: Number.MAX_SAFE_INTEGER,
+      maxDurationSec: Math.max(7200, this.config.durationSec + 1800),
       maxDiskBytes: this.config.maxMb * 1024 * 1024,
+      maxRssBytes: (this.config.maxRssMb ?? 256) * 1024 * 1024,
     });
 
     await this.runner.initialize();
@@ -246,6 +293,13 @@ export class PilotLiveCollectorSession {
               console.warn(`[PILOT_RECORD_CANDIDATE_ERROR] ${String(err)}`);
             }
           }
+
+          // Check if candidate target reached during candidate loop
+          if (this.runner.getStats().candidates >= this.config.targetCandidates) {
+            this.stopReason = "TARGET_REACHED";
+            this.isRunning = false;
+            break;
+          }
         }
 
         // 5. Forward Outcome Observations Poll
@@ -263,6 +317,9 @@ export class PilotLiveCollectorSession {
           await new Promise((r) => setTimeout(r, 100));
         }
       }
+    } catch (fatalErr) {
+      this.stopReason = "FATAL_ERROR";
+      console.error(`[PILOT_FATAL_ERROR] ${String(fatalErr)}`);
     } finally {
       process.removeListener("SIGINT", onSignal);
       process.removeListener("SIGTERM", onSignal);
@@ -271,9 +328,44 @@ export class PilotLiveCollectorSession {
     const finalStopReason = this.stopReason ?? "NORMAL_TERMINATION";
     const finalDecisionsCount = this.runner.getStats().candidates;
 
-    // Determine final status
+    // D24F-02: Forward Outcome Terminal Drainage & Censoring Phase
+    // Every registered outcome target and completeness summary must be written before sealing manifest.json
+    if (this.forwardTracker) {
+      if (
+        finalStopReason === "OPERATOR_INTERRUPT" ||
+        finalStopReason === "RESOURCE_CEILING_REACHED" ||
+        finalStopReason === "FATAL_ERROR"
+      ) {
+        this.forwardTracker.censorRemainingPendingTargets(
+          "CENSORED_TERMINAL_INTERRUPT",
+          `Session halted early: ${finalStopReason}`,
+        );
+      } else {
+        // Poll any currently due observations
+        if (this.rpcClient) {
+          try {
+            await this.forwardTracker.pollDueObservations(this.rpcClient, Date.now());
+          } catch {
+            // Non-critical
+          }
+        }
+        // Account for any remaining pending targets whose scheduled interval exceeds session lifetime
+        const censorReason =
+          finalStopReason === "DURATION_EXPIRED"
+            ? "SESSION_DURATION_EXPIRED_BEFORE_INTERVAL"
+            : "TARGET_REACHED_BEFORE_FORWARD_WINDOW";
+        this.forwardTracker.censorRemainingPendingTargets("WINDOW_TRUNCATED", censorReason);
+      }
+
+      this.forwardTracker.writeForwardSummary();
+    }
+
+    // Determine truthful final status
     const targetStatus =
-      finalDecisionsCount > 0 || finalStopReason === "DURATION_EXPIRED"
+      (finalStopReason === "TARGET_REACHED" ||
+        finalStopReason === "DURATION_EXPIRED" ||
+        finalStopReason === "NORMAL_TERMINATION") &&
+      finalDecisionsCount > 0
         ? "FINALIZED"
         : "INTERRUPTED";
 
@@ -332,8 +424,14 @@ export async function runPilotCollectorCli(argv: string[] = process.argv): Promi
   }
 }
 
-// Auto-run if executed directly as entrypoint
-if (process.argv[1] && path.resolve(process.argv[1]).endsWith("PilotLiveCollectorCli.ts")) {
+// Auto-run if executed directly as entrypoint in either TypeScript or compiled JavaScript (D24F-01)
+const scriptPath = process.argv[1];
+const isEntrypoint =
+  typeof scriptPath === "string" &&
+  (path.basename(scriptPath).replace(/\.[jt]sx?$/, "") === "PilotLiveCollectorCli" ||
+    path.resolve(scriptPath) === path.resolve(fileURLToPath(import.meta.url)));
+
+if (isEntrypoint) {
   runPilotCollectorCli().then((code) => {
     process.exit(code);
   });

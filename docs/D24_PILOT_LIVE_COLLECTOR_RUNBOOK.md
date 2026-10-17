@@ -1,6 +1,6 @@
 # NeXusTrade — Milestone D.2.4 Live Read-Only Collector Runbook
 
-**Document Revision:** 1.0.0  
+**Document Revision:** 1.1.0
 **Phase:** 12.94-D Milestone D.2.4  
 **Scope:** Minimal Live Read-Only Linux/Fedora Pilot Collection & Windows Research Import  
 **Target Environment:** Fedora Linux 44 (Collection) & Windows Quantitative Research Environment (Import & Analysis)
@@ -38,25 +38,25 @@ The D.2.4 live collector is strictly an observational research instrument design
    - **Windows Import Root:** Strictly imports into `.tmp/pilot-imports/sessions/`. Never directly mutates or overwrites historical `.tmp/telemetry/sessions/`.
 
 5. **Resource Ceilings:**
-   - **RSS Memory Ceiling:** 256 MB maximum resident set size. Halts cleanly if exceeded.
-   - **Disk Storage Quota:** 256 MB default operational ceiling.
+   - **RSS Memory Ceiling:** 256 MB maximum resident set size (`--max-rss-mb=256`). Halts cleanly if exceeded.
+   - **Disk Storage Quota:** 256 MB default operational ceiling (`--max-mb=256`).
 
 ---
 
 ## 2. Operator Configuration Defaults
 
-| Setting                     | Default Value                                          | CLI Flag                      | Description                                                |
-| --------------------------- | ------------------------------------------------------ | ----------------------------- | ---------------------------------------------------------- |
-| **Network Gating**          | `disabled`                                             | `--network=enabled`           | Mandatory explicit authorization for live collection       |
-| **Solana RPC**              | Public mainnet (`https://api.mainnet-beta.solana.com`) | `--rpc-url=<url>`             | Solana JSON-RPC endpoint with fail-closed 429 throttling   |
-| **DexScreener Poll**        | `30s`                                                  | `--poll-interval-sec=30`      | Profile polling interval with token deduplication          |
-| **Session Duration**        | `7200s` (2 hours)                                      | `--duration-sec=7200`         | Bounded duration box                                       |
-| **Candidate Target**        | `100`                                                  | `--target-candidates=100`     | Automatic session finalization candidate ceiling           |
-| **Diagnostic Yield Target** | `15`                                                   | `--target-yield=15`           | Diagnostic yield monitoring benchmark (non-fatal if unmet) |
-| **Operational Storage**     | `256 MB`                                               | `--max-mb=256`                | Maximum allowed disk bytes for the session directory       |
-| **Memory Ceiling**          | `256 MB`                                               | `--max-rss-mb=256`            | RSS watchdog threshold                                     |
-| **Storage Directory**       | `~/nexustrade-pilot-data/sessions`                     | `--output-dir=<path>`         | Isolated Linux session directory                           |
-| **Forward Tracking**        | `true`                                                 | `--forward-observations=true` | Post-decision observations at +1m, +5m, +15m               |
+| Setting                     | Default Value                                          | CLI Flag                      | Description                                                                   |
+| --------------------------- | ------------------------------------------------------ | ----------------------------- | ----------------------------------------------------------------------------- |
+| **Network Gating**          | `disabled`                                             | `--network=enabled`           | Mandatory explicit authorization for live collection                          |
+| **Solana RPC**              | Public mainnet (`https://api.mainnet-beta.solana.com`) | `--rpc-url=<url>`             | Solana JSON-RPC endpoint with fail-closed 429 throttling                      |
+| **DexScreener Poll**        | `30s`                                                  | `--poll-interval-sec=30`      | Profile polling interval with token deduplication                             |
+| **Session Duration**        | `7200s` (2 hours)                                      | `--duration-sec=7200`         | Bounded duration box                                                          |
+| **Candidate Target**        | `100`                                                  | `--target-candidates=100`     | Candidate ceiling triggering orderly collection shutdown                      |
+| **Diagnostic Yield Target** | `15`                                                   | `--target-yield=15`           | Diagnostic yield monitoring benchmark (alias: `--target-diagnostic-yield=15`) |
+| **Operational Storage**     | `256 MB`                                               | `--max-mb=256`                | Maximum allowed disk bytes for the session directory                          |
+| **Memory Ceiling**          | `256 MB`                                               | `--max-rss-mb=256`            | RSS memory watchdog threshold                                                 |
+| **Storage Directory**       | `~/nexustrade-pilot-data/sessions`                     | `--output-dir=<path>`         | Isolated Linux session directory                                              |
+| **Forward Tracking**        | `true`                                                 | `--forward-observations=true` | Post-decision observations at +1m, +5m, +15m                                  |
 
 ---
 
@@ -77,14 +77,16 @@ pnpm --version
 mkdir -p ~/nexustrade-pilot-data/sessions
 ```
 
-### Step 3.2: Build TypeScript Project
+### Step 3.2: Build TypeScript Project to Executable Distribution
 
-From the project root:
+From the repository root on Fedora:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm run build
+node scripts/build-pilot-cli.mjs
 ```
+
+This compiles all required backend TypeScript modules into `backend/dist/research/pilot/PilotLiveCollectorCli.js` as pure ES Modules.
 
 ---
 
@@ -100,6 +102,8 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js \
   --target-candidates=100 \
   --target-yield=15 \
   --max-mb=256 \
+  --max-rss-mb=256 \
+  --forward-observations=true \
   --output-dir=$HOME/nexustrade-pilot-data/sessions
 ```
 
@@ -120,6 +124,7 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js \
 [COLLECTOR] Scheduled forward observations at +1m, +5m, +15m
 ...
 [PILOT_LIVE_COLLECTOR] Stopping condition reached: DURATION_EXPIRED
+[PILOT_LIVE_COLLECTOR] Draining due forward outcomes and accounting for pending windows...
 [PILOT_LIVE_COLLECTOR] Finalizing session archive...
 [PILOT_LIVE_COLLECTOR] Session finalized successfully: FINALIZED
 [PILOT_LIVE_COLLECTOR] SHA-256 Export manifest generated: manifest.json (VALID)
@@ -130,10 +135,10 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js \
 
 The runner automatically halts cleanly and exports a sealed, verified dataset under any of the following stopping conditions:
 
-1. `DURATION_EXPIRED`: 2-hour duration box elapsed (finalized as `FINALIZED` if data recorded).
-2. `TARGET_REACHED`: `--target-candidates` ceiling reached.
-3. `OPERATOR_INTERRUPT`: Clean signal capture (`Ctrl+C` / `SIGINT` / `SIGTERM`) drains in-flight writes, reconciles baselines, and seals `manifest.json`.
-4. `RESOURCE_CEILING_REACHED`: Memory watchdog triggers if process RSS reaches 256 MB.
+1. `DURATION_EXPIRED`: 2-hour duration box elapsed (finalized as `FINALIZED` if candidates recorded).
+2. `TARGET_REACHED`: `--target-candidates` ceiling reached (finalized as `FINALIZED`).
+3. `OPERATOR_INTERRUPT`: Clean signal capture (`Ctrl+C` / `SIGINT` / `SIGTERM`) drains in-flight writes, censors remaining future targets, reconciles baselines, and seals `manifest.json` as `INTERRUPTED`.
+4. `RESOURCE_CEILING_REACHED`: Memory watchdog triggers if process RSS reaches 256 MB (finalized as `INTERRUPTED`).
 
 ---
 
@@ -148,7 +153,8 @@ Upon completion, the session directory in `~/nexustrade-pilot-data/sessions/<ses
 ├── candidate-decisions.jsonl            # Canonical candidate decision records (5-tuple keys)
 ├── shadow-evaluations.jsonl             # Canonical shadow evaluation records
 ├── market-observations.jsonl            # On-chain Raydium AMM pool states & accounting
-├── forward-observations.jsonl           # Outcome measurements at +1m, +5m, +15m
+├── forward-observations.jsonl           # Outcome measurements at +1m, +5m, +15m and censored accounting
+├── forward-summary.json                 # Summary totals of scheduled, completed, and truncated intervals
 ├── pilot-research-compatibility.json    # Exploratory classification & D.1 reconciliation
 └── manifest.json                        # Authoritative SHA-256 export manifest of all files
 ```
@@ -168,17 +174,21 @@ scp -r ~/nexustrade-pilot-data/sessions/pilot-sess-1792215300000 user@windows-bo
 
 ### Step 6.2: Safe Import & Manifest Integrity Verification
 
-Use the `PilotArchiveImporter` to safely import and verify the dataset into `.tmp/pilot-imports/sessions/`:
+Use `PilotArchiveImporter` or `scripts/import-pilot-archive.mjs` to safely import and verify the dataset into `.tmp/pilot-imports/sessions/`:
 
 ```bash
-# Execute isolated Windows import and verification script
+# Execute isolated Windows import and verification script (non-destructive by default)
 node scripts/import-pilot-archive.mjs --source="D:/Staging/pilot-sess-1792215300000"
+
+# Optional --overwrite flag authorizes replacing an existing same-named imported session
+node scripts/import-pilot-archive.mjs --source="D:/Staging/pilot-sess-1792215300000" --overwrite
 ```
 
 The importer:
 
-1. Copies the session files into isolated `.tmp/pilot-imports/sessions/<session-id>/`.
-2. Computes SHA-256 digests for all files and verifies against `manifest.json`.
-3. Runs baseline reconciliation and ungraceful crash recovery.
-4. Audits compatibility with Phase 12.94-D.1 research readiness gates.
-5. Emits an import validation report without mutating historical `.tmp/telemetry/sessions/`.
+1. Rejects collision if destination session directory already exists, unless `--overwrite` is explicitly passed.
+2. Verifies SHA-256 hashes against `manifest.json` on the source archive before any files are copied or moved.
+3. Copies files into an isolated temporary staging directory (`.tmp/pilot-imports/sessions/.staging-...`).
+4. Re-verifies manifest integrity and executes crash recovery verification in staging, ensuring status remains `FINALIZED` with 0 torn lines.
+5. Atomically publishes the verified session into `.tmp/pilot-imports/sessions/<session-id>/`.
+6. Audits compatibility with Phase 12.94-D.1 research readiness gates without mutating historical `.tmp/telemetry/sessions/`.

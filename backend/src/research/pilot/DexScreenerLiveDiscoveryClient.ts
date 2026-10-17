@@ -7,8 +7,9 @@
  * Safety & Integrity:
  * - Read-only HTTP GET exclusively against allowlisted DexScreener endpoints.
  * - Deduplicates discovered tokens and caches pair resolutions.
- * - Enforces default 30-second profile polling interval and handles 429 Retry-After.
- * - Captures authentic request/receipt timestamps without synthesizing source times.
+ * - Enforces per-request outbound budget at the transport boundary (D24F-05).
+ * - Distinguishes discovered tokens from resolved pairs; retries transient 429 failures.
+ * - Bounded pair lookups per poll cycle to prevent request bursts.
  * - Injectable transport for 100% offline deterministic testing.
  */
 
@@ -26,6 +27,8 @@ export const DEXSCREENER_TOKENS_ENDPOINT_PREFIX = "https://api.dexscreener.com/l
 export const DEFAULT_PROFILE_POLL_INTERVAL_MS = 30_000; // 30 seconds operator default
 export const DEFAULT_HTTP_TIMEOUT_MS = 5_000; // 5 seconds
 export const DEFAULT_PAIR_CACHE_TTL_MS = 300_000; // 5 minutes
+export const DEFAULT_MAX_REQUESTS_PER_MINUTE = 60; // 60 req/min default
+export const DEFAULT_MAX_PAIR_LOOKUPS_PER_POLL = 10; // Max pair lookups in one poll cycle
 
 export interface ILiveHttpTransport {
   fetch(url: string, init?: RequestInit): Promise<Response>;
@@ -35,6 +38,8 @@ export interface DexScreenerClientOptions {
   readonly pollIntervalMs?: number | undefined;
   readonly httpTimeoutMs?: number | undefined;
   readonly pairCacheTtlMs?: number | undefined;
+  readonly maxRequestsPerMinute?: number | undefined;
+  readonly maxPairLookupsPerPoll?: number | undefined;
   readonly transport?: ILiveHttpTransport | undefined;
 }
 
@@ -42,6 +47,11 @@ export interface DiscoveredCandidateResult {
   readonly candidate: D23ScreenedCandidate;
   readonly pairSummary: DexScreenerPairSummary | null;
   readonly isNewDiscovery: boolean;
+}
+
+interface RetryQueueItem {
+  attempts: number;
+  nextRetryEpochMs: number;
 }
 
 /**
@@ -71,36 +81,66 @@ export class DexScreenerLiveDiscoveryClient {
   private readonly pollIntervalMs: number;
   private readonly httpTimeoutMs: number;
   private readonly pairCacheTtlMs: number;
+  private readonly maxRequestsPerMinute: number;
+  private readonly maxPairLookupsPerPoll: number;
   private readonly transport: ILiveHttpTransport;
 
-  private readonly seenMints = new Set<string>();
+  // D24F-05: Distinguish discovered from resolved
+  private readonly discoveredMints = new Set<string>();
+  private readonly resolvedMints = new Set<string>();
+  private readonly retryQueue = new Map<string, RetryQueueItem>();
+
   private readonly pairCache = new Map<
     string,
     { summary: DexScreenerPairSummary | null; cachedAtEpochMs: number }
   >();
 
+  private requestTimestamps: number[] = [];
   private lastProfilePollEpochMs = 0;
   private retryAfterUntilEpochMs = 0;
+
+  // Telemetry counters
+  private rateLimitsEncountered = 0;
+  private timeoutsEncountered = 0;
 
   constructor(options?: DexScreenerClientOptions) {
     this.pollIntervalMs = options?.pollIntervalMs ?? DEFAULT_PROFILE_POLL_INTERVAL_MS;
     this.httpTimeoutMs = options?.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
     this.pairCacheTtlMs = options?.pairCacheTtlMs ?? DEFAULT_PAIR_CACHE_TTL_MS;
+    this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? DEFAULT_MAX_REQUESTS_PER_MINUTE;
+    this.maxPairLookupsPerPoll =
+      options?.maxPairLookupsPerPoll ?? DEFAULT_MAX_PAIR_LOOKUPS_PER_POLL;
     this.transport = options?.transport ?? {
       fetch: (url: string, init?: RequestInit) => globalThis.fetch(url, init),
     };
   }
 
   public getSeenMintsCount(): number {
-    return this.seenMints.size;
+    return this.discoveredMints.size;
   }
 
   public isMintSeen(mint: string): boolean {
-    return this.seenMints.has(mint);
+    return this.discoveredMints.has(mint);
+  }
+
+  public isMintResolved(mint: string): boolean {
+    return this.resolvedMints.has(mint);
   }
 
   public getPairCacheSize(): number {
     return this.pairCache.size;
+  }
+
+  public getRateLimitsEncounteredCount(): number {
+    return this.rateLimitsEncountered;
+  }
+
+  public getTimeoutsEncounteredCount(): number {
+    return this.timeoutsEncountered;
+  }
+
+  public getRetryQueueSize(): number {
+    return this.retryQueue.size;
   }
 
   /**
@@ -119,40 +159,85 @@ export class DexScreenerLiveDiscoveryClient {
       return [];
     }
 
-    // Enforce profile poll interval
+    // Determine mints to resolve this cycle (retries first, then new profile discoveries)
+    const mintsToResolve: string[] = [];
+
+    // 1. Process pending items from retry queue whose backoff expired
+    for (const [mint, item] of this.retryQueue.entries()) {
+      if (now >= item.nextRetryEpochMs) {
+        mintsToResolve.push(mint);
+        if (mintsToResolve.length >= this.maxPairLookupsPerPoll) {
+          break;
+        }
+      }
+    }
+
+    // 2. Fetch and parse token profiles if poll interval has elapsed and quota allows
     if (
-      this.lastProfilePollEpochMs > 0 &&
-      now - this.lastProfilePollEpochMs < this.pollIntervalMs
+      (this.lastProfilePollEpochMs === 0 ||
+        now - this.lastProfilePollEpochMs >= this.pollIntervalMs) &&
+      mintsToResolve.length < this.maxPairLookupsPerPoll
     ) {
-      return [];
+      this.lastProfilePollEpochMs = now;
+      const profilesPayload = await this.executeGetJson(DEXSCREENER_PROFILES_ENDPOINT);
+      if (profilesPayload) {
+        const profilesResult = parseDexScreenerTokenProfiles(profilesPayload);
+        if (profilesResult.ok && profilesResult.candidates.length > 0) {
+          for (const profile of profilesResult.candidates) {
+            const mint = profile.tokenAddress;
+            const isNew = !this.discoveredMints.has(mint);
+            this.discoveredMints.add(mint);
+
+            if (isNew && !this.resolvedMints.has(mint) && !this.retryQueue.has(mint)) {
+              if (mintsToResolve.length < this.maxPairLookupsPerPoll) {
+                mintsToResolve.push(mint);
+              } else {
+                // Queue for next poll so discovery is not lost
+                this.retryQueue.set(mint, { attempts: 0, nextRetryEpochMs: now });
+              }
+            }
+          }
+        }
+      }
     }
 
-    this.lastProfilePollEpochMs = now;
-
-    // Stage 1: Fetch and parse token profiles
-    const profilesPayload = await this.executeGetJson(DEXSCREENER_PROFILES_ENDPOINT);
-    if (!profilesPayload) {
-      return [];
-    }
-
-    const profilesResult = parseDexScreenerTokenProfiles(profilesPayload);
-    if (!profilesResult.ok || profilesResult.candidates.length === 0) {
+    if (mintsToResolve.length === 0) {
       return [];
     }
 
     const results: DiscoveredCandidateResult[] = [];
 
-    // Stage 2: For new mints, resolve token pair summary
-    for (const profile of profilesResult.candidates) {
-      const mint = profile.tokenAddress;
-      const isNew = !this.seenMints.has(mint);
-      this.seenMints.add(mint);
-
-      if (!isNew) {
+    // Stage 3: Resolve token pair summary within bounded budget
+    for (const mint of mintsToResolve) {
+      if (this.resolvedMints.has(mint)) {
         continue;
       }
 
-      const pairSummary = await this.resolveTokenPair(mint);
+      const pairResult = await this.resolveTokenPairWithStatus(mint);
+
+      if (pairResult.status === "RATE_LIMITED" || pairResult.status === "TRANSIENT_ERROR") {
+        // D24F-05: Transient failure; queue for retry rather than permanently dropping
+        const existing = this.retryQueue.get(mint);
+        const attempts = (existing?.attempts ?? 0) + 1;
+        if (attempts <= 3) {
+          const backoffMs =
+            typeof pairResult.retryAfterSec === "number"
+              ? pairResult.retryAfterSec * 1000
+              : Math.min(60_000, Math.pow(2, attempts) * 100);
+          this.retryQueue.set(mint, { attempts, nextRetryEpochMs: Date.now() + backoffMs });
+        } else {
+          // Exceeded retry budget; mark resolved with null
+          this.resolvedMints.add(mint);
+          this.retryQueue.delete(mint);
+        }
+        continue;
+      }
+
+      // Successful resolution or confirmed non-existent pair
+      this.resolvedMints.add(mint);
+      this.retryQueue.delete(mint);
+
+      const pairSummary = pairResult.summary;
       const decisionEpochMs = Date.now();
       const eventId = `evt-ds-${mint.slice(0, 8)}-${decisionEpochMs}`;
 
@@ -171,7 +256,8 @@ export class DexScreenerLiveDiscoveryClient {
           : "FILTERED_REJECTED",
         selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
         decisionEpochMs,
-        requestEpochMs: this.lastProfilePollEpochMs,
+        requestEpochMs:
+          this.lastProfilePollEpochMs > 0 ? this.lastProfilePollEpochMs : decisionEpochMs,
         receiptEpochMs: decisionEpochMs,
         sourceTimestampMs: null, // Truthful: DexScreener does not attest source quote timestamps
         passedEligibility: Boolean(pairSummary?.isRaydiumAmmCandidate),
@@ -207,36 +293,84 @@ export class DexScreenerLiveDiscoveryClient {
    * Resolves pair summary for a specific mint address with local caching.
    */
   public async resolveTokenPair(mintAddress: string): Promise<DexScreenerPairSummary | null> {
-    const now = Date.now();
-    const cached = this.pairCache.get(mintAddress);
-    if (cached && now - cached.cachedAtEpochMs < this.pairCacheTtlMs) {
-      return cached.summary;
-    }
-
-    const url = `${DEXSCREENER_TOKENS_ENDPOINT_PREFIX}${mintAddress}`;
-    const pairsPayload = await this.executeGetJson(url);
-    if (!pairsPayload) {
-      this.pairCache.set(mintAddress, { summary: null, cachedAtEpochMs: now });
-      return null;
-    }
-
-    const pairsResult = parseDexScreenerPairsResponse(pairsPayload, mintAddress);
-    const summary = pairsResult.matchingRaydiumPair ?? pairsResult.pairs[0] ?? null;
-
-    this.pairCache.set(mintAddress, { summary, cachedAtEpochMs: now });
-    return summary;
+    const res = await this.resolveTokenPairWithStatus(mintAddress);
+    return res.summary;
   }
 
   /**
-   * Executes a strictly allowlisted GET request with timeout and Retry-After handling.
+   * Internal pair resolver distinguishing success, rate limiting, and errors.
+   */
+  private async resolveTokenPairWithStatus(mintAddress: string): Promise<{
+    summary: DexScreenerPairSummary | null;
+    status: "OK" | "RATE_LIMITED" | "TRANSIENT_ERROR";
+    retryAfterSec?: number | undefined;
+  }> {
+    const now = Date.now();
+    const cached = this.pairCache.get(mintAddress);
+    if (cached && now - cached.cachedAtEpochMs < this.pairCacheTtlMs) {
+      return { summary: cached.summary, status: "OK" };
+    }
+
+    const url = `${DEXSCREENER_TOKENS_ENDPOINT_PREFIX}${mintAddress}`;
+    const fetchResult = await this.executeGetJsonWithStatus(url);
+
+    if (fetchResult.status === "RATE_LIMITED") {
+      return { summary: null, status: "RATE_LIMITED", retryAfterSec: fetchResult.retryAfterSec };
+    }
+    if (fetchResult.status === "ERROR") {
+      return { summary: null, status: "TRANSIENT_ERROR" };
+    }
+
+    if (!fetchResult.data) {
+      this.pairCache.set(mintAddress, { summary: null, cachedAtEpochMs: now });
+      return { summary: null, status: "OK" };
+    }
+
+    const pairsResult = parseDexScreenerPairsResponse(fetchResult.data, mintAddress);
+    const summary = pairsResult.matchingRaydiumPair ?? pairsResult.pairs[0] ?? null;
+
+    this.pairCache.set(mintAddress, { summary, cachedAtEpochMs: now });
+    return { summary, status: "OK" };
+  }
+
+  /**
+   * Executes a strictly allowlisted GET request with rate budgeting, timeout, and Retry-After handling.
    */
   private async executeGetJson(url: string): Promise<unknown | null> {
+    const res = await this.executeGetJsonWithStatus(url);
+    return res.data;
+  }
+
+  private async executeGetJsonWithStatus(url: string): Promise<{
+    data: unknown | null;
+    status: "OK" | "RATE_LIMITED" | "ERROR";
+    retryAfterSec?: number | undefined;
+  }> {
     if (!isAllowlistedDexScreenerUrl(url)) {
       throw new Error(`[FORBIDDEN_HTTP_URL] URL '${url}' is not on the DexScreener allowlist`);
     }
 
+    const now = Date.now();
+    if (now < this.retryAfterUntilEpochMs) {
+      return {
+        data: null,
+        status: "RATE_LIMITED",
+        retryAfterSec: Math.ceil((this.retryAfterUntilEpochMs - now) / 1000),
+      };
+    }
+
+    // D24F-05: Enforce outbound rate budget at transport boundary
+    try {
+      this.enforceRateBudget();
+    } catch {
+      return { data: null, status: "RATE_LIMITED" };
+    }
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.httpTimeoutMs);
+    const timeout = setTimeout(() => {
+      this.timeoutsEncountered++;
+      controller.abort();
+    }, this.httpTimeoutMs);
 
     try {
       const response = await this.transport.fetch(url, {
@@ -249,31 +383,45 @@ export class DexScreenerLiveDiscoveryClient {
       });
 
       if (response.status === 429) {
-        this.handleRateLimit(response);
-        return null;
+        this.rateLimitsEncountered++;
+        const backoffSec = this.handleRateLimit(response);
+        return { data: null, status: "RATE_LIMITED", retryAfterSec: backoffSec };
       }
 
       if (!response.ok) {
-        return null;
+        return { data: null, status: "ERROR" };
       }
 
-      return await response.json();
+      const data = await response.json();
+      return { data, status: "OK" };
     } catch {
-      return null;
+      return { data: null, status: "ERROR" };
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private handleRateLimit(response: Response): void {
+  private enforceRateBudget(): void {
+    const now = Date.now();
+    this.requestTimestamps = this.requestTimestamps.filter((t) => now - t < 60_000);
+    if (this.requestTimestamps.length >= this.maxRequestsPerMinute) {
+      throw new Error(
+        `[DEXSCREENER_RATE_BUDGET_EXCEEDED] DexScreener client exceeded budget of ${this.maxRequestsPerMinute} req/min`,
+      );
+    }
+    this.requestTimestamps.push(now);
+  }
+
+  private handleRateLimit(response: Response): number {
     const retryAfterHeader = response.headers?.get?.("retry-after");
     let backoffSeconds = 10;
     if (retryAfterHeader) {
       const parsedSeconds = parseInt(retryAfterHeader, 10);
-      if (Number.isFinite(parsedSeconds) && parsedSeconds > 0) {
+      if (Number.isFinite(parsedSeconds) && parsedSeconds >= 0) {
         backoffSeconds = Math.min(parsedSeconds, 120);
       }
     }
     this.retryAfterUntilEpochMs = Date.now() + backoffSeconds * 1000;
+    return backoffSeconds;
   }
 }
