@@ -34,6 +34,21 @@ export interface SolanaRpcClientOptions {
   readonly httpTimeoutMs?: number | undefined;
   readonly maxRequestsPerMinute?: number | undefined;
   readonly transport?: ISolanaRpcTransport | undefined;
+  readonly onLog?: ((message: string) => void) | undefined;
+}
+
+export interface SolanaRpcObservationDiagnostics {
+  readonly totalCalls: number;
+  readonly successfulCalls: number;
+  readonly failedCalls: number;
+  readonly rateLimitsEncountered: number;
+  readonly timeoutsEncountered: number;
+  readonly poolsObserved: number;
+  readonly poolsSuccessful: number;
+  readonly poolsFailed: number;
+  readonly slotDiscrepancies: number;
+  readonly methodsCalled: Record<string, number>;
+  readonly lastCallEpochMs: number;
 }
 
 export interface ObservedPoolStateResult {
@@ -51,9 +66,23 @@ export class SolanaRpcLiveObservationClient {
   private readonly httpTimeoutMs: number;
   private readonly maxRequestsPerMinute: number;
   private readonly transport: ISolanaRpcTransport;
+  private readonly onLog?: ((message: string) => void) | undefined;
 
   private requestTimestamps: number[] = [];
   private retryAfterUntilEpochMs = 0;
+
+  // Telemetry counters
+  private totalCalls = 0;
+  private successfulCalls = 0;
+  private failedCalls = 0;
+  private rateLimitsEncountered = 0;
+  private timeoutsEncountered = 0;
+  private poolsObserved = 0;
+  private poolsSuccessful = 0;
+  private poolsFailed = 0;
+  private slotDiscrepancies = 0;
+  private readonly methodsCalled: Record<string, number> = {};
+  private lastCallEpochMs = 0;
 
   constructor(options?: SolanaRpcClientOptions) {
     this.rpcUrl = options?.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC;
@@ -82,10 +111,27 @@ export class SolanaRpcLiveObservationClient {
         return await res.json();
       },
     };
+    this.onLog = options?.onLog;
   }
 
   public getRpcUrl(): string {
     return this.rpcUrl;
+  }
+
+  public getDiagnostics(): SolanaRpcObservationDiagnostics {
+    return {
+      totalCalls: this.totalCalls,
+      successfulCalls: this.successfulCalls,
+      failedCalls: this.failedCalls,
+      rateLimitsEncountered: this.rateLimitsEncountered,
+      timeoutsEncountered: this.timeoutsEncountered,
+      poolsObserved: this.poolsObserved,
+      poolsSuccessful: this.poolsSuccessful,
+      poolsFailed: this.poolsFailed,
+      slotDiscrepancies: this.slotDiscrepancies,
+      methodsCalled: { ...this.methodsCalled },
+      lastCallEpochMs: this.lastCallEpochMs,
+    };
   }
 
   /**
@@ -111,8 +157,13 @@ export class SolanaRpcLiveObservationClient {
       poolId: string;
     };
   }): Promise<ObservedPoolStateResult> {
+    this.poolsObserved++;
+    this.onLog?.(`Observing Raydium pool ${params.poolAddress} for mint ${params.targetMint}...`);
     const now = Date.now();
     if (now < this.retryAfterUntilEpochMs) {
+      this.poolsFailed++;
+      const errMsg = `[RPC_THROTTLED] Solana RPC rate-limited until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`;
+      this.onLog?.(`${errMsg}`);
       return {
         ok: false,
         observation: null,
@@ -120,7 +171,7 @@ export class SolanaRpcLiveObservationClient {
         vaultSlot: null,
         slotDiscrepancy: false,
         reserveAccounting: null,
-        error: `[RPC_THROTTLED] Solana RPC rate-limited until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`,
+        error: errMsg,
       };
     }
 
@@ -139,6 +190,9 @@ export class SolanaRpcLiveObservationClient {
       );
 
       if (!poolResult.ok || !poolResult.poolState) {
+        this.poolsFailed++;
+        const errMsg = poolResult.error ?? "Failed to decode Raydium pool account";
+        this.onLog?.(`Pool ${params.poolAddress} account decode failed: ${errMsg}`);
         return {
           ok: false,
           observation: null,
@@ -146,12 +200,15 @@ export class SolanaRpcLiveObservationClient {
           vaultSlot: null,
           slotDiscrepancy: false,
           reserveAccounting: null,
-          error: poolResult.error ?? "Failed to decode Raydium pool account",
+          error: errMsg,
         };
       }
 
       const poolState = poolResult.poolState;
       if (poolState.programId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+        this.poolsFailed++;
+        const errMsg = `[UNAUTHORIZED_PROGRAM_ID] Pool program ID '${poolState.programId}' is not Raydium AMM v4`;
+        this.onLog?.(`Pool ${params.poolAddress} owner check failed: ${errMsg}`);
         return {
           ok: false,
           observation: null,
@@ -159,7 +216,7 @@ export class SolanaRpcLiveObservationClient {
           vaultSlot: null,
           slotDiscrepancy: false,
           reserveAccounting: null,
-          error: `[UNAUTHORIZED_PROGRAM_ID] Pool program ID '${poolState.programId}' is not Raydium AMM v4`,
+          error: errMsg,
         };
       }
 
@@ -176,6 +233,9 @@ export class SolanaRpcLiveObservationClient {
       );
 
       if (!vaultsResult.ok || !vaultsResult.balances) {
+        this.poolsFailed++;
+        const errMsg = vaultsResult.error ?? "Failed to decode pool vault balances";
+        this.onLog?.(`Pool ${params.poolAddress} vaults decode failed: ${errMsg}`);
         return {
           ok: false,
           observation: null,
@@ -183,7 +243,7 @@ export class SolanaRpcLiveObservationClient {
           vaultSlot: vaultsResult.slot,
           slotDiscrepancy: false,
           reserveAccounting: null,
-          error: vaultsResult.error ?? "Failed to decode pool vault balances",
+          error: errMsg,
         };
       }
 
@@ -227,6 +287,14 @@ export class SolanaRpcLiveObservationClient {
         missingFields: ["sourceTimestampMs"],
       };
 
+      this.poolsSuccessful++;
+      if (slotDiscrepancy) {
+        this.slotDiscrepancies++;
+      }
+      this.onLog?.(
+        `Pool ${params.poolAddress} observed successfully (slot: ${vaultsResult.slot ?? poolResult.slot}, slotDiscrepancy: ${slotDiscrepancy})`,
+      );
+
       return {
         ok: true,
         observation,
@@ -236,6 +304,9 @@ export class SolanaRpcLiveObservationClient {
         reserveAccounting,
       };
     } catch (err) {
+      this.poolsFailed++;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.onLog?.(`Pool ${params.poolAddress} observation failed: ${errMsg}`);
       return {
         ok: false,
         observation: null,
@@ -243,7 +314,7 @@ export class SolanaRpcLiveObservationClient {
         vaultSlot: null,
         slotDiscrepancy: false,
         reserveAccounting: null,
-        error: err instanceof Error ? err.message : String(err),
+        error: errMsg,
       };
     }
   }
@@ -269,8 +340,15 @@ export class SolanaRpcLiveObservationClient {
     // D24F-05: Enforce rate budget on EVERY outbound RPC call
     this.enforceRateBudget();
 
+    this.totalCalls++;
+    this.lastCallEpochMs = now;
+    this.methodsCalled[method] = (this.methodsCalled[method] ?? 0) + 1;
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.httpTimeoutMs);
+    const timeout = setTimeout(() => {
+      this.timeoutsEncountered++;
+      controller.abort();
+    }, this.httpTimeoutMs);
 
     const rpcBody = {
       jsonrpc: "2.0",
@@ -280,13 +358,22 @@ export class SolanaRpcLiveObservationClient {
     };
 
     try {
-      return await this.transport.post(this.rpcUrl, rpcBody, {
+      const res = await this.transport.post(this.rpcUrl, rpcBody, {
         signal: controller.signal,
       });
+      this.successfulCalls++;
+      this.onLog?.(`${method} call succeeded`);
+      return res;
     } catch (err) {
+      this.failedCalls++;
       if (err instanceof Error && err.message.includes("429")) {
+        this.rateLimitsEncountered++;
         this.retryAfterUntilEpochMs = Date.now() + 10_000;
       }
+      if (err instanceof Error && (err.name === "AbortError" || err.message.includes("timeout"))) {
+        this.timeoutsEncountered++;
+      }
+      this.onLog?.(`${method} call failed: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
     } finally {
       clearTimeout(timeout);

@@ -1322,4 +1322,469 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       ).toBe(false);
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 6. Operational Observability & Negative Control Persistence
+  // --------------------------------------------------------------------------
+  describe("Operational Observability & Negative Control Persistence", () => {
+    it("records non-Raydium and ineligible candidates honestly as FILTERED_REJECTED without dropping negative controls", async () => {
+      const testDir = await makeTestDir("neg-controls");
+      const pumpMint = "PumpM111111111111111111111111111111111111111";
+
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async (url: string) => {
+          if (url.includes("/token-profiles/latest/v1")) {
+            return new Response(
+              JSON.stringify([
+                {
+                  tokenAddress: pumpMint,
+                  chainId: "solana",
+                  header: "PumpToken",
+                  description: "Pump token on PumpSwap",
+                },
+                {
+                  tokenAddress: FIXTURE_MEME_MINT,
+                  chainId: "solana",
+                  header: "Bonk",
+                  description: "Bonk on Raydium AMM",
+                },
+              ]),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes(`/latest/dex/tokens/${pumpMint}`)) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "pump",
+                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    baseToken: { address: pumpMint, symbol: "PUMP" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                    priceUsd: "0.0001",
+                    volume: { m5: 50 },
+                    txns: { m5: { buys: 2, sells: 1 } },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes(`/latest/dex/tokens/${FIXTURE_MEME_MINT}`)) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "raydium",
+                    pairAddress: FIXTURE_POOL_ADDRESS,
+                    baseToken: { address: FIXTURE_MEME_MINT, symbol: "BONK" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                    priceUsd: "0.00001",
+                    volume: { m5: 1200 },
+                    txns: { m5: { buys: 12, sells: 4 } },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 404 });
+        },
+      };
+
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async (_url, payload) => {
+          const body = payload as { method: string; params: unknown[] };
+          if (body.method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: 300000001 },
+                value: {
+                  data: [poolBuffer.toString("base64"), "base64"],
+                  executable: false,
+                  lamports: 10000000,
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                  rentEpoch: 0,
+                },
+              },
+            };
+          }
+          if (body.method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: 2,
+              result: {
+                context: { slot: 300000002 },
+                value: [
+                  {
+                    data: [baseVaultBuffer.toString("base64"), "base64"],
+                    executable: false,
+                    lamports: 5000000,
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    rentEpoch: 0,
+                  },
+                  {
+                    data: [quoteVaultBuffer.toString("base64"), "base64"],
+                    executable: false,
+                    lamports: 5000000,
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    rentEpoch: 0,
+                  },
+                ],
+              },
+            };
+          }
+          return { jsonrpc: "2.0", id: 99, error: { message: "Unknown" } };
+        },
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 5,
+        targetCandidates: 2, // Screen both PumpToken and Bonk
+        targetDiagnosticYield: 1,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: true,
+        httpTransport: mockHttp,
+        rpcTransport: mockRpc,
+      });
+
+      const result = await runner.run();
+      expect(result.status).toBe("FINALIZED");
+      expect(result.totalDecisionsRecorded).toBe(2);
+      expect(result.manifestValid).toBe(true);
+
+      // Verify candidate-decisions.jsonl has BOTH records
+      const decisionsFile = path.join(result.sessionDir, "candidate-decisions.jsonl");
+      expect(fsSync.existsSync(decisionsFile)).toBe(true);
+      const decisionLines = (await fs.readFile(decisionsFile, "utf8"))
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l));
+
+      expect(decisionLines).toHaveLength(2);
+
+      // PumpToken must be recorded as FILTERED_REJECTED
+      const pumpRecord = decisionLines.find((r) => r.mintAddress === pumpMint);
+      expect(pumpRecord).toBeDefined();
+      expect(pumpRecord.decisionCohort).toBe("FILTERED_REJECTED");
+      expect(pumpRecord.primaryRejectionReason).toBe("NO_RAYDIUM_AMM_PAIR_IDENTIFIED");
+
+      // Bonk must be recorded as WATCHLIST_RADAR
+      const bonkRecord = decisionLines.find((r) => r.mintAddress === FIXTURE_MEME_MINT);
+      expect(bonkRecord).toBeDefined();
+      expect(bonkRecord.decisionCohort).toBe("WATCHLIST_RADAR");
+
+      // Verify session-summary.json counts both cohorts truthfully
+      const summaryFile = path.join(result.sessionDir, "session-summary.json");
+      const summary = JSON.parse(await fs.readFile(summaryFile, "utf8"));
+      expect(summary.totalCandidatesScreened).toBe(2);
+      expect(summary.cohortBreakdown.watchlistRadar).toBe(1);
+      expect(summary.cohortBreakdown.filteredRejected).toBe(1);
+
+      // Market observations only recorded for verified Raydium candidate (Bonk)
+      const obsFile = path.join(result.sessionDir, "market-observations.jsonl");
+      expect(fsSync.existsSync(obsFile)).toBe(true);
+      const obsLines = (await fs.readFile(obsFile, "utf8"))
+        .split("\n")
+        .filter((l) => l.trim().length > 0);
+      expect(obsLines).toHaveLength(1);
+
+      // Forward observations only scheduled for WATCHLIST_RADAR (3 targets)
+      const fwdFile = path.join(result.sessionDir, "forward-observations.jsonl");
+      expect(fsSync.existsSync(fwdFile)).toBe(true);
+      const fwdLines = (await fs.readFile(fwdFile, "utf8"))
+        .split("\n")
+        .filter((l) => l.trim().length > 0);
+      expect(fwdLines).toHaveLength(3);
+    });
+
+    it("converts candidate to FILTERED_REJECTED when on-chain RPC verification fails", async () => {
+      const testDir = await makeTestDir("rpc-fail-record");
+
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async (url: string) => {
+          if (url.includes("/token-profiles/latest/v1")) {
+            return new Response(
+              JSON.stringify([
+                {
+                  tokenAddress: FIXTURE_MEME_MINT,
+                  chainId: "solana",
+                  header: "Bonk",
+                  description: "Bonk token",
+                },
+              ]),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes("/latest/dex/tokens/")) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "raydium",
+                    pairAddress: FIXTURE_POOL_ADDRESS,
+                    baseToken: { address: FIXTURE_MEME_MINT, symbol: "BONK" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                    priceUsd: "0.00001",
+                    volume: { m5: 1200 },
+                    txns: { m5: { buys: 12, sells: 4 } },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 404 });
+        },
+      };
+
+      // Mock RPC fails with non-Raydium program owner error
+      const mockRpc: ISolanaRpcTransport = {
+        post: async () => {
+          return {
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              context: { slot: 100 },
+              value: {
+                data: [Buffer.alloc(100).toString("base64"), "base64"],
+                executable: false,
+                lamports: 1000,
+                owner: "11111111111111111111111111111111", // Not Raydium AMM v4
+                rentEpoch: 0,
+              },
+            },
+          };
+        },
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 5,
+        targetCandidates: 1,
+        targetDiagnosticYield: 1,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: true,
+        httpTransport: mockHttp,
+        rpcTransport: mockRpc,
+      });
+
+      const result = await runner.run();
+      expect(result.status).toBe("FINALIZED");
+      expect(result.totalDecisionsRecorded).toBe(1);
+
+      // Verify recorded as FILTERED_REJECTED due to failed on-chain verification
+      const decisionsFile = path.join(result.sessionDir, "candidate-decisions.jsonl");
+      const lines = (await fs.readFile(decisionsFile, "utf8"))
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l));
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0].decisionCohort).toBe("FILTERED_REJECTED");
+      expect(lines[0].primaryRejectionReason).toContain("UNAUTHORIZED_POOL_OWNER");
+
+      // Session summary reflects 0 radar, 1 rejected
+      const summaryFile = path.join(result.sessionDir, "session-summary.json");
+      const summary = JSON.parse(await fs.readFile(summaryFile, "utf8"));
+      expect(summary.cohortBreakdown.watchlistRadar).toBe(0);
+      expect(summary.cohortBreakdown.filteredRejected).toBe(1);
+    });
+
+    it("captures comprehensive diagnostics from discovery and RPC clients", async () => {
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async (url: string) => {
+          if (url.includes("/token-profiles/latest/v1")) {
+            return new Response(
+              JSON.stringify([
+                {
+                  tokenAddress: FIXTURE_MEME_MINT,
+                  chainId: "solana",
+                  header: "Bonk",
+                  description: "Bonk",
+                },
+              ]),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes("/latest/dex/tokens/")) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "raydium",
+                    pairAddress: FIXTURE_POOL_ADDRESS,
+                    baseToken: { address: FIXTURE_MEME_MINT, symbol: "BONK" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                    priceUsd: "0.00001",
+                    volume: { m5: 100 },
+                    txns: { m5: { buys: 1, sells: 0 } },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 404 });
+        },
+      };
+
+      const discoveryClient = new DexScreenerLiveDiscoveryClient({
+        pollIntervalMs: 1,
+        transport: mockHttp,
+      });
+
+      await discoveryClient.pollDiscoveredCandidates({
+        sessionId: "sess-diag",
+        generationId: "gen1",
+      });
+
+      const dsDiag = discoveryClient.getDiagnostics();
+      expect(dsDiag.totalPolls).toBe(1);
+      expect(dsDiag.totalProfilesFetched).toBe(1);
+      expect(dsDiag.totalPairLookups).toBe(1);
+      expect(dsDiag.raydiumAmmCandidatesFound).toBe(1);
+      expect(dsDiag.seenMintsCount).toBe(1);
+      expect(dsDiag.resolvedMintsCount).toBe(1);
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { context: { slot: 100 }, value: null },
+        }),
+      };
+
+      const rpcClient = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://mock-rpc",
+        transport: mockRpc,
+      });
+
+      await rpcClient.executeRpcCall("getAccountInfo", ["addr1"]);
+      const rpcDiag = rpcClient.getDiagnostics();
+      expect(rpcDiag.totalCalls).toBe(1);
+      expect(rpcDiag.successfulCalls).toBe(1);
+      expect(rpcDiag.methodsCalled.getAccountInfo).toBe(1);
+    });
+
+    it("appends operational logs to direct log file specified by --log-file", async () => {
+      const testDir = await makeTestDir("log-file-test");
+      const logFilePath = path.join(testDir, "operational.log");
+
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async () =>
+          new Response(
+            JSON.stringify([
+              {
+                tokenAddress: FIXTURE_MEME_MINT,
+                chainId: "solana",
+                header: "Bonk",
+                description: "Bonk",
+              },
+            ]),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 1,
+        targetCandidates: 1,
+        targetDiagnosticYield: 15,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: false,
+        logFilePath,
+        httpTransport: mockHttp,
+      });
+
+      await runner.run();
+
+      expect(fsSync.existsSync(logFilePath)).toBe(true);
+      const logContent = await fs.readFile(logFilePath, "utf8");
+      expect(logContent).toContain("[INFO] [STARTUP]");
+      expect(logContent).toContain("[INFO] [CONFIG]");
+      expect(logContent).toContain("[INFO] [DISCOVERY_POLL]");
+      expect(logContent).toContain("[INFO] [FINALIZING]");
+    });
+
+    it("handles interrupted session cleanly: manifest skipped, manifestStatus=NOT_APPLICABLE_INTERRUPTED, exit code 0", async () => {
+      const testDir = await makeTestDir("interrupted-test");
+
+      // Mock HTTP returns empty profiles -> 0 candidates -> duration expires
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async () =>
+          new Response(JSON.stringify([]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 1, // 1 second duration
+        targetCandidates: 10,
+        targetDiagnosticYield: 15,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: false,
+        httpTransport: mockHttp,
+      });
+
+      const result = await runner.run();
+      expect(result.status).toBe("INTERRUPTED");
+      expect(result.stopReason).toBe("DURATION_EXPIRED");
+      expect(result.totalDecisionsRecorded).toBe(0);
+      expect(result.manifestValid).toBe(false);
+      expect(result.manifestStatus).toBe("NOT_APPLICABLE_INTERRUPTED");
+
+      // Verify manifest.json does NOT exist for interrupted session
+      const manifestPath = path.join(result.sessionDir, "manifest.json");
+      expect(fsSync.existsSync(manifestPath)).toBe(false);
+
+      // Verify session-meta.json reports INTERRUPTED
+      const meta = JSON.parse(
+        await fs.readFile(path.join(result.sessionDir, "session-meta.json"), "utf8"),
+      );
+      expect(meta.sessionStatus).toBe("INTERRUPTED");
+      expect(meta.isInterruptedSession).toBe(true);
+
+      // Verify runPilotCollectorCli returns exit code 0 for clean interruption
+      const exitCode = await runPilotCollectorCli(
+        ["node", "cli.js", "--network=enabled", "--duration-sec=1", "--output-dir=" + testDir],
+        { httpTransport: mockHttp },
+      );
+      // Should exit 0 because it was clean stop
+      expect(exitCode).toBe(0);
+    });
+  });
 });
