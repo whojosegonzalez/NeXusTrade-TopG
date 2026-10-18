@@ -172,6 +172,21 @@ export class DexScreenerLiveDiscoveryClient {
     return this.retryQueue.size;
   }
 
+  public isPollDue(): boolean {
+    const now = Date.now();
+    if (now < this.retryAfterUntilEpochMs) {
+      return false;
+    }
+    for (const item of this.retryQueue.values()) {
+      if (now >= item.nextRetryEpochMs) {
+        return true;
+      }
+    }
+    return (
+      this.lastProfilePollEpochMs === 0 || now - this.lastProfilePollEpochMs >= this.pollIntervalMs
+    );
+  }
+
   public getDiagnostics(): DexScreenerDiscoveryDiagnostics {
     const rejections: Record<string, number> = {};
     for (const [k, v] of this.rejectionCountsByReason.entries()) {
@@ -229,12 +244,15 @@ export class DexScreenerLiveDiscoveryClient {
       }
     }
 
+    let profilesFetchedThisCycle = false;
+
     // 2. Fetch and parse token profiles if poll interval has elapsed and quota allows
     if (
       (this.lastProfilePollEpochMs === 0 ||
         now - this.lastProfilePollEpochMs >= this.pollIntervalMs) &&
       mintsToResolve.length < this.maxPairLookupsPerPoll
     ) {
+      profilesFetchedThisCycle = true;
       this.lastProfilePollEpochMs = now;
       this.onLog?.(`Polling promotional profiles from ${DEXSCREENER_PROFILES_ENDPOINT}`);
       const profilesPayload = await this.executeGetJson(DEXSCREENER_PROFILES_ENDPOINT);
@@ -270,9 +288,11 @@ export class DexScreenerLiveDiscoveryClient {
     }
 
     if (mintsToResolve.length === 0) {
-      this.onLog?.(
-        `Poll cycle complete: 0 mints to resolve (total seen: ${this.discoveredMints.size}, resolved: ${this.resolvedMints.size})`,
-      );
+      if (profilesFetchedThisCycle) {
+        this.onLog?.(
+          `Poll cycle complete: 0 new mints to resolve (total seen: ${this.discoveredMints.size}, resolved: ${this.resolvedMints.size})`,
+        );
+      }
       return [];
     }
 

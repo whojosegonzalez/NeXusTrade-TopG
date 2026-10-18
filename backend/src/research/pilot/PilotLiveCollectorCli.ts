@@ -30,6 +30,7 @@ import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTra
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
 import { D23_STRATEGY_REVISION } from "./PilotSchemaBridge.js";
 import type { D23ScreenedCandidate } from "./PilotTypes.js";
+import type { DexScreenerPairSummary } from "./DexScreenerResponseAdapter.js";
 
 export class PilotLogger {
   private readonly logFilePath: string | null = null;
@@ -100,6 +101,7 @@ export interface PilotLiveCollectorConfig {
   readonly outputDir: string;
   readonly enableForwardObservations: boolean;
   readonly logFilePath?: string | undefined;
+  readonly verifyPoolAddress?: string | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
   readonly logger?: PilotLogger | undefined;
@@ -132,6 +134,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
   let logFilePath: string | undefined = undefined;
+  let verifyPoolAddress: string | undefined = undefined;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -150,11 +153,14 @@ Required:
   --network=enabled                Explicit authorization required to perform read-only network collection
 
 Options:
+  --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
   --poll-interval-sec=<n>          DexScreener discovery polling interval in seconds (default: 30)
   --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
-  --target-candidates=<n>          Target number of candidates to screen before stopping (default: 100)
+  --target-candidates=<n>          Safety ceiling of candidates to screen before stopping (default: 100)
+  --max-candidates-screened=<n>    Alias for --target-candidates
   --target-yield=<n>               Diagnostic target yield requirement (default: 15)
+  --target-verified-candidates=<n> Alias for --target-yield
   --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 256)
   --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
   --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
@@ -167,6 +173,12 @@ Options:
       network = "enabled";
     } else if (arg === "--network=disabled") {
       network = "disabled";
+    } else if (arg.startsWith("--verify-pool=")) {
+      const val = arg.slice("--verify-pool=".length).trim();
+      if (!val) {
+        throw new Error("[INVALID_ARGUMENT] Option '--verify-pool' requires a non-empty address");
+      }
+      verifyPoolAddress = val;
     } else if (arg.startsWith("--rpc-url=")) {
       const val = arg.slice("--rpc-url=".length).trim();
       if (!val) {
@@ -185,6 +197,11 @@ Options:
         "--target-candidates",
         arg.slice("--target-candidates=".length),
       );
+    } else if (arg.startsWith("--max-candidates-screened=")) {
+      targetCandidates = parsePositiveInt(
+        "--max-candidates-screened",
+        arg.slice("--max-candidates-screened=".length),
+      );
     } else if (arg.startsWith("--target-yield=")) {
       targetDiagnosticYield = parsePositiveInt(
         "--target-yield",
@@ -194,6 +211,11 @@ Options:
       targetDiagnosticYield = parsePositiveInt(
         "--target-diagnostic-yield",
         arg.slice("--target-diagnostic-yield=".length),
+      );
+    } else if (arg.startsWith("--target-verified-candidates=")) {
+      targetDiagnosticYield = parsePositiveInt(
+        "--target-verified-candidates",
+        arg.slice("--target-verified-candidates=".length),
       );
     } else if (arg.startsWith("--max-mb=")) {
       maxMb = parsePositiveInt("--max-mb", arg.slice("--max-mb=".length));
@@ -232,6 +254,7 @@ Options:
     outputDir,
     enableForwardObservations,
     logFilePath,
+    verifyPoolAddress,
   };
 }
 
@@ -349,12 +372,23 @@ export class PilotLiveCollectorSession {
           break;
         }
 
-        // 2. Candidate target check
-        if (this.runner.getStats().candidates >= this.config.targetCandidates) {
-          this.stopReason = "TARGET_REACHED";
+        // 2. Candidate target checks
+        // A. Desired verified WATCHLIST_RADAR yield reached
+        if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
+          this.stopReason = "TARGET_YIELD_REACHED";
           this.logger.info(
             "STOPPING",
-            `Candidate target reached (${this.config.targetCandidates}). Stopping.`,
+            `Target diagnostic yield reached (${this.runner.getStats().radar} >= ${this.config.targetDiagnosticYield} verified Raydium AMM candidates). Stopping.`,
+          );
+          break;
+        }
+
+        // B. Safety ceiling for total screened candidates reached
+        if (this.runner.getStats().candidates >= this.config.targetCandidates) {
+          this.stopReason = "MAX_CANDIDATES_SCREENED_REACHED";
+          this.logger.info(
+            "STOPPING",
+            `Max screened candidates safety ceiling reached (${this.runner.getStats().candidates} >= ${this.config.targetCandidates}). Stopping.`,
           );
           break;
         }
@@ -370,21 +404,27 @@ export class PilotLiveCollectorSession {
           break;
         }
 
-        // 4. Discovery Poll
-        this.logger.info(
-          "DISCOVERY_POLL",
-          `Executing discovery poll... (Mints seen so far: ${this.discoveryClient.getSeenMintsCount()})`,
-        );
-        const discovered = await this.discoveryClient.pollDiscoveredCandidates({
-          sessionId,
-          generationId,
-        });
-
-        if (discovered.length > 0) {
+        // 4. Discovery Poll (only executed and logged when poll interval or retry is due)
+        let discovered: Array<{
+          candidate: D23ScreenedCandidate;
+          pairSummary: DexScreenerPairSummary | null;
+        }> = [];
+        if (this.discoveryClient.isPollDue()) {
           this.logger.info(
             "DISCOVERY_POLL",
-            `Discovered ${discovered.length} candidate record(s) to process.`,
+            `Executing discovery poll... (Mints seen so far: ${this.discoveryClient.getSeenMintsCount()})`,
           );
+          discovered = await this.discoveryClient.pollDiscoveredCandidates({
+            sessionId,
+            generationId,
+          });
+
+          if (discovered.length > 0) {
+            this.logger.info(
+              "DISCOVERY_POLL",
+              `Discovered ${discovered.length} candidate record(s) to process.`,
+            );
+          }
         }
 
         for (const item of discovered) {
@@ -481,9 +521,14 @@ export class PilotLiveCollectorSession {
             }
           }
 
-          // Check if candidate target reached during candidate loop
+          // Check if candidate targets reached during candidate loop
+          if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
+            this.stopReason = "TARGET_YIELD_REACHED";
+            this.isRunning = false;
+            break;
+          }
           if (this.runner.getStats().candidates >= this.config.targetCandidates) {
-            this.stopReason = "TARGET_REACHED";
+            this.stopReason = "MAX_CANDIDATES_SCREENED_REACHED";
             this.isRunning = false;
             break;
           }
@@ -570,6 +615,8 @@ export class PilotLiveCollectorSession {
     // Determine truthful final status
     const targetStatus =
       (finalStopReason === "TARGET_REACHED" ||
+        finalStopReason === "TARGET_YIELD_REACHED" ||
+        finalStopReason === "MAX_CANDIDATES_SCREENED_REACHED" ||
         finalStopReason === "DURATION_EXPIRED" ||
         finalStopReason === "NORMAL_TERMINATION") &&
       finalDecisionsCount > 0
@@ -642,6 +689,37 @@ export async function runPilotCollectorCli(
       "[NETWORK_DISABLED] Live network collection disabled by default. Pass --network=enabled to authorize network collection.",
     );
     return 1;
+  }
+
+  // Independent On-Chain Raydium Pool Verification Diagnostic Mode (Task 2)
+  if (config.verifyPoolAddress) {
+    const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
+    logger.info(
+      "VERIFY_POOL_START",
+      `Initiating independent on-chain verification for pool ${config.verifyPoolAddress}...`,
+    );
+    const rpcClient = new SolanaRpcLiveObservationClient({
+      rpcUrl: config.rpcUrl,
+      transport: config.rpcTransport,
+      onLog: (msg) => logger.info("SOLANA_RPC", msg),
+    });
+
+    const report = await rpcClient.verifyPoolAccount(config.verifyPoolAddress);
+    console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+
+    if (report.verified) {
+      logger.info(
+        "VERIFY_POOL_SUCCESS",
+        `Pool ${config.verifyPoolAddress} verified as canonical Raydium AMM v4.`,
+      );
+      return 0;
+    } else {
+      logger.warn(
+        "VERIFY_POOL_FAILED",
+        `Pool ${config.verifyPoolAddress} verification failed: ${report.verificationStatus} (${report.error ?? "Verification error"})`,
+      );
+      return 1;
+    }
   }
 
   try {

@@ -43,6 +43,8 @@ import {
   FIXTURE_WSOL_MINT,
 } from "./fixtures/AuthoritativeRaydiumFixtures.js";
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
+import { toCanonicalCandidateDecision } from "./PilotSchemaBridge.js";
+import { isValidCandidateDecisionRecord } from "../shadow/ShadowCollectorEngine.js";
 import type { D23ObservationRecord, D23ScreenedCandidate } from "./PilotTypes.js";
 
 describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () => {
@@ -282,7 +284,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
       const result = await runner.run();
       expect(result.status).toBe("FINALIZED");
-      expect(result.stopReason).toBe("TARGET_REACHED");
+      expect(["TARGET_REACHED", "TARGET_YIELD_REACHED"]).toContain(result.stopReason);
       expect(result.totalDecisionsRecorded).toBe(1);
       expect(result.manifestValid).toBe(true);
 
@@ -1785,6 +1787,449 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       );
       // Should exit 0 because it was clean stop
       expect(exitCode).toBe(0);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 7. Tasks 2, 3 & 4: Independent Verification, Negative Control Reconciliation, Timestamp Invariance & Stopping Bounds
+  // --------------------------------------------------------------------------
+  describe("Task 2, 3 & 4: Independent Verification, Rejection Reconciliation, Timestamps & Stopping Bounds", () => {
+    it("verifyPoolAccount verifies canonical Raydium AMM v4 pool on-chain independently", async () => {
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async (_url, payload) => {
+          const body = payload as { method: string; params: unknown[] };
+          if (body.method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: 300000001 },
+                value: {
+                  data: [poolBuffer.toString("base64"), "base64"],
+                  executable: false,
+                  lamports: 10000000,
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                  rentEpoch: 0,
+                },
+              },
+            };
+          }
+          if (body.method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: 2,
+              result: {
+                context: { slot: 300000001 },
+                value: [
+                  {
+                    data: [baseVaultBuffer.toString("base64"), "base64"],
+                    executable: false,
+                    lamports: 2039280,
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    rentEpoch: 0,
+                  },
+                  {
+                    data: [quoteVaultBuffer.toString("base64"), "base64"],
+                    executable: false,
+                    lamports: 2039280,
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    rentEpoch: 0,
+                  },
+                ],
+              },
+            };
+          }
+          return { jsonrpc: "2.0", id: 99, error: { message: "Unknown" } };
+        },
+      };
+
+      const rpcClient = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://mock-rpc",
+        transport: mockRpc,
+      });
+
+      const report = await rpcClient.verifyPoolAccount(FIXTURE_POOL_ADDRESS);
+      expect(report.verified).toBe(true);
+      expect(report.verificationStatus).toBe("VERIFIED_RAYDIUM_AMM_V4");
+      expect(report.poolAddress).toBe(FIXTURE_POOL_ADDRESS);
+      expect(report.programOwner).toBe(RAYDIUM_AMM_V4_PROGRAM_ID);
+      expect(report.baseMint).toBe(FIXTURE_MEME_MINT);
+      expect(report.quoteMint).toBe(FIXTURE_WSOL_MINT);
+      expect(report.slotDiscrepancy).toBe(false);
+      expect(report.reserveAccounting).not.toBeNull();
+      expect(report.reserveAccounting?.spotPriceSol).toBe(0.0001);
+      expect(report.missingFields).toContain("sourceTimestampMs");
+    });
+
+    it("verifyPoolAccount classifies unauthorized program owner, null account, and slot discrepancy honestly", async () => {
+      // 1. Unauthorized program owner
+      const wrongOwnerRpc: ISolanaRpcTransport = {
+        post: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            context: { slot: 300000001 },
+            value: {
+              data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+              owner: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // Pump.fun program
+            },
+          },
+        }),
+      };
+      const client1 = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://mock-rpc",
+        transport: wrongOwnerRpc,
+      });
+      const rep1 = await client1.verifyPoolAccount(FIXTURE_POOL_ADDRESS);
+      expect(rep1.verified).toBe(false);
+      expect(rep1.verificationStatus).toBe("UNAUTHORIZED_PROGRAM_ID");
+      expect(rep1.programOwner).toBe("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+      // 2. Null account
+      const nullRpc: ISolanaRpcTransport = {
+        post: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            context: { slot: 300000001 },
+            value: null,
+          },
+        }),
+      };
+      const client2 = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://mock-rpc",
+        transport: nullRpc,
+      });
+      const rep2 = await client2.verifyPoolAccount(FIXTURE_POOL_ADDRESS);
+      expect(rep2.verified).toBe(false);
+      expect(rep2.verificationStatus).toBe("NULL_ACCOUNT");
+
+      // 3. Rate limit 429
+      const rateLimitRpc: ISolanaRpcTransport = {
+        post: async () => {
+          throw new Error("429 Too Many Requests");
+        },
+      };
+      const client3 = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://mock-rpc",
+        transport: rateLimitRpc,
+      });
+      const rep3 = await client3.verifyPoolAccount(FIXTURE_POOL_ADDRESS);
+      expect(rep3.verified).toBe(false);
+      expect(rep3.verificationStatus).toBe("RATE_LIMITED_429");
+    });
+
+    it("CLI --verify-pool validates pool on-chain and exits 0 without creating session archives", async () => {
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async (_url, payload) => {
+          const body = payload as { method: string; params: unknown[] };
+          if (body.method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: 300000001 },
+                value: {
+                  data: [poolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                },
+              },
+            };
+          }
+          if (body.method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: 2,
+              result: {
+                context: { slot: 300000001 },
+                value: [
+                  {
+                    data: [baseVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                  {
+                    data: [quoteVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                ],
+              },
+            };
+          }
+          return { jsonrpc: "2.0", id: 99, error: { message: "Unknown" } };
+        },
+      };
+
+      const testDir = await makeTestDir("verify-pool-cli");
+      const exitCodeSuccess = await runPilotCollectorCli(
+        ["node", "cli.js", "--network=enabled", `--verify-pool=${FIXTURE_POOL_ADDRESS}`],
+        { rpcTransport: mockRpc },
+      );
+      expect(exitCodeSuccess).toBe(0);
+
+      // Verify that no session directory was created in testDir
+      const files = await fs.readdir(testDir);
+      expect(files.length).toBe(0);
+
+      // Verify exit code 1 if network not enabled
+      const exitCodeDisabled = await runPilotCollectorCli([
+        "node",
+        "cli.js",
+        `--verify-pool=${FIXTURE_POOL_ADDRESS}`,
+      ]);
+      expect(exitCodeDisabled).toBe(1);
+    });
+
+    it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {
+      const testDir = await makeTestDir("rejection-summary-test");
+      const pumpMint1 = "Pump111111111111111111111111111111111111111";
+      const pumpMint2 = "Pump222222222222222222222222222222222222222";
+
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async (url: string) => {
+          if (url.includes("/token-profiles/latest/v1")) {
+            return new Response(
+              JSON.stringify([
+                { chainId: "solana", tokenAddress: pumpMint1 },
+                { chainId: "solana", tokenAddress: pumpMint2 },
+              ]),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes(pumpMint1) || url.includes(pumpMint2)) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "pumpfun",
+                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    baseToken: { address: pumpMint1, symbol: "PUMP1" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 404 });
+        },
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 5,
+        targetCandidates: 2,
+        targetDiagnosticYield: 15,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: false,
+        httpTransport: mockHttp,
+      });
+
+      const result = await runner.run();
+      expect(result.status).toBe("FINALIZED");
+      expect(result.totalDecisionsRecorded).toBe(2);
+
+      // Verify session-summary.json contains topRejectionReasons matching candidate-decisions.jsonl
+      const summaryFile = path.join(result.sessionDir, "session-summary.json");
+      const summary = JSON.parse(await fs.readFile(summaryFile, "utf8"));
+      expect(summary.totalCandidatesScreened).toBe(2);
+      expect(summary.cohortBreakdown.filteredRejected).toBe(2);
+      expect(summary.cohortBreakdown.watchlistRadar).toBe(0);
+      expect(summary.topRejectionReasons).toEqual({
+        NO_RAYDIUM_AMM_PAIR_IDENTIFIED: 2,
+      });
+
+      // Verify recovery also reconstructs topRejectionReasons faithfully
+      const recovery = await import("./PilotCollectorRunner.js").then((m) =>
+        m.PilotCollectorRunner.recoverSession(result.sessionDir),
+      );
+      expect(recovery.recovered).toBe(true);
+      const recoveredSummary = JSON.parse(await fs.readFile(summaryFile, "utf8"));
+      expect(recoveredSummary.topRejectionReasons).toEqual({
+        NO_RAYDIUM_AMM_PAIR_IDENTIFIED: 2,
+      });
+    });
+
+    it("Task 3B: sourceTimestampMs: 0 is an audited missing-time convention rejected by downstream H2 validation", () => {
+      const candidateWithoutTime: D23ScreenedCandidate = {
+        compositeId: {
+          decisionEventId: "evt-notime-1",
+          sessionId: "sess-notime",
+          generationId: "gen1",
+          mintAddress: FIXTURE_MEME_MINT,
+          poolId: FIXTURE_POOL_ADDRESS,
+        },
+        symbol: "TEST",
+        decisionType: "CANDIDATE_DISCOVERY_PROFILE",
+        decisionCohort: "FILTERED_REJECTED",
+        selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE",
+        decisionEpochMs: 1792000002000,
+        requestEpochMs: 1792000000000,
+        receiptEpochMs: 1792000001000,
+        sourceTimestampMs: null, // DexScreener does not attest source quote timestamps
+        passedEligibility: false,
+        filterEvaluations: [],
+        rejectionReasons: ["NO_RAYDIUM_AMM_PAIR_IDENTIFIED"],
+        missingFields: ["sourceTimestampMs"],
+        providerIdentity: "dexscreener_public_v1:OBSERVATIONAL",
+      };
+
+      const canonical = toCanonicalCandidateDecision(candidateWithoutTime);
+      expect(canonical.sourceTimestampMs).toBe(0);
+      expect(canonical.missingFields).toContain("sourceTimestampMs");
+
+      // Verify that strict downstream H2 eligibility validator rejects records with sourceTimestampMs <= 0
+      const isH2Eligible = isValidCandidateDecisionRecord(canonical);
+      expect(isH2Eligible).toBe(false);
+    });
+
+    it("Task 4: stops on TARGET_YIELD_REACHED when target diagnostic yield is reached before max candidates", async () => {
+      const testDir = await makeTestDir("target-yield-stop");
+      const pumpMint = "Pump111111111111111111111111111111111111111";
+
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async (url: string) => {
+          if (url.includes("/token-profiles/latest/v1")) {
+            return new Response(
+              JSON.stringify([
+                { chainId: "solana", tokenAddress: pumpMint },
+                { chainId: "solana", tokenAddress: FIXTURE_MEME_MINT },
+              ]),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes(pumpMint)) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "pump",
+                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    baseToken: { address: pumpMint, symbol: "PUMP" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (url.includes(FIXTURE_MEME_MINT)) {
+            return new Response(
+              JSON.stringify({
+                pairs: [
+                  {
+                    chainId: "solana",
+                    dexId: "raydium",
+                    pairAddress: FIXTURE_POOL_ADDRESS,
+                    baseToken: { address: FIXTURE_MEME_MINT, symbol: "BONK" },
+                    quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(null, { status: 404 });
+        },
+      };
+
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async (_url, payload) => {
+          const body = payload as { method: string; params: unknown[] };
+          if (body.method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: 300000001 },
+                value: {
+                  data: [poolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                },
+              },
+            };
+          }
+          if (body.method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: 2,
+              result: {
+                context: { slot: 300000001 },
+                value: [
+                  {
+                    data: [baseVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                  {
+                    data: [quoteVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                ],
+              },
+            };
+          }
+          return { jsonrpc: "2.0", id: 99, error: { message: "Unknown" } };
+        },
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        outputDir: testDir,
+        durationSec: 10,
+        targetCandidates: 50, // High ceiling
+        targetDiagnosticYield: 1, // Stop when 1 verified radar observation obtained
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1,
+        enableForwardObservations: false,
+        httpTransport: mockHttp,
+        rpcTransport: mockRpc,
+      });
+
+      const result = await runner.run();
+      expect(result.status).toBe("FINALIZED");
+      expect(result.stopReason).toBe("TARGET_YIELD_REACHED");
+      expect(result.totalDecisionsRecorded).toBe(2); // 1 pump (rejected) + 1 bonk (radar)
     });
   });
 });

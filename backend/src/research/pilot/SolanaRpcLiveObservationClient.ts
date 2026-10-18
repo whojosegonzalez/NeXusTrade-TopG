@@ -19,7 +19,11 @@ import {
   type SolanaRpcPoolResult,
   type SolanaRpcVaultsResult,
 } from "./SolanaRpcResponseAdapter.js";
-import { RAYDIUM_AMM_V4_PROGRAM_ID, computeReserveAccounting } from "./RaydiumAmmParser.js";
+import {
+  RAYDIUM_AMM_V4_PROGRAM_ID,
+  computeReserveAccounting,
+  isCanonicalSolanaBase58,
+} from "./RaydiumAmmParser.js";
 import type { D23ObservationRecord, D23ReserveAccounting } from "./PilotTypes.js";
 
 export const DEFAULT_SOLANA_MAINNET_RPC = "https://api.mainnet-beta.solana.com";
@@ -58,6 +62,35 @@ export interface ObservedPoolStateResult {
   readonly vaultSlot: number | null;
   readonly slotDiscrepancy: boolean;
   readonly reserveAccounting: D23ReserveAccounting | null;
+  readonly error?: string | undefined;
+}
+
+export interface RaydiumPoolVerificationReport {
+  readonly poolAddress: string;
+  readonly rpcUrl: string;
+  readonly verificationStatus:
+    | "VERIFIED_RAYDIUM_AMM_V4"
+    | "UNAUTHORIZED_PROGRAM_ID"
+    | "NULL_ACCOUNT"
+    | "MALFORMED_POOL_DATA"
+    | "VAULT_VERIFICATION_FAILED"
+    | "RATE_LIMITED_429"
+    | "RPC_ERROR";
+  readonly verified: boolean;
+  readonly onChainSlot: number | null;
+  readonly poolSlot: number | null;
+  readonly vaultSlot: number | null;
+  readonly slotDiscrepancy: boolean;
+  readonly programOwner: string | null;
+  readonly baseMint: string | null;
+  readonly quoteMint: string | null;
+  readonly baseVault: string | null;
+  readonly quoteVault: string | null;
+  readonly baseDecimals: number | null;
+  readonly quoteDecimals: number | null;
+  readonly reserveAccounting: D23ReserveAccounting | null;
+  readonly hostElapsedMs: number;
+  readonly missingFields: readonly string[];
   readonly error?: string | undefined;
 }
 
@@ -314,6 +347,252 @@ export class SolanaRpcLiveObservationClient {
         vaultSlot: null,
         slotDiscrepancy: false,
         reserveAccounting: null,
+        error: errMsg,
+      };
+    }
+  }
+
+  /**
+   * Performs an independent on-chain verification of a Raydium AMM v4 pool address.
+   * Validates account existence, program ownership, SPL token vaults, and reserve accounting.
+   * Returns a structured diagnostic report without modifying canonical research datasets.
+   */
+  public async verifyPoolAccount(poolAddress: string): Promise<RaydiumPoolVerificationReport> {
+    const requestEpochMs = Date.now();
+    this.poolsObserved++;
+    this.onLog?.(`Verifying pool ${poolAddress} on-chain via Solana RPC...`);
+
+    if (!isCanonicalSolanaBase58(poolAddress)) {
+      this.poolsFailed++;
+      return {
+        poolAddress,
+        rpcUrl: this.rpcUrl,
+        verificationStatus: "MALFORMED_POOL_DATA",
+        verified: false,
+        onChainSlot: null,
+        poolSlot: null,
+        vaultSlot: null,
+        slotDiscrepancy: false,
+        programOwner: null,
+        baseMint: null,
+        quoteMint: null,
+        baseVault: null,
+        quoteVault: null,
+        baseDecimals: null,
+        quoteDecimals: null,
+        reserveAccounting: null,
+        hostElapsedMs: Date.now() - requestEpochMs,
+        missingFields: ["sourceTimestampMs"],
+        error: `Invalid Solana base58 pool address format: '${poolAddress}'`,
+      };
+    }
+
+    if (Date.now() < this.retryAfterUntilEpochMs) {
+      this.poolsFailed++;
+      const errMsg = `[RPC_THROTTLED] Solana RPC rate-limited until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`;
+      return {
+        poolAddress,
+        rpcUrl: this.rpcUrl,
+        verificationStatus: "RATE_LIMITED_429",
+        verified: false,
+        onChainSlot: null,
+        poolSlot: null,
+        vaultSlot: null,
+        slotDiscrepancy: false,
+        programOwner: null,
+        baseMint: null,
+        quoteMint: null,
+        baseVault: null,
+        quoteVault: null,
+        baseDecimals: null,
+        quoteDecimals: null,
+        reserveAccounting: null,
+        hostElapsedMs: Date.now() - requestEpochMs,
+        missingFields: ["sourceTimestampMs"],
+        error: errMsg,
+      };
+    }
+
+    try {
+      // 1. Fetch Pool Account Info
+      const poolPayload = await this.executeRpcCall("getAccountInfo", [
+        poolAddress,
+        { encoding: "base64", commitment: "confirmed" },
+      ]);
+
+      const poolResult: SolanaRpcPoolResult = parseSolanaRpcPoolAccountResponse(
+        poolPayload,
+        poolAddress,
+      );
+
+      if (!poolResult.ok || !poolResult.poolState) {
+        this.poolsFailed++;
+        const errLower = (poolResult.error ?? "").toLowerCase();
+        const rawOwner =
+          typeof (poolPayload as Record<string, unknown> | null)?.result === "object" &&
+          (poolPayload as { result?: { value?: { owner?: unknown } } })?.result?.value &&
+          typeof (poolPayload as { result: { value: { owner?: unknown } } }).result.value.owner ===
+            "string"
+            ? (poolPayload as { result: { value: { owner: string } } }).result.value.owner
+            : null;
+        const isUnauthorized = errLower.includes("unauthorized");
+        const status =
+          errLower.includes("null") || errLower.includes("missing")
+            ? "NULL_ACCOUNT"
+            : isUnauthorized
+              ? "UNAUTHORIZED_PROGRAM_ID"
+              : "MALFORMED_POOL_DATA";
+        return {
+          poolAddress,
+          rpcUrl: this.rpcUrl,
+          verificationStatus: status,
+          verified: false,
+          onChainSlot: poolResult.slot,
+          poolSlot: poolResult.slot,
+          vaultSlot: null,
+          slotDiscrepancy: false,
+          programOwner: isUnauthorized ? rawOwner : null,
+          baseMint: null,
+          quoteMint: null,
+          baseVault: null,
+          quoteVault: null,
+          baseDecimals: null,
+          quoteDecimals: null,
+          reserveAccounting: null,
+          hostElapsedMs: Date.now() - requestEpochMs,
+          missingFields: ["sourceTimestampMs"],
+          error: poolResult.error ?? "Failed to decode pool account",
+        };
+      }
+
+      const poolState = poolResult.poolState;
+      if (poolState.programId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+        this.poolsFailed++;
+        return {
+          poolAddress,
+          rpcUrl: this.rpcUrl,
+          verificationStatus: "UNAUTHORIZED_PROGRAM_ID",
+          verified: false,
+          onChainSlot: poolResult.slot,
+          poolSlot: poolResult.slot,
+          vaultSlot: null,
+          slotDiscrepancy: false,
+          programOwner: poolState.programId,
+          baseMint: poolState.baseMint,
+          quoteMint: poolState.quoteMint,
+          baseVault: poolState.baseVault,
+          quoteVault: poolState.quoteVault,
+          baseDecimals: Number(poolState.baseDecimal),
+          quoteDecimals: Number(poolState.quoteDecimal),
+          reserveAccounting: null,
+          hostElapsedMs: Date.now() - requestEpochMs,
+          missingFields: ["sourceTimestampMs"],
+          error: `[UNAUTHORIZED_PROGRAM_ID] Pool program ID '${poolState.programId}' is not canonical Raydium AMM v4 (${RAYDIUM_AMM_V4_PROGRAM_ID})`,
+        };
+      }
+
+      // 2. Fetch Vault Accounts Info
+      const vaultsPayload = await this.executeRpcCall("getMultipleAccounts", [
+        [poolState.baseVault, poolState.quoteVault],
+        { encoding: "base64", commitment: "confirmed" },
+      ]);
+
+      const vaultsResult: SolanaRpcVaultsResult = parseSolanaRpcMultipleVaultsResponse(
+        vaultsPayload,
+        [poolState.baseVault, poolState.quoteVault],
+        [poolState.baseMint, poolState.quoteMint],
+      );
+
+      if (!vaultsResult.ok || !vaultsResult.balances) {
+        this.poolsFailed++;
+        return {
+          poolAddress,
+          rpcUrl: this.rpcUrl,
+          verificationStatus: "VAULT_VERIFICATION_FAILED",
+          verified: false,
+          onChainSlot: poolResult.slot,
+          poolSlot: poolResult.slot,
+          vaultSlot: vaultsResult.slot,
+          slotDiscrepancy: false,
+          programOwner: poolState.programId,
+          baseMint: poolState.baseMint,
+          quoteMint: poolState.quoteMint,
+          baseVault: poolState.baseVault,
+          quoteVault: poolState.quoteVault,
+          baseDecimals: Number(poolState.baseDecimal),
+          quoteDecimals: Number(poolState.quoteDecimal),
+          reserveAccounting: null,
+          hostElapsedMs: Date.now() - requestEpochMs,
+          missingFields: ["sourceTimestampMs"],
+          error: vaultsResult.error ?? "Failed to decode vault accounts",
+        };
+      }
+
+      const balances = vaultsResult.balances;
+      const reserveAccounting = computeReserveAccounting(
+        poolState,
+        balances.baseVaultRaw,
+        balances.quoteVaultRaw,
+        "VAULT_ONLY_PROXY",
+      );
+
+      const slotDiscrepancy = Boolean(
+        poolResult.slot !== null &&
+        vaultsResult.slot !== null &&
+        Math.abs(poolResult.slot - vaultsResult.slot) > 2,
+      );
+
+      this.poolsSuccessful++;
+      if (slotDiscrepancy) {
+        this.slotDiscrepancies++;
+      }
+
+      return {
+        poolAddress,
+        rpcUrl: this.rpcUrl,
+        verificationStatus: "VERIFIED_RAYDIUM_AMM_V4",
+        verified: true,
+        onChainSlot: vaultsResult.slot ?? poolResult.slot,
+        poolSlot: poolResult.slot,
+        vaultSlot: vaultsResult.slot,
+        slotDiscrepancy,
+        programOwner: poolState.programId,
+        baseMint: poolState.baseMint,
+        quoteMint: poolState.quoteMint,
+        baseVault: poolState.baseVault,
+        quoteVault: poolState.quoteVault,
+        baseDecimals: Number(poolState.baseDecimal),
+        quoteDecimals: Number(poolState.quoteDecimal),
+        reserveAccounting,
+        hostElapsedMs: Date.now() - requestEpochMs,
+        missingFields: ["sourceTimestampMs"],
+      };
+    } catch (err: unknown) {
+      this.poolsFailed++;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const is429 = errMsg.includes("429");
+      const isTimeout =
+        errMsg.includes("timeout") || (err instanceof Error && err.name === "AbortError");
+      const status = is429 ? "RATE_LIMITED_429" : isTimeout ? "RPC_ERROR" : "RPC_ERROR";
+      return {
+        poolAddress,
+        rpcUrl: this.rpcUrl,
+        verificationStatus: status,
+        verified: false,
+        onChainSlot: null,
+        poolSlot: null,
+        vaultSlot: null,
+        slotDiscrepancy: false,
+        programOwner: null,
+        baseMint: null,
+        quoteMint: null,
+        baseVault: null,
+        quoteVault: null,
+        baseDecimals: null,
+        quoteDecimals: null,
+        reserveAccounting: null,
+        hostElapsedMs: Date.now() - requestEpochMs,
+        missingFields: ["sourceTimestampMs"],
         error: errMsg,
       };
     }

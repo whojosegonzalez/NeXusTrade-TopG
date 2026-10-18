@@ -433,6 +433,7 @@ export class PilotCollectorRunner {
   private totalEvaluationsRecorded: number = 0;
   private totalObservationsRecorded: number = 0;
   private readonly uniquePoolsSeen = new Set<string>();
+  private readonly rejectionReasonsCounts = new Map<string, number>();
   private interruptionReason?: string | undefined;
 
   // Append-time baseline tracking for deep reconciliation (D23F-03)
@@ -690,6 +691,11 @@ export class PilotCollectorRunner {
         this.totalWatchlistRadar += 1;
       } else {
         this.totalFilteredRejected += 1;
+        const reason =
+          canonicalCandidate.primaryRejectionReason ??
+          candidate.rejectionReasons[0] ??
+          "INELIGIBLE";
+        this.rejectionReasonsCounts.set(reason, (this.rejectionReasonsCounts.get(reason) ?? 0) + 1);
       }
       if (candidate.compositeId.poolId) {
         this.uniquePoolsSeen.add(candidate.compositeId.poolId);
@@ -936,7 +942,16 @@ export class PilotCollectorRunner {
           triggerRejected: 0,
           executedBuy: 0,
         },
-        topRejectionReasons: interruptionReason ? { [interruptionReason]: 1 } : {},
+        topRejectionReasons: (() => {
+          const rejections: Record<string, number> = {};
+          for (const [r, count] of this.rejectionReasonsCounts.entries()) {
+            rejections[r] = count;
+          }
+          if (interruptionReason && Object.keys(rejections).length === 0) {
+            rejections[interruptionReason] = 1;
+          }
+          return rejections;
+        })(),
         totalMarketObservationsRecorded: this.totalObservationsRecorded,
         totalStratifiedCandidatesTracked: 0,
         missedWinnersCount: 0,
@@ -1023,7 +1038,16 @@ export class PilotCollectorRunner {
         triggerRejected: 0,
         executedBuy: 0,
       },
-      topRejectionReasons: { [reason]: 1 },
+      topRejectionReasons: (() => {
+        const rejections: Record<string, number> = {};
+        for (const [r, count] of this.rejectionReasonsCounts.entries()) {
+          rejections[r] = count;
+        }
+        if (Object.keys(rejections).length === 0) {
+          rejections[reason] = 1;
+        }
+        return rejections;
+      })(),
       totalMarketObservationsRecorded: this.totalObservationsRecorded,
       totalStratifiedCandidatesTracked: 0,
       missedWinnersCount: 0,
@@ -1413,12 +1437,25 @@ export class PilotCollectorRunner {
         totalDecisionsRecorded: decisions.length,
         decisionWriteFailures: summary?.decisionWriteFailures ?? 0,
         cohortBreakdown: summary?.cohortBreakdown ?? {
-          filteredRejected: 0,
-          watchlistRadar: 0,
+          filteredRejected: decisions.filter((d) => d.decisionCohort === "FILTERED_REJECTED")
+            .length,
+          watchlistRadar: decisions.filter((d) => d.decisionCohort === "WATCHLIST_RADAR").length,
           triggerRejected: 0,
           executedBuy: 0,
         },
-        topRejectionReasons: { [interruptionReason]: 1 },
+        topRejectionReasons: (() => {
+          const recoveredRejections: Record<string, number> = {};
+          for (const dec of decisions) {
+            if (dec.decisionCohort === "FILTERED_REJECTED") {
+              const reason = dec.primaryRejectionReason ?? "INELIGIBLE";
+              recoveredRejections[reason] = (recoveredRejections[reason] ?? 0) + 1;
+            }
+          }
+          if (interruptionReason && Object.keys(recoveredRejections).length === 0) {
+            recoveredRejections[interruptionReason] = 1;
+          }
+          return recoveredRejections;
+        })(),
         totalMarketObservationsRecorded: observations.length,
         totalStratifiedCandidatesTracked: 0,
         missedWinnersCount: 0,
