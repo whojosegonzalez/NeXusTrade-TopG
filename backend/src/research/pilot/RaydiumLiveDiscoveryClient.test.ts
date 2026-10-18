@@ -573,5 +573,145 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(backoffPoll.length).toBe(0);
       expect(attempt).toBe(1); // No new network call made
     });
+
+    it("allows unmarking a seen pool via unmarkSeenPool for bounded recovery", async () => {
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () =>
+          ({
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: 1,
+                data: [
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: POOL_BONK_SOL,
+                    mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+                    mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    openTime: "1792300000",
+                  },
+                ],
+              },
+            }),
+          }) as unknown as Response,
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+      });
+
+      const poll1 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-unmark",
+        generationId: "gen",
+      });
+      expect(poll1.length).toBe(1);
+      expect(client.isPoolSeen(POOL_BONK_SOL)).toBe(true);
+
+      // Poll 2 skips because it was already seen
+      const poll2 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-unmark",
+        generationId: "gen",
+      });
+      expect(poll2.length).toBe(0);
+
+      // Unmark the pool
+      const unmarked = client.unmarkSeenPool(POOL_BONK_SOL);
+      expect(unmarked).toBe(true);
+      expect(client.isPoolSeen(POOL_BONK_SOL)).toBe(false);
+
+      // Poll 3 can now discover it again
+      const poll3 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-unmark",
+        generationId: "gen",
+      });
+      expect(poll3.length).toBe(1);
+      expect(poll3[0]!.poolSummary.poolId).toBe(POOL_BONK_SOL);
+    });
+
+    it("enforces default 30 req/min rate budget", async () => {
+      let callCount = 0;
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () => {
+          callCount++;
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({ success: true, data: { data: [] } }),
+          } as unknown as Response;
+        },
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+        maxRequestsPerMinute: 30, // Default 30 req/min
+      });
+
+      // Execute 30 calls successfully
+      for (let i = 0; i < 30; i++) {
+        await client.pollDiscoveredCandidates({ sessionId: "sess-budget", generationId: "gen" });
+      }
+      expect(callCount).toBe(30);
+
+      // The 31st call hits the 30 req/min rate limit budget
+      const throttledPoll = await client.pollDiscoveredCandidates({
+        sessionId: "sess-budget",
+        generationId: "gen",
+      });
+      expect(throttledPoll.length).toBe(0);
+      expect(callCount).toBe(30); // Request was blocked before outbound network
+    });
+
+    it("populates structured candidate provenance fields truthfully", async () => {
+      const fixedOpenTimeSec = 1792299000;
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () =>
+          ({
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: 1,
+                data: [
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: POOL_BONK_SOL,
+                    mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+                    mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    openTime: String(fixedOpenTimeSec),
+                  },
+                ],
+              },
+            }),
+          }) as unknown as Response,
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+      });
+
+      const results = await client.pollDiscoveredCandidates({
+        sessionId: "sess-provenance",
+        generationId: "gen",
+      });
+      expect(results.length).toBe(1);
+      const c = results[0]!.candidate;
+
+      expect(c.poolOpenTimeMs).toBe(fixedOpenTimeSec * 1000);
+      expect(c.poolAgeAtDiscoverySec).toBeGreaterThanOrEqual(0);
+      expect(c.firstSeenEpochMs).toBe(c.receiptEpochMs);
+      expect(c.discoverySource).toBe("raydium");
+      expect(c.discoveryEndpoint).toBe("https://api-v3.raydium.io/pools/info/list");
+      expect(c.discoveryPage).toBe(1);
+      expect(c.discoverySortField).toBe("default");
+      expect(c.sourceTimestampMs).toBeNull(); // Truthful: not fabricated from openTime
+    });
   });
 });

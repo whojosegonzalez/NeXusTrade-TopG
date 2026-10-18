@@ -89,12 +89,85 @@ export class PilotLogger {
   }
 }
 
+export type RpcVerificationFailureType = "TRANSIENT_PROVIDER_ERROR" | "CONFIRMED_INELIGIBILITY";
+
+/**
+ * Classifies an RPC observation error as confirmed on-chain protocol ineligibility
+ * vs transient provider availability error (D25-F1).
+ */
+export function classifyRpcVerificationError(errorMsg?: string | null): {
+  type: RpcVerificationFailureType;
+  reasonCode: string;
+} {
+  if (!errorMsg) {
+    return { type: "TRANSIENT_PROVIDER_ERROR", reasonCode: "RPC_OBSERVATION_FAILED" };
+  }
+  const msgLower = errorMsg.toLowerCase();
+
+  // 1. Confirmed On-Chain Protocol Ineligibility
+  if (msgLower.includes("unauthorized_pool_owner") || msgLower.includes("unauthorized")) {
+    return { type: "CONFIRMED_INELIGIBILITY", reasonCode: "UNAUTHORIZED_POOL_OWNER" };
+  }
+  if (msgLower.includes("null value") || msgLower.includes("not found on-chain")) {
+    return { type: "CONFIRMED_INELIGIBILITY", reasonCode: "NULL_ACCOUNT" };
+  }
+  if (
+    msgLower.includes("raydium parse error") ||
+    msgLower.includes("failed to extract base64") ||
+    msgLower.includes("invalid solana base58")
+  ) {
+    return { type: "CONFIRMED_INELIGIBILITY", reasonCode: "MALFORMED_POOL_DATA" };
+  }
+  if (
+    msgLower.includes("vault account") ||
+    msgLower.includes("vault token mint") ||
+    msgLower.includes("failed to decode pool vault")
+  ) {
+    return { type: "CONFIRMED_INELIGIBILITY", reasonCode: "VAULT_VERIFICATION_FAILED" };
+  }
+
+  // 2. Transient Provider Errors
+  if (
+    msgLower.includes("429") ||
+    msgLower.includes("throttled") ||
+    msgLower.includes("rate_budget_exceeded") ||
+    msgLower.includes("rate-limited")
+  ) {
+    return { type: "TRANSIENT_PROVIDER_ERROR", reasonCode: "RATE_LIMITED_429" };
+  }
+  if (
+    msgLower.includes("timeout") ||
+    msgLower.includes("timed out") ||
+    msgLower.includes("aborterror")
+  ) {
+    return { type: "TRANSIENT_PROVIDER_ERROR", reasonCode: "RPC_TIMEOUT" };
+  }
+
+  // General network / transport / 5xx RPC provider error
+  return { type: "TRANSIENT_PROVIDER_ERROR", reasonCode: "RPC_UNAVAILABLE" };
+}
+
+export interface DeferredVerificationCandidate {
+  readonly candidate: D23ScreenedCandidate;
+  readonly poolId: string;
+  readonly volume5mUsd: number | null;
+  readonly buys5m: number | null;
+  readonly sells5m: number | null;
+  retryCount: number;
+  lastAttemptEpochMs: number;
+  lastError: string;
+}
+
+export const MAX_RPC_VERIFICATION_RETRIES = 3;
+export const RPC_RETRY_BACKOFF_MS = 2000;
+
 export interface PilotLiveCollectorConfig {
   readonly network: "enabled" | "disabled";
   readonly rpcUrl: string;
   readonly pollIntervalSec: number;
   readonly durationSec: number;
   readonly targetCandidates: number;
+  readonly maxCandidatesScreened?: number | undefined;
   readonly targetDiagnosticYield: number;
   readonly maxMb: number;
   readonly maxRssMb?: number | undefined;
@@ -146,8 +219,9 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let rpcUrl = DEFAULT_SOLANA_MAINNET_RPC;
   let pollIntervalSec = 30; // 30s operator default
   let durationSec = 7200; // 2 hours
-  let targetCandidates = 100;
+  let targetCandidates = 15;
   let targetDiagnosticYield = 15;
+  let maxCandidatesScreened = 500; // Hard safety stop ceiling for screened candidates (D25-F2)
   let maxMb = 256; // 256 MB accepted operational storage limit
   let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
@@ -178,13 +252,13 @@ Options:
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
   --discovery-source=dexscreener|raydium Discovery source adapter (default: dexscreener)
   --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
-  --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000)
+  --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000, 30 req/min budget)
   --poll-interval-sec=<n>          Discovery polling interval in seconds (default: 30)
   --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
-  --target-candidates=<n>          Safety ceiling of candidates to screen before stopping (default: 100)
-  --max-candidates-screened=<n>    Alias for --target-candidates
-  --target-yield=<n>               Diagnostic target yield requirement (default: 15)
+  --target-yield=<n>               Diagnostic target yield requirement of eligible candidates (default: 15)
+  --target-candidates=<n>          Alias for --target-yield
   --target-verified-candidates=<n> Alias for --target-yield
+  --max-candidates-screened=<n>    Safety ceiling of total candidates screened before stopping (default: 500)
   --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 256)
   --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
   --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
@@ -240,7 +314,7 @@ Options:
         arg.slice("--target-candidates=".length),
       );
     } else if (arg.startsWith("--max-candidates-screened=")) {
-      targetCandidates = parsePositiveInt(
+      maxCandidatesScreened = parsePositiveInt(
         "--max-candidates-screened",
         arg.slice("--max-candidates-screened=".length),
       );
@@ -290,6 +364,7 @@ Options:
     pollIntervalSec,
     durationSec,
     targetCandidates,
+    maxCandidatesScreened,
     targetDiagnosticYield,
     maxMb,
     maxRssMb,
@@ -314,6 +389,7 @@ export class PilotLiveCollectorSession {
 
   private isRunning = false;
   private stopReason: string | null = null;
+  private readonly deferredVerificationQueue: DeferredVerificationCandidate[] = [];
 
   constructor(config: PilotLiveCollectorConfig) {
     this.config = config;
@@ -322,6 +398,185 @@ export class PilotLiveCollectorSession {
 
   public getLogger(): PilotLogger {
     return this.logger;
+  }
+
+  public getDeferredVerificationQueueCount(): number {
+    return this.deferredVerificationQueue.length;
+  }
+
+  private async processDeferredVerifications(now: number): Promise<void> {
+    if (!this.rpcClient || !this.runner || this.deferredVerificationQueue.length === 0) {
+      return;
+    }
+
+    const remainingQueue: DeferredVerificationCandidate[] = [];
+
+    for (const item of this.deferredVerificationQueue) {
+      if (!this.isRunning) {
+        remainingQueue.push(item);
+        continue;
+      }
+
+      if (now - item.lastAttemptEpochMs < RPC_RETRY_BACKOFF_MS) {
+        remainingQueue.push(item);
+        continue;
+      }
+
+      try {
+        this.logger.info(
+          "RPC_VERIFY_RETRY",
+          `Retrying on-chain verification for candidate ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) / pool ${item.poolId} (attempt ${item.retryCount + 1}/${MAX_RPC_VERIFICATION_RETRIES})...`,
+        );
+
+        const obsResult = await this.rpcClient.observeRaydiumPool({
+          poolAddress: item.poolId,
+          targetMint: item.candidate.compositeId.mintAddress,
+          flowMetrics: {
+            volume5mUsd: item.volume5mUsd,
+            buys5m: item.buys5m,
+            sells5m: item.sells5m,
+            netBuyerVolumeUsd: null,
+          },
+          compositeId: item.candidate.compositeId,
+        });
+
+        if (obsResult.ok && obsResult.observation) {
+          const decisionEpochMs = Math.max(Date.now(), obsResult.observation.receiptEpochMs);
+          const causalCandidate: D23ScreenedCandidate = {
+            ...item.candidate,
+            decisionEpochMs,
+          };
+          await this.runner.recordScreenedCandidate(causalCandidate, obsResult.observation);
+
+          this.logger.info(
+            "RPC_VERIFY_RECOVERED",
+            `[WATCHLIST_RADAR] Mint: ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) | Pool: ${item.poolId} | Slot: ${obsResult.observation.onChainSlot} | Verified on retry ${item.retryCount + 1}`,
+          );
+
+          if (this.forwardTracker) {
+            this.forwardTracker.registerCandidateForForwardObservation(
+              causalCandidate,
+              obsResult.observation,
+            );
+          }
+        } else {
+          const rawErr = obsResult.error ?? "RPC_OBSERVATION_FAILED";
+          const classification = classifyRpcVerificationError(rawErr);
+
+          if (classification.type === "CONFIRMED_INELIGIBILITY") {
+            const rpcErr = classification.reasonCode;
+            this.logger.warn(
+              "RPC_VERIFY_INELIGIBLE",
+              `Pool ${item.poolId} confirmed on-chain ineligibility on retry [${rpcErr}]: ${rawErr}. Recording as FILTERED_REJECTED.`,
+            );
+            const decisionEpochMs = Math.max(Date.now(), item.candidate.receiptEpochMs);
+            const rejectedCandidate: D23ScreenedCandidate = {
+              ...item.candidate,
+              decisionCohort: "FILTERED_REJECTED",
+              passedEligibility: false,
+              decisionEpochMs,
+              filterEvaluations: [
+                ...item.candidate.filterEvaluations,
+                {
+                  filterName: "RAYDIUM_ONCHAIN_RPC_VERIFIED",
+                  passed: false,
+                  observed: "confirmed_ineligible",
+                  threshold: "verified_raydium_amm_v4",
+                  rejectionReason: rpcErr,
+                },
+              ],
+              rejectionReasons: [...item.candidate.rejectionReasons, rpcErr],
+            };
+            await this.runner.recordScreenedCandidate(rejectedCandidate);
+            this.logger.info(
+              "CANDIDATE_RECORDED",
+              `[FILTERED_REJECTED] Mint: ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) | Rejection: ${rpcErr} | Total screened: ${this.runner.getStats().candidates}`,
+            );
+          } else {
+            item.retryCount += 1;
+            item.lastAttemptEpochMs = Date.now();
+            item.lastError = `${classification.reasonCode}:${rawErr}`;
+
+            if (item.retryCount >= MAX_RPC_VERIFICATION_RETRIES) {
+              const reason = "RPC_VERIFICATION_EXHAUSTED";
+              this.logger.warn(
+                "RPC_VERIFY_EXHAUSTED",
+                `Pool ${item.poolId} verification exhausted after ${item.retryCount} retries. Provider error provenance: ${item.lastError}`,
+              );
+              const decisionEpochMs = Math.max(Date.now(), item.candidate.receiptEpochMs);
+              const rejectedCandidate: D23ScreenedCandidate = {
+                ...item.candidate,
+                decisionCohort: "FILTERED_REJECTED",
+                passedEligibility: false,
+                decisionEpochMs,
+                filterEvaluations: [
+                  ...item.candidate.filterEvaluations,
+                  {
+                    filterName: "RAYDIUM_ONCHAIN_RPC_VERIFIED",
+                    passed: false,
+                    observed: "rpc_unavailable",
+                    threshold: "verified_raydium_amm_v4",
+                    rejectionReason: `${reason}:${item.lastError}`,
+                  },
+                ],
+                rejectionReasons: [...item.candidate.rejectionReasons, reason],
+              };
+              await this.runner.recordScreenedCandidate(rejectedCandidate);
+              this.logger.info(
+                "CANDIDATE_RECORDED",
+                `[FILTERED_REJECTED] Mint: ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) | Rejection: ${reason} | Total screened: ${this.runner.getStats().candidates}`,
+              );
+            } else {
+              remainingQueue.push(item);
+            }
+          }
+        }
+      } catch (retryErr) {
+        this.logger.warn("RPC_RETRY_ERROR", `${String(retryErr)}`);
+        remainingQueue.push(item);
+      }
+    }
+
+    this.deferredVerificationQueue.length = 0;
+    this.deferredVerificationQueue.push(...remainingQueue);
+  }
+
+  private async drainRemainingDeferredVerifications(reasonPrefix: string): Promise<void> {
+    if (!this.runner || this.deferredVerificationQueue.length === 0) return;
+
+    this.logger.info(
+      "DRAIN_DEFERRED_VERIFICATIONS",
+      `Draining ${this.deferredVerificationQueue.length} deferred verification candidate(s) before shutdown...`,
+    );
+
+    for (const item of this.deferredVerificationQueue) {
+      try {
+        const reason = "RPC_VERIFICATION_EXHAUSTED";
+        const decisionEpochMs = Math.max(Date.now(), item.candidate.receiptEpochMs);
+        const rejectedCandidate: D23ScreenedCandidate = {
+          ...item.candidate,
+          decisionCohort: "FILTERED_REJECTED",
+          passedEligibility: false,
+          decisionEpochMs,
+          filterEvaluations: [
+            ...item.candidate.filterEvaluations,
+            {
+              filterName: "RAYDIUM_ONCHAIN_RPC_VERIFIED",
+              passed: false,
+              observed: "rpc_unavailable",
+              threshold: "verified_raydium_amm_v4",
+              rejectionReason: `${reason}:${reasonPrefix}:${item.lastError}`,
+            },
+          ],
+          rejectionReasons: [...item.candidate.rejectionReasons, reason],
+        };
+        await this.runner.recordScreenedCandidate(rejectedCandidate);
+      } catch (drainErr) {
+        this.logger.warn("DRAIN_DEFERRED_ERROR", `${String(drainErr)}`);
+      }
+    }
+
+    this.deferredVerificationQueue.length = 0;
   }
 
   public async run(): Promise<{
@@ -440,6 +695,9 @@ export class PilotLiveCollectorSession {
           break;
         }
 
+        // 1b. Process deferred RPC verification retries (D25-F1)
+        await this.processDeferredVerifications(now);
+
         // 2. Candidate target checks
         // A. Desired verified WATCHLIST_RADAR yield reached
         if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
@@ -451,12 +709,14 @@ export class PilotLiveCollectorSession {
           break;
         }
 
-        // B. Safety ceiling for total screened candidates reached
-        if (this.runner.getStats().candidates >= this.config.targetCandidates) {
+        // B. Safety ceiling for total screened candidates reached (D25-F2)
+        const maxScreenedCeiling =
+          this.config.maxCandidatesScreened ?? this.config.targetCandidates;
+        if (this.runner.getStats().candidates >= maxScreenedCeiling) {
           this.stopReason = "MAX_CANDIDATES_SCREENED_REACHED";
           this.logger.info(
             "STOPPING",
-            `Max screened candidates safety ceiling reached (${this.runner.getStats().candidates} >= ${this.config.targetCandidates}). Stopping.`,
+            `Max screened candidates safety ceiling reached (${this.runner.getStats().candidates} >= ${maxScreenedCeiling}). Stopping.`,
           );
           break;
         }
@@ -578,34 +838,57 @@ export class PilotLiveCollectorSession {
                   );
                 }
               } else {
-                const rpcErr = obsResult.error ?? "RPC_OBSERVATION_FAILED";
-                this.logger.warn(
-                  "RPC_VERIFY_FAILED",
-                  `Pool ${poolId} failed verification: ${rpcErr}. Recording as FILTERED_REJECTED.`,
-                );
-                const decisionEpochMs = Math.max(Date.now(), candidate.receiptEpochMs);
-                const rejectedCandidate: D23ScreenedCandidate = {
-                  ...candidate,
-                  decisionCohort: "FILTERED_REJECTED",
-                  passedEligibility: false,
-                  decisionEpochMs,
-                  filterEvaluations: [
-                    ...candidate.filterEvaluations,
-                    {
-                      filterName: "RAYDIUM_ONCHAIN_RPC_VERIFIED",
-                      passed: false,
-                      observed: "rpc_failed",
-                      threshold: "verified_raydium_amm_v4",
-                      rejectionReason: rpcErr,
-                    },
-                  ],
-                  rejectionReasons: [...candidate.rejectionReasons, rpcErr],
-                };
-                await this.runner.recordScreenedCandidate(rejectedCandidate);
-                this.logger.info(
-                  "CANDIDATE_RECORDED",
-                  `[FILTERED_REJECTED] Mint: ${candidate.compositeId.mintAddress} (${candidate.symbol}) | Rejection: ${rpcErr} | Total screened: ${this.runner.getStats().candidates}`,
-                );
+                const rawErr = obsResult.error ?? "RPC_OBSERVATION_FAILED";
+                const classification = classifyRpcVerificationError(rawErr);
+
+                if (classification.type === "TRANSIENT_PROVIDER_ERROR") {
+                  // Transient RPC provider error (429, timeout, network failure)
+                  // Do NOT count as confirmed protocol failure or immediately reject (D25-F1)
+                  this.logger.warn(
+                    "RPC_VERIFY_DEFERRED",
+                    `Pool ${poolId} encountered transient error [${classification.reasonCode}]: ${rawErr}. Deferring verification (attempt 1/${MAX_RPC_VERIFICATION_RETRIES}).`,
+                  );
+                  this.deferredVerificationQueue.push({
+                    candidate,
+                    poolId,
+                    volume5mUsd,
+                    buys5m,
+                    sells5m,
+                    retryCount: 1,
+                    lastAttemptEpochMs: Date.now(),
+                    lastError: `${classification.reasonCode}:${rawErr}`,
+                  });
+                } else {
+                  // Confirmed on-chain ineligibility (unauthorized program owner, null account, malformed data, vault mismatch)
+                  const rpcErr = classification.reasonCode;
+                  this.logger.warn(
+                    "RPC_VERIFY_INELIGIBLE",
+                    `Pool ${poolId} confirmed on-chain ineligibility [${rpcErr}]: ${rawErr}. Recording as FILTERED_REJECTED.`,
+                  );
+                  const decisionEpochMs = Math.max(Date.now(), candidate.receiptEpochMs);
+                  const rejectedCandidate: D23ScreenedCandidate = {
+                    ...candidate,
+                    decisionCohort: "FILTERED_REJECTED",
+                    passedEligibility: false,
+                    decisionEpochMs,
+                    filterEvaluations: [
+                      ...candidate.filterEvaluations,
+                      {
+                        filterName: "RAYDIUM_ONCHAIN_RPC_VERIFIED",
+                        passed: false,
+                        observed: "confirmed_ineligible",
+                        threshold: "verified_raydium_amm_v4",
+                        rejectionReason: rpcErr,
+                      },
+                    ],
+                    rejectionReasons: [...candidate.rejectionReasons, rpcErr],
+                  };
+                  await this.runner.recordScreenedCandidate(rejectedCandidate);
+                  this.logger.info(
+                    "CANDIDATE_RECORDED",
+                    `[FILTERED_REJECTED] Mint: ${candidate.compositeId.mintAddress} (${candidate.symbol}) | Rejection: ${rpcErr} | Total screened: ${this.runner.getStats().candidates}`,
+                  );
+                }
               }
             } catch (err) {
               this.logger.warn("PILOT_RECORD_CANDIDATE_ERROR", `${String(err)}`);
@@ -635,7 +918,10 @@ export class PilotLiveCollectorSession {
             this.isRunning = false;
             break;
           }
-          if (this.runner.getStats().candidates >= this.config.targetCandidates) {
+          if (
+            this.runner.getStats().candidates >=
+            (this.config.maxCandidatesScreened ?? this.config.targetCandidates)
+          ) {
             this.stopReason = "MAX_CANDIDATES_SCREENED_REACHED";
             this.isRunning = false;
             break;
@@ -657,6 +943,7 @@ export class PilotLiveCollectorSession {
         const rssMb = (process.memoryUsage().rss / (1024 * 1024)).toFixed(1);
         const rpcDiag = this.rpcClient.getDiagnostics();
         const fwdPending = this.forwardTracker ? this.forwardTracker.getPendingTargetsCount() : 0;
+        const deferredCount = this.deferredVerificationQueue.length;
 
         if (now - lastHeartbeatEpochMs >= 30_000) {
           lastHeartbeatEpochMs = now;
@@ -666,7 +953,7 @@ export class PilotLiveCollectorSession {
               : `Seen Mints: ${this.discoveryClient?.getSeenMintsCount() ?? 0}`;
           this.logger.info(
             "HEARTBEAT",
-            `Elapsed: ${elapsedSec}s | Screened: ${currentStats.candidates} (Radar: ${currentStats.radar}, Rejected: ${currentStats.rejected}) | ${seenStats} | RPC: ${rpcDiag.totalCalls} calls (${rpcDiag.successfulCalls} ok, ${rpcDiag.failedCalls} fail) | Fwd Pending: ${fwdPending} | RSS: ${rssMb} MB`,
+            `Elapsed: ${elapsedSec}s | Screened: ${currentStats.candidates} (Radar: ${currentStats.radar}, Rejected: ${currentStats.rejected}) | Deferred: ${deferredCount} | ${seenStats} | RPC: ${rpcDiag.totalCalls} calls (${rpcDiag.successfulCalls} ok, ${rpcDiag.failedCalls} fail) | Fwd Pending: ${fwdPending} | RSS: ${rssMb} MB`,
           );
         }
 
@@ -685,6 +972,10 @@ export class PilotLiveCollectorSession {
     }
 
     const finalStopReason = this.stopReason ?? "NORMAL_TERMINATION";
+
+    // Drain any remaining deferred RPC verification candidates before forward drainage
+    await this.drainRemainingDeferredVerifications(finalStopReason);
+
     const finalDecisionsCount = this.runner.getStats().candidates;
     this.logger.info(
       "FINALIZING",

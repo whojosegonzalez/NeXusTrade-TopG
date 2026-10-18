@@ -36,6 +36,7 @@ import type {
   CanonicalSessionStatus,
   D23ObservationRecord,
   D23ScreenedCandidate,
+  DiscoveryDiagnosticRecord,
   PilotCollectorConfig,
 } from "./PilotTypes.js";
 import type {
@@ -444,6 +445,7 @@ export class PilotCollectorRunner {
   private readonly decisionsBaseline = new Map<string, CandidateDecisionRecord>();
   private readonly evaluationsBaseline = new Map<string, ShadowEvaluationRecord>();
   private readonly observationsBaseline: MarketObservationRecord[] = [];
+  private readonly discoveryDiagnosticsBaseline = new Map<string, DiscoveryDiagnosticRecord>();
   private writeMutex: Promise<void> = Promise.resolve();
 
   constructor(
@@ -573,6 +575,8 @@ export class PilotCollectorRunner {
     let candidateLine: string;
     let evalLine: string;
     let obsLine: string;
+    let diagRecord: DiscoveryDiagnosticRecord;
+    let diagLine: string;
     let totalProjectedBytes: number;
 
     try {
@@ -641,10 +645,41 @@ export class PilotCollectorRunner {
       evalLine = JSON.stringify(canonicalEvaluation) + "\n";
       obsLine = canonicalObs ? JSON.stringify(canonicalObs) + "\n" : "";
 
+      diagRecord = {
+        decisionEventId: candidate.compositeId.decisionEventId,
+        sessionId: candidate.compositeId.sessionId,
+        generationId: candidate.compositeId.generationId,
+        mintAddress: candidate.compositeId.mintAddress,
+        poolId: candidate.compositeId.poolId,
+        symbol: candidate.symbol,
+        discoverySource:
+          candidate.discoverySource ??
+          (candidate.selectionBias === "RAYDIUM_API_STANDARD_POOLS" ? "raydium" : "dexscreener"),
+        cohortLabel: candidate.decisionCohort,
+        primaryRejectionReason: candidate.rejectionReasons[0] ?? null,
+        poolOpenTimeMs: candidate.poolOpenTimeMs ?? null,
+        poolAgeAtDiscoverySec: candidate.poolAgeAtDiscoverySec ?? null,
+        firstSeenEpochMs: candidate.firstSeenEpochMs ?? candidate.receiptEpochMs,
+        decisionEpochMs: candidate.decisionEpochMs,
+        sourceTimestampMs: candidate.sourceTimestampMs,
+        requestEndpoint:
+          candidate.discoveryEndpoint ??
+          (candidate.discoverySource === "raydium"
+            ? "https://api-v3.raydium.io/pools/info/list"
+            : "https://api.dexscreener.com/token-profiles/latest/v1"),
+        requestPage: candidate.discoveryPage ?? 1,
+        requestSortField:
+          candidate.discoverySortField ??
+          (candidate.discoverySource === "raydium" ? "default" : "latest"),
+        requestPageSize: candidate.discoverySource === "raydium" ? 50 : 30,
+      };
+      diagLine = JSON.stringify(diagRecord) + "\n";
+
       const candidateBytes = Buffer.byteLength(candidateLine, "utf8");
       const evalBytes = Buffer.byteLength(evalLine, "utf8");
       const obsBytes = obsLine ? Buffer.byteLength(obsLine, "utf8") : 0;
-      totalProjectedBytes = candidateBytes + evalBytes + obsBytes;
+      const diagBytes = Buffer.byteLength(diagLine, "utf8");
+      totalProjectedBytes = candidateBytes + evalBytes + obsBytes + diagBytes;
     } catch (err) {
       // Synchronous validation error before disk queue: cancel synchronous reservation (D23R-03)
       this.seenDecisionEventIds.delete(eventId);
@@ -681,6 +716,7 @@ export class PilotCollectorRunner {
       if (obsLine) {
         await this.appendFile("market-observations.jsonl", obsLine);
       }
+      await this.appendFile("discovery-diagnostics.jsonl", diagLine);
 
       // Record immutable append snapshots for pre-finalization deep reconciliation (D23F-03)
       this.decisionsBaseline.set(
@@ -694,6 +730,10 @@ export class PilotCollectorRunner {
       if (canonicalObs) {
         this.observationsBaseline.push(JSON.parse(JSON.stringify(canonicalObs)));
       }
+      this.discoveryDiagnosticsBaseline.set(
+        diagRecord.decisionEventId,
+        JSON.parse(JSON.stringify(diagRecord)),
+      );
 
       // Update counters
       this.totalCandidatesScreened += 1;
@@ -839,6 +879,43 @@ export class PilotCollectorRunner {
           return {
             success: false,
             reason: `RECONCILIATION_IDENTITY_MISMATCH: Observation record at line ${i + 1} on disk does not match append baseline.`,
+          };
+        }
+      }
+    }
+
+    // Reconcile discovery-diagnostics.jsonl (D25-F3)
+    const diagPath = path.join(this.sessionDir, "discovery-diagnostics.jsonl");
+    if (this.discoveryDiagnosticsBaseline.size > 0) {
+      if (!fsSync.existsSync(diagPath)) {
+        return { success: false, reason: "MISSING_PERSISTED_DISCOVERY_DIAGNOSTICS_FILE" };
+      }
+      const content = await fs.readFile(diagPath, "utf8");
+      const lines = content.split("\n").filter((l) => l.trim().length > 0);
+      if (lines.length !== this.discoveryDiagnosticsBaseline.size) {
+        return {
+          success: false,
+          reason: `DIAGNOSTIC_COUNT_MISMATCH: expected ${this.discoveryDiagnosticsBaseline.size}, on-disk ${lines.length}`,
+        };
+      }
+      for (const line of lines) {
+        let parsed: DiscoveryDiagnosticRecord;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          return { success: false, reason: "CORRUPT_JSONL_DIAGNOSTIC_LINE" };
+        }
+        const baseline = this.discoveryDiagnosticsBaseline.get(parsed.decisionEventId);
+        if (!baseline) {
+          return {
+            success: false,
+            reason: `UNKNOWN_DIAGNOSTIC_ON_DISK: ${parsed.decisionEventId}`,
+          };
+        }
+        if (!deepEqualRecords(parsed, baseline)) {
+          return {
+            success: false,
+            reason: `RECONCILIATION_IDENTITY_MISMATCH: Diagnostic record '${parsed.decisionEventId}' on disk does not match append baseline.`,
           };
         }
       }
@@ -1119,6 +1196,7 @@ export class PilotCollectorRunner {
       { name: "candidate-decisions.jsonl", list: decisions },
       { name: "shadow-evaluations.jsonl", list: evaluations },
       { name: "market-observations.jsonl", list: observations },
+      { name: "discovery-diagnostics.jsonl", list: [] },
     ];
     for (const { name: file, list } of jsonlFiles) {
       const filePath = path.join(sessionDir, file);

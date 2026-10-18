@@ -28,7 +28,7 @@ import type { ILiveHttpTransport } from "./DexScreenerLiveDiscoveryClient.js";
 export const DEFAULT_RAYDIUM_POLL_INTERVAL_MS = 30_000; // 30 seconds operator default
 export const DEFAULT_RAYDIUM_MIN_REQUEST_INTERVAL_MS = 2_000; // 2 seconds inter-request spacing (D25-R5)
 export const DEFAULT_RAYDIUM_HTTP_TIMEOUT_MS = 5_000; // 5 seconds
-export const DEFAULT_RAYDIUM_MAX_REQUESTS_PER_MINUTE = 60; // 60 req/min
+export const DEFAULT_RAYDIUM_MAX_REQUESTS_PER_MINUTE = 30; // 30 req/min aligned with 2000ms inter-request spacing
 export const DEFAULT_RAYDIUM_PAGE_SIZE = 50;
 
 export const RAYDIUM_PROVIDER_IDENTITY = "raydium_api_v3:STANDARD_POOLS";
@@ -127,6 +127,10 @@ export class RaydiumLiveDiscoveryClient {
 
   public isPoolSeen(poolId: string): boolean {
     return this.seenPoolIds.has(poolId);
+  }
+
+  public unmarkSeenPool(poolId: string): boolean {
+    return this.seenPoolIds.delete(poolId);
   }
 
   public getMaxPoolAgeSec(): number {
@@ -376,7 +380,11 @@ export class RaydiumLiveDiscoveryClient {
         sourceTimestampMs: null, // Truthful: Raydium API does not attest contemporaneous quote times
         poolOpenTimeMs: pool.openTimeMs,
         poolAgeAtDiscoverySec: pool.poolAgeAtDiscoverySec,
+        firstSeenEpochMs: receiptEpochMs,
         discoverySource: "raydium",
+        discoveryEndpoint: RAYDIUM_POOLS_INFO_LIST_ENDPOINT,
+        discoveryPage: 1,
+        discoverySortField: "default",
         passedEligibility,
         filterEvaluations,
         rejectionReasons,

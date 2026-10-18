@@ -377,6 +377,11 @@ export class DexScreenerLiveDiscoveryClient {
           this.lastProfilePollEpochMs > 0 ? this.lastProfilePollEpochMs : decisionEpochMs,
         receiptEpochMs: decisionEpochMs,
         sourceTimestampMs: null, // Truthful: DexScreener does not attest source quote timestamps
+        firstSeenEpochMs: decisionEpochMs,
+        discoverySource: "dexscreener",
+        discoveryEndpoint: "https://api.dexscreener.com/token-profiles/latest/v1",
+        discoveryPage: 1,
+        discoverySortField: "latest",
         passedEligibility: Boolean(pairSummary?.isRaydiumAmmCandidate),
         filterEvaluations: [
           {

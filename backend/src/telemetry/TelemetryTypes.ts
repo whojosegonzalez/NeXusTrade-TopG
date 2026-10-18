@@ -47,6 +47,12 @@ export interface CandidateDecisionRecord {
   readonly ingestionTimestampMs: number;
   readonly decisionTimestampMs: number;
   readonly poolOpenTimeMs?: number | undefined;
+  readonly poolAgeAtDiscoverySec?: number | undefined;
+  readonly firstSeenEpochMs?: number | undefined;
+  readonly discoverySource?: string | undefined;
+  readonly discoveryEndpoint?: string | undefined;
+  readonly discoveryPage?: number | undefined;
+  readonly discoverySortField?: string | undefined;
   readonly strategyRevision: string;
   readonly decisionCohort: DecisionCohort;
   readonly primaryRejectionReason?: string | undefined;

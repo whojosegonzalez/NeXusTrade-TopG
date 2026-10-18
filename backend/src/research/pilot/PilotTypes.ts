@@ -176,7 +176,11 @@ export interface D23ScreenedCandidate {
   readonly sourceTimestampMs: number | null;
   readonly poolOpenTimeMs?: number | null | undefined;
   readonly poolAgeAtDiscoverySec?: number | null | undefined;
+  readonly firstSeenEpochMs?: number | null | undefined;
   readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoveryEndpoint?: string | undefined;
+  readonly discoveryPage?: number | undefined;
+  readonly discoverySortField?: string | undefined;
   readonly passedEligibility: boolean;
   readonly filterEvaluations: readonly {
     readonly filterName: string;
@@ -188,6 +192,30 @@ export interface D23ScreenedCandidate {
   readonly rejectionReasons: readonly string[];
   readonly missingFields: readonly string[];
   readonly providerIdentity: string;
+}
+
+/**
+ * Diagnostic sidecar record for candidate discovery provenance (D25-F3).
+ */
+export interface DiscoveryDiagnosticRecord {
+  readonly decisionEventId: string;
+  readonly sessionId: string;
+  readonly generationId: string;
+  readonly mintAddress: string;
+  readonly poolId: string;
+  readonly symbol: string;
+  readonly discoverySource: string;
+  readonly cohortLabel: "WATCHLIST_RADAR" | "FILTERED_REJECTED";
+  readonly primaryRejectionReason: string | null;
+  readonly poolOpenTimeMs: number | null;
+  readonly poolAgeAtDiscoverySec: number | null;
+  readonly firstSeenEpochMs: number;
+  readonly decisionEpochMs: number;
+  readonly sourceTimestampMs: number | null;
+  readonly requestEndpoint: string;
+  readonly requestPage: number;
+  readonly requestSortField: string;
+  readonly requestPageSize: number;
 }
 
 /**
@@ -233,7 +261,9 @@ export interface PilotCollectorConfig {
   readonly strategyRevision: string;
   readonly outputRootDir: string;
   readonly allowedRootDir?: string | undefined;
-  readonly targetCandidates?: number | undefined; // Default 100
+  readonly targetCandidates?: number | undefined; // Default 100 (or targetDiagnosticYield)
+  readonly maxCandidatesScreened?: number | undefined; // Safety ceiling for screened candidates (default 500)
+  readonly targetDiagnosticYield?: number | undefined; // Target yield of eligible candidates (default 15)
   readonly targetPools?: number | undefined; // Default 20
   readonly maxDurationSec?: number | undefined; // Default 7200s (2h)
   readonly maxDiskBytes?: number | undefined; // Default 20 MB (20 * 1024 * 1024)

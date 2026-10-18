@@ -117,6 +117,22 @@ export function toCanonicalCandidateDecision(
     ...(candidate.poolOpenTimeMs !== undefined && candidate.poolOpenTimeMs !== null
       ? { poolOpenTimeMs: candidate.poolOpenTimeMs }
       : {}),
+    ...(candidate.poolAgeAtDiscoverySec !== undefined && candidate.poolAgeAtDiscoverySec !== null
+      ? { poolAgeAtDiscoverySec: candidate.poolAgeAtDiscoverySec }
+      : {}),
+    ...(candidate.firstSeenEpochMs !== undefined && candidate.firstSeenEpochMs !== null
+      ? { firstSeenEpochMs: candidate.firstSeenEpochMs }
+      : {}),
+    ...(candidate.discoverySource !== undefined
+      ? { discoverySource: candidate.discoverySource }
+      : {}),
+    ...(candidate.discoveryEndpoint !== undefined
+      ? { discoveryEndpoint: candidate.discoveryEndpoint }
+      : {}),
+    ...(candidate.discoveryPage !== undefined ? { discoveryPage: candidate.discoveryPage } : {}),
+    ...(candidate.discoverySortField !== undefined
+      ? { discoverySortField: candidate.discoverySortField }
+      : {}),
     strategyRevision: D23_STRATEGY_REVISION,
     decisionCohort: candidate.decisionCohort,
     ...(candidate.rejectionReasons.length > 0
