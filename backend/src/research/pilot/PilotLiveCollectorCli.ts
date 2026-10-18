@@ -21,6 +21,7 @@ import {
   DexScreenerLiveDiscoveryClient,
   type ILiveHttpTransport,
 } from "./DexScreenerLiveDiscoveryClient.js";
+import { RaydiumLiveDiscoveryClient } from "./RaydiumLiveDiscoveryClient.js";
 import {
   SolanaRpcLiveObservationClient,
   type ISolanaRpcTransport,
@@ -30,7 +31,6 @@ import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTra
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
 import { D23_STRATEGY_REVISION } from "./PilotSchemaBridge.js";
 import type { D23ScreenedCandidate } from "./PilotTypes.js";
-import type { DexScreenerPairSummary } from "./DexScreenerResponseAdapter.js";
 
 export class PilotLogger {
   private readonly logFilePath: string | null = null;
@@ -100,11 +100,29 @@ export interface PilotLiveCollectorConfig {
   readonly maxRssMb?: number | undefined;
   readonly outputDir: string;
   readonly enableForwardObservations: boolean;
+  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly maxPoolAgeSec?: number | undefined;
+  readonly minRequestIntervalMs?: number | undefined;
   readonly logFilePath?: string | undefined;
   readonly verifyPoolAddress?: string | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
   readonly logger?: PilotLogger | undefined;
+}
+
+function parseNonNegativeInt(flagName: string, valueStr: string): number {
+  if (!/^\d+$/.test(valueStr)) {
+    throw new Error(
+      `[INVALID_ARGUMENT] Option '${flagName}' must be a non-negative integer, got '${valueStr}'`,
+    );
+  }
+  const parsed = parseInt(valueStr, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(
+      `[INVALID_ARGUMENT] Option '${flagName}' must be greater than or equal to 0, got '${parsed}'`,
+    );
+  }
+  return parsed;
 }
 
 function parsePositiveInt(flagName: string, valueStr: string): number {
@@ -133,6 +151,9 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let maxMb = 256; // 256 MB accepted operational storage limit
   let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
+  let discoverySource: "dexscreener" | "raydium" = "dexscreener";
+  let maxPoolAgeSec = 0;
+  let minRequestIntervalMs = 2000;
   let logFilePath: string | undefined = undefined;
   let verifyPoolAddress: string | undefined = undefined;
 
@@ -146,7 +167,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
 
   for (const arg of args) {
     if (arg === "--help" || arg === "-h") {
-      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4)
+      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4 / D.2.5)
 Usage: node backend/dist/research/pilot/PilotLiveCollectorCli.js [options]
 
 Required:
@@ -155,7 +176,10 @@ Required:
 Options:
   --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
-  --poll-interval-sec=<n>          DexScreener discovery polling interval in seconds (default: 30)
+  --discovery-source=dexscreener|raydium Discovery source adapter (default: dexscreener)
+  --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
+  --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000)
+  --poll-interval-sec=<n>          Discovery polling interval in seconds (default: 30)
   --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
   --target-candidates=<n>          Safety ceiling of candidates to screen before stopping (default: 100)
   --max-candidates-screened=<n>    Alias for --target-candidates
@@ -173,6 +197,24 @@ Options:
       network = "enabled";
     } else if (arg === "--network=disabled") {
       network = "disabled";
+    } else if (arg.startsWith("--discovery-source=")) {
+      const val = arg.slice("--discovery-source=".length).trim().toLowerCase();
+      if (val !== "dexscreener" && val !== "raydium") {
+        throw new Error(
+          `[INVALID_ARGUMENT] Option '--discovery-source' must be 'dexscreener' or 'raydium', got '${val}'`,
+        );
+      }
+      discoverySource = val;
+    } else if (arg.startsWith("--max-pool-age-sec=")) {
+      maxPoolAgeSec = parseNonNegativeInt(
+        "--max-pool-age-sec",
+        arg.slice("--max-pool-age-sec=".length),
+      );
+    } else if (arg.startsWith("--min-request-interval-ms=")) {
+      minRequestIntervalMs = parseNonNegativeInt(
+        "--min-request-interval-ms",
+        arg.slice("--min-request-interval-ms=".length),
+      );
     } else if (arg.startsWith("--verify-pool=")) {
       const val = arg.slice("--verify-pool=".length).trim();
       if (!val) {
@@ -253,6 +295,9 @@ Options:
     maxRssMb,
     outputDir,
     enableForwardObservations,
+    discoverySource,
+    maxPoolAgeSec,
+    minRequestIntervalMs,
     logFilePath,
     verifyPoolAddress,
   };
@@ -263,6 +308,7 @@ export class PilotLiveCollectorSession {
   private readonly logger: PilotLogger;
   private runner: PilotCollectorRunner | null = null;
   private discoveryClient: DexScreenerLiveDiscoveryClient | null = null;
+  private raydiumClient: RaydiumLiveDiscoveryClient | null = null;
   private rpcClient: SolanaRpcLiveObservationClient | null = null;
   private forwardTracker: ForwardOutcomeObservationTracker | null = null;
 
@@ -309,22 +355,44 @@ export class PilotLiveCollectorSession {
       maxDurationSec: Math.max(7200, this.config.durationSec + 1800),
       maxDiskBytes: this.config.maxMb * 1024 * 1024,
       maxRssBytes: (this.config.maxRssMb ?? 256) * 1024 * 1024,
+      discoverySource: this.config.discoverySource ?? "dexscreener",
+      maxPoolAgeSec: this.config.maxPoolAgeSec ?? 0,
+      minRequestIntervalMs: this.config.minRequestIntervalMs ?? 2000,
     });
 
     await this.runner.initialize();
     const sessionDir = this.runner.getSessionDirectory();
 
+    const discoverySource = this.config.discoverySource ?? "dexscreener";
+    const maxPoolAgeSec = this.config.maxPoolAgeSec ?? 0;
+    const minRequestIntervalMs = this.config.minRequestIntervalMs ?? 2000;
+
     this.logger.info("STARTUP", `Session ${sessionId} initialized in ${sessionDir}`);
     this.logger.info(
       "CONFIG",
-      `network=${this.config.network}, pollIntervalSec=${this.config.pollIntervalSec}, durationSec=${this.config.durationSec}, targetCandidates=${this.config.targetCandidates}, targetDiagnosticYield=${this.config.targetDiagnosticYield}, rpcUrl=${this.config.rpcUrl}`,
+      `network=${this.config.network}, discoverySource=${discoverySource}, maxPoolAgeSec=${maxPoolAgeSec}, minRequestIntervalMs=${minRequestIntervalMs}, pollIntervalSec=${this.config.pollIntervalSec}, durationSec=${this.config.durationSec}, targetCandidates=${this.config.targetCandidates}, targetDiagnosticYield=${this.config.targetDiagnosticYield}, rpcUrl=${this.config.rpcUrl}`,
     );
 
-    this.discoveryClient = new DexScreenerLiveDiscoveryClient({
-      pollIntervalMs: this.config.pollIntervalSec * 1000,
-      transport: this.config.httpTransport,
-      onLog: (msg) => this.logger.info("DEXSCREENER", msg),
-    });
+    if (discoverySource === "raydium") {
+      this.raydiumClient = new RaydiumLiveDiscoveryClient({
+        pollIntervalMs: this.config.pollIntervalSec * 1000,
+        minRequestIntervalMs,
+        maxPoolAgeSec,
+        transport: this.config.httpTransport,
+        onLog: (msg) => this.logger.info("RAYDIUM_API", msg),
+      });
+      this.logger.info("DISCOVERY", "Raydium API v3 catalog discovery client initialized");
+    } else {
+      this.discoveryClient = new DexScreenerLiveDiscoveryClient({
+        pollIntervalMs: this.config.pollIntervalSec * 1000,
+        transport: this.config.httpTransport,
+        onLog: (msg) => this.logger.info("DEXSCREENER", msg),
+      });
+      this.logger.info(
+        "DISCOVERY",
+        "DexScreener promotional profiles discovery client initialized",
+      );
+    }
 
     this.rpcClient = new SolanaRpcLiveObservationClient({
       rpcUrl: this.config.rpcUrl,
@@ -405,46 +473,86 @@ export class PilotLiveCollectorSession {
         }
 
         // 4. Discovery Poll (only executed and logged when poll interval or retry is due)
-        let discovered: Array<{
-          candidate: D23ScreenedCandidate;
-          pairSummary: DexScreenerPairSummary | null;
-        }> = [];
-        if (this.discoveryClient.isPollDue()) {
-          this.logger.info(
-            "DISCOVERY_POLL",
-            `Executing discovery poll... (Mints seen so far: ${this.discoveryClient.getSeenMintsCount()})`,
-          );
-          discovered = await this.discoveryClient.pollDiscoveredCandidates({
-            sessionId,
-            generationId,
-          });
+        interface UnifiedDiscoveredItem {
+          readonly candidate: D23ScreenedCandidate;
+          readonly poolId: string | null;
+          readonly volume5mUsd: number | null;
+          readonly buys5m: number | null;
+          readonly sells5m: number | null;
+        }
 
-          if (discovered.length > 0) {
+        let discovered: UnifiedDiscoveredItem[] = [];
+
+        if (this.config.discoverySource === "raydium" && this.raydiumClient) {
+          if (this.raydiumClient.isPollDue()) {
             this.logger.info(
               "DISCOVERY_POLL",
-              `Discovered ${discovered.length} candidate record(s) to process.`,
+              `Executing Raydium catalog discovery poll... (Pools seen so far: ${this.raydiumClient.getSeenPoolIdsCount()})`,
             );
+            const raydiumDiscovered = await this.raydiumClient.pollDiscoveredCandidates({
+              sessionId,
+              generationId,
+            });
+
+            if (raydiumDiscovered.length > 0) {
+              this.logger.info(
+                "DISCOVERY_POLL",
+                `Discovered ${raydiumDiscovered.length} candidate record(s) from Raydium catalog.`,
+              );
+              discovered = raydiumDiscovered.map((item) => ({
+                candidate: item.candidate,
+                poolId: item.poolSummary.poolId,
+                volume5mUsd: item.poolSummary.volume5mUsd,
+                buys5m: item.poolSummary.buys5m,
+                sells5m: item.poolSummary.sells5m,
+              }));
+            }
+          }
+        } else if (this.discoveryClient) {
+          if (this.discoveryClient.isPollDue()) {
+            this.logger.info(
+              "DISCOVERY_POLL",
+              `Executing discovery poll... (Mints seen so far: ${this.discoveryClient.getSeenMintsCount()})`,
+            );
+            const dexDiscovered = await this.discoveryClient.pollDiscoveredCandidates({
+              sessionId,
+              generationId,
+            });
+
+            if (dexDiscovered.length > 0) {
+              this.logger.info(
+                "DISCOVERY_POLL",
+                `Discovered ${dexDiscovered.length} candidate record(s) to process.`,
+              );
+              discovered = dexDiscovered.map((item) => ({
+                candidate: item.candidate,
+                poolId: item.pairSummary?.poolId ?? null,
+                volume5mUsd: item.pairSummary?.volume5mUsd ?? null,
+                buys5m: item.pairSummary?.buys5m ?? null,
+                sells5m: item.pairSummary?.sells5m ?? null,
+              }));
+            }
           }
         }
 
         for (const item of discovered) {
           if (!this.isRunning) break;
-          const { candidate, pairSummary } = item;
+          const { candidate, poolId, volume5mUsd, buys5m, sells5m } = item;
 
-          if (candidate.passedEligibility && pairSummary?.poolId) {
+          if (candidate.passedEligibility && poolId) {
             // Confirm Raydium AMM on-chain via Solana RPC
             try {
               this.logger.info(
                 "RPC_VERIFY",
-                `Verifying Raydium pool ${pairSummary.poolId} on-chain for candidate ${candidate.compositeId.mintAddress} (${candidate.symbol})...`,
+                `Verifying Raydium pool ${poolId} on-chain for candidate ${candidate.compositeId.mintAddress} (${candidate.symbol})...`,
               );
               const obsResult = await this.rpcClient.observeRaydiumPool({
-                poolAddress: pairSummary.poolId,
+                poolAddress: poolId,
                 targetMint: candidate.compositeId.mintAddress,
                 flowMetrics: {
-                  volume5mUsd: pairSummary.volume5mUsd,
-                  buys5m: pairSummary.buys5m,
-                  sells5m: pairSummary.sells5m,
+                  volume5mUsd,
+                  buys5m,
+                  sells5m,
                   netBuyerVolumeUsd: null,
                 },
                 compositeId: candidate.compositeId,
@@ -460,7 +568,7 @@ export class PilotLiveCollectorSession {
 
                 this.logger.info(
                   "CANDIDATE_RECORDED",
-                  `[WATCHLIST_RADAR] Mint: ${candidate.compositeId.mintAddress} (${candidate.symbol}) | Pool: ${pairSummary.poolId} | Slot: ${obsResult.observation.onChainSlot} | Total screened: ${this.runner.getStats().candidates}`,
+                  `[WATCHLIST_RADAR] Mint: ${candidate.compositeId.mintAddress} (${candidate.symbol}) | Pool: ${poolId} | Slot: ${obsResult.observation.onChainSlot} | Total screened: ${this.runner.getStats().candidates}`,
                 );
 
                 if (this.forwardTracker) {
@@ -473,7 +581,7 @@ export class PilotLiveCollectorSession {
                 const rpcErr = obsResult.error ?? "RPC_OBSERVATION_FAILED";
                 this.logger.warn(
                   "RPC_VERIFY_FAILED",
-                  `Pool ${pairSummary.poolId} failed verification: ${rpcErr}. Recording as FILTERED_REJECTED.`,
+                  `Pool ${poolId} failed verification: ${rpcErr}. Recording as FILTERED_REJECTED.`,
                 );
                 const decisionEpochMs = Math.max(Date.now(), candidate.receiptEpochMs);
                 const rejectedCandidate: D23ScreenedCandidate = {
@@ -552,9 +660,13 @@ export class PilotLiveCollectorSession {
 
         if (now - lastHeartbeatEpochMs >= 30_000) {
           lastHeartbeatEpochMs = now;
+          const seenStats =
+            this.config.discoverySource === "raydium" && this.raydiumClient
+              ? `Seen Pools: ${this.raydiumClient.getSeenPoolIdsCount()}`
+              : `Seen Mints: ${this.discoveryClient?.getSeenMintsCount() ?? 0}`;
           this.logger.info(
             "HEARTBEAT",
-            `Elapsed: ${elapsedSec}s | Screened: ${currentStats.candidates} (Radar: ${currentStats.radar}, Rejected: ${currentStats.rejected}) | Seen Mints: ${this.discoveryClient.getSeenMintsCount()} | RPC: ${rpcDiag.totalCalls} calls (${rpcDiag.successfulCalls} ok, ${rpcDiag.failedCalls} fail) | Fwd Pending: ${fwdPending} | RSS: ${rssMb} MB`,
+            `Elapsed: ${elapsedSec}s | Screened: ${currentStats.candidates} (Radar: ${currentStats.radar}, Rejected: ${currentStats.rejected}) | ${seenStats} | RPC: ${rpcDiag.totalCalls} calls (${rpcDiag.successfulCalls} ok, ${rpcDiag.failedCalls} fail) | Fwd Pending: ${fwdPending} | RSS: ${rssMb} MB`,
           );
         }
 

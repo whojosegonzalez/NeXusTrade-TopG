@@ -169,11 +169,14 @@ export interface D23ScreenedCandidate {
   readonly symbol: string;
   readonly decisionType: "CANDIDATE_DISCOVERY_PROFILE";
   readonly decisionCohort: "WATCHLIST_RADAR" | "FILTERED_REJECTED";
-  readonly selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE";
+  readonly selectionBias: "DEXSCREENER_PROMOTIONAL_PROFILE" | "RAYDIUM_API_STANDARD_POOLS";
   readonly decisionEpochMs: number;
   readonly requestEpochMs: number;
   readonly receiptEpochMs: number;
   readonly sourceTimestampMs: number | null;
+  readonly poolOpenTimeMs?: number | null | undefined;
+  readonly poolAgeAtDiscoverySec?: number | null | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
   readonly passedEligibility: boolean;
   readonly filterEvaluations: readonly {
     readonly filterName: string;
@@ -238,4 +241,7 @@ export interface PilotCollectorConfig {
   readonly maxRssBytes?: number | undefined; // Default 256 MB (256 * 1024 * 1024)
   readonly maxConsecutiveErrors?: number | undefined; // Default 5
   readonly candidatePollIntervalMs?: number | undefined; // Default 60,000ms
+  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly maxPoolAgeSec?: number | undefined;
+  readonly minRequestIntervalMs?: number | undefined;
 }

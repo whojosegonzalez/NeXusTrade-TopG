@@ -114,6 +114,9 @@ export function toCanonicalCandidateDecision(
     sourceTimestampMs,
     ingestionTimestampMs: candidate.receiptEpochMs,
     decisionTimestampMs: candidate.decisionEpochMs,
+    ...(candidate.poolOpenTimeMs !== undefined && candidate.poolOpenTimeMs !== null
+      ? { poolOpenTimeMs: candidate.poolOpenTimeMs }
+      : {}),
     strategyRevision: D23_STRATEGY_REVISION,
     decisionCohort: candidate.decisionCohort,
     ...(candidate.rejectionReasons.length > 0
@@ -122,7 +125,7 @@ export function toCanonicalCandidateDecision(
     filterEvaluations,
     metricsSnapshot,
     missingFields,
-    providerIdentity: D23_OBSERVATIONAL_PROVIDER,
+    providerIdentity: candidate.providerIdentity || D23_OBSERVATIONAL_PROVIDER,
   };
 }
 

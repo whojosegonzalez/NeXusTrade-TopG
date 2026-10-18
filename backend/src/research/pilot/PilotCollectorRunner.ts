@@ -71,6 +71,9 @@ export interface ResolvedPilotConfig {
   readonly maxRssBytes: number;
   readonly maxConsecutiveErrors: number;
   readonly candidatePollIntervalMs: number;
+  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly maxPoolAgeSec?: number | undefined;
+  readonly minRequestIntervalMs?: number | undefined;
 }
 
 /**
@@ -470,6 +473,9 @@ export class PilotCollectorRunner {
       maxRssBytes: config.maxRssBytes ?? 256 * 1024 * 1024, // 256 MB
       maxConsecutiveErrors: config.maxConsecutiveErrors ?? 5,
       candidatePollIntervalMs: config.candidatePollIntervalMs ?? 60_000,
+      discoverySource: config.discoverySource ?? "dexscreener",
+      maxPoolAgeSec: config.maxPoolAgeSec,
+      minRequestIntervalMs: config.minRequestIntervalMs,
     };
 
     this.dataSource = dataSource;
@@ -532,6 +538,10 @@ export class PilotCollectorRunner {
       sessionStatus: "ACTIVE",
       isInterruptedSession: false,
       resumedFromPriorCrash: false,
+      discoverySource: this.config.discoverySource,
+      ...(this.config.maxPoolAgeSec !== undefined
+        ? { maxPoolAgeSec: this.config.maxPoolAgeSec }
+        : {}),
     };
 
     await this.writeSessionMeta(meta, false);
@@ -901,6 +911,10 @@ export class PilotCollectorRunner {
       sessionStatus: targetStatus,
       isInterruptedSession: targetStatus === "INTERRUPTED",
       resumedFromPriorCrash: false,
+      discoverySource: this.config.discoverySource,
+      ...(this.config.maxPoolAgeSec !== undefined
+        ? { maxPoolAgeSec: this.config.maxPoolAgeSec }
+        : {}),
     };
 
     await this.writeSessionMeta(meta, false);
@@ -958,6 +972,10 @@ export class PilotCollectorRunner {
         avoidedRugsCount: 0,
         isCompleteSession: targetStatus === "FINALIZED",
         isInterruptedSession: targetStatus === "INTERRUPTED",
+        discoverySource: this.config.discoverySource,
+        ...(this.config.maxPoolAgeSec !== undefined
+          ? { maxPoolAgeSec: this.config.maxPoolAgeSec }
+          : {}),
         ...(exploratoryReceiptTimeFlowDecisions > 0
           ? {
               researchClassification: {
