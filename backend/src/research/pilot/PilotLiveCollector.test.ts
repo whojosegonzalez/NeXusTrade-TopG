@@ -16,7 +16,8 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import http from "node:http";
 
 import {
   DexScreenerLiveDiscoveryClient,
@@ -2001,6 +2002,169 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
         `--verify-pool=${FIXTURE_POOL_ADDRESS}`,
       ]);
       expect(exitCodeDisabled).toBe(1);
+    });
+
+    it("spawns compiled binary with --verify-pool against offline mock RPC and exits cleanly without Windows libuv shutdown crashes", async () => {
+      const compiledCliPath = path.resolve("backend/dist/research/pilot/PilotLiveCollectorCli.js");
+      expect(fsSync.existsSync(compiledCliPath)).toBe(true);
+
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_MEME_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: FIXTURE_POOL_ADDRESS,
+        rawAmount: 100_000_000_000n,
+      });
+
+      let requestedPool = "";
+      const server = http.createServer((req, res) => {
+        let bodyStr = "";
+        req.on("data", (chunk) => {
+          bodyStr += chunk;
+        });
+        req.on("end", () => {
+          let body: { method: string; params: unknown[] } = { method: "", params: [] };
+          try {
+            body = JSON.parse(bodyStr);
+          } catch {
+            res.writeHead(400);
+            res.end();
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          if (body.method === "getAccountInfo") {
+            requestedPool = String((body.params as unknown[])?.[0] ?? "");
+            if (requestedPool === FIXTURE_POOL_ADDRESS) {
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    context: { slot: 458336910 },
+                    value: {
+                      data: [poolBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 10000000,
+                      owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                  },
+                }),
+              );
+            } else {
+              // Unauthorized / wrong owner
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    context: { slot: 458336910 },
+                    value: {
+                      data: [poolBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 10000000,
+                      owner: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ1PYDa6mt6px",
+                      rentEpoch: 0,
+                    },
+                  },
+                }),
+              );
+            }
+          } else if (body.method === "getMultipleAccounts") {
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: {
+                  context: { slot: 458336910 },
+                  value: [
+                    {
+                      data: [baseVaultBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 2039280,
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                    {
+                      data: [quoteVaultBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 2039280,
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                  ],
+                },
+              }),
+            );
+          } else {
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: 99, error: { message: "Unknown" } }));
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      const mockRpcUrl = `http://127.0.0.1:${port}`;
+
+      const runSpawnedCli = (args: string[]) => {
+        return new Promise<{
+          status: number | null;
+          signal: NodeJS.Signals | null;
+          stdout: string;
+          stderr: string;
+        }>((resolve) => {
+          const child = spawn(process.execPath, [compiledCliPath, ...args]);
+          let stdout = "";
+          let stderr = "";
+          child.stdout?.on("data", (d) => {
+            stdout += d.toString();
+          });
+          child.stderr?.on("data", (d) => {
+            stderr += d.toString();
+          });
+          child.on("close", (status, signal) => {
+            resolve({ status, signal, stdout, stderr });
+          });
+        });
+      };
+
+      try {
+        // 1. Success case: verify canonical pool
+        const resSuccess = await runSpawnedCli([
+          "--network=enabled",
+          `--rpc-url=${mockRpcUrl}`,
+          `--verify-pool=${FIXTURE_POOL_ADDRESS}`,
+        ]);
+
+        expect(resSuccess.status).toBe(0);
+        expect(resSuccess.signal).toBeNull();
+        expect(resSuccess.stderr).not.toContain("Assertion failed");
+        expect(resSuccess.stderr).not.toContain("0xC0000409");
+        expect(resSuccess.stdout).toContain("[VERIFY_POOL_SUCCESS]");
+        expect(resSuccess.stdout).toContain('"verified": true');
+        expect(resSuccess.stdout).toContain('"verificationStatus": "VERIFIED_RAYDIUM_AMM_V4"');
+
+        // 2. Failure case: verify non-canonical pool
+        const resFail = await runSpawnedCli([
+          "--network=enabled",
+          `--rpc-url=${mockRpcUrl}`,
+          `--verify-pool=${FIXTURE_MEME_MINT}`,
+        ]);
+
+        expect(resFail.status).toBe(1);
+        expect(resFail.signal).toBeNull();
+        expect(resFail.stderr).not.toContain("Assertion failed");
+        expect(resFail.stderr).toContain("[VERIFY_POOL_FAILED]");
+        expect(resFail.stdout).toContain('"verificationStatus": "UNAUTHORIZED_PROGRAM_ID"');
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {

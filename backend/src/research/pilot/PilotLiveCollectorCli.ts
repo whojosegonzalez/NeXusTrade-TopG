@@ -758,7 +758,12 @@ const isEntrypoint =
     path.resolve(scriptPath) === path.resolve(fileURLToPath(import.meta.url)));
 
 if (isEntrypoint) {
-  runPilotCollectorCli().then((code) => {
-    process.exit(code);
-  });
+  runPilotCollectorCli()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((err) => {
+      console.error(`[UNCAUGHT_FATAL] ${err}`);
+      process.exitCode = 1;
+    });
 }
