@@ -224,6 +224,25 @@ export function toCanonicalMarketObservation(
     ? Math.max(0, observation.receiptEpochMs - sourceTimestampMs)
     : Number.MAX_SAFE_INTEGER;
 
+  // D26-F1: Distinguish instantaneous slot-level state from 5-minute flow windows.
+  // Instantaneous Solana RPC reserve snapshots have durationSec: 0 and window covering request-to-receipt.
+  // If 5-minute flow metrics are present, flowMeasurementWindowSec records the flow duration.
+  const isInstantaneousSnapshot =
+    observation.providerIdentity.startsWith("solana_rpc") ||
+    observation.provenance === "D23_OBSERVATIONAL_SCREENING";
+
+  const windowStartMs = isInstantaneousSnapshot
+    ? observation.requestEpochMs
+    : Math.max(0, observation.receiptEpochMs - 300_000);
+  const windowEndMs = observation.receiptEpochMs;
+  const durationSec = isInstantaneousSnapshot ? 0 : 300;
+
+  const flowMeasurementWindowSec =
+    observation.flowMetrics?.volume5mUsd !== null &&
+    observation.flowMetrics?.volume5mUsd !== undefined
+      ? 300
+      : null;
+
   return {
     observationId: observation.observationId,
     sessionId: observation.compositeId.sessionId,
@@ -236,9 +255,9 @@ export function toCanonicalMarketObservation(
     responseReceivedMs: observation.receiptEpochMs,
     dataFreshnessMs,
     measurementWindow: {
-      windowStartMs: Math.max(0, observation.receiptEpochMs - 300_000),
-      windowEndMs: observation.receiptEpochMs,
-      durationSec: 300,
+      windowStartMs,
+      windowEndMs,
+      durationSec,
     },
     derivationStatus: "DIRECT_OBSERVATION",
     providerIdentity: observation.providerIdentity,
@@ -275,6 +294,10 @@ export function toCanonicalMarketObservation(
     },
     missingFields,
     strategyRevision,
+    ...(observation.onChainSlot !== null && observation.onChainSlot !== undefined
+      ? { onChainSlot: observation.onChainSlot }
+      : {}),
+    ...(flowMeasurementWindowSec !== null ? { flowMeasurementWindowSec } : {}),
     ...(observation.slotDiscrepancy
       ? { clockSkewWarning: "SLOT_DISCREPANCY_DETECTED_ACROSS_VAULT_READS" }
       : {}),

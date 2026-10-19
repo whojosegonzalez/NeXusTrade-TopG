@@ -41,6 +41,7 @@ import type {
 } from "./PilotTypes.js";
 import type {
   CandidateDecisionRecord,
+  DiscoveryFunnelMetrics,
   MarketObservationRecord,
   SessionTelemetryMeta,
   SessionTelemetrySummary,
@@ -439,6 +440,7 @@ export class PilotCollectorRunner {
   private readonly uniquePoolsSeen = new Set<string>();
   private readonly rejectionReasonsCounts = new Map<string, number>();
   private interruptionReason?: string | undefined;
+  private discoveryFunnel?: DiscoveryFunnelMetrics | undefined;
 
   // Append-time baseline tracking for deep reconciliation (D23F-03)
   private readonly seenDecisionEventIds = new Set<string>();
@@ -1053,6 +1055,7 @@ export class PilotCollectorRunner {
         ...(this.config.maxPoolAgeSec !== undefined
           ? { maxPoolAgeSec: this.config.maxPoolAgeSec }
           : {}),
+        ...(this.discoveryFunnel ? { discoveryFunnel: this.discoveryFunnel } : {}),
         ...(exploratoryReceiptTimeFlowDecisions > 0
           ? {
               researchClassification: {
@@ -1638,6 +1641,14 @@ export class PilotCollectorRunner {
 
   public getInterruptionReason(): string | undefined {
     return this.interruptionReason;
+  }
+
+  public setDiscoveryFunnel(funnel: DiscoveryFunnelMetrics): void {
+    this.discoveryFunnel = funnel;
+  }
+
+  public getDiscoveryFunnel(): DiscoveryFunnelMetrics | undefined {
+    return this.discoveryFunnel;
   }
 
   public getStats(): {

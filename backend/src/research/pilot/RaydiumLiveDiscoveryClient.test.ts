@@ -24,6 +24,7 @@ import { describe, expect, it } from "vitest";
 import {
   isAllowlistedRaydiumUrl,
   parseRaydiumApiPoolListResponse,
+  parseRaydiumOpenTime,
 } from "./RaydiumResponseAdapter.js";
 import {
   RaydiumLiveDiscoveryClient,
@@ -712,6 +713,145 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(c.discoveryPage).toBe(1);
       expect(c.discoverySortField).toBe("default");
       expect(c.sourceTimestampMs).toBeNull(); // Truthful: not fabricated from openTime
+    });
+
+    it("parses diverse openTime formats with parseRaydiumOpenTime (D26-F2)", () => {
+      const receiptMs = 1792300000000;
+
+      // 1. Valid unix seconds
+      const secRes = parseRaydiumOpenTime(1792200000, receiptMs);
+      expect(secRes.openTimeStatus).toBe("VALID");
+      expect(secRes.openTimeMs).toBe(1792200000000);
+      expect(secRes.poolAgeAtDiscoverySec).toBe(100000);
+
+      // 2. Valid unix milliseconds
+      const msRes = parseRaydiumOpenTime(1792200000000, receiptMs);
+      expect(msRes.openTimeStatus).toBe("VALID");
+      expect(msRes.openTimeMs).toBe(1792200000000);
+      expect(msRes.poolAgeAtDiscoverySec).toBe(100000);
+
+      // 3. Valid ISO string (D26-F2 bugfix: not parsed with parseFloat)
+      const isoRes = parseRaydiumOpenTime("2026-10-18T04:00:00.000Z", receiptMs);
+      expect(isoRes.openTimeStatus).toBe("VALID");
+      expect(isoRes.openTimeMs).toBe(Date.parse("2026-10-18T04:00:00.000Z"));
+      expect(isoRes.poolAgeAtDiscoverySec).toBeGreaterThan(0);
+
+      // 4. String numeric seconds
+      const strSecRes = parseRaydiumOpenTime("1792200000", receiptMs);
+      expect(strSecRes.openTimeStatus).toBe("VALID");
+      expect(strSecRes.openTimeMs).toBe(1792200000000);
+
+      // 5. "0" sentinel string (Raydium API unindexed / zero timestamp) -> INVALID
+      const zeroStrRes = parseRaydiumOpenTime("0", receiptMs);
+      expect(zeroStrRes.openTimeStatus).toBe("INVALID");
+      expect(zeroStrRes.openTimeMs).toBeNull();
+      expect(zeroStrRes.poolAgeAtDiscoverySec).toBeNull();
+
+      // 6. Numeric 0 -> INVALID
+      const zeroNumRes = parseRaydiumOpenTime(0, receiptMs);
+      expect(zeroNumRes.openTimeStatus).toBe("INVALID");
+      expect(zeroNumRes.openTimeMs).toBeNull();
+
+      // 7. Negative numbers -> INVALID
+      const negRes = parseRaydiumOpenTime(-100, receiptMs);
+      expect(negRes.openTimeStatus).toBe("INVALID");
+      expect(negRes.openTimeMs).toBeNull();
+
+      // 8. Missing / null / undefined / empty -> MISSING
+      expect(parseRaydiumOpenTime(null, receiptMs).openTimeStatus).toBe("MISSING");
+      expect(parseRaydiumOpenTime(undefined, receiptMs).openTimeStatus).toBe("MISSING");
+      expect(parseRaydiumOpenTime("", receiptMs).openTimeStatus).toBe("MISSING");
+      expect(parseRaydiumOpenTime("   ", receiptMs).openTimeStatus).toBe("MISSING");
+      expect(parseRaydiumOpenTime("null", receiptMs).openTimeStatus).toBe("MISSING");
+
+      // 9. Unparseable garbage string -> INVALID
+      expect(parseRaydiumOpenTime("not-a-timestamp", receiptMs).openTimeStatus).toBe("INVALID");
+
+      // 10. Future-dated timestamp (> receiptMs + 60s) -> FUTURE_DATED
+      const futureRes = parseRaydiumOpenTime(receiptMs + 120_000, receiptMs);
+      expect(futureRes.openTimeStatus).toBe("FUTURE_DATED");
+      expect(futureRes.openTimeMs).toBe(receiptMs + 120_000);
+      expect(futureRes.poolAgeAtDiscoverySec).toBeNull();
+    });
+
+    it("never treats MISSING or INVALID pool age as fresh when age filter is active (D26-F2)", async () => {
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () =>
+          ({
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: 3,
+                data: [
+                  // Pool 1: valid fresh pool (100s old)
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: POOL_BONK_SOL,
+                    mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+                    mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    openTime: String(Math.floor((Date.now() - 100 * 1000) / 1000)),
+                  },
+                  // Pool 2: missing openTime ("0" sentinel)
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: POOL_SOL_USDC,
+                    mintA: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+                    openTime: "0",
+                  },
+                  // Pool 3: null openTime
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: POOL_BONK_SOL_2,
+                    mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+                    mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    openTime: null,
+                  },
+                ],
+              },
+            }),
+          }) as unknown as Response,
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+        maxPoolAgeSec: 3600, // Active age filter: 1 hour max age
+      });
+
+      const results = await client.pollDiscoveredCandidates({
+        sessionId: "sess-age-filter",
+        generationId: "gen",
+      });
+
+      // All 3 candidates are emitted to preserve negative controls:
+      // Pool 1: WATCHLIST_RADAR (eligible fresh pool)
+      // Pool 2 & 3: FILTERED_REJECTED (MISSING or INVALID openTime excluded by age filter)
+      expect(results.length).toBe(3);
+      const eligible = results.filter((r) => r.candidate.decisionCohort === "WATCHLIST_RADAR");
+      expect(eligible.length).toBe(1);
+      expect(eligible[0]!.poolSummary.poolId).toBe(POOL_BONK_SOL);
+
+      const rejected = results.filter((r) => r.candidate.decisionCohort === "FILTERED_REJECTED");
+      expect(rejected.length).toBe(2);
+      expect(rejected.map((r) => r.poolSummary.poolId)).toContain(POOL_SOL_USDC);
+      expect(rejected.map((r) => r.poolSummary.poolId)).toContain(POOL_BONK_SOL_2);
+
+      const funnel = client.getFunnelMetrics();
+      expect(funnel.apiPoolsReturned).toBe(3);
+      expect(funnel.uniquePoolsEncountered).toBe(3);
+      expect(funnel.repeatedPoolsSuppressed).toBe(0);
+      expect(funnel.poolAgeClassifications.validAgeCount).toBe(1);
+      expect(funnel.poolAgeClassifications.invalidAgeCount).toBe(1);
+      expect(funnel.poolAgeClassifications.missingAgeCount).toBe(1);
+      expect(funnel.poolAgeClassifications.confirmedAgeFilterPasses).toBe(1);
+      expect(funnel.poolAgeClassifications.ageFilterExclusions).toBe(2);
+      expect(funnel.preVerificationExclusions.totalPreVerificationExcluded).toBe(2);
     });
   });
 });

@@ -42,6 +42,10 @@ import {
   validateCandidateCausality,
   validatePathConfinement,
 } from "./PilotCollectorRunner.js";
+import {
+  isValidCandidateDecisionRecord,
+  isValidMarketObservationRecord,
+} from "../shadow/ShadowCollectorEngine.js";
 // @ts-expect-error D.1 readiness audit script is authored as .mjs with sibling .d.ts
 import { runReadinessAudit } from "../../../../scripts/audit-research-readiness.mjs";
 import { evaluateResearchEligibility } from "../ResearchEligibilityGate.js";
@@ -398,7 +402,7 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(shadow.observedReserveSnapshot).toBeUndefined(); // null source time = no snapshot
     });
 
-    it("translates to MarketObservationRecord", () => {
+    it("translates to MarketObservationRecord with instantaneous snapshot window (D26-F1)", () => {
       const obs = toCanonicalMarketObservation(mockObservation);
       expect(obs.observationId).toBe("obs-test-001");
       expect(obs.sessionId).toBe("session-pilot-test-01");
@@ -407,6 +411,42 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(obs.flowMetrics.volumeUsd).toBe(1250);
       expect(obs.flowMetrics.buys).toBe(15);
       expect(obs.flowMetrics.sells).toBe(8);
+
+      // D26-F1: Instantaneous Solana RPC reserve snapshot window semantics
+      expect(obs.measurementWindow.durationSec).toBe(0);
+      expect(obs.measurementWindow.windowStartMs).toBe(mockObservation.requestEpochMs);
+      expect(obs.measurementWindow.windowEndMs).toBe(mockObservation.receiptEpochMs);
+      expect(obs.onChainSlot).toBe(mockObservation.onChainSlot);
+      expect(obs.flowMeasurementWindowSec).toBe(300);
+
+      // Observational records with sourceTimestampMs = 0 sentinel are rejected by downstream H2 execution validator
+      expect(isValidMarketObservationRecord(obs, "session-pilot-test-01")).toBe(false);
+
+      // Records with genuine source timestamp pass downstream H2 execution validator
+      const obsWithSourceTime: D23ObservationRecord = {
+        ...mockObservation,
+        sourceReportedTimeMs: 1791940001000,
+      };
+      const canonicalWithSourceTime = toCanonicalMarketObservation(obsWithSourceTime);
+      expect(isValidMarketObservationRecord(canonicalWithSourceTime, "session-pilot-test-01")).toBe(
+        true,
+      );
+
+      // Flow measurement window omitted when flow metrics absent
+      const obsWithoutFlow: D23ObservationRecord = {
+        ...obsWithSourceTime,
+        flowMetrics: {
+          volume5mUsd: null,
+          buys5m: null,
+          sells5m: null,
+          netBuyerVolumeUsd: null,
+        },
+      };
+      const canonicalWithoutFlow = toCanonicalMarketObservation(obsWithoutFlow);
+      expect(canonicalWithoutFlow.flowMeasurementWindowSec).toBeUndefined();
+      expect(isValidMarketObservationRecord(canonicalWithoutFlow, "session-pilot-test-01")).toBe(
+        true,
+      );
     });
 
     it("truthfully handles unavailable sourceTimestampMs with sentinel 0 and missingFields (D23F-04)", () => {
@@ -418,6 +458,8 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(canonical.sourceTimestampMs).toBe(SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS);
       expect(canonical.sourceTimestampMs).toBe(0);
       expect(canonical.missingFields).toContain("sourceTimestampMs");
+      // Downstream H2 eligibility rejects missing source time
+      expect(isValidCandidateDecisionRecord(canonical, "session-pilot-test-01")).toBe(false);
 
       const observationWithoutTime: D23ObservationRecord = {
         ...mockObservation,
@@ -427,6 +469,8 @@ describe("Pilot Adapters and Runner - Milestone D.2.3", () => {
       expect(canonicalObs.sourceTimestampMs).toBe(SYNTHETIC_UNAVAILABLE_SOURCE_TIMESTAMP_MS);
       expect(canonicalObs.sourceTimestampMs).toBe(0);
       expect(canonicalObs.dataFreshnessMs).toBe(Number.MAX_SAFE_INTEGER);
+      // Downstream H2 eligibility rejects missing source time
+      expect(isValidMarketObservationRecord(canonicalObs, "session-pilot-test-01")).toBe(false);
     });
 
     it("marks all absent or non-finite metrics as UNAVAILABLE in metricProvenance (D23F-04)", () => {

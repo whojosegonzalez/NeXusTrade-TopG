@@ -177,6 +177,44 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(raydiumParsed.minRequestIntervalMs).toBe(1000);
     });
 
+    it("parseCliArgs reconciles legacy and Raydium candidate/yield options safely (D26-F5)", () => {
+      // 1. DexScreener mode: --target-candidates sets maxCandidatesScreened and targetDiagnosticYield
+      const dexParsed = parseCliArgs([
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--discovery-source=dexscreener",
+        "--target-candidates=50",
+      ]);
+      expect(dexParsed.targetCandidates).toBe(50);
+      expect(dexParsed.maxCandidatesScreened).toBe(50);
+      expect(dexParsed.targetDiagnosticYield).toBe(50);
+
+      // 2. Raydium mode: --target-candidates acts as alias for targetDiagnosticYield, with default safety ceiling
+      const rayParsed = parseCliArgs([
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--discovery-source=raydium",
+        "--target-candidates=5",
+      ]);
+      expect(rayParsed.targetCandidates).toBe(5);
+      expect(rayParsed.targetDiagnosticYield).toBe(5);
+      expect(rayParsed.maxCandidatesScreened).toBe(500);
+
+      // 3. Raydium mode: explicit --target-yield and --max-candidates-screened
+      const rayExplicit = parseCliArgs([
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--discovery-source=raydium",
+        "--target-yield=2",
+        "--max-candidates-screened=150",
+      ]);
+      expect(rayExplicit.targetDiagnosticYield).toBe(2);
+      expect(rayExplicit.maxCandidatesScreened).toBe(150);
+    });
+
     it("parseCliArgs rejects invalid discovery-source and negative numeric bounds", () => {
       expect(() =>
         parseCliArgs(["node", "cli.js", "--network=enabled", "--discovery-source=uniswap"]),
@@ -3842,6 +3880,39 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
       const manifestVerification = await verifySessionExportManifest(result.sessionDir);
       expect(manifestVerification.valid).toBe(true);
+
+      // 4. Verify instantaneous Solana RPC reserve snapshot window in market-observations.jsonl (D26-F1)
+      const obsPath = path.join(result.sessionDir, "market-observations.jsonl");
+      expect(fsSync.existsSync(obsPath)).toBe(true);
+      const obsContent = await fs.readFile(obsPath, "utf8");
+      expect(obsContent.trim().length).toBeGreaterThan(0);
+      const obsRecords = obsContent
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      expect(obsRecords).toHaveLength(1);
+      const obsRecord = obsRecords[0];
+      expect(obsRecord.measurementWindow.durationSec).toBe(0);
+      expect(obsRecord.measurementWindow.windowStartMs).toBeGreaterThan(0);
+      expect(obsRecord.measurementWindow.windowEndMs).toBeGreaterThanOrEqual(
+        obsRecord.measurementWindow.windowStartMs,
+      );
+      expect(obsRecord.onChainSlot).toBe(300000001);
+
+      // 5. Verify Discovery Funnel telemetry recorded in session-summary.json (D26-F3)
+      const summaryPath = path.join(result.sessionDir, "session-summary.json");
+      expect(fsSync.existsSync(summaryPath)).toBe(true);
+      const summary = JSON.parse(await fs.readFile(summaryPath, "utf8"));
+      expect(summary.discoveryFunnel).toBeDefined();
+      expect(summary.discoveryFunnel.apiPoolsReturned).toBe(1);
+      expect(summary.discoveryFunnel.uniquePoolsEncountered).toBe(1);
+      expect(summary.discoveryFunnel.repeatedPoolsSuppressed).toBe(0);
+      expect(summary.discoveryFunnel.poolAgeClassifications.validAgeCount).toBe(1);
+      expect(summary.discoveryFunnel.verificationAttempts).toBe(1);
+      expect(summary.discoveryFunnel.verifiedAmmV4Pools).toBe(1);
+      expect(summary.discoveryFunnel.confirmedOnChainIneligible).toBe(0);
+      expect(summary.discoveryFunnel.rpcProviderUnavailable).toBe(0);
+      expect(summary.discoveryFunnel.rpcRetriesExhausted).toBe(0);
     });
   });
 });

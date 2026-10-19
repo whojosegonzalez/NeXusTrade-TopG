@@ -22,12 +22,14 @@ export class DecisionContextReconstructor {
 
     // Decision cutoff timestamp: the exact time when the decision was computed
     const decisionCutoffMs = decision.decisionTimestampMs || decision.ingestionTimestampMs;
+    const effectiveSourceCutoffMs =
+      decision.sourceTimestampMs > 0 ? decision.sourceTimestampMs : decisionCutoffMs;
 
     // Strictly filter to observations that satisfy genuine Point-in-Time availability:
     // 1. Same generation, session, pool, and mint identity
-    // 2. Source timestamp occurred on or before decision source timestamp
+    // 2. Source timestamp occurred on or before decision source timestamp (or decision cutoff when source time is unavailable)
     // 3. Ingestion timestamp occurred on or before decision cutoff (No late-arriving observations!)
-    // 4. Measurement window must have fully closed on or before decision source timestamp
+    // 4. Measurement window must have fully closed on or before decision cutoff
     const priorObservations = allObservations.filter((obs) => {
       if (obs.generationId !== decision.generationId) return false;
       if (obs.sessionId !== decision.sessionId) return false;
@@ -35,26 +37,38 @@ export class DecisionContextReconstructor {
       if (obs.mintAddress !== decision.mintAddress) return false;
 
       // Event source timing
-      if (obs.sourceTimestampMs > decision.sourceTimestampMs) return false;
+      if (decision.sourceTimestampMs > 0) {
+        if (obs.sourceTimestampMs > decision.sourceTimestampMs) return false;
+      } else if (obs.sourceTimestampMs > 0 && obs.sourceTimestampMs > decisionCutoffMs) {
+        return false;
+      }
 
       // Actual ingestion availability timing (prevent lookahead from late arrivals)
       if (obs.ingestionTimestampMs > decisionCutoffMs) return false;
 
       // Closed measurement window (prevent aggregated window from leaking future ticks)
-      if (obs.measurementWindow && obs.measurementWindow.windowEndMs > decision.sourceTimestampMs) {
+      if (obs.measurementWindow && obs.measurementWindow.windowEndMs > effectiveSourceCutoffMs) {
         return false;
       }
 
       return true;
     });
 
-    // Sort chronologically by source timestamp
-    priorObservations.sort((a, b) => a.sourceTimestampMs - b.sourceTimestampMs);
+    // Sort chronologically by source timestamp (or ingestion timestamp if source timestamp is 0)
+    priorObservations.sort((a, b) => {
+      const timeA = a.sourceTimestampMs > 0 ? a.sourceTimestampMs : a.ingestionTimestampMs;
+      const timeB = b.sourceTimestampMs > 0 ? b.sourceTimestampMs : b.ingestionTimestampMs;
+      return timeA - timeB;
+    });
 
-    const windowStartMs = decision.sourceTimestampMs - lookbackDurationMs;
-    const preDecisionWindow = priorObservations.filter(
-      (obs) => obs.sourceTimestampMs >= windowStartMs,
-    );
+    const windowStartMs = effectiveSourceCutoffMs - lookbackDurationMs;
+    const preDecisionWindow = priorObservations.filter((obs) => {
+      const obsTime =
+        obs.sourceTimestampMs > 0
+          ? obs.sourceTimestampMs
+          : (obs.responseReceivedMs ?? obs.ingestionTimestampMs);
+      return obsTime >= windowStartMs;
+    });
 
     let inTradeWindow: MarketObservationRecord[] | undefined;
     let postExitWindow: MarketObservationRecord[] | undefined;

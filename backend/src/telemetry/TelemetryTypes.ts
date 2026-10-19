@@ -117,6 +117,8 @@ export interface MarketObservationRecord {
   readonly missingFields: readonly string[];
   readonly strategyRevision: string;
   readonly clockSkewWarning?: string | undefined;
+  readonly onChainSlot?: number | null | undefined;
+  readonly flowMeasurementWindowSec?: number | null | undefined;
 }
 
 /**
@@ -233,6 +235,36 @@ export interface SessionTelemetrySummary {
   readonly isInterruptedSession?: boolean | undefined;
   readonly discoverySource?: "dexscreener" | "raydium" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
+  readonly discoveryFunnel?: DiscoveryFunnelMetrics | undefined;
+}
+
+export interface DiscoveryFunnelMetrics {
+  readonly apiPoolsReturned: number;
+  readonly uniquePoolsEncountered: number;
+  readonly repeatedPoolsSuppressed: number;
+  readonly preVerificationExclusions: {
+    readonly nonSolPairs: number;
+    readonly nonStandardAmm: number;
+    readonly missingOpenTime: number;
+    readonly invalidOpenTime: number;
+    readonly futureDatedOpenTime: number;
+    readonly exceedsMaxPoolAge: number;
+    readonly totalPreVerificationExcluded: number;
+  };
+  readonly poolAgeClassifications: {
+    readonly validAgeCount: number;
+    readonly missingAgeCount: number;
+    readonly invalidAgeCount: number;
+    readonly futureDatedAgeCount: number;
+    readonly confirmedAgeFilterPasses: number;
+    readonly ageFilterExclusions: number;
+  };
+  readonly verificationAttempts: number;
+  readonly verifiedAmmV4Pools: number;
+  readonly confirmedOnChainIneligible: number;
+  readonly rpcProviderUnavailable: number;
+  readonly rpcRetriesExhausted: number;
+  readonly unreachedCandidatesDueToStopping: number;
 }
 
 export interface ReconstructedDecisionContext {

@@ -31,6 +31,7 @@ import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTra
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
 import { D23_STRATEGY_REVISION } from "./PilotSchemaBridge.js";
 import type { D23ScreenedCandidate } from "./PilotTypes.js";
+import type { DiscoveryFunnelMetrics } from "../../telemetry/TelemetryTypes.js";
 
 export class PilotLogger {
   private readonly logFilePath: string | null = null;
@@ -222,6 +223,9 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let targetCandidates = 15;
   let targetDiagnosticYield = 15;
   let maxCandidatesScreened = 500; // Hard safety stop ceiling for screened candidates (D25-F2)
+  let explicitTargetCandidates = false;
+  let explicitTargetYield = false;
+  let explicitMaxCandidatesScreened = false;
   let maxMb = 256; // 256 MB accepted operational storage limit
   let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
@@ -309,26 +313,31 @@ Options:
     } else if (arg.startsWith("--duration-sec=")) {
       durationSec = parsePositiveInt("--duration-sec", arg.slice("--duration-sec=".length));
     } else if (arg.startsWith("--target-candidates=")) {
+      explicitTargetCandidates = true;
       targetCandidates = parsePositiveInt(
         "--target-candidates",
         arg.slice("--target-candidates=".length),
       );
     } else if (arg.startsWith("--max-candidates-screened=")) {
+      explicitMaxCandidatesScreened = true;
       maxCandidatesScreened = parsePositiveInt(
         "--max-candidates-screened",
         arg.slice("--max-candidates-screened=".length),
       );
     } else if (arg.startsWith("--target-yield=")) {
+      explicitTargetYield = true;
       targetDiagnosticYield = parsePositiveInt(
         "--target-yield",
         arg.slice("--target-yield=".length),
       );
     } else if (arg.startsWith("--target-diagnostic-yield=")) {
+      explicitTargetYield = true;
       targetDiagnosticYield = parsePositiveInt(
         "--target-diagnostic-yield",
         arg.slice("--target-diagnostic-yield=".length),
       );
     } else if (arg.startsWith("--target-verified-candidates=")) {
+      explicitTargetYield = true;
       targetDiagnosticYield = parsePositiveInt(
         "--target-verified-candidates",
         arg.slice("--target-verified-candidates=".length),
@@ -355,6 +364,30 @@ Options:
       enableForwardObservations = false;
     } else {
       throw new Error(`[INVALID_ARGUMENT] Unknown CLI option: '${arg}'`);
+    }
+  }
+
+  // D26-F5: Reconcile legacy CLI semantics safely across DexScreener and Raydium discovery sources
+  if (discoverySource === "dexscreener") {
+    // Legacy D.2.4 DexScreener behavior: targetCandidates specifies the total candidates to screen
+    if (explicitTargetCandidates && !explicitMaxCandidatesScreened) {
+      maxCandidatesScreened = targetCandidates;
+    }
+    if (explicitTargetCandidates && !explicitTargetYield) {
+      targetDiagnosticYield = targetCandidates;
+    }
+    if (!explicitMaxCandidatesScreened && !explicitTargetCandidates) {
+      maxCandidatesScreened = 100;
+    }
+  } else {
+    // Raydium discovery behavior (D.2.5 / D.2.6):
+    // If operator provided --target-candidates but not --target-yield, accept as alias for target yield
+    if (explicitTargetCandidates && !explicitTargetYield) {
+      targetDiagnosticYield = targetCandidates;
+    }
+    // If operator specified target yield but not maxCandidatesScreened, provide standard safety ceiling
+    if (!explicitMaxCandidatesScreened) {
+      maxCandidatesScreened = Math.max(500, targetDiagnosticYield * 10);
     }
   }
 
@@ -390,6 +423,14 @@ export class PilotLiveCollectorSession {
   private isRunning = false;
   private stopReason: string | null = null;
   private readonly deferredVerificationQueue: DeferredVerificationCandidate[] = [];
+
+  // Funnel accounting counters (D26-F3)
+  private verificationAttempts = 0;
+  private verifiedAmmV4Pools = 0;
+  private confirmedOnChainIneligible = 0;
+  private rpcProviderUnavailable = 0;
+  private rpcRetriesExhausted = 0;
+  private unreachedCandidatesDueToStopping = 0;
 
   constructor(config: PilotLiveCollectorConfig) {
     this.config = config;
@@ -428,6 +469,7 @@ export class PilotLiveCollectorSession {
           `Retrying on-chain verification for candidate ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) / pool ${item.poolId} (attempt ${item.retryCount + 1}/${MAX_RPC_VERIFICATION_RETRIES})...`,
         );
 
+        this.verificationAttempts++;
         const obsResult = await this.rpcClient.observeRaydiumPool({
           poolAddress: item.poolId,
           targetMint: item.candidate.compositeId.mintAddress,
@@ -441,6 +483,7 @@ export class PilotLiveCollectorSession {
         });
 
         if (obsResult.ok && obsResult.observation) {
+          this.verifiedAmmV4Pools++;
           const decisionEpochMs = Math.max(Date.now(), obsResult.observation.receiptEpochMs);
           const causalCandidate: D23ScreenedCandidate = {
             ...item.candidate,
@@ -464,6 +507,7 @@ export class PilotLiveCollectorSession {
           const classification = classifyRpcVerificationError(rawErr);
 
           if (classification.type === "CONFIRMED_INELIGIBILITY") {
+            this.confirmedOnChainIneligible++;
             const rpcErr = classification.reasonCode;
             this.logger.warn(
               "RPC_VERIFY_INELIGIBLE",
@@ -493,11 +537,13 @@ export class PilotLiveCollectorSession {
               `[FILTERED_REJECTED] Mint: ${item.candidate.compositeId.mintAddress} (${item.candidate.symbol}) | Rejection: ${rpcErr} | Total screened: ${this.runner.getStats().candidates}`,
             );
           } else {
+            this.rpcProviderUnavailable++;
             item.retryCount += 1;
             item.lastAttemptEpochMs = Date.now();
             item.lastError = `${classification.reasonCode}:${rawErr}`;
 
             if (item.retryCount >= MAX_RPC_VERIFICATION_RETRIES) {
+              this.rpcRetriesExhausted++;
               const reason = "RPC_VERIFICATION_EXHAUSTED";
               this.logger.warn(
                 "RPC_VERIFY_EXHAUSTED",
@@ -551,6 +597,7 @@ export class PilotLiveCollectorSession {
 
     for (const item of this.deferredVerificationQueue) {
       try {
+        this.rpcRetriesExhausted++;
         const reason = "RPC_VERIFICATION_EXHAUSTED";
         const decisionEpochMs = Math.max(Date.now(), item.candidate.receiptEpochMs);
         const rejectedCandidate: D23ScreenedCandidate = {
@@ -795,11 +842,16 @@ export class PilotLiveCollectorSession {
           }
         }
 
-        for (const item of discovered) {
-          if (!this.isRunning) break;
+        for (let itemIndex = 0; itemIndex < discovered.length; itemIndex++) {
+          if (!this.isRunning) {
+            this.unreachedCandidatesDueToStopping += discovered.length - itemIndex;
+            break;
+          }
+          const item = discovered[itemIndex]!;
           const { candidate, poolId, volume5mUsd, buys5m, sells5m } = item;
 
           if (candidate.passedEligibility && poolId) {
+            this.verificationAttempts++;
             // Confirm Raydium AMM on-chain via Solana RPC
             try {
               this.logger.info(
@@ -819,6 +871,7 @@ export class PilotLiveCollectorSession {
               });
 
               if (obsResult.ok && obsResult.observation) {
+                this.verifiedAmmV4Pools++;
                 const decisionEpochMs = Math.max(Date.now(), obsResult.observation.receiptEpochMs);
                 const causalCandidate: D23ScreenedCandidate = {
                   ...candidate,
@@ -842,6 +895,7 @@ export class PilotLiveCollectorSession {
                 const classification = classifyRpcVerificationError(rawErr);
 
                 if (classification.type === "TRANSIENT_PROVIDER_ERROR") {
+                  this.rpcProviderUnavailable++;
                   // Transient RPC provider error (429, timeout, network failure)
                   // Do NOT count as confirmed protocol failure or immediately reject (D25-F1)
                   this.logger.warn(
@@ -859,6 +913,7 @@ export class PilotLiveCollectorSession {
                     lastError: `${classification.reasonCode}:${rawErr}`,
                   });
                 } else {
+                  this.confirmedOnChainIneligible++;
                   // Confirmed on-chain ineligibility (unauthorized program owner, null account, malformed data, vault mismatch)
                   const rpcErr = classification.reasonCode;
                   this.logger.warn(
@@ -916,6 +971,10 @@ export class PilotLiveCollectorSession {
           if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
             this.stopReason = "TARGET_YIELD_REACHED";
             this.isRunning = false;
+            const unreachedInBatch = discovered.length - 1 - itemIndex;
+            if (unreachedInBatch > 0) {
+              this.unreachedCandidatesDueToStopping += unreachedInBatch;
+            }
             break;
           }
           if (
@@ -924,6 +983,10 @@ export class PilotLiveCollectorSession {
           ) {
             this.stopReason = "MAX_CANDIDATES_SCREENED_REACHED";
             this.isRunning = false;
+            const unreachedInBatch = discovered.length - 1 - itemIndex;
+            if (unreachedInBatch > 0) {
+              this.unreachedCandidatesDueToStopping += unreachedInBatch;
+            }
             break;
           }
         }
@@ -1025,6 +1088,26 @@ export class PilotLiveCollectorSession {
       finalDecisionsCount > 0
         ? "FINALIZED"
         : "INTERRUPTED";
+
+    // D26-F3: Assemble and seal full discovery funnel metrics
+    if (this.config.discoverySource === "raydium" && this.raydiumClient) {
+      const raydiumFunnel = this.raydiumClient.getFunnelMetrics();
+      const funnelMetrics: DiscoveryFunnelMetrics = {
+        apiPoolsReturned: raydiumFunnel.apiPoolsReturned,
+        uniquePoolsEncountered: raydiumFunnel.uniquePoolsEncountered,
+        repeatedPoolsSuppressed: raydiumFunnel.repeatedPoolsSuppressed,
+        preVerificationExclusions: raydiumFunnel.preVerificationExclusions,
+        poolAgeClassifications: raydiumFunnel.poolAgeClassifications,
+        verificationAttempts: this.verificationAttempts,
+        verifiedAmmV4Pools: this.verifiedAmmV4Pools,
+        confirmedOnChainIneligible: this.confirmedOnChainIneligible,
+        rpcProviderUnavailable: this.rpcProviderUnavailable,
+        rpcRetriesExhausted: this.rpcRetriesExhausted,
+        unreachedCandidatesDueToStopping: this.unreachedCandidatesDueToStopping,
+      };
+      this.runner.setDiscoveryFunnel(funnelMetrics);
+      this.logger.info("DISCOVERY_FUNNEL", JSON.stringify(funnelMetrics, null, 2));
+    }
 
     await this.runner.finalize(targetStatus);
 

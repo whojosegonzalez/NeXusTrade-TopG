@@ -78,11 +78,82 @@ export interface RaydiumPoolListParseResult {
   readonly validPoolsCount: number;
   readonly nonSolPoolsCount: number;
   readonly invalidAddressPoolsCount: number;
+  readonly validOpenTimeCount: number;
   readonly missingOpenTimeCount: number;
   readonly invalidOpenTimeCount: number;
   readonly futureDatedOpenTimeCount: number;
   readonly parseErrors: readonly string[];
   readonly hasNextPage: boolean;
+}
+
+/**
+ * Truthfully parses and validates openTime metadata from Raydium API records (D25-R1, D26-F2).
+ * Strictly preserves INVALID, MISSING, FUTURE_DATED, and VALID classifications.
+ * Never treats unknown/invalid age as fresh.
+ */
+export function parseRaydiumOpenTime(
+  openTimeRaw: string | number | null | undefined,
+  receiptEpochMs: number,
+): {
+  openTimeStatus: RaydiumOpenTimeStatus;
+  openTimeMs: number | null;
+  poolAgeAtDiscoverySec: number | null;
+} {
+  if (openTimeRaw === null || openTimeRaw === undefined) {
+    return { openTimeStatus: "MISSING", openTimeMs: null, poolAgeAtDiscoverySec: null };
+  }
+
+  if (typeof openTimeRaw === "number") {
+    if (!Number.isFinite(openTimeRaw) || openTimeRaw <= 0) {
+      return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
+    }
+    const parsedMs = openTimeRaw < 1e11 ? Math.round(openTimeRaw * 1000) : Math.round(openTimeRaw);
+    if (parsedMs > receiptEpochMs + 60_000) {
+      return { openTimeStatus: "FUTURE_DATED", openTimeMs: parsedMs, poolAgeAtDiscoverySec: null };
+    }
+    return {
+      openTimeStatus: "VALID",
+      openTimeMs: parsedMs,
+      poolAgeAtDiscoverySec: Math.max(0, Math.floor((receiptEpochMs - parsedMs) / 1000)),
+    };
+  }
+
+  if (typeof openTimeRaw === "string") {
+    const trimmed = openTimeRaw.trim();
+    if (trimmed === "" || trimmed === "null" || trimmed === "undefined") {
+      return { openTimeStatus: "MISSING", openTimeMs: null, poolAgeAtDiscoverySec: null };
+    }
+    if (trimmed === "0") {
+      return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
+    }
+
+    let parsedMs: number | null = null;
+    if (trimmed.includes("-") || trimmed.includes("T")) {
+      const parsedDate = Date.parse(trimmed);
+      if (Number.isFinite(parsedDate) && parsedDate > 0) {
+        parsedMs = parsedDate;
+      } else {
+        return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
+      }
+    } else {
+      const num = Number(trimmed);
+      if (!Number.isFinite(num) || num <= 0) {
+        return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
+      }
+      parsedMs = num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+    }
+
+    if (parsedMs > receiptEpochMs + 60_000) {
+      return { openTimeStatus: "FUTURE_DATED", openTimeMs: parsedMs, poolAgeAtDiscoverySec: null };
+    }
+    return {
+      openTimeStatus: "VALID",
+      openTimeMs: parsedMs,
+      poolAgeAtDiscoverySec: Math.max(0, Math.floor((receiptEpochMs - parsedMs) / 1000)),
+    };
+  }
+
+  return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
 }
 
 /**
@@ -98,6 +169,7 @@ export function parseRaydiumApiPoolListResponse(
   let totalPoolsInPayload = 0;
   let nonSolPoolsCount = 0;
   let invalidAddressPoolsCount = 0;
+  let validOpenTimeCount = 0;
   let missingOpenTimeCount = 0;
   let invalidOpenTimeCount = 0;
   let futureDatedOpenTimeCount = 0;
@@ -111,6 +183,7 @@ export function parseRaydiumApiPoolListResponse(
       validPoolsCount: 0,
       nonSolPoolsCount: 0,
       invalidAddressPoolsCount: 0,
+      validOpenTimeCount: 0,
       missingOpenTimeCount: 0,
       invalidOpenTimeCount: 0,
       futureDatedOpenTimeCount: 0,
@@ -131,6 +204,7 @@ export function parseRaydiumApiPoolListResponse(
       validPoolsCount: 0,
       nonSolPoolsCount: 0,
       invalidAddressPoolsCount: 0,
+      validOpenTimeCount: 0,
       missingOpenTimeCount: 0,
       invalidOpenTimeCount: 0,
       futureDatedOpenTimeCount: 0,
@@ -264,40 +338,22 @@ export function parseRaydiumApiPoolListResponse(
       vaultBAddress = item.vaultB.trim();
     }
 
-    // Parse openTime (D25-R1 / D25-R3)
+    // Parse openTime truthfully using parseRaydiumOpenTime (D25-R1 / D25-R3 / D26-F2)
     const openTimeRaw =
       typeof item.openTime === "string" || typeof item.openTime === "number" ? item.openTime : null;
-    let openTimeStatus: RaydiumOpenTimeStatus = "MISSING";
-    let openTimeMs: number | null = null;
-    let poolAgeAtDiscoverySec: number | null = null;
+    const { openTimeStatus, openTimeMs, poolAgeAtDiscoverySec } = parseRaydiumOpenTime(
+      openTimeRaw,
+      receiptEpochMs,
+    );
 
-    if (openTimeRaw === null || openTimeRaw === "") {
-      openTimeStatus = "MISSING";
+    if (openTimeStatus === "VALID") {
+      validOpenTimeCount++;
+    } else if (openTimeStatus === "MISSING") {
       missingOpenTimeCount++;
-    } else {
-      const parsedNum =
-        typeof openTimeRaw === "number"
-          ? openTimeRaw
-          : Number.parseFloat(String(openTimeRaw).trim());
-
-      if (!Number.isFinite(parsedNum) || parsedNum <= 0) {
-        openTimeStatus = "INVALID";
-        invalidOpenTimeCount++;
-      } else {
-        // Convert seconds to milliseconds if timestamp is in seconds (< 1e11)
-        const parsedMs = parsedNum < 1e11 ? Math.round(parsedNum * 1000) : Math.round(parsedNum);
-
-        // Allow 60 seconds tolerance for forward clock skew
-        if (parsedMs > receiptEpochMs + 60_000) {
-          openTimeStatus = "FUTURE_DATED";
-          openTimeMs = parsedMs;
-          futureDatedOpenTimeCount++;
-        } else {
-          openTimeStatus = "VALID";
-          openTimeMs = parsedMs;
-          poolAgeAtDiscoverySec = Math.max(0, Math.floor((receiptEpochMs - parsedMs) / 1000));
-        }
-      }
+    } else if (openTimeStatus === "INVALID") {
+      invalidOpenTimeCount++;
+    } else if (openTimeStatus === "FUTURE_DATED") {
+      futureDatedOpenTimeCount++;
     }
 
     // Extract price and liquidity metrics
@@ -379,6 +435,7 @@ export function parseRaydiumApiPoolListResponse(
     validPoolsCount: pools.length,
     nonSolPoolsCount,
     invalidAddressPoolsCount,
+    validOpenTimeCount,
     missingOpenTimeCount,
     invalidOpenTimeCount,
     futureDatedOpenTimeCount,
