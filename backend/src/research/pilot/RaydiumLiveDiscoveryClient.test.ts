@@ -39,6 +39,10 @@ const MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const POOL_SOL_USDC = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
 const POOL_BONK_SOL = "HV14AnPfqvEepqBgk6kX9zB1Z5tJp5j7kM8qQ9X4yZ2b";
 const POOL_BONK_SOL_2 = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+const RAYDIUM_CPMM_PROGRAM_ID = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+const RAYDIUM_CLMM_PROGRAM_ID = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const POOL_CPMM_SOL = "3sjNoCnkkhWPVXYGDtem8rCciHSGc9jSFZuUAzKbvRVp";
+const POOL_NON_SOL_AMM = "6UmmUiYoBjSrhakAobJw8BvkmJtDVxaeBtbt7rxWo1mg";
 
 describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () => {
   // --------------------------------------------------------------------------
@@ -165,7 +169,10 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(result.pools.length).toBe(1);
       expect(result.nonSolPoolsCount).toBe(1);
       expect(result.pools[0]!.orientation).toBe("NON_SOL_PAIR");
-      expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(false);
+      // D27-F2: Protocol classification is decoupled from WSOL orientation.
+      // Pool uses canonical AMM v4 programId, so isRaydiumStandardAmmCandidate is true,
+      // while orientation is truthfully recorded as NON_SOL_PAIR.
+      expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(true);
     });
 
     it("classifies missing openTime as MISSING status and null age", () => {
@@ -350,6 +357,145 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
       expect(result.ok).toBe(false);
       expect(result.parseErrors).toContain("Rate limited or internal error");
+    });
+
+    describe("D27-F2: Protocol Classification & Orientation Decoupling in Adapter", () => {
+      it("classifies canonical AMM v4 paired with WSOL as eligible AMM candidate", () => {
+        const payload = {
+          success: true,
+          data: {
+            data: [
+              {
+                type: "Standard",
+                programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                id: POOL_BONK_SOL,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                openTime: Math.floor((fixedNowMs - 3600 * 1000) / 1000),
+              },
+            ],
+          },
+        };
+        const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
+        expect(result.ok).toBe(true);
+        expect(result.pools[0]!.orientation).toBe("TOKEN_BASE_SOL_QUOTE");
+        expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(true);
+      });
+
+      it("classifies canonical AMM v4 without WSOL as AMM candidate but NON_SOL_PAIR", () => {
+        const payload = {
+          success: true,
+          data: {
+            data: [
+              {
+                type: "Standard",
+                programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                id: POOL_NON_SOL_AMM,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+                openTime: Math.floor((fixedNowMs - 3600 * 1000) / 1000),
+              },
+            ],
+          },
+        };
+        const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
+        expect(result.ok).toBe(true);
+        expect(result.pools[0]!.orientation).toBe("NON_SOL_PAIR");
+        expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(true);
+      });
+
+      it("rejects CPMM paired with WSOL even if labeled type='Standard'", () => {
+        const payload = {
+          success: true,
+          data: {
+            data: [
+              {
+                type: "Standard",
+                programId: RAYDIUM_CPMM_PROGRAM_ID,
+                id: POOL_CPMM_SOL,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                openTime: Math.floor((fixedNowMs - 3600 * 1000) / 1000),
+              },
+            ],
+          },
+        };
+        const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
+        expect(result.ok).toBe(true);
+        expect(result.pools[0]!.orientation).toBe("TOKEN_BASE_SOL_QUOTE");
+        expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(false);
+      });
+
+      it("rejects CPMM without WSOL as both non-candidate and NON_SOL_PAIR", () => {
+        const payload = {
+          success: true,
+          data: {
+            data: [
+              {
+                type: "Standard",
+                programId: RAYDIUM_CPMM_PROGRAM_ID,
+                id: POOL_CPMM_SOL,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+                openTime: Math.floor((fixedNowMs - 3600 * 1000) / 1000),
+              },
+            ],
+          },
+        };
+        const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
+        expect(result.ok).toBe(true);
+        expect(result.pools[0]!.orientation).toBe("NON_SOL_PAIR");
+        expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(false);
+      });
+
+      it("rejects missing or conflicting protocol metadata", () => {
+        const payload = {
+          success: true,
+          data: {
+            data: [
+              // Missing programId
+              {
+                type: "Standard",
+                programId: null,
+                id: POOL_BONK_SOL,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+              },
+              // Conflicting type (CLMM with AMM v4 programId)
+              {
+                type: "Concentrated",
+                programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                id: POOL_BONK_SOL_2,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+              },
+              // Conflicting type (CPMM with AMM v4 programId)
+              {
+                type: "CPMM",
+                programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                id: POOL_CPMM_SOL,
+                mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+                mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+              },
+              // Unsupported non-AMM programId (e.g. CLMM)
+              {
+                type: "Standard",
+                programId: RAYDIUM_CLMM_PROGRAM_ID,
+                id: POOL_SOL_USDC,
+                mintA: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+              },
+            ],
+          },
+        };
+        const result = parseRaydiumApiPoolListResponse(payload, fixedNowMs);
+        expect(result.ok).toBe(true);
+        expect(result.pools.length).toBe(4);
+        expect(result.pools[0]!.isRaydiumStandardAmmCandidate).toBe(false);
+        expect(result.pools[1]!.isRaydiumStandardAmmCandidate).toBe(false);
+        expect(result.pools[2]!.isRaydiumStandardAmmCandidate).toBe(false);
+        expect(result.pools[3]!.isRaydiumStandardAmmCandidate).toBe(false);
+      });
     });
   });
 
@@ -1409,6 +1555,125 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(diag.malformedRawEntriesCount).toBe(funnel.malformedRawEntries);
       expect(diag.seenPoolIdsCount).toBe(funnel.uniquePoolsEncountered);
       expect(diag.repeatedPoolsSuppressed).toBe(funnel.repeatedPoolsSuppressed);
+    });
+
+    it("D27-F2: accurately screens and accounts for decoupled protocol and orientation combinations", async () => {
+      const now = Date.now();
+      const payload = {
+        success: true,
+        data: {
+          data: [
+            // 1. Canonical AMM v4 paired with WSOL -> Eligible
+            {
+              type: "Standard",
+              programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+              id: POOL_BONK_SOL,
+              mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+              mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+              openTime: Math.floor((now - 300 * 1000) / 1000), // 300s ago
+            },
+            // 2. Canonical AMM v4 without WSOL -> Fails WSOL_PAIR_ORIENTATION, passes RAYDIUM_STANDARD_AMM
+            {
+              type: "Standard",
+              programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+              id: POOL_NON_SOL_AMM,
+              mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+              mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+              openTime: Math.floor((now - 300 * 1000) / 1000),
+            },
+            // 3. CPMM paired with WSOL (labeled 'Standard') -> Passes WSOL_PAIR_ORIENTATION, fails RAYDIUM_STANDARD_AMM
+            {
+              type: "Standard",
+              programId: RAYDIUM_CPMM_PROGRAM_ID,
+              id: POOL_CPMM_SOL,
+              mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+              mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+              openTime: Math.floor((now - 300 * 1000) / 1000),
+            },
+            // 4. CPMM without WSOL -> Fails BOTH WSOL_PAIR_ORIENTATION and RAYDIUM_STANDARD_AMM (multifactor)
+            {
+              type: "Standard",
+              programId: RAYDIUM_CPMM_PROGRAM_ID,
+              id: "6FhywW1XG9F425kspxYxRkX4oV2y5mPj3bK1tG9mN4qZ",
+              mintA: { address: MINT_BONK, symbol: "Bonk", decimals: 5 },
+              mintB: { address: MINT_USDC, symbol: "USDC", decimals: 6 },
+              openTime: Math.floor((now - 300 * 1000) / 1000),
+            },
+          ],
+        },
+      };
+
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () =>
+          ({
+            status: 200,
+            ok: true,
+            json: async () => payload,
+          }) as unknown as Response,
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        maxPoolAgeSec: 86400,
+        minRequestIntervalMs: 0,
+      });
+
+      const results = await client.pollDiscoveredCandidates({
+        sessionId: "s-d27-test",
+        generationId: "g-d27-test",
+      });
+
+      expect(results.length).toBe(4);
+
+      // Candidate 1: Canonical AMM v4 paired with WSOL -> WATCHLIST_RADAR
+      const c1 = results[0]!.candidate;
+      expect(c1.decisionCohort).toBe("WATCHLIST_RADAR");
+      expect(c1.passedEligibility).toBe(true);
+      expect(c1.rejectionReasons).toHaveLength(0);
+
+      // Candidate 2: Canonical AMM v4 without WSOL -> FILTERED_REJECTED
+      const c2 = results[1]!.candidate;
+      expect(c2.decisionCohort).toBe("FILTERED_REJECTED");
+      expect(c2.passedEligibility).toBe(false);
+      expect(c2.rejectionReasons).toEqual(["NON_SOL_PAIR"]);
+      const ammEvalC2 = c2.filterEvaluations.find((f) => f.filterName === "RAYDIUM_STANDARD_AMM");
+      expect(ammEvalC2?.passed).toBe(true);
+      const orientEvalC2 = c2.filterEvaluations.find(
+        (f) => f.filterName === "WSOL_PAIR_ORIENTATION",
+      );
+      expect(orientEvalC2?.passed).toBe(false);
+
+      // Candidate 3: CPMM paired with WSOL -> FILTERED_REJECTED
+      const c3 = results[2]!.candidate;
+      expect(c3.decisionCohort).toBe("FILTERED_REJECTED");
+      expect(c3.passedEligibility).toBe(false);
+      expect(c3.rejectionReasons).toEqual(["NON_RAYDIUM_STANDARD_AMM"]);
+      const ammEvalC3 = c3.filterEvaluations.find((f) => f.filterName === "RAYDIUM_STANDARD_AMM");
+      expect(ammEvalC3?.passed).toBe(false);
+      const orientEvalC3 = c3.filterEvaluations.find(
+        (f) => f.filterName === "WSOL_PAIR_ORIENTATION",
+      );
+      expect(orientEvalC3?.passed).toBe(true);
+
+      // Candidate 4: CPMM without WSOL -> FILTERED_REJECTED with multifactor rejection reasons
+      const c4 = results[3]!.candidate;
+      expect(c4.decisionCohort).toBe("FILTERED_REJECTED");
+      expect(c4.passedEligibility).toBe(false);
+      expect(c4.rejectionReasons).toEqual(["NON_SOL_PAIR", "NON_RAYDIUM_STANDARD_AMM"]);
+      const ammEvalC4 = c4.filterEvaluations.find((f) => f.filterName === "RAYDIUM_STANDARD_AMM");
+      expect(ammEvalC4?.passed).toBe(false);
+      const orientEvalC4 = c4.filterEvaluations.find(
+        (f) => f.filterName === "WSOL_PAIR_ORIENTATION",
+      );
+      expect(orientEvalC4?.passed).toBe(false);
+
+      // Funnel metrics inspection
+      const funnel = client.getFunnelMetrics();
+      expect(funnel.uniquePoolsEncountered).toBe(4);
+      expect(funnel.eligibleForVerification).toBe(1);
+      expect(funnel.preVerificationExclusions.totalPreVerificationExcluded).toBe(3);
+      expect(funnel.preVerificationExclusions.nonSolPairs).toBe(2); // Candidates 2 & 4
+      expect(funnel.preVerificationExclusions.nonStandardAmm).toBe(2); // Candidates 3 & 4
     });
   });
 });

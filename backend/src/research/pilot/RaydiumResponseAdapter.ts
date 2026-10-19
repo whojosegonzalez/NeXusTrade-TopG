@@ -391,15 +391,12 @@ export function parseRaydiumApiPoolListResponse(
       "sells5m",
     ];
 
-    // Identify eligible Raydium standard AMM v4 candidate
-    const typeLower = poolType.toLowerCase();
-    const isStandard =
-      typeLower === "standard" ||
-      programId === RAYDIUM_AMM_V4_PROGRAM_ID ||
-      typeLower.includes("amm");
-    const isClmmOrCpmm = /clmm|cpmm|concentrated/i.test(typeLower);
-    const isRaydiumStandardAmmCandidate =
-      orientation !== "NON_SOL_PAIR" && isStandard && !isClmmOrCpmm;
+    // Identify eligible Raydium standard AMM v4 candidate (D27-F2)
+    // Decouple protocol-family classification from WSOL orientation.
+    // Require exact canonical program-ID equality, and reject any conflicting
+    // non-AMM protocol indicators (e.g. CLMM, CPMM, Concentrated, PumpSwap).
+    const isClmmOrCpmm = /clmm|cpmm|concentrated|pumpswap/i.test(poolType);
+    const isRaydiumStandardAmmCandidate = programId === RAYDIUM_AMM_V4_PROGRAM_ID && !isClmmOrCpmm;
 
     pools.push({
       poolId,

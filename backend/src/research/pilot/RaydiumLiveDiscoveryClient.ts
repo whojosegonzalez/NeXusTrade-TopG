@@ -430,7 +430,7 @@ export class RaydiumLiveDiscoveryClient {
         rejectionReasons.push("NON_SOL_PAIR");
       }
 
-      // 2. Standard AMM v4 Classification Check
+      // 2. Standard AMM v4 Classification Check (D27-F2)
       const ammPassed = pool.isRaydiumStandardAmmCandidate;
       filterEvaluations.push({
         filterName: "RAYDIUM_STANDARD_AMM",
@@ -443,9 +443,7 @@ export class RaydiumLiveDiscoveryClient {
       });
       if (!ammPassed) {
         this.nonStandardAmmCount++;
-        if (orientationPassed) {
-          rejectionReasons.push("NON_RAYDIUM_STANDARD_AMM");
-        }
+        rejectionReasons.push("NON_RAYDIUM_STANDARD_AMM");
       }
 
       // 3. Pool Age Freshness Evaluation (D25-R1 / D25-R2 / D26-F2 / G2-F1 / G2-F3)
