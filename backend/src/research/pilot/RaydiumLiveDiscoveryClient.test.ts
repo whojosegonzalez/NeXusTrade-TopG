@@ -268,6 +268,50 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(result.pools[0]!.poolAgeAtDiscoverySec).toBe(7200);
     });
 
+    it("G2-F4: strictly rejects negative openTime strings and non-canonical formats", () => {
+      // Node.js Date.parse("-1") historically evaluated to 978336000000 (year 2001)
+      const resNeg1 = parseRaydiumOpenTime("-1", fixedNowMs);
+      expect(resNeg1.openTimeStatus).toBe("INVALID");
+      expect(resNeg1.openTimeMs).toBeNull();
+
+      const resNeg100 = parseRaydiumOpenTime("-100", fixedNowMs);
+      expect(resNeg100.openTimeStatus).toBe("INVALID");
+      expect(resNeg100.openTimeMs).toBeNull();
+
+      const resZero = parseRaydiumOpenTime("0", fixedNowMs);
+      expect(resZero.openTimeStatus).toBe("INVALID");
+      expect(resZero.openTimeMs).toBeNull();
+
+      const resEmpty = parseRaydiumOpenTime("", fixedNowMs);
+      expect(resEmpty.openTimeStatus).toBe("MISSING");
+
+      const resSpaces = parseRaydiumOpenTime("   ", fixedNowMs);
+      expect(resSpaces.openTimeStatus).toBe("MISSING");
+
+      const resNull = parseRaydiumOpenTime("null", fixedNowMs);
+      expect(resNull.openTimeStatus).toBe("MISSING");
+
+      const resUndefined = parseRaydiumOpenTime("undefined", fixedNowMs);
+      expect(resUndefined.openTimeStatus).toBe("MISSING");
+
+      const resRawNull = parseRaydiumOpenTime(null, fixedNowMs);
+      expect(resRawNull.openTimeStatus).toBe("MISSING");
+
+      // Valid ISO-8601 string
+      const isoStr = "2026-01-15T10:00:00.000Z";
+      const expectedIsoMs = Date.parse(isoStr);
+      const resIso = parseRaydiumOpenTime(isoStr, fixedNowMs);
+      expect(resIso.openTimeStatus).toBe("VALID");
+      expect(resIso.openTimeMs).toBe(expectedIsoMs);
+
+      // Valid Unix timestamp string (seconds)
+      const unixSecStr = "1792296400"; // 3600s before fixedNowMs
+      const resSec = parseRaydiumOpenTime(unixSecStr, fixedNowMs);
+      expect(resSec.openTimeStatus).toBe("VALID");
+      expect(resSec.openTimeMs).toBe(1792296400000);
+      expect(resSec.poolAgeAtDiscoverySec).toBe(3600);
+    });
+
     it("rejects invalid base58 addresses cleanly without crashing", () => {
       const payload = {
         success: true,
@@ -852,6 +896,145 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(funnel.poolAgeClassifications.confirmedAgeFilterPasses).toBe(1);
       expect(funnel.poolAgeClassifications.ageFilterExclusions).toBe(2);
       expect(funnel.preVerificationExclusions.totalPreVerificationExcluded).toBe(2);
+    });
+
+    it("G2-F1: verifies discovery funnel denominator consistency across 3 repeated catalog polls", async () => {
+      // Helper to generate valid 38-character base58 pool IDs using strictly base58 characters
+      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+      const makePoolId = (idx: number) =>
+        "11111111111111111111111111111111AAAA" +
+        B58[Math.floor(idx / B58.length)]! +
+        B58[idx % B58.length]!;
+
+      // Construct 50 standard AMM v4 pools
+      const basePools = Array.from({ length: 50 }, (_, i) => ({
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(i + 1),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - (i % 2 === 0 ? 100 : 7200) * 1000) / 1000)),
+      }));
+
+      // Poll 1: 50 pools (initial snapshot)
+      // Poll 2: identical 50 pools
+      // Poll 3: identical 50 pools + 1 brand new pool (total 51 pools)
+      const newPool = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(999),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 50 * 1000) / 1000)),
+      };
+
+      let pollCount = 0;
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () => {
+          pollCount++;
+          let data = basePools;
+          if (pollCount === 3) {
+            data = [...basePools, newPool];
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: data.length,
+                data,
+              },
+            }),
+          } as unknown as Response;
+        },
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+        pollIntervalMs: 0,
+        maxPoolAgeSec: 3600, // 1 hour threshold: even idx pools are fresh (100s), odd idx are mature (7200s)
+      });
+
+      // Poll 1: initial baseline catalog snapshot
+      const results1 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-g2-f1",
+        generationId: "gen",
+      });
+      expect(results1.length).toBe(50);
+      expect(results1[0]!.candidate.discoveryPollCycle).toBe(1);
+      expect(results1[0]!.candidate.isInitialCatalogSnapshot).toBe(true);
+
+      // Poll 2: identical 50 pools -> all suppressed as duplicates
+      const results2 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-g2-f1",
+        generationId: "gen",
+      });
+      expect(results2.length).toBe(0);
+
+      // Poll 3: 50 duplicates + 1 new pool -> only the 1 new pool emitted
+      const results3 = await client.pollDiscoveredCandidates({
+        sessionId: "sess-g2-f1",
+        generationId: "gen",
+      });
+      expect(results3.length).toBe(1);
+      expect(results3[0]!.candidate.discoveryPollCycle).toBe(3);
+      expect(results3[0]!.candidate.isInitialCatalogSnapshot).toBe(false);
+      expect(results3[0]!.poolSummary.poolId).toBe(makePoolId(999));
+
+      // Funnel metrics inspection and invariant verification (G2-F1)
+      const funnel = client.getFunnelMetrics();
+
+      // 1. Raw response impressions vs unique deduplication
+      expect(funnel.apiPoolsReturned).toBe(151); // 50 + 50 + 51
+      expect(funnel.uniquePoolsEncountered).toBe(51);
+      expect(funnel.repeatedPoolsSuppressed).toBe(100);
+      expect(funnel.uniquePoolsEncountered + funnel.repeatedPoolsSuppressed).toBe(
+        funnel.apiPoolsReturned,
+      );
+
+      // 2. Snapshot vs later poll arrivals
+      expect(funnel.initialSnapshotPoolsEncountered).toBe(50);
+      expect(funnel.laterPollArrivalsEncountered).toBe(1);
+      expect(funnel.initialSnapshotPoolsEncountered + funnel.laterPollArrivalsEncountered).toBe(
+        funnel.uniquePoolsEncountered,
+      );
+
+      // 3. Unique age classifications sum to uniquePoolsEncountered
+      const ageClass = funnel.poolAgeClassifications;
+      expect(ageClass.validAgeCount).toBe(51);
+      expect(ageClass.missingAgeCount).toBe(0);
+      expect(ageClass.invalidAgeCount).toBe(0);
+      expect(ageClass.futureDatedAgeCount).toBe(0);
+      expect(
+        ageClass.validAgeCount +
+          ageClass.missingAgeCount +
+          ageClass.invalidAgeCount +
+          ageClass.futureDatedAgeCount,
+      ).toBe(funnel.uniquePoolsEncountered);
+
+      // 4. Age filter passes and exclusions sum to uniquePoolsEncountered
+      // 50 base pools: 25 even (100s <= 3600s: pass), 25 odd (7200s > 3600s: fail). 1 new pool: 50s <= 3600s: pass.
+      // Total passes: 25 + 1 = 26. Total age exclusions: 25.
+      expect(ageClass.confirmedAgeFilterPasses).toBe(26);
+      expect(ageClass.initialSnapshotFreshPasses).toBe(25);
+      expect(ageClass.laterPollFreshArrivals).toBe(1);
+      expect(ageClass.initialSnapshotFreshPasses + ageClass.laterPollFreshArrivals).toBe(
+        ageClass.confirmedAgeFilterPasses,
+      );
+      expect(ageClass.ageFilterExclusions).toBe(25);
+      expect(ageClass.confirmedAgeFilterPasses + ageClass.ageFilterExclusions).toBe(
+        funnel.uniquePoolsEncountered,
+      );
+
+      // 5. Eligible vs pre-verification excluded sum to uniquePoolsEncountered
+      expect(funnel.eligibleForVerification).toBe(26);
+      expect(funnel.preVerificationExclusions.totalPreVerificationExcluded).toBe(25);
+      expect(
+        funnel.eligibleForVerification +
+          funnel.preVerificationExclusions.totalPreVerificationExcluded,
+      ).toBe(funnel.uniquePoolsEncountered);
     });
   });
 });

@@ -674,6 +674,8 @@ export class PilotCollectorRunner {
           candidate.discoverySortField ??
           (candidate.discoverySource === "raydium" ? "default" : "latest"),
         requestPageSize: candidate.discoverySource === "raydium" ? 50 : 30,
+        discoveryPollCycle: candidate.discoveryPollCycle ?? undefined,
+        isInitialCatalogSnapshot: candidate.isInitialCatalogSnapshot ?? undefined,
       };
       diagLine = JSON.stringify(diagRecord) + "\n";
 

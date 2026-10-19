@@ -181,6 +181,8 @@ export interface D23ScreenedCandidate {
   readonly discoveryEndpoint?: string | undefined;
   readonly discoveryPage?: number | undefined;
   readonly discoverySortField?: string | undefined;
+  readonly discoveryPollCycle?: number | undefined;
+  readonly isInitialCatalogSnapshot?: boolean | undefined;
   readonly passedEligibility: boolean;
   readonly filterEvaluations: readonly {
     readonly filterName: string;
@@ -216,6 +218,8 @@ export interface DiscoveryDiagnosticRecord {
   readonly requestPage: number;
   readonly requestSortField: string;
   readonly requestPageSize: number;
+  readonly discoveryPollCycle?: number | undefined;
+  readonly isInitialCatalogSnapshot?: boolean | undefined;
 }
 
 /**

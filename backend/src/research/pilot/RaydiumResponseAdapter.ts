@@ -123,12 +123,21 @@ export function parseRaydiumOpenTime(
     if (trimmed === "" || trimmed === "null" || trimmed === "undefined") {
       return { openTimeStatus: "MISSING", openTimeMs: null, poolAgeAtDiscoverySec: null };
     }
-    if (trimmed === "0") {
+    // Explicitly reject negative numeric strings, zero sentinels, and non-canonical prefixes (G2-F4)
+    if (trimmed.startsWith("-") || trimmed === "0") {
       return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
     }
 
     let parsedMs: number | null = null;
-    if (trimmed.includes("-") || trimmed.includes("T")) {
+    if (/^\d+$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (!Number.isFinite(num) || num <= 0) {
+        return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
+      }
+      parsedMs = num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+    } else if (
+      /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(trimmed)
+    ) {
       const parsedDate = Date.parse(trimmed);
       if (Number.isFinite(parsedDate) && parsedDate > 0) {
         parsedMs = parsedDate;
@@ -136,11 +145,8 @@ export function parseRaydiumOpenTime(
         return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
       }
     } else {
-      const num = Number(trimmed);
-      if (!Number.isFinite(num) || num <= 0) {
-        return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
-      }
-      parsedMs = num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+      // Unrecognized or malformed format
+      return { openTimeStatus: "INVALID", openTimeMs: null, poolAgeAtDiscoverySec: null };
     }
 
     if (parsedMs > receiptEpochMs + 60_000) {

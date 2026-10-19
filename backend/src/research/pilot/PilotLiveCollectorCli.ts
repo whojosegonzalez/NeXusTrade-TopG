@@ -314,7 +314,7 @@ Options:
       durationSec = parsePositiveInt("--duration-sec", arg.slice("--duration-sec=".length));
     } else if (arg.startsWith("--target-candidates=")) {
       explicitTargetCandidates = true;
-      targetCandidates = parsePositiveInt(
+      targetCandidates = parseNonNegativeInt(
         "--target-candidates",
         arg.slice("--target-candidates=".length),
       );
@@ -326,19 +326,19 @@ Options:
       );
     } else if (arg.startsWith("--target-yield=")) {
       explicitTargetYield = true;
-      targetDiagnosticYield = parsePositiveInt(
+      targetDiagnosticYield = parseNonNegativeInt(
         "--target-yield",
         arg.slice("--target-yield=".length),
       );
     } else if (arg.startsWith("--target-diagnostic-yield=")) {
       explicitTargetYield = true;
-      targetDiagnosticYield = parsePositiveInt(
+      targetDiagnosticYield = parseNonNegativeInt(
         "--target-diagnostic-yield",
         arg.slice("--target-diagnostic-yield=".length),
       );
     } else if (arg.startsWith("--target-verified-candidates=")) {
       explicitTargetYield = true;
-      targetDiagnosticYield = parsePositiveInt(
+      targetDiagnosticYield = parseNonNegativeInt(
         "--target-verified-candidates",
         arg.slice("--target-verified-candidates=".length),
       );
@@ -746,8 +746,11 @@ export class PilotLiveCollectorSession {
         await this.processDeferredVerifications(now);
 
         // 2. Candidate target checks
-        // A. Desired verified WATCHLIST_RADAR yield reached
-        if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
+        // A. Desired verified WATCHLIST_RADAR yield reached (disabled when targetDiagnosticYield === 0)
+        if (
+          this.config.targetDiagnosticYield > 0 &&
+          this.runner.getStats().radar >= this.config.targetDiagnosticYield
+        ) {
           this.stopReason = "TARGET_YIELD_REACHED";
           this.logger.info(
             "STOPPING",
@@ -967,8 +970,11 @@ export class PilotLiveCollectorSession {
             }
           }
 
-          // Check if candidate targets reached during candidate loop
-          if (this.runner.getStats().radar >= this.config.targetDiagnosticYield) {
+          // Check if candidate targets reached during candidate loop (disabled when targetDiagnosticYield === 0)
+          if (
+            this.config.targetDiagnosticYield > 0 &&
+            this.runner.getStats().radar >= this.config.targetDiagnosticYield
+          ) {
             this.stopReason = "TARGET_YIELD_REACHED";
             this.isRunning = false;
             const unreachedInBatch = discovered.length - 1 - itemIndex;
@@ -1096,8 +1102,11 @@ export class PilotLiveCollectorSession {
         apiPoolsReturned: raydiumFunnel.apiPoolsReturned,
         uniquePoolsEncountered: raydiumFunnel.uniquePoolsEncountered,
         repeatedPoolsSuppressed: raydiumFunnel.repeatedPoolsSuppressed,
+        initialSnapshotPoolsEncountered: raydiumFunnel.initialSnapshotPoolsEncountered,
+        laterPollArrivalsEncountered: raydiumFunnel.laterPollArrivalsEncountered,
         preVerificationExclusions: raydiumFunnel.preVerificationExclusions,
         poolAgeClassifications: raydiumFunnel.poolAgeClassifications,
+        eligibleForVerification: raydiumFunnel.eligibleForVerification,
         verificationAttempts: this.verificationAttempts,
         verifiedAmmV4Pools: this.verifiedAmmV4Pools,
         confirmedOnChainIneligible: this.confirmedOnChainIneligible,

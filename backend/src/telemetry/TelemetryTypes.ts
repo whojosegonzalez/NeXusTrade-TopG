@@ -53,6 +53,8 @@ export interface CandidateDecisionRecord {
   readonly discoveryEndpoint?: string | undefined;
   readonly discoveryPage?: number | undefined;
   readonly discoverySortField?: string | undefined;
+  readonly discoveryPollCycle?: number | undefined;
+  readonly isInitialCatalogSnapshot?: boolean | undefined;
   readonly strategyRevision: string;
   readonly decisionCohort: DecisionCohort;
   readonly primaryRejectionReason?: string | undefined;
@@ -239,9 +241,17 @@ export interface SessionTelemetrySummary {
 }
 
 export interface DiscoveryFunnelMetrics {
+  /** Total raw pool entries returned across all API responses (impressions). */
   readonly apiPoolsReturned: number;
+  /** Total count of distinct pool IDs discovered (uniquePoolsEncountered + repeatedPoolsSuppressed === apiPoolsReturned). */
   readonly uniquePoolsEncountered: number;
+  /** Count of duplicate pool entries suppressed across subsequent polls/pages. */
   readonly repeatedPoolsSuppressed: number;
+  /** Count of unique pool IDs discovered in the initial baseline catalog poll (poll 1). */
+  readonly initialSnapshotPoolsEncountered: number;
+  /** Count of previously unseen unique pool IDs appearing on subsequent polls (poll 2+). */
+  readonly laterPollArrivalsEncountered: number;
+  /** Unique pools failing pre-verification checks (denominator: uniquePoolsEncountered). */
   readonly preVerificationExclusions: {
     readonly nonSolPairs: number;
     readonly nonStandardAmm: number;
@@ -249,21 +259,37 @@ export interface DiscoveryFunnelMetrics {
     readonly invalidOpenTime: number;
     readonly futureDatedOpenTime: number;
     readonly exceedsMaxPoolAge: number;
+    /** Distinct unique pools excluded. Note: sum of subcategories may exceed this due to overlapping defects. */
     readonly totalPreVerificationExcluded: number;
   };
+  /** Unique pools classified by API-reported opening time status (denominator: uniquePoolsEncountered). */
   readonly poolAgeClassifications: {
     readonly validAgeCount: number;
     readonly missingAgeCount: number;
     readonly invalidAgeCount: number;
     readonly futureDatedAgeCount: number;
+    /** Unique pools whose API-reported age satisfied the age filter threshold. */
     readonly confirmedAgeFilterPasses: number;
+    /** API-reported fresh pools present in the initial baseline snapshot (poll 1). */
+    readonly initialSnapshotFreshPasses: number;
+    /** API-reported fresh pools arriving on subsequent polls (poll 2+). */
+    readonly laterPollFreshArrivals: number;
+    /** Unique pools excluded due to missing, invalid, future-dated, or mature age. */
     readonly ageFilterExclusions: number;
   };
+  /** Unique pools that passed all pre-verification filters and were queued for on-chain verification. */
+  readonly eligibleForVerification: number;
+  /** On-chain Solana RPC verification calls attempted. */
   readonly verificationAttempts: number;
+  /** Unique pools independently confirmed on-chain as canonical Raydium AMM v4 (WATCHLIST_RADAR). */
   readonly verifiedAmmV4Pools: number;
+  /** Pools confirmed ineligible by on-chain state (unauthorized program, null account, etc.). */
   readonly confirmedOnChainIneligible: number;
+  /** Transient Solana RPC provider failures (HTTP 429, timeout, network error). */
   readonly rpcProviderUnavailable: number;
+  /** Candidates whose RPC verification retries were exhausted without on-chain confirmation. */
   readonly rpcRetriesExhausted: number;
+  /** Screened candidates left unreached due to early stopping conditions. */
   readonly unreachedCandidatesDueToStopping: number;
 }
 

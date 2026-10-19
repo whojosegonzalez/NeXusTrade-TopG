@@ -133,6 +133,12 @@ export function toCanonicalCandidateDecision(
     ...(candidate.discoverySortField !== undefined
       ? { discoverySortField: candidate.discoverySortField }
       : {}),
+    ...(candidate.discoveryPollCycle !== undefined
+      ? { discoveryPollCycle: candidate.discoveryPollCycle }
+      : {}),
+    ...(candidate.isInitialCatalogSnapshot !== undefined
+      ? { isInitialCatalogSnapshot: candidate.isInitialCatalogSnapshot }
+      : {}),
     strategyRevision: D23_STRATEGY_REVISION,
     decisionCohort: candidate.decisionCohort,
     ...(candidate.rejectionReasons.length > 0

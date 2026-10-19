@@ -1,10 +1,11 @@
 # NeXusTrade — Phase 12.94-D.2.6: Gate 2 Fresh-Pool Feasibility Runbook
 
-**Document Revision:** 1.0.0  
-**Phase:** Phase 12.94-D.2.6  
-**Scope:** Prospective Fresh-Pool Discovery Feasibility, Funnel Telemetry & On-Chain AMM v4 Verification  
-**Target Environment:** Windows 11 Quantitative Research Station (PowerShell) & Linux / Fedora 44  
+**Document Revision:** 2.0.0 (Post-G2 Review Corrections)
+**Phase:** Phase 12.94-D.2.6
+**Scope:** Prospective Fresh-Pool Discovery Feasibility, Funnel Telemetry & On-Chain AMM v4 Verification
+**Target Environment:** Windows 11 Quantitative Research Station (PowerShell) & Linux / Fedora 44
 **Classification:** Research Telemetry & Experimental Evaluation Protocol
+**Progression Rule:** Strictly Gated. No automatic progression to Milestone D.2.7.
 
 ---
 
@@ -38,68 +39,80 @@ The D.2.6 Gate 2 experiment operates under strict, fail-closed research guardrai
 
 5. **Resource Bounding & Clean Shutdown:**
    - Maximum process RSS memory ceiling: **256 MB** (`--max-rss-mb=256`).
+   - Storage ceiling: **256 MB** (`--max-mb=256`).
    - Clean shutdown handler with libuv event loop draining, ensuring exit code 0 on Windows without assertion failures.
 
 ---
 
-## 2. Gate 2 Experimental Objectives & Hypothesis
+## 2. Gate 2 Experimental Objectives & Hypotheses
 
 ### Primary Research Objective
 
-Empirically measure whether Raydium API v3's volume-ranked standard catalog (`poolType=standard&poolSortField=default&sortType=desc`) can surface genuinely fresh Raydium AMM v4 liquidity pools within a bounded 10–15 minute observational window under an active pool age threshold.
+Empirically measure whether Raydium API v3's volume-ranked standard catalog (`poolType=standard&poolSortField=default&sortType=desc`) can surface fresh Raydium AMM v4 liquidity pools within a fixed 10-minute observational window under an active pool age threshold.
 
-### Hypothesis Under Evaluation
+### Preregistered Hypotheses
 
 Because the standard Raydium catalog endpoint sorts by 24-hour volume by default and does not expose a chronological creation-time index, top-ranked pools represent mature, high-liquidity pools.
 
-- **Hypothesis A (Fresh Arrival):** New high-volume pools (e.g. viral meme tokens) enter the top-50 catalog within 10–15 minutes and pass the freshness filter (`poolAgeAtDiscoverySec <= maxPoolAgeSec`).
-- **Hypothesis B (Catalog Saturation / Stasis):** Top-50 catalog remains composed entirely of mature pools (`poolAgeAtDiscoverySec > maxPoolAgeSec`) or unindexed pools (`openTime = "0"`).
+- **Hypothesis A (Fresh Arrival):** High-volume pools initialized within the active age window enter the top-50 catalog and pass the freshness filter (`poolAgeAtDiscoverySec <= maxPoolAgeSec`).
+- **Hypothesis B (Catalog Saturation / Stasis):** Top-50 catalog remains composed entirely of mature pools (`poolAgeAtDiscoverySec > maxPoolAgeSec`) or unindexed pools (`openTime = "0"`), yielding 0 fresh pools during the fixed observation window.
 
-**Crucial Research Principle:** Both outcomes are scientifically valuable. Hypothesis B is not an engineering failure; it provides authoritative empirical proof of the catalog's arrival horizon and justifies subsequent event-driven discovery mechanisms (e.g. WebSocket log subscriptions) without compromising research integrity.
+**Scientific Principle:** Both outcomes are scientifically conclusive. Hypothesis B is not an engineering failure; it provides authoritative empirical proof of the catalog's arrival horizon and justifies subsequent event-driven discovery mechanisms (e.g. WebSocket log subscriptions) without compromising research integrity.
 
 ---
 
-## 3. Experimental Parameters & Funnel Accounting
+## 3. Preregistered Parameters & Funnel Accounting
 
-### Recommended Gate 2 Configuration
+### Preregistered Primary Configuration (24h Age Threshold)
+
+To balance freshness with empirical feasibility, **24 hours (`--max-pool-age-sec=86400`) is preregistered as the primary experimental threshold**.
 
 - **Discovery Source:** `raydium`
-- **Session Duration:** 600–900 seconds (10–15 minutes)
-- **Polling Interval:** 15–30 seconds
-- **Age Threshold (`--max-pool-age-sec`):**
-  - **Option 1 (Aggressive Freshness):** `3600` (pools created within the last 1 hour)
-  - **Option 2 (Moderate Freshness):** `86400` (pools created within the last 24 hours)
-- **Target Diagnostic Yield (`--target-yield`):** 1–5 verified pools
-- **Screening Ceiling (`--max-candidates-screened`):** 500 candidates
+- **Session Duration:** 600 seconds (10 minutes fixed duration)
+- **Target Yield:** `0` (`--target-yield=0`, disables target-yield early exit to guarantee full 10-minute observation)
+- **Forward Observations:** `false` (`--forward-observations=false`, explicitly disabled for discovery feasibility)
+- **Polling Interval:** 20 seconds (`--poll-interval-sec=20`)
+- **Inter-Request Spacing:** 2000 ms (`--min-request-interval-ms=2000`)
+- **Primary Age Threshold:** 86,400 seconds (`--max-pool-age-sec=86400`, 24 hours)
+- **Safety Screening Ceiling:** 500 candidates (`--max-candidates-screened=500`)
+- **Memory Ceiling:** 256 MB (`--max-rss-mb=256`)
+- **Disk Ceiling:** 256 MB (`--max-mb=256`)
 
-### End-to-End Funnel Metrics (D26-F3)
+_(Optional Sensitivity Analysis: A subsequent 1-hour run with `--max-pool-age-sec=3600` may be executed as a sensitivity analysis, but the 24-hour run is the preregistered primary benchmark)._
 
-All sampling stages are tracked and persisted in `session-summary.json` under `discoveryFunnel`:
+### End-to-End Funnel Metrics (G2-F1 / G2-F3)
+
+All sampling stages are tracked and persisted in `session-summary.json` under `discoveryFunnel` with strict mathematical accounting:
 
 ```json
 {
-  "apiPoolsReturned": 150,
+  "apiPoolsReturned": 1500,
   "uniquePoolsEncountered": 50,
-  "repeatedPoolsSuppressed": 100,
+  "repeatedPoolsSuppressed": 1450,
+  "initialSnapshotPoolsEncountered": 50,
+  "laterPollArrivalsEncountered": 0,
   "preVerificationExclusions": {
     "nonSolPairs": 2,
     "nonStandardAmm": 0,
-    "missingOpenTime": 1,
-    "invalidOpenTime": 5,
+    "missingOpenTime": 0,
+    "invalidOpenTime": 0,
     "futureDatedOpenTime": 0,
-    "exceedsMaxPoolAge": 42,
+    "exceedsMaxPoolAge": 48,
     "totalPreVerificationExcluded": 50
   },
   "poolAgeClassifications": {
-    "validAgeCount": 44,
-    "missingAgeCount": 1,
-    "invalidAgeCount": 5,
+    "validAgeCount": 50,
+    "missingAgeCount": 0,
+    "invalidAgeCount": 0,
     "futureDatedAgeCount": 0,
-    "confirmedAgeFilterPasses": 2,
-    "ageFilterExclusions": 48
+    "confirmedAgeFilterPasses": 0,
+    "initialSnapshotFreshPasses": 0,
+    "laterPollFreshArrivals": 0,
+    "ageFilterExclusions": 50
   },
-  "verificationAttempts": 2,
-  "verifiedAmmV4Pools": 2,
+  "eligibleForVerification": 0,
+  "verificationAttempts": 0,
+  "verifiedAmmV4Pools": 0,
   "confirmedOnChainIneligible": 0,
   "rpcProviderUnavailable": 0,
   "rpcRetriesExhausted": 0,
@@ -107,13 +120,22 @@ All sampling stages are tracked and persisted in `session-summary.json` under `d
 }
 ```
 
+### Funnel Mathematical Invariants
+
+1. `uniquePoolsEncountered + repeatedPoolsSuppressed === apiPoolsReturned`
+2. `initialSnapshotPoolsEncountered + laterPollArrivalsEncountered === uniquePoolsEncountered`
+3. `validAgeCount + missingAgeCount + invalidAgeCount + futureDatedAgeCount === uniquePoolsEncountered`
+4. `confirmedAgeFilterPasses + ageFilterExclusions === uniquePoolsEncountered`
+5. `initialSnapshotFreshPasses + laterPollFreshArrivals === confirmedAgeFilterPasses`
+6. `eligibleForVerification + totalPreVerificationExcluded === uniquePoolsEncountered`
+
 ---
 
 ## 4. Execution Protocol (Windows PowerShell)
 
 > [!IMPORTANT]
 > **PRE-EXECUTION PREREQUISITE:**
-> Do NOT execute this command until Gate 2 authorization is granted. Ensure all local tests and CI checks are 100% green.
+> Do NOT execute this live network command until Gate 2 authorization is granted. Ensure all local tests and CI checks are 100% green.
 
 ### Step 1: Pre-Flight Environment Verification
 
@@ -134,27 +156,7 @@ New-Item -ItemType Directory -Force -Path $SESSION_DIR
 New-Item -ItemType Directory -Force -Path $LOG_DIR
 ```
 
-### Step 2: Gate 2 Execution Invocations
-
-#### Option A: Aggressive Freshness Window (1 Hour Max Age, 10 Minutes Duration)
-
-```powershell
-node backend/dist/research/pilot/PilotLiveCollectorCli.js `
-  --network=enabled `
-  --discovery-source=raydium `
-  --max-pool-age-sec=3600 `
-  --min-request-interval-ms=2000 `
-  --poll-interval-sec=20 `
-  --duration-sec=600 `
-  --target-yield=3 `
-  --max-candidates-screened=500 `
-  --max-mb=256 `
-  --max-rss-mb=256 `
-  --output-dir="$SESSION_DIR" `
-  --log-file="$LOG_DIR\gate2-feasibility-1h.log"
-```
-
-#### Option B: Moderate Freshness Window (24 Hours Max Age, 10 Minutes Duration)
+### Step 2: Primary Gate 2 Execution (Preregistered 24h Threshold, Fixed 10m Duration)
 
 ```powershell
 node backend/dist/research/pilot/PilotLiveCollectorCli.js `
@@ -164,7 +166,8 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js `
   --min-request-interval-ms=2000 `
   --poll-interval-sec=20 `
   --duration-sec=600 `
-  --target-yield=3 `
+  --target-yield=0 `
+  --forward-observations=false `
   --max-candidates-screened=500 `
   --max-mb=256 `
   --max-rss-mb=256 `
@@ -172,15 +175,62 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js `
   --log-file="$LOG_DIR\gate2-feasibility-24h.log"
 ```
 
+_(Optional Sensitivity Analysis: If desired after primary run review)_:
+
+```powershell
+node backend/dist/research/pilot/PilotLiveCollectorCli.js `
+  --network=enabled `
+  --discovery-source=raydium `
+  --max-pool-age-sec=3600 `
+  --min-request-interval-ms=2000 `
+  --poll-interval-sec=20 `
+  --duration-sec=600 `
+  --target-yield=0 `
+  --forward-observations=false `
+  --max-candidates-screened=500 `
+  --max-mb=256 `
+  --max-rss-mb=256 `
+  --output-dir="$SESSION_DIR" `
+  --log-file="$LOG_DIR\gate2-feasibility-1h-sensitivity.log"
+```
+
 ---
 
-## 5. Objective Pass / Fail / Inconclusive Evaluation Criteria
+## 5. Success Definitions: Operational vs Research Success
 
-| Evaluation Outcome                                        | Telemetry Conditions                                                                                                                                                                         | Scientific Interpretation & Action                                                                                                                                                                         |
-| :-------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **PASS**                                                  | `verifiedAmmV4Pools >= 1`, `durationSec === 0` in observations, manifest `VALID`, exit code `0`.                                                                                             | Catalog discovery produces verified fresh Raydium AMM v4 pools. Proceed to prospective outcome observation pilot (Milestone D.2.7).                                                                        |
-| **INCONCLUSIVE (Catalog Freshness Limitation Confirmed)** | `verifiedAmmV4Pools === 0`, `exceedsMaxPoolAge > 0` or `invalidOpenTime > 0`, manifest `VALID`, exit code `0`, no memory or libuv crash.                                                     | Top-50 catalog volume sorting does not surface freshly initialized pools in the given window. Authoritatively establishes the boundaries of catalog discovery; motivates real-time event-driven discovery. |
-| **FAIL**                                                  | Exit code `!= 0`, unhandled promise rejection, libuv shutdown crash (`UV_HANDLE_CLOSING`), manifest checksum mismatch, memory `> 256MB`, or RPC error conflated with protocol ineligibility. | Implementation defect. Block forward progression and remediate.                                                                                                                                            |
+To ensure research integrity, we explicitly separate **operational execution success** from **research empirical outcomes**:
+
+### Operational Success Criteria
+
+The experiment is an **operational success** if and only if:
+
+1. Process exit code is `0`.
+2. Process shuts down cleanly with zero libuv handle assertion errors (`UV_HANDLE_CLOSING`).
+3. Zero unhandled promise rejections or fatal exceptions.
+4. Final session status in `session-summary.json` is `FINALIZED`.
+5. Final stop reason is `DURATION_EXPIRED` (or `MAX_CANDIDATES_SCREENED_REACHED` if the 500 ceiling was reached).
+6. Manifest verification passes (`scripts/verify-pilot-manifest.mjs` outputs `[VALID]`).
+7. Process memory remained strictly below 256 MB RSS throughout.
+8. Outbound request rates remained within the 30 req/min budget.
+
+### Research Empirical Outcomes
+
+Once operational success is confirmed, the research results fall into one of two valid empirical scenarios:
+
+| Research Outcome                                     | Empirical Findings                                                            | Scientific Conclusion & Next Step                                                                                                                                                                 |
+| :--------------------------------------------------- | :---------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Scenario A: Catalog Arrival Observed**             | `verifiedAmmV4Pools >= 1` and `confirmedAgeFilterPasses >= 1`.                | Raydium API v3 catalog can surface fresh Raydium AMM v4 pools within the threshold. Document candidate profiles, arrival latency, and pool attributes.                                            |
+| **Scenario B: Catalog Stasis / Saturation Observed** | `verifiedAmmV4Pools === 0`, `exceedsMaxPoolAge > 0` or `invalidOpenTime > 0`. | Raydium API v3 volume-ranked catalog is saturated with mature pools and does not surface fresh pools within the fixed window. Provides empirical justification for real-time WebSocket discovery. |
+
+### Operational Failure Criteria
+
+The experiment is an **operational failure** if:
+
+- Process exit code `!= 0`.
+- Unhandled promise rejection or libuv assertion failure occurs.
+- Session status is `INTERRUPTED` or manifest fails verification (`INVALID`).
+- Memory exceeds 256 MB RSS or disk exceeds 256 MB.
+- RPC errors are conflated with on-chain ineligibility.
 
 ---
 
@@ -189,15 +239,17 @@ node backend/dist/research/pilot/PilotLiveCollectorCli.js `
 Following run completion:
 
 1. Verify process exit code was `0`.
-2. Inspect `$LOG_DIR\gate2-feasibility-*.log` for clean shutdown.
-3. Validate session manifest:
+2. Inspect `$LOG_DIR\gate2-feasibility-24h.log` for clean shutdown.
+3. Validate session manifest using the standalone, non-mutating manifest verifier:
    ```powershell
-   node scripts/import-pilot-archive.mjs --source-dir="$SESSION_DIR\<session-id>" --dry-run
+   node scripts/verify-pilot-manifest.mjs --source="$SESSION_DIR\<session-id>"
    ```
-4. Verify `market-observations.jsonl`:
-   - `measurementWindow.durationSec` is `0` for instantaneous RPC snapshots.
-   - `onChainSlot` is populated.
-   - `flowMeasurementWindowSec` is `300` when 5m flow metrics are included.
+4. Verify `discovery-diagnostics.jsonl`:
+   - `discoveryPollCycle` and `isInitialCatalogSnapshot` are recorded on every line.
+   - `poolAgeAtDiscoverySec` matches API-reported openTime.
 5. Verify `session-summary.json`:
-   - `discoveryFunnel` contains complete, non-null funnel statistics.
-   - Rejection reasons in candidate decisions match funnel tallies.
+   - `discoveryFunnel` contains complete, mathematically consistent counters.
+   - `sessionStatus` is `FINALIZED`.
+   - `stopReason` is `DURATION_EXPIRED`.
+6. Compile findings into evidence package for governance review.
+7. **Strict Rule:** No progression to Milestone D.2.7 until governance review is complete and authorized.

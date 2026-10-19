@@ -100,12 +100,19 @@ export class RaydiumLiveDiscoveryClient {
   private totalPoolsFetched = 0;
   private unseenPoolsCount = 0;
   private repeatedPoolsSuppressed = 0;
+  private initialSnapshotPoolsEncountered = 0;
+  private laterPollArrivalsEncountered = 0;
   private maturePoolsSkipped = 0;
   private validAgePoolsCount = 0;
   private missingAgePoolsCount = 0;
   private invalidAgePoolsCount = 0;
   private futureDatedAgePoolsCount = 0;
   private confirmedAgeFilterPasses = 0;
+  private initialSnapshotFreshPasses = 0;
+  private laterPollFreshArrivals = 0;
+  private missingAgeExclusionsCount = 0;
+  private invalidAgeExclusionsCount = 0;
+  private futureDatedAgeExclusionsCount = 0;
   private ageFilterExclusions = 0;
   private nonSolPairsCount = 0;
   private nonStandardAmmCount = 0;
@@ -203,12 +210,14 @@ export class RaydiumLiveDiscoveryClient {
   }
 
   /**
-   * Returns pre-verification discovery funnel counters (D26-F3).
+   * Returns pre-verification discovery funnel counters (D26-F3, G2-F1).
    */
   public getFunnelMetrics(): {
     apiPoolsReturned: number;
     uniquePoolsEncountered: number;
     repeatedPoolsSuppressed: number;
+    initialSnapshotPoolsEncountered: number;
+    laterPollArrivalsEncountered: number;
     preVerificationExclusions: {
       nonSolPairs: number;
       nonStandardAmm: number;
@@ -224,19 +233,24 @@ export class RaydiumLiveDiscoveryClient {
       invalidAgeCount: number;
       futureDatedAgeCount: number;
       confirmedAgeFilterPasses: number;
+      initialSnapshotFreshPasses: number;
+      laterPollFreshArrivals: number;
       ageFilterExclusions: number;
     };
+    eligibleForVerification: number;
   } {
     return {
       apiPoolsReturned: this.totalPoolsFetched,
       uniquePoolsEncountered: this.seenPoolIds.size,
       repeatedPoolsSuppressed: this.repeatedPoolsSuppressed,
+      initialSnapshotPoolsEncountered: this.initialSnapshotPoolsEncountered,
+      laterPollArrivalsEncountered: this.laterPollArrivalsEncountered,
       preVerificationExclusions: {
         nonSolPairs: this.nonSolPairsCount,
         nonStandardAmm: this.nonStandardAmmCount,
-        missingOpenTime: this.missingAgePoolsCount,
-        invalidOpenTime: this.invalidAgePoolsCount,
-        futureDatedOpenTime: this.futureDatedAgePoolsCount,
+        missingOpenTime: this.missingAgeExclusionsCount,
+        invalidOpenTime: this.invalidAgeExclusionsCount,
+        futureDatedOpenTime: this.futureDatedAgeExclusionsCount,
         exceedsMaxPoolAge: this.maturePoolsSkipped,
         totalPreVerificationExcluded: this.totalPreVerificationExcluded,
       },
@@ -246,8 +260,11 @@ export class RaydiumLiveDiscoveryClient {
         invalidAgeCount: this.invalidAgePoolsCount,
         futureDatedAgeCount: this.futureDatedAgePoolsCount,
         confirmedAgeFilterPasses: this.confirmedAgeFilterPasses,
+        initialSnapshotFreshPasses: this.initialSnapshotFreshPasses,
+        laterPollFreshArrivals: this.laterPollFreshArrivals,
         ageFilterExclusions: this.ageFilterExclusions,
       },
+      eligibleForVerification: this.eligiblePoolsCount,
     };
   }
 
@@ -295,11 +312,6 @@ export class RaydiumLiveDiscoveryClient {
 
     const parseResult = parseRaydiumApiPoolListResponse(fetchResult.data, receiptEpochMs);
     this.totalPoolsFetched += parseResult.totalPoolsInPayload;
-    this.validAgePoolsCount += parseResult.validOpenTimeCount;
-    this.missingAgePoolsCount += parseResult.missingOpenTimeCount;
-    this.invalidAgePoolsCount += parseResult.invalidOpenTimeCount;
-    this.futureDatedAgePoolsCount += parseResult.futureDatedOpenTimeCount;
-    this.nonSolPairsCount += parseResult.nonSolPoolsCount;
 
     if (!parseResult.ok || parseResult.pools.length === 0) {
       this.onLog?.(
@@ -312,6 +324,8 @@ export class RaydiumLiveDiscoveryClient {
       `Received ${parseResult.pools.length} pool(s) from Raydium catalog (total in payload: ${parseResult.totalPoolsInPayload})`,
     );
 
+    const isInitialCatalogSnapshot = this.totalPolls === 1;
+    const discoveryPollCycle = this.totalPolls;
     const results: DiscoveredRaydiumCandidateResult[] = [];
 
     for (const pool of parseResult.pools) {
@@ -325,6 +339,22 @@ export class RaydiumLiveDiscoveryClient {
       }
 
       this.unseenPoolsCount++;
+      if (isInitialCatalogSnapshot) {
+        this.initialSnapshotPoolsEncountered++;
+      } else {
+        this.laterPollArrivalsEncountered++;
+      }
+
+      // Record unique pool age classification (denominator: uniquePoolsEncountered, G2-F1)
+      if (pool.openTimeStatus === "VALID") {
+        this.validAgePoolsCount++;
+      } else if (pool.openTimeStatus === "MISSING") {
+        this.missingAgePoolsCount++;
+      } else if (pool.openTimeStatus === "INVALID") {
+        this.invalidAgePoolsCount++;
+      } else if (pool.openTimeStatus === "FUTURE_DATED") {
+        this.futureDatedAgePoolsCount++;
+      }
 
       // Filter evaluations (D25-R1 / D25-R4)
       const filterEvaluations: Array<{
@@ -348,6 +378,7 @@ export class RaydiumLiveDiscoveryClient {
           : `Pool is not paired with canonical WSOL (base: ${pool.baseTokenSymbol}, quote: ${pool.quoteTokenSymbol})`,
       });
       if (!orientationPassed) {
+        this.nonSolPairsCount++;
         rejectionReasons.push("NON_SOL_PAIR");
       }
 
@@ -369,7 +400,7 @@ export class RaydiumLiveDiscoveryClient {
         }
       }
 
-      // 3. Pool Age Freshness Evaluation (D25-R1 / D25-R2 / D26-F2)
+      // 3. Pool Age Freshness Evaluation (D25-R1 / D25-R2 / D26-F2 / G2-F1 / G2-F3)
       let agePassed = true;
       let ageRejectionReason: string | undefined = undefined;
 
@@ -377,16 +408,24 @@ export class RaydiumLiveDiscoveryClient {
         // Filter-disabled mode: Gate 1 connectivity testing (D25-R2)
         agePassed = true;
         this.confirmedAgeFilterPasses++;
+        if (isInitialCatalogSnapshot) {
+          this.initialSnapshotFreshPasses++;
+        } else {
+          this.laterPollFreshArrivals++;
+        }
       } else {
         if (pool.openTimeStatus === "MISSING") {
           agePassed = false;
           ageRejectionReason = "MISSING_OPEN_TIME";
+          this.missingAgeExclusionsCount++;
         } else if (pool.openTimeStatus === "INVALID") {
           agePassed = false;
           ageRejectionReason = "INVALID_OPEN_TIME";
+          this.invalidAgeExclusionsCount++;
         } else if (pool.openTimeStatus === "FUTURE_DATED") {
           agePassed = false;
           ageRejectionReason = "FUTURE_DATED_OPEN_TIME";
+          this.futureDatedAgeExclusionsCount++;
         } else if (
           pool.poolAgeAtDiscoverySec !== null &&
           pool.poolAgeAtDiscoverySec > this.maxPoolAgeSec
@@ -398,6 +437,11 @@ export class RaydiumLiveDiscoveryClient {
 
         if (agePassed) {
           this.confirmedAgeFilterPasses++;
+          if (isInitialCatalogSnapshot) {
+            this.initialSnapshotFreshPasses++;
+          } else {
+            this.laterPollFreshArrivals++;
+          }
         } else {
           this.ageFilterExclusions++;
         }
@@ -465,6 +509,8 @@ export class RaydiumLiveDiscoveryClient {
         discoveryEndpoint: RAYDIUM_POOLS_INFO_LIST_ENDPOINT,
         discoveryPage: 1,
         discoverySortField: "default",
+        discoveryPollCycle,
+        isInitialCatalogSnapshot,
         passedEligibility,
         filterEvaluations,
         rejectionReasons,

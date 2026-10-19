@@ -152,7 +152,10 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(() => parseCliArgs(["node", "cli.js", "--duration-sec=-10"])).toThrow(
         "[INVALID_ARGUMENT]",
       );
-      expect(() => parseCliArgs(["node", "cli.js", "--target-candidates=0"])).toThrow(
+      expect(() => parseCliArgs(["node", "cli.js", "--target-candidates=-1"])).toThrow(
+        "[INVALID_ARGUMENT]",
+      );
+      expect(() => parseCliArgs(["node", "cli.js", "--target-yield=-5"])).toThrow(
         "[INVALID_ARGUMENT]",
       );
       expect(() => parseCliArgs(["node", "cli.js", "--max-mb=abc"])).toThrow("[INVALID_ARGUMENT]");
@@ -3907,12 +3910,180 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(summary.discoveryFunnel.apiPoolsReturned).toBe(1);
       expect(summary.discoveryFunnel.uniquePoolsEncountered).toBe(1);
       expect(summary.discoveryFunnel.repeatedPoolsSuppressed).toBe(0);
+      expect(summary.discoveryFunnel.initialSnapshotPoolsEncountered).toBe(1);
+      expect(summary.discoveryFunnel.laterPollArrivalsEncountered).toBe(0);
       expect(summary.discoveryFunnel.poolAgeClassifications.validAgeCount).toBe(1);
       expect(summary.discoveryFunnel.verificationAttempts).toBe(1);
       expect(summary.discoveryFunnel.verifiedAmmV4Pools).toBe(1);
       expect(summary.discoveryFunnel.confirmedOnChainIneligible).toBe(0);
       expect(summary.discoveryFunnel.rpcProviderUnavailable).toBe(0);
       expect(summary.discoveryFunnel.rpcRetriesExhausted).toBe(0);
+    });
+
+    it("G2-F2: supports --target-yield=0 for fixed-duration observation and runs full duration", async () => {
+      // Verify parseCliArgs accepts --target-yield=0 without throwing
+      const cliConfig = parseCliArgs([
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--discovery-source=raydium",
+        "--target-yield=0",
+        "--duration-sec=600",
+        "--forward-observations=false",
+      ]);
+      expect(cliConfig.targetDiagnosticYield).toBe(0);
+      expect(cliConfig.durationSec).toBe(600);
+      expect(cliConfig.enableForwardObservations).toBe(false);
+
+      const testDir = await makeTestDir("g2-f2-fixed-dur");
+
+      const pool1 = FIXTURE_POOL_ADDRESS;
+      const pool2 = "HV14AnPfqvEepqBgk6kX9zB1Z5tJp5j7kM8qQ9X4yZ2b";
+      const mint1 = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+      const mint2 = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+
+      let pollCallCount = 0;
+      const mockHttp: ILiveHttpTransport = {
+        fetch: async () => {
+          pollCallCount++;
+          const currentPool = pollCallCount === 1 ? pool1 : pool2;
+          const currentMint = pollCallCount === 1 ? mint1 : mint2;
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: 1,
+                data: [
+                  {
+                    type: "Standard",
+                    programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    id: currentPool,
+                    mintA: { address: currentMint, symbol: `TKN${pollCallCount}`, decimals: 6 },
+                    mintB: { address: FIXTURE_WSOL_MINT, symbol: "WSOL", decimals: 9 },
+                    price: 1.0,
+                    tvl: 100000,
+                    day: { volume: 50000 },
+                    openTime: String(Math.floor((Date.now() - 100 * 1000) / 1000)),
+                  },
+                ],
+              },
+            }),
+          } as unknown as Response;
+        },
+      };
+
+      const poolBuffer = createAuthoritativeRaydiumAmmV4Buffer();
+      const baseVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: mint1,
+        ownerBase58: pool1,
+        rawAmount: 1_000_000_000_000n,
+      });
+      const quoteVaultBuffer = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_WSOL_MINT,
+        ownerBase58: pool1,
+        rawAmount: 100_000_000_000n,
+      });
+
+      const mockRpc: ISolanaRpcTransport = {
+        post: async (_url, payload) => {
+          const body = payload as { method: string };
+          if (body.method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: 300000001 },
+                value: {
+                  data: [poolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                },
+              },
+            };
+          }
+          if (body.method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: 2,
+              result: {
+                context: { slot: 300000001 },
+                value: [
+                  {
+                    data: [baseVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                  {
+                    data: [quoteVaultBuffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                  },
+                ],
+              },
+            };
+          }
+          return { jsonrpc: "2.0", id: 99, error: { message: "Unknown" } };
+        },
+      };
+
+      const runner = new LiveCollectorRunner({
+        network: "enabled",
+        discoverySource: "raydium",
+        maxPoolAgeSec: 0,
+        outputDir: testDir,
+        durationSec: 3, // 3 seconds fixed duration
+        targetCandidates: 0,
+        targetDiagnosticYield: 0, // G2-F2: fixed duration observation disabled from early target yield exit
+        maxCandidatesScreened: 50,
+        maxMb: 10,
+        rpcUrl: "http://mock-rpc",
+        pollIntervalSec: 1, // Poll every 1s -> completes at least 2 polls in 3s
+        minRequestIntervalMs: 0, // 0ms spacing in test environment
+        enableForwardObservations: false,
+        httpTransport: mockHttp,
+        rpcTransport: mockRpc,
+      });
+
+      const result = await runner.run();
+
+      // Must complete at least 2 polls without early exit on yield
+      expect(pollCallCount).toBeGreaterThanOrEqual(2);
+      expect(result.stopReason).toBe("DURATION_EXPIRED");
+      expect(result.status).toBe("FINALIZED");
+      expect(result.manifestValid).toBe(true);
+      expect(result.totalDecisionsRecorded).toBeGreaterThanOrEqual(2);
+
+      // Verify candidates have truthful discoveryPollCycle and isInitialCatalogSnapshot provenance
+      const decisionsPath = path.join(result.sessionDir, "candidate-decisions.jsonl");
+      const candidateLines = (await fs.readFile(decisionsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+
+      expect(candidateLines.length).toBeGreaterThanOrEqual(2);
+      expect(candidateLines[0].discoveryPollCycle).toBe(1);
+      expect(candidateLines[0].isInitialCatalogSnapshot).toBe(true);
+      expect(candidateLines[1].discoveryPollCycle).toBe(2);
+      expect(candidateLines[1].isInitialCatalogSnapshot).toBe(false);
+
+      // Verify discovery-diagnostics.jsonl records have matching provenance
+      const diagPath = path.join(result.sessionDir, "discovery-diagnostics.jsonl");
+      const diagLines = (await fs.readFile(diagPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+
+      expect(diagLines.length).toBeGreaterThanOrEqual(2);
+      expect(diagLines[0].discoveryPollCycle).toBe(1);
+      expect(diagLines[0].isInitialCatalogSnapshot).toBe(true);
+      expect(diagLines[1].discoveryPollCycle).toBe(2);
+      expect(diagLines[1].isInitialCatalogSnapshot).toBe(false);
+
+      // Verify session-summary.json discoveryFunnel accounting
+      const summaryPath = path.join(result.sessionDir, "session-summary.json");
+      const summary = JSON.parse(await fs.readFile(summaryPath, "utf8"));
+      expect(summary.discoveryFunnel.initialSnapshotPoolsEncountered).toBe(1);
+      expect(summary.discoveryFunnel.laterPollArrivalsEncountered).toBeGreaterThanOrEqual(1);
+      expect(summary.discoveryFunnel.verifiedAmmV4Pools).toBeGreaterThanOrEqual(2);
     });
   });
 });
