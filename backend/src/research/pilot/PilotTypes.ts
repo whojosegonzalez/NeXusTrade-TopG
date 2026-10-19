@@ -63,6 +63,75 @@ export interface D23RaydiumAmmV4State {
 }
 
 /**
+ * Governed Quote Asset Research Classification Cohort (D28-ADG-02).
+ * Orthogonal to strategy cohorts (Established Runner vs Micro-Cap Probe).
+ */
+export type QuoteAssetCohort =
+  | "WSOL_NATIVE" // Paired directly with WSOL (Single-hop execution candidate)
+  | "STABLECOIN_USD" // Paired directly with USDC/USDT (Requires synchronous reference rate)
+  | "EXOTIC_CROSS"; // Meme-to-meme or other SPL cross-pair (Observation-only quarantined)
+
+/**
+ * Decoded Raydium CPMM Pool State (637 bytes Anchor layout: raydium-cp-swap v0.1.0).
+ * All raw token integer amounts are preserved as exact `bigint` values.
+ */
+export interface D28RaydiumCpmmState {
+  readonly ammConfig: string;
+  readonly poolCreator: string;
+  readonly token0Vault: string;
+  readonly token1Vault: string;
+  readonly lpMint: string;
+  readonly token0Mint: string;
+  readonly token1Mint: string;
+  readonly token0Program: string;
+  readonly token1Program: string;
+  readonly observationKey: string;
+  readonly authBump: number;
+  readonly status: number;
+  readonly lpMintDecimals: number;
+  readonly mint0Decimals: number;
+  readonly mint1Decimals: number;
+  readonly lpSupply: bigint;
+  readonly protocolFeesToken0: bigint;
+  readonly protocolFeesToken1: bigint;
+  readonly fundFeesToken0: bigint;
+  readonly fundFeesToken1: bigint;
+  /** Swap activation timestamp in Unix seconds (not independently verified pool creation time) */
+  readonly swapActivationTimeSec: bigint;
+  readonly poolAddress: string;
+  readonly programId: string;
+  readonly accountSlot?: number | undefined;
+}
+
+/**
+ * CPMM Reserve Accounting with Fee Liability Segregation (D28-ADG-02).
+ */
+export interface D28CpmmReserveAccounting {
+  readonly poolAddress: string;
+  readonly token0Mint: string;
+  readonly token1Mint: string;
+  readonly token0Decimals: number;
+  readonly token1Decimals: number;
+  readonly token0VaultRaw: bigint;
+  readonly token1VaultRaw: bigint;
+  readonly token0TotalFeesRaw: bigint;
+  readonly token1TotalFeesRaw: bigint;
+  readonly effectiveReserve0Raw: bigint;
+  readonly effectiveReserve1Raw: bigint;
+  readonly effectiveReserve0Decimal: number;
+  readonly effectiveReserve1Decimal: number;
+  readonly spotPrice0Per1: number | null;
+  readonly spotPrice1Per0: number | null;
+  readonly spotPriceSol: number | null;
+  readonly quoteCohort: QuoteAssetCohort;
+  readonly orientation: RaydiumPairOrientation;
+  readonly effectiveReservesAvailable: boolean;
+  readonly slotDiscrepancy: boolean;
+  readonly slotDelta?: number | undefined;
+  readonly unavailabilityReason?: string | undefined;
+}
+
+/**
  * Raydium pair asset orientation.
  */
 export type RaydiumPairOrientation =
