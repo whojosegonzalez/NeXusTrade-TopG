@@ -8,9 +8,9 @@
  * 3. File presence: all declared files exist with exact size and SHA-256 match.
  * 4. Extraneous file detection: no unsealed/extraneous files exist in the session directory.
  *
- * Guarantees (G2-F5):
- * - Strictly read-only and non-mutating (zero writes, zero moves, zero imports).
- * - Exits 0 on valid manifest, exits 1 on invalid manifest or missing directory.
+ * Guarantees (G2-F5, G2-F8):
+ * - Strictly read-only and non-mutating (zero writes, zero moves, zero builds, zero file modifications).
+ * - Exits 0 on valid manifest, exits 1 on invalid manifest, missing directory, or missing dependencies.
  */
 
 import fs from "node:fs";
@@ -32,22 +32,29 @@ Options:
   --source=<path>    Path to pilot session directory containing manifest.json
   --help, -h         Display this help message
 `);
-      process.exit(0);
+      return { source: null, help: true };
     } else if (arg.startsWith("--source=")) {
       source = arg.slice("--source=".length).trim();
     } else if (!arg.startsWith("-") && !source) {
       source = arg.trim();
     } else {
       console.error(`[ERROR] Unrecognized argument: '${arg}'`);
-      process.exit(1);
+      return { source: null, help: false, error: `Unrecognized argument: '${arg}'` };
     }
   }
 
-  return { source };
+  return { source, help: false };
 }
 
 export async function runVerifyManifestCli(argv = process.argv) {
-  const { source } = parseArgs(argv);
+  const { source, help, error } = parseArgs(argv);
+
+  if (help) {
+    return 0;
+  }
+  if (error) {
+    return 1;
+  }
 
   if (!source) {
     console.error("[ERROR] Missing session directory path.");
@@ -67,17 +74,18 @@ export async function runVerifyManifestCli(argv = process.argv) {
     return 1;
   }
 
-  // Ensure backend is compiled
+  // Strictly read-only check for compiled backend dependencies (G2-F8)
   const distManifestPath = path.resolve(
     __dirname,
     "../backend/dist/research/pilot/PilotExportManifest.js",
   );
   if (!fs.existsSync(distManifestPath)) {
-    console.log("[VERIFY] Compiling backend modules via scripts/build-pilot-cli.mjs...");
-    const { execSync } = await import("node:child_process");
-    execSync(`"${process.execPath}" "${path.resolve(__dirname, "build-pilot-cli.mjs")}"`, {
-      stdio: "inherit",
-    });
+    console.error(
+      `[ERROR] Required compiled backend module is missing: ${distManifestPath}\n` +
+        `The manifest verifier is strictly read-only and will not compile code automatically.\n` +
+        `Please build the backend first by running: node scripts/build-pilot-cli.mjs`,
+    );
+    return 1;
   }
 
   const { verifySessionExportManifest } =
@@ -113,6 +121,6 @@ export async function runVerifyManifestCli(argv = process.argv) {
 // Auto-run when executed directly
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
   runVerifyManifestCli(process.argv).then((code) => {
-    process.exit(code);
+    process.exitCode = code;
   });
 }

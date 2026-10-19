@@ -46,6 +46,11 @@ export interface RaydiumDiscoveryClientOptions {
 
 export interface RaydiumDiscoveryDiagnostics {
   readonly totalPolls: number;
+  readonly totalPollAttempts?: number | undefined;
+  readonly successfulPolls?: number | undefined;
+  readonly emptyOrFailedPolls?: number | undefined;
+  readonly hasEstablishedInitialBaseline?: boolean | undefined;
+  readonly malformedRawEntriesCount?: number | undefined;
   readonly totalHttpRequests: number;
   readonly rateLimitsEncountered: number;
   readonly timeoutsEncountered: number;
@@ -92,12 +97,17 @@ export class RaydiumLiveDiscoveryClient {
   private lastRequestEpochMs = 0;
   private retryAfterUntilEpochMs = 0;
 
-  // Telemetry counters
+  // Telemetry counters & baseline tracking (G2-F6 / G2-F7)
   private totalPolls = 0;
+  private totalPollAttempts = 0;
+  private successfulPolls = 0;
+  private emptyOrFailedPolls = 0;
+  private hasEstablishedInitialBaseline = false;
   private totalHttpRequests = 0;
   private rateLimitsEncountered = 0;
   private timeoutsEncountered = 0;
   private totalPoolsFetched = 0;
+  private malformedRawEntriesCount = 0;
   private unseenPoolsCount = 0;
   private repeatedPoolsSuppressed = 0;
   private initialSnapshotPoolsEncountered = 0;
@@ -168,6 +178,26 @@ export class RaydiumLiveDiscoveryClient {
     return this.timeoutsEncountered;
   }
 
+  public getTotalPollAttempts(): number {
+    return this.totalPollAttempts;
+  }
+
+  public getSuccessfulPolls(): number {
+    return this.successfulPolls;
+  }
+
+  public getEmptyOrFailedPolls(): number {
+    return this.emptyOrFailedPolls;
+  }
+
+  public getMalformedRawEntriesCount(): number {
+    return this.malformedRawEntriesCount;
+  }
+
+  public getHasEstablishedInitialBaseline(): boolean {
+    return this.hasEstablishedInitialBaseline;
+  }
+
   public isPollDue(): boolean {
     const now = Date.now();
     if (now < this.retryAfterUntilEpochMs) {
@@ -185,7 +215,12 @@ export class RaydiumLiveDiscoveryClient {
       rejections[k] = v;
     }
     return {
-      totalPolls: this.totalPolls,
+      totalPolls: this.totalPollAttempts,
+      totalPollAttempts: this.totalPollAttempts,
+      successfulPolls: this.successfulPolls,
+      emptyOrFailedPolls: this.emptyOrFailedPolls,
+      hasEstablishedInitialBaseline: this.hasEstablishedInitialBaseline,
+      malformedRawEntriesCount: this.malformedRawEntriesCount,
       totalHttpRequests: this.totalHttpRequests,
       rateLimitsEncountered: this.rateLimitsEncountered,
       timeoutsEncountered: this.timeoutsEncountered,
@@ -210,10 +245,11 @@ export class RaydiumLiveDiscoveryClient {
   }
 
   /**
-   * Returns pre-verification discovery funnel counters (D26-F3, G2-F1).
+   * Returns pre-verification discovery funnel counters (D26-F3, G2-F1, G2-F7).
    */
   public getFunnelMetrics(): {
     apiPoolsReturned: number;
+    malformedRawEntries: number;
     uniquePoolsEncountered: number;
     repeatedPoolsSuppressed: number;
     initialSnapshotPoolsEncountered: number;
@@ -241,6 +277,7 @@ export class RaydiumLiveDiscoveryClient {
   } {
     return {
       apiPoolsReturned: this.totalPoolsFetched,
+      malformedRawEntries: this.malformedRawEntriesCount,
       uniquePoolsEncountered: this.seenPoolIds.size,
       repeatedPoolsSuppressed: this.repeatedPoolsSuppressed,
       initialSnapshotPoolsEncountered: this.initialSnapshotPoolsEncountered,
@@ -275,11 +312,13 @@ export class RaydiumLiveDiscoveryClient {
     sessionId: string;
     generationId: string;
   }): Promise<DiscoveredRaydiumCandidateResult[]> {
+    this.totalPollAttempts++;
     this.totalPolls++;
     const now = Date.now();
 
     // Respect Retry-After backoff if currently active
     if (now < this.retryAfterUntilEpochMs) {
+      this.emptyOrFailedPolls++;
       this.onLog?.(
         `Poll skipped: rate-limit backoff active until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`,
       );
@@ -288,6 +327,7 @@ export class RaydiumLiveDiscoveryClient {
 
     // Respect minimum inter-request spacing (D25-R5)
     if (this.lastRequestEpochMs > 0 && now - this.lastRequestEpochMs < this.minRequestIntervalMs) {
+      this.emptyOrFailedPolls++;
       this.onLog?.(
         `Poll skipped: inter-request interval not elapsed (${now - this.lastRequestEpochMs}ms < ${this.minRequestIntervalMs}ms)`,
       );
@@ -307,25 +347,33 @@ export class RaydiumLiveDiscoveryClient {
       fetchResult.status === "ERROR" ||
       !fetchResult.data
     ) {
+      this.emptyOrFailedPolls++;
       return [];
     }
 
     const parseResult = parseRaydiumApiPoolListResponse(fetchResult.data, receiptEpochMs);
     this.totalPoolsFetched += parseResult.totalPoolsInPayload;
+    const malformedInPayload = Math.max(
+      0,
+      parseResult.totalPoolsInPayload - parseResult.pools.length,
+    );
+    this.malformedRawEntriesCount += malformedInPayload;
 
     if (!parseResult.ok || parseResult.pools.length === 0) {
+      this.emptyOrFailedPolls++;
       this.onLog?.(
-        `Raydium catalog response contained 0 pools or parse errors: ${parseResult.parseErrors.join("; ") || "empty list"}`,
+        `Raydium catalog response contained 0 usable pools or parse errors: ${parseResult.parseErrors.join("; ") || "empty list"} (raw total: ${parseResult.totalPoolsInPayload}, malformed: ${malformedInPayload})`,
       );
       return [];
     }
 
+    this.successfulPolls++;
     this.onLog?.(
-      `Received ${parseResult.pools.length} pool(s) from Raydium catalog (total in payload: ${parseResult.totalPoolsInPayload})`,
+      `Received ${parseResult.pools.length} usable pool(s) from Raydium catalog (total in payload: ${parseResult.totalPoolsInPayload}, malformed: ${malformedInPayload})`,
     );
 
-    const isInitialCatalogSnapshot = this.totalPolls === 1;
-    const discoveryPollCycle = this.totalPolls;
+    const isInitialCatalogSnapshot = !this.hasEstablishedInitialBaseline;
+    const discoveryPollCycle = this.totalPollAttempts;
     const results: DiscoveredRaydiumCandidateResult[] = [];
 
     for (const pool of parseResult.pools) {
@@ -525,6 +573,7 @@ export class RaydiumLiveDiscoveryClient {
       });
     }
 
+    this.hasEstablishedInitialBaseline = true;
     return results;
   }
 

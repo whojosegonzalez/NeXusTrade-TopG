@@ -990,9 +990,10 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
       expect(funnel.apiPoolsReturned).toBe(151); // 50 + 50 + 51
       expect(funnel.uniquePoolsEncountered).toBe(51);
       expect(funnel.repeatedPoolsSuppressed).toBe(100);
-      expect(funnel.uniquePoolsEncountered + funnel.repeatedPoolsSuppressed).toBe(
-        funnel.apiPoolsReturned,
-      );
+      expect(funnel.malformedRawEntries).toBe(0);
+      expect(
+        funnel.uniquePoolsEncountered + funnel.repeatedPoolsSuppressed + funnel.malformedRawEntries,
+      ).toBe(funnel.apiPoolsReturned);
 
       // 2. Snapshot vs later poll arrivals
       expect(funnel.initialSnapshotPoolsEncountered).toBe(50);
@@ -1035,6 +1036,379 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
         funnel.eligibleForVerification +
           funnel.preVerificationExclusions.totalPreVerificationExcluded,
       ).toBe(funnel.uniquePoolsEncountered);
+    });
+
+    it("G2-F6: establishes initial catalog snapshot from first usable response after errors/empty polls, preserving poll attempt provenance", async () => {
+      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+      const makePoolId = (idx: number) =>
+        "11111111111111111111111111111111BBBB" +
+        B58[Math.floor(idx / B58.length)]! +
+        B58[idx % B58.length]!;
+
+      const poolA = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(1),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 100 * 1000) / 1000)),
+      };
+      const poolB = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(2),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 200 * 1000) / 1000)),
+      };
+      const poolC = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(3),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 300 * 1000) / 1000)),
+      };
+      const poolD = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(4),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 50 * 1000) / 1000)),
+      };
+
+      let pollIndex = 0;
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () => {
+          pollIndex++;
+          if (pollIndex === 1) {
+            // Poll 1: 429 Rate limited (transient failure)
+            return {
+              status: 429,
+              ok: false,
+              headers: {
+                get: (header: string) => (header.toLowerCase() === "retry-after" ? "0" : null),
+              },
+            } as unknown as Response;
+          }
+          if (pollIndex === 2) {
+            // Poll 2: Empty response (0 pools in data)
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                success: true,
+                data: { count: 0, data: [] },
+              }),
+            } as unknown as Response;
+          }
+          if (pollIndex === 3) {
+            // Poll 3: First successful usable snapshot (3 pools)
+            return {
+              status: 200,
+              ok: true,
+              json: async () => ({
+                success: true,
+                data: { count: 3, data: [poolA, poolB, poolC] },
+              }),
+            } as unknown as Response;
+          }
+          // Poll 4: 3 duplicate pools + 1 genuine later arrival (poolD)
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: { count: 4, data: [poolA, poolB, poolC, poolD] },
+            }),
+          } as unknown as Response;
+        },
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+        pollIntervalMs: 0,
+        maxPoolAgeSec: 3600,
+      });
+
+      // Poll 1: fails on HTTP 429
+      const results1 = await client.pollDiscoveredCandidates({
+        sessionId: "s1",
+        generationId: "g1",
+      });
+      expect(results1.length).toBe(0);
+      expect(client.getTotalPollAttempts()).toBe(1);
+      expect(client.getSuccessfulPolls()).toBe(0);
+      expect(client.getEmptyOrFailedPolls()).toBe(1);
+      expect(client.getHasEstablishedInitialBaseline()).toBe(false);
+
+      // Poll 2: empty list response
+      const results2 = await client.pollDiscoveredCandidates({
+        sessionId: "s1",
+        generationId: "g1",
+      });
+      expect(results2.length).toBe(0);
+      expect(client.getTotalPollAttempts()).toBe(2);
+      expect(client.getSuccessfulPolls()).toBe(0);
+      expect(client.getEmptyOrFailedPolls()).toBe(2);
+      expect(client.getHasEstablishedInitialBaseline()).toBe(false);
+
+      // Poll 3: first successful usable snapshot establishes initial baseline
+      const results3 = await client.pollDiscoveredCandidates({
+        sessionId: "s1",
+        generationId: "g1",
+      });
+      expect(results3.length).toBe(3);
+      expect(client.getTotalPollAttempts()).toBe(3);
+      expect(client.getSuccessfulPolls()).toBe(1);
+      expect(client.getEmptyOrFailedPolls()).toBe(2);
+      expect(client.getHasEstablishedInitialBaseline()).toBe(true);
+
+      // Verify candidates from first usable poll are marked as initial catalog snapshot
+      for (const res of results3) {
+        expect(res.candidate.isInitialCatalogSnapshot).toBe(true);
+        expect(res.candidate.discoveryPollCycle).toBe(3);
+      }
+
+      // Poll 4: duplicates suppressed, only genuine new arrival emitted as later arrival
+      const results4 = await client.pollDiscoveredCandidates({
+        sessionId: "s1",
+        generationId: "g1",
+      });
+      expect(results4.length).toBe(1);
+      expect(client.getTotalPollAttempts()).toBe(4);
+      expect(client.getSuccessfulPolls()).toBe(2);
+      expect(client.getEmptyOrFailedPolls()).toBe(2);
+      expect(results4[0]!.candidate.isInitialCatalogSnapshot).toBe(false);
+      expect(results4[0]!.candidate.discoveryPollCycle).toBe(4);
+      expect(results4[0]!.poolSummary.poolId).toBe(poolD.id);
+
+      // Verify funnel metrics
+      const funnel = client.getFunnelMetrics();
+      expect(funnel.initialSnapshotPoolsEncountered).toBe(3);
+      expect(funnel.laterPollArrivalsEncountered).toBe(1);
+      expect(funnel.uniquePoolsEncountered).toBe(4);
+      expect(funnel.repeatedPoolsSuppressed).toBe(3);
+      expect(funnel.malformedRawEntries).toBe(0);
+      expect(funnel.apiPoolsReturned).toBe(7); // 3 from poll 3 + 4 from poll 4
+      expect(
+        funnel.uniquePoolsEncountered + funnel.repeatedPoolsSuppressed + funnel.malformedRawEntries,
+      ).toBe(funnel.apiPoolsReturned);
+
+      // Diagnostics verification
+      const diag = client.getDiagnostics();
+      expect(diag.totalPollAttempts).toBe(4);
+      expect(diag.successfulPolls).toBe(2);
+      expect(diag.emptyOrFailedPolls).toBe(2);
+      expect(diag.hasEstablishedInitialBaseline).toBe(true);
+    });
+
+    it("G2-F7: preserves strict mathematical invariants when catalog responses contain malformed entries across multiple polls", async () => {
+      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+      const makePoolId = (idx: number) =>
+        "11111111111111111111111111111111CCCC" +
+        B58[Math.floor(idx / B58.length)]! +
+        B58[idx % B58.length]!;
+
+      // 10 valid base pools
+      const baseValidPools = Array.from({ length: 10 }, (_, i) => ({
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(i + 1),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 500 * 1000) / 1000)),
+      }));
+
+      // 3 new valid pools
+      const newValidPool1 = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(101),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 400 * 1000) / 1000)),
+      };
+      const newValidPool2 = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(102),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 300 * 1000) / 1000)),
+      };
+      const newValidPool3 = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(103),
+        mintA: { address: MINT_BONK, symbol: "BONK", decimals: 5 },
+        mintB: { address: WSOL_MINT, symbol: "WSOL", decimals: 9 },
+        openTime: String(Math.floor((Date.now() - 200 * 1000) / 1000)),
+      };
+
+      // Malformed entries of different defective shapes
+      const malformedNull = null;
+      const malformedNotObject = "this-is-not-an-object";
+      const malformedInvalidBase58Id = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: "NOT_BASE58!@#$%^&*",
+        mintA: { address: MINT_BONK, symbol: "BONK" },
+        mintB: { address: WSOL_MINT, symbol: "WSOL" },
+      };
+      const malformedMissingMintA = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: makePoolId(201),
+        mintA: { address: "INVALID_BASE58_MINT", symbol: "BAD" },
+        mintB: { address: WSOL_MINT, symbol: "WSOL" },
+      };
+      const malformedEmptyId = {
+        type: "Standard",
+        programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+        id: "",
+        mintA: { address: MINT_BONK, symbol: "BONK" },
+        mintB: { address: WSOL_MINT, symbol: "WSOL" },
+      };
+      const malformedNonObjectItem = 12345;
+
+      let pollCount = 0;
+      const mockTransport: ILiveHttpTransport = {
+        fetch: async () => {
+          pollCount++;
+          let rawItems: unknown[] = [];
+          if (pollCount === 1) {
+            // Poll 1: 10 valid pools + 3 malformed entries (total 13 raw entries)
+            rawItems = [
+              ...baseValidPools,
+              malformedNull,
+              malformedInvalidBase58Id,
+              malformedNotObject,
+            ];
+          } else if (pollCount === 2) {
+            // Poll 2: 10 duplicate pools + 1 new valid pool + 2 malformed entries (total 13 raw entries)
+            rawItems = [...baseValidPools, newValidPool1, malformedMissingMintA, malformedEmptyId];
+          } else if (pollCount === 3) {
+            // Poll 3: 11 duplicate pools + 2 new valid pools + 1 malformed entry (total 14 raw entries)
+            rawItems = [
+              ...baseValidPools,
+              newValidPool1,
+              newValidPool2,
+              newValidPool3,
+              malformedNonObjectItem,
+            ];
+          } else {
+            // Poll 4: 0 valid pools + 2 malformed entries (total 2 raw entries)
+            rawItems = [malformedInvalidBase58Id, malformedNotObject];
+          }
+
+          return {
+            status: 200,
+            ok: true,
+            json: async () => ({
+              success: true,
+              data: {
+                count: rawItems.length,
+                data: rawItems,
+              },
+            }),
+          } as unknown as Response;
+        },
+      };
+
+      const client = new RaydiumLiveDiscoveryClient({
+        transport: mockTransport,
+        minRequestIntervalMs: 0,
+        pollIntervalMs: 0,
+        maxPoolAgeSec: 3600,
+      });
+
+      // Poll 1: 10 valid + 3 malformed
+      const results1 = await client.pollDiscoveredCandidates({
+        sessionId: "s2",
+        generationId: "g2",
+      });
+      expect(results1.length).toBe(10);
+      expect(client.getMalformedRawEntriesCount()).toBe(3);
+
+      // Poll 2: 10 duplicates (suppressed) + 1 new valid + 2 malformed
+      const results2 = await client.pollDiscoveredCandidates({
+        sessionId: "s2",
+        generationId: "g2",
+      });
+      expect(results2.length).toBe(1);
+      expect(results2[0]!.poolSummary.poolId).toBe(newValidPool1.id);
+      expect(client.getMalformedRawEntriesCount()).toBe(5); // 3 + 2
+
+      // Poll 3: 11 duplicates (suppressed) + 2 new valid + 1 malformed
+      const results3 = await client.pollDiscoveredCandidates({
+        sessionId: "s2",
+        generationId: "g2",
+      });
+      expect(results3.length).toBe(2);
+      expect(client.getMalformedRawEntriesCount()).toBe(6); // 5 + 1
+
+      // Poll 4: 0 valid + 2 malformed (no usable pools, emptyOrFailedPolls increments)
+      const results4 = await client.pollDiscoveredCandidates({
+        sessionId: "s2",
+        generationId: "g2",
+      });
+      expect(results4.length).toBe(0);
+      expect(client.getMalformedRawEntriesCount()).toBe(8); // 6 + 2
+
+      // Inspect Funnel Metrics & Invariants
+      const funnel = client.getFunnelMetrics();
+
+      // Invariant 1: uniquePoolsEncountered + repeatedPoolsSuppressed + malformedRawEntries === apiPoolsReturned
+      expect(funnel.apiPoolsReturned).toBe(42); // 13 + 13 + 14 + 2
+      expect(funnel.malformedRawEntries).toBe(8);
+      expect(funnel.uniquePoolsEncountered).toBe(13); // 10 from poll 1 + 1 from poll 2 + 2 from poll 3
+      expect(funnel.repeatedPoolsSuppressed).toBe(21); // 0 + 10 + 11 + 0
+      expect(
+        funnel.uniquePoolsEncountered + funnel.repeatedPoolsSuppressed + funnel.malformedRawEntries,
+      ).toBe(funnel.apiPoolsReturned);
+
+      // Invariant 2: initialSnapshotPoolsEncountered + laterPollArrivalsEncountered === uniquePoolsEncountered
+      expect(funnel.initialSnapshotPoolsEncountered).toBe(10);
+      expect(funnel.laterPollArrivalsEncountered).toBe(3);
+      expect(funnel.initialSnapshotPoolsEncountered + funnel.laterPollArrivalsEncountered).toBe(
+        funnel.uniquePoolsEncountered,
+      );
+
+      // Invariant 3: age classifications sum to uniquePoolsEncountered
+      const ageClass = funnel.poolAgeClassifications;
+      expect(ageClass.validAgeCount).toBe(13);
+      expect(
+        ageClass.validAgeCount +
+          ageClass.missingAgeCount +
+          ageClass.invalidAgeCount +
+          ageClass.futureDatedAgeCount,
+      ).toBe(funnel.uniquePoolsEncountered);
+
+      // Invariant 4: confirmedAgeFilterPasses + ageFilterExclusions === uniquePoolsEncountered
+      expect(ageClass.confirmedAgeFilterPasses + ageClass.ageFilterExclusions).toBe(
+        funnel.uniquePoolsEncountered,
+      );
+
+      // Invariant 5: initialSnapshotFreshPasses + laterPollFreshArrivals === confirmedAgeFilterPasses
+      expect(ageClass.initialSnapshotFreshPasses + ageClass.laterPollFreshArrivals).toBe(
+        ageClass.confirmedAgeFilterPasses,
+      );
+
+      // Invariant 6: eligibleForVerification + totalPreVerificationExcluded === uniquePoolsEncountered
+      expect(
+        funnel.eligibleForVerification +
+          funnel.preVerificationExclusions.totalPreVerificationExcluded,
+      ).toBe(funnel.uniquePoolsEncountered);
+
+      // Verify diagnostics match funnel metrics
+      const diag = client.getDiagnostics();
+      expect(diag.totalPoolsFetched).toBe(funnel.apiPoolsReturned);
+      expect(diag.malformedRawEntriesCount).toBe(funnel.malformedRawEntries);
+      expect(diag.seenPoolIdsCount).toBe(funnel.uniquePoolsEncountered);
+      expect(diag.repeatedPoolsSuppressed).toBe(funnel.repeatedPoolsSuppressed);
     });
   });
 });

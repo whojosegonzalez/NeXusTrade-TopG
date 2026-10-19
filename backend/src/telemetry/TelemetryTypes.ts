@@ -243,13 +243,15 @@ export interface SessionTelemetrySummary {
 export interface DiscoveryFunnelMetrics {
   /** Total raw pool entries returned across all API responses (impressions). */
   readonly apiPoolsReturned: number;
-  /** Total count of distinct pool IDs discovered (uniquePoolsEncountered + repeatedPoolsSuppressed === apiPoolsReturned). */
+  /** Total count of unusable/skipped raw catalog entries (malformed JSON, invalid base58, missing required tokens). */
+  readonly malformedRawEntries: number;
+  /** Total count of distinct pool IDs discovered (uniquePoolsEncountered + repeatedPoolsSuppressed + malformedRawEntries === apiPoolsReturned). */
   readonly uniquePoolsEncountered: number;
   /** Count of duplicate pool entries suppressed across subsequent polls/pages. */
   readonly repeatedPoolsSuppressed: number;
-  /** Count of unique pool IDs discovered in the initial baseline catalog poll (poll 1). */
+  /** Count of unique pool IDs discovered in the initial baseline catalog poll (first usable catalog poll). */
   readonly initialSnapshotPoolsEncountered: number;
-  /** Count of previously unseen unique pool IDs appearing on subsequent polls (poll 2+). */
+  /** Count of previously unseen unique pool IDs appearing on subsequent polls (subsequent usable polls). */
   readonly laterPollArrivalsEncountered: number;
   /** Unique pools failing pre-verification checks (denominator: uniquePoolsEncountered). */
   readonly preVerificationExclusions: {
@@ -270,9 +272,9 @@ export interface DiscoveryFunnelMetrics {
     readonly futureDatedAgeCount: number;
     /** Unique pools whose API-reported age satisfied the age filter threshold. */
     readonly confirmedAgeFilterPasses: number;
-    /** API-reported fresh pools present in the initial baseline snapshot (poll 1). */
+    /** API-reported fresh pools present in the initial baseline snapshot (first usable poll). */
     readonly initialSnapshotFreshPasses: number;
-    /** API-reported fresh pools arriving on subsequent polls (poll 2+). */
+    /** API-reported fresh pools arriving on subsequent polls (subsequent usable polls). */
     readonly laterPollFreshArrivals: number;
     /** Unique pools excluded due to missing, invalid, future-dated, or mature age. */
     readonly ageFilterExclusions: number;

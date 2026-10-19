@@ -57,7 +57,12 @@ export function verificationPlan(mode = "all") {
   }
   if (mode !== "static") {
     plan.push(
-      node(["--test", "scripts/architecture-check.test.mjs", "scripts/verify-isolated.test.mjs"]),
+      node([
+        "--test",
+        "scripts/architecture-check.test.mjs",
+        "scripts/verify-isolated.test.mjs",
+        "scripts/verify-pilot-manifest.test.mjs",
+      ]),
     );
     for (const config of ["measurement-analysis", "h2", "h3", "h4"])
       plan.push(

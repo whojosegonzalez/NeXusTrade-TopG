@@ -1100,6 +1100,7 @@ export class PilotLiveCollectorSession {
       const raydiumFunnel = this.raydiumClient.getFunnelMetrics();
       const funnelMetrics: DiscoveryFunnelMetrics = {
         apiPoolsReturned: raydiumFunnel.apiPoolsReturned,
+        malformedRawEntries: raydiumFunnel.malformedRawEntries,
         uniquePoolsEncountered: raydiumFunnel.uniquePoolsEncountered,
         repeatedPoolsSuppressed: raydiumFunnel.repeatedPoolsSuppressed,
         initialSnapshotPoolsEncountered: raydiumFunnel.initialSnapshotPoolsEncountered,

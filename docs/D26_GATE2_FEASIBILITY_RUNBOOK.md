@@ -48,16 +48,37 @@ The D.2.6 Gate 2 experiment operates under strict, fail-closed research guardrai
 
 ### Primary Research Objective
 
-Empirically measure whether Raydium API v3's volume-ranked standard catalog (`poolType=standard&poolSortField=default&sortType=desc`) can surface fresh Raydium AMM v4 liquidity pools within a fixed 10-minute observational window under an active pool age threshold.
+Empirically characterize the candidate turnover, pool-age distribution, and arrival behavior of Raydium API v3's volume-ranked standard catalog (page 1, top-50, `poolType=standard&poolSortField=default&sortType=desc`) within a fixed 10-minute observational window under an active pool age threshold.
+
+### Strict Scientific Distinctions & Conceptual Definitions (G2-F9)
+
+To ensure empirical rigour, Gate 2 establishes four foundational scientific distinctions:
+
+1. **Initial Snapshot Freshness vs. Later Arrival Freshness:**
+   - **Initial Snapshot Fresh Pools (`initialSnapshotFreshPasses`):** Pools present on the first successful, usable catalog response whose API-reported age satisfies the freshness threshold. These represent pre-existing catalog entries that happen to fall within the window at observation start.
+   - **Later Arrival Fresh Pools (`laterPollFreshArrivals`):** Previously unseen pools appearing on subsequent poll cycles (poll 2+) whose API-reported age satisfies the freshness threshold. These represent prospective new arrivals surfaced by the catalog during the observation window.
+
+2. **API-Reported openTime vs. On-Chain openTime / Slot Ground Truth:**
+   - **API-Reported `openTime`:** Upstream metadata provided by the Raydium API v3 JSON envelope. It is treated as an unauthenticated heuristic for preliminary client-side filtering only.
+   - **On-Chain Ground Truth:** Independent Solana JSON-RPC account inspection (`getAccountInfo` / `getMultipleAccounts` at `confirmed` commitment), verifying canonical program ownership (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`), 752-byte AMM v4 layout, and exact on-chain slot provenance.
+
+3. **Completed Zero-Yield Observation vs. Operational Provider Failure:**
+   - **Completed Zero-Yield Observation (Scientific Finding):** The collector executes across its full preregistered 600-second observation window (`stopReason: "DURATION_EXPIRED"`), completing all scheduled catalog polls and screening passes with status `FINALIZED`, resulting in 0 eligible fresh pools or 0 verified on-chain AMM v4 pools. This is a scientifically valid outcome characterizing endpoint turnover during the sampled window.
+   - **Operational Provider Failure (Operational Failure):** Premature termination due to unhandled provider errors, persistent rate-limit backoff, network disconnection, or process crashes resulting in status `INTERRUPTED`.
+   - **Strict Rule on Interrupted Archives:** A zero-candidate `INTERRUPTED` session is **NOT** a completed or valid research archive. It cannot be used to claim catalog saturation or absence of arrivals.
+
+4. **Bounded Empirical Scope:**
+   - The findings of Gate 2 characterize solely the empirical behavior of page 1 of the volume-ranked standard pool catalog during the specific 10-minute observation window.
+   - Gate 2 makes **no universal claims** regarding API-wide limits, unpolled pagination depths, or alternative query parameters.
 
 ### Preregistered Hypotheses
 
 Because the standard Raydium catalog endpoint sorts by 24-hour volume by default and does not expose a chronological creation-time index, top-ranked pools represent mature, high-liquidity pools.
 
-- **Hypothesis A (Fresh Arrival):** High-volume pools initialized within the active age window enter the top-50 catalog and pass the freshness filter (`poolAgeAtDiscoverySec <= maxPoolAgeSec`).
-- **Hypothesis B (Catalog Saturation / Stasis):** Top-50 catalog remains composed entirely of mature pools (`poolAgeAtDiscoverySec > maxPoolAgeSec`) or unindexed pools (`openTime = "0"`), yielding 0 fresh pools during the fixed observation window.
+- **Hypothesis A (Fresh Arrival Observed):** Pools initialized within the active age window enter the top-50 volume-ranked catalog during the observation window and pass the freshness filter (`poolAgeAtDiscoverySec <= maxPoolAgeSec`).
+- **Hypothesis B (Catalog Stasis / Saturation Observed):** Top-50 volume-ranked catalog remains composed entirely of mature pools (`poolAgeAtDiscoverySec > maxPoolAgeSec`) or unindexed pools (`openTime = "0"`), yielding 0 fresh pool arrivals during the fixed 10-minute window.
 
-**Scientific Principle:** Both outcomes are scientifically conclusive. Hypothesis B is not an engineering failure; it provides authoritative empirical proof of the catalog's arrival horizon and justifies subsequent event-driven discovery mechanisms (e.g. WebSocket log subscriptions) without compromising research integrity.
+**Scientific Principle:** Both outcomes are scientifically valid empirical characterizations. Hypothesis B is not an engineering failure; it provides bounded empirical evidence of page-1 volume catalog turnover during the sample period and motivates exploring event-driven discovery mechanisms (e.g. WebSocket log subscriptions) without compromising research integrity.
 
 ---
 
@@ -80,13 +101,14 @@ To balance freshness with empirical feasibility, **24 hours (`--max-pool-age-sec
 
 _(Optional Sensitivity Analysis: A subsequent 1-hour run with `--max-pool-age-sec=3600` may be executed as a sensitivity analysis, but the 24-hour run is the preregistered primary benchmark)._
 
-### End-to-End Funnel Metrics (G2-F1 / G2-F3)
+### End-to-End Funnel Metrics (G2-F1 / G2-F3 / G2-F7)
 
 All sampling stages are tracked and persisted in `session-summary.json` under `discoveryFunnel` with strict mathematical accounting:
 
 ```json
 {
   "apiPoolsReturned": 1500,
+  "malformedRawEntries": 0,
   "uniquePoolsEncountered": 50,
   "repeatedPoolsSuppressed": 1450,
   "initialSnapshotPoolsEncountered": 50,
@@ -122,7 +144,7 @@ All sampling stages are tracked and persisted in `session-summary.json` under `d
 
 ### Funnel Mathematical Invariants
 
-1. `uniquePoolsEncountered + repeatedPoolsSuppressed === apiPoolsReturned`
+1. `uniquePoolsEncountered + repeatedPoolsSuppressed + malformedRawEntries === apiPoolsReturned`
 2. `initialSnapshotPoolsEncountered + laterPollArrivalsEncountered === uniquePoolsEncountered`
 3. `validAgeCount + missingAgeCount + invalidAgeCount + futureDatedAgeCount === uniquePoolsEncountered`
 4. `confirmedAgeFilterPasses + ageFilterExclusions === uniquePoolsEncountered`
@@ -213,22 +235,25 @@ The experiment is an **operational success** if and only if:
 7. Process memory remained strictly below 256 MB RSS throughout.
 8. Outbound request rates remained within the 30 req/min budget.
 
+**Zero-Candidate Session Criterion:** A session with 0 recorded candidates is a valid research archive IF AND ONLY IF it completed its full observation period with status `FINALIZED`, stop reason `DURATION_EXPIRED`, and a valid manifest. If any session terminates prematurely with status `INTERRUPTED` or exits non-zero, it is classified as an operational failure and is **NOT** a completed or valid research archive.
+
 ### Research Empirical Outcomes
 
 Once operational success is confirmed, the research results fall into one of two valid empirical scenarios:
 
-| Research Outcome                                     | Empirical Findings                                                            | Scientific Conclusion & Next Step                                                                                                                                                                 |
-| :--------------------------------------------------- | :---------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Scenario A: Catalog Arrival Observed**             | `verifiedAmmV4Pools >= 1` and `confirmedAgeFilterPasses >= 1`.                | Raydium API v3 catalog can surface fresh Raydium AMM v4 pools within the threshold. Document candidate profiles, arrival latency, and pool attributes.                                            |
-| **Scenario B: Catalog Stasis / Saturation Observed** | `verifiedAmmV4Pools === 0`, `exceedsMaxPoolAge > 0` or `invalidOpenTime > 0`. | Raydium API v3 volume-ranked catalog is saturated with mature pools and does not surface fresh pools within the fixed window. Provides empirical justification for real-time WebSocket discovery. |
+| Research Outcome                                     | Empirical Findings                                                            | Scientific Conclusion & Next Step                                                                                                                                                                                                                                             |
+| :--------------------------------------------------- | :---------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scenario A: Catalog Arrival Observed**             | `verifiedAmmV4Pools >= 1` and `confirmedAgeFilterPasses >= 1`.                | Raydium API v3 volume-ranked standard catalog surfaced fresh Raydium AMM v4 pools during the observation window. Document candidate profiles, arrival latency, initial snapshot vs later arrival provenance, and pool attributes.                                             |
+| **Scenario B: Catalog Stasis / Saturation Observed** | `verifiedAmmV4Pools === 0`, `exceedsMaxPoolAge > 0` or `invalidOpenTime > 0`. | Page 1 of the volume-ranked standard catalog remained saturated with mature or unindexed pools during the fixed 10-minute window, surfacing 0 fresh arrivals. Bounds prospective polling utility for this endpoint and justifies evaluating event-driven WebSocket discovery. |
 
 ### Operational Failure Criteria
 
-The experiment is an **operational failure** if:
+The experiment is an **operational failure** (requiring investigation and invalidating the run as a research archive) if:
 
 - Process exit code `!= 0`.
 - Unhandled promise rejection or libuv assertion failure occurs.
 - Session status is `INTERRUPTED` or manifest fails verification (`INVALID`).
+- Target duration was not reached due to unhandled provider errors, network dropouts, or unbudgeted rate limiting.
 - Memory exceeds 256 MB RSS or disk exceeds 256 MB.
 - RPC errors are conflated with on-chain ineligibility.
 
