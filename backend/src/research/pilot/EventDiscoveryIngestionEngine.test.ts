@@ -520,5 +520,46 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       expect(metrics.failedInitDecodes).toBe(1);
       expect(metrics.coherentTierPoolsCount).toBe(0);
     });
+
+    it("halts processing and fails closed when transaction slot delta exceeds maxSlotDelta (D29-H2)", async () => {
+      const engine = new EventDiscoveryIngestionEngine({
+        maxRetriesPerTx: 1,
+        maxSlotDelta: 100, // Maximum allowed slot delta is 100
+      });
+      const signature = "sig_slot_discrepant_tx";
+      // Notification says slot 300000000
+      const notificationSlot = 300000000;
+      // Returned transaction has slot 300000500 (delta = 500 > 100)
+      const tx = createAmmV4InitTransactionFixture({
+        signature,
+        slot: 300000500,
+      });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx);
+
+      const accountFetcher = new MockOnChainAccountFetcher();
+      accountFetcher.setAccount(
+        FIXTURE_POOL_ADDRESS,
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+
+      await engine.handleLogNotification(
+        createMockLogNotificationEnvelope(signature, notificationSlot),
+      );
+
+      const results = await engine.processQueue(txFetcher, accountFetcher);
+
+      // Ingestion must halt immediately: no pool verification dispatched or emitted
+      expect(results.length).toBe(0);
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.slotDiscrepancyIncidents).toBe(1);
+      expect(metrics.slotDiscrepantTierCount).toBe(1);
+      expect(metrics.candidatePoolsDiscovered).toBe(0);
+      expect(metrics.successfulInitDecodes).toBe(0);
+      expect(metrics.coherentTierPoolsCount).toBe(0);
+    });
   });
 });

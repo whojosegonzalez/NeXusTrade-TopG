@@ -73,7 +73,7 @@ export interface ResolvedPilotConfig {
   readonly maxRssBytes: number;
   readonly maxConsecutiveErrors: number;
   readonly candidatePollIntervalMs: number;
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
   readonly minRequestIntervalMs?: number | undefined;
 }

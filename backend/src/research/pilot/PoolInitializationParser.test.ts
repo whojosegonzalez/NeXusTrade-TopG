@@ -206,6 +206,30 @@ describe("Milestone D.2.9-A: Pool Initialization Parser Tests", () => {
       expect(result.protocol).toBe("UNSUPPORTED_PROTOCOL");
       expect(result.reason).toBe("NON_INITIALIZATION_INSTRUCTION");
     });
+
+    it("fails closed when CPMM initialize instruction has fewer than 20 accounts (D29-H1)", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      // Test with 17 accounts (previous non-authoritative count), 18, and 19 accounts
+      for (const accountCount of [17, 18, 19]) {
+        const tx = {
+          ...baseTx,
+          instructions: [
+            {
+              ...baseTx.instructions[0]!,
+              accountKeyIndexes: baseTx.instructions[0]!.accountKeyIndexes.slice(0, accountCount),
+            },
+          ],
+        };
+
+        const result = identifyPoolInitializationInstruction(tx);
+        expect(result.ok).toBe(false);
+        if (result.ok) return;
+
+        expect(result.protocol).toBe("RAYDIUM_CPMM");
+        expect(result.reason).toBe("MISSING_ACCOUNTS");
+        expect(result.message).toContain("requires at least 20 accounts");
+      }
+    });
   });
 
   // --------------------------------------------------------------------------

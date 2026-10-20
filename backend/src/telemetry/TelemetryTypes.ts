@@ -204,7 +204,7 @@ export interface SessionTelemetryMeta {
   readonly sessionStatus?: "ACTIVE" | "INTERRUPTED" | "FINALIZED" | undefined;
   readonly isInterruptedSession?: boolean | undefined;
   readonly resumedFromPriorCrash?: boolean | undefined;
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
 }
 
@@ -235,7 +235,7 @@ export interface SessionTelemetrySummary {
   readonly avoidedRugsCount: number;
   readonly isCompleteSession?: boolean | undefined;
   readonly isInterruptedSession?: boolean | undefined;
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
   readonly discoveryFunnel?: DiscoveryFunnelMetrics | undefined;
 }

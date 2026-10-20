@@ -436,7 +436,7 @@ function parseSingleInstruction(
       };
     }
 
-    // Expected accounts layout for Raydium CPMM initialize (17 accounts):
+    // Authoritative accounts layout for Raydium CPMM initialize per raydium-cp-swap instructions/initialize.rs (20 accounts):
     // 0: creator (Signer)
     // 1: amm_config
     // 2: authority PDA
@@ -454,12 +454,15 @@ function parseSingleInstruction(
     // 14: token_program
     // 15: token_0_program
     // 16: token_1_program
-    if (accounts.length < 17) {
+    // 17: associated_token_program
+    // 18: system_program
+    // 19: rent sysvar
+    if (accounts.length < 20) {
       return {
         error: {
           protocol: "RAYDIUM_CPMM",
           reason: "MISSING_ACCOUNTS",
-          message: `Raydium CPMM init instruction requires at least 17 accounts, got ${accounts.length}`,
+          message: `Raydium CPMM initialize requires at least 20 accounts in authoritative upstream order, got ${accounts.length}`,
         },
       };
     }

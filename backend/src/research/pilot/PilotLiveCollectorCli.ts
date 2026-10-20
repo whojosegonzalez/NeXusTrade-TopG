@@ -32,6 +32,16 @@ import { verifySessionExportManifest } from "./PilotExportManifest.js";
 import { D23_STRATEGY_REVISION } from "./PilotSchemaBridge.js";
 import type { D23ScreenedCandidate } from "./PilotTypes.js";
 import type { DiscoveryFunnelMetrics } from "../../telemetry/TelemetryTypes.js";
+import {
+  EventDiscoveryIngestionEngine,
+  type ITransactionFetcher,
+} from "./EventDiscoveryIngestionEngine.js";
+import type {
+  DiscoveredPoolAccountPayload,
+  EventDiscoveryMetricsSnapshot,
+  IOnChainAccountFetcher,
+  VersionedTransactionMetadata,
+} from "./EventDiscoveryContracts.js";
 
 export class PilotLogger {
   private readonly logFilePath: string | null = null;
@@ -174,11 +184,16 @@ export interface PilotLiveCollectorConfig {
   readonly maxRssMb?: number | undefined;
   readonly outputDir: string;
   readonly enableForwardObservations: boolean;
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
   readonly minRequestIntervalMs?: number | undefined;
   readonly logFilePath?: string | undefined;
   readonly verifyPoolAddress?: string | undefined;
+  readonly verifyCpmmPoolAddress?: string | undefined;
+  readonly replayFixturesPath?: string | undefined;
+  readonly captureFixturesDir?: string | undefined;
+  readonly maxEvents?: number | undefined;
+  readonly maxTransactions?: number | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
   readonly logger?: PilotLogger | undefined;
@@ -229,11 +244,16 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let maxMb = 256; // 256 MB accepted operational storage limit
   let maxRssMb = 256; // 256 MB accepted RSS memory ceiling
   let enableForwardObservations = true;
-  let discoverySource: "dexscreener" | "raydium" = "dexscreener";
+  let discoverySource: "dexscreener" | "raydium" | "events" = "dexscreener";
   let maxPoolAgeSec = 0;
   let minRequestIntervalMs = 2000;
   let logFilePath: string | undefined = undefined;
   let verifyPoolAddress: string | undefined = undefined;
+  let verifyCpmmPoolAddress: string | undefined = undefined;
+  let replayFixturesPath: string | undefined = undefined;
+  let captureFixturesDir: string | undefined = undefined;
+  let maxEvents: number | undefined = undefined;
+  let maxTransactions: number | undefined = undefined;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -245,7 +265,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
 
   for (const arg of args) {
     if (arg === "--help" || arg === "-h") {
-      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4 / D.2.5)
+      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4 / D.2.5 / D.2.9)
 Usage: node backend/dist/research/pilot/PilotLiveCollectorCli.js [options]
 
 Required:
@@ -253,8 +273,13 @@ Required:
 
 Options:
   --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
+  --verify-cpmm-pool=<address>     Perform independent on-chain Raydium CPMM verification and print report (D29-H3)
+  --replay-fixtures=<path>         Replay recorded event/transaction fixtures offline without network (D29-H3)
+  --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3)
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
-  --discovery-source=dexscreener|raydium Discovery source adapter (default: dexscreener)
+  --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
+  --max-events=<n>                 Maximum event budget for event discovery (default: 50)
+  --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
   --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
   --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000, 30 req/min budget)
   --poll-interval-sec=<n>          Discovery polling interval in seconds (default: 30)
@@ -277,12 +302,12 @@ Options:
       network = "disabled";
     } else if (arg.startsWith("--discovery-source=")) {
       const val = arg.slice("--discovery-source=".length).trim().toLowerCase();
-      if (val !== "dexscreener" && val !== "raydium") {
+      if (val !== "dexscreener" && val !== "raydium" && val !== "events") {
         throw new Error(
-          `[INVALID_ARGUMENT] Option '--discovery-source' must be 'dexscreener' or 'raydium', got '${val}'`,
+          `[INVALID_ARGUMENT] Option '--discovery-source' must be 'dexscreener', 'raydium', or 'events', got '${val}'`,
         );
       }
-      discoverySource = val;
+      discoverySource = val as "dexscreener" | "raydium" | "events";
     } else if (arg.startsWith("--max-pool-age-sec=")) {
       maxPoolAgeSec = parseNonNegativeInt(
         "--max-pool-age-sec",
@@ -299,6 +324,35 @@ Options:
         throw new Error("[INVALID_ARGUMENT] Option '--verify-pool' requires a non-empty address");
       }
       verifyPoolAddress = val;
+    } else if (arg.startsWith("--verify-cpmm-pool=")) {
+      const val = arg.slice("--verify-cpmm-pool=".length).trim();
+      if (!val) {
+        throw new Error(
+          "[INVALID_ARGUMENT] Option '--verify-cpmm-pool' requires a non-empty address",
+        );
+      }
+      verifyCpmmPoolAddress = val;
+    } else if (arg.startsWith("--replay-fixtures=")) {
+      const val = arg.slice("--replay-fixtures=".length).trim();
+      if (!val) {
+        throw new Error("[INVALID_ARGUMENT] Option '--replay-fixtures' requires a non-empty path");
+      }
+      replayFixturesPath = path.resolve(val);
+    } else if (arg.startsWith("--capture-fixtures-dir=")) {
+      const val = arg.slice("--capture-fixtures-dir=".length).trim();
+      if (!val) {
+        throw new Error(
+          "[INVALID_ARGUMENT] Option '--capture-fixtures-dir' requires a non-empty directory path",
+        );
+      }
+      captureFixturesDir = path.resolve(val);
+    } else if (arg.startsWith("--max-events=")) {
+      maxEvents = parsePositiveInt("--max-events", arg.slice("--max-events=".length));
+    } else if (arg.startsWith("--max-transactions=")) {
+      maxTransactions = parsePositiveInt(
+        "--max-transactions",
+        arg.slice("--max-transactions=".length),
+      );
     } else if (arg.startsWith("--rpc-url=")) {
       const val = arg.slice("--rpc-url=".length).trim();
       if (!val) {
@@ -408,6 +462,11 @@ Options:
     minRequestIntervalMs,
     logFilePath,
     verifyPoolAddress,
+    verifyCpmmPoolAddress,
+    replayFixturesPath,
+    captureFixturesDir,
+    maxEvents,
+    maxTransactions,
   };
 }
 
@@ -684,6 +743,10 @@ export class PilotLiveCollectorSession {
         onLog: (msg) => this.logger.info("RAYDIUM_API", msg),
       });
       this.logger.info("DISCOVERY", "Raydium API v3 catalog discovery client initialized");
+    } else if (discoverySource === "events") {
+      throw new Error(
+        "[DISCOVERY_UNAUTHORIZED] Live event-driven discovery is deferred to Milestone D.2.9-B upon authorization. Use --replay-fixtures=<path> for offline event verification.",
+      );
     } else {
       this.discoveryClient = new DexScreenerLiveDiscoveryClient({
         pollIntervalMs: this.config.pollIntervalSec * 1000,
@@ -1154,6 +1217,118 @@ export class PilotLiveCollectorSession {
 export { PilotLiveCollectorSession as LiveCollectorRunner };
 
 /**
+ * Executes an offline event discovery replay session from recorded fixture files (D29-H3).
+ */
+export async function runReplaySession(
+  config: PilotLiveCollectorConfig,
+  logger: PilotLogger,
+): Promise<{ ok: boolean; metrics: EventDiscoveryMetricsSnapshot; poolsVerified: number }> {
+  if (!config.replayFixturesPath || !fsSync.existsSync(config.replayFixturesPath)) {
+    throw new Error(`[REPLAY_ERROR] Fixtures path does not exist: ${config.replayFixturesPath}`);
+  }
+
+  const stat = fsSync.statSync(config.replayFixturesPath);
+  const fixtureFiles: string[] = [];
+  if (stat.isDirectory()) {
+    const entries = fsSync.readdirSync(config.replayFixturesPath);
+    for (const e of entries) {
+      if (e.endsWith(".json")) {
+        fixtureFiles.push(path.join(config.replayFixturesPath, e));
+      }
+    }
+  } else {
+    fixtureFiles.push(config.replayFixturesPath);
+  }
+
+  logger.info(
+    "REPLAY_LOAD",
+    `Loading ${fixtureFiles.length} fixture files from ${config.replayFixturesPath}...`,
+  );
+
+  const engine = new EventDiscoveryIngestionEngine({
+    maxQueueSize: config.maxEvents ?? 500,
+  });
+
+  const txMap = new Map<string, VersionedTransactionMetadata>();
+  const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
+
+  for (const filePath of fixtureFiles) {
+    try {
+      const raw = fsSync.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed.signature && parsed.accountKeys) {
+        txMap.set(parsed.signature, parsed);
+        await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: parsed.slot ?? 0 },
+              value: {
+                signature: parsed.signature,
+                err: parsed.err ?? null,
+                logs: parsed.logs ?? ["Program log: initialize"],
+              },
+            },
+            subscription: 1,
+          },
+        });
+      } else if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && typeof item === "object" && item.signature && item.accountKeys) {
+            txMap.set(item.signature, item);
+            await engine.handleLogNotification({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                result: {
+                  context: { slot: item.slot ?? 0 },
+                  value: {
+                    signature: item.signature,
+                    err: item.err ?? null,
+                    logs: item.logs ?? ["Program log: initialize"],
+                  },
+                },
+                subscription: 1,
+              },
+            });
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn("REPLAY_PARSE_WARN", `Failed to parse fixture file ${filePath}: ${err}`);
+    }
+  }
+
+  const txFetcher: ITransactionFetcher = {
+    fetchTransaction: async (sig: string) => txMap.get(sig) ?? null,
+  };
+
+  const accountFetcher: IOnChainAccountFetcher = {
+    getAccountInfo: async (addr: string) => accountMap.get(addr) ?? null,
+    getMultipleAccounts: async (addrs: readonly string[]) =>
+      addrs.map((a) => accountMap.get(a) ?? null),
+    getSlot: async () => 300000000,
+  };
+
+  const dispatchResults = await engine.processQueue(txFetcher, accountFetcher);
+  const metrics = engine.getMetricsSnapshot();
+
+  if (config.captureFixturesDir) {
+    fsSync.mkdirSync(config.captureFixturesDir, { recursive: true });
+    const dumpPath = path.join(config.captureFixturesDir, `replayed-metrics-${Date.now()}.json`);
+    fsSync.writeFileSync(dumpPath, JSON.stringify(metrics, null, 2), "utf8");
+    logger.info("CAPTURE_FIXTURES", `Wrote captured replay telemetry to ${dumpPath}`);
+  }
+
+  return {
+    ok: true,
+    metrics,
+    poolsVerified: dispatchResults.filter((r) => r.verified).length,
+  };
+}
+
+/**
  * CLI Execution Entrypoint
  */
 export async function runPilotCollectorCli(
@@ -1178,6 +1353,19 @@ export async function runPilotCollectorCli(
   } catch (err) {
     console.error(`[CONFIG_ERROR] Failed to parse CLI arguments: ${err}`);
     return 1;
+  }
+
+  // Offline Replay Mode (D29-H3): Does not require network authorization
+  if (config.replayFixturesPath) {
+    const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
+    try {
+      const report = await runReplaySession(config, logger);
+      console.log(JSON.stringify(report, null, 2));
+      return report.ok ? 0 : 1;
+    } catch (err) {
+      logger.error("REPLAY_ERROR", `Failed to replay fixtures: ${err}`);
+      return 1;
+    }
   }
 
   if (config.network !== "enabled") {
@@ -1213,6 +1401,37 @@ export async function runPilotCollectorCli(
       logger.warn(
         "VERIFY_POOL_FAILED",
         `Pool ${config.verifyPoolAddress} verification failed: ${report.verificationStatus} (${report.error ?? "Verification error"})`,
+      );
+      return 1;
+    }
+  }
+
+  // Independent On-Chain Raydium CPMM Pool Verification Diagnostic Mode (D29-H3)
+  if (config.verifyCpmmPoolAddress) {
+    const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
+    logger.info(
+      "VERIFY_CPMM_POOL_START",
+      `Initiating independent on-chain verification for Raydium CPMM pool ${config.verifyCpmmPoolAddress}...`,
+    );
+    const rpcClient = new SolanaRpcLiveObservationClient({
+      rpcUrl: config.rpcUrl,
+      transport: config.rpcTransport,
+      onLog: (msg) => logger.info("SOLANA_RPC", msg),
+    });
+
+    const report = await rpcClient.verifyCpmmPoolAccount(config.verifyCpmmPoolAddress);
+    console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+
+    if (report.verified) {
+      logger.info(
+        "VERIFY_CPMM_POOL_SUCCESS",
+        `Pool ${config.verifyCpmmPoolAddress} verified as canonical Raydium CPMM (tier: ${report.verificationTier}).`,
+      );
+      return 0;
+    } else {
+      logger.warn(
+        "VERIFY_CPMM_POOL_FAILED",
+        `Pool ${config.verifyCpmmPoolAddress} verification failed: ${report.verificationStatus} (${report.error ?? "Verification error"})`,
       );
       return 1;
     }

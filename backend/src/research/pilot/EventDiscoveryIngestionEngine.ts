@@ -263,10 +263,14 @@ export class EventDiscoveryIngestionEngine {
         continue;
       }
 
-      // Validate slot delta bounds
+      // Validate slot delta bounds (D29-H2: fail closed on excessive slot disagreement)
       const txSlotDelta = Math.abs(tx.slot - item.slot);
       if (txSlotDelta > this.maxSlotDelta) {
         this.slotDiscrepancyIncidents += 1;
+        this.completedSignatures.add(item.signature);
+        this.slotDiscrepantTierCount += 1;
+        item.lifecycleState = "SLOT_DISCREPANT";
+        continue;
       }
 
       item.lifecycleState = "TX_FETCHED";

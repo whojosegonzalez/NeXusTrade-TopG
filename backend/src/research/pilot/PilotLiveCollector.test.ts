@@ -36,6 +36,7 @@ import {
 } from "./PilotLiveCollectorCli.js";
 import { importAndVerifyPilotSession } from "./PilotArchiveImporter.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
+import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
   createAuthoritativeSplVaultBuffer,
@@ -43,6 +44,16 @@ import {
   FIXTURE_POOL_ADDRESS,
   FIXTURE_WSOL_MINT,
 } from "./fixtures/AuthoritativeRaydiumFixtures.js";
+import {
+  createAuthoritativeRaydiumCpmmBuffer,
+  createAuthoritativeCpmmSplVaultBuffer,
+  FIXTURE_CPMM_POOL_ADDRESS,
+  FIXTURE_CPMM_TOKEN_0_MINT,
+  FIXTURE_CPMM_TOKEN_1_MINT,
+  FIXTURE_CPMM_TOKEN_0_VAULT,
+  FIXTURE_CPMM_TOKEN_1_VAULT,
+} from "./fixtures/AuthoritativeCpmmFixtures.js";
+import { createCpmmInitTransactionFixture } from "./fixtures/AuthoritativeEventFixtures.js";
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
 import { toCanonicalCandidateDecision } from "./PilotSchemaBridge.js";
 import { isValidCandidateDecisionRecord } from "../shadow/ShadowCollectorEngine.js";
@@ -239,7 +250,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(res.status).toBe(1);
       expect(res.stderr).toContain("[INVALID_ARGUMENT]");
       expect(res.stderr).toContain(
-        "Option '--discovery-source' must be 'dexscreener' or 'raydium'",
+        "Option '--discovery-source' must be 'dexscreener', 'raydium', or 'events'",
       );
     });
 
@@ -2237,6 +2248,11 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
           `--verify-pool=${FIXTURE_POOL_ADDRESS}`,
         ]);
 
+        if (resSuccess.status !== 0) {
+          throw new Error(
+            `CLI FAILED: status=${resSuccess.status}, stderr=${resSuccess.stderr}, stdout=${resSuccess.stdout}`,
+          );
+        }
         expect(resSuccess.status).toBe(0);
         expect(resSuccess.signal).toBeNull();
         expect(resSuccess.stderr).not.toContain("Assertion failed");
@@ -2260,6 +2276,196 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
+    });
+
+    it("spawns compiled binary with --verify-cpmm-pool against offline mock RPC and exits cleanly with verification report (D29-H3)", async () => {
+      const compiledCliPath = path.resolve("backend/dist/research/pilot/PilotLiveCollectorCli.js");
+      expect(fsSync.existsSync(compiledCliPath)).toBe(true);
+
+      const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 10_000_000_000n,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 50_000_000_000n,
+      });
+
+      let requestedPool = "";
+      const server = http.createServer((req, res) => {
+        let bodyStr = "";
+        req.on("data", (chunk) => {
+          bodyStr += chunk;
+        });
+        req.on("end", () => {
+          let body: { method: string; params: unknown[] } = { method: "", params: [] };
+          try {
+            body = JSON.parse(bodyStr);
+          } catch {
+            res.writeHead(400);
+            res.end();
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          if (body.method === "getAccountInfo") {
+            requestedPool = String((body.params as unknown[])?.[0] ?? "");
+            if (requestedPool === FIXTURE_CPMM_POOL_ADDRESS) {
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    context: { slot: 458336920 },
+                    value: {
+                      data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 10000000,
+                      owner: RAYDIUM_CPMM_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                  },
+                }),
+              );
+            } else {
+              // Unauthorized / wrong owner
+              res.end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    context: { slot: 458336920 },
+                    value: {
+                      data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 10000000,
+                      owner: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ1PYDa6mt6px",
+                      rentEpoch: 0,
+                    },
+                  },
+                }),
+              );
+            }
+          } else if (body.method === "getMultipleAccounts") {
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: {
+                  context: { slot: 458336920 },
+                  value: [
+                    {
+                      data: [v0Buffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 2039280,
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                    {
+                      data: [v1Buffer.toString("base64"), "base64"],
+                      executable: false,
+                      lamports: 2039280,
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      rentEpoch: 0,
+                    },
+                  ],
+                },
+              }),
+            );
+          } else {
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: 99, error: { message: "Unknown" } }));
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      const mockRpcUrl = `http://127.0.0.1:${port}`;
+
+      const runSpawnedCli = (args: string[]) => {
+        return new Promise<{
+          status: number | null;
+          signal: NodeJS.Signals | null;
+          stdout: string;
+          stderr: string;
+        }>((resolve) => {
+          const child = spawn(process.execPath, [compiledCliPath, ...args]);
+          let stdout = "";
+          let stderr = "";
+          child.stdout?.on("data", (d) => {
+            stdout += d.toString();
+          });
+          child.stderr?.on("data", (d) => {
+            stderr += d.toString();
+          });
+          child.on("close", (status, signal) => {
+            resolve({ status, signal, stdout, stderr });
+          });
+        });
+      };
+
+      try {
+        // 1. Success case: verify canonical CPMM pool
+        const resSuccess = await runSpawnedCli([
+          "--network=enabled",
+          `--rpc-url=${mockRpcUrl}`,
+          `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+        ]);
+
+        if (resSuccess.status !== 0) {
+          throw new Error(
+            `CLI FAILED: status=${resSuccess.status}, stderr=${resSuccess.stderr}, stdout=${resSuccess.stdout}`,
+          );
+        }
+        expect(resSuccess.status).toBe(0);
+        expect(resSuccess.signal).toBeNull();
+        expect(resSuccess.stdout).toContain("[VERIFY_CPMM_POOL_SUCCESS]");
+        expect(resSuccess.stdout).toContain('"verified": true');
+        expect(resSuccess.stdout).toContain('"verificationStatus": "VERIFIED_RAYDIUM_CPMM"');
+
+        // 2. Failure case: verify non-canonical CPMM pool
+        const resFail = await runSpawnedCli([
+          "--network=enabled",
+          `--rpc-url=${mockRpcUrl}`,
+          `--verify-cpmm-pool=${FIXTURE_MEME_MINT}`,
+        ]);
+
+        expect(resFail.status).toBe(1);
+        expect(resFail.signal).toBeNull();
+        expect(resFail.stderr).toContain("[VERIFY_CPMM_POOL_FAILED]");
+        expect(resFail.stdout).toContain('"verificationStatus": "UNAUTHORIZED_PROGRAM_ID"');
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it("replays recorded event fixtures offline and records telemetry via --replay-fixtures (D29-H3)", async () => {
+      const testDir = await makeTestDir("replay-fixtures-test");
+      const fixturePath = path.join(testDir, "test-fixture.json");
+      const captureDir = path.join(testDir, "captured");
+
+      const txFixture = createCpmmInitTransactionFixture();
+      fsSync.writeFileSync(fixturePath, JSON.stringify(txFixture, null, 2), "utf8");
+
+      const exitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--replay-fixtures=${fixturePath}`,
+        `--capture-fixtures-dir=${captureDir}`,
+      ]);
+
+      expect(exitCode).toBe(0);
+      expect(fsSync.existsSync(captureDir)).toBe(true);
+      const capturedFiles = fsSync.readdirSync(captureDir);
+      expect(capturedFiles.length).toBeGreaterThanOrEqual(1);
+      const metricsRaw = fsSync.readFileSync(path.join(captureDir, capturedFiles[0]!), "utf8");
+      const metrics = JSON.parse(metricsRaw);
+      expect(metrics.rawLogNotificationsReceived).toBe(1);
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {

@@ -284,7 +284,7 @@ export interface D23ScreenedCandidate {
   readonly poolOpenTimeMs?: number | null | undefined;
   readonly poolAgeAtDiscoverySec?: number | null | undefined;
   readonly firstSeenEpochMs?: number | null | undefined;
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly discoveryEndpoint?: string | undefined;
   readonly discoveryPage?: number | undefined;
   readonly discoverySortField?: string | undefined;
@@ -382,7 +382,7 @@ export interface PilotCollectorConfig {
   readonly maxRssBytes?: number | undefined; // Default 256 MB (256 * 1024 * 1024)
   readonly maxConsecutiveErrors?: number | undefined; // Default 5
   readonly candidatePollIntervalMs?: number | undefined; // Default 60,000ms
-  readonly discoverySource?: "dexscreener" | "raydium" | undefined;
+  readonly discoverySource?: "dexscreener" | "raydium" | "events" | undefined;
   readonly maxPoolAgeSec?: number | undefined;
   readonly minRequestIntervalMs?: number | undefined;
 }

@@ -139,7 +139,7 @@ export async function dispatchPoolVerification(
       protocol: event.protocol,
       verified: false,
       rejectionReason: `Slot delta ${slotDelta} exceeds maximum acceptable threshold ${options.maxAcceptableSlotDelta}`,
-      verificationTier: "REJECTED",
+      verificationTier: "SLOT_DISCREPANT",
       transactionSlot: txSlot,
       poolAccountSlot: poolSlot,
       vault0AccountSlot: v0Slot,

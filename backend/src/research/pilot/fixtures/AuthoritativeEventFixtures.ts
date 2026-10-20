@@ -269,12 +269,13 @@ export function createCpmmInitTransactionFixture(
   const token1Vault = options.token1Vault ?? FIXTURE_CPMM_TOKEN_1_VAULT;
   const creatorWallet = options.creatorWallet ?? FIXTURE_CPMM_CREATOR;
 
-  // Ordered accounts for CPMM initialize:
+  // Ordered accounts for CPMM initialize per raydium-cp-swap instructions/initialize.rs (20 accounts):
   // 0: creator, 1: amm_config, 2: authority PDA, 3: pool_state,
   // 4: token_0_mint, 5: token_1_mint, 6: lp_mint, 7: creator_token_0,
   // 8: creator_token_1, 9: creator_lp_token, 10: token_0_vault, 11: token_1_vault,
   // 12: create_pool_fee, 13: observation_state, 14: token_program,
-  // 15: token_0_program, 16: token_1_program, 17: CPMM Program
+  // 15: token_0_program, 16: token_1_program, 17: associated_token_program,
+  // 18: system_program, 19: rent, 20: CPMM Program
   const accounts = [
     creatorWallet, // 0
     FIXTURE_CPMM_AMM_CONFIG, // 1
@@ -293,7 +294,10 @@ export function createCpmmInitTransactionFixture(
     SPL_TOKEN_PROGRAM_ID, // 14: token_program
     SPL_TOKEN_PROGRAM_ID, // 15: token_0_program
     SPL_TOKEN_PROGRAM_ID, // 16: token_1_program
-    RAYDIUM_CPMM_PROGRAM_ID, // 17: Program ID
+    FIXTURE_ASSOCIATED_TOKEN_PROGRAM, // 17: associated_token_program
+    FIXTURE_SYSTEM_PROGRAM, // 18: system_program
+    FIXTURE_RENT_SYSVAR, // 19: rent sysvar
+    RAYDIUM_CPMM_PROGRAM_ID, // 20: Program ID
   ];
 
   const length = options.customDataLength ?? 32;
@@ -316,15 +320,15 @@ export function createCpmmInitTransactionFixture(
     finalEncoding = "base64";
   }
 
-  const accountKeyIndexes = accounts.map((_, idx) => idx).slice(0, 17);
+  const accountKeyIndexes = accounts.map((_, idx) => idx).slice(0, 20);
 
   if (options.isVersion0) {
-    const staticAccountKeys = accounts.slice(0, 8);
-    const loadedWritable = accounts.slice(8, 14);
-    const loadedReadonly = accounts.slice(14);
+    const staticAccountKeys = accounts.slice(0, 10);
+    const loadedWritable = accounts.slice(10, 16);
+    const loadedReadonly = accounts.slice(16);
 
     const compiledInstruction: CompiledInstruction = {
-      programIdIndex: 17, // CPMM program ID
+      programIdIndex: 20, // CPMM program ID
       accountKeyIndexes,
       data: finalData,
       ...(finalEncoding ? { dataEncoding: finalEncoding } : {}),
@@ -348,7 +352,7 @@ export function createCpmmInitTransactionFixture(
   }
 
   const compiledInstruction: CompiledInstruction = {
-    programIdIndex: 17,
+    programIdIndex: 20,
     accountKeyIndexes,
     data: finalData,
     ...(finalEncoding ? { dataEncoding: finalEncoding } : {}),
