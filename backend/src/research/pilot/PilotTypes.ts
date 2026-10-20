@@ -72,6 +72,15 @@ export type QuoteAssetCohort =
   | "EXOTIC_CROSS"; // Meme-to-meme or other SPL cross-pair (Observation-only quarantined)
 
 /**
+ * CPMM Reserve and Price Verification Tier (D28-F3, D28-F4).
+ */
+export type CpmmVerificationTier =
+  | "INDEPENDENTLY_COHERENT" // All 3 slots match exactly, authority & token programs verified, pool owner verified
+  | "PARTIALLY_VERIFIED" // Decoded without error but lacks complete slot provenance or authority proof
+  | "SLOT_DISCREPANT" // Explicit mismatch between vault slots or pool-to-vault slots
+  | "UNAVAILABLE"; // Insolvent reserves, zero reserves, or data mismatch
+
+/**
  * Decoded Raydium CPMM Pool State (637 bytes Anchor layout: raydium-cp-swap v0.1.0).
  * All raw token integer amounts are preserved as exact `bigint` values.
  */
@@ -96,15 +105,28 @@ export interface D28RaydiumCpmmState {
   readonly protocolFeesToken1: bigint;
   readonly fundFeesToken0: bigint;
   readonly fundFeesToken1: bigint;
-  /** Swap activation timestamp in Unix seconds (not independently verified pool creation time) */
+  /** Creator fee collection mode (0: BothToken, 1: OnlyToken0, 2: OnlyToken1) */
+  readonly creatorFeeOn: number;
+  /** Whether creator trade fees are enabled for this pool */
+  readonly enableCreatorFee: boolean;
+  /** Accumulated uncollected creator fees for token 0 */
+  readonly creatorFeesToken0: bigint;
+  /** Accumulated uncollected creator fees for token 1 */
+  readonly creatorFeesToken1: bigint;
+  /** Recent epoch of pool interaction */
+  readonly recentEpoch: bigint;
+  /** Pool unlock / swap-activation Unix timestamp in seconds (not independently established pool-creation time) */
   readonly swapActivationTimeSec: bigint;
   readonly poolAddress: string;
-  readonly programId: string;
+  /** Verified program ID or null if unverified/missing owner proof (D28-F3) */
+  readonly programId: string | null;
+  /** Whether pool account owner was independently confirmed as canonical CPMM program */
+  readonly ownerVerified: boolean;
   readonly accountSlot?: number | undefined;
 }
 
 /**
- * CPMM Reserve Accounting with Fee Liability Segregation (D28-ADG-02).
+ * CPMM Reserve Accounting with Fee Liability Segregation (D28-ADG-02, D28-F1, D28-F3, D28-F4).
  */
 export interface D28CpmmReserveAccounting {
   readonly poolAddress: string;
@@ -114,6 +136,12 @@ export interface D28CpmmReserveAccounting {
   readonly token1Decimals: number;
   readonly token0VaultRaw: bigint;
   readonly token1VaultRaw: bigint;
+  readonly protocolFeesToken0Raw: bigint;
+  readonly protocolFeesToken1Raw: bigint;
+  readonly fundFeesToken0Raw: bigint;
+  readonly fundFeesToken1Raw: bigint;
+  readonly creatorFeesToken0Raw: bigint;
+  readonly creatorFeesToken1Raw: bigint;
   readonly token0TotalFeesRaw: bigint;
   readonly token1TotalFeesRaw: bigint;
   readonly effectiveReserve0Raw: bigint;
@@ -126,8 +154,18 @@ export interface D28CpmmReserveAccounting {
   readonly quoteCohort: QuoteAssetCohort;
   readonly orientation: RaydiumPairOrientation;
   readonly effectiveReservesAvailable: boolean;
+  readonly verificationTier: CpmmVerificationTier;
+  readonly isCoherentPointInTime: boolean;
+  readonly poolOwnerVerified: boolean;
+  readonly vaultAuthoritiesVerified: boolean;
+  readonly vaultTokenProgramsVerified: boolean;
+  readonly slotProvenanceComplete: boolean;
   readonly slotDiscrepancy: boolean;
+  readonly poolSlot?: number | undefined;
+  readonly vault0Slot?: number | undefined;
+  readonly vault1Slot?: number | undefined;
   readonly slotDelta?: number | undefined;
+  readonly poolVaultSlotDelta?: number | undefined;
   readonly unavailabilityReason?: string | undefined;
 }
 

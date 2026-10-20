@@ -2,24 +2,12 @@
  * Phase 12.94-D Milestone D.2.8: Authoritative Raydium CPMM Fixtures
  *
  * Constructs 637-byte Raydium CPMM PoolState account buffers matching the official
- * Anchor zero_copy packed C layout in raydium-io/raydium-cp-swap v0.1.0.
+ * Anchor zero_copy packed C layout in raydium-io/raydium-cp-swap v0.1.0 (PR #55/#80).
  *
  * Provides:
- * 1. Positive fixtures:
- *    - WSOL native pair (Token 0 Token / Token 1 WSOL)
- *    - Inverted WSOL native pair (Token 0 WSOL / Token 1 Token)
- *    - Stablecoin USD pair (Token 0 Token / Token 1 USDC)
- *    - Exotic cross-pair (Token 0 Meme / Token 1 Meme)
- *    - Fee liability accruals (protocol fees, fund fees)
- *    - Token-2022 program pair
- * 2. Negative fixtures:
- *    - Truncated buffer (< 637 bytes)
- *    - Corrupted Anchor discriminator (not 0xf7ede3f5d7c3de46)
- *    - Contradictory mints (token_0_mint === token_1_mint)
- *    - Contradictory vaults (token_0_vault === token_1_vault)
- *    - Invalid decimals (> 18)
- *    - Unsupported token program (neither SPL Token nor Token-2022)
- *    - Invalid pubkey bytes
+ * 1. Standard configurable fixture generator (`createAuthoritativeRaydiumCpmmBuffer`).
+ * 2. Independent hardcoded layout buffer (`createIndependentHardcodedCpmmBuffer`)
+ *    that uses raw literal byte offsets independent of parser constant references (D28-F1).
  */
 
 import {
@@ -68,6 +56,11 @@ export interface CpmmFixtureOptions {
   fundFeesToken0?: bigint;
   fundFeesToken1?: bigint;
   openTime?: bigint;
+  recentEpoch?: bigint;
+  creatorFeeOn?: number;
+  enableCreatorFee?: boolean;
+  creatorFeesToken0?: bigint;
+  creatorFeesToken1?: bigint;
 }
 
 /**
@@ -145,6 +138,92 @@ export function createAuthoritativeRaydiumCpmmBuffer(options: CpmmFixtureOptions
   buffer.writeBigUInt64LE(options.fundFeesToken0 ?? 0n, RAYDIUM_CPMM_OFFSETS.FUND_FEES_TOKEN_0);
   buffer.writeBigUInt64LE(options.fundFeesToken1 ?? 0n, RAYDIUM_CPMM_OFFSETS.FUND_FEES_TOKEN_1);
   buffer.writeBigUInt64LE(options.openTime ?? 1792370000n, RAYDIUM_CPMM_OFFSETS.OPEN_TIME);
+  buffer.writeBigUInt64LE(options.recentEpoch ?? 650n, RAYDIUM_CPMM_OFFSETS.RECENT_EPOCH);
+
+  // 5. Creator fees (D28-F1)
+  buffer.writeUInt8(options.creatorFeeOn ?? 0, RAYDIUM_CPMM_OFFSETS.CREATOR_FEE_ON);
+  buffer.writeUInt8(options.enableCreatorFee ? 1 : 0, RAYDIUM_CPMM_OFFSETS.ENABLE_CREATOR_FEE);
+  buffer.writeBigUInt64LE(
+    options.creatorFeesToken0 ?? 0n,
+    RAYDIUM_CPMM_OFFSETS.CREATOR_FEES_TOKEN_0,
+  );
+  buffer.writeBigUInt64LE(
+    options.creatorFeesToken1 ?? 0n,
+    RAYDIUM_CPMM_OFFSETS.CREATOR_FEES_TOKEN_1,
+  );
 
   return buffer;
+}
+
+/**
+ * Creates an independent raw 637-byte buffer using hardcoded literal byte offsets,
+ * entirely independent of the parser's RAYDIUM_CPMM_OFFSETS constants (D28-F1 requirement 7).
+ */
+export function createIndependentHardcodedCpmmBuffer(params: {
+  token0MintBase58: string;
+  token1MintBase58: string;
+  token0VaultBase58: string;
+  token1VaultBase58: string;
+  mint0Decimals: number;
+  mint1Decimals: number;
+  protocolFeesToken0: bigint;
+  protocolFeesToken1: bigint;
+  fundFeesToken0: bigint;
+  fundFeesToken1: bigint;
+  creatorFeesToken0: bigint;
+  creatorFeesToken1: bigint;
+  creatorFeeOn: number;
+  enableCreatorFee: boolean;
+  openTime: bigint;
+  recentEpoch: bigint;
+}): Buffer {
+  const buf = Buffer.alloc(637);
+
+  // Hardcoded literal discriminator
+  buf[0] = 0xf7;
+  buf[1] = 0xed;
+  buf[2] = 0xe3;
+  buf[3] = 0xf5;
+  buf[4] = 0xd7;
+  buf[5] = 0xc3;
+  buf[6] = 0xde;
+  buf[7] = 0x46;
+
+  const set32 = (offset: number, b58: string) => {
+    buf.set(decodeBase58To32Bytes(b58), offset);
+  };
+
+  set32(8, FIXTURE_CPMM_AMM_CONFIG);
+  set32(40, FIXTURE_CPMM_CREATOR);
+  set32(72, params.token0VaultBase58);
+  set32(104, params.token1VaultBase58);
+  set32(136, FIXTURE_CPMM_LP_MINT);
+  set32(168, params.token0MintBase58);
+  set32(200, params.token1MintBase58);
+  set32(232, SPL_TOKEN_PROGRAM_ID);
+  set32(264, SPL_TOKEN_PROGRAM_ID);
+  set32(296, FIXTURE_CPMM_OBSERVATION);
+
+  buf.writeUInt8(254, 328); // authBump
+  buf.writeUInt8(0, 329); // status
+  buf.writeUInt8(6, 330); // lpMintDecimals
+  buf.writeUInt8(params.mint0Decimals, 331); // mint0Decimals
+  buf.writeUInt8(params.mint1Decimals, 332); // mint1Decimals
+
+  buf.writeBigUInt64LE(1_000_000_000n, 333); // lpSupply
+  buf.writeBigUInt64LE(params.protocolFeesToken0, 341); // protocolFeesToken0
+  buf.writeBigUInt64LE(params.protocolFeesToken1, 349); // protocolFeesToken1
+  buf.writeBigUInt64LE(params.fundFeesToken0, 357); // fundFeesToken0
+  buf.writeBigUInt64LE(params.fundFeesToken1, 365); // fundFeesToken1
+  buf.writeBigUInt64LE(params.openTime, 373); // openTime
+  buf.writeBigUInt64LE(params.recentEpoch, 381); // recentEpoch
+
+  buf.writeUInt8(params.creatorFeeOn, 389); // creatorFeeOn
+  buf.writeUInt8(params.enableCreatorFee ? 1 : 0, 390); // enableCreatorFee
+  // 391..397 padding1 (6 bytes zero)
+  buf.writeBigUInt64LE(params.creatorFeesToken0, 397); // creatorFeesToken0
+  buf.writeBigUInt64LE(params.creatorFeesToken1, 405); // creatorFeesToken1
+  // 413..637 padding (224 bytes zero)
+
+  return buf;
 }

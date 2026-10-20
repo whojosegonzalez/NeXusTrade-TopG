@@ -4,13 +4,14 @@
  * Comprehensive offline verification of:
  * 1. RaydiumCpmmParser account decoding (637 bytes Anchor PoolState layout).
  * 2. Anchor discriminator enforcement (0xf7ede3f5d7c3de46).
- * 3. Canonical program ownership (CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C).
+ * 3. Separation of binary decoding from verified on-chain owner (D28-F3).
  * 4. Token-2022 and SPL Token program validation.
  * 5. Layout invariant checks (non-identical mints, non-identical vaults, decimal sanity <= 18).
- * 6. Quote cohort classification (WSOL_NATIVE, STABLECOIN_USD, EXOTIC_CROSS).
- * 7. Fee liability subtraction from physical vault balances for effective trading reserves.
- * 8. Decimal normalization and spot price proxy derivation.
- * 9. Fail-closed behavior on insolvent, zero, or mismatched reserves.
+ * 6. Literal-address quote cohort classification: canonical WSOL, USDC, USDT, and historical typo rejection (D28-F2).
+ * 7. Fee liability deduction including creator fees (protocol + fund + creator) matching upstream vault_amount_without_fee() (D28-F1).
+ * 8. Insolvent/zero reserve detection with creator fees (D28-F1).
+ * 9. Honest observation causality: vault-to-vault mismatch, pool-to-vault mismatch, missing provenance, and authority verification (D28-F3, D28-F4).
+ * 10. Independent hardcoded layout verification (D28-F1 requirement 7).
  *
  * 100% offline, zero network requests, deterministic synthetic fixtures.
  */
@@ -18,13 +19,18 @@
 import { describe, expect, it } from "vitest";
 import {
   computeCpmmReserveAccounting,
+  HISTORICAL_INCORRECT_USDT_MINT,
   parseRaydiumCpmmAccount,
+  RAYDIUM_CPMM_AUTHORITY,
   RAYDIUM_CPMM_LAYOUT_LENGTH,
   RAYDIUM_CPMM_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
+  USDC_MINT,
+  USDT_MINT,
 } from "./RaydiumCpmmParser.js";
 import {
   createAuthoritativeRaydiumCpmmBuffer,
+  createIndependentHardcodedCpmmBuffer,
   FIXTURE_CPMM_AMM_CONFIG,
   FIXTURE_CPMM_CREATOR,
   FIXTURE_CPMM_MEME_MINT_2,
@@ -34,22 +40,29 @@ import {
   FIXTURE_CPMM_TOKEN_0_VAULT,
   FIXTURE_CPMM_TOKEN_1_MINT,
   FIXTURE_CPMM_TOKEN_1_VAULT,
-  FIXTURE_CPMM_USDC_MINT,
 } from "./fixtures/AuthoritativeCpmmFixtures.js";
 import { SPL_TOKEN_PROGRAM_ID, WSOL_MINT } from "./RaydiumAmmParser.js";
-import type { D23SplTokenVaultState } from "./PilotTypes.js";
+import type { CpmmVaultSnapshot } from "./RaydiumCpmmParser.js";
 
 describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests", () => {
-  describe("1. PoolState Binary Layout Parsing", () => {
-    it("successfully decodes authoritative 637-byte CPMM buffer with WSOL_NATIVE quote cohort", () => {
+  // --------------------------------------------------------------------------
+  // 1. Binary Layout Parsing & Owner Verification Separation (D28-F1, D28-F3)
+  // --------------------------------------------------------------------------
+  describe("1. PoolState Binary Layout Parsing & Owner Separation", () => {
+    it("successfully decodes authoritative 637-byte CPMM buffer with creator fees and verified owner", () => {
       const buffer = createAuthoritativeRaydiumCpmmBuffer({
         mint0Decimals: 6,
         mint1Decimals: 9,
         openTime: 1792370123n,
+        recentEpoch: 651n,
         protocolFeesToken0: 500n,
         fundFeesToken0: 250n,
         protocolFeesToken1: 1000n,
         fundFeesToken1: 500n,
+        creatorFeeOn: 0,
+        enableCreatorFee: true,
+        creatorFeesToken0: 125n,
+        creatorFeesToken1: 250n,
       });
 
       expect(buffer.length).toBe(RAYDIUM_CPMM_LAYOUT_LENGTH);
@@ -68,6 +81,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.orientation).toBe("TOKEN_BASE_SOL_QUOTE");
       expect(result.state.poolAddress).toBe(FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.state.programId).toBe(RAYDIUM_CPMM_PROGRAM_ID);
+      expect(result.state.ownerVerified).toBe(true);
       expect(result.state.ammConfig).toBe(FIXTURE_CPMM_AMM_CONFIG);
       expect(result.state.poolCreator).toBe(FIXTURE_CPMM_CREATOR);
       expect(result.state.token0Vault).toBe(FIXTURE_CPMM_TOKEN_0_VAULT);
@@ -85,56 +99,38 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.state.fundFeesToken0).toBe(250n);
       expect(result.state.protocolFeesToken1).toBe(1000n);
       expect(result.state.fundFeesToken1).toBe(500n);
+      expect(result.state.creatorFeeOn).toBe(0);
+      expect(result.state.enableCreatorFee).toBe(true);
+      expect(result.state.creatorFeesToken0).toBe(125n);
+      expect(result.state.creatorFeesToken1).toBe(250n);
+      expect(result.state.recentEpoch).toBe(651n);
       expect(result.state.swapActivationTimeSec).toBe(1792370123n);
       expect(result.state.accountSlot).toBe(300000001);
     });
 
-    it("correctly classifies inverted SOL_BASE_TOKEN_QUOTE orientation when token0 is WSOL", () => {
-      const buffer = createAuthoritativeRaydiumCpmmBuffer({
-        token0MintBase58: WSOL_MINT,
-        token1MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
-        mint0Decimals: 9,
-        mint1Decimals: 6,
-      });
+    it("separates binary decoding from owner proof: missing owner leaves programId null and ownerVerified false (D28-F3)", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer();
 
+      // No ownerProgramId passed
       const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
-      expect(result.quoteCohort).toBe("WSOL_NATIVE");
-      expect(result.orientation).toBe("SOL_BASE_TOKEN_QUOTE");
+      expect(result.state.ownerVerified).toBe(false);
+      expect(result.state.programId).toBeNull();
     });
 
-    it("correctly classifies STABLECOIN_USD quote cohort when paired with USDC", () => {
-      const buffer = createAuthoritativeRaydiumCpmmBuffer({
-        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
-        token1MintBase58: FIXTURE_CPMM_USDC_MINT,
-        mint0Decimals: 6,
-        mint1Decimals: 6,
-      });
+    it("rejects unauthorized program owner (D28-F3)", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer();
+      const result = parseRaydiumCpmmAccount(
+        buffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // AMM v4
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
 
-      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-
-      expect(result.quoteCohort).toBe("STABLECOIN_USD");
-      expect(result.orientation).toBe("NON_SOL_PAIR");
-    });
-
-    it("correctly classifies EXOTIC_CROSS quote cohort for meme-to-meme pairs", () => {
-      const buffer = createAuthoritativeRaydiumCpmmBuffer({
-        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
-        token1MintBase58: FIXTURE_CPMM_MEME_MINT_2,
-        mint0Decimals: 6,
-        mint1Decimals: 6,
-      });
-
-      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-
-      expect(result.quoteCohort).toBe("EXOTIC_CROSS");
-      expect(result.orientation).toBe("NON_SOL_PAIR");
+      expect(result.category).toBe("UNAUTHORIZED_OWNER_PROGRAM");
     });
 
     it("accepts Token-2022 program as valid token program", () => {
@@ -149,7 +145,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.state.token0Program).toBe(TOKEN_2022_PROGRAM_ID);
     });
 
-    it("rejects truncated buffer length", () => {
+    it("rejects truncated buffer length (< 637 bytes)", () => {
       const truncated = Buffer.alloc(636);
       const result = parseRaydiumCpmmAccount(truncated, FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.ok).toBe(false);
@@ -158,7 +154,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.category).toBe("INVALID_BUFFER_LENGTH");
     });
 
-    it("rejects oversized buffer length", () => {
+    it("rejects oversized buffer length (> 637 bytes)", () => {
       const oversized = Buffer.alloc(752); // AMM v4 size
       const result = parseRaydiumCpmmAccount(oversized, FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.ok).toBe(false);
@@ -178,23 +174,10 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.category).toBe("INVALID_ANCHOR_DISCRIMINATOR");
     });
 
-    it("rejects unauthorized program owner", () => {
-      const buffer = createAuthoritativeRaydiumCpmmBuffer();
-      const result = parseRaydiumCpmmAccount(
-        buffer,
-        FIXTURE_CPMM_POOL_ADDRESS,
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium AMM v4
-      );
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-
-      expect(result.category).toBe("UNAUTHORIZED_OWNER_PROGRAM");
-    });
-
     it("rejects contradictory identical mints (token0 === token1)", () => {
       const buffer = createAuthoritativeRaydiumCpmmBuffer({
         token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
-        token1MintBase58: FIXTURE_CPMM_TOKEN_0_MINT, // identical!
+        token1MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
       });
       const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.ok).toBe(false);
@@ -206,7 +189,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
     it("rejects contradictory identical vaults (vault0 === vault1)", () => {
       const buffer = createAuthoritativeRaydiumCpmmBuffer({
         token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
-        token1VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT, // identical!
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
       });
       const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
       expect(result.ok).toBe(false);
@@ -226,7 +209,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.category).toBe("INVALID_DECIMALS");
     });
 
-    it("rejects unsupported token program", () => {
+    it("rejects unsupported token program (neither SPL Token nor Token-2022)", () => {
       const buffer = createAuthoritativeRaydiumCpmmBuffer({
         token0ProgramBase58: "11111111111111111111111111111111", // System program
       });
@@ -238,35 +221,139 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
     });
   });
 
-  describe("2. Reserve Accounting & Fee Liability Segregation", () => {
-    it("deducts protocol and fund fees from vault balances to derive effective reserves", () => {
+  // --------------------------------------------------------------------------
+  // 2. Canonical Token Mint Identities & Literal Address Regression (D28-F2)
+  // --------------------------------------------------------------------------
+  describe("2. Canonical Token Mint Identities & Literal Address Regression", () => {
+    it("recognizes canonical USDC (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: USDC_MINT,
+      });
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.quoteCohort).toBe("STABLECOIN_USD");
+      expect(result.orientation).toBe("NON_SOL_PAIR");
+    });
+
+    it("recognizes canonical Solana Mainnet USDT (Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB)", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: USDT_MINT,
+      });
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.quoteCohort).toBe("STABLECOIN_USD");
+      expect(result.orientation).toBe("NON_SOL_PAIR");
+    });
+
+    it("rejects historical incorrect USDT address from STABLECOIN_USD cohort (D28-F2)", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: HISTORICAL_INCORRECT_USDT_MINT,
+      });
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      // Must be classified as EXOTIC_CROSS, NOT STABLECOIN_USD!
+      expect(result.quoteCohort).toBe("EXOTIC_CROSS");
+      expect(result.quoteCohort).not.toBe("STABLECOIN_USD");
+    });
+
+    it("does not admit unknown tokens with stablecoin-like symbols into STABLECOIN_USD (literal address equality)", () => {
+      // Fake stablecoin address mimicking USDC
+      const fakeUsdcMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt99";
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: fakeUsdcMint,
+      });
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.quoteCohort).toBe("EXOTIC_CROSS");
+      expect(result.quoteCohort).not.toBe("STABLECOIN_USD");
+    });
+
+    it("correctly classifies inverted SOL_BASE_TOKEN_QUOTE orientation when token0 is WSOL", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: WSOL_MINT,
+        token1MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        mint0Decimals: 9,
+        mint1Decimals: 6,
+      });
+
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.quoteCohort).toBe("WSOL_NATIVE");
+      expect(result.orientation).toBe("SOL_BASE_TOKEN_QUOTE");
+    });
+
+    it("correctly classifies EXOTIC_CROSS quote cohort for meme-to-meme pairs", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: FIXTURE_CPMM_MEME_MINT_2,
+        mint0Decimals: 6,
+        mint1Decimals: 6,
+      });
+
+      const result = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.quoteCohort).toBe("EXOTIC_CROSS");
+      expect(result.orientation).toBe("NON_SOL_PAIR");
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 3. Creator-Fee Accounting & Liability Segregation (D28-F1)
+  // --------------------------------------------------------------------------
+  describe("3. Creator-Fee Accounting & Liability Segregation", () => {
+    it("deducts protocol, fund, AND creator fees from vault balances to derive effective reserves (D28-F1)", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
         mint0Decimals: 6,
         mint1Decimals: 9,
         protocolFeesToken0: 10_000n,
         fundFeesToken0: 5_000n,
+        creatorFeesToken0: 2_500n, // Creator fee
         protocolFeesToken1: 20_000_000n,
         fundFeesToken1: 10_000_000n,
+        creatorFeesToken1: 5_000_000n, // Creator fee
       });
 
-      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
+      const parsedPool = parseRaydiumCpmmAccount(
+        poolBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+        300000001,
+      );
       expect(parsedPool.ok).toBe(true);
       if (!parsedPool.ok) return;
 
-      const vault0: D23SplTokenVaultState = {
+      const vault0: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 100_015_000n, // 100,000,000 effective + 15,000 fees
+        rawAmount: 100_017_500n, // 100,000,000 effective + 17,500 total fees (10k + 5k + 2.5k)
         slot: 300000001,
+        authority: RAYDIUM_CPMM_AUTHORITY,
+        ownerProgramId: SPL_TOKEN_PROGRAM_ID,
       };
 
-      const vault1: D23SplTokenVaultState = {
+      const vault1: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 50_030_000_000n, // 50,000,000,000 effective (50 SOL) + 30,000,000 fees (0.03 SOL)
+        rawAmount: 50_035_000_000n, // 50 SOL effective + 35,000,000 total fees (20M + 10M + 5M)
         slot: 300000001,
+        authority: RAYDIUM_CPMM_AUTHORITY,
+        ownerProgramId: SPL_TOKEN_PROGRAM_ID,
       };
 
       const accountingResult = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
@@ -274,8 +361,16 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       if (!accountingResult.ok) return;
 
       const acct = accountingResult.accounting;
-      expect(acct.token0TotalFeesRaw).toBe(15_000n);
-      expect(acct.token1TotalFeesRaw).toBe(30_000_000n);
+      expect(acct.protocolFeesToken0Raw).toBe(10_000n);
+      expect(acct.fundFeesToken0Raw).toBe(5_000n);
+      expect(acct.creatorFeesToken0Raw).toBe(2_500n);
+      expect(acct.token0TotalFeesRaw).toBe(17_500n);
+
+      expect(acct.protocolFeesToken1Raw).toBe(20_000_000n);
+      expect(acct.fundFeesToken1Raw).toBe(10_000_000n);
+      expect(acct.creatorFeesToken1Raw).toBe(5_000_000n);
+      expect(acct.token1TotalFeesRaw).toBe(35_000_000n);
+
       expect(acct.effectiveReserve0Raw).toBe(100_000_000n); // 100 token units (at 6 decimals)
       expect(acct.effectiveReserve1Raw).toBe(50_000_000_000n); // 50 SOL (at 9 decimals)
       expect(acct.effectiveReserve0Decimal).toBe(100);
@@ -284,67 +379,72 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       // Spot Price: 50 SOL / 100 Tokens = 0.5 SOL/token
       expect(acct.spotPrice0Per1).toBe(0.5);
       expect(acct.spotPriceSol).toBe(0.5);
-      expect(acct.spotPrice1Per0).toBe(2.0); // 2 tokens per SOL
-      expect(acct.quoteCohort).toBe("WSOL_NATIVE");
-      expect(acct.slotDiscrepancy).toBe(false);
+      expect(acct.spotPrice1Per0).toBe(2.0);
+      expect(acct.verificationTier).toBe("INDEPENDENTLY_COHERENT");
+      expect(acct.isCoherentPointInTime).toBe(true);
     });
 
-    it("rejects when vault balance is less than accrued fees (insolvent reserves)", () => {
+    it("fails closed with INSOLVENT_RESERVES when ignoring creator fees would produce positive reserve, but including them causes insolvency (D28-F1)", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
-        protocolFeesToken0: 50_000n,
-        fundFeesToken0: 50_000n, // total fees: 100,000
+        protocolFeesToken0: 5_000n,
+        fundFeesToken0: 5_000n, // sum = 10,000
+        creatorFeesToken0: 20_000n, // total liabilities = 30,000
       });
 
       const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
       expect(parsedPool.ok).toBe(true);
       if (!parsedPool.ok) return;
 
-      const insolventVault0: D23SplTokenVaultState = {
+      // Vault has 15,000.
+      // If creator fees were ignored: 15,000 - 10,000 = +5,000 (falsely solvent!)
+      // With creator fees included: 15,000 < 30,000 (insolvent!)
+      const vault0: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 90_000n, // Less than 100,000 fees!
+        rawAmount: 15_000n,
       };
 
-      const vault1: D23SplTokenVaultState = {
+      const vault1: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
         rawAmount: 1_000_000_000n,
       };
 
-      const result = computeCpmmReserveAccounting(parsedPool.state, insolventVault0, vault1);
+      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
       expect(result.ok).toBe(false);
       if (result.ok) return;
 
       expect(result.category).toBe("INSOLVENT_RESERVES");
+      expect(result.message).toContain("total accrued fee liabilities (30000");
     });
 
-    it("rejects when effective reserve is zero", () => {
+    it("fails closed with ZERO_RESERVES when ignoring creator fees would produce positive reserve, but including them leaves 0 effective reserve (D28-F1)", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
         protocolFeesToken0: 10_000n,
         fundFeesToken0: 0n,
+        creatorFeesToken0: 5_000n, // total = 15,000
       });
 
       const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
       expect(parsedPool.ok).toBe(true);
       if (!parsedPool.ok) return;
 
-      const zeroVault0: D23SplTokenVaultState = {
+      // Vault has 15,000.
+      // If creator fees ignored: 15,000 - 10,000 = 5,000 (falsely non-zero!)
+      // With creator fees included: 15,000 - 15,000 = 0 (zero reserves!)
+      const vault0: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 10_000n, // exactly equal to fees -> effective reserve 0
+        rawAmount: 15_000n,
       };
 
-      const vault1: D23SplTokenVaultState = {
+      const vault1: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
         rawAmount: 1_000_000_000n,
       };
 
-      const result = computeCpmmReserveAccounting(parsedPool.state, zeroVault0, vault1);
+      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
       expect(result.ok).toBe(false);
       if (result.ok) return;
 
@@ -354,7 +454,7 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
     it("strictly sets spotPriceSol to null for non-WSOL pairs (fail-closed pricing)", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
         token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
-        token1MintBase58: FIXTURE_CPMM_USDC_MINT,
+        token1MintBase58: USDC_MINT,
         mint0Decimals: 6,
         mint1Decimals: 6,
       });
@@ -363,17 +463,15 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(parsedPool.ok).toBe(true);
       if (!parsedPool.ok) return;
 
-      const vault0: D23SplTokenVaultState = {
+      const vault0: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
         rawAmount: 10_000_000n,
       };
 
-      const vault1: D23SplTokenVaultState = {
+      const vault1: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
-        mintAddress: FIXTURE_CPMM_USDC_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
+        mintAddress: USDC_MINT,
         rawAmount: 20_000_000n,
       };
 
@@ -383,78 +481,34 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
 
       expect(result.accounting.quoteCohort).toBe("STABLECOIN_USD");
       expect(result.accounting.spotPrice0Per1).toBe(2.0); // 2.0 USDC per Token 0
-      expect(result.accounting.spotPriceSol).toBeNull(); // Fail-closed: No unanchored conversion to SOL
+      expect(result.accounting.spotPriceSol).toBeNull(); // Fail-closed
     });
+  });
 
-    it("rejects vault address mismatch", () => {
+  // --------------------------------------------------------------------------
+  // 4. Honest Reserve Causality & Verification Tiers (D28-F3, D28-F4)
+  // --------------------------------------------------------------------------
+  describe("4. Honest Reserve Causality & Verification Tiers", () => {
+    it("flags vault-to-vault slot mismatch as SLOT_DISCREPANT and nullifies spot prices (D28-F4)", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
-      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
+      const parsedPool = parseRaydiumCpmmAccount(
+        poolBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+        300000000,
+      );
       expect(parsedPool.ok).toBe(true);
       if (!parsedPool.ok) return;
 
-      const wrongVault0: D23SplTokenVaultState = {
-        vaultAddress: "11111111111111111111111111111111", // wrong address
-        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 1_000_000n,
-      };
-      const vault1: D23SplTokenVaultState = {
-        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
-        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 1_000_000n,
-      };
-
-      const result = computeCpmmReserveAccounting(parsedPool.state, wrongVault0, vault1);
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-
-      expect(result.category).toBe("VAULT_ADDRESS_MISMATCH");
-    });
-
-    it("rejects vault mint mismatch", () => {
-      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
-      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
-      expect(parsedPool.ok).toBe(true);
-      if (!parsedPool.ok) return;
-
-      const vault0: D23SplTokenVaultState = {
+      const vault0: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 1_000_000n,
-      };
-      const wrongVault1: D23SplTokenVaultState = {
-        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
-        mintAddress: FIXTURE_CPMM_USDC_MINT, // mismatch (expected WSOL)
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
-        rawAmount: 1_000_000n,
-      };
-
-      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, wrongVault1);
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-
-      expect(result.category).toBe("VAULT_MINT_MISMATCH");
-    });
-
-    it("detects and flags slot discrepancies between vault observations", () => {
-      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
-      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
-      expect(parsedPool.ok).toBe(true);
-      if (!parsedPool.ok) return;
-
-      const vault0: D23SplTokenVaultState = {
-        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
-        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
         rawAmount: 1_000_000n,
         slot: 300000000,
       };
-      const vault1: D23SplTokenVaultState = {
+      const vault1: CpmmVaultSnapshot = {
         vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
         mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
-        ownerAddress: FIXTURE_CPMM_POOL_ADDRESS,
         rawAmount: 1_000_000n,
         slot: 300000005, // 5 slots ahead!
       };
@@ -465,6 +519,179 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
 
       expect(result.accounting.slotDiscrepancy).toBe(true);
       expect(result.accounting.slotDelta).toBe(5);
+      expect(result.accounting.verificationTier).toBe("SLOT_DISCREPANT");
+      expect(result.accounting.isCoherentPointInTime).toBe(false);
+      expect(result.accounting.effectiveReservesAvailable).toBe(false);
+      expect(result.accounting.spotPrice0Per1).toBeNull();
+      expect(result.accounting.spotPriceSol).toBeNull();
+      expect(result.accounting.unavailabilityReason).toContain("Vault-to-vault slot mismatch");
+    });
+
+    it("flags pool-to-vault slot mismatch as SLOT_DISCREPANT and nullifies spot prices (D28-F4)", () => {
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      const parsedPool = parseRaydiumCpmmAccount(
+        poolBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+        300000010, // Pool slot is 300000010
+      );
+      expect(parsedPool.ok).toBe(true);
+      if (!parsedPool.ok) return;
+
+      const vault0: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000000, // Vault slots are 300000000
+      };
+      const vault1: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000000,
+      };
+
+      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.accounting.slotDiscrepancy).toBe(true);
+      expect(result.accounting.verificationTier).toBe("SLOT_DISCREPANT");
+      expect(result.accounting.isCoherentPointInTime).toBe(false);
+      expect(result.accounting.effectiveReservesAvailable).toBe(false);
+      expect(result.accounting.spotPrice0Per1).toBeNull();
+      expect(result.accounting.unavailabilityReason).toContain("Pool-to-vault slot mismatch");
+    });
+
+    it("classifies snapshot as PARTIALLY_VERIFIED when slot provenance is incomplete (D28-F4)", () => {
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      // No pool account slot
+      const parsedPool = parseRaydiumCpmmAccount(
+        poolBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+      );
+      expect(parsedPool.ok).toBe(true);
+      if (!parsedPool.ok) return;
+
+      const vault0: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000000,
+      };
+      const vault1: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000000,
+      };
+
+      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.accounting.slotDiscrepancy).toBe(false);
+      expect(result.accounting.slotProvenanceComplete).toBe(false);
+      expect(result.accounting.verificationTier).toBe("PARTIALLY_VERIFIED");
+      expect(result.accounting.isCoherentPointInTime).toBe(false);
+      // Reserves are available as an exploratory proxy
+      expect(result.accounting.effectiveReservesAvailable).toBe(true);
+      expect(result.accounting.spotPriceSol).not.toBeNull();
+    });
+
+    it("rejects unauthorized vault authority (D28-F3)", () => {
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsedPool.ok).toBe(true);
+      if (!parsedPool.ok) return;
+
+      const rogueVault0: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 1_000_000n,
+        authority: "11111111111111111111111111111111", // Not RAYDIUM_CPMM_AUTHORITY!
+      };
+      const vault1: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 1_000_000n,
+      };
+
+      const result = computeCpmmReserveAccounting(parsedPool.state, rogueVault0, vault1);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.category).toBe("UNAUTHORIZED_VAULT_AUTHORITY");
+    });
+
+    it("rejects unauthorized vault token program (D28-F3)", () => {
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0ProgramBase58: SPL_TOKEN_PROGRAM_ID,
+      });
+      const parsedPool = parseRaydiumCpmmAccount(poolBuffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsedPool.ok).toBe(true);
+      if (!parsedPool.ok) return;
+
+      const rogueVault0: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 1_000_000n,
+        ownerProgramId: TOKEN_2022_PROGRAM_ID, // Mismatch with pool's SPL_TOKEN_PROGRAM_ID
+      };
+      const vault1: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 1_000_000n,
+      };
+
+      const result = computeCpmmReserveAccounting(parsedPool.state, rogueVault0, vault1);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.category).toBe("UNAUTHORIZED_VAULT_TOKEN_PROGRAM");
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 5. Independent Layout & Offset Cross-Check (D28-F1 requirement 7, D28-F6)
+  // --------------------------------------------------------------------------
+  describe("5. Independent Layout & Offset Cross-Check", () => {
+    it("successfully parses independently generated buffer built with hardcoded literal offsets", () => {
+      const independentBuffer = createIndependentHardcodedCpmmBuffer({
+        token0MintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1MintBase58: WSOL_MINT,
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mint0Decimals: 6,
+        mint1Decimals: 9,
+        protocolFeesToken0: 100n,
+        protocolFeesToken1: 200n,
+        fundFeesToken0: 50n,
+        fundFeesToken1: 75n,
+        creatorFeesToken0: 25n,
+        creatorFeesToken1: 50n,
+        creatorFeeOn: 0,
+        enableCreatorFee: true,
+        openTime: 1792375000n,
+        recentEpoch: 652n,
+      });
+
+      expect(independentBuffer.length).toBe(637);
+
+      const parsed = parseRaydiumCpmmAccount(
+        independentBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+      );
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+
+      expect(parsed.state.creatorFeesToken0).toBe(25n);
+      expect(parsed.state.creatorFeesToken1).toBe(50n);
+      expect(parsed.state.enableCreatorFee).toBe(true);
+      expect(parsed.state.recentEpoch).toBe(652n);
+      expect(parsed.state.swapActivationTimeSec).toBe(1792375000n);
     });
   });
 });
