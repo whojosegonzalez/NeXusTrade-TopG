@@ -99,6 +99,7 @@ export type RaydiumCpmmParseErrorCategory =
   | "CONTRADICTORY_VAULTS"
   | "INVALID_DECIMALS"
   | "INVALID_PUBKEY_ENCODING"
+  | "MALFORMED_CREATOR_FEE_FLAG"
   | "CORRUPTED_LAYOUT";
 
 export interface RaydiumCpmmParseSuccess {
@@ -344,9 +345,27 @@ export function parseRaydiumCpmmAccount(
     const openTime = view.getBigUint64(RAYDIUM_CPMM_OFFSETS.OPEN_TIME, true);
     const recentEpoch = view.getBigUint64(RAYDIUM_CPMM_OFFSETS.RECENT_EPOCH, true);
 
-    // Creator fee fields (D28-F1)
+    // Creator fee fields (D28-F1, D29-A7)
     const creatorFeeOn = view.getUint8(RAYDIUM_CPMM_OFFSETS.CREATOR_FEE_ON);
-    const enableCreatorFee = view.getUint8(RAYDIUM_CPMM_OFFSETS.ENABLE_CREATOR_FEE) !== 0;
+    const rawEnableCreatorFee = view.getUint8(RAYDIUM_CPMM_OFFSETS.ENABLE_CREATOR_FEE);
+
+    if (rawEnableCreatorFee > 1) {
+      return {
+        ok: false,
+        category: "MALFORMED_CREATOR_FEE_FLAG",
+        message: `Invalid boolean representation for enable_creator_fee: expected 0 or 1, got ${rawEnableCreatorFee}`,
+      };
+    }
+
+    if (creatorFeeOn > 2) {
+      return {
+        ok: false,
+        category: "MALFORMED_CREATOR_FEE_FLAG",
+        message: `Invalid enum representation for creator_fee_on: expected 0 (BothToken), 1 (OnlyToken0), or 2 (OnlyToken1), got ${creatorFeeOn}`,
+      };
+    }
+
+    const enableCreatorFee = rawEnableCreatorFee === 1;
     const creatorFeesToken0 = view.getBigUint64(RAYDIUM_CPMM_OFFSETS.CREATOR_FEES_TOKEN_0, true);
     const creatorFeesToken1 = view.getBigUint64(RAYDIUM_CPMM_OFFSETS.CREATOR_FEES_TOKEN_1, true);
 

@@ -23,6 +23,7 @@ import {
   parseRaydiumCpmmAccount,
   RAYDIUM_CPMM_AUTHORITY,
   RAYDIUM_CPMM_LAYOUT_LENGTH,
+  RAYDIUM_CPMM_OFFSETS,
   RAYDIUM_CPMM_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   USDC_MINT,
@@ -692,6 +693,81 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(parsed.state.enableCreatorFee).toBe(true);
       expect(parsed.state.recentEpoch).toBe(652n);
       expect(parsed.state.swapActivationTimeSec).toBe(1792375000n);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 6. Minor Integration Risks & Strict Literal Regressions (D29-A7)
+  // --------------------------------------------------------------------------
+  describe("6. Minor Integration Risks & Strict Literal Regressions (D29-A7)", () => {
+    it("asserts canonical mint constants match independent literal addresses", () => {
+      // Independent literal strings asserting constants haven't drifted
+      expect(WSOL_MINT).toBe("So11111111111111111111111111111111111111112");
+      expect(USDC_MINT).toBe("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+      expect(USDT_MINT).toBe("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+      expect(HISTORICAL_INCORRECT_USDT_MINT).toBe("Es9vMFrz79aC5CaBpNtuDAkVqhpMtC7S2Re27563dNY7");
+    });
+
+    it("fails closed with MALFORMED_CREATOR_FEE_FLAG when enable_creator_fee byte > 1", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer();
+      // Set enable_creator_fee to 2 (invalid bool in Rust repr(C))
+      buffer[RAYDIUM_CPMM_OFFSETS.ENABLE_CREATOR_FEE] = 2;
+
+      const parsed = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+
+      expect(parsed.category).toBe("MALFORMED_CREATOR_FEE_FLAG");
+      expect(parsed.message).toContain("Invalid boolean representation for enable_creator_fee");
+    });
+
+    it("fails closed with MALFORMED_CREATOR_FEE_FLAG when creator_fee_on enum byte > 2", () => {
+      const buffer = createAuthoritativeRaydiumCpmmBuffer();
+      // Set creator_fee_on to 3 (invalid enum in upstream pool.rs)
+      buffer[RAYDIUM_CPMM_OFFSETS.CREATOR_FEE_ON] = 3;
+
+      const parsed = parseRaydiumCpmmAccount(buffer, FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+
+      expect(parsed.category).toBe("MALFORMED_CREATOR_FEE_FLAG");
+      expect(parsed.message).toContain("Invalid enum representation for creator_fee_on");
+    });
+
+    it("strictly isolates PARTIALLY_VERIFIED and SLOT_DISCREPANT states from verified admission", () => {
+      // When slot discrepancy exists, effective reserves are marked unavailable and spot price is null
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      const parsedPool = parseRaydiumCpmmAccount(
+        poolBuffer,
+        FIXTURE_CPMM_POOL_ADDRESS,
+        RAYDIUM_CPMM_PROGRAM_ID,
+        300000000,
+      );
+      expect(parsedPool.ok).toBe(true);
+      if (!parsedPool.ok) return;
+
+      const vault0: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_0_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000000,
+      };
+      const vault1: CpmmVaultSnapshot = {
+        vaultAddress: FIXTURE_CPMM_TOKEN_1_VAULT,
+        mintAddress: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 1_000_000n,
+        slot: 300000001, // Mismatch
+      };
+
+      const result = computeCpmmReserveAccounting(parsedPool.state, vault0, vault1);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      // Invariant: SLOT_DISCREPANT must never produce usable spot price for trading or execution feasibility
+      expect(result.accounting.verificationTier).toBe("SLOT_DISCREPANT");
+      expect(result.accounting.effectiveReservesAvailable).toBe(false);
+      expect(result.accounting.spotPriceSol).toBeNull();
+      expect(result.accounting.spotPrice0Per1).toBeNull();
     });
   });
 });

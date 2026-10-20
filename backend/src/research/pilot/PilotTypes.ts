@@ -386,3 +386,6 @@ export interface PilotCollectorConfig {
   readonly maxPoolAgeSec?: number | undefined;
   readonly minRequestIntervalMs?: number | undefined;
 }
+
+// Re-export Phase 12.94-D.2.9-A Event Discovery Contracts & Interfaces
+export * from "./EventDiscoveryContracts.js";
