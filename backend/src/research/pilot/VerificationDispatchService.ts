@@ -31,9 +31,8 @@ import {
 } from "./RaydiumAmmParser.js";
 import {
   computeCpmmReserveAccounting,
-  type CpmmVaultSnapshot,
+  parseCpmmVaultAccount,
   parseRaydiumCpmmAccount,
-  RAYDIUM_CPMM_AUTHORITY,
   RAYDIUM_CPMM_PROGRAM_ID,
 } from "./RaydiumCpmmParser.js";
 
@@ -285,7 +284,7 @@ export async function dispatchPoolVerification(
         protocol: "RAYDIUM_AMM_V4",
         verified: false,
         rejectionReason: `Slot discrepancy between pool (${poolSlot}) and vaults (${v0Slot}, ${v1Slot})`,
-        verificationTier: "REJECTED",
+        verificationTier: "SLOT_DISCREPANT",
         transactionSlot: txSlot,
         poolAccountSlot: poolSlot,
         vault0AccountSlot: v0Slot,
@@ -380,32 +379,102 @@ export async function dispatchPoolVerification(
 
     const cpmmState = cpmmParseResult.state;
 
-    // Build vault snapshots
-    // Parse raw amount from SPL vault offset 64..72
-    const v0Data = Buffer.from(vault0Account.data);
-    const v1Data = Buffer.from(vault1Account.data);
-    const v0Amount = v0Data.length >= 72 ? v0Data.readBigUInt64LE(64) : 0n;
-    const v1Amount = v1Data.length >= 72 ? v1Data.readBigUInt64LE(64) : 0n;
+    // 1. Verify initialization event matches decoded state
+    if (
+      event.token0Mint !== cpmmState.token0Mint ||
+      event.token1Mint !== cpmmState.token1Mint ||
+      event.token0Vault !== cpmmState.token0Vault ||
+      event.token1Vault !== cpmmState.token1Vault
+    ) {
+      return {
+        poolId: event.poolId,
+        protocol: "RAYDIUM_CPMM",
+        verified: false,
+        rejectionReason: `Initialization event parameters mismatch CPMM pool state: event mints (${event.token0Mint}, ${event.token1Mint}) vs state mints (${cpmmState.token0Mint}, ${cpmmState.token1Mint})`,
+        verificationTier: "REJECTED",
+        transactionSlot: txSlot,
+        poolAccountSlot: poolSlot,
+        vault0AccountSlot: v0Slot,
+        vault1AccountSlot: v1Slot,
+        slotDiscrepancy,
+        slotDelta,
+        verifiedAtEpochMs: hostObservedAt,
+        hostObservationTimestampMs: hostObservedAt,
+        effectiveReservesAvailable: false,
+        spotPriceSol: null,
+        spotPrice0Per1: null,
+        decodedCpmmState: cpmmState,
+      };
+    }
 
-    const vault0Snapshot: CpmmVaultSnapshot = {
-      vaultAddress: event.token0Vault,
-      mintAddress: cpmmState.token0Mint,
-      rawAmount: v0Amount,
-      slot: v0Slot,
-      authority: RAYDIUM_CPMM_AUTHORITY,
-      ownerProgramId: vault0Account.owner,
-    };
+    // 2. Independently parse and verify token 0 and token 1 vault accounts (D29-F1)
+    const v0Parse = parseCpmmVaultAccount(
+      vault0Account.data,
+      event.token0Vault,
+      cpmmState.token0Vault,
+      cpmmState.token0Mint,
+      cpmmState.token0Program,
+      vault0Account.owner,
+      v0Slot,
+    );
+    if (!v0Parse.ok) {
+      return {
+        poolId: event.poolId,
+        protocol: "RAYDIUM_CPMM",
+        verified: false,
+        rejectionReason: `CPMM Vault 0 verification failed: ${v0Parse.category} - ${v0Parse.message}`,
+        verificationTier: "REJECTED",
+        transactionSlot: txSlot,
+        poolAccountSlot: poolSlot,
+        vault0AccountSlot: v0Slot,
+        vault1AccountSlot: v1Slot,
+        slotDiscrepancy,
+        slotDelta,
+        verifiedAtEpochMs: hostObservedAt,
+        hostObservationTimestampMs: hostObservedAt,
+        effectiveReservesAvailable: false,
+        spotPriceSol: null,
+        spotPrice0Per1: null,
+        decodedCpmmState: cpmmState,
+      };
+    }
 
-    const vault1Snapshot: CpmmVaultSnapshot = {
-      vaultAddress: event.token1Vault,
-      mintAddress: cpmmState.token1Mint,
-      rawAmount: v1Amount,
-      slot: v1Slot,
-      authority: RAYDIUM_CPMM_AUTHORITY,
-      ownerProgramId: vault1Account.owner,
-    };
+    const v1Parse = parseCpmmVaultAccount(
+      vault1Account.data,
+      event.token1Vault,
+      cpmmState.token1Vault,
+      cpmmState.token1Mint,
+      cpmmState.token1Program,
+      vault1Account.owner,
+      v1Slot,
+    );
+    if (!v1Parse.ok) {
+      return {
+        poolId: event.poolId,
+        protocol: "RAYDIUM_CPMM",
+        verified: false,
+        rejectionReason: `CPMM Vault 1 verification failed: ${v1Parse.category} - ${v1Parse.message}`,
+        verificationTier: "REJECTED",
+        transactionSlot: txSlot,
+        poolAccountSlot: poolSlot,
+        vault0AccountSlot: v0Slot,
+        vault1AccountSlot: v1Slot,
+        slotDiscrepancy,
+        slotDelta,
+        verifiedAtEpochMs: hostObservedAt,
+        hostObservationTimestampMs: hostObservedAt,
+        effectiveReservesAvailable: false,
+        spotPriceSol: null,
+        spotPrice0Per1: null,
+        decodedCpmmState: cpmmState,
+      };
+    }
 
-    const reserveResult = computeCpmmReserveAccounting(cpmmState, vault0Snapshot, vault1Snapshot);
+    const reserveResult = computeCpmmReserveAccounting(
+      cpmmState,
+      v0Parse.snapshot,
+      v1Parse.snapshot,
+    );
 
     if (!reserveResult.ok) {
       return {

@@ -20,6 +20,7 @@ import { describe, expect, it } from "vitest";
 import {
   computeCpmmReserveAccounting,
   HISTORICAL_INCORRECT_USDT_MINT,
+  parseCpmmVaultAccount,
   parseRaydiumCpmmAccount,
   RAYDIUM_CPMM_AUTHORITY,
   RAYDIUM_CPMM_LAYOUT_LENGTH,
@@ -30,6 +31,7 @@ import {
   USDT_MINT,
 } from "./RaydiumCpmmParser.js";
 import {
+  createAuthoritativeCpmmSplVaultBuffer,
   createAuthoritativeRaydiumCpmmBuffer,
   createIndependentHardcodedCpmmBuffer,
   FIXTURE_CPMM_AMM_CONFIG,
@@ -768,6 +770,99 @@ describe("Milestone D.2.8: Raydium CPMM Binary Parser & Reserve Accounting Tests
       expect(result.accounting.effectiveReservesAvailable).toBe(false);
       expect(result.accounting.spotPriceSol).toBeNull();
       expect(result.accounting.spotPrice0Per1).toBeNull();
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 7. parseCpmmVaultAccount Independent Decoding Tests (D29-F1)
+  // --------------------------------------------------------------------------
+  describe("7. parseCpmmVaultAccount Independent Decoding Tests (D29-F1)", () => {
+    it("successfully extracts mint, canonical authority, and balance from authoritative 165-byte vault buffer", () => {
+      const buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 77_000_000n,
+      });
+
+      const result = parseCpmmVaultAccount(
+        buffer,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_MINT,
+        SPL_TOKEN_PROGRAM_ID,
+        SPL_TOKEN_PROGRAM_ID,
+        300000500,
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.snapshot.vaultAddress).toBe(FIXTURE_CPMM_TOKEN_0_VAULT);
+      expect(result.snapshot.mintAddress).toBe(FIXTURE_CPMM_TOKEN_0_MINT);
+      expect(result.snapshot.authority).toBe(RAYDIUM_CPMM_AUTHORITY);
+      expect(result.snapshot.rawAmount).toBe(77_000_000n);
+      expect(result.snapshot.slot).toBe(300000500);
+      expect(result.snapshot.ownerProgramId).toBe(SPL_TOKEN_PROGRAM_ID);
+    });
+
+    it("fails closed when decoded authority does not match canonical CPMM authority", () => {
+      // Create vault with AMM v4 program as authority
+      const buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        ownerBase58: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Not CPMM authority!
+      });
+
+      const result = parseCpmmVaultAccount(
+        buffer,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_MINT,
+        SPL_TOKEN_PROGRAM_ID,
+        SPL_TOKEN_PROGRAM_ID,
+      );
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.category).toBe("UNAUTHORIZED_VAULT_AUTHORITY");
+      expect(result.message).toContain("does not match canonical CPMM authority");
+    });
+
+    it("fails closed when decoded mint does not match expected mint", () => {
+      const buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: "WrongMint11111111111111111111111111111111111",
+      });
+
+      const result = parseCpmmVaultAccount(
+        buffer,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_MINT,
+        SPL_TOKEN_PROGRAM_ID,
+        SPL_TOKEN_PROGRAM_ID,
+      );
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.category).toBe("VAULT_MINT_MISMATCH");
+    });
+
+    it("rejects unsupported Token-2022 vault accounts", () => {
+      const buffer = createAuthoritativeCpmmSplVaultBuffer();
+
+      const result = parseCpmmVaultAccount(
+        buffer,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_VAULT,
+        FIXTURE_CPMM_TOKEN_0_MINT,
+        SPL_TOKEN_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID, // Token-2022 owner
+      );
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.category).toBe("UNSUPPORTED_TOKEN_2022");
     });
   });
 });

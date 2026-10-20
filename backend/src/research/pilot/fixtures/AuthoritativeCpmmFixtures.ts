@@ -12,13 +12,18 @@
 
 import {
   RAYDIUM_CPMM_ANCHOR_DISCRIMINATOR,
+  RAYDIUM_CPMM_AUTHORITY,
   RAYDIUM_CPMM_LAYOUT_LENGTH,
   RAYDIUM_CPMM_OFFSETS,
   SPL_TOKEN_PROGRAM_ID,
   USDC_MINT,
   WSOL_MINT,
 } from "../RaydiumCpmmParser.js";
-import { decodeBase58To32Bytes } from "./AuthoritativeRaydiumFixtures.js";
+import {
+  createAuthoritativeSplVaultBuffer,
+  decodeBase58To32Bytes,
+  type SplVaultFixtureOptions,
+} from "./AuthoritativeRaydiumFixtures.js";
 
 export const FIXTURE_CPMM_POOL_ADDRESS = "3sjNoCnkkhWPVXYGDtem8rCciHSGc9jSFZuUAzKbvRVp";
 export const FIXTURE_CPMM_AMM_CONFIG = "D4F5ch3Syuy9WP3MKNmxoWgKcDpDxWtaMmrtwpjRQDU";
@@ -226,4 +231,17 @@ export function createIndependentHardcodedCpmmBuffer(params: {
   // 413..637 padding (224 bytes zero)
 
   return buf;
+}
+
+/**
+ * Creates an authoritative 165-byte SPL Token Account Buffer for a CPMM vault,
+ * with owner/authority matching the canonical Raydium CPMM authority PDA (D29-F1).
+ */
+export function createAuthoritativeCpmmSplVaultBuffer(
+  options: SplVaultFixtureOptions = {},
+): Buffer {
+  return createAuthoritativeSplVaultBuffer({
+    ...options,
+    ownerBase58: options.ownerBase58 ?? RAYDIUM_CPMM_AUTHORITY,
+  });
 }

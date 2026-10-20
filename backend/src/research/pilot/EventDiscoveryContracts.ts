@@ -76,12 +76,18 @@ export interface WebSocketLogNotificationEnvelope {
 }
 
 /**
+ * Instruction data encodings supported by Solana JSON RPC and pilot ingestion.
+ */
+export type InstructionDataEncoding = "raw" | "base58" | "base64";
+
+/**
  * Individual compiled instruction within a Solana transaction.
  */
 export interface CompiledInstruction {
   readonly programIdIndex: number;
   readonly accountKeyIndexes: readonly number[];
-  readonly data: Uint8Array | Buffer | string; // Raw bytes or base58 string
+  readonly data: Uint8Array | Buffer | string; // Raw bytes, base58, or base64 string
+  readonly dataEncoding?: InstructionDataEncoding | undefined;
 }
 
 /**
@@ -136,7 +142,9 @@ export type UnsupportedProtocolReason =
   | "MOONSHOT"
   | "UNKNOWN_PROGRAM"
   | "NON_INITIALIZATION_INSTRUCTION"
+  | "DEPRECATED_INITIALIZE_TAG"
   | "TRANSACTION_FAILED"
+  | "TRANSACTION_SIGNATURE_MISMATCH"
   | "MISSING_ACCOUNTS"
   | "CORRUPTED_INSTRUCTION_DATA"
   | "UNRESOLVED_LOOKUP_TABLE_INDEX";
@@ -146,9 +154,11 @@ export type UnsupportedProtocolReason =
  * Preserves strict separation between creation blockTime, host observation, and pool activation openTime.
  */
 export interface DiscoveredPoolInitializationEvent {
-  readonly eventId: string; // ${signature}:${instructionIndex}
+  readonly eventId: string; // ${signature}:${outerInstructionIndex} or ${signature}:${outerInstructionIndex}:inner:${innerInstructionIndex}
   readonly signature: string;
-  readonly instructionIndex: number;
+  readonly outerInstructionIndex: number;
+  readonly innerInstructionIndex?: number | undefined;
+  readonly instructionIndex: number; // Retained for backward compatibility (= outerInstructionIndex)
   readonly slot: number;
   readonly blockTimeSec: number | null;
   readonly firstSeenTimestampMs: number;
@@ -180,6 +190,9 @@ export type EventLifecycleState =
   | "TX_DECODE_FAILED"
   | "VERIFICATION_QUEUED"
   | "VERIFIED_COHERENT"
+  | "PARTIALLY_VERIFIED"
+  | "SLOT_DISCREPANT"
+  | "REJECTED_NON_COHERENT"
   | "VERIFICATION_FAILED"
   | "DROPPED_RESOURCE_LIMIT"
   | "DUPLICATE_IGNORED";
@@ -246,6 +259,8 @@ export interface EventDiscoveryMetricsSnapshot {
   readonly candidatePoolsDiscovered: number;
   readonly duplicatePoolIdsIgnored: number;
   readonly transactionFetchFailures: number;
+  readonly transactionFetchRetries: number;
+  readonly exhaustedRetriesCount: number;
   readonly rpcVerificationFailures: number;
   readonly queueFullDrops: number;
   readonly rateLimitDrops: number;

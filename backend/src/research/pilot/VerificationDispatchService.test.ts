@@ -30,6 +30,7 @@ import {
 } from "./fixtures/AuthoritativeRaydiumFixtures.js";
 import {
   createAuthoritativeRaydiumCpmmBuffer,
+  createAuthoritativeCpmmSplVaultBuffer,
   FIXTURE_CPMM_POOL_ADDRESS,
   FIXTURE_CPMM_TOKEN_0_MINT,
   FIXTURE_CPMM_TOKEN_0_VAULT,
@@ -38,7 +39,7 @@ import {
 } from "./fixtures/AuthoritativeCpmmFixtures.js";
 import { identifyPoolInitializationInstruction } from "./PoolInitializationParser.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
-import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
+import { RAYDIUM_CPMM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "./RaydiumCpmmParser.js";
 import { dispatchPoolVerification } from "./VerificationDispatchService.js";
 
 describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
@@ -149,12 +150,12 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
       });
       fetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, poolBuffer, 300000200);
 
-      // Setup vaults with positive balances exceeding total fees
-      const v0Buffer = createAuthoritativeSplVaultBuffer({
+      // Setup vaults with positive balances exceeding total fees (canonical CPMM authority)
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
         rawAmount: 10_000_000n,
       });
-      const v1Buffer = createAuthoritativeSplVaultBuffer({
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
         rawAmount: 20_000_000n,
       });
@@ -173,6 +174,75 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
       expect(result.spotPrice0Per1).not.toBeNull();
       expect(result.quoteCohort).toBe("WSOL_NATIVE");
       expect(result.cpmmReserveAccounting).toBeDefined();
+    });
+
+    it("fails verification if CPMM vault account bytes contain wrong authority (D29-F1 regression)", async () => {
+      const tx = createCpmmInitTransactionFixture();
+      const parseResult = identifyPoolInitializationInstruction(tx);
+      expect(parseResult.ok).toBe(true);
+      if (!parseResult.ok) return;
+
+      const fetcher = new MockOnChainAccountFetcher();
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      fetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, poolBuffer, 300000200);
+
+      // Vault 0 has incorrect authority in bytes (historical AMM v4 program instead of CPMM authority)
+      const rogueVault0 = createAuthoritativeSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID, // WRONG AUTHORITY IN BYTES!
+        rawAmount: 10_000_000n,
+      });
+      const validVault1 = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 20_000_000n,
+      });
+
+      fetcher.setAccount(FIXTURE_CPMM_TOKEN_0_VAULT, SPL_TOKEN_PROGRAM_ID, rogueVault0, 300000200);
+      fetcher.setAccount(FIXTURE_CPMM_TOKEN_1_VAULT, SPL_TOKEN_PROGRAM_ID, validVault1, 300000200);
+
+      const result = await dispatchPoolVerification(parseResult.event, fetcher);
+
+      expect(result.verified).toBe(false);
+      expect(result.verificationTier).toBe("REJECTED");
+      expect(result.rejectionReason).toContain("UNAUTHORIZED_VAULT_AUTHORITY");
+      expect(result.effectiveReservesAvailable).toBe(false);
+      expect(result.spotPriceSol).toBeNull();
+    });
+
+    it("rejects unsupported Token-2022 vault accounts (D29-F1)", async () => {
+      const tx = createCpmmInitTransactionFixture();
+      const parseResult = identifyPoolInitializationInstruction(tx);
+      expect(parseResult.ok).toBe(true);
+      if (!parseResult.ok) return;
+
+      const fetcher = new MockOnChainAccountFetcher();
+      const poolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      fetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, poolBuffer, 300000200);
+
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 10_000_000n,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 20_000_000n,
+      });
+
+      // Token 0 account owned by Token-2022 program
+      fetcher.setAccount(FIXTURE_CPMM_TOKEN_0_VAULT, TOKEN_2022_PROGRAM_ID, v0Buffer, 300000200);
+      fetcher.setAccount(FIXTURE_CPMM_TOKEN_1_VAULT, SPL_TOKEN_PROGRAM_ID, v1Buffer, 300000200);
+
+      const result = await dispatchPoolVerification(parseResult.event, fetcher);
+
+      expect(result.verified).toBe(false);
+      expect(result.verificationTier).toBe("REJECTED");
+      expect(result.rejectionReason).toContain("UNSUPPORTED_TOKEN_2022");
     });
 
     it("fails verification if pool account owner mismatches RAYDIUM_CPMM_PROGRAM_ID", async () => {
@@ -283,11 +353,11 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
       const poolBuffer = createAuthoritativeRaydiumCpmmBuffer();
       fetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, poolBuffer, 300000200);
 
-      const v0Buffer = createAuthoritativeSplVaultBuffer({
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
         rawAmount: 10_000_000n,
       });
-      const v1Buffer = createAuthoritativeSplVaultBuffer({
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
         rawAmount: 20_000_000n,
       });
@@ -316,11 +386,11 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
       // Pool slot is 300000210, vault slots are 300000200
       fetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, poolBuffer, 300000210);
 
-      const v0Buffer = createAuthoritativeSplVaultBuffer({
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
         rawAmount: 10_000_000n,
       });
-      const v1Buffer = createAuthoritativeSplVaultBuffer({
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
         mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
         rawAmount: 20_000_000n,
       });
@@ -340,6 +410,7 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
       const unsupportedEvent: DiscoveredPoolInitializationEvent = {
         eventId: "sig:0",
         signature: "sig",
+        outerInstructionIndex: 0,
         instructionIndex: 0,
         slot: 300000100,
         blockTimeSec: 1792375000,

@@ -2,6 +2,7 @@ import { parseTokenMintAddress } from "@nexustrade/shared";
 import { describe, expect, it } from "vitest";
 
 import {
+  decodeBase58,
   encodeBase58,
   parseSolanaRpcMintAccountResponse,
   SPL_TOKEN_PROGRAM_ID,
@@ -109,6 +110,42 @@ describe("parseSolanaRpcMintAccountResponse", () => {
       ok: false,
       category: "SOLANA_RPC_UNSUPPORTED_OWNER",
       message: "Solana RPC account owner is not a token mint.",
+    });
+  });
+
+  describe("decodeBase58 & encodeBase58", () => {
+    it("round-trips arbitrary byte sequences faithfully", () => {
+      const testCases = [
+        Buffer.from([]),
+        Buffer.from([0]),
+        Buffer.from([0, 0]),
+        Buffer.from([1]),
+        Buffer.from([0, 1, 2, 3]),
+        Buffer.from([0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed]),
+        Buffer.from("Hello World!", "utf8"),
+        Buffer.alloc(32, 0xff),
+      ];
+
+      for (const original of testCases) {
+        const encoded = encodeBase58(original);
+        const decoded = decodeBase58(encoded);
+        expect(Buffer.compare(decoded, original)).toBe(0);
+      }
+    });
+
+    it("correctly decodes standard Solana public keys", () => {
+      const wsol = "So11111111111111111111111111111111111111112";
+      const decoded = decodeBase58(wsol);
+      expect(decoded.length).toBe(32);
+      expect(encodeBase58(decoded)).toBe(wsol);
+    });
+
+    it("fails closed on invalid base58 characters", () => {
+      expect(() => decodeBase58("0invalid")).toThrow(/Invalid base58 character '0'/);
+      expect(() => decodeBase58("Oinvalid")).toThrow(/Invalid base58 character 'O'/);
+      expect(() => decodeBase58("Iinvalid")).toThrow(/Invalid base58 character 'I'/);
+      expect(() => decodeBase58("linvalid")).toThrow(/Invalid base58 character 'l'/);
+      expect(() => decodeBase58("+notbase58")).toThrow(/Invalid base58 character '\+'/);
     });
   });
 });

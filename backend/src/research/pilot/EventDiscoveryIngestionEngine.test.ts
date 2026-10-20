@@ -17,6 +17,7 @@ import {
 } from "./EventDiscoveryIngestionEngine.js";
 import {
   createAmmV4InitTransactionFixture,
+  createAuthoritativeCpmmSplVaultBuffer,
   createCpmmInitTransactionFixture,
   createMockLogNotificationEnvelope,
   MockOnChainAccountFetcher,
@@ -291,7 +292,7 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       accountFetcher.setAccount(
         cpmmVault0,
         SPL_TOKEN_PROGRAM_ID,
-        createAuthoritativeSplVaultBuffer({
+        createAuthoritativeCpmmSplVaultBuffer({
           mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
           rawAmount: 10_000_000n,
         }),
@@ -300,7 +301,7 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       accountFetcher.setAccount(
         cpmmVault1,
         SPL_TOKEN_PROGRAM_ID,
-        createAuthoritativeSplVaultBuffer({
+        createAuthoritativeCpmmSplVaultBuffer({
           mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
           rawAmount: 20_000_000n,
         }),
@@ -377,6 +378,147 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       const metrics = engine.getMetricsSnapshot();
       expect(metrics.candidatePoolsDiscovered).toBe(1);
       expect(metrics.duplicatePoolIdsIgnored).toBe(1);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 6. Lifecycle, Retry & Deduplication Invariants (D29-F5)
+  // --------------------------------------------------------------------------
+  describe("6. Lifecycle, Retry & Deduplication Invariants (D29-F5)", () => {
+    it("admits and processes previously dropped event when re-observed after queue drain (D29-F5)", async () => {
+      // Small queue with DROP_NEWEST backpressure
+      const engine = new EventDiscoveryIngestionEngine({
+        maxQueueSize: 1,
+        backpressurePolicy: "DROP_NEWEST",
+      });
+
+      const env1 = createMockLogNotificationEnvelope("sig_first", 300000100);
+      const env2 = createMockLogNotificationEnvelope("sig_dropped_then_reobserved", 300000101);
+
+      // Enqueue first item (queue now full)
+      const res1 = await engine.handleLogNotification(env1);
+      expect(res1.enqueued).toBe(true);
+
+      // Enqueue second item (dropped due to DROP_NEWEST)
+      const res2 = await engine.handleLogNotification(env2);
+      expect(res2.enqueued).toBe(false);
+      expect(res2.reason).toBe("QUEUE_FULL_DROP_NEWEST");
+
+      // Setup fixtures
+      const tx1 = createAmmV4InitTransactionFixture({ signature: "sig_first" });
+      const tx2 = createAmmV4InitTransactionFixture({
+        signature: "sig_dropped_then_reobserved",
+        poolId: "PoolReobserved111111111111111111111111111",
+      });
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx1);
+      txFetcher.setTransaction(tx2);
+
+      const accountFetcher = new MockOnChainAccountFetcher();
+      accountFetcher.setAccount(
+        FIXTURE_POOL_ADDRESS,
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+      accountFetcher.setAccount(
+        "PoolReobserved111111111111111111111111111",
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer({
+          baseVaultBase58: FIXTURE_BASE_VAULT,
+          quoteVaultBase58: FIXTURE_QUOTE_VAULT,
+        }),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_BASE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_QUOTE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+      );
+
+      // Process queue to drain item 1
+      const results1 = await engine.processQueue(txFetcher, accountFetcher);
+      expect(results1.length).toBe(1);
+      expect(engine.getQueueLength()).toBe(0);
+
+      // Re-observe env2 (now that queue has space)
+      const res3 = await engine.handleLogNotification(env2);
+      expect(res3.enqueued).toBe(true); // NOT permanently suppressed!
+      expect(engine.getQueueLength()).toBe(1);
+
+      // Process queue to verify item 2
+      const results2 = await engine.processQueue(txFetcher, accountFetcher);
+      expect(results2.length).toBe(1);
+      expect(results2[0]!.poolId).toBe("PoolReobserved111111111111111111111111111");
+      expect(results2[0]!.verified).toBe(true);
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.queueFullDrops).toBe(1);
+      expect(metrics.candidatePoolsDiscovered).toBe(2);
+      expect(metrics.coherentTierPoolsCount).toBe(2);
+    });
+
+    it("recovers from transient tx-fetch failures via retry accounting (D29-F5)", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxRetriesPerTx: 3 });
+      const signature = "sig_transient_recovery";
+      const tx = createAmmV4InitTransactionFixture({ signature });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx);
+      txFetcher.setTransientFailures(signature, 2); // Fails 2 times before success
+
+      const accountFetcher = new MockOnChainAccountFetcher();
+      accountFetcher.setAccount(
+        FIXTURE_POOL_ADDRESS,
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_BASE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_QUOTE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+      );
+
+      await engine.handleLogNotification(createMockLogNotificationEnvelope(signature));
+
+      const results = await engine.processQueue(txFetcher, accountFetcher);
+      expect(results.length).toBe(1);
+      expect(results[0]!.verified).toBe(true);
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.transactionFetchRetries).toBe(2);
+      expect(metrics.transactionFetchFailures).toBe(0);
+      expect(metrics.exhaustedRetriesCount).toBe(0);
+      expect(metrics.coherentTierPoolsCount).toBe(1);
+    });
+
+    it("fails closed when fetched transaction signature mismatches notification signature (D29-F5)", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxRetriesPerTx: 1 });
+      const expectedSig = "sig_expected_notification";
+      // txFetcher returns a transaction with a rogue signature
+      const rogueTx = createAmmV4InitTransactionFixture({ signature: "sig_rogue_different" });
+
+      const txFetcher: ITransactionFetcher = {
+        fetchTransaction: async () => rogueTx,
+      };
+      const accountFetcher = new MockOnChainAccountFetcher();
+
+      await engine.handleLogNotification(createMockLogNotificationEnvelope(expectedSig));
+
+      const results = await engine.processQueue(txFetcher, accountFetcher);
+      expect(results.length).toBe(0); // Failed closed!
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.failedInitDecodes).toBe(1);
+      expect(metrics.coherentTierPoolsCount).toBe(0);
     });
   });
 });

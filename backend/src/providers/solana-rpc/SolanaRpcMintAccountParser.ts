@@ -9,6 +9,10 @@ export const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuE
 
 const BASE_MINT_LAYOUT_LENGTH = 82;
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_INDEX_MAP: number[] = new Array(256).fill(-1);
+for (let i = 0; i < BASE58_ALPHABET.length; i++) {
+  BASE58_INDEX_MAP[BASE58_ALPHABET.charCodeAt(i)] = i;
+}
 
 export type SolanaRpcAuthorityParser = "JSON_PARSED" | "BASE64_LAYOUT";
 
@@ -316,4 +320,49 @@ export function encodeBase58(bytes: Uint8Array): string {
     .reverse()
     .map((digit) => BASE58_ALPHABET[digit])
     .join("")}`;
+}
+
+export function decodeBase58(str: string): Buffer {
+  if (typeof str !== "string") {
+    throw new Error("Base58 input must be a string");
+  }
+  if (str.length === 0) {
+    return Buffer.alloc(0);
+  }
+
+  let zeroes = 0;
+  while (zeroes < str.length && str[zeroes] === "1") {
+    zeroes += 1;
+  }
+
+  const size = Math.floor(((str.length - zeroes) * 733) / 1000) + 1;
+  const b256 = new Uint8Array(size);
+  let length = 0;
+
+  for (let i = zeroes; i < str.length; i++) {
+    const charCode = str.charCodeAt(i);
+    const carry = charCode < 256 ? BASE58_INDEX_MAP[charCode] : -1;
+    if (carry === undefined || carry === -1) {
+      throw new Error(`Invalid base58 character '${str[i]}' at index ${i}`);
+    }
+
+    let c = carry;
+    for (let j = 0; j < length; j++) {
+      c += (b256[j] ?? 0) * 58;
+      b256[j] = c & 0xff;
+      c >>= 8;
+    }
+
+    while (c > 0) {
+      b256[length++] = c & 0xff;
+      c >>= 8;
+    }
+  }
+
+  const result = Buffer.alloc(zeroes + length);
+  for (let i = 0; i < length; i++) {
+    result[zeroes + length - 1 - i] = b256[i]!;
+  }
+
+  return result;
 }

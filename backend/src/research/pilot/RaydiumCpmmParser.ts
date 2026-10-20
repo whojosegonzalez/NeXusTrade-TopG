@@ -21,7 +21,13 @@
  */
 
 import { encodeBase58 } from "../../providers/solana-rpc/SolanaRpcMintAccountParser.js";
-import { isCanonicalSolanaBase58, SPL_TOKEN_PROGRAM_ID, WSOL_MINT } from "./RaydiumAmmParser.js";
+import {
+  isCanonicalSolanaBase58,
+  SPL_TOKEN_PROGRAM_ID,
+  SPL_VAULT_LAYOUT_LENGTH,
+  SPL_VAULT_OFFSETS,
+  WSOL_MINT,
+} from "./RaydiumAmmParser.js";
 
 export { WSOL_MINT, SPL_TOKEN_PROGRAM_ID };
 import type {
@@ -417,6 +423,117 @@ export function parseRaydiumCpmmAccount(
       message: `Exception decoding Raydium CPMM layout: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+export interface CpmmVaultParseSuccess {
+  readonly ok: true;
+  readonly snapshot: CpmmVaultSnapshot;
+}
+
+export interface CpmmVaultParseFailure {
+  readonly ok: false;
+  readonly category:
+    | "INVALID_VAULT_LENGTH"
+    | "UNSUPPORTED_TOKEN_2022"
+    | "UNAUTHORIZED_VAULT_OWNER"
+    | "UNAUTHORIZED_VAULT_AUTHORITY"
+    | "VAULT_MINT_MISMATCH"
+    | "VAULT_ADDRESS_MISMATCH";
+  readonly message: string;
+}
+
+export type CpmmVaultParseResult = CpmmVaultParseSuccess | CpmmVaultParseFailure;
+
+/**
+ * Parses and verifies an on-chain token vault account for Raydium CPMM pools.
+ * Independently extracts mint, authority PDA, and raw balance from account bytes (D29-F1).
+ */
+export function parseCpmmVaultAccount(
+  data: Uint8Array | Buffer,
+  vaultAddress: string,
+  expectedVaultAddress: string,
+  expectedMintAddress: string,
+  expectedTokenProgram: string,
+  actualOwnerProgram: string,
+  accountSlot?: number | undefined,
+): CpmmVaultParseResult {
+  // 1. Vault address check
+  if (vaultAddress !== expectedVaultAddress) {
+    return {
+      ok: false,
+      category: "VAULT_ADDRESS_MISMATCH",
+      message: `Vault address ${vaultAddress} does not match expected pool vault ${expectedVaultAddress}`,
+    };
+  }
+
+  // 2. Reject unsupported Token-2022 accounts
+  if (
+    actualOwnerProgram === TOKEN_2022_PROGRAM_ID ||
+    expectedTokenProgram === TOKEN_2022_PROGRAM_ID
+  ) {
+    return {
+      ok: false,
+      category: "UNSUPPORTED_TOKEN_2022",
+      message: `Token-2022 vault accounts are not supported in offline research verification`,
+    };
+  }
+
+  // 3. Vault owner program check
+  if (actualOwnerProgram !== SPL_TOKEN_PROGRAM_ID || actualOwnerProgram !== expectedTokenProgram) {
+    return {
+      ok: false,
+      category: "UNAUTHORIZED_VAULT_OWNER",
+      message: `Vault account owner program ${actualOwnerProgram} does not match expected SPL token program ${expectedTokenProgram}`,
+    };
+  }
+
+  // 4. Validate exact SPL token account length (165 bytes)
+  if (!data || data.length !== SPL_VAULT_LAYOUT_LENGTH) {
+    return {
+      ok: false,
+      category: "INVALID_VAULT_LENGTH",
+      message: `Expected SPL token vault buffer of exactly ${SPL_VAULT_LAYOUT_LENGTH} bytes, received ${data?.length ?? 0}`,
+    };
+  }
+
+  // 5. Decode actual mint, authority, and amount directly from binary layout
+  const mintBytes = data.subarray(SPL_VAULT_OFFSETS.MINT, SPL_VAULT_OFFSETS.MINT + 32);
+  const authorityBytes = data.subarray(SPL_VAULT_OFFSETS.OWNER, SPL_VAULT_OFFSETS.OWNER + 32);
+  const decodedMint = encodeBase58(mintBytes);
+  const decodedAuthority = encodeBase58(authorityBytes);
+
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const decodedAmount = view.getBigUint64(SPL_VAULT_OFFSETS.AMOUNT, true);
+
+  // 6. Verify decoded mint matches expected mint
+  if (decodedMint !== expectedMintAddress) {
+    return {
+      ok: false,
+      category: "VAULT_MINT_MISMATCH",
+      message: `Decoded vault mint ${decodedMint} does not match expected pool mint ${expectedMintAddress}`,
+    };
+  }
+
+  // 7. Verify decoded authority matches canonical CPMM authority PDA
+  if (decodedAuthority !== RAYDIUM_CPMM_AUTHORITY) {
+    return {
+      ok: false,
+      category: "UNAUTHORIZED_VAULT_AUTHORITY",
+      message: `Decoded vault authority ${decodedAuthority} does not match canonical CPMM authority ${RAYDIUM_CPMM_AUTHORITY}`,
+    };
+  }
+
+  return {
+    ok: true,
+    snapshot: {
+      vaultAddress,
+      mintAddress: decodedMint,
+      rawAmount: decodedAmount,
+      slot: accountSlot,
+      authority: decodedAuthority,
+      ownerProgramId: actualOwnerProgram,
+    },
+  };
 }
 
 /**
