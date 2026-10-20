@@ -42,6 +42,26 @@ import type {
   IOnChainAccountFetcher,
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
+import {
+  createAuthoritativeRaydiumCpmmBuffer,
+  FIXTURE_CPMM_POOL_ADDRESS,
+  FIXTURE_CPMM_TOKEN_0_MINT,
+  FIXTURE_CPMM_TOKEN_1_MINT,
+  FIXTURE_CPMM_TOKEN_0_VAULT,
+  FIXTURE_CPMM_TOKEN_1_VAULT,
+} from "./fixtures/AuthoritativeCpmmFixtures.js";
+import { createAuthoritativeCpmmSplVaultBuffer } from "./fixtures/AuthoritativeEventFixtures.js";
+import {
+  createAuthoritativeRaydiumAmmV4Buffer,
+  createAuthoritativeSplVaultBuffer,
+  FIXTURE_BASE_VAULT,
+  FIXTURE_MEME_MINT,
+  FIXTURE_POOL_ADDRESS,
+  FIXTURE_QUOTE_VAULT,
+  FIXTURE_WSOL_MINT,
+} from "./fixtures/AuthoritativeRaydiumFixtures.js";
+import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
+import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
 
 export class PilotLogger {
   private readonly logFilePath: string | null = null;
@@ -1217,7 +1237,273 @@ export class PilotLiveCollectorSession {
 export { PilotLiveCollectorSession as LiveCollectorRunner };
 
 /**
- * Executes an offline event discovery replay session from recorded fixture files (D29-H3).
+ * Parses an account payload from arbitrary JSON fixture representations.
+ */
+export function parseAccountPayload(
+  rawAcc: unknown,
+  defaultSlot: number = 300000100,
+): DiscoveredPoolAccountPayload | null {
+  if (!rawAcc || typeof rawAcc !== "object") return null;
+  const acc = rawAcc as Record<string, unknown>;
+  const address = typeof acc.address === "string" ? acc.address : undefined;
+  if (!address) return null;
+
+  let dataBuf: Buffer;
+  const rawData = acc.data ?? acc.dataBase64 ?? acc.accountData;
+  if (Buffer.isBuffer(rawData)) {
+    dataBuf = rawData;
+  } else if (rawData instanceof Uint8Array) {
+    dataBuf = Buffer.from(rawData);
+  } else if (Array.isArray(rawData)) {
+    if (rawData.length === 2 && typeof rawData[0] === "string" && rawData[1] === "base64") {
+      dataBuf = Buffer.from(rawData[0], "base64");
+    } else {
+      dataBuf = Buffer.from(rawData as number[]);
+    }
+  } else if (typeof rawData === "string") {
+    dataBuf = Buffer.from(rawData, "base64");
+  } else {
+    dataBuf = Buffer.alloc(0);
+  }
+
+  const owner = typeof acc.owner === "string" ? acc.owner : "";
+  const lamports =
+    typeof acc.lamports === "bigint" || typeof acc.lamports === "number"
+      ? BigInt(acc.lamports)
+      : 0n;
+  const slot =
+    typeof acc.slot === "number" && Number.isInteger(acc.slot) && acc.slot > 0
+      ? acc.slot
+      : defaultSlot;
+
+  return {
+    address,
+    data: dataBuf,
+    owner,
+    lamports,
+    slot,
+  };
+}
+
+/**
+ * Loads synthetic and recorded account payloads from replay fixtures directory or file (BREADY-05).
+ */
+export function loadAccountMapFromFixtures(
+  fixturesPath: string,
+): Map<string, DiscoveredPoolAccountPayload> {
+  const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
+  if (!fsSync.existsSync(fixturesPath)) return accountMap;
+
+  const stat = fsSync.statSync(fixturesPath);
+  const fixtureFiles: string[] = [];
+  if (stat.isDirectory()) {
+    const entries = fsSync.readdirSync(fixturesPath);
+    for (const e of entries) {
+      if (e.endsWith(".json")) {
+        fixtureFiles.push(path.join(fixturesPath, e));
+      }
+    }
+  } else {
+    fixtureFiles.push(fixturesPath);
+  }
+
+  let defaultSlot = 300000100;
+
+  for (const filePath of fixtureFiles) {
+    try {
+      const raw = fsSync.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+
+      if (parsed.slot && typeof parsed.slot === "number" && parsed.slot > 0) {
+        defaultSlot = parsed.slot;
+      }
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item?.slot && typeof item.slot === "number" && item.slot > 0) {
+            defaultSlot = item.slot;
+          }
+        }
+      }
+
+      // 1. Array of accounts or record map in parsed.accounts
+      if (Array.isArray(parsed.accounts)) {
+        for (const item of parsed.accounts) {
+          const acc = parseAccountPayload(item, defaultSlot);
+          if (acc) accountMap.set(acc.address, acc);
+        }
+      } else if (parsed.accounts && typeof parsed.accounts === "object") {
+        for (const [addr, item] of Object.entries(parsed.accounts)) {
+          const acc = parseAccountPayload({ address: addr, ...(item as object) }, defaultSlot);
+          if (acc) accountMap.set(acc.address, acc);
+        }
+      }
+
+      // 2. Single account in parsed.account
+      if (parsed.account && typeof parsed.account === "object") {
+        const acc = parseAccountPayload(parsed.account, defaultSlot);
+        if (acc) accountMap.set(acc.address, acc);
+      }
+
+      // 3. Top-level account snapshot
+      if (
+        parsed.address &&
+        (parsed.data !== undefined ||
+          parsed.dataBase64 !== undefined ||
+          parsed.accountData !== undefined)
+      ) {
+        const acc = parseAccountPayload(parsed, defaultSlot);
+        if (acc) accountMap.set(acc.address, acc);
+      }
+
+      // 4. Root array of items
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && typeof item === "object") {
+            const acc = parseAccountPayload(item, defaultSlot);
+            if (acc) accountMap.set(acc.address, acc);
+          }
+        }
+      }
+    } catch {
+      // Ignore parse warnings on non-JSON files
+    }
+  }
+
+  // Populate default authoritative synthetic fixtures for offline testing
+  if (!accountMap.has(FIXTURE_CPMM_POOL_ADDRESS)) {
+    accountMap.set(FIXTURE_CPMM_POOL_ADDRESS, {
+      address: FIXTURE_CPMM_POOL_ADDRESS,
+      data: createAuthoritativeRaydiumCpmmBuffer(),
+      owner: RAYDIUM_CPMM_PROGRAM_ID,
+      lamports: 10000000n,
+      slot: defaultSlot,
+    });
+  }
+  if (!accountMap.has(FIXTURE_CPMM_TOKEN_0_VAULT)) {
+    accountMap.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+      address: FIXTURE_CPMM_TOKEN_0_VAULT,
+      data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+      owner: SPL_TOKEN_PROGRAM_ID,
+      lamports: 2000000n,
+      slot: defaultSlot,
+    });
+  }
+  if (!accountMap.has(FIXTURE_CPMM_TOKEN_1_VAULT)) {
+    accountMap.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+      address: FIXTURE_CPMM_TOKEN_1_VAULT,
+      data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+      owner: SPL_TOKEN_PROGRAM_ID,
+      lamports: 2000000n,
+      slot: defaultSlot,
+    });
+  }
+  if (!accountMap.has(FIXTURE_POOL_ADDRESS)) {
+    accountMap.set(FIXTURE_POOL_ADDRESS, {
+      address: FIXTURE_POOL_ADDRESS,
+      data: createAuthoritativeRaydiumAmmV4Buffer(),
+      owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+      lamports: 10000000n,
+      slot: defaultSlot,
+    });
+  }
+  if (!accountMap.has(FIXTURE_BASE_VAULT)) {
+    accountMap.set(FIXTURE_BASE_VAULT, {
+      address: FIXTURE_BASE_VAULT,
+      data: createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+      owner: SPL_TOKEN_PROGRAM_ID,
+      lamports: 2000000n,
+      slot: defaultSlot,
+    });
+  }
+  if (!accountMap.has(FIXTURE_QUOTE_VAULT)) {
+    accountMap.set(FIXTURE_QUOTE_VAULT, {
+      address: FIXTURE_QUOTE_VAULT,
+      data: createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+      owner: SPL_TOKEN_PROGRAM_ID,
+      lamports: 2000000n,
+      slot: defaultSlot,
+    });
+  }
+
+  return accountMap;
+}
+
+/**
+ * Constructs an offline mock RPC transport that serves accounts loaded from replay fixtures (BREADY-05).
+ */
+export function createOfflineRpcTransportFromFixtures(fixturesPath: string): ISolanaRpcTransport {
+  const accountMap = loadAccountMapFromFixtures(fixturesPath);
+
+  return {
+    async post(_url: string, body: Record<string, unknown>): Promise<unknown> {
+      const method = body.method as string;
+      const params = body.params as unknown[];
+      const reqId = body.id ?? 1;
+
+      if (method === "getAccountInfo") {
+        const address = (params?.[0] as string) ?? "";
+        const acc = accountMap.get(address);
+        if (!acc) {
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: { context: { slot: 300000100 }, value: null },
+          };
+        }
+        return {
+          jsonrpc: "2.0",
+          id: reqId,
+          result: {
+            context: { slot: acc.slot },
+            value: {
+              data: [Buffer.from(acc.data).toString("base64"), "base64"],
+              owner: acc.owner,
+              lamports: Number(acc.lamports),
+            },
+          },
+        };
+      }
+
+      if (method === "getMultipleAccounts") {
+        const addresses = (params?.[0] as string[]) ?? [];
+        let maxSlot = 300000100;
+        const value = addresses.map((addr) => {
+          const acc = accountMap.get(addr);
+          if (!acc) return null;
+          if (acc.slot > maxSlot) maxSlot = acc.slot;
+          return {
+            data: [Buffer.from(acc.data).toString("base64"), "base64"],
+            owner: acc.owner,
+            lamports: Number(acc.lamports),
+          };
+        });
+        return {
+          jsonrpc: "2.0",
+          id: reqId,
+          result: {
+            context: { slot: maxSlot },
+            value,
+          },
+        };
+      }
+
+      if (method === "getSlot") {
+        return {
+          jsonrpc: "2.0",
+          id: reqId,
+          result: 300000100,
+        };
+      }
+
+      throw new Error(
+        `[OFFLINE_RPC] Method '${method}' not supported by offline fixture transport`,
+      );
+    },
+  };
+}
+
+/**
+ * Executes an offline event discovery replay session from recorded fixture files (D29-H3 / BREADY-05).
  */
 export async function runReplaySession(
   config: PilotLiveCollectorConfig,
@@ -1247,23 +1533,36 @@ export async function runReplaySession(
 
   const engine = new EventDiscoveryIngestionEngine({
     maxQueueSize: config.maxEvents ?? 500,
+    maxEvents: config.maxEvents,
+    maxTransactions: config.maxTransactions,
   });
 
   const txMap = new Map<string, VersionedTransactionMetadata>();
-  const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
+  const accountMap = loadAccountMapFromFixtures(config.replayFixturesPath);
+
+  let eventsEnqueued = 0;
+  const maxEventsCeiling = config.maxEvents ?? Infinity;
 
   for (const filePath of fixtureFiles) {
+    if (eventsEnqueued >= maxEventsCeiling) {
+      logger.info(
+        "REPLAY_CEILING",
+        `Reached maxEvents ceiling (${maxEventsCeiling}). Halting fixture loading.`,
+      );
+      break;
+    }
+
     try {
       const raw = fsSync.readFileSync(filePath, "utf8");
       const parsed = JSON.parse(raw);
       if (parsed.signature && parsed.accountKeys) {
         txMap.set(parsed.signature, parsed);
-        await engine.handleLogNotification({
+        const enq = await engine.handleLogNotification({
           jsonrpc: "2.0",
           method: "logsNotification",
           params: {
             result: {
-              context: { slot: parsed.slot ?? 0 },
+              context: { slot: parsed.slot ?? 300000100 },
               value: {
                 signature: parsed.signature,
                 err: parsed.err ?? null,
@@ -1273,16 +1572,18 @@ export async function runReplaySession(
             subscription: 1,
           },
         });
+        if (enq.enqueued) eventsEnqueued++;
       } else if (Array.isArray(parsed)) {
         for (const item of parsed) {
+          if (eventsEnqueued >= maxEventsCeiling) break;
           if (item && typeof item === "object" && item.signature && item.accountKeys) {
             txMap.set(item.signature, item);
-            await engine.handleLogNotification({
+            const enq = await engine.handleLogNotification({
               jsonrpc: "2.0",
               method: "logsNotification",
               params: {
                 result: {
-                  context: { slot: item.slot ?? 0 },
+                  context: { slot: item.slot ?? 300000100 },
                   value: {
                     signature: item.signature,
                     err: item.err ?? null,
@@ -1292,6 +1593,7 @@ export async function runReplaySession(
                 subscription: 1,
               },
             });
+            if (enq.enqueued) eventsEnqueued++;
           }
         }
       }
@@ -1304,11 +1606,16 @@ export async function runReplaySession(
     fetchTransaction: async (sig: string) => txMap.get(sig) ?? null,
   };
 
+  let maxSlotSeen = 300000100;
+  for (const acc of accountMap.values()) {
+    if (acc.slot > maxSlotSeen) maxSlotSeen = acc.slot;
+  }
+
   const accountFetcher: IOnChainAccountFetcher = {
     getAccountInfo: async (addr: string) => accountMap.get(addr) ?? null,
     getMultipleAccounts: async (addrs: readonly string[]) =>
       addrs.map((a) => accountMap.get(a) ?? null),
-    getSlot: async () => 300000000,
+    getSlot: async () => maxSlotSeen,
   };
 
   const dispatchResults = await engine.processQueue(txFetcher, accountFetcher);
@@ -1355,9 +1662,56 @@ export async function runPilotCollectorCli(
     return 1;
   }
 
-  // Offline Replay Mode (D29-H3): Does not require network authorization
+  // D.2.9-B Authorization Guard: Reject live WebSocket event capture unless explicitly authorized in Gate 2.9-B (BREADY-05)
+  if (config.network === "enabled" && config.discoverySource === "events") {
+    console.error(
+      "[UNAUTHORIZED_LIVE_EVENTS] Live WebSocket event capture is unauthorized until Phase 12.94-D.2.9-B is formally approved. Use --replay-fixtures=<path> for offline event discovery verification.",
+    );
+    return 1;
+  }
+
+  // Offline Replay Mode or Offline Verification with Replay Fixtures (D29-H3 / BREADY-05): Does not require network authorization
   if (config.replayFixturesPath) {
     const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
+
+    // Offline CPMM verification from replay fixtures
+    if (config.verifyCpmmPoolAddress) {
+      logger.info(
+        "VERIFY_CPMM_POOL_START",
+        `Initiating offline on-chain verification for Raydium CPMM pool ${config.verifyCpmmPoolAddress} using fixtures from ${config.replayFixturesPath}...`,
+      );
+      const offlineTransport =
+        config.rpcTransport ?? createOfflineRpcTransportFromFixtures(config.replayFixturesPath);
+      const rpcClient = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://offline-fixtures",
+        transport: offlineTransport,
+        onLog: (msg) => logger.info("SOLANA_RPC", msg),
+      });
+
+      const report = await rpcClient.verifyCpmmPoolAccount(config.verifyCpmmPoolAddress);
+      console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+      return report.verified ? 0 : 1;
+    }
+
+    // Offline AMM v4 verification from replay fixtures
+    if (config.verifyPoolAddress) {
+      logger.info(
+        "VERIFY_POOL_START",
+        `Initiating offline on-chain verification for Raydium AMM v4 pool ${config.verifyPoolAddress} using fixtures from ${config.replayFixturesPath}...`,
+      );
+      const offlineTransport =
+        config.rpcTransport ?? createOfflineRpcTransportFromFixtures(config.replayFixturesPath);
+      const rpcClient = new SolanaRpcLiveObservationClient({
+        rpcUrl: "http://offline-fixtures",
+        transport: offlineTransport,
+        onLog: (msg) => logger.info("SOLANA_RPC", msg),
+      });
+
+      const report = await rpcClient.verifyPoolAccount(config.verifyPoolAddress);
+      console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+      return report.verified ? 0 : 1;
+    }
+
     try {
       const report = await runReplaySession(config, logger);
       console.log(JSON.stringify(report, null, 2));

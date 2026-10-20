@@ -477,4 +477,175 @@ describe("Milestone D.2.9-A: Pool Initialization Parser Tests", () => {
       expect(result.reason).toBe("UNKNOWN_PROGRAM");
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 7. Authoritative Account Vector Validation (BREADY-01)
+  // --------------------------------------------------------------------------
+  describe("7. Authoritative Account Vector Validation (BREADY-01)", () => {
+    it("fails closed when Raydium CPMM authority PDA at index 2 is wrong", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[2] = "11111111111111111111111111111111"; // Not RAYDIUM_CPMM_AUTHORITY
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("INVALID_AUTHORITY");
+      expect(result.message).toContain("authority PDA at account index 2");
+    });
+
+    it("fails closed when Raydium CPMM associated_token_program at index 17 is wrong", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[17] = "11111111111111111111111111111111"; // Wrong program
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("INVALID_FIXED_PROGRAM");
+      expect(result.message).toContain("associated_token_program at account index 17");
+    });
+
+    it("fails closed when Raydium CPMM system_program at index 18 is wrong", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[18] = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"; // Wrong program
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("INVALID_FIXED_PROGRAM");
+      expect(result.message).toContain("system_program at account index 18");
+    });
+
+    it("fails closed when Raydium CPMM rent sysvar at index 19 is wrong", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[19] = "11111111111111111111111111111111"; // Not SysvarRent
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("INVALID_FIXED_PROGRAM");
+      expect(result.message).toContain("rent sysvar at account index 19");
+    });
+
+    it("fails closed when Raydium CPMM token_program at index 14 is unsupported", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[14] = "11111111111111111111111111111111"; // Not SPL Token or Token-2022
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("UNSUPPORTED_TOKEN_PROGRAM");
+    });
+
+    it("fails closed when Raydium CPMM accounts are reordered", () => {
+      const baseTx = createCpmmInitTransactionFixture();
+      const reorderedKeys = [...baseTx.accountKeys.staticAccountKeys];
+      // Swap index 17 (associated_token_program) and index 18 (system_program)
+      const tmp = reorderedKeys[17]!;
+      reorderedKeys[17] = reorderedKeys[18]!;
+      reorderedKeys[18] = tmp;
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: reorderedKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_CPMM");
+      expect(result.reason).toBe("INVALID_FIXED_PROGRAM");
+    });
+
+    it("fails closed when Raydium AMM v4 fixed program at index 1 is wrong", () => {
+      const baseTx = createAmmV4InitTransactionFixture();
+      const wrongKeys = [...baseTx.accountKeys.staticAccountKeys];
+      wrongKeys[1] = "11111111111111111111111111111111"; // Not associated token program
+
+      const tx = {
+        ...baseTx,
+        accountKeys: {
+          ...baseTx.accountKeys,
+          staticAccountKeys: wrongKeys,
+        },
+      };
+
+      const result = identifyPoolInitializationInstruction(tx);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+
+      expect(result.protocol).toBe("RAYDIUM_AMM_V4");
+      expect(result.reason).toBe("INVALID_FIXED_PROGRAM");
+      expect(result.message).toContain("associated token program at index 1");
+    });
+
+    it("preserves separate instructionRequestedOpenTimeSec and poolOpenTimeSec", () => {
+      const tx = createCpmmInitTransactionFixture({ openTime: 1792376000 });
+      const result = identifyPoolInitializationInstruction(tx);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.event.instructionRequestedOpenTimeSec).toBe(1792376000);
+      expect(result.event.poolOpenTimeSec).toBe(1792376000);
+    });
+  });
 });

@@ -118,6 +118,7 @@ export interface SplVaultFixtureOptions {
   mintBase58?: string;
   ownerBase58?: string;
   rawAmount?: bigint;
+  state?: number;
   customBufferLength?: number;
 }
 
@@ -139,6 +140,7 @@ export function createAuthoritativeSplVaultBuffer(options: SplVaultFixtureOption
   buffer.set(ownerBytes, SPL_VAULT_OFFSETS.OWNER);
 
   buffer.writeBigUInt64LE(options.rawAmount ?? 1_000_000_000_000n, SPL_VAULT_OFFSETS.AMOUNT);
+  buffer[SPL_VAULT_OFFSETS.STATE] = options.state ?? 1; // Default to 1: Initialized (BREADY-03)
 
   return buffer;
 }

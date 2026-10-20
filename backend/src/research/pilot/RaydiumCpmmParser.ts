@@ -437,6 +437,7 @@ export interface CpmmVaultParseFailure {
     | "UNSUPPORTED_TOKEN_2022"
     | "UNAUTHORIZED_VAULT_OWNER"
     | "UNAUTHORIZED_VAULT_AUTHORITY"
+    | "UNINITIALIZED_OR_FROZEN_VAULT"
     | "VAULT_MINT_MISMATCH"
     | "VAULT_ADDRESS_MISMATCH";
   readonly message: string;
@@ -520,6 +521,16 @@ export function parseCpmmVaultAccount(
       ok: false,
       category: "UNAUTHORIZED_VAULT_AUTHORITY",
       message: `Decoded vault authority ${decodedAuthority} does not match canonical CPMM authority ${RAYDIUM_CPMM_AUTHORITY}`,
+    };
+  }
+
+  // 8. Verify SPL Token AccountState at offset 108 (1: Initialized) (BREADY-03)
+  const accountState = data[SPL_VAULT_OFFSETS.STATE];
+  if (accountState !== 1) {
+    return {
+      ok: false,
+      category: "UNINITIALIZED_OR_FROZEN_VAULT",
+      message: `CPMM vault account state is ${accountState === 0 ? "UNINITIALIZED" : accountState === 2 ? "FROZEN" : "INVALID"} (expected 1: INITIALIZED)`,
     };
   }
 

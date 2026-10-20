@@ -46,6 +46,7 @@ export const SPL_VAULT_OFFSETS = {
   MINT: 0, // 32-byte pubkey (offset 0..32)
   OWNER: 32, // 32-byte pubkey (offset 32..64)
   AMOUNT: 64, // u64 little-endian (offset 64..72)
+  STATE: 108, // u8 account state (0: Uninitialized, 1: Initialized, 2: Frozen)
 } as const;
 
 export type RaydiumParseErrorCategory =
@@ -76,7 +77,12 @@ export interface SplVaultParseSuccess {
 
 export interface SplVaultParseFailure {
   readonly ok: false;
-  readonly category: "INVALID_VAULT_LENGTH" | "UNAUTHORIZED_VAULT_OWNER" | "MINT_MISMATCH";
+  readonly category:
+    | "INVALID_VAULT_LENGTH"
+    | "UNAUTHORIZED_VAULT_OWNER"
+    | "UNAUTHORIZED_VAULT_AUTHORITY"
+    | "UNINITIALIZED_OR_FROZEN_VAULT"
+    | "MINT_MISMATCH";
   readonly message: string;
 }
 
@@ -246,6 +252,7 @@ export function parseSplTokenVaultAccount(
   expectedMintAddress?: string | undefined,
   ownerProgramId?: string | undefined,
   accountSlot?: number | undefined,
+  expectedAuthorityAddress?: string | undefined,
 ): SplVaultParseResult {
   if (!data || data.length !== SPL_VAULT_LAYOUT_LENGTH) {
     return {
@@ -273,6 +280,24 @@ export function parseSplTokenVaultAccount(
       ok: false,
       category: "MINT_MISMATCH",
       message: `Vault mint ${mintAddress} does not match expected pool mint ${expectedMintAddress}`,
+    };
+  }
+
+  if (expectedAuthorityAddress && ownerAddress !== expectedAuthorityAddress) {
+    return {
+      ok: false,
+      category: "UNAUTHORIZED_VAULT_AUTHORITY",
+      message: `Vault authority ${ownerAddress} does not match expected authority ${expectedAuthorityAddress}`,
+    };
+  }
+
+  // Validate SPL Token AccountState at offset 108 (BREADY-03)
+  const accountState = data[SPL_VAULT_OFFSETS.STATE];
+  if (accountState !== 1) {
+    return {
+      ok: false,
+      category: "UNINITIALIZED_OR_FROZEN_VAULT",
+      message: `Token vault account state is ${accountState === 0 ? "UNINITIALIZED" : accountState === 2 ? "FROZEN" : "INVALID"} (expected 1: INITIALIZED)`,
     };
   }
 

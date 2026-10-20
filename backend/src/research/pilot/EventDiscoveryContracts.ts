@@ -146,12 +146,16 @@ export type UnsupportedProtocolReason =
   | "TRANSACTION_FAILED"
   | "TRANSACTION_SIGNATURE_MISMATCH"
   | "MISSING_ACCOUNTS"
+  | "INVALID_AUTHORITY"
+  | "INVALID_FIXED_PROGRAM"
+  | "UNSUPPORTED_TOKEN_PROGRAM"
+  | "INVALID_ACCOUNT_VECTOR"
   | "CORRUPTED_INSTRUCTION_DATA"
   | "UNRESOLVED_LOOKUP_TABLE_INDEX";
 
 /**
  * Representation of an identified pool initialization event.
- * Preserves strict separation between creation blockTime, host observation, and pool activation openTime.
+ * Preserves strict separation between creation blockTime, host observation, and instruction-requested openTime.
  */
 export interface DiscoveredPoolInitializationEvent {
   readonly eventId: string; // ${signature}:${outerInstructionIndex} or ${signature}:${outerInstructionIndex}:inner:${innerInstructionIndex}
@@ -162,6 +166,9 @@ export interface DiscoveredPoolInitializationEvent {
   readonly slot: number;
   readonly blockTimeSec: number | null;
   readonly firstSeenTimestampMs: number;
+  /** Unix timestamp in seconds requested inside initialization instruction bytes (BREADY-01) */
+  readonly instructionRequestedOpenTimeSec: number | null;
+  /** Alias for instructionRequestedOpenTimeSec retained for backward compatibility */
   readonly poolOpenTimeSec: number | null;
   readonly protocol: DiscoveredProtocolType;
   readonly unsupportedReason?: UnsupportedProtocolReason | undefined;
@@ -241,6 +248,10 @@ export interface VerificationDispatchResult {
   readonly spotPriceSol: number | null;
   readonly spotPrice0Per1: number | null;
   readonly quoteCohort?: QuoteAssetCohort | undefined;
+  /** Opening time requested inside instruction bytes (BREADY-01) */
+  readonly instructionRequestedOpenTimeSec?: number | null | undefined;
+  /** Independently decoded pool-state activation / swap-unlock time in seconds (BREADY-01) */
+  readonly decodedPoolStateActivationTimeSec?: number | bigint | null | undefined;
   readonly decodedAmmState?: D23RaydiumAmmV4State | undefined;
   readonly decodedCpmmState?: D28RaydiumCpmmState | undefined;
   readonly cpmmReserveAccounting?: D28CpmmReserveAccounting | undefined;
@@ -276,4 +287,8 @@ export interface EventDiscoveryMetricsSnapshot {
   readonly partiallyVerifiedTierCount: number;
   readonly slotDiscrepantTierCount: number;
   readonly unavailableTierCount: number;
+  /** Verification-level transient retry and recovery metrics (BREADY-04) */
+  readonly verificationRetries?: number | undefined;
+  readonly exhaustedVerificationRetriesCount?: number | undefined;
+  readonly pendingVerificationsCount?: number | undefined;
 }

@@ -110,6 +110,8 @@ export interface CpmmPoolVerificationReport {
   readonly rpcUrl: string;
   readonly verificationStatus:
     | "VERIFIED_RAYDIUM_CPMM"
+    | "SLOT_PROVENANCE_UNAVAILABLE"
+    | "SLOT_DISCREPANT"
     | "UNAUTHORIZED_PROGRAM_ID"
     | "NULL_ACCOUNT"
     | "MALFORMED_POOL_DATA"
@@ -123,6 +125,8 @@ export interface CpmmPoolVerificationReport {
   readonly vault0Slot: number | null;
   readonly vault1Slot: number | null;
   readonly slotDiscrepancy: boolean;
+  /** Independently decoded pool-state activation / swap-unlock time in seconds (BREADY-01/02) */
+  readonly decodedPoolStateActivationTimeSec?: number | bigint | null | undefined;
   readonly programOwner?: string | undefined;
   readonly token0Mint?: string | undefined;
   readonly token1Mint?: string | undefined;
@@ -691,7 +695,11 @@ export class SolanaRpcLiveObservationClient {
         } | null);
 
       const poolVal = poolInfoResponse?.value;
-      const poolSlot = poolInfoResponse?.context?.slot ?? null;
+      const rawPoolSlot = poolInfoResponse?.context?.slot;
+      const poolSlot =
+        typeof rawPoolSlot === "number" && Number.isInteger(rawPoolSlot) && rawPoolSlot > 0
+          ? rawPoolSlot
+          : null;
 
       if (!poolVal) {
         this.poolsFailed++;
@@ -748,7 +756,7 @@ export class SolanaRpcLiveObservationClient {
         poolBuffer,
         poolAddress,
         poolVal.owner,
-        poolSlot ?? 0,
+        poolSlot ?? undefined,
       );
 
       if (!cpmmParseResult.ok) {
@@ -793,7 +801,11 @@ export class SolanaRpcLiveObservationClient {
           } | null>;
         } | null);
 
-      const vaultsSlot = vaultsResponse?.context?.slot ?? null;
+      const rawVaultsSlot = vaultsResponse?.context?.slot;
+      const vaultsSlot =
+        typeof rawVaultsSlot === "number" && Number.isInteger(rawVaultsSlot) && rawVaultsSlot > 0
+          ? rawVaultsSlot
+          : null;
       const v0Account = vaultsResponse?.value?.[0];
       const v1Account = vaultsResponse?.value?.[1];
 
@@ -828,7 +840,7 @@ export class SolanaRpcLiveObservationClient {
         poolState.token0Mint,
         poolState.token0Program,
         v0Account.owner ?? "",
-        vaultsSlot ?? poolSlot ?? 0,
+        vaultsSlot ?? undefined,
       );
 
       const v1Parsed = parseCpmmVaultAccount(
@@ -838,7 +850,7 @@ export class SolanaRpcLiveObservationClient {
         poolState.token1Mint,
         poolState.token1Program,
         v1Account.owner ?? "",
-        vaultsSlot ?? poolSlot ?? 0,
+        vaultsSlot ?? undefined,
       );
 
       if (!v0Parsed.ok) {
@@ -883,11 +895,59 @@ export class SolanaRpcLiveObservationClient {
         };
       }
 
-      // 3. Compute Reserve Accounting
-      const slotDiscrepancy = Boolean(
-        poolSlot !== null && vaultsSlot !== null && Math.abs(poolSlot - vaultsSlot) > 2,
-      );
+      // 3. Slot Provenance & Discrepancy Checks (BREADY-02)
+      // Missing or invalid context slots remain explicitly unavailable and must not produce INDEPENDENTLY_COHERENT or VERIFIED_RAYDIUM_CPMM
+      if (poolSlot === null || vaultsSlot === null) {
+        this.poolsFailed++;
+        return {
+          poolAddress,
+          rpcUrl: this.rpcUrl,
+          verificationStatus: "SLOT_PROVENANCE_UNAVAILABLE",
+          verified: false,
+          verificationTier: "PARTIALLY_VERIFIED",
+          onChainSlot: vaultsSlot ?? poolSlot,
+          poolSlot,
+          vault0Slot: vaultsSlot,
+          vault1Slot: vaultsSlot,
+          slotDiscrepancy: false,
+          decodedPoolStateActivationTimeSec: poolState.swapActivationTimeSec,
+          programOwner: poolVal.owner,
+          token0Mint: poolState.token0Mint,
+          token1Mint: poolState.token1Mint,
+          token0Vault: poolState.token0Vault,
+          token1Vault: poolState.token1Vault,
+          error: `Missing authentic slot provenance: poolSlot=${poolSlot}, vaultsSlot=${vaultsSlot}`,
+        };
+      }
 
+      const slotDelta = Math.abs(poolSlot - vaultsSlot);
+      const slotDiscrepancy = slotDelta > 2;
+
+      if (slotDiscrepancy) {
+        this.poolsFailed++;
+        this.slotDiscrepancies++;
+        return {
+          poolAddress,
+          rpcUrl: this.rpcUrl,
+          verificationStatus: "SLOT_DISCREPANT",
+          verified: false,
+          verificationTier: "SLOT_DISCREPANT",
+          onChainSlot: vaultsSlot,
+          poolSlot,
+          vault0Slot: vaultsSlot,
+          vault1Slot: vaultsSlot,
+          slotDiscrepancy: true,
+          decodedPoolStateActivationTimeSec: poolState.swapActivationTimeSec,
+          programOwner: poolVal.owner,
+          token0Mint: poolState.token0Mint,
+          token1Mint: poolState.token1Mint,
+          token0Vault: poolState.token0Vault,
+          token1Vault: poolState.token1Vault,
+          error: `Slot discrepancy between pool observation (${poolSlot}) and vault observation (${vaultsSlot}): delta=${slotDelta}`,
+        };
+      }
+
+      // 4. Compute Reserve Accounting
       const reserveResult = computeCpmmReserveAccounting(
         poolState,
         v0Parsed.snapshot,
@@ -901,11 +961,12 @@ export class SolanaRpcLiveObservationClient {
           rpcUrl: this.rpcUrl,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
-          onChainSlot: vaultsSlot ?? poolSlot,
+          onChainSlot: vaultsSlot,
           poolSlot,
           vault0Slot: vaultsSlot,
           vault1Slot: vaultsSlot,
-          slotDiscrepancy,
+          slotDiscrepancy: false,
+          decodedPoolStateActivationTimeSec: poolState.swapActivationTimeSec,
           programOwner: poolVal.owner,
           token0Mint: poolState.token0Mint,
           token1Mint: poolState.token1Mint,
@@ -916,13 +977,9 @@ export class SolanaRpcLiveObservationClient {
       }
 
       const accounting = reserveResult.accounting;
-      const isCoherent =
-        accounting.verificationTier === "INDEPENDENTLY_COHERENT" && !slotDiscrepancy;
+      const isCoherent = accounting.verificationTier === "INDEPENDENTLY_COHERENT";
 
       this.poolsSuccessful++;
-      if (slotDiscrepancy) {
-        this.slotDiscrepancies++;
-      }
 
       return {
         poolAddress,
@@ -930,11 +987,12 @@ export class SolanaRpcLiveObservationClient {
         verificationStatus: isCoherent ? "VERIFIED_RAYDIUM_CPMM" : "VAULT_VERIFICATION_FAILED",
         verified: isCoherent,
         verificationTier: accounting.verificationTier,
-        onChainSlot: vaultsSlot ?? poolSlot,
+        onChainSlot: vaultsSlot,
         poolSlot,
         vault0Slot: vaultsSlot,
         vault1Slot: vaultsSlot,
-        slotDiscrepancy,
+        slotDiscrepancy: false,
+        decodedPoolStateActivationTimeSec: poolState.swapActivationTimeSec,
         programOwner: poolVal.owner,
         token0Mint: poolState.token0Mint,
         token1Mint: poolState.token1Mint,

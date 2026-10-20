@@ -31,9 +31,18 @@ import type {
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
-import { RAYDIUM_CPMM_AUTHORITY, RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
+import {
+  RAYDIUM_CPMM_AUTHORITY,
+  RAYDIUM_CPMM_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+} from "./RaydiumCpmmParser.js";
 
 export { RAYDIUM_AMM_V4_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID, RAYDIUM_CPMM_AUTHORITY };
+
+// Canonical Solana programs & sysvars required at fixed account indices (BREADY-01)
+export const ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+export const SYSVAR_RENT_PUBKEY = "SysvarRent111111111111111111111111111111111";
 
 // Anchor Discriminator for CPMM initialize: sha256("global:initialize")[0..8]
 export const RAYDIUM_CPMM_INIT_DISCRIMINATOR = Object.freeze([
@@ -152,6 +161,17 @@ export function normalizeInstructionData(
   }
   if (data instanceof Uint8Array) {
     return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (Array.isArray(data)) {
+    return Buffer.from(data);
+  }
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    (data as { type?: unknown }).type === "Buffer" &&
+    Array.isArray((data as { data?: unknown }).data)
+  ) {
+    return Buffer.from((data as { data: number[] }).data);
   }
 
   if (typeof data !== "string") {
@@ -347,6 +367,47 @@ function parseSingleInstruction(
       };
     }
 
+    // Verify canonical programs and sysvars at required positions (BREADY-01)
+    if (accounts[0] !== SPL_TOKEN_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_AMM_V4",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium AMM v4 initialize2 token program at index 0 (${accounts[0]}) does not match canonical SPL Token Program (${SPL_TOKEN_PROGRAM_ID})`,
+        },
+      };
+    }
+
+    if (accounts[1] !== ASSOCIATED_TOKEN_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_AMM_V4",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium AMM v4 initialize2 associated token program at index 1 (${accounts[1]}) does not match canonical Associated Token Program (${ASSOCIATED_TOKEN_PROGRAM_ID})`,
+        },
+      };
+    }
+
+    if (accounts[2] !== SYSTEM_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_AMM_V4",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium AMM v4 initialize2 system program at index 2 (${accounts[2]}) does not match canonical System Program (${SYSTEM_PROGRAM_ID})`,
+        },
+      };
+    }
+
+    if (accounts[3] !== SYSVAR_RENT_PUBKEY) {
+      return {
+        error: {
+          protocol: "RAYDIUM_AMM_V4",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium AMM v4 initialize2 rent sysvar at index 3 (${accounts[3]}) does not match canonical Rent Sysvar (${SYSVAR_RENT_PUBKEY})`,
+        },
+      };
+    }
+
     const poolId = accounts[4]!;
     const authorityPda = accounts[5];
     const lpMint = accounts[7];
@@ -375,6 +436,7 @@ function parseSingleInstruction(
       slot: tx.slot,
       blockTimeSec: tx.blockTime,
       firstSeenTimestampMs: hostObservationTimestampMs,
+      instructionRequestedOpenTimeSec: poolOpenTimeSec, // Decoded from initialize2 instruction bytes (BREADY-01)
       poolOpenTimeSec, // Decoded from initialize2 instruction bytes
       protocol: "RAYDIUM_AMM_V4",
       poolId,
@@ -467,6 +529,84 @@ function parseSingleInstruction(
       };
     }
 
+    // Fixed account validations (BREADY-01)
+    // Index 2: authority PDA derived from "vault_and_lp_mint_auth_seed"
+    if (accounts[2] !== RAYDIUM_CPMM_AUTHORITY) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "INVALID_AUTHORITY",
+          message: `Raydium CPMM initialize authority PDA at account index 2 (${accounts[2]}) does not match canonical CPMM authority ${RAYDIUM_CPMM_AUTHORITY}`,
+        },
+      };
+    }
+
+    // Index 14: token_program (Interface<TokenInterface>)
+    if (accounts[14] !== SPL_TOKEN_PROGRAM_ID && accounts[14] !== TOKEN_2022_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "UNSUPPORTED_TOKEN_PROGRAM",
+          message: `Raydium CPMM initialize token_program at account index 14 (${accounts[14]}) is not an allowed token program`,
+        },
+      };
+    }
+
+    // Index 15: token_0_program (Interface<TokenInterface>)
+    if (accounts[15] !== SPL_TOKEN_PROGRAM_ID && accounts[15] !== TOKEN_2022_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "UNSUPPORTED_TOKEN_PROGRAM",
+          message: `Raydium CPMM initialize token_0_program at account index 15 (${accounts[15]}) is not an allowed token program`,
+        },
+      };
+    }
+
+    // Index 16: token_1_program (Interface<TokenInterface>)
+    if (accounts[16] !== SPL_TOKEN_PROGRAM_ID && accounts[16] !== TOKEN_2022_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "UNSUPPORTED_TOKEN_PROGRAM",
+          message: `Raydium CPMM initialize token_1_program at account index 16 (${accounts[16]}) is not an allowed token program`,
+        },
+      };
+    }
+
+    // Index 17: associated_token_program (Program<AssociatedToken>)
+    if (accounts[17] !== ASSOCIATED_TOKEN_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium CPMM initialize associated_token_program at account index 17 (${accounts[17]}) does not match canonical Associated Token Program ${ASSOCIATED_TOKEN_PROGRAM_ID}`,
+        },
+      };
+    }
+
+    // Index 18: system_program (Program<System>)
+    if (accounts[18] !== SYSTEM_PROGRAM_ID) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium CPMM initialize system_program at account index 18 (${accounts[18]}) does not match canonical System Program ${SYSTEM_PROGRAM_ID}`,
+        },
+      };
+    }
+
+    // Index 19: rent (Sysvar<Rent>)
+    if (accounts[19] !== SYSVAR_RENT_PUBKEY) {
+      return {
+        error: {
+          protocol: "RAYDIUM_CPMM",
+          reason: "INVALID_FIXED_PROGRAM",
+          message: `Raydium CPMM initialize rent sysvar at account index 19 (${accounts[19]}) does not match canonical Rent Sysvar ${SYSVAR_RENT_PUBKEY}`,
+        },
+      };
+    }
+
     const creatorWallet = accounts[0];
     const ammConfigOrMarket = accounts[1];
     const authorityPda = accounts[2];
@@ -497,6 +637,7 @@ function parseSingleInstruction(
       slot: tx.slot,
       blockTimeSec: tx.blockTime,
       firstSeenTimestampMs: hostObservationTimestampMs,
+      instructionRequestedOpenTimeSec: poolOpenTimeSec, // Decoded from CPMM initialize instruction bytes (BREADY-01)
       poolOpenTimeSec, // Decoded from CPMM initialize instruction bytes
       protocol: "RAYDIUM_CPMM",
       poolId,

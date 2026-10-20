@@ -21,6 +21,7 @@
  */
 
 import type {
+  DiscoveredPoolInitializationEvent,
   EventDiscoveryMetricsSnapshot,
   EventLifecycleState,
   IOnChainAccountFetcher,
@@ -46,8 +47,11 @@ export interface EventDiscoveryEngineOptions {
   readonly maxQueueSize?: number | undefined; // Maximum queue capacity (default 500)
   readonly backpressurePolicy?: "DROP_OLDEST" | "DROP_NEWEST" | undefined; // Default DROP_OLDEST
   readonly maxRetriesPerTx?: number | undefined; // Max fetch attempts (default 3)
+  readonly maxVerificationRetries?: number | undefined; // Max verification attempts per event (default 3, BREADY-04)
   readonly clock?: { now(): number } | undefined; // Injectable clock for deterministic tests
   readonly maxSlotDelta?: number | undefined; // Maximum acceptable slot delta (default 1000)
+  readonly maxEvents?: number | undefined; // Total session events budget ceiling (BREADY-05)
+  readonly maxTransactions?: number | undefined; // Total session fetched transactions budget ceiling (BREADY-05)
 }
 
 interface QueuedItem {
@@ -58,6 +62,14 @@ interface QueuedItem {
   lifecycleState: EventLifecycleState;
 }
 
+export interface PendingVerificationItem {
+  readonly event: DiscoveredPoolInitializationEvent;
+  readonly detectedAtMs: number;
+  readonly signature: string;
+  retryCount: number;
+  lastError?: string;
+}
+
 /**
  * Protocol-neutral event discovery ingestion engine.
  */
@@ -65,11 +77,17 @@ export class EventDiscoveryIngestionEngine {
   private readonly maxQueueSize: number;
   private readonly backpressurePolicy: "DROP_OLDEST" | "DROP_NEWEST";
   private readonly maxRetries: number;
+  private readonly maxVerificationRetries: number;
   private readonly clock: { now(): number };
   private readonly maxSlotDelta: number;
+  private readonly maxEvents?: number | undefined;
+  private readonly maxTransactions?: number | undefined;
+
+  private totalTransactionsProcessed = 0;
 
   private connectionStatus: WebSocketConnectionStatus = "DISCONNECTED";
   private queue: QueuedItem[] = [];
+  private readonly pendingVerifications = new Map<string, PendingVerificationItem>();
 
   // Decoupled lifecycle sets (D29-F5)
   private readonly observedSignatures = new Set<string>(); // All signatures seen in notifications
@@ -112,13 +130,18 @@ export class EventDiscoveryIngestionEngine {
   private partiallyVerifiedTierCount = 0;
   private slotDiscrepantTierCount = 0;
   private unavailableTierCount = 0;
+  private verificationRetries = 0;
+  private exhaustedVerificationRetriesCount = 0;
 
   constructor(options: EventDiscoveryEngineOptions = {}) {
     this.maxQueueSize = options.maxQueueSize ?? 500;
     this.backpressurePolicy = options.backpressurePolicy ?? "DROP_OLDEST";
     this.maxRetries = options.maxRetriesPerTx ?? 3;
+    this.maxVerificationRetries = options.maxVerificationRetries ?? 3;
     this.clock = options.clock ?? { now: () => Date.now() };
     this.maxSlotDelta = options.maxSlotDelta ?? 1000;
+    this.maxEvents = options.maxEvents;
+    this.maxTransactions = options.maxTransactions;
   }
 
   // --------------------------------------------------------------------------
@@ -154,6 +177,11 @@ export class EventDiscoveryIngestionEngine {
   public async handleLogNotification(
     envelope: WebSocketLogNotificationEnvelope,
   ): Promise<{ enqueued: boolean; reason?: string }> {
+    if (this.maxEvents !== undefined && this.rawLogNotificationsReceived >= this.maxEvents) {
+      this.rateLimitDrops += 1;
+      return { enqueued: false, reason: "MAX_EVENTS_EXCEEDED" };
+    }
+
     this.rawLogNotificationsReceived += 1;
 
     const value = envelope.params?.result?.value;
@@ -226,10 +254,21 @@ export class EventDiscoveryIngestionEngine {
   ): Promise<readonly VerificationDispatchResult[]> {
     const results: VerificationDispatchResult[] = [];
 
+    // 0. Retry any pending verifications from previous attempts (BREADY-04)
+    const retried = await this.retryPendingVerifications(accountFetcher);
+    results.push(...retried);
+
     while (this.queue.length > 0) {
+      if (
+        this.maxTransactions !== undefined &&
+        this.totalTransactionsProcessed >= this.maxTransactions
+      ) {
+        break;
+      }
       const item = this.queue.shift()!;
       this.queuedSignatures.delete(item.signature);
       item.lifecycleState = "TX_FETCH_QUEUED";
+      this.totalTransactionsProcessed += 1;
 
       // 1. Fetch transaction metadata with bounded retry accounting (D29-F5)
       let tx: VersionedTransactionMetadata | null = null;
@@ -295,6 +334,13 @@ export class EventDiscoveryIngestionEngine {
           item.lifecycleState = "DUPLICATE_IGNORED";
           continue;
         }
+
+        // If event is already in pending queue for retry, suppress duplicate
+        if (this.pendingVerifications.has(event.eventId)) {
+          this.duplicatePoolIdsIgnored += 1;
+          continue;
+        }
+
         this.candidatePoolsDiscovered += 1;
 
         // Track detection latency
@@ -305,65 +351,46 @@ export class EventDiscoveryIngestionEngine {
           this.detectionLatencySamples += 1;
         }
 
-        // Dispatch to independent on-chain verification
+        // Dispatch to independent on-chain verification with bounded per-event retry (BREADY-04)
         item.lifecycleState = "VERIFICATION_QUEUED";
-        let dispatchResult: VerificationDispatchResult;
+        let dispatchResult: VerificationDispatchResult | null = null;
         try {
           dispatchResult = await dispatchPoolVerification(event, accountFetcher);
-        } catch {
-          this.rpcVerificationFailures += 1;
-          item.lifecycleState = "VERIFICATION_FAILED";
-          continue;
-        }
+        } catch (err) {
+          this.verificationRetries += 1;
+          const pendingItem: PendingVerificationItem = {
+            event,
+            detectedAtMs: item.detectedAtMs,
+            signature: item.signature,
+            retryCount: 1,
+            lastError: err instanceof Error ? err.message : String(err),
+          };
 
-        // Track verification latency
-        const verificationLatencyMs = Math.max(
-          0,
-          dispatchResult.verifiedAtEpochMs - item.detectedAtMs,
-        );
-        this.totalVerificationLatencyMs += verificationLatencyMs;
-        this.verificationLatencySamples += 1;
-
-        // Track total discovery latency
-        if (event.blockTimeSec !== null) {
-          const totalDiscoveryLatencyMs = Math.max(
-            0,
-            dispatchResult.verifiedAtEpochMs - event.blockTimeSec * 1000,
-          );
-          this.totalDiscoveryLatencyMs += totalDiscoveryLatencyMs;
-          this.totalDiscoverySamples += 1;
-        }
-
-        // Track slot metrics
-        if (dispatchResult.slotDelta > this.maxSlotDeltaObserved) {
-          this.maxSlotDeltaObserved = dispatchResult.slotDelta;
-        }
-        if (dispatchResult.slotDiscrepancy) {
-          this.slotDiscrepancyIncidents += 1;
-        }
-
-        // Track verification tiers (D29-F5)
-        // Never assign VERIFIED_COHERENT to a PARTIALLY_VERIFIED result!
-        switch (dispatchResult.verificationTier) {
-          case "INDEPENDENTLY_COHERENT":
-          case "VERIFIED_AMM_V4":
-            this.coherentTierPoolsCount += 1;
-            this.verifiedPoolIds.add(event.poolId);
-            item.lifecycleState = "VERIFIED_COHERENT";
-            break;
-          case "PARTIALLY_VERIFIED":
-            this.partiallyVerifiedTierCount += 1;
-            item.lifecycleState = "PARTIALLY_VERIFIED"; // Preserved as PARTIALLY_VERIFIED (D29-F5)
-            break;
-          case "SLOT_DISCREPANT":
-            this.slotDiscrepantTierCount += 1;
-            item.lifecycleState = "SLOT_DISCREPANT";
-            break;
-          default:
+          if (pendingItem.retryCount <= this.maxVerificationRetries) {
+            this.pendingVerifications.set(event.eventId, pendingItem);
+            item.lifecycleState = "VERIFICATION_FAILED";
+            continue;
+          } else {
+            this.rpcVerificationFailures += 1;
+            this.exhaustedVerificationRetriesCount += 1;
             this.rejectedPoolIds.add(event.poolId);
-            this.unavailableTierCount += 1;
-            item.lifecycleState = "REJECTED_NON_COHERENT";
-            break;
+            item.lifecycleState = "VERIFICATION_FAILED";
+            continue;
+          }
+        }
+
+        this.recordDispatchMetrics(dispatchResult, event, item.detectedAtMs);
+        if (
+          dispatchResult.verificationTier === "INDEPENDENTLY_COHERENT" ||
+          dispatchResult.verificationTier === "VERIFIED_AMM_V4"
+        ) {
+          item.lifecycleState = "VERIFIED_COHERENT";
+        } else if (dispatchResult.verificationTier === "PARTIALLY_VERIFIED") {
+          item.lifecycleState = "PARTIALLY_VERIFIED";
+        } else if (dispatchResult.verificationTier === "SLOT_DISCREPANT") {
+          item.lifecycleState = "SLOT_DISCREPANT";
+        } else {
+          item.lifecycleState = "REJECTED_NON_COHERENT";
         }
 
         results.push(dispatchResult);
@@ -373,6 +400,108 @@ export class EventDiscoveryIngestionEngine {
     }
 
     return Object.freeze(results);
+  }
+
+  /**
+   * Retries all pending verification events with bounded retry limits (BREADY-04).
+   * Successful events are preserved without re-processing already completed events.
+   */
+  public async retryPendingVerifications(
+    accountFetcher: IOnChainAccountFetcher,
+  ): Promise<readonly VerificationDispatchResult[]> {
+    const recoveredResults: VerificationDispatchResult[] = [];
+    const pendingEntries = Array.from(this.pendingVerifications.entries());
+
+    for (const [eventId, pending] of pendingEntries) {
+      if (this.verifiedPoolIds.has(pending.event.poolId)) {
+        this.pendingVerifications.delete(eventId);
+        continue;
+      }
+
+      try {
+        const dispatchResult = await dispatchPoolVerification(pending.event, accountFetcher);
+        this.pendingVerifications.delete(eventId);
+        this.recordDispatchMetrics(dispatchResult, pending.event, pending.detectedAtMs);
+        recoveredResults.push(dispatchResult);
+      } catch (err) {
+        pending.retryCount += 1;
+        pending.lastError = err instanceof Error ? err.message : String(err);
+        this.verificationRetries += 1;
+
+        if (pending.retryCount > this.maxVerificationRetries) {
+          this.pendingVerifications.delete(eventId);
+          this.rpcVerificationFailures += 1;
+          this.exhaustedVerificationRetriesCount += 1;
+          this.rejectedPoolIds.add(pending.event.poolId);
+          const failureResult: VerificationDispatchResult = {
+            poolId: pending.event.poolId,
+            protocol: pending.event.protocol,
+            verified: false,
+            rejectionReason: `Verification retries exhausted (${this.maxVerificationRetries}): ${pending.lastError}`,
+            verificationTier: "REJECTED",
+            transactionSlot: pending.event.slot,
+            poolAccountSlot: null,
+            vault0AccountSlot: null,
+            vault1AccountSlot: null,
+            slotDiscrepancy: false,
+            slotDelta: 0,
+            verifiedAtEpochMs: this.clock.now(),
+            hostObservationTimestampMs: this.clock.now(),
+            effectiveReservesAvailable: false,
+            spotPriceSol: null,
+            spotPrice0Per1: null,
+          };
+          this.recordDispatchMetrics(failureResult, pending.event, pending.detectedAtMs);
+          recoveredResults.push(failureResult);
+        }
+      }
+    }
+
+    return Object.freeze(recoveredResults);
+  }
+
+  private recordDispatchMetrics(
+    dispatchResult: VerificationDispatchResult,
+    event: DiscoveredPoolInitializationEvent,
+    detectedAtMs: number,
+  ): void {
+    const verificationLatencyMs = Math.max(0, dispatchResult.verifiedAtEpochMs - detectedAtMs);
+    this.totalVerificationLatencyMs += verificationLatencyMs;
+    this.verificationLatencySamples += 1;
+
+    if (event.blockTimeSec !== null) {
+      const totalDiscoveryLatencyMs = Math.max(
+        0,
+        dispatchResult.verifiedAtEpochMs - event.blockTimeSec * 1000,
+      );
+      this.totalDiscoveryLatencyMs += totalDiscoveryLatencyMs;
+      this.totalDiscoverySamples += 1;
+    }
+
+    if (dispatchResult.slotDelta > this.maxSlotDeltaObserved) {
+      this.maxSlotDeltaObserved = dispatchResult.slotDelta;
+    }
+    if (dispatchResult.slotDiscrepancy) {
+      this.slotDiscrepancyIncidents += 1;
+    }
+
+    switch (dispatchResult.verificationTier) {
+      case "INDEPENDENTLY_COHERENT":
+      case "VERIFIED_AMM_V4":
+        this.coherentTierPoolsCount += 1;
+        this.verifiedPoolIds.add(event.poolId);
+        break;
+      case "PARTIALLY_VERIFIED":
+        this.partiallyVerifiedTierCount += 1;
+        break;
+      case "SLOT_DISCREPANT":
+        this.slotDiscrepantTierCount += 1;
+        break;
+      default:
+        this.rejectedPoolIds.add(event.poolId);
+        this.unavailableTierCount += 1;
+        break;
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -426,6 +555,9 @@ export class EventDiscoveryIngestionEngine {
       partiallyVerifiedTierCount: this.partiallyVerifiedTierCount,
       slotDiscrepantTierCount: this.slotDiscrepantTierCount,
       unavailableTierCount: this.unavailableTierCount,
+      verificationRetries: this.verificationRetries,
+      exhaustedVerificationRetriesCount: this.exhaustedVerificationRetriesCount,
+      pendingVerificationsCount: this.pendingVerifications.size,
     });
   }
 }

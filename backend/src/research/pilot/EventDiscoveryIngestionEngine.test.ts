@@ -36,6 +36,8 @@ import {
   FIXTURE_CPMM_POOL_ADDRESS,
   FIXTURE_CPMM_TOKEN_0_MINT,
   FIXTURE_CPMM_TOKEN_1_MINT,
+  FIXTURE_CPMM_TOKEN_0_VAULT,
+  FIXTURE_CPMM_TOKEN_1_VAULT,
 } from "./fixtures/AuthoritativeCpmmFixtures.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
 import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
@@ -560,6 +562,304 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       expect(metrics.candidatePoolsDiscovered).toBe(0);
       expect(metrics.successfulInitDecodes).toBe(0);
       expect(metrics.coherentTierPoolsCount).toBe(0);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 6. Bounded Per-Event Verification Recovery (BREADY-04)
+  // --------------------------------------------------------------------------
+  describe("6. Bounded Per-Event Verification Recovery (BREADY-04)", () => {
+    it("recovers transient verification failure on retry without duplicate counting", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxVerificationRetries: 3 });
+      const signature = "sig_cpmm_transient_verify_fail";
+      const tx = createCpmmInitTransactionFixture({ signature });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx);
+
+      // Flaky account fetcher: throws on first attempt, succeeds on second
+      let attempts = 0;
+      const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+      });
+
+      const flakyFetcher: MockOnChainAccountFetcher = new MockOnChainAccountFetcher(300000100);
+      flakyFetcher.setAccount(FIXTURE_CPMM_POOL_ADDRESS, RAYDIUM_CPMM_PROGRAM_ID, cpmmPoolBuffer);
+      flakyFetcher.setAccount(FIXTURE_CPMM_TOKEN_0_VAULT, SPL_TOKEN_PROGRAM_ID, v0Buffer);
+      flakyFetcher.setAccount(FIXTURE_CPMM_TOKEN_1_VAULT, SPL_TOKEN_PROGRAM_ID, v1Buffer);
+
+      const interceptingFetcher = {
+        getAccountInfo: (a: string) => flakyFetcher.getAccountInfo(a),
+        getMultipleAccounts: async (addrs: readonly string[]) => {
+          attempts++;
+          if (attempts === 1) {
+            throw new Error("RPC 429 Too Many Requests");
+          }
+          return flakyFetcher.getMultipleAccounts(addrs);
+        },
+        getSlot: () => flakyFetcher.getSlot(),
+      };
+
+      await engine.handleLogNotification(createMockLogNotificationEnvelope(signature, 300000100));
+
+      // Attempt 1: encounters transient RPC failure
+      const results1 = await engine.processQueue(txFetcher, interceptingFetcher);
+      expect(results1.length).toBe(0); // Event was not permanently dropped; placed in pending
+
+      let metrics = engine.getMetricsSnapshot();
+      expect(metrics.verificationRetries).toBe(1);
+      expect(metrics.pendingVerificationsCount).toBe(1);
+      expect(metrics.rpcVerificationFailures).toBe(0); // Not exhausted yet!
+
+      // Attempt 2: recovery via retryPendingVerifications
+      const recovered = await engine.retryPendingVerifications(interceptingFetcher);
+      expect(recovered.length).toBe(1);
+      expect(recovered[0]!.verified).toBe(true);
+      expect(recovered[0]!.verificationTier).toBe("INDEPENDENTLY_COHERENT");
+
+      metrics = engine.getMetricsSnapshot();
+      expect(metrics.pendingVerificationsCount).toBe(0);
+      expect(metrics.coherentTierPoolsCount).toBe(1);
+      expect(metrics.candidatePoolsDiscovered).toBe(1); // Denominator not inflated!
+    });
+
+    it("exhausts retries and fails closed when verification failure persists", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxVerificationRetries: 2 });
+      const signature = "sig_cpmm_permanent_fail";
+      const tx = createCpmmInitTransactionFixture({ signature });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx);
+
+      const failingFetcher = {
+        getAccountInfo: async () => null,
+        getMultipleAccounts: async () => {
+          throw new Error("Persistent network disconnect");
+        },
+        getSlot: async () => 300000100,
+      };
+
+      await engine.handleLogNotification(createMockLogNotificationEnvelope(signature, 300000100));
+
+      // Attempt 1 (initial: retryCount=1 <= 2)
+      await engine.processQueue(txFetcher, failingFetcher);
+      expect(engine.getMetricsSnapshot().pendingVerificationsCount).toBe(1);
+
+      // Attempt 2 (retry 1: retryCount=2 <= 2)
+      await engine.retryPendingVerifications(failingFetcher);
+      expect(engine.getMetricsSnapshot().pendingVerificationsCount).toBe(1);
+
+      // Attempt 3 (retry 2: retryCount=3 > 2 => retries exhausted)
+      const failedResults = await engine.retryPendingVerifications(failingFetcher);
+      expect(failedResults.length).toBe(1);
+      expect(failedResults[0]!.verified).toBe(false);
+      expect(failedResults[0]!.rejectionReason).toContain("Verification retries exhausted (2)");
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.pendingVerificationsCount).toBe(0);
+      expect(metrics.exhaustedVerificationRetriesCount).toBe(1);
+      expect(metrics.rpcVerificationFailures).toBe(1);
+      expect(metrics.coherentTierPoolsCount).toBe(0);
+    });
+
+    it("preserves successful events from multi-event transaction while recovering failing event", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxVerificationRetries: 3 });
+      const signature = "sig_multi_event_tx";
+
+      // Create transaction with 2 instructions
+      const tx1 = createAmmV4InitTransactionFixture({
+        signature,
+        poolId: "PoolAMM111111111111111111111111111111111111",
+      });
+      const tx2 = createCpmmInitTransactionFixture({
+        signature,
+        poolId: "PoolCPMM22222222222222222222222222222222222",
+      });
+
+      // Merge into a multi-instruction transaction
+      const keys = [
+        ...Array.from(
+          new Set([...tx1.accountKeys.staticAccountKeys, ...tx2.accountKeys.staticAccountKeys]),
+        ),
+      ];
+      const inst0 = {
+        ...tx1.instructions[0]!,
+        programIdIndex: keys.indexOf(RAYDIUM_AMM_V4_PROGRAM_ID),
+        accountKeyIndexes: tx1.instructions[0]!.accountKeyIndexes.map((i) =>
+          keys.indexOf(tx1.accountKeys.staticAccountKeys[i]!),
+        ),
+      };
+      const inst1 = {
+        ...tx2.instructions[0]!,
+        programIdIndex: keys.indexOf(RAYDIUM_CPMM_PROGRAM_ID),
+        accountKeyIndexes: tx2.instructions[0]!.accountKeyIndexes.map((i) =>
+          keys.indexOf(tx2.accountKeys.staticAccountKeys[i]!),
+        ),
+      };
+      const mergedTx: VersionedTransactionMetadata = {
+        ...tx1,
+        instructions: [inst0, inst1],
+        accountKeys: {
+          staticAccountKeys: keys,
+        },
+      };
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(mergedTx);
+
+      // Account fetcher: succeeds for AMM pool, throws for CPMM pool on first pass
+      let cpmmAttempts = 0;
+      const selectiveFetcher = {
+        getAccountInfo: async () => null,
+        getMultipleAccounts: async (addrs: readonly string[]) => {
+          if (addrs.includes("PoolCPMM22222222222222222222222222222222222")) {
+            cpmmAttempts++;
+            if (cpmmAttempts === 1) {
+              throw new Error("Transient RPC 503 for CPMM pool");
+            }
+            // Second attempt: succeeds
+            return [
+              {
+                address: "PoolCPMM22222222222222222222222222222222222",
+                data: createAuthoritativeRaydiumCpmmBuffer(),
+                owner: RAYDIUM_CPMM_PROGRAM_ID,
+                lamports: 10000000,
+                slot: 300000100,
+              },
+              {
+                address: FIXTURE_CPMM_TOKEN_0_VAULT,
+                data: createAuthoritativeCpmmSplVaultBuffer({
+                  mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+                }),
+                owner: SPL_TOKEN_PROGRAM_ID,
+                lamports: 2000000,
+                slot: 300000100,
+              },
+              {
+                address: FIXTURE_CPMM_TOKEN_1_VAULT,
+                data: createAuthoritativeCpmmSplVaultBuffer({
+                  mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+                }),
+                owner: SPL_TOKEN_PROGRAM_ID,
+                lamports: 2000000,
+                slot: 300000100,
+              },
+            ];
+          }
+          // AMM pool accounts
+          return [
+            {
+              address: "PoolAMM111111111111111111111111111111111111",
+              data: createAuthoritativeRaydiumAmmV4Buffer(),
+              owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+              lamports: 10000000,
+              slot: 300000100,
+            },
+            {
+              address: FIXTURE_BASE_VAULT,
+              data: createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+              owner: SPL_TOKEN_PROGRAM_ID,
+              lamports: 2000000,
+              slot: 300000100,
+            },
+            {
+              address: FIXTURE_QUOTE_VAULT,
+              data: createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+              owner: SPL_TOKEN_PROGRAM_ID,
+              lamports: 2000000,
+              slot: 300000100,
+            },
+          ];
+        },
+        getSlot: async () => 300000100,
+      };
+
+      await engine.handleLogNotification(createMockLogNotificationEnvelope(signature, 300000100));
+
+      // First pass: AMM succeeds immediately; CPMM is placed in pending
+      const results1 = await engine.processQueue(txFetcher, selectiveFetcher);
+      expect(results1.length).toBe(1);
+      expect(results1[0]!.poolId).toBe("PoolAMM111111111111111111111111111111111111");
+      expect(results1[0]!.verified).toBe(true);
+      expect(engine.getMetricsSnapshot().pendingVerificationsCount).toBe(1);
+
+      // Second pass: CPMM recovered without duplicating AMM
+      const results2 = await engine.retryPendingVerifications(selectiveFetcher);
+      expect(results2.length).toBe(1);
+      expect(results2[0]!.poolId).toBe("PoolCPMM22222222222222222222222222222222222");
+      expect(results2[0]!.verified).toBe(true);
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.pendingVerificationsCount).toBe(0);
+      expect(metrics.coherentTierPoolsCount).toBe(2);
+      expect(metrics.candidatePoolsDiscovered).toBe(2);
+    });
+  });
+
+  describe("7. Session Usage Ceilings (BREADY-05)", () => {
+    it("enforces maxEvents session ceiling and rejects excess log notifications", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxEvents: 2 });
+
+      const res1 = await engine.handleLogNotification(
+        createMockLogNotificationEnvelope("sig_ceil_1", 300000100),
+      );
+      expect(res1.enqueued).toBe(true);
+
+      const res2 = await engine.handleLogNotification(
+        createMockLogNotificationEnvelope("sig_ceil_2", 300000100),
+      );
+      expect(res2.enqueued).toBe(true);
+
+      // Third notification exceeds maxEvents ceiling
+      const res3 = await engine.handleLogNotification(
+        createMockLogNotificationEnvelope("sig_ceil_3", 300000100),
+      );
+      expect(res3.enqueued).toBe(false);
+      expect(res3.reason).toBe("MAX_EVENTS_EXCEEDED");
+    });
+
+    it("enforces maxTransactions session ceiling and halts processing when budget exhausted", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxTransactions: 1 });
+
+      const tx1 = createAmmV4InitTransactionFixture({ signature: "sig_tx_ceil_1" });
+      const tx2 = createAmmV4InitTransactionFixture({ signature: "sig_tx_ceil_2" });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx1);
+      txFetcher.setTransaction(tx2);
+
+      const accountFetcher = new MockOnChainAccountFetcher(300000100);
+      accountFetcher.setAccount(
+        FIXTURE_POOL_ADDRESS,
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_BASE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_QUOTE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+      );
+
+      await engine.handleLogNotification(
+        createMockLogNotificationEnvelope("sig_tx_ceil_1", 300000100),
+      );
+      await engine.handleLogNotification(
+        createMockLogNotificationEnvelope("sig_tx_ceil_2", 300000100),
+      );
+
+      const results = await engine.processQueue(txFetcher, accountFetcher);
+      // Only 1 transaction fetched and processed
+      expect(results.length).toBe(1);
+      expect(results[0]!.poolId).toBe(FIXTURE_POOL_ADDRESS);
     });
   });
 });

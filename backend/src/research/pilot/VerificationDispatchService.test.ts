@@ -415,6 +415,7 @@ describe("Milestone D.2.9-A: Verification Dispatch Service Tests", () => {
         slot: 300000100,
         blockTimeSec: 1792375000,
         firstSeenTimestampMs: 1792375000000,
+        instructionRequestedOpenTimeSec: 1792375000,
         poolOpenTimeSec: 1792375000,
         protocol: "UNSUPPORTED_PROTOCOL",
         unsupportedReason: "ORCA_WHIRLPOOL",

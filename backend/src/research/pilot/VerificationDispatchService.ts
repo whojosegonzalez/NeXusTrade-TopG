@@ -123,6 +123,70 @@ export async function dispatchPoolVerification(
     };
   }
 
+  // Confirm fetched account identity against requested pool and vault addresses (BREADY-03)
+  if (poolAccount.address && poolAccount.address !== event.poolId) {
+    return {
+      poolId: event.poolId,
+      protocol: event.protocol,
+      verified: false,
+      rejectionReason: `Pool account address mismatch: requested ${event.poolId}, received ${poolAccount.address}`,
+      verificationTier: "REJECTED",
+      transactionSlot: txSlot,
+      poolAccountSlot: poolAccount.slot,
+      vault0AccountSlot: vault0Account.slot,
+      vault1AccountSlot: vault1Account.slot,
+      slotDiscrepancy: false,
+      slotDelta: 0,
+      verifiedAtEpochMs: hostObservedAt,
+      hostObservationTimestampMs: hostObservedAt,
+      effectiveReservesAvailable: false,
+      spotPriceSol: null,
+      spotPrice0Per1: null,
+    };
+  }
+
+  if (vault0Account.address && vault0Account.address !== event.token0Vault) {
+    return {
+      poolId: event.poolId,
+      protocol: event.protocol,
+      verified: false,
+      rejectionReason: `Vault 0 address mismatch: requested ${event.token0Vault}, received ${vault0Account.address}`,
+      verificationTier: "REJECTED",
+      transactionSlot: txSlot,
+      poolAccountSlot: poolAccount.slot,
+      vault0AccountSlot: vault0Account.slot,
+      vault1AccountSlot: vault1Account.slot,
+      slotDiscrepancy: false,
+      slotDelta: 0,
+      verifiedAtEpochMs: hostObservedAt,
+      hostObservationTimestampMs: hostObservedAt,
+      effectiveReservesAvailable: false,
+      spotPriceSol: null,
+      spotPrice0Per1: null,
+    };
+  }
+
+  if (vault1Account.address && vault1Account.address !== event.token1Vault) {
+    return {
+      poolId: event.poolId,
+      protocol: event.protocol,
+      verified: false,
+      rejectionReason: `Vault 1 address mismatch: requested ${event.token1Vault}, received ${vault1Account.address}`,
+      verificationTier: "REJECTED",
+      transactionSlot: txSlot,
+      poolAccountSlot: poolAccount.slot,
+      vault0AccountSlot: vault0Account.slot,
+      vault1AccountSlot: vault1Account.slot,
+      slotDiscrepancy: false,
+      slotDelta: 0,
+      verifiedAtEpochMs: hostObservedAt,
+      hostObservationTimestampMs: hostObservedAt,
+      effectiveReservesAvailable: false,
+      spotPriceSol: null,
+      spotPrice0Per1: null,
+    };
+  }
+
   const poolSlot = poolAccount.slot;
   const v0Slot = vault0Account.slot;
   const v1Slot = vault1Account.slot;
@@ -210,6 +274,36 @@ export async function dispatchPoolVerification(
     }
 
     const ammState = ammParseResult.state;
+
+    // Verify AMM v4 event mints and vaults match independently decoded state (BREADY-03)
+    if (
+      event.token0Mint !== ammState.baseMint ||
+      event.token1Mint !== ammState.quoteMint ||
+      event.token0Vault !== ammState.baseVault ||
+      event.token1Vault !== ammState.quoteVault
+    ) {
+      return {
+        poolId: event.poolId,
+        protocol: "RAYDIUM_AMM_V4",
+        verified: false,
+        rejectionReason: `Initialization event parameters mismatch AMM v4 pool state: event mints (${event.token0Mint}, ${event.token1Mint}) vs state mints (${ammState.baseMint}, ${ammState.quoteMint}), event vaults (${event.token0Vault}, ${event.token1Vault}) vs state vaults (${ammState.baseVault}, ${ammState.quoteVault})`,
+        verificationTier: "REJECTED",
+        transactionSlot: txSlot,
+        poolAccountSlot: poolSlot,
+        vault0AccountSlot: v0Slot,
+        vault1AccountSlot: v1Slot,
+        slotDiscrepancy,
+        slotDelta,
+        verifiedAtEpochMs: hostObservedAt,
+        hostObservationTimestampMs: hostObservedAt,
+        effectiveReservesAvailable: false,
+        spotPriceSol: null,
+        spotPrice0Per1: null,
+        instructionRequestedOpenTimeSec:
+          event.instructionRequestedOpenTimeSec ?? event.poolOpenTimeSec,
+        decodedAmmState: ammState,
+      };
+    }
 
     // Verify SPL token vaults
     const v0Data = Buffer.from(vault0Account.data);
@@ -318,6 +412,8 @@ export async function dispatchPoolVerification(
       spotPriceSol: null, // AMM v4 calculation handled in reserve accounting
       spotPrice0Per1: null,
       quoteCohort,
+      instructionRequestedOpenTimeSec:
+        event.instructionRequestedOpenTimeSec ?? event.poolOpenTimeSec,
       decodedAmmState: ammState,
     };
   }
@@ -521,6 +617,9 @@ export async function dispatchPoolVerification(
       spotPriceSol: isCoherent ? accounting.spotPriceSol : null,
       spotPrice0Per1: isCoherent ? accounting.spotPrice0Per1 : null,
       quoteCohort: accounting.quoteCohort,
+      instructionRequestedOpenTimeSec:
+        event.instructionRequestedOpenTimeSec ?? event.poolOpenTimeSec,
+      decodedPoolStateActivationTimeSec: cpmmState.swapActivationTimeSec,
       decodedCpmmState: cpmmState,
       cpmmReserveAccounting: accounting,
     };

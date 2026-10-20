@@ -11,7 +11,7 @@
  * ALL tests execute 100% offline with zero outbound network requests and zero Fedora laptop interaction.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -2466,6 +2466,181 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       const metricsRaw = fsSync.readFileSync(path.join(captureDir, capturedFiles[0]!), "utf8");
       const metrics = JSON.parse(metricsRaw);
       expect(metrics.rawLogNotificationsReceived).toBe(1);
+      expect(metrics.coherentTierPoolsCount).toBe(1);
+    });
+
+    it("replays recorded event and account fixtures offline, successfully verifying CPMM pool (BREADY-05)", async () => {
+      const testDir = await makeTestDir("replay-with-accounts-test");
+      const fixturePath = path.join(testDir, "cpmm-fixture-bundle.json");
+
+      const txFixture = createCpmmInitTransactionFixture();
+      const bundle = {
+        transactions: [txFixture],
+        accounts: [
+          {
+            address: FIXTURE_CPMM_POOL_ADDRESS,
+            data: createAuthoritativeRaydiumCpmmBuffer().toString("base64"),
+            owner: RAYDIUM_CPMM_PROGRAM_ID,
+            lamports: 10000000,
+            slot: 300000100,
+          },
+          {
+            address: FIXTURE_CPMM_TOKEN_0_VAULT,
+            data: createAuthoritativeCpmmSplVaultBuffer({
+              mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+            }).toString("base64"),
+            owner: SPL_TOKEN_PROGRAM_ID,
+            lamports: 2000000,
+            slot: 300000100,
+          },
+          {
+            address: FIXTURE_CPMM_TOKEN_1_VAULT,
+            data: createAuthoritativeCpmmSplVaultBuffer({
+              mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+            }).toString("base64"),
+            owner: SPL_TOKEN_PROGRAM_ID,
+            lamports: 2000000,
+            slot: 300000100,
+          },
+        ],
+      };
+      fsSync.writeFileSync(fixturePath, JSON.stringify(bundle, null, 2), "utf8");
+
+      const exitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--replay-fixtures=${fixturePath}`,
+      ]);
+
+      expect(exitCode).toBe(0);
+    });
+
+    it("verifies CPMM pool offline via --verify-cpmm-pool and --replay-fixtures without requiring --network=enabled (BREADY-05)", async () => {
+      const testDir = await makeTestDir("verify-cpmm-offline");
+      const fixturePath = path.join(testDir, "fixtures.json");
+      const txFixture = createCpmmInitTransactionFixture();
+      fsSync.writeFileSync(
+        fixturePath,
+        JSON.stringify({ transactions: [txFixture] }, null, 2),
+        "utf8",
+      );
+
+      const exitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--replay-fixtures=${fixturePath}`,
+        `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+      ]);
+
+      expect(exitCode).toBe(0);
+    });
+
+    it("explicitly rejects --discovery-source=events with --network=enabled as unauthorized (BREADY-05)", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const exitCode = await runPilotCollectorCli([
+          process.execPath,
+          "PilotLiveCollectorCli.js",
+          "--network=enabled",
+          "--discovery-source=events",
+        ]);
+
+        expect(exitCode).toBe(1);
+        expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("[UNAUTHORIZED_LIVE_EVENTS]"));
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
+    it("enforces --max-events ceiling in replay mode stopping loading when reached (BREADY-05)", async () => {
+      const testDir = await makeTestDir("max-events-replay-test");
+      const fixturePath = path.join(testDir, "fixtures.json");
+      const captureDir = path.join(testDir, "captured");
+
+      const tx1 = createCpmmInitTransactionFixture({ signature: "sig_replay_ceil_1" });
+      const tx2 = createCpmmInitTransactionFixture({ signature: "sig_replay_ceil_2" });
+      fsSync.writeFileSync(fixturePath, JSON.stringify([tx1, tx2], null, 2), "utf8");
+
+      const exitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--replay-fixtures=${fixturePath}`,
+        `--capture-fixtures-dir=${captureDir}`,
+        "--max-events=1",
+      ]);
+
+      expect(exitCode).toBe(0);
+      const capturedFiles = fsSync.readdirSync(captureDir);
+      const metrics = JSON.parse(
+        fsSync.readFileSync(path.join(captureDir, capturedFiles[0]!), "utf8"),
+      );
+      expect(metrics.rawLogNotificationsReceived).toBe(1);
+    });
+
+    it("returns SLOT_PROVENANCE_UNAVAILABLE when context slot is non-positive in --verify-cpmm-pool (BREADY-02/05)", async () => {
+      const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer();
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+      });
+
+      const mockRpcMissingSlot: ISolanaRpcTransport = {
+        async post(_url: string, body: Record<string, unknown>) {
+          const method = body.method as string;
+          const reqId = body.id ?? 1;
+          if (method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 0 }, // non-positive slot!
+                value: {
+                  data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_CPMM_PROGRAM_ID,
+                  lamports: 10000000,
+                },
+              },
+            };
+          }
+          if (method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 0 },
+                value: [
+                  {
+                    data: [v0Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                  {
+                    data: [v1Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                ],
+              },
+            };
+          }
+          return null;
+        },
+      };
+
+      const exitCode = await runPilotCollectorCli(
+        [
+          process.execPath,
+          "PilotLiveCollectorCli.js",
+          "--network=enabled",
+          `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+        ],
+        { rpcTransport: mockRpcMissingSlot },
+      );
+
+      // Fails verification because slot provenance is unavailable
+      expect(exitCode).toBe(1);
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {
