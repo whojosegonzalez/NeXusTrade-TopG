@@ -28,12 +28,16 @@ import {
 import {
   SolanaRpcLiveObservationClient,
   type ISolanaRpcTransport,
+  sanitizeSolanaRpcUrl,
 } from "./SolanaRpcLiveObservationClient.js";
 import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTracker.js";
 import {
   LiveCollectorRunner,
   parseCliArgs,
   runPilotCollectorCli,
+  saveCpmmSnapshot,
+  loadAccountMapFromFixtures,
+  EXPECTED_CPMM_EVIDENCE_FILES,
 } from "./PilotLiveCollectorCli.js";
 import { importAndVerifyPilotSession } from "./PilotArchiveImporter.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
@@ -3547,6 +3551,438 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
         `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
       ]);
       expect(failExitCode).toBe(1);
+    });
+
+    // ==========================================================================
+    // Phase 12.94-D.2.9-B1: Manifest Verification & Credential Safeguards
+    // (B1-EVIDENCE-01 & B1-EVIDENCE-02)
+    // ==========================================================================
+
+    describe("B1-EVIDENCE-01: Complete Manifest Verification Contract", () => {
+      it("validates canonical manifestSha256 and exact file sizes during authentic replay", async () => {
+        const testDir = await makeTestDir("manifest-verification-valid");
+        const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+          token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+          token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+        });
+        const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+          mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+          rawAmount: 10_000_000_000n,
+        });
+        const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+          mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+          rawAmount: 50_000_000_000n,
+        });
+
+        const mockTransport: ISolanaRpcTransport = {
+          async post(_url, body) {
+            const method = body.method as string;
+            const reqId = body.id as string | number;
+            if (method === "getAccountInfo") {
+              return {
+                jsonrpc: "2.0",
+                id: reqId,
+                result: {
+                  context: { slot: 300000100 },
+                  value: {
+                    data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                    owner: RAYDIUM_CPMM_PROGRAM_ID,
+                    lamports: 10000000,
+                  },
+                },
+              };
+            }
+            if (method === "getMultipleAccounts") {
+              return {
+                jsonrpc: "2.0",
+                id: reqId,
+                result: {
+                  context: { slot: 300000100 },
+                  value: [
+                    {
+                      data: [v0Buffer.toString("base64"), "base64"],
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      lamports: 2000000,
+                    },
+                    {
+                      data: [v1Buffer.toString("base64"), "base64"],
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      lamports: 2000000,
+                    },
+                  ],
+                },
+              };
+            }
+            return null;
+          },
+        };
+
+        const client = new SolanaRpcLiveObservationClient({
+          transport: mockTransport,
+          maxRequestsBudget: 2,
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifest } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        expect(EXPECTED_CPMM_EVIDENCE_FILES.length).toBe(4);
+        expect(manifest.totalFiles).toBe(4);
+        expect(manifest.files.length).toBe(4);
+        expect(manifest.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
+
+        // Authentic replay succeeds cleanly
+        const accountMap = loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" });
+        expect(accountMap.size).toBe(3);
+        expect(accountMap.has(FIXTURE_CPMM_POOL_ADDRESS)).toBe(true);
+        expect(accountMap.has(FIXTURE_CPMM_TOKEN_0_VAULT)).toBe(true);
+        expect(accountMap.has(FIXTURE_CPMM_TOKEN_1_VAULT)).toBe(true);
+      });
+
+      it("rejects manifest when canonical manifestSha256 calculation does not match", async () => {
+        const testDir = await makeTestDir("manifest-verification-tampered-hash");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        // Tamper with manifestSha256
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+        manifest.manifestSha256 = "0".repeat(64);
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(/STRICT_REPLAY_INTEGRITY_FAILURE.*Canonical manifestSha256 mismatch/);
+      });
+
+      it("rejects manifest when file byte size on disk does not match entry byteSize", async () => {
+        const testDir = await makeTestDir("manifest-verification-tampered-bytesize");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        type ManifestEntry = { filename: string; sha256: string; byteSize: number };
+        // Tamper with byteSize in manifest entry (without altering disk file)
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+          files: ManifestEntry[];
+          totalBytes: number;
+          manifestSha256: string;
+        };
+        manifest.files[0]!.byteSize += 10;
+        manifest.totalBytes += 10;
+        // Recalculate canonical manifestSha256 so that check passes, isolating the byteSize check
+        const sortedEntries = [...manifest.files].sort((a, b) =>
+          a.filename.localeCompare(b.filename),
+        );
+        manifest.manifestSha256 = crypto
+          .createHash("sha256")
+          .update(sortedEntries.map((f) => `${f.filename}:${f.sha256}`).join("\n"))
+          .digest("hex");
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(/STRICT_REPLAY_INTEGRITY_FAILURE.*Byte size mismatch/);
+      });
+
+      it("rejects manifest with duplicate file entries", async () => {
+        const testDir = await makeTestDir("manifest-verification-duplicate-entry");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+          files: unknown[];
+        };
+        manifest.files[1] = { ...((manifest.files[0] as object) ?? {}) }; // duplicate entry
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(/AUTHENTIC_REPLAY_ERROR.*Duplicate file entry/);
+      });
+
+      it("rejects manifest missing any of the 4 required evidence files", async () => {
+        const testDir = await makeTestDir("manifest-verification-missing-file-entry");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        type ManifestEntry = { filename: string; sha256: string; byteSize: number };
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+          files: ManifestEntry[];
+        };
+        manifest.files = manifest.files.filter((f) => f.filename !== "vault-accounts-rpc.json");
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(/AUTHENTIC_REPLAY_ERROR.*Invalid manifest file count/);
+      });
+
+      it("rejects manifest containing an unexpected extra file entry", async () => {
+        const testDir = await makeTestDir("manifest-verification-unexpected-file");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+        manifest.files[3] = {
+          filename: "unauthorized-extra.json",
+          sha256: "a".repeat(64),
+          byteSize: 100,
+        };
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(
+          /AUTHENTIC_REPLAY_ERROR.*Unexpected evidence file in manifest: 'unauthorized-extra.json'/,
+        );
+      });
+
+      it("rejects manifest with inconsistent totalBytes sum", async () => {
+        const testDir = await makeTestDir("manifest-verification-totalbytes-mismatch");
+        const client = new SolanaRpcLiveObservationClient({
+          transport: {
+            async post() {
+              return {
+                jsonrpc: "2.0",
+                id: 1,
+                result: { context: { slot: 300000100 }, value: null },
+              };
+            },
+          },
+        });
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        const { snapshotDir, manifestPath } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+
+        const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+        manifest.totalBytes = 999999;
+        await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+        expect(() =>
+          loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" }),
+        ).toThrowError(/AUTHENTIC_REPLAY_ERROR.*Manifest totalBytes inconsistency/);
+      });
+    });
+
+    describe("B1-EVIDENCE-02: Prevent RPC Credential Exposure", () => {
+      it("sanitizeSolanaRpcUrl properly redacts userinfo, query tokens, and path keys", () => {
+        // Query param apiKey
+        const res1 = sanitizeSolanaRpcUrl(
+          "https://mainnet.helius-rpc.com/?api-key=supersecret123456",
+        );
+        expect(res1.sanitizedUrl).toBe("https://mainnet.helius-rpc.com/?api-key=[REDACTED]");
+        expect(res1.host).toBe("mainnet.helius-rpc.com");
+        expect(res1.endpointFingerprint).toMatch(/^sha256:[0-9a-f]{16}$/);
+
+        // Basic auth userinfo
+        const res2 = sanitizeSolanaRpcUrl(
+          "https://alice:supersecretpw@my-solana-rpc.internal:8899/rpc",
+        );
+        expect(res2.sanitizedUrl).toContain("[REDACTED]");
+        expect(res2.sanitizedUrl).not.toContain("alice");
+        expect(res2.sanitizedUrl).not.toContain("supersecretpw");
+        expect(res2.host).toBe("my-solana-rpc.internal");
+
+        // Alchemy path token
+        const res3 = sanitizeSolanaRpcUrl(
+          "https://solana-mainnet.g.alchemy.com/v2/SecretKeyAlchemy999888",
+        );
+        expect(res3.sanitizedUrl).toBe("https://solana-mainnet.g.alchemy.com/v2/[REDACTED]");
+        expect(res3.sanitizedUrl).not.toContain("SecretKeyAlchemy999888");
+        expect(res3.host).toBe("solana-mainnet.g.alchemy.com");
+
+        // Clean public endpoint
+        const res4 = sanitizeSolanaRpcUrl("https://api.mainnet-beta.solana.com");
+        expect(res4.sanitizedUrl).toBe("https://api.mainnet-beta.solana.com");
+        expect(res4.host).toBe("api.mainnet-beta.solana.com");
+      });
+
+      it("preserves raw endpoint for transport while ensuring sensitive credentials never appear in evidence files (B1-EVIDENCE-02)", async () => {
+        const testDir = await makeTestDir("credential-redaction-test");
+        const secretApiKey = "SuperSecretApiKeyXYZ12345";
+        const secretPassword = "SuperSecretPasswordABC987";
+        const secretPathKey = "SecretAlchemyPathToken555";
+        const credentialUrl = `https://user:${secretPassword}@mock-solana-node.internal:8899/v2/${secretPathKey}?api-key=${secretApiKey}&other=safe`;
+
+        let transportReceivedUrl = "";
+        const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+          token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+          token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+        });
+        const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+          mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+          rawAmount: 10_000_000_000n,
+        });
+        const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+          mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+          rawAmount: 50_000_000_000n,
+        });
+
+        const mockTransport: ISolanaRpcTransport = {
+          async post(url, body) {
+            transportReceivedUrl = url;
+            const method = body.method as string;
+            const reqId = body.id as string | number;
+            if (method === "getAccountInfo") {
+              return {
+                jsonrpc: "2.0",
+                id: reqId,
+                result: {
+                  context: { slot: 300000100 },
+                  value: {
+                    data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                    owner: RAYDIUM_CPMM_PROGRAM_ID,
+                    lamports: 10000000,
+                  },
+                },
+              };
+            }
+            if (method === "getMultipleAccounts") {
+              return {
+                jsonrpc: "2.0",
+                id: reqId,
+                result: {
+                  context: { slot: 300000100 },
+                  value: [
+                    {
+                      data: [v0Buffer.toString("base64"), "base64"],
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      lamports: 2000000,
+                    },
+                    {
+                      data: [v1Buffer.toString("base64"), "base64"],
+                      owner: SPL_TOKEN_PROGRAM_ID,
+                      lamports: 2000000,
+                    },
+                  ],
+                },
+              };
+            }
+            return null;
+          },
+        };
+
+        const client = new SolanaRpcLiveObservationClient({
+          rpcUrl: credentialUrl,
+          transport: mockTransport,
+          maxRequestsBudget: 2,
+        });
+
+        const report = await client.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        expect(report.verified).toBe(true);
+        expect(report.rpcUrl).not.toContain(secretApiKey);
+        expect(report.rpcUrl).not.toContain(secretPassword);
+        expect(report.rpcUrl).not.toContain(secretPathKey);
+
+        // 1. Confirm transport received the unmodified raw URL
+        expect(transportReceivedUrl).toBe(credentialUrl);
+
+        // 2. Save snapshot to disk
+        const { snapshotDir } = saveCpmmSnapshot(testDir, FIXTURE_CPMM_POOL_ADDRESS, report);
+
+        // 3. Inspect every file in the sealed snapshot directory
+        const sealedFiles = await fs.readdir(snapshotDir);
+        expect(sealedFiles.length).toBe(5); // 4 evidence files + 1 manifest
+
+        for (const filename of sealedFiles) {
+          const content = await fs.readFile(path.join(snapshotDir, filename), "utf8");
+          expect(content).not.toContain(secretApiKey);
+          expect(content).not.toContain(secretPassword);
+          expect(content).not.toContain(secretPathKey);
+        }
+
+        // 4. Verify snapshot-metadata.json preserves host and fingerprint
+        const metadata = JSON.parse(
+          await fs.readFile(path.join(snapshotDir, "snapshot-metadata.json"), "utf8"),
+        );
+        expect(metadata.rpcHost).toBe("mock-solana-node.internal");
+        expect(metadata.rpcFingerprint).toMatch(/^sha256:[0-9a-f]{16}$/);
+        expect(metadata.rpcUrl).toContain("[REDACTED]");
+
+        // 5. Authentic replay cleanly loads and verifies the sealed snapshot
+        const replayedMap = loadAccountMapFromFixtures(snapshotDir, { replayMode: "authentic" });
+        expect(replayedMap.size).toBe(3);
+        expect(replayedMap.has(FIXTURE_CPMM_POOL_ADDRESS)).toBe(true);
+      });
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {

@@ -13,6 +13,7 @@
  * - Injectable transport for 100% offline deterministic testing.
  */
 
+import crypto from "node:crypto";
 import {
   parseSolanaRpcPoolAccountResponse,
   parseSolanaRpcMultipleVaultsResponse,
@@ -40,6 +41,112 @@ import type {
 export const DEFAULT_SOLANA_MAINNET_RPC = "https://api.mainnet-beta.solana.com";
 export const ALLOWLISTED_RPC_METHODS = new Set(["getAccountInfo", "getMultipleAccounts"]);
 
+export interface SanitizedRpcEndpointInfo {
+  readonly rawUrl: string;
+  readonly sanitizedUrl: string;
+  readonly host: string;
+  readonly endpointFingerprint: string;
+}
+
+/**
+ * Sanitizes credential-bearing components (tokens, passwords, API keys) from RPC endpoint URLs
+ * while preserving network transport fidelity and research provenance (B1-EVIDENCE-02).
+ */
+export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
+  const hash = crypto.createHash("sha256").update(rawUrl).digest("hex");
+  const endpointFingerprint = `sha256:${hash.slice(0, 16)}`;
+
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname;
+
+    // 1. Sanitize userinfo credentials (user:password@)
+    if (parsed.username || parsed.password) {
+      if (parsed.username) parsed.username = "[REDACTED]";
+      if (parsed.password) parsed.password = "[REDACTED]";
+    }
+
+    // 2. Sanitize sensitive or secret-bearing query parameter values
+    const sensitiveParamKeys = new Set([
+      "api-key",
+      "apikey",
+      "api_key",
+      "token",
+      "auth",
+      "authorization",
+      "key",
+      "secret",
+      "dkey",
+      "access_token",
+      "password",
+    ]);
+
+    for (const [key, val] of Array.from(parsed.searchParams.entries())) {
+      const lower = key.toLowerCase();
+      if (
+        sensitiveParamKeys.has(lower) ||
+        lower.includes("key") ||
+        lower.includes("token") ||
+        lower.includes("secret") ||
+        lower.includes("auth") ||
+        val.length >= 10
+      ) {
+        parsed.searchParams.set(key, "[REDACTED]");
+      }
+    }
+
+    // 3. Sanitize path segments containing high-entropy tokens or API keys
+    const standardSegments = new Set([
+      "",
+      "v1",
+      "v2",
+      "solana",
+      "rpc",
+      "mainnet",
+      "devnet",
+      "testnet",
+    ]);
+    const segments = parsed.pathname.split("/");
+    const sanitizedSegments = segments.map((seg, idx) => {
+      if (idx === 0 && seg === "") return "";
+      if (standardSegments.has(seg.toLowerCase())) return seg;
+      const prevSeg = idx > 0 ? (segments[idx - 1] ?? "").toLowerCase() : "";
+      if (
+        prevSeg === "v1" ||
+        prevSeg === "v2" ||
+        seg.length >= 12 ||
+        /^[0-9a-fA-F-]{16,}$/.test(seg) ||
+        /^[A-Za-z0-9_-]{16,}$/.test(seg)
+      ) {
+        return "[REDACTED]";
+      }
+      return seg;
+    });
+    parsed.pathname = sanitizedSegments.join("/");
+
+    let sanitizedUrl = parsed.toString();
+    // Normalize URL-encoded bracket placeholders into clean canonical literal tokens
+    sanitizedUrl = sanitizedUrl.split("%5BREDACTED%5D").join("[REDACTED]");
+    if (!rawUrl.endsWith("/") && sanitizedUrl.endsWith("/")) {
+      sanitizedUrl = sanitizedUrl.slice(0, -1);
+    }
+
+    return {
+      rawUrl,
+      sanitizedUrl,
+      host,
+      endpointFingerprint,
+    };
+  } catch {
+    return {
+      rawUrl,
+      sanitizedUrl: "[MALFORMED_URL_REDACTED]",
+      host: "unknown",
+      endpointFingerprint,
+    };
+  }
+}
+
 export interface ISolanaRpcTransport {
   post(url: string, body: Record<string, unknown>, init?: RequestInit): Promise<unknown>;
 }
@@ -51,6 +158,7 @@ export interface RawRpcInteractionRecord {
     readonly method: string;
     readonly params: unknown[];
     readonly endpoint: string;
+    readonly endpointFingerprint?: string | undefined;
     readonly timestampIso: string;
     readonly timestampEpochMs: number;
   };
@@ -109,6 +217,8 @@ export interface ObservedPoolStateResult {
 export interface RaydiumPoolVerificationReport {
   readonly poolAddress: string;
   readonly rpcUrl: string;
+  readonly endpointFingerprint?: string | undefined;
+  readonly endpointHost?: string | undefined;
   readonly verificationStatus:
     | "VERIFIED_RAYDIUM_AMM_V4"
     | "UNAUTHORIZED_PROGRAM_ID"
@@ -138,6 +248,8 @@ export interface RaydiumPoolVerificationReport {
 export interface CpmmPoolVerificationReport {
   readonly poolAddress: string;
   readonly rpcUrl: string;
+  readonly endpointFingerprint?: string | undefined;
+  readonly endpointHost?: string | undefined;
   readonly verificationStatus:
     | "VERIFIED_RAYDIUM_CPMM"
     | "SLOT_PROVENANCE_UNAVAILABLE"
@@ -176,7 +288,10 @@ export interface CpmmPoolVerificationReport {
 }
 
 export class SolanaRpcLiveObservationClient {
-  private readonly rpcUrl: string;
+  private readonly rawRpcUrl: string;
+  private readonly sanitizedRpcUrl: string;
+  private readonly endpointHost: string;
+  private readonly endpointFingerprint: string;
   private readonly httpTimeoutMs: number;
   private readonly maxRequestsPerMinute: number;
   private readonly maxRequestsBudget?: number | undefined;
@@ -201,7 +316,12 @@ export class SolanaRpcLiveObservationClient {
   private lastCallEpochMs = 0;
 
   constructor(options?: SolanaRpcClientOptions) {
-    this.rpcUrl = options?.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC;
+    const rawUrl = options?.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC;
+    const sanitized = sanitizeSolanaRpcUrl(rawUrl);
+    this.rawRpcUrl = rawUrl;
+    this.sanitizedRpcUrl = sanitized.sanitizedUrl;
+    this.endpointHost = sanitized.host;
+    this.endpointFingerprint = sanitized.endpointFingerprint;
     this.httpTimeoutMs = options?.httpTimeoutMs ?? 5_000;
     this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? 60;
     this.maxRequestsBudget = options?.maxRequestsBudget;
@@ -233,7 +353,19 @@ export class SolanaRpcLiveObservationClient {
   }
 
   public getRpcUrl(): string {
-    return this.rpcUrl;
+    return this.sanitizedRpcUrl;
+  }
+
+  public getRawRpcUrl(): string {
+    return this.rawRpcUrl;
+  }
+
+  public getEndpointHost(): string {
+    return this.endpointHost;
+  }
+
+  public getEndpointFingerprint(): string {
+    return this.endpointFingerprint;
   }
 
   public getDiagnostics(): SolanaRpcObservationDiagnostics {
@@ -392,7 +524,7 @@ export class SolanaRpcLiveObservationClient {
         onChainSlot: vaultsResult.slot ?? poolResult.slot,
         slotDiscrepancy,
         provenance: "D23_OBSERVATIONAL_SCREENING",
-        providerIdentity: `solana_rpc:${new URL(this.rpcUrl).hostname}`,
+        providerIdentity: `solana_rpc:${this.endpointHost}`,
         actualResponsePoolId: params.poolAddress,
         isMatchingPool: true,
         reserveAccounting,
@@ -451,7 +583,9 @@ export class SolanaRpcLiveObservationClient {
       this.poolsFailed++;
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         verificationStatus: "MALFORMED_POOL_DATA",
         verified: false,
         onChainSlot: null,
@@ -477,7 +611,9 @@ export class SolanaRpcLiveObservationClient {
       const errMsg = `[RPC_THROTTLED] Solana RPC rate-limited until ${new Date(this.retryAfterUntilEpochMs).toISOString()}`;
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         verificationStatus: "RATE_LIMITED_429",
         verified: false,
         onChainSlot: null,
@@ -529,7 +665,9 @@ export class SolanaRpcLiveObservationClient {
               : "MALFORMED_POOL_DATA";
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           verificationStatus: status,
           verified: false,
           onChainSlot: poolResult.slot,
@@ -555,7 +693,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           verificationStatus: "UNAUTHORIZED_PROGRAM_ID",
           verified: false,
           onChainSlot: poolResult.slot,
@@ -592,7 +732,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
           onChainSlot: poolResult.slot,
@@ -634,7 +776,9 @@ export class SolanaRpcLiveObservationClient {
 
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         verificationStatus: "VERIFIED_RAYDIUM_AMM_V4",
         verified: true,
         onChainSlot: vaultsResult.slot ?? poolResult.slot,
@@ -661,7 +805,9 @@ export class SolanaRpcLiveObservationClient {
       const status = is429 ? "RATE_LIMITED_429" : isTimeout ? "RPC_ERROR" : "RPC_ERROR";
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         verificationStatus: status,
         verified: false,
         onChainSlot: null,
@@ -715,7 +861,9 @@ export class SolanaRpcLiveObservationClient {
       this.poolsFailed++;
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         requestedCommitment: this.commitment,
         verificationStatus: "MALFORMED_POOL_DATA",
         verified: false,
@@ -773,7 +921,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "NULL_ACCOUNT",
           verified: false,
@@ -791,7 +941,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "UNAUTHORIZED_PROGRAM_ID",
           verified: false,
@@ -811,7 +963,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "MALFORMED_POOL_DATA",
           verified: false,
@@ -837,7 +991,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "MALFORMED_POOL_DATA",
           verified: false,
@@ -898,7 +1054,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
@@ -947,7 +1105,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
@@ -973,7 +1133,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
@@ -1001,7 +1163,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "SLOT_PROVENANCE_UNAVAILABLE",
           verified: false,
@@ -1033,7 +1197,9 @@ export class SolanaRpcLiveObservationClient {
         this.slotDiscrepancies++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "SLOT_DISCREPANT",
           verified: false,
@@ -1068,7 +1234,9 @@ export class SolanaRpcLiveObservationClient {
         this.poolsFailed++;
         return {
           poolAddress,
-          rpcUrl: this.rpcUrl,
+          rpcUrl: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
+          endpointHost: this.endpointHost,
           requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
@@ -1098,7 +1266,9 @@ export class SolanaRpcLiveObservationClient {
 
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         requestedCommitment: this.commitment,
         verificationStatus: isCoherent ? "VERIFIED_RAYDIUM_CPMM" : "VAULT_VERIFICATION_FAILED",
         verified: isCoherent,
@@ -1134,7 +1304,9 @@ export class SolanaRpcLiveObservationClient {
       const status = is429 ? "RATE_LIMITED_429" : isTimeout ? "RPC_ERROR" : "RPC_ERROR";
       return {
         poolAddress,
-        rpcUrl: this.rpcUrl,
+        rpcUrl: this.sanitizedRpcUrl,
+        endpointFingerprint: this.endpointFingerprint,
+        endpointHost: this.endpointHost,
         requestedCommitment: this.commitment,
         verificationStatus: status,
         verified: false,
@@ -1200,7 +1372,7 @@ export class SolanaRpcLiveObservationClient {
 
     const callStartEpochMs = Date.now();
     try {
-      const res = await this.transport.post(this.rpcUrl, rpcBody, {
+      const res = await this.transport.post(this.rawRpcUrl, rpcBody, {
         signal: controller.signal,
       });
       const elapsedMs = Date.now() - callStartEpochMs;
@@ -1217,7 +1389,8 @@ export class SolanaRpcLiveObservationClient {
           id: reqId,
           method,
           params,
-          endpoint: this.rpcUrl,
+          endpoint: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
           timestampIso: new Date(callStartEpochMs).toISOString(),
           timestampEpochMs: callStartEpochMs,
         },
@@ -1239,7 +1412,8 @@ export class SolanaRpcLiveObservationClient {
       if (err instanceof Error && (err.name === "AbortError" || err.message.includes("timeout"))) {
         this.timeoutsEncountered++;
       }
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = rawErrMsg.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
       this.onLog?.(`${method} call failed: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -1248,7 +1422,8 @@ export class SolanaRpcLiveObservationClient {
           id: reqId,
           method,
           params,
-          endpoint: this.rpcUrl,
+          endpoint: this.sanitizedRpcUrl,
+          endpointFingerprint: this.endpointFingerprint,
           timestampIso: new Date(callStartEpochMs).toISOString(),
           timestampEpochMs: callStartEpochMs,
         },

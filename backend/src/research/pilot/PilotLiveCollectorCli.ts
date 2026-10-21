@@ -28,6 +28,7 @@ import {
   type ISolanaRpcTransport,
   type CpmmPoolVerificationReport,
   DEFAULT_SOLANA_MAINNET_RPC,
+  sanitizeSolanaRpcUrl,
 } from "./SolanaRpcLiveObservationClient.js";
 import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTracker.js";
 import { verifySessionExportManifest } from "./PilotExportManifest.js";
@@ -777,7 +778,7 @@ export class PilotLiveCollectorSession {
     this.logger.info("STARTUP", `Session ${sessionId} initialized in ${sessionDir}`);
     this.logger.info(
       "CONFIG",
-      `network=${this.config.network}, discoverySource=${discoverySource}, maxPoolAgeSec=${maxPoolAgeSec}, minRequestIntervalMs=${minRequestIntervalMs}, pollIntervalSec=${this.config.pollIntervalSec}, durationSec=${this.config.durationSec}, targetCandidates=${this.config.targetCandidates}, targetDiagnosticYield=${this.config.targetDiagnosticYield}, rpcUrl=${this.config.rpcUrl}`,
+      `network=${this.config.network}, discoverySource=${discoverySource}, maxPoolAgeSec=${maxPoolAgeSec}, minRequestIntervalMs=${minRequestIntervalMs}, pollIntervalSec=${this.config.pollIntervalSec}, durationSec=${this.config.durationSec}, targetCandidates=${this.config.targetCandidates}, targetDiagnosticYield=${this.config.targetDiagnosticYield}, rpcUrl=${sanitizeSolanaRpcUrl(this.config.rpcUrl).sanitizedUrl}`,
     );
 
     if (discoverySource === "raydium") {
@@ -1379,6 +1380,11 @@ export function saveCpmmSnapshot(
     token0Vault: report.token0Vault ?? null,
     token1Vault: report.token1Vault ?? null,
     rpcUrl: report.rpcUrl,
+    rpcHost:
+      report.endpointHost ?? (report.rpcUrl ? sanitizeSolanaRpcUrl(report.rpcUrl).host : null),
+    rpcFingerprint:
+      report.endpointFingerprint ??
+      (report.rpcUrl ? sanitizeSolanaRpcUrl(report.rpcUrl).endpointFingerprint : null),
     commitment: requestedCommitment,
     wirePayloadPreservation: "JSON_RPC_OBJECTS_BASE64",
     maxRpcCallsCeiling: report.rawCaptureBundle?.maxRpcCallsBudget ?? 2,
@@ -1501,6 +1507,13 @@ export function parseAccountPayload(
   };
 }
 
+export const EXPECTED_CPMM_EVIDENCE_FILES = [
+  "cpmm-verification-report.json",
+  "pool-account-rpc.json",
+  "snapshot-metadata.json",
+  "vault-accounts-rpc.json",
+] as const;
+
 /**
  * Loads synthetic and recorded account payloads from replay fixtures directory or file (BREADY-05 / B1-PREP-04).
  * When options.replayMode === 'authentic', strictly verifies against sealed SHA-256 manifest and forbids synthetic fallbacks.
@@ -1512,7 +1525,7 @@ export function loadAccountMapFromFixtures(
   const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
   if (!fsSync.existsSync(fixturesPath)) return accountMap;
 
-  // Authentic Replay Mode (B1-PREP-04): Strict verification against sealed SHA-256 manifest
+  // Authentic Replay Mode (B1-PREP-04 / B1-EVIDENCE-01): Strict verification against sealed SHA-256 manifest
   if (options?.replayMode === "authentic") {
     const stat = fsSync.statSync(fixturesPath);
     const targetDir = stat.isDirectory() ? fixturesPath : path.dirname(fixturesPath);
@@ -1532,7 +1545,13 @@ export function loadAccountMapFromFixtures(
     const manifestPath = path.join(targetDir, manifestName);
     const manifestRaw = fsSync.readFileSync(manifestPath, "utf8");
     let manifest: {
-      files?: Array<{ filename: string; sha256: string; byteSize?: number }>;
+      manifestVersion?: string;
+      snapshotId?: string;
+      createdAtIso?: string;
+      status?: string;
+      totalFiles?: number;
+      totalBytes?: number;
+      files?: Array<{ filename: string; sha256: string; byteSize: number }>;
       manifestSha256?: string;
     };
     try {
@@ -1541,13 +1560,117 @@ export function loadAccountMapFromFixtures(
       throw new Error(`[AUTHENTIC_REPLAY_ERROR] Failed to parse manifest JSON in ${manifestPath}`);
     }
 
-    if (!manifest.files || !Array.isArray(manifest.files) || manifest.files.length === 0) {
+    if (!manifest || typeof manifest !== "object") {
+      throw new Error(`[AUTHENTIC_REPLAY_ERROR] Manifest in ${manifestPath} must be a JSON object`);
+    }
+
+    // B1-EVIDENCE-01.3 & 01.4: Strict validation of totalFiles, totalBytes, and files list
+    if (!Array.isArray(manifest.files)) {
       throw new Error(
-        `[AUTHENTIC_REPLAY_ERROR] Manifest in ${manifestPath} contains no file records`,
+        `[AUTHENTIC_REPLAY_ERROR] Manifest in ${manifestPath} contains no valid files array`,
       );
     }
 
-    // Verify SHA-256 integrity of all sealed files before decoding
+    if (manifest.files.length !== EXPECTED_CPMM_EVIDENCE_FILES.length) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Invalid manifest file count: expected exactly ${EXPECTED_CPMM_EVIDENCE_FILES.length} evidence files, got ${manifest.files.length}`,
+      );
+    }
+
+    if (manifest.totalFiles !== EXPECTED_CPMM_EVIDENCE_FILES.length) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Manifest totalFiles mismatch: expected ${EXPECTED_CPMM_EVIDENCE_FILES.length}, got ${manifest.totalFiles}`,
+      );
+    }
+
+    if (
+      typeof manifest.manifestSha256 !== "string" ||
+      manifest.manifestSha256.trim().length === 0
+    ) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Manifest in ${manifestPath} is missing required manifestSha256 digest`,
+      );
+    }
+
+    // Verify exactly the expected 4 evidence files with zero duplicates and zero missing
+    const seenFiles = new Set<string>();
+    let computedTotalBytes = 0;
+
+    for (const entry of manifest.files) {
+      if (!entry || typeof entry !== "object") {
+        throw new Error(`[AUTHENTIC_REPLAY_ERROR] Malformed file entry in ${manifestPath}`);
+      }
+      if (!entry.filename || typeof entry.filename !== "string") {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Manifest entry missing filename in ${manifestPath}`,
+        );
+      }
+      if (seenFiles.has(entry.filename)) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Duplicate file entry in manifest: ${entry.filename}`,
+        );
+      }
+      seenFiles.add(entry.filename);
+
+      if (
+        !EXPECTED_CPMM_EVIDENCE_FILES.includes(
+          entry.filename as (typeof EXPECTED_CPMM_EVIDENCE_FILES)[number],
+        )
+      ) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Unexpected evidence file in manifest: '${entry.filename}'. Expected only canonical CPMM evidence files.`,
+        );
+      }
+
+      if (typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(entry.sha256)) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Invalid SHA-256 digest for '${entry.filename}' in manifest: ${entry.sha256}`,
+        );
+      }
+
+      if (
+        typeof entry.byteSize !== "number" ||
+        !Number.isInteger(entry.byteSize) ||
+        entry.byteSize <= 0
+      ) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Invalid byteSize for '${entry.filename}' in manifest: ${entry.byteSize}`,
+        );
+      }
+      computedTotalBytes += entry.byteSize;
+    }
+
+    for (const expectedFile of EXPECTED_CPMM_EVIDENCE_FILES) {
+      if (!seenFiles.has(expectedFile)) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Manifest missing required evidence file: ${expectedFile}`,
+        );
+      }
+    }
+
+    if (manifest.totalBytes !== computedTotalBytes) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Manifest totalBytes inconsistency: declared ${manifest.totalBytes}, sum of entries is ${computedTotalBytes}`,
+      );
+    }
+
+    // B1-EVIDENCE-01.1: Canonical calculation and verification of manifestSha256
+    // NOTE ON INTEGRITY: Local SHA-256 hashes establish internal tamper-evidence and file consistency across the captured snapshot set.
+    // They do NOT provide independent cryptographic proof of blockchain origin (which requires RPC cryptographic signatures / Merkle proofs)
+    // nor do they protect against an adversarial operator replacing both the manifest and its contents in their entirety.
+    const sortedEntries = [...manifest.files].sort((a, b) => a.filename.localeCompare(b.filename));
+    const canonicalPayload = sortedEntries.map((f) => `${f.filename}:${f.sha256}`).join("\n");
+    const canonicalManifestSha256 = crypto
+      .createHash("sha256")
+      .update(canonicalPayload)
+      .digest("hex");
+    if (canonicalManifestSha256 !== manifest.manifestSha256) {
+      throw new Error(
+        `[STRICT_REPLAY_INTEGRITY_FAILURE] Canonical manifestSha256 mismatch: manifest declared ${manifest.manifestSha256}, computed ${canonicalManifestSha256}`,
+      );
+    }
+
+    // B1-EVIDENCE-01.2: Verify each file's actual byte size and SHA-256 against disk
     for (const entry of manifest.files) {
       const filePath = path.join(targetDir, entry.filename);
       if (!fsSync.existsSync(filePath)) {
@@ -1556,6 +1679,11 @@ export function loadAccountMapFromFixtures(
         );
       }
       const fileBytes = fsSync.readFileSync(filePath);
+      if (fileBytes.byteLength !== entry.byteSize) {
+        throw new Error(
+          `[STRICT_REPLAY_INTEGRITY_FAILURE] Byte size mismatch for '${entry.filename}': manifest expected ${entry.byteSize} bytes, disk file is ${fileBytes.byteLength} bytes`,
+        );
+      }
       const actualHash = crypto.createHash("sha256").update(fileBytes).digest("hex");
       if (actualHash !== entry.sha256) {
         throw new Error(
