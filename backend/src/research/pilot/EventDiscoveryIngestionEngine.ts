@@ -179,12 +179,12 @@ export class EventDiscoveryIngestionEngine {
   public async handleLogNotification(
     envelope: WebSocketLogNotificationEnvelope,
   ): Promise<{ enqueued: boolean; reason?: string }> {
-    if (this.maxEvents !== undefined && this.rawLogNotificationsReceived >= this.maxEvents) {
+    this.rawLogNotificationsReceived += 1;
+
+    if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
       this.rateLimitDrops += 1;
       return { enqueued: false, reason: "MAX_EVENTS_EXCEEDED" };
     }
-
-    this.rawLogNotificationsReceived += 1;
 
     const value = envelope.params?.result?.value;
     const context = envelope.params?.result?.context;
@@ -262,8 +262,8 @@ export class EventDiscoveryIngestionEngine {
       return results;
     }
 
-    // 0. Retry any pending verifications from previous attempts (BREADY-04)
-    const retried = await this.retryPendingVerifications(accountFetcher);
+    // 0. Retry any pending verifications from previous attempts (BREADY-04, B2-GO-02)
+    const retried = await this.retryPendingVerifications(accountFetcher, options);
     results.push(...retried);
 
     while (this.queue.length > 0) {
@@ -339,16 +339,23 @@ export class EventDiscoveryIngestionEngine {
 
       item.lifecycleState = "TX_DECODE_SUCCESS";
       this.successfulInitDecodes += scanResult.events.length;
-      this.discoveredEvents.push(...scanResult.events);
 
       // 4. Dispatch verification for each identified pool initialization event
       for (const event of scanResult.events) {
+        // Enforce exact ceiling on admitted discovered events (B2-GO-01)
+        if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
+          this.rateLimitDrops += 1;
+          continue;
+        }
+
+        // Admit discovered event up to the hard ceiling
+        this.discoveredEvents.push(event);
+
+        // Stop initiating further account queries if observation deadline has elapsed (B2-GO-02)
         if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
           break;
         }
-        if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
-          break;
-        }
+
         // Pool ID deduplication (check if already verified or encountered)
         if (this.verifiedPoolIds.has(event.poolId)) {
           this.duplicatePoolIdsIgnored += 1;
@@ -372,32 +379,39 @@ export class EventDiscoveryIngestionEngine {
           this.detectionLatencySamples += 1;
         }
 
-        // Dispatch to independent on-chain verification with bounded per-event retry (BREADY-04)
+        // Dispatch to independent on-chain verification with bounded per-event retry (BREADY-04, B2-GO-02)
         item.lifecycleState = "VERIFICATION_QUEUED";
         let dispatchResult: VerificationDispatchResult | null = null;
         try {
-          dispatchResult = await dispatchPoolVerification(event, accountFetcher);
+          dispatchResult = await dispatchPoolVerification(event, accountFetcher, {
+            deadlineEpochMs: options?.deadlineEpochMs,
+          });
         } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
           this.verificationRetries += 1;
           const pendingItem: PendingVerificationItem = {
             event,
             detectedAtMs: item.detectedAtMs,
             signature: item.signature,
             retryCount: 1,
-            lastError: err instanceof Error ? err.message : String(err),
+            lastError: errMsg,
           };
 
           if (pendingItem.retryCount <= this.maxVerificationRetries) {
             this.pendingVerifications.set(event.eventId, pendingItem);
             item.lifecycleState = "VERIFICATION_FAILED";
-            continue;
           } else {
             this.rpcVerificationFailures += 1;
             this.exhaustedVerificationRetriesCount += 1;
             this.rejectedPoolIds.add(event.poolId);
             item.lifecycleState = "VERIFICATION_FAILED";
-            continue;
           }
+
+          if (errMsg.includes("DEADLINE_EXCEEDED")) {
+            // Deadline reached: stop further verification dispatches immediately
+            break;
+          }
+          continue;
         }
 
         this.recordDispatchMetrics(dispatchResult, event, item.detectedAtMs);
@@ -424,29 +438,44 @@ export class EventDiscoveryIngestionEngine {
   }
 
   /**
-   * Retries all pending verification events with bounded retry limits (BREADY-04).
+   * Retries all pending verification events with bounded retry limits (BREADY-04, B2-GO-02).
    * Successful events are preserved without re-processing already completed events.
    */
   public async retryPendingVerifications(
     accountFetcher: IOnChainAccountFetcher,
+    options?: { readonly deadlineEpochMs?: number | undefined } | undefined,
   ): Promise<readonly VerificationDispatchResult[]> {
     const recoveredResults: VerificationDispatchResult[] = [];
     const pendingEntries = Array.from(this.pendingVerifications.entries());
 
     for (const [eventId, pending] of pendingEntries) {
+      // Check deadline before each retry iteration (B2-GO-02)
+      if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+        break;
+      }
+
       if (this.verifiedPoolIds.has(pending.event.poolId)) {
         this.pendingVerifications.delete(eventId);
         continue;
       }
 
       try {
-        const dispatchResult = await dispatchPoolVerification(pending.event, accountFetcher);
+        const dispatchResult = await dispatchPoolVerification(pending.event, accountFetcher, {
+          deadlineEpochMs: options?.deadlineEpochMs,
+        });
         this.pendingVerifications.delete(eventId);
         this.recordDispatchMetrics(dispatchResult, pending.event, pending.detectedAtMs);
         recoveredResults.push(dispatchResult);
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("DEADLINE_EXCEEDED")) {
+          // Cease retries when observation deadline has passed; leave pending item intact without fabricating verdict (B2-GO-02)
+          pending.lastError = errMsg;
+          break;
+        }
+
         pending.retryCount += 1;
-        pending.lastError = err instanceof Error ? err.message : String(err);
+        pending.lastError = errMsg;
         this.verificationRetries += 1;
 
         if (pending.retryCount > this.maxVerificationRetries) {
@@ -532,6 +561,10 @@ export class EventDiscoveryIngestionEngine {
 
   public getQueueLength(): number {
     return this.queue.length;
+  }
+
+  public getPendingVerificationsCount(): number {
+    return this.pendingVerifications.size;
   }
 
   public getDiscoveredEvents(): readonly DiscoveredPoolInitializationEvent[] {

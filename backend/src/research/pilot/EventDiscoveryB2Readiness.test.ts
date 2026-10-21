@@ -22,6 +22,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   DiscoveredPoolAccountPayload,
+  DiscoveredPoolInitializationEvent,
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
 import { EventDiscoveryIngestionEngine } from "./EventDiscoveryIngestionEngine.js";
@@ -35,7 +36,11 @@ import {
   saveB2EventSession,
   verifyB2SessionManifest,
 } from "./EventSessionEvidenceCapture.js";
-import { createAmmV4InitTransactionFixture } from "./fixtures/AuthoritativeEventFixtures.js";
+import {
+  createAmmV4InitTransactionFixture,
+  createCpmmInitTransactionFixture,
+} from "./fixtures/AuthoritativeEventFixtures.js";
+import { dispatchPoolVerification } from "./VerificationDispatchService.js";
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
   createAuthoritativeSplVaultBuffer,
@@ -2566,43 +2571,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
     });
 
     it("B2-LAUNCH-03: verifies separate enforcement of maxEvents (50) and maxWsMessages (500)", async () => {
-      // 1. Engine enforces maxEvents = 50
-      const engine = new EventDiscoveryIngestionEngine({
-        maxEvents: 50,
-      });
-
-      let enqueuedCount = 0;
-      let rejectedCount = 0;
-
-      for (let i = 0; i < 60; i++) {
-        const res = await engine.handleLogNotification({
-          jsonrpc: "2.0",
-          method: "logsNotification",
-          params: {
-            result: {
-              context: { slot: 450000000 + i },
-              value: {
-                signature: `sig-event-${i}`,
-                err: null,
-                logs: ["Program log: initialize"],
-              },
-            },
-            subscription: 1,
-          },
-        });
-        if (res.enqueued) {
-          enqueuedCount++;
-        } else if (res.reason === "MAX_EVENTS_EXCEEDED") {
-          rejectedCount++;
-        }
-      }
-
-      // First 50 enqueued, remaining 10 rejected due to maxEvents = 50
-      expect(enqueuedCount).toBe(50);
-      expect(rejectedCount).toBe(10);
-      expect(engine.getMetricsSnapshot().rawLogNotificationsReceived).toBe(50);
-
-      // 2. WebSocket client enforces maxWsMessages = 500 separately
+      // 1. WebSocket client enforces maxWsMessages = 500 separately
       const wsTransport = new MockWebSocketTransport();
       wsTransport.autoOpenAndAck = true;
       const wsClient = new SolanaWebSocketSubscriptionClient({
@@ -2678,6 +2647,611 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       // No transactions fetched, queue draining halted
       expect(results.length).toBe(0);
       expect(engine.getQueueLength()).toBe(5);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 11. B2-GO Launch Audit Defect Verifications (B2-GO-01, B2-GO-02)
+  // --------------------------------------------------------------------------
+  describe("11. B2-GO Launch Audit Defect Verifications (B2-GO-01, B2-GO-02)", () => {
+    it("B2-GO-01: examines 100+ non-initialization notifications without consuming the 50-event budget, then admits and verifies 1 valid initialization", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxEvents: 50 });
+      const mockRpc = new MockSolanaRpcTransport();
+
+      // Setup 105 non-initialization transactions
+      for (let i = 0; i < 105; i++) {
+        mockRpc.transactions.set(`sig-non-init-${i}`, {
+          signature: `sig-non-init-${i}`,
+          slot: 450000000 + i,
+          blockTime: 1792375000 + i,
+          version: "legacy",
+          accountKeys: {
+            staticAccountKeys: ["payer", "systemProgram"],
+          },
+          instructions: [
+            {
+              programIdIndex: 1,
+              accountKeyIndexes: [0],
+              data: "",
+            },
+          ],
+          err: null,
+          logMessages: [
+            "Program 11111111111111111111111111111111 invoke [1]",
+            "Program 11111111111111111111111111111111 success",
+          ],
+        });
+      }
+
+      // Setup 1 valid CPMM pool initialization transaction
+      const validCpmmTx = createCpmmInitTransactionFixture({
+        signature: "sig-valid-init-106",
+        slot: 450000200,
+        poolId: FIXTURE_CPMM_POOL_ADDRESS,
+        token0Vault: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1Vault: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      mockRpc.transactions.set("sig-valid-init-106", validCpmmTx);
+
+      // Register CPMM pool and vault accounts
+      mockRpc.accounts.set(FIXTURE_CPMM_POOL_ADDRESS, {
+        address: FIXTURE_CPMM_POOL_ADDRESS,
+        owner: RAYDIUM_CPMM_PROGRAM_ID,
+        data: createAuthoritativeRaydiumCpmmBuffer(),
+        lamports: 10000000,
+        slot: 450000200,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_0_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+        lamports: 5000000,
+        slot: 450000200,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_1_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+        lamports: 5000000,
+        slot: 450000200,
+      });
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxTransactionsBudget: 200,
+      });
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxAccountCallsBudget: 50,
+      });
+
+      // 1. Feed 105 non-initialization notifications
+      for (let i = 0; i < 105; i++) {
+        const res = await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000000 + i },
+              value: {
+                signature: `sig-non-init-${i}`,
+                err: null,
+                logs: ["Program log: some ordinary transfer"],
+              },
+            },
+            subscription: 1,
+          },
+        });
+        expect(res.enqueued).toBe(true);
+      }
+
+      expect(engine.getMetricsSnapshot().rawLogNotificationsReceived).toBe(105);
+
+      // Process queue for the 105 non-init notifications
+      const interimReports = await engine.processQueue(txFetcher, accountFetcher);
+      expect(interimReports.length).toBe(0);
+      expect(engine.getDiscoveredEvents().length).toBe(0); // 50-event budget untouched!
+      expect(engine.getMetricsSnapshot().successfulInitDecodes).toBe(0);
+      expect(engine.getMetricsSnapshot().failedInitDecodes).toBe(105);
+
+      // 2. Feed 1 valid pool initialization notification
+      const resValid = await engine.handleLogNotification({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000200 },
+            value: {
+              signature: "sig-valid-init-106",
+              err: null,
+              logs: ["Program log: initialize"],
+            },
+          },
+          subscription: 1,
+        },
+      });
+      expect(resValid.enqueued).toBe(true);
+
+      const finalReports = await engine.processQueue(txFetcher, accountFetcher);
+      expect(finalReports.length).toBe(1);
+      expect(finalReports[0]!.verified).toBe(true);
+      expect(finalReports[0]!.verificationTier).toBe("INDEPENDENTLY_COHERENT");
+
+      const metrics = engine.getMetricsSnapshot();
+      expect(metrics.rawLogNotificationsReceived).toBe(106);
+      expect(metrics.uniqueTransactionsEncountered).toBe(106);
+      expect(metrics.successfulInitDecodes).toBe(1);
+      expect(metrics.candidatePoolsDiscovered).toBe(1);
+      expect(engine.getDiscoveredEvents().length).toBe(1);
+      expect(metrics.coherentTierPoolsCount).toBe(1);
+      expect(metrics.rateLimitDrops).toBe(0);
+    });
+
+    it("B2-GO-01: enforces exact 50-event boundary and verifies the 50th event without skipping", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxEvents: 50 });
+      const mockRpc = new MockSolanaRpcTransport();
+
+      // Register standard vault accounts
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_0_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+        lamports: 5000000,
+        slot: 450000000,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_1_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+        lamports: 5000000,
+        slot: 450000000,
+      });
+
+      // Create 50 distinct CPMM pool initialization transactions and accounts
+      for (let i = 0; i < 50; i++) {
+        const poolId = `PoolStateExactBoundary${String(i).padStart(4, "0")}1111111111111`;
+        const sig = `sig-exact-pool-${i}`;
+
+        const tx = createCpmmInitTransactionFixture({
+          signature: sig,
+          slot: 450000000 + i,
+          poolId,
+        });
+        mockRpc.transactions.set(sig, tx);
+
+        mockRpc.accounts.set(poolId, {
+          address: poolId,
+          owner: RAYDIUM_CPMM_PROGRAM_ID,
+          data: createAuthoritativeRaydiumCpmmBuffer(),
+          lamports: 10000000,
+          slot: 450000000 + i,
+        });
+
+        await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000000 + i },
+              value: { signature: sig, err: null, logs: ["Program log: initialize"] },
+            },
+            subscription: 1,
+          },
+        });
+      }
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxTransactionsBudget: 60,
+      });
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxAccountCallsBudget: 60,
+      });
+
+      const reports = await engine.processQueue(txFetcher, accountFetcher);
+
+      // Verify that exactly 50 events were admitted and verified
+      expect(engine.getDiscoveredEvents().length).toBe(50);
+      expect(reports.length).toBe(50);
+      expect(reports[49]!.poolId).toBe(`PoolStateExactBoundary00491111111111111`);
+      expect(reports[49]!.verified).toBe(true);
+      expect(engine.getMetricsSnapshot().successfulInitDecodes).toBe(50);
+      expect(engine.getMetricsSnapshot().rateLimitDrops).toBe(0);
+
+      // Now feed 51st event -> rejected with MAX_EVENTS_EXCEEDED
+      const excessRes = await engine.handleLogNotification({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000051 },
+            value: { signature: "sig-exact-pool-50", err: null, logs: ["Program log: initialize"] },
+          },
+          subscription: 1,
+        },
+      });
+      expect(excessRes.enqueued).toBe(false);
+      expect(excessRes.reason).toBe("MAX_EVENTS_EXCEEDED");
+      expect(engine.getDiscoveredEvents().length).toBe(50); // Hard ceiling preserved
+      expect(engine.getMetricsSnapshot().rateLimitDrops).toBe(1);
+    });
+
+    it("B2-GO-01: multi-initialization transaction at the boundary admits up to exactly 50 events and drops excess events to rateLimitDrops", async () => {
+      const engine = new EventDiscoveryIngestionEngine({ maxEvents: 50 });
+      const mockRpc = new MockSolanaRpcTransport();
+
+      // Register standard vault accounts
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_0_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+        lamports: 5000000,
+        slot: 450000000,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_1_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+        lamports: 5000000,
+        slot: 450000000,
+      });
+
+      // Pre-populate 49 initialization events
+      for (let i = 0; i < 49; i++) {
+        const poolId = `PoolPrePop${String(i).padStart(4, "0")}11111111111111111111111`;
+        const sig = `sig-prepop-${i}`;
+
+        const tx = createCpmmInitTransactionFixture({
+          signature: sig,
+          slot: 450000000 + i,
+          poolId,
+        });
+        mockRpc.transactions.set(sig, tx);
+
+        mockRpc.accounts.set(poolId, {
+          address: poolId,
+          owner: RAYDIUM_CPMM_PROGRAM_ID,
+          data: createAuthoritativeRaydiumCpmmBuffer(),
+          lamports: 10000000,
+          slot: 450000000 + i,
+        });
+
+        await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000000 + i },
+              value: { signature: sig, err: null, logs: ["Program log: initialize"] },
+            },
+            subscription: 1,
+          },
+        });
+      }
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxTransactionsBudget: 60,
+      });
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxAccountCallsBudget: 60,
+      });
+
+      await engine.processQueue(txFetcher, accountFetcher);
+      expect(engine.getDiscoveredEvents().length).toBe(49);
+
+      // Now create a multi-initialization transaction with 3 CPMM initializations
+      const multiSig = "sig-multi-init-at-boundary";
+      const pool0 = "PoolMulti_0_1111111111111111111111111111111";
+      const pool1 = "PoolMulti_1_1111111111111111111111111111111";
+      const pool2 = "PoolMulti_2_1111111111111111111111111111111";
+
+      const baseTx = createCpmmInitTransactionFixture({
+        signature: multiSig,
+        slot: 450000100,
+        poolId: pool0,
+      });
+
+      // Construct accounts and instructions for 3 initializations
+      const staticKeys = [...baseTx.accountKeys.staticAccountKeys, pool1, pool2];
+      const p1Index = staticKeys.indexOf(pool1);
+      const p2Index = staticKeys.indexOf(pool2);
+
+      const inst0 = baseTx.instructions[0]!;
+      const inst1 = {
+        programIdIndex: inst0.programIdIndex,
+        accountKeyIndexes: inst0.accountKeyIndexes.map((idx, pos) => (pos === 3 ? p1Index : idx)),
+        data: inst0.data,
+      };
+      const inst2 = {
+        programIdIndex: inst0.programIdIndex,
+        accountKeyIndexes: inst0.accountKeyIndexes.map((idx, pos) => (pos === 3 ? p2Index : idx)),
+        data: inst0.data,
+      };
+
+      const multiTx: VersionedTransactionMetadata = {
+        ...baseTx,
+        accountKeys: {
+          staticAccountKeys: staticKeys,
+        },
+        instructions: [inst0, inst1, inst2],
+      };
+      mockRpc.transactions.set(multiSig, multiTx);
+
+      mockRpc.accounts.set(pool0, {
+        address: pool0,
+        owner: RAYDIUM_CPMM_PROGRAM_ID,
+        data: createAuthoritativeRaydiumCpmmBuffer(),
+        lamports: 10000000,
+        slot: 450000100,
+      });
+
+      await engine.handleLogNotification({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000100 },
+            value: { signature: multiSig, err: null, logs: ["Program log: initialize"] },
+          },
+          subscription: 1,
+        },
+      });
+
+      const multiReports = await engine.processQueue(txFetcher, accountFetcher);
+
+      const metrics = engine.getMetricsSnapshot();
+      // Total decoded initializations: 49 + 3 = 52
+      expect(metrics.successfulInitDecodes).toBe(52);
+      // Exactly 50 admitted events (hard ceiling)
+      expect(engine.getDiscoveredEvents().length).toBe(50);
+      // Excess 2 events dropped to rateLimitDrops
+      expect(metrics.rateLimitDrops).toBe(2);
+      // The 50th event was verified
+      expect(multiReports.length).toBe(1);
+      expect(multiReports[0]!.poolId).toBe(pool0);
+      expect(multiReports[0]!.verified).toBe(true);
+    });
+
+    it("B2-GO-02: retryPendingVerifications checks deadlineEpochMs before each iteration and halts without querying RPC", async () => {
+      const engine = new EventDiscoveryIngestionEngine();
+      let accountCallsMade = 0;
+      const trackingFetcher = {
+        getAccountInfo: async () => {
+          accountCallsMade++;
+          return null;
+        },
+        getMultipleAccounts: async () => {
+          accountCallsMade++;
+          return [null, null, null];
+        },
+        getSlot: async () => 450000000,
+      };
+
+      const failingFetcher = {
+        getAccountInfo: async () => null,
+        getMultipleAccounts: async () => {
+          throw new Error("Temporary network glitch");
+        },
+        getSlot: async () => 450000000,
+      };
+
+      const tx = createCpmmInitTransactionFixture({
+        signature: "sig-retry-deadline-1",
+        slot: 450000100,
+      });
+      const txFetcher = {
+        fetchTransaction: async () => tx,
+      };
+
+      await engine.handleLogNotification({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000100 },
+            value: {
+              signature: "sig-retry-deadline-1",
+              err: null,
+              logs: ["Program log: initialize"],
+            },
+          },
+          subscription: 1,
+        },
+      });
+
+      // Initial queue processing fails with network glitch, populating pendingVerifications
+      await engine.processQueue(txFetcher, failingFetcher);
+      expect(engine.getPendingVerificationsCount()).toBe(1);
+
+      // Now attempt retry with an expired deadline
+      const retried = await engine.retryPendingVerifications(trackingFetcher, {
+        deadlineEpochMs: Date.now() - 1000,
+      });
+
+      // Zero RPC account calls initiated past deadline
+      expect(accountCallsMade).toBe(0);
+      expect(retried.length).toBe(0);
+      // Pending item remains preserved intact for honest unresolved evidence accounting
+      expect(engine.getPendingVerificationsCount()).toBe(1);
+    });
+
+    it("B2-GO-02: dispatchPoolVerification checks deadlineEpochMs and prevents sequential account queries past deadline", async () => {
+      const event: DiscoveredPoolInitializationEvent = {
+        eventId: "sig-pool:0",
+        signature: "sig-pool",
+        outerInstructionIndex: 0,
+        instructionIndex: 0,
+        protocol: "RAYDIUM_CPMM",
+        poolId: FIXTURE_CPMM_POOL_ADDRESS,
+        token0Vault: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1Vault: FIXTURE_CPMM_TOKEN_1_VAULT,
+        token0Mint: FIXTURE_CPMM_TOKEN_0_MINT,
+        token1Mint: FIXTURE_CPMM_TOKEN_1_MINT,
+        slot: 450000100,
+        blockTimeSec: 1792375000,
+        firstSeenTimestampMs: Date.now(),
+        instructionRequestedOpenTimeSec: 1792375300,
+        poolOpenTimeSec: 1792375300,
+      };
+
+      let fetcherCalled = false;
+      const fetcher = {
+        getAccountInfo: async () => {
+          fetcherCalled = true;
+          return null;
+        },
+        getMultipleAccounts: async () => {
+          fetcherCalled = true;
+          return [null, null, null];
+        },
+        getSlot: async () => 450000100,
+      };
+
+      await expect(
+        dispatchPoolVerification(event, fetcher, {
+          deadlineEpochMs: Date.now() - 50,
+        }),
+      ).rejects.toThrow("[VERIFICATION_DEADLINE_EXCEEDED]");
+
+      expect(fetcherCalled).toBe(false);
+    });
+
+    it("B2-GO-02: delayed-transport coordinator session stops boundedly, seals evidence honestly, and leaves unfinished verification in pendingVerifications", async () => {
+      const captureDir = path.join(os.tmpdir(), `b2-test-delayed-${Date.now()}`);
+      fsSync.mkdirSync(captureDir, { recursive: true });
+
+      const wsTransport = new MockWebSocketTransport();
+      wsTransport.autoOpenAndAck = true;
+
+      const wsClient = new SolanaWebSocketSubscriptionClient({
+        wsUrl: "wss://api.mainnet-beta.solana.com/",
+        transport: wsTransport,
+      });
+
+      const tx = createCpmmInitTransactionFixture({
+        signature: "sig-delayed-tx",
+        slot: 450000100,
+      });
+
+      const mockRpc = new MockSolanaRpcTransport();
+      mockRpc.transactions.set("sig-delayed-tx", tx);
+      mockRpc.accounts.set(FIXTURE_CPMM_POOL_ADDRESS, {
+        address: FIXTURE_CPMM_POOL_ADDRESS,
+        owner: RAYDIUM_CPMM_PROGRAM_ID,
+        data: createAuthoritativeRaydiumCpmmBuffer(),
+        lamports: 10000000,
+        slot: 450000100,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_0_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+        lamports: 5000000,
+        slot: 450000100,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_1_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+        lamports: 5000000,
+        slot: 450000100,
+      });
+
+      // Account fetcher will fail with a transient error on attempt 1,
+      // and simulate a delay that pushes elapsed time past the deadline
+      let callCount = 0;
+      const delayedAccTransport: ISolanaRpcTransport = {
+        post: async (_url: string, body: Record<string, unknown>) => {
+          const method = body.method as string;
+          if (method === "getMultipleAccounts" || method === "getAccountInfo") {
+            callCount++;
+            // Delay 120ms to push elapsed time past the 100ms deadline
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            throw new Error("Simulated transient transport timeout");
+          }
+          return mockRpc.post(_url, body);
+        },
+      };
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+      });
+
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: delayedAccTransport,
+      });
+
+      const coordinator = new EventDiscoverySessionCoordinator({
+        wsClient,
+        txFetcher,
+        accountFetcher,
+        captureBaseDir: captureDir,
+        budgets: {
+          durationSec: 0.1, // 100ms observation window
+          maxEvents: 50,
+          maxWsMessages: 500,
+          maxTransactions: 25,
+          maxAccountReads: 20,
+          maxTotalRpcCalls: 45,
+          maxRssMb: 256,
+          maxDiskMb: 256,
+        },
+      });
+
+      // WebSocket delivers 1 valid initialization notification with subscriptions acknowledged
+      wsTransport.triggerOpen();
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 10 }));
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 20 }));
+
+      wsTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000100 },
+              value: { signature: "sig-delayed-tx", err: null, logs: ["Program log: initialize"] },
+            },
+            subscription: 20,
+          },
+        }),
+      );
+
+      const summary = await coordinator.runSession();
+
+      // Session finished boundedly without hanging
+      expect(summary.status).toBe("FINALIZED");
+      expect(summary.stopReason).toContain("DURATION_LIMIT_REACHED");
+
+      // Evidence was cleanly sealed and manifest verified
+      expect(summary.manifestVerified).toBe(true);
+      expect(summary.sessionDir).toBeDefined();
+
+      // Honest accounting: 1 candidate pool discovered, 0 verified, 0 rejected, 1 unresolved
+      expect(summary.accounting.uniquePoolsDiscovered).toBe(1);
+      expect(summary.accounting.poolsVerifiedCoherent).toBe(0);
+      expect(summary.accounting.poolsRejected).toBe(0);
+      expect(summary.accounting.unresolvedObservations).toBe(1);
+      expect(summary.metrics.pendingVerificationsCount).toBe(1);
+      expect(callCount).toBeGreaterThanOrEqual(1);
+
+      // Cleanup
+      try {
+        fsSync.rmSync(captureDir, { recursive: true, force: true });
+      } catch {
+        // Ignored in test cleanup
+      }
     });
   });
 });

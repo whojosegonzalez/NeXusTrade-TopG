@@ -804,6 +804,41 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
     it("enforces maxEvents session ceiling and rejects excess log notifications", async () => {
       const engine = new EventDiscoveryIngestionEngine({ maxEvents: 2 });
 
+      const tx1 = createAmmV4InitTransactionFixture({
+        signature: "sig_ceil_1",
+        poolId: "PoolCeil11111111111111111111111111111111111",
+      });
+      const tx2 = createAmmV4InitTransactionFixture({
+        signature: "sig_ceil_2",
+        poolId: "PoolCeil22222222222222222222222222222222222",
+      });
+
+      const txFetcher = new MockTransactionFetcher();
+      txFetcher.setTransaction(tx1);
+      txFetcher.setTransaction(tx2);
+
+      const accountFetcher = new MockOnChainAccountFetcher(300000100);
+      accountFetcher.setAccount(
+        "PoolCeil11111111111111111111111111111111111",
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+      accountFetcher.setAccount(
+        "PoolCeil22222222222222222222222222222222222",
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+        createAuthoritativeRaydiumAmmV4Buffer(),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_BASE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_MEME_MINT }),
+      );
+      accountFetcher.setAccount(
+        FIXTURE_QUOTE_VAULT,
+        SPL_TOKEN_PROGRAM_ID,
+        createAuthoritativeSplVaultBuffer({ mintBase58: FIXTURE_WSOL_MINT }),
+      );
+
       const res1 = await engine.handleLogNotification(
         createMockLogNotificationEnvelope("sig_ceil_1", 300000100),
       );
@@ -814,7 +849,11 @@ describe("Milestone D.2.9-A: Event Discovery Ingestion Engine Tests", () => {
       );
       expect(res2.enqueued).toBe(true);
 
-      // Third notification exceeds maxEvents ceiling
+      // Process queue so that both initialization events are admitted and verified
+      await engine.processQueue(txFetcher, accountFetcher);
+      expect(engine.getDiscoveredEvents().length).toBe(2);
+
+      // Third notification exceeds maxEvents ceiling because 2 events are already admitted
       const res3 = await engine.handleLogNotification(
         createMockLogNotificationEnvelope("sig_ceil_3", 300000100),
       );

@@ -390,9 +390,10 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 7. Drain pending queued transactions with wall-clock deadline
+        // 7. Drain pending queued transactions and retry pending verifications with wall-clock deadline (B2-GO-02)
         const pendingQueueLength = this.engine.getQueueLength();
-        if (pendingQueueLength > 0) {
+        const pendingVerificationsCount = this.engine.getPendingVerificationsCount();
+        if (pendingQueueLength > 0 || pendingVerificationsCount > 0) {
           await this.engine.processQueue(this.txFetcher, this.accountFetcher, { deadlineEpochMs });
           if (!this.isDiskExhausted) {
             this.flushProgressiveEvidence();
@@ -455,7 +456,8 @@ export class EventDiscoverySessionCoordinator {
     ).length;
     const unresolvedCount =
       metrics.rawLogNotificationsReceived -
-      (metrics.uniqueTransactionsEncountered - metrics.transactionFetchFailures);
+      (metrics.uniqueTransactionsEncountered - metrics.transactionFetchFailures) +
+      (metrics.pendingVerificationsCount ?? 0);
 
     let manifest: B2SnapshotManifest | undefined = undefined;
     let manifestVerified: boolean | undefined = undefined;

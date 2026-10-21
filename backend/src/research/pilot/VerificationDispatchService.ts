@@ -39,6 +39,7 @@ import {
 export interface VerificationDispatchOptions {
   readonly maxAcceptableSlotDelta?: number | undefined; // Maximum allowed slot delta from tx
   readonly enforceStrictSlotMatch?: boolean | undefined; // If true, requires exact slot match between accounts
+  readonly deadlineEpochMs?: number | undefined; // Wall-clock epoch deadline for observation window (B2-GO-02)
 }
 
 /**
@@ -74,12 +75,26 @@ export async function dispatchPoolVerification(
     };
   }
 
-  // 2. Fetch pool account and both vault accounts in parallel
+  // 2. Check observation deadline before initiating account queries (B2-GO-02)
+  if (options.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+    throw new Error(
+      `[VERIFICATION_DEADLINE_EXCEEDED] Observation deadline reached before initiating account queries (${Date.now()} >= ${options.deadlineEpochMs})`,
+    );
+  }
+
+  // 3. Fetch pool account and both vault accounts in parallel
   const [poolAccount, vault0Account, vault1Account] = await fetcher.getMultipleAccounts([
     event.poolId,
     event.token0Vault,
     event.token1Vault,
   ]);
+
+  // Check observation deadline after account queries complete to prevent fabricated verdicts (B2-GO-02)
+  if (options.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+    throw new Error(
+      `[VERIFICATION_DEADLINE_EXCEEDED] Observation deadline reached during account queries (${Date.now()} >= ${options.deadlineEpochMs})`,
+    );
+  }
 
   if (!poolAccount) {
     return {
