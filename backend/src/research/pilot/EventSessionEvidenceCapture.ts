@@ -82,6 +82,8 @@ export class ProgressiveEvidenceRecorder {
   private readonly targetDir: string;
   private readonly sessionId: string;
   private readonly maxDiskBytes: number;
+  private readonly reservedHeadroomBytes: number;
+  private readonly streamBudgetBytes: number;
   private totalBytesWritten = 0;
   private isFinalized = false;
   private readonly counts = {
@@ -101,6 +103,9 @@ export class ProgressiveEvidenceRecorder {
     this.sessionId = options.sessionId ?? `b2-events-session-${timestamp}`;
     this.targetDir = path.join(options.captureBaseDir, this.sessionId);
     this.maxDiskBytes = (options.maxDiskMb ?? 256) * 1024 * 1024;
+    // B2-FINAL-04: Reserve headroom (1MB or 10% if small) specifically for session-metadata.json and session-manifest.json
+    this.reservedHeadroomBytes = Math.min(1024 * 1024, Math.floor(this.maxDiskBytes * 0.1));
+    this.streamBudgetBytes = Math.max(512, this.maxDiskBytes - this.reservedHeadroomBytes);
     fsSync.mkdirSync(this.targetDir, { recursive: true });
 
     // Ensure all 5 JSONL streams exist
@@ -127,9 +132,9 @@ export class ProgressiveEvidenceRecorder {
     const line =
       JSON.stringify(item, (_k, val) => (typeof val === "bigint" ? val.toString() : val)) + "\n";
     const lineBytes = Buffer.byteLength(line, "utf8");
-    if (this.totalBytesWritten + lineBytes > this.maxDiskBytes) {
+    if (this.totalBytesWritten + lineBytes > this.streamBudgetBytes) {
       throw new Error(
-        `[DISK_BUDGET_EXCEEDED] Cannot append to ${filename}: exceeded disk budget of ${this.maxDiskBytes} bytes (${this.totalBytesWritten + lineBytes} bytes)`,
+        `[DISK_BUDGET_EXCEEDED] Cannot append to ${filename}: reached streaming disk ceiling (${this.totalBytesWritten + lineBytes} bytes > ${this.streamBudgetBytes} bytes). Headroom reserved for manifest sealing.`,
       );
     }
     const fp = path.join(this.targetDir, filename);

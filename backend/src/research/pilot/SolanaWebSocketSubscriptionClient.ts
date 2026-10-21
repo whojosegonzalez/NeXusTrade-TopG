@@ -223,6 +223,21 @@ export class SolanaWebSocketSubscriptionClient {
     };
   }
 
+  /**
+   * B2-FINAL-04: Returns true only when both AMM v4 and CPMM subscriptions are actively confirmed.
+   */
+  public hasBothSubscriptionsActive(): boolean {
+    const protocols = new Set(this.activeSubscriptions.values());
+    return protocols.has("RAYDIUM_AMM_V4") && protocols.has("RAYDIUM_CPMM");
+  }
+
+  /**
+   * Returns true if the specified protocol subscription has been confirmed by the server.
+   */
+  public hasActiveSubscription(protocol: RaydiumSubscriptionProtocol): boolean {
+    return Array.from(this.activeSubscriptions.values()).includes(protocol);
+  }
+
   private setStatus(newStatus: WebSocketConnectionStatus): void {
     if (this.status !== newStatus) {
       this.status = newStatus;

@@ -54,8 +54,10 @@ import { SolanaRpcRecordingAccountFetcher } from "./SolanaRpcRecordingAccountFet
 import { EventDiscoverySessionCoordinator } from "./EventDiscoverySessionCoordinator.js";
 import type {
   DiscoveredPoolAccountPayload,
+  DiscoveredPoolInitializationEvent,
   EventDiscoveryMetricsSnapshot,
   IOnChainAccountFetcher,
+  VerificationDispatchResult,
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
 import {
@@ -235,7 +237,9 @@ export interface PilotLiveCollectorConfig {
   readonly maxWsMessages?: number | undefined;
   readonly maxEvents?: number | undefined;
   readonly maxTransactions?: number | undefined;
+  readonly maxAccountReads?: number | undefined;
   readonly authorizeB2Live?: boolean | undefined;
+  readonly help?: boolean | undefined;
   readonly wsTransport?: ISolanaWebSocketTransport | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
@@ -272,6 +276,44 @@ function parsePositiveInt(flagName: string, valueStr: string): number {
   return parsed;
 }
 
+export const CLI_HELP_TEXT = `NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4 / D.2.5 / D.2.9)
+Usage: node backend/dist/research/pilot/PilotLiveCollectorCli.js [options]
+
+Required:
+  --network=enabled                Explicit authorization required to perform read-only network collection
+
+Options:
+  --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
+  --verify-cpmm-pool=<address>     Perform independent on-chain Raydium CPMM verification and print report (D29-H3)
+  --replay-fixtures=<path>         Replay recorded event/transaction fixtures offline without network (D29-H3)
+  --replay-mode=synthetic|authentic Replay fidelity mode (default: synthetic, authentic requires sealed manifest) (B1-PREP-04)
+  --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3 / B1-PREP-01)
+  --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
+  --ws-url=<url>                   Solana WebSocket endpoint URL (default: wss://api.mainnet-beta.solana.com) (D29-B2)
+  --rpc-max-calls=<n>              Hard ceiling on total combined RPC calls across all clients (default: 45 in B2, 2 in CPMM mode) (B2-FINAL-02)
+  --max-account-reads=<n>          Maximum on-chain account read calls for event discovery (default: 20) (B2-FINAL-02)
+  --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
+  --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
+  --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
+  --authorize-b2-live              Explicit operator authorization to execute live event discovery (B2-READY-01)
+  --max-ws-messages=<n>            Maximum WebSocket incoming messages budget (default: 500) (D29-B2)
+  --max-events=<n>                 Maximum event budget for event discovery (default: 50)
+  --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
+  --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000, 30 req/min budget)
+  --poll-interval-sec=<n>          Discovery polling interval in seconds (default: 30)
+  --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
+  --target-yield=<n>               Diagnostic target yield requirement of eligible candidates (default: 15)
+  --target-candidates=<n>          Alias for --target-yield
+  --target-verified-candidates=<n> Alias for --target-yield
+  --max-candidates-screened=<n>    Safety ceiling of total candidates screened before stopping (default: 500)
+  --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 256)
+  --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
+  --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
+  --log-file=<path>                Direct log file path to record operational diagnostics
+  --forward-observations=true|false  Enable forward outcome observations at +1m, +5m, +15m (default: true)
+  --help, -h                       Display this help text
+`;
+
 export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   const args = argv.slice(2);
   let network: "enabled" | "disabled" = "disabled";
@@ -297,12 +339,14 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let captureFixturesDir: string | undefined = undefined;
   let maxEvents: number | undefined = undefined;
   let maxTransactions: number | undefined = undefined;
+  let maxAccountReads: number | undefined = undefined;
   let replayMode: "synthetic" | "authentic" | undefined = undefined;
   let rpcMaxCalls: number | undefined = undefined;
   let rpcTimeoutMs: number | undefined = undefined;
   let wsUrl: string | undefined = undefined;
   let maxWsMessages: number | undefined = undefined;
   let authorizeB2Live = false;
+  let help = false;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -314,43 +358,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
 
   for (const arg of args) {
     if (arg === "--help" || arg === "-h") {
-      console.log(`NeXusTrade Pilot Live Collector CLI (Phase 12.94-D.2.4 / D.2.5 / D.2.9)
-Usage: node backend/dist/research/pilot/PilotLiveCollectorCli.js [options]
-
-Required:
-  --network=enabled                Explicit authorization required to perform read-only network collection
-
-Options:
-  --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
-  --verify-cpmm-pool=<address>     Perform independent on-chain Raydium CPMM verification and print report (D29-H3)
-  --replay-fixtures=<path>         Replay recorded event/transaction fixtures offline without network (D29-H3)
-  --replay-mode=synthetic|authentic Replay fidelity mode (default: synthetic, authentic requires sealed manifest) (B1-PREP-04)
-  --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3 / B1-PREP-01)
-  --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
-  --ws-url=<url>                   Solana WebSocket endpoint URL (default: wss://api.mainnet-beta.solana.com) (D29-B2)
-  --rpc-max-calls=<n>              Outbound RPC call ceiling budget (default: 2 in CPMM verification mode) (B1-PREP-03)
-  --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
-  --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
-  --authorize-b2-live              Explicit operator authorization to execute live event discovery (B2-READY-01)
-  --max-ws-messages=<n>            Maximum WebSocket incoming messages budget (default: 500) (D29-B2)
-  --max-events=<n>                 Maximum event budget for event discovery (default: 50)
-  --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
-  --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
-  --min-request-interval-ms=<n>    Minimum inter-request spacing in ms (default: 2000, 30 req/min budget)
-  --poll-interval-sec=<n>          Discovery polling interval in seconds (default: 30)
-  --duration-sec=<n>               Collection duration limit in seconds (default: 7200)
-  --target-yield=<n>               Diagnostic target yield requirement of eligible candidates (default: 15)
-  --target-candidates=<n>          Alias for --target-yield
-  --target-verified-candidates=<n> Alias for --target-yield
-  --max-candidates-screened=<n>    Safety ceiling of total candidates screened before stopping (default: 500)
-  --max-mb=<n>                     Maximum disk space ceiling in megabytes (default: 256)
-  --max-rss-mb=<n>                 Process resident memory watchdog limit in MB (default: 256)
-  --output-dir=<dir>               Local output directory (default: ~/nexustrade-pilot-data/sessions)
-  --log-file=<path>                Direct log file path to record operational diagnostics
-  --forward-observations=true|false  Enable forward outcome observations at +1m, +5m, +15m (default: true)
-  --help, -h                       Display this help text
-`);
-      process.exit(0);
+      help = true;
     } else if (arg === "--network=enabled") {
       network = "enabled";
     } else if (arg === "--network=disabled") {
@@ -419,6 +427,11 @@ Options:
       maxTransactions = parsePositiveInt(
         "--max-transactions",
         arg.slice("--max-transactions=".length),
+      );
+    } else if (arg.startsWith("--max-account-reads=")) {
+      maxAccountReads = parsePositiveInt(
+        "--max-account-reads",
+        arg.slice("--max-account-reads=".length),
       );
     } else if (arg.startsWith("--rpc-url=")) {
       const val = arg.slice("--rpc-url=".length).trim();
@@ -549,7 +562,9 @@ Options:
     maxWsMessages,
     maxEvents,
     maxTransactions,
+    maxAccountReads,
     authorizeB2Live,
+    help,
   };
 }
 
@@ -2128,69 +2143,168 @@ export async function runReplaySession(
       .filter((l) => l.trim().length > 0);
     const txRecords: RawRpcInteractionRecord[] = rawTxLines.map((l) => JSON.parse(l));
 
-    const txMap = new Map<string, VersionedTransactionMetadata>();
+    const txMap = new Map<string, VersionedTransactionMetadata | null>();
+    const recordedSignatures = new Set<string>();
+
     for (const rec of txRecords) {
       const sig = rec.request?.params?.[0] as string;
-      if (!sig) {
+      if (!sig || typeof sig !== "string") {
         throw new Error("[REPLAY_MALFORMED_TRANSACTION] Missing signature in transaction request");
       }
+      recordedSignatures.add(sig);
+
+      // Handle recorded RPC error or missing/null response without fabricating data (B2-FINAL-03)
+      if (rec.error || !rec.response) {
+        txMap.set(sig, null);
+        continue;
+      }
+
       const res = rec.response;
-      if (!res || typeof res !== "object" || !("result" in res)) {
+      if (typeof res !== "object" || res === null) {
+        txMap.set(sig, null);
+        continue;
+      }
+
+      if ("error" in res && (res as Record<string, unknown>).error) {
+        txMap.set(sig, null);
+        continue;
+      }
+
+      if (!("result" in res)) {
         throw new Error(
           `[REPLAY_MALFORMED_TRANSACTION] Malformed transaction response for '${sig}'`,
         );
       }
-      const parsedTx = SolanaRpcTransactionFetcher.parseTransactionResponse(sig, res);
-      if (!parsedTx) {
-        throw new Error(
-          `[REPLAY_MALFORMED_TRANSACTION] Failed to parse transaction response for '${sig}': invalid slot or format`,
-        );
-      }
+
+      const parsedTx = SolanaRpcTransactionFetcher.parseTransactionResponse(
+        sig,
+        res as Record<string, unknown>,
+      );
       txMap.set(sig, parsedTx);
     }
 
-    // 4. Read raw-accounts.jsonl
-    const accountMap = loadAccountMapFromFixtures(config.replayFixturesPath, {
-      replayMode: config.replayMode ?? "authentic",
-    });
+    // 4. Read raw-accounts.jsonl (supporting recorded missing accounts and RPC failures authentically)
+    const accountsPath = path.join(config.replayFixturesPath, "raw-accounts.jsonl");
+    const rawAccountLines = fsSync
+      .readFileSync(accountsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+    const accountRecords: RawRpcInteractionRecord[] = rawAccountLines.map((l) => JSON.parse(l));
+
+    const accountMap = new Map<string, DiscoveredPoolAccountPayload | null>();
+    const recordedAccountAddresses = new Set<string>();
+    let maxSlotSeen = 0;
+
+    for (const rec of accountRecords) {
+      const method = rec.request?.method;
+      const params = rec.request?.params;
+
+      if (method === "getAccountInfo") {
+        const addr = params?.[0] as string;
+        if (addr && typeof addr === "string") {
+          recordedAccountAddresses.add(addr);
+          if (rec.error || !rec.response) {
+            accountMap.set(addr, null);
+            continue;
+          }
+          const resObj = rec.response as Record<string, unknown>;
+          const result = resObj?.result as Record<string, unknown> | null | undefined;
+          const val = result?.value as Record<string, unknown> | null | undefined;
+          const slot = (result?.context as Record<string, unknown>)?.slot as number | undefined;
+          if (typeof slot === "number" && slot > maxSlotSeen) {
+            maxSlotSeen = slot;
+          }
+          if (!val || !val.data || !Array.isArray(val.data) || !val.data[0]) {
+            accountMap.set(addr, null);
+          } else {
+            accountMap.set(addr, {
+              address: addr,
+              data: Buffer.from(val.data[0] as string, "base64"),
+              owner: (val.owner as string) ?? "",
+              lamports: BigInt((val.lamports as number | bigint) ?? 0),
+              slot: slot ?? 300000100,
+            });
+          }
+        }
+      } else if (method === "getMultipleAccounts") {
+        const addrs = params?.[0] as string[];
+        if (Array.isArray(addrs)) {
+          for (const a of addrs) {
+            if (a && typeof a === "string") recordedAccountAddresses.add(a);
+          }
+          if (rec.error || !rec.response) {
+            for (const a of addrs) {
+              if (a) accountMap.set(a, null);
+            }
+            continue;
+          }
+          const resObj = rec.response as Record<string, unknown>;
+          const result = resObj?.result as Record<string, unknown> | null | undefined;
+          const vals = result?.value as Array<Record<string, unknown> | null> | null | undefined;
+          const slot = (result?.context as Record<string, unknown>)?.slot as number | undefined;
+          if (typeof slot === "number" && slot > maxSlotSeen) {
+            maxSlotSeen = slot;
+          }
+          if (Array.isArray(vals)) {
+            for (let i = 0; i < addrs.length; i++) {
+              const a = addrs[i];
+              const val = vals[i];
+              if (!a) continue;
+              if (!val || !val.data || !Array.isArray(val.data) || !val.data[0]) {
+                accountMap.set(a, null);
+              } else {
+                accountMap.set(a, {
+                  address: a,
+                  data: Buffer.from(val.data[0] as string, "base64"),
+                  owner: (val.owner as string) ?? "",
+                  lamports: BigInt((val.lamports as number | bigint) ?? 0),
+                  slot: slot ?? 300000100,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
 
     // 5. Build authentic fetchers (fail closed if requested item not in recorded wire records)
     const txFetcher: ITransactionFetcher = {
       fetchTransaction: async (sig: string) => {
-        const tx = txMap.get(sig);
-        if (!tx) {
+        if (!recordedSignatures.has(sig)) {
           throw new Error(
             `[REPLAY_MISSING_TRANSACTION] Transaction wire record missing for signature '${sig}'`,
           );
         }
-        return tx;
+        return txMap.get(sig) ?? null;
       },
     };
 
-    let maxSlotSeen = 0;
-    for (const acc of accountMap.values()) {
-      if (acc.slot > maxSlotSeen) maxSlotSeen = acc.slot;
+    if (maxSlotSeen === 0) {
+      for (const n of notifications) {
+        const slot = n.envelope?.params?.result?.context?.slot;
+        if (typeof slot === "number" && slot > maxSlotSeen) maxSlotSeen = slot;
+      }
+      if (maxSlotSeen === 0) maxSlotSeen = 300000100;
     }
 
     const accountFetcher: IOnChainAccountFetcher = {
       getAccountInfo: async (addr: string) => {
-        const acc = accountMap.get(addr);
-        if (!acc) {
+        if (!recordedAccountAddresses.has(addr)) {
           throw new Error(
             `[REPLAY_MISSING_ACCOUNT] Account wire record missing for address '${addr}'`,
           );
         }
-        return acc;
+        return accountMap.get(addr) ?? null;
       },
       getMultipleAccounts: async (addrs: readonly string[]) => {
         return addrs.map((addr) => {
-          const acc = accountMap.get(addr);
-          if (!acc) {
+          if (!recordedAccountAddresses.has(addr)) {
             throw new Error(
               `[REPLAY_MISSING_ACCOUNT] Account wire record missing for address '${addr}'`,
             );
           }
-          return acc;
+          return accountMap.get(addr) ?? null;
         });
       },
       getSlot: async () => maxSlotSeen,
@@ -2225,10 +2339,46 @@ export async function runReplaySession(
         .trim()
         .split("\n")
         .filter((l) => l.trim().length > 0);
-      if (recEventLines.length !== discoveredEvents.length) {
+      const recordedEvents: DiscoveredPoolInitializationEvent[] = recEventLines.map((l) =>
+        JSON.parse(l),
+      );
+
+      if (recordedEvents.length !== discoveredEvents.length) {
         throw new Error(
-          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recEventLines.length} discovered events, reproduced ${discoveredEvents.length}`,
+          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recordedEvents.length} discovered events, reproduced ${discoveredEvents.length}`,
         );
+      }
+
+      // Field-by-field verification of stable content (B2-FINAL-03)
+      for (let i = 0; i < recordedEvents.length; i++) {
+        const rec = recordedEvents[i]!;
+        const rep = discoveredEvents[i];
+        if (!rep) {
+          throw new Error(`[REPLAY_REPRODUCTION_MISMATCH] Missing reproduced event at index ${i}`);
+        }
+
+        const stableEventFields: (keyof DiscoveredPoolInitializationEvent)[] = [
+          "eventId",
+          "signature",
+          "protocol",
+          "poolId",
+          "slot",
+          "instructionIndex",
+          "token0Mint",
+          "token1Mint",
+          "token0Vault",
+          "token1Vault",
+        ];
+
+        for (const f of stableEventFields) {
+          const repVal = String(rep[f] ?? "");
+          const recVal = String(rec[f] ?? "");
+          if (repVal !== recVal) {
+            throw new Error(
+              `[REPLAY_REPRODUCTION_MISMATCH] Discovered event at index ${i} has mismatched '${String(f)}': recorded='${recVal}', reproduced='${repVal}'`,
+            );
+          }
+        }
       }
     }
 
@@ -2239,9 +2389,83 @@ export async function runReplaySession(
         .trim()
         .split("\n")
         .filter((l) => l.trim().length > 0);
-      if (recReportLines.length !== dispatchResults.length) {
+      const recordedReports: VerificationDispatchResult[] = recReportLines.map((l) =>
+        JSON.parse(l),
+      );
+
+      if (recordedReports.length !== dispatchResults.length) {
         throw new Error(
-          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recReportLines.length} verification reports, reproduced ${dispatchResults.length}`,
+          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recordedReports.length} verification reports, reproduced ${dispatchResults.length}`,
+        );
+      }
+
+      // Field-by-field verification of stable content (B2-FINAL-03)
+      for (let i = 0; i < recordedReports.length; i++) {
+        const rec = recordedReports[i]!;
+        const rep = dispatchResults[i];
+        if (!rep) {
+          throw new Error(
+            `[REPLAY_REPRODUCTION_MISMATCH] Missing reproduced verification report at index ${i}`,
+          );
+        }
+
+        const stableReportFields: (keyof VerificationDispatchResult)[] = [
+          "poolId",
+          "protocol",
+          "verified",
+          "verificationTier",
+          "transactionSlot",
+          "poolAccountSlot",
+          "vault0AccountSlot",
+          "vault1AccountSlot",
+          "slotDiscrepancy",
+          "slotDelta",
+          "effectiveReservesAvailable",
+          "spotPriceSol",
+        ];
+
+        for (const f of stableReportFields) {
+          if (f === "spotPriceSol") {
+            if (rec.spotPriceSol === null && rep.spotPriceSol === null) continue;
+            if (
+              rec.spotPriceSol === null ||
+              rep.spotPriceSol === null ||
+              Math.abs(Number(rec.spotPriceSol) - Number(rep.spotPriceSol)) > 1e-12
+            ) {
+              throw new Error(
+                `[REPLAY_REPRODUCTION_MISMATCH] Verification report at index ${i} has mismatched spotPriceSol: recorded=${rec.spotPriceSol}, reproduced=${rep.spotPriceSol}`,
+              );
+            }
+          } else {
+            const repVal = String(rep[f] ?? "");
+            const recVal = String(rec[f] ?? "");
+            if (repVal !== recVal) {
+              throw new Error(
+                `[REPLAY_REPRODUCTION_MISMATCH] Verification report at index ${i} has mismatched '${String(f)}': recorded='${recVal}', reproduced='${repVal}'`,
+              );
+            }
+          }
+        }
+      }
+    }
+
+    const metadataPath = path.join(config.replayFixturesPath, "session-metadata.json");
+    if (fsSync.existsSync(metadataPath)) {
+      const meta = JSON.parse(fsSync.readFileSync(metadataPath, "utf8"));
+      if (
+        typeof meta.totalEventsDiscovered === "number" &&
+        meta.totalEventsDiscovered !== discoveredEvents.length
+      ) {
+        throw new Error(
+          `[REPLAY_REPRODUCTION_MISMATCH] Metadata totalEventsDiscovered (${meta.totalEventsDiscovered}) does not match reproduced events (${discoveredEvents.length})`,
+        );
+      }
+      if (
+        typeof meta.totalPoolsVerified === "number" &&
+        meta.totalPoolsVerified !== dispatchResults.filter((r) => r.verified).length
+      ) {
+        throw new Error(
+          `[REPLAY_REPRODUCTION_MISMATCH] Metadata totalPoolsVerified (${meta.totalPoolsVerified}) does not match reproduced verified pools (${dispatchResults.filter((r) => r.verified).length})`,
         );
       }
     }
@@ -2407,10 +2631,14 @@ export async function runLiveEventDiscoverySession(
 
   const rpcTransport = config.rpcTransport ?? createDefaultSolanaRpcTransport();
 
+  const maxTxBudget = config.maxTransactions ?? 25;
+  const maxAccBudget = config.maxAccountReads ?? 20;
+  const maxCombinedRpcBudget = config.rpcMaxCalls ?? maxTxBudget + maxAccBudget;
+
   const txFetcher = new SolanaRpcTransactionFetcher({
     rpcUrl: config.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC,
     transport: rpcTransport,
-    maxTransactionsBudget: config.maxTransactions ?? 25,
+    maxTransactionsBudget: maxTxBudget,
     httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
     commitment: "confirmed",
     onLog: (msg) => logger.info("SOLANA_RPC_TX", msg),
@@ -2419,7 +2647,7 @@ export async function runLiveEventDiscoverySession(
   const accountFetcher = new SolanaRpcRecordingAccountFetcher({
     rpcUrl: config.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC,
     transport: rpcTransport,
-    maxAccountCallsBudget: config.rpcMaxCalls ?? 20,
+    maxAccountCallsBudget: maxAccBudget,
     httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
     commitment: "confirmed",
     onLog: (msg) => logger.info("SOLANA_RPC_ACC", msg),
@@ -2433,9 +2661,9 @@ export async function runLiveEventDiscoverySession(
     budgets: {
       durationSec: config.durationSec !== 7200 ? config.durationSec : 60,
       maxWsMessages: config.maxWsMessages ?? 500,
-      maxTransactions: config.maxTransactions ?? 25,
-      maxAccountReads: config.rpcMaxCalls ?? 20,
-      maxTotalRpcCalls: (config.rpcMaxCalls ?? 20) + (config.maxTransactions ?? 25),
+      maxTransactions: maxTxBudget,
+      maxAccountReads: maxAccBudget,
+      maxTotalRpcCalls: maxCombinedRpcBudget,
       maxRssMb: config.maxRssMb ?? 256,
       maxDiskMb: config.maxMb ?? 256,
     },
@@ -2499,6 +2727,11 @@ export async function runPilotCollectorCli(
   } catch (err) {
     console.error(`[CONFIG_ERROR] Failed to parse CLI arguments: ${err}`);
     return 1;
+  }
+
+  if (config.help) {
+    console.log(CLI_HELP_TEXT);
+    return 0;
   }
 
   // D.2.9-B Authorization Guard (BREADY-05 / B2-READY-01): Reject live WebSocket event capture unless explicitly authorized

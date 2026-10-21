@@ -31,6 +31,7 @@ import {
 } from "./EventDiscoverySessionCoordinator.js";
 import {
   EXPECTED_B2_EVIDENCE_FILES,
+  ProgressiveEvidenceRecorder,
   saveB2EventSession,
   verifyB2SessionManifest,
 } from "./EventSessionEvidenceCapture.js";
@@ -55,6 +56,7 @@ import {
 } from "./fixtures/AuthoritativeCpmmFixtures.js";
 import {
   loadAccountMapFromFixtures,
+  parseCliArgs,
   PilotLogger,
   runPilotCollectorCli,
   runReplaySession,
@@ -83,8 +85,28 @@ class MockWebSocketTransport implements ISolanaWebSocketTransport {
   private errorListeners: ((err: Error) => void)[] = [];
   private closeListeners: ((code: number, reason: string) => void)[] = [];
 
+  public autoOpenAndAck = false;
+
   public send(data: string): void {
     this.sentFrames.push(data);
+    if (this.autoOpenAndAck) {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.method === "logsSubscribe" && parsed.id) {
+          setTimeout(() => {
+            this.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: typeof parsed.id === "number" ? parsed.id * 10 : 100,
+              }),
+            );
+          }, 5);
+        }
+      } catch {
+        // ignore
+      }
+    }
   }
 
   public close(code?: number, reason?: string): void {
@@ -102,12 +124,18 @@ class MockWebSocketTransport implements ISolanaWebSocketTransport {
       | ((err: Error) => void)
       | ((code: number, reason: string) => void),
   ): void {
-    if (event === "open") this.openListeners.push(listener as () => void);
-    else if (event === "message")
+    if (event === "open") {
+      this.openListeners.push(listener as () => void);
+      if (this.autoOpenAndAck) {
+        setTimeout(() => (listener as () => void)(), 5);
+      }
+    } else if (event === "message") {
       this.messageListeners.push(listener as (data: string | Buffer) => void);
-    else if (event === "error") this.errorListeners.push(listener as (err: Error) => void);
-    else if (event === "close")
+    } else if (event === "error") {
+      this.errorListeners.push(listener as (err: Error) => void);
+    } else if (event === "close") {
       this.closeListeners.push(listener as (code: number, reason: string) => void);
+    }
   }
 
   public triggerOpen(): void {
@@ -120,6 +148,13 @@ class MockWebSocketTransport implements ISolanaWebSocketTransport {
 
   public triggerError(err: Error): void {
     for (const fn of this.errorListeners) fn(err);
+  }
+
+  public triggerClose(code?: number, reason?: string): void {
+    this.closed = true;
+    this.closeCode = code ?? 1006;
+    this.closeReason = reason ?? "Abnormal closure";
+    for (const fn of this.closeListeners) fn(this.closeCode, this.closeReason);
   }
 }
 
@@ -553,6 +588,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
 
   it("coordinates full prospective discovery session, obeys all budgets, and generates auditable accounting", async () => {
     const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = true;
     const mockRpc = new MockSolanaRpcTransport();
 
     const wsClient = new SolanaWebSocketSubscriptionClient({
@@ -670,6 +706,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
 
   it("handles operator interruption cleanly with honest status and sealed evidence", async () => {
     const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = true;
     const mockRpc = new MockSolanaRpcTransport();
 
     const wsClient = new SolanaWebSocketSubscriptionClient({
@@ -776,6 +813,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
 
     // 2. Explicit operator flag with offline mock transports executes cleanly
     const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = true;
     const mockRpc = new MockSolanaRpcTransport();
     const logger = new PilotLogger();
 
@@ -1242,6 +1280,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
 
   it("B2-READY-05: safe zero-event session finishes as FINALIZED without error", async () => {
     const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = true;
     const mockRpc = new MockSolanaRpcTransport();
 
     const wsClient = new SolanaWebSocketSubscriptionClient({
@@ -1279,5 +1318,872 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
     expect(summary.accounting.poolsVerifiedCoherent).toBe(0);
     expect(summary.manifest?.status).toBe("FINALIZED");
     expect(summary.manifestVerified).toBe(true);
+  });
+
+  // =========================================================================
+  // D.2.9-B2 Audit Findings Safeguards (B2-FINAL-02, B2-FINAL-03, B2-FINAL-04)
+  // =========================================================================
+
+  it("B2-FINAL-02: CLI budget flags parse and coordinator enforces 25 tx, 20 acc, and 45 combined RPC ceiling", async () => {
+    const rawArgs = [
+      "node",
+      "PilotLiveCollectorCli.js",
+      "--network=enabled",
+      "--discovery-source=events",
+      "--duration-sec=60",
+      "--max-transactions=25",
+      "--max-account-reads=20",
+      "--rpc-max-calls=45",
+      "--max-ws-messages=500",
+      "--max-events=50",
+    ];
+
+    const config = parseCliArgs(rawArgs);
+    expect(config.durationSec).toBe(60);
+    expect(config.maxTransactions).toBe(25);
+    expect(config.maxAccountReads).toBe(20);
+    expect(config.rpcMaxCalls).toBe(45);
+    expect(config.maxWsMessages).toBe(500);
+    expect(config.maxEvents).toBe(50);
+
+    const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = true;
+    const mockRpc = new MockSolanaRpcTransport();
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+    });
+    const txFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+      maxTransactionsBudget: config.maxTransactions,
+    });
+    const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+      maxAccountCallsBudget: config.maxAccountReads,
+    });
+
+    const coordinator = new EventDiscoverySessionCoordinator({
+      wsClient,
+      txFetcher,
+      accountFetcher,
+      captureBaseDir: path.join(testTmpBase, "budget-test"),
+      budgets: {
+        durationSec: config.durationSec,
+        maxTransactions: config.maxTransactions,
+        maxAccountReads: config.maxAccountReads,
+        maxTotalRpcCalls: config.rpcMaxCalls,
+      },
+    });
+
+    expect(coordinator.getBudgets().maxTransactions).toBe(25);
+    expect(coordinator.getBudgets().maxAccountReads).toBe(20);
+    expect(coordinator.getBudgets().maxTotalRpcCalls).toBe(45);
+    expect(coordinator.getBudgets().durationSec).toBe(60);
+
+    // Test compiled command offline with network disabled, verifying all options parse and validate correctly
+    const helpCode = await runPilotCollectorCli(["node", "PilotLiveCollectorCli.js", "--help"]);
+    expect(helpCode).toBe(0);
+
+    const disabledNetCode = await runPilotCollectorCli([
+      "node",
+      "PilotLiveCollectorCli.js",
+      "--network=disabled",
+      "--discovery-source=events",
+      "--duration-sec=60",
+      "--max-transactions=25",
+      "--max-account-reads=20",
+      "--rpc-max-calls=45",
+    ]);
+    expect(disabledNetCode).toBe(1);
+  });
+
+  it("B2-FINAL-03: authentic replay reproduction validates stable fields and fails on content tampering", async () => {
+    const ammV4Tx = createAmmV4InitTransactionFixture();
+    const sig = ammV4Tx.signature;
+    const sessionDir = path.join(testTmpBase, "b2-repro-validation-base");
+
+    saveB2EventSession({
+      captureBaseDir: testTmpBase,
+      sessionId: "b2-repro-validation-base",
+      forcedStatus: "FINALIZED",
+      rawNotifications: [
+        {
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 10,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: {
+                  signature: sig,
+                  err: null,
+                  logs: ["Program log: initialize2"],
+                },
+              },
+              subscription: 10,
+            },
+          },
+        },
+      ],
+      rawTransactions: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            method: "getTransaction",
+            params: [sig, { encoding: "json", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            result: {
+              slot: 450000100,
+              blockTime: 1746886997,
+              version: 0,
+              transaction: {
+                message: {
+                  accountKeys: ammV4Tx.accountKeys.staticAccountKeys,
+                  instructions: ammV4Tx.instructions,
+                },
+              },
+              meta: { err: null, innerInstructions: [] },
+            },
+          },
+          timing: { elapsedMs: 50, payloadSizeBytes: 2000 },
+        },
+      ],
+      rawAccounts: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            method: "getAccountInfo",
+            params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            result: {
+              context: { slot: 450000100 },
+              value: {
+                data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                lamports: 10000000,
+              },
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            method: "getMultipleAccounts",
+            params: [
+              [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+              { encoding: "base64", commitment: "confirmed" },
+            ],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            result: {
+              context: { slot: 450000100 },
+              value: [
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_MEME_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_WSOL_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+              ],
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+      ],
+      discoveredEvents: [
+        {
+          eventId: `${sig}:0`,
+          signature: sig,
+          outerInstructionIndex: 0,
+          instructionIndex: 0,
+          slot: 450000100,
+          blockTimeSec: 1746886997,
+          firstSeenTimestampMs: Date.now(),
+          instructionRequestedOpenTimeSec: 1746886997,
+          poolOpenTimeSec: 1746886997,
+          protocol: "RAYDIUM_AMM_V4",
+          poolId: FIXTURE_POOL_ADDRESS,
+          token0Mint: FIXTURE_MEME_MINT,
+          token1Mint: FIXTURE_WSOL_MINT,
+          token0Vault: FIXTURE_BASE_VAULT,
+          token1Vault: FIXTURE_QUOTE_VAULT,
+        },
+      ],
+      verificationReports: [
+        {
+          poolId: FIXTURE_POOL_ADDRESS,
+          protocol: "RAYDIUM_AMM_V4",
+          verified: true,
+          verificationTier: "VERIFIED_AMM_V4",
+          transactionSlot: 450000100,
+          poolAccountSlot: 450000100,
+          vault0AccountSlot: 450000100,
+          vault1AccountSlot: 450000100,
+          slotDiscrepancy: false,
+          slotDelta: 0,
+          verifiedAtEpochMs: Date.now(),
+          hostObservationTimestampMs: Date.now(),
+          effectiveReservesAvailable: true,
+          spotPriceSol: null,
+          spotPrice0Per1: null,
+        },
+      ],
+    });
+
+    const logger = new PilotLogger();
+
+    // 1. Replay authentic session -> succeeds
+    const okReplay = await runReplaySession(
+      {
+        network: "disabled",
+        rpcUrl: "https://api.mainnet-beta.solana.com",
+        replayFixturesPath: sessionDir,
+        replayMode: "authentic",
+        pollIntervalSec: 1,
+        durationSec: 10,
+        targetCandidates: 1,
+        maxCandidatesScreened: 1,
+        targetDiagnosticYield: 1,
+        maxMb: 10,
+        maxRssMb: 256,
+        outputDir: testTmpBase,
+        enableForwardObservations: false,
+      },
+      logger,
+    );
+    expect(okReplay.ok).toBe(true);
+    expect(okReplay.poolsVerified).toBe(1);
+
+    // 2. Negative test: Mutate poolId in discoveredEvents -> reproduction fails
+    const tamperedEventDir = path.join(testTmpBase, "tampered-event-poolid");
+    saveB2EventSession({
+      captureBaseDir: testTmpBase,
+      sessionId: "tampered-event-poolid",
+      forcedStatus: "FINALIZED",
+      rawNotifications: [
+        {
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 10,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: { signature: sig, err: null, logs: ["Program log: initialize2"] },
+              },
+              subscription: 10,
+            },
+          },
+        },
+      ],
+      rawTransactions: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            method: "getTransaction",
+            params: [sig, { encoding: "json", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            result: {
+              slot: 450000100,
+              blockTime: 1746886997,
+              version: 0,
+              transaction: {
+                message: {
+                  accountKeys: ammV4Tx.accountKeys.staticAccountKeys,
+                  instructions: ammV4Tx.instructions,
+                },
+              },
+              meta: { err: null, innerInstructions: [] },
+            },
+          },
+          timing: { elapsedMs: 50, payloadSizeBytes: 2000 },
+        },
+      ],
+      rawAccounts: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            method: "getAccountInfo",
+            params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            result: {
+              context: { slot: 450000100 },
+              value: {
+                data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                lamports: 10000000,
+              },
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            method: "getMultipleAccounts",
+            params: [
+              [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+              { encoding: "base64", commitment: "confirmed" },
+            ],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            result: {
+              context: { slot: 450000100 },
+              value: [
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_MEME_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_WSOL_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+              ],
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+      ],
+      discoveredEvents: [
+        {
+          eventId: `${sig}:0`,
+          signature: sig,
+          outerInstructionIndex: 0,
+          instructionIndex: 0,
+          slot: 450000100,
+          blockTimeSec: 1746886997,
+          firstSeenTimestampMs: Date.now(),
+          instructionRequestedOpenTimeSec: 1746886997,
+          poolOpenTimeSec: 1746886997,
+          protocol: "RAYDIUM_AMM_V4",
+          poolId: "MutatedPoolAddress1111111111111111111111111111", // MUTATED POOL ID
+          token0Mint: FIXTURE_MEME_MINT,
+          token1Mint: FIXTURE_WSOL_MINT,
+          token0Vault: FIXTURE_BASE_VAULT,
+          token1Vault: FIXTURE_QUOTE_VAULT,
+        },
+      ],
+      verificationReports: [
+        {
+          poolId: FIXTURE_POOL_ADDRESS,
+          protocol: "RAYDIUM_AMM_V4",
+          verified: true,
+          verificationTier: "VERIFIED_AMM_V4",
+          transactionSlot: 450000100,
+          poolAccountSlot: 450000100,
+          vault0AccountSlot: 450000100,
+          vault1AccountSlot: 450000100,
+          slotDiscrepancy: false,
+          slotDelta: 0,
+          verifiedAtEpochMs: Date.now(),
+          hostObservationTimestampMs: Date.now(),
+          effectiveReservesAvailable: true,
+          spotPriceSol: null,
+          spotPrice0Per1: null,
+        },
+      ],
+    });
+
+    await expect(
+      runReplaySession(
+        {
+          network: "disabled",
+          rpcUrl: "https://api.mainnet-beta.solana.com",
+          replayFixturesPath: tamperedEventDir,
+          replayMode: "authentic",
+          pollIntervalSec: 1,
+          durationSec: 10,
+          targetCandidates: 1,
+          maxCandidatesScreened: 1,
+          targetDiagnosticYield: 1,
+          maxMb: 10,
+          maxRssMb: 256,
+          outputDir: testTmpBase,
+          enableForwardObservations: false,
+        },
+        logger,
+      ),
+    ).rejects.toThrow("REPLAY_REPRODUCTION_MISMATCH");
+
+    // 3. Negative test: Mutate verification report verdict -> reproduction fails
+    const tamperedReportDir = path.join(testTmpBase, "tampered-report-verdict");
+    saveB2EventSession({
+      captureBaseDir: testTmpBase,
+      sessionId: "tampered-report-verdict",
+      forcedStatus: "FINALIZED",
+      rawNotifications: [
+        {
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 10,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: { signature: sig, err: null, logs: ["Program log: initialize2"] },
+              },
+              subscription: 10,
+            },
+          },
+        },
+      ],
+      rawTransactions: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            method: "getTransaction",
+            params: [sig, { encoding: "json", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            result: {
+              slot: 450000100,
+              blockTime: 1746886997,
+              version: 0,
+              transaction: {
+                message: {
+                  accountKeys: ammV4Tx.accountKeys.staticAccountKeys,
+                  instructions: ammV4Tx.instructions,
+                },
+              },
+              meta: { err: null, innerInstructions: [] },
+            },
+          },
+          timing: { elapsedMs: 50, payloadSizeBytes: 2000 },
+        },
+      ],
+      rawAccounts: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            method: "getAccountInfo",
+            params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            result: {
+              context: { slot: 450000100 },
+              value: {
+                data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                lamports: 10000000,
+              },
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            method: "getMultipleAccounts",
+            params: [
+              [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+              { encoding: "base64", commitment: "confirmed" },
+            ],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            result: {
+              context: { slot: 450000100 },
+              value: [
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_MEME_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_WSOL_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+              ],
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+      ],
+      discoveredEvents: [
+        {
+          eventId: `${sig}:0`,
+          signature: sig,
+          outerInstructionIndex: 0,
+          instructionIndex: 0,
+          slot: 450000100,
+          blockTimeSec: 1746886997,
+          firstSeenTimestampMs: Date.now(),
+          instructionRequestedOpenTimeSec: 1746886997,
+          poolOpenTimeSec: 1746886997,
+          protocol: "RAYDIUM_AMM_V4",
+          poolId: FIXTURE_POOL_ADDRESS,
+          token0Mint: FIXTURE_MEME_MINT,
+          token1Mint: FIXTURE_WSOL_MINT,
+          token0Vault: FIXTURE_BASE_VAULT,
+          token1Vault: FIXTURE_QUOTE_VAULT,
+        },
+      ],
+      verificationReports: [
+        {
+          poolId: FIXTURE_POOL_ADDRESS,
+          protocol: "RAYDIUM_AMM_V4",
+          verified: false, // MUTATED VERDICT
+          verificationTier: "REJECTED", // MUTATED TIER
+          transactionSlot: 450000100,
+          poolAccountSlot: 450000100,
+          vault0AccountSlot: 450000100,
+          vault1AccountSlot: 450000100,
+          slotDiscrepancy: false,
+          slotDelta: 0,
+          verifiedAtEpochMs: Date.now(),
+          hostObservationTimestampMs: Date.now(),
+          effectiveReservesAvailable: true,
+          spotPriceSol: null,
+          spotPrice0Per1: null,
+        },
+      ],
+    });
+
+    await expect(
+      runReplaySession(
+        {
+          network: "disabled",
+          rpcUrl: "https://api.mainnet-beta.solana.com",
+          replayFixturesPath: tamperedReportDir,
+          replayMode: "authentic",
+          pollIntervalSec: 1,
+          durationSec: 10,
+          targetCandidates: 1,
+          maxCandidatesScreened: 1,
+          targetDiagnosticYield: 1,
+          maxMb: 10,
+          maxRssMb: 256,
+          outputDir: testTmpBase,
+          enableForwardObservations: false,
+        },
+        logger,
+      ),
+    ).rejects.toThrow("REPLAY_REPRODUCTION_MISMATCH");
+  });
+
+  it("B2-FINAL-03: authentic replay reproduces legitimately recorded failed RPC calls and missing accounts without fabricated data", async () => {
+    const errorSessionDir = path.join(testTmpBase, "b2-error-capture-session");
+    const sig = "err-sig-failed-call-11111111111111111111111111111";
+
+    saveB2EventSession({
+      captureBaseDir: testTmpBase,
+      sessionId: "b2-error-capture-session",
+      forcedStatus: "FINALIZED",
+      rawNotifications: [
+        {
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 10,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: { signature: sig, err: null, logs: ["Program log: initialize2"] },
+              },
+              subscription: 10,
+            },
+          },
+        },
+      ],
+      rawTransactions: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "tx-req-failed",
+            method: "getTransaction",
+            params: [sig, { encoding: "json", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: null,
+          error: "Simulated 503 Service Unavailable",
+          timing: { elapsedMs: 50, payloadSizeBytes: 0 },
+        },
+      ],
+      rawAccounts: [],
+      discoveredEvents: [],
+      verificationReports: [],
+    });
+
+    const logger = new PilotLogger();
+    const replayResult = await runReplaySession(
+      {
+        network: "disabled",
+        rpcUrl: "https://api.mainnet-beta.solana.com",
+        replayFixturesPath: errorSessionDir,
+        replayMode: "authentic",
+        pollIntervalSec: 1,
+        durationSec: 10,
+        targetCandidates: 1,
+        maxCandidatesScreened: 1,
+        targetDiagnosticYield: 1,
+        maxMb: 10,
+        maxRssMb: 256,
+        outputDir: testTmpBase,
+        enableForwardObservations: false,
+      },
+      logger,
+    );
+
+    expect(replayResult.ok).toBe(true);
+    expect(replayResult.metrics.transactionFetchFailures).toBe(1);
+    expect(replayResult.poolsVerified).toBe(0);
+  });
+
+  it("B2-FINAL-04: missing WebSocket startup subscription acknowledgment fails closed with FAILED status", async () => {
+    const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = false;
+    const mockRpc = new MockSolanaRpcTransport();
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+    });
+    const txFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+    const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+
+    const coordinator = new EventDiscoverySessionCoordinator({
+      wsClient,
+      txFetcher,
+      accountFetcher,
+      captureBaseDir: path.join(testTmpBase, "unack-session"),
+      budgets: { durationSec: 0.1 },
+    });
+
+    wsTransport.triggerOpen();
+    // Only acknowledge AMM v4 (id: 1), but do NOT acknowledge CPMM (id: 2)
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 100 }));
+
+    const summary = await coordinator.runSession();
+    expect(summary.status).toBe("FAILED");
+    expect(summary.stopReason).toContain("WS_SUBSCRIPTION_STARTUP_TIMEOUT");
+    expect(summary.manifest?.status).toBe("FAILED");
+  });
+
+  it("B2-FINAL-04: unexpected WebSocket disconnect fails closed with FAILED status", async () => {
+    const wsTransport = new MockWebSocketTransport();
+    wsTransport.autoOpenAndAck = false;
+    const mockRpc = new MockSolanaRpcTransport();
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+    });
+    const txFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+    const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+
+    const coordinator = new EventDiscoverySessionCoordinator({
+      wsClient,
+      txFetcher,
+      accountFetcher,
+      captureBaseDir: path.join(testTmpBase, "disconnect-session"),
+      budgets: { durationSec: 1 },
+    });
+
+    wsTransport.triggerOpen();
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 100 }));
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 200 }));
+
+    // Trigger unexpected close
+    setTimeout(() => {
+      wsTransport.triggerClose(1006, "Abnormal closure");
+    }, 20);
+
+    const summary = await coordinator.runSession();
+    expect(summary.status).toBe("FAILED");
+    expect(summary.stopReason).toContain("WS_DISCONNECTED_UNEXPECTEDLY");
+    expect(summary.manifest?.status).toBe("FAILED");
+  });
+
+  it("B2-FINAL-04: progressive recorder preserves written evidence and reserved headroom seals manifest on disk exhaust", async () => {
+    const diskBudgetBase = path.join(testTmpBase, "disk-headroom-base");
+    fsSync.mkdirSync(diskBudgetBase, { recursive: true });
+
+    // 0.005 MB = ~5242 bytes (reserved headroom = 524 bytes, stream budget = 4718 bytes)
+    const recorder = new ProgressiveEvidenceRecorder({
+      captureBaseDir: diskBudgetBase,
+      sessionId: "exhausted-disk-session",
+      maxDiskMb: 0.005,
+    });
+
+    let hitLimit = false;
+    try {
+      for (let i = 0; i < 50; i++) {
+        recorder.recordNotification({
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 1,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000000 + i },
+                value: {
+                  signature: `sig-${i}-${"X".repeat(120)}`,
+                  err: null,
+                  logs: ["Program log: test"],
+                },
+              },
+              subscription: 1,
+            },
+          },
+        });
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes("DISK_BUDGET_EXCEEDED")) {
+        hitLimit = true;
+      }
+    }
+    expect(hitLimit).toBe(true);
+
+    // Finalize must succeed using reserved headroom!
+    const sealed = recorder.finalize({
+      status: "INTERRUPTED",
+      error: "DISK_BUDGET_EXCEEDED",
+    });
+
+    expect(sealed.status).toBe("INTERRUPTED");
+    expect(fsSync.existsSync(sealed.manifestPath)).toBe(true);
+    const verification = verifyB2SessionManifest(recorder.getSessionDir());
+    expect(verification.valid).toBe(true);
   });
 });

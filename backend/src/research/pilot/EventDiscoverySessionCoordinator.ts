@@ -209,6 +209,10 @@ export class EventDiscoverySessionCoordinator {
     });
   }
 
+  public getBudgets(): EventDiscoverySessionBudgets {
+    return { ...this.budgets };
+  }
+
   public requestStop(reason: string): void {
     this.stopRequested = true;
     this.stopReason = reason;
@@ -261,10 +265,40 @@ export class EventDiscoverySessionCoordinator {
       : "FINALIZED";
     let executionError: string | undefined = undefined;
 
+    // B2-FINAL-04: Bounded WebSocket startup acknowledgment check.
+    // Both AMM v4 and CPMM subscriptions must be acknowledged before classifying any observation.
+    const startupTimeoutMs = Math.min(5000, Math.max(50, durationMs));
+    const startupStartMs = Date.now();
+    let startupAcknowledged = this.wsClient.hasBothSubscriptionsActive();
+
+    while (!startupAcknowledged && Date.now() - startupStartMs < startupTimeoutMs) {
+      if (this.stopRequested || this.wsClient.getStatus() === "DISCONNECTED") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      startupAcknowledged = this.wsClient.hasBothSubscriptionsActive();
+    }
+
+    if (!startupAcknowledged && !this.stopRequested) {
+      const activeCount = this.wsClient.getMetrics().activeSubscriptionsCount;
+      sessionStatus = "FAILED";
+      executionError = `WS_SUBSCRIPTION_STARTUP_TIMEOUT: Expected 2 active subscriptions (AMM v4 and CPMM), got ${activeCount} within ${startupTimeoutMs}ms startup timeout`;
+      this.stopReason = executionError;
+      this.onLog?.(`[STARTUP_FAILURE] ${executionError}`);
+      this.isRunning = false;
+    }
+
     try {
       while (this.isRunning && !this.stopRequested) {
         const now = Date.now();
         const elapsed = now - startEpochMs;
+
+        // Health check: fail closed if WebSocket disconnected unexpectedly
+        if (this.wsClient.getStatus() === "DISCONNECTED") {
+          this.stopReason = "WS_DISCONNECTED_UNEXPECTEDLY";
+          sessionStatus = "FAILED";
+          break;
+        }
 
         // 1. Duration budget check
         if (elapsed >= durationMs) {
@@ -322,9 +356,14 @@ export class EventDiscoverySessionCoordinator {
         }
       }
     } catch (err) {
-      sessionStatus = "FAILED";
       executionError = err instanceof Error ? err.message : String(err);
-      this.stopReason = `EXECUTION_ERROR: ${executionError}`;
+      if (executionError.includes("DISK_BUDGET_EXCEEDED")) {
+        sessionStatus = "INTERRUPTED";
+        this.stopReason = `DISK_BUDGET_EXCEEDED: ${executionError}`;
+      } else {
+        sessionStatus = "FAILED";
+        this.stopReason = `EXECUTION_ERROR: ${executionError}`;
+      }
       this.onLog?.(`[SESSION_ERROR] ${executionError}`);
     } finally {
       this.isRunning = false;
@@ -333,6 +372,12 @@ export class EventDiscoverySessionCoordinator {
 
     if (this.stopRequested && sessionStatus === "FINALIZED") {
       sessionStatus = "INTERRUPTED";
+    }
+
+    // Zero-event session must not be finalized if subscriptions were never acknowledged
+    if (sessionStatus === "FINALIZED" && !startupAcknowledged) {
+      sessionStatus = "FAILED";
+      this.stopReason = "WS_SUBSCRIPTIONS_UNACKNOWLEDGED";
     }
 
     // Flush remaining in-flight records
