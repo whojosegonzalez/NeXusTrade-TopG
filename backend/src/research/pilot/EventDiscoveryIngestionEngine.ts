@@ -132,6 +132,8 @@ export class EventDiscoveryIngestionEngine {
   private unavailableTierCount = 0;
   private verificationRetries = 0;
   private exhaustedVerificationRetriesCount = 0;
+  private readonly discoveredEvents: DiscoveredPoolInitializationEvent[] = [];
+  private readonly verificationReports: VerificationDispatchResult[] = [];
 
   constructor(options: EventDiscoveryEngineOptions = {}) {
     this.maxQueueSize = options.maxQueueSize ?? 500;
@@ -325,6 +327,7 @@ export class EventDiscoveryIngestionEngine {
 
       item.lifecycleState = "TX_DECODE_SUCCESS";
       this.successfulInitDecodes += scanResult.events.length;
+      this.discoveredEvents.push(...scanResult.events);
 
       // 4. Dispatch verification for each identified pool initialization event
       for (const event of scanResult.events) {
@@ -465,6 +468,7 @@ export class EventDiscoveryIngestionEngine {
     event: DiscoveredPoolInitializationEvent,
     detectedAtMs: number,
   ): void {
+    this.verificationReports.push(dispatchResult);
     const verificationLatencyMs = Math.max(0, dispatchResult.verifiedAtEpochMs - detectedAtMs);
     this.totalVerificationLatencyMs += verificationLatencyMs;
     this.verificationLatencySamples += 1;
@@ -510,6 +514,14 @@ export class EventDiscoveryIngestionEngine {
 
   public getQueueLength(): number {
     return this.queue.length;
+  }
+
+  public getDiscoveredEvents(): readonly DiscoveredPoolInitializationEvent[] {
+    return this.discoveredEvents;
+  }
+
+  public getVerificationReports(): readonly VerificationDispatchResult[] {
+    return this.verificationReports;
   }
 
   public getMetricsSnapshot(): EventDiscoveryMetricsSnapshot {

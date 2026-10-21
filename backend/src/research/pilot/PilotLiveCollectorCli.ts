@@ -39,6 +39,7 @@ import {
   EventDiscoveryIngestionEngine,
   type ITransactionFetcher,
 } from "./EventDiscoveryIngestionEngine.js";
+import { verifyB2SessionManifest } from "./EventSessionEvidenceCapture.js";
 import type {
   DiscoveredPoolAccountPayload,
   EventDiscoveryMetricsSnapshot,
@@ -218,6 +219,8 @@ export interface PilotLiveCollectorConfig {
   readonly replayMode?: "synthetic" | "authentic" | undefined;
   readonly rpcMaxCalls?: number | undefined;
   readonly rpcTimeoutMs?: number | undefined;
+  readonly wsUrl?: string | undefined;
+  readonly maxWsMessages?: number | undefined;
   readonly maxEvents?: number | undefined;
   readonly maxTransactions?: number | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
@@ -283,6 +286,8 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let replayMode: "synthetic" | "authentic" | undefined = undefined;
   let rpcMaxCalls: number | undefined = undefined;
   let rpcTimeoutMs: number | undefined = undefined;
+  let wsUrl: string | undefined = undefined;
+  let maxWsMessages: number | undefined = undefined;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -307,9 +312,11 @@ Options:
   --replay-mode=synthetic|authentic Replay fidelity mode (default: synthetic, authentic requires sealed manifest) (B1-PREP-04)
   --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3 / B1-PREP-01)
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
+  --ws-url=<url>                   Solana WebSocket endpoint URL (default: wss://api.mainnet-beta.solana.com) (D29-B2)
   --rpc-max-calls=<n>              Outbound RPC call ceiling budget (default: 2 in CPMM verification mode) (B1-PREP-03)
   --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
   --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
+  --max-ws-messages=<n>            Maximum WebSocket incoming messages budget (default: 500) (D29-B2)
   --max-events=<n>                 Maximum event budget for event discovery (default: 50)
   --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
   --max-pool-age-sec=<n>           Max pool age in seconds (0 = filter-disabled mode, default: 0)
@@ -403,6 +410,14 @@ Options:
         throw new Error("[INVALID_ARGUMENT] Option '--rpc-url' requires a non-empty URL");
       }
       rpcUrl = val;
+    } else if (arg.startsWith("--ws-url=")) {
+      const val = arg.slice("--ws-url=".length).trim();
+      if (!val) {
+        throw new Error("[INVALID_ARGUMENT] Option '--ws-url' requires a non-empty URL");
+      }
+      wsUrl = val;
+    } else if (arg.startsWith("--max-ws-messages=")) {
+      maxWsMessages = parsePositiveInt("--max-ws-messages", arg.slice("--max-ws-messages=".length));
     } else if (arg.startsWith("--poll-interval-sec=")) {
       pollIntervalSec = parsePositiveInt(
         "--poll-interval-sec",
@@ -512,6 +527,8 @@ Options:
     replayMode,
     rpcMaxCalls,
     rpcTimeoutMs,
+    wsUrl,
+    maxWsMessages,
     maxEvents,
     maxTransactions,
   };
@@ -1525,10 +1542,63 @@ export function loadAccountMapFromFixtures(
   const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
   if (!fsSync.existsSync(fixturesPath)) return accountMap;
 
-  // Authentic Replay Mode (B1-PREP-04 / B1-EVIDENCE-01): Strict verification against sealed SHA-256 manifest
+  // Authentic Replay Mode (B1-PREP-04 / B1-EVIDENCE-01 / D29-B2): Strict verification against sealed SHA-256 manifest
   if (options?.replayMode === "authentic") {
     const stat = fsSync.statSync(fixturesPath);
     const targetDir = stat.isDirectory() ? fixturesPath : path.dirname(fixturesPath);
+
+    // Support B2 Event Discovery session manifest
+    if (fsSync.existsSync(path.join(targetDir, "session-manifest.json"))) {
+      verifyB2SessionManifest(targetDir);
+      const rawAccountsPath = path.join(targetDir, "raw-accounts.jsonl");
+      if (fsSync.existsSync(rawAccountsPath)) {
+        const rawLines = fsSync.readFileSync(rawAccountsPath, "utf8").trim().split("\n");
+        for (const line of rawLines) {
+          if (!line.trim()) continue;
+          try {
+            const record = JSON.parse(line);
+            const req = record.request;
+            const res = record.response;
+            if (req?.method === "getAccountInfo") {
+              const addr = req.params?.[0];
+              const val = res?.result?.value ?? res?.value;
+              const slot = res?.result?.context?.slot ?? res?.context?.slot ?? 300000100;
+              if (addr && val?.data?.[0]) {
+                accountMap.set(addr, {
+                  address: addr,
+                  data: Buffer.from(val.data[0], "base64"),
+                  owner: val.owner ?? "",
+                  lamports: BigInt(val.lamports ?? 0),
+                  slot,
+                });
+              }
+            } else if (req?.method === "getMultipleAccounts") {
+              const addrs = req.params?.[0] as string[];
+              const vals = res?.result?.value ?? res?.value;
+              const slot = res?.result?.context?.slot ?? res?.context?.slot ?? 300000100;
+              if (Array.isArray(addrs) && Array.isArray(vals)) {
+                for (let i = 0; i < addrs.length; i++) {
+                  const addr = addrs[i];
+                  const val = vals[i];
+                  if (addr && val?.data?.[0]) {
+                    accountMap.set(addr, {
+                      address: addr,
+                      data: Buffer.from(val.data[0], "base64"),
+                      owner: val.owner ?? "",
+                      lamports: BigInt(val.lamports ?? 0),
+                      slot,
+                    });
+                  }
+                }
+              }
+            }
+          } catch {
+            // ignore malformed line
+          }
+        }
+      }
+      return accountMap;
+    }
 
     const manifestName = fsSync.existsSync(path.join(targetDir, "cpmm-snapshot-manifest.json"))
       ? "cpmm-snapshot-manifest.json"
