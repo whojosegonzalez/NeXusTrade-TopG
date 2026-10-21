@@ -3983,6 +3983,100 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
         expect(replayedMap.size).toBe(3);
         expect(replayedMap.has(FIXTURE_CPMM_POOL_ADDRESS)).toBe(true);
       });
+
+      it("B1-PREFLIGHT-01: ensures mock transport throwing credential-bearing error propagates sanitized error without leaking secrets", async () => {
+        const testDir = await makeTestDir("credential-redaction-error-test");
+        const secretApiKey = "SuperSecretApiKeyXYZ12345";
+        const secretPassword = "SuperSecretPasswordABC987";
+        const secretPathKey = "SecretAlchemyPathToken555";
+        const credentialUrl = `https://user:${secretPassword}@mock-solana-node.internal:8899/v2/${secretPathKey}?api-key=${secretApiKey}&other=safe`;
+
+        let transportReceivedUrl = "";
+        const mockFailingTransport: ISolanaRpcTransport = {
+          async post(url: string) {
+            transportReceivedUrl = url;
+            // Mock network layer throwing error containing the full raw URL and credentials
+            throw new Error(
+              `FetchError: request to ${url} failed, reason: connect ECONNREFUSED with auth ${secretPassword} and token ${secretApiKey}`,
+            );
+          },
+        };
+
+        const logs: string[] = [];
+
+        // 1. Direct call to executeRpcCallWithRecord must throw sanitized error
+        const directClient = new SolanaRpcLiveObservationClient({
+          rpcUrl: credentialUrl,
+          transport: mockFailingTransport,
+          maxRequestsBudget: 2,
+          onLog: (msg) => logs.push(msg),
+        });
+
+        try {
+          await directClient.executeRpcCallWithRecord("getAccountInfo", [
+            FIXTURE_CPMM_POOL_ADDRESS,
+            { encoding: "base64" },
+          ]);
+          expect.fail("Expected executeRpcCallWithRecord to throw");
+        } catch (thrownErr) {
+          const err = thrownErr as Error;
+          expect(err.message).not.toContain(secretApiKey);
+          expect(err.message).not.toContain(secretPassword);
+          expect(err.message).not.toContain(secretPathKey);
+          expect(err.message).toContain("[REDACTED]");
+          if (err.stack) {
+            expect(err.stack).not.toContain(secretApiKey);
+            expect(err.stack).not.toContain(secretPassword);
+            expect(err.stack).not.toContain(secretPathKey);
+          }
+        }
+
+        // 2. verifyCpmmPoolAccount must catch sanitized error and return structured failure report
+        const verifyClient = new SolanaRpcLiveObservationClient({
+          rpcUrl: credentialUrl,
+          transport: mockFailingTransport,
+          maxRequestsBudget: 2,
+          onLog: (msg) => logs.push(msg),
+        });
+
+        const report = await verifyClient.verifyCpmmPoolAccount(FIXTURE_CPMM_POOL_ADDRESS);
+        expect(report.verified).toBe(false);
+        expect(report.verificationStatus).toBe("RPC_ERROR");
+        expect(report.error).toBeDefined();
+        expect(report.error).not.toContain(secretApiKey);
+        expect(report.error).not.toContain(secretPassword);
+        expect(report.error).not.toContain(secretPathKey);
+        expect(report.error).toContain("[REDACTED]");
+
+        // 3. Confirm transport received the unmodified raw URL for outbound request
+        expect(transportReceivedUrl).toBe(credentialUrl);
+
+        // 4. Save failed snapshot to disk
+        const { snapshotDir, status } = saveCpmmSnapshot(
+          testDir,
+          FIXTURE_CPMM_POOL_ADDRESS,
+          report,
+        );
+        expect(status).toBe("FAILED");
+
+        // 5. Inspect every file in the sealed failure snapshot directory
+        const sealedFiles = await fs.readdir(snapshotDir);
+        expect(sealedFiles.length).toBe(5); // 4 evidence files + 1 manifest
+
+        for (const filename of sealedFiles) {
+          const content = await fs.readFile(path.join(snapshotDir, filename), "utf8");
+          expect(content).not.toContain(secretApiKey);
+          expect(content).not.toContain(secretPassword);
+          expect(content).not.toContain(secretPathKey);
+        }
+
+        // 6. Confirm none of the logs collected leaked any secret
+        for (const log of logs) {
+          expect(log).not.toContain(secretApiKey);
+          expect(log).not.toContain(secretPassword);
+          expect(log).not.toContain(secretPathKey);
+        }
+      });
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {

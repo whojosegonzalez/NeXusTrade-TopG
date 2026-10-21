@@ -46,24 +46,34 @@ export interface SanitizedRpcEndpointInfo {
   readonly sanitizedUrl: string;
   readonly host: string;
   readonly endpointFingerprint: string;
+  readonly sensitiveTokens: readonly string[];
 }
 
 /**
  * Sanitizes credential-bearing components (tokens, passwords, API keys) from RPC endpoint URLs
- * while preserving network transport fidelity and research provenance (B1-EVIDENCE-02).
+ * while preserving network transport fidelity and research provenance (B1-EVIDENCE-02 / B1-PREFLIGHT-01).
  */
 export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
   const hash = crypto.createHash("sha256").update(rawUrl).digest("hex");
   const endpointFingerprint = `sha256:${hash.slice(0, 16)}`;
+  const sensitiveTokens: string[] = [];
 
   try {
     const parsed = new URL(rawUrl);
     const host = parsed.hostname;
 
     // 1. Sanitize userinfo credentials (user:password@)
-    if (parsed.username || parsed.password) {
-      if (parsed.username) parsed.username = "[REDACTED]";
-      if (parsed.password) parsed.password = "[REDACTED]";
+    if (parsed.username) {
+      if (parsed.username !== "[REDACTED]" && parsed.username.length > 0) {
+        sensitiveTokens.push(parsed.username);
+      }
+      parsed.username = "[REDACTED]";
+    }
+    if (parsed.password) {
+      if (parsed.password !== "[REDACTED]" && parsed.password.length > 0) {
+        sensitiveTokens.push(parsed.password);
+      }
+      parsed.password = "[REDACTED]";
     }
 
     // 2. Sanitize sensitive or secret-bearing query parameter values
@@ -91,6 +101,9 @@ export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
         lower.includes("auth") ||
         val.length >= 10
       ) {
+        if (val && val !== "[REDACTED]" && val.length > 2) {
+          sensitiveTokens.push(val);
+        }
         parsed.searchParams.set(key, "[REDACTED]");
       }
     }
@@ -118,6 +131,9 @@ export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
         /^[0-9a-fA-F-]{16,}$/.test(seg) ||
         /^[A-Za-z0-9_-]{16,}$/.test(seg)
       ) {
+        if (seg && seg !== "[REDACTED]" && seg.length > 2) {
+          sensitiveTokens.push(seg);
+        }
         return "[REDACTED]";
       }
       return seg;
@@ -131,11 +147,15 @@ export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
       sanitizedUrl = sanitizedUrl.slice(0, -1);
     }
 
+    const uniqueTokens = Array.from(new Set(sensitiveTokens)).filter((t) => t.length > 0);
+    uniqueTokens.sort((a, b) => b.length - a.length);
+
     return {
       rawUrl,
       sanitizedUrl,
       host,
       endpointFingerprint,
+      sensitiveTokens: uniqueTokens,
     };
   } catch {
     return {
@@ -143,6 +163,7 @@ export function sanitizeSolanaRpcUrl(rawUrl: string): SanitizedRpcEndpointInfo {
       sanitizedUrl: "[MALFORMED_URL_REDACTED]",
       host: "unknown",
       endpointFingerprint,
+      sensitiveTokens: [],
     };
   }
 }
@@ -292,6 +313,7 @@ export class SolanaRpcLiveObservationClient {
   private readonly sanitizedRpcUrl: string;
   private readonly endpointHost: string;
   private readonly endpointFingerprint: string;
+  private readonly sensitiveTokens: readonly string[];
   private readonly httpTimeoutMs: number;
   private readonly maxRequestsPerMinute: number;
   private readonly maxRequestsBudget?: number | undefined;
@@ -322,6 +344,7 @@ export class SolanaRpcLiveObservationClient {
     this.sanitizedRpcUrl = sanitized.sanitizedUrl;
     this.endpointHost = sanitized.host;
     this.endpointFingerprint = sanitized.endpointFingerprint;
+    this.sensitiveTokens = sanitized.sensitiveTokens;
     this.httpTimeoutMs = options?.httpTimeoutMs ?? 5_000;
     this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? 60;
     this.maxRequestsBudget = options?.maxRequestsBudget;
@@ -366,6 +389,38 @@ export class SolanaRpcLiveObservationClient {
 
   public getEndpointFingerprint(): string {
     return this.endpointFingerprint;
+  }
+
+  /**
+   * Sanitizes any text string (error message, stack trace, diagnostic log) to guarantee that
+   * credential-bearing URLs, API keys, passwords, and tokens never leak into persisted evidence (B1-PREFLIGHT-01).
+   */
+  public sanitizeErrorMessage(text: string): string {
+    if (!text) return text;
+    let sanitized = text;
+
+    // 1. Direct replacement of raw RPC URL with sanitized URL
+    if (this.rawRpcUrl && this.rawRpcUrl !== this.sanitizedRpcUrl) {
+      sanitized = sanitized.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+    }
+
+    // 2. Direct replacement of any collected sensitive credential tokens
+    for (const token of this.sensitiveTokens) {
+      if (token && token.length > 0) {
+        sanitized = sanitized.split(token).join("[REDACTED]");
+        const encoded = encodeURIComponent(token);
+        if (encoded !== token) {
+          sanitized = sanitized.split(encoded).join("[REDACTED]");
+        }
+      }
+    }
+
+    // 3. Redact any embedded URLs matching credential patterns
+    sanitized = sanitized.replace(/https?:\/\/[^\s"'<>)]+/g, (matchedUrl) => {
+      return sanitizeSolanaRpcUrl(matchedUrl).sanitizedUrl;
+    });
+
+    return sanitized;
   }
 
   public getDiagnostics(): SolanaRpcObservationDiagnostics {
@@ -555,7 +610,8 @@ export class SolanaRpcLiveObservationClient {
       };
     } catch (err) {
       this.poolsFailed++;
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       this.onLog?.(`Pool ${params.poolAddress} observation failed: ${errMsg}`);
       return {
         ok: false,
@@ -798,11 +854,13 @@ export class SolanaRpcLiveObservationClient {
       };
     } catch (err: unknown) {
       this.poolsFailed++;
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       const is429 = errMsg.includes("429");
       const isTimeout =
         errMsg.includes("timeout") || (err instanceof Error && err.name === "AbortError");
       const status = is429 ? "RATE_LIMITED_429" : isTimeout ? "RPC_ERROR" : "RPC_ERROR";
+      this.onLog?.(`Failed to verify AMM v4 pool ${poolAddress}: ${errMsg}`);
       return {
         poolAddress,
         rpcUrl: this.sanitizedRpcUrl,
@@ -1297,11 +1355,16 @@ export class SolanaRpcLiveObservationClient {
       };
     } catch (err: unknown) {
       this.poolsFailed++;
-      const errMsg = err instanceof Error ? err.message : String(err);
+      if (!poolRecord && err && typeof err === "object" && "rpcRecord" in err) {
+        poolRecord = (err as { rpcRecord: RawRpcInteractionRecord }).rpcRecord;
+      }
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       const is429 = errMsg.includes("429");
       const isTimeout =
         errMsg.includes("timeout") || (err instanceof Error && err.name === "AbortError");
       const status = is429 ? "RATE_LIMITED_429" : isTimeout ? "RPC_ERROR" : "RPC_ERROR";
+      this.onLog?.(`Failed to verify CPMM pool ${poolAddress}: ${errMsg}`);
       return {
         poolAddress,
         rpcUrl: this.sanitizedRpcUrl,
@@ -1413,7 +1476,7 @@ export class SolanaRpcLiveObservationClient {
         this.timeoutsEncountered++;
       }
       const rawErrMsg = err instanceof Error ? err.message : String(err);
-      const errMsg = rawErrMsg.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       this.onLog?.(`${method} call failed: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -1435,8 +1498,13 @@ export class SolanaRpcLiveObservationClient {
         error: errMsg,
       };
 
-      (err as { rpcRecord?: RawRpcInteractionRecord }).rpcRecord = record;
-      throw err;
+      const sanitizedErr = new Error(errMsg);
+      sanitizedErr.name = err instanceof Error ? err.name : "RpcError";
+      if (err instanceof Error && err.stack) {
+        sanitizedErr.stack = this.sanitizeErrorMessage(err.stack);
+      }
+      (sanitizedErr as { rpcRecord?: RawRpcInteractionRecord }).rpcRecord = record;
+      throw sanitizedErr;
     } finally {
       clearTimeout(timeout);
     }
