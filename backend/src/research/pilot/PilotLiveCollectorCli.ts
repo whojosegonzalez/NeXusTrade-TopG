@@ -2691,12 +2691,15 @@ export async function runLiveEventDiscoverySession(
   const maxTxBudget = config.maxTransactions ?? 25;
   const maxAccBudget = config.maxAccountReads ?? 20;
   const maxCombinedRpcBudget = config.rpcMaxCalls ?? maxTxBudget + maxAccBudget;
+  const minIntervalMs = config.minRequestIntervalMs ?? 200;
 
   const txFetcher = new SolanaRpcTransactionFetcher({
     rpcUrl: config.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC,
     transport: rpcTransport,
     maxTransactionsBudget: maxTxBudget,
     httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+    maxSupportedTransactionVersion: 1,
+    minRequestIntervalMs: minIntervalMs,
     commitment: "confirmed",
     onLog: (msg) => logger.info("SOLANA_RPC_TX", msg),
   });
@@ -2706,6 +2709,7 @@ export async function runLiveEventDiscoverySession(
     transport: rpcTransport,
     maxAccountCallsBudget: maxAccBudget,
     httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+    minRequestIntervalMs: minIntervalMs,
     commitment: "confirmed",
     onLog: (msg) => logger.info("SOLANA_RPC_ACC", msg),
   });

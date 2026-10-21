@@ -33,6 +33,7 @@ export interface SolanaRpcRecordingAccountFetcherOptions {
   readonly maxAccountCallsBudget?: number | undefined; // Hard ceiling on total account RPC calls (default: 20)
   readonly sharedBudget?: ISharedRpcBudget | undefined; // Shared cross-client RPC call budget (B2-READY-02)
   readonly httpTimeoutMs?: number | undefined;
+  readonly minRequestIntervalMs?: number | undefined; // Minimum interval between outbound calls (default: 200)
   readonly onLog?: ((msg: string) => void) | undefined;
 }
 
@@ -47,10 +48,13 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
   private readonly maxAccountCallsBudget: number;
   private sharedBudget?: ISharedRpcBudget | undefined;
   private readonly httpTimeoutMs: number;
+  private readonly minRequestIntervalMs: number;
   private readonly onLog?: ((msg: string) => void) | undefined;
 
   private totalCallsExecuted = 0;
   private maxObservedSlot = 0;
+  private lastRequestEpochMs = 0;
+  private retryAfterUntilEpochMs = 0;
   private readonly capturedInteractions: RawRpcInteractionRecord[] = [];
 
   constructor(options: SolanaRpcRecordingAccountFetcherOptions) {
@@ -66,6 +70,7 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     this.maxAccountCallsBudget = options.maxAccountCallsBudget ?? 20;
     this.sharedBudget = options.sharedBudget;
     this.httpTimeoutMs = options.httpTimeoutMs ?? 10_000;
+    this.minRequestIntervalMs = Math.max(0, options.minRequestIntervalMs ?? 0);
     this.onLog = options.onLog;
   }
 
@@ -75,6 +80,14 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
 
   public getCallsExecutedCount(): number {
     return this.totalCallsExecuted;
+  }
+
+  public getMinRequestIntervalMs(): number {
+    return this.minRequestIntervalMs;
+  }
+
+  public getRetryAfterUntilEpochMs(): number {
+    return this.retryAfterUntilEpochMs;
   }
 
   public getSanitizedEndpoint(): string {
@@ -124,6 +137,26 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       return null;
     }
 
+    // 3. Provider rate-limit backoff pacing
+    const now = Date.now();
+    if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
+      const backoffMs = this.retryAfterUntilEpochMs - now;
+      this.onLog?.(
+        `[RATE_LIMIT_BACKOFF] Pausing getAccountInfo for ${backoffMs}ms due to provider throttling`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
+    }
+
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
+      const elapsed = Date.now() - this.lastRequestEpochMs;
+      if (elapsed < this.minRequestIntervalMs) {
+        const waitMs = this.minRequestIntervalMs - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
+
+    this.lastRequestEpochMs = Date.now();
     this.totalCallsExecuted++;
     this.sharedBudget?.recordCall();
 
@@ -181,6 +214,14 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       const elapsedMs = Date.now() - callStartEpochMs;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
+
+      if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
+        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        this.onLog?.(
+          `[RPC_429_THROTTLED] Provider rate limit encountered for account ${address}; backoff set to 2000ms`,
+        );
+      }
+
       this.onLog?.(`getAccountInfo failed for ${address}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -234,6 +275,26 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       return addresses.map(() => null);
     }
 
+    // 3. Provider rate-limit backoff pacing
+    const now = Date.now();
+    if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
+      const backoffMs = this.retryAfterUntilEpochMs - now;
+      this.onLog?.(
+        `[RATE_LIMIT_BACKOFF] Pausing getMultipleAccounts for ${backoffMs}ms due to provider throttling`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
+    }
+
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
+      const elapsed = Date.now() - this.lastRequestEpochMs;
+      if (elapsed < this.minRequestIntervalMs) {
+        const waitMs = this.minRequestIntervalMs - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
+
+    this.lastRequestEpochMs = Date.now();
     this.totalCallsExecuted++;
     this.sharedBudget?.recordCall();
 
@@ -293,6 +354,14 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       const elapsedMs = Date.now() - callStartEpochMs;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
+
+      if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
+        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        this.onLog?.(
+          `[RPC_429_THROTTLED] Provider rate limit encountered for multiple accounts; backoff set to 2000ms`,
+        );
+      }
+
       this.onLog?.(`getMultipleAccounts failed for ${addresses.join(",")}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {

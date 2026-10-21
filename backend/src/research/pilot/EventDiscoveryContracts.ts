@@ -112,6 +112,11 @@ export interface InnerInstructionGroup {
 }
 
 /**
+ * Transaction version indicator as returned by Solana JSON-RPC.
+ */
+export type TransactionVersion = "legacy" | 0 | 1 | number;
+
+/**
  * Versioned transaction metadata required for offline pool initialization recognition.
  */
 export interface VersionedTransactionMetadata {
@@ -119,7 +124,7 @@ export interface VersionedTransactionMetadata {
   readonly slot: number;
   readonly blockTime: number | null;
   readonly err: unknown | null;
-  readonly version: "legacy" | 0;
+  readonly version: TransactionVersion;
   readonly accountKeys: VersionedTransactionAccountResolution;
   readonly instructions: readonly CompiledInstruction[];
   readonly innerInstructions?: readonly InnerInstructionGroup[] | undefined;

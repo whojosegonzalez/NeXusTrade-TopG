@@ -16,6 +16,7 @@
 import type {
   CompiledInstruction,
   InnerInstructionGroup,
+  TransactionVersion,
   VersionedTransactionAccountResolution,
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
@@ -40,6 +41,8 @@ export interface SolanaRpcTransactionFetcherOptions {
   readonly maxTransactionsBudget?: number | undefined; // Hard ceiling on getTransaction calls (default: 25)
   readonly sharedBudget?: ISharedRpcBudget | undefined; // Shared cross-client RPC call budget (B2-READY-02)
   readonly httpTimeoutMs?: number | undefined; // Request timeout in ms (default: 10000)
+  readonly maxSupportedTransactionVersion?: 0 | 1 | undefined; // Supported Solana tx version (default: 1)
+  readonly minRequestIntervalMs?: number | undefined; // Minimum interval between outbound calls (default: 200)
   readonly onLog?: ((msg: string) => void) | undefined;
 }
 
@@ -54,11 +57,15 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
   private readonly maxTransactionsBudget: number;
   private sharedBudget?: ISharedRpcBudget | undefined;
   private readonly httpTimeoutMs: number;
+  private readonly maxSupportedTransactionVersion: 0 | 1;
+  private readonly minRequestIntervalMs: number;
   private readonly onLog?: ((msg: string) => void) | undefined;
 
   private totalCallsExecuted = 0;
   private successfulCalls = 0;
   private failedCalls = 0;
+  private lastRequestEpochMs = 0;
+  private retryAfterUntilEpochMs = 0;
   private readonly capturedTransactions: RawRpcInteractionRecord[] = [];
 
   constructor(options: SolanaRpcTransactionFetcherOptions) {
@@ -74,6 +81,8 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     this.maxTransactionsBudget = options.maxTransactionsBudget ?? 25;
     this.sharedBudget = options.sharedBudget;
     this.httpTimeoutMs = options.httpTimeoutMs ?? 10_000;
+    this.maxSupportedTransactionVersion = options.maxSupportedTransactionVersion ?? 1;
+    this.minRequestIntervalMs = Math.max(0, options.minRequestIntervalMs ?? 0);
     this.onLog = options.onLog;
   }
 
@@ -97,6 +106,14 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     return this.endpointHost;
   }
 
+  public getMinRequestIntervalMs(): number {
+    return this.minRequestIntervalMs;
+  }
+
+  public getRetryAfterUntilEpochMs(): number {
+    return this.retryAfterUntilEpochMs;
+  }
+
   public setSharedBudget(sharedBudget: ISharedRpcBudget): void {
     this.sharedBudget = sharedBudget;
   }
@@ -115,7 +132,7 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
   /**
    * Fetches and parses a versioned transaction from Solana RPC.
    * Enforces maxTransactionsBudget boundary, shared RPC budget, per-request timeout,
-   * and records raw wire evidence.
+   * provider-aware pacing, rate-limit backoff, and records raw wire evidence.
    */
   public async fetchTransaction(signature: string): Promise<VersionedTransactionMetadata | null> {
     // 1. Shared total RPC ceiling check (B2-READY-02)
@@ -134,6 +151,26 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       return null;
     }
 
+    // 3. Provider rate-limit backoff pacing (respect 429 retry-after)
+    const now = Date.now();
+    if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
+      const backoffMs = this.retryAfterUntilEpochMs - now;
+      this.onLog?.(
+        `[RATE_LIMIT_BACKOFF] Pausing getTransaction for ${backoffMs}ms due to provider throttling`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
+    }
+
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
+      const elapsed = Date.now() - this.lastRequestEpochMs;
+      if (elapsed < this.minRequestIntervalMs) {
+        const waitMs = this.minRequestIntervalMs - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
+
+    this.lastRequestEpochMs = Date.now();
     this.totalCallsExecuted++;
     this.sharedBudget?.recordCall();
 
@@ -146,7 +183,7 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
         signature,
         {
           encoding: "json",
-          maxSupportedTransactionVersion: 0,
+          maxSupportedTransactionVersion: this.maxSupportedTransactionVersion,
           commitment: this.commitment,
         },
       ],
@@ -194,6 +231,16 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       this.failedCalls++;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
+
+      // Provider rate limit tracking
+      if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
+        // Default 2 second backoff on 429 when retry-after header is absent
+        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        this.onLog?.(
+          `[RPC_429_THROTTLED] Provider rate limit encountered for ${signature}; backoff set to 2000ms`,
+        );
+      }
+
       this.onLog?.(`getTransaction failed for ${signature}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -253,7 +300,14 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
 
     const err = meta?.err ?? null;
     const rawVersion = result.version;
-    const version: "legacy" | 0 = rawVersion === 0 ? 0 : "legacy";
+    const version: TransactionVersion =
+      rawVersion === 1
+        ? 1
+        : rawVersion === 0
+          ? 0
+          : typeof rawVersion === "number"
+            ? rawVersion
+            : "legacy";
 
     // 1. Account Keys resolution (Static + ALTs)
     const rawAccountKeys = message.accountKeys;

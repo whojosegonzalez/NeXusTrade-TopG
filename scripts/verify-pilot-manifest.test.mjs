@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, runVerifyManifestCli } from "./verify-pilot-manifest.mjs";
 import { generateSessionExportManifest } from "../backend/dist/research/pilot/PilotExportManifest.js";
+import { saveB2EventSession } from "../backend/dist/research/pilot/EventSessionEvidenceCapture.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -250,4 +251,43 @@ test("runVerifyManifestCli fails closed with exit code 1 when compiled module is
     false,
     "Must NOT compile or write backend/dist automatically",
   );
+});
+
+test("runVerifyManifestCli validates a sealed B2 session manifest and rejects tampering", async () => {
+  const sessionDir = createTempDir("b2-manifest-test-");
+
+  const saveResult = saveB2EventSession({
+    captureBaseDir: sessionDir,
+    sessionId: "b2-test-cli-verify",
+    wsUrl: "wss://api.mainnet-beta.solana.com",
+    rpcUrl: "https://api.mainnet-beta.solana.com",
+    endpointHost: "api.mainnet-beta.solana.com",
+    endpointFingerprint: "sha256:test",
+    forcedStatus: "FINALIZED",
+    rawNotifications: [],
+    rawTransactions: [],
+    rawAccounts: [],
+    discoveredEvents: [],
+    verificationReports: [],
+  });
+
+  // Verify valid B2 manifest returns 0
+  const validExit = await runVerifyManifestCli([
+    "node",
+    "scripts/verify-pilot-manifest.mjs",
+    `--source=${saveResult.sessionDir}`,
+  ]);
+  assert.equal(validExit, 0, "Valid B2 session manifest must exit 0");
+
+  // Tamper with one of the files
+  const notifPath = path.join(saveResult.sessionDir, "raw-notifications.jsonl");
+  fs.writeFileSync(notifPath, "tampered-content");
+
+  // Verify tampered B2 manifest returns 1
+  const tamperedExit = await runVerifyManifestCli([
+    "node",
+    "scripts/verify-pilot-manifest.mjs",
+    `--source=${saveResult.sessionDir}`,
+  ]);
+  assert.equal(tamperedExit, 1, "Tampered B2 session manifest must exit 1");
 });

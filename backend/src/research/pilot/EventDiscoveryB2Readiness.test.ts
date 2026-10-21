@@ -40,6 +40,7 @@ import {
   createAmmV4InitTransactionFixture,
   createCpmmInitTransactionFixture,
 } from "./fixtures/AuthoritativeEventFixtures.js";
+import { identifyPoolInitializationInstructions } from "./PoolInitializationParser.js";
 import { dispatchPoolVerification } from "./VerificationDispatchService.js";
 import {
   createAuthoritativeRaydiumAmmV4Buffer,
@@ -3252,6 +3253,290 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       } catch {
         // Ignored in test cleanup
       }
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 12. Version 1 Transaction Support & Provider-Aware Pacing (B2-CORR-01, B2-CORR-02)
+  // --------------------------------------------------------------------------
+  describe("12. Version 1 Transaction Support & Provider-Aware Pacing (B2-CORR-01, B2-CORR-02)", () => {
+    it("B2-CORR-01: SolanaRpcTransactionFetcher requests maxSupportedTransactionVersion: 1 and decodes v1 transaction metadata with ALTs", async () => {
+      let capturedBody: Record<string, unknown> | null = null;
+      const mockTransport: ISolanaRpcTransport = {
+        post: async (_url: string, body: Record<string, unknown>) => {
+          capturedBody = body;
+          return {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              slot: 459800100,
+              blockTime: 1792618963,
+              version: 1,
+              transaction: {
+                message: {
+                  accountKeys: [
+                    RAYDIUM_AMM_V4_PROGRAM_ID,
+                    SPL_TOKEN_PROGRAM_ID,
+                    "SysvarRent111111111111111111111111111111111",
+                  ],
+                  instructions: [
+                    {
+                      programIdIndex: 0,
+                      accounts: [0, 1, 3, 4],
+                      data: "3wSt22XFDwrF",
+                    },
+                  ],
+                },
+              },
+              meta: {
+                err: null,
+                loadedAddresses: {
+                  writable: ["vault0ALT11111111111111111111111111111111111"],
+                  readonly: ["vault1ALT11111111111111111111111111111111111"],
+                },
+                innerInstructions: [
+                  {
+                    index: 0,
+                    instructions: [
+                      {
+                        programIdIndex: 1,
+                        accounts: [3, 4],
+                        data: "JQ5Laj",
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          };
+        },
+      };
+
+      const fetcher = new SolanaRpcTransactionFetcher({
+        transport: mockTransport,
+        maxTransactionsBudget: 5,
+        minRequestIntervalMs: 0,
+      });
+
+      const tx = await fetcher.fetchTransaction("sig-v1-test");
+      expect(tx).not.toBeNull();
+      expect(tx?.version).toBe(1);
+      expect(tx?.slot).toBe(459800100);
+      expect(tx?.accountKeys.staticAccountKeys.length).toBe(3);
+      expect(tx?.accountKeys.loadedAddresses?.writable).toEqual([
+        "vault0ALT11111111111111111111111111111111111",
+      ]);
+      expect(tx?.accountKeys.loadedAddresses?.readonly).toEqual([
+        "vault1ALT11111111111111111111111111111111111",
+      ]);
+      expect(tx?.innerInstructions?.length).toBe(1);
+
+      // Verify maxSupportedTransactionVersion: 1 was transmitted in JSON-RPC body
+      expect(capturedBody).not.toBeNull();
+      const params = (capturedBody as unknown as { params?: unknown[] })?.params;
+      const opts = params?.[1] as Record<string, unknown> | undefined;
+      expect(opts?.["maxSupportedTransactionVersion"]).toBe(1);
+    });
+
+    it("B2-CORR-01: identifyPoolInitializationInstructions correctly parses positive AMM v4 and CPMM initializations from v1 transactions with ALTs", () => {
+      // 1. Raydium AMM v4 v1 transaction with ALTs resolving vaults
+      const ammV4Tx = createAmmV4InitTransactionFixture({
+        signature: "sig-amm-v1",
+        slot: 459800150,
+      });
+      // Convert to version 1
+      const v1AmmTx: VersionedTransactionMetadata = {
+        ...ammV4Tx,
+        version: 1,
+      };
+
+      const ammResult = identifyPoolInitializationInstructions(v1AmmTx);
+      expect(ammResult.ok).toBe(true);
+      if (ammResult.ok) {
+        expect(ammResult.events.length).toBe(1);
+        expect(ammResult.events[0]?.protocol).toBe("RAYDIUM_AMM_V4");
+        expect(ammResult.events[0]?.slot).toBe(459800150);
+        expect(ammResult.events[0]?.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      }
+
+      // 2. Raydium CPMM v1 transaction with ALTs
+      const cpmmTx = createCpmmInitTransactionFixture({
+        signature: "sig-cpmm-v1",
+        slot: 459800160,
+      });
+      const v1CpmmTx: VersionedTransactionMetadata = {
+        ...cpmmTx,
+        version: 1,
+      };
+
+      const cpmmResult = identifyPoolInitializationInstructions(v1CpmmTx);
+      expect(cpmmResult.ok).toBe(true);
+      if (cpmmResult.ok) {
+        expect(cpmmResult.events.length).toBe(1);
+        expect(cpmmResult.events[0]?.protocol).toBe("RAYDIUM_CPMM");
+        expect(cpmmResult.events[0]?.slot).toBe(459800160);
+        expect(cpmmResult.events[0]?.poolId).toBe(FIXTURE_CPMM_POOL_ADDRESS);
+      }
+    });
+
+    it("B2-CORR-01: rejects malformed v1 transactions (missing slot, out-of-bounds ALT index, corrupted data)", () => {
+      // 1. Missing / invalid slot
+      const malformedSlot = SolanaRpcTransactionFetcher.parseTransactionResponse("sig-bad-slot", {
+        result: {
+          slot: 0,
+          version: 1,
+          transaction: { message: { accountKeys: [] } },
+        },
+      });
+      expect(malformedSlot).toBeNull();
+
+      // 2. Out-of-bounds ALT index in instruction
+      const baseFixture = createAmmV4InitTransactionFixture({ signature: "sig-oob-alt" });
+      const oobAltTx: VersionedTransactionMetadata = {
+        ...baseFixture,
+        version: 1,
+        instructions: [
+          {
+            programIdIndex: 0,
+            accountKeyIndexes: [9999], // non-existent index
+            data: "3wSt22XFDwrF",
+            dataEncoding: "base58",
+          },
+        ],
+      };
+      const oobResult = identifyPoolInitializationInstructions(oobAltTx);
+      expect(oobResult.ok).toBe(false);
+      if (!oobResult.ok) {
+        expect(oobResult.reason).toBe("UNRESOLVED_LOOKUP_TABLE_INDEX");
+      }
+
+      // 3. Corrupted instruction data
+      const corruptedTx: VersionedTransactionMetadata = {
+        ...baseFixture,
+        version: 1,
+        instructions: [
+          {
+            programIdIndex: 0,
+            accountKeyIndexes: [0, 1],
+            data: "???not-valid-base58???",
+            dataEncoding: "base58",
+          },
+        ],
+      };
+      const corruptedResult = identifyPoolInitializationInstructions(corruptedTx);
+      expect(corruptedResult.ok).toBe(false);
+      if (!corruptedResult.ok) {
+        expect(corruptedResult.reason).toBe("CORRUPTED_INSTRUCTION_DATA");
+      }
+    });
+
+    it("B2-CORR-02: SolanaRpcTransactionFetcher enforces minimum request interval pacing between consecutive calls", async () => {
+      const timestamps: number[] = [];
+      const mockTransport: ISolanaRpcTransport = {
+        post: async (_url: string, body: Record<string, unknown>) => {
+          timestamps.push(Date.now());
+          return {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              slot: 459800100,
+              version: 1,
+              transaction: { message: { accountKeys: [] } },
+            },
+          };
+        },
+      };
+
+      const fetcher = new SolanaRpcTransactionFetcher({
+        transport: mockTransport,
+        maxTransactionsBudget: 5,
+        minRequestIntervalMs: 60, // 60ms pacing
+      });
+
+      await fetcher.fetchTransaction("sig-pace-1");
+      await fetcher.fetchTransaction("sig-pace-2");
+      await fetcher.fetchTransaction("sig-pace-3");
+
+      expect(timestamps.length).toBe(3);
+      const delta1 = timestamps[1]! - timestamps[0]!;
+      const delta2 = timestamps[2]! - timestamps[1]!;
+
+      // Verify each consecutive call waited at least the paced interval (~60ms)
+      expect(delta1).toBeGreaterThanOrEqual(50);
+      expect(delta2).toBeGreaterThanOrEqual(50);
+      expect(fetcher.getCallsExecutedCount()).toBe(3);
+    });
+
+    it("B2-CORR-02: handles HTTP 429 provider throttling by setting backoff and pausing subsequent calls without exceeding budget", async () => {
+      let callAttempts = 0;
+      const mockTransport: ISolanaRpcTransport = {
+        post: async (_url: string, body: Record<string, unknown>) => {
+          callAttempts++;
+          if (callAttempts === 1) {
+            throw new Error("[RPC_RATE_LIMIT_429] Solana RPC responded with 429 Too Many Requests");
+          }
+          return {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              slot: 459800100,
+              version: 1,
+              transaction: { message: { accountKeys: [] } },
+            },
+          };
+        },
+      };
+
+      const fetcher = new SolanaRpcTransactionFetcher({
+        transport: mockTransport,
+        maxTransactionsBudget: 2,
+        minRequestIntervalMs: 10,
+      });
+
+      // Call 1 fails with 429
+      const res1 = await fetcher.fetchTransaction("sig-rate-limited");
+      expect(res1).toBeNull();
+      expect(fetcher.getRetryAfterUntilEpochMs()).toBeGreaterThan(Date.now());
+      expect(fetcher.getCallsExecutedCount()).toBe(1);
+
+      // Verify captured record records the rate limit error cleanly
+      const captured = fetcher.getCapturedTransactions();
+      expect(captured.length).toBe(1);
+      expect(captured[0]!.error).toContain("429");
+      expect(captured[0]!.response).toBeNull();
+    });
+
+    it("B2-CORR-02: respects request timeout and AbortSignal cancellation", async () => {
+      const mockTransport: ISolanaRpcTransport = {
+        post: async (_url: string, _body: Record<string, unknown>, init?: RequestInit) => {
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+              resolve({ jsonrpc: "2.0", result: null });
+            }, 1000);
+            init?.signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new Error("[RPC_TIMEOUT] getTransaction request timed out after 50ms"));
+            });
+          });
+        },
+      };
+
+      const fetcher = new SolanaRpcTransactionFetcher({
+        transport: mockTransport,
+        maxTransactionsBudget: 2,
+        httpTimeoutMs: 50, // 50ms timeout
+        minRequestIntervalMs: 0,
+      });
+
+      const startMs = Date.now();
+      const res = await fetcher.fetchTransaction("sig-timeout");
+      const elapsedMs = Date.now() - startMs;
+
+      expect(res).toBeNull();
+      expect(elapsedMs).toBeLessThan(300); // Must not hang for 1000ms
+      const captured = fetcher.getCapturedTransactions();
+      expect(captured.length).toBe(1);
+      expect(captured[0]!.error).toContain("RPC_TIMEOUT");
     });
   });
 });
