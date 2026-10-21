@@ -15,6 +15,7 @@
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { PilotCollectorRunner } from "./PilotCollectorRunner.js";
 import {
@@ -25,6 +26,7 @@ import { RaydiumLiveDiscoveryClient } from "./RaydiumLiveDiscoveryClient.js";
 import {
   SolanaRpcLiveObservationClient,
   type ISolanaRpcTransport,
+  type CpmmPoolVerificationReport,
   DEFAULT_SOLANA_MAINNET_RPC,
 } from "./SolanaRpcLiveObservationClient.js";
 import { ForwardOutcomeObservationTracker } from "./ForwardOutcomeObservationTracker.js";
@@ -212,6 +214,9 @@ export interface PilotLiveCollectorConfig {
   readonly verifyCpmmPoolAddress?: string | undefined;
   readonly replayFixturesPath?: string | undefined;
   readonly captureFixturesDir?: string | undefined;
+  readonly replayMode?: "synthetic" | "authentic" | undefined;
+  readonly rpcMaxCalls?: number | undefined;
+  readonly rpcTimeoutMs?: number | undefined;
   readonly maxEvents?: number | undefined;
   readonly maxTransactions?: number | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
@@ -274,6 +279,9 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let captureFixturesDir: string | undefined = undefined;
   let maxEvents: number | undefined = undefined;
   let maxTransactions: number | undefined = undefined;
+  let replayMode: "synthetic" | "authentic" | undefined = undefined;
+  let rpcMaxCalls: number | undefined = undefined;
+  let rpcTimeoutMs: number | undefined = undefined;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -295,8 +303,11 @@ Options:
   --verify-pool=<address>          Perform independent on-chain Raydium AMM v4 verification and print report
   --verify-cpmm-pool=<address>     Perform independent on-chain Raydium CPMM verification and print report (D29-H3)
   --replay-fixtures=<path>         Replay recorded event/transaction fixtures offline without network (D29-H3)
-  --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3)
+  --replay-mode=synthetic|authentic Replay fidelity mode (default: synthetic, authentic requires sealed manifest) (B1-PREP-04)
+  --capture-fixtures-dir=<dir>     Directory to persist captured raw immutable fixtures (D29-H3 / B1-PREP-01)
   --rpc-url=<url>                  Solana RPC endpoint URL (default: https://api.mainnet-beta.solana.com)
+  --rpc-max-calls=<n>              Outbound RPC call ceiling budget (default: 2 in CPMM verification mode) (B1-PREP-03)
+  --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
   --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
   --max-events=<n>                 Maximum event budget for event discovery (default: 50)
   --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
@@ -358,6 +369,18 @@ Options:
         throw new Error("[INVALID_ARGUMENT] Option '--replay-fixtures' requires a non-empty path");
       }
       replayFixturesPath = path.resolve(val);
+    } else if (arg.startsWith("--replay-mode=")) {
+      const val = arg.slice("--replay-mode=".length).trim().toLowerCase();
+      if (val !== "synthetic" && val !== "authentic") {
+        throw new Error(
+          `[INVALID_ARGUMENT] Option '--replay-mode' must be 'synthetic' or 'authentic', got '${val}'`,
+        );
+      }
+      replayMode = val as "synthetic" | "authentic";
+    } else if (arg.startsWith("--rpc-max-calls=")) {
+      rpcMaxCalls = parsePositiveInt("--rpc-max-calls", arg.slice("--rpc-max-calls=".length));
+    } else if (arg.startsWith("--rpc-timeout-ms=")) {
+      rpcTimeoutMs = parsePositiveInt("--rpc-timeout-ms", arg.slice("--rpc-timeout-ms=".length));
     } else if (arg.startsWith("--capture-fixtures-dir=")) {
       const val = arg.slice("--capture-fixtures-dir=".length).trim();
       if (!val) {
@@ -485,6 +508,9 @@ Options:
     verifyCpmmPoolAddress,
     replayFixturesPath,
     captureFixturesDir,
+    replayMode,
+    rpcMaxCalls,
+    rpcTimeoutMs,
     maxEvents,
     maxTransactions,
   };
@@ -1236,6 +1262,180 @@ export class PilotLiveCollectorSession {
 
 export { PilotLiveCollectorSession as LiveCollectorRunner };
 
+export interface CpmmSnapshotManifestFileEntry {
+  readonly filename: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+}
+
+export interface CpmmSnapshotManifest {
+  readonly manifestVersion: "1.0";
+  readonly snapshotId: string;
+  readonly createdAtIso: string;
+  readonly status: "FINALIZED" | "FAILED" | "INTERRUPTED";
+  readonly totalFiles: number;
+  readonly totalBytes: number;
+  readonly files: readonly CpmmSnapshotManifestFileEntry[];
+  readonly manifestSha256: string;
+}
+
+/**
+ * Persists raw on-chain CPMM JSON-RPC response payloads, execution metadata, and sealed SHA-256 manifest (B1-PREP-01).
+ * Isolates fixtures in a session-unique subdirectory under captureFixturesDir.
+ */
+export function saveCpmmSnapshot(
+  captureFixturesDir: string,
+  poolAddress: string,
+  report: CpmmPoolVerificationReport,
+  logger?: PilotLogger | undefined,
+  forcedStatus?: "FINALIZED" | "FAILED" | "INTERRUPTED",
+): {
+  snapshotDir: string;
+  manifestPath: string;
+  status: "FINALIZED" | "FAILED" | "INTERRUPTED";
+  manifest: CpmmSnapshotManifest;
+} {
+  const snapshotTimestamp = Date.now();
+  const snapshotId = `cpmm-snapshot-${snapshotTimestamp}`;
+  const targetDir = path.join(captureFixturesDir, snapshotId);
+  fsSync.mkdirSync(targetDir, { recursive: true });
+
+  const status: "FINALIZED" | "FAILED" | "INTERRUPTED" =
+    forcedStatus ?? (report.verified ? "FINALIZED" : "FAILED");
+
+  // 1. pool-account-rpc.json
+  const poolAccountRpcData = report.rawCaptureBundle?.poolAccountRpc ?? {
+    request: {
+      jsonrpc: "2.0" as const,
+      id: "capture-req-pool",
+      method: "getAccountInfo",
+      params: [poolAddress, { encoding: "base64" }],
+      endpoint: report.rpcUrl,
+      timestampIso: new Date(snapshotTimestamp).toISOString(),
+      timestampEpochMs: snapshotTimestamp,
+    },
+    response: null,
+    timing: { elapsedMs: report.hostElapsedMs ?? 0, payloadSizeBytes: 0 },
+    error: report.error ?? "No raw pool RPC record available",
+  };
+  const poolFilePath = path.join(targetDir, "pool-account-rpc.json");
+  fsSync.writeFileSync(poolFilePath, JSON.stringify(poolAccountRpcData, null, 2), "utf8");
+
+  // 2. vault-accounts-rpc.json
+  const vaultAccountsRpcData = report.rawCaptureBundle?.vaultAccountsRpc ?? {
+    request: {
+      jsonrpc: "2.0" as const,
+      id: "capture-req-vaults",
+      method: "getMultipleAccounts",
+      params: [[report.token0Vault ?? "", report.token1Vault ?? ""], { encoding: "base64" }],
+      endpoint: report.rpcUrl,
+      timestampIso: new Date(snapshotTimestamp).toISOString(),
+      timestampEpochMs: snapshotTimestamp,
+    },
+    response: null,
+    timing: { elapsedMs: 0, payloadSizeBytes: 0 },
+    error: report.rawCaptureBundle?.vaultAccountsRpc
+      ? undefined
+      : "Vault accounts RPC call not executed",
+  };
+  const vaultsFilePath = path.join(targetDir, "vault-accounts-rpc.json");
+  fsSync.writeFileSync(vaultsFilePath, JSON.stringify(vaultAccountsRpcData, null, 2), "utf8");
+
+  // 3. cpmm-verification-report.json
+  const cleanReport = { ...report };
+  delete (cleanReport as { rawCaptureBundle?: unknown }).rawCaptureBundle;
+  const reportFilePath = path.join(targetDir, "cpmm-verification-report.json");
+  fsSync.writeFileSync(
+    reportFilePath,
+    JSON.stringify(cleanReport, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2),
+    "utf8",
+  );
+
+  // 4. snapshot-metadata.json
+  const slotDelta =
+    report.poolSlot !== null && report.vault0Slot !== null
+      ? Math.abs(report.poolSlot - report.vault0Slot)
+      : null;
+  const metadata = {
+    snapshotId,
+    captureTimestampIso: new Date(snapshotTimestamp).toISOString(),
+    captureTimestampEpochMs: snapshotTimestamp,
+    poolAddress,
+    token0Vault: report.token0Vault ?? null,
+    token1Vault: report.token1Vault ?? null,
+    rpcUrl: report.rpcUrl,
+    commitment: "confirmed",
+    maxRpcCallsCeiling: report.rawCaptureBundle?.maxRpcCallsBudget ?? 2,
+    totalRpcCallsExecuted:
+      report.rawCaptureBundle?.totalRpcCalls ?? (vaultAccountsRpcData.response ? 2 : 1),
+    status,
+    verificationStatus: report.verificationStatus,
+    verified: report.verified,
+    verificationTier: report.verificationTier ?? null,
+    poolSlot: report.poolSlot,
+    vaultsSlot: report.vault0Slot,
+    slotDelta,
+    error: report.error ?? null,
+  };
+  const metadataFilePath = path.join(targetDir, "snapshot-metadata.json");
+  fsSync.writeFileSync(metadataFilePath, JSON.stringify(metadata, null, 2), "utf8");
+
+  // 5. Generate SHA-256 Manifest (cpmm-snapshot-manifest.json)
+  const filesToSeal = [
+    "pool-account-rpc.json",
+    "vault-accounts-rpc.json",
+    "cpmm-verification-report.json",
+    "snapshot-metadata.json",
+  ];
+
+  const fileEntries: CpmmSnapshotManifestFileEntry[] = [];
+  let totalBytes = 0;
+
+  for (const filename of filesToSeal) {
+    const filePath = path.join(targetDir, filename);
+    const content = fsSync.readFileSync(filePath);
+    const hash = crypto.createHash("sha256").update(content).digest("hex");
+    fileEntries.push({
+      filename,
+      sha256: hash,
+      byteSize: content.length,
+    });
+    totalBytes += content.length;
+  }
+
+  // Sort files deterministically by filename
+  fileEntries.sort((a, b) => a.filename.localeCompare(b.filename));
+
+  const manifestPayload = fileEntries.map((f) => `${f.filename}:${f.sha256}`).join("\n");
+  const manifestSha256 = crypto.createHash("sha256").update(manifestPayload).digest("hex");
+
+  const manifest: CpmmSnapshotManifest = {
+    manifestVersion: "1.0",
+    snapshotId,
+    createdAtIso: new Date(snapshotTimestamp).toISOString(),
+    status,
+    totalFiles: fileEntries.length,
+    totalBytes,
+    files: fileEntries,
+    manifestSha256,
+  };
+
+  const manifestFilePath = path.join(targetDir, "cpmm-snapshot-manifest.json");
+  fsSync.writeFileSync(manifestFilePath, JSON.stringify(manifest, null, 2), "utf8");
+
+  logger?.info(
+    "CPMM_SNAPSHOT_SEALED",
+    `Sealed raw CPMM snapshot [${status}] in ${targetDir} with SHA-256 manifest ${manifestFilePath} (manifestSha256: ${manifestSha256})`,
+  );
+
+  return {
+    snapshotDir: targetDir,
+    manifestPath: manifestFilePath,
+    status,
+    manifest,
+  };
+}
+
 /**
  * Parses an account payload from arbitrary JSON fixture representations.
  */
@@ -1286,13 +1486,158 @@ export function parseAccountPayload(
 }
 
 /**
- * Loads synthetic and recorded account payloads from replay fixtures directory or file (BREADY-05).
+ * Loads synthetic and recorded account payloads from replay fixtures directory or file (BREADY-05 / B1-PREP-04).
+ * When options.replayMode === 'authentic', strictly verifies against sealed SHA-256 manifest and forbids synthetic fallbacks.
  */
 export function loadAccountMapFromFixtures(
   fixturesPath: string,
+  options?: { replayMode?: "synthetic" | "authentic" | undefined },
 ): Map<string, DiscoveredPoolAccountPayload> {
   const accountMap = new Map<string, DiscoveredPoolAccountPayload>();
   if (!fsSync.existsSync(fixturesPath)) return accountMap;
+
+  // Authentic Replay Mode (B1-PREP-04): Strict verification against sealed SHA-256 manifest
+  if (options?.replayMode === "authentic") {
+    const stat = fsSync.statSync(fixturesPath);
+    const targetDir = stat.isDirectory() ? fixturesPath : path.dirname(fixturesPath);
+
+    const manifestName = fsSync.existsSync(path.join(targetDir, "cpmm-snapshot-manifest.json"))
+      ? "cpmm-snapshot-manifest.json"
+      : fsSync.existsSync(path.join(targetDir, "manifest.json"))
+        ? "manifest.json"
+        : null;
+
+    if (!manifestName) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Authentic replay requires a sealed manifest (cpmm-snapshot-manifest.json). None found in ${targetDir}`,
+      );
+    }
+
+    const manifestPath = path.join(targetDir, manifestName);
+    const manifestRaw = fsSync.readFileSync(manifestPath, "utf8");
+    let manifest: {
+      files?: Array<{ filename: string; sha256: string; byteSize?: number }>;
+      manifestSha256?: string;
+    };
+    try {
+      manifest = JSON.parse(manifestRaw);
+    } catch {
+      throw new Error(`[AUTHENTIC_REPLAY_ERROR] Failed to parse manifest JSON in ${manifestPath}`);
+    }
+
+    if (!manifest.files || !Array.isArray(manifest.files) || manifest.files.length === 0) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Manifest in ${manifestPath} contains no file records`,
+      );
+    }
+
+    // Verify SHA-256 integrity of all sealed files before decoding
+    for (const entry of manifest.files) {
+      const filePath = path.join(targetDir, entry.filename);
+      if (!fsSync.existsSync(filePath)) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Missing sealed fixture file: ${entry.filename} (listed in ${manifestName})`,
+        );
+      }
+      const fileBytes = fsSync.readFileSync(filePath);
+      const actualHash = crypto.createHash("sha256").update(fileBytes).digest("hex");
+      if (actualHash !== entry.sha256) {
+        throw new Error(
+          `[STRICT_REPLAY_INTEGRITY_FAILURE] SHA-256 hash mismatch for '${entry.filename}': expected ${entry.sha256}, got ${actualHash}`,
+        );
+      }
+    }
+
+    // 1. Load Pool Account from pool-account-rpc.json
+    const poolFilePath = path.join(targetDir, "pool-account-rpc.json");
+    if (!fsSync.existsSync(poolFilePath)) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Missing required CPMM pool payload: pool-account-rpc.json`,
+      );
+    }
+    const poolJson = JSON.parse(fsSync.readFileSync(poolFilePath, "utf8"));
+    const poolReq = poolJson.request;
+    const poolRes = poolJson.response;
+    const poolAddress = poolReq?.params?.[0];
+    const poolVal = poolRes?.result?.value ?? poolRes?.value;
+    const poolSlot = poolRes?.result?.context?.slot ?? poolRes?.context?.slot;
+
+    if (!poolAddress || typeof poolAddress !== "string") {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Missing or invalid pool address in ${poolFilePath}`,
+      );
+    }
+    if (!poolVal || !poolVal.data?.[0]) {
+      throw new Error(`[AUTHENTIC_REPLAY_ERROR] Missing pool account data in ${poolFilePath}`);
+    }
+    if (typeof poolSlot !== "number" || !Number.isInteger(poolSlot) || poolSlot <= 0) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Invalid non-positive context slot for pool account in ${poolFilePath}: ${poolSlot}`,
+      );
+    }
+    accountMap.set(poolAddress, {
+      address: poolAddress,
+      data: Buffer.from(poolVal.data[0], "base64"),
+      owner: poolVal.owner ?? "",
+      lamports: BigInt(poolVal.lamports ?? 0),
+      slot: poolSlot,
+    });
+
+    // 2. Load Vault Accounts from vault-accounts-rpc.json
+    const vaultsFilePath = path.join(targetDir, "vault-accounts-rpc.json");
+    if (!fsSync.existsSync(vaultsFilePath)) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Missing required CPMM vaults payload: vault-accounts-rpc.json`,
+      );
+    }
+    const vaultsJson = JSON.parse(fsSync.readFileSync(vaultsFilePath, "utf8"));
+    const vaultsReq = vaultsJson.request;
+    const vaultsRes = vaultsJson.response;
+    const vaultAddrs = vaultsReq?.params?.[0] as string[];
+    const vaultVals = vaultsRes?.result?.value ?? vaultsRes?.value;
+    const vaultsSlot = vaultsRes?.result?.context?.slot ?? vaultsRes?.context?.slot;
+
+    if (!Array.isArray(vaultAddrs) || vaultAddrs.length !== 2) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Expected 2 vault addresses in ${vaultsFilePath}, got ${vaultAddrs?.length}`,
+      );
+    }
+    if (!Array.isArray(vaultVals) || vaultVals.length !== 2) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Expected 2 vault account values in ${vaultsFilePath}, got ${vaultVals?.length}`,
+      );
+    }
+    if (typeof vaultsSlot !== "number" || !Number.isInteger(vaultsSlot) || vaultsSlot <= 0) {
+      throw new Error(
+        `[AUTHENTIC_REPLAY_ERROR] Invalid non-positive context slot for vault accounts in ${vaultsFilePath}: ${vaultsSlot}`,
+      );
+    }
+
+    for (let i = 0; i < 2; i++) {
+      const addr = vaultAddrs[i];
+      if (!addr || typeof addr !== "string") {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Missing vault address at index ${i} in ${vaultsFilePath}`,
+        );
+      }
+      const vVal = vaultVals[i];
+      if (!vVal || !vVal.data?.[0]) {
+        throw new Error(
+          `[AUTHENTIC_REPLAY_ERROR] Empty vault account ${i} payload in ${vaultsFilePath}`,
+        );
+      }
+      accountMap.set(addr, {
+        address: addr,
+        data: Buffer.from(vVal.data[0], "base64"),
+        owner: vVal.owner ?? "",
+        lamports: BigInt(vVal.lamports ?? 0),
+        slot: vaultsSlot,
+      });
+    }
+
+    // STRICT REPLAY: Zero synthetic fallbacks permitted!
+    return accountMap;
+  }
 
   const stat = fsSync.statSync(fixturesPath);
   const fixtureFiles: string[] = [];
@@ -1429,10 +1774,13 @@ export function loadAccountMapFromFixtures(
 }
 
 /**
- * Constructs an offline mock RPC transport that serves accounts loaded from replay fixtures (BREADY-05).
+ * Constructs an offline mock RPC transport that serves accounts loaded from replay fixtures (BREADY-05 / B1-PREP-04).
  */
-export function createOfflineRpcTransportFromFixtures(fixturesPath: string): ISolanaRpcTransport {
-  const accountMap = loadAccountMapFromFixtures(fixturesPath);
+export function createOfflineRpcTransportFromFixtures(
+  fixturesPath: string,
+  options?: { replayMode?: "synthetic" | "authentic" | undefined },
+): ISolanaRpcTransport {
+  const accountMap = loadAccountMapFromFixtures(fixturesPath, options);
 
   return {
     async post(_url: string, body: Record<string, unknown>): Promise<unknown> {
@@ -1678,19 +2026,32 @@ export async function runPilotCollectorCli(
     if (config.verifyCpmmPoolAddress) {
       logger.info(
         "VERIFY_CPMM_POOL_START",
-        `Initiating offline on-chain verification for Raydium CPMM pool ${config.verifyCpmmPoolAddress} using fixtures from ${config.replayFixturesPath}...`,
+        `Initiating offline on-chain verification for Raydium CPMM pool ${config.verifyCpmmPoolAddress} using fixtures from ${config.replayFixturesPath} (replayMode: ${config.replayMode ?? "synthetic"})...`,
       );
-      const offlineTransport =
-        config.rpcTransport ?? createOfflineRpcTransportFromFixtures(config.replayFixturesPath);
-      const rpcClient = new SolanaRpcLiveObservationClient({
-        rpcUrl: "http://offline-fixtures",
-        transport: offlineTransport,
-        onLog: (msg) => logger.info("SOLANA_RPC", msg),
-      });
+      try {
+        const offlineTransport =
+          config.rpcTransport ??
+          createOfflineRpcTransportFromFixtures(config.replayFixturesPath, {
+            replayMode: config.replayMode,
+          });
+        const rpcClient = new SolanaRpcLiveObservationClient({
+          rpcUrl: "http://offline-fixtures",
+          transport: offlineTransport,
+          maxRequestsBudget: config.rpcMaxCalls ?? 2,
+          httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+          onLog: (msg) => logger.info("SOLANA_RPC", msg),
+        });
 
-      const report = await rpcClient.verifyCpmmPoolAccount(config.verifyCpmmPoolAddress);
-      console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
-      return report.verified ? 0 : 1;
+        const report = await rpcClient.verifyCpmmPoolAccount(config.verifyCpmmPoolAddress);
+        console.log(
+          JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2),
+        );
+        return report.verified ? 0 : 1;
+      } catch (err) {
+        logger.error("REPLAY_ERROR", `Failed offline CPMM verification: ${err}`);
+        console.error(`[STRICT_REPLAY_FAILED] ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
     }
 
     // Offline AMM v4 verification from replay fixtures
@@ -1760,7 +2121,7 @@ export async function runPilotCollectorCli(
     }
   }
 
-  // Independent On-Chain Raydium CPMM Pool Verification Diagnostic Mode (D29-H3)
+  // Independent On-Chain Raydium CPMM Pool Verification Diagnostic Mode (D29-H3 / B1-PREP-01 / B1-PREP-03)
   if (config.verifyCpmmPoolAddress) {
     const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
     logger.info(
@@ -1770,11 +2131,26 @@ export async function runPilotCollectorCli(
     const rpcClient = new SolanaRpcLiveObservationClient({
       rpcUrl: config.rpcUrl,
       transport: config.rpcTransport,
+      maxRequestsBudget: config.rpcMaxCalls ?? 2,
+      httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
       onLog: (msg) => logger.info("SOLANA_RPC", msg),
     });
 
     const report = await rpcClient.verifyCpmmPoolAccount(config.verifyCpmmPoolAddress);
     console.log(JSON.stringify(report, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+
+    if (config.captureFixturesDir) {
+      const snapshot = saveCpmmSnapshot(
+        config.captureFixturesDir,
+        config.verifyCpmmPoolAddress,
+        report,
+        logger,
+      );
+      logger.info(
+        "CPMM_SNAPSHOT_SUMMARY",
+        `Snapshot [${snapshot.status}] sealed at ${snapshot.snapshotDir} (manifest: ${snapshot.manifestPath})`,
+      );
+    }
 
     if (report.verified) {
       logger.info(

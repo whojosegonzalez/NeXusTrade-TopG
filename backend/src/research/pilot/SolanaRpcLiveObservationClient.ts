@@ -44,10 +44,39 @@ export interface ISolanaRpcTransport {
   post(url: string, body: Record<string, unknown>, init?: RequestInit): Promise<unknown>;
 }
 
+export interface RawRpcInteractionRecord {
+  readonly request: {
+    readonly jsonrpc: "2.0";
+    readonly id: string | number;
+    readonly method: string;
+    readonly params: unknown[];
+    readonly endpoint: string;
+    readonly timestampIso: string;
+    readonly timestampEpochMs: number;
+  };
+  readonly response: Record<string, unknown> | null;
+  readonly timing: {
+    readonly elapsedMs: number;
+    readonly payloadSizeBytes: number;
+  };
+  readonly error?: string | undefined;
+}
+
+export interface CpmmRawSnapshotBundle {
+  readonly poolAccountRpc: RawRpcInteractionRecord;
+  readonly vaultAccountsRpc: RawRpcInteractionRecord | null;
+  readonly requestedPoolAddress: string;
+  readonly requestedVault0Address?: string | undefined;
+  readonly requestedVault1Address?: string | undefined;
+  readonly totalRpcCalls: number;
+  readonly maxRpcCallsBudget: number;
+}
+
 export interface SolanaRpcClientOptions {
   readonly rpcUrl?: string | undefined;
   readonly httpTimeoutMs?: number | undefined;
   readonly maxRequestsPerMinute?: number | undefined;
+  readonly maxRequestsBudget?: number | undefined;
   readonly transport?: ISolanaRpcTransport | undefined;
   readonly onLog?: ((message: string) => void) | undefined;
 }
@@ -139,12 +168,15 @@ export interface CpmmPoolVerificationReport {
   readonly spotPrice0Per1?: number | null | undefined;
   readonly hostElapsedMs?: number | undefined;
   readonly error?: string | undefined;
+  /** Raw JSON-RPC responses and timing metadata captured during verification (B1-PREP-01) */
+  readonly rawCaptureBundle?: CpmmRawSnapshotBundle | undefined;
 }
 
 export class SolanaRpcLiveObservationClient {
   private readonly rpcUrl: string;
   private readonly httpTimeoutMs: number;
   private readonly maxRequestsPerMinute: number;
+  private readonly maxRequestsBudget?: number | undefined;
   private readonly transport: ISolanaRpcTransport;
   private readonly onLog?: ((message: string) => void) | undefined;
 
@@ -168,6 +200,7 @@ export class SolanaRpcLiveObservationClient {
     this.rpcUrl = options?.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC;
     this.httpTimeoutMs = options?.httpTimeoutMs ?? 5_000;
     this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? 60;
+    this.maxRequestsBudget = options?.maxRequestsBudget;
     this.transport = options?.transport ?? {
       post: async (url: string, body: Record<string, unknown>, init?: RequestInit) => {
         const res = await globalThis.fetch(url, {
@@ -653,6 +686,26 @@ export class SolanaRpcLiveObservationClient {
     const requestEpochMs = Date.now();
     this.poolsObserved++;
 
+    let callsExecuted = 0;
+    let poolRecord: RawRpcInteractionRecord | null = null;
+    let vaultsRecord: RawRpcInteractionRecord | null = null;
+
+    const buildCaptureBundle = (extra?: {
+      v0?: string;
+      v1?: string;
+    }): CpmmRawSnapshotBundle | undefined => {
+      if (!poolRecord) return undefined;
+      return {
+        poolAccountRpc: poolRecord,
+        vaultAccountsRpc: vaultsRecord,
+        requestedPoolAddress: poolAddress,
+        requestedVault0Address: extra?.v0,
+        requestedVault1Address: extra?.v1,
+        totalRpcCalls: callsExecuted,
+        maxRpcCallsBudget: this.maxRequestsBudget ?? 2,
+      };
+    };
+
     if (!isCanonicalSolanaBase58(poolAddress)) {
       this.poolsFailed++;
       return {
@@ -670,11 +723,20 @@ export class SolanaRpcLiveObservationClient {
     }
 
     try {
-      // 1. Fetch Pool State Account
-      const rawPoolResponse = (await this.executeRpcCall("getAccountInfo", [
-        poolAddress,
-        { encoding: "base64" },
-      ])) as Record<string, unknown> | null;
+      // 1. Fetch Pool State Account (Call 1 of 2 in standard budget)
+      callsExecuted++;
+      let rawPoolResponse: Record<string, unknown> | null = null;
+      try {
+        const res = await this.executeRpcCallWithRecord("getAccountInfo", [
+          poolAddress,
+          { encoding: "base64" },
+        ]);
+        rawPoolResponse = res.response as Record<string, unknown> | null;
+        poolRecord = res.record;
+      } catch (err) {
+        poolRecord = (err as { rpcRecord?: RawRpcInteractionRecord })?.rpcRecord ?? null;
+        throw err;
+      }
 
       const poolInfoResponse =
         (rawPoolResponse?.result as {
@@ -714,6 +776,7 @@ export class SolanaRpcLiveObservationClient {
           vault1Slot: null,
           slotDiscrepancy: false,
           error: "CPMM pool account not found on-chain",
+          rawCaptureBundle: buildCaptureBundle(),
         };
       }
 
@@ -731,6 +794,7 @@ export class SolanaRpcLiveObservationClient {
           slotDiscrepancy: false,
           programOwner: poolVal.owner,
           error: `Unauthorized pool owner: expected ${RAYDIUM_CPMM_PROGRAM_ID}, got ${poolVal.owner}`,
+          rawCaptureBundle: buildCaptureBundle(),
         };
       }
 
@@ -748,6 +812,7 @@ export class SolanaRpcLiveObservationClient {
           vault1Slot: null,
           slotDiscrepancy: false,
           error: "Empty pool account data payload",
+          rawCaptureBundle: buildCaptureBundle(),
         };
       }
 
@@ -772,16 +837,26 @@ export class SolanaRpcLiveObservationClient {
           vault1Slot: null,
           slotDiscrepancy: false,
           error: `Failed to decode CPMM pool state: ${cpmmParseResult.message}`,
+          rawCaptureBundle: buildCaptureBundle(),
         };
       }
 
       const poolState = cpmmParseResult.state;
 
-      // 2. Fetch Vault Accounts
-      const rawVaultsResponse = (await this.executeRpcCall("getMultipleAccounts", [
-        [poolState.token0Vault, poolState.token1Vault],
-        { encoding: "base64" },
-      ])) as Record<string, unknown> | null;
+      // 2. Fetch Vault Accounts (Call 2 of 2 in standard budget)
+      callsExecuted++;
+      let rawVaultsResponse: Record<string, unknown> | null = null;
+      try {
+        const res = await this.executeRpcCallWithRecord("getMultipleAccounts", [
+          [poolState.token0Vault, poolState.token1Vault],
+          { encoding: "base64" },
+        ]);
+        rawVaultsResponse = res.response as Record<string, unknown> | null;
+        vaultsRecord = res.record;
+      } catch (err) {
+        vaultsRecord = (err as { rpcRecord?: RawRpcInteractionRecord })?.rpcRecord ?? null;
+        throw err;
+      }
 
       const vaultsResponse =
         (rawVaultsResponse?.result as {
@@ -827,6 +902,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: "One or both CPMM vault accounts not found on-chain",
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -871,6 +950,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: `Vault 0 verification failed: ${v0Parsed.category} - ${v0Parsed.message}`,
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -892,6 +975,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: `Vault 1 verification failed: ${v1Parsed.category} - ${v1Parsed.message}`,
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -917,6 +1004,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: `Missing authentic slot provenance: poolSlot=${poolSlot}, vaultsSlot=${vaultsSlot}`,
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -944,6 +1035,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: `Slot discrepancy between pool observation (${poolSlot}) and vault observation (${vaultsSlot}): delta=${slotDelta}`,
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -973,6 +1068,10 @@ export class SolanaRpcLiveObservationClient {
           token0Vault: poolState.token0Vault,
           token1Vault: poolState.token1Vault,
           error: `Reserve accounting failed: ${reserveResult.message}`,
+          rawCaptureBundle: buildCaptureBundle({
+            v0: poolState.token0Vault,
+            v1: poolState.token1Vault,
+          }),
         };
       }
 
@@ -1004,6 +1103,10 @@ export class SolanaRpcLiveObservationClient {
         spotPriceSol: isCoherent ? accounting.spotPriceSol : null,
         spotPrice0Per1: isCoherent ? accounting.spotPrice0Per1 : null,
         hostElapsedMs: Date.now() - requestEpochMs,
+        rawCaptureBundle: buildCaptureBundle({
+          v0: poolState.token0Vault,
+          v1: poolState.token1Vault,
+        }),
       };
     } catch (err: unknown) {
       this.poolsFailed++;
@@ -1024,18 +1127,28 @@ export class SolanaRpcLiveObservationClient {
         slotDiscrepancy: false,
         hostElapsedMs: Date.now() - requestEpochMs,
         error: errMsg,
+        rawCaptureBundle: buildCaptureBundle(),
       };
     }
   }
 
   /**
-   * Executes an allowlisted Solana JSON-RPC 2.0 call.
-   * Enforces outbound request budget at the transport boundary for every call (D24F-05).
+   * Executes an allowlisted Solana JSON-RPC 2.0 call and captures complete request/response records (B1-PREP-01).
+   * Enforces outbound request budget at the transport boundary for every call (D24F-05 / B1-PREP-03).
    */
-  public async executeRpcCall(method: string, params: unknown[]): Promise<unknown> {
+  public async executeRpcCallWithRecord(
+    method: string,
+    params: unknown[],
+  ): Promise<{ response: unknown; record: RawRpcInteractionRecord }> {
     if (!ALLOWLISTED_RPC_METHODS.has(method)) {
       throw new Error(
         `[FORBIDDEN_RPC_METHOD] Method '${method}' is not permitted. Only read-only methods [getAccountInfo, getMultipleAccounts] are authorized.`,
+      );
+    }
+
+    if (this.maxRequestsBudget !== undefined && this.totalCalls >= this.maxRequestsBudget) {
+      throw new Error(
+        `[REQUEST_BUDGET_EXCEEDED] Outbound RPC call rejected: exceeded strict budget of ${this.maxRequestsBudget} requests (totalCalls: ${this.totalCalls})`,
       );
     }
 
@@ -1059,21 +1172,47 @@ export class SolanaRpcLiveObservationClient {
       controller.abort();
     }, this.httpTimeoutMs);
 
+    const reqId = `pilot-req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const rpcBody = {
-      jsonrpc: "2.0",
-      id: `pilot-req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      jsonrpc: "2.0" as const,
+      id: reqId,
       method,
       params,
     };
 
+    const callStartEpochMs = Date.now();
     try {
       const res = await this.transport.post(this.rpcUrl, rpcBody, {
         signal: controller.signal,
       });
+      const elapsedMs = Date.now() - callStartEpochMs;
       this.successfulCalls++;
       this.onLog?.(`${method} call succeeded`);
-      return res;
+
+      const resObj =
+        res && typeof res === "object" ? (res as Record<string, unknown>) : { result: res };
+      const payloadSizeBytes = Buffer.byteLength(JSON.stringify(resObj), "utf8");
+
+      const record: RawRpcInteractionRecord = {
+        request: {
+          jsonrpc: "2.0",
+          id: reqId,
+          method,
+          params,
+          endpoint: this.rpcUrl,
+          timestampIso: new Date(callStartEpochMs).toISOString(),
+          timestampEpochMs: callStartEpochMs,
+        },
+        response: resObj,
+        timing: {
+          elapsedMs,
+          payloadSizeBytes,
+        },
+      };
+
+      return { response: res, record };
     } catch (err) {
+      const elapsedMs = Date.now() - callStartEpochMs;
       this.failedCalls++;
       if (err instanceof Error && err.message.includes("429")) {
         this.rateLimitsEncountered++;
@@ -1082,11 +1221,41 @@ export class SolanaRpcLiveObservationClient {
       if (err instanceof Error && (err.name === "AbortError" || err.message.includes("timeout"))) {
         this.timeoutsEncountered++;
       }
-      this.onLog?.(`${method} call failed: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.onLog?.(`${method} call failed: ${errMsg}`);
+
+      const record: RawRpcInteractionRecord = {
+        request: {
+          jsonrpc: "2.0",
+          id: reqId,
+          method,
+          params,
+          endpoint: this.rpcUrl,
+          timestampIso: new Date(callStartEpochMs).toISOString(),
+          timestampEpochMs: callStartEpochMs,
+        },
+        response: null,
+        timing: {
+          elapsedMs,
+          payloadSizeBytes: 0,
+        },
+        error: errMsg,
+      };
+
+      (err as { rpcRecord?: RawRpcInteractionRecord }).rpcRecord = record;
       throw err;
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  /**
+   * Executes an allowlisted Solana JSON-RPC 2.0 call.
+   * Enforces outbound request budget at the transport boundary for every call (D24F-05).
+   */
+  public async executeRpcCall(method: string, params: unknown[]): Promise<unknown> {
+    const { response } = await this.executeRpcCallWithRecord(method, params);
+    return response;
   }
 
   private enforceRateBudget(): void {
