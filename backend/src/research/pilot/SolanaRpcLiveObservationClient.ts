@@ -77,6 +77,7 @@ export interface SolanaRpcClientOptions {
   readonly httpTimeoutMs?: number | undefined;
   readonly maxRequestsPerMinute?: number | undefined;
   readonly maxRequestsBudget?: number | undefined;
+  readonly commitment?: "confirmed" | "processed" | "finalized" | undefined;
   readonly transport?: ISolanaRpcTransport | undefined;
   readonly onLog?: ((message: string) => void) | undefined;
 }
@@ -168,6 +169,8 @@ export interface CpmmPoolVerificationReport {
   readonly spotPrice0Per1?: number | null | undefined;
   readonly hostElapsedMs?: number | undefined;
   readonly error?: string | undefined;
+  /** Requested on-chain commitment level (e.g. 'confirmed') (B1-FINAL-03) */
+  readonly requestedCommitment?: string | undefined;
   /** Raw JSON-RPC responses and timing metadata captured during verification (B1-PREP-01) */
   readonly rawCaptureBundle?: CpmmRawSnapshotBundle | undefined;
 }
@@ -177,6 +180,7 @@ export class SolanaRpcLiveObservationClient {
   private readonly httpTimeoutMs: number;
   private readonly maxRequestsPerMinute: number;
   private readonly maxRequestsBudget?: number | undefined;
+  private readonly commitment: "confirmed" | "processed" | "finalized";
   private readonly transport: ISolanaRpcTransport;
   private readonly onLog?: ((message: string) => void) | undefined;
 
@@ -201,6 +205,7 @@ export class SolanaRpcLiveObservationClient {
     this.httpTimeoutMs = options?.httpTimeoutMs ?? 5_000;
     this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? 60;
     this.maxRequestsBudget = options?.maxRequestsBudget;
+    this.commitment = options?.commitment ?? "confirmed";
     this.transport = options?.transport ?? {
       post: async (url: string, body: Record<string, unknown>, init?: RequestInit) => {
         const res = await globalThis.fetch(url, {
@@ -711,6 +716,7 @@ export class SolanaRpcLiveObservationClient {
       return {
         poolAddress,
         rpcUrl: this.rpcUrl,
+        requestedCommitment: this.commitment,
         verificationStatus: "MALFORMED_POOL_DATA",
         verified: false,
         onChainSlot: null,
@@ -729,7 +735,7 @@ export class SolanaRpcLiveObservationClient {
       try {
         const res = await this.executeRpcCallWithRecord("getAccountInfo", [
           poolAddress,
-          { encoding: "base64" },
+          { encoding: "base64", commitment: this.commitment },
         ]);
         rawPoolResponse = res.response as Record<string, unknown> | null;
         poolRecord = res.record;
@@ -768,6 +774,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "NULL_ACCOUNT",
           verified: false,
           onChainSlot: poolSlot,
@@ -785,6 +792,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "UNAUTHORIZED_PROGRAM_ID",
           verified: false,
           onChainSlot: poolSlot,
@@ -804,6 +812,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "MALFORMED_POOL_DATA",
           verified: false,
           onChainSlot: poolSlot,
@@ -829,6 +838,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "MALFORMED_POOL_DATA",
           verified: false,
           onChainSlot: poolSlot,
@@ -849,7 +859,7 @@ export class SolanaRpcLiveObservationClient {
       try {
         const res = await this.executeRpcCallWithRecord("getMultipleAccounts", [
           [poolState.token0Vault, poolState.token1Vault],
-          { encoding: "base64" },
+          { encoding: "base64", commitment: this.commitment },
         ]);
         rawVaultsResponse = res.response as Record<string, unknown> | null;
         vaultsRecord = res.record;
@@ -889,6 +899,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
           onChainSlot: vaultsSlot ?? poolSlot,
@@ -937,6 +948,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
           onChainSlot: vaultsSlot ?? poolSlot,
@@ -962,6 +974,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
           onChainSlot: vaultsSlot ?? poolSlot,
@@ -989,6 +1002,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "SLOT_PROVENANCE_UNAVAILABLE",
           verified: false,
           verificationTier: "PARTIALLY_VERIFIED",
@@ -1020,6 +1034,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "SLOT_DISCREPANT",
           verified: false,
           verificationTier: "SLOT_DISCREPANT",
@@ -1054,6 +1069,7 @@ export class SolanaRpcLiveObservationClient {
         return {
           poolAddress,
           rpcUrl: this.rpcUrl,
+          requestedCommitment: this.commitment,
           verificationStatus: "VAULT_VERIFICATION_FAILED",
           verified: false,
           onChainSlot: vaultsSlot,
@@ -1083,6 +1099,7 @@ export class SolanaRpcLiveObservationClient {
       return {
         poolAddress,
         rpcUrl: this.rpcUrl,
+        requestedCommitment: this.commitment,
         verificationStatus: isCoherent ? "VERIFIED_RAYDIUM_CPMM" : "VAULT_VERIFICATION_FAILED",
         verified: isCoherent,
         verificationTier: accounting.verificationTier,
@@ -1118,6 +1135,7 @@ export class SolanaRpcLiveObservationClient {
       return {
         poolAddress,
         rpcUrl: this.rpcUrl,
+        requestedCommitment: this.commitment,
         verificationStatus: status,
         verified: false,
         onChainSlot: null,

@@ -2722,19 +2722,28 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
       expect(bundle.requestedVault0Address).toBe(FIXTURE_CPMM_TOKEN_0_VAULT);
       expect(bundle.requestedVault1Address).toBe(FIXTURE_CPMM_TOKEN_1_VAULT);
 
-      // Verify Call 1 metadata and response
+      // Verify Call 1 metadata, requested commitment, and response
       expect(bundle.poolAccountRpc.request.method).toBe("getAccountInfo");
       expect(bundle.poolAccountRpc.request.params[0]).toBe(FIXTURE_CPMM_POOL_ADDRESS);
+      expect(bundle.poolAccountRpc.request.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
       expect(bundle.poolAccountRpc.request.endpoint).toBe("http://mock-rpc");
       expect(bundle.poolAccountRpc.timing.payloadSizeBytes).toBeGreaterThan(0);
       expect(bundle.poolAccountRpc.response).toBeDefined();
 
-      // Verify Call 2 metadata and response
+      // Verify Call 2 metadata, requested commitment, and response
       expect(bundle.vaultAccountsRpc).toBeDefined();
       expect(bundle.vaultAccountsRpc!.request.method).toBe("getMultipleAccounts");
+      expect(bundle.vaultAccountsRpc!.request.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
       expect(bundle.vaultAccountsRpc!.request.endpoint).toBe("http://mock-rpc");
       expect(bundle.vaultAccountsRpc!.timing.payloadSizeBytes).toBeGreaterThan(0);
       expect(bundle.vaultAccountsRpc!.response).toBeDefined();
+      expect(report.requestedCommitment).toBe("confirmed");
     });
 
     it("enforces dedicated request ceiling budget at transport boundary in verification mode (B1-PREP-03)", async () => {
@@ -3257,6 +3266,287 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
       // Returns 1 because pool is null (NULL_ACCOUNT)
       expect(exitCode).toBe(1);
+    });
+
+    it("proves requested commitment is present in both RPC payloads and recorded honestly in snapshot metadata (B1-FINAL-03)", async () => {
+      const testDir = await makeTestDir("honest-commitment-test");
+      const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 10_000_000_000n,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 50_000_000_000n,
+      });
+
+      const observedCallParams: Array<{ method: string; params: unknown[] }> = [];
+
+      const mockTransport: ISolanaRpcTransport = {
+        async post(_url, body) {
+          const method = body.method as string;
+          const reqId = body.id as string | number;
+          observedCallParams.push({ method, params: body.params as unknown[] });
+
+          if (method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 300000100 },
+                value: {
+                  data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_CPMM_PROGRAM_ID,
+                  lamports: 10000000,
+                },
+              },
+            };
+          }
+          if (method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 300000100 },
+                value: [
+                  {
+                    data: [v0Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                  {
+                    data: [v1Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                ],
+              },
+            };
+          }
+          return null;
+        },
+      };
+
+      const exitCode = await runPilotCollectorCli(
+        [
+          process.execPath,
+          "PilotLiveCollectorCli.js",
+          "--network=enabled",
+          `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+          `--capture-fixtures-dir=${testDir}`,
+          "--rpc-max-calls=2",
+          "--rpc-timeout-ms=10000",
+        ],
+        { rpcTransport: mockTransport },
+      );
+      expect(exitCode).toBe(0);
+
+      // Verify that BOTH outbound RPC requests explicitly sent commitment: "confirmed"
+      expect(observedCallParams).toHaveLength(2);
+      expect(observedCallParams[0]!.method).toBe("getAccountInfo");
+      expect(observedCallParams[0]!.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
+      expect(observedCallParams[1]!.method).toBe("getMultipleAccounts");
+      expect(observedCallParams[1]!.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
+
+      // Verify saved session directory and metadata honesty
+      const subdirs = await fs.readdir(testDir);
+      const snapshotDirName = subdirs.find((d) => d.startsWith("cpmm-snapshot-"));
+      expect(snapshotDirName).toBeDefined();
+      const snapshotDir = path.join(testDir, snapshotDirName!);
+
+      const metadataRaw = await fs.readFile(
+        path.join(snapshotDir, "snapshot-metadata.json"),
+        "utf8",
+      );
+      const metadata = JSON.parse(metadataRaw);
+      expect(metadata.commitment).toBe("confirmed");
+      expect(metadata.wirePayloadPreservation).toBe("JSON_RPC_OBJECTS_BASE64");
+      expect(metadata.status).toBe("FINALIZED");
+      expect(metadata.verified).toBe(true);
+
+      const poolRpcRaw = await fs.readFile(path.join(snapshotDir, "pool-account-rpc.json"), "utf8");
+      const poolRpc = JSON.parse(poolRpcRaw);
+      expect(poolRpc.request.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
+
+      const vaultsRpcRaw = await fs.readFile(
+        path.join(snapshotDir, "vault-accounts-rpc.json"),
+        "utf8",
+      );
+      const vaultsRpc = JSON.parse(vaultsRpcRaw);
+      expect(vaultsRpc.request.params[1]).toEqual({
+        encoding: "base64",
+        commitment: "confirmed",
+      });
+    });
+
+    it("parses and validates exact operator command arguments and rejects unsupported flags (B1-FINAL-01)", () => {
+      // 1. Live Verification Command Flags
+      const liveArgs = [
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--rpc-url=https://mock.solana.rpc",
+        `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+        "--capture-fixtures-dir=.tmp/cpmm-captures",
+        "--rpc-max-calls=2",
+        "--rpc-timeout-ms=10000",
+      ];
+      const parsedLive = parseCliArgs(liveArgs);
+      expect(parsedLive.network).toBe("enabled");
+      expect(parsedLive.rpcUrl).toBe("https://mock.solana.rpc");
+      expect(parsedLive.verifyCpmmPoolAddress).toBe(FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsedLive.captureFixturesDir).toBe(path.resolve(".tmp/cpmm-captures"));
+      expect(parsedLive.rpcMaxCalls).toBe(2);
+      expect(parsedLive.rpcTimeoutMs).toBe(10000);
+
+      // 2. Offline Replay Command Flags
+      const replayArgs = [
+        "node",
+        "cli.js",
+        "--replay-fixtures=.tmp/cpmm-captures/cpmm-snapshot-12345678",
+        `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+        "--replay-mode=authentic",
+      ];
+      const parsedReplay = parseCliArgs(replayArgs);
+      expect(parsedReplay.network).toBe("disabled"); // Stays strictly network-disabled
+      expect(parsedReplay.replayFixturesPath).toBe(
+        path.resolve(".tmp/cpmm-captures/cpmm-snapshot-12345678"),
+      );
+      expect(parsedReplay.verifyCpmmPoolAddress).toBe(FIXTURE_CPMM_POOL_ADDRESS);
+      expect(parsedReplay.replayMode).toBe("authentic");
+
+      // 3. Unsupported flags must throw [INVALID_ARGUMENT]
+      expect(() =>
+        parseCliArgs(["node", "cli.js", "--solana-rpc-url=https://api.mainnet-beta.solana.com"]),
+      ).toThrow(
+        "[INVALID_ARGUMENT] Unknown CLI option: '--solana-rpc-url=https://api.mainnet-beta.solana.com'",
+      );
+
+      expect(() => parseCliArgs(["node", "cli.js", "--offline"])).toThrow(
+        "[INVALID_ARGUMENT] Unknown CLI option: '--offline'",
+      );
+
+      expect(() => parseCliArgs(["node", "cli.js", "--fixtures-dir=.tmp/captures"])).toThrow(
+        "[INVALID_ARGUMENT] Unknown CLI option: '--fixtures-dir=.tmp/captures'",
+      );
+
+      expect(() => parseCliArgs(["node", "cli.js", "--commitment=confirmed"])).toThrow(
+        "[INVALID_ARGUMENT] Unknown CLI option: '--commitment=confirmed'",
+      );
+    });
+
+    it("dispatches live capture and offline authentic replay across nested session directory using injected transports (B1-FINAL-01 / B1-FINAL-03)", async () => {
+      const baseCaptureDir = await makeTestDir("two-phase-operator-test");
+      const cpmmPoolBuffer = createAuthoritativeRaydiumCpmmBuffer({
+        token0VaultBase58: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1VaultBase58: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      const v0Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_0_MINT,
+        rawAmount: 10_000_000_000n,
+      });
+      const v1Buffer = createAuthoritativeCpmmSplVaultBuffer({
+        mintBase58: FIXTURE_CPMM_TOKEN_1_MINT,
+        rawAmount: 50_000_000_000n,
+      });
+
+      let rpcCallCount = 0;
+      const mockTransport: ISolanaRpcTransport = {
+        async post(_url, body) {
+          rpcCallCount++;
+          const method = body.method as string;
+          const reqId = body.id as string | number;
+          if (method === "getAccountInfo") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 300000100 },
+                value: {
+                  data: [cpmmPoolBuffer.toString("base64"), "base64"],
+                  owner: RAYDIUM_CPMM_PROGRAM_ID,
+                  lamports: 10000000,
+                },
+              },
+            };
+          }
+          if (method === "getMultipleAccounts") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                context: { slot: 300000100 },
+                value: [
+                  {
+                    data: [v0Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                  {
+                    data: [v1Buffer.toString("base64"), "base64"],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                ],
+              },
+            };
+          }
+          return null;
+        },
+      };
+
+      // Phase 1: Live Verification Command (with --network=enabled)
+      const liveExitCode = await runPilotCollectorCli(
+        [
+          process.execPath,
+          "PilotLiveCollectorCli.js",
+          "--network=enabled",
+          "--rpc-url=http://mock-rpc",
+          `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+          `--capture-fixtures-dir=${baseCaptureDir}`,
+          "--rpc-max-calls=2",
+          "--rpc-timeout-ms=10000",
+        ],
+        { rpcTransport: mockTransport },
+      );
+      expect(liveExitCode).toBe(0);
+      expect(rpcCallCount).toBe(2);
+
+      // Verify nested session directory was created beneath baseCaptureDir
+      const subdirs = await fs.readdir(baseCaptureDir);
+      const sessionDirName = subdirs.find((d) => d.startsWith("cpmm-snapshot-"));
+      expect(sessionDirName).toBeDefined();
+      const actualSealedSessionDir = path.join(baseCaptureDir, sessionDirName!);
+
+      // Phase 2: Offline Authentic Replay Command targeting the sealed session directory (no --network flag)
+      const replayExitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--replay-fixtures=${actualSealedSessionDir}`,
+        `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+        "--replay-mode=authentic",
+      ]);
+      expect(replayExitCode).toBe(0);
+
+      // Negative check: live verify without --network=enabled fails closed
+      const failExitCode = await runPilotCollectorCli([
+        process.execPath,
+        "PilotLiveCollectorCli.js",
+        `--verify-cpmm-pool=${FIXTURE_CPMM_POOL_ADDRESS}`,
+      ]);
+      expect(failExitCode).toBe(1);
     });
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {

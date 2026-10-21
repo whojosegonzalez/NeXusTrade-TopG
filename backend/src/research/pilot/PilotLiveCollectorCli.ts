@@ -1309,7 +1309,10 @@ export function saveCpmmSnapshot(
       jsonrpc: "2.0" as const,
       id: "capture-req-pool",
       method: "getAccountInfo",
-      params: [poolAddress, { encoding: "base64" }],
+      params: [
+        poolAddress,
+        { encoding: "base64", commitment: report.requestedCommitment ?? "confirmed" },
+      ],
       endpoint: report.rpcUrl,
       timestampIso: new Date(snapshotTimestamp).toISOString(),
       timestampEpochMs: snapshotTimestamp,
@@ -1327,7 +1330,10 @@ export function saveCpmmSnapshot(
       jsonrpc: "2.0" as const,
       id: "capture-req-vaults",
       method: "getMultipleAccounts",
-      params: [[report.token0Vault ?? "", report.token1Vault ?? ""], { encoding: "base64" }],
+      params: [
+        [report.token0Vault ?? "", report.token1Vault ?? ""],
+        { encoding: "base64", commitment: report.requestedCommitment ?? "confirmed" },
+      ],
       endpoint: report.rpcUrl,
       timestampIso: new Date(snapshotTimestamp).toISOString(),
       timestampEpochMs: snapshotTimestamp,
@@ -1356,6 +1362,15 @@ export function saveCpmmSnapshot(
     report.poolSlot !== null && report.vault0Slot !== null
       ? Math.abs(report.poolSlot - report.vault0Slot)
       : null;
+  const requestedCommitment =
+    report.requestedCommitment ??
+    (
+      report.rawCaptureBundle?.poolAccountRpc?.request?.params?.[1] as
+        | { commitment?: string }
+        | undefined
+    )?.commitment ??
+    "unspecified";
+
   const metadata = {
     snapshotId,
     captureTimestampIso: new Date(snapshotTimestamp).toISOString(),
@@ -1364,7 +1379,8 @@ export function saveCpmmSnapshot(
     token0Vault: report.token0Vault ?? null,
     token1Vault: report.token1Vault ?? null,
     rpcUrl: report.rpcUrl,
-    commitment: "confirmed",
+    commitment: requestedCommitment,
+    wirePayloadPreservation: "JSON_RPC_OBJECTS_BASE64",
     maxRpcCallsCeiling: report.rawCaptureBundle?.maxRpcCallsBudget ?? 2,
     totalRpcCallsExecuted:
       report.rawCaptureBundle?.totalRpcCalls ?? (vaultAccountsRpcData.response ? 2 : 1),
@@ -2039,6 +2055,7 @@ export async function runPilotCollectorCli(
           transport: offlineTransport,
           maxRequestsBudget: config.rpcMaxCalls ?? 2,
           httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+          commitment: "confirmed",
           onLog: (msg) => logger.info("SOLANA_RPC", msg),
         });
 
@@ -2133,6 +2150,7 @@ export async function runPilotCollectorCli(
       transport: config.rpcTransport,
       maxRequestsBudget: config.rpcMaxCalls ?? 2,
       httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+      commitment: "confirmed",
       onLog: (msg) => logger.info("SOLANA_RPC", msg),
     });
 
