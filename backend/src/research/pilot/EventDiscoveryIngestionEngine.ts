@@ -253,18 +253,30 @@ export class EventDiscoveryIngestionEngine {
   public async processQueue(
     txFetcher: ITransactionFetcher,
     accountFetcher: IOnChainAccountFetcher,
+    options?: { readonly deadlineEpochMs?: number | undefined } | undefined,
   ): Promise<readonly VerificationDispatchResult[]> {
     const results: VerificationDispatchResult[] = [];
+
+    // Stop queue draining if wall-clock deadline already passed (B2-LAUNCH-03)
+    if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+      return results;
+    }
 
     // 0. Retry any pending verifications from previous attempts (BREADY-04)
     const retried = await this.retryPendingVerifications(accountFetcher);
     results.push(...retried);
 
     while (this.queue.length > 0) {
+      if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+        break;
+      }
       if (
         this.maxTransactions !== undefined &&
         this.totalTransactionsProcessed >= this.maxTransactions
       ) {
+        break;
+      }
+      if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
         break;
       }
       const item = this.queue.shift()!;
@@ -331,6 +343,12 @@ export class EventDiscoveryIngestionEngine {
 
       // 4. Dispatch verification for each identified pool initialization event
       for (const event of scanResult.events) {
+        if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+          break;
+        }
+        if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
+          break;
+        }
         // Pool ID deduplication (check if already verified or encountered)
         if (this.verifiedPoolIds.has(event.poolId)) {
           this.duplicatePoolIdsIgnored += 1;

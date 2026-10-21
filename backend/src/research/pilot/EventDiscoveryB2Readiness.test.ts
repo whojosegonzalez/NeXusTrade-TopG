@@ -2186,4 +2186,498 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
     const verification = verifyB2SessionManifest(recorder.getSessionDir());
     expect(verification.valid).toBe(true);
   });
+
+  describe("B2-LAUNCH-01 / B2-LAUNCH-02 / B2-LAUNCH-03 Final Preflight Verifications", () => {
+    const baseReplayConfig = {
+      network: "disabled" as const,
+      discoverySource: "events" as const,
+      rpcUrl: "https://api.mainnet-beta.solana.com",
+      pollIntervalSec: 1,
+      durationSec: 10,
+      targetCandidates: 1,
+      maxCandidatesScreened: 1,
+      targetDiagnosticYield: 1,
+      maxMb: 10,
+      maxRssMb: 256,
+      outputDir: testTmpBase,
+      enableForwardObservations: false,
+    };
+
+    it("B2-LAUNCH-01: authentic replay rejects getAccountInfo with missing, zero, or non-integer slot without synthetic fallback", async () => {
+      const logger = new PilotLogger();
+      const testSig =
+        "5xLaunchTestSigAmmV4Init111111111111111111111111111111111111111111111111111111111111111";
+      const ammV4Tx = createAmmV4InitTransactionFixture({
+        signature: testSig,
+        slot: 450000100,
+        poolId: FIXTURE_POOL_ADDRESS,
+        token0Vault: FIXTURE_BASE_VAULT,
+        token1Vault: FIXTURE_QUOTE_VAULT,
+        token0Mint: FIXTURE_MEME_MINT,
+        token1Mint: FIXTURE_WSOL_MINT,
+      });
+
+      // Test Case 1: getAccountInfo with missing context slot
+      const missingSlotSessionDir = path.join(testTmpBase, "missing-account-slot-session");
+      saveB2EventSession({
+        captureBaseDir: testTmpBase,
+        sessionId: "missing-account-slot-session",
+        forcedStatus: "FINALIZED",
+        rawNotifications: [
+          {
+            receivedEpochMs: Date.now(),
+            receivedIso: new Date().toISOString(),
+            subscriptionId: 10,
+            protocol: "RAYDIUM_AMM_V4",
+            envelope: {
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                result: {
+                  context: { slot: 450000100 },
+                  value: { signature: testSig, err: null, logs: ["Program log: initialize2"] },
+                },
+                subscription: 10,
+              },
+            },
+          },
+        ],
+        rawTransactions: [
+          {
+            request: {
+              jsonrpc: "2.0",
+              id: "tx-req-1",
+              method: "getTransaction",
+              params: [testSig, { encoding: "json", commitment: "confirmed" }],
+              endpoint: "https://api.mainnet-beta.solana.com/",
+              endpointFingerprint: "fp",
+              timestampIso: new Date().toISOString(),
+              timestampEpochMs: Date.now(),
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: "tx-req-1",
+              result: {
+                slot: 450000100,
+                blockTime: 1746886997,
+                version: 0,
+                transaction: {
+                  message: {
+                    accountKeys: ammV4Tx.accountKeys.staticAccountKeys,
+                    instructions: ammV4Tx.instructions,
+                  },
+                },
+                meta: { err: null, innerInstructions: [] },
+              },
+            },
+            timing: { elapsedMs: 50, payloadSizeBytes: 2000 },
+          },
+        ],
+        rawAccounts: [
+          {
+            request: {
+              jsonrpc: "2.0",
+              id: "acc-req-1",
+              method: "getAccountInfo",
+              params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+              endpoint: "https://api.mainnet-beta.solana.com/",
+              endpointFingerprint: "fp",
+              timestampIso: new Date().toISOString(),
+              timestampEpochMs: Date.now(),
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: "acc-req-1",
+              result: {
+                context: {}, // MISSING SLOT
+                value: {
+                  data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                  lamports: 10000000,
+                },
+              },
+            },
+            timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+          },
+        ],
+        discoveredEvents: [],
+        verificationReports: [],
+      });
+
+      // Must fail closed in authentic replay and never substitute 300000100
+      await expect(
+        runReplaySession(
+          {
+            ...baseReplayConfig,
+            replayMode: "authentic",
+            replayFixturesPath: missingSlotSessionDir,
+          },
+          logger,
+        ),
+      ).rejects.toThrow("[REPLAY_MALFORMED_ACCOUNT_SLOT]");
+
+      // Also verify loadAccountMapFromFixtures in authentic mode throws without synthetic fallback
+      expect(() =>
+        loadAccountMapFromFixtures(missingSlotSessionDir, { replayMode: "authentic" }),
+      ).toThrow("[REPLAY_MALFORMED_ACCOUNT_SLOT]");
+
+      // Test Case 2: getAccountInfo with zero slot
+      const zeroSlotSessionDir = path.join(testTmpBase, "zero-account-slot-session");
+      saveB2EventSession({
+        captureBaseDir: testTmpBase,
+        sessionId: "zero-account-slot-session",
+        forcedStatus: "FINALIZED",
+        rawNotifications: [],
+        rawTransactions: [],
+        rawAccounts: [
+          {
+            request: {
+              jsonrpc: "2.0",
+              id: "acc-req-zero",
+              method: "getAccountInfo",
+              params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+              endpoint: "https://api.mainnet-beta.solana.com/",
+              endpointFingerprint: "fp",
+              timestampIso: new Date().toISOString(),
+              timestampEpochMs: Date.now(),
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: "acc-req-zero",
+              result: {
+                context: { slot: 0 }, // ZERO SLOT
+                value: {
+                  data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                  lamports: 10000000,
+                },
+              },
+            },
+            timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+          },
+        ],
+        discoveredEvents: [],
+        verificationReports: [],
+      });
+
+      await expect(
+        runReplaySession(
+          {
+            ...baseReplayConfig,
+            replayMode: "authentic",
+            replayFixturesPath: zeroSlotSessionDir,
+          },
+          logger,
+        ),
+      ).rejects.toThrow("[REPLAY_MALFORMED_ACCOUNT_SLOT]");
+    });
+
+    it("B2-LAUNCH-01: authentic replay rejects getMultipleAccounts with missing, zero, or non-integer slot without synthetic fallback", async () => {
+      const logger = new PilotLogger();
+
+      const malformedMultipleAccSessionDir = path.join(
+        testTmpBase,
+        "malformed-multiple-acc-slot-session",
+      );
+      saveB2EventSession({
+        captureBaseDir: testTmpBase,
+        sessionId: "malformed-multiple-acc-slot-session",
+        forcedStatus: "FINALIZED",
+        rawNotifications: [],
+        rawTransactions: [],
+        rawAccounts: [
+          {
+            request: {
+              jsonrpc: "2.0",
+              id: "acc-req-mult",
+              method: "getMultipleAccounts",
+              params: [
+                [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+                { encoding: "base64", commitment: "confirmed" },
+              ],
+              endpoint: "https://api.mainnet-beta.solana.com/",
+              endpointFingerprint: "fp",
+              timestampIso: new Date().toISOString(),
+              timestampEpochMs: Date.now(),
+            },
+            response: {
+              jsonrpc: "2.0",
+              id: "acc-req-mult",
+              result: {
+                context: { slot: "invalid-slot" }, // STRING SLOT
+                value: [
+                  {
+                    data: [
+                      createAuthoritativeSplVaultBuffer({
+                        mintBase58: FIXTURE_MEME_MINT,
+                        ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                      }).toString("base64"),
+                      "base64",
+                    ],
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    lamports: 2000000,
+                  },
+                ],
+              },
+            },
+            timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+          },
+        ],
+        discoveredEvents: [],
+        verificationReports: [],
+      });
+
+      await expect(
+        runReplaySession(
+          {
+            ...baseReplayConfig,
+            replayMode: "authentic",
+            replayFixturesPath: malformedMultipleAccSessionDir,
+          },
+          logger,
+        ),
+      ).rejects.toThrow("[REPLAY_MALFORMED_ACCOUNT_SLOT]");
+
+      expect(() =>
+        loadAccountMapFromFixtures(malformedMultipleAccSessionDir, { replayMode: "authentic" }),
+      ).toThrow("[REPLAY_MALFORMED_ACCOUNT_SLOT]");
+    });
+
+    it("B2-LAUNCH-01: authentic getSlot throws REPLAY_SLOT_UNAVAILABLE when no valid slot exists, and synthetic mode preserves fallback", async () => {
+      // Session with empty notifications, transactions, and accounts (no slot observed anywhere)
+      const emptySlotSessionDir = path.join(testTmpBase, "empty-slot-session");
+      saveB2EventSession({
+        captureBaseDir: testTmpBase,
+        sessionId: "empty-slot-session",
+        forcedStatus: "FINALIZED",
+        rawNotifications: [],
+        rawTransactions: [],
+        rawAccounts: [],
+        discoveredEvents: [],
+        verificationReports: [],
+      });
+
+      // Authentic replay should complete reproduction with 0 events, but if getSlot is called, it must not return fabricated 300000100
+      const authenticTransport = (
+        await import("./PilotLiveCollectorCli.js")
+      ).createOfflineRpcTransportFromFixtures(emptySlotSessionDir, { replayMode: "authentic" });
+      await expect(
+        authenticTransport.post("https://api.mainnet-beta.solana.com/", {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getSlot",
+          params: [],
+        }),
+      ).rejects.toThrow("[REPLAY_SLOT_UNAVAILABLE]");
+
+      // In synthetic mode, fallback slot 300000100 is explicitly preserved
+      const syntheticTransport = (
+        await import("./PilotLiveCollectorCli.js")
+      ).createOfflineRpcTransportFromFixtures(emptySlotSessionDir, { replayMode: "synthetic" });
+      const synthRes = (await syntheticTransport.post("https://api.mainnet-beta.solana.com/", {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "getSlot",
+        params: [],
+      })) as { result: number };
+      expect(synthRes.result).toBe(300000100);
+    });
+
+    it("B2-LAUNCH-02: coordinator safely halts and seals INTERRUPTED manifest on progressive disk-budget exhaustion during active session", async () => {
+      const diskExhaustBase = path.join(testTmpBase, "coordinator-disk-exhaust-base");
+      fsSync.mkdirSync(diskExhaustBase, { recursive: true });
+
+      const wsTransport = new MockWebSocketTransport();
+      wsTransport.autoOpenAndAck = true;
+      const mockRpc = new MockSolanaRpcTransport();
+
+      const wsClient = new SolanaWebSocketSubscriptionClient({
+        wsUrl: "wss://api.mainnet-beta.solana.com/",
+        transport: wsTransport,
+      });
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxTransactionsBudget: 25,
+      });
+
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxAccountCallsBudget: 20,
+      });
+
+      // Allocate tiny disk ceiling (0.005 MB = ~5242 bytes; stream limit = ~4718 bytes, headroom = ~524 bytes)
+      const coordinator = new EventDiscoverySessionCoordinator({
+        wsClient,
+        txFetcher,
+        accountFetcher,
+        captureBaseDir: diskExhaustBase,
+        budgets: {
+          durationSec: 3,
+          maxDiskMb: 0.01,
+          maxWsMessages: 500,
+          maxTransactions: 25,
+          maxAccountReads: 20,
+          maxTotalRpcCalls: 45,
+        },
+      });
+
+      // Pump notifications asynchronously until disk limit is exhausted (using active AMM v4 subscriptionId 10)
+      const pumpPromise = (async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 40; i++) {
+          wsTransport.triggerMessage(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                result: {
+                  context: { slot: 450000000 + i },
+                  value: {
+                    signature: `sig-exhaust-${i}-${"L".repeat(150)}`,
+                    err: null,
+                    logs: ["Program log: exhaust disk budget test record stream"],
+                  },
+                },
+                subscription: 10,
+              },
+            }),
+          );
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      })();
+
+      const summary = await coordinator.runSession();
+      await pumpPromise;
+
+      // Must be safely marked INTERRUPTED due to disk budget exhaustion
+      expect(summary.status).toBe("INTERRUPTED");
+      expect(summary.stopReason).toContain("DISK_BUDGET_EXCEEDED");
+      expect(summary.manifest?.status).toBe("INTERRUPTED");
+      expect(summary.sessionDir).toBeDefined();
+
+      // Reserved headroom must have successfully sealed valid session manifest
+      expect(fsSync.existsSync(path.join(summary.sessionDir!, "session-manifest.json"))).toBe(true);
+      const verification = verifyB2SessionManifest(summary.sessionDir!);
+      expect(verification.valid).toBe(true);
+      expect(verification.manifest.status).toBe("INTERRUPTED");
+    });
+
+    it("B2-LAUNCH-03: verifies separate enforcement of maxEvents (50) and maxWsMessages (500)", async () => {
+      // 1. Engine enforces maxEvents = 50
+      const engine = new EventDiscoveryIngestionEngine({
+        maxEvents: 50,
+      });
+
+      let enqueuedCount = 0;
+      let rejectedCount = 0;
+
+      for (let i = 0; i < 60; i++) {
+        const res = await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000000 + i },
+              value: {
+                signature: `sig-event-${i}`,
+                err: null,
+                logs: ["Program log: initialize"],
+              },
+            },
+            subscription: 1,
+          },
+        });
+        if (res.enqueued) {
+          enqueuedCount++;
+        } else if (res.reason === "MAX_EVENTS_EXCEEDED") {
+          rejectedCount++;
+        }
+      }
+
+      // First 50 enqueued, remaining 10 rejected due to maxEvents = 50
+      expect(enqueuedCount).toBe(50);
+      expect(rejectedCount).toBe(10);
+      expect(engine.getMetricsSnapshot().rawLogNotificationsReceived).toBe(50);
+
+      // 2. WebSocket client enforces maxWsMessages = 500 separately
+      const wsTransport = new MockWebSocketTransport();
+      wsTransport.autoOpenAndAck = true;
+      const wsClient = new SolanaWebSocketSubscriptionClient({
+        wsUrl: "wss://api.mainnet-beta.solana.com/",
+        transport: wsTransport,
+        maxMessagesBudget: 500,
+      });
+      wsTransport.triggerOpen();
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 10 }));
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 20 }));
+      expect(wsClient.getStatus()).toBe("SUBSCRIBED");
+
+      // Emit 60 messages to wsClient -> all 60 are accepted because 60 < 500
+      for (let i = 0; i < 60; i++) {
+        wsTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000000 + i },
+                value: { signature: `sig-ws-${i}`, err: null, logs: [] },
+              },
+              subscription: 10,
+            },
+          }),
+        );
+      }
+      expect(wsClient.getMetrics().messagesReceived).toBe(60);
+      expect(wsClient.getStatus()).toBe("SUBSCRIBED");
+      wsClient.close();
+    });
+
+    it("B2-LAUNCH-03: verifies wall-clock deadline semantics stop queue draining immediately", async () => {
+      const engine = new EventDiscoveryIngestionEngine();
+
+      // Enqueue 5 items
+      for (let i = 0; i < 5; i++) {
+        await engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000000 + i },
+              value: {
+                signature: `sig-deadline-${i}`,
+                err: null,
+                logs: ["Program log: initialize"],
+              },
+            },
+            subscription: 1,
+          },
+        });
+      }
+      expect(engine.getQueueLength()).toBe(5);
+
+      const mockTxFetcher = {
+        fetchTransaction: async () => {
+          throw new Error("Should not be called past deadline");
+        },
+      };
+      const mockAccFetcher = {
+        getAccountInfo: async () => null,
+        getMultipleAccounts: async () => [],
+        getSlot: async () => 450000000,
+      };
+
+      // Pass an expired deadline (e.g. deadline was 100ms ago)
+      const results = await engine.processQueue(mockTxFetcher, mockAccFetcher, {
+        deadlineEpochMs: Date.now() - 100,
+      });
+
+      // No transactions fetched, queue draining halted
+      expect(results.length).toBe(0);
+      expect(engine.getQueueLength()).toBe(5);
+    });
+  });
 });

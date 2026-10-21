@@ -1596,8 +1596,13 @@ export function loadAccountMapFromFixtures(
             if (req?.method === "getAccountInfo") {
               const addr = req.params?.[0];
               const val = res?.result?.value ?? res?.value;
-              const slot = res?.result?.context?.slot ?? res?.context?.slot ?? 300000100;
+              const slot = res?.result?.context?.slot ?? res?.context?.slot;
               if (addr && val?.data?.[0]) {
+                if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
+                  throw new Error(
+                    `[REPLAY_MALFORMED_ACCOUNT_SLOT] Account record for '${addr}' contains missing, zero, or invalid context slot: ${slot}`,
+                  );
+                }
                 accountMap.set(addr, {
                   address: addr,
                   data: Buffer.from(val.data[0], "base64"),
@@ -1609,12 +1614,17 @@ export function loadAccountMapFromFixtures(
             } else if (req?.method === "getMultipleAccounts") {
               const addrs = req.params?.[0] as string[];
               const vals = res?.result?.value ?? res?.value;
-              const slot = res?.result?.context?.slot ?? res?.context?.slot ?? 300000100;
+              const slot = res?.result?.context?.slot ?? res?.context?.slot;
               if (Array.isArray(addrs) && Array.isArray(vals)) {
                 for (let i = 0; i < addrs.length; i++) {
                   const addr = addrs[i];
                   const val = vals[i];
                   if (addr && val?.data?.[0]) {
+                    if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
+                      throw new Error(
+                        `[REPLAY_MALFORMED_ACCOUNT_SLOT] Account record for '${addr}' in getMultipleAccounts contains missing, zero, or invalid context slot: ${slot}`,
+                      );
+                    }
                     accountMap.set(addr, {
                       address: addr,
                       data: Buffer.from(val.data[0], "base64"),
@@ -1626,7 +1636,10 @@ export function loadAccountMapFromFixtures(
                 }
               }
             }
-          } catch {
+          } catch (err: unknown) {
+            if (err instanceof Error && err.message.includes("[REPLAY_MALFORMED_ACCOUNT_SLOT]")) {
+              throw err;
+            }
             // ignore malformed line
           }
         }
@@ -2040,6 +2053,11 @@ export function createOfflineRpcTransportFromFixtures(
         const address = (params?.[0] as string) ?? "";
         const acc = accountMap.get(address);
         if (!acc) {
+          if (options?.replayMode === "authentic") {
+            throw new Error(
+              `[REPLAY_MISSING_ACCOUNT] Account '${address}' missing in authentic fixtures`,
+            );
+          }
           return {
             jsonrpc: "2.0",
             id: reqId,
@@ -2062,7 +2080,7 @@ export function createOfflineRpcTransportFromFixtures(
 
       if (method === "getMultipleAccounts") {
         const addresses = (params?.[0] as string[]) ?? [];
-        let maxSlot = 300000100;
+        let maxSlot = options?.replayMode === "authentic" ? 0 : 300000100;
         const value = addresses.map((addr) => {
           const acc = accountMap.get(addr);
           if (!acc) return null;
@@ -2073,6 +2091,11 @@ export function createOfflineRpcTransportFromFixtures(
             lamports: Number(acc.lamports),
           };
         });
+        if (options?.replayMode === "authentic" && maxSlot <= 0) {
+          throw new Error(
+            `[REPLAY_SLOT_UNAVAILABLE] No valid slot found for getMultipleAccounts in authentic fixtures`,
+          );
+        }
         return {
           jsonrpc: "2.0",
           id: reqId,
@@ -2084,6 +2107,20 @@ export function createOfflineRpcTransportFromFixtures(
       }
 
       if (method === "getSlot") {
+        if (options?.replayMode === "authentic") {
+          let maxSlot = 0;
+          for (const acc of accountMap.values()) {
+            if (acc.slot > maxSlot) maxSlot = acc.slot;
+          }
+          if (maxSlot <= 0) {
+            throw new Error("[REPLAY_SLOT_UNAVAILABLE] No valid slot found in authentic fixtures");
+          }
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: maxSlot,
+          };
+        }
         return {
           jsonrpc: "2.0",
           id: reqId,
@@ -2212,18 +2249,24 @@ export async function runReplaySession(
           const result = resObj?.result as Record<string, unknown> | null | undefined;
           const val = result?.value as Record<string, unknown> | null | undefined;
           const slot = (result?.context as Record<string, unknown>)?.slot as number | undefined;
-          if (typeof slot === "number" && slot > maxSlotSeen) {
-            maxSlotSeen = slot;
+          if (typeof slot === "number" && Number.isInteger(slot) && slot > 0) {
+            if (slot > maxSlotSeen) maxSlotSeen = slot;
           }
           if (!val || !val.data || !Array.isArray(val.data) || !val.data[0]) {
             accountMap.set(addr, null);
           } else {
+            // B2-LAUNCH-01: Remove fabricated slots from authentic replay
+            if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
+              throw new Error(
+                `[REPLAY_MALFORMED_ACCOUNT_SLOT] Account wire record for '${addr}' contains missing, zero, or invalid context slot: ${slot}`,
+              );
+            }
             accountMap.set(addr, {
               address: addr,
               data: Buffer.from(val.data[0] as string, "base64"),
               owner: (val.owner as string) ?? "",
               lamports: BigInt((val.lamports as number | bigint) ?? 0),
-              slot: slot ?? 300000100,
+              slot,
             });
           }
         }
@@ -2243,8 +2286,8 @@ export async function runReplaySession(
           const result = resObj?.result as Record<string, unknown> | null | undefined;
           const vals = result?.value as Array<Record<string, unknown> | null> | null | undefined;
           const slot = (result?.context as Record<string, unknown>)?.slot as number | undefined;
-          if (typeof slot === "number" && slot > maxSlotSeen) {
-            maxSlotSeen = slot;
+          if (typeof slot === "number" && Number.isInteger(slot) && slot > 0) {
+            if (slot > maxSlotSeen) maxSlotSeen = slot;
           }
           if (Array.isArray(vals)) {
             for (let i = 0; i < addrs.length; i++) {
@@ -2254,12 +2297,18 @@ export async function runReplaySession(
               if (!val || !val.data || !Array.isArray(val.data) || !val.data[0]) {
                 accountMap.set(a, null);
               } else {
+                // B2-LAUNCH-01: Remove fabricated slots from authentic replay
+                if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
+                  throw new Error(
+                    `[REPLAY_MALFORMED_ACCOUNT_SLOT] Account wire record for '${a}' in getMultipleAccounts contains missing, zero, or invalid context slot: ${slot}`,
+                  );
+                }
                 accountMap.set(a, {
                   address: a,
                   data: Buffer.from(val.data[0] as string, "base64"),
                   owner: (val.owner as string) ?? "",
                   lamports: BigInt((val.lamports as number | bigint) ?? 0),
-                  slot: slot ?? 300000100,
+                  slot,
                 });
               }
             }
@@ -2283,9 +2332,10 @@ export async function runReplaySession(
     if (maxSlotSeen === 0) {
       for (const n of notifications) {
         const slot = n.envelope?.params?.result?.context?.slot;
-        if (typeof slot === "number" && slot > maxSlotSeen) maxSlotSeen = slot;
+        if (typeof slot === "number" && Number.isInteger(slot) && slot > maxSlotSeen) {
+          maxSlotSeen = slot;
+        }
       }
-      if (maxSlotSeen === 0) maxSlotSeen = 300000100;
     }
 
     const accountFetcher: IOnChainAccountFetcher = {
@@ -2307,7 +2357,14 @@ export async function runReplaySession(
           return accountMap.get(addr) ?? null;
         });
       },
-      getSlot: async () => maxSlotSeen,
+      getSlot: async () => {
+        if (maxSlotSeen <= 0) {
+          throw new Error(
+            "[REPLAY_SLOT_UNAVAILABLE] No authentic slot observed in recorded evidence",
+          );
+        }
+        return maxSlotSeen;
+      },
     };
 
     // 6. Feed authentic notifications into Ingestion Engine
@@ -2660,6 +2717,7 @@ export async function runLiveEventDiscoverySession(
     captureBaseDir: config.captureFixturesDir ?? ".tmp/b2-captures",
     budgets: {
       durationSec: config.durationSec !== 7200 ? config.durationSec : 60,
+      maxEvents: config.maxEvents ?? 50,
       maxWsMessages: config.maxWsMessages ?? 500,
       maxTransactions: maxTxBudget,
       maxAccountReads: maxAccBudget,

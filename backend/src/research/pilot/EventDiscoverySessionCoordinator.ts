@@ -71,16 +71,18 @@ class SharedRpcBudgetTracker implements ISharedRpcBudget {
 
 export interface EventDiscoverySessionBudgets {
   readonly durationSec?: number | undefined; // Session runtime ceiling in seconds (default: 60)
+  readonly maxEvents?: number | undefined; // Discovered events ceiling (default: 50)
   readonly maxWsMessages?: number | undefined; // WebSocket message budget ceiling (default: 500)
   readonly maxTransactions?: number | undefined; // getTransaction ceiling (default: 25)
   readonly maxAccountReads?: number | undefined; // Account read calls ceiling (default: 20)
-  readonly maxTotalRpcCalls?: number | undefined; // Combined RPC calls ceiling (default: 50)
+  readonly maxTotalRpcCalls?: number | undefined; // Combined RPC calls ceiling (default: 45)
   readonly maxRssMb?: number | undefined; // Process RSS ceiling in megabytes (default: 256)
   readonly maxDiskMb?: number | undefined; // Disk write limit in megabytes (default: 256)
 }
 
 export interface ResolvedEventDiscoveryBudgets {
   readonly durationSec: number;
+  readonly maxEvents: number;
   readonly maxWsMessages: number;
   readonly maxTransactions: number;
   readonly maxAccountReads: number;
@@ -108,6 +110,7 @@ export interface EventDiscoverySessionSummary {
   readonly elapsedSec: number;
   readonly budgets: {
     readonly durationSec: number;
+    readonly maxEvents: number;
     readonly maxWsMessages: number;
     readonly maxTransactions: number;
     readonly maxAccountReads: number;
@@ -147,6 +150,7 @@ export class EventDiscoverySessionCoordinator {
   private isRunning = false;
   private stopRequested = false;
   private stopReason = "COMPLETED";
+  private isDiskExhausted = false;
   private readonly pendingNotificationPromises: Promise<unknown>[] = [];
 
   private recordedNotificationCount = 0;
@@ -165,10 +169,11 @@ export class EventDiscoverySessionCoordinator {
     const b = options.budgets ?? {};
     this.budgets = {
       durationSec: b.durationSec ?? 60,
+      maxEvents: b.maxEvents ?? 50,
       maxWsMessages: b.maxWsMessages ?? 500,
       maxTransactions: b.maxTransactions ?? 25,
       maxAccountReads: b.maxAccountReads ?? 20,
-      maxTotalRpcCalls: b.maxTotalRpcCalls ?? 50,
+      maxTotalRpcCalls: b.maxTotalRpcCalls ?? 45,
       maxRssMb: b.maxRssMb ?? 256,
       maxDiskMb: b.maxDiskMb ?? 256,
     };
@@ -189,7 +194,7 @@ export class EventDiscoverySessionCoordinator {
     this.engine =
       options.engine ??
       new EventDiscoveryIngestionEngine({
-        maxEvents: this.budgets.maxWsMessages,
+        maxEvents: this.budgets.maxEvents,
         maxTransactions: this.budgets.maxTransactions,
         ...(options.engineOptions ?? {}),
       });
@@ -198,12 +203,25 @@ export class EventDiscoverySessionCoordinator {
       const p = this.engine.handleLogNotification(envelope);
       this.pendingNotificationPromises.push(p);
 
-      // Progressively persist raw notification
-      if (this.evidenceRecorder) {
-        const notifications = this.wsClient.getCapturedNotifications();
-        while (this.recordedNotificationCount < notifications.length) {
-          const rec = notifications[this.recordedNotificationCount++];
-          if (rec) this.evidenceRecorder.recordNotification(rec);
+      // Progressively persist raw notification (safely halting if disk limit reached, B2-LAUNCH-02)
+      if (this.evidenceRecorder && !this.isDiskExhausted) {
+        try {
+          const notifications = this.wsClient.getCapturedNotifications();
+          while (this.recordedNotificationCount < notifications.length) {
+            const rec = notifications[this.recordedNotificationCount];
+            if (rec) this.evidenceRecorder.recordNotification(rec);
+            this.recordedNotificationCount++;
+          }
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (errMsg.includes("DISK_BUDGET_EXCEEDED")) {
+            this.isDiskExhausted = true;
+            this.stopRequested = true;
+            this.stopReason = `DISK_BUDGET_EXCEEDED: ${errMsg}`;
+            this.onLog?.(`[DISK_LIMIT] Notification recording halted: ${errMsg}`);
+          } else {
+            throw err;
+          }
         }
       }
     });
@@ -220,30 +238,46 @@ export class EventDiscoverySessionCoordinator {
   }
 
   private flushProgressiveEvidence(): void {
-    if (!this.evidenceRecorder) return;
+    if (!this.evidenceRecorder || this.isDiskExhausted) return;
 
-    const txs = this.txFetcher.getCapturedTransactions();
-    while (this.recordedTxCount < txs.length) {
-      const rec = txs[this.recordedTxCount++];
-      if (rec) this.evidenceRecorder.recordTransaction(rec);
-    }
+    try {
+      const txs = this.txFetcher.getCapturedTransactions();
+      while (this.recordedTxCount < txs.length) {
+        const rec = txs[this.recordedTxCount];
+        if (rec) this.evidenceRecorder.recordTransaction(rec);
+        this.recordedTxCount++;
+      }
 
-    const accs = this.accountFetcher.getCapturedInteractions();
-    while (this.recordedAccCount < accs.length) {
-      const rec = accs[this.recordedAccCount++];
-      if (rec) this.evidenceRecorder.recordAccount(rec);
-    }
+      const accs = this.accountFetcher.getCapturedInteractions();
+      while (this.recordedAccCount < accs.length) {
+        const rec = accs[this.recordedAccCount];
+        if (rec) this.evidenceRecorder.recordAccount(rec);
+        this.recordedAccCount++;
+      }
 
-    const events = this.engine.getDiscoveredEvents();
-    while (this.recordedEventCount < events.length) {
-      const ev = events[this.recordedEventCount++];
-      if (ev) this.evidenceRecorder.recordEvent(ev);
-    }
+      const events = this.engine.getDiscoveredEvents();
+      while (this.recordedEventCount < events.length) {
+        const ev = events[this.recordedEventCount];
+        if (ev) this.evidenceRecorder.recordEvent(ev);
+        this.recordedEventCount++;
+      }
 
-    const reports = this.engine.getVerificationReports();
-    while (this.recordedReportCount < reports.length) {
-      const rep = reports[this.recordedReportCount++];
-      if (rep) this.evidenceRecorder.recordReport(rep);
+      const reports = this.engine.getVerificationReports();
+      while (this.recordedReportCount < reports.length) {
+        const rep = reports[this.recordedReportCount];
+        if (rep) this.evidenceRecorder.recordReport(rep);
+        this.recordedReportCount++;
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("DISK_BUDGET_EXCEEDED")) {
+        this.isDiskExhausted = true;
+        this.stopRequested = true;
+        this.stopReason = `DISK_BUDGET_EXCEEDED: ${errMsg}`;
+        this.onLog?.(`[DISK_LIMIT] Progressive evidence flush halted: ${errMsg}`);
+      } else {
+        throw err;
+      }
     }
   }
 
@@ -254,10 +288,11 @@ export class EventDiscoverySessionCoordinator {
     this.isRunning = true;
     const startEpochMs = Date.now();
     const durationMs = this.budgets.durationSec * 1000;
+    const deadlineEpochMs = startEpochMs + durationMs;
     const maxRssBytes = this.budgets.maxRssMb * 1024 * 1024;
 
     this.onLog?.(
-      `Starting Event Discovery Session with budgets: duration=${this.budgets.durationSec}s, maxWsMessages=${this.budgets.maxWsMessages}, maxTx=${this.budgets.maxTransactions}, maxAcc=${this.budgets.maxAccountReads}, maxRpc=${this.budgets.maxTotalRpcCalls}, maxDisk=${this.budgets.maxDiskMb}MB`,
+      `Starting Event Discovery Session with budgets: duration=${this.budgets.durationSec}s, maxEvents=${this.budgets.maxEvents}, maxWsMessages=${this.budgets.maxWsMessages}, maxTx=${this.budgets.maxTransactions}, maxAcc=${this.budgets.maxAccountReads}, maxRpc=${this.budgets.maxTotalRpcCalls}, maxDisk=${this.budgets.maxDiskMb}MB`,
     );
 
     let sessionStatus: "FINALIZED" | "INTERRUPTED" | "FAILED" = this.stopRequested
@@ -289,9 +324,8 @@ export class EventDiscoverySessionCoordinator {
     }
 
     try {
-      while (this.isRunning && !this.stopRequested) {
+      while (this.isRunning && !this.stopRequested && !this.isDiskExhausted) {
         const now = Date.now();
-        const elapsed = now - startEpochMs;
 
         // Health check: fail closed if WebSocket disconnected unexpectedly
         if (this.wsClient.getStatus() === "DISCONNECTED") {
@@ -300,20 +334,27 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 1. Duration budget check
-        if (elapsed >= durationMs) {
+        // 1. Duration budget check (wall-clock deadline)
+        if (now >= deadlineEpochMs) {
           this.stopReason = `DURATION_LIMIT_REACHED (${this.budgets.durationSec}s)`;
           break;
         }
 
-        // 2. WebSocket message ceiling check
+        // 2. Discovered events ceiling check (B2-LAUNCH-03)
+        const eventsCount = this.engine.getDiscoveredEvents().length;
+        if (eventsCount >= this.budgets.maxEvents) {
+          this.stopReason = `EVENTS_BUDGET_REACHED (${eventsCount}/${this.budgets.maxEvents})`;
+          break;
+        }
+
+        // 3. WebSocket message ceiling check
         const wsMetrics = this.wsClient.getMetrics();
         if (wsMetrics.messagesReceived >= this.budgets.maxWsMessages) {
           this.stopReason = `WS_MESSAGES_BUDGET_REACHED (${wsMetrics.messagesReceived}/${this.budgets.maxWsMessages})`;
           break;
         }
 
-        // 3. RPC Call budgets check
+        // 4. RPC Call budgets check
         const txCalls = this.txFetcher.getCallsExecutedCount();
         const accCalls = this.accountFetcher.getCallsExecutedCount();
         const totalRpc = txCalls + accCalls;
@@ -331,7 +372,7 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 4. Memory watchdog check
+        // 5. Memory watchdog check
         const mem = process.memoryUsage();
         if (mem.rss > maxRssBytes) {
           this.stopReason = `RSS_MEMORY_LIMIT_EXCEEDED (${Math.round(mem.rss / 1024 / 1024)}MB > ${this.budgets.maxRssMb}MB)`;
@@ -339,17 +380,23 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 5. Await in-flight notification handling
+        // 6. Await in-flight notification handling
         if (this.pendingNotificationPromises.length > 0) {
           const promises = this.pendingNotificationPromises.splice(0);
           await Promise.all(promises);
         }
 
-        // 6. Drain pending queued transactions
+        if (this.isDiskExhausted) {
+          break;
+        }
+
+        // 7. Drain pending queued transactions with wall-clock deadline
         const pendingQueueLength = this.engine.getQueueLength();
         if (pendingQueueLength > 0) {
-          await this.engine.processQueue(this.txFetcher, this.accountFetcher);
-          this.flushProgressiveEvidence();
+          await this.engine.processQueue(this.txFetcher, this.accountFetcher, { deadlineEpochMs });
+          if (!this.isDiskExhausted) {
+            this.flushProgressiveEvidence();
+          }
         } else {
           // Micro-tick pause when queue is empty to yield event loop
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -358,6 +405,7 @@ export class EventDiscoverySessionCoordinator {
     } catch (err) {
       executionError = err instanceof Error ? err.message : String(err);
       if (executionError.includes("DISK_BUDGET_EXCEEDED")) {
+        this.isDiskExhausted = true;
         sessionStatus = "INTERRUPTED";
         this.stopReason = `DISK_BUDGET_EXCEEDED: ${executionError}`;
       } else {
@@ -370,6 +418,10 @@ export class EventDiscoverySessionCoordinator {
       this.wsClient.close();
     }
 
+    if (this.isDiskExhausted && sessionStatus === "FINALIZED") {
+      sessionStatus = "INTERRUPTED";
+    }
+
     if (this.stopRequested && sessionStatus === "FINALIZED") {
       sessionStatus = "INTERRUPTED";
     }
@@ -380,8 +432,10 @@ export class EventDiscoverySessionCoordinator {
       this.stopReason = "WS_SUBSCRIPTIONS_UNACKNOWLEDGED";
     }
 
-    // Flush remaining in-flight records
-    this.flushProgressiveEvidence();
+    // Flush remaining in-flight records only if disk is not exhausted (B2-LAUNCH-02)
+    if (!this.isDiskExhausted) {
+      this.flushProgressiveEvidence();
+    }
 
     const elapsedSec = (Date.now() - startEpochMs) / 1000;
     const metrics = this.engine.getMetricsSnapshot();
@@ -410,29 +464,35 @@ export class EventDiscoverySessionCoordinator {
     // Evidence Capture & Sealing via ProgressiveEvidenceRecorder
     if (this.evidenceRecorder) {
       sessionDir = this.evidenceRecorder.getSessionDir();
-      const sealResult = this.evidenceRecorder.finalize({
-        status: sessionStatus,
-        wsUrl: this.wsClient.getSanitizedUrl(),
-        rpcUrl: this.txFetcher.getSanitizedEndpoint(),
-        endpointHost: this.txFetcher.getEndpointHost(),
-        endpointFingerprint: this.txFetcher.getEndpointFingerprint(),
-        commitment: "confirmed",
-        maxEventsBudget: this.budgets.maxWsMessages,
-        maxTransactionsBudget: this.budgets.maxTransactions,
-        totalPoolsVerified: verifiedCoherentCount,
-        error: executionError,
-        metrics,
-      });
-
-      manifest = sealResult.manifest;
-
-      // Replay-verify manifest immediately to confirm mathematical integrity
       try {
-        const verifyResult = verifyB2SessionManifest(sessionDir);
-        manifestVerified = verifyResult.valid;
-      } catch (err) {
+        const sealResult = this.evidenceRecorder.finalize({
+          status: sessionStatus,
+          wsUrl: this.wsClient.getSanitizedUrl(),
+          rpcUrl: this.txFetcher.getSanitizedEndpoint(),
+          endpointHost: this.txFetcher.getEndpointHost(),
+          endpointFingerprint: this.txFetcher.getEndpointFingerprint(),
+          commitment: "confirmed",
+          maxEventsBudget: this.budgets.maxEvents,
+          maxTransactionsBudget: this.budgets.maxTransactions,
+          totalPoolsVerified: verifiedCoherentCount,
+          error: executionError,
+          metrics,
+        });
+
+        manifest = sealResult.manifest;
+
+        // Replay-verify manifest immediately to confirm mathematical integrity
+        try {
+          const verifyResult = verifyB2SessionManifest(sessionDir);
+          manifestVerified = verifyResult.valid;
+        } catch (err) {
+          manifestVerified = false;
+          this.onLog?.(`Manifest verification failed: ${err}`);
+        }
+      } catch (sealErr: unknown) {
         manifestVerified = false;
-        this.onLog?.(`Manifest verification failed: ${err}`);
+        const msg = sealErr instanceof Error ? sealErr.message : String(sealErr);
+        this.onLog?.(`Evidence sealing failed: ${msg}`);
       }
     }
 
@@ -444,6 +504,7 @@ export class EventDiscoverySessionCoordinator {
       elapsedSec,
       budgets: {
         durationSec: this.budgets.durationSec,
+        maxEvents: this.budgets.maxEvents,
         maxWsMessages: this.budgets.maxWsMessages,
         maxTransactions: this.budgets.maxTransactions,
         maxAccountReads: this.budgets.maxAccountReads,

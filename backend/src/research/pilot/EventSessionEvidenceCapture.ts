@@ -103,8 +103,11 @@ export class ProgressiveEvidenceRecorder {
     this.sessionId = options.sessionId ?? `b2-events-session-${timestamp}`;
     this.targetDir = path.join(options.captureBaseDir, this.sessionId);
     this.maxDiskBytes = (options.maxDiskMb ?? 256) * 1024 * 1024;
-    // B2-FINAL-04: Reserve headroom (1MB or 10% if small) specifically for session-metadata.json and session-manifest.json
-    this.reservedHeadroomBytes = Math.min(1024 * 1024, Math.floor(this.maxDiskBytes * 0.1));
+    // B2-FINAL-04: Reserve headroom (1MB or at least 4KB if small) specifically for session-metadata.json and session-manifest.json
+    this.reservedHeadroomBytes = Math.min(
+      1024 * 1024,
+      Math.max(4096, Math.floor(this.maxDiskBytes * 0.2)),
+    );
     this.streamBudgetBytes = Math.max(512, this.maxDiskBytes - this.reservedHeadroomBytes);
     fsSync.mkdirSync(this.targetDir, { recursive: true });
 
