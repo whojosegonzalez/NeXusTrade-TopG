@@ -172,6 +172,38 @@ export interface ISolanaRpcTransport {
   post(url: string, body: Record<string, unknown>, init?: RequestInit): Promise<unknown>;
 }
 
+/**
+ * Standard Solana JSON-RPC HTTP transport using native fetch with AbortSignal support (B2-READY-01).
+ */
+export function createDefaultSolanaRpcTransport(options?: {
+  readonly onRateLimit?: ((retryAfterEpochMs: number) => void) | undefined;
+}): ISolanaRpcTransport {
+  return {
+    post: async (url: string, body: Record<string, unknown>, init?: RequestInit) => {
+      const res = await globalThis.fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(body),
+        ...init,
+      });
+      if (res.status === 429) {
+        const retryHeader = res.headers?.get?.("retry-after");
+        const secs = retryHeader ? parseInt(retryHeader, 10) : 10;
+        const retryUntil = Date.now() + (Number.isFinite(secs) ? secs : 10) * 1000;
+        options?.onRateLimit?.(retryUntil);
+        throw new Error(`[RPC_RATE_LIMIT_429] Solana RPC responded with 429 Too Many Requests`);
+      }
+      if (!res.ok) {
+        throw new Error(`[RPC_HTTP_ERROR] Solana RPC HTTP status ${res.status}`);
+      }
+      return await res.json();
+    },
+  };
+}
+
 export interface RawRpcInteractionRecord {
   readonly request: {
     readonly jsonrpc: "2.0";
@@ -349,29 +381,13 @@ export class SolanaRpcLiveObservationClient {
     this.maxRequestsPerMinute = options?.maxRequestsPerMinute ?? 60;
     this.maxRequestsBudget = options?.maxRequestsBudget;
     this.commitment = options?.commitment ?? "confirmed";
-    this.transport = options?.transport ?? {
-      post: async (url: string, body: Record<string, unknown>, init?: RequestInit) => {
-        const res = await globalThis.fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify(body),
-          ...init,
-        });
-        if (res.status === 429) {
-          const retryHeader = res.headers?.get?.("retry-after");
-          const secs = retryHeader ? parseInt(retryHeader, 10) : 10;
-          this.retryAfterUntilEpochMs = Date.now() + (Number.isFinite(secs) ? secs : 10) * 1000;
-          throw new Error(`[RPC_RATE_LIMIT_429] Solana RPC responded with 429 Too Many Requests`);
-        }
-        if (!res.ok) {
-          throw new Error(`[RPC_HTTP_ERROR] Solana RPC HTTP status ${res.status}`);
-        }
-        return await res.json();
-      },
-    };
+    this.transport =
+      options?.transport ??
+      createDefaultSolanaRpcTransport({
+        onRateLimit: (retryUntil) => {
+          this.retryAfterUntilEpochMs = retryUntil;
+        },
+      });
     this.onLog = options?.onLog;
   }
 

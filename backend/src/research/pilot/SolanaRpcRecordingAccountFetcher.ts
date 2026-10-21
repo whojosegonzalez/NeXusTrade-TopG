@@ -22,6 +22,7 @@ import {
   type RawRpcInteractionRecord,
   sanitizeSolanaRpcUrl,
 } from "./SolanaRpcLiveObservationClient.js";
+import type { ISharedRpcBudget } from "./SolanaRpcTransactionFetcher.js";
 
 export const ALLOWLISTED_ACCOUNT_RPC_METHODS = new Set(["getAccountInfo", "getMultipleAccounts"]);
 
@@ -30,6 +31,7 @@ export interface SolanaRpcRecordingAccountFetcherOptions {
   readonly transport: ISolanaRpcTransport;
   readonly commitment?: "confirmed" | "finalized" | undefined;
   readonly maxAccountCallsBudget?: number | undefined; // Hard ceiling on total account RPC calls (default: 20)
+  readonly sharedBudget?: ISharedRpcBudget | undefined; // Shared cross-client RPC call budget (B2-READY-02)
   readonly httpTimeoutMs?: number | undefined;
   readonly onLog?: ((msg: string) => void) | undefined;
 }
@@ -39,9 +41,11 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
   private readonly sanitizedRpcUrl: string;
   private readonly endpointHost: string;
   private readonly endpointFingerprint: string;
+  private readonly sensitiveTokens: readonly string[];
   private readonly transport: ISolanaRpcTransport;
   private readonly commitment: "confirmed" | "finalized";
   private readonly maxAccountCallsBudget: number;
+  private sharedBudget?: ISharedRpcBudget | undefined;
   private readonly httpTimeoutMs: number;
   private readonly onLog?: ((msg: string) => void) | undefined;
 
@@ -56,9 +60,11 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     this.sanitizedRpcUrl = sanitized.sanitizedUrl;
     this.endpointHost = sanitized.host;
     this.endpointFingerprint = sanitized.endpointFingerprint;
+    this.sensitiveTokens = sanitized.sensitiveTokens;
     this.transport = options.transport;
     this.commitment = options.commitment ?? "confirmed";
     this.maxAccountCallsBudget = options.maxAccountCallsBudget ?? 20;
+    this.sharedBudget = options.sharedBudget;
     this.httpTimeoutMs = options.httpTimeoutMs ?? 10_000;
     this.onLog = options.onLog;
   }
@@ -79,6 +85,21 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     return this.endpointFingerprint;
   }
 
+  public setSharedBudget(sharedBudget: ISharedRpcBudget): void {
+    this.sharedBudget = sharedBudget;
+  }
+
+  public sanitizeErrorMessage(text: string): string {
+    if (!text) return text;
+    let out = text.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+    for (const token of this.sensitiveTokens) {
+      if (token && token.length > 0) {
+        out = out.split(token).join("[REDACTED]");
+      }
+    }
+    return out;
+  }
+
   public async getSlot(): Promise<number> {
     return this.maxObservedSlot;
   }
@@ -87,6 +108,15 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
    * Fetches a single account via allowlisted getAccountInfo.
    */
   public async getAccountInfo(address: string): Promise<DiscoveredPoolAccountPayload | null> {
+    // 1. Shared total RPC ceiling check (B2-READY-02)
+    if (this.sharedBudget && !this.sharedBudget.canExecute()) {
+      this.onLog?.(
+        `[TOTAL_RPC_BUDGET_EXCEEDED] Cannot fetch account '${address}': shared RPC ceiling reached`,
+      );
+      return null;
+    }
+
+    // 2. Individual account calls budget ceiling check (B2-READY-02)
     if (this.totalCallsExecuted >= this.maxAccountCallsBudget) {
       this.onLog?.(
         `[ACCOUNT_BUDGET_EXCEEDED] Cannot fetch account '${address}': reached budget ceiling of ${this.maxAccountCallsBudget} calls`,
@@ -95,6 +125,8 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     }
 
     this.totalCallsExecuted++;
+    this.sharedBudget?.recordCall();
+
     const reqId = `pilot-acc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const rpcBody = {
       jsonrpc: "2.0" as const,
@@ -110,8 +142,15 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     };
 
     const callStartEpochMs = Date.now();
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      controller.abort(
+        new Error(`[RPC_TIMEOUT] getAccountInfo request timed out after ${this.httpTimeoutMs}ms`),
+      );
+    }, this.httpTimeoutMs);
+
     try {
-      const res = await this.transport.post(this.rawRpcUrl, rpcBody);
+      const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
       const elapsedMs = Date.now() - callStartEpochMs;
 
       const resObj =
@@ -141,7 +180,7 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     } catch (err) {
       const elapsedMs = Date.now() - callStartEpochMs;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
-      const errMsg = rawErrMsg.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       this.onLog?.(`getAccountInfo failed for ${address}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -164,6 +203,8 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       };
       this.capturedInteractions.push(record);
       return null;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 
@@ -177,6 +218,15 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       return [];
     }
 
+    // 1. Shared total RPC ceiling check (B2-READY-02)
+    if (this.sharedBudget && !this.sharedBudget.canExecute()) {
+      this.onLog?.(
+        `[TOTAL_RPC_BUDGET_EXCEEDED] Cannot fetch ${addresses.length} accounts: shared RPC ceiling reached`,
+      );
+      return addresses.map(() => null);
+    }
+
+    // 2. Individual account calls budget ceiling check (B2-READY-02)
     if (this.totalCallsExecuted >= this.maxAccountCallsBudget) {
       this.onLog?.(
         `[ACCOUNT_BUDGET_EXCEEDED] Cannot fetch ${addresses.length} accounts: reached budget ceiling of ${this.maxAccountCallsBudget} calls`,
@@ -185,6 +235,8 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     }
 
     this.totalCallsExecuted++;
+    this.sharedBudget?.recordCall();
+
     const reqId = `pilot-multacc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const rpcBody = {
       jsonrpc: "2.0" as const,
@@ -200,8 +252,17 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     };
 
     const callStartEpochMs = Date.now();
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      controller.abort(
+        new Error(
+          `[RPC_TIMEOUT] getMultipleAccounts request timed out after ${this.httpTimeoutMs}ms`,
+        ),
+      );
+    }, this.httpTimeoutMs);
+
     try {
-      const res = await this.transport.post(this.rawRpcUrl, rpcBody);
+      const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
       const elapsedMs = Date.now() - callStartEpochMs;
 
       const resObj =
@@ -231,7 +292,7 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     } catch (err) {
       const elapsedMs = Date.now() - callStartEpochMs;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
-      const errMsg = rawErrMsg.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       this.onLog?.(`getMultipleAccounts failed for ${addresses.join(",")}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -254,6 +315,8 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       };
       this.capturedInteractions.push(record);
       return addresses.map(() => null);
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 

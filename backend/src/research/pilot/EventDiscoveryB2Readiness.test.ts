@@ -53,7 +53,12 @@ import {
   FIXTURE_CPMM_TOKEN_1_MINT,
   FIXTURE_CPMM_TOKEN_1_VAULT,
 } from "./fixtures/AuthoritativeCpmmFixtures.js";
-import { loadAccountMapFromFixtures, runPilotCollectorCli } from "./PilotLiveCollectorCli.js";
+import {
+  loadAccountMapFromFixtures,
+  PilotLogger,
+  runPilotCollectorCli,
+  runReplaySession,
+} from "./PilotLiveCollectorCli.js";
 import { RAYDIUM_AMM_V4_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID } from "./RaydiumAmmParser.js";
 import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
 import type { ISolanaRpcTransport } from "./SolanaRpcLiveObservationClient.js";
@@ -125,12 +130,22 @@ class MockSolanaRpcTransport implements ISolanaRpcTransport {
   public calls: Array<{ method: string; params: unknown[] }> = [];
   public transactions = new Map<string, VersionedTransactionMetadata>();
   public accounts = new Map<string, DiscoveredPoolAccountPayload>();
+  public customResponses = new Map<string, unknown>();
+
+  public registerResponse(method: string, response: unknown): void {
+    this.customResponses.set(method, response);
+  }
 
   public async post(_url: string, body: Record<string, unknown>): Promise<unknown> {
     const method = body.method as string;
     const params = (body.params as unknown[]) ?? [];
     const id = body.id ?? "mock-id";
     this.calls.push({ method, params });
+
+    if (this.customResponses.has(method)) {
+      const resp = this.customResponses.get(method) as Record<string, unknown>;
+      return { jsonrpc: "2.0", id, ...resp };
+    }
 
     if (method === "getTransaction") {
       const signature = params[0] as string;
@@ -747,5 +762,522 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       replayMode: "authentic",
     });
     expect(accountMap.has(FIXTURE_CPMM_POOL_ADDRESS)).toBe(true);
+  });
+
+  it("B2-READY-01: operator authorization gate prevents network execution without flag, and executes when authorized with mock transport", async () => {
+    // 1. Missing flag rejects immediately with exit code 1
+    const exitCodeUnauthorized = await runPilotCollectorCli([
+      "node",
+      "cli.js",
+      "--network=enabled",
+      "--discovery-source=events",
+    ]);
+    expect(exitCodeUnauthorized).toBe(1);
+
+    // 2. Explicit operator flag with offline mock transports executes cleanly
+    const wsTransport = new MockWebSocketTransport();
+    const mockRpc = new MockSolanaRpcTransport();
+    const logger = new PilotLogger();
+
+    const exitCodeAuthorized = await runPilotCollectorCli(
+      [
+        "node",
+        "cli.js",
+        "--network=enabled",
+        "--discovery-source=events",
+        "--authorize-b2-live",
+        "--duration-sec=1",
+        "--max-ws-messages=10",
+        `--capture-fixtures-dir=${path.join(testTmpBase, "authorized-b2-session")}`,
+      ],
+      {
+        wsTransport,
+        rpcTransport: mockRpc,
+        logger,
+      },
+    );
+    expect(exitCodeAuthorized).toBe(0);
+  });
+
+  it("B2-READY-02: enforces bounded per-request timeouts, shared cross-client RPC budget, and message ceiling closure", async () => {
+    // 1. Bounded per-request timeout with AbortSignal
+    const hangingRpc: ISolanaRpcTransport = {
+      post: async (_url, _body, init) => {
+        return new Promise((resolve, reject) => {
+          if (init?.signal) {
+            init.signal.addEventListener("abort", () => {
+              reject(new Error("[RPC_TIMEOUT] Request aborted due to timeout"));
+            });
+          }
+        });
+      },
+    };
+
+    const timedTxFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: hangingRpc,
+      httpTimeoutMs: 50,
+    });
+
+    const txRes = await timedTxFetcher.fetchTransaction("hang-sig-1");
+    expect(txRes).toBeNull();
+    const txRecords = timedTxFetcher.getCapturedTransactions();
+    expect(txRecords.length).toBe(1);
+    expect(txRecords[0]!.error).toContain("RPC_TIMEOUT");
+
+    // 2. Shared cross-client total RPC ceiling
+    const mockRpc = new MockSolanaRpcTransport();
+    mockRpc.registerResponse("getTransaction", {
+      result: {
+        slot: 450000100,
+        transaction: {
+          message: {
+            accountKeys: ["payer", "prog"],
+            instructions: [{ programIdIndex: 1, accounts: [0], data: "" }],
+          },
+        },
+      },
+    });
+    mockRpc.registerResponse("getAccountInfo", {
+      result: {
+        context: { slot: 450000100 },
+        value: {
+          data: ["", "base64"],
+          owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+          lamports: 1000,
+        },
+      },
+    });
+
+    class TestSharedBudget {
+      public count = 0;
+      constructor(private readonly max: number) {}
+      canExecute() {
+        return this.count < this.max;
+      }
+      recordCall() {
+        this.count++;
+      }
+      getRemaining() {
+        return Math.max(0, this.max - this.count);
+      }
+      getTotalExecuted() {
+        return this.count;
+      }
+    }
+
+    const shared = new TestSharedBudget(2);
+    const sharedTxFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+      sharedBudget: shared,
+    });
+    const sharedAccFetcher = new SolanaRpcRecordingAccountFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+      sharedBudget: shared,
+    });
+
+    // Call 1: tx fetcher (consumes 1)
+    await sharedTxFetcher.fetchTransaction("sig-1");
+    expect(shared.getTotalExecuted()).toBe(1);
+
+    // Call 2: acc fetcher (consumes 2)
+    await sharedAccFetcher.getAccountInfo("acc-1");
+    expect(shared.getTotalExecuted()).toBe(2);
+
+    // Call 3: should be rejected by shared ceiling across clients
+    const rejectedAcc = await sharedAccFetcher.getAccountInfo("acc-2");
+    expect(rejectedAcc).toBeNull();
+    expect(shared.getTotalExecuted()).toBe(2);
+
+    // 3. WebSocket message ceiling triggers socket closure
+    const wsTransport = new MockWebSocketTransport();
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+      maxMessagesBudget: 2,
+    });
+
+    wsTransport.triggerOpen();
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 100 }));
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 200 }));
+
+    // Send notification 1 (messagesReceived = 1)
+    wsTransport.triggerMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000100 },
+            value: { signature: "sig-ws-1", err: null, logs: [] },
+          },
+          subscription: 100,
+        },
+      }),
+    );
+    expect(wsTransport.closed).toBe(false);
+
+    // Send notification 2 (messagesReceived reaches ceiling = 2)
+    wsTransport.triggerMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000100 },
+            value: { signature: "sig-ws-2", err: null, logs: [] },
+          },
+          subscription: 100,
+        },
+      }),
+    );
+    // Socket must be closed, not merely counting dropped messages
+    expect(wsTransport.closed).toBe(true);
+    expect(wsClient.getStatus()).toBe("DISCONNECTED");
+  });
+
+  it("B2-READY-03: quarantines unknown subscriptions, rejects missing/zero transaction slots, and sanitizes secrets on error paths", async () => {
+    // 1. Unknown subscription quarantine
+    const wsTransport = new MockWebSocketTransport();
+    let notificationDelivered = false;
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+      onNotification: () => {
+        notificationDelivered = true;
+      },
+    });
+
+    wsTransport.triggerOpen();
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 100 }));
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 200 }));
+
+    // Notification with unmapped subscription ID 999
+    wsTransport.triggerMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000100 },
+            value: { signature: "sig-unknown-sub", err: null, logs: [] },
+          },
+          subscription: 999,
+        },
+      }),
+    );
+
+    expect(wsClient.getMetrics().unknownNotifications).toBe(1);
+    expect(wsClient.getMetrics().ammV4Notifications).toBe(0);
+    expect(wsClient.getMetrics().cpmmNotifications).toBe(0);
+    expect(notificationDelivered).toBe(false);
+
+    // 2. Reject fabricated slot 0 or missing slot
+    const mockRpc = new MockSolanaRpcTransport();
+    mockRpc.registerResponse("getTransaction", {
+      result: {
+        slot: 0, // Invalid fabricated slot 0
+        transaction: {
+          message: {
+            accountKeys: ["payer"],
+            instructions: [{ programIdIndex: 0, accounts: [], data: "" }],
+          },
+        },
+      },
+    });
+
+    const txFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+    const parsedTxZero = await txFetcher.fetchTransaction("sig-slot-zero");
+    expect(parsedTxZero).toBeNull();
+
+    // 3. Credential sanitization on error paths
+    const secretUrl = "https://api.mainnet-beta.solana.com/?api-key=secretToken12345";
+    const throwingRpc: ISolanaRpcTransport = {
+      post: async () => {
+        throw new Error(`Failed to connect to ${secretUrl}`);
+      },
+    };
+
+    const secretTxFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: secretUrl,
+      transport: throwingRpc,
+    });
+    await secretTxFetcher.fetchTransaction("sig-secret-err");
+    const secretRecords = secretTxFetcher.getCapturedTransactions();
+    expect(secretRecords.length).toBe(1);
+    expect(secretRecords[0]!.error).not.toContain("secretToken12345");
+    expect(secretRecords[0]!.error).toContain("[REDACTED]");
+  });
+
+  it("B2-READY-04: executes genuine authentic B2 replay from raw JSONL files and rejects tampered or missing records", async () => {
+    const replayBaseDir = path.join(testTmpBase, "b2-authentic-replay-suite");
+    fsSync.mkdirSync(replayBaseDir, { recursive: true });
+
+    const ammV4Tx = createAmmV4InitTransactionFixture();
+    const sig = ammV4Tx.signature;
+
+    // Create authentic B2 session with raw JSONL records
+    const b2Capture = saveB2EventSession({
+      captureBaseDir: replayBaseDir,
+      sessionId: "b2-session-authentic",
+      forcedStatus: "FINALIZED",
+      rawNotifications: [
+        {
+          receivedEpochMs: Date.now(),
+          receivedIso: new Date().toISOString(),
+          subscriptionId: 10,
+          protocol: "RAYDIUM_AMM_V4",
+          envelope: {
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: {
+                  signature: sig,
+                  err: null,
+                  logs: ["Program log: initialize2"],
+                },
+              },
+              subscription: 10,
+            },
+          },
+        },
+      ],
+      rawTransactions: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            method: "getTransaction",
+            params: [sig, { encoding: "json", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "tx-req-1",
+            result: {
+              slot: 450000100,
+              blockTime: 1746886997,
+              version: 0,
+              transaction: {
+                message: {
+                  accountKeys: ammV4Tx.accountKeys.staticAccountKeys,
+                  instructions: ammV4Tx.instructions,
+                },
+              },
+              meta: {
+                err: null,
+                innerInstructions: [],
+              },
+            },
+          },
+          timing: { elapsedMs: 50, payloadSizeBytes: 2000 },
+        },
+      ],
+      rawAccounts: [
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            method: "getAccountInfo",
+            params: [FIXTURE_POOL_ADDRESS, { encoding: "base64", commitment: "confirmed" }],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-1",
+            result: {
+              context: { slot: 450000100 },
+              value: {
+                data: [createAuthoritativeRaydiumAmmV4Buffer().toString("base64"), "base64"],
+                owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                lamports: 10000000,
+              },
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+        {
+          request: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            method: "getMultipleAccounts",
+            params: [
+              [FIXTURE_BASE_VAULT, FIXTURE_QUOTE_VAULT],
+              { encoding: "base64", commitment: "confirmed" },
+            ],
+            endpoint: "https://api.mainnet-beta.solana.com/",
+            endpointFingerprint: "fp",
+            timestampIso: new Date().toISOString(),
+            timestampEpochMs: Date.now(),
+          },
+          response: {
+            jsonrpc: "2.0",
+            id: "acc-req-2",
+            result: {
+              context: { slot: 450000100 },
+              value: [
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_MEME_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+                {
+                  data: [
+                    createAuthoritativeSplVaultBuffer({
+                      mintBase58: FIXTURE_WSOL_MINT,
+                      ownerBase58: RAYDIUM_AMM_V4_PROGRAM_ID,
+                    }).toString("base64"),
+                    "base64",
+                  ],
+                  owner: SPL_TOKEN_PROGRAM_ID,
+                  lamports: 2000000,
+                },
+              ],
+            },
+          },
+          timing: { elapsedMs: 30, payloadSizeBytes: 1000 },
+        },
+      ],
+      discoveredEvents: [
+        {
+          eventId: `${sig}:0`,
+          signature: sig,
+          outerInstructionIndex: 0,
+          instructionIndex: 0,
+          slot: 450000100,
+          blockTimeSec: 1746886997,
+          firstSeenTimestampMs: Date.now(),
+          instructionRequestedOpenTimeSec: 1746886997,
+          poolOpenTimeSec: 1746886997,
+          protocol: "RAYDIUM_AMM_V4",
+          poolId: FIXTURE_POOL_ADDRESS,
+          token0Mint: FIXTURE_MEME_MINT,
+          token1Mint: FIXTURE_WSOL_MINT,
+          token0Vault: FIXTURE_BASE_VAULT,
+          token1Vault: FIXTURE_QUOTE_VAULT,
+        },
+      ],
+      verificationReports: [
+        {
+          poolId: FIXTURE_POOL_ADDRESS,
+          protocol: "RAYDIUM_AMM_V4",
+          verified: true,
+          verificationTier: "VERIFIED_AMM_V4",
+          transactionSlot: 450000100,
+          poolAccountSlot: 450000100,
+          vault0AccountSlot: 450000100,
+          vault1AccountSlot: 450000100,
+          slotDiscrepancy: false,
+          slotDelta: 0,
+          verifiedAtEpochMs: Date.now(),
+          hostObservationTimestampMs: Date.now(),
+          effectiveReservesAvailable: true,
+          spotPriceSol: null,
+          spotPrice0Per1: null,
+        },
+      ],
+    });
+
+    // 1. Replay authentic session -> succeeds and reproduces 1 event and 1 verified pool
+    const logger = new PilotLogger();
+    const replayResult = await runReplaySession(
+      {
+        network: "disabled",
+        rpcUrl: "https://api.mainnet-beta.solana.com",
+        replayFixturesPath: b2Capture.sessionDir,
+        replayMode: "authentic",
+        pollIntervalSec: 1,
+        durationSec: 10,
+        targetCandidates: 1,
+        maxCandidatesScreened: 1,
+        targetDiagnosticYield: 1,
+        maxMb: 10,
+        maxRssMb: 256,
+        outputDir: testTmpBase,
+        enableForwardObservations: false,
+      },
+      logger,
+    );
+    expect(replayResult.ok).toBe(true);
+    expect(replayResult.poolsVerified).toBe(1);
+
+    // 2. Negative test: Tampering with evidence file size causes size mismatch rejection
+    const rawTxFile = path.join(b2Capture.sessionDir, "raw-transactions.jsonl");
+    const origBuf = fsSync.readFileSync(rawTxFile);
+    fsSync.appendFileSync(rawTxFile, "\n// tampered extra data\n");
+    expect(() => verifyB2SessionManifest(b2Capture.sessionDir)).toThrow("SIZE_MISMATCH");
+
+    // Negative test: Tampering with content while preserving byte size causes SHA-256 hash mismatch rejection
+    const tamperedSameLength = Buffer.from(origBuf);
+    tamperedSameLength[tamperedSameLength.length - 1] =
+      tamperedSameLength[tamperedSameLength.length - 1] === 32 ? 33 : 32;
+    fsSync.writeFileSync(rawTxFile, tamperedSameLength);
+    expect(() => verifyB2SessionManifest(b2Capture.sessionDir)).toThrow("HASH_MISMATCH");
+
+    // 3. Negative test: Extraneous unmanifested file causes rejection (restore valid file first)
+    fsSync.writeFileSync(rawTxFile, origBuf);
+    const unmanifestedFile = path.join(b2Capture.sessionDir, "untracked-payload.bin");
+    fsSync.writeFileSync(unmanifestedFile, "untracked");
+    expect(() => verifyB2SessionManifest(b2Capture.sessionDir)).toThrow("EXTRANEOUS_FILE");
+  });
+
+  it("B2-READY-05: safe zero-event session finishes as FINALIZED without error", async () => {
+    const wsTransport = new MockWebSocketTransport();
+    const mockRpc = new MockSolanaRpcTransport();
+
+    const wsClient = new SolanaWebSocketSubscriptionClient({
+      wsUrl: "wss://api.mainnet-beta.solana.com/",
+      transport: wsTransport,
+    });
+    const txFetcher = new SolanaRpcTransactionFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+    const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+      rpcUrl: "https://api.mainnet-beta.solana.com/",
+      transport: mockRpc,
+    });
+
+    const captureDir = path.join(testTmpBase, "zero-event-session");
+    const coordinator = new EventDiscoverySessionCoordinator({
+      wsClient,
+      txFetcher,
+      accountFetcher,
+      captureBaseDir: captureDir,
+      budgets: { durationSec: 0.05 }, // Short duration budget
+    });
+
+    wsTransport.triggerOpen();
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 100 }));
+    wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 200 }));
+
+    const summary = await coordinator.runSession();
+
+    // Zero pool initializations observed, completed duration limit
+    expect(summary.status).toBe("FINALIZED");
+    expect(summary.stopReason).toContain("DURATION_LIMIT_REACHED");
+    expect(summary.accounting.uniquePoolsDiscovered).toBe(0);
+    expect(summary.accounting.poolsVerifiedCoherent).toBe(0);
+    expect(summary.manifest?.status).toBe("FINALIZED");
+    expect(summary.manifestVerified).toBe(true);
   });
 });

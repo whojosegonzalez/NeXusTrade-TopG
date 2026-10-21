@@ -62,6 +62,7 @@ export interface EventSessionCaptureInput {
   readonly commitment?: string | undefined;
   readonly maxEventsBudget?: number | undefined;
   readonly maxTransactionsBudget?: number | undefined;
+  readonly maxDiskMb?: number | undefined; // Disk budget limit in megabytes (B2-READY-02)
   readonly forcedStatus?: "FINALIZED" | "FAILED" | "INTERRUPTED" | undefined;
   readonly rawNotifications?: readonly RawWebSocketNotificationRecord[] | undefined;
   readonly rawTransactions?: readonly RawRpcInteractionRecord[] | undefined;
@@ -70,6 +71,192 @@ export interface EventSessionCaptureInput {
   readonly verificationReports?: readonly VerificationDispatchResult[] | undefined;
   readonly metrics?: EventDiscoveryMetricsSnapshot | undefined;
   readonly error?: string | undefined;
+}
+
+/**
+ * Incremental progressive evidence recorder (B2-READY-05 / B2-READY-02).
+ * Progressively persists JSONL frames to disk as they arrive, enforcing disk budget ceilings,
+ * ensuring crash-resilient evidence preservation even if interrupted.
+ */
+export class ProgressiveEvidenceRecorder {
+  private readonly targetDir: string;
+  private readonly sessionId: string;
+  private readonly maxDiskBytes: number;
+  private totalBytesWritten = 0;
+  private isFinalized = false;
+  private readonly counts = {
+    notifications: 0,
+    transactions: 0,
+    accounts: 0,
+    events: 0,
+    reports: 0,
+  };
+
+  constructor(options: {
+    readonly captureBaseDir: string;
+    readonly sessionId?: string | undefined;
+    readonly maxDiskMb?: number | undefined;
+  }) {
+    const timestamp = Date.now();
+    this.sessionId = options.sessionId ?? `b2-events-session-${timestamp}`;
+    this.targetDir = path.join(options.captureBaseDir, this.sessionId);
+    this.maxDiskBytes = (options.maxDiskMb ?? 256) * 1024 * 1024;
+    fsSync.mkdirSync(this.targetDir, { recursive: true });
+
+    // Ensure all 5 JSONL streams exist
+    for (const f of EXPECTED_B2_EVIDENCE_FILES) {
+      if (f.endsWith(".jsonl")) {
+        const fp = path.join(this.targetDir, f);
+        if (!fsSync.existsSync(fp)) {
+          fsSync.writeFileSync(fp, "", "utf8");
+        }
+      }
+    }
+  }
+
+  public getSessionDir(): string {
+    return this.targetDir;
+  }
+
+  public getSessionId(): string {
+    return this.sessionId;
+  }
+
+  private appendJsonl(filename: B2EvidenceFileName, item: unknown): void {
+    if (this.isFinalized) return;
+    const line =
+      JSON.stringify(item, (_k, val) => (typeof val === "bigint" ? val.toString() : val)) + "\n";
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (this.totalBytesWritten + lineBytes > this.maxDiskBytes) {
+      throw new Error(
+        `[DISK_BUDGET_EXCEEDED] Cannot append to ${filename}: exceeded disk budget of ${this.maxDiskBytes} bytes (${this.totalBytesWritten + lineBytes} bytes)`,
+      );
+    }
+    const fp = path.join(this.targetDir, filename);
+    fsSync.appendFileSync(fp, line, "utf8");
+    this.totalBytesWritten += lineBytes;
+  }
+
+  public recordNotification(record: RawWebSocketNotificationRecord): void {
+    this.appendJsonl("raw-notifications.jsonl", record);
+    this.counts.notifications++;
+  }
+
+  public recordTransaction(record: RawRpcInteractionRecord): void {
+    this.appendJsonl("raw-transactions.jsonl", record);
+    this.counts.transactions++;
+  }
+
+  public recordAccount(record: RawRpcInteractionRecord): void {
+    this.appendJsonl("raw-accounts.jsonl", record);
+    this.counts.accounts++;
+  }
+
+  public recordEvent(event: DiscoveredPoolInitializationEvent): void {
+    this.appendJsonl("discovered-events.jsonl", event);
+    this.counts.events++;
+  }
+
+  public recordReport(report: VerificationDispatchResult): void {
+    this.appendJsonl("verification-reports.jsonl", report);
+    this.counts.reports++;
+  }
+
+  public finalize(metadataInput: {
+    readonly status: "FINALIZED" | "FAILED" | "INTERRUPTED";
+    readonly wsUrl?: string | undefined;
+    readonly rpcUrl?: string | undefined;
+    readonly endpointHost?: string | undefined;
+    readonly endpointFingerprint?: string | undefined;
+    readonly commitment?: string | undefined;
+    readonly maxEventsBudget?: number | undefined;
+    readonly maxTransactionsBudget?: number | undefined;
+    readonly totalPoolsVerified?: number | undefined;
+    readonly error?: string | null | undefined;
+    readonly metrics?: EventDiscoveryMetricsSnapshot | null | undefined;
+  }): {
+    readonly sessionDir: string;
+    readonly manifestPath: string;
+    readonly status: "FINALIZED" | "FAILED" | "INTERRUPTED";
+    readonly manifest: B2SnapshotManifest;
+  } {
+    this.isFinalized = true;
+    const timestamp = Date.now();
+    const metadata = {
+      sessionId: this.sessionId,
+      createdAtIso: new Date(timestamp).toISOString(),
+      createdAtEpochMs: timestamp,
+      status: metadataInput.status,
+      wsUrl: metadataInput.wsUrl ?? "unknown",
+      rpcUrl: metadataInput.rpcUrl ?? "unknown",
+      endpointHost: metadataInput.endpointHost ?? "unknown",
+      endpointFingerprint: metadataInput.endpointFingerprint ?? "unknown",
+      commitment: metadataInput.commitment ?? "confirmed",
+      maxEventsBudget: metadataInput.maxEventsBudget ?? 50,
+      maxTransactionsBudget: metadataInput.maxTransactionsBudget ?? 25,
+      totalNotificationsReceived: this.counts.notifications,
+      totalTransactionsFetched: this.counts.transactions,
+      totalEventsDiscovered: this.counts.events,
+      totalPoolsVerified: metadataInput.totalPoolsVerified ?? this.counts.reports,
+      error: metadataInput.error ?? null,
+      metrics: metadataInput.metrics ?? null,
+    };
+
+    const metadataContent = JSON.stringify(
+      metadata,
+      (_k, val) => (typeof val === "bigint" ? val.toString() : val),
+      2,
+    );
+    const metaBytes = Buffer.byteLength(metadataContent, "utf8");
+    if (this.totalBytesWritten + metaBytes > this.maxDiskBytes) {
+      throw new Error(
+        `[DISK_BUDGET_EXCEEDED] Cannot write session-metadata.json: exceeded disk budget of ${this.maxDiskBytes} bytes`,
+      );
+    }
+    const metaPath = path.join(this.targetDir, "session-metadata.json");
+    fsSync.writeFileSync(metaPath, metadataContent, "utf8");
+    this.totalBytesWritten += metaBytes;
+
+    // Generate manifest
+    const fileEntries: B2SnapshotManifestFileEntry[] = [];
+    let totalBytes = 0;
+    for (const filename of EXPECTED_B2_EVIDENCE_FILES) {
+      const filePath = path.join(this.targetDir, filename);
+      const content = fsSync.readFileSync(filePath);
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+      fileEntries.push({
+        filename,
+        sha256: hash,
+        byteSize: content.length,
+      });
+      totalBytes += content.length;
+    }
+    fileEntries.sort((a, b) => a.filename.localeCompare(b.filename));
+
+    const manifestPayload = fileEntries.map((f) => `${f.filename}:${f.sha256}`).join("\n");
+    const manifestSha256 = crypto.createHash("sha256").update(manifestPayload).digest("hex");
+
+    const manifest: B2SnapshotManifest = {
+      manifestVersion: "1.0",
+      sessionId: this.sessionId,
+      createdAtIso: new Date(timestamp).toISOString(),
+      status: metadataInput.status,
+      totalFiles: fileEntries.length,
+      totalBytes,
+      files: fileEntries,
+      manifestSha256,
+    };
+
+    const manifestPath = path.join(this.targetDir, "session-manifest.json");
+    fsSync.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+    return {
+      sessionDir: this.targetDir,
+      manifestPath,
+      status: metadataInput.status,
+      manifest,
+    };
+  }
 }
 
 export function saveB2EventSession(input: EventSessionCaptureInput): {
@@ -81,17 +268,16 @@ export function saveB2EventSession(input: EventSessionCaptureInput): {
   const timestamp = Date.now();
   const sessionId = input.sessionId ?? `b2-events-session-${timestamp}`;
   const targetDir = path.join(input.captureBaseDir, sessionId);
+  const maxDiskBytes = (input.maxDiskMb ?? 256) * 1024 * 1024;
   fsSync.mkdirSync(targetDir, { recursive: true });
 
-  const status: "FINALIZED" | "FAILED" | "INTERRUPTED" =
-    input.forcedStatus ??
-    (input.error
-      ? "FAILED"
-      : (input.verificationReports?.length ?? 0) > 0
-        ? "FINALIZED"
-        : "FAILED");
+  let cumulativeBytes = 0;
 
-  // Helper to write JSONL stream with BigInt serialization support
+  // B2-READY-05: Zero-event sessions without error finish safely as FINALIZED
+  const status: "FINALIZED" | "FAILED" | "INTERRUPTED" =
+    input.forcedStatus ?? (input.error ? "FAILED" : "FINALIZED");
+
+  // Helper to write JSONL stream with BigInt serialization support and disk budget enforcement
   const writeJsonl = (filename: B2EvidenceFileName, items: readonly unknown[]): string => {
     const filePath = path.join(targetDir, filename);
     const content =
@@ -100,7 +286,14 @@ export function saveB2EventSession(input: EventSessionCaptureInput): {
           JSON.stringify(item, (_key, val) => (typeof val === "bigint" ? val.toString() : val)),
         )
         .join("\n") + (items.length > 0 ? "\n" : "");
+    const fileBytes = Buffer.byteLength(content, "utf8");
+    if (cumulativeBytes + fileBytes > maxDiskBytes) {
+      throw new Error(
+        `[DISK_BUDGET_EXCEEDED] Cannot write ${filename}: reached disk budget ceiling of ${maxDiskBytes} bytes`,
+      );
+    }
     fsSync.writeFileSync(filePath, content, "utf8");
+    cumulativeBytes += fileBytes;
     return filePath;
   };
 
@@ -139,12 +332,20 @@ export function saveB2EventSession(input: EventSessionCaptureInput): {
     error: input.error ?? null,
     metrics: input.metrics ?? null,
   };
-  const metadataFilePath = path.join(targetDir, "session-metadata.json");
-  fsSync.writeFileSync(
-    metadataFilePath,
-    JSON.stringify(metadata, (_key, val) => (typeof val === "bigint" ? val.toString() : val), 2),
-    "utf8",
+  const metadataContent = JSON.stringify(
+    metadata,
+    (_key, val) => (typeof val === "bigint" ? val.toString() : val),
+    2,
   );
+  const metaBytes = Buffer.byteLength(metadataContent, "utf8");
+  if (cumulativeBytes + metaBytes > maxDiskBytes) {
+    throw new Error(
+      `[DISK_BUDGET_EXCEEDED] Cannot write session-metadata.json: reached disk budget ceiling of ${maxDiskBytes} bytes`,
+    );
+  }
+  const metadataFilePath = path.join(targetDir, "session-metadata.json");
+  fsSync.writeFileSync(metadataFilePath, metadataContent, "utf8");
+  cumulativeBytes += metaBytes;
 
   // 7. Calculate file hashes and generate session-manifest.json
   const fileEntries: B2SnapshotManifestFileEntry[] = [];
@@ -257,6 +458,16 @@ export function verifyB2SessionManifest(sessionDir: string): {
     throw new Error(
       `[B2_MANIFEST_SHA256_MISMATCH] Declared ${manifest.manifestSha256}, computed ${canonicalHash}`,
     );
+  }
+
+  // B2-READY-05: Reject extraneous or unlisted evidence files on disk
+  const diskEntries = fsSync.readdirSync(sessionDir);
+  for (const entry of diskEntries) {
+    if (entry !== "session-manifest.json" && !seen.has(entry)) {
+      throw new Error(
+        `[B2_MANIFEST_EXTRANEOUS_FILE] Extraneous unmanifested file on disk in ${sessionDir}: ${entry}`,
+      );
+    }
   }
 
   return { valid: true, manifest };

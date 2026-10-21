@@ -27,6 +27,7 @@ import {
   SolanaRpcLiveObservationClient,
   type ISolanaRpcTransport,
   type CpmmPoolVerificationReport,
+  type RawRpcInteractionRecord,
   DEFAULT_SOLANA_MAINNET_RPC,
   sanitizeSolanaRpcUrl,
 } from "./SolanaRpcLiveObservationClient.js";
@@ -40,6 +41,17 @@ import {
   type ITransactionFetcher,
 } from "./EventDiscoveryIngestionEngine.js";
 import { verifyB2SessionManifest } from "./EventSessionEvidenceCapture.js";
+import {
+  DEFAULT_SOLANA_MAINNET_WSS,
+  NativeWebSocketTransport,
+  SolanaWebSocketSubscriptionClient,
+  type ISolanaWebSocketTransport,
+  type RawWebSocketNotificationRecord,
+} from "./SolanaWebSocketSubscriptionClient.js";
+import { createDefaultSolanaRpcTransport } from "./SolanaRpcLiveObservationClient.js";
+import { SolanaRpcTransactionFetcher } from "./SolanaRpcTransactionFetcher.js";
+import { SolanaRpcRecordingAccountFetcher } from "./SolanaRpcRecordingAccountFetcher.js";
+import { EventDiscoverySessionCoordinator } from "./EventDiscoverySessionCoordinator.js";
 import type {
   DiscoveredPoolAccountPayload,
   EventDiscoveryMetricsSnapshot,
@@ -223,6 +235,8 @@ export interface PilotLiveCollectorConfig {
   readonly maxWsMessages?: number | undefined;
   readonly maxEvents?: number | undefined;
   readonly maxTransactions?: number | undefined;
+  readonly authorizeB2Live?: boolean | undefined;
+  readonly wsTransport?: ISolanaWebSocketTransport | undefined;
   readonly httpTransport?: ILiveHttpTransport | undefined;
   readonly rpcTransport?: ISolanaRpcTransport | undefined;
   readonly logger?: PilotLogger | undefined;
@@ -288,6 +302,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let rpcTimeoutMs: number | undefined = undefined;
   let wsUrl: string | undefined = undefined;
   let maxWsMessages: number | undefined = undefined;
+  let authorizeB2Live = false;
 
   // Linux default: ~/nexustrade-pilot-data/sessions/
   // Windows default: .tmp/pilot-data/sessions/
@@ -316,6 +331,7 @@ Options:
   --rpc-max-calls=<n>              Outbound RPC call ceiling budget (default: 2 in CPMM verification mode) (B1-PREP-03)
   --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
   --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
+  --authorize-b2-live              Explicit operator authorization to execute live event discovery (B2-READY-01)
   --max-ws-messages=<n>            Maximum WebSocket incoming messages budget (default: 500) (D29-B2)
   --max-events=<n>                 Maximum event budget for event discovery (default: 50)
   --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
@@ -475,6 +491,8 @@ Options:
       enableForwardObservations = true;
     } else if (arg === "--forward-observations=false" || arg === "--disable-forward-observations") {
       enableForwardObservations = false;
+    } else if (arg === "--authorize-b2-live") {
+      authorizeB2Live = true;
     } else {
       throw new Error(`[INVALID_ARGUMENT] Unknown CLI option: '${arg}'`);
     }
@@ -531,6 +549,7 @@ Options:
     maxWsMessages,
     maxEvents,
     maxTransactions,
+    authorizeB2Live,
   };
 }
 
@@ -2065,7 +2084,7 @@ export function createOfflineRpcTransportFromFixtures(
 }
 
 /**
- * Executes an offline event discovery replay session from recorded fixture files (D29-H3 / BREADY-05).
+ * Executes an offline event discovery replay session from recorded fixture files (D29-H3 / BREADY-05 / B2-READY-04).
  */
 export async function runReplaySession(
   config: PilotLiveCollectorConfig,
@@ -2076,6 +2095,169 @@ export async function runReplaySession(
   }
 
   const stat = fsSync.statSync(config.replayFixturesPath);
+
+  // B2-READY-04: Authentic B2 Replay Engine reconstructing genuine event discovery from raw JSONL
+  const isB2Session =
+    stat.isDirectory() &&
+    fsSync.existsSync(path.join(config.replayFixturesPath, "session-manifest.json"));
+
+  if (isB2Session) {
+    logger.info(
+      "REPLAY_B2_START",
+      `Detected B2 Event Discovery session in ${config.replayFixturesPath}. Replaying in authentic mode...`,
+    );
+
+    // 1. Verify B2 manifest integrity before reading any files
+    verifyB2SessionManifest(config.replayFixturesPath);
+
+    // 2. Read raw-notifications.jsonl
+    const notifsPath = path.join(config.replayFixturesPath, "raw-notifications.jsonl");
+    const rawNotifLines = fsSync
+      .readFileSync(notifsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+    const notifications: RawWebSocketNotificationRecord[] = rawNotifLines.map((l) => JSON.parse(l));
+
+    // 3. Read raw-transactions.jsonl
+    const txsPath = path.join(config.replayFixturesPath, "raw-transactions.jsonl");
+    const rawTxLines = fsSync
+      .readFileSync(txsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+    const txRecords: RawRpcInteractionRecord[] = rawTxLines.map((l) => JSON.parse(l));
+
+    const txMap = new Map<string, VersionedTransactionMetadata>();
+    for (const rec of txRecords) {
+      const sig = rec.request?.params?.[0] as string;
+      if (!sig) {
+        throw new Error("[REPLAY_MALFORMED_TRANSACTION] Missing signature in transaction request");
+      }
+      const res = rec.response;
+      if (!res || typeof res !== "object" || !("result" in res)) {
+        throw new Error(
+          `[REPLAY_MALFORMED_TRANSACTION] Malformed transaction response for '${sig}'`,
+        );
+      }
+      const parsedTx = SolanaRpcTransactionFetcher.parseTransactionResponse(sig, res);
+      if (!parsedTx) {
+        throw new Error(
+          `[REPLAY_MALFORMED_TRANSACTION] Failed to parse transaction response for '${sig}': invalid slot or format`,
+        );
+      }
+      txMap.set(sig, parsedTx);
+    }
+
+    // 4. Read raw-accounts.jsonl
+    const accountMap = loadAccountMapFromFixtures(config.replayFixturesPath, {
+      replayMode: config.replayMode ?? "authentic",
+    });
+
+    // 5. Build authentic fetchers (fail closed if requested item not in recorded wire records)
+    const txFetcher: ITransactionFetcher = {
+      fetchTransaction: async (sig: string) => {
+        const tx = txMap.get(sig);
+        if (!tx) {
+          throw new Error(
+            `[REPLAY_MISSING_TRANSACTION] Transaction wire record missing for signature '${sig}'`,
+          );
+        }
+        return tx;
+      },
+    };
+
+    let maxSlotSeen = 0;
+    for (const acc of accountMap.values()) {
+      if (acc.slot > maxSlotSeen) maxSlotSeen = acc.slot;
+    }
+
+    const accountFetcher: IOnChainAccountFetcher = {
+      getAccountInfo: async (addr: string) => {
+        const acc = accountMap.get(addr);
+        if (!acc) {
+          throw new Error(
+            `[REPLAY_MISSING_ACCOUNT] Account wire record missing for address '${addr}'`,
+          );
+        }
+        return acc;
+      },
+      getMultipleAccounts: async (addrs: readonly string[]) => {
+        return addrs.map((addr) => {
+          const acc = accountMap.get(addr);
+          if (!acc) {
+            throw new Error(
+              `[REPLAY_MISSING_ACCOUNT] Account wire record missing for address '${addr}'`,
+            );
+          }
+          return acc;
+        });
+      },
+      getSlot: async () => maxSlotSeen,
+    };
+
+    // 6. Feed authentic notifications into Ingestion Engine
+    const engine = new EventDiscoveryIngestionEngine({
+      maxQueueSize: config.maxEvents ?? 500,
+      maxEvents: config.maxEvents,
+      maxTransactions: config.maxTransactions,
+    });
+
+    for (const notif of notifications) {
+      if (!notif.envelope?.params?.result?.context?.slot) {
+        throw new Error(
+          `[REPLAY_MALFORMED_NOTIFICATION] Notification missing context slot for ${notif.envelope?.params?.result?.value?.signature}`,
+        );
+      }
+      await engine.handleLogNotification(notif.envelope);
+    }
+
+    // 7. Drain and verify queue
+    const dispatchResults = await engine.processQueue(txFetcher, accountFetcher);
+    const metrics = engine.getMetricsSnapshot();
+    const discoveredEvents = engine.getDiscoveredEvents();
+
+    // 8. Verify reproduction against recorded discovered-events.jsonl and verification-reports.jsonl
+    const recordedEventsPath = path.join(config.replayFixturesPath, "discovered-events.jsonl");
+    if (fsSync.existsSync(recordedEventsPath)) {
+      const recEventLines = fsSync
+        .readFileSync(recordedEventsPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim().length > 0);
+      if (recEventLines.length !== discoveredEvents.length) {
+        throw new Error(
+          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recEventLines.length} discovered events, reproduced ${discoveredEvents.length}`,
+        );
+      }
+    }
+
+    const recordedReportsPath = path.join(config.replayFixturesPath, "verification-reports.jsonl");
+    if (fsSync.existsSync(recordedReportsPath)) {
+      const recReportLines = fsSync
+        .readFileSync(recordedReportsPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim().length > 0);
+      if (recReportLines.length !== dispatchResults.length) {
+        throw new Error(
+          `[REPLAY_REPRODUCTION_MISMATCH] Expected ${recReportLines.length} verification reports, reproduced ${dispatchResults.length}`,
+        );
+      }
+    }
+
+    logger.info(
+      "REPLAY_B2_SUCCESS",
+      `Authentic B2 replay successful: reproduced ${discoveredEvents.length} events and ${dispatchResults.length} verification reports with zero synthetic data.`,
+    );
+
+    return {
+      ok: true,
+      metrics,
+      poolsVerified: dispatchResults.filter((r) => r.verified).length,
+    };
+  }
+
   const fixtureFiles: string[] = [];
   if (stat.isDirectory()) {
     const entries = fsSync.readdirSync(config.replayFixturesPath);
@@ -2100,7 +2282,9 @@ export async function runReplaySession(
   });
 
   const txMap = new Map<string, VersionedTransactionMetadata>();
-  const accountMap = loadAccountMapFromFixtures(config.replayFixturesPath);
+  const accountMap = loadAccountMapFromFixtures(config.replayFixturesPath, {
+    replayMode: config.replayMode,
+  });
 
   let eventsEnqueued = 0;
   const maxEventsCeiling = config.maxEvents ?? Infinity;
@@ -2198,6 +2382,92 @@ export async function runReplaySession(
 }
 
 /**
+ * Executes a bounded live event discovery session upon explicit operator authorization (B2-READY-01).
+ */
+export async function runLiveEventDiscoverySession(
+  config: PilotLiveCollectorConfig,
+): Promise<number> {
+  const logger = config.logger ?? new PilotLogger({ logFilePath: config.logFilePath });
+
+  logger.info(
+    "LIVE_B2_START",
+    `Initializing operator-authorized D.2.9-B2 Live Prospective Event Discovery session...`,
+  );
+
+  const wsTransport =
+    config.wsTransport ?? new NativeWebSocketTransport(config.wsUrl ?? DEFAULT_SOLANA_MAINNET_WSS);
+
+  const wsClient = new SolanaWebSocketSubscriptionClient({
+    wsUrl: config.wsUrl ?? DEFAULT_SOLANA_MAINNET_WSS,
+    transport: wsTransport,
+    maxMessagesBudget: config.maxWsMessages ?? 500,
+    commitment: "confirmed",
+    onLog: (msg) => logger.info("SOLANA_WS", msg),
+  });
+
+  const rpcTransport = config.rpcTransport ?? createDefaultSolanaRpcTransport();
+
+  const txFetcher = new SolanaRpcTransactionFetcher({
+    rpcUrl: config.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC,
+    transport: rpcTransport,
+    maxTransactionsBudget: config.maxTransactions ?? 25,
+    httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+    commitment: "confirmed",
+    onLog: (msg) => logger.info("SOLANA_RPC_TX", msg),
+  });
+
+  const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+    rpcUrl: config.rpcUrl ?? DEFAULT_SOLANA_MAINNET_RPC,
+    transport: rpcTransport,
+    maxAccountCallsBudget: config.rpcMaxCalls ?? 20,
+    httpTimeoutMs: config.rpcTimeoutMs ?? 10_000,
+    commitment: "confirmed",
+    onLog: (msg) => logger.info("SOLANA_RPC_ACC", msg),
+  });
+
+  const coordinator = new EventDiscoverySessionCoordinator({
+    wsClient,
+    txFetcher,
+    accountFetcher,
+    captureBaseDir: config.captureFixturesDir ?? ".tmp/b2-captures",
+    budgets: {
+      durationSec: config.durationSec !== 7200 ? config.durationSec : 60,
+      maxWsMessages: config.maxWsMessages ?? 500,
+      maxTransactions: config.maxTransactions ?? 25,
+      maxAccountReads: config.rpcMaxCalls ?? 20,
+      maxTotalRpcCalls: (config.rpcMaxCalls ?? 20) + (config.maxTransactions ?? 25),
+      maxRssMb: config.maxRssMb ?? 256,
+      maxDiskMb: config.maxMb ?? 256,
+    },
+    onLog: (msg) => logger.info("B2_COORDINATOR", msg),
+  });
+
+  // Attach OS signal interruption handlers (B2-READY-05)
+  const sigintHandler = () => {
+    logger.warn("OPERATOR_INTERRUPT", "Received SIGINT, sealing evidence gracefully...");
+    coordinator.requestStop("SIGINT_OPERATOR_INTERRUPT");
+  };
+  const sigtermHandler = () => {
+    logger.warn("OPERATOR_INTERRUPT", "Received SIGTERM, sealing evidence gracefully...");
+    coordinator.requestStop("SIGTERM_OPERATOR_INTERRUPT");
+  };
+
+  process.on("SIGINT", sigintHandler);
+  process.on("SIGTERM", sigtermHandler);
+
+  try {
+    const summary = await coordinator.runSession();
+    console.log(
+      JSON.stringify(summary, (_k, val) => (typeof val === "bigint" ? val.toString() : val), 2),
+    );
+    return summary.status === "FAILED" ? 1 : 0;
+  } finally {
+    process.removeListener("SIGINT", sigintHandler);
+    process.removeListener("SIGTERM", sigtermHandler);
+  }
+}
+
+/**
  * CLI Execution Entrypoint
  */
 export async function runPilotCollectorCli(
@@ -2205,17 +2475,24 @@ export async function runPilotCollectorCli(
   options?: {
     httpTransport?: ILiveHttpTransport | undefined;
     rpcTransport?: ISolanaRpcTransport | undefined;
+    wsTransport?: ISolanaWebSocketTransport | undefined;
     logger?: PilotLogger | undefined;
   },
 ): Promise<number> {
   let config: PilotLiveCollectorConfig;
   try {
     config = parseCliArgs(argv);
-    if (options?.httpTransport || options?.rpcTransport || options?.logger) {
+    if (
+      options?.httpTransport ||
+      options?.rpcTransport ||
+      options?.wsTransport ||
+      options?.logger
+    ) {
       config = {
         ...config,
         ...(options.httpTransport ? { httpTransport: options.httpTransport } : {}),
         ...(options.rpcTransport ? { rpcTransport: options.rpcTransport } : {}),
+        ...(options.wsTransport ? { wsTransport: options.wsTransport } : {}),
         ...(options.logger ? { logger: options.logger } : {}),
       };
     }
@@ -2224,12 +2501,15 @@ export async function runPilotCollectorCli(
     return 1;
   }
 
-  // D.2.9-B Authorization Guard: Reject live WebSocket event capture unless explicitly authorized in Gate 2.9-B (BREADY-05)
+  // D.2.9-B Authorization Guard (BREADY-05 / B2-READY-01): Reject live WebSocket event capture unless explicitly authorized
   if (config.network === "enabled" && config.discoverySource === "events") {
-    console.error(
-      "[UNAUTHORIZED_LIVE_EVENTS] Live WebSocket event capture is unauthorized until Phase 12.94-D.2.9-B is formally approved. Use --replay-fixtures=<path> for offline event discovery verification.",
-    );
-    return 1;
+    if (!config.authorizeB2Live) {
+      console.error(
+        "[UNAUTHORIZED_LIVE_EVENTS] Live WebSocket event capture is unauthorized until Phase 12.94-D.2.9-B is formally approved. Pass --authorize-b2-live to execute upon operator authorization, or use --replay-fixtures=<path> for offline event discovery verification.",
+      );
+      return 1;
+    }
+    return await runLiveEventDiscoverySession(config);
   }
 
   // Offline Replay Mode or Offline Verification with Replay Fixtures (D29-H3 / BREADY-05): Does not require network authorization

@@ -39,12 +39,35 @@ import {
 } from "./EventDiscoveryIngestionEngine.js";
 import {
   type B2SnapshotManifest,
-  saveB2EventSession,
+  ProgressiveEvidenceRecorder,
   verifyB2SessionManifest,
 } from "./EventSessionEvidenceCapture.js";
 import type { SolanaRpcRecordingAccountFetcher } from "./SolanaRpcRecordingAccountFetcher.js";
-import type { SolanaRpcTransactionFetcher } from "./SolanaRpcTransactionFetcher.js";
+import {
+  type ISharedRpcBudget,
+  type SolanaRpcTransactionFetcher,
+} from "./SolanaRpcTransactionFetcher.js";
 import type { SolanaWebSocketSubscriptionClient } from "./SolanaWebSocketSubscriptionClient.js";
+
+/**
+ * Shared cross-client RPC budget counter enforcing total ceiling across transaction and account clients (B2-READY-02).
+ */
+class SharedRpcBudgetTracker implements ISharedRpcBudget {
+  private count = 0;
+  constructor(private readonly maxCalls: number) {}
+  public canExecute(): boolean {
+    return this.count < this.maxCalls;
+  }
+  public recordCall(): void {
+    this.count++;
+  }
+  public getRemaining(): number {
+    return Math.max(0, this.maxCalls - this.count);
+  }
+  public getTotalExecuted(): number {
+    return this.count;
+  }
+}
 
 export interface EventDiscoverySessionBudgets {
   readonly durationSec?: number | undefined; // Session runtime ceiling in seconds (default: 60)
@@ -119,11 +142,18 @@ export class EventDiscoverySessionCoordinator {
   private readonly budgets: ResolvedEventDiscoveryBudgets;
   private readonly captureBaseDir?: string | undefined;
   private readonly onLog?: ((msg: string) => void) | undefined;
+  private readonly evidenceRecorder?: ProgressiveEvidenceRecorder | undefined;
 
   private isRunning = false;
   private stopRequested = false;
   private stopReason = "COMPLETED";
   private readonly pendingNotificationPromises: Promise<unknown>[] = [];
+
+  private recordedNotificationCount = 0;
+  private recordedTxCount = 0;
+  private recordedAccCount = 0;
+  private recordedEventCount = 0;
+  private recordedReportCount = 0;
 
   constructor(options: EventDiscoverySessionOptions) {
     this.wsClient = options.wsClient;
@@ -143,6 +173,19 @@ export class EventDiscoverySessionCoordinator {
       maxDiskMb: b.maxDiskMb ?? 256,
     };
 
+    // Shared RPC budget enforcement across transaction and account fetchers (B2-READY-02)
+    const sharedBudget = new SharedRpcBudgetTracker(this.budgets.maxTotalRpcCalls);
+    this.txFetcher.setSharedBudget(sharedBudget);
+    this.accountFetcher.setSharedBudget(sharedBudget);
+
+    // Initialize progressive evidence recorder if capture directory provided (B2-READY-05)
+    if (this.captureBaseDir) {
+      this.evidenceRecorder = new ProgressiveEvidenceRecorder({
+        captureBaseDir: this.captureBaseDir,
+        maxDiskMb: this.budgets.maxDiskMb,
+      });
+    }
+
     this.engine =
       options.engine ??
       new EventDiscoveryIngestionEngine({
@@ -154,6 +197,15 @@ export class EventDiscoverySessionCoordinator {
     this.wsClient.setNotificationHandler((envelope) => {
       const p = this.engine.handleLogNotification(envelope);
       this.pendingNotificationPromises.push(p);
+
+      // Progressively persist raw notification
+      if (this.evidenceRecorder) {
+        const notifications = this.wsClient.getCapturedNotifications();
+        while (this.recordedNotificationCount < notifications.length) {
+          const rec = notifications[this.recordedNotificationCount++];
+          if (rec) this.evidenceRecorder.recordNotification(rec);
+        }
+      }
     });
   }
 
@@ -161,6 +213,34 @@ export class EventDiscoverySessionCoordinator {
     this.stopRequested = true;
     this.stopReason = reason;
     this.onLog?.(`[SESSION_STOP_REQUESTED] Reason: ${reason}`);
+  }
+
+  private flushProgressiveEvidence(): void {
+    if (!this.evidenceRecorder) return;
+
+    const txs = this.txFetcher.getCapturedTransactions();
+    while (this.recordedTxCount < txs.length) {
+      const rec = txs[this.recordedTxCount++];
+      if (rec) this.evidenceRecorder.recordTransaction(rec);
+    }
+
+    const accs = this.accountFetcher.getCapturedInteractions();
+    while (this.recordedAccCount < accs.length) {
+      const rec = accs[this.recordedAccCount++];
+      if (rec) this.evidenceRecorder.recordAccount(rec);
+    }
+
+    const events = this.engine.getDiscoveredEvents();
+    while (this.recordedEventCount < events.length) {
+      const ev = events[this.recordedEventCount++];
+      if (ev) this.evidenceRecorder.recordEvent(ev);
+    }
+
+    const reports = this.engine.getVerificationReports();
+    while (this.recordedReportCount < reports.length) {
+      const rep = reports[this.recordedReportCount++];
+      if (rep) this.evidenceRecorder.recordReport(rep);
+    }
   }
 
   /**
@@ -173,7 +253,7 @@ export class EventDiscoverySessionCoordinator {
     const maxRssBytes = this.budgets.maxRssMb * 1024 * 1024;
 
     this.onLog?.(
-      `Starting Event Discovery Session with budgets: duration=${this.budgets.durationSec}s, maxWsMessages=${this.budgets.maxWsMessages}, maxTx=${this.budgets.maxTransactions}, maxAcc=${this.budgets.maxAccountReads}, maxRpc=${this.budgets.maxTotalRpcCalls}`,
+      `Starting Event Discovery Session with budgets: duration=${this.budgets.durationSec}s, maxWsMessages=${this.budgets.maxWsMessages}, maxTx=${this.budgets.maxTransactions}, maxAcc=${this.budgets.maxAccountReads}, maxRpc=${this.budgets.maxTotalRpcCalls}, maxDisk=${this.budgets.maxDiskMb}MB`,
     );
 
     let sessionStatus: "FINALIZED" | "INTERRUPTED" | "FAILED" = this.stopRequested
@@ -225,7 +305,7 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 5. Await any in-flight notification handling
+        // 5. Await in-flight notification handling
         if (this.pendingNotificationPromises.length > 0) {
           const promises = this.pendingNotificationPromises.splice(0);
           await Promise.all(promises);
@@ -235,6 +315,7 @@ export class EventDiscoverySessionCoordinator {
         const pendingQueueLength = this.engine.getQueueLength();
         if (pendingQueueLength > 0) {
           await this.engine.processQueue(this.txFetcher, this.accountFetcher);
+          this.flushProgressiveEvidence();
         } else {
           // Micro-tick pause when queue is empty to yield event loop
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -254,11 +335,11 @@ export class EventDiscoverySessionCoordinator {
       sessionStatus = "INTERRUPTED";
     }
 
+    // Flush remaining in-flight records
+    this.flushProgressiveEvidence();
+
     const elapsedSec = (Date.now() - startEpochMs) / 1000;
     const metrics = this.engine.getMetricsSnapshot();
-    const rawNotifications = this.wsClient.getCapturedNotifications();
-    const rawTransactions = this.txFetcher.getCapturedTransactions();
-    const rawAccounts = this.accountFetcher.getCapturedInteractions();
     const discoveredEvents = this.engine.getDiscoveredEvents();
     const verificationReports = this.engine.getVerificationReports();
 
@@ -266,7 +347,7 @@ export class EventDiscoverySessionCoordinator {
     const accCalls = this.accountFetcher.getCallsExecutedCount();
     const totalRpc = txCalls + accCalls;
 
-    // Auditable Accounting
+    // Auditable Accounting (B2-READY-05)
     const verifiedCoherentCount = verificationReports.filter(
       (r: VerificationDispatchResult) => r.verified,
     ).length;
@@ -281,28 +362,24 @@ export class EventDiscoverySessionCoordinator {
     let manifestVerified: boolean | undefined = undefined;
     let sessionDir: string | undefined = undefined;
 
-    // Evidence Capture & Sealing
-    if (this.captureBaseDir) {
-      const captureResult = saveB2EventSession({
-        captureBaseDir: this.captureBaseDir,
+    // Evidence Capture & Sealing via ProgressiveEvidenceRecorder
+    if (this.evidenceRecorder) {
+      sessionDir = this.evidenceRecorder.getSessionDir();
+      const sealResult = this.evidenceRecorder.finalize({
+        status: sessionStatus,
         wsUrl: this.wsClient.getSanitizedUrl(),
         rpcUrl: this.txFetcher.getSanitizedEndpoint(),
         endpointHost: this.txFetcher.getEndpointHost(),
         endpointFingerprint: this.txFetcher.getEndpointFingerprint(),
-        forcedStatus: sessionStatus,
+        commitment: "confirmed",
         maxEventsBudget: this.budgets.maxWsMessages,
         maxTransactionsBudget: this.budgets.maxTransactions,
-        rawNotifications,
-        rawTransactions,
-        rawAccounts,
-        discoveredEvents,
-        verificationReports,
-        metrics,
+        totalPoolsVerified: verifiedCoherentCount,
         error: executionError,
+        metrics,
       });
 
-      sessionDir = captureResult.sessionDir;
-      manifest = captureResult.manifest;
+      manifest = sealResult.manifest;
 
       // Replay-verify manifest immediately to confirm mathematical integrity
       try {

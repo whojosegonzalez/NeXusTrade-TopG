@@ -26,11 +26,19 @@ import {
   sanitizeSolanaRpcUrl,
 } from "./SolanaRpcLiveObservationClient.js";
 
+export interface ISharedRpcBudget {
+  canExecute(): boolean;
+  recordCall(): void;
+  getRemaining(): number;
+  getTotalExecuted(): number;
+}
+
 export interface SolanaRpcTransactionFetcherOptions {
   readonly rpcUrl?: string | undefined;
   readonly transport: ISolanaRpcTransport;
   readonly commitment?: "confirmed" | "finalized" | undefined;
   readonly maxTransactionsBudget?: number | undefined; // Hard ceiling on getTransaction calls (default: 25)
+  readonly sharedBudget?: ISharedRpcBudget | undefined; // Shared cross-client RPC call budget (B2-READY-02)
   readonly httpTimeoutMs?: number | undefined; // Request timeout in ms (default: 10000)
   readonly onLog?: ((msg: string) => void) | undefined;
 }
@@ -40,9 +48,11 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
   private readonly sanitizedRpcUrl: string;
   private readonly endpointHost: string;
   private readonly endpointFingerprint: string;
+  private readonly sensitiveTokens: readonly string[];
   private readonly transport: ISolanaRpcTransport;
   private readonly commitment: "confirmed" | "finalized";
   private readonly maxTransactionsBudget: number;
+  private sharedBudget?: ISharedRpcBudget | undefined;
   private readonly httpTimeoutMs: number;
   private readonly onLog?: ((msg: string) => void) | undefined;
 
@@ -58,9 +68,11 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     this.sanitizedRpcUrl = sanitized.sanitizedUrl;
     this.endpointHost = sanitized.host;
     this.endpointFingerprint = sanitized.endpointFingerprint;
+    this.sensitiveTokens = sanitized.sensitiveTokens;
     this.transport = options.transport;
     this.commitment = options.commitment ?? "confirmed";
     this.maxTransactionsBudget = options.maxTransactionsBudget ?? 25;
+    this.sharedBudget = options.sharedBudget;
     this.httpTimeoutMs = options.httpTimeoutMs ?? 10_000;
     this.onLog = options.onLog;
   }
@@ -85,11 +97,36 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     return this.endpointHost;
   }
 
+  public setSharedBudget(sharedBudget: ISharedRpcBudget): void {
+    this.sharedBudget = sharedBudget;
+  }
+
+  public sanitizeErrorMessage(text: string): string {
+    if (!text) return text;
+    let out = text.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+    for (const token of this.sensitiveTokens) {
+      if (token && token.length > 0) {
+        out = out.split(token).join("[REDACTED]");
+      }
+    }
+    return out;
+  }
+
   /**
    * Fetches and parses a versioned transaction from Solana RPC.
-   * Enforces maxTransactionsBudget boundary and records raw wire evidence.
+   * Enforces maxTransactionsBudget boundary, shared RPC budget, per-request timeout,
+   * and records raw wire evidence.
    */
   public async fetchTransaction(signature: string): Promise<VersionedTransactionMetadata | null> {
+    // 1. Shared total RPC ceiling check (B2-READY-02)
+    if (this.sharedBudget && !this.sharedBudget.canExecute()) {
+      this.onLog?.(
+        `[TOTAL_RPC_BUDGET_EXCEEDED] Cannot fetch transaction '${signature}': shared RPC ceiling reached`,
+      );
+      return null;
+    }
+
+    // 2. Individual transaction budget ceiling check (B2-READY-02)
     if (this.totalCallsExecuted >= this.maxTransactionsBudget) {
       this.onLog?.(
         `[TRANSACTION_BUDGET_EXCEEDED] Cannot fetch signature '${signature}': exceeded ceiling of ${this.maxTransactionsBudget} calls`,
@@ -98,6 +135,8 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     }
 
     this.totalCallsExecuted++;
+    this.sharedBudget?.recordCall();
+
     const reqId = `pilot-tx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const rpcBody = {
       jsonrpc: "2.0" as const,
@@ -114,8 +153,15 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     };
 
     const callStartEpochMs = Date.now();
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      controller.abort(
+        new Error(`[RPC_TIMEOUT] getTransaction request timed out after ${this.httpTimeoutMs}ms`),
+      );
+    }, this.httpTimeoutMs);
+
     try {
-      const res = await this.transport.post(this.rawRpcUrl, rpcBody);
+      const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
       const elapsedMs = Date.now() - callStartEpochMs;
       this.successfulCalls++;
 
@@ -142,12 +188,12 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       };
       this.capturedTransactions.push(record);
 
-      return this.parseTransactionResponse(signature, resObj);
+      return SolanaRpcTransactionFetcher.parseTransactionResponse(signature, resObj, this.onLog);
     } catch (err) {
       const elapsedMs = Date.now() - callStartEpochMs;
       this.failedCalls++;
       const rawErrMsg = err instanceof Error ? err.message : String(err);
-      const errMsg = rawErrMsg.split(this.rawRpcUrl).join(this.sanitizedRpcUrl);
+      const errMsg = this.sanitizeErrorMessage(rawErrMsg);
       this.onLog?.(`getTransaction failed for ${signature}: ${errMsg}`);
 
       const record: RawRpcInteractionRecord = {
@@ -170,22 +216,32 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       };
       this.capturedTransactions.push(record);
       return null;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 
   /**
    * Translates raw getTransaction JSON response into VersionedTransactionMetadata.
    */
-  private parseTransactionResponse(
+  public static parseTransactionResponse(
     signature: string,
     response: Record<string, unknown>,
+    onLog?: ((msg: string) => void) | undefined,
   ): VersionedTransactionMetadata | null {
     const result = response.result as Record<string, unknown> | null | undefined;
     if (!result || typeof result !== "object") {
       return null;
     }
 
-    const slot = typeof result.slot === "number" ? result.slot : 0;
+    // B2-READY-03: Never assign fabricated slot 0; fail closed on missing or non-positive slot
+    if (typeof result.slot !== "number" || result.slot <= 0 || Number.isNaN(result.slot)) {
+      onLog?.(
+        `[MALFORMED_TRANSACTION_SLOT] Rejecting getTransaction for '${signature}': slot is missing, non-numeric, or zero`,
+      );
+      return null;
+    }
+    const slot = result.slot;
     const blockTime = typeof result.blockTime === "number" ? result.blockTime : null;
     const meta = result.meta as Record<string, unknown> | null | undefined;
     const transaction = result.transaction as Record<string, unknown> | null | undefined;
@@ -225,7 +281,13 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     if (Array.isArray(rawInstructions)) {
       for (const inst of rawInstructions) {
         if (!inst || typeof inst !== "object") continue;
-        const programIdIndex = typeof inst.programIdIndex === "number" ? inst.programIdIndex : 0;
+        const programIdIndex = typeof inst.programIdIndex === "number" ? inst.programIdIndex : -1;
+        if (programIdIndex < 0) {
+          onLog?.(
+            `[MALFORMED_INSTRUCTION] Invalid programIdIndex for instruction in signature '${signature}'`,
+          );
+          return null;
+        }
         const accountKeyIndexes = Array.isArray(inst.accounts)
           ? (inst.accounts as number[])
           : Array.isArray(inst.accountKeyIndexes)
@@ -253,8 +315,11 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
         if (Array.isArray(group.instructions)) {
           for (const inst of group.instructions) {
             if (!inst || typeof inst !== "object") continue;
+            const programIdIndex =
+              typeof inst.programIdIndex === "number" ? inst.programIdIndex : -1;
+            if (programIdIndex < 0) continue;
             groupInstructions.push({
-              programIdIndex: typeof inst.programIdIndex === "number" ? inst.programIdIndex : 0,
+              programIdIndex,
               accountKeyIndexes: Array.isArray(inst.accounts) ? (inst.accounts as number[]) : [],
               data: inst.data ?? "",
               dataEncoding: typeof inst.data === "string" ? "base58" : "raw",

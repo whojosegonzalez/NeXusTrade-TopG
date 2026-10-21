@@ -34,6 +34,77 @@ export interface ISolanaWebSocketTransport {
   on(event: "close", listener: (code: number, reason: string) => void): void;
 }
 
+/**
+ * Standard WebSocket transport wrapping native globalThis.WebSocket for live execution (B2-READY-01).
+ */
+export class NativeWebSocketTransport implements ISolanaWebSocketTransport {
+  private ws: WebSocket | null = null;
+  private readonly listeners: {
+    open: (() => void)[];
+    message: ((data: string | Buffer) => void)[];
+    error: ((err: Error) => void)[];
+    close: ((code: number, reason: string) => void)[];
+  } = {
+    open: [],
+    message: [],
+    error: [],
+    close: [],
+  };
+
+  constructor(url: string) {
+    if (typeof WebSocket === "undefined") {
+      throw new Error(
+        "[WEBSOCKET_UNAVAILABLE] Native WebSocket is not available in the current Node.js runtime environment",
+      );
+    }
+    this.ws = new WebSocket(url);
+    this.ws.addEventListener("open", () => {
+      for (const listener of this.listeners.open) listener();
+    });
+    this.ws.addEventListener("message", (event: MessageEvent) => {
+      const data =
+        typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer);
+      for (const listener of this.listeners.message) listener(data);
+    });
+    this.ws.addEventListener("error", (event: Event) => {
+      const msg = (event as { message?: string }).message ?? "WebSocket transport error";
+      const err = new Error(msg);
+      for (const listener of this.listeners.error) listener(err);
+    });
+    this.ws.addEventListener("close", (event: CloseEvent) => {
+      for (const listener of this.listeners.close) listener(event.code, event.reason);
+    });
+  }
+
+  public send(data: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("[WEBSOCKET_NOT_OPEN] Cannot send message: socket is not in OPEN state");
+    }
+    this.ws.send(data);
+  }
+
+  public close(code?: number, reason?: string): void {
+    if (this.ws) {
+      try {
+        this.ws.close(code ?? 1000, reason ?? "Normal closure");
+      } catch {
+        // ignore if already closed
+      }
+    }
+  }
+
+  public on(event: "open", listener: () => void): void;
+  public on(event: "message", listener: (data: string | Buffer) => void): void;
+  public on(event: "error", listener: (err: Error) => void): void;
+  public on(event: "close", listener: (code: number, reason: string) => void): void;
+  public on(
+    event: "open" | "message" | "error" | "close",
+    listener: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+  ): void {
+    this.listeners[event].push(listener);
+  }
+}
+
 export interface SolanaWebSocketClientOptions {
   readonly wsUrl?: string | undefined;
   readonly transport?: ISolanaWebSocketTransport | undefined;
@@ -160,6 +231,18 @@ export class SolanaWebSocketSubscriptionClient {
     }
   }
 
+  public sanitizeErrorMessage(text: string): string {
+    if (!text) return text;
+    const sanitized = sanitizeSolanaRpcUrl(this.rawWsUrl);
+    let out = text.split(this.rawWsUrl).join(sanitized.sanitizedUrl);
+    for (const token of sanitized.sensitiveTokens) {
+      if (token && token.length > 0) {
+        out = out.split(token).join("[REDACTED]");
+      }
+    }
+    return out;
+  }
+
   /**
    * Binds listeners to the provided WebSocket transport.
    */
@@ -176,11 +259,13 @@ export class SolanaWebSocketSubscriptionClient {
     });
 
     transport.on("error", (err: Error) => {
-      this.onLog?.(`WebSocket transport error: ${err.message}`);
+      const safeMsg = this.sanitizeErrorMessage(err.message || String(err));
+      this.onLog?.(`WebSocket transport error: ${safeMsg}`);
     });
 
     transport.on("close", (code: number, reason: string) => {
-      this.onLog?.(`WebSocket closed: code ${code}, reason: ${reason}`);
+      const safeReason = this.sanitizeErrorMessage(reason || "none");
+      this.onLog?.(`WebSocket closed: code ${code}, reason: ${safeReason}`);
       this.setStatus("DISCONNECTED");
       this.activeSubscriptions.clear();
       this.pendingRequests.clear();
@@ -224,7 +309,8 @@ export class SolanaWebSocketSubscriptionClient {
     try {
       parsed = JSON.parse(rawMessage);
     } catch (err) {
-      this.onLog?.(`Failed to parse WebSocket JSON frame: ${err}`);
+      const safeErr = this.sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+      this.onLog?.(`Failed to parse WebSocket JSON frame: ${safeErr}`);
       return;
     }
 
@@ -253,8 +339,9 @@ export class SolanaWebSocketSubscriptionClient {
       if (this.messagesReceived >= this.maxMessagesBudget) {
         this.droppedBudgetExceeded++;
         this.onLog?.(
-          `[WS_MESSAGE_BUDGET_EXCEEDED] Dropping incoming logsNotification: reached budget of ${this.maxMessagesBudget}`,
+          `[WS_MESSAGE_BUDGET_EXCEEDED] Closing WebSocket: reached budget ceiling of ${this.maxMessagesBudget} messages`,
         );
+        this.close();
         return;
       }
 
@@ -263,25 +350,38 @@ export class SolanaWebSocketSubscriptionClient {
       const subId = envelope.params?.subscription;
       const protocol = this.activeSubscriptions.get(subId);
 
-      if (protocol === "RAYDIUM_AMM_V4") {
-        this.ammV4Notifications++;
-      } else if (protocol === "RAYDIUM_CPMM") {
-        this.cpmmNotifications++;
-      } else {
+      // B2-READY-03: Fail closed on unknown subscriptions; quarantine and never fallback to AMM v4
+      if (!protocol) {
         this.unknownNotifications++;
+        this.onLog?.(
+          `[WS_NOTIFICATION_QUARANTINED] Unknown or unmapped subscriptionId ${subId} - quarantined, rejecting from ingestion`,
+        );
+        return;
       }
 
-      const assignedProtocol = protocol ?? "RAYDIUM_AMM_V4";
+      if (protocol === "RAYDIUM_AMM_V4") {
+        this.ammV4Notifications++;
+      } else {
+        this.cpmmNotifications++;
+      }
+
       const record: RawWebSocketNotificationRecord = {
         receivedEpochMs: now,
         receivedIso: new Date(now).toISOString(),
         subscriptionId: subId ?? 0,
-        protocol: assignedProtocol,
+        protocol,
         envelope,
       };
       this.capturedNotifications.push(record);
 
-      this.onNotification?.(envelope, assignedProtocol);
+      this.onNotification?.(envelope, protocol);
+
+      if (this.messagesReceived >= this.maxMessagesBudget) {
+        this.onLog?.(
+          `[WS_MESSAGE_BUDGET_REACHED] Reached message budget ceiling of ${this.maxMessagesBudget}. Closing WebSocket connection.`,
+        );
+        this.close();
+      }
     }
   }
 
