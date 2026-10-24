@@ -743,6 +743,46 @@ export class EventDiscoveryIngestionEngine {
     return this.priorityQueue.length + this.fallbackQueue.length;
   }
 
+  /**
+   * Returns count of queued items that can currently be dispatched,
+   * respecting transaction ceilings and fallback quotas (B2-LAUNCH-SCHEDULER-01).
+   */
+  public getDispatchableQueueLength(): number {
+    if (
+      this.maxTransactions !== undefined &&
+      this.totalTransactionsProcessed >= this.maxTransactions
+    ) {
+      return 0;
+    }
+    if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
+      return 0;
+    }
+
+    const priorityCount = this.priorityQueue.length;
+    const canProcessFallback =
+      this.maxFallbackTransactions === undefined ||
+      this.fallbackTransactionsProcessed < this.maxFallbackTransactions;
+
+    const dispatchableFallbackCount = canProcessFallback ? this.fallbackQueue.length : 0;
+    return priorityCount + dispatchableFallbackCount;
+  }
+
+  /**
+   * Returns whether any pending verifications are awaiting retry (B2-LAUNCH-SCHEDULER-01).
+   */
+  public hasActionableVerifications(): boolean {
+    return this.pendingVerifications.size > 0;
+  }
+
+  /**
+   * Distinguishes total queue size from currently actionable/dispatchable work (B2-LAUNCH-SCHEDULER-01).
+   * Returns true only when prioritized items, quota-permitted fallback items,
+   * or actionable pending verifications exist.
+   */
+  public hasDispatchableWork(): boolean {
+    return this.getDispatchableQueueLength() > 0 || this.hasActionableVerifications();
+  }
+
   public getPendingVerificationsCount(): number {
     return this.pendingVerifications.size;
   }

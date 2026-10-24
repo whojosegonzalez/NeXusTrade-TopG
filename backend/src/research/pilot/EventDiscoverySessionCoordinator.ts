@@ -407,16 +407,19 @@ export class EventDiscoverySessionCoordinator {
           break;
         }
 
-        // 7. Drain pending queued transactions and retry pending verifications with wall-clock deadline (B2-GO-02)
-        const pendingQueueLength = this.engine.getQueueLength();
-        const pendingVerificationsCount = this.engine.getPendingVerificationsCount();
-        if (pendingQueueLength > 0 || pendingVerificationsCount > 0) {
+        // 7. Drain pending queued transactions and retry pending verifications with wall-clock deadline (B2-GO-02, B2-LAUNCH-SCHEDULER-01)
+        const hasDispatchableWork =
+          typeof this.engine.hasDispatchableWork === "function"
+            ? this.engine.hasDispatchableWork()
+            : this.engine.getQueueLength() > 0 || this.engine.getPendingVerificationsCount() > 0;
+        if (hasDispatchableWork) {
           await this.engine.processQueue(this.txFetcher, this.accountFetcher, { deadlineEpochMs });
           if (!this.isDiskExhausted) {
             this.flushProgressiveEvidence();
           }
         } else {
-          // Micro-tick pause when queue is empty to yield event loop
+          // Bounded asynchronous pause when queue is empty or only quota-blocked fallback items remain (B2-LAUNCH-SCHEDULER-01)
+          // Yields to the Node event loop to preserve WebSocket responsiveness and prompt priority dispatch
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
       }

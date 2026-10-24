@@ -19,7 +19,7 @@
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   DiscoveredPoolAccountPayload,
   DiscoveredPoolInitializationEvent,
@@ -4388,6 +4388,231 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       // Cleanup
       try {
         fsSync.rmSync(captureDir, { recursive: true, force: true });
+      } catch {
+        // Ignored
+      }
+    });
+
+    it("B2-LAUNCH-SCHEDULER-01: coordinator yields to event loop after fallback quota exhaustion and promptly dispatches late-arriving prioritized initialization", async () => {
+      const testTmpBase = path.join(os.tmpdir(), `b2-scheduler-test-${Date.now()}`);
+      fsSync.mkdirSync(testTmpBase, { recursive: true });
+
+      const wsTransport = new MockWebSocketTransport();
+      wsTransport.autoOpenAndAck = true;
+      const mockRpc = new MockSolanaRpcTransport();
+
+      // Setup 8 routine fallback swap transactions in mock RPC
+      for (let i = 0; i < 8; i++) {
+        mockRpc.transactions.set(`sig-routine-${i}`, {
+          signature: `sig-routine-${i}`,
+          slot: 450000100 + i,
+          blockTime: 1746886997 + i,
+          err: null,
+          version: "legacy",
+          accountKeys: {
+            staticAccountKeys: [
+              "SomeAccount11111111111111111111111111111111",
+              "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            ],
+          },
+          instructions: [
+            {
+              programIdIndex: 1,
+              accountKeyIndexes: [0],
+              data: "dummy",
+            },
+          ],
+          logMessages: ["Program log: Instruction: Swap"],
+        });
+      }
+
+      // Setup 1 prioritized genuine Raydium CPMM pool initialization transaction
+      const prioritySig = "sig-cpmm-late-init";
+      const validCpmmTx = createCpmmInitTransactionFixture({
+        signature: prioritySig,
+        slot: 450000200,
+        poolId: FIXTURE_CPMM_POOL_ADDRESS,
+        token0Vault: FIXTURE_CPMM_TOKEN_0_VAULT,
+        token1Vault: FIXTURE_CPMM_TOKEN_1_VAULT,
+      });
+      mockRpc.transactions.set(prioritySig, validCpmmTx);
+
+      mockRpc.accounts.set(FIXTURE_CPMM_POOL_ADDRESS, {
+        address: FIXTURE_CPMM_POOL_ADDRESS,
+        owner: RAYDIUM_CPMM_PROGRAM_ID,
+        data: createAuthoritativeRaydiumCpmmBuffer(),
+        lamports: 10000000,
+        slot: 450000200,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_0_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_0_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_0_MINT }),
+        lamports: 5000000,
+        slot: 450000200,
+      });
+      mockRpc.accounts.set(FIXTURE_CPMM_TOKEN_1_VAULT, {
+        address: FIXTURE_CPMM_TOKEN_1_VAULT,
+        owner: SPL_TOKEN_PROGRAM_ID,
+        data: createAuthoritativeCpmmSplVaultBuffer({ mintBase58: FIXTURE_CPMM_TOKEN_1_MINT }),
+        lamports: 5000000,
+        slot: 450000200,
+      });
+
+      const wsClient = new SolanaWebSocketSubscriptionClient({
+        wsUrl: "wss://api.mainnet-beta.solana.com/",
+        transport: wsTransport,
+      });
+
+      const txFetcher = new SolanaRpcTransactionFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxTransactionsBudget: 25,
+      });
+
+      const accountFetcher = new SolanaRpcRecordingAccountFetcher({
+        rpcUrl: "https://api.mainnet-beta.solana.com/",
+        transport: mockRpc,
+        maxAccountCallsBudget: 20,
+      });
+
+      const engine = new EventDiscoveryIngestionEngine({
+        maxEvents: 50,
+        maxTransactions: 25,
+        maxFallbackTransactions: 5,
+        reservedPrioritizedTransactions: 20,
+      });
+
+      const processQueueSpy = vi.spyOn(engine, "processQueue");
+
+      const coordinator = new EventDiscoverySessionCoordinator({
+        wsClient,
+        txFetcher,
+        accountFetcher,
+        engine,
+        captureBaseDir: testTmpBase,
+        budgets: {
+          durationSec: 1,
+          maxEvents: 50,
+          maxWsMessages: 500,
+          maxTransactions: 25,
+          maxAccountReads: 20,
+          maxTotalRpcCalls: 45,
+          maxFallbackTransactions: 5,
+          reservedPrioritizedTransactions: 20,
+        },
+      });
+
+      // Pump 8 routine notifications immediately, then wait and pump genuine prioritized CPMM init via real asynchronous timer
+      const pumpPromise = (async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 8; i++) {
+          wsTransport.triggerMessage(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                result: {
+                  context: { slot: 450000100 + i },
+                  value: {
+                    signature: `sig-routine-${i}`,
+                    err: null,
+                    logs: ["Program log: Instruction: Swap"],
+                  },
+                },
+                subscription: 10,
+              },
+            }),
+          );
+        }
+
+        // Real asynchronous timer delay to ensure fallback quota (5) is exhausted and coordinator yields to event loop
+        await new Promise((resolve) => setTimeout(resolve, 60));
+
+        // Inject genuine-shaped Raydium CPMM pool initialization notification
+        wsTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000200 },
+                value: {
+                  signature: prioritySig,
+                  err: null,
+                  logs: [
+                    "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C invoke [1]",
+                    "Program log: Instruction: Initialize",
+                    "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C success",
+                  ],
+                },
+              },
+              subscription: 20,
+            },
+          }),
+        );
+      })();
+
+      const summary = await coordinator.runSession();
+      await pumpPromise;
+
+      expect(summary.status).toBe("FINALIZED");
+      expect(summary.accounting.rawNotificationsReceived).toBe(9);
+      expect(summary.accounting.transactionsFetched).toBe(9); // 9 unique transaction signatures encountered
+      expect(summary.accounting.fallbackTransactionsFetched).toBe(5);
+      expect(summary.accounting.prioritizedTransactionsFetched).toBe(1);
+      expect(summary.accounting.unusedReservedTransactionsBudget).toBe(19);
+      expect(summary.accounting.remainingUnfetchedSignatures).toBe(3);
+      expect(summary.accounting.uniquePoolsDiscovered).toBe(1);
+      expect(summary.accounting.poolsVerifiedCoherent).toBe(1);
+
+      // Verify RPC calls are strictly bounded
+      expect(summary.rpcCallsExecuted.transactionFetches).toBe(6);
+      expect(summary.rpcCallsExecuted.accountReads).toBeLessThanOrEqual(20);
+      expect(summary.rpcCallsExecuted.totalRpcCalls).toBeLessThanOrEqual(45);
+
+      // Verify coordinator yielded to event loop rather than spinning in a tight microtask loop:
+      // Under previous tight-loop behavior (checking getQueueLength() > 0 without checking dispatchable work),
+      // processQueue would be called hundreds/thousands of times during the 60ms pause.
+      // Under fixed scheduler, processQueue is only called when dispatchable work exists (<= 5 calls).
+      expect(processQueueSpy.mock.calls.length).toBeLessThan(10);
+
+      // Verify queue length distinction
+      expect(engine.getQueueLength()).toBe(3); // 3 unfetched routine fallback items remaining
+      expect(engine.getDispatchableQueueLength()).toBe(0); // 0 dispatchable items (fallback capped at 5)
+      expect(engine.hasDispatchableWork()).toBe(false);
+
+      // Verify valid evidence manifest was generated and verified
+      expect(summary.sessionDir).toBeDefined();
+      const manifestVerification = verifyB2SessionManifest(summary.sessionDir!);
+      expect(manifestVerification.valid).toBe(true);
+
+      // Verify authentic offline replay reproduction
+      const logger = new PilotLogger();
+      const replayResult = await runReplaySession(
+        {
+          network: "disabled",
+          rpcUrl: "https://api.mainnet-beta.solana.com",
+          replayFixturesPath: summary.sessionDir!,
+          replayMode: "authentic",
+          pollIntervalSec: 1,
+          durationSec: 10,
+          targetCandidates: 1,
+          maxCandidatesScreened: 1,
+          targetDiagnosticYield: 1,
+          maxMb: 10,
+          maxRssMb: 256,
+          outputDir: testTmpBase,
+          enableForwardObservations: false,
+        },
+        logger,
+      );
+      expect(replayResult.ok).toBe(true);
+      expect(replayResult.poolsVerified).toBe(1);
+
+      // Cleanup
+      try {
+        fsSync.rmSync(testTmpBase, { recursive: true, force: true });
       } catch {
         // Ignored
       }
