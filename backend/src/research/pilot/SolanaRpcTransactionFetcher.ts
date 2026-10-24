@@ -384,16 +384,14 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       (message.transactionConfig as Record<string, unknown> | undefined) ??
       (transaction?.transactionConfig as Record<string, unknown> | undefined);
     if (rawTxConfig && typeof rawTxConfig === "object") {
+      const rawFee = rawTxConfig.priorityFee ?? rawTxConfig.priorityFeeLamports;
       transactionConfig = {
         computeUnitLimit:
           typeof rawTxConfig.computeUnitLimit === "number"
             ? rawTxConfig.computeUnitLimit
             : undefined,
         priorityFeeLamports:
-          typeof rawTxConfig.priorityFeeLamports === "number" ||
-          typeof rawTxConfig.priorityFeeLamports === "bigint"
-            ? rawTxConfig.priorityFeeLamports
-            : undefined,
+          typeof rawFee === "number" || typeof rawFee === "bigint" ? rawFee : undefined,
         loadedAccountsDataSizeLimit:
           typeof rawTxConfig.loadedAccountsDataSizeLimit === "number"
             ? rawTxConfig.loadedAccountsDataSizeLimit

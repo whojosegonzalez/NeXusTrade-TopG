@@ -328,4 +328,10 @@ export interface EventDiscoveryMetricsSnapshot {
   readonly bypassedSignaturesCount?: number | undefined;
   readonly unfetchedSignaturesCount?: number | undefined;
   readonly unclassifiableSignaturesCount?: number | undefined;
+  /** B2-GO-FIX-02: Bounded transaction reservation and queue execution metrics */
+  readonly prioritizedTransactionsExecuted?: number | undefined;
+  readonly fallbackTransactionsExecuted?: number | undefined;
+  readonly reservedPrioritizedCalls?: number | undefined;
+  readonly unusedReservedCalls?: number | undefined;
+  readonly remainingUnfetchedSignatures?: number | undefined;
 }

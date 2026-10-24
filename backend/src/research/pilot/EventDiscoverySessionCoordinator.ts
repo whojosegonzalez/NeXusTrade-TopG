@@ -76,6 +76,8 @@ export interface EventDiscoverySessionBudgets {
   readonly maxTransactions?: number | undefined; // getTransaction ceiling (default: 25)
   readonly maxAccountReads?: number | undefined; // Account read calls ceiling (default: 20)
   readonly maxTotalRpcCalls?: number | undefined; // Combined RPC calls ceiling (default: 45)
+  readonly maxFallbackTransactions?: number | undefined; // Fallback transactions budget ceiling (default: 5, B2-GO-FIX-02)
+  readonly reservedPrioritizedTransactions?: number | undefined; // Budget reserved for prioritized inits (default: 20, B2-GO-FIX-02)
   readonly maxRssMb?: number | undefined; // Process RSS ceiling in megabytes (default: 256)
   readonly maxDiskMb?: number | undefined; // Disk write limit in megabytes (default: 256)
 }
@@ -87,6 +89,8 @@ export interface ResolvedEventDiscoveryBudgets {
   readonly maxTransactions: number;
   readonly maxAccountReads: number;
   readonly maxTotalRpcCalls: number;
+  readonly maxFallbackTransactions: number;
+  readonly reservedPrioritizedTransactions: number;
   readonly maxRssMb: number;
   readonly maxDiskMb: number;
 }
@@ -115,6 +119,8 @@ export interface EventDiscoverySessionSummary {
     readonly maxTransactions: number;
     readonly maxAccountReads: number;
     readonly maxTotalRpcCalls: number;
+    readonly maxFallbackTransactions?: number | undefined;
+    readonly reservedPrioritizedTransactions?: number | undefined;
   };
   readonly accounting: {
     readonly rawNotificationsReceived: number;
@@ -124,6 +130,10 @@ export interface EventDiscoverySessionSummary {
     readonly poolsVerifiedCoherent: number;
     readonly poolsRejected: number;
     readonly unresolvedObservations: number;
+    readonly prioritizedTransactionsFetched?: number | undefined;
+    readonly fallbackTransactionsFetched?: number | undefined;
+    readonly unusedReservedTransactionsBudget?: number | undefined;
+    readonly remainingUnfetchedSignatures?: number | undefined;
   };
   readonly rpcCallsExecuted: {
     readonly transactionFetches: number;
@@ -174,6 +184,10 @@ export class EventDiscoverySessionCoordinator {
       maxTransactions: b.maxTransactions ?? 25,
       maxAccountReads: b.maxAccountReads ?? 20,
       maxTotalRpcCalls: b.maxTotalRpcCalls ?? 45,
+      maxFallbackTransactions: b.maxFallbackTransactions ?? 5,
+      reservedPrioritizedTransactions:
+        b.reservedPrioritizedTransactions ??
+        Math.max(0, (b.maxTransactions ?? 25) - (b.maxFallbackTransactions ?? 5)),
       maxRssMb: b.maxRssMb ?? 256,
       maxDiskMb: b.maxDiskMb ?? 256,
     };
@@ -196,6 +210,8 @@ export class EventDiscoverySessionCoordinator {
       new EventDiscoveryIngestionEngine({
         maxEvents: this.budgets.maxEvents,
         maxTransactions: this.budgets.maxTransactions,
+        maxFallbackTransactions: this.budgets.maxFallbackTransactions,
+        reservedPrioritizedTransactions: this.budgets.reservedPrioritizedTransactions,
         ...(options.engineOptions ?? {}),
       });
 
@@ -327,13 +343,6 @@ export class EventDiscoverySessionCoordinator {
       while (this.isRunning && !this.stopRequested && !this.isDiskExhausted) {
         const now = Date.now();
 
-        // Health check: fail closed if WebSocket disconnected unexpectedly
-        if (this.wsClient.getStatus() === "DISCONNECTED") {
-          this.stopReason = "WS_DISCONNECTED_UNEXPECTEDLY";
-          sessionStatus = "FAILED";
-          break;
-        }
-
         // 1. Duration budget check (wall-clock deadline)
         if (now >= deadlineEpochMs) {
           this.stopReason = `DURATION_LIMIT_REACHED (${this.budgets.durationSec}s)`;
@@ -350,7 +359,15 @@ export class EventDiscoverySessionCoordinator {
         // 3. WebSocket message ceiling check
         const wsMetrics = this.wsClient.getMetrics();
         if (wsMetrics.messagesReceived >= this.budgets.maxWsMessages) {
-          this.stopReason = `WS_MESSAGES_BUDGET_REACHED (${wsMetrics.messagesReceived}/${this.budgets.maxWsMessages})`;
+          const currentElapsedSec = Math.round((now - startEpochMs) / 1000);
+          this.stopReason = `WS_MESSAGES_BUDGET_REACHED (${wsMetrics.messagesReceived}/${this.budgets.maxWsMessages}) after ${currentElapsedSec}s (coverage: ${currentElapsedSec}s / ${this.budgets.durationSec}s)`;
+          break;
+        }
+
+        // 4. Health check: fail closed if WebSocket disconnected unexpectedly
+        if (this.wsClient.getStatus() === "DISCONNECTED") {
+          this.stopReason = "WS_DISCONNECTED_UNEXPECTEDLY";
+          sessionStatus = "FAILED";
           break;
         }
 
@@ -511,6 +528,8 @@ export class EventDiscoverySessionCoordinator {
         maxTransactions: this.budgets.maxTransactions,
         maxAccountReads: this.budgets.maxAccountReads,
         maxTotalRpcCalls: this.budgets.maxTotalRpcCalls,
+        maxFallbackTransactions: this.budgets.maxFallbackTransactions,
+        reservedPrioritizedTransactions: this.budgets.reservedPrioritizedTransactions,
       },
       accounting: {
         rawNotificationsReceived: metrics.rawLogNotificationsReceived,
@@ -520,6 +539,11 @@ export class EventDiscoverySessionCoordinator {
         poolsVerifiedCoherent: verifiedCoherentCount,
         poolsRejected: rejectedCount,
         unresolvedObservations: Math.max(0, unresolvedCount),
+        prioritizedTransactionsFetched: metrics.prioritizedTransactionsExecuted ?? 0,
+        fallbackTransactionsFetched: metrics.fallbackTransactionsExecuted ?? 0,
+        unusedReservedTransactionsBudget: metrics.unusedReservedCalls ?? 0,
+        remainingUnfetchedSignatures:
+          metrics.remainingUnfetchedSignatures ?? this.engine.getQueueLength(),
       },
       rpcCallsExecuted: {
         transactionFetches: txCalls,

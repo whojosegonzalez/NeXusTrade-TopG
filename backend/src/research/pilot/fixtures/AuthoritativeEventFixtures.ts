@@ -758,6 +758,16 @@ export function createRealisticVersion1GetTransactionRpcResponse(
       heapSize: 32_768,
     };
 
+  // Solana JSON-RPC wire format for version 1 transactionConfig uses 'priorityFee' (SIMD-0385, B2-GO-FIX-03)
+  const rawPriorityFee =
+    txConfig.priorityFeeLamports ?? (txConfig as Record<string, unknown>).priorityFee;
+  const wireTxConfig: Record<string, unknown> = {
+    computeUnitLimit: txConfig.computeUnitLimit,
+    priorityFee: rawPriorityFee,
+    loadedAccountsDataSizeLimit: txConfig.loadedAccountsDataSizeLimit,
+    heapSize: txConfig.heapSize,
+  };
+
   const accountKeys = [...baseTx.accountKeys.staticAccountKeys];
 
   // Map instructions to JSON-RPC format
@@ -816,7 +826,7 @@ export function createRealisticVersion1GetTransactionRpcResponse(
           accountKeys,
           recentBlockhash: "GHtXQBkQwsr65ppjL1TKqc2UoxZrKV21stUvNDmwkpea",
           instructions,
-          transactionConfig: txConfig,
+          transactionConfig: wireTxConfig,
         },
       },
       meta: {

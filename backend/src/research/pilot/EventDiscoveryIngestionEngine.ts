@@ -33,6 +33,8 @@ import type {
 } from "./EventDiscoveryContracts.js";
 import { identifyPoolInitializationInstructions } from "./PoolInitializationParser.js";
 import { dispatchPoolVerification } from "./VerificationDispatchService.js";
+import { RAYDIUM_AMM_V4_PROGRAM_ID } from "./RaydiumAmmParser.js";
+import { RAYDIUM_CPMM_PROGRAM_ID } from "./RaydiumCpmmParser.js";
 
 /**
  * Interface for decoupled transaction retrieval.
@@ -45,7 +47,9 @@ export interface ITransactionFetcher {
 }
 
 /**
- * Classifies notification logs into prioritized, fallback, routine, or unclassifiable (B2-NEXT-03).
+ * Classifies notification logs into prioritized, fallback, routine, or unclassifiable (B2-NEXT-03, B2-GO-FIX-01).
+ * Strictly attributes logs to canonical Raydium AMM v4 or CPMM programs using an invocation call stack.
+ * Prevents false prioritizations from token account initializations (e.g. InitializeAccount3, InitializeImmutableOwner).
  */
 export function classifyNotificationLogs(
   logs: readonly string[] | undefined,
@@ -58,23 +62,64 @@ export function classifyNotificationLogs(
     return "FALLBACK_AMBIGUOUS";
   }
 
-  let hasStrongInit = false;
+  let hasConfirmedInit = false;
   let hasRoutineSwap = false;
+  const callStack: string[] = [];
 
   for (const log of logs) {
     if (typeof log !== "string") continue;
 
-    // AMM v4 or CPMM strong pool creation signal (including CPI)
-    if (
-      log.includes("initialize2") ||
-      log.includes("Program log: initialize") ||
-      log.includes("Instruction: Initialize")
-    ) {
-      hasStrongInit = true;
-      break;
+    // Track invocation stack: Program <pubkey> invoke [<depth>]
+    const invokeMatch = log.match(/^Program\s+([1-9A-HJ-NP-Za-km-z]+)\s+invoke\s+\[(\d+)\]/);
+    if (invokeMatch) {
+      const pubkey = invokeMatch[1]!;
+      const depth = parseInt(invokeMatch[2]!, 10);
+      while (callStack.length >= depth) {
+        callStack.pop();
+      }
+      callStack.push(pubkey);
+      continue;
     }
 
-    // Routine swap / non-initialization markers
+    // Track return: Program <pubkey> (success|failed)
+    const returnMatch = log.match(/^Program\s+([1-9A-HJ-NP-Za-km-z]+)\s+(success|failed)/);
+    if (returnMatch) {
+      const pubkey = returnMatch[1]!;
+      if (callStack.length > 0 && callStack[callStack.length - 1] === pubkey) {
+        callStack.pop();
+      }
+      continue;
+    }
+
+    const currentProgram = callStack.length > 0 ? callStack[callStack.length - 1] : undefined;
+
+    // AMM v4 pool initialization:
+    // When inside Raydium AMM v4 program, match canonical initialize2 instruction
+    if (currentProgram === RAYDIUM_AMM_V4_PROGRAM_ID) {
+      if (
+        log.includes("initialize2") ||
+        /^Program log:\s*Instruction:\s*Initialize2\s*$/i.test(log) ||
+        /^Instruction:\s*Initialize2\s*$/i.test(log)
+      ) {
+        hasConfirmedInit = true;
+        break;
+      }
+    }
+
+    // CPMM pool initialization:
+    // When inside Raydium CPMM program, match exact canonical Initialize instruction
+    if (currentProgram === RAYDIUM_CPMM_PROGRAM_ID) {
+      if (
+        /^Program log:\s*Instruction:\s*Initialize\s*$/i.test(log) ||
+        /^Program log:\s*initialize\s*$/i.test(log) ||
+        /^Instruction:\s*Initialize\s*$/i.test(log)
+      ) {
+        hasConfirmedInit = true;
+        break;
+      }
+    }
+
+    // Routine swap / non-initialization markers (can be detected at any level or in Raydium)
     if (
       log.includes("ray_log") ||
       log.includes("Instruction: Swap") ||
@@ -87,7 +132,7 @@ export function classifyNotificationLogs(
     }
   }
 
-  if (hasStrongInit) {
+  if (hasConfirmedInit) {
     return "PRIORITIZED_INITIALIZATION";
   }
 
@@ -110,6 +155,8 @@ export interface EventDiscoveryEngineOptions {
   readonly maxSlotDelta?: number | undefined; // Maximum acceptable slot delta (default 1000)
   readonly maxEvents?: number | undefined; // Total session events budget ceiling (BREADY-05)
   readonly maxTransactions?: number | undefined; // Total session fetched transactions budget ceiling (BREADY-05)
+  readonly maxFallbackTransactions?: number | undefined; // Maximum fallback transactions budget (default 5, B2-GO-FIX-02)
+  readonly reservedPrioritizedTransactions?: number | undefined; // Budget reserved for prioritized inits (default 20, B2-GO-FIX-02)
 }
 
 interface QueuedItem {
@@ -141,8 +188,12 @@ export class EventDiscoveryIngestionEngine {
   private readonly maxSlotDelta: number;
   private readonly maxEvents?: number | undefined;
   private readonly maxTransactions?: number | undefined;
+  private readonly maxFallbackTransactions?: number | undefined;
+  private readonly reservedPrioritizedTransactions: number;
 
   private totalTransactionsProcessed = 0;
+  private prioritizedTransactionsProcessed = 0;
+  private fallbackTransactionsProcessed = 0;
 
   private connectionStatus: WebSocketConnectionStatus = "DISCONNECTED";
   private readonly priorityQueue: QueuedItem[] = [];
@@ -210,6 +261,18 @@ export class EventDiscoveryIngestionEngine {
     this.maxSlotDelta = options.maxSlotDelta ?? 1000;
     this.maxEvents = options.maxEvents;
     this.maxTransactions = options.maxTransactions;
+    this.maxFallbackTransactions =
+      options.maxFallbackTransactions !== undefined
+        ? options.maxFallbackTransactions
+        : options.maxTransactions !== undefined
+          ? Math.min(5, options.maxTransactions)
+          : undefined;
+    this.reservedPrioritizedTransactions =
+      options.reservedPrioritizedTransactions !== undefined
+        ? options.reservedPrioritizedTransactions
+        : options.maxTransactions !== undefined
+          ? Math.max(0, options.maxTransactions - (this.maxFallbackTransactions ?? 0))
+          : 0;
   }
 
   public static classifyNotificationLogs = classifyNotificationLogs;
@@ -355,7 +418,12 @@ export class EventDiscoveryIngestionEngine {
     const retried = await this.retryPendingVerifications(accountFetcher, options);
     results.push(...retried);
 
-    while (this.priorityQueue.length > 0 || this.fallbackQueue.length > 0) {
+    while (
+      this.priorityQueue.length > 0 ||
+      (this.fallbackQueue.length > 0 &&
+        (this.maxFallbackTransactions === undefined ||
+          this.fallbackTransactionsProcessed < this.maxFallbackTransactions))
+    ) {
       if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
         break;
       }
@@ -371,13 +439,18 @@ export class EventDiscoveryIngestionEngine {
         break;
       }
 
-      // Prioritize strong initialization signals first, then fallback/ambiguous
-      const item =
-        this.priorityQueue.length > 0 ? this.priorityQueue.shift()! : this.fallbackQueue.shift()!;
+      // Prioritize strong initialization signals first, then fallback/ambiguous bounded by maxFallbackTransactions (B2-GO-FIX-02)
+      const isPriority = this.priorityQueue.length > 0;
+      const item = isPriority ? this.priorityQueue.shift()! : this.fallbackQueue.shift()!;
 
       this.queuedSignatures.delete(item.signature);
       item.lifecycleState = "TX_FETCH_QUEUED";
       this.totalTransactionsProcessed += 1;
+      if (isPriority) {
+        this.prioritizedTransactionsProcessed += 1;
+      } else {
+        this.fallbackTransactionsProcessed += 1;
+      }
 
       // 1. Fetch transaction metadata with bounded retry accounting (D29-F5)
       let tx: VersionedTransactionMetadata | null = null;
@@ -531,6 +604,14 @@ export class EventDiscoveryIngestionEngine {
       }
 
       this.completedSignatures.add(item.signature);
+    }
+
+    if (
+      this.fallbackQueue.length > 0 &&
+      this.maxFallbackTransactions !== undefined &&
+      this.fallbackTransactionsProcessed >= this.maxFallbackTransactions
+    ) {
+      this.bypassedSignaturesCount = this.fallbackQueue.length;
     }
 
     return Object.freeze(results);
@@ -729,6 +810,14 @@ export class EventDiscoveryIngestionEngine {
       bypassedSignaturesCount: this.bypassedSignaturesCount,
       unfetchedSignaturesCount: this.priorityQueue.length + this.fallbackQueue.length,
       unclassifiableSignaturesCount: this.unclassifiableSignaturesCount,
+      prioritizedTransactionsExecuted: this.prioritizedTransactionsProcessed,
+      fallbackTransactionsExecuted: this.fallbackTransactionsProcessed,
+      reservedPrioritizedCalls: this.reservedPrioritizedTransactions,
+      unusedReservedCalls: Math.max(
+        0,
+        this.reservedPrioritizedTransactions - this.prioritizedTransactionsProcessed,
+      ),
+      remainingUnfetchedSignatures: this.priorityQueue.length + this.fallbackQueue.length,
     });
   }
 }

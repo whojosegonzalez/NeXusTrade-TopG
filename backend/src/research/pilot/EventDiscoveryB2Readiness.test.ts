@@ -2530,6 +2530,7 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
           maxDiskMb: 0.01,
           maxWsMessages: 500,
           maxTransactions: 25,
+          maxFallbackTransactions: 25,
           maxAccountReads: 20,
           maxTotalRpcCalls: 45,
         },
@@ -3305,6 +3306,16 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       expect(tx?.transactionConfig?.loadedAccountsDataSizeLimit).toBe(64_000);
       expect(tx?.transactionConfig?.heapSize).toBe(32_768);
 
+      // SIMD-0385 / B2-GO-FIX-03: Wire payload uses 'priorityFee'
+      const wireTx = (realisticV1Rpc.result as Record<string, unknown>)?.transaction as Record<
+        string,
+        unknown
+      >;
+      const wireMessage = wireTx?.message as Record<string, unknown>;
+      const wireTxConfig = wireMessage?.transactionConfig as Record<string, unknown>;
+      expect(wireTxConfig?.priorityFee).toBe(10_000);
+      expect(wireTxConfig?.priorityFeeLamports).toBeUndefined();
+
       // Verify maxSupportedTransactionVersion: 1 was transmitted in JSON-RPC body
       expect(capturedBody).not.toBeNull();
       const params = (capturedBody as unknown as { params?: unknown[] })?.params;
@@ -3524,6 +3535,73 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       expect(parsed?.version).toBe(1);
       // loadedAddresses MUST be undefined for version 1 transactions per SIMD-0385
       expect(parsed?.accountKeys.loadedAddresses).toBeUndefined();
+    });
+
+    it("B2-GO-FIX-03: maps wire 'priorityFee' to normalized 'priorityFeeLamports', supports fallback and handles missing configs", () => {
+      // 1. Wire format with priorityFee
+      const wirePayloadWithPriorityFee = {
+        result: {
+          slot: 450000100,
+          version: 1,
+          transaction: {
+            message: {
+              accountKeys: ["11111111111111111111111111111111"],
+              instructions: [],
+              transactionConfig: {
+                computeUnitLimit: 150_000,
+                priorityFee: 25_000,
+              },
+            },
+          },
+        },
+      };
+      const parsed1 = SolanaRpcTransactionFetcher.parseTransactionResponse(
+        "sig-wire-1",
+        wirePayloadWithPriorityFee,
+      );
+      expect(parsed1?.transactionConfig?.priorityFeeLamports).toBe(25_000);
+      expect(parsed1?.transactionConfig?.computeUnitLimit).toBe(150_000);
+
+      // 2. Wire format with fallback priorityFeeLamports
+      const wirePayloadWithFallback = {
+        result: {
+          slot: 450000101,
+          version: 1,
+          transaction: {
+            message: {
+              accountKeys: ["11111111111111111111111111111111"],
+              instructions: [],
+              transactionConfig: {
+                priorityFeeLamports: 30_000,
+              },
+            },
+          },
+        },
+      };
+      const parsed2 = SolanaRpcTransactionFetcher.parseTransactionResponse(
+        "sig-wire-2",
+        wirePayloadWithFallback,
+      );
+      expect(parsed2?.transactionConfig?.priorityFeeLamports).toBe(30_000);
+
+      // 3. Wire format with no transactionConfig (v0 or legacy or omitted)
+      const wirePayloadLegacy = {
+        result: {
+          slot: 450000102,
+          version: "legacy",
+          transaction: {
+            message: {
+              accountKeys: ["11111111111111111111111111111111"],
+              instructions: [],
+            },
+          },
+        },
+      };
+      const parsed3 = SolanaRpcTransactionFetcher.parseTransactionResponse(
+        "sig-wire-3",
+        wirePayloadLegacy,
+      );
+      expect(parsed3?.transactionConfig).toBeUndefined();
     });
   });
 
@@ -3845,7 +3923,11 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
             value: {
               signature: "sig-priority-init",
               err: null,
-              logs: ["Program log: initialize2"],
+              logs: [
+                "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+                "Program log: initialize2",
+                "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+              ],
             },
           },
           subscription: 10,
@@ -3914,7 +3996,15 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
           params: {
             result: {
               context: { slot: 450000100 },
-              value: { signature: "sig-prio", err: null, logs: ["Program log: initialize2"] },
+              value: {
+                signature: "sig-prio",
+                err: null,
+                logs: [
+                  "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+                  "Program log: initialize2",
+                  "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+                ],
+              },
             },
             subscription: 10,
           },
@@ -3941,6 +4031,359 @@ describe("D.2.9-B2 Offline Readiness Integration Suite", () => {
       expect(summary.accounting.rawNotificationsReceived).toBe(2);
       expect(summary.metrics.prioritizedSignaturesCount).toBe(1);
       expect(summary.metrics.fallbackSignaturesCount).toBe(1);
+
+      // Cleanup
+      try {
+        fsSync.rmSync(captureDir, { recursive: true, force: true });
+      } catch {
+        // Ignored
+      }
+    });
+
+    it("B2-GO-FIX-01-01: negative tests for SPL Token ATA creation, unrelated inits, and positive Raydium inits (including CPI)", () => {
+      // Negative 1: InitializeAccount3 inside Token-2022 -> FALLBACK_AMBIGUOUS (not Raydium init)
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb invoke [2]",
+          "Program log: Instruction: InitializeAccount3",
+          "Program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 2: InitializeAccount3 inside classic SPL Token -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+          "Program log: Instruction: InitializeAccount3",
+          "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 3: InitializeMint inside SPL Token -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+          "Program log: Instruction: InitializeMint",
+          "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 4: InitializeImmutableOwner inside Token-2022 -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb invoke [2]",
+          "Program log: Instruction: InitializeImmutableOwner",
+          "Program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 5: CreateIdempotent inside Associated Token Program -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL invoke [1]",
+          "Program log: CreateIdempotent",
+          "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 6: Ordinary swap with ATA creation (InitializeAccount3 + ray_log swap) -> ROUTINE_SWAP_DEPRIORITIZED
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+          "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL invoke [2]",
+          "Program log: Instruction: InitializeAccount3",
+          "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL success",
+          "Program log: ray_log: AwAAAAAAAAAAAAAAAA==",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+        ]),
+      ).toBe("ROUTINE_SWAP_DEPRIORITIZED");
+
+      // Negative 7: Unrelated program with 'Instruction: Initialize' -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program 11111111111111111111111111111111 invoke [1]",
+          "Program log: Instruction: Initialize",
+          "Program 11111111111111111111111111111111 success",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 8: Unattributed 'Instruction: Initialize' (no invoke line) -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program log: Instruction: Initialize",
+        ]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Negative 9: Unattributed 'initialize2' (no invoke line) -> FALLBACK_AMBIGUOUS
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs(["Program log: initialize2"]),
+      ).toBe("FALLBACK_AMBIGUOUS");
+
+      // Positive 1: Canonical AMM v4 init -> PRIORITIZED_INITIALIZATION
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+          "Program log: initialize2: InitializeInstruction2",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+        ]),
+      ).toBe("PRIORITIZED_INITIALIZATION");
+
+      // Positive 2: Canonical CPMM init -> PRIORITIZED_INITIALIZATION
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C invoke [1]",
+          "Program log: Instruction: Initialize",
+          "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C success",
+        ]),
+      ).toBe("PRIORITIZED_INITIALIZATION");
+
+      // Positive 3: CPMM init via CPI -> PRIORITIZED_INITIALIZATION
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program Router111111111111111111111111111111111111 invoke [1]",
+          "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C invoke [2]",
+          "Program log: Instruction: Initialize",
+          "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C success",
+          "Program Router111111111111111111111111111111111111 success",
+        ]),
+      ).toBe("PRIORITIZED_INITIALIZATION");
+
+      // Positive 4: AMM v4 init via CPI -> PRIORITIZED_INITIALIZATION
+      expect(
+        EventDiscoveryIngestionEngine.classifyNotificationLogs([
+          "Program Router111111111111111111111111111111111111 invoke [1]",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [2]",
+          "Program log: initialize2",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+          "Program Router111111111111111111111111111111111111 success",
+        ]),
+      ).toBe("PRIORITIZED_INITIALIZATION");
+    });
+
+    it("B2-GO-FIX-01-02: replays 74 authentic historical notifications from first diagnostic and confirms 100% false-positive elimination", () => {
+      const historicalPath = path.resolve(
+        ".tmp/b2-captures/b2-events-session-1792618962026/raw-notifications.jsonl",
+      );
+      if (!fsSync.existsSync(historicalPath)) {
+        return; // Guard if historical capture file not in test runner directory
+      }
+
+      const fileContent = fsSync.readFileSync(historicalPath, "utf8");
+      const lines = fileContent.split("\n").filter((l) => l.trim().length > 0);
+      expect(lines.length).toBe(74);
+
+      const counts = {
+        PRIORITIZED_INITIALIZATION: 0,
+        ROUTINE_SWAP_DEPRIORITIZED: 0,
+        FALLBACK_AMBIGUOUS: 0,
+        UNCLASSIFIABLE: 0,
+      };
+
+      for (const line of lines) {
+        const parsed = JSON.parse(line);
+        const envelope = parsed.envelope ?? parsed;
+        const logs = envelope.params?.result?.value?.logs;
+        const classification = EventDiscoveryIngestionEngine.classifyNotificationLogs(logs);
+        counts[classification]++;
+      }
+
+      // Assert exact breakdown on authentic mainnet capture
+      expect(counts.PRIORITIZED_INITIALIZATION).toBe(0);
+      expect(counts.ROUTINE_SWAP_DEPRIORITIZED).toBe(27);
+      expect(counts.FALLBACK_AMBIGUOUS).toBe(47);
+      expect(counts.UNCLASSIFIABLE).toBe(0);
+      expect(
+        counts.PRIORITIZED_INITIALIZATION +
+          counts.ROUTINE_SWAP_DEPRIORITIZED +
+          counts.FALLBACK_AMBIGUOUS +
+          counts.UNCLASSIFIABLE,
+      ).toBe(74);
+    });
+
+    it("B2-GO-FIX-02-01: reservation policy prevents starvation of later initialization when numerous routine swaps arrive first", async () => {
+      const fetchedSignatures: string[] = [];
+      const mockFetcher = {
+        fetchTransaction: async (sig: string) => {
+          fetchedSignatures.push(sig);
+          if (sig === "sig-priority-init-late") {
+            return createCpmmInitTransactionFixture({
+              signature: sig,
+              poolId: "LatePool1111111111111111111111111111111111",
+            });
+          }
+          return {
+            signature: sig,
+            slot: 450000100,
+            blockTime: 1792618963,
+            err: null,
+            version: "legacy" as const,
+            accountKeys: { staticAccountKeys: [] },
+            instructions: [],
+          };
+        },
+      };
+
+      const engine = new EventDiscoveryIngestionEngine({
+        maxTransactions: 25,
+        maxFallbackTransactions: 5,
+        reservedPrioritizedTransactions: 20,
+        maxEvents: 50,
+      });
+
+      // 1. Send 10 routine swap notifications
+      for (let i = 1; i <= 10; i++) {
+        engine.handleLogNotification({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            result: {
+              context: { slot: 450000100 + i },
+              value: {
+                signature: `sig-routine-swap-${i}`,
+                err: null,
+                logs: ["Program log: Instruction: Swap"],
+              },
+            },
+            subscription: 10,
+          },
+        });
+      }
+
+      const mockAccountFetcher = new MockOnChainAccountFetcher();
+
+      // Process queue: only 5 fallback transactions should execute!
+      await engine.processQueue(mockFetcher, mockAccountFetcher);
+
+      expect(fetchedSignatures.length).toBe(5);
+      expect(engine.getQueueLength()).toBe(5); // 5 routine items remain in queue
+
+      let metrics = engine.getMetrics();
+      expect(metrics.fallbackTransactionsExecuted).toBe(5);
+      expect(metrics.prioritizedTransactionsExecuted).toBe(0);
+      expect(metrics.reservedPrioritizedCalls).toBe(20);
+      expect(metrics.unusedReservedCalls).toBe(20);
+      expect(metrics.remainingUnfetchedSignatures).toBe(5);
+      expect(metrics.bypassedSignaturesCount).toBe(5);
+
+      // 2. Now send 1 prioritized CPMM pool initialization notification
+      engine.handleLogNotification({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            context: { slot: 450000200 },
+            value: {
+              signature: "sig-priority-init-late",
+              err: null,
+              logs: [
+                "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C invoke [1]",
+                "Program log: Instruction: Initialize",
+                "Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C success",
+              ],
+            },
+          },
+          subscription: 20,
+        },
+      });
+
+      // Process queue again: the prioritized initialization MUST execute using reserved budget!
+      await engine.processQueue(mockFetcher, mockAccountFetcher);
+
+      expect(fetchedSignatures.length).toBe(6);
+      expect(fetchedSignatures[5]).toBe("sig-priority-init-late");
+
+      metrics = engine.getMetrics();
+      expect(metrics.prioritizedTransactionsExecuted).toBe(1);
+      expect(metrics.fallbackTransactionsExecuted).toBe(5);
+      expect(metrics.reservedPrioritizedCalls).toBe(20);
+      expect(metrics.unusedReservedCalls).toBe(19);
+      expect(metrics.remainingUnfetchedSignatures).toBe(5);
+    });
+
+    it("B2-GO-FIX-02-02: coordinator reports honest coverage window if WebSocket message ceiling halts run early", async () => {
+      const captureDir = path.join(os.tmpdir(), `b2-test-ws-ceiling-${Date.now()}`);
+      fsSync.mkdirSync(captureDir, { recursive: true });
+
+      const wsTransport = new MockWebSocketTransport();
+      const mockRpc = new MockSolanaRpcTransport();
+
+      const coordinator = new EventDiscoverySessionCoordinator({
+        wsClient: new SolanaWebSocketSubscriptionClient({
+          wsUrl: "wss://api.mainnet-beta.solana.com/",
+          transport: wsTransport,
+          maxMessagesBudget: 2,
+        }),
+        accountFetcher: new SolanaRpcRecordingAccountFetcher({
+          rpcUrl: "https://api.mainnet-beta.solana.com/",
+          transport: mockRpc,
+        }),
+        txFetcher: new SolanaRpcTransactionFetcher({
+          rpcUrl: "https://api.mainnet-beta.solana.com/",
+          transport: mockRpc,
+          maxTransactionsBudget: 25,
+        }),
+        captureBaseDir: captureDir,
+        budgets: {
+          durationSec: 60,
+          maxEvents: 50,
+          maxWsMessages: 2, // Ceiling is 2 messages
+          maxTransactions: 25,
+          maxAccountReads: 20,
+          maxTotalRpcCalls: 45,
+          maxFallbackTransactions: 5,
+          reservedPrioritizedTransactions: 20,
+        },
+      });
+
+      wsTransport.triggerOpen();
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 10 }));
+      wsTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 2, result: 20 }));
+
+      // Pump 2 notifications asynchronously during session to reach the ceiling
+      const pumpPromise = (async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        wsTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000100 },
+                value: { signature: "sig-ws-1", err: null, logs: [] },
+              },
+              subscription: 10,
+            },
+          }),
+        );
+        await new Promise((r) => setTimeout(r, 10));
+        wsTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              result: {
+                context: { slot: 450000101 },
+                value: { signature: "sig-ws-2", err: null, logs: [] },
+              },
+              subscription: 20,
+            },
+          }),
+        );
+      })();
+
+      const summary = await coordinator.runSession();
+      await pumpPromise;
+      expect(summary.status).toBe("FINALIZED");
+      expect(summary.stopReason).toMatch(
+        /WS_MESSAGES_BUDGET_REACHED \(2\/2\) after \d+s \(coverage: \d+s \/ 60s\)/,
+      );
+      expect(summary.budgets.maxFallbackTransactions).toBe(5);
+      expect(summary.budgets.reservedPrioritizedTransactions).toBe(20);
+      expect(summary.accounting.prioritizedTransactionsFetched).toBe(0);
+      expect(summary.accounting.fallbackTransactionsFetched).toBe(
+        summary.metrics.fallbackTransactionsExecuted,
+      );
+      expect(summary.accounting.unusedReservedTransactionsBudget).toBe(20);
 
       // Cleanup
       try {

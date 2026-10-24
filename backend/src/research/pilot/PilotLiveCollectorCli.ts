@@ -237,6 +237,8 @@ export interface PilotLiveCollectorConfig {
   readonly maxWsMessages?: number | undefined;
   readonly maxEvents?: number | undefined;
   readonly maxTransactions?: number | undefined;
+  readonly maxFallbackTransactions?: number | undefined;
+  readonly reservedPrioritizedTransactions?: number | undefined;
   readonly maxAccountReads?: number | undefined;
   readonly authorizeB2Live?: boolean | undefined;
   readonly help?: boolean | undefined;
@@ -293,6 +295,8 @@ Options:
   --rpc-max-calls=<n>              Hard ceiling on total combined RPC calls across all clients (default: 45 in B2, 2 in CPMM mode) (B2-FINAL-02)
   --max-account-reads=<n>          Maximum on-chain account read calls for event discovery (default: 20) (B2-FINAL-02)
   --max-transactions=<n>           Maximum fetched transactions budget (default: 25)
+  --max-fallback-transactions=<n>  Maximum fallback transactions budget (default: 5) (B2-GO-FIX-02)
+  --reserved-prioritized-transactions=<n> Budget reserved for prioritized inits (default: 20) (B2-GO-FIX-02)
   --rpc-timeout-ms=<n>             HTTP RPC request timeout in ms (default: 10000)
   --discovery-source=dexscreener|raydium|events Discovery source adapter (default: dexscreener)
   --authorize-b2-live              Explicit operator authorization to execute live event discovery (B2-READY-01)
@@ -339,6 +343,8 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let captureFixturesDir: string | undefined = undefined;
   let maxEvents: number | undefined = undefined;
   let maxTransactions: number | undefined = undefined;
+  let maxFallbackTransactions: number | undefined = undefined;
+  let reservedPrioritizedTransactions: number | undefined = undefined;
   let maxAccountReads: number | undefined = undefined;
   let replayMode: "synthetic" | "authentic" | undefined = undefined;
   let rpcMaxCalls: number | undefined = undefined;
@@ -427,6 +433,16 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
       maxTransactions = parsePositiveInt(
         "--max-transactions",
         arg.slice("--max-transactions=".length),
+      );
+    } else if (arg.startsWith("--max-fallback-transactions=")) {
+      maxFallbackTransactions = parsePositiveInt(
+        "--max-fallback-transactions",
+        arg.slice("--max-fallback-transactions=".length),
+      );
+    } else if (arg.startsWith("--reserved-prioritized-transactions=")) {
+      reservedPrioritizedTransactions = parsePositiveInt(
+        "--reserved-prioritized-transactions",
+        arg.slice("--reserved-prioritized-transactions=".length),
       );
     } else if (arg.startsWith("--max-account-reads=")) {
       maxAccountReads = parsePositiveInt(
@@ -565,6 +581,8 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
     maxWsMessages,
     maxEvents,
     maxTransactions,
+    maxFallbackTransactions,
+    reservedPrioritizedTransactions,
     maxAccountReads,
     authorizeB2Live,
     help,
@@ -2692,6 +2710,9 @@ export async function runLiveEventDiscoverySession(
   const rpcTransport = config.rpcTransport ?? createDefaultSolanaRpcTransport();
 
   const maxTxBudget = config.maxTransactions ?? 25;
+  const maxFallbackBudget = config.maxFallbackTransactions ?? 5;
+  const reservedPrioritizedBudget =
+    config.reservedPrioritizedTransactions ?? Math.max(0, maxTxBudget - maxFallbackBudget);
   const maxAccBudget = config.maxAccountReads ?? 20;
   const maxCombinedRpcBudget = config.rpcMaxCalls ?? maxTxBudget + maxAccBudget;
   const minIntervalMs = config.minRequestIntervalMs ?? 200;
@@ -2729,6 +2750,8 @@ export async function runLiveEventDiscoverySession(
       maxTransactions: maxTxBudget,
       maxAccountReads: maxAccBudget,
       maxTotalRpcCalls: maxCombinedRpcBudget,
+      maxFallbackTransactions: maxFallbackBudget,
+      reservedPrioritizedTransactions: reservedPrioritizedBudget,
       maxRssMb: config.maxRssMb ?? 256,
       maxDiskMb: config.maxMb ?? 256,
     },
