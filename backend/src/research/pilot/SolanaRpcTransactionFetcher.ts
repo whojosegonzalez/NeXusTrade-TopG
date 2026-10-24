@@ -17,6 +17,7 @@ import type {
   CompiledInstruction,
   InnerInstructionGroup,
   TransactionVersion,
+  Version1TransactionConfig,
   VersionedTransactionAccountResolution,
   VersionedTransactionMetadata,
 } from "./EventDiscoveryContracts.js";
@@ -134,7 +135,18 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
    * Enforces maxTransactionsBudget boundary, shared RPC budget, per-request timeout,
    * provider-aware pacing, rate-limit backoff, and records raw wire evidence.
    */
-  public async fetchTransaction(signature: string): Promise<VersionedTransactionMetadata | null> {
+  public async fetchTransaction(
+    signature: string,
+    options?: { readonly deadlineEpochMs?: number | undefined },
+  ): Promise<VersionedTransactionMetadata | null> {
+    const now = Date.now();
+    if (options?.deadlineEpochMs !== undefined && now >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getTransaction for ${signature}: session deadline reached`,
+      );
+      return null;
+    }
+
     // 1. Shared total RPC ceiling check (B2-READY-02)
     if (this.sharedBudget && !this.sharedBudget.canExecute()) {
       this.onLog?.(
@@ -151,23 +163,45 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       return null;
     }
 
-    // 3. Provider rate-limit backoff pacing (respect 429 retry-after)
-    const now = Date.now();
+    // 3. Provider rate-limit backoff pacing (respect 429 retry-after bounded by deadline)
     if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
       const backoffMs = this.retryAfterUntilEpochMs - now;
+      if (options?.deadlineEpochMs !== undefined && now + backoffMs >= options.deadlineEpochMs) {
+        this.onLog?.(
+          `[RPC_DEADLINE_EXCEEDED] Skipping getTransaction for ${signature}: rate limit backoff ${backoffMs}ms would exceed deadline`,
+        );
+        return null;
+      }
       this.onLog?.(
         `[RATE_LIMIT_BACKOFF] Pausing getTransaction for ${backoffMs}ms due to provider throttling`,
       );
       await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
     }
 
-    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls (bounded by deadline)
     if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
       const elapsed = Date.now() - this.lastRequestEpochMs;
       if (elapsed < this.minRequestIntervalMs) {
         const waitMs = this.minRequestIntervalMs - elapsed;
+        if (
+          options?.deadlineEpochMs !== undefined &&
+          Date.now() + waitMs >= options.deadlineEpochMs
+        ) {
+          this.onLog?.(
+            `[RPC_DEADLINE_EXCEEDED] Skipping getTransaction for ${signature}: pacing wait ${waitMs}ms would exceed deadline`,
+          );
+          return null;
+        }
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
+    }
+
+    // Post-wait deadline check
+    if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getTransaction for ${signature}: session deadline reached after wait`,
+      );
+      return null;
     }
 
     this.lastRequestEpochMs = Date.now();
@@ -190,12 +224,18 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
     };
 
     const callStartEpochMs = Date.now();
+    const remainingToDeadline =
+      options?.deadlineEpochMs !== undefined
+        ? Math.max(1, options.deadlineEpochMs - callStartEpochMs)
+        : this.httpTimeoutMs;
+    const effectiveTimeoutMs = Math.min(this.httpTimeoutMs, remainingToDeadline);
+
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => {
       controller.abort(
-        new Error(`[RPC_TIMEOUT] getTransaction request timed out after ${this.httpTimeoutMs}ms`),
+        new Error(`[RPC_TIMEOUT] getTransaction request timed out after ${effectiveTimeoutMs}ms`),
       );
-    }, this.httpTimeoutMs);
+    }, effectiveTimeoutMs);
 
     try {
       const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
@@ -232,12 +272,17 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       const rawErrMsg = err instanceof Error ? err.message : String(err);
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
 
-      // Provider rate limit tracking
+      // Provider rate limit tracking: bounded retry-after header or fixed fallback (B2-NEXT-02)
       if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
-        // Default 2 second backoff on 429 when retry-after header is absent
-        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        const match = rawErrMsg.match(/retryAfter=(\d+)s/);
+        const parsedSecs = match ? parseInt(match[1]!, 10) : undefined;
+        const delaySecs =
+          parsedSecs && Number.isFinite(parsedSecs) && parsedSecs > 0
+            ? Math.min(parsedSecs, 10)
+            : 2;
+        this.retryAfterUntilEpochMs = Date.now() + delaySecs * 1000;
         this.onLog?.(
-          `[RPC_429_THROTTLED] Provider rate limit encountered for ${signature}; backoff set to 2000ms`,
+          `[RPC_429_THROTTLED] Provider rate limit encountered for ${signature}; backoff set to ${delaySecs * 1000}ms (${parsedSecs ? "from header" : "fixed fallback"})`,
         );
       }
 
@@ -310,24 +355,52 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
             : "legacy";
 
     // 1. Account Keys resolution (Static + ALTs)
+    // Note: Version 1 transactions (SIMD-0385) store all addresses inline and drop ALTs.
+    // Address Lookup Tables (ALTs) are strictly supported for version 0 (v0).
     const rawAccountKeys = message.accountKeys;
     const staticAccountKeys: string[] = Array.isArray(rawAccountKeys)
       ? rawAccountKeys.map((k) => (typeof k === "string" ? k : (k?.pubkey ?? "")))
       : [];
 
     let loadedAddresses: VersionedTransactionAccountResolution["loadedAddresses"] = undefined;
-    const rawLoaded = meta?.loadedAddresses as Record<string, unknown> | undefined;
-    if (rawLoaded && (Array.isArray(rawLoaded.writable) || Array.isArray(rawLoaded.readonly))) {
-      loadedAddresses = {
-        writable: Array.isArray(rawLoaded.writable) ? (rawLoaded.writable as string[]) : [],
-        readonly: Array.isArray(rawLoaded.readonly) ? (rawLoaded.readonly as string[]) : [],
-      };
+    if (version !== 1) {
+      const rawLoaded = meta?.loadedAddresses as Record<string, unknown> | undefined;
+      if (rawLoaded && (Array.isArray(rawLoaded.writable) || Array.isArray(rawLoaded.readonly))) {
+        loadedAddresses = {
+          writable: Array.isArray(rawLoaded.writable) ? (rawLoaded.writable as string[]) : [],
+          readonly: Array.isArray(rawLoaded.readonly) ? (rawLoaded.readonly as string[]) : [],
+        };
+      }
     }
 
     const accountKeys: VersionedTransactionAccountResolution = {
       staticAccountKeys,
       loadedAddresses,
     };
+
+    // First-class resource configuration for Version 1 transactions (SIMD-0385 / txv1)
+    let transactionConfig: Version1TransactionConfig | undefined = undefined;
+    const rawTxConfig =
+      (message.transactionConfig as Record<string, unknown> | undefined) ??
+      (transaction?.transactionConfig as Record<string, unknown> | undefined);
+    if (rawTxConfig && typeof rawTxConfig === "object") {
+      transactionConfig = {
+        computeUnitLimit:
+          typeof rawTxConfig.computeUnitLimit === "number"
+            ? rawTxConfig.computeUnitLimit
+            : undefined,
+        priorityFeeLamports:
+          typeof rawTxConfig.priorityFeeLamports === "number" ||
+          typeof rawTxConfig.priorityFeeLamports === "bigint"
+            ? rawTxConfig.priorityFeeLamports
+            : undefined,
+        loadedAccountsDataSizeLimit:
+          typeof rawTxConfig.loadedAccountsDataSizeLimit === "number"
+            ? rawTxConfig.loadedAccountsDataSizeLimit
+            : undefined,
+        heapSize: typeof rawTxConfig.heapSize === "number" ? rawTxConfig.heapSize : undefined,
+      };
+    }
 
     // 2. Compiled Instructions
     const rawInstructions = message.instructions;
@@ -402,6 +475,7 @@ export class SolanaRpcTransactionFetcher implements ITransactionFetcher {
       instructions,
       innerInstructions,
       logMessages,
+      ...(transactionConfig ? { transactionConfig } : {}),
     };
   }
 }

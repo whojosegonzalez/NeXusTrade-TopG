@@ -331,7 +331,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
   let enableForwardObservations = true;
   let discoverySource: "dexscreener" | "raydium" | "events" = "dexscreener";
   let maxPoolAgeSec = 0;
-  let minRequestIntervalMs = 2000;
+  let minRequestIntervalMs: number | undefined = undefined;
   let logFilePath: string | undefined = undefined;
   let verifyPoolAddress: string | undefined = undefined;
   let verifyCpmmPoolAddress: string | undefined = undefined;
@@ -535,6 +535,9 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
     }
   }
 
+  const resolvedMinRequestIntervalMs =
+    minRequestIntervalMs ?? (discoverySource === "events" ? 500 : 2000);
+
   return {
     network,
     rpcUrl,
@@ -549,7 +552,7 @@ export function parseCliArgs(argv: string[]): PilotLiveCollectorConfig {
     enableForwardObservations,
     discoverySource,
     maxPoolAgeSec,
-    minRequestIntervalMs,
+    minRequestIntervalMs: resolvedMinRequestIntervalMs,
     logFilePath,
     verifyPoolAddress,
     verifyCpmmPoolAddress,

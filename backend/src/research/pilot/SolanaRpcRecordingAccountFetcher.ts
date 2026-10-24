@@ -113,14 +113,31 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     return out;
   }
 
-  public async getSlot(): Promise<number> {
+  public async getSlot(options?: {
+    readonly deadlineEpochMs?: number | undefined;
+  }): Promise<number> {
+    if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+      this.onLog?.("[RPC_DEADLINE_EXCEEDED] Skipping getSlot: session deadline reached");
+      return 0;
+    }
     return this.maxObservedSlot;
   }
 
   /**
    * Fetches a single account via allowlisted getAccountInfo.
    */
-  public async getAccountInfo(address: string): Promise<DiscoveredPoolAccountPayload | null> {
+  public async getAccountInfo(
+    address: string,
+    options?: { readonly deadlineEpochMs?: number | undefined },
+  ): Promise<DiscoveredPoolAccountPayload | null> {
+    const now = Date.now();
+    if (options?.deadlineEpochMs !== undefined && now >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getAccountInfo for ${address}: session deadline reached`,
+      );
+      return null;
+    }
+
     // 1. Shared total RPC ceiling check (B2-READY-02)
     if (this.sharedBudget && !this.sharedBudget.canExecute()) {
       this.onLog?.(
@@ -137,23 +154,45 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       return null;
     }
 
-    // 3. Provider rate-limit backoff pacing
-    const now = Date.now();
+    // 3. Provider rate-limit backoff pacing (respect 429 retry-after bounded by deadline)
     if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
       const backoffMs = this.retryAfterUntilEpochMs - now;
+      if (options?.deadlineEpochMs !== undefined && now + backoffMs >= options.deadlineEpochMs) {
+        this.onLog?.(
+          `[RPC_DEADLINE_EXCEEDED] Skipping getAccountInfo for ${address}: rate limit backoff ${backoffMs}ms would exceed deadline`,
+        );
+        return null;
+      }
       this.onLog?.(
         `[RATE_LIMIT_BACKOFF] Pausing getAccountInfo for ${backoffMs}ms due to provider throttling`,
       );
       await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
     }
 
-    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls (bounded by deadline)
     if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
       const elapsed = Date.now() - this.lastRequestEpochMs;
       if (elapsed < this.minRequestIntervalMs) {
         const waitMs = this.minRequestIntervalMs - elapsed;
+        if (
+          options?.deadlineEpochMs !== undefined &&
+          Date.now() + waitMs >= options.deadlineEpochMs
+        ) {
+          this.onLog?.(
+            `[RPC_DEADLINE_EXCEEDED] Skipping getAccountInfo for ${address}: pacing wait ${waitMs}ms would exceed deadline`,
+          );
+          return null;
+        }
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
+    }
+
+    // Post-wait deadline check
+    if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getAccountInfo for ${address}: session deadline reached after wait`,
+      );
+      return null;
     }
 
     this.lastRequestEpochMs = Date.now();
@@ -175,12 +214,18 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     };
 
     const callStartEpochMs = Date.now();
+    const remainingToDeadline =
+      options?.deadlineEpochMs !== undefined
+        ? Math.max(1, options.deadlineEpochMs - callStartEpochMs)
+        : this.httpTimeoutMs;
+    const effectiveTimeoutMs = Math.min(this.httpTimeoutMs, remainingToDeadline);
+
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => {
       controller.abort(
-        new Error(`[RPC_TIMEOUT] getAccountInfo request timed out after ${this.httpTimeoutMs}ms`),
+        new Error(`[RPC_TIMEOUT] getAccountInfo request timed out after ${effectiveTimeoutMs}ms`),
       );
-    }, this.httpTimeoutMs);
+    }, effectiveTimeoutMs);
 
     try {
       const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
@@ -216,9 +261,15 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
 
       if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
-        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        const match = rawErrMsg.match(/retryAfter=(\d+)s/);
+        const parsedSecs = match ? parseInt(match[1]!, 10) : undefined;
+        const delaySecs =
+          parsedSecs && Number.isFinite(parsedSecs) && parsedSecs > 0
+            ? Math.min(parsedSecs, 10)
+            : 2;
+        this.retryAfterUntilEpochMs = Date.now() + delaySecs * 1000;
         this.onLog?.(
-          `[RPC_429_THROTTLED] Provider rate limit encountered for account ${address}; backoff set to 2000ms`,
+          `[RPC_429_THROTTLED] Provider rate limit encountered for account ${address}; backoff set to ${delaySecs * 1000}ms (${parsedSecs ? "from header" : "fixed fallback"})`,
         );
       }
 
@@ -254,9 +305,18 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
    */
   public async getMultipleAccounts(
     addresses: readonly string[],
+    options?: { readonly deadlineEpochMs?: number | undefined },
   ): Promise<readonly (DiscoveredPoolAccountPayload | null)[]> {
     if (addresses.length === 0) {
       return [];
+    }
+
+    const now = Date.now();
+    if (options?.deadlineEpochMs !== undefined && now >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getMultipleAccounts for ${addresses.length} accounts: session deadline reached`,
+      );
+      return addresses.map(() => null);
     }
 
     // 1. Shared total RPC ceiling check (B2-READY-02)
@@ -275,23 +335,45 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       return addresses.map(() => null);
     }
 
-    // 3. Provider rate-limit backoff pacing
-    const now = Date.now();
+    // 3. Provider rate-limit backoff pacing (respect 429 retry-after bounded by deadline)
     if (this.retryAfterUntilEpochMs > 0 && now < this.retryAfterUntilEpochMs) {
       const backoffMs = this.retryAfterUntilEpochMs - now;
+      if (options?.deadlineEpochMs !== undefined && now + backoffMs >= options.deadlineEpochMs) {
+        this.onLog?.(
+          `[RPC_DEADLINE_EXCEEDED] Skipping getMultipleAccounts: rate limit backoff ${backoffMs}ms would exceed deadline`,
+        );
+        return addresses.map(() => null);
+      }
       this.onLog?.(
         `[RATE_LIMIT_BACKOFF] Pausing getMultipleAccounts for ${backoffMs}ms due to provider throttling`,
       );
       await new Promise((resolve) => setTimeout(resolve, Math.min(backoffMs, this.httpTimeoutMs)));
     }
 
-    // 4. Inter-request pacing: enforce minimum spacing between outbound calls
+    // 4. Inter-request pacing: enforce minimum spacing between outbound calls (bounded by deadline)
     if (this.minRequestIntervalMs > 0 && this.lastRequestEpochMs > 0) {
       const elapsed = Date.now() - this.lastRequestEpochMs;
       if (elapsed < this.minRequestIntervalMs) {
         const waitMs = this.minRequestIntervalMs - elapsed;
+        if (
+          options?.deadlineEpochMs !== undefined &&
+          Date.now() + waitMs >= options.deadlineEpochMs
+        ) {
+          this.onLog?.(
+            `[RPC_DEADLINE_EXCEEDED] Skipping getMultipleAccounts: pacing wait ${waitMs}ms would exceed deadline`,
+          );
+          return addresses.map(() => null);
+        }
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
+    }
+
+    // Post-wait deadline check
+    if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
+      this.onLog?.(
+        `[RPC_DEADLINE_EXCEEDED] Skipping getMultipleAccounts: session deadline reached after wait`,
+      );
+      return addresses.map(() => null);
     }
 
     this.lastRequestEpochMs = Date.now();
@@ -313,14 +395,20 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
     };
 
     const callStartEpochMs = Date.now();
+    const remainingToDeadline =
+      options?.deadlineEpochMs !== undefined
+        ? Math.max(1, options.deadlineEpochMs - callStartEpochMs)
+        : this.httpTimeoutMs;
+    const effectiveTimeoutMs = Math.min(this.httpTimeoutMs, remainingToDeadline);
+
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => {
       controller.abort(
         new Error(
-          `[RPC_TIMEOUT] getMultipleAccounts request timed out after ${this.httpTimeoutMs}ms`,
+          `[RPC_TIMEOUT] getMultipleAccounts request timed out after ${effectiveTimeoutMs}ms`,
         ),
       );
-    }, this.httpTimeoutMs);
+    }, effectiveTimeoutMs);
 
     try {
       const res = await this.transport.post(this.rawRpcUrl, rpcBody, { signal: controller.signal });
@@ -356,9 +444,15 @@ export class SolanaRpcRecordingAccountFetcher implements IOnChainAccountFetcher 
       const errMsg = this.sanitizeErrorMessage(rawErrMsg);
 
       if (rawErrMsg.includes("429") || rawErrMsg.includes("RATE_LIMIT")) {
-        this.retryAfterUntilEpochMs = Date.now() + 2000;
+        const match = rawErrMsg.match(/retryAfter=(\d+)s/);
+        const parsedSecs = match ? parseInt(match[1]!, 10) : undefined;
+        const delaySecs =
+          parsedSecs && Number.isFinite(parsedSecs) && parsedSecs > 0
+            ? Math.min(parsedSecs, 10)
+            : 2;
+        this.retryAfterUntilEpochMs = Date.now() + delaySecs * 1000;
         this.onLog?.(
-          `[RPC_429_THROTTLED] Provider rate limit encountered for multiple accounts; backoff set to 2000ms`,
+          `[RPC_429_THROTTLED] Provider rate limit encountered for multiple accounts; backoff set to ${delaySecs * 1000}ms (${parsedSecs ? "from header" : "fixed fallback"})`,
         );
       }
 

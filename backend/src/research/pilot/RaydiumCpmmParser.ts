@@ -20,6 +20,9 @@
  *    EXOTIC_CROSS cohorts. Uses canonical literal mint addresses for USDC and USDT.
  */
 
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { encodeBase58 } from "../../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
   isCanonicalSolanaBase58,
@@ -816,5 +819,191 @@ export function computeCpmmReserveAccounting(
   return {
     ok: true,
     accounting,
+  };
+}
+
+/**
+ * Expected canonical evidence files in a sealed D.2.9-B1 CPMM snapshot.
+ */
+export const EXPECTED_CPMM_EVIDENCE_FILES = Object.freeze([
+  "pool-account-rpc.json",
+  "vault-accounts-rpc.json",
+  "snapshot-metadata.json",
+  "cpmm-verification-report.json",
+] as const);
+
+export interface CpmmSnapshotManifestVerificationResult {
+  readonly valid: boolean;
+  readonly manifestSha256: string;
+  readonly totalFiles: number;
+  readonly totalBytes: number;
+  readonly files: readonly {
+    readonly filename: string;
+    readonly sha256: string;
+    readonly byteSize: number;
+  }[];
+}
+
+/**
+ * Verifies a sealed D.2.9-B1 CPMM snapshot manifest against disk contents.
+ * Recomputes canonical manifestSha256 and verifies byte sizes and SHA-256 digests.
+ */
+export function verifyCpmmSnapshotManifest(
+  targetDir: string,
+): CpmmSnapshotManifestVerificationResult {
+  const manifestName = fs.existsSync(path.join(targetDir, "cpmm-snapshot-manifest.json"))
+    ? "cpmm-snapshot-manifest.json"
+    : fs.existsSync(path.join(targetDir, "manifest.json"))
+      ? "manifest.json"
+      : null;
+
+  if (!manifestName) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Missing sealed CPMM snapshot manifest (cpmm-snapshot-manifest.json or manifest.json) in ${targetDir}`,
+    );
+  }
+
+  const manifestPath = path.join(targetDir, manifestName);
+  const manifestRaw = fs.readFileSync(manifestPath, "utf8");
+  let manifest: {
+    manifestVersion?: string;
+    snapshotId?: string;
+    createdAtIso?: string;
+    status?: string;
+    totalFiles?: number;
+    totalBytes?: number;
+    files?: Array<{ filename: string; sha256: string; byteSize: number }>;
+    manifestSha256?: string;
+  };
+
+  try {
+    manifest = JSON.parse(manifestRaw);
+  } catch {
+    throw new Error(`[CPMM_MANIFEST_ERROR] Failed to parse manifest JSON in ${manifestPath}`);
+  }
+
+  if (!manifest || typeof manifest !== "object") {
+    throw new Error(`[CPMM_MANIFEST_ERROR] Manifest in ${manifestPath} must be a JSON object`);
+  }
+
+  if (!Array.isArray(manifest.files)) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Manifest in ${manifestPath} contains no valid files array`,
+    );
+  }
+
+  if (manifest.files.length !== EXPECTED_CPMM_EVIDENCE_FILES.length) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Invalid manifest file count: expected exactly ${EXPECTED_CPMM_EVIDENCE_FILES.length} evidence files, got ${manifest.files.length}`,
+    );
+  }
+
+  if (manifest.totalFiles !== EXPECTED_CPMM_EVIDENCE_FILES.length) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Manifest totalFiles mismatch: expected ${EXPECTED_CPMM_EVIDENCE_FILES.length}, got ${manifest.totalFiles}`,
+    );
+  }
+
+  if (typeof manifest.manifestSha256 !== "string" || manifest.manifestSha256.trim().length === 0) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Manifest in ${manifestPath} is missing required manifestSha256 digest`,
+    );
+  }
+
+  const seenFiles = new Set<string>();
+  let computedTotalBytes = 0;
+
+  for (const entry of manifest.files) {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`[CPMM_MANIFEST_ERROR] Malformed file entry in ${manifestPath}`);
+    }
+    if (!entry.filename || typeof entry.filename !== "string") {
+      throw new Error(`[CPMM_MANIFEST_ERROR] Manifest entry missing filename in ${manifestPath}`);
+    }
+    if (seenFiles.has(entry.filename)) {
+      throw new Error(`[CPMM_MANIFEST_ERROR] Duplicate file entry in manifest: ${entry.filename}`);
+    }
+    seenFiles.add(entry.filename);
+
+    if (
+      !EXPECTED_CPMM_EVIDENCE_FILES.includes(
+        entry.filename as (typeof EXPECTED_CPMM_EVIDENCE_FILES)[number],
+      )
+    ) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] Unexpected evidence file in manifest: '${entry.filename}'. Expected only canonical CPMM evidence files.`,
+      );
+    }
+
+    if (typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(entry.sha256)) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] Invalid SHA-256 digest for '${entry.filename}' in manifest: ${entry.sha256}`,
+      );
+    }
+
+    if (
+      typeof entry.byteSize !== "number" ||
+      !Number.isInteger(entry.byteSize) ||
+      entry.byteSize <= 0
+    ) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] Invalid byteSize for '${entry.filename}' in manifest: ${entry.byteSize}`,
+      );
+    }
+    computedTotalBytes += entry.byteSize;
+  }
+
+  for (const expectedFile of EXPECTED_CPMM_EVIDENCE_FILES) {
+    if (!seenFiles.has(expectedFile)) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] Manifest missing required evidence file: ${expectedFile}`,
+      );
+    }
+  }
+
+  if (manifest.totalBytes !== computedTotalBytes) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Manifest totalBytes inconsistency: declared ${manifest.totalBytes}, sum of entries is ${computedTotalBytes}`,
+    );
+  }
+
+  const sortedEntries = [...manifest.files].sort((a, b) => a.filename.localeCompare(b.filename));
+  const canonicalPayload = sortedEntries.map((f) => `${f.filename}:${f.sha256}`).join("\n");
+  const canonicalManifestSha256 = crypto
+    .createHash("sha256")
+    .update(canonicalPayload)
+    .digest("hex");
+
+  if (canonicalManifestSha256 !== manifest.manifestSha256) {
+    throw new Error(
+      `[CPMM_MANIFEST_ERROR] Canonical manifestSha256 mismatch: manifest declared ${manifest.manifestSha256}, computed ${canonicalManifestSha256}`,
+    );
+  }
+
+  for (const entry of manifest.files) {
+    const filePath = path.join(targetDir, entry.filename);
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`[CPMM_MANIFEST_ERROR] Missing sealed fixture file: ${entry.filename}`);
+    }
+    const fileBytes = fs.readFileSync(filePath);
+    if (fileBytes.byteLength !== entry.byteSize) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] Byte size mismatch for '${entry.filename}': manifest expected ${entry.byteSize} bytes, disk file is ${fileBytes.byteLength} bytes`,
+      );
+    }
+    const actualHash = crypto.createHash("sha256").update(fileBytes).digest("hex");
+    if (actualHash !== entry.sha256) {
+      throw new Error(
+        `[CPMM_MANIFEST_ERROR] SHA-256 hash mismatch for '${entry.filename}': expected ${entry.sha256}, got ${actualHash}`,
+      );
+    }
+  }
+
+  return {
+    valid: true,
+    manifestSha256: manifest.manifestSha256,
+    totalFiles: manifest.totalFiles,
+    totalBytes: manifest.totalBytes,
+    files: manifest.files,
   };
 }

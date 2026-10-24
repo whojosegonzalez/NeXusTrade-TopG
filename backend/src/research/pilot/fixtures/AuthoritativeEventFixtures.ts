@@ -22,6 +22,7 @@ import type {
   CompiledInstruction,
   DiscoveredPoolAccountPayload,
   IOnChainAccountFetcher,
+  Version1TransactionConfig,
   VersionedTransactionMetadata,
   WebSocketLogNotificationEnvelope,
 } from "../EventDiscoveryContracts.js";
@@ -68,24 +69,27 @@ export const FIXTURE_LP_MINT = "F3tWbXQhZkP2xL4cR8gY6mE9pQvJ7rT1uA5sN8wB3dK";
 export const FIXTURE_USER_WALLET = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ";
 
 export interface AmmV4TxFixtureOptions {
-  signature?: string;
-  slot?: number;
-  blockTime?: number;
-  openTime?: number;
-  isVersion0?: boolean;
-  poolId?: string;
-  token0Mint?: string;
-  token1Mint?: string;
-  token0Vault?: string;
-  token1Vault?: string;
-  creatorWallet?: string;
-  marketId?: string;
-  marketProgramId?: string;
-  err?: unknown | null;
-  tag?: number;
-  customDataLength?: number;
-  asBase58String?: boolean;
-  asBase64String?: boolean;
+  signature?: string | undefined;
+  slot?: number | undefined;
+  blockTime?: number | undefined;
+  openTime?: number | undefined;
+  isVersion0?: boolean | undefined;
+  isVersion1?: boolean | undefined;
+  version?: "legacy" | 0 | 1 | undefined;
+  transactionConfig?: Version1TransactionConfig | undefined;
+  poolId?: string | undefined;
+  token0Mint?: string | undefined;
+  token1Mint?: string | undefined;
+  token0Vault?: string | undefined;
+  token1Vault?: string | undefined;
+  creatorWallet?: string | undefined;
+  marketId?: string | undefined;
+  marketProgramId?: string | undefined;
+  err?: unknown | null | undefined;
+  tag?: number | undefined;
+  customDataLength?: number | undefined;
+  asBase58String?: boolean | undefined;
+  asBase64String?: boolean | undefined;
 }
 
 /**
@@ -183,7 +187,35 @@ export function createAmmV4InitTransactionFixture(
 
   const accountKeyIndexes = accounts.map((_, idx) => idx).slice(0, 21);
 
-  if (options.isVersion0) {
+  if (options.isVersion1 || options.version === 1) {
+    // Version 1 (SIMD-0385): All account keys are inline in staticAccountKeys (no ALTs)
+    const compiledInstruction: CompiledInstruction = {
+      programIdIndex: 21,
+      accountKeyIndexes,
+      data: finalData,
+      ...(finalEncoding ? { dataEncoding: finalEncoding } : {}),
+    };
+
+    return {
+      signature,
+      slot,
+      blockTime,
+      err: options.err ?? null,
+      version: 1,
+      accountKeys: {
+        staticAccountKeys: accounts,
+      },
+      instructions: [compiledInstruction],
+      transactionConfig: options.transactionConfig ?? {
+        computeUnitLimit: 200_000,
+        priorityFeeLamports: 10_000,
+        loadedAccountsDataSizeLimit: 64_000,
+        heapSize: 32_768,
+      },
+    };
+  }
+
+  if (options.isVersion0 || options.version === 0) {
     // Split into static keys and Address Lookup Table loaded keys
     const staticAccountKeys = accounts.slice(0, 11);
     const loadedWritable = accounts.slice(11, 17);
@@ -235,21 +267,24 @@ export function createAmmV4InitTransactionFixture(
 }
 
 export interface CpmmTxFixtureOptions {
-  signature?: string;
-  slot?: number;
-  blockTime?: number;
-  openTime?: number;
-  isVersion0?: boolean;
-  poolId?: string;
-  token0Mint?: string;
-  token1Mint?: string;
-  token0Vault?: string;
-  token1Vault?: string;
-  creatorWallet?: string;
-  err?: unknown | null;
-  asBase58String?: boolean;
-  asBase64String?: boolean;
-  customDataLength?: number;
+  signature?: string | undefined;
+  slot?: number | undefined;
+  blockTime?: number | undefined;
+  openTime?: number | undefined;
+  isVersion0?: boolean | undefined;
+  isVersion1?: boolean | undefined;
+  version?: "legacy" | 0 | 1 | undefined;
+  transactionConfig?: Version1TransactionConfig | undefined;
+  poolId?: string | undefined;
+  token0Mint?: string | undefined;
+  token1Mint?: string | undefined;
+  token0Vault?: string | undefined;
+  token1Vault?: string | undefined;
+  creatorWallet?: string | undefined;
+  err?: unknown | null | undefined;
+  asBase58String?: boolean | undefined;
+  asBase64String?: boolean | undefined;
+  customDataLength?: number | undefined;
 }
 
 /**
@@ -322,7 +357,35 @@ export function createCpmmInitTransactionFixture(
 
   const accountKeyIndexes = accounts.map((_, idx) => idx).slice(0, 20);
 
-  if (options.isVersion0) {
+  if (options.isVersion1 || options.version === 1) {
+    // Version 1 (SIMD-0385): All account keys are inline in staticAccountKeys (no ALTs)
+    const compiledInstruction: CompiledInstruction = {
+      programIdIndex: 20,
+      accountKeyIndexes,
+      data: finalData,
+      ...(finalEncoding ? { dataEncoding: finalEncoding } : {}),
+    };
+
+    return {
+      signature,
+      slot,
+      blockTime,
+      err: options.err ?? null,
+      version: 1,
+      accountKeys: {
+        staticAccountKeys: accounts,
+      },
+      instructions: [compiledInstruction],
+      transactionConfig: options.transactionConfig ?? {
+        computeUnitLimit: 200_000,
+        priorityFeeLamports: 10_000,
+        loadedAccountsDataSizeLimit: 64_000,
+        heapSize: 32_768,
+      },
+    };
+  }
+
+  if (options.isVersion0 || options.version === 0) {
     const staticAccountKeys = accounts.slice(0, 10);
     const loadedWritable = accounts.slice(10, 16);
     const loadedReadonly = accounts.slice(16);
@@ -371,19 +434,43 @@ export function createCpmmInitTransactionFixture(
   };
 }
 
+export interface CpiTxFixtureOptions {
+  protocol?: "RAYDIUM_AMM_V4" | "RAYDIUM_CPMM" | undefined;
+  version?: "legacy" | 0 | 1 | undefined;
+  isVersion1?: boolean | undefined;
+  transactionConfig?: Version1TransactionConfig | undefined;
+  signature?: string | undefined;
+  slot?: number | undefined;
+  blockTime?: number | undefined;
+}
+
 /**
  * Creates a transaction fixture with nested CPI innerInstructions (D29-F4).
  */
 export function createCpiPoolInitTransactionFixture(
-  protocol: "RAYDIUM_AMM_V4" | "RAYDIUM_CPMM" = "RAYDIUM_AMM_V4",
+  protocolOrOptions: "RAYDIUM_AMM_V4" | "RAYDIUM_CPMM" | CpiTxFixtureOptions = "RAYDIUM_AMM_V4",
 ): VersionedTransactionMetadata {
+  const options: CpiTxFixtureOptions =
+    typeof protocolOrOptions === "string" ? { protocol: protocolOrOptions } : protocolOrOptions;
+  const protocol = options.protocol ?? "RAYDIUM_AMM_V4";
+  const isV1 = options.isVersion1 || options.version === 1;
+  const sig = options.signature ?? "5K...cpiPoolInitSignature111111111111111111111111";
+
   const baseTx =
     protocol === "RAYDIUM_AMM_V4"
       ? createAmmV4InitTransactionFixture({
-          signature: "5K...cpiPoolInitSignature111111111111111111111111",
+          signature: sig,
+          slot: options.slot,
+          blockTime: options.blockTime,
+          isVersion1: isV1,
+          transactionConfig: options.transactionConfig,
         })
       : createCpmmInitTransactionFixture({
-          signature: "5K...cpiPoolInitSignature111111111111111111111111",
+          signature: sig,
+          slot: options.slot,
+          blockTime: options.blockTime,
+          isVersion1: isV1,
+          transactionConfig: options.transactionConfig,
         });
 
   // Top-level instruction invokes a proxy/wrapper contract
@@ -405,7 +492,7 @@ export function createCpiPoolInitTransactionFixture(
     slot: baseTx.slot,
     blockTime: baseTx.blockTime,
     err: null,
-    version: "legacy",
+    version: isV1 ? 1 : "legacy",
     accountKeys: {
       staticAccountKeys: accounts,
     },
@@ -416,6 +503,15 @@ export function createCpiPoolInitTransactionFixture(
         instructions: [innerInstruction],
       },
     ],
+    ...(isV1
+      ? {
+          transactionConfig: options.transactionConfig ?? {
+            computeUnitLimit: 300_000,
+            priorityFeeLamports: 25_000,
+            loadedAccountsDataSizeLimit: 64_000,
+          },
+        }
+      : {}),
   };
 }
 
@@ -583,4 +679,156 @@ export class MockOnChainAccountFetcher implements IOnChainAccountFetcher {
   public async getSlot(): Promise<number> {
     return this.currentSlot;
   }
+}
+
+export interface RealisticV1RpcOptions {
+  signature?: string | undefined;
+  slot?: number | undefined;
+  blockTime?: number | undefined;
+  protocol?: "RAYDIUM_AMM_V4" | "RAYDIUM_CPMM" | undefined;
+  isCpi?: boolean | undefined;
+  poolId?: string | undefined;
+  token0Mint?: string | undefined;
+  token1Mint?: string | undefined;
+  token0Vault?: string | undefined;
+  token1Vault?: string | undefined;
+  creatorWallet?: string | undefined;
+  transactionConfig?: Version1TransactionConfig | undefined;
+  err?: unknown | null | undefined;
+  malformedProgramIndex?: boolean | undefined;
+  malformedAccountIndex?: boolean | undefined;
+  corruptInstructionData?: boolean | undefined;
+}
+
+/**
+ * Creates a genuine-shaped Solana JSON-RPC getTransaction response for a version 1 transaction (SIMD-0385 / txv1).
+ * Features inline accountKeys, first-class transactionConfig, and no Address Lookup Tables (ALTs).
+ */
+export function createRealisticVersion1GetTransactionRpcResponse(
+  options: RealisticV1RpcOptions = {},
+): Record<string, unknown> {
+  const protocol = options.protocol ?? "RAYDIUM_AMM_V4";
+  const isCpi = options.isCpi ?? false;
+  const signature = options.signature ?? "5K...v1RealisticRpcSignature11111111111111111111111";
+  const slot = options.slot ?? 459800100;
+  const blockTime = options.blockTime ?? 1792618963;
+
+  const baseTx = isCpi
+    ? createCpiPoolInitTransactionFixture({
+        protocol,
+        version: 1,
+        signature,
+        slot,
+        blockTime,
+        transactionConfig: options.transactionConfig,
+      })
+    : protocol === "RAYDIUM_AMM_V4"
+      ? createAmmV4InitTransactionFixture({
+          signature,
+          slot,
+          blockTime,
+          version: 1,
+          poolId: options.poolId,
+          token0Mint: options.token0Mint,
+          token1Mint: options.token1Mint,
+          token0Vault: options.token0Vault,
+          token1Vault: options.token1Vault,
+          creatorWallet: options.creatorWallet,
+          transactionConfig: options.transactionConfig,
+        })
+      : createCpmmInitTransactionFixture({
+          signature,
+          slot,
+          blockTime,
+          version: 1,
+          poolId: options.poolId,
+          token0Mint: options.token0Mint,
+          token1Mint: options.token1Mint,
+          token0Vault: options.token0Vault,
+          token1Vault: options.token1Vault,
+          creatorWallet: options.creatorWallet,
+          transactionConfig: options.transactionConfig,
+        });
+
+  const txConfig = options.transactionConfig ??
+    baseTx.transactionConfig ?? {
+      computeUnitLimit: 200_000,
+      priorityFeeLamports: 10_000,
+      loadedAccountsDataSizeLimit: 64_000,
+      heapSize: 32_768,
+    };
+
+  const accountKeys = [...baseTx.accountKeys.staticAccountKeys];
+
+  // Map instructions to JSON-RPC format
+  const instructions = baseTx.instructions.map((inst) => {
+    let programIdIndex = inst.programIdIndex;
+    if (options.malformedProgramIndex) {
+      programIdIndex = -1; // Corrupted programIdIndex
+    }
+
+    let accounts = [...inst.accountKeyIndexes];
+    if (options.malformedAccountIndex) {
+      accounts = [9999]; // Out of bounds account index
+    }
+
+    let dataStr = typeof inst.data === "string" ? inst.data : encodeBase58(Buffer.from(inst.data));
+    if (options.corruptInstructionData) {
+      dataStr = "???not-valid-base58???";
+    }
+
+    return {
+      programIdIndex,
+      accounts,
+      data: dataStr,
+    };
+  });
+
+  const innerInstructions = baseTx.innerInstructions?.map((group) => ({
+    index: group.index,
+    instructions: group.instructions.map((inst) => {
+      let programIdIndex = inst.programIdIndex;
+      if (options.malformedProgramIndex) programIdIndex = -1;
+      let accounts = [...inst.accountKeyIndexes];
+      if (options.malformedAccountIndex) accounts = [9999];
+      let dataStr =
+        typeof inst.data === "string" ? inst.data : encodeBase58(Buffer.from(inst.data));
+      if (options.corruptInstructionData) dataStr = "???not-valid-base58???";
+
+      return {
+        programIdIndex,
+        accounts,
+        data: dataStr,
+      };
+    }),
+  }));
+
+  return {
+    jsonrpc: "2.0",
+    id: `pilot-tx-${Date.now()}`,
+    result: {
+      slot,
+      blockTime,
+      version: 1,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys,
+          recentBlockhash: "GHtXQBkQwsr65ppjL1TKqc2UoxZrKV21stUvNDmwkpea",
+          instructions,
+          transactionConfig: txConfig,
+        },
+      },
+      meta: {
+        err: options.err ?? null,
+        fee: 5000,
+        logMessages: [
+          `Program ${accountKeys[instructions[0]?.programIdIndex ?? 0]} invoke [1]`,
+          "Program log: initialize",
+          `Program ${accountKeys[instructions[0]?.programIdIndex ?? 0]} success`,
+        ],
+        ...(innerInstructions ? { innerInstructions } : {}),
+      },
+    },
+  };
 }

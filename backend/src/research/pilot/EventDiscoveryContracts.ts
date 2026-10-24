@@ -117,6 +117,17 @@ export interface InnerInstructionGroup {
 export type TransactionVersion = "legacy" | 0 | 1 | number;
 
 /**
+ * First-class resource configuration for Solana version 1 transactions (SIMD-0385 / txv1).
+ * Replaces ComputeBudget instructions with structured metadata headers.
+ */
+export interface Version1TransactionConfig {
+  readonly computeUnitLimit?: number | undefined;
+  readonly priorityFeeLamports?: number | bigint | undefined;
+  readonly loadedAccountsDataSizeLimit?: number | undefined;
+  readonly heapSize?: number | undefined;
+}
+
+/**
  * Versioned transaction metadata required for offline pool initialization recognition.
  */
 export interface VersionedTransactionMetadata {
@@ -129,6 +140,7 @@ export interface VersionedTransactionMetadata {
   readonly instructions: readonly CompiledInstruction[];
   readonly innerInstructions?: readonly InnerInstructionGroup[] | undefined;
   readonly logMessages?: readonly string[] | undefined;
+  readonly transactionConfig?: Version1TransactionConfig | undefined;
 }
 
 /**
@@ -221,15 +233,29 @@ export interface DiscoveredPoolAccountPayload {
 }
 
 /**
+ * Signal classification for WebSocket log notification envelopes (B2-NEXT-03).
+ * Separates strong Raydium pool initialization signals from fallback/ambiguous and routine signals.
+ */
+export type NotificationSignalClassification =
+  | "PRIORITIZED_INITIALIZATION"
+  | "FALLBACK_AMBIGUOUS"
+  | "ROUTINE_SWAP_DEPRIORITIZED"
+  | "UNCLASSIFIABLE";
+
+/**
  * Interface for decoupled, read-only on-chain account fetching.
  * Kept strictly behind interfaces to enable deterministic offline testing.
  */
 export interface IOnChainAccountFetcher {
-  getAccountInfo(address: string): Promise<DiscoveredPoolAccountPayload | null>;
+  getAccountInfo(
+    address: string,
+    options?: { readonly deadlineEpochMs?: number | undefined },
+  ): Promise<DiscoveredPoolAccountPayload | null>;
   getMultipleAccounts(
     addresses: readonly string[],
+    options?: { readonly deadlineEpochMs?: number | undefined },
   ): Promise<readonly (DiscoveredPoolAccountPayload | null)[]>;
-  getSlot(): Promise<number>;
+  getSlot(options?: { readonly deadlineEpochMs?: number | undefined }): Promise<number>;
 }
 
 /**
@@ -296,4 +322,10 @@ export interface EventDiscoveryMetricsSnapshot {
   readonly verificationRetries?: number | undefined;
   readonly exhaustedVerificationRetriesCount?: number | undefined;
   readonly pendingVerificationsCount?: number | undefined;
+  /** B2-NEXT-03: Evidence-based transaction prioritization metrics */
+  readonly prioritizedSignaturesCount?: number | undefined;
+  readonly fallbackSignaturesCount?: number | undefined;
+  readonly bypassedSignaturesCount?: number | undefined;
+  readonly unfetchedSignaturesCount?: number | undefined;
+  readonly unclassifiableSignaturesCount?: number | undefined;
 }

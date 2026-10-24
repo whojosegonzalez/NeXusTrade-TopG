@@ -25,6 +25,7 @@ import type {
   EventDiscoveryMetricsSnapshot,
   EventLifecycleState,
   IOnChainAccountFetcher,
+  NotificationSignalClassification,
   VerificationDispatchResult,
   VersionedTransactionMetadata,
   WebSocketConnectionStatus,
@@ -37,7 +38,64 @@ import { dispatchPoolVerification } from "./VerificationDispatchService.js";
  * Interface for decoupled transaction retrieval.
  */
 export interface ITransactionFetcher {
-  fetchTransaction(signature: string): Promise<VersionedTransactionMetadata | null>;
+  fetchTransaction(
+    signature: string,
+    options?: { readonly deadlineEpochMs?: number | undefined },
+  ): Promise<VersionedTransactionMetadata | null>;
+}
+
+/**
+ * Classifies notification logs into prioritized, fallback, routine, or unclassifiable (B2-NEXT-03).
+ */
+export function classifyNotificationLogs(
+  logs: readonly string[] | undefined,
+): NotificationSignalClassification {
+  if (!logs || !Array.isArray(logs)) {
+    return "UNCLASSIFIABLE";
+  }
+
+  if (logs.length === 0) {
+    return "FALLBACK_AMBIGUOUS";
+  }
+
+  let hasStrongInit = false;
+  let hasRoutineSwap = false;
+
+  for (const log of logs) {
+    if (typeof log !== "string") continue;
+
+    // AMM v4 or CPMM strong pool creation signal (including CPI)
+    if (
+      log.includes("initialize2") ||
+      log.includes("Program log: initialize") ||
+      log.includes("Instruction: Initialize")
+    ) {
+      hasStrongInit = true;
+      break;
+    }
+
+    // Routine swap / non-initialization markers
+    if (
+      log.includes("ray_log") ||
+      log.includes("Instruction: Swap") ||
+      log.includes("Instruction: SwapBaseInput") ||
+      log.includes("Instruction: Swap2") ||
+      log.includes("Instruction: SharedAccountsRouteV2") ||
+      log.includes("Instruction: SwapWithDestination")
+    ) {
+      hasRoutineSwap = true;
+    }
+  }
+
+  if (hasStrongInit) {
+    return "PRIORITIZED_INITIALIZATION";
+  }
+
+  if (hasRoutineSwap) {
+    return "ROUTINE_SWAP_DEPRIORITIZED";
+  }
+
+  return "FALLBACK_AMBIGUOUS";
 }
 
 /**
@@ -58,6 +116,7 @@ interface QueuedItem {
   readonly signature: string;
   readonly slot: number;
   readonly detectedAtMs: number;
+  readonly classification: NotificationSignalClassification;
   retryCount: number;
   lifecycleState: EventLifecycleState;
 }
@@ -86,8 +145,15 @@ export class EventDiscoveryIngestionEngine {
   private totalTransactionsProcessed = 0;
 
   private connectionStatus: WebSocketConnectionStatus = "DISCONNECTED";
-  private queue: QueuedItem[] = [];
+  private readonly priorityQueue: QueuedItem[] = [];
+  private readonly fallbackQueue: QueuedItem[] = [];
   private readonly pendingVerifications = new Map<string, PendingVerificationItem>();
+
+  // Prioritization counters (B2-NEXT-03)
+  private prioritizedSignaturesCount = 0;
+  private fallbackSignaturesCount = 0;
+  private unclassifiableSignaturesCount = 0;
+  private bypassedSignaturesCount = 0;
 
   // Decoupled lifecycle sets (D29-F5)
   private readonly observedSignatures = new Set<string>(); // All signatures seen in notifications
@@ -146,6 +212,8 @@ export class EventDiscoveryIngestionEngine {
     this.maxTransactions = options.maxTransactions;
   }
 
+  public static classifyNotificationLogs = classifyNotificationLogs;
+
   // --------------------------------------------------------------------------
   // Connection Lifecycle Simulation
   // --------------------------------------------------------------------------
@@ -175,6 +243,7 @@ export class EventDiscoveryIngestionEngine {
    * Receives a raw WebSocket log-notification envelope (D29-F5).
    * Separates observed, active queued, and completed signatures to prevent
    * permanent candidate suppression after queue drops or transient failures.
+   * Performs conservative signal classification to prioritize pool creations (B2-NEXT-03).
    */
   public async handleLogNotification(
     envelope: WebSocketLogNotificationEnvelope,
@@ -197,6 +266,17 @@ export class EventDiscoveryIngestionEngine {
     const slot = context?.slot ?? 0;
     const now = this.clock.now();
 
+    // Signal classification (B2-NEXT-03)
+    const classification = classifyNotificationLogs(value.logs);
+    if (classification === "PRIORITIZED_INITIALIZATION") {
+      this.prioritizedSignaturesCount += 1;
+    } else if (classification === "UNCLASSIFIABLE") {
+      this.unclassifiableSignaturesCount += 1;
+      this.fallbackSignaturesCount += 1;
+    } else {
+      this.fallbackSignaturesCount += 1;
+    }
+
     // Track total unique signatures observed across all notifications
     if (!this.observedSignatures.has(signature)) {
       this.observedSignatures.add(signature);
@@ -216,11 +296,14 @@ export class EventDiscoveryIngestionEngine {
       return { enqueued: false, reason: "FAILED_TRANSACTION" };
     }
 
-    // Check bounded queue capacity and apply backpressure policy (D29-F5)
-    if (this.queue.length >= this.maxQueueSize) {
+    // Check bounded total queue capacity and apply backpressure policy (D29-F5)
+    const currentTotalQueue = this.priorityQueue.length + this.fallbackQueue.length;
+    if (currentTotalQueue >= this.maxQueueSize) {
       this.queueFullDrops += 1;
       if (this.backpressurePolicy === "DROP_OLDEST") {
-        const dropped = this.queue.shift(); // Evict oldest
+        // Evict from fallback queue first to preserve high-priority pool initializations
+        const dropped =
+          this.fallbackQueue.length > 0 ? this.fallbackQueue.shift() : this.priorityQueue.shift();
         if (dropped) {
           this.queuedSignatures.delete(dropped.signature);
         }
@@ -234,11 +317,16 @@ export class EventDiscoveryIngestionEngine {
       signature,
       slot,
       detectedAtMs: now,
+      classification,
       retryCount: 0,
       lifecycleState: "LOG_DETECTED",
     };
 
-    this.queue.push(item);
+    if (classification === "PRIORITIZED_INITIALIZATION") {
+      this.priorityQueue.push(item);
+    } else {
+      this.fallbackQueue.push(item);
+    }
     this.queuedSignatures.add(signature);
     return { enqueued: true };
   }
@@ -248,7 +336,8 @@ export class EventDiscoveryIngestionEngine {
   // --------------------------------------------------------------------------
 
   /**
-   * Processes all pending items in the bounded queue.
+   * Processes pending items with strict priority-queue draining (B2-NEXT-03).
+   * Prioritized pool creations are drained first; fallback/ambiguous items follow.
    */
   public async processQueue(
     txFetcher: ITransactionFetcher,
@@ -266,7 +355,7 @@ export class EventDiscoveryIngestionEngine {
     const retried = await this.retryPendingVerifications(accountFetcher, options);
     results.push(...retried);
 
-    while (this.queue.length > 0) {
+    while (this.priorityQueue.length > 0 || this.fallbackQueue.length > 0) {
       if (options?.deadlineEpochMs !== undefined && Date.now() >= options.deadlineEpochMs) {
         break;
       }
@@ -274,12 +363,18 @@ export class EventDiscoveryIngestionEngine {
         this.maxTransactions !== undefined &&
         this.totalTransactionsProcessed >= this.maxTransactions
       ) {
+        // Record bypassed fallback signatures that could not be fetched within budget
+        this.bypassedSignaturesCount = this.fallbackQueue.length;
         break;
       }
       if (this.maxEvents !== undefined && this.discoveredEvents.length >= this.maxEvents) {
         break;
       }
-      const item = this.queue.shift()!;
+
+      // Prioritize strong initialization signals first, then fallback/ambiguous
+      const item =
+        this.priorityQueue.length > 0 ? this.priorityQueue.shift()! : this.fallbackQueue.shift()!;
+
       this.queuedSignatures.delete(item.signature);
       item.lifecycleState = "TX_FETCH_QUEUED";
       this.totalTransactionsProcessed += 1;
@@ -287,7 +382,7 @@ export class EventDiscoveryIngestionEngine {
       // 1. Fetch transaction metadata with bounded retry accounting (D29-F5)
       let tx: VersionedTransactionMetadata | null = null;
       try {
-        tx = await txFetcher.fetchTransaction(item.signature);
+        tx = await txFetcher.fetchTransaction(item.signature, options);
       } catch {
         tx = null;
       }
@@ -296,7 +391,11 @@ export class EventDiscoveryIngestionEngine {
         this.transactionFetchRetries += 1;
         if (item.retryCount < this.maxRetries) {
           item.retryCount += 1;
-          this.queue.push(item); // Re-enqueue for retry
+          if (item.classification === "PRIORITIZED_INITIALIZATION") {
+            this.priorityQueue.push(item);
+          } else {
+            this.fallbackQueue.push(item);
+          }
           this.queuedSignatures.add(item.signature);
           continue;
         } else {
@@ -560,7 +659,7 @@ export class EventDiscoveryIngestionEngine {
   // --------------------------------------------------------------------------
 
   public getQueueLength(): number {
-    return this.queue.length;
+    return this.priorityQueue.length + this.fallbackQueue.length;
   }
 
   public getPendingVerificationsCount(): number {
@@ -573,6 +672,10 @@ export class EventDiscoveryIngestionEngine {
 
   public getVerificationReports(): readonly VerificationDispatchResult[] {
     return this.verificationReports;
+  }
+
+  public getMetrics(): EventDiscoveryMetricsSnapshot {
+    return this.getMetricsSnapshot();
   }
 
   public getMetricsSnapshot(): EventDiscoveryMetricsSnapshot {
@@ -621,6 +724,11 @@ export class EventDiscoveryIngestionEngine {
       verificationRetries: this.verificationRetries,
       exhaustedVerificationRetriesCount: this.exhaustedVerificationRetriesCount,
       pendingVerificationsCount: this.pendingVerifications.size,
+      prioritizedSignaturesCount: this.prioritizedSignaturesCount,
+      fallbackSignaturesCount: this.fallbackSignaturesCount,
+      bypassedSignaturesCount: this.bypassedSignaturesCount,
+      unfetchedSignaturesCount: this.priorityQueue.length + this.fallbackQueue.length,
+      unclassifiableSignaturesCount: this.unclassifiableSignaturesCount,
     });
   }
 }

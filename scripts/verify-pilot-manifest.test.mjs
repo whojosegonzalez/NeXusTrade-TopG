@@ -291,3 +291,89 @@ test("runVerifyManifestCli validates a sealed B2 session manifest and rejects ta
   ]);
   assert.equal(tamperedExit, 1, "Tampered B2 session manifest must exit 1");
 });
+
+test("runVerifyManifestCli validates CPMM snapshot manifest (B1 format) and rejects tampering", async () => {
+  const { verifyCpmmSnapshotManifest } =
+    await import("../backend/dist/research/pilot/RaydiumCpmmParser.js");
+  assert.equal(
+    typeof verifyCpmmSnapshotManifest,
+    "function",
+    "verifyCpmmSnapshotManifest must be exported from RaydiumCpmmParser.js",
+  );
+
+  // If authentic B1 directory exists, verify it passes
+  const authenticB1Dir = path.join(rootDir, ".tmp", "cpmm-captures", "cpmm-snapshot-1792560830086");
+  if (fs.existsSync(authenticB1Dir)) {
+    const exitCode = await runVerifyManifestCli([
+      "node",
+      "scripts/verify-pilot-manifest.mjs",
+      `--source=${authenticB1Dir}`,
+    ]);
+    assert.equal(exitCode, 0, "Authentic B1 snapshot directory must verify with exit code 0");
+  }
+
+  // Create isolated synthetic CPMM snapshot directory
+  const snapshotDir = createTempDir("cpmm-snapshot-test-");
+  const files = [
+    "pool-account-rpc.json",
+    "vault-accounts-rpc.json",
+    "snapshot-metadata.json",
+    "cpmm-verification-report.json",
+  ];
+
+  let totalBytes = 0;
+  const manifestFiles = [];
+  for (const filename of files) {
+    const content = Buffer.from(`test-content-for-${filename}`, "utf8");
+    fs.writeFileSync(path.join(snapshotDir, filename), content);
+    const sha256 = crypto.createHash("sha256").update(content).digest("hex");
+    totalBytes += content.length;
+    manifestFiles.push({
+      filename,
+      byteSize: content.length,
+      sha256,
+    });
+  }
+
+  manifestFiles.sort((a, b) => a.filename.localeCompare(b.filename));
+  const canonicalPayload = manifestFiles.map((f) => `${f.filename}:${f.sha256}`).join("\n");
+  const canonicalManifestSha256 = crypto
+    .createHash("sha256")
+    .update(canonicalPayload)
+    .digest("hex");
+
+  const manifestObj = {
+    manifestVersion: "1.0.0",
+    snapshotId: "cpmm-snapshot-test",
+    createdAtIso: new Date().toISOString(),
+    status: "FINALIZED",
+    manifestSha256: canonicalManifestSha256,
+    totalFiles: manifestFiles.length,
+    totalBytes,
+    files: manifestFiles,
+  };
+
+  fs.writeFileSync(
+    path.join(snapshotDir, "cpmm-snapshot-manifest.json"),
+    JSON.stringify(manifestObj, null, 2),
+  );
+
+  // Valid exit code check
+  const validExit = await runVerifyManifestCli([
+    "node",
+    "scripts/verify-pilot-manifest.mjs",
+    `--source=${snapshotDir}`,
+  ]);
+  assert.equal(validExit, 0, "Valid CPMM snapshot manifest must exit 0");
+
+  // Tamper with one of the files
+  fs.writeFileSync(path.join(snapshotDir, "snapshot-metadata.json"), "tampered-content");
+
+  // Tampered exit code check
+  const tamperedExit = await runVerifyManifestCli([
+    "node",
+    "scripts/verify-pilot-manifest.mjs",
+    `--source=${snapshotDir}`,
+  ]);
+  assert.equal(tamperedExit, 1, "Tampered CPMM snapshot manifest must exit 1");
+});
