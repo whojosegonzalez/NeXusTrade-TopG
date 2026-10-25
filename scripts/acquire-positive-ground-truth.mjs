@@ -189,6 +189,7 @@ export const DEFAULT_ACQUISITION_CONFIG = {
   maxTransactionCalls: 20,
   maxAccountCalls: 10,
   maxTotalRpcCalls: 54,
+  maxSessionDurationSec: 180, // C2-LAUNCH-01: 180s overall session ceiling
   minRequestIntervalMs: 1000,
   rpcTimeoutMs: 10000,
   targetAmmV4: 5,
@@ -425,10 +426,19 @@ export class PositiveGroundTruthAcquisitionCollector {
     this.consecutiveRpcErrors = 0;
     this.lastRequestEpochMs = 0;
 
+    this.sessionStartEpochMs = Date.now();
+    this.sessionDeadlineEpochMs =
+      this.sessionStartEpochMs + (this.options.maxSessionDurationSec ?? 180) * 1000;
+
     this.rawTransactions = [];
+    this.rawRpcInteractions = []; // C2-LAUNCH-03: Complete interaction wire audit
     this.candidateHistoryLog = [];
     this.positiveRegistry = [];
     this.evaluatedSeeds = [];
+
+    // C2-LAUNCH-02: Enforce strictly unique positive evidence
+    this.seenPositiveSignatures = new Set();
+    this.seenPositivePoolAddresses = new Set();
 
     this.discoveredAmmV4Count = 0;
     this.discoveredCpmmCount = 0;
@@ -445,6 +455,15 @@ export class PositiveGroundTruthAcquisitionCollector {
    * Every retry counts against both the specific method ceiling and the total ceiling (Correction 4).
    */
   async executeRpcCall(method, params, callType) {
+    // C2-LAUNCH-01: Enforce overall session deadline
+    const now = Date.now();
+    if (this.sessionDeadlineEpochMs !== undefined && now >= this.sessionDeadlineEpochMs) {
+      this.stopReason = `SESSION_DEADLINE_EXCEEDED (${this.options.maxSessionDurationSec}s ceiling reached)`;
+      throw new Error(
+        `[SESSION_DEADLINE_EXCEEDED] Cannot dispatch ${method}: session ceiling of ${this.options.maxSessionDurationSec}s reached`,
+      );
+    }
+
     // 1. Check total budget ceiling (Hard ceiling of 54)
     if (this.totalRpcCallsExecuted >= this.options.maxTotalRpcCalls) {
       this.stopReason = `TOTAL_RPC_BUDGET_EXCEEDED (${this.totalRpcCallsExecuted}/${this.options.maxTotalRpcCalls})`;
@@ -477,6 +496,14 @@ export class PositiveGroundTruthAcquisitionCollector {
     const maxRetries = this.options.maxRetriesPerCall ?? 2;
 
     while (attempt <= maxRetries) {
+      // Re-verify deadline before attempt/retry
+      if (this.sessionDeadlineEpochMs !== undefined && Date.now() >= this.sessionDeadlineEpochMs) {
+        this.stopReason = `SESSION_DEADLINE_EXCEEDED (${this.options.maxSessionDurationSec}s ceiling reached)`;
+        throw new Error(
+          `[SESSION_DEADLINE_EXCEEDED] Cannot dispatch ${method}: session deadline reached`,
+        );
+      }
+
       // Re-verify budget before each attempt (including retries)
       if (this.totalRpcCallsExecuted >= this.options.maxTotalRpcCalls) {
         this.stopReason = `TOTAL_RPC_BUDGET_EXCEEDED (${this.totalRpcCallsExecuted}/${this.options.maxTotalRpcCalls})`;
@@ -503,6 +530,15 @@ export class PositiveGroundTruthAcquisitionCollector {
         const elapsed = Date.now() - this.lastRequestEpochMs;
         if (elapsed < this.options.minRequestIntervalMs) {
           const waitMs = this.options.minRequestIntervalMs - elapsed;
+          if (
+            this.sessionDeadlineEpochMs !== undefined &&
+            Date.now() + waitMs >= this.sessionDeadlineEpochMs
+          ) {
+            this.stopReason = `SESSION_DEADLINE_EXCEEDED (Pacing wait would exceed ${this.options.maxSessionDurationSec}s deadline)`;
+            throw new Error(
+              `[SESSION_DEADLINE_EXCEEDED] Pacing wait of ${waitMs}ms would exceed session deadline`,
+            );
+          }
           await new Promise((r) => setTimeout(r, waitMs));
         }
       }
@@ -521,16 +557,28 @@ export class PositiveGroundTruthAcquisitionCollector {
         params,
       };
 
+      const callStartEpochMs = Date.now();
+      const callIndex = this.totalRpcCallsExecuted;
+
       try {
         let responseData;
         if (this.customTransport) {
           responseData = await this.customTransport(method, params, requestPayload);
         } else {
-          // Standard live fetch with timeout
+          // Standard live fetch with timeout bounded by session deadline
+          const remainingToDeadline =
+            this.sessionDeadlineEpochMs !== undefined
+              ? Math.max(1, this.sessionDeadlineEpochMs - callStartEpochMs)
+              : this.options.rpcTimeoutMs;
+          const effectiveTimeoutMs = Math.min(this.options.rpcTimeoutMs, remainingToDeadline);
+
           const controller = new AbortController();
           const timer = setTimeout(
-            () => controller.abort(new Error(`RPC timeout after ${this.options.rpcTimeoutMs}ms`)),
-            this.options.rpcTimeoutMs,
+            () =>
+              controller.abort(
+                new Error(`RPC timeout after ${effectiveTimeoutMs}ms (deadline-bounded)`),
+              ),
+            effectiveTimeoutMs,
           );
           try {
             const resp = await fetch(this.options.rpcUrl, {
@@ -563,11 +611,40 @@ export class PositiveGroundTruthAcquisitionCollector {
 
         // Call succeeded: reset circuit breaker
         this.consecutiveRpcErrors = 0;
+
+        // C2-LAUNCH-03: Record full outbound and inbound wire interaction
+        this.rawRpcInteractions.push({
+          requestIndex: callIndex,
+          callType,
+          method,
+          params,
+          timestampIso: new Date(callStartEpochMs).toISOString(),
+          timestampEpochMs: callStartEpochMs,
+          elapsedMs: Date.now() - callStartEpochMs,
+          attempt: attempt + 1,
+          response: responseData,
+          error: null,
+        });
+
         return responseData;
       } catch (err) {
         this.consecutiveRpcErrors++;
         const errMsg = err instanceof Error ? err.message : String(err);
         this.log(`Call to ${method} failed (attempt ${attempt + 1}/${maxRetries + 1}): ${errMsg}`);
+
+        // C2-LAUNCH-03: Record failed attempt in interaction provenance log
+        this.rawRpcInteractions.push({
+          requestIndex: callIndex,
+          callType,
+          method,
+          params,
+          timestampIso: new Date(callStartEpochMs).toISOString(),
+          timestampEpochMs: callStartEpochMs,
+          elapsedMs: Date.now() - callStartEpochMs,
+          attempt: attempt + 1,
+          response: null,
+          error: errMsg,
+        });
 
         // Circuit breaker check
         if (this.consecutiveRpcErrors >= this.options.circuitBreakerConsecutiveErrors) {
@@ -583,6 +660,17 @@ export class PositiveGroundTruthAcquisitionCollector {
           attempt++;
           const backoffBase = isRateLimit ? 2000 : 1000;
           const backoffMs = backoffBase * Math.pow(2, attempt - 1);
+
+          if (
+            this.sessionDeadlineEpochMs !== undefined &&
+            Date.now() + backoffMs >= this.sessionDeadlineEpochMs
+          ) {
+            this.stopReason = `SESSION_DEADLINE_EXCEEDED (Retry backoff would exceed ${this.options.maxSessionDurationSec}s deadline)`;
+            throw new Error(
+              `[SESSION_DEADLINE_EXCEEDED] Retry backoff of ${backoffMs}ms would exceed session deadline`,
+            );
+          }
+
           this.log(`Backing off for ${backoffMs}ms before retry...`);
           await new Promise((r) => setTimeout(r, backoffMs));
           continue;
@@ -734,6 +822,36 @@ export class PositiveGroundTruthAcquisitionCollector {
     );
 
     if (independentEval.isPositive) {
+      // C2-LAUNCH-02: Require strictly unique positive evidence by signature and pool identity
+      if (this.seenPositiveSignatures.has(candidateSig)) {
+        this.log(
+          `[DUPLICATE_POSITIVE_SIGNATURE] Signature ${candidateSig} already registered. Skipping duplicate.`,
+        );
+        this.evaluatedSeeds.push({
+          ...seed,
+          status: "DUPLICATE_POSITIVE_SIGNATURE",
+          signature: candidateSig,
+          poolAddress: independentEval.poolAddress,
+        });
+        return;
+      }
+
+      if (this.seenPositivePoolAddresses.has(independentEval.poolAddress)) {
+        this.log(
+          `[DUPLICATE_POOL_IDENTITY] Pool ${independentEval.poolAddress} already registered. Skipping duplicate.`,
+        );
+        this.evaluatedSeeds.push({
+          ...seed,
+          status: "DUPLICATE_POOL_IDENTITY",
+          signature: candidateSig,
+          poolAddress: independentEval.poolAddress,
+        });
+        return;
+      }
+
+      this.seenPositiveSignatures.add(candidateSig);
+      this.seenPositivePoolAddresses.add(independentEval.poolAddress);
+
       this.log(
         `[AUTHENTIC_POSITIVE_CONFIRMED] Seed ${seed.symbol} confirmed on-chain positive pool initialization!`,
       );
@@ -840,11 +958,24 @@ export class PositiveGroundTruthAcquisitionCollector {
   async runAcquisition(candidateSeeds = DEFAULT_CANDIDATE_SEEDS) {
     await loadBackendDependencies();
 
+    this.sessionStartEpochMs = Date.now();
+    this.sessionDeadlineEpochMs =
+      this.sessionStartEpochMs + (this.options.maxSessionDurationSec ?? 180) * 1000;
+
     const maxSeeds = Math.min(candidateSeeds.length, this.options.maxSeeds);
     this.log(`Starting bounded positive acquisition runbook across up to ${maxSeeds} seeds...`);
 
     for (let i = 0; i < maxSeeds; i++) {
       if (this.stopReason) break;
+
+      // C2-LAUNCH-01: Session deadline check
+      if (this.sessionDeadlineEpochMs !== undefined && Date.now() >= this.sessionDeadlineEpochMs) {
+        this.stopReason = `SESSION_DEADLINE_EXCEEDED (${this.options.maxSessionDurationSec}s ceiling reached)`;
+        this.log(
+          `[DEADLINE_HALT] Reached overall session deadline of ${this.options.maxSessionDurationSec}s.`,
+        );
+        break;
+      }
 
       // Check if target yields are reached (Early Termination)
       if (
@@ -908,11 +1039,15 @@ export class PositiveGroundTruthAcquisitionCollector {
       transactionCallsExecuted: this.transactionCallsExecuted,
       accountCallsExecuted: this.accountCallsExecuted,
       consecutiveRpcErrors: this.consecutiveRpcErrors,
+      sessionStartEpochMs: this.sessionStartEpochMs,
+      sessionDeadlineEpochMs: this.sessionDeadlineEpochMs,
+      sessionElapsedSec: Math.round((Date.now() - this.sessionStartEpochMs) / 1000),
       options: {
         maxSeeds: this.options.maxSeeds,
         maxHistoryCalls: this.options.maxHistoryCalls,
         maxTransactionCalls: this.options.maxTransactionCalls,
         maxTotalRpcCalls: this.options.maxTotalRpcCalls,
+        maxSessionDurationSec: this.options.maxSessionDurationSec,
         maxSupportedTransactionVersion: this.options.maxSupportedTransactionVersion,
       },
     };
@@ -932,20 +1067,30 @@ export class PositiveGroundTruthAcquisitionCollector {
       "utf8",
     );
 
-    // 3. raw-transactions.jsonl
+    // 3. raw-rpc-interactions.jsonl (C2-LAUNCH-03: Complete Wire Interaction Provenance)
+    const interactionsContent =
+      this.rawRpcInteractions.map((item) => JSON.stringify(item)).join("\n") +
+      (this.rawRpcInteractions.length > 0 ? "\n" : "");
+    fs.writeFileSync(
+      path.join(targetDir, "raw-rpc-interactions.jsonl"),
+      interactionsContent,
+      "utf8",
+    );
+
+    // 4. raw-transactions.jsonl
     const rawTxContent =
       this.rawTransactions.map((item) => JSON.stringify(item)).join("\n") +
       (this.rawTransactions.length > 0 ? "\n" : "");
     fs.writeFileSync(path.join(targetDir, "raw-transactions.jsonl"), rawTxContent, "utf8");
 
-    // 4. positive-ground-truth-registry.json
+    // 5. positive-ground-truth-registry.json
     fs.writeFileSync(
       path.join(targetDir, "positive-ground-truth-registry.json"),
       JSON.stringify(this.positiveRegistry, null, 2),
       "utf8",
     );
 
-    // 5. acquisition-summary.json
+    // 6. acquisition-summary.json
     const summary = {
       sessionId,
       status: "FINALIZED",
@@ -966,11 +1111,12 @@ export class PositiveGroundTruthAcquisitionCollector {
       "utf8",
     );
 
-    // 6. Compute Cryptographic Manifest (session-manifest.json and c2-manifest.json)
+    // 7. Compute Cryptographic Manifest (session-manifest.json and c2-manifest.json)
     const filesToManifest = [
       "acquisition-summary.json",
       "candidate-history-log.jsonl",
       "positive-ground-truth-registry.json",
+      "raw-rpc-interactions.jsonl",
       "raw-transactions.jsonl",
       "session-metadata.json",
     ];
@@ -1120,6 +1266,8 @@ export function parseAcquisitionCliArgs(argv) {
       options.targetAmmV4 = parseInt(arg.slice("--target-amm-v4=".length), 10);
     } else if (arg.startsWith("--target-cpmm=")) {
       options.targetCpmm = parseInt(arg.slice("--target-cpmm=".length), 10);
+    } else if (arg.startsWith("--max-duration-sec=")) {
+      options.maxSessionDurationSec = parseInt(arg.slice("--max-duration-sec=".length), 10);
     } else if (arg.startsWith("--output-dir=")) {
       options.outputDir = arg.slice("--output-dir=".length).trim();
     }

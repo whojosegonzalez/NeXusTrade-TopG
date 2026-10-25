@@ -417,7 +417,7 @@ test("Retries Count Toward All Applicable Ceilings: 429 retries increment method
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test("Early Termination: Stops when target yields are achieved before exhausting budget", async () => {
+test("Early Termination: Stops when target yields are achieved before exhausting budget with 10 distinct pools", async () => {
   let seedIdx = 0;
   const mockTransport = async (method, params) => {
     if (method === "getSignaturesForAddress") {
@@ -425,13 +425,14 @@ test("Early Termination: Stops when target yields are achieved before exhausting
     }
     if (method === "getTransaction") {
       const isAmm = seedIdx < 5;
+      const poolAddr = isAmm ? `amm-pool-${seedIdx}` : `cpmm-pool-${seedIdx - 5}`;
       seedIdx++;
       return {
         result: createMockTx({
           signature: params[0],
           isAmmV4Init: isAmm,
           isCpmmInit: !isAmm,
-          poolAddress: isAmm ? "amm-pool" : "cpmm-pool",
+          poolAddress: poolAddr,
         }),
       };
     }
@@ -440,14 +441,18 @@ test("Early Termination: Stops when target yields are achieved before exhausting
 
   const seeds = [];
   for (let i = 0; i < 5; i++) {
-    seeds.push({ poolAddress: "amm-pool", symbol: `AMM_${i}`, protocol: "RAYDIUM_AMM_V4" });
+    seeds.push({ poolAddress: `amm-pool-${i}`, symbol: `AMM_${i}`, protocol: "RAYDIUM_AMM_V4" });
   }
   for (let j = 0; j < 5; j++) {
-    seeds.push({ poolAddress: "cpmm-pool", symbol: `CPMM_${j}`, protocol: "RAYDIUM_CPMM" });
+    seeds.push({ poolAddress: `cpmm-pool-${j}`, symbol: `CPMM_${j}`, protocol: "RAYDIUM_CPMM" });
   }
   // Extra seeds that should not be touched
   for (let k = 0; k < 5; k++) {
-    seeds.push({ poolAddress: "extra-pool", symbol: `EXTRA_${k}`, protocol: "RAYDIUM_AMM_V4" });
+    seeds.push({
+      poolAddress: `extra-pool-${k}`,
+      symbol: `EXTRA_${k}`,
+      protocol: "RAYDIUM_AMM_V4",
+    });
   }
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2-test-early-term-"));
@@ -470,6 +475,132 @@ test("Early Termination: Stops when target yields are achieved before exhausting
     `Expected TARGET_YIELD_REACHED, got ${result.stopReason}`,
   );
   assert.equal(collector.evaluatedSeeds.length, 10, "Extra seeds were not evaluated");
+
+  // Verify all 10 accepted positives represent 10 distinct pools and 10 distinct signatures (C2-LAUNCH-02)
+  const poolSet = new Set(collector.positiveRegistry.map((p) => p.poolAddress));
+  const sigSet = new Set(collector.positiveRegistry.map((p) => p.signature));
+  assert.equal(poolSet.size, 10, "Must contain 10 distinct pool identities");
+  assert.equal(sigSet.size, 10, "Must contain 10 distinct transaction signatures");
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test("C2-LAUNCH-02: Repeated pool identities or duplicate signatures cannot inflate benchmark counts", async () => {
+  let poolACalls = 0;
+  const mockTransport = async (method, params) => {
+    if (method === "getSignaturesForAddress") {
+      if (params[0] === "pool-A") {
+        poolACalls++;
+        const sig = poolACalls === 1 ? "sig-1" : "sig-2";
+        return { result: [{ signature: sig, slot: 100 }] };
+      }
+      if (params[0] === "pool-B") {
+        return { result: [{ signature: "sig-1", slot: 100 }] };
+      }
+    }
+    if (method === "getTransaction") {
+      const sig = params[0];
+      if (sig === "sig-1") {
+        const currentPool = poolACalls === 1 ? "pool-A" : "pool-B";
+        return {
+          result: createMockTx({
+            signature: "sig-1",
+            isAmmV4Init: true,
+            poolAddress: currentPool,
+          }),
+        };
+      }
+      if (sig === "sig-2") {
+        return {
+          result: createMockTx({
+            signature: "sig-2",
+            isAmmV4Init: true,
+            poolAddress: "pool-A", // Duplicate pool identity
+          }),
+        };
+      }
+    }
+    return { result: null };
+  };
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2-test-dedup-"));
+  const collector = new PositiveGroundTruthAcquisitionCollector({
+    transport: mockTransport,
+    minRequestIntervalMs: 0,
+    outputDir: tempDir,
+    maxSeeds: 5,
+  });
+
+  const seeds = [
+    { poolAddress: "pool-A", symbol: "SEED_1", protocol: "RAYDIUM_AMM_V4" },
+    { poolAddress: "pool-A", symbol: "SEED_2", protocol: "RAYDIUM_AMM_V4" },
+    { poolAddress: "pool-B", symbol: "SEED_3", protocol: "RAYDIUM_AMM_V4" },
+  ];
+
+  await collector.runAcquisition(seeds);
+
+  // Seed 1 accepted; Seed 2 rejected as duplicate pool; Seed 3 rejected as duplicate signature
+  assert.equal(collector.positiveRegistry.length, 1, "Only first unique positive accepted");
+  assert.equal(collector.discoveredAmmV4Count, 1, "Count must not be inflated");
+  assert.equal(collector.evaluatedSeeds[1].status, "DUPLICATE_POOL_IDENTITY");
+  assert.equal(collector.evaluatedSeeds[2].status, "DUPLICATE_POSITIVE_SIGNATURE");
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test("C2-LAUNCH-01: Overall session deadline halts collection cleanly and seals partial evidence", async () => {
+  let callCount = 0;
+  const mockTransport = async (method, params) => {
+    callCount++;
+    if (method === "getSignaturesForAddress") {
+      return { result: [{ signature: `sig-deadline-${callCount}`, slot: 100 }] };
+    }
+    if (method === "getTransaction") {
+      return {
+        result: createMockTx({
+          signature: params[0],
+          isAmmV4Init: true,
+          poolAddress: `pool-deadline-${callCount}`,
+        }),
+      };
+    }
+    return { result: null };
+  };
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2-test-deadline-"));
+  const collector = new PositiveGroundTruthAcquisitionCollector({
+    transport: mockTransport,
+    minRequestIntervalMs: 0,
+    outputDir: tempDir,
+    maxSeeds: 10,
+    maxSessionDurationSec: 1, // 1-second deadline
+  });
+
+  // Inject a small sleep in transport to exceed 1s deadline
+  const slowTransport = async (method, params) => {
+    await new Promise((r) => setTimeout(r, 600)); // Two calls = 1200ms > 1000ms deadline
+    return mockTransport(method, params);
+  };
+  collector.customTransport = slowTransport;
+
+  const seeds = [];
+  for (let s = 0; s < 5; s++) {
+    seeds.push({
+      poolAddress: `pool-deadline-${s}`,
+      symbol: `DEAD_${s}`,
+      protocol: "RAYDIUM_AMM_V4",
+    });
+  }
+
+  const result = await collector.runAcquisition(seeds);
+
+  assert.ok(
+    result.stopReason.includes("SESSION_DEADLINE_EXCEEDED"),
+    `Expected stopReason SESSION_DEADLINE_EXCEEDED, got ${result.stopReason}`,
+  );
+  // Verify that partial session was sealed and passes manifest validation
+  const manifestResult = verifyC2SessionManifest(result.targetDir);
+  assert.equal(manifestResult.valid, true, "Partial session manifest must be valid");
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
