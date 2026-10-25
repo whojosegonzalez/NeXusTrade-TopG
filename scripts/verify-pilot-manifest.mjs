@@ -79,6 +79,34 @@ export async function runVerifyManifestCli(argv = process.argv) {
   const cpmmManifestPath = path.join(resolvedSource, "cpmm-snapshot-manifest.json");
 
   if (fs.existsSync(b2ManifestPath)) {
+    try {
+      const manifestRaw = JSON.parse(fs.readFileSync(b2ManifestPath, "utf8"));
+      if (
+        manifestRaw.manifestType === "C2_GROUND_TRUTH" ||
+        (typeof manifestRaw.sessionId === "string" && manifestRaw.sessionId.startsWith("c2-"))
+      ) {
+        const { verifyC2SessionManifest } = await import("./acquire-positive-ground-truth.mjs");
+        console.log(`[VERIFY] Checking C2 ground truth session manifest: ${resolvedSource}`);
+        const result = verifyC2SessionManifest(resolvedSource);
+        if (result.valid) {
+          console.log(`[VALID] C2 ground truth session manifest verified successfully.`);
+          console.log(`  Directory: ${resolvedSource}`);
+          console.log(`  Manifest Status: VALID (${result.manifest.status})`);
+          console.log(`  Files: ${result.manifest.totalFiles}`);
+          console.log(`  Canonical SHA-256: ${result.manifest.manifestSha256}`);
+          return 0;
+        }
+      }
+    } catch (checkErr) {
+      // If C2 check error is specific, report it; otherwise fall through to standard verifier
+      if (checkErr.message?.startsWith("[C2_MANIFEST_")) {
+        console.error(`[INVALID] C2 ground truth session manifest verification FAILED.`);
+        console.error(`  Directory: ${resolvedSource}`);
+        console.error(`  Error details: ${checkErr.message}`);
+        return 1;
+      }
+    }
+
     const distB2Path = path.resolve(
       __dirname,
       "../backend/dist/research/pilot/EventSessionEvidenceCapture.js",
