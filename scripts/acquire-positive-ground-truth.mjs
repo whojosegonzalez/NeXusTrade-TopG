@@ -687,84 +687,104 @@ export class PositiveGroundTruthAcquisitionCollector {
    * Evaluates a single candidate pool seed.
    */
   async evaluateSeed(seed) {
-    this.log(`Evaluating seed pool '${seed.symbol}' (${seed.poolAddress}) on ${seed.protocol}...`);
+    const seedIdentifier = seed.symbol ?? seed.candidateId ?? seed.poolAddress ?? "UNKNOWN";
+    this.log(
+      `Evaluating seed '${seedIdentifier}' (${seed.poolAddress ?? "pool to be resolved"}) on ${seed.protocol}...`,
+    );
 
-    let candidateSignatures = [];
+    let candidateSig = seed.signature ?? seed.candidateSignature ?? null;
     let isHistoryTruncated = false;
+    let candidateSignatures = [];
 
-    // Page 1: Query getSignaturesForAddress
-    try {
-      const page1Resp = await this.executeRpcCall(
-        "getSignaturesForAddress",
-        [seed.poolAddress, { limit: 100, commitment: "confirmed" }],
-        "history",
+    if (candidateSig) {
+      // Signature-first direct verification (Milestone D.2.9-C3)
+      this.log(
+        `Seed ${seedIdentifier}: using directly provided candidate signature ${candidateSig}`,
       );
-      const page1Sigs = Array.isArray(page1Resp?.result) ? page1Resp.result : [];
-      candidateSignatures.push(...page1Sigs);
       this.candidateHistoryLog.push({
-        poolAddress: seed.poolAddress,
-        symbol: seed.symbol,
-        page: 1,
-        signaturesReturned: page1Sigs.length,
-        oldestSigInPage: page1Sigs[page1Sigs.length - 1]?.signature ?? null,
+        candidateId: seed.candidateId ?? seed.symbol ?? "DIRECT_CANDIDATE",
+        poolAddress: seed.poolAddress ?? null,
+        protocol: seed.protocol,
+        source: seed.source ?? "DIRECT_SIGNATURE_REGISTRY",
+        signature: candidateSig,
+        signaturesReturned: 1,
+        mode: "DIRECT_CANDIDATE_SIGNATURE",
       });
+    } else {
+      // Legacy history search across up to 2 pages (Milestone D.2.9-C2)
+      try {
+        const page1Resp = await this.executeRpcCall(
+          "getSignaturesForAddress",
+          [seed.poolAddress, { limit: 100, commitment: "confirmed" }],
+          "history",
+        );
+        const page1Sigs = Array.isArray(page1Resp?.result) ? page1Resp.result : [];
+        candidateSignatures.push(...page1Sigs);
+        this.candidateHistoryLog.push({
+          poolAddress: seed.poolAddress,
+          symbol: seed.symbol,
+          page: 1,
+          signaturesReturned: page1Sigs.length,
+          oldestSigInPage: page1Sigs[page1Sigs.length - 1]?.signature ?? null,
+        });
 
-      // Page 2: If page 1 returned exactly 100 and pagination allowed
-      if (
-        page1Sigs.length === 100 &&
-        this.options.maxSignaturesPerSeed >= 2 &&
-        this.historyCallsExecuted < this.options.maxHistoryCalls
-      ) {
-        const oldestPage1 = page1Sigs[page1Sigs.length - 1]?.signature;
-        if (oldestPage1) {
-          const page2Resp = await this.executeRpcCall(
-            "getSignaturesForAddress",
-            [seed.poolAddress, { limit: 100, before: oldestPage1, commitment: "confirmed" }],
-            "history",
-          );
-          const page2Sigs = Array.isArray(page2Resp?.result) ? page2Resp.result : [];
-          candidateSignatures.push(...page2Sigs);
-          this.candidateHistoryLog.push({
-            poolAddress: seed.poolAddress,
-            symbol: seed.symbol,
-            page: 2,
-            signaturesReturned: page2Sigs.length,
-            oldestSigInPage: page2Sigs[page2Sigs.length - 1]?.signature ?? null,
-          });
+        // Page 2: If page 1 returned exactly 100 and pagination allowed
+        if (
+          page1Sigs.length === 100 &&
+          this.options.maxSignaturesPerSeed >= 2 &&
+          this.historyCallsExecuted < this.options.maxHistoryCalls
+        ) {
+          const oldestPage1 = page1Sigs[page1Sigs.length - 1]?.signature;
+          if (oldestPage1) {
+            const page2Resp = await this.executeRpcCall(
+              "getSignaturesForAddress",
+              [seed.poolAddress, { limit: 100, before: oldestPage1, commitment: "confirmed" }],
+              "history",
+            );
+            const page2Sigs = Array.isArray(page2Resp?.result) ? page2Resp.result : [];
+            candidateSignatures.push(...page2Sigs);
+            this.candidateHistoryLog.push({
+              poolAddress: seed.poolAddress,
+              symbol: seed.symbol,
+              page: 2,
+              signaturesReturned: page2Sigs.length,
+              oldestSigInPage: page2Sigs[page2Sigs.length - 1]?.signature ?? null,
+            });
 
-          // If page 2 also returned 100, history is deeper than our 200 signature budget window
-          if (page2Sigs.length === 100) {
-            isHistoryTruncated = true;
+            // If page 2 also returned 100, history is deeper than our 200 signature budget window
+            if (page2Sigs.length === 100) {
+              isHistoryTruncated = true;
+            }
           }
         }
+      } catch (err) {
+        this.log(`Error querying signatures for seed ${seed.symbol}: ${err.message}`);
+        this.evaluatedSeeds.push({
+          ...seed,
+          status: "SIGNATURES_QUERY_FAILED",
+          error: err.message,
+        });
+        return;
       }
-    } catch (err) {
-      this.log(`Error querying signatures for seed ${seed.symbol}: ${err.message}`);
-      this.evaluatedSeeds.push({
-        ...seed,
-        status: "SIGNATURES_QUERY_FAILED",
-        error: err.message,
-      });
-      return;
+
+      if (candidateSignatures.length === 0) {
+        this.log(`Seed ${seed.symbol} has 0 signatures in history. Marking EMPTY_HISTORY.`);
+        this.evaluatedSeeds.push({
+          ...seed,
+          status: "EMPTY_HISTORY",
+          candidateSignaturesSeen: 0,
+        });
+        return;
+      }
+
+      // Identify candidate earliest signature
+      const earliestSigEntry = candidateSignatures[candidateSignatures.length - 1];
+      candidateSig = earliestSigEntry?.signature;
+
+      this.log(
+        `Seed ${seed.symbol}: ${candidateSignatures.length} signatures retrieved. Oldest candidate: ${candidateSig}`,
+      );
     }
-
-    if (candidateSignatures.length === 0) {
-      this.log(`Seed ${seed.symbol} has 0 signatures in history. Marking EMPTY_HISTORY.`);
-      this.evaluatedSeeds.push({
-        ...seed,
-        status: "EMPTY_HISTORY",
-        candidateSignaturesSeen: 0,
-      });
-      return;
-    }
-
-    // Identify candidate earliest signature
-    const earliestSigEntry = candidateSignatures[candidateSignatures.length - 1];
-    const candidateSig = earliestSigEntry?.signature;
-
-    this.log(
-      `Seed ${seed.symbol}: ${candidateSignatures.length} signatures retrieved. Oldest candidate: ${candidateSig}`,
-    );
 
     // Fetch candidate transaction (Correction 1: maxSupportedTransactionVersion: 1)
     let txResp;
@@ -955,8 +975,27 @@ export class PositiveGroundTruthAcquisitionCollector {
   /**
    * Executes the full bounded acquisition runbook.
    */
-  async runAcquisition(candidateSeeds = DEFAULT_CANDIDATE_SEEDS) {
+  async runAcquisition(customSeeds = null) {
     await loadBackendDependencies();
+
+    let candidateSeeds = customSeeds;
+    if (!candidateSeeds) {
+      if (this.options.seedsFile && fs.existsSync(this.options.seedsFile)) {
+        try {
+          const raw = fs.readFileSync(this.options.seedsFile, "utf-8");
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            // Load candidate seeds, filtering out reserves unless explicit
+            candidateSeeds = parsed.filter((s) => !s.isReserve);
+          }
+        } catch (err) {
+          this.log(`Failed to read seeds from ${this.options.seedsFile}: ${err.message}`);
+        }
+      }
+    }
+    if (!candidateSeeds) {
+      candidateSeeds = DEFAULT_CANDIDATE_SEEDS;
+    }
 
     this.sessionStartEpochMs = Date.now();
     this.sessionDeadlineEpochMs =
@@ -1242,7 +1281,7 @@ export function parseAcquisitionCliArgs(argv) {
   const options = {};
 
   for (const arg of argv.slice(2)) {
-    if (arg === "--authorize-c2-acquisition") {
+    if (arg === "--authorize-c2-acquisition" || arg === "--authorize-c3-verification") {
       authorized = true;
     } else if (arg === "--network=enabled") {
       networkEnabled = true;
@@ -1270,6 +1309,8 @@ export function parseAcquisitionCliArgs(argv) {
       options.maxSessionDurationSec = parseInt(arg.slice("--max-duration-sec=".length), 10);
     } else if (arg.startsWith("--output-dir=")) {
       options.outputDir = arg.slice("--output-dir=".length).trim();
+    } else if (arg.startsWith("--seeds-file=")) {
+      options.seedsFile = arg.slice("--seeds-file=".length).trim();
     }
   }
 
@@ -1284,7 +1325,7 @@ export async function runAcquisitionCli(argv = process.argv, customOptions = {})
 
   if (!authorized) {
     console.error(
-      "[ERROR] Operator authorization required: missing '--authorize-c2-acquisition' flag.",
+      "[ERROR] Operator authorization required: missing '--authorize-c2-acquisition' or '--authorize-c3-verification' flag.",
     );
     console.error("Execution halted fail-closed without network activity.");
     return 1;

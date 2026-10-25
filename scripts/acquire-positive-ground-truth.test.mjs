@@ -697,3 +697,85 @@ test("Manifest Integrity: Generated C2 session passes verifyC2SessionManifest an
 
   fs.rmSync(tempBaseDir, { recursive: true, force: true });
 });
+
+test("Milestone D.2.9-C3: Signature-first verification executes 0 history calls and verifies candidate directly", async () => {
+  let historyCalls = 0;
+  let transactionCalls = 0;
+
+  const mockTransport = async (method, params) => {
+    if (method === "getSignaturesForAddress") {
+      historyCalls++;
+      return { result: [] };
+    }
+    if (method === "getTransaction") {
+      transactionCalls++;
+      const sig = params[0];
+      if (sig === "amm-sig-1") {
+        return {
+          result: createMockTx({
+            signature: "amm-sig-1",
+            isAmmV4Init: true,
+            poolAddress: "amm-pool-discovered",
+          }),
+        };
+      }
+      if (sig === "cpmm-sig-1") {
+        return {
+          result: createMockTx({
+            signature: "cpmm-sig-1",
+            isCpmmInit: true,
+            poolAddress: "cpmm-pool-discovered",
+          }),
+        };
+      }
+    }
+    return { result: null };
+  };
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "c3-test-direct-"));
+  const collector = new PositiveGroundTruthAcquisitionCollector({
+    transport: mockTransport,
+    minRequestIntervalMs: 0,
+    outputDir: tempDir,
+    maxSeeds: 2,
+    maxTransactionCalls: 2,
+    maxHistoryCalls: 0,
+    maxTotalRpcCalls: 2,
+    targetAmmV4: 1,
+    targetCpmm: 1,
+  });
+
+  const candidates = [
+    {
+      candidateId: "CANDIDATE-01",
+      signature: "amm-sig-1",
+      protocol: "RAYDIUM_AMM_V4",
+      poolAddress: null,
+    },
+    {
+      candidateId: "CANDIDATE-02",
+      signature: "cpmm-sig-1",
+      protocol: "RAYDIUM_CPMM",
+      poolAddress: null,
+    },
+  ];
+
+  const result = await collector.runAcquisition(candidates);
+
+  assert.equal(historyCalls, 0, "Zero getSignaturesForAddress calls executed");
+  assert.equal(transactionCalls, 2, "Exactly 2 getTransaction calls executed");
+  assert.equal(
+    collector.positiveRegistry.length,
+    2,
+    "Both candidates confirmed as authentic positives",
+  );
+  assert.equal(collector.discoveredAmmV4Count, 1);
+  assert.equal(collector.discoveredCpmmCount, 1);
+  assert.equal(collector.positiveRegistry[0].poolAddress, "amm-pool-discovered");
+  assert.equal(collector.positiveRegistry[1].poolAddress, "cpmm-pool-discovered");
+
+  const manifestResult = verifyC2SessionManifest(result.targetDir);
+  assert.equal(manifestResult.valid, true, "Sealed manifest must be valid");
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});

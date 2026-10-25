@@ -1,0 +1,41 @@
+[
+  {
+    "candidateId": "CANDIDATE-01",
+    "signature": "2YY7BM9NMH8fbSgNsy6YhWg6hEvnbpau4kNdmTXYcqs7UHo6NxY8MuZZH7qJke71vuNvmQmUUDA8LdkdgqYyrFP9",
+    "protocol": "RAYDIUM_AMM_V4",
+    "programId": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "instruction": "initialize2",
+    "discriminator": "0x01",
+    "claimedPoolAddress": null,
+    "source": "https://www.soldev.cn/topics/71",
+    "sourceDescription": "Published Solana development tutorial identifying captured Raydium AMM v4 initialize2 transaction",
+    "status": "PUBLICLY_DOCUMENTED_CANDIDATE_UNVERIFIED",
+    "isReserve": false
+  },
+  {
+    "candidateId": "CANDIDATE-02",
+    "signature": "25mwtoditp55vn7kQtqs4RmEfhvEZ4x4AxGFS68M62vnCSwbeQ7Efg9j4ovMen1XwvLVZNFyMPYBjxdVaTgBSkJv",
+    "protocol": "RAYDIUM_CPMM",
+    "programId": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "instruction": "initialize",
+    "discriminator": "0xafaf6d1f0d989bed",
+    "claimedPoolAddress": null,
+    "source": "https://solscan.io/tx/25mwtoditp55vn7kQtqs4RmEfhvEZ4x4AxGFS68M62vnCSwbeQ7Efg9j4ovMen1XwvLVZNFyMPYBjxdVaTgBSkJv",
+    "sourceDescription": "Solscan public transaction explorer identifying successful Raydium CPMM pool creation with initialize instruction",
+    "status": "PUBLICLY_INDEXED_CANDIDATE_UNVERIFIED",
+    "isReserve": false
+  },
+  {
+    "candidateId": "CANDIDATE-03-RESERVE",
+    "signature": "4j6NuFZSfXehhVVe9fw9dqwohWXUqcHVv53uGq5ypyQoh6ZhJFVworjC7EVNCJugvyayNP241ibadi4hjYbALFVi",
+    "protocol": "RAYDIUM_CPMM",
+    "programId": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "instruction": "initialize",
+    "discriminator": "0xafaf6d1f0d989bed",
+    "claimedPoolAddress": "JBAdtP9nYk95z44KRrb8gHffUUr4HVKkuXDKReZ5HyXg",
+    "source": "https://github.com/gyurasitszoltan/pump.footprint/blob/main/pumpapi.io_stream_docs.md",
+    "sourceDescription": "PumpAPI documentation example labeling txType createPool and pool raydium-cpmm",
+    "status": "RESERVE_CANDIDATE_HELD",
+    "isReserve": true
+  }
+]
