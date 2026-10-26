@@ -54,6 +54,8 @@ export interface ShadowQuoteResult {
 export interface IShadowMarketDataProvider {
   readonly providerName: string;
   fetchQuote(poolId: string, mintAddress: string): Promise<ShadowQuoteResult>;
+  getTargetUrl?(poolId: string, mintAddress: string): string;
+  getLastHttpEvidence?(): HttpObservationEvidence | undefined;
 }
 
 export interface ShadowCandidateInput {
@@ -519,6 +521,7 @@ export class ShadowObservationRunner {
         this.forwardQuoteAttemptsCount++;
 
         // 4. Fetch quote from provider safely
+        const requestStartMs = this.clock();
         try {
           const quote = await this.marketDataProvider.fetchQuote(task.poolId, task.mintAddress);
           const actualObsTime = this.clock(); // Timestamp captured AFTER network response
@@ -541,6 +544,28 @@ export class ShadowObservationRunner {
                 horizonSec: task.horizonSec,
                 forwardOutcomeId: forwardRecord.forwardOutcomeId,
                 failureReason: "RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE",
+              });
+            } else {
+              const targetUrl =
+                this.marketDataProvider.getTargetUrl?.(task.poolId, task.mintAddress) ?? "UNKNOWN";
+              this.forwardHttpEvidenceList.push({
+                evidenceType: "FORWARD_QUOTE_OBSERVATION",
+                targetUrl,
+                httpStatus: quote.httpStatus ?? null,
+                requestStartMs,
+                responseCompleteMs: actualObsTime,
+                requestDurationMs: actualObsTime - requestStartMs,
+                rawResponseSha256: null,
+                rawResponseLengthBytes: null,
+                observedPairCount: 0,
+                preservedPairData: null,
+                extractedPriceSol: null,
+                priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+                observedLiquidityUsd: null,
+                failureReason: "RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE",
+                decisionEventId: task.decisionEventId,
+                horizonSec: task.horizonSec,
+                forwardOutcomeId: forwardRecord.forwardOutcomeId,
               });
             }
             task.status = "FINALIZED";
@@ -644,42 +669,56 @@ export class ShadowObservationRunner {
             });
           }
         } catch (err) {
-          const actualObsTime = this.clock();
-          const errMsg = (err as Error).message;
-          if (errMsg.includes("429")) {
-            this.budgetManager.recordResponseStatus(429);
-          }
-          if (this.budgetManager.is429HaltRequired() && !this.isIntakeStopped) {
-            this.earlyStopReason = "CONSECUTIVE_HTTP_429_LIMIT_REACHED";
-            this.stopIntake(actualObsTime);
-          }
+          const failureTimestampMs = this.clock();
+          const errMsg = (err as Error).message || String(err);
 
           // Catch provider failures safely: record outcome without crashing runner
           const forwardRecord = this.recorder.recordHorizonOutcome({
             decisionEventId: task.decisionEventId,
             horizonSec: task.horizonSec,
-            observationTimestampMs: actualObsTime,
+            observationTimestampMs: failureTimestampMs,
             outcomeStatus: "MISSING_QUOTE_UNAVAILABLE",
             indicativePriceSol: null,
             liquidityUsd: null,
             missingReason: `PROVIDER_ERROR: ${errMsg}`,
           });
 
+          // Check if provider preserved truthful HTTP evidence before throwing
+          const providerEvidence =
+            this.marketDataProvider.getLastHttpEvidence?.() ??
+            (this.marketDataProvider as { lastHttpEvidence?: HttpObservationEvidence })
+              .lastHttpEvidence;
+
+          let targetUrl = "UNKNOWN";
+          if (providerEvidence?.targetUrl) {
+            targetUrl = providerEvidence.targetUrl;
+          } else if (this.marketDataProvider.getTargetUrl) {
+            targetUrl = this.marketDataProvider.getTargetUrl(task.poolId, task.mintAddress);
+          }
+
+          const actualStartMs = providerEvidence?.requestStartMs ?? requestStartMs;
+          const actualDurationMs = failureTimestampMs - actualStartMs;
+          const httpStatus = providerEvidence?.httpStatus ?? null;
+          const headersReceivedMs = providerEvidence?.headersReceivedMs ?? null;
+
           this.forwardHttpEvidenceList.push({
             evidenceType: "FORWARD_QUOTE_OBSERVATION",
-            targetUrl: `PROVIDER_FETCH_CALL:${task.poolId}`,
-            httpStatus: errMsg.includes("429") ? 429 : null,
-            requestStartMs: actualObsTime,
-            responseCompleteMs: actualObsTime,
-            requestDurationMs: 0,
+            targetUrl,
+            httpStatus,
+            httpStatusText: providerEvidence?.httpStatusText,
+            requestStartMs: actualStartMs,
+            headersReceivedMs,
+            responseCompleteMs: null, // Response did not complete successfully; never manufacture a completed response
+            failureTimestampMs,
+            requestDurationMs: actualDurationMs,
             rawResponseSha256: null,
-            rawResponseLengthBytes: 0,
+            rawResponseLengthBytes: null,
             observedPairCount: 0,
             preservedPairData: null,
             extractedPriceSol: null,
             priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
             observedLiquidityUsd: null,
-            failureReason: `PROVIDER_ERROR: ${errMsg}`,
+            failureReason: `PROVIDER_ERROR_${errMsg}`,
             decisionEventId: task.decisionEventId,
             horizonSec: task.horizonSec,
             forwardOutcomeId: forwardRecord.forwardOutcomeId,

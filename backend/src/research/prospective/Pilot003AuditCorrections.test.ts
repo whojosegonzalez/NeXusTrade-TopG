@@ -554,4 +554,361 @@ describe("D.3.3 Pilot 003 Consolidated Audit Corrections", () => {
     // Upstream quote freshness was unknown (null) across all records -> average is null
     expect(summaryObserved.dataQuality.quoteFreshnessAverageMs).toBeNull();
   });
+
+  it("Requirement 8: HTTP timeout covers full body retrieval; prompt headers with stalled body aborts cleanly", async () => {
+    let clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    const mockFetch: FetchFunction = async (_url, init) => {
+      clock += 20; // Headers arrive in 20ms
+      const signal = init?.signal;
+      return {
+        status: 200,
+        statusText: "OK",
+        ok: true,
+        text: () =>
+          new Promise<string>((_resolve, reject) => {
+            // Body stalls until aborted
+            if (signal?.aborted) {
+              const err = new Error("The operation was aborted");
+              err.name = "AbortError";
+              reject(err);
+            } else {
+              signal?.addEventListener("abort", () => {
+                clock += 180; // Abort fires at 200ms total
+                const err = new Error("The operation was aborted");
+                err.name = "AbortError";
+                reject(err);
+              });
+            }
+          }),
+      } as unknown as Response;
+    };
+
+    const quoteProvider = new LiveDexScreenerQuoteProvider(
+      budgetManager,
+      mockFetch,
+      () => clock,
+      200, // 200ms timeout
+    );
+
+    const result = await quoteProvider.fetchQuote(VALID_POOL, VALID_MINT);
+    expect(result.indicativePriceSol).toBeNull();
+    expect(result.missingReason).toContain("HTTP_TIMEOUT_AFTER_200MS");
+    expect(result.httpStatus).toBe(200); // Retains genuine headers status received before body stalled!
+
+    const evidence = result.httpEvidence;
+    expect(evidence).toBeDefined();
+    expect(evidence?.headersReceivedMs).toBe(10_000_020);
+    expect(evidence?.responseCompleteMs).toBeNull(); // Never manufactured
+    expect(evidence?.failureTimestampMs).toBe(10_000_200);
+    expect(evidence?.requestDurationMs).toBe(200);
+  });
+
+  it("Requirement 9: Body completion occurring later than headers records accurate completion timing", async () => {
+    let clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    const mockFetch: FetchFunction = async () => {
+      clock += 50; // Headers arrive at +50ms
+      return {
+        status: 200,
+        statusText: "OK",
+        ok: true,
+        text: async () => {
+          clock += 200; // Body stream finishes at +250ms total
+          return JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: VALID_POOL,
+                baseToken: { address: VALID_MINT, symbol: "RAY" },
+                quoteToken: { address: WSOL_MINT, symbol: "SOL" },
+                priceNative: "0.025",
+                liquidity: { usd: 4_500_000 },
+              },
+            ],
+          });
+        },
+      } as unknown as Response;
+    };
+
+    const quoteProvider = new LiveDexScreenerQuoteProvider(
+      budgetManager,
+      mockFetch,
+      () => clock,
+      1000,
+    );
+
+    const result = await quoteProvider.fetchQuote(VALID_POOL, VALID_MINT);
+    expect(result.indicativePriceSol).toBe(0.025);
+    const ev = result.httpEvidence;
+    expect(ev).toBeDefined();
+    expect(ev?.requestStartMs).toBe(10_000_000);
+    expect(ev?.headersReceivedMs).toBe(10_000_050);
+    expect(ev?.responseCompleteMs).toBe(10_000_250);
+    expect(ev?.requestDurationMs).toBe(250);
+  });
+
+  it("Requirement 10: Transport and body-read failures retain truthful request evidence and genuine status", async () => {
+    let clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    // Case A: Connection refused (no headers, no status)
+    const connRefusedFetch: FetchFunction = async () => {
+      clock += 75;
+      throw new Error("connect ECONNREFUSED 127.0.0.1:443");
+    };
+
+    const quoteProviderConn = new LiveDexScreenerQuoteProvider(
+      budgetManager,
+      connRefusedFetch,
+      () => clock,
+    );
+    const resultConn = await quoteProviderConn.fetchQuote(VALID_POOL, VALID_MINT);
+    expect(resultConn.indicativePriceSol).toBeNull();
+    expect(resultConn.httpStatus).toBeNull();
+    const evConn = resultConn.httpEvidence;
+    expect(evConn?.targetUrl).toBe(
+      `https://api.dexscreener.com/latest/dex/pairs/solana/${VALID_POOL}`,
+    );
+    expect(evConn?.requestStartMs).toBe(10_000_000);
+    expect(evConn?.headersReceivedMs).toBeNull();
+    expect(evConn?.responseCompleteMs).toBeNull();
+    expect(evConn?.failureTimestampMs).toBe(10_000_075);
+    expect(evConn?.requestDurationMs).toBe(75);
+    expect(evConn?.failureReason).toContain("ECONNREFUSED");
+
+    // Case B: HTTP 500 headers arrived, but body stream fails mid-read
+    clock = 20_000_000;
+    const streamFailFetch: FetchFunction = async () => {
+      clock += 40; // Headers received at +40ms
+      return {
+        status: 500,
+        statusText: "Internal Server Error",
+        ok: false,
+        text: async () => {
+          clock += 60; // Body read fails at +100ms total
+          throw new Error("Premature close of response stream");
+        },
+      } as unknown as Response;
+    };
+
+    const quoteProviderStream = new LiveDexScreenerQuoteProvider(
+      budgetManager,
+      streamFailFetch,
+      () => clock,
+    );
+    const resultStream = await quoteProviderStream.fetchQuote(VALID_POOL, VALID_MINT);
+    expect(resultStream.indicativePriceSol).toBeNull();
+    expect(resultStream.httpStatus).toBe(500); // Genuinely received 500 status retained!
+    const evStream = resultStream.httpEvidence;
+    expect(evStream?.headersReceivedMs).toBe(20_000_040);
+    expect(evStream?.responseCompleteMs).toBeNull();
+    expect(evStream?.failureTimestampMs).toBe(20_000_100);
+    expect(evStream?.requestDurationMs).toBe(100);
+    expect(evStream?.failureReason).toContain("Premature close");
+  });
+
+  it("Requirement 11: Validates complete priceNative string and rejects reciprocal overflow & malformed values", async () => {
+    const clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    // Helper to test quoteProvider with custom priceNative & base/quote configuration
+    const testPriceParsing = async (
+      priceNative: unknown,
+      isBaseWsol: boolean,
+    ): Promise<{ price: number | null; reason: string | undefined }> => {
+      const mockFetch: FetchFunction = async () => {
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: VALID_POOL,
+                baseToken: isBaseWsol
+                  ? { address: WSOL_MINT, symbol: "SOL" }
+                  : { address: VALID_MINT, symbol: "RAY" },
+                quoteToken: isBaseWsol
+                  ? { address: VALID_MINT, symbol: "RAY" }
+                  : { address: WSOL_MINT, symbol: "SOL" },
+                priceNative,
+                liquidity: { usd: 4_500_000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      };
+      const provider = new LiveDexScreenerQuoteProvider(budgetManager, mockFetch, () => clock);
+      const res = await provider.fetchQuote(VALID_POOL, VALID_MINT);
+      return { price: res.indicativePriceSol, reason: res.missingReason };
+    };
+
+    // 1. Direct path: numeric prefix (parseFloat bug) MUST be rejected as malformed
+    const prefixRes = await testPriceParsing("0.025abc", false);
+    expect(prefixRes.price).toBeNull();
+    expect(prefixRes.reason).toBe("MALFORMED_PRICE_NATIVE_STRING");
+
+    // 2. Direct path: negative price MUST be rejected
+    const negativeRes = await testPriceParsing("-0.025", false);
+    expect(negativeRes.price).toBeNull();
+    expect(negativeRes.reason).toBe("MALFORMED_PRICE_NATIVE_STRING");
+
+    // 3. Direct path: zero price MUST be rejected
+    const zeroRes = await testPriceParsing("0.000", false);
+    expect(zeroRes.price).toBeNull();
+    expect(zeroRes.reason).toBe("INVALID_PRICE_NATIVE_VALUE");
+
+    // 4. Inverted path: reciprocal overflow (tiny denominator 1e-320 -> Infinity) MUST be rejected
+    const overflowRes = await testPriceParsing("1e-320", true);
+    expect(overflowRes.price).toBeNull();
+    expect(overflowRes.reason).toBe("RECIPROCAL_OVERFLOW_OR_UNDERFLOW");
+
+    // 5. Inverted path: non-finite float (1e320 > MAX_VALUE -> Infinity) MUST be rejected
+    const nonFiniteRes = await testPriceParsing("1e320", true);
+    expect(nonFiniteRes.price).toBeNull();
+    expect(nonFiniteRes.reason).toBe("INVALID_PRICE_NATIVE_VALUE");
+
+    // 6. Valid inverted price (1 / 0.025 = 40.0) MUST succeed
+    const validInverted = await testPriceParsing("0.025", true);
+    expect(validInverted.price).toBe(40.0);
+    expect(validInverted.reason).toBeUndefined();
+  });
+
+  it("Requirement 12: Forward request beginning when due and completing after session deadline exercises response-after-deadline branch and links evidence", async () => {
+    let clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nxt-late-deadline-"));
+    const recorder = new ProspectiveObservationRecorder({
+      sessionId: "session-late-resp-test",
+      configFingerprint: "sha256:late-resp",
+      outputDir: tmpDir,
+      clock: () => clock,
+    });
+
+    // Mock quote provider whose fetchQuote begins when due (t0 + 300s) and completes after session deadline (t0 + 360s)
+    const mockQuoteProvider: IShadowMarketDataProvider = {
+      providerName: "DEXSCREENER",
+      getTargetUrl: () => `https://api.dexscreener.com/latest/dex/pairs/solana/${VALID_POOL}`,
+      fetchQuote: async () => {
+        clock = 10_365_000; // Response completes 5 seconds AFTER the 10_360_000 session deadline!
+        return {
+          indicativePriceSol: 0.026,
+          liquidityUsd: 4_500_000,
+          quoteTimestampMs: null,
+          quoteSource: "DEXSCREENER",
+          isExecutableQuote: false,
+          httpStatus: 200,
+          httpEvidence: {
+            evidenceType: "FORWARD_QUOTE_OBSERVATION",
+            targetUrl: `https://api.dexscreener.com/latest/dex/pairs/solana/${VALID_POOL}`,
+            httpStatus: 200,
+            requestStartMs: 10_300_000,
+            responseCompleteMs: 10_365_000,
+            requestDurationMs: 65_000,
+            rawResponseSha256: crypto.createHash("sha256").update("mock").digest("hex"),
+            rawResponseLengthBytes: 4,
+            observedPairCount: 1,
+            preservedPairData: { pool: VALID_POOL },
+            extractedPriceSol: 0.026,
+            priceInterpretation: "DIRECT_BASE_WSOL",
+            observedLiquidityUsd: 4_500_000,
+            failureReason: null,
+          },
+        };
+      },
+    };
+
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "session-late-resp-test",
+        configFingerprint: "sha256:late-resp",
+        intakeDurationMs: 60_000,
+        drainDurationMs: 300_000, // Total session ceiling: 10_360_000
+        outputDir: tmpDir,
+        clock: () => clock,
+      },
+      { marketDataProvider: mockQuoteProvider, budgetManager, recorder },
+    );
+
+    const decId = runner.ingestCandidate(
+      {
+        poolId: VALID_POOL,
+        mintAddress: VALID_MINT,
+        symbol: "RAY",
+        discoveryTimestampMs: clock,
+        streamSource: "DEXSCREENER_EXACT_PAIR_LOOKUP",
+        indicativePriceSol: 0.025,
+        priceQuoteTimestampMs: null,
+        liquidityUsd: 4_500_000,
+        marketCapUsd: 500_000_000,
+        lmcRatio: null,
+        lpBurnPct: null,
+        assetAgeSeconds: 86400,
+        volume5mUsd: 50000,
+        buys5m: 10,
+        sells5m: 5,
+        buyToSellRatio: 2.0,
+      },
+      clock,
+    );
+    expect(decId).not.toBeNull();
+
+    // Advance clock to when horizon 300 is due (10_300_000)
+    clock = 10_300_000;
+    const processed = await runner.processDueObservations(clock);
+    expect(processed).toBe(1);
+
+    // Verify outcome recorded as MISSING_QUOTE_UNAVAILABLE with RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE
+    const fwdRecords = recorder.getForwardRecords();
+    const h300Record = fwdRecords.find((r) => r.horizonSec === 300);
+    expect(h300Record).toBeDefined();
+    expect(h300Record?.outcomeStatus).toBe("MISSING_QUOTE_UNAVAILABLE");
+    expect(h300Record?.missingReason).toBe("RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE");
+    expect(h300Record?.actualObservationTimestampMs).toBe(10_365_000);
+
+    // Verify evidence linkage
+    const forwardEv = runner.getForwardHttpEvidence();
+    expect(forwardEv.length).toBe(1);
+    expect(forwardEv[0]?.decisionEventId).toBe(decId);
+    expect(forwardEv[0]?.horizonSec).toBe(300);
+    expect(forwardEv[0]?.forwardOutcomeId).toBe(h300Record?.forwardOutcomeId);
+    expect(forwardEv[0]?.failureReason).toBe("RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE");
+
+    // Close session and verify manifest file digests include forward-quote-evidence.json
+    const { manifest } = runner.closeSession(10_365_000);
+    expect(manifest.files.some((f) => f.filename === "forward-quote-evidence.json")).toBe(true);
+
+    const fwdEvidenceDisk = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "forward-quote-evidence.json"), "utf8"),
+    );
+    expect(fwdEvidenceDisk[0].forwardOutcomeId).toBe(h300Record?.forwardOutcomeId);
+    expect(fwdEvidenceDisk[0].failureReason).toBe("RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE");
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
 });

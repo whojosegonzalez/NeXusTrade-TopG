@@ -45,6 +45,81 @@ export function isWsolToken(token?: { address?: string; symbol?: string }): bool
   return token.address === WSOL_MINT;
 }
 
+export interface ParsedPriceResult {
+  readonly priceSol: number | null;
+  readonly interpretation: "DIRECT_BASE_WSOL" | "INVERTED_QUOTE_WSOL" | null;
+  readonly errorReason: string | null;
+}
+
+/**
+ * Validates the complete priceNative string rather than accepting a numeric prefix through parseFloat().
+ * Requires the final indicative SOL price to be strictly positive and finite.
+ * Rejects malformed values and reciprocal overflow with explicit diagnostic reasons.
+ */
+export function parseStrictIndicativePriceSol(
+  rawPriceNative: unknown,
+  isBaseToken: boolean,
+): ParsedPriceResult {
+  if (typeof rawPriceNative !== "string") {
+    return {
+      priceSol: null,
+      interpretation: null,
+      errorReason: "MISSING_PRICE_NATIVE",
+    };
+  }
+
+  const trimmed = rawPriceNative.trim();
+  if (trimmed.length === 0) {
+    return {
+      priceSol: null,
+      interpretation: null,
+      errorReason: "MALFORMED_PRICE_NATIVE_STRING",
+    };
+  }
+
+  // Reject strings with trailing or leading non-numeric chars, NaN, Infinity, negative signs, etc.
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+    return {
+      priceSol: null,
+      interpretation: null,
+      errorReason: "MALFORMED_PRICE_NATIVE_STRING",
+    };
+  }
+
+  const num = Number(trimmed);
+  if (!Number.isFinite(num) || Number.isNaN(num) || num <= 0) {
+    return {
+      priceSol: null,
+      interpretation: null,
+      errorReason: "INVALID_PRICE_NATIVE_VALUE",
+    };
+  }
+
+  if (isBaseToken) {
+    return {
+      priceSol: num,
+      interpretation: "DIRECT_BASE_WSOL",
+      errorReason: null,
+    };
+  }
+
+  // Inverted conversion: 1 / num
+  const inverted = 1 / num;
+  if (!Number.isFinite(inverted) || Number.isNaN(inverted) || inverted <= 0) {
+    return {
+      priceSol: null,
+      interpretation: "INVERTED_QUOTE_WSOL",
+      errorReason: "RECIPROCAL_OVERFLOW_OR_UNDERFLOW",
+    };
+  }
+
+  return {
+    priceSol: inverted,
+    interpretation: "INVERTED_QUOTE_WSOL",
+    errorReason: null,
+  };
+}
+
 export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
   public readonly providerName = "DEXSCREENER";
   private readonly fetchFn: FetchFunction;
@@ -75,59 +150,65 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     return this.evidenceHistory;
   }
 
+  public getTargetUrl(poolId?: string, mintAddress?: string): string {
+    return poolId && poolId.length > 20
+      ? `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${poolId}`
+      : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
+  }
+
   async fetchQuote(poolId: string, mintAddress: string): Promise<ShadowQuoteResult> {
-    const targetUrl =
-      poolId && poolId.length > 20
-        ? `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${poolId}`
-        : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
+    const targetUrl = this.getTargetUrl(poolId, mintAddress);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
     const requestStartMs = this.clock();
-    let res: Response;
+    let headersReceivedMs: number | null = null;
+    let receivedStatus: number | null = null;
+    let receivedStatusText: string | null = null;
+    let responseCompleteMs: number | null = null;
+    let rawText: string | null = null;
+
     try {
-      res = await this.fetchFn(targetUrl, {
+      const res = await this.fetchFn(targetUrl, {
         method: "GET",
         headers: { Accept: "application/json" },
         signal: controller.signal,
       });
+
+      headersReceivedMs = this.clock();
+      receivedStatus = res.status;
+      receivedStatusText = res.statusText;
+      this.budgetManager.recordResponseStatus(res.status);
+
+      rawText = await res.text();
+      responseCompleteMs = this.clock();
     } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        throw new Error(`HTTP request timed out after ${this.timeoutMs}ms`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timeoutId);
-    }
+      const failureTimestampMs = this.clock();
+      const isTimeout =
+        (err as Error).name === "AbortError" || (err as Error).message?.includes("timed out");
+      const failureReason = isTimeout
+        ? `HTTP_TIMEOUT_AFTER_${this.timeoutMs}MS`
+        : `TRANSPORT_ERROR_${(err as Error).name || "ERROR"}: ${(err as Error).message}`;
 
-    const responseCompleteMs = this.clock();
-    const requestDurationMs = responseCompleteMs - requestStartMs;
-
-    const httpStatus = res.status;
-    this.budgetManager.recordResponseStatus(httpStatus);
-
-    const rawText = await res.text();
-    const rawResponseSha256 = crypto.createHash("sha256").update(rawText).digest("hex");
-    const rawResponseLengthBytes = Buffer.byteLength(rawText, "utf8");
-
-    if (!res.ok) {
       const httpEvidence: HttpObservationEvidence = {
         evidenceType: "FORWARD_QUOTE_OBSERVATION",
         targetUrl,
-        httpStatus,
-        httpStatusText: res.statusText,
+        httpStatus: receivedStatus,
+        httpStatusText: receivedStatusText ?? undefined,
         requestStartMs,
-        responseCompleteMs,
-        requestDurationMs,
-        rawResponseSha256,
-        rawResponseLengthBytes,
+        headersReceivedMs,
+        responseCompleteMs: null,
+        failureTimestampMs,
+        requestDurationMs: failureTimestampMs - requestStartMs,
+        rawResponseSha256: null,
+        rawResponseLengthBytes: null,
         observedPairCount: 0,
         preservedPairData: null,
         extractedPriceSol: null,
         priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
         observedLiquidityUsd: null,
-        failureReason: `HTTP_${httpStatus}_${res.statusText}`,
+        failureReason,
       };
       this.lastHttpEvidence = httpEvidence;
       this.evidenceHistory.push(httpEvidence);
@@ -138,7 +219,48 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         quoteTimestampMs: null,
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
-        missingReason: `HTTP_${httpStatus}_${res.statusText}`,
+        missingReason: failureReason,
+        httpStatus: receivedStatus,
+        httpEvidence,
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const requestDurationMs = responseCompleteMs - requestStartMs;
+    const httpStatus = receivedStatus!;
+    const rawResponseSha256 = crypto.createHash("sha256").update(rawText).digest("hex");
+    const rawResponseLengthBytes = Buffer.byteLength(rawText, "utf8");
+
+    if (httpStatus < 200 || httpStatus >= 300) {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: receivedStatusText ?? undefined,
+        requestStartMs,
+        headersReceivedMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: 0,
+        preservedPairData: null,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: `HTTP_${httpStatus}_${receivedStatusText || "ERROR"}`,
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
+      return {
+        indicativePriceSol: null,
+        liquidityUsd: null,
+        quoteTimestampMs: null,
+        quoteSource: "DEXSCREENER",
+        isExecutableQuote: false,
+        missingReason: `HTTP_${httpStatus}_${receivedStatusText || "ERROR"}`,
         httpStatus,
         httpEvidence,
       };
@@ -152,8 +274,9 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         evidenceType: "FORWARD_QUOTE_OBSERVATION",
         targetUrl,
         httpStatus,
-        httpStatusText: res.statusText,
+        httpStatusText: receivedStatusText ?? undefined,
         requestStartMs,
+        headersReceivedMs,
         responseCompleteMs,
         requestDurationMs,
         rawResponseSha256,
@@ -192,24 +315,39 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
               : []
     ) as Array<Record<string, unknown>>;
 
+    const makeEvidence = (
+      preservedPair: Record<string, unknown> | null,
+      priceSol: number | null,
+      interp: "DIRECT_BASE_WSOL" | "INVERTED_QUOTE_WSOL" | "NON_WSOL_OR_UNAVAILABLE",
+      liqUsd: number | null,
+      failReason: string | null,
+    ): HttpObservationEvidence => ({
+      evidenceType: "FORWARD_QUOTE_OBSERVATION",
+      targetUrl,
+      httpStatus,
+      httpStatusText: receivedStatusText ?? undefined,
+      requestStartMs,
+      headersReceivedMs,
+      responseCompleteMs,
+      requestDurationMs,
+      rawResponseSha256,
+      rawResponseLengthBytes,
+      observedPairCount: pairs.length,
+      preservedPairData: preservedPair,
+      extractedPriceSol: priceSol,
+      priceInterpretation: interp,
+      observedLiquidityUsd: liqUsd,
+      failureReason: failReason,
+    });
+
     if (pairs.length === 0) {
-      const httpEvidence: HttpObservationEvidence = {
-        evidenceType: "FORWARD_QUOTE_OBSERVATION",
-        targetUrl,
-        httpStatus,
-        httpStatusText: res.statusText,
-        requestStartMs,
-        responseCompleteMs,
-        requestDurationMs,
-        rawResponseSha256,
-        rawResponseLengthBytes,
-        observedPairCount: 0,
-        preservedPairData: null,
-        extractedPriceSol: null,
-        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
-        observedLiquidityUsd: null,
-        failureReason: "EMPTY_PAIRS_ARRAY",
-      };
+      const httpEvidence = makeEvidence(
+        null,
+        null,
+        "NON_WSOL_OR_UNAVAILABLE",
+        null,
+        "EMPTY_PAIRS_ARRAY",
+      );
       this.lastHttpEvidence = httpEvidence;
       this.evidenceHistory.push(httpEvidence);
 
@@ -228,23 +366,13 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     // 1. Filter Solana pairs
     const solPairs = pairs.filter((p) => p && p.chainId === "solana");
     if (solPairs.length === 0) {
-      const httpEvidence: HttpObservationEvidence = {
-        evidenceType: "FORWARD_QUOTE_OBSERVATION",
-        targetUrl,
-        httpStatus,
-        httpStatusText: res.statusText,
-        requestStartMs,
-        responseCompleteMs,
-        requestDurationMs,
-        rawResponseSha256,
-        rawResponseLengthBytes,
-        observedPairCount: pairs.length,
-        preservedPairData: (pairs[0] as Record<string, unknown> | undefined) ?? null,
-        extractedPriceSol: null,
-        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
-        observedLiquidityUsd: null,
-        failureReason: "NON_SOLANA_CHAIN",
-      };
+      const httpEvidence = makeEvidence(
+        (pairs[0] as Record<string, unknown> | undefined) ?? null,
+        null,
+        "NON_WSOL_OR_UNAVAILABLE",
+        null,
+        "NON_SOLANA_CHAIN",
+      );
       this.lastHttpEvidence = httpEvidence;
       this.evidenceHistory.push(httpEvidence);
 
@@ -274,23 +402,13 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         const reason = poolOnOtherDex
           ? "NON_RAYDIUM_DEX_REJECTED"
           : "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND";
-        const httpEvidence: HttpObservationEvidence = {
-          evidenceType: "FORWARD_QUOTE_OBSERVATION",
-          targetUrl,
-          httpStatus,
-          httpStatusText: res.statusText,
-          requestStartMs,
-          responseCompleteMs,
-          requestDurationMs,
-          rawResponseSha256,
-          rawResponseLengthBytes,
-          observedPairCount: pairs.length,
-          preservedPairData: (poolOnOtherDex ?? solPairs[0]) || null,
-          extractedPriceSol: null,
-          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
-          observedLiquidityUsd: null,
-          failureReason: reason,
-        };
+        const httpEvidence = makeEvidence(
+          (poolOnOtherDex ?? solPairs[0]) || null,
+          null,
+          "NON_WSOL_OR_UNAVAILABLE",
+          null,
+          reason,
+        );
         this.lastHttpEvidence = httpEvidence;
         this.evidenceHistory.push(httpEvidence);
 
@@ -309,23 +427,13 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       // Raydium pool matching when poolId is not specified
       matchingPair = solPairs.find((p) => p.dexId === "raydium");
       if (!matchingPair) {
-        const httpEvidence: HttpObservationEvidence = {
-          evidenceType: "FORWARD_QUOTE_OBSERVATION",
-          targetUrl,
-          httpStatus,
-          httpStatusText: res.statusText,
-          requestStartMs,
-          responseCompleteMs,
-          requestDurationMs,
-          rawResponseSha256,
-          rawResponseLengthBytes,
-          observedPairCount: pairs.length,
-          preservedPairData: (solPairs[0] as Record<string, unknown> | undefined) ?? null,
-          extractedPriceSol: null,
-          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
-          observedLiquidityUsd: null,
-          failureReason: "NO_RAYDIUM_POOL_FOUND",
-        };
+        const httpEvidence = makeEvidence(
+          (solPairs[0] as Record<string, unknown> | undefined) ?? null,
+          null,
+          "NON_WSOL_OR_UNAVAILABLE",
+          null,
+          "NO_RAYDIUM_POOL_FOUND",
+        );
         this.lastHttpEvidence = httpEvidence;
         this.evidenceHistory.push(httpEvidence);
 
@@ -349,23 +457,13 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     const isQuoteToken = quoteToken.address === mintAddress;
 
     if (!isBaseToken && !isQuoteToken) {
-      const httpEvidence: HttpObservationEvidence = {
-        evidenceType: "FORWARD_QUOTE_OBSERVATION",
-        targetUrl,
-        httpStatus,
-        httpStatusText: res.statusText,
-        requestStartMs,
-        responseCompleteMs,
-        requestDurationMs,
-        rawResponseSha256,
-        rawResponseLengthBytes,
-        observedPairCount: pairs.length,
-        preservedPairData: matchingPair,
-        extractedPriceSol: null,
-        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
-        observedLiquidityUsd: null,
-        failureReason: "MINT_ADDRESS_MISMATCH",
-      };
+      const httpEvidence = makeEvidence(
+        matchingPair,
+        null,
+        "NON_WSOL_OR_UNAVAILABLE",
+        null,
+        "MINT_ADDRESS_MISMATCH",
+      );
       this.lastHttpEvidence = httpEvidence;
       this.evidenceHistory.push(httpEvidence);
 
@@ -381,21 +479,21 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       };
     }
 
-    // 4. Validate quote token denomination (WSOL check)
+    // 4. Validate quote token denomination (WSOL check) and strictly parse priceNative
     let indicativePriceSol: number | null = null;
     let missingReason: string | undefined;
 
     if (isBaseToken) {
       if (isWsolToken(quoteToken)) {
-        if (typeof matchingPair.priceNative === "string") {
-          const parsed = Number.parseFloat(matchingPair.priceNative);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            indicativePriceSol = parsed;
-          } else {
-            missingReason = "INVALID_PRICE_NATIVE_FORMAT";
-          }
+        const priceResult = parseStrictIndicativePriceSol(matchingPair.priceNative, true);
+        if (
+          priceResult.priceSol !== null &&
+          Number.isFinite(priceResult.priceSol) &&
+          priceResult.priceSol > 0
+        ) {
+          indicativePriceSol = priceResult.priceSol;
         } else {
-          missingReason = "MISSING_PRICE_NATIVE";
+          missingReason = priceResult.errorReason ?? "INVALID_PRICE_NATIVE_VALUE";
         }
       } else {
         // Quote token is USDC, USDT, or non-SOL: no arbitrary $150/SOL conversion allowed
@@ -405,15 +503,15 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     } else {
       // Inverted pair (candidate is quote token)
       if (isWsolToken(baseToken)) {
-        if (typeof matchingPair.priceNative === "string") {
-          const parsed = Number.parseFloat(matchingPair.priceNative);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            indicativePriceSol = 1 / parsed;
-          } else {
-            missingReason = "INVALID_PRICE_NATIVE_FORMAT";
-          }
+        const priceResult = parseStrictIndicativePriceSol(matchingPair.priceNative, false);
+        if (
+          priceResult.priceSol !== null &&
+          Number.isFinite(priceResult.priceSol) &&
+          priceResult.priceSol > 0
+        ) {
+          indicativePriceSol = priceResult.priceSol;
         } else {
-          missingReason = "MISSING_PRICE_NATIVE";
+          missingReason = priceResult.errorReason ?? "INVALID_PRICE_NATIVE_VALUE";
         }
       } else {
         indicativePriceSol = null;
@@ -444,27 +542,23 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     // avoiding the manufacture of quote freshness from local HTTP retrieval time.
     const quoteTimestampMs: number | null = null;
 
-    const httpEvidence: HttpObservationEvidence = {
-      evidenceType: "FORWARD_QUOTE_OBSERVATION",
-      targetUrl,
-      httpStatus,
-      httpStatusText: res.statusText,
-      requestStartMs,
-      responseCompleteMs,
-      requestDurationMs,
-      rawResponseSha256,
-      rawResponseLengthBytes,
-      observedPairCount: pairs.length,
-      preservedPairData: matchingPair,
-      extractedPriceSol: indicativePriceSol,
-      priceInterpretation: isBaseToken
+    const priceInterpretation:
+      | "DIRECT_BASE_WSOL"
+      | "INVERTED_QUOTE_WSOL"
+      | "NON_WSOL_OR_UNAVAILABLE" =
+      isBaseToken && isWsolToken(quoteToken)
         ? "DIRECT_BASE_WSOL"
-        : isQuoteToken
+        : isQuoteToken && isWsolToken(baseToken)
           ? "INVERTED_QUOTE_WSOL"
-          : "NON_WSOL_OR_UNAVAILABLE",
-      observedLiquidityUsd: liquidityUsd,
-      failureReason: missingReason ?? null,
-    };
+          : "NON_WSOL_OR_UNAVAILABLE";
+
+    const httpEvidence = makeEvidence(
+      matchingPair,
+      indicativePriceSol,
+      priceInterpretation,
+      liquidityUsd,
+      missingReason ?? null,
+    );
     this.lastHttpEvidence = httpEvidence;
     this.evidenceHistory.push(httpEvidence);
 
@@ -661,6 +755,11 @@ export class LiveDexScreenerCandidateSource {
       : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
 
     const requestStartMs = this.clock();
+    let headersReceivedMs: number | null = null;
+    let receivedStatus: number | null = null;
+    let receivedStatusText: string | null = null;
+    let responseCompleteMs: number | null = null;
+
     try {
       const res = await this.fetchFn(targetUrl, {
         method: "GET",
@@ -668,12 +767,15 @@ export class LiveDexScreenerCandidateSource {
         signal: controller.signal,
       });
 
-      const responseCompleteMs = this.clock();
-      const requestDurationMs = responseCompleteMs - requestStartMs;
-
+      headersReceivedMs = this.clock();
+      receivedStatus = res.status;
+      receivedStatusText = res.statusText;
       this.budgetManager.recordResponseStatus(res.status);
 
       const rawText = await res.text();
+      responseCompleteMs = this.clock();
+      const requestDurationMs = responseCompleteMs - requestStartMs;
+
       const payloadSha256 = crypto.createHash("sha256").update(rawText).digest("hex");
       const rawBytes = Buffer.byteLength(rawText, "utf8");
       const snippet = rawText.slice(0, 500);
@@ -688,6 +790,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -720,6 +823,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -761,6 +865,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -811,6 +916,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -857,14 +963,16 @@ export class LiveDexScreenerCandidateSource {
 
         if (!hasCanonicalWsol) {
           missingPriceReason = "NON_SOL_QUOTE_DENOMINATION";
-        } else if (typeof p.priceNative !== "string") {
-          missingPriceReason = "MISSING_PRICE_NATIVE";
         } else {
-          const parsed = Number.parseFloat(p.priceNative);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            indicativePriceSol = isBaseToken ? parsed : 1 / parsed;
+          const priceResult = parseStrictIndicativePriceSol(p.priceNative, isBaseToken);
+          if (
+            priceResult.priceSol !== null &&
+            Number.isFinite(priceResult.priceSol) &&
+            priceResult.priceSol > 0
+          ) {
+            indicativePriceSol = priceResult.priceSol;
           } else {
-            missingPriceReason = "INVALID_PRICE_NATIVE_VALUE";
+            missingPriceReason = priceResult.errorReason ?? "INVALID_PRICE_NATIVE_VALUE";
           }
         }
 
@@ -878,7 +986,10 @@ export class LiveDexScreenerCandidateSource {
         const volume5mUsd =
           typeof volume.m5 === "number" && Number.isFinite(volume.m5) ? volume.m5 : null;
 
-        const hasValidPrice = indicativePriceSol !== null && indicativePriceSol > 0;
+        const hasValidPrice =
+          indicativePriceSol !== null &&
+          Number.isFinite(indicativePriceSol) &&
+          indicativePriceSol > 0;
 
         return {
           pair: p,
@@ -911,6 +1022,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -940,6 +1052,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -969,6 +1082,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -998,6 +1112,7 @@ export class LiveDexScreenerCandidateSource {
             httpStatus: res.status,
             httpStatusText: res.statusText,
             requestStartMs,
+            headersReceivedMs,
             responseCompleteMs,
             requestDurationMs,
             rawResponseSha256: payloadSha256,
@@ -1028,6 +1143,7 @@ export class LiveDexScreenerCandidateSource {
           httpStatus: res.status,
           httpStatusText: res.statusText,
           requestStartMs,
+          headersReceivedMs,
           responseCompleteMs,
           requestDurationMs,
           rawResponseSha256: payloadSha256,
@@ -1193,16 +1309,25 @@ export class LiveDexScreenerCandidateSource {
       };
     } catch (err) {
       if (targetPoolAddress) {
-        const responseCompleteMs = this.clock();
+        const failureTimestampMs = this.clock();
+        const isTimeout =
+          (err as Error).name === "AbortError" || (err as Error).message?.includes("timed out");
+        const failureReason = isTimeout
+          ? `HTTP_TIMEOUT_AFTER_${this.timeoutMs}MS`
+          : `FETCH_ERROR_${(err as Error).name || (err as Error).message}`;
+
         this.lastSeededLookupDiagnostics = {
           evidenceType: "BASELINE_SEEDED_LOOKUP",
           targetUrl,
           mintAddress,
           targetPoolAddress,
-          httpStatus: null,
+          httpStatus: receivedStatus,
+          httpStatusText: receivedStatusText ?? undefined,
           requestStartMs,
-          responseCompleteMs,
-          requestDurationMs: responseCompleteMs - requestStartMs,
+          headersReceivedMs,
+          responseCompleteMs: null,
+          failureTimestampMs,
+          requestDurationMs: failureTimestampMs - requestStartMs,
           rawResponseSha256: null,
           payloadSha256: null,
           rawResponseLengthBytes: 0,
@@ -1211,8 +1336,8 @@ export class LiveDexScreenerCandidateSource {
           extractedPriceSol: null,
           priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
           observedLiquidityUsd: null,
-          failureReason: `FETCH_ERROR_${(err as Error).name || (err as Error).message}`,
-          timestampMs: this.clock(),
+          failureReason,
+          timestampMs: failureTimestampMs,
         };
       }
       this.mismatchedPairsCount++;

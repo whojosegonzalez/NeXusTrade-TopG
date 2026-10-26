@@ -132,10 +132,12 @@ export interface HttpObservationEvidence {
   readonly httpStatus: number | null;
   readonly httpStatusText?: string | undefined;
   readonly requestStartMs: number;
-  readonly responseCompleteMs: number;
-  readonly requestDurationMs: number;
+  readonly headersReceivedMs?: number | null | undefined;
+  readonly responseCompleteMs: number | null;
+  readonly failureTimestampMs?: number | null | undefined;
+  readonly requestDurationMs: number | null;
   readonly rawResponseSha256: string | null;
-  readonly rawResponseLengthBytes: number;
+  readonly rawResponseLengthBytes: number | null;
   readonly observedPairCount: number;
   readonly preservedPairData: Record<string, unknown> | null;
   readonly extractedPriceSol: number | null;
