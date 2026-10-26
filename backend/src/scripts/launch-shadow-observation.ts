@@ -45,6 +45,8 @@ export interface ShadowLauncherArgs {
   minReservedForwardRequests?: number | undefined;
   pacingMs?: number | undefined;
   pollIntervalMs?: number | undefined;
+  seedMint?: string | undefined;
+  seedPool?: string | undefined;
   dryRun?: boolean | undefined;
 }
 
@@ -151,6 +153,10 @@ export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
       args.pacingMs = Number(argv[++i]);
     } else if (arg === "--pollIntervalMs" && argv[i + 1]) {
       args.pollIntervalMs = Number(argv[++i]);
+    } else if (arg === "--seedMint" && argv[i + 1]) {
+      args.seedMint = argv[++i];
+    } else if (arg === "--seedPool" && argv[i + 1]) {
+      args.seedPool = argv[++i];
     } else if (arg === "--dryRun") {
       args.dryRun = true;
     }
@@ -300,6 +306,26 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
 
   process.once("SIGINT", () => handleExitSignal("SIGINT"));
   process.once("SIGTERM", () => handleExitSignal("SIGTERM"));
+
+  // 6.5 Optional Verified Reference Seed Mint Injection
+  if (cliArgs.seedMint) {
+    console.log(`[SEED_FIXTURE] Ingesting verified reference mint fixture: ${cliArgs.seedMint}`);
+    try {
+      const seedCandidate = await candidateSource.enrichCandidate(cliArgs.seedMint);
+      if (seedCandidate) {
+        const decId = runner.ingestCandidate(seedCandidate, Date.now());
+        console.log(
+          `  -> Seed candidate evaluated: ${seedCandidate.symbol} (${seedCandidate.mintAddress.slice(0, 8)}...) - Pool: ${seedCandidate.poolId} - Decision: ${decId}`,
+        );
+      } else {
+        console.warn(
+          `[SEED_FIXTURE_WARN] Could not enrich seed mint ${cliArgs.seedMint} on Raydium.`,
+        );
+      }
+    } catch (err) {
+      console.error(`[SEED_FIXTURE_ERROR] Failed to enrich seed mint: ${(err as Error).message}`);
+    }
+  }
 
   // 7. Supervision Loop
   console.log("\n[EXECUTION] Starting bounded observation supervision loop...");

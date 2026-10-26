@@ -399,7 +399,7 @@ export class LiveDexScreenerCandidateSource {
     return candidates;
   }
 
-  private async enrichCandidate(mintAddress: string): Promise<ShadowCandidateInput | null> {
+  public async enrichCandidate(mintAddress: string): Promise<ShadowCandidateInput | null> {
     const now = this.clock();
     const recorded = this.budgetManager.recordRequestAttempt(
       "DEXSCREENER",
