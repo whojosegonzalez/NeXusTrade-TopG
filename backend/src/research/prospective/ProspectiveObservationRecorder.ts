@@ -259,10 +259,13 @@ export class ProspectiveObservationRecorder {
         (input.marketFeatures.priceQuoteTimestampMs !== null
           ? Math.max(0, now - input.marketFeatures.priceQuoteTimestampMs)
           : null),
+      selectedPoolAddress: input.marketFeatures.selectedPoolAddress ?? undefined,
+      poolSelectionBasis: input.marketFeatures.poolSelectionBasis ?? undefined,
       liquidityUsd: input.marketFeatures.liquidityUsd,
       volume5mUsd: input.marketFeatures.volume5mUsd,
       marketCapUsd: input.marketFeatures.marketCapUsd,
       assetAgeSeconds: input.marketFeatures.assetAgeSeconds,
+      lpBurnPct: input.marketFeatures.lpBurnPct ?? null,
       holdersCount: input.marketFeatures.holdersCount,
       buyToSellRatio: input.marketFeatures.buyToSellRatio,
       recentBuys60s: input.marketFeatures.recentBuys60s,
@@ -372,11 +375,16 @@ export class ProspectiveObservationRecorder {
           (((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4),
         );
       } else if (input.outcomeStatus === "POOL_DRAINED") {
-        // Adverse outcome: if residual price exists calculate, otherwise -100% loss
-        priceReturnPct =
-          input.indicativePriceSol !== null && input.indicativePriceSol > 0
-            ? Number((((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4))
-            : -100.0;
+        // Adverse outcome: preserve actual return if residual price exists; if price is confirmed 0 calculate -100%; otherwise null
+        if (input.indicativePriceSol !== null && input.indicativePriceSol > 0) {
+          priceReturnPct = Number(
+            (((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4),
+          );
+        } else if (input.indicativePriceSol === 0) {
+          priceReturnPct = -100.0;
+        } else {
+          priceReturnPct = null;
+        }
       }
     }
 
@@ -614,15 +622,19 @@ export class ProspectiveObservationRecorder {
     };
 
     // Data quality
-    const observedLatencyForwards = allForwards.filter((f) => f.observationLatencyMs !== null);
+    // Quote observation latency: calculate only from actual completed usable quote observations (OBSERVED_PRICE)
+    const qualifyingLatencyForwards = allForwards.filter(
+      (f) => f.outcomeStatus === "OBSERVED_PRICE" && f.observationLatencyMs !== null,
+    );
     const avgLatency =
-      observedLatencyForwards.length > 0
+      qualifyingLatencyForwards.length > 0
         ? Math.round(
-            observedLatencyForwards.reduce((acc, f) => acc + Math.abs(f.observationLatencyMs!), 0) /
-              observedLatencyForwards.length,
+            qualifyingLatencyForwards.reduce((acc, f) => acc + f.observationLatencyMs!, 0) /
+              qualifyingLatencyForwards.length,
           )
-        : 0;
+        : null;
 
+    // Upstream price freshness: calculate only from records where upstream freshness was provided
     const freshnessRecords = allForwards.filter((f) => f.quoteFreshnessMs !== null);
     const avgFreshness =
       freshnessRecords.length > 0
@@ -630,7 +642,7 @@ export class ProspectiveObservationRecorder {
             freshnessRecords.reduce((acc, f) => acc + f.quoteFreshnessMs!, 0) /
               freshnessRecords.length,
           )
-        : 0;
+        : null;
 
     const summary: ProspectiveSessionSummary = {
       sessionId: this.sessionId,
@@ -684,6 +696,7 @@ export class ProspectiveObservationRecorder {
       "forward-observations.jsonl",
       "prospective-session-summary.json",
       "seeded-lookup-evidence.json",
+      "forward-quote-evidence.json",
       "source-selection-evidence.json",
     ];
 

@@ -13,6 +13,7 @@
 
 import crypto from "node:crypto";
 import type { GlobalResourceBudgetManager } from "./GlobalResourceBudgetManager.js";
+import type { HttpObservationEvidence } from "./ProspectiveObservationTypes.js";
 import type {
   IShadowMarketDataProvider,
   ShadowCandidateInput,
@@ -27,16 +28,10 @@ export const DEXSCREENER_TOKENS_PREFIX = "https://api.dexscreener.com/latest/dex
 export const RAYDIUM_POOLS_ENDPOINT = "https://api-v3.raydium.io/pools/info/list";
 export const DEFAULT_HTTP_TIMEOUT_MS = 5000;
 
-export interface SeededLookupDiagnostics {
-  readonly targetUrl: string;
+export interface SeededLookupDiagnostics extends HttpObservationEvidence {
   readonly mintAddress: string;
   readonly targetPoolAddress?: string | undefined;
-  readonly httpStatus: number | null;
-  readonly httpStatusText?: string | undefined;
   readonly payloadSha256: string | null;
-  readonly rawResponseLengthBytes: number;
-  readonly observedPairCount: number;
-  readonly failureReason: string | null;
   readonly sanitizedResponseSnippet?: string | undefined;
   readonly timestampMs: number;
 }
@@ -69,6 +64,17 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     this.timeoutMs = timeoutMs;
   }
 
+  private lastHttpEvidence?: HttpObservationEvidence | undefined;
+  private readonly evidenceHistory: HttpObservationEvidence[] = [];
+
+  public getLastHttpEvidence(): HttpObservationEvidence | undefined {
+    return this.lastHttpEvidence;
+  }
+
+  public getEvidenceHistory(): readonly HttpObservationEvidence[] {
+    return this.evidenceHistory;
+  }
+
   async fetchQuote(poolId: string, mintAddress: string): Promise<ShadowQuoteResult> {
     const targetUrl =
       poolId && poolId.length > 20
@@ -78,6 +84,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
+    const requestStartMs = this.clock();
     let res: Response;
     try {
       res = await this.fetchFn(targetUrl, {
@@ -94,10 +101,37 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       clearTimeout(timeoutId);
     }
 
+    const responseCompleteMs = this.clock();
+    const requestDurationMs = responseCompleteMs - requestStartMs;
+
     const httpStatus = res.status;
     this.budgetManager.recordResponseStatus(httpStatus);
 
+    const rawText = await res.text();
+    const rawResponseSha256 = crypto.createHash("sha256").update(rawText).digest("hex");
+    const rawResponseLengthBytes = Buffer.byteLength(rawText, "utf8");
+
     if (!res.ok) {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: res.statusText,
+        requestStartMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: 0,
+        preservedPairData: null,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: `HTTP_${httpStatus}_${res.statusText}`,
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
@@ -106,10 +140,46 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         isExecutableQuote: false,
         missingReason: `HTTP_${httpStatus}_${res.statusText}`,
         httpStatus,
+        httpEvidence,
       };
     }
 
-    const payload = (await res.json()) as Record<string, unknown>;
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(rawText) as Record<string, unknown>;
+    } catch {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: res.statusText,
+        requestStartMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: 0,
+        preservedPairData: null,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: "INVALID_JSON_PAYLOAD",
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
+      return {
+        indicativePriceSol: null,
+        liquidityUsd: null,
+        quoteTimestampMs: null,
+        quoteSource: "DEXSCREENER",
+        isExecutableQuote: false,
+        missingReason: "INVALID_JSON_PAYLOAD",
+        httpStatus,
+        httpEvidence,
+      };
+    }
+
     const pairs = (
       Array.isArray(payload)
         ? payload
@@ -123,6 +193,26 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     ) as Array<Record<string, unknown>>;
 
     if (pairs.length === 0) {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: res.statusText,
+        requestStartMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: 0,
+        preservedPairData: null,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: "EMPTY_PAIRS_ARRAY",
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
@@ -131,12 +221,33 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         isExecutableQuote: false,
         missingReason: "EMPTY_PAIRS_ARRAY",
         httpStatus,
+        httpEvidence,
       };
     }
 
     // 1. Filter Solana pairs
     const solPairs = pairs.filter((p) => p && p.chainId === "solana");
     if (solPairs.length === 0) {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: res.statusText,
+        requestStartMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: pairs.length,
+        preservedPairData: (pairs[0] as Record<string, unknown> | undefined) ?? null,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: "NON_SOLANA_CHAIN",
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
@@ -145,40 +256,79 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         isExecutableQuote: false,
         missingReason: "NON_SOLANA_CHAIN",
         httpStatus,
+        httpEvidence,
       };
     }
 
-    // 2. Exact pool matching when poolId is specified (strictly enforcing Raydium dexId)
+    // 2. Exact case-sensitive pool matching when poolId is specified (strictly enforcing Raydium dexId)
     let matchingPair: Record<string, unknown> | undefined;
     if (poolId && poolId.length > 20) {
       matchingPair = solPairs.find(
         (p) =>
-          typeof p.pairAddress === "string" &&
-          p.pairAddress.toLowerCase() === poolId.toLowerCase() &&
-          p.dexId === "raydium",
+          typeof p.pairAddress === "string" && p.pairAddress === poolId && p.dexId === "raydium",
       );
       if (!matchingPair) {
         const poolOnOtherDex = solPairs.find(
-          (p) =>
-            typeof p.pairAddress === "string" &&
-            p.pairAddress.toLowerCase() === poolId.toLowerCase(),
+          (p) => typeof p.pairAddress === "string" && p.pairAddress === poolId,
         );
+        const reason = poolOnOtherDex
+          ? "NON_RAYDIUM_DEX_REJECTED"
+          : "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND";
+        const httpEvidence: HttpObservationEvidence = {
+          evidenceType: "FORWARD_QUOTE_OBSERVATION",
+          targetUrl,
+          httpStatus,
+          httpStatusText: res.statusText,
+          requestStartMs,
+          responseCompleteMs,
+          requestDurationMs,
+          rawResponseSha256,
+          rawResponseLengthBytes,
+          observedPairCount: pairs.length,
+          preservedPairData: (poolOnOtherDex ?? solPairs[0]) || null,
+          extractedPriceSol: null,
+          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+          observedLiquidityUsd: null,
+          failureReason: reason,
+        };
+        this.lastHttpEvidence = httpEvidence;
+        this.evidenceHistory.push(httpEvidence);
+
         return {
           indicativePriceSol: null,
           liquidityUsd: null,
           quoteTimestampMs: null,
           quoteSource: "DEXSCREENER",
           isExecutableQuote: false,
-          missingReason: poolOnOtherDex
-            ? "NON_RAYDIUM_DEX_REJECTED"
-            : "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND",
+          missingReason: reason,
           httpStatus,
+          httpEvidence,
         };
       }
     } else {
       // Raydium pool matching when poolId is not specified
       matchingPair = solPairs.find((p) => p.dexId === "raydium");
       if (!matchingPair) {
+        const httpEvidence: HttpObservationEvidence = {
+          evidenceType: "FORWARD_QUOTE_OBSERVATION",
+          targetUrl,
+          httpStatus,
+          httpStatusText: res.statusText,
+          requestStartMs,
+          responseCompleteMs,
+          requestDurationMs,
+          rawResponseSha256,
+          rawResponseLengthBytes,
+          observedPairCount: pairs.length,
+          preservedPairData: (solPairs[0] as Record<string, unknown> | undefined) ?? null,
+          extractedPriceSol: null,
+          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+          observedLiquidityUsd: null,
+          failureReason: "NO_RAYDIUM_POOL_FOUND",
+        };
+        this.lastHttpEvidence = httpEvidence;
+        this.evidenceHistory.push(httpEvidence);
+
         return {
           indicativePriceSol: null,
           liquidityUsd: null,
@@ -187,6 +337,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
           isExecutableQuote: false,
           missingReason: "NO_RAYDIUM_POOL_FOUND",
           httpStatus,
+          httpEvidence,
         };
       }
     }
@@ -198,6 +349,26 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     const isQuoteToken = quoteToken.address === mintAddress;
 
     if (!isBaseToken && !isQuoteToken) {
+      const httpEvidence: HttpObservationEvidence = {
+        evidenceType: "FORWARD_QUOTE_OBSERVATION",
+        targetUrl,
+        httpStatus,
+        httpStatusText: res.statusText,
+        requestStartMs,
+        responseCompleteMs,
+        requestDurationMs,
+        rawResponseSha256,
+        rawResponseLengthBytes,
+        observedPairCount: pairs.length,
+        preservedPairData: matchingPair,
+        extractedPriceSol: null,
+        priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+        observedLiquidityUsd: null,
+        failureReason: "MINT_ADDRESS_MISMATCH",
+      };
+      this.lastHttpEvidence = httpEvidence;
+      this.evidenceHistory.push(httpEvidence);
+
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
@@ -206,6 +377,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         isExecutableQuote: false,
         missingReason: "MINT_ADDRESS_MISMATCH",
         httpStatus,
+        httpEvidence,
       };
     }
 
@@ -272,6 +444,30 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
     // avoiding the manufacture of quote freshness from local HTTP retrieval time.
     const quoteTimestampMs: number | null = null;
 
+    const httpEvidence: HttpObservationEvidence = {
+      evidenceType: "FORWARD_QUOTE_OBSERVATION",
+      targetUrl,
+      httpStatus,
+      httpStatusText: res.statusText,
+      requestStartMs,
+      responseCompleteMs,
+      requestDurationMs,
+      rawResponseSha256,
+      rawResponseLengthBytes,
+      observedPairCount: pairs.length,
+      preservedPairData: matchingPair,
+      extractedPriceSol: indicativePriceSol,
+      priceInterpretation: isBaseToken
+        ? "DIRECT_BASE_WSOL"
+        : isQuoteToken
+          ? "INVERTED_QUOTE_WSOL"
+          : "NON_WSOL_OR_UNAVAILABLE",
+      observedLiquidityUsd: liquidityUsd,
+      failureReason: missingReason ?? null,
+    };
+    this.lastHttpEvidence = httpEvidence;
+    this.evidenceHistory.push(httpEvidence);
+
     return {
       indicativePriceSol,
       liquidityUsd,
@@ -281,6 +477,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       isPoolDrained,
       httpStatus,
       missingReason,
+      httpEvidence,
     };
   }
 }
@@ -432,13 +629,22 @@ export class LiveDexScreenerCandidateSource {
     if (!recorded) {
       if (targetPoolAddress) {
         this.lastSeededLookupDiagnostics = {
+          evidenceType: "BASELINE_SEEDED_LOOKUP",
           targetUrl: `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${targetPoolAddress}`,
           mintAddress,
           targetPoolAddress,
           httpStatus: null,
+          requestStartMs: now,
+          responseCompleteMs: now,
+          requestDurationMs: 0,
+          rawResponseSha256: null,
           payloadSha256: null,
           rawResponseLengthBytes: 0,
           observedPairCount: 0,
+          preservedPairData: null,
+          extractedPriceSol: null,
+          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+          observedLiquidityUsd: null,
           failureReason: "BUDGET_REJECTED_OR_PACING_NOT_MET",
           timestampMs: now,
         };
@@ -454,12 +660,16 @@ export class LiveDexScreenerCandidateSource {
       ? `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${targetPoolAddress}`
       : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
 
+    const requestStartMs = this.clock();
     try {
       const res = await this.fetchFn(targetUrl, {
         method: "GET",
         headers: { Accept: "application/json" },
         signal: controller.signal,
       });
+
+      const responseCompleteMs = this.clock();
+      const requestDurationMs = responseCompleteMs - requestStartMs;
 
       this.budgetManager.recordResponseStatus(res.status);
 
@@ -471,14 +681,23 @@ export class LiveDexScreenerCandidateSource {
       if (!res.ok) {
         if (targetPoolAddress) {
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: 0,
+            preservedPairData: null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
             failureReason: `SEED_HTTP_STATUS_${res.status}_${res.statusText || "ERROR"}`,
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -494,14 +713,23 @@ export class LiveDexScreenerCandidateSource {
       } catch {
         if (targetPoolAddress) {
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: 0,
+            preservedPairData: null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
             failureReason: "SEED_INVALID_JSON_PAYLOAD",
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -526,14 +754,23 @@ export class LiveDexScreenerCandidateSource {
       if (pairs.length === 0) {
         if (targetPoolAddress) {
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: 0,
+            preservedPairData: null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
             failureReason: "SEED_EMPTY_PAIRS_ARRAY",
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -554,10 +791,7 @@ export class LiveDexScreenerCandidateSource {
       if (matchingPairs.length === 0) {
         if (targetPoolAddress) {
           const foundPool = pairs.find(
-            (p) =>
-              p &&
-              typeof p.pairAddress === "string" &&
-              p.pairAddress.toLowerCase() === targetPoolAddress.toLowerCase(),
+            (p) => p && typeof p.pairAddress === "string" && p.pairAddress === targetPoolAddress,
           );
           let failureReason = "SEED_POOL_ADDRESS_NOT_FOUND_IN_RESPONSE";
           if (foundPool) {
@@ -570,14 +804,23 @@ export class LiveDexScreenerCandidateSource {
             }
           }
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: pairs.length,
+            preservedPairData: (foundPool ?? pairs[0]) || null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
             failureReason,
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -656,21 +899,29 @@ export class LiveDexScreenerCandidateSource {
       let selectionBasis: string;
 
       // When a specific targetPoolAddress is requested (e.g. seeded reference test),
-      // we strictly enforce matching that exact pool. We NEVER substitute a higher-liquidity alternative.
+      // we strictly enforce matching that exact pool with exact case-sensitivity. We NEVER substitute a higher-liquidity alternative.
       if (targetPoolAddress) {
-        const exactMatch = assessments.find(
-          (a) => a.pairAddress.toLowerCase() === targetPoolAddress.toLowerCase(),
-        );
+        const exactMatch = assessments.find((a) => a.pairAddress === targetPoolAddress);
         if (!exactMatch) {
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: pairs.length,
+            preservedPairData:
+              (assessments[0]?.pair as Record<string, unknown> | undefined) ?? null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
             failureReason: "SEED_POOL_ADDRESS_NOT_FOUND_IN_MATCHING_ASSESSMENTS",
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -678,17 +929,29 @@ export class LiveDexScreenerCandidateSource {
           this.mismatchedPairsCount++;
           return null;
         }
+
         if (!exactMatch.hasValidPrice) {
           const specificReason = exactMatch.missingPriceReason ?? "SEED_PRICE_INVALID_OR_MISSING";
           this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
             targetUrl,
             mintAddress,
             targetPoolAddress,
             httpStatus: res.status,
             httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
             payloadSha256,
             rawResponseLengthBytes: rawBytes,
             observedPairCount: pairs.length,
+            preservedPairData: exactMatch.pair,
+            extractedPriceSol: exactMatch.indicativePriceSol,
+            priceInterpretation: exactMatch.isBaseToken
+              ? "DIRECT_BASE_WSOL"
+              : "INVERTED_QUOTE_WSOL",
+            observedLiquidityUsd: exactMatch.liquidityUsd,
             failureReason: specificReason,
             sanitizedResponseSnippet: snippet,
             timestampMs: this.clock(),
@@ -696,17 +959,85 @@ export class LiveDexScreenerCandidateSource {
           this.mismatchedPairsCount++;
           return null;
         }
+
+        if (exactMatch.liquidityUsd === null || !Number.isFinite(exactMatch.liquidityUsd)) {
+          this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: pairs.length,
+            preservedPairData: exactMatch.pair,
+            extractedPriceSol: exactMatch.indicativePriceSol,
+            priceInterpretation: exactMatch.isBaseToken
+              ? "DIRECT_BASE_WSOL"
+              : "INVERTED_QUOTE_WSOL",
+            observedLiquidityUsd: null,
+            failureReason: "SEED_LIQUIDITY_INVALID_OR_MISSING",
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+          this.mismatchedPairsCount++;
+          return null;
+        }
+
+        if (exactMatch.liquidityUsd <= 0) {
+          this.lastSeededLookupDiagnostics = {
+            evidenceType: "BASELINE_SEEDED_LOOKUP",
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            requestStartMs,
+            responseCompleteMs,
+            requestDurationMs,
+            rawResponseSha256: payloadSha256,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: pairs.length,
+            preservedPairData: exactMatch.pair,
+            extractedPriceSol: exactMatch.indicativePriceSol,
+            priceInterpretation: exactMatch.isBaseToken
+              ? "DIRECT_BASE_WSOL"
+              : "INVERTED_QUOTE_WSOL",
+            observedLiquidityUsd: exactMatch.liquidityUsd,
+            failureReason: "SEED_ZERO_OR_NEGATIVE_LIQUIDITY",
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+          this.mismatchedPairsCount++;
+          return null;
+        }
+
         selected = exactMatch;
         selectionBasis = "EXACT_ENFORCED_SEED_POOL_MATCH";
         this.lastSeededLookupDiagnostics = {
+          evidenceType: "BASELINE_SEEDED_LOOKUP",
           targetUrl,
           mintAddress,
           targetPoolAddress,
           httpStatus: res.status,
           httpStatusText: res.statusText,
+          requestStartMs,
+          responseCompleteMs,
+          requestDurationMs,
+          rawResponseSha256: payloadSha256,
           payloadSha256,
           rawResponseLengthBytes: rawBytes,
           observedPairCount: pairs.length,
+          preservedPairData: exactMatch.pair,
+          extractedPriceSol: exactMatch.indicativePriceSol,
+          priceInterpretation: exactMatch.isBaseToken ? "DIRECT_BASE_WSOL" : "INVERTED_QUOTE_WSOL",
+          observedLiquidityUsd: exactMatch.liquidityUsd,
           failureReason: null,
           sanitizedResponseSnippet: snippet,
           timestampMs: this.clock(),
@@ -862,14 +1193,24 @@ export class LiveDexScreenerCandidateSource {
       };
     } catch (err) {
       if (targetPoolAddress) {
+        const responseCompleteMs = this.clock();
         this.lastSeededLookupDiagnostics = {
+          evidenceType: "BASELINE_SEEDED_LOOKUP",
           targetUrl,
           mintAddress,
           targetPoolAddress,
           httpStatus: null,
+          requestStartMs,
+          responseCompleteMs,
+          requestDurationMs: responseCompleteMs - requestStartMs,
+          rawResponseSha256: null,
           payloadSha256: null,
           rawResponseLengthBytes: 0,
           observedPairCount: 0,
+          preservedPairData: null,
+          extractedPriceSol: null,
+          priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+          observedLiquidityUsd: null,
           failureReason: `FETCH_ERROR_${(err as Error).name || (err as Error).message}`,
           timestampMs: this.clock(),
         };

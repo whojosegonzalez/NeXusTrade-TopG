@@ -233,7 +233,8 @@ test("Final Acceptance Test — Full E2E Accelerated Observation Lifecycle", asy
 
   assert.ok(manifest);
   assert.equal(manifest.verificationStatus, "VERIFIED_OFFLINE");
-  assert.equal(manifest.files.length, 3);
+  assert.equal(manifest.files.length, 4);
+  assert.ok(manifest.files.map((f) => f.filename).includes("forward-quote-evidence.json"));
 
   for (const fileEntry of manifest.files) {
     const filePath = path.join(tmpDir, fileEntry.filename);

@@ -126,6 +126,30 @@ export interface ForwardHorizonOutcomeRecord {
   readonly missingReason?: string | undefined;
 }
 
+export interface HttpObservationEvidence {
+  readonly evidenceType: "BASELINE_SEEDED_LOOKUP" | "FORWARD_QUOTE_OBSERVATION";
+  readonly targetUrl: string;
+  readonly httpStatus: number | null;
+  readonly httpStatusText?: string | undefined;
+  readonly requestStartMs: number;
+  readonly responseCompleteMs: number;
+  readonly requestDurationMs: number;
+  readonly rawResponseSha256: string | null;
+  readonly rawResponseLengthBytes: number;
+  readonly observedPairCount: number;
+  readonly preservedPairData: Record<string, unknown> | null;
+  readonly extractedPriceSol: number | null;
+  readonly priceInterpretation:
+    | "DIRECT_BASE_WSOL"
+    | "INVERTED_QUOTE_WSOL"
+    | "NON_WSOL_OR_UNAVAILABLE";
+  readonly observedLiquidityUsd: number | null;
+  readonly failureReason: string | null;
+  readonly decisionEventId?: string | null | undefined;
+  readonly horizonSec?: number | null | undefined;
+  readonly forwardOutcomeId?: string | null | undefined;
+}
+
 export interface SessionManifestFileEntry {
   readonly filename: string;
   readonly relativePath: string;
@@ -213,11 +237,11 @@ export interface ProspectiveSessionSummary {
       }
     | undefined;
   readonly dataQuality: {
-    readonly averageQuoteLatencyMs: number;
+    readonly averageQuoteLatencyMs: number | null;
     readonly staleQuotesDetected: number;
     readonly unavailableQuotesDetected: number;
     readonly drainedPoolsDetected: number;
-    readonly quoteFreshnessAverageMs: number;
+    readonly quoteFreshnessAverageMs: number | null;
   };
   readonly pipelineYieldStats?: PipelineYieldStats | undefined;
 }

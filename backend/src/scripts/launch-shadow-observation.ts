@@ -350,13 +350,27 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
         console.log(`[SHUTDOWN] Seeded session closed cleanly due to unavailable seed pool.`);
         return;
       }
-      if (seedCandidate.poolId.toLowerCase() !== cliArgs.seedPool.toLowerCase()) {
+      if (seedCandidate.poolId !== cliArgs.seedPool) {
         throw new Error(
           `[SECURITY_VIOLATION] Selected candidate pool ${seedCandidate.poolId} does not match required seed pool ${cliArgs.seedPool}`,
         );
       }
       const evaluationTimestamp = Date.now();
       const decId = runner.ingestCandidate(seedCandidate, evaluationTimestamp);
+
+      // Link baseline seeded evidence to the recorded decision event
+      if (diagnostics && outDir) {
+        const linkedDiagnostics = {
+          ...diagnostics,
+          decisionEventId: decId,
+        };
+        fs.writeFileSync(
+          path.join(outDir, "seeded-lookup-evidence.json"),
+          JSON.stringify(linkedDiagnostics, null, 2),
+          "utf8",
+        );
+      }
+
       console.log(
         `  -> Seed candidate evaluated: ${seedCandidate.symbol} (${seedCandidate.mintAddress.slice(0, 8)}...) - Pool: ${seedCandidate.poolId} - Decision: ${decId}`,
       );

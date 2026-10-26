@@ -30,7 +30,9 @@ import {
 import {
   FORWARD_HORIZONS_SEC,
   type CandidateStreamSource,
+  type ForwardHorizonOutcomeRecord,
   type ForwardHorizonSec,
+  type HttpObservationEvidence,
   type PipelineYieldStats,
   type ProspectiveSessionSummary,
   type ProspectiveStrategyCohort,
@@ -46,6 +48,7 @@ export interface ShadowQuoteResult {
   readonly isPoolDrained?: boolean | undefined;
   readonly httpStatus?: number | undefined;
   readonly missingReason?: string | undefined;
+  readonly httpEvidence?: HttpObservationEvidence | undefined;
 }
 
 export interface IShadowMarketDataProvider {
@@ -137,6 +140,7 @@ export class ShadowObservationRunner {
   private isSessionClosed = false;
   private isProcessingObservations = false;
   private earlyStopReason: string | null = null;
+  private readonly forwardHttpEvidenceList: HttpObservationEvidence[] = [];
 
   constructor(config: ShadowRunnerConfig, dependencies: ShadowRunnerDependencies = {}) {
     this.config = config;
@@ -198,6 +202,10 @@ export class ShadowObservationRunner {
 
   public setEarlyStopReason(reason: string): void {
     this.earlyStopReason = reason;
+  }
+
+  public getForwardHttpEvidence(): readonly HttpObservationEvidence[] {
+    return this.forwardHttpEvidenceList;
   }
 
   /**
@@ -517,15 +525,24 @@ export class ShadowObservationRunner {
 
           // Check if late response crossed hard session deadline
           if (actualObsTime >= this.sessionDeadlineMs) {
-            this.recorder.recordHorizonOutcome({
+            const forwardRecord = this.recorder.recordHorizonOutcome({
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
-              outcomeStatus: "WINDOW_TRUNCATED",
+              outcomeStatus: "MISSING_QUOTE_UNAVAILABLE",
               indicativePriceSol: null,
               liquidityUsd: null,
               missingReason: "RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE",
             });
+            if (quote.httpEvidence) {
+              this.forwardHttpEvidenceList.push({
+                ...quote.httpEvidence,
+                decisionEventId: task.decisionEventId,
+                horizonSec: task.horizonSec,
+                forwardOutcomeId: forwardRecord.forwardOutcomeId,
+                failureReason: "RESPONSE_ARRIVED_AFTER_SESSION_DEADLINE",
+              });
+            }
             task.status = "FINALIZED";
             processedCount++;
             continue;
@@ -540,12 +557,14 @@ export class ShadowObservationRunner {
           const hasQuoteTimestamp =
             quote.quoteTimestampMs !== null && quote.quoteTimestampMs !== undefined;
 
+          let forwardRecord: ForwardHorizonOutcomeRecord;
+
           // Check for stale pre-horizon prices masquerading as outcomes (when quote timestamp is provided)
           if (
             hasQuoteTimestamp &&
             quote.quoteTimestampMs! < task.scheduledDueTimestampMs - 60_000
           ) {
-            this.recorder.recordHorizonOutcome({
+            forwardRecord = this.recorder.recordHorizonOutcome({
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
@@ -558,7 +577,7 @@ export class ShadowObservationRunner {
               missingReason: "PRE_HORIZON_STALE_QUOTE",
             });
           } else if (quote.isPoolDrained) {
-            this.recorder.recordHorizonOutcome({
+            forwardRecord = this.recorder.recordHorizonOutcome({
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
@@ -566,12 +585,12 @@ export class ShadowObservationRunner {
               quoteSource: quote.quoteSource,
               isExecutableQuote: quote.isExecutableQuote,
               outcomeStatus: "POOL_DRAINED",
-              indicativePriceSol: 0,
+              indicativePriceSol: quote.indicativePriceSol ?? null,
               liquidityUsd: quote.liquidityUsd,
               missingReason: "POOL_DRAINED_LIQUIDITY_COLLAPSED",
             });
           } else if (quote.indicativePriceSol === null) {
-            this.recorder.recordHorizonOutcome({
+            forwardRecord = this.recorder.recordHorizonOutcome({
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
@@ -588,7 +607,7 @@ export class ShadowObservationRunner {
               ? Math.max(0, actualObsTime - quote.quoteTimestampMs!)
               : null;
             if (freshness !== null && freshness > this.maxQuoteStaleMs) {
-              this.recorder.recordHorizonOutcome({
+              forwardRecord = this.recorder.recordHorizonOutcome({
                 decisionEventId: task.decisionEventId,
                 horizonSec: task.horizonSec,
                 observationTimestampMs: actualObsTime,
@@ -601,7 +620,7 @@ export class ShadowObservationRunner {
                 missingReason: `STALE_QUOTE_AGE_${freshness}MS`,
               });
             } else {
-              this.recorder.recordHorizonOutcome({
+              forwardRecord = this.recorder.recordHorizonOutcome({
                 decisionEventId: task.decisionEventId,
                 horizonSec: task.horizonSec,
                 observationTimestampMs: actualObsTime,
@@ -615,6 +634,15 @@ export class ShadowObservationRunner {
               this.successfulForwardPriceObservationsCount++;
             }
           }
+
+          if (quote.httpEvidence) {
+            this.forwardHttpEvidenceList.push({
+              ...quote.httpEvidence,
+              decisionEventId: task.decisionEventId,
+              horizonSec: task.horizonSec,
+              forwardOutcomeId: forwardRecord.forwardOutcomeId,
+            });
+          }
         } catch (err) {
           const actualObsTime = this.clock();
           const errMsg = (err as Error).message;
@@ -627,7 +655,7 @@ export class ShadowObservationRunner {
           }
 
           // Catch provider failures safely: record outcome without crashing runner
-          this.recorder.recordHorizonOutcome({
+          const forwardRecord = this.recorder.recordHorizonOutcome({
             decisionEventId: task.decisionEventId,
             horizonSec: task.horizonSec,
             observationTimestampMs: actualObsTime,
@@ -635,6 +663,26 @@ export class ShadowObservationRunner {
             indicativePriceSol: null,
             liquidityUsd: null,
             missingReason: `PROVIDER_ERROR: ${errMsg}`,
+          });
+
+          this.forwardHttpEvidenceList.push({
+            evidenceType: "FORWARD_QUOTE_OBSERVATION",
+            targetUrl: `PROVIDER_FETCH_CALL:${task.poolId}`,
+            httpStatus: errMsg.includes("429") ? 429 : null,
+            requestStartMs: actualObsTime,
+            responseCompleteMs: actualObsTime,
+            requestDurationMs: 0,
+            rawResponseSha256: null,
+            rawResponseLengthBytes: 0,
+            observedPairCount: 0,
+            preservedPairData: null,
+            extractedPriceSol: null,
+            priceInterpretation: "NON_WSOL_OR_UNAVAILABLE",
+            observedLiquidityUsd: null,
+            failureReason: `PROVIDER_ERROR: ${errMsg}`,
+            decisionEventId: task.decisionEventId,
+            horizonSec: task.horizonSec,
+            forwardOutcomeId: forwardRecord.forwardOutcomeId,
           });
         }
 
@@ -714,6 +762,16 @@ export class ShadowObservationRunner {
       globalRequestStats: this.budgetManager.getStats(),
       pipelineYieldStats: finalYieldStats,
     };
+
+    // Finalize forward HTTP quote evidence before manifest hashing
+    if (this.config.outputDir && this.forwardHttpEvidenceList.length > 0) {
+      const fwdEvidencePath = path.join(this.config.outputDir, "forward-quote-evidence.json");
+      fs.writeFileSync(
+        fwdEvidencePath,
+        JSON.stringify(this.forwardHttpEvidenceList, null, 2),
+        "utf8",
+      );
+    }
 
     // Re-save session summary with global request stats before manifest hashing
     if (this.config.outputDir) {

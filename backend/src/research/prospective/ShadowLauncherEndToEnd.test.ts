@@ -298,10 +298,11 @@ describe("ShadowLauncher Final Acceptance Test", () => {
     expect(summary.globalRequestStats?.totalRequests).toBeLessThanOrEqual(120);
     expect(summary.globalRequestStats?.forwardObservationRequests).toBe(12);
 
-    // Verify cryptographic manifest
+    // Verify cryptographic manifest covering all 4 evidence artifacts
     expect(manifest).toBeDefined();
     expect(manifest?.verificationStatus).toBe("VERIFIED_OFFLINE");
-    expect(manifest?.files.length).toBe(3);
+    expect(manifest?.files.length).toBe(4);
+    expect(manifest?.files.map((f) => f.filename)).toContain("forward-quote-evidence.json");
 
     for (const fileEntry of manifest!.files) {
       const filePath = path.join(tmpDir, fileEntry.filename);
