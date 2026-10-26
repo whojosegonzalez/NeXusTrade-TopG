@@ -114,7 +114,29 @@ export interface ForwardHorizonOutcomeRecord {
   readonly priceReturnPct: number | null;
   readonly liquidityUsd: number | null;
   readonly liquidityChangePct: number | null;
+  readonly quoteTimestampMs: number | null;
+  readonly quoteSource: string | null;
+  readonly quoteFreshnessMs: number | null;
+  readonly isExecutableQuote: boolean;
   readonly missingReason?: string | undefined;
+}
+
+export interface SessionManifestFileEntry {
+  readonly filename: string;
+  readonly relativePath: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+  readonly recordCount?: number | undefined;
+}
+
+export interface SessionManifest {
+  readonly manifestVersion: string;
+  readonly sessionId: string;
+  readonly configFingerprint: string;
+  readonly createdAt: string;
+  readonly files: readonly SessionManifestFileEntry[];
+  readonly manifestDigestSha256: string;
+  readonly verificationStatus: "VERIFIED_OFFLINE" | "VERIFIED_LIVE";
 }
 
 export interface CohortHorizonStatistics {
@@ -162,5 +184,7 @@ export interface ProspectiveSessionSummary {
     readonly averageQuoteLatencyMs: number;
     readonly staleQuotesDetected: number;
     readonly unavailableQuotesDetected: number;
+    readonly drainedPoolsDetected: number;
+    readonly quoteFreshnessAverageMs: number;
   };
 }

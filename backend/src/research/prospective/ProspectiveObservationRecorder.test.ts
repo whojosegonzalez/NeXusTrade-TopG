@@ -171,7 +171,7 @@ describe("ProspectiveObservationRecorder", () => {
 
     const baseline = recorder.recordDecisionEvent(createMockDecisionInput())!;
 
-    virtualClock = 1_300_000;
+    virtualClock = 1_300_015;
     recorder.recordHorizonOutcome({
       decisionEventId: baseline.decisionEventId,
       horizonSec: 300,
@@ -180,7 +180,7 @@ describe("ProspectiveObservationRecorder", () => {
       outcomeStatus: "OBSERVED_PRICE",
     });
 
-    virtualClock = 1_900_000;
+    virtualClock = 1_900_015;
     const fwd15m = recorder.recordHorizonOutcome({
       decisionEventId: baseline.decisionEventId,
       horizonSec: 900,
@@ -306,6 +306,195 @@ describe("ProspectiveObservationRecorder", () => {
     expect(fs.existsSync(path.join(tmpDir, "forward-observations.jsonl"))).toBe(true);
     expect(fs.existsSync(path.join(tmpDir, "prospective-session-summary.json"))).toBe(true);
 
+    const manifest = recorder.writeSessionManifest();
+    expect(manifest).toBeDefined();
+    expect(manifest?.verificationStatus).toBe("VERIFIED_OFFLINE");
+    expect(manifest?.files.length).toBe(3);
+    expect(fs.existsSync(path.join(tmpDir, "session-manifest.json"))).toBe(true);
+
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("enforces fail-closed lifecycle boundaries and prevents duplicate horizon recording", () => {
+    let virtualClock = 1_000_000;
+    const recorder = new ProspectiveObservationRecorder({
+      sessionId: "shadow-test-06",
+      configFingerprint: "sha256:fingerprint",
+      maxCandidates: 2,
+      intakeDeadlineMs: 1_050_000,
+      clock: () => virtualClock,
+    });
+
+    const c1 = recorder.recordDecisionEvent(
+      createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_1" }),
+    );
+    expect(c1).toBeDefined();
+
+    const c2 = recorder.recordDecisionEvent(
+      createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_2" }),
+    );
+    expect(c2).toBeDefined();
+
+    // 1. Candidate ceiling reached: 3rd candidate rejected fail-closed
+    const c3 = recorder.recordDecisionEvent(
+      createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_3" }),
+    );
+    expect(c3).toBeNull();
+
+    // 2. Advance clock past intake deadline (1_050_000)
+    virtualClock = 1_060_000;
+    const c4 = recorder.recordDecisionEvent(
+      createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_4" }),
+    );
+    expect(c4).toBeNull();
+
+    // 3. Record valid forward horizon at +5m (due at 1_000_010 + 300_000 = 1_300_010)
+    virtualClock = 1_300_010;
+    recorder.recordHorizonOutcome({
+      decisionEventId: c1!.decisionEventId,
+      horizonSec: 300,
+      outcomeStatus: "OBSERVED_PRICE",
+      indicativePriceSol: 0.000006,
+      liquidityUsd: 70000,
+    });
+
+    // 4. Duplicate horizon finalization attempt must throw
+    expect(() => {
+      recorder.recordHorizonOutcome({
+        decisionEventId: c1!.decisionEventId,
+        horizonSec: 300,
+        outcomeStatus: "OBSERVED_PRICE",
+        indicativePriceSol: 0.000007,
+        liquidityUsd: 70000,
+      });
+    }).toThrow(/DUPLICATE_HORIZON/);
+
+    // 5. Premature horizon recording attempt must throw
+    expect(() => {
+      recorder.recordHorizonOutcome({
+        decisionEventId: c1!.decisionEventId,
+        horizonSec: 900, // due at 1_900_010, current clock is 1_300_010
+        outcomeStatus: "OBSERVED_PRICE",
+        indicativePriceSol: 0.000006,
+        liquidityUsd: 70000,
+      });
+    }).toThrow(/PREMATURE_OBSERVATION/);
+
+    // 6. Future-dated quote timestamp must throw
+    expect(() => {
+      recorder.recordHorizonOutcome({
+        decisionEventId: c1!.decisionEventId,
+        horizonSec: 900,
+        observationTimestampMs: 1_900_010,
+        quoteTimestampMs: 1_900_020, // 10ms in the future
+        outcomeStatus: "OBSERVED_PRICE",
+        indicativePriceSol: 0.000006,
+        liquidityUsd: 70000,
+      });
+    }).toThrow(/FUTURE_DATED_QUOTE/);
+
+    // 7. Pool drainage recorded as adverse outcome (-100%)
+    const drainedOutcome = recorder.recordHorizonOutcome({
+      decisionEventId: c2!.decisionEventId,
+      horizonSec: 300,
+      observationTimestampMs: 1_300_010,
+      outcomeStatus: "POOL_DRAINED",
+      indicativePriceSol: 0,
+      liquidityUsd: 0,
+    });
+    expect(drainedOutcome.outcomeStatus).toBe("POOL_DRAINED");
+    expect(drainedOutcome.priceReturnPct).toBe(-100);
+
+    // 8. Close session at 1_500_000:
+    // Notice for c1:
+    // - 300s was observed
+    // - 900s was due at 1_900_010 (> 1_500_000) -> WINDOW_TRUNCATED
+    // Notice for c2:
+    // - 300s was observed
+    // - 900s was due at 1_900_010 (> 1_500_000) -> WINDOW_TRUNCATED
+    virtualClock = 1_500_000;
+    recorder.closeSession();
+
+    // 9. Operations after session closure are rejected
+    expect(() => {
+      recorder.recordDecisionEvent(createMockDecisionInput({ mintAddress: "AFTER_CLOSE" }));
+    }).toThrow(/SESSION_CLOSED/);
+
+    expect(() => {
+      recorder.recordHorizonOutcome({
+        decisionEventId: c1!.decisionEventId,
+        horizonSec: 900,
+        outcomeStatus: "OBSERVED_PRICE",
+        indicativePriceSol: 0.000005,
+        liquidityUsd: 60000,
+      });
+    }).toThrow(/SESSION_CLOSED/);
+  });
+
+  it("differentiates already-due missing observations from genuine window truncation", () => {
+    let virtualClock = 1_000_000;
+    const recorder = new ProspectiveObservationRecorder({
+      sessionId: "shadow-test-07",
+      configFingerprint: "sha256:fingerprint",
+      clock: () => virtualClock,
+    });
+
+    recorder.recordDecisionEvent(createMockDecisionInput({ mintAddress: "MINT_DUE_TEST" }));
+
+    // Advance clock past +5m (1_300_010) and +15m (1_900_010) without recording them!
+    // Current time is 2_000_000 (both 300s and 900s were due, but 1800s and 3600s are future)
+    virtualClock = 2_000_000;
+    recorder.closeSession();
+
+    const forwards = recorder.getForwardRecords();
+    expect(forwards.length).toBe(4);
+
+    const fwd5m = forwards.find((f) => f.horizonSec === 300)!;
+    const fwd15m = forwards.find((f) => f.horizonSec === 900)!;
+    const fwd30m = forwards.find((f) => f.horizonSec === 1800)!;
+    const fwd60m = forwards.find((f) => f.horizonSec === 3600)!;
+
+    // Already-due horizons are classified as MISSING_QUOTE_UNAVAILABLE, not WINDOW_TRUNCATED
+    expect(fwd5m.outcomeStatus).toBe("MISSING_QUOTE_UNAVAILABLE");
+    expect(fwd5m.missingReason).toBe("UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE");
+
+    expect(fwd15m.outcomeStatus).toBe("MISSING_QUOTE_UNAVAILABLE");
+    expect(fwd15m.missingReason).toBe("UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE");
+
+    // Horizons due after 2_000_000 are genuinely WINDOW_TRUNCATED
+    expect(fwd30m.outcomeStatus).toBe("WINDOW_TRUNCATED");
+    expect(fwd30m.missingReason).toBe("SESSION_CLOSED_BEFORE_HORIZON_ELAPSED");
+
+    expect(fwd60m.outcomeStatus).toBe("WINDOW_TRUNCATED");
+    expect(fwd60m.missingReason).toBe("SESSION_CLOSED_BEFORE_HORIZON_ELAPSED");
+  });
+
+  it("enforces filesystem confinement to approved root directory", () => {
+    const rootDir = path.join(os.tmpdir(), `shadow-confinement-root-${Date.now()}`);
+    fs.mkdirSync(rootDir, { recursive: true });
+
+    // Output dir within approved root should succeed
+    const validOut = path.join(rootDir, "valid-session");
+    expect(() => {
+      new ProspectiveObservationRecorder({
+        sessionId: "confinement-test-valid",
+        configFingerprint: "sha256:fp",
+        outputDir: validOut,
+        approvedRootPath: rootDir,
+      });
+    }).not.toThrow();
+
+    // Output dir outside approved root must throw security error
+    const escapeOut = path.join(os.tmpdir(), "forbidden-escape-dir");
+    expect(() => {
+      new ProspectiveObservationRecorder({
+        sessionId: "confinement-test-invalid",
+        configFingerprint: "sha256:fp",
+        outputDir: escapeOut,
+        approvedRootPath: rootDir,
+      });
+    }).toThrow(/outside approved root/);
+
+    fs.rmSync(rootDir, { recursive: true, force: true });
   });
 });

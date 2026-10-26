@@ -30,14 +30,20 @@ import {
   type ProspectiveSessionSummary,
   type ProspectiveStrategyCohort,
   type RejectionCategory,
+  type SessionManifest,
+  type SessionManifestFileEntry,
 } from "./ProspectiveObservationTypes.js";
 
 export interface ProspectiveRecorderOptions {
   readonly sessionId: string;
   readonly configFingerprint: string;
   readonly outputDir?: string | undefined;
+  readonly approvedRootPath?: string | undefined;
   readonly clock?: () => number;
   readonly suppressDuplicateCandidates?: boolean;
+  readonly maxCandidates?: number | undefined;
+  readonly intakeDeadlineMs?: number | undefined;
+  readonly sessionDeadlineMs?: number | undefined;
 }
 
 export interface RecordDecisionInput {
@@ -61,6 +67,9 @@ export interface RecordHorizonOutcomeInput {
   readonly outcomeStatus: ForwardOutcomeStatus;
   readonly indicativePriceSol: number | null;
   readonly liquidityUsd: number | null;
+  readonly quoteTimestampMs?: number | null | undefined;
+  readonly quoteSource?: string | null | undefined;
+  readonly isExecutableQuote?: boolean | undefined;
   readonly missingReason?: string | undefined;
 }
 
@@ -68,12 +77,18 @@ export class ProspectiveObservationRecorder {
   private readonly sessionId: string;
   private readonly configFingerprint: string;
   private readonly outputDir: string | null;
+  private readonly approvedRootPath: string | null;
   private readonly clock: () => number;
   private readonly suppressDuplicates: boolean;
+  private readonly maxCandidates: number | null;
+  private readonly intakeDeadlineMs: number | null;
+  private readonly sessionDeadlineMs: number | null;
 
   private readonly decisionRecords = new Map<string, DecisionTimeObservationRecord>();
   private readonly forwardRecords = new Map<string, ForwardHorizonOutcomeRecord[]>(); // decisionEventId -> records
+  private readonly observedCandidateKeys = new Set<string>();
   private readonly observedMints = new Set<string>();
+  private readonly finalizedHorizons = new Map<string, Set<ForwardHorizonSec>>();
 
   private sessionStartedAtMs: number;
   private intakeStoppedAtMs: number | null = null;
@@ -84,12 +99,28 @@ export class ProspectiveObservationRecorder {
     this.sessionId = options.sessionId;
     this.configFingerprint = options.configFingerprint;
     this.outputDir = options.outputDir ?? null;
+    this.approvedRootPath = options.approvedRootPath ?? null;
     this.clock = options.clock ?? (() => Date.now());
     this.suppressDuplicates = options.suppressDuplicateCandidates ?? true;
+    this.maxCandidates = options.maxCandidates ?? null;
+    this.intakeDeadlineMs = options.intakeDeadlineMs ?? null;
+    this.sessionDeadlineMs = options.sessionDeadlineMs ?? null;
     this.sessionStartedAtMs = this.clock();
 
-    if (this.outputDir && !fs.existsSync(this.outputDir)) {
-      fs.mkdirSync(this.outputDir, { recursive: true });
+    if (this.outputDir) {
+      const resolvedOut = path.resolve(this.outputDir);
+      if (this.approvedRootPath) {
+        const resolvedRoot = path.resolve(this.approvedRootPath);
+        const relative = path.relative(resolvedRoot, resolvedOut);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          throw new Error(
+            `[SECURITY] Output directory ${resolvedOut} is outside approved root ${resolvedRoot}`,
+          );
+        }
+      }
+      if (!fs.existsSync(resolvedOut)) {
+        fs.mkdirSync(resolvedOut, { recursive: true });
+      }
     }
   }
 
@@ -165,11 +196,36 @@ export class ProspectiveObservationRecorder {
   public recordDecisionEvent(input: RecordDecisionInput): DecisionTimeObservationRecord | null {
     const now = input.decisionTimestampMs ?? this.clock();
 
+    // Enforce session boundary fail-closed
+    if (
+      this.sessionClosedAtMs !== null ||
+      (this.sessionDeadlineMs !== null && now >= this.sessionDeadlineMs)
+    ) {
+      throw new Error("[SESSION_CLOSED] Cannot record candidate decision after session closed.");
+    }
+
+    // Enforce intake boundary fail-closed
+    if (
+      this.intakeStoppedAtMs !== null ||
+      (this.intakeDeadlineMs !== null && now >= this.intakeDeadlineMs)
+    ) {
+      return null;
+    }
+
+    // Enforce candidate ceiling fail-closed
+    if (this.maxCandidates !== null && this.decisionRecords.size >= this.maxCandidates) {
+      return null;
+    }
+
+    // Candidate composite key: mint + pool + cohort prevents suppressing distinct pools/cohorts
+    const candidateKey = `${input.mintAddress}:${input.poolId}:${input.strategyCohort}`;
+
     // Check duplicate suppression
-    if (this.suppressDuplicates && this.observedMints.has(input.mintAddress)) {
+    if (this.suppressDuplicates && this.observedCandidateKeys.has(candidateKey)) {
       this.duplicateSuppressedCount += 1;
       return null;
     }
+    this.observedCandidateKeys.add(candidateKey);
     this.observedMints.add(input.mintAddress);
 
     const eventId = `dec-${input.mintAddress.slice(0, 8)}-${now}-${crypto.randomBytes(4).toString("hex")}`;
@@ -246,6 +302,7 @@ export class ProspectiveObservationRecorder {
 
   /**
    * Records a forward outcome observation (+5m, +15m, +30m, +60m) referencing a decision.
+   * Enforces that every scheduled horizon resolves to exactly one finalized outcome.
    */
   public recordHorizonOutcome(input: RecordHorizonOutcomeInput): ForwardHorizonOutcomeRecord {
     const baseline = this.decisionRecords.get(input.decisionEventId);
@@ -256,19 +313,70 @@ export class ProspectiveObservationRecorder {
     }
 
     const now = input.observationTimestampMs ?? this.clock();
+
+    // Check session closure: ordinary observations are rejected after session closure
+    if (
+      this.sessionClosedAtMs !== null &&
+      input.outcomeStatus !== "WINDOW_TRUNCATED" &&
+      input.missingReason !== "UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE"
+    ) {
+      throw new Error(
+        "[SESSION_CLOSED] Cannot record ordinary horizon outcome after session closure.",
+      );
+    }
+
+    // Check duplicate horizon finalization invariant: exactly one finalized outcome per horizon
+    let horizonSet = this.finalizedHorizons.get(input.decisionEventId);
+    if (!horizonSet) {
+      horizonSet = new Set();
+      this.finalizedHorizons.set(input.decisionEventId, horizonSet);
+    }
+    if (horizonSet.has(input.horizonSec)) {
+      throw new Error(
+        `[DUPLICATE_HORIZON] Horizon ${input.horizonSec}s already finalized for decision ${input.decisionEventId}.`,
+      );
+    }
+
     const scheduledDue = baseline.decisionTimestampMs + input.horizonSec * 1000;
     const latency = now - scheduledDue;
 
+    // Reject premature price observations
+    if (input.outcomeStatus === "OBSERVED_PRICE" && now < scheduledDue) {
+      throw new Error(
+        `[PREMATURE_OBSERVATION] Cannot record OBSERVED_PRICE at ${now} before scheduled due ${scheduledDue} (horizon +${input.horizonSec}s).`,
+      );
+    }
+
+    // Reject future-dated quotes
+    if (
+      input.quoteTimestampMs !== undefined &&
+      input.quoteTimestampMs !== null &&
+      input.quoteTimestampMs > now
+    ) {
+      throw new Error(
+        `[FUTURE_DATED_QUOTE] Quote timestamp ${input.quoteTimestampMs} is in the future relative to observation timestamp ${now}.`,
+      );
+    }
+
+    const quoteFreshnessMs =
+      input.quoteTimestampMs !== undefined && input.quoteTimestampMs !== null
+        ? Math.max(0, now - input.quoteTimestampMs)
+        : null;
+
     const basePrice = baseline.marketFeatures.indicativePriceSol;
     let priceReturnPct: number | null = null;
-    if (
-      input.indicativePriceSol !== null &&
-      basePrice > 0 &&
-      input.outcomeStatus === "OBSERVED_PRICE"
-    ) {
-      priceReturnPct = Number(
-        (((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4),
-      );
+    if (basePrice > 0) {
+      if (input.outcomeStatus === "OBSERVED_PRICE" && input.indicativePriceSol !== null) {
+        priceReturnPct = Number(
+          (((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4),
+        );
+      } else if (input.outcomeStatus === "POOL_DRAINED") {
+        // Adverse outcome: if residual price exists calculate, otherwise -100% loss
+        priceReturnPct =
+          input.indicativePriceSol !== null && input.indicativePriceSol > 0
+            ? Number((((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4))
+            : -100.0;
+      }
     }
 
     const baseLiq = baseline.marketFeatures.liquidityUsd;
@@ -294,9 +402,14 @@ export class ProspectiveObservationRecorder {
       priceReturnPct,
       liquidityUsd: input.liquidityUsd,
       liquidityChangePct,
+      quoteTimestampMs: input.quoteTimestampMs ?? null,
+      quoteSource: input.quoteSource ?? null,
+      quoteFreshnessMs,
+      isExecutableQuote: input.isExecutableQuote ?? false,
       missingReason: input.missingReason,
     });
 
+    horizonSet.add(input.horizonSec);
     const list = this.forwardRecords.get(input.decisionEventId)!;
     list.push(record);
 
@@ -318,7 +431,8 @@ export class ProspectiveObservationRecorder {
   }
 
   /**
-   * Closes the session and marks any remaining unobserved horizons as truncated.
+   * Closes the session and finalizes any remaining unobserved horizons.
+   * Horizontally differentiates already-due missing observations from genuine truncations.
    */
   public closeSession(nowTimestampMs?: number): void {
     const now = nowTimestampMs ?? this.clock();
@@ -327,22 +441,37 @@ export class ProspectiveObservationRecorder {
       this.intakeStoppedAtMs = now;
     }
 
-    // Identify any scheduled horizons that were never recorded
+    // Finalize all scheduled horizons that were not recorded
     for (const decisionId of this.decisionRecords.keys()) {
-      const recorded = this.forwardRecords.get(decisionId) || [];
-      const recordedHorizons = new Set(recorded.map((r) => r.horizonSec));
+      const baseline = this.decisionRecords.get(decisionId)!;
+      const horizonSet = this.finalizedHorizons.get(decisionId) ?? new Set();
 
       for (const h of FORWARD_HORIZONS_SEC) {
-        if (!recordedHorizons.has(h)) {
-          this.recordHorizonOutcome({
-            decisionEventId: decisionId,
-            horizonSec: h,
-            observationTimestampMs: now,
-            outcomeStatus: "WINDOW_TRUNCATED",
-            indicativePriceSol: null,
-            liquidityUsd: null,
-            missingReason: "SESSION_CLOSED_BEFORE_HORIZON_ELAPSED",
-          });
+        if (!horizonSet.has(h)) {
+          const scheduledDue = baseline.decisionTimestampMs + h * 1000;
+          if (scheduledDue <= now) {
+            // Already due before session closed, but missing
+            this.recordHorizonOutcome({
+              decisionEventId: decisionId,
+              horizonSec: h,
+              observationTimestampMs: now,
+              outcomeStatus: "MISSING_QUOTE_UNAVAILABLE",
+              indicativePriceSol: null,
+              liquidityUsd: null,
+              missingReason: "UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE",
+            });
+          } else {
+            // Session closed before horizon elapsed
+            this.recordHorizonOutcome({
+              decisionEventId: decisionId,
+              horizonSec: h,
+              observationTimestampMs: now,
+              outcomeStatus: "WINDOW_TRUNCATED",
+              indicativePriceSol: null,
+              liquidityUsd: null,
+              missingReason: "SESSION_CLOSED_BEFORE_HORIZON_ELAPSED",
+            });
+          }
         }
       }
     }
@@ -493,6 +622,15 @@ export class ProspectiveObservationRecorder {
           )
         : 0;
 
+    const freshnessRecords = allForwards.filter((f) => f.quoteFreshnessMs !== null);
+    const avgFreshness =
+      freshnessRecords.length > 0
+        ? Math.round(
+            freshnessRecords.reduce((acc, f) => acc + f.quoteFreshnessMs!, 0) /
+              freshnessRecords.length,
+          )
+        : 0;
+
     const summary: ProspectiveSessionSummary = {
       sessionId: this.sessionId,
       configFingerprint: this.configFingerprint,
@@ -516,6 +654,8 @@ export class ProspectiveObservationRecorder {
         unavailableQuotesDetected: allForwards.filter(
           (f) => f.outcomeStatus === "MISSING_QUOTE_UNAVAILABLE",
         ).length,
+        drainedPoolsDetected: allForwards.filter((f) => f.outcomeStatus === "POOL_DRAINED").length,
+        quoteFreshnessAverageMs: avgFreshness,
       },
     };
 
@@ -525,6 +665,67 @@ export class ProspectiveObservationRecorder {
     }
 
     return summary;
+  }
+
+  /**
+   * Generates and writes a cryptographic SHA-256 session manifest covering
+   * all generated evidence files in the output directory.
+   */
+  public writeSessionManifest(): SessionManifest | null {
+    if (!this.outputDir) return null;
+
+    const filesToDigest = [
+      "decision-observations.jsonl",
+      "forward-observations.jsonl",
+      "prospective-session-summary.json",
+    ];
+
+    const entries: SessionManifestFileEntry[] = [];
+    for (const filename of filesToDigest) {
+      const filePath = path.join(this.outputDir, filename);
+      if (fs.existsSync(filePath)) {
+        const content = fs.readFileSync(filePath);
+        const sha256 = crypto.createHash("sha256").update(content).digest("hex");
+        const stats = fs.statSync(filePath);
+        let recordCount: number | undefined;
+        if (filename.endsWith(".jsonl")) {
+          const lines = content
+            .toString("utf8")
+            .trim()
+            .split("\n")
+            .filter((l) => l.trim().length > 0);
+          recordCount = lines.length;
+        }
+        entries.push({
+          filename,
+          relativePath: filename,
+          sha256,
+          byteSize: stats.size,
+          recordCount,
+        });
+      }
+    }
+
+    const canonicalFileJson = JSON.stringify(entries);
+    const manifestDigestSha256 = crypto
+      .createHash("sha256")
+      .update(canonicalFileJson)
+      .digest("hex");
+
+    const manifest: SessionManifest = {
+      manifestVersion: "1.0",
+      sessionId: this.sessionId,
+      configFingerprint: this.configFingerprint,
+      createdAt: new Date(this.clock()).toISOString(),
+      files: entries,
+      manifestDigestSha256,
+      verificationStatus: "VERIFIED_OFFLINE",
+    };
+
+    const manifestPath = path.join(this.outputDir, "session-manifest.json");
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+    return manifest;
   }
 
   // Getters for inspectability

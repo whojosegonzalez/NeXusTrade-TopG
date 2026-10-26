@@ -176,7 +176,7 @@ test("ProspectiveObservationRecorder — Missing Observation Handling & Truncati
 
   const baseline = recorder.recordDecisionEvent(createMockDecisionInput());
 
-  virtualClock = 1_300_000;
+  virtualClock = 1_300_015;
   recorder.recordHorizonOutcome({
     decisionEventId: baseline.decisionEventId,
     horizonSec: 300,
@@ -185,7 +185,7 @@ test("ProspectiveObservationRecorder — Missing Observation Handling & Truncati
     outcomeStatus: "OBSERVED_PRICE",
   });
 
-  virtualClock = 1_900_000;
+  virtualClock = 1_900_015;
   const fwd15m = recorder.recordHorizonOutcome({
     decisionEventId: baseline.decisionEventId,
     horizonSec: 900,
@@ -311,5 +311,182 @@ test("ProspectiveObservationRecorder — Verifiable Session Summary Generation &
   assert.ok(fs.existsSync(path.join(tmpDir, "forward-observations.jsonl")));
   assert.ok(fs.existsSync(path.join(tmpDir, "prospective-session-summary.json")));
 
+  const manifest = recorder.writeSessionManifest();
+  assert.ok(manifest);
+  assert.equal(manifest.verificationStatus, "VERIFIED_OFFLINE");
+  assert.equal(manifest.files.length, 3);
+  assert.ok(fs.existsSync(path.join(tmpDir, "session-manifest.json")));
+
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("ProspectiveObservationRecorder — Fail-Closed Lifecycle Boundaries & Deduplication", () => {
+  let virtualClock = 1_000_000;
+  const recorder = new ProspectiveObservationRecorder({
+    sessionId: "shadow-test-06",
+    configFingerprint: "sha256:fingerprint",
+    maxCandidates: 2,
+    intakeDeadlineMs: 1_050_000,
+    clock: () => virtualClock,
+  });
+
+  const c1 = recorder.recordDecisionEvent(
+    createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_1" }),
+  );
+  assert.ok(c1);
+
+  const c2 = recorder.recordDecisionEvent(
+    createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_2" }),
+  );
+  assert.ok(c2);
+
+  // 1. Candidate ceiling reached: 3rd candidate rejected fail-closed
+  const c3 = recorder.recordDecisionEvent(
+    createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_3" }),
+  );
+  assert.equal(c3, null);
+
+  // 2. Advance clock past intake deadline (1_050_000)
+  virtualClock = 1_060_000;
+  const c4 = recorder.recordDecisionEvent(
+    createMockDecisionInput({ mintAddress: "MINT_CANDIDATE_4" }),
+  );
+  assert.equal(c4, null);
+
+  // 3. Record valid forward horizon at +5m (due at 1_000_010 + 300_000 = 1_300_010)
+  virtualClock = 1_300_010;
+  recorder.recordHorizonOutcome({
+    decisionEventId: c1.decisionEventId,
+    horizonSec: 300,
+    outcomeStatus: "OBSERVED_PRICE",
+    indicativePriceSol: 0.000006,
+    liquidityUsd: 70000,
+  });
+
+  // 4. Duplicate horizon finalization attempt must throw
+  assert.throws(() => {
+    recorder.recordHorizonOutcome({
+      decisionEventId: c1.decisionEventId,
+      horizonSec: 300,
+      outcomeStatus: "OBSERVED_PRICE",
+      indicativePriceSol: 0.000007,
+      liquidityUsd: 70000,
+    });
+  }, /DUPLICATE_HORIZON/);
+
+  // 5. Premature horizon recording attempt must throw
+  assert.throws(() => {
+    recorder.recordHorizonOutcome({
+      decisionEventId: c1.decisionEventId,
+      horizonSec: 900,
+      outcomeStatus: "OBSERVED_PRICE",
+      indicativePriceSol: 0.000006,
+      liquidityUsd: 70000,
+    });
+  }, /PREMATURE_OBSERVATION/);
+
+  // 6. Future-dated quote timestamp must throw
+  assert.throws(() => {
+    recorder.recordHorizonOutcome({
+      decisionEventId: c1.decisionEventId,
+      horizonSec: 900,
+      observationTimestampMs: 1_900_010,
+      quoteTimestampMs: 1_900_020,
+      outcomeStatus: "OBSERVED_PRICE",
+      indicativePriceSol: 0.000006,
+      liquidityUsd: 70000,
+    });
+  }, /FUTURE_DATED_QUOTE/);
+
+  // 7. Pool drainage recorded as adverse outcome (-100%)
+  const drainedOutcome = recorder.recordHorizonOutcome({
+    decisionEventId: c2.decisionEventId,
+    horizonSec: 300,
+    observationTimestampMs: 1_300_010,
+    outcomeStatus: "POOL_DRAINED",
+    indicativePriceSol: 0,
+    liquidityUsd: 0,
+  });
+  assert.equal(drainedOutcome.outcomeStatus, "POOL_DRAINED");
+  assert.equal(drainedOutcome.priceReturnPct, -100);
+
+  // 8. Close session
+  virtualClock = 1_500_000;
+  recorder.closeSession();
+
+  // 9. Operations after session closure are rejected
+  assert.throws(() => {
+    recorder.recordDecisionEvent(createMockDecisionInput({ mintAddress: "AFTER_CLOSE" }));
+  }, /SESSION_CLOSED/);
+
+  assert.throws(() => {
+    recorder.recordHorizonOutcome({
+      decisionEventId: c1.decisionEventId,
+      horizonSec: 900,
+      outcomeStatus: "OBSERVED_PRICE",
+      indicativePriceSol: 0.000005,
+      liquidityUsd: 60000,
+    });
+  }, /SESSION_CLOSED/);
+});
+
+test("ProspectiveObservationRecorder — Differentiate Due Missing vs Truncated", () => {
+  let virtualClock = 1_000_000;
+  const recorder = new ProspectiveObservationRecorder({
+    sessionId: "shadow-test-07",
+    configFingerprint: "sha256:fingerprint",
+    clock: () => virtualClock,
+  });
+
+  recorder.recordDecisionEvent(createMockDecisionInput({ mintAddress: "MINT_DUE_TEST" }));
+
+  virtualClock = 2_000_000;
+  recorder.closeSession();
+
+  const forwards = recorder.getForwardRecords();
+  assert.equal(forwards.length, 4);
+
+  const fwd5m = forwards.find((f) => f.horizonSec === 300);
+  const fwd15m = forwards.find((f) => f.horizonSec === 900);
+  const fwd30m = forwards.find((f) => f.horizonSec === 1800);
+  const fwd60m = forwards.find((f) => f.horizonSec === 3600);
+
+  assert.equal(fwd5m.outcomeStatus, "MISSING_QUOTE_UNAVAILABLE");
+  assert.equal(fwd5m.missingReason, "UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE");
+
+  assert.equal(fwd15m.outcomeStatus, "MISSING_QUOTE_UNAVAILABLE");
+  assert.equal(fwd15m.missingReason, "UNOBSERVED_AT_SESSION_CLOSE_ALREADY_DUE");
+
+  assert.equal(fwd30m.outcomeStatus, "WINDOW_TRUNCATED");
+  assert.equal(fwd30m.missingReason, "SESSION_CLOSED_BEFORE_HORIZON_ELAPSED");
+
+  assert.equal(fwd60m.outcomeStatus, "WINDOW_TRUNCATED");
+  assert.equal(fwd60m.missingReason, "SESSION_CLOSED_BEFORE_HORIZON_ELAPSED");
+});
+
+test("ProspectiveObservationRecorder — Approved Root Confinement", () => {
+  const rootDir = path.join(os.tmpdir(), `shadow-confinement-root-${Date.now()}`);
+  fs.mkdirSync(rootDir, { recursive: true });
+
+  const validOut = path.join(rootDir, "valid-session");
+  assert.doesNotThrow(() => {
+    new ProspectiveObservationRecorder({
+      sessionId: "confinement-test-valid",
+      configFingerprint: "sha256:fp",
+      outputDir: validOut,
+      approvedRootPath: rootDir,
+    });
+  });
+
+  const escapeOut = path.join(os.tmpdir(), "forbidden-escape-dir");
+  assert.throws(() => {
+    new ProspectiveObservationRecorder({
+      sessionId: "confinement-test-invalid",
+      configFingerprint: "sha256:fp",
+      outputDir: escapeOut,
+      approvedRootPath: rootDir,
+    });
+  }, /outside approved root/);
+
+  fs.rmSync(rootDir, { recursive: true, force: true });
 });
