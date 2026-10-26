@@ -417,33 +417,27 @@ test("Invariant 3: Deterministic pool selection prefers highest liquidity canoni
   assert.equal(candidate.indicativePriceSol, 0.003);
 });
 
-test("Invariant 4: Enforces exact target pool address for seeded candidate and never substitutes higher-liquidity alternatives", async () => {
+test("Invariant 4: Uses exact-pool endpoint for seeded enrichment and fails closed on mismatched responses", async () => {
   let clock = 10_000_000;
-  const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+  const budgetManager = new GlobalResourceBudgetManager({
+    minProviderSpacingMs: 0,
+    clock: () => clock,
+  });
+  const recordedUrls = [];
 
   const mockFetch = async (url) => {
-    if (url.includes("MINT_SEED_MULTI")) {
+    recordedUrls.push(url);
+
+    if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-b-seed-target-50k") {
       return new Response(
         JSON.stringify({
+          schemaVersion: "1.0.0",
           pairs: [
-            // Pool A: $200,000 liquidity (high liquidity alternative)
-            {
-              chainId: "solana",
-              dexId: "raydium",
-              pairAddress: "pool-a-high-liq-200k",
-              baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
-              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
-              priceNative: "0.005",
-              liquidity: { usd: 200000 },
-              marketCap: 500000,
-              pairCreatedAt: 10_000_000 - 3000 * 1000,
-            },
-            // Pool B: $50,000 liquidity (target seed pool)
             {
               chainId: "solana",
               dexId: "raydium",
               pairAddress: "pool-b-seed-target-50k",
-              baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+              baseToken: { address: "MINT_SEED_TARGET", symbol: "SEED" },
               quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
               priceNative: "0.004",
               liquidity: { usd: 50000 },
@@ -455,6 +449,66 @@ test("Invariant 4: Enforces exact target pool address for seeded candidate and n
         { status: 200 },
       );
     }
+
+    if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-mismatched-dex") {
+      return new Response(
+        JSON.stringify({
+          schemaVersion: "1.0.0",
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "orca",
+              pairAddress: "pool-mismatched-dex",
+              baseToken: { address: "MINT_SEED_TARGET", symbol: "SEED" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.004",
+              liquidity: { usd: 50000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
+    if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-mismatched-mint") {
+      return new Response(
+        JSON.stringify({
+          schemaVersion: "1.0.0",
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-mismatched-mint",
+              baseToken: { address: "OTHER_MINT_111111111111111111111111", symbol: "DIFF" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.004",
+              liquidity: { usd: 50000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
+    if (url === "https://api.dexscreener.com/latest/dex/tokens/MINT_UNSEEDED_DISCOVERY") {
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-unseeded-wsol",
+              baseToken: { address: "MINT_UNSEEDED_DISCOVERY", symbol: "UNSEED" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.005",
+              liquidity: { usd: 80000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
     return new Response(JSON.stringify({ pairs: [] }), { status: 404 });
   };
 
@@ -467,24 +521,50 @@ test("Invariant 4: Enforces exact target pool address for seeded candidate and n
     },
   );
 
-  // 1. Explicitly request target seed pool (Pool B)
+  // 1. Seeded enrichment: must call exact pairs endpoint
   const seedCandidate = await candidateSource.enrichCandidate(
-    "MINT_SEED_MULTI",
+    "MINT_SEED_TARGET",
     "pool-b-seed-target-50k",
   );
   assert.ok(seedCandidate);
+  assert.equal(
+    recordedUrls[0],
+    "https://api.dexscreener.com/latest/dex/pairs/solana/pool-b-seed-target-50k",
+  );
   assert.equal(seedCandidate.poolId, "pool-b-seed-target-50k");
   assert.equal(seedCandidate.selectedPoolAddress, "pool-b-seed-target-50k");
   assert.equal(seedCandidate.poolSelectionBasis, "EXACT_ENFORCED_SEED_POOL_MATCH");
-  assert.equal(seedCandidate.liquidityUsd, 50000);
   assert.equal(seedCandidate.indicativePriceSol, 0.004);
 
-  // 2. Request nonexistent Pool C -> MUST return null and NEVER substitute Pool A or B
-  const missingCandidate = await candidateSource.enrichCandidate(
-    "MINT_SEED_MULTI",
-    "pool-c-nonexistent-999k",
+  // 2. Mismatched DEX (Orca instead of Raydium) -> Fails closed (returns null)
+  const mismatchedDex = await candidateSource.enrichCandidate(
+    "MINT_SEED_TARGET",
+    "pool-mismatched-dex",
   );
-  assert.equal(missingCandidate, null);
+  assert.equal(mismatchedDex, null);
+
+  // 3. Mismatched Mint address -> Fails closed (returns null)
+  const mismatchedMint = await candidateSource.enrichCandidate(
+    "MINT_SEED_TARGET",
+    "pool-mismatched-mint",
+  );
+  assert.equal(mismatchedMint, null);
+
+  // 4. Nonexistent pool (404) -> Fails closed (returns null)
+  const nonexistent = await candidateSource.enrichCandidate(
+    "MINT_SEED_TARGET",
+    "pool-nonexistent-404",
+  );
+  assert.equal(nonexistent, null);
+
+  // 5. Unseeded discovery: must call tokens endpoint
+  const unseededCandidate = await candidateSource.enrichCandidate("MINT_UNSEEDED_DISCOVERY");
+  assert.ok(unseededCandidate);
+  assert.equal(
+    recordedUrls[recordedUrls.length - 1],
+    "https://api.dexscreener.com/latest/dex/tokens/MINT_UNSEEDED_DISCOVERY",
+  );
+  assert.equal(unseededCandidate.poolId, "pool-unseeded-wsol");
 });
 
 test("Invariant 5: Enforces decision timestamp causality and rejects retrospective timestamps", async () => {

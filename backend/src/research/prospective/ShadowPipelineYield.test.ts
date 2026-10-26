@@ -446,33 +446,27 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
     expect(candidate.indicativePriceSol).toBe(0.003);
   });
 
-  it("Invariant 4: Enforces exact target pool address for seeded candidate and never substitutes higher-liquidity alternatives", async () => {
+  it("Invariant 4: Uses exact-pool endpoint for seeded enrichment and fails closed on mismatched responses", async () => {
     let clock = 10_000_000;
-    const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+    const budgetManager = new GlobalResourceBudgetManager({
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+    const recordedUrls: string[] = [];
 
     const mockFetch: FetchFunction = async (url: string) => {
-      if (url.includes("MINT_SEED_MULTI")) {
+      recordedUrls.push(url);
+
+      if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-b-seed-target-50k") {
         return new Response(
           JSON.stringify({
+            schemaVersion: "1.0.0",
             pairs: [
-              // Pool A: $200,000 liquidity (high liquidity alternative)
-              {
-                chainId: "solana",
-                dexId: "raydium",
-                pairAddress: "pool-a-high-liq-200k",
-                baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
-                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
-                priceNative: "0.005",
-                liquidity: { usd: 200000 },
-                marketCap: 500000,
-                pairCreatedAt: 10_000_000 - 3000 * 1000,
-              },
-              // Pool B: $50,000 liquidity (target seed pool)
               {
                 chainId: "solana",
                 dexId: "raydium",
                 pairAddress: "pool-b-seed-target-50k",
-                baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+                baseToken: { address: "MINT_SEED_TARGET", symbol: "SEED" },
                 quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
                 priceNative: "0.004",
                 liquidity: { usd: 50000 },
@@ -484,6 +478,66 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
           { status: 200 },
         );
       }
+
+      if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-mismatched-dex") {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "orca",
+                pairAddress: "pool-mismatched-dex",
+                baseToken: { address: "MINT_SEED_TARGET", symbol: "SEED" },
+                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+                priceNative: "0.004",
+                liquidity: { usd: 50000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url === "https://api.dexscreener.com/latest/dex/pairs/solana/pool-mismatched-mint") {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: "1.0.0",
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "pool-mismatched-mint",
+                baseToken: { address: "OTHER_MINT_111111111111111111111111", symbol: "DIFF" },
+                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+                priceNative: "0.004",
+                liquidity: { usd: 50000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url === "https://api.dexscreener.com/latest/dex/tokens/MINT_UNSEEDED_DISCOVERY") {
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "pool-unseeded-wsol",
+                baseToken: { address: "MINT_UNSEEDED_DISCOVERY", symbol: "UNSEED" },
+                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+                priceNative: "0.005",
+                liquidity: { usd: 80000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
       return new Response(JSON.stringify({ pairs: [] }), { status: 404 });
     };
 
@@ -496,24 +550,49 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
       },
     );
 
-    // 1. Explicitly request target seed pool (Pool B)
+    // 1. Seeded enrichment: must call exact pairs endpoint
     const seedCandidate = await candidateSource.enrichCandidate(
-      "MINT_SEED_MULTI",
+      "MINT_SEED_TARGET",
       "pool-b-seed-target-50k",
     );
     expect(seedCandidate).not.toBeNull();
+    expect(recordedUrls[0]).toBe(
+      "https://api.dexscreener.com/latest/dex/pairs/solana/pool-b-seed-target-50k",
+    );
     expect(seedCandidate?.poolId).toBe("pool-b-seed-target-50k");
     expect(seedCandidate?.selectedPoolAddress).toBe("pool-b-seed-target-50k");
     expect(seedCandidate?.poolSelectionBasis).toBe("EXACT_ENFORCED_SEED_POOL_MATCH");
     expect(seedCandidate?.liquidityUsd).toBe(50000);
     expect(seedCandidate?.indicativePriceSol).toBe(0.004);
 
-    // 2. Request nonexistent Pool C -> MUST return null and NEVER substitute Pool A or B
-    const missingCandidate = await candidateSource.enrichCandidate(
-      "MINT_SEED_MULTI",
-      "pool-c-nonexistent-999k",
+    // 2. Mismatched DEX (Orca instead of Raydium) -> Fails closed (returns null)
+    const mismatchedDex = await candidateSource.enrichCandidate(
+      "MINT_SEED_TARGET",
+      "pool-mismatched-dex",
     );
-    expect(missingCandidate).toBeNull();
+    expect(mismatchedDex).toBeNull();
+
+    // 3. Mismatched Mint address -> Fails closed (returns null)
+    const mismatchedMint = await candidateSource.enrichCandidate(
+      "MINT_SEED_TARGET",
+      "pool-mismatched-mint",
+    );
+    expect(mismatchedMint).toBeNull();
+
+    // 4. Nonexistent pool (404) -> Fails closed (returns null)
+    const nonexistent = await candidateSource.enrichCandidate(
+      "MINT_SEED_TARGET",
+      "pool-nonexistent-404",
+    );
+    expect(nonexistent).toBeNull();
+
+    // 5. Unseeded discovery: must call tokens endpoint
+    const unseededCandidate = await candidateSource.enrichCandidate("MINT_UNSEEDED_DISCOVERY");
+    expect(unseededCandidate).not.toBeNull();
+    expect(recordedUrls[recordedUrls.length - 1]).toBe(
+      "https://api.dexscreener.com/latest/dex/tokens/MINT_UNSEEDED_DISCOVERY",
+    );
+    expect(unseededCandidate?.poolId).toBe("pool-unseeded-wsol");
   });
 
   it("Invariant 5: Enforces decision timestamp causality and rejects retrospective timestamps", async () => {

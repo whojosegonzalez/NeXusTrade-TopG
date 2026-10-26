@@ -414,8 +414,12 @@ export class LiveDexScreenerCandidateSource {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
+    const targetUrl = targetPoolAddress
+      ? `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${targetPoolAddress}`
+      : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
+
     try {
-      const res = await this.fetchFn(`${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`, {
+      const res = await this.fetchFn(targetUrl, {
         method: "GET",
         headers: { Accept: "application/json" },
         signal: controller.signal,
@@ -424,8 +428,18 @@ export class LiveDexScreenerCandidateSource {
       this.budgetManager.recordResponseStatus(res.status);
       if (!res.ok) return null;
 
-      const data = (await res.json()) as { pairs?: Array<Record<string, unknown>> };
-      const pairs = data.pairs || [];
+      const payload = (await res.json()) as Record<string, unknown>;
+      const pairs = (
+        Array.isArray(payload)
+          ? payload
+          : Array.isArray(payload?.pairs)
+            ? (payload.pairs as unknown[])
+            : Array.isArray(payload?.pair)
+              ? [payload.pair]
+              : typeof payload?.pair === "object" && payload.pair !== null
+                ? [payload.pair]
+                : []
+      ) as Array<Record<string, unknown>>;
       const matchingPairs = pairs.filter((p) => {
         if (!p || p.chainId !== "solana" || p.dexId !== "raydium") return false;
         if (typeof p.pairAddress !== "string" || p.pairAddress.trim().length === 0) return false;
