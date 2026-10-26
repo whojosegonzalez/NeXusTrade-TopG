@@ -27,6 +27,10 @@ const { computeCombinedSessionFingerprint, computeStrategyConfigFingerprint } = 
   `file://${path.join(distDir, "research", "prospective", "StrategyConfigurationFingerprint.js").replace(/\\/g, "/")}`
 );
 
+const { parseLauncherArgs } = await import(
+  `file://${path.join(distDir, "scripts", "launch-shadow-observation.js").replace(/\\/g, "/")}`
+);
+
 const TEST_OUT_DIR = path.resolve(rootDir, "data/research/prospective/test-pipeline-yield-node");
 
 test("Invariant 1: Enforces enrichment ceiling and preserves budget for forward quote observation", async (t) => {
@@ -653,19 +657,22 @@ test("Invariant 6: Captures uncollapsed seeded-lookup diagnostics, updates pipel
     clock: () => clock,
   });
 
+  const VALID_POOL = "VALID_POOL_33333333333333333333333333";
+  const VALID_MINT = "VALID_MINT_22222222222222222222222222";
+
   const mockFetch = async (url) => {
     if (url.includes("EMPTY_POOL")) {
       return new Response(JSON.stringify({ pairs: [] }), { status: 200 });
     }
-    if (url.includes("VALID_POOL")) {
+    if (url.includes(VALID_POOL) || url.includes(VALID_MINT)) {
       return new Response(
         JSON.stringify({
           pairs: [
             {
               chainId: "solana",
               dexId: "raydium",
-              pairAddress: "VALID_POOL",
-              baseToken: { address: "VALID_MINT", symbol: "VALID" },
+              pairAddress: VALID_POOL,
+              baseToken: { address: VALID_MINT, symbol: "VALID" },
               quoteToken: { address: WSOL_MINT, symbol: "SOL" },
               priceNative: "0.042",
               liquidity: { usd: 100000 },
@@ -681,12 +688,15 @@ test("Invariant 6: Captures uncollapsed seeded-lookup diagnostics, updates pipel
   const candidateSource = new LiveDexScreenerCandidateSource(budgetManager, mockFetch, () => clock);
 
   // 1. Seeded lookup on empty pool
-  const result1 = await candidateSource.enrichCandidate("SOME_MINT", "EMPTY_POOL");
+  const result1 = await candidateSource.enrichCandidate(
+    "SOME_MINT",
+    "EMPTY_POOL_11111111111111111111111111",
+  );
   assert.equal(result1, null);
 
   const diag1 = candidateSource.getSeededLookupDiagnostics();
   assert.ok(diag1);
-  assert.equal(diag1.targetPoolAddress, "EMPTY_POOL");
+  assert.equal(diag1.targetPoolAddress, "EMPTY_POOL_11111111111111111111111111");
   assert.equal(diag1.observedPairCount, 0);
   assert.equal(diag1.failureReason, "SEED_EMPTY_PAIRS_ARRAY");
   assert.equal(diag1.httpStatus, 200);
@@ -713,8 +723,9 @@ test("Invariant 6: Captures uncollapsed seeded-lookup diagnostics, updates pipel
   assert.equal(summary.pipelineYieldStats.mismatchedPairsCount, 1);
 
   // 3. Seeded lookup on valid pool
-  const result2 = await candidateSource.enrichCandidate("VALID_MINT", "VALID_POOL");
+  const result2 = await candidateSource.enrichCandidate(VALID_MINT, VALID_POOL);
   assert.ok(result2);
+  assert.equal(result2.streamSource, "DEXSCREENER_EXACT_PAIR_LOOKUP");
   const diag2 = candidateSource.getSeededLookupDiagnostics();
   assert.ok(diag2);
   assert.equal(diag2.failureReason, null);
@@ -723,4 +734,16 @@ test("Invariant 6: Captures uncollapsed seeded-lookup diagnostics, updates pipel
   const yieldStats2 = candidateSource.getYieldStats();
   assert.equal(yieldStats2.enrichmentAttemptsCount, 2);
   assert.equal(yieldStats2.priceQualifiedCandidatesCount, 1);
+
+  // 4. Quote provider preserves unknown upstream quote timestamp as null
+  const quoteProvider = new LiveDexScreenerQuoteProvider(budgetManager, mockFetch, () => clock);
+  const quote = await quoteProvider.fetchQuote(VALID_POOL, VALID_MINT);
+  assert.equal(quote.indicativePriceSol, 0.042);
+  assert.equal(quote.quoteTimestampMs, null);
+
+  // 5. parseLauncherArgs supports both --session and --sessionId
+  const args1 = parseLauncherArgs(["--session", "my-test-session"]);
+  assert.equal(args1.sessionId, "my-test-session");
+  const args2 = parseLauncherArgs(["--sessionId", "my-test-session-2"]);
+  assert.equal(args2.sessionId, "my-test-session-2");
 });

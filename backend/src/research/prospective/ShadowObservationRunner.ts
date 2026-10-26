@@ -40,7 +40,7 @@ import {
 export interface ShadowQuoteResult {
   readonly indicativePriceSol: number | null;
   readonly liquidityUsd: number | null;
-  readonly quoteTimestampMs: number;
+  readonly quoteTimestampMs?: number | null | undefined;
   readonly quoteSource: string;
   readonly isExecutableQuote: boolean;
   readonly isPoolDrained?: boolean | undefined;
@@ -537,8 +537,14 @@ export class ShadowObservationRunner {
             this.stopIntake(actualObsTime);
           }
 
-          // Check for stale pre-horizon prices masquerading as outcomes
-          if (quote.quoteTimestampMs < task.scheduledDueTimestampMs - 60_000) {
+          const hasQuoteTimestamp =
+            quote.quoteTimestampMs !== null && quote.quoteTimestampMs !== undefined;
+
+          // Check for stale pre-horizon prices masquerading as outcomes (when quote timestamp is provided)
+          if (
+            hasQuoteTimestamp &&
+            quote.quoteTimestampMs! < task.scheduledDueTimestampMs - 60_000
+          ) {
             this.recorder.recordHorizonOutcome({
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
@@ -556,7 +562,7 @@ export class ShadowObservationRunner {
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
-              quoteTimestampMs: quote.quoteTimestampMs,
+              quoteTimestampMs: quote.quoteTimestampMs ?? null,
               quoteSource: quote.quoteSource,
               isExecutableQuote: quote.isExecutableQuote,
               outcomeStatus: "POOL_DRAINED",
@@ -569,7 +575,7 @@ export class ShadowObservationRunner {
               decisionEventId: task.decisionEventId,
               horizonSec: task.horizonSec,
               observationTimestampMs: actualObsTime,
-              quoteTimestampMs: quote.quoteTimestampMs,
+              quoteTimestampMs: quote.quoteTimestampMs ?? null,
               quoteSource: quote.quoteSource,
               isExecutableQuote: quote.isExecutableQuote,
               outcomeStatus: "MISSING_QUOTE_UNAVAILABLE",
@@ -578,8 +584,10 @@ export class ShadowObservationRunner {
               missingReason: quote.missingReason ?? "PROVIDER_RETURNED_NULL_PRICE",
             });
           } else {
-            const freshness = Math.max(0, actualObsTime - quote.quoteTimestampMs);
-            if (freshness > this.maxQuoteStaleMs) {
+            const freshness = hasQuoteTimestamp
+              ? Math.max(0, actualObsTime - quote.quoteTimestampMs!)
+              : null;
+            if (freshness !== null && freshness > this.maxQuoteStaleMs) {
               this.recorder.recordHorizonOutcome({
                 decisionEventId: task.decisionEventId,
                 horizonSec: task.horizonSec,
@@ -597,7 +605,7 @@ export class ShadowObservationRunner {
                 decisionEventId: task.decisionEventId,
                 horizonSec: task.horizonSec,
                 observationTimestampMs: actualObsTime,
-                quoteTimestampMs: quote.quoteTimestampMs,
+                quoteTimestampMs: quote.quoteTimestampMs ?? null,
                 quoteSource: quote.quoteSource,
                 isExecutableQuote: quote.isExecutableQuote,
                 outcomeStatus: "OBSERVED_PRICE",

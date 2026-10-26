@@ -146,7 +146,7 @@ export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
   const args: ShadowLauncherArgs = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--session" && argv[i + 1]) {
+    if ((arg === "--session" || arg === "--sessionId") && argv[i + 1]) {
       args.sessionId = argv[++i];
     } else if (arg === "--outDir" && argv[i + 1]) {
       args.outDir = argv[++i];
@@ -515,7 +515,11 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
 }
 
 // Direct invocation handler
-if (process.argv[1] && process.argv[1].endsWith("launch-shadow-observation.ts")) {
+if (
+  process.argv[1] &&
+  (process.argv[1].endsWith("launch-shadow-observation.ts") ||
+    process.argv[1].endsWith("launch-shadow-observation.js"))
+) {
   const parsedArgs = parseLauncherArgs(process.argv.slice(2));
   runShadowLauncher(parsedArgs).catch((err) => {
     console.error(`[FATAL] Launcher encountered unhandled error: ${err.message}`);

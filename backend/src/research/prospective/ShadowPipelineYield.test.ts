@@ -25,6 +25,7 @@ import {
   computeCombinedSessionFingerprint,
   computeStrategyConfigFingerprint,
 } from "./StrategyConfigurationFingerprint.js";
+import { parseLauncherArgs } from "../../scripts/launch-shadow-observation.js";
 
 const TEST_OUT_DIR = path.resolve("data/research/prospective/test-pipeline-yield-suite");
 
@@ -684,19 +685,22 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
       clock: () => clock,
     });
 
+    const VALID_POOL = "VALID_POOL_33333333333333333333333333";
+    const VALID_MINT = "VALID_MINT_22222222222222222222222222";
+
     const mockFetch: FetchFunction = async (url) => {
       if (url.includes("EMPTY_POOL")) {
         return new Response(JSON.stringify({ pairs: [] }), { status: 200 });
       }
-      if (url.includes("VALID_POOL")) {
+      if (url.includes(VALID_POOL) || url.includes(VALID_MINT)) {
         return new Response(
           JSON.stringify({
             pairs: [
               {
                 chainId: "solana",
                 dexId: "raydium",
-                pairAddress: "VALID_POOL",
-                baseToken: { address: "VALID_MINT", symbol: "VALID" },
+                pairAddress: VALID_POOL,
+                baseToken: { address: VALID_MINT, symbol: "VALID" },
                 quoteToken: { address: WSOL_MINT, symbol: "SOL" },
                 priceNative: "0.042",
                 liquidity: { usd: 100000 },
@@ -716,12 +720,15 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
     );
 
     // 1. Seeded lookup on empty pool
-    const result1 = await candidateSource.enrichCandidate("SOME_MINT", "EMPTY_POOL");
+    const result1 = await candidateSource.enrichCandidate(
+      "SOME_MINT",
+      "EMPTY_POOL_11111111111111111111111111",
+    );
     expect(result1).toBeNull();
 
     const diag1 = candidateSource.getSeededLookupDiagnostics();
     expect(diag1).toBeDefined();
-    expect(diag1!.targetPoolAddress).toBe("EMPTY_POOL");
+    expect(diag1!.targetPoolAddress).toBe("EMPTY_POOL_11111111111111111111111111");
     expect(diag1!.observedPairCount).toBe(0);
     expect(diag1!.failureReason).toBe("SEED_EMPTY_PAIRS_ARRAY");
     expect(diag1!.httpStatus).toBe(200);
@@ -748,8 +755,10 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
     expect(summary.pipelineYieldStats?.mismatchedPairsCount).toBe(1);
 
     // 3. Seeded lookup on valid pool
-    const result2 = await candidateSource.enrichCandidate("VALID_MINT", "VALID_POOL");
+    const result2 = await candidateSource.enrichCandidate(VALID_MINT, VALID_POOL);
     expect(result2).not.toBeNull();
+    expect(result2!.streamSource).toBe("DEXSCREENER_EXACT_PAIR_LOOKUP");
+
     const diag2 = candidateSource.getSeededLookupDiagnostics();
     expect(diag2).toBeDefined();
     expect(diag2!.failureReason).toBeNull();
@@ -758,5 +767,17 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
     const yieldStats2 = candidateSource.getYieldStats();
     expect(yieldStats2.enrichmentAttemptsCount).toBe(2);
     expect(yieldStats2.priceQualifiedCandidatesCount).toBe(1);
+
+    // 4. Quote provider preserves unknown upstream quote timestamp as null
+    const quoteProvider = new LiveDexScreenerQuoteProvider(budgetManager, mockFetch, () => clock);
+    const quote = await quoteProvider.fetchQuote(VALID_POOL, VALID_MINT);
+    expect(quote.indicativePriceSol).toBe(0.042);
+    expect(quote.quoteTimestampMs).toBeNull();
+
+    // 5. parseLauncherArgs supports both --session and --sessionId
+    const args1 = parseLauncherArgs(["--session", "my-test-session"]);
+    expect(args1.sessionId).toBe("my-test-session");
+    const args2 = parseLauncherArgs(["--sessionId", "my-test-session-2"]);
+    expect(args2.sessionId).toBe("my-test-session-2");
   });
 });

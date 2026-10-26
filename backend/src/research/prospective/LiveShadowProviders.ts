@@ -101,7 +101,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
-        quoteTimestampMs: this.clock(),
+        quoteTimestampMs: null,
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
         missingReason: `HTTP_${httpStatus}_${res.statusText}`,
@@ -126,7 +126,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
-        quoteTimestampMs: this.clock(),
+        quoteTimestampMs: null,
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
         missingReason: "EMPTY_PAIRS_ARRAY",
@@ -140,7 +140,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
-        quoteTimestampMs: this.clock(),
+        quoteTimestampMs: null,
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
         missingReason: "NON_SOLANA_CHAIN",
@@ -166,7 +166,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         return {
           indicativePriceSol: null,
           liquidityUsd: null,
-          quoteTimestampMs: this.clock(),
+          quoteTimestampMs: null,
           quoteSource: "DEXSCREENER",
           isExecutableQuote: false,
           missingReason: poolOnOtherDex
@@ -182,7 +182,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         return {
           indicativePriceSol: null,
           liquidityUsd: null,
-          quoteTimestampMs: this.clock(),
+          quoteTimestampMs: null,
           quoteSource: "DEXSCREENER",
           isExecutableQuote: false,
           missingReason: "NO_RAYDIUM_POOL_FOUND",
@@ -201,7 +201,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       return {
         indicativePriceSol: null,
         liquidityUsd: null,
-        quoteTimestampMs: this.clock(),
+        quoteTimestampMs: null,
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
         missingReason: "MINT_ADDRESS_MISMATCH",
@@ -267,7 +267,10 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       }
     }
 
-    const quoteTimestampMs = this.clock();
+    // DexScreener does not provide an authenticated upstream price-tick timestamp.
+    // Preserving quoteTimestampMs as null accurately records that upstream market-tick age is unknown,
+    // avoiding the manufacture of quote freshness from local HTTP retrieval time.
+    const quoteTimestampMs: number | null = null;
 
     return {
       indicativePriceSol,
@@ -836,7 +839,9 @@ export class LiveDexScreenerCandidateSource {
         mintAddress,
         symbol: baseToken.symbol || "UNKNOWN",
         discoveryTimestampMs: this.clock(),
-        streamSource: "DEXSCREENER_LATEST_TOKEN_PROFILES",
+        streamSource: targetPoolAddress
+          ? "DEXSCREENER_EXACT_PAIR_LOOKUP"
+          : "DEXSCREENER_LATEST_TOKEN_PROFILES",
         indicativePriceSol,
         missingPriceReason: selected.missingPriceReason,
         priceQuoteTimestampMs: null, // Upstream tick timestamp unknown; never represent receipt time as tick timestamp

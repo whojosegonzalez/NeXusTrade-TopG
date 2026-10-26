@@ -17,6 +17,7 @@ export type ProspectiveStrategyCohort = "ESTABLISHED_RUNNER" | "MICRO_CAP_PROBE"
 
 export type CandidateStreamSource =
   | "DEXSCREENER_LATEST_TOKEN_PROFILES"
+  | "DEXSCREENER_EXACT_PAIR_LOOKUP"
   | "RAYDIUM_TOP_TRADED"
   | "DEXSCREENER_RECENT"
   | "BIRDEYE_TRENDING"
