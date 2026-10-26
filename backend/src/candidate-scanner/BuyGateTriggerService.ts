@@ -90,6 +90,10 @@ export class BuyGateTriggerService {
     this.config = { ...BUY_GATE_DEFAULTS, ...config };
   }
 
+  public getConfig(): BuyGateConfig {
+    return { ...this.config };
+  }
+
   public static fromStrategyThresholds(
     thresholds?: Partial<StrategyThresholds>,
   ): BuyGateTriggerService {

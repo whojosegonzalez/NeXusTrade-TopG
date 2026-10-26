@@ -50,6 +50,8 @@ export interface DecisionMarketFeatures {
   readonly bundlerPct: number | null;
   readonly top10HolderPct: number | null;
   readonly unavailableInputs: readonly string[];
+  readonly selectedPoolAddress?: string | undefined;
+  readonly poolSelectionBasis?: string | undefined;
 }
 
 export interface GateCheckRecord {
@@ -131,10 +133,23 @@ export interface SessionManifestFileEntry {
   readonly recordCount?: number | undefined;
 }
 
+export interface PipelineYieldStats {
+  readonly profilesReceivedCount: number;
+  readonly enrichmentAttemptsCount: number;
+  readonly mismatchedPairsCount: number;
+  readonly priceQualifiedCandidatesCount: number;
+  readonly candidateDecisionsRecordedCount: number;
+  readonly forwardQuoteAttemptsCount: number;
+  readonly successfulForwardPriceObservationsCount: number;
+}
+
 export interface SessionManifest {
   readonly manifestVersion: string;
   readonly sessionId: string;
   readonly configFingerprint: string;
+  readonly strategyConfigFingerprint?: string | undefined;
+  readonly launcherConfigFingerprint?: string | undefined;
+  readonly strategyVersion?: string | undefined;
   readonly createdAt: string;
   readonly files: readonly SessionManifestFileEntry[];
   readonly manifestDigestSha256: string;
@@ -163,6 +178,9 @@ export interface HorizonCoverageSummary {
 export interface ProspectiveSessionSummary {
   readonly sessionId: string;
   readonly configFingerprint: string;
+  readonly strategyConfigFingerprint?: string | undefined;
+  readonly launcherConfigFingerprint?: string | undefined;
+  readonly strategyVersion?: string | undefined;
   readonly sessionStartedAtMs: number;
   readonly intakeStoppedAtMs: number;
   readonly sessionClosedAtMs: number;
@@ -200,4 +218,5 @@ export interface ProspectiveSessionSummary {
     readonly drainedPoolsDetected: number;
     readonly quoteFreshnessAverageMs: number;
   };
+  readonly pipelineYieldStats?: PipelineYieldStats | undefined;
 }

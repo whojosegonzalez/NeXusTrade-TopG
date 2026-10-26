@@ -670,7 +670,11 @@ export class ProspectiveObservationRecorder {
    * Generates and writes a cryptographic SHA-256 session manifest covering
    * all generated evidence files in the output directory.
    */
-  public writeSessionManifest(): SessionManifest | null {
+  public writeSessionManifest(manifestMetadata?: {
+    strategyConfigFingerprint?: string | undefined;
+    launcherConfigFingerprint?: string | undefined;
+    strategyVersion?: string | undefined;
+  }): SessionManifest | null {
     if (!this.outputDir) return null;
 
     const filesToDigest = [
@@ -715,6 +719,9 @@ export class ProspectiveObservationRecorder {
       manifestVersion: "1.0",
       sessionId: this.sessionId,
       configFingerprint: this.configFingerprint,
+      strategyConfigFingerprint: manifestMetadata?.strategyConfigFingerprint,
+      launcherConfigFingerprint: manifestMetadata?.launcherConfigFingerprint,
+      strategyVersion: manifestMetadata?.strategyVersion,
       createdAt: new Date(this.clock()).toISOString(),
       files: entries,
       manifestDigestSha256,

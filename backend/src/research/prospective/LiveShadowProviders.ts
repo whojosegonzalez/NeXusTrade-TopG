@@ -275,6 +275,11 @@ export class LiveDexScreenerCandidateSource {
   private readonly timeoutMs: number;
   private readonly seenMints = new Set<string>();
 
+  private profilesReceivedCount = 0;
+  private enrichmentAttemptsCount = 0;
+  private mismatchedPairsCount = 0;
+  private priceQualifiedCandidatesCount = 0;
+
   constructor(
     budgetManager: GlobalResourceBudgetManager,
     fetchFn: FetchFunction = fetch,
@@ -289,11 +294,25 @@ export class LiveDexScreenerCandidateSource {
     this.timeoutMs = timeoutMs;
   }
 
+  public getYieldStats(): {
+    profilesReceivedCount: number;
+    enrichmentAttemptsCount: number;
+    mismatchedPairsCount: number;
+    priceQualifiedCandidatesCount: number;
+  } {
+    return {
+      profilesReceivedCount: this.profilesReceivedCount,
+      enrichmentAttemptsCount: this.enrichmentAttemptsCount,
+      mismatchedPairsCount: this.mismatchedPairsCount,
+      priceQualifiedCandidatesCount: this.priceQualifiedCandidatesCount,
+    };
+  }
+
   public async pollCandidates(maxToDiscover = 10): Promise<ShadowCandidateInput[]> {
     const now = this.clock();
 
-    // Check budget before discovery request
-    const discoveryCheck = this.budgetManager.canMakeRequest("DEXSCREENER", now);
+    // Check budget before discovery request (honoring reservation for forward quotes)
+    const discoveryCheck = this.budgetManager.canMakeRequest("DEXSCREENER", now, "DISCOVERY_POLL");
     if (!discoveryCheck.allowed) {
       if (
         discoveryCheck.reason === "PROVIDER_PACING_NOT_MET" &&
@@ -336,6 +355,7 @@ export class LiveDexScreenerCandidateSource {
     }
 
     const solanaProfiles = profiles.filter((p) => p && p.chainId === "solana" && p.tokenAddress);
+    this.profilesReceivedCount += solanaProfiles.length;
     const candidates: ShadowCandidateInput[] = [];
 
     for (const profile of solanaProfiles) {
@@ -345,8 +365,12 @@ export class LiveDexScreenerCandidateSource {
       if (this.seenMints.has(mint)) continue;
       this.seenMints.add(mint);
 
-      // Check budget before candidate enrichment
-      const check = this.budgetManager.canMakeRequest("DEXSCREENER", this.clock());
+      // Check budget before candidate enrichment (enforces maxEnrichmentAttempts & reserved forward quotes)
+      const check = this.budgetManager.canMakeRequest(
+        "DEXSCREENER",
+        this.clock(),
+        "CANDIDATE_ENRICHMENT",
+      );
       if (!check.allowed) {
         if (
           check.reason === "PROVIDER_PACING_NOT_MET" &&
@@ -355,13 +379,20 @@ export class LiveDexScreenerCandidateSource {
         ) {
           await this.sleepFn(check.waitMs);
         } else {
+          // Ceilings reached (e.g. MAX_ENRICHMENT_ATTEMPTS_REACHED or RESERVED_FOR_FORWARD_OBSERVATIONS)
           break;
         }
       }
 
+      this.enrichmentAttemptsCount++;
       const enriched = await this.enrichCandidate(mint);
       if (enriched) {
+        if (enriched.indicativePriceSol !== null && enriched.indicativePriceSol > 0) {
+          this.priceQualifiedCandidatesCount++;
+        }
         candidates.push(enriched);
+      } else {
+        this.mismatchedPairsCount++;
       }
     }
 
@@ -392,18 +423,110 @@ export class LiveDexScreenerCandidateSource {
 
       const data = (await res.json()) as { pairs?: Array<Record<string, unknown>> };
       const pairs = data.pairs || [];
-      const solanaRaydiumPairs = pairs.filter(
-        (p) => p && p.chainId === "solana" && p.dexId === "raydium",
-      );
-      const bestPair = solanaRaydiumPairs.find(
-        (p) =>
-          (p.baseToken as Record<string, string>)?.address === mintAddress ||
-          (p.quoteToken as Record<string, string>)?.address === mintAddress,
-      );
-      if (!bestPair) return null;
+      const matchingPairs = pairs.filter((p) => {
+        if (!p || p.chainId !== "solana" || p.dexId !== "raydium") return false;
+        if (typeof p.pairAddress !== "string" || p.pairAddress.trim().length === 0) return false;
+        const base = (p.baseToken as Record<string, string>)?.address;
+        const quote = (p.quoteToken as Record<string, string>)?.address;
+        return base === mintAddress || quote === mintAddress;
+      });
 
-      const baseToken = (bestPair.baseToken as Record<string, string>) || {};
-      const quoteToken = (bestPair.quoteToken as Record<string, string>) || {};
+      if (matchingPairs.length === 0) {
+        return null;
+      }
+
+      interface CandidatePairAssessment {
+        pair: Record<string, unknown>;
+        pairAddress: string;
+        baseToken: Record<string, string>;
+        quoteToken: Record<string, string>;
+        isBaseToken: boolean;
+        hasCanonicalWsol: boolean;
+        indicativePriceSol: number | null;
+        missingPriceReason?: string;
+        liquidityUsd: number | null;
+        volume5mUsd: number | null;
+        hasValidPrice: boolean;
+      }
+
+      const assessments: CandidatePairAssessment[] = matchingPairs.map((p) => {
+        const pairAddress = (p.pairAddress as string).trim();
+        const baseToken = (p.baseToken as Record<string, string>) || {};
+        const quoteToken = (p.quoteToken as Record<string, string>) || {};
+        const isBaseToken = baseToken.address === mintAddress;
+        const counterToken = isBaseToken ? quoteToken : baseToken;
+        const hasCanonicalWsol = isWsolToken(counterToken);
+
+        let indicativePriceSol: number | null = null;
+        let missingPriceReason: string | undefined;
+
+        if (!hasCanonicalWsol) {
+          missingPriceReason = "NON_SOL_QUOTE_DENOMINATION";
+        } else if (typeof p.priceNative !== "string") {
+          missingPriceReason = "MISSING_PRICE_NATIVE";
+        } else {
+          const parsed = Number.parseFloat(p.priceNative);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            indicativePriceSol = isBaseToken ? parsed : 1 / parsed;
+          } else {
+            missingPriceReason = "INVALID_PRICE_NATIVE_VALUE";
+          }
+        }
+
+        const liquidity = (p.liquidity as Record<string, number>) || {};
+        const liquidityUsd =
+          typeof liquidity.usd === "number" && Number.isFinite(liquidity.usd)
+            ? liquidity.usd
+            : null;
+
+        const volume = (p.volume as Record<string, number>) || {};
+        const volume5mUsd =
+          typeof volume.m5 === "number" && Number.isFinite(volume.m5) ? volume.m5 : null;
+
+        const hasValidPrice = indicativePriceSol !== null && indicativePriceSol > 0;
+
+        return {
+          pair: p,
+          pairAddress,
+          baseToken,
+          quoteToken,
+          isBaseToken,
+          hasCanonicalWsol,
+          indicativePriceSol,
+          missingPriceReason,
+          liquidityUsd,
+          volume5mUsd,
+          hasValidPrice,
+        };
+      });
+
+      // Deterministic selection: require genuine canonical WSOL Raydium pair with valid price
+      const priceQualified = assessments.filter((a) => a.hasValidPrice);
+      if (priceQualified.length === 0) {
+        return null;
+      }
+
+      // If multiple price-qualified pairs exist, sort deterministically:
+      // 1. Highest liquidity first
+      // 2. Highest 5m volume second
+      // 3. Alphabetical tie-break on pairAddress
+      priceQualified.sort((a, b) => {
+        const liqA = a.liquidityUsd ?? -1;
+        const liqB = b.liquidityUsd ?? -1;
+        if (liqB !== liqA) return liqB - liqA;
+
+        const volA = a.volume5mUsd ?? -1;
+        const volB = b.volume5mUsd ?? -1;
+        if (volB !== volA) return volB - volA;
+
+        return a.pairAddress.localeCompare(b.pairAddress);
+      });
+
+      const selected = priceQualified[0]!;
+      const selectionBasis = "HIGHEST_LIQUIDITY_CANONICAL_WSOL_RAYDIUM_PAIR";
+
+      const bestPair = selected.pair;
+      const baseToken = selected.baseToken;
       const liquidity = (bestPair.liquidity as Record<string, number>) || {};
       const volume = (bestPair.volume as Record<string, number>) || {};
       const txns = (bestPair.txns as Record<string, Record<string, number>>) || {};
@@ -411,25 +534,10 @@ export class LiveDexScreenerCandidateSource {
 
       const unavailableInputs: string[] = [];
 
-      // 1. Price Native & Quote Denomination Validation
-      let indicativePriceSol: number | null = null;
-      if (baseToken.address === mintAddress && isWsolToken(quoteToken)) {
-        if (typeof bestPair.priceNative === "string") {
-          const parsed = Number.parseFloat(bestPair.priceNative);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            indicativePriceSol = parsed;
-          }
-        }
-      } else if (quoteToken.address === mintAddress && isWsolToken(baseToken)) {
-        if (typeof bestPair.priceNative === "string") {
-          const parsed = Number.parseFloat(bestPair.priceNative);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            indicativePriceSol = 1 / parsed;
-          }
-        }
-      }
+      // 1. Indicative Price & Specific Missing Reason
+      const indicativePriceSol = selected.indicativePriceSol;
       if (indicativePriceSol === null) {
-        unavailableInputs.push("indicativePriceSol");
+        unavailableInputs.push(selected.missingPriceReason ?? "indicativePriceSol");
       }
 
       // 2. Liquidity (No fabricated defaults)
@@ -505,13 +613,16 @@ export class LiveDexScreenerCandidateSource {
       unavailableInputs.push("holdersCount", "rugScore", "bundlerPct", "top10HolderPct");
 
       return {
-        poolId: (bestPair.pairAddress as string) || `pool-${mintAddress.slice(0, 8)}`,
+        poolId: selected.pairAddress,
+        selectedPoolAddress: selected.pairAddress,
+        poolSelectionBasis: selectionBasis,
         mintAddress,
         symbol: baseToken.symbol || "UNKNOWN",
         discoveryTimestampMs: this.clock(),
         streamSource: "DEXSCREENER_LATEST_TOKEN_PROFILES",
         indicativePriceSol,
-        priceQuoteTimestampMs: this.clock(),
+        missingPriceReason: selected.missingPriceReason,
+        priceQuoteTimestampMs: null, // Upstream tick timestamp unknown; never represent receipt time as tick timestamp
         liquidityUsd,
         marketCapUsd,
         lmcRatio,

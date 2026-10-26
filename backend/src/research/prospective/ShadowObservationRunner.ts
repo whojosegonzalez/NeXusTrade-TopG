@@ -31,6 +31,7 @@ import {
   FORWARD_HORIZONS_SEC,
   type CandidateStreamSource,
   type ForwardHorizonSec,
+  type PipelineYieldStats,
   type ProspectiveSessionSummary,
   type ProspectiveStrategyCohort,
   type SessionManifest,
@@ -59,7 +60,10 @@ export interface ShadowCandidateInput {
   readonly discoveryTimestampMs: number;
   readonly streamSource: CandidateStreamSource;
   readonly indicativePriceSol: number | null;
+  readonly missingPriceReason?: string | undefined;
   readonly priceQuoteTimestampMs?: number | null | undefined;
+  readonly selectedPoolAddress?: string | undefined;
+  readonly poolSelectionBasis?: string | undefined;
   readonly liquidityUsd: number | null;
   readonly marketCapUsd: number | null;
   readonly lmcRatio: number | null;
@@ -90,6 +94,9 @@ export interface ScheduledHorizonTask {
 export interface ShadowRunnerConfig {
   readonly sessionId: string;
   readonly configFingerprint: string;
+  readonly strategyConfigFingerprint?: string | undefined;
+  readonly launcherConfigFingerprint?: string | undefined;
+  readonly strategyVersion?: string | undefined;
   readonly outputDir?: string | undefined;
   readonly approvedRootPath?: string | undefined;
   readonly maxCandidates?: number | undefined; // e.g. 25
@@ -124,6 +131,8 @@ export class ShadowObservationRunner {
 
   private readonly scheduledTasks: ScheduledHorizonTask[] = [];
   private candidateCount = 0;
+  private forwardQuoteAttemptsCount = 0;
+  private successfulForwardPriceObservationsCount = 0;
   private isIntakeStopped = false;
   private isSessionClosed = false;
   private isProcessingObservations = false;
@@ -244,7 +253,7 @@ export class ShadowObservationRunner {
     // 2. Identify missing or unverified mandatory screening inputs
     const missingInputs: string[] = [];
     if (candidate.indicativePriceSol === null || candidate.indicativePriceSol <= 0) {
-      missingInputs.push("MISSING_PRICE_DATA");
+      missingInputs.push(candidate.missingPriceReason ?? "MISSING_PRICE_DATA");
     }
     if (candidate.liquidityUsd === null) {
       missingInputs.push("MISSING_LIQUIDITY_DATA");
@@ -339,11 +348,13 @@ export class ShadowObservationRunner {
       strategyCohort,
       marketFeatures: {
         indicativePriceSol: candidate.indicativePriceSol,
-        priceQuoteTimestampMs: candidate.priceQuoteTimestampMs ?? candidate.discoveryTimestampMs,
-        priceQuoteFreshnessMs: Math.max(
-          0,
-          now - (candidate.priceQuoteTimestampMs ?? candidate.discoveryTimestampMs),
-        ),
+        priceQuoteTimestampMs: candidate.priceQuoteTimestampMs ?? null,
+        priceQuoteFreshnessMs:
+          candidate.priceQuoteTimestampMs !== null && candidate.priceQuoteTimestampMs !== undefined
+            ? Math.max(0, now - candidate.priceQuoteTimestampMs)
+            : null,
+        selectedPoolAddress: candidate.selectedPoolAddress ?? candidate.poolId,
+        poolSelectionBasis: candidate.poolSelectionBasis ?? "EXACT_PAIR_ADDRESS",
         liquidityUsd: candidate.liquidityUsd,
         volume5mUsd: candidate.volume5mUsd,
         marketCapUsd: candidate.marketCapUsd,
@@ -482,6 +493,7 @@ export class ShadowObservationRunner {
           task.status = "PENDING";
           continue;
         }
+        this.forwardQuoteAttemptsCount++;
 
         // 4. Fetch quote from provider safely
         try {
@@ -577,6 +589,7 @@ export class ShadowObservationRunner {
                 indicativePriceSol: quote.indicativePriceSol,
                 liquidityUsd: quote.liquidityUsd,
               });
+              this.successfulForwardPriceObservationsCount++;
             }
           }
         } catch (err) {
@@ -640,9 +653,12 @@ export class ShadowObservationRunner {
 
   /**
    * Closes session cleanly, finalizing remaining horizons, generating summary,
-   * appending global request statistics, and writing SHA-256 session manifest.
+   * appending global request statistics and pipeline yield metrics, and writing SHA-256 session manifest.
    */
-  public closeSession(nowTimestampMs?: number): {
+  public closeSession(
+    nowTimestampMs?: number,
+    yieldStats?: Partial<PipelineYieldStats>,
+  ): {
     readonly summary: ProspectiveSessionSummary;
     readonly manifest: SessionManifest | null;
   } {
@@ -651,10 +667,25 @@ export class ShadowObservationRunner {
     this.recorder.closeSession(now);
 
     const baseSummary = this.recorder.generateSessionSummary();
+    const finalYieldStats: PipelineYieldStats = {
+      profilesReceivedCount: yieldStats?.profilesReceivedCount ?? 0,
+      enrichmentAttemptsCount:
+        yieldStats?.enrichmentAttemptsCount ?? this.budgetManager.getStats().enrichmentRequests,
+      mismatchedPairsCount: yieldStats?.mismatchedPairsCount ?? 0,
+      priceQualifiedCandidatesCount: yieldStats?.priceQualifiedCandidatesCount ?? 0,
+      candidateDecisionsRecordedCount: this.candidateCount,
+      forwardQuoteAttemptsCount: this.forwardQuoteAttemptsCount,
+      successfulForwardPriceObservationsCount: this.successfulForwardPriceObservationsCount,
+    };
+
     const enhancedSummary: ProspectiveSessionSummary = {
       ...baseSummary,
+      strategyConfigFingerprint: this.config.strategyConfigFingerprint,
+      launcherConfigFingerprint: this.config.launcherConfigFingerprint,
+      strategyVersion: this.config.strategyVersion ?? "nexustrade-strategy-v1.0",
       earlyStopReason: this.earlyStopReason,
       globalRequestStats: this.budgetManager.getStats(),
+      pipelineYieldStats: finalYieldStats,
     };
 
     // Re-save session summary with global request stats before manifest hashing
@@ -663,9 +694,25 @@ export class ShadowObservationRunner {
       fs.writeFileSync(summaryPath, JSON.stringify(enhancedSummary, null, 2), "utf8");
     }
 
-    const manifest = this.recorder.writeSessionManifest();
+    const manifest = this.recorder.writeSessionManifest({
+      strategyConfigFingerprint: this.config.strategyConfigFingerprint,
+      launcherConfigFingerprint: this.config.launcherConfigFingerprint,
+      strategyVersion: this.config.strategyVersion,
+    });
 
     return { summary: enhancedSummary, manifest };
+  }
+
+  public getYieldStats(): {
+    forwardQuoteAttemptsCount: number;
+    successfulForwardPriceObservationsCount: number;
+    candidateDecisionsRecordedCount: number;
+  } {
+    return {
+      forwardQuoteAttemptsCount: this.forwardQuoteAttemptsCount,
+      successfulForwardPriceObservationsCount: this.successfulForwardPriceObservationsCount,
+      candidateDecisionsRecordedCount: this.candidateCount,
+    };
   }
 
   /**

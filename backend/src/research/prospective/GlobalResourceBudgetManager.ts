@@ -32,16 +32,22 @@ export interface GlobalBudgetStats {
   readonly retries: number;
   readonly consecutive429sEncountered: number;
   readonly isStopTriggered429: boolean;
+  readonly maxEnrichmentAttempts: number;
+  readonly minReservedForwardRequests: number;
 }
 
 export interface GlobalBudgetOptions {
   readonly maxTotalRequests?: number | undefined; // default 120
+  readonly maxEnrichmentAttempts?: number | undefined; // default 10 (or per-session limit)
+  readonly minReservedForwardRequests?: number | undefined; // default 4 (reserved for quotes)
   readonly minProviderSpacingMs?: number | undefined; // default 2,500 ms
   readonly clock?: () => number;
 }
 
 export class GlobalResourceBudgetManager {
   private readonly maxTotalRequests: number;
+  private readonly maxEnrichmentAttempts: number;
+  private readonly minReservedForwardRequests: number;
   private readonly minProviderSpacingMs: number;
   private readonly clock: () => number;
 
@@ -59,6 +65,8 @@ export class GlobalResourceBudgetManager {
 
   constructor(options: GlobalBudgetOptions = {}) {
     this.maxTotalRequests = options.maxTotalRequests ?? 120;
+    this.maxEnrichmentAttempts = options.maxEnrichmentAttempts ?? 10;
+    this.minReservedForwardRequests = options.minReservedForwardRequests ?? 4;
     this.minProviderSpacingMs = options.minProviderSpacingMs ?? 2500;
     this.clock = options.clock ?? (() => Date.now());
   }
@@ -73,12 +81,15 @@ export class GlobalResourceBudgetManager {
       retries: this.retries,
       consecutive429sEncountered: this.consecutive429Count,
       isStopTriggered429: this.is429StopTriggered,
+      maxEnrichmentAttempts: this.maxEnrichmentAttempts,
+      minReservedForwardRequests: this.minReservedForwardRequests,
     };
   }
 
   public canMakeRequest(
     providerName: string,
     nowMs?: number,
+    purpose?: RequestPurpose,
   ): { allowed: boolean; reason?: string; waitMs?: number } {
     if (this.is429StopTriggered) {
       return { allowed: false, reason: "CONSECUTIVE_HTTP_429_LIMIT_REACHED" };
@@ -86,6 +97,20 @@ export class GlobalResourceBudgetManager {
 
     if (this.totalRequests >= this.maxTotalRequests) {
       return { allowed: false, reason: "GLOBAL_REQUEST_CEILING_REACHED" };
+    }
+
+    // Purpose-specific budget reservations
+    if (purpose === "CANDIDATE_ENRICHMENT") {
+      if (this.enrichmentRequests >= this.maxEnrichmentAttempts) {
+        return { allowed: false, reason: "MAX_ENRICHMENT_ATTEMPTS_REACHED" };
+      }
+      if (this.totalRequests + this.minReservedForwardRequests >= this.maxTotalRequests) {
+        return { allowed: false, reason: "RESERVED_FOR_FORWARD_OBSERVATIONS" };
+      }
+    } else if (purpose === "DISCOVERY_POLL") {
+      if (this.totalRequests + this.minReservedForwardRequests >= this.maxTotalRequests) {
+        return { allowed: false, reason: "RESERVED_FOR_FORWARD_OBSERVATIONS" };
+      }
     }
 
     const now = nowMs ?? this.clock();
@@ -108,7 +133,7 @@ export class GlobalResourceBudgetManager {
     purpose: RequestPurpose,
     nowMs?: number,
   ): boolean {
-    const check = this.canMakeRequest(providerName, nowMs);
+    const check = this.canMakeRequest(providerName, nowMs, purpose);
     if (!check.allowed) {
       return false;
     }

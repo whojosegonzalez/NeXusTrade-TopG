@@ -28,6 +28,7 @@ import {
   ShadowObservationRunner,
   type ShadowRunnerConfig,
 } from "../research/prospective/ShadowObservationRunner.js";
+import { computeCombinedSessionFingerprint } from "../research/prospective/StrategyConfigurationFingerprint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,6 +41,8 @@ export interface ShadowLauncherArgs {
   drainMinutes?: number | undefined;
   maxCandidates?: number | undefined;
   maxRequests?: number | undefined;
+  maxEnrichmentAttempts?: number | undefined;
+  minReservedForwardRequests?: number | undefined;
   pacingMs?: number | undefined;
   pollIntervalMs?: number | undefined;
   dryRun?: boolean | undefined;
@@ -88,6 +91,28 @@ export function validateLauncherArgs(args: ShadowLauncherArgs): void {
       );
     }
   }
+  if (args.maxEnrichmentAttempts !== undefined) {
+    if (
+      !Number.isFinite(args.maxEnrichmentAttempts) ||
+      args.maxEnrichmentAttempts <= 0 ||
+      args.maxEnrichmentAttempts > 60
+    ) {
+      throw new Error(
+        `[INVALID_ARGUMENT] maxEnrichmentAttempts must be between 1 and 60 (got: ${args.maxEnrichmentAttempts})`,
+      );
+    }
+  }
+  if (args.minReservedForwardRequests !== undefined) {
+    if (
+      !Number.isFinite(args.minReservedForwardRequests) ||
+      args.minReservedForwardRequests < 0 ||
+      args.minReservedForwardRequests > 60
+    ) {
+      throw new Error(
+        `[INVALID_ARGUMENT] minReservedForwardRequests must be between 0 and 60 (got: ${args.minReservedForwardRequests})`,
+      );
+    }
+  }
   if (args.pacingMs !== undefined) {
     if (!Number.isFinite(args.pacingMs) || args.pacingMs < 2500) {
       throw new Error(`[INVALID_ARGUMENT] pacingMs must be >= 2500 ms (got: ${args.pacingMs})`);
@@ -118,6 +143,10 @@ export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
       args.maxCandidates = Number(argv[++i]);
     } else if (arg === "--maxRequests" && argv[i + 1]) {
       args.maxRequests = Number(argv[++i]);
+    } else if (arg === "--maxEnrichmentAttempts" && argv[i + 1]) {
+      args.maxEnrichmentAttempts = Number(argv[++i]);
+    } else if (arg === "--minReservedForwardRequests" && argv[i + 1]) {
+      args.minReservedForwardRequests = Number(argv[++i]);
     } else if (arg === "--pacingMs" && argv[i + 1]) {
       args.pacingMs = Number(argv[++i]);
     } else if (arg === "--pollIntervalMs" && argv[i + 1]) {
@@ -141,6 +170,10 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   const drainMinutes = cliArgs.drainMinutes ?? 60;
   const maxCandidates = cliArgs.maxCandidates ?? 25;
   const maxRequests = cliArgs.maxRequests ?? 120;
+  const maxEnrichmentAttempts =
+    cliArgs.maxEnrichmentAttempts ?? Math.min(8, Math.max(1, Math.floor(maxRequests * 0.6)));
+  const minReservedForwardRequests =
+    cliArgs.minReservedForwardRequests ?? Math.min(4, Math.max(1, Math.floor(maxRequests * 0.3)));
   const pacingMs = cliArgs.pacingMs ?? 2500;
   const pollIntervalMs = cliArgs.pollIntervalMs ?? 180_000; // 3 minutes
 
@@ -155,6 +188,8 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   console.log(`Hard Session Ceiling:${intakeMinutes + drainMinutes} minutes`);
   console.log(`Max Candidates:      ${maxCandidates}`);
   console.log(`Global Request Cap:  ${maxRequests} requests`);
+  console.log(`Max Enrich Attempts: ${maxEnrichmentAttempts} attempts`);
+  console.log(`Min Reserved Quotes: ${minReservedForwardRequests} requests`);
   console.log(`Provider Pacing:     ${pacingMs} ms`);
   console.log(`Virtual Wallet:      7.9259 SOL (Strictly Frozen)`);
   console.log("================================================================================");
@@ -183,24 +218,24 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
     fs.mkdirSync(resolvedOut, { recursive: true });
   }
 
-  // 2. Compute Config Fingerprint
-  const configFingerprint = `sha256:${crypto
-    .createHash("sha256")
-    .update(
-      JSON.stringify({
-        sessionId,
-        intakeMinutes,
-        drainMinutes,
-        maxCandidates,
-        maxRequests,
-        pacingMs,
-        walletBalance: "7.9259 SOL",
-      }),
-    )
-    .digest("hex")
-    .slice(0, 16)}`;
+  // 2. Compute Config Fingerprints (Binding actual strategy Buy Gate rules + cohort boundaries)
+  const fingerprintResult = computeCombinedSessionFingerprint({
+    sessionId,
+    intakeMinutes,
+    drainMinutes,
+    maxCandidates,
+    maxRequests,
+    maxEnrichmentAttempts,
+    minReservedForwardRequests,
+    pacingMs,
+    walletBalance: "7.9259 SOL",
+  });
+  const configFingerprint = fingerprintResult.combinedFingerprint;
 
-  console.log(`[PREFLIGHT] Config Fingerprint: ${configFingerprint}`);
+  console.log(`[PREFLIGHT] Combined Fingerprint: ${fingerprintResult.combinedFingerprint}`);
+  console.log(`[PREFLIGHT] Strategy Fingerprint: ${fingerprintResult.strategyConfigFingerprint}`);
+  console.log(`[PREFLIGHT] Strategy Version:     ${fingerprintResult.strategyVersion}`);
+  console.log(`[PREFLIGHT] Launcher Fingerprint: ${fingerprintResult.launcherConfigFingerprint}`);
 
   if (cliArgs.dryRun) {
     console.log(
@@ -212,6 +247,8 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   // 3. Initialize Shared Global Resource Controller
   const budgetManager = new GlobalResourceBudgetManager({
     maxTotalRequests: maxRequests,
+    maxEnrichmentAttempts,
+    minReservedForwardRequests,
     minProviderSpacingMs: pacingMs,
   });
 
@@ -223,6 +260,9 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   const runnerConfig: ShadowRunnerConfig = {
     sessionId,
     configFingerprint,
+    strategyConfigFingerprint: fingerprintResult.strategyConfigFingerprint,
+    launcherConfigFingerprint: fingerprintResult.launcherConfigFingerprint,
+    strategyVersion: fingerprintResult.strategyVersion,
     outputDir: outDir,
     approvedRootPath: path.join(rootDir, "data", "research"),
     maxCandidates,
@@ -347,18 +387,36 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
 
   // 8. Finalize Session Cleanly
   console.log("\n[FINALIZATION] Finalizing prospective shadow observation session...");
-  const { summary, manifest } = runner.closeSession(Date.now());
+  const { summary, manifest } = runner.closeSession(Date.now(), candidateSource.getYieldStats());
 
   console.log("================================================================================");
   console.log(" SESSION SUMMARY RESULTS");
   console.log("================================================================================");
   console.log(`Session ID:            ${summary.sessionId}`);
+  console.log(`Strategy Version:      ${summary.strategyVersion ?? "nexustrade-strategy-v1.0"}`);
+  console.log(`Strategy Fingerprint:  ${summary.strategyConfigFingerprint ?? "N/A"}`);
+  console.log(`Combined Fingerprint:  ${summary.configFingerprint}`);
   console.log(`Candidates Screened:   ${summary.totalCandidatesScreened}`);
   console.log(`Accepted Candidates:   ${summary.acceptedCandidatesCount}`);
   console.log(`Rejected Candidates:   ${summary.rejectedCandidatesCount}`);
   console.log(
     `Total Requests Made:   ${summary.globalRequestStats?.totalRequests ?? runner.getTotalRequestsMade()}`,
   );
+  if (summary.pipelineYieldStats) {
+    console.log(`Profiles Received:     ${summary.pipelineYieldStats.profilesReceivedCount}`);
+    console.log(`Enrichment Attempts:   ${summary.pipelineYieldStats.enrichmentAttemptsCount}`);
+    console.log(`Mismatched Pairs:      ${summary.pipelineYieldStats.mismatchedPairsCount}`);
+    console.log(
+      `Price-Qualified Cands: ${summary.pipelineYieldStats.priceQualifiedCandidatesCount}`,
+    );
+    console.log(
+      `Decisions Recorded:    ${summary.pipelineYieldStats.candidateDecisionsRecordedCount}`,
+    );
+    console.log(`Forward Quote Attempts:${summary.pipelineYieldStats.forwardQuoteAttemptsCount}`);
+    console.log(
+      `Forward Prices Obs:    ${summary.pipelineYieldStats.successfulForwardPriceObservationsCount}`,
+    );
+  }
   console.log(
     `Early Stop Reason:     ${summary.earlyStopReason ?? "NONE (Full Duration Elapsed)"}`,
   );
