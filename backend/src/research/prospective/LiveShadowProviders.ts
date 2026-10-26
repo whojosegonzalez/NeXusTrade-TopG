@@ -399,7 +399,10 @@ export class LiveDexScreenerCandidateSource {
     return candidates;
   }
 
-  public async enrichCandidate(mintAddress: string): Promise<ShadowCandidateInput | null> {
+  public async enrichCandidate(
+    mintAddress: string,
+    targetPoolAddress?: string,
+  ): Promise<ShadowCandidateInput | null> {
     const now = this.clock();
     const recorded = this.budgetManager.recordRequestAttempt(
       "DEXSCREENER",
@@ -443,7 +446,7 @@ export class LiveDexScreenerCandidateSource {
         isBaseToken: boolean;
         hasCanonicalWsol: boolean;
         indicativePriceSol: number | null;
-        missingPriceReason?: string;
+        missingPriceReason?: string | undefined;
         liquidityUsd: number | null;
         volume5mUsd: number | null;
         hasValidPrice: boolean;
@@ -500,30 +503,51 @@ export class LiveDexScreenerCandidateSource {
         };
       });
 
-      // Deterministic selection: require genuine canonical WSOL Raydium pair with valid price
-      const priceQualified = assessments.filter((a) => a.hasValidPrice);
-      if (priceQualified.length === 0) {
-        return null;
+      let selected: CandidatePairAssessment;
+      let selectionBasis: string;
+
+      // When a specific targetPoolAddress is requested (e.g. seeded reference test),
+      // we strictly enforce matching that exact pool. We NEVER substitute a higher-liquidity alternative.
+      if (targetPoolAddress) {
+        const exactMatch = assessments.find(
+          (a) => a.pairAddress.toLowerCase() === targetPoolAddress.toLowerCase(),
+        );
+        if (!exactMatch) {
+          // Requested pool not found among Solana Raydium pairs for this token
+          return null;
+        }
+        if (!exactMatch.hasValidPrice) {
+          // Requested pool does not have a valid canonical WSOL price
+          return null;
+        }
+        selected = exactMatch;
+        selectionBasis = "EXACT_ENFORCED_SEED_POOL_MATCH";
+      } else {
+        // Unseeded discovery mode: deterministic selection requiring genuine canonical WSOL Raydium pair with valid price
+        const priceQualified = assessments.filter((a) => a.hasValidPrice);
+        if (priceQualified.length === 0) {
+          return null;
+        }
+
+        // If multiple price-qualified pairs exist, sort deterministically:
+        // 1. Highest liquidity first
+        // 2. Highest 5m volume second
+        // 3. Alphabetical tie-break on pairAddress
+        priceQualified.sort((a, b) => {
+          const liqA = a.liquidityUsd ?? -1;
+          const liqB = b.liquidityUsd ?? -1;
+          if (liqB !== liqA) return liqB - liqA;
+
+          const volA = a.volume5mUsd ?? -1;
+          const volB = b.volume5mUsd ?? -1;
+          if (volB !== volA) return volB - volA;
+
+          return a.pairAddress.localeCompare(b.pairAddress);
+        });
+
+        selected = priceQualified[0]!;
+        selectionBasis = "HIGHEST_LIQUIDITY_CANONICAL_WSOL_RAYDIUM_PAIR";
       }
-
-      // If multiple price-qualified pairs exist, sort deterministically:
-      // 1. Highest liquidity first
-      // 2. Highest 5m volume second
-      // 3. Alphabetical tie-break on pairAddress
-      priceQualified.sort((a, b) => {
-        const liqA = a.liquidityUsd ?? -1;
-        const liqB = b.liquidityUsd ?? -1;
-        if (liqB !== liqA) return liqB - liqA;
-
-        const volA = a.volume5mUsd ?? -1;
-        const volB = b.volume5mUsd ?? -1;
-        if (volB !== volA) return volB - volA;
-
-        return a.pairAddress.localeCompare(b.pairAddress);
-      });
-
-      const selected = priceQualified[0]!;
-      const selectionBasis = "HIGHEST_LIQUIDITY_CANONICAL_WSOL_RAYDIUM_PAIR";
 
       const bestPair = selected.pair;
       const baseToken = selected.baseToken;

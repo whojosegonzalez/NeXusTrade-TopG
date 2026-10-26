@@ -445,4 +445,153 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
     expect(candidate.liquidityUsd).toBe(75000);
     expect(candidate.indicativePriceSol).toBe(0.003);
   });
+
+  it("Invariant 4: Enforces exact target pool address for seeded candidate and never substitutes higher-liquidity alternatives", async () => {
+    let clock = 10_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+
+    const mockFetch: FetchFunction = async (url: string) => {
+      if (url.includes("MINT_SEED_MULTI")) {
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              // Pool A: $200,000 liquidity (high liquidity alternative)
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "pool-a-high-liq-200k",
+                baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+                priceNative: "0.005",
+                liquidity: { usd: 200000 },
+                marketCap: 500000,
+                pairCreatedAt: 10_000_000 - 3000 * 1000,
+              },
+              // Pool B: $50,000 liquidity (target seed pool)
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "pool-b-seed-target-50k",
+                baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+                quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+                priceNative: "0.004",
+                liquidity: { usd: 50000 },
+                marketCap: 500000,
+                pairCreatedAt: 10_000_000 - 3000 * 1000,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ pairs: [] }), { status: 404 });
+    };
+
+    const candidateSource = new LiveDexScreenerCandidateSource(
+      budgetManager,
+      mockFetch,
+      () => clock,
+      async (ms) => {
+        clock += ms;
+      },
+    );
+
+    // 1. Explicitly request target seed pool (Pool B)
+    const seedCandidate = await candidateSource.enrichCandidate(
+      "MINT_SEED_MULTI",
+      "pool-b-seed-target-50k",
+    );
+    expect(seedCandidate).not.toBeNull();
+    expect(seedCandidate?.poolId).toBe("pool-b-seed-target-50k");
+    expect(seedCandidate?.selectedPoolAddress).toBe("pool-b-seed-target-50k");
+    expect(seedCandidate?.poolSelectionBasis).toBe("EXACT_ENFORCED_SEED_POOL_MATCH");
+    expect(seedCandidate?.liquidityUsd).toBe(50000);
+    expect(seedCandidate?.indicativePriceSol).toBe(0.004);
+
+    // 2. Request nonexistent Pool C -> MUST return null and NEVER substitute Pool A or B
+    const missingCandidate = await candidateSource.enrichCandidate(
+      "MINT_SEED_MULTI",
+      "pool-c-nonexistent-999k",
+    );
+    expect(missingCandidate).toBeNull();
+  });
+
+  it("Invariant 5: Enforces decision timestamp causality and rejects retrospective timestamps", async () => {
+    let clock = 10_000_000;
+    const initialClock = clock;
+    const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+
+    const mockFetch: FetchFunction = async () => {
+      // Simulate network latency advancing clock during enrichment
+      clock += 5000;
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-latency-test-111",
+              baseToken: { address: "MINT_LATENCY", symbol: "LAT" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.01",
+              liquidity: { usd: 60000 },
+              marketCap: 200000,
+              pairCreatedAt: clock - 2000 * 1000,
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+
+    const candidateSource = new LiveDexScreenerCandidateSource(
+      budgetManager,
+      mockFetch,
+      () => clock,
+      async (ms) => {
+        clock += ms;
+      },
+    );
+
+    const candidate = await candidateSource.enrichCandidate("MINT_LATENCY");
+    expect(candidate).not.toBeNull();
+    // Clock advanced by 5000ms during fetch
+    expect(candidate!.discoveryTimestampMs).toBe(10_005_000);
+
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "test-causality",
+        configFingerprint: "sha256:causality-test",
+        clock: () => clock,
+      },
+      { budgetManager },
+    );
+
+    // 1. Passing retrospective timestamp (initialClock = 10_000_000 < discoveryTimestamp = 10_005_000) MUST throw CAUSALITY_VIOLATION
+    expect(() => {
+      runner.ingestCandidate(candidate!, initialClock);
+    }).toThrowError(/\[CAUSALITY_VIOLATION\]/);
+
+    // 2. Passing valid causal timestamp (clock = 10_005_000 or later) succeeds
+    const evaluationTimestamp = clock + 1000; // 10_006_000
+    const decId = runner.ingestCandidate(candidate!, evaluationTimestamp);
+    expect(decId).toBeTruthy();
+
+    const decisionRecord = runner
+      .getRecorder()
+      .getDecisionRecords()
+      .find((d) => d.decisionEventId === decId);
+    expect(decisionRecord).toBeDefined();
+    expect(decisionRecord!.decisionTimestampMs).toBe(evaluationTimestamp);
+    expect(decisionRecord!.decisionTimestampMs).toBeGreaterThanOrEqual(
+      candidate!.discoveryTimestampMs,
+    );
+
+    // 3. Forward horizons are scheduled strictly relative to decision timestamp
+    const scheduled = runner.getScheduledTasks();
+    expect(scheduled.length).toBe(4);
+    for (const task of scheduled) {
+      expect(task.scheduledDueTimestampMs).toBe(evaluationTimestamp + task.horizonSec * 1000);
+    }
+  });
 });

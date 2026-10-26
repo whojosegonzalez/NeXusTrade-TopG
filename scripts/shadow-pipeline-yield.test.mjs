@@ -416,3 +416,149 @@ test("Invariant 3: Deterministic pool selection prefers highest liquidity canoni
   assert.equal(candidate.liquidityUsd, 75000);
   assert.equal(candidate.indicativePriceSol, 0.003);
 });
+
+test("Invariant 4: Enforces exact target pool address for seeded candidate and never substitutes higher-liquidity alternatives", async () => {
+  let clock = 10_000_000;
+  const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+
+  const mockFetch = async (url) => {
+    if (url.includes("MINT_SEED_MULTI")) {
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            // Pool A: $200,000 liquidity (high liquidity alternative)
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-a-high-liq-200k",
+              baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.005",
+              liquidity: { usd: 200000 },
+              marketCap: 500000,
+              pairCreatedAt: 10_000_000 - 3000 * 1000,
+            },
+            // Pool B: $50,000 liquidity (target seed pool)
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-b-seed-target-50k",
+              baseToken: { address: "MINT_SEED_MULTI", symbol: "SEED" },
+              quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+              priceNative: "0.004",
+              liquidity: { usd: 50000 },
+              marketCap: 500000,
+              pairCreatedAt: 10_000_000 - 3000 * 1000,
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify({ pairs: [] }), { status: 404 });
+  };
+
+  const candidateSource = new LiveDexScreenerCandidateSource(
+    budgetManager,
+    mockFetch,
+    () => clock,
+    async (ms) => {
+      clock += ms;
+    },
+  );
+
+  // 1. Explicitly request target seed pool (Pool B)
+  const seedCandidate = await candidateSource.enrichCandidate(
+    "MINT_SEED_MULTI",
+    "pool-b-seed-target-50k",
+  );
+  assert.ok(seedCandidate);
+  assert.equal(seedCandidate.poolId, "pool-b-seed-target-50k");
+  assert.equal(seedCandidate.selectedPoolAddress, "pool-b-seed-target-50k");
+  assert.equal(seedCandidate.poolSelectionBasis, "EXACT_ENFORCED_SEED_POOL_MATCH");
+  assert.equal(seedCandidate.liquidityUsd, 50000);
+  assert.equal(seedCandidate.indicativePriceSol, 0.004);
+
+  // 2. Request nonexistent Pool C -> MUST return null and NEVER substitute Pool A or B
+  const missingCandidate = await candidateSource.enrichCandidate(
+    "MINT_SEED_MULTI",
+    "pool-c-nonexistent-999k",
+  );
+  assert.equal(missingCandidate, null);
+});
+
+test("Invariant 5: Enforces decision timestamp causality and rejects retrospective timestamps", async () => {
+  let clock = 10_000_000;
+  const initialClock = clock;
+  const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
+
+  const mockFetch = async () => {
+    // Simulate network latency advancing clock during enrichment
+    clock += 5000;
+    return new Response(
+      JSON.stringify({
+        pairs: [
+          {
+            chainId: "solana",
+            dexId: "raydium",
+            pairAddress: "pool-latency-test-111",
+            baseToken: { address: "MINT_LATENCY", symbol: "LAT" },
+            quoteToken: { address: WSOL_MINT, symbol: "WSOL" },
+            priceNative: "0.01",
+            liquidity: { usd: 60000 },
+            marketCap: 200000,
+            pairCreatedAt: clock - 2000 * 1000,
+          },
+        ],
+      }),
+      { status: 200 },
+    );
+  };
+
+  const candidateSource = new LiveDexScreenerCandidateSource(
+    budgetManager,
+    mockFetch,
+    () => clock,
+    async (ms) => {
+      clock += ms;
+    },
+  );
+
+  const candidate = await candidateSource.enrichCandidate("MINT_LATENCY");
+  assert.ok(candidate);
+  assert.equal(candidate.discoveryTimestampMs, 10_005_000);
+
+  const runner = new ShadowObservationRunner(
+    {
+      sessionId: "test-causality-node",
+      configFingerprint: "sha256:causality-test",
+      clock: () => clock,
+    },
+    { budgetManager },
+  );
+
+  // 1. Passing retrospective timestamp (initialClock = 10_000_000 < discoveryTimestamp = 10_005_000) MUST throw CAUSALITY_VIOLATION
+  assert.throws(() => {
+    runner.ingestCandidate(candidate, initialClock);
+  }, /\[CAUSALITY_VIOLATION\]/);
+
+  // 2. Passing valid causal timestamp (clock = 10_005_000 or later) succeeds
+  const evaluationTimestamp = clock + 1000;
+  const decId = runner.ingestCandidate(candidate, evaluationTimestamp);
+  assert.ok(decId);
+
+  const decisionRecord = runner
+    .getRecorder()
+    .getDecisionRecords()
+    .find((d) => d.decisionEventId === decId);
+  assert.ok(decisionRecord);
+  assert.equal(decisionRecord.decisionTimestampMs, evaluationTimestamp);
+  assert.ok(decisionRecord.decisionTimestampMs >= candidate.discoveryTimestampMs);
+
+  // 3. Forward horizons are scheduled strictly relative to decision timestamp
+  const scheduled = runner.getScheduledTasks();
+  assert.equal(scheduled.length, 4);
+  for (const task of scheduled) {
+    assert.equal(task.scheduledDueTimestampMs, evaluationTimestamp + task.horizonSec * 1000);
+  }
+});

@@ -200,6 +200,13 @@ export class ShadowObservationRunner {
   public ingestCandidate(candidate: ShadowCandidateInput, nowMs?: number): string | null {
     const now = nowMs ?? this.clock();
 
+    // Causality Invariant: Decision timestamp MUST NOT predate candidate discovery timestamp
+    if (now < candidate.discoveryTimestampMs) {
+      throw new Error(
+        `[CAUSALITY_VIOLATION] Decision timestamp (${now}) cannot predate candidate discovery timestamp (${candidate.discoveryTimestampMs}). Ensure evaluation timestamp is captured after network enrichment.`,
+      );
+    }
+
     // Check session closure
     if (this.isSessionClosed || now >= this.sessionDeadlineMs) {
       return null;

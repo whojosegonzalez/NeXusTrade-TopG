@@ -127,6 +127,19 @@ export function validateLauncherArgs(args: ShadowLauncherArgs): void {
       );
     }
   }
+  if (args.seedMint !== undefined || args.seedPool !== undefined) {
+    if (!args.seedMint || !args.seedPool) {
+      throw new Error(
+        "[INVALID_ARGUMENT] Both --seedMint and --seedPool must be provided together for a seeded test.",
+      );
+    }
+    if (typeof args.seedMint !== "string" || args.seedMint.trim().length < 32) {
+      throw new Error(`[INVALID_ARGUMENT] Invalid seed mint address: ${args.seedMint}`);
+    }
+    if (typeof args.seedPool !== "string" || args.seedPool.trim().length < 32) {
+      throw new Error(`[INVALID_ARGUMENT] Invalid seed pool address: ${args.seedPool}`);
+    }
+  }
 }
 
 export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
@@ -307,23 +320,48 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   process.once("SIGINT", () => handleExitSignal("SIGINT"));
   process.once("SIGTERM", () => handleExitSignal("SIGTERM"));
 
+  let isIntakeCompleted = false;
+
   // 6.5 Optional Verified Reference Seed Mint Injection
-  if (cliArgs.seedMint) {
-    console.log(`[SEED_FIXTURE] Ingesting verified reference mint fixture: ${cliArgs.seedMint}`);
+  if (cliArgs.seedMint && cliArgs.seedPool) {
+    console.log(
+      `[SEED_FIXTURE] Ingesting verified reference fixture - Mint: ${cliArgs.seedMint}, Pool: ${cliArgs.seedPool}`,
+    );
     try {
-      const seedCandidate = await candidateSource.enrichCandidate(cliArgs.seedMint);
-      if (seedCandidate) {
-        const decId = runner.ingestCandidate(seedCandidate, Date.now());
-        console.log(
-          `  -> Seed candidate evaluated: ${seedCandidate.symbol} (${seedCandidate.mintAddress.slice(0, 8)}...) - Pool: ${seedCandidate.poolId} - Decision: ${decId}`,
-        );
-      } else {
+      const seedCandidate = await candidateSource.enrichCandidate(
+        cliArgs.seedMint,
+        cliArgs.seedPool,
+      );
+      if (!seedCandidate) {
         console.warn(
-          `[SEED_FIXTURE_WARN] Could not enrich seed mint ${cliArgs.seedMint} on Raydium.`,
+          `[SEED_FIXTURE_UNAVAILABLE] Could not enrich seed mint ${cliArgs.seedMint} with exact pool ${cliArgs.seedPool} on Raydium. Halting seeded session fail-closed.`,
+        );
+        runner.closeSession(Date.now(), candidateSource.getYieldStats());
+        console.log(`[SHUTDOWN] Seeded session closed cleanly due to unavailable seed pool.`);
+        return;
+      }
+      if (seedCandidate.poolId.toLowerCase() !== cliArgs.seedPool.toLowerCase()) {
+        throw new Error(
+          `[SECURITY_VIOLATION] Selected candidate pool ${seedCandidate.poolId} does not match required seed pool ${cliArgs.seedPool}`,
         );
       }
+      const evaluationTimestamp = Date.now();
+      const decId = runner.ingestCandidate(seedCandidate, evaluationTimestamp);
+      console.log(
+        `  -> Seed candidate evaluated: ${seedCandidate.symbol} (${seedCandidate.mintAddress.slice(0, 8)}...) - Pool: ${seedCandidate.poolId} - Decision: ${decId}`,
+      );
+      // For a seeded test, once the seed candidate is admitted, stop intake immediately so no random discovery requests run
+      console.log(
+        `[SEED_FIXTURE] Seed candidate admitted. Halting intake immediately to reserve requests for forward quotes.`,
+      );
+      runner.stopIntake(Date.now());
+      isIntakeCompleted = true;
     } catch (err) {
-      console.error(`[SEED_FIXTURE_ERROR] Failed to enrich seed mint: ${(err as Error).message}`);
+      console.error(
+        `[SEED_FIXTURE_ERROR] Failed to ingest seed candidate: ${(err as Error).message}`,
+      );
+      runner.closeSession(Date.now(), candidateSource.getYieldStats());
+      return;
     }
   }
 
@@ -334,7 +372,6 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   const hardDeadline = startTime + (intakeMinutes + drainMinutes) * 60_000;
 
   let lastPollTime = 0;
-  let isIntakeCompleted = false;
 
   const tickIntervalMs = 5_000; // 5-second scheduler tick
 
@@ -357,7 +394,7 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
         try {
           const candidates = await candidateSource.pollCandidates(5);
           for (const cand of candidates) {
-            const decId = runner.ingestCandidate(cand, now);
+            const decId = runner.ingestCandidate(cand, Date.now());
             if (decId) {
               console.log(
                 `  -> Evaluated candidate: ${cand.symbol} (${cand.mintAddress.slice(0, 8)}...) - Decision: ${decId}`,

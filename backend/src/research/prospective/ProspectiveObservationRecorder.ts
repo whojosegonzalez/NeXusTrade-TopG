@@ -256,7 +256,9 @@ export class ProspectiveObservationRecorder {
       priceQuoteTimestampMs: input.marketFeatures.priceQuoteTimestampMs,
       priceQuoteFreshnessMs:
         input.marketFeatures.priceQuoteFreshnessMs ??
-        Math.max(0, now - input.marketFeatures.priceQuoteTimestampMs),
+        (input.marketFeatures.priceQuoteTimestampMs !== null
+          ? Math.max(0, now - input.marketFeatures.priceQuoteTimestampMs)
+          : null),
       liquidityUsd: input.marketFeatures.liquidityUsd,
       volume5mUsd: input.marketFeatures.volume5mUsd,
       marketCapUsd: input.marketFeatures.marketCapUsd,
@@ -364,7 +366,7 @@ export class ProspectiveObservationRecorder {
 
     const basePrice = baseline.marketFeatures.indicativePriceSol;
     let priceReturnPct: number | null = null;
-    if (basePrice > 0) {
+    if (basePrice !== null && basePrice > 0) {
       if (input.outcomeStatus === "OBSERVED_PRICE" && input.indicativePriceSol !== null) {
         priceReturnPct = Number(
           (((input.indicativePriceSol - basePrice) / basePrice) * 100).toFixed(4),
@@ -380,7 +382,7 @@ export class ProspectiveObservationRecorder {
 
     const baseLiq = baseline.marketFeatures.liquidityUsd;
     let liquidityChangePct: number | null = null;
-    if (input.liquidityUsd !== null && baseLiq > 0) {
+    if (input.liquidityUsd !== null && baseLiq !== null && baseLiq > 0) {
       liquidityChangePct = Number((((input.liquidityUsd - baseLiq) / baseLiq) * 100).toFixed(4));
     }
 
