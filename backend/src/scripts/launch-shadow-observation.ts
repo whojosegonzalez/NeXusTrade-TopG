@@ -45,6 +45,63 @@ export interface ShadowLauncherArgs {
   dryRun?: boolean | undefined;
 }
 
+export function validateLauncherArgs(args: ShadowLauncherArgs): void {
+  if (args.intakeMinutes !== undefined) {
+    if (
+      !Number.isFinite(args.intakeMinutes) ||
+      args.intakeMinutes <= 0 ||
+      args.intakeMinutes > 120
+    ) {
+      throw new Error(
+        `[INVALID_ARGUMENT] intakeMinutes must be between 1 and 120 (got: ${args.intakeMinutes})`,
+      );
+    }
+  }
+  if (args.drainMinutes !== undefined) {
+    if (!Number.isFinite(args.drainMinutes) || args.drainMinutes <= 0 || args.drainMinutes > 120) {
+      throw new Error(
+        `[INVALID_ARGUMENT] drainMinutes must be between 1 and 120 (got: ${args.drainMinutes})`,
+      );
+    }
+  }
+  const totalMinutes = (args.intakeMinutes ?? 60) + (args.drainMinutes ?? 60);
+  if (totalMinutes > 180) {
+    throw new Error(
+      `[INVALID_ARGUMENT] Total session duration (intake + drain) cannot exceed 180 minutes (got: ${totalMinutes})`,
+    );
+  }
+  if (args.maxCandidates !== undefined) {
+    if (
+      !Number.isFinite(args.maxCandidates) ||
+      args.maxCandidates <= 0 ||
+      args.maxCandidates > 25
+    ) {
+      throw new Error(
+        `[INVALID_ARGUMENT] maxCandidates must be between 1 and 25 (got: ${args.maxCandidates})`,
+      );
+    }
+  }
+  if (args.maxRequests !== undefined) {
+    if (!Number.isFinite(args.maxRequests) || args.maxRequests <= 0 || args.maxRequests > 120) {
+      throw new Error(
+        `[INVALID_ARGUMENT] maxRequests must be between 1 and 120 (got: ${args.maxRequests})`,
+      );
+    }
+  }
+  if (args.pacingMs !== undefined) {
+    if (!Number.isFinite(args.pacingMs) || args.pacingMs < 2500) {
+      throw new Error(`[INVALID_ARGUMENT] pacingMs must be >= 2500 ms (got: ${args.pacingMs})`);
+    }
+  }
+  if (args.pollIntervalMs !== undefined) {
+    if (!Number.isFinite(args.pollIntervalMs) || args.pollIntervalMs < 5000) {
+      throw new Error(
+        `[INVALID_ARGUMENT] pollIntervalMs must be >= 5000 ms (got: ${args.pollIntervalMs})`,
+      );
+    }
+  }
+}
+
 export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
   const args: ShadowLauncherArgs = {};
   for (let i = 0; i < argv.length; i++) {
@@ -69,10 +126,13 @@ export function parseLauncherArgs(argv: string[]): ShadowLauncherArgs {
       args.dryRun = true;
     }
   }
+  validateLauncherArgs(args);
   return args;
 }
 
 export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promise<void> {
+  validateLauncherArgs(cliArgs);
+
   const sessionId =
     cliArgs.sessionId || `shadow-live-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const outDir = cliArgs.outDir || path.join(rootDir, "data", "research", "prospective", sessionId);
@@ -102,19 +162,25 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   // Mandatory Preflight Isolation Checks
   console.log("\n[PREFLIGHT] Verifying safety and isolation invariants...");
 
-  // 1. Directory Collision Guard
-  if (fs.existsSync(outDir)) {
-    const existing = fs.readdirSync(outDir);
-    if (
-      existing.includes("decision-observations.jsonl") ||
-      existing.includes("session-manifest.json")
-    ) {
+  // 1. Path Confinement & Nonempty Directory Collision Guard
+  const approvedRoot = path.resolve(rootDir, "data", "research", "prospective");
+  const resolvedOut = path.resolve(outDir);
+  const relative = path.relative(approvedRoot, resolvedOut);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(
+      `[SECURITY] Output directory ${resolvedOut} is outside approved root ${approvedRoot}`,
+    );
+  }
+
+  if (fs.existsSync(resolvedOut)) {
+    const existing = fs.readdirSync(resolvedOut);
+    if (existing.length > 0) {
       throw new Error(
-        `[PREFLIGHT_FAIL] Output directory ${outDir} already contains session evidence. Aborting to prevent overwrite.`,
+        `[PREFLIGHT_FAIL] Output directory ${resolvedOut} is not empty (${existing.length} file(s) exist). Cannot use nonempty directory.`,
       );
     }
   } else {
-    fs.mkdirSync(outDir, { recursive: true });
+    fs.mkdirSync(resolvedOut, { recursive: true });
   }
 
   // 2. Compute Config Fingerprint
@@ -137,7 +203,9 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
   console.log(`[PREFLIGHT] Config Fingerprint: ${configFingerprint}`);
 
   if (cliArgs.dryRun) {
-    console.log("[PREFLIGHT] Dry-run requested. Exiting cleanly before any network activity.");
+    console.log(
+      "[PREFLIGHT] Dry-run validation successful. Exiting cleanly with zero network activity.",
+    );
     return;
   }
 

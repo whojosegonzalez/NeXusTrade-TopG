@@ -137,14 +137,13 @@ export class ProspectiveObservationRecorder {
 
     // 1. Missing Data
     if (
-      allReasons.some((r) =>
-        [
-          "MISSING_PRICE_DATA",
-          "MISSING_LIQUIDITY_DATA",
-          "UNAVAILABLE_RUGCHECK",
-          "UNAVAILABLE_HOLDERS",
-          "GATE_FAIL_MISSING_DATA",
-        ].includes(r),
+      allReasons.some(
+        (r) =>
+          r.startsWith("MISSING_") ||
+          r.startsWith("UNAVAILABLE_") ||
+          r.startsWith("UNVERIFIED_") ||
+          r === "GATE_FAIL_MISSING_DATA" ||
+          r === "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN",
       )
     ) {
       return "REJECTED_BY_MISSING_DATA";

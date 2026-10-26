@@ -5,7 +5,10 @@
  * - Read-only HTTP GET exclusively against allowlisted public endpoints (DexScreener & Raydium).
  * - Zero RPC/WebSocket calls. Zero wallet keys. Zero mutations.
  * - Integrates with GlobalResourceBudgetManager for unified request accounting across all calls.
- * - Injectable fetch implementation for offline deterministic testing.
+ * - Strict data integrity: ZERO fabricated market inputs (no default lpBurn, no liquidity*3 mcap,
+ *   no fake age, no $150/SOL conversions). Absent inputs preserved truthfully as null with provenance.
+ * - Pool and token denomination validation: exact pair matching, WSOL quote verification.
+ * - Injectable fetch implementation and abort timeout for offline deterministic testing.
  */
 
 import type { GlobalResourceBudgetManager } from "./GlobalResourceBudgetManager.js";
@@ -15,29 +18,41 @@ import type {
   ShadowQuoteResult,
 } from "./ShadowObservationRunner.js";
 
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 export const DEXSCREENER_PROFILES_ENDPOINT = "https://api.dexscreener.com/token-profiles/latest/v1";
 export const DEXSCREENER_PAIRS_SOLANA_PREFIX =
   "https://api.dexscreener.com/latest/dex/pairs/solana/";
 export const DEXSCREENER_TOKENS_PREFIX = "https://api.dexscreener.com/latest/dex/tokens/";
 export const RAYDIUM_POOLS_ENDPOINT = "https://api-v3.raydium.io/pools/info/list";
+export const DEFAULT_HTTP_TIMEOUT_MS = 5000;
 
 export type FetchFunction = (url: string, init?: RequestInit) => Promise<Response>;
 export type SleepFunction = (ms: number) => Promise<void>;
+
+export function isWsolToken(token?: { address?: string; symbol?: string }): boolean {
+  if (!token) return false;
+  if (token.address === WSOL_MINT) return true;
+  const sym = token.symbol?.toUpperCase();
+  return sym === "SOL" || sym === "WSOL";
+}
 
 export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
   public readonly providerName = "DEXSCREENER";
   private readonly fetchFn: FetchFunction;
   private readonly budgetManager: GlobalResourceBudgetManager;
   private readonly clock: () => number;
+  private readonly timeoutMs: number;
 
   constructor(
     budgetManager: GlobalResourceBudgetManager,
     fetchFn: FetchFunction = fetch,
     clock: () => number = () => Date.now(),
+    timeoutMs: number = DEFAULT_HTTP_TIMEOUT_MS,
   ) {
     this.budgetManager = budgetManager;
     this.fetchFn = fetchFn;
     this.clock = clock;
+    this.timeoutMs = timeoutMs;
   }
 
   async fetchQuote(poolId: string, mintAddress: string): Promise<ShadowQuoteResult> {
@@ -46,16 +61,38 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         ? `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${poolId}`
         : `${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`;
 
-    const res = await this.fetchFn(targetUrl, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    let res: Response;
+    try {
+      res = await this.fetchFn(targetUrl, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        throw new Error(`HTTP request timed out after ${this.timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     const httpStatus = res.status;
     this.budgetManager.recordResponseStatus(httpStatus);
 
     if (!res.ok) {
-      throw new Error(`HTTP ${httpStatus} ${res.statusText}`);
+      return {
+        indicativePriceSol: null,
+        liquidityUsd: null,
+        quoteTimestampMs: this.clock(),
+        quoteSource: "DEXSCREENER",
+        isExecutableQuote: false,
+        missingReason: `HTTP_${httpStatus}_${res.statusText}`,
+        httpStatus,
+      };
     }
 
     const payload = (await res.json()) as Record<string, unknown>;
@@ -78,30 +115,133 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
         quoteTimestampMs: this.clock(),
         quoteSource: "DEXSCREENER",
         isExecutableQuote: false,
+        missingReason: "EMPTY_PAIRS_ARRAY",
         httpStatus,
       };
     }
 
-    // Select matching pair or best available
+    // 1. Filter Solana pairs
     const solPairs = pairs.filter((p) => p && p.chainId === "solana");
-    const pair = solPairs[0] || pairs[0]!;
+    if (solPairs.length === 0) {
+      return {
+        indicativePriceSol: null,
+        liquidityUsd: null,
+        quoteTimestampMs: this.clock(),
+        quoteSource: "DEXSCREENER",
+        isExecutableQuote: false,
+        missingReason: "NON_SOLANA_CHAIN",
+        httpStatus,
+      };
+    }
 
-    const liquidity = (pair.liquidity as Record<string, number>) || {};
-    const liquidityUsd = typeof liquidity.usd === "number" ? liquidity.usd : 0;
+    // 2. Exact pool matching when poolId is specified
+    let matchingPair: Record<string, unknown> | undefined;
+    if (poolId && poolId.length > 20) {
+      matchingPair = solPairs.find(
+        (p) =>
+          typeof p.pairAddress === "string" && p.pairAddress.toLowerCase() === poolId.toLowerCase(),
+      );
+      if (!matchingPair) {
+        return {
+          indicativePriceSol: null,
+          liquidityUsd: null,
+          quoteTimestampMs: this.clock(),
+          quoteSource: "DEXSCREENER",
+          isExecutableQuote: false,
+          missingReason: "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND",
+          httpStatus,
+        };
+      }
+    } else {
+      // Raydium pool matching when poolId is not specified
+      matchingPair = solPairs.find((p) => p.dexId === "raydium");
+      if (!matchingPair) {
+        return {
+          indicativePriceSol: null,
+          liquidityUsd: null,
+          quoteTimestampMs: this.clock(),
+          quoteSource: "DEXSCREENER",
+          isExecutableQuote: false,
+          missingReason: "NO_RAYDIUM_POOL_FOUND",
+          httpStatus,
+        };
+      }
+    }
 
-    const priceNativeRaw =
-      typeof pair.priceNative === "string" ? Number.parseFloat(pair.priceNative) : null;
-    const priceUsdRaw = typeof pair.priceUsd === "string" ? Number.parseFloat(pair.priceUsd) : null;
+    // 3. Verify requested token mint matches base or quote
+    const baseToken = (matchingPair.baseToken as Record<string, string>) || {};
+    const quoteToken = (matchingPair.quoteToken as Record<string, string>) || {};
+    const isBaseToken = baseToken.address === mintAddress;
+    const isQuoteToken = quoteToken.address === mintAddress;
 
-    // Detect pool drainage
-    const isPoolDrained = liquidityUsd < 500;
+    if (!isBaseToken && !isQuoteToken) {
+      return {
+        indicativePriceSol: null,
+        liquidityUsd: null,
+        quoteTimestampMs: this.clock(),
+        quoteSource: "DEXSCREENER",
+        isExecutableQuote: false,
+        missingReason: "MINT_ADDRESS_MISMATCH",
+        httpStatus,
+      };
+    }
 
+    // 4. Validate quote token denomination (WSOL check)
     let indicativePriceSol: number | null = null;
-    if (priceNativeRaw !== null && Number.isFinite(priceNativeRaw) && priceNativeRaw > 0) {
-      indicativePriceSol = priceNativeRaw;
-    } else if (priceUsdRaw !== null && Number.isFinite(priceUsdRaw) && priceUsdRaw > 0) {
-      // Fallback: estimate SOL price assuming approximate SOL/USD ~150
-      indicativePriceSol = priceUsdRaw / 150;
+    let missingReason: string | undefined;
+
+    if (isBaseToken) {
+      if (isWsolToken(quoteToken)) {
+        if (typeof matchingPair.priceNative === "string") {
+          const parsed = Number.parseFloat(matchingPair.priceNative);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            indicativePriceSol = parsed;
+          } else {
+            missingReason = "INVALID_PRICE_NATIVE_FORMAT";
+          }
+        } else {
+          missingReason = "MISSING_PRICE_NATIVE";
+        }
+      } else {
+        // Quote token is USDC, USDT, or non-SOL: no arbitrary $150/SOL conversion allowed
+        indicativePriceSol = null;
+        missingReason = "NON_SOL_QUOTE_DENOMINATION";
+      }
+    } else {
+      // Inverted pair (candidate is quote token)
+      if (isWsolToken(baseToken)) {
+        if (typeof matchingPair.priceNative === "string") {
+          const parsed = Number.parseFloat(matchingPair.priceNative);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            indicativePriceSol = 1 / parsed;
+          } else {
+            missingReason = "INVALID_PRICE_NATIVE_FORMAT";
+          }
+        } else {
+          missingReason = "MISSING_PRICE_NATIVE";
+        }
+      } else {
+        indicativePriceSol = null;
+        missingReason = "NON_SOL_QUOTE_DENOMINATION";
+      }
+    }
+
+    // 5. Liquidity & confirmed pool drainage check
+    const liquidity = (matchingPair.liquidity as Record<string, number>) || {};
+    let liquidityUsd: number | null = null;
+    let isPoolDrained = false;
+
+    if (typeof liquidity.usd === "number" && Number.isFinite(liquidity.usd)) {
+      liquidityUsd = liquidity.usd;
+      // Confirmed pool drainage requires actual observed liquidity < $500
+      isPoolDrained = liquidityUsd < 500;
+    } else {
+      // Missing liquidity field is NOT pool drainage; it is unavailable data
+      liquidityUsd = null;
+      isPoolDrained = false;
+      if (!missingReason) {
+        missingReason = "MISSING_LIQUIDITY_DATA";
+      }
     }
 
     const quoteTimestampMs = this.clock();
@@ -114,6 +254,7 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       isExecutableQuote: false,
       isPoolDrained,
       httpStatus,
+      missingReason,
     };
   }
 }
@@ -123,6 +264,7 @@ export class LiveDexScreenerCandidateSource {
   private readonly budgetManager: GlobalResourceBudgetManager;
   private readonly clock: () => number;
   private readonly sleepFn: SleepFunction;
+  private readonly timeoutMs: number;
   private readonly seenMints = new Set<string>();
 
   constructor(
@@ -130,11 +272,13 @@ export class LiveDexScreenerCandidateSource {
     fetchFn: FetchFunction = fetch,
     clock: () => number = () => Date.now(),
     sleepFn: SleepFunction = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    timeoutMs: number = DEFAULT_HTTP_TIMEOUT_MS,
   ) {
     this.budgetManager = budgetManager;
     this.fetchFn = fetchFn;
     this.clock = clock;
     this.sleepFn = sleepFn;
+    this.timeoutMs = timeoutMs;
   }
 
   public async pollCandidates(maxToDiscover = 10): Promise<ShadowCandidateInput[]> {
@@ -162,10 +306,14 @@ export class LiveDexScreenerCandidateSource {
     if (!recorded) return [];
 
     let profiles: Array<{ tokenAddress?: string; chainId?: string }> = [];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
     try {
       const res = await this.fetchFn(DEXSCREENER_PROFILES_ENDPOINT, {
         method: "GET",
         headers: { Accept: "application/json" },
+        signal: controller.signal,
       });
 
       this.budgetManager.recordResponseStatus(res.status);
@@ -175,10 +323,11 @@ export class LiveDexScreenerCandidateSource {
       profiles = Array.isArray(body) ? body : [];
     } catch {
       return [];
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     const solanaProfiles = profiles.filter((p) => p && p.chainId === "solana" && p.tokenAddress);
-
     const candidates: ShadowCandidateInput[] = [];
 
     for (const profile of solanaProfiles) {
@@ -220,10 +369,14 @@ export class LiveDexScreenerCandidateSource {
     );
     if (!recorded) return null;
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
     try {
       const res = await this.fetchFn(`${DEXSCREENER_TOKENS_PREFIX}${mintAddress}`, {
         method: "GET",
         headers: { Accept: "application/json" },
+        signal: controller.signal,
       });
 
       this.budgetManager.recordResponseStatus(res.status);
@@ -231,56 +384,145 @@ export class LiveDexScreenerCandidateSource {
 
       const data = (await res.json()) as { pairs?: Array<Record<string, unknown>> };
       const pairs = data.pairs || [];
-      const solanaPairs = pairs.filter((p) => p && p.chainId === "solana" && p.dexId === "raydium");
-      const bestPair = solanaPairs[0] || pairs[0];
+      const solanaRaydiumPairs = pairs.filter(
+        (p) => p && p.chainId === "solana" && p.dexId === "raydium",
+      );
+      const bestPair = solanaRaydiumPairs.find(
+        (p) =>
+          (p.baseToken as Record<string, string>)?.address === mintAddress ||
+          (p.quoteToken as Record<string, string>)?.address === mintAddress,
+      );
       if (!bestPair) return null;
 
       const baseToken = (bestPair.baseToken as Record<string, string>) || {};
+      const quoteToken = (bestPair.quoteToken as Record<string, string>) || {};
       const liquidity = (bestPair.liquidity as Record<string, number>) || {};
       const volume = (bestPair.volume as Record<string, number>) || {};
       const txns = (bestPair.txns as Record<string, Record<string, number>>) || {};
       const m5Txns = txns.m5 || {};
 
-      const priceNative =
-        typeof bestPair.priceNative === "string" ? parseFloat(bestPair.priceNative) : 0;
-      const priceUsd = typeof bestPair.priceUsd === "string" ? parseFloat(bestPair.priceUsd) : 0;
-      const liquidityUsd = liquidity.usd || 0;
-      const marketCapUsd =
-        (typeof bestPair.marketCap === "number"
-          ? bestPair.marketCap
-          : typeof bestPair.fdv === "number"
-            ? bestPair.fdv
-            : liquidityUsd * 3) || 0;
-      const volume5mUsd = volume.m5 || 0;
-      const buys5m = m5Txns.buys || 0;
-      const sells5m = m5Txns.sells || 0;
-      const buyToSellRatio = sells5m > 0 ? Number((buys5m / sells5m).toFixed(2)) : buys5m;
-      const lmcRatio = marketCapUsd > 0 ? Number((liquidityUsd / marketCapUsd).toFixed(4)) : 0;
-      const createdAt =
-        typeof bestPair.pairCreatedAt === "number" ? bestPair.pairCreatedAt : this.clock();
-      const assetAgeSeconds = Math.max(0, Math.floor((this.clock() - createdAt) / 1000));
+      const unavailableInputs: string[] = [];
+
+      // 1. Price Native & Quote Denomination Validation
+      let indicativePriceSol: number | null = null;
+      if (baseToken.address === mintAddress && isWsolToken(quoteToken)) {
+        if (typeof bestPair.priceNative === "string") {
+          const parsed = Number.parseFloat(bestPair.priceNative);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            indicativePriceSol = parsed;
+          }
+        }
+      } else if (quoteToken.address === mintAddress && isWsolToken(baseToken)) {
+        if (typeof bestPair.priceNative === "string") {
+          const parsed = Number.parseFloat(bestPair.priceNative);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            indicativePriceSol = 1 / parsed;
+          }
+        }
+      }
+      if (indicativePriceSol === null) {
+        unavailableInputs.push("indicativePriceSol");
+      }
+
+      // 2. Liquidity (No fabricated defaults)
+      let liquidityUsd: number | null = null;
+      if (typeof liquidity.usd === "number" && Number.isFinite(liquidity.usd)) {
+        liquidityUsd = liquidity.usd;
+      } else {
+        unavailableInputs.push("liquidityUsd");
+      }
+
+      // 3. Market Cap (NO liquidity * 3 estimation)
+      let marketCapUsd: number | null = null;
+      if (typeof bestPair.marketCap === "number" && Number.isFinite(bestPair.marketCap)) {
+        marketCapUsd = bestPair.marketCap;
+      } else if (typeof bestPair.fdv === "number" && Number.isFinite(bestPair.fdv)) {
+        marketCapUsd = bestPair.fdv;
+      } else {
+        unavailableInputs.push("marketCapUsd");
+      }
+
+      // 4. L/MC Ratio
+      let lmcRatio: number | null = null;
+      if (liquidityUsd !== null && marketCapUsd !== null && marketCapUsd > 0) {
+        lmcRatio = Number((liquidityUsd / marketCapUsd).toFixed(4));
+      } else {
+        unavailableInputs.push("lmcRatio");
+      }
+
+      // 5. Asset Age (NO manufactured 1800s / 30m default)
+      let assetAgeSeconds: number | null = null;
+      if (typeof bestPair.pairCreatedAt === "number" && bestPair.pairCreatedAt > 0) {
+        assetAgeSeconds = Math.max(0, Math.floor((this.clock() - bestPair.pairCreatedAt) / 1000));
+      } else {
+        unavailableInputs.push("assetAgeSeconds");
+      }
+
+      // 6. LP Burn Pct (NO fabricated lpBurnPct = 100)
+      const lpBurnPct: number | null = null;
+      unavailableInputs.push("lpBurnPct");
+
+      // 7. Volume 5m
+      let volume5mUsd: number | null = null;
+      if (typeof volume.m5 === "number" && Number.isFinite(volume.m5)) {
+        volume5mUsd = volume.m5;
+      } else {
+        unavailableInputs.push("volume5mUsd");
+      }
+
+      // 8. Transactions 5m & Flow Ratio
+      let buys5m: number | null = null;
+      let sells5m: number | null = null;
+      let buyToSellRatio: number | null = null;
+
+      if (typeof m5Txns.buys === "number" && Number.isFinite(m5Txns.buys)) {
+        buys5m = m5Txns.buys;
+      } else {
+        unavailableInputs.push("buys5m");
+      }
+
+      if (typeof m5Txns.sells === "number" && Number.isFinite(m5Txns.sells)) {
+        sells5m = m5Txns.sells;
+      } else {
+        unavailableInputs.push("sells5m");
+      }
+
+      if (buys5m !== null && sells5m !== null) {
+        buyToSellRatio = sells5m > 0 ? Number((buys5m / sells5m).toFixed(2)) : buys5m;
+      } else {
+        unavailableInputs.push("buyToSellRatio");
+      }
+
+      // 9. Risk & Security Metrics (DexScreener does not provide these; preserved truthfully as null)
+      unavailableInputs.push("holdersCount", "rugScore", "bundlerPct", "top10HolderPct");
 
       return {
         poolId: (bestPair.pairAddress as string) || `pool-${mintAddress.slice(0, 8)}`,
         mintAddress,
         symbol: baseToken.symbol || "UNKNOWN",
         discoveryTimestampMs: this.clock(),
-        streamSource: "DEXSCREENER_RECENT",
-        indicativePriceSol:
-          priceNative > 0 ? priceNative : priceUsd > 0 ? priceUsd / 150 : 0.000001,
+        streamSource: "DEXSCREENER_LATEST_TOKEN_PROFILES",
+        indicativePriceSol,
         priceQuoteTimestampMs: this.clock(),
         liquidityUsd,
         marketCapUsd,
         lmcRatio,
-        lpBurnPct: 100,
-        assetAgeSeconds: assetAgeSeconds > 0 ? assetAgeSeconds : 1800,
+        lpBurnPct,
+        assetAgeSeconds,
         volume5mUsd,
         buys5m,
         sells5m,
         buyToSellRatio,
+        holdersCount: null,
+        rugScore: null,
+        bundlerPct: null,
+        top10HolderPct: null,
+        unavailableInputs,
       };
     } catch {
       return null;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }

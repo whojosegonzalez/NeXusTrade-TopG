@@ -80,6 +80,10 @@ export class GlobalResourceBudgetManager {
     providerName: string,
     nowMs?: number,
   ): { allowed: boolean; reason?: string; waitMs?: number } {
+    if (this.is429StopTriggered) {
+      return { allowed: false, reason: "CONSECUTIVE_HTTP_429_LIMIT_REACHED" };
+    }
+
     if (this.totalRequests >= this.maxTotalRequests) {
       return { allowed: false, reason: "GLOBAL_REQUEST_CEILING_REACHED" };
     }

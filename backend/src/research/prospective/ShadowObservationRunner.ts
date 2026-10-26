@@ -44,6 +44,7 @@ export interface ShadowQuoteResult {
   readonly isExecutableQuote: boolean;
   readonly isPoolDrained?: boolean | undefined;
   readonly httpStatus?: number | undefined;
+  readonly missingReason?: string | undefined;
 }
 
 export interface IShadowMarketDataProvider {
@@ -57,17 +58,17 @@ export interface ShadowCandidateInput {
   readonly symbol: string;
   readonly discoveryTimestampMs: number;
   readonly streamSource: CandidateStreamSource;
-  readonly indicativePriceSol: number;
-  readonly priceQuoteTimestampMs?: number | undefined;
-  readonly liquidityUsd: number;
-  readonly marketCapUsd: number;
-  readonly lmcRatio: number;
-  readonly lpBurnPct: number;
-  readonly assetAgeSeconds: number;
-  readonly volume5mUsd: number;
-  readonly buys5m: number;
-  readonly sells5m: number;
-  readonly buyToSellRatio: number;
+  readonly indicativePriceSol: number | null;
+  readonly priceQuoteTimestampMs?: number | null | undefined;
+  readonly liquidityUsd: number | null;
+  readonly marketCapUsd: number | null;
+  readonly lmcRatio: number | null;
+  readonly lpBurnPct: number | null;
+  readonly assetAgeSeconds: number | null;
+  readonly volume5mUsd: number | null;
+  readonly buys5m: number | null;
+  readonly sells5m: number | null;
+  readonly buyToSellRatio: number | null;
   readonly holdersCount?: number | null | undefined;
   readonly rugScore?: number | null | undefined;
   readonly bundlerPct?: number | null | undefined;
@@ -220,12 +221,16 @@ export class ShadowObservationRunner {
     // 1. Determine cohort strictly according to approved strategy baseline
     let strategyCohort: ProspectiveStrategyCohort = "UNCLASSIFIED";
     if (
+      candidate.liquidityUsd !== null &&
+      candidate.assetAgeSeconds !== null &&
       candidate.liquidityUsd >= 50000 &&
       candidate.assetAgeSeconds >= 1800 &&
       candidate.assetAgeSeconds <= 7200
     ) {
       strategyCohort = "ESTABLISHED_RUNNER";
     } else if (
+      candidate.liquidityUsd !== null &&
+      candidate.assetAgeSeconds !== null &&
       candidate.liquidityUsd >= 20000 &&
       candidate.liquidityUsd < 50000 &&
       candidate.assetAgeSeconds >= 300 &&
@@ -236,36 +241,89 @@ export class ShadowObservationRunner {
       strategyCohort = "UNCLASSIFIED";
     }
 
-    // 2. Map candidate to BuyGateTriggerService input
-    const watchlistItem: WatchlistCandidateItem = {
-      poolId: candidate.poolId,
-      mintAddress: candidate.mintAddress,
-      symbol: candidate.symbol,
-      liquidityUsd: candidate.liquidityUsd,
-      marketCapUsd: candidate.marketCapUsd,
-      lmcRatio: candidate.lmcRatio,
-      lpBurnPct: candidate.lpBurnPct,
-      assetAgeSeconds: candidate.assetAgeSeconds,
-      volume5mUsd: candidate.volume5mUsd,
-      buys5m: candidate.buys5m,
-      sells5m: candidate.sells5m,
-      buyToSellRatio: candidate.buyToSellRatio,
-      status: "WATCHING",
-      discoveredAt: new Date(candidate.discoveryTimestampMs).toISOString(),
-      lastEvaluatedAt: new Date(now).toISOString(),
-    };
+    // 2. Identify missing or unverified mandatory screening inputs
+    const missingInputs: string[] = [];
+    if (candidate.indicativePriceSol === null || candidate.indicativePriceSol <= 0) {
+      missingInputs.push("MISSING_PRICE_DATA");
+    }
+    if (candidate.liquidityUsd === null) {
+      missingInputs.push("MISSING_LIQUIDITY_DATA");
+    }
+    if (candidate.assetAgeSeconds === null) {
+      missingInputs.push("MISSING_ASSET_AGE_DATA");
+    }
+    if (candidate.lmcRatio === null) {
+      missingInputs.push("MISSING_LMC_RATIO_DATA");
+    }
+    if (candidate.lpBurnPct === null) {
+      missingInputs.push("UNVERIFIED_LP_BURN_DATA");
+    }
+    if (candidate.volume5mUsd === null) {
+      missingInputs.push("MISSING_VOLUME_DATA");
+    }
+    if (candidate.buyToSellRatio === null) {
+      missingInputs.push("MISSING_FLOW_DATA");
+    }
 
-    const marketContext: AdvancedMarketContext = {
-      holdersCount: candidate.holdersCount ?? undefined,
-      rugScore: candidate.rugScore ?? undefined,
-      bundlerPct: candidate.bundlerPct ?? undefined,
-      top10HolderPct: candidate.top10HolderPct ?? undefined,
-      recentBuysCount60s: candidate.recentBuys60s ?? undefined,
-      recentSellsCount60s: candidate.recentSells60s ?? undefined,
-    };
+    let gateTriggered = false;
+    let primaryRejection: string | undefined;
+    let gateChecks: Array<{
+      name: string;
+      passed: boolean;
+      value: number | null;
+      requirement: string;
+    }> = [];
 
-    // 3. Evaluate candidate through real gate logic
-    const gateEval = this.buyGateService.evaluateCandidate(watchlistItem, marketContext);
+    if (missingInputs.length > 0) {
+      // Cannot pass screening if mandatory inputs are absent or unverified
+      gateTriggered = false;
+      primaryRejection = missingInputs[0];
+      gateChecks = missingInputs.map((m) => ({
+        name: m,
+        passed: false,
+        value: null,
+        requirement: "Mandatory observed data required",
+      }));
+    } else {
+      // 3. Map candidate to BuyGateTriggerService input when all mandatory inputs observed
+      const watchlistItem: WatchlistCandidateItem = {
+        poolId: candidate.poolId,
+        mintAddress: candidate.mintAddress,
+        symbol: candidate.symbol,
+        liquidityUsd: candidate.liquidityUsd!,
+        marketCapUsd: candidate.marketCapUsd ?? candidate.liquidityUsd! * 2,
+        lmcRatio: candidate.lmcRatio!,
+        lpBurnPct: candidate.lpBurnPct!,
+        assetAgeSeconds: candidate.assetAgeSeconds!,
+        volume5mUsd: candidate.volume5mUsd!,
+        buys5m: candidate.buys5m ?? 0,
+        sells5m: candidate.sells5m ?? 0,
+        buyToSellRatio: candidate.buyToSellRatio!,
+        status: "WATCHING",
+        discoveredAt: new Date(candidate.discoveryTimestampMs).toISOString(),
+        lastEvaluatedAt: new Date(now).toISOString(),
+      };
+
+      const marketContext: AdvancedMarketContext = {
+        holdersCount: candidate.holdersCount ?? undefined,
+        rugScore: candidate.rugScore ?? undefined,
+        bundlerPct: candidate.bundlerPct ?? undefined,
+        top10HolderPct: candidate.top10HolderPct ?? undefined,
+        recentBuysCount60s: candidate.recentBuys60s ?? undefined,
+        recentSellsCount60s: candidate.recentSells60s ?? undefined,
+      };
+
+      // Evaluate candidate through real gate logic
+      const gateEval = this.buyGateService.evaluateCandidate(watchlistItem, marketContext);
+      gateTriggered = gateEval.triggered;
+      primaryRejection = gateEval.rejectionReason;
+      gateChecks = gateEval.gates.map((g) => ({
+        name: g.name,
+        passed: g.passed,
+        value: g.value,
+        requirement: g.requirement,
+      }));
+    }
 
     // 4. Assemble decision record input
     const recordInput: RecordDecisionInput = {
@@ -287,6 +345,7 @@ export class ShadowObservationRunner {
         volume5mUsd: candidate.volume5mUsd,
         marketCapUsd: candidate.marketCapUsd,
         assetAgeSeconds: candidate.assetAgeSeconds,
+        lpBurnPct: candidate.lpBurnPct,
         holdersCount: candidate.holdersCount ?? null,
         buyToSellRatio: candidate.buyToSellRatio,
         recentBuys60s: candidate.recentBuys60s ?? null,
@@ -295,16 +354,14 @@ export class ShadowObservationRunner {
         rugScore: candidate.rugScore ?? null,
         bundlerPct: candidate.bundlerPct ?? null,
         top10HolderPct: candidate.top10HolderPct ?? null,
-        unavailableInputs: candidate.unavailableInputs ?? [],
+        unavailableInputs: [
+          ...(candidate.unavailableInputs ?? []),
+          ...missingInputs.map((m) => m.toLowerCase()),
+        ],
       },
-      triggered: gateEval.triggered,
-      rejectionReason: gateEval.rejectionReason,
-      gateChecks: gateEval.gates.map((g) => ({
-        name: g.name,
-        passed: g.passed,
-        value: g.value,
-        requirement: g.requirement,
-      })),
+      triggered: gateTriggered,
+      rejectionReason: primaryRejection,
+      gateChecks,
     };
 
     // 5. Record decision
@@ -444,12 +501,10 @@ export class ShadowObservationRunner {
             continue;
           }
 
-          if (quote.httpStatus) {
-            this.budgetManager.recordResponseStatus(quote.httpStatus);
-            if (this.budgetManager.is429HaltRequired() && !this.isIntakeStopped) {
-              this.earlyStopReason = "CONSECUTIVE_HTTP_429_LIMIT_REACHED";
-              this.stopIntake(actualObsTime);
-            }
+          // Check 429 circuit breaker from budget manager
+          if (this.budgetManager.is429HaltRequired() && !this.isIntakeStopped) {
+            this.earlyStopReason = "CONSECUTIVE_HTTP_429_LIMIT_REACHED";
+            this.stopIntake(actualObsTime);
           }
 
           // Check for stale pre-horizon prices masquerading as outcomes
@@ -475,7 +530,7 @@ export class ShadowObservationRunner {
               quoteSource: quote.quoteSource,
               isExecutableQuote: quote.isExecutableQuote,
               outcomeStatus: "POOL_DRAINED",
-              indicativePriceSol: quote.indicativePriceSol,
+              indicativePriceSol: 0,
               liquidityUsd: quote.liquidityUsd,
               missingReason: "POOL_DRAINED_LIQUIDITY_COLLAPSED",
             });
@@ -489,8 +544,8 @@ export class ShadowObservationRunner {
               isExecutableQuote: quote.isExecutableQuote,
               outcomeStatus: "MISSING_QUOTE_UNAVAILABLE",
               indicativePriceSol: null,
-              liquidityUsd: null,
-              missingReason: "PROVIDER_RETURNED_NULL_PRICE",
+              liquidityUsd: quote.liquidityUsd,
+              missingReason: quote.missingReason ?? "PROVIDER_RETURNED_NULL_PRICE",
             });
           } else {
             const freshness = Math.max(0, actualObsTime - quote.quoteTimestampMs);
@@ -526,10 +581,10 @@ export class ShadowObservationRunner {
           const errMsg = (err as Error).message;
           if (errMsg.includes("429")) {
             this.budgetManager.recordResponseStatus(429);
-            if (this.budgetManager.is429HaltRequired() && !this.isIntakeStopped) {
-              this.earlyStopReason = "CONSECUTIVE_HTTP_429_LIMIT_REACHED";
-              this.stopIntake(actualObsTime);
-            }
+          }
+          if (this.budgetManager.is429HaltRequired() && !this.isIntakeStopped) {
+            this.earlyStopReason = "CONSECUTIVE_HTTP_429_LIMIT_REACHED";
+            this.stopIntake(actualObsTime);
           }
 
           // Catch provider failures safely: record outcome without crashing runner

@@ -82,8 +82,22 @@ function createMockFetch(clock: () => number): {
 
     // 2. DexScreener token pair lookup
     if (url.includes("/latest/dex/tokens/") || url.includes("/latest/dex/pairs/solana/")) {
-      const isCandidate1 = url.includes("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
-      const isCandidate2 = url.includes("Dw4uLKPb3tvRfuUYNvaiNMZyCk85c4zLffaieVXUDUxF");
+      const isCandidate1 =
+        url.includes("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU") || url.includes("pool-runner");
+      const isCandidate2 =
+        url.includes("Dw4uLKPb3tvRfuUYNvaiNMZyCk85c4zLffaieVXUDUxF") || url.includes("pool-micro");
+
+      const tokenAddress = isCandidate1
+        ? "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+        : isCandidate2
+          ? "Dw4uLKPb3tvRfuUYNvaiNMZyCk85c4zLffaieVXUDUxF"
+          : "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+      const poolAddress = isCandidate1
+        ? "pool-runner-7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZ"
+        : isCandidate2
+          ? "pool-micro-Dw4uLKPb3tvRfuUYNvaiNMZyCk85c4zLff"
+          : "pool-viral-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGG";
 
       // Candidate 1: Established Runner ($65k liquidity, 2400s age)
       // Candidate 2: Micro-Cap Probe ($25k liquidity, 600s age)
@@ -97,14 +111,19 @@ function createMockFetch(clock: () => number): {
           {
             chainId: "solana",
             dexId: "raydium",
-            pairAddress: `pool-${url.slice(-8)}`,
+            pairAddress: poolAddress,
             baseToken: {
-              address: url.slice(-44),
+              address: tokenAddress,
               symbol: isCandidate1 ? "RUNNER" : isCandidate2 ? "MICRO" : "VIRAL",
+            },
+            quoteToken: {
+              address: "So11111111111111111111111111111111111111112",
+              symbol: "WSOL",
             },
             priceNative: "0.000005",
             priceUsd: "0.00075",
             liquidity: { usd: liquidityUsd },
+            marketCap: liquidityUsd * 3,
             volume: { m5: 35000 },
             txns: {
               m5: { buys: 45, sells: 20 },
@@ -137,7 +156,7 @@ function createMockFetch(clock: () => number): {
 
 describe("ShadowLauncher Final Acceptance Test", () => {
   it("executes complete prospective observation lifecycle with accelerated clock", async () => {
-    let virtualClock = 1_000_000;
+    let virtualClock = 10_000_000;
     const clock = () => virtualClock;
 
     const tmpDir = path.join(os.tmpdir(), `shadow-e2e-session-${Date.now()}`);

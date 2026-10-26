@@ -16,6 +16,7 @@
 export type ProspectiveStrategyCohort = "ESTABLISHED_RUNNER" | "MICRO_CAP_PROBE" | "UNCLASSIFIED";
 
 export type CandidateStreamSource =
+  | "DEXSCREENER_LATEST_TOKEN_PROFILES"
   | "RAYDIUM_TOP_TRADED"
   | "DEXSCREENER_RECENT"
   | "BIRDEYE_TRENDING"
@@ -32,18 +33,19 @@ export type GateDecisionOutcome = "ACCEPTED_ARMED" | "FILTERED_REJECTED";
 
 export interface DecisionMarketFeatures {
   /** Indicative market price in SOL at decision time. NOT an executable swap quote. */
-  readonly indicativePriceSol: number;
-  readonly priceQuoteTimestampMs: number;
-  readonly priceQuoteFreshnessMs: number;
-  readonly liquidityUsd: number;
-  readonly volume5mUsd: number;
-  readonly marketCapUsd: number;
-  readonly assetAgeSeconds: number;
+  readonly indicativePriceSol: number | null;
+  readonly priceQuoteTimestampMs: number | null;
+  readonly priceQuoteFreshnessMs: number | null;
+  readonly liquidityUsd: number | null;
+  readonly volume5mUsd: number | null;
+  readonly marketCapUsd: number | null;
+  readonly assetAgeSeconds: number | null;
+  readonly lpBurnPct?: number | null | undefined;
   readonly holdersCount: number | null;
-  readonly buyToSellRatio: number;
+  readonly buyToSellRatio: number | null;
   readonly recentBuys60s: number | null;
   readonly recentSells60s: number | null;
-  readonly lmcRatio: number;
+  readonly lmcRatio: number | null;
   readonly rugScore: number | null;
   readonly bundlerPct: number | null;
   readonly top10HolderPct: number | null;
