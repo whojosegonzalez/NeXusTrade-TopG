@@ -192,6 +192,14 @@ export class ShadowObservationRunner {
       });
   }
 
+  public getOutputDir(): string | undefined {
+    return this.config.outputDir;
+  }
+
+  public setEarlyStopReason(reason: string): void {
+    this.earlyStopReason = reason;
+  }
+
   /**
    * Evaluates and ingests a candidate item.
    * Feeds the candidate into BuyGateTriggerService, records decision truthfully,
@@ -665,12 +673,16 @@ export class ShadowObservationRunner {
   public closeSession(
     nowTimestampMs?: number,
     yieldStats?: Partial<PipelineYieldStats>,
+    earlyStopReason?: string,
   ): {
     readonly summary: ProspectiveSessionSummary;
     readonly manifest: SessionManifest | null;
   } {
     const now = nowTimestampMs ?? this.clock();
     this.isSessionClosed = true;
+    if (earlyStopReason) {
+      this.earlyStopReason = earlyStopReason;
+    }
     this.recorder.closeSession(now);
 
     const baseSummary = this.recorder.generateSessionSummary();

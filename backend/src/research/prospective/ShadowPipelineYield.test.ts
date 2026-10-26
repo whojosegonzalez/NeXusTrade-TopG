@@ -673,4 +673,90 @@ describe("Milestone D.3.3: Shadow Pipeline Yield & Budget Reservation Integratio
       expect(task.scheduledDueTimestampMs).toBe(evaluationTimestamp + task.horizonSec * 1000);
     }
   });
+
+  it("Invariant 6: Captures uncollapsed seeded-lookup diagnostics, updates pipeline yield counts, and propagates earlyStopReason", async () => {
+    const clock = 20_000_000;
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 10,
+      maxEnrichmentAttempts: 5,
+      minReservedForwardRequests: 4,
+      minProviderSpacingMs: 0,
+      clock: () => clock,
+    });
+
+    const mockFetch: FetchFunction = async (url) => {
+      if (url.includes("EMPTY_POOL")) {
+        return new Response(JSON.stringify({ pairs: [] }), { status: 200 });
+      }
+      if (url.includes("VALID_POOL")) {
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "VALID_POOL",
+                baseToken: { address: "VALID_MINT", symbol: "VALID" },
+                quoteToken: { address: WSOL_MINT, symbol: "SOL" },
+                priceNative: "0.042",
+                liquidity: { usd: 100000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Not Found", { status: 404 });
+    };
+
+    const candidateSource = new LiveDexScreenerCandidateSource(
+      budgetManager,
+      mockFetch,
+      () => clock,
+    );
+
+    // 1. Seeded lookup on empty pool
+    const result1 = await candidateSource.enrichCandidate("SOME_MINT", "EMPTY_POOL");
+    expect(result1).toBeNull();
+
+    const diag1 = candidateSource.getSeededLookupDiagnostics();
+    expect(diag1).toBeDefined();
+    expect(diag1!.targetPoolAddress).toBe("EMPTY_POOL");
+    expect(diag1!.observedPairCount).toBe(0);
+    expect(diag1!.failureReason).toBe("SEED_EMPTY_PAIRS_ARRAY");
+    expect(diag1!.httpStatus).toBe(200);
+    expect(diag1!.payloadSha256).toBeTruthy();
+
+    const yieldStats1 = candidateSource.getYieldStats();
+    expect(yieldStats1.enrichmentAttemptsCount).toBe(1);
+    expect(yieldStats1.mismatchedPairsCount).toBe(1);
+    expect(yieldStats1.priceQualifiedCandidatesCount).toBe(0);
+
+    // 2. Runner closeSession propagates earlyStopReason
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "test-seeded-diagnostics",
+        configFingerprint: "sha256:diag-test",
+        clock: () => clock,
+      },
+      { budgetManager },
+    );
+
+    const { summary } = runner.closeSession(clock, yieldStats1, diag1!.failureReason!);
+    expect(summary.earlyStopReason).toBe("SEED_EMPTY_PAIRS_ARRAY");
+    expect(summary.pipelineYieldStats?.enrichmentAttemptsCount).toBe(1);
+    expect(summary.pipelineYieldStats?.mismatchedPairsCount).toBe(1);
+
+    // 3. Seeded lookup on valid pool
+    const result2 = await candidateSource.enrichCandidate("VALID_MINT", "VALID_POOL");
+    expect(result2).not.toBeNull();
+    const diag2 = candidateSource.getSeededLookupDiagnostics();
+    expect(diag2).toBeDefined();
+    expect(diag2!.failureReason).toBeNull();
+    expect(diag2!.observedPairCount).toBe(1);
+
+    const yieldStats2 = candidateSource.getYieldStats();
+    expect(yieldStats2.enrichmentAttemptsCount).toBe(2);
+    expect(yieldStats2.priceQualifiedCandidatesCount).toBe(1);
+  });
 });

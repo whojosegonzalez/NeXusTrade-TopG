@@ -683,6 +683,8 @@ export class ProspectiveObservationRecorder {
       "decision-observations.jsonl",
       "forward-observations.jsonl",
       "prospective-session-summary.json",
+      "seeded-lookup-evidence.json",
+      "source-selection-evidence.json",
     ];
 
     const entries: SessionManifestFileEntry[] = [];

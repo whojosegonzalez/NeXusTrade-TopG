@@ -332,11 +332,21 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
         cliArgs.seedMint,
         cliArgs.seedPool,
       );
-      if (!seedCandidate) {
-        console.warn(
-          `[SEED_FIXTURE_UNAVAILABLE] Could not enrich seed mint ${cliArgs.seedMint} with exact pool ${cliArgs.seedPool} on Raydium. Halting seeded session fail-closed.`,
+      const diagnostics = candidateSource.getSeededLookupDiagnostics();
+      if (diagnostics && outDir) {
+        fs.writeFileSync(
+          path.join(outDir, "seeded-lookup-evidence.json"),
+          JSON.stringify(diagnostics, null, 2),
+          "utf8",
         );
-        runner.closeSession(Date.now(), candidateSource.getYieldStats());
+      }
+      if (!seedCandidate) {
+        const failureReason = diagnostics?.failureReason ?? "SEED_FIXTURE_UNAVAILABLE";
+        console.warn(
+          `[SEED_FIXTURE_UNAVAILABLE] Could not enrich seed mint ${cliArgs.seedMint} with exact pool ${cliArgs.seedPool} on Raydium. Halting seeded session fail-closed: ${failureReason}`,
+        );
+        runner.setEarlyStopReason(failureReason);
+        runner.closeSession(Date.now(), candidateSource.getYieldStats(), failureReason);
         console.log(`[SHUTDOWN] Seeded session closed cleanly due to unavailable seed pool.`);
         return;
       }
@@ -357,10 +367,20 @@ export async function runShadowLauncher(cliArgs: ShadowLauncherArgs = {}): Promi
       runner.stopIntake(Date.now());
       isIntakeCompleted = true;
     } catch (err) {
+      const diagnostics = candidateSource.getSeededLookupDiagnostics();
+      if (diagnostics && outDir) {
+        fs.writeFileSync(
+          path.join(outDir, "seeded-lookup-evidence.json"),
+          JSON.stringify(diagnostics, null, 2),
+          "utf8",
+        );
+      }
+      const failureReason = `SEED_FIXTURE_ERROR_${(err as Error).name || (err as Error).message}`;
       console.error(
         `[SEED_FIXTURE_ERROR] Failed to ingest seed candidate: ${(err as Error).message}`,
       );
-      runner.closeSession(Date.now(), candidateSource.getYieldStats());
+      runner.setEarlyStopReason(failureReason);
+      runner.closeSession(Date.now(), candidateSource.getYieldStats(), failureReason);
       return;
     }
   }

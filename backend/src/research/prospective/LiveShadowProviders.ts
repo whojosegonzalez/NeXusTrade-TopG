@@ -11,6 +11,7 @@
  * - Injectable fetch implementation and abort timeout for offline deterministic testing.
  */
 
+import crypto from "node:crypto";
 import type { GlobalResourceBudgetManager } from "./GlobalResourceBudgetManager.js";
 import type {
   IShadowMarketDataProvider,
@@ -25,6 +26,20 @@ export const DEXSCREENER_PAIRS_SOLANA_PREFIX =
 export const DEXSCREENER_TOKENS_PREFIX = "https://api.dexscreener.com/latest/dex/tokens/";
 export const RAYDIUM_POOLS_ENDPOINT = "https://api-v3.raydium.io/pools/info/list";
 export const DEFAULT_HTTP_TIMEOUT_MS = 5000;
+
+export interface SeededLookupDiagnostics {
+  readonly targetUrl: string;
+  readonly mintAddress: string;
+  readonly targetPoolAddress?: string | undefined;
+  readonly httpStatus: number | null;
+  readonly httpStatusText?: string | undefined;
+  readonly payloadSha256: string | null;
+  readonly rawResponseLengthBytes: number;
+  readonly observedPairCount: number;
+  readonly failureReason: string | null;
+  readonly sanitizedResponseSnippet?: string | undefined;
+  readonly timestampMs: number;
+}
 
 export type FetchFunction = (url: string, init?: RequestInit) => Promise<Response>;
 export type SleepFunction = (ms: number) => Promise<void>;
@@ -308,6 +323,12 @@ export class LiveDexScreenerCandidateSource {
     };
   }
 
+  private lastSeededLookupDiagnostics?: SeededLookupDiagnostics | undefined;
+
+  public getSeededLookupDiagnostics(): SeededLookupDiagnostics | undefined {
+    return this.lastSeededLookupDiagnostics;
+  }
+
   public async pollCandidates(maxToDiscover = 10): Promise<ShadowCandidateInput[]> {
     const now = this.clock();
 
@@ -384,15 +405,9 @@ export class LiveDexScreenerCandidateSource {
         }
       }
 
-      this.enrichmentAttemptsCount++;
       const enriched = await this.enrichCandidate(mint);
       if (enriched) {
-        if (enriched.indicativePriceSol !== null && enriched.indicativePriceSol > 0) {
-          this.priceQualifiedCandidatesCount++;
-        }
         candidates.push(enriched);
-      } else {
-        this.mismatchedPairsCount++;
       }
     }
 
@@ -404,12 +419,30 @@ export class LiveDexScreenerCandidateSource {
     targetPoolAddress?: string,
   ): Promise<ShadowCandidateInput | null> {
     const now = this.clock();
+    this.enrichmentAttemptsCount++;
+
     const recorded = this.budgetManager.recordRequestAttempt(
       "DEXSCREENER",
       "CANDIDATE_ENRICHMENT",
       now,
     );
-    if (!recorded) return null;
+    if (!recorded) {
+      if (targetPoolAddress) {
+        this.lastSeededLookupDiagnostics = {
+          targetUrl: `${DEXSCREENER_PAIRS_SOLANA_PREFIX}${targetPoolAddress}`,
+          mintAddress,
+          targetPoolAddress,
+          httpStatus: null,
+          payloadSha256: null,
+          rawResponseLengthBytes: 0,
+          observedPairCount: 0,
+          failureReason: "BUDGET_REJECTED_OR_PACING_NOT_MET",
+          timestampMs: now,
+        };
+      }
+      this.mismatchedPairsCount++;
+      return null;
+    }
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -426,9 +459,55 @@ export class LiveDexScreenerCandidateSource {
       });
 
       this.budgetManager.recordResponseStatus(res.status);
-      if (!res.ok) return null;
 
-      const payload = (await res.json()) as Record<string, unknown>;
+      const rawText = await res.text();
+      const payloadSha256 = crypto.createHash("sha256").update(rawText).digest("hex");
+      const rawBytes = Buffer.byteLength(rawText, "utf8");
+      const snippet = rawText.slice(0, 500);
+
+      if (!res.ok) {
+        if (targetPoolAddress) {
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: 0,
+            failureReason: `SEED_HTTP_STATUS_${res.status}_${res.statusText || "ERROR"}`,
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+        }
+        this.mismatchedPairsCount++;
+        return null;
+      }
+
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(rawText) as Record<string, unknown>;
+      } catch {
+        if (targetPoolAddress) {
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: 0,
+            failureReason: "SEED_INVALID_JSON_PAYLOAD",
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+        }
+        this.mismatchedPairsCount++;
+        return null;
+      }
+
       const pairs = (
         Array.isArray(payload)
           ? payload
@@ -440,6 +519,27 @@ export class LiveDexScreenerCandidateSource {
                 ? [payload.pair]
                 : []
       ) as Array<Record<string, unknown>>;
+
+      if (pairs.length === 0) {
+        if (targetPoolAddress) {
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: 0,
+            failureReason: "SEED_EMPTY_PAIRS_ARRAY",
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+        }
+        this.mismatchedPairsCount++;
+        return null;
+      }
+
       const matchingPairs = pairs.filter((p) => {
         if (!p || p.chainId !== "solana" || p.dexId !== "raydium") return false;
         if (typeof p.pairAddress !== "string" || p.pairAddress.trim().length === 0) return false;
@@ -449,6 +549,38 @@ export class LiveDexScreenerCandidateSource {
       });
 
       if (matchingPairs.length === 0) {
+        if (targetPoolAddress) {
+          const foundPool = pairs.find(
+            (p) =>
+              p &&
+              typeof p.pairAddress === "string" &&
+              p.pairAddress.toLowerCase() === targetPoolAddress.toLowerCase(),
+          );
+          let failureReason = "SEED_POOL_ADDRESS_NOT_FOUND_IN_RESPONSE";
+          if (foundPool) {
+            if (foundPool.chainId !== "solana") {
+              failureReason = "SEED_NON_SOLANA_CHAIN";
+            } else if (foundPool.dexId !== "raydium") {
+              failureReason = `SEED_NON_RAYDIUM_DEX_${String(foundPool.dexId)}`;
+            } else {
+              failureReason = "SEED_MINT_ADDRESS_MISMATCH";
+            }
+          }
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: pairs.length,
+            failureReason,
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+        }
+        this.mismatchedPairsCount++;
         return null;
       }
 
@@ -527,19 +659,60 @@ export class LiveDexScreenerCandidateSource {
           (a) => a.pairAddress.toLowerCase() === targetPoolAddress.toLowerCase(),
         );
         if (!exactMatch) {
-          // Requested pool not found among Solana Raydium pairs for this token
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: pairs.length,
+            failureReason: "SEED_POOL_ADDRESS_NOT_FOUND_IN_MATCHING_ASSESSMENTS",
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+          this.mismatchedPairsCount++;
           return null;
         }
         if (!exactMatch.hasValidPrice) {
-          // Requested pool does not have a valid canonical WSOL price
+          const specificReason = exactMatch.missingPriceReason ?? "SEED_PRICE_INVALID_OR_MISSING";
+          this.lastSeededLookupDiagnostics = {
+            targetUrl,
+            mintAddress,
+            targetPoolAddress,
+            httpStatus: res.status,
+            httpStatusText: res.statusText,
+            payloadSha256,
+            rawResponseLengthBytes: rawBytes,
+            observedPairCount: pairs.length,
+            failureReason: specificReason,
+            sanitizedResponseSnippet: snippet,
+            timestampMs: this.clock(),
+          };
+          this.mismatchedPairsCount++;
           return null;
         }
         selected = exactMatch;
         selectionBasis = "EXACT_ENFORCED_SEED_POOL_MATCH";
+        this.lastSeededLookupDiagnostics = {
+          targetUrl,
+          mintAddress,
+          targetPoolAddress,
+          httpStatus: res.status,
+          httpStatusText: res.statusText,
+          payloadSha256,
+          rawResponseLengthBytes: rawBytes,
+          observedPairCount: pairs.length,
+          failureReason: null,
+          sanitizedResponseSnippet: snippet,
+          timestampMs: this.clock(),
+        };
       } else {
         // Unseeded discovery mode: deterministic selection requiring genuine canonical WSOL Raydium pair with valid price
         const priceQualified = assessments.filter((a) => a.hasValidPrice);
         if (priceQualified.length === 0) {
+          this.mismatchedPairsCount++;
           return null;
         }
 
@@ -650,6 +823,12 @@ export class LiveDexScreenerCandidateSource {
       // 9. Risk & Security Metrics (DexScreener does not provide these; preserved truthfully as null)
       unavailableInputs.push("holdersCount", "rugScore", "bundlerPct", "top10HolderPct");
 
+      if (indicativePriceSol !== null && indicativePriceSol > 0) {
+        this.priceQualifiedCandidatesCount++;
+      } else {
+        this.mismatchedPairsCount++;
+      }
+
       return {
         poolId: selected.pairAddress,
         selectedPoolAddress: selected.pairAddress,
@@ -676,7 +855,21 @@ export class LiveDexScreenerCandidateSource {
         top10HolderPct: null,
         unavailableInputs,
       };
-    } catch {
+    } catch (err) {
+      if (targetPoolAddress) {
+        this.lastSeededLookupDiagnostics = {
+          targetUrl,
+          mintAddress,
+          targetPoolAddress,
+          httpStatus: null,
+          payloadSha256: null,
+          rawResponseLengthBytes: 0,
+          observedPairCount: 0,
+          failureReason: `FETCH_ERROR_${(err as Error).name || (err as Error).message}`,
+          timestampMs: this.clock(),
+        };
+      }
+      this.mismatchedPairsCount++;
       return null;
     } finally {
       clearTimeout(timeoutId);
