@@ -48,6 +48,7 @@
     "shadow:fast-exit-validate": "tsx src/scripts/shadow-fast-exit-validate.ts",
     "shadow:fast-feature-attribute": "tsx src/scripts/shadow-fast-feature-attribute.ts",
     "shadow:observe": "tsx src/scripts/shadow-observe.ts",
+    "shadow:observe:live": "tsx src/scripts/launch-shadow-observation.ts",
     "shadow:threshold-validate": "tsx src/scripts/shadow-threshold-validate.ts",
     "strategy:evaluate": "tsx src/scripts/strategy-evaluate.ts",
     "terminal:run": "tsx src/scripts/terminal-runner.ts",

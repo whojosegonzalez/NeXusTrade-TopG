@@ -180,6 +180,17 @@ export interface ProspectiveSessionSummary {
     readonly rejectedByRisk: Record<string, CohortHorizonStatistics>;
     readonly rejectedByEligibility: Record<string, CohortHorizonStatistics>;
   };
+  readonly earlyStopReason?: string | null | undefined;
+  readonly globalRequestStats?:
+    | {
+        readonly totalRequests: number;
+        readonly discoveryRequests: number;
+        readonly enrichmentRequests: number;
+        readonly forwardObservationRequests: number;
+        readonly retries: number;
+        readonly consecutive429sEncountered: number;
+      }
+    | undefined;
   readonly dataQuality: {
     readonly averageQuoteLatencyMs: number;
     readonly staleQuotesDetected: number;

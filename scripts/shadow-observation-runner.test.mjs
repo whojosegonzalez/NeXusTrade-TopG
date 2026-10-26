@@ -280,7 +280,7 @@ test("ShadowObservationRunner — Invariant 8: Provider failure and pool drainag
   mockProvider.failNextWith = new Error("HTTP 503 Service Unavailable");
   await runner.processDueObservations();
 
-  virtualClock = 1_302_000;
+  virtualClock = 1_303_000;
   mockProvider.nextQuoteOverrides = {
     isPoolDrained: true,
     indicativePriceSol: 0,

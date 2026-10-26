@@ -108,6 +108,55 @@ describe("ShadowObservationRunner Integration Suite", () => {
     expect(tasks.every((t) => t.status === "PENDING")).toBe(true);
   });
 
+  it("Invariant 1B: Reconciles cohort assignment strictly to strategy baseline (no 15m/$30k heuristic)", () => {
+    const runner = new ShadowObservationRunner({
+      sessionId: "test-cohort-reconciliation",
+      configFingerprint: "sha256:fp-cohort",
+    });
+
+    // 1. Approved Established Runner (>= $50k liquidity AND age between 1800s and 7200s)
+    const idEst = runner.ingestCandidate(
+      createCandidate({
+        mintAddress: "MINT_ESTABLISHED",
+        liquidityUsd: 65000,
+        assetAgeSeconds: 2400,
+      }),
+    )!;
+    const estRecord = runner
+      .getRecorder()
+      .getDecisionRecords()
+      .find((d) => d.decisionEventId === idEst);
+    expect(estRecord?.strategyCohort).toBe("ESTABLISHED_RUNNER");
+
+    // 2. Approved Micro-Cap Probe (>= $20k liquidity AND age between 300s and 1800s)
+    const idMicro = runner.ingestCandidate(
+      createCandidate({
+        mintAddress: "MINT_MICRO",
+        liquidityUsd: 25000,
+        assetAgeSeconds: 600,
+      }),
+    )!;
+    const microRecord = runner
+      .getRecorder()
+      .getDecisionRecords()
+      .find((d) => d.decisionEventId === idMicro);
+    expect(microRecord?.strategyCohort).toBe("MICRO_CAP_PROBE");
+
+    // 3. 20-minute / $30k candidate MUST be UNCLASSIFIED, not silently labeled established runner
+    const idViral = runner.ingestCandidate(
+      createCandidate({
+        mintAddress: "MINT_VIRAL_HEURISTIC",
+        liquidityUsd: 30000,
+        assetAgeSeconds: 1200,
+      }),
+    )!;
+    const viralRecord = runner
+      .getRecorder()
+      .getDecisionRecords()
+      .find((d) => d.decisionEventId === idViral);
+    expect(viralRecord?.strategyCohort).toBe("UNCLASSIFIED");
+  });
+
   it("Invariant 2: Evaluates rejected candidates, captures rejection categories, and schedules forward horizons", () => {
     const virtualClock = 1_000_000;
     const runner = new ShadowObservationRunner({
@@ -310,8 +359,8 @@ describe("ShadowObservationRunner Integration Suite", () => {
     mockProvider.failNextWith = new Error("HTTP 503 Service Unavailable");
     await runner.processDueObservations();
 
-    // Advance clock for next task
-    virtualClock = 1_302_000;
+    // Advance clock past 2,500ms pacing interval
+    virtualClock = 1_303_000;
     // Simulate pool drainage event
     mockProvider.nextQuoteOverrides = {
       isPoolDrained: true,
@@ -377,5 +426,123 @@ describe("ShadowObservationRunner Integration Suite", () => {
     expect(safety.paperTradingActive).toBe(false);
     expect(safety.openPositionsCount).toBe(0);
     expect(safety.networkMutationsAllowed).toBe(false);
+  });
+
+  it("Operational Gap 1: Three consecutive HTTP 429s stop intake fail-closed", async () => {
+    let virtualClock = 1_000_000;
+    const mockProvider = new MockMarketDataProvider();
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "test-429-stop",
+        configFingerprint: "sha256:fp-429",
+        minProviderSpacingMs: 1_000,
+        clock: () => virtualClock,
+      },
+      { marketDataProvider: mockProvider },
+    );
+
+    runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_1" }));
+    runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_2" }));
+    runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_3" }));
+
+    virtualClock = 1_300_000;
+    // 1st 429
+    mockProvider.failNextWith = new Error("HTTP 429 Too Many Requests");
+    await runner.processDueObservations();
+
+    virtualClock = 1_301_500;
+    // 2nd 429
+    mockProvider.failNextWith = new Error("HTTP 429 Rate Limit");
+    await runner.processDueObservations();
+
+    virtualClock = 1_303_000;
+    // 3rd consecutive 429 -> triggers halt
+    mockProvider.failNextWith = new Error("HTTP 429 Rate Limit Exceeded");
+    await runner.processDueObservations();
+
+    expect(runner.getEarlyStopReason()).toBe("CONSECUTIVE_HTTP_429_LIMIT_REACHED");
+
+    // Attempting to ingest candidates after 3 consecutive 429s must be rejected fail-closed
+    const rejectedCand = runner.ingestCandidate(createCandidate({ mintAddress: "MINT_POST_429" }));
+    expect(rejectedCand).toBeNull();
+  });
+
+  it("Operational Gap 2: Missing quote rate > 35% triggers documented early-stop", async () => {
+    let virtualClock = 1_000_000;
+    const mockProvider = new MockMarketDataProvider();
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "test-excessive-missing-stop",
+        configFingerprint: "sha256:fp-missing",
+        minProviderSpacingMs: 100,
+        maxCandidates: 15,
+        clock: () => virtualClock,
+      },
+      { marketDataProvider: mockProvider },
+    );
+
+    // Ingest 12 candidates
+    for (let i = 0; i < 12; i++) {
+      runner.ingestCandidate(createCandidate({ mintAddress: `MINT_MISS_${i}` }));
+    }
+
+    // Set provider to fail for 6 of the 12 candidates (6/12 = 50% missing, which is > 35%)
+    virtualClock = 1_300_000;
+    for (let i = 0; i < 12; i++) {
+      virtualClock += 200;
+      if (i < 6) {
+        mockProvider.failNextWith = new Error("HTTP 500 Internal Server Error");
+      }
+      await runner.processDueObservations(virtualClock);
+    }
+
+    expect(runner.getEarlyStopReason()).toBe("EXCESSIVE_MISSING_QUOTES_RATIO");
+  });
+
+  it("Operational Gap 3: Stale pre-horizon prices cannot masquerade as later outcomes", async () => {
+    let virtualClock = 1_000_000;
+    const mockProvider = new MockMarketDataProvider();
+    const runner = new ShadowObservationRunner(
+      {
+        sessionId: "test-stale-pre-horizon",
+        configFingerprint: "sha256:fp-stale",
+        clock: () => virtualClock,
+      },
+      { marketDataProvider: mockProvider },
+    );
+
+    runner.ingestCandidate(createCandidate({ mintAddress: "MINT_STALE_HORIZON" }));
+
+    // Advance clock to +5m (1_300_000)
+    virtualClock = 1_300_000;
+    // Return a quote that was created at 1_100_000 (well before scheduled due 1_300_000)
+    mockProvider.nextQuoteOverrides = {
+      indicativePriceSol: 0.000006,
+      quoteTimestampMs: 1_100_000, // 200s before horizon due
+    };
+    await runner.processDueObservations();
+
+    const forwardRecords = runner.getRecorder().getForwardRecords();
+    const staleRecord = forwardRecords.find((f) => f.missingReason === "PRE_HORIZON_STALE_QUOTE");
+    expect(staleRecord).toBeDefined();
+    expect(staleRecord?.outcomeStatus).toBe("MISSING_STALE_QUOTE");
+  });
+
+  it("Operational Gap 4: Output directory collision protection prevents overwriting evidence", () => {
+    const tmpDir = path.join(os.tmpdir(), `shadow-collision-test-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // Place an existing decision-observations.jsonl in directory
+    fs.writeFileSync(path.join(tmpDir, "decision-observations.jsonl"), '{"sample":true}\n');
+
+    expect(() => {
+      new ShadowObservationRunner({
+        sessionId: "collision-attempt",
+        configFingerprint: "sha256:fp",
+        outputDir: tmpDir,
+      });
+    }).toThrow(/already contains session artifacts/);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });
