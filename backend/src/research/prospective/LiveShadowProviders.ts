@@ -30,10 +30,9 @@ export type FetchFunction = (url: string, init?: RequestInit) => Promise<Respons
 export type SleepFunction = (ms: number) => Promise<void>;
 
 export function isWsolToken(token?: { address?: string; symbol?: string }): boolean {
-  if (!token) return false;
-  if (token.address === WSOL_MINT) return true;
-  const sym = token.symbol?.toUpperCase();
-  return sym === "SOL" || sym === "WSOL";
+  if (!token || typeof token.address !== "string") return false;
+  // Strictly require canonical WSOL mint address. Never trust token symbols alone.
+  return token.address === WSOL_MINT;
 }
 
 export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
@@ -134,21 +133,30 @@ export class LiveDexScreenerQuoteProvider implements IShadowMarketDataProvider {
       };
     }
 
-    // 2. Exact pool matching when poolId is specified
+    // 2. Exact pool matching when poolId is specified (strictly enforcing Raydium dexId)
     let matchingPair: Record<string, unknown> | undefined;
     if (poolId && poolId.length > 20) {
       matchingPair = solPairs.find(
         (p) =>
-          typeof p.pairAddress === "string" && p.pairAddress.toLowerCase() === poolId.toLowerCase(),
+          typeof p.pairAddress === "string" &&
+          p.pairAddress.toLowerCase() === poolId.toLowerCase() &&
+          p.dexId === "raydium",
       );
       if (!matchingPair) {
+        const poolOnOtherDex = solPairs.find(
+          (p) =>
+            typeof p.pairAddress === "string" &&
+            p.pairAddress.toLowerCase() === poolId.toLowerCase(),
+        );
         return {
           indicativePriceSol: null,
           liquidityUsd: null,
           quoteTimestampMs: this.clock(),
           quoteSource: "DEXSCREENER",
           isExecutableQuote: false,
-          missingReason: "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND",
+          missingReason: poolOnOtherDex
+            ? "NON_RAYDIUM_DEX_REJECTED"
+            : "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND",
           httpStatus,
         };
       }

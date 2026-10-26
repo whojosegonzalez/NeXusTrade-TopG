@@ -127,7 +127,7 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
       .find((d) => d.decisionEventId === decIdC);
     expect(recordC?.gateOutcome.decision).toBe("FILTERED_REJECTED");
     expect(recordC?.gateOutcome.rejectionCategory).toBe("REJECTED_BY_MISSING_DATA");
-    expect(recordC?.gateOutcome.primaryFailedRule).toBe("MISSING_LMC_RATIO_DATA");
+    expect(recordC?.gateOutcome.primaryFailedRule).toBe("MISSING_MARKET_CAP_DATA");
   });
 
   it("counterexample 2: validates exact pairAddress, chainId, and dexId without fallback", async () => {
@@ -146,6 +146,26 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
                 dexId: "raydium",
                 pairAddress: "pool-DIFFERENT-99999999999999999999",
                 baseToken: { address: "MINT_A" },
+                quoteToken: { address: WSOL_MINT },
+                priceNative: "0.00005",
+                liquidity: { usd: 50000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.includes("pool-ORCA-MATCH-11111111111111111111")) {
+        // Exact pair address matches, but dexId is Orca (not Raydium)
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "orca",
+                pairAddress: "pool-ORCA-MATCH-11111111111111111111",
+                baseToken: { address: "MINT_B" },
                 quoteToken: { address: WSOL_MINT },
                 priceNative: "0.00005",
                 liquidity: { usd: 50000 },
@@ -206,13 +226,22 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
     expect(resA.indicativePriceSol).toBeNull();
     expect(resA.missingReason).toBe("PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND");
 
-    // 2. Non-Raydium dexId
+    // 2. Exact pairAddress match on non-Raydium DEX (Orca)
+    clock += 3000;
+    const resOrca = await quoteProvider.fetchQuote(
+      "pool-ORCA-MATCH-11111111111111111111",
+      "MINT_B",
+    );
+    expect(resOrca.indicativePriceSol).toBeNull();
+    expect(resOrca.missingReason).toBe("NON_RAYDIUM_DEX_REJECTED");
+
+    // 3. Non-Raydium dexId without poolId
     clock += 3000;
     const resB = await quoteProvider.fetchQuote("", "MINT_B");
     expect(resB.indicativePriceSol).toBeNull();
     expect(resB.missingReason).toBe("NO_RAYDIUM_POOL_FOUND");
 
-    // 3. Non-Solana chain
+    // 4. Non-Solana chain
     clock += 3000;
     const resC = await quoteProvider.fetchQuote("pool-ETH-CHAIN", "MINT_C");
     expect(resC.indicativePriceSol).toBeNull();
@@ -245,8 +274,32 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
         );
       }
 
+      if (url.includes("MINT_FAKESOL") || url.includes("pool-FAKESOL-PAIR")) {
+        // Fake WSOL token: symbol is "WSOL" but mint address is NOT canonical WSOL
+        return new Response(
+          JSON.stringify({
+            pairs: [
+              {
+                chainId: "solana",
+                dexId: "raydium",
+                pairAddress: "pool-FAKESOL-PAIR-11111111111111111",
+                baseToken: { address: "MINT_FAKESOL", symbol: "FAKE_RUNNER" },
+                quoteToken: {
+                  address: "FakeWSolAddress11111111111111111111111111",
+                  symbol: "WSOL",
+                },
+                priceNative: "0.005",
+                priceUsd: "0.75",
+                liquidity: { usd: 60000 },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
       if (url.includes("MINT_WSOL") || url.includes("pool-WSOL-PAIR")) {
-        // Pair quoted against WSOL
+        // Pair quoted against canonical WSOL mint
         return new Response(
           JSON.stringify({
             pairs: [
@@ -279,7 +332,16 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
     expect(resUsdc.indicativePriceSol).toBeNull();
     expect(resUsdc.missingReason).toBe("NON_SOL_QUOTE_DENOMINATION");
 
-    // 2. WSOL pair query
+    // 2. Fake WSOL pair query (symbol is WSOL, but mint is non-canonical)
+    clock += 3000;
+    const resFakeSol = await quoteProvider.fetchQuote(
+      "pool-FAKESOL-PAIR-11111111111111111",
+      "MINT_FAKESOL",
+    );
+    expect(resFakeSol.indicativePriceSol).toBeNull();
+    expect(resFakeSol.missingReason).toBe("NON_SOL_QUOTE_DENOMINATION");
+
+    // 3. Canonical WSOL pair query
     clock += 3000;
     const resWsol = await quoteProvider.fetchQuote(
       "pool-WSOL-PAIR-11111111111111111111",

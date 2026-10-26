@@ -91,6 +91,34 @@ test("Counterexample 1: Missing LP burn, age, or market cap cannot pass screenin
   assert.equal(recordB.gateOutcome.decision, "FILTERED_REJECTED");
   assert.equal(recordB.gateOutcome.rejectionCategory, "REJECTED_BY_MISSING_DATA");
   assert.equal(recordB.gateOutcome.primaryFailedRule, "MISSING_ASSET_AGE_DATA");
+
+  const candC = {
+    poolId: "pool-test-mcap-missing",
+    mintAddress: "MINT_TEST_MCAP_MISSING",
+    symbol: "NOMCAP",
+    discoveryTimestampMs: clock,
+    streamSource: "DEXSCREENER_LATEST_TOKEN_PROFILES",
+    indicativePriceSol: 0.0001,
+    liquidityUsd: 60000,
+    marketCapUsd: null,
+    lmcRatio: null,
+    lpBurnPct: 100,
+    assetAgeSeconds: 2400,
+    volume5mUsd: 15000,
+    buys5m: 40,
+    sells5m: 20,
+    buyToSellRatio: 2.0,
+    unavailableInputs: ["marketCapUsd", "lmcRatio"],
+  };
+
+  const decIdC = runner.ingestCandidate(candC);
+  const recordC = runner
+    .getRecorder()
+    .getDecisionRecords()
+    .find((d) => d.decisionEventId === decIdC);
+  assert.equal(recordC.gateOutcome.decision, "FILTERED_REJECTED");
+  assert.equal(recordC.gateOutcome.rejectionCategory, "REJECTED_BY_MISSING_DATA");
+  assert.equal(recordC.gateOutcome.primaryFailedRule, "MISSING_MARKET_CAP_DATA");
 });
 
 test("Counterexample 2: Validates exact pairAddress, chainId, and dexId without fallback", async () => {
@@ -107,6 +135,25 @@ test("Counterexample 2: Validates exact pairAddress, chainId, and dexId without 
               dexId: "raydium",
               pairAddress: "pool-DIFFERENT-99999999999999999999",
               baseToken: { address: "MINT_A" },
+              quoteToken: { address: WSOL_MINT },
+              priceNative: "0.00005",
+              liquidity: { usd: 50000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
+    if (url.includes("pool-ORCA-MATCH-11111111111111111111")) {
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "orca",
+              pairAddress: "pool-ORCA-MATCH-11111111111111111111",
+              baseToken: { address: "MINT_B" },
               quoteToken: { address: WSOL_MINT },
               priceNative: "0.00005",
               liquidity: { usd: 50000 },
@@ -136,6 +183,25 @@ test("Counterexample 2: Validates exact pairAddress, chainId, and dexId without 
       );
     }
 
+    if (url.includes("pool-ETH-CHAIN") || url.includes("MINT_C")) {
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "ethereum",
+              dexId: "uniswap",
+              pairAddress: "pool-ETH-CHAIN",
+              baseToken: { address: "MINT_C" },
+              quoteToken: { address: "WETH" },
+              priceNative: "0.00005",
+              liquidity: { usd: 50000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
     return new Response(JSON.stringify({ pairs: [] }), { status: 200 });
   };
 
@@ -146,9 +212,19 @@ test("Counterexample 2: Validates exact pairAddress, chainId, and dexId without 
   assert.equal(resA.missingReason, "PAIR_ADDRESS_MISMATCH_OR_NOT_FOUND");
 
   clock += 3000;
+  const resOrca = await quoteProvider.fetchQuote("pool-ORCA-MATCH-11111111111111111111", "MINT_B");
+  assert.equal(resOrca.indicativePriceSol, null);
+  assert.equal(resOrca.missingReason, "NON_RAYDIUM_DEX_REJECTED");
+
+  clock += 3000;
   const resB = await quoteProvider.fetchQuote("", "MINT_B");
   assert.equal(resB.indicativePriceSol, null);
   assert.equal(resB.missingReason, "NO_RAYDIUM_POOL_FOUND");
+
+  clock += 3000;
+  const resC = await quoteProvider.fetchQuote("pool-ETH-CHAIN", "MINT_C");
+  assert.equal(resC.indicativePriceSol, null);
+  assert.equal(resC.missingReason, "NON_SOLANA_CHAIN");
 });
 
 test("Counterexample 3: USDC-quoted token vs WSOL-quoted token", async () => {
@@ -168,6 +244,26 @@ test("Counterexample 3: USDC-quoted token vs WSOL-quoted token", async () => {
               quoteToken: { address: USDC_MINT, symbol: "USDC" },
               priceNative: "1.50",
               priceUsd: "1.50",
+              liquidity: { usd: 60000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+
+    if (url.includes("MINT_FAKESOL") || url.includes("pool-FAKESOL-PAIR")) {
+      return new Response(
+        JSON.stringify({
+          pairs: [
+            {
+              chainId: "solana",
+              dexId: "raydium",
+              pairAddress: "pool-FAKESOL-PAIR-11111111111111111",
+              baseToken: { address: "MINT_FAKESOL", symbol: "FAKE_RUNNER" },
+              quoteToken: { address: "FakeWSolAddress11111111111111111111111111", symbol: "WSOL" },
+              priceNative: "0.005",
+              priceUsd: "0.75",
               liquidity: { usd: 60000 },
             },
           ],
@@ -207,6 +303,14 @@ test("Counterexample 3: USDC-quoted token vs WSOL-quoted token", async () => {
   );
   assert.equal(resUsdc.indicativePriceSol, null);
   assert.equal(resUsdc.missingReason, "NON_SOL_QUOTE_DENOMINATION");
+
+  clock += 3000;
+  const resFakeSol = await quoteProvider.fetchQuote(
+    "pool-FAKESOL-PAIR-11111111111111111",
+    "MINT_FAKESOL",
+  );
+  assert.equal(resFakeSol.indicativePriceSol, null);
+  assert.equal(resFakeSol.missingReason, "NON_SOL_QUOTE_DENOMINATION");
 
   clock += 3000;
   const resWsol = await quoteProvider.fetchQuote(

@@ -249,6 +249,9 @@ export class ShadowObservationRunner {
     if (candidate.liquidityUsd === null) {
       missingInputs.push("MISSING_LIQUIDITY_DATA");
     }
+    if (candidate.marketCapUsd === null) {
+      missingInputs.push("MISSING_MARKET_CAP_DATA");
+    }
     if (candidate.assetAgeSeconds === null) {
       missingInputs.push("MISSING_ASSET_AGE_DATA");
     }
@@ -291,7 +294,7 @@ export class ShadowObservationRunner {
         mintAddress: candidate.mintAddress,
         symbol: candidate.symbol,
         liquidityUsd: candidate.liquidityUsd!,
-        marketCapUsd: candidate.marketCapUsd ?? candidate.liquidityUsd! * 2,
+        marketCapUsd: candidate.marketCapUsd!,
         lmcRatio: candidate.lmcRatio!,
         lpBurnPct: candidate.lpBurnPct!,
         assetAgeSeconds: candidate.assetAgeSeconds!,
