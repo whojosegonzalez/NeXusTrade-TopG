@@ -502,14 +502,17 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
   });
 
   it("counterexample 7: delayed or hanging requests abort cleanly without indefinitely extending session", async () => {
-    const clock = 1_000_000;
+    let clock = 1_000_000;
     const budgetManager = new GlobalResourceBudgetManager({ clock: () => clock });
 
+    let fetchCallCount = 0;
     // Hanging fetch mock that never resolves on its own
     const hangingFetch: FetchFunction = (_url, init) => {
+      fetchCallCount++;
       return new Promise((_resolve, reject) => {
         if (init?.signal) {
           init.signal.addEventListener("abort", () => {
+            clock += 50;
             const abortErr = new Error("This operation was aborted");
             abortErr.name = "AbortError";
             reject(abortErr);
@@ -526,9 +529,24 @@ describe("Milestone D.3.3 Data Integrity & Safeguards Suite", () => {
       50,
     );
 
-    await expect(quoteProvider.fetchQuote("pool-HANGING", "MINT_HANG")).rejects.toThrow(
-      /HTTP request timed out after 50ms/,
-    );
+    const result = await quoteProvider.fetchQuote("pool-HANGING", "MINT_HANG");
+    expect(result.indicativePriceSol).toBeNull();
+    expect(result.missingReason).toContain("HTTP_TIMEOUT_AFTER_50MS");
+    expect(result.httpStatus).toBeNull();
+
+    const evidence = result.httpEvidence;
+    expect(evidence).toBeDefined();
+    expect(evidence?.targetUrl).toBe("https://api.dexscreener.com/latest/dex/tokens/MINT_HANG");
+    expect(evidence?.requestStartMs).toBe(1_000_000);
+    expect(evidence?.headersReceivedMs).toBeNull();
+    expect(evidence?.responseCompleteMs).toBeNull();
+    expect(evidence?.failureTimestampMs).toBe(1_000_050);
+    expect(evidence?.requestDurationMs).toBe(50);
+    expect(evidence?.failureReason).toContain("HTTP_TIMEOUT_AFTER_50MS");
+
+    // Bounded completion: exactly 1 request attempted with no retries or additional requests
+    expect(fetchCallCount).toBe(1);
+    expect(budgetManager.getStats().totalRequests).toBe(0);
   });
 
   it("counterexample 8: accurate request-budget accounting and cryptographic session manifest", () => {

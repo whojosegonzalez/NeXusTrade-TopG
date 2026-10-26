@@ -19,6 +19,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { GlobalResourceBudgetManager } from "./GlobalResourceBudgetManager.js";
+import { type FetchFunction, LiveDexScreenerQuoteProvider } from "./LiveShadowProviders.js";
 import {
   ShadowObservationRunner,
   type IShadowMarketDataProvider,
@@ -430,7 +432,36 @@ describe("ShadowObservationRunner Integration Suite", () => {
 
   it("Operational Gap 1: Three consecutive HTTP 429s stop intake fail-closed", async () => {
     let virtualClock = 1_000_000;
-    const mockProvider = new MockMarketDataProvider();
+    const budgetManager = new GlobalResourceBudgetManager({
+      maxTotalRequests: 50,
+      minProviderSpacingMs: 1_000,
+      clock: () => virtualClock,
+    });
+
+    let mockHttpStatus = 200;
+    let mockFetchError: Error | null = null;
+    let fetchCallCount = 0;
+
+    const mockFetch: FetchFunction = async () => {
+      fetchCallCount++;
+      if (mockFetchError) {
+        const err = mockFetchError;
+        mockFetchError = null;
+        throw err;
+      }
+      return new Response(JSON.stringify({ pairs: [] }), {
+        status: mockHttpStatus,
+        statusText: mockHttpStatus === 429 ? "Too Many Requests" : "OK",
+      });
+    };
+
+    const quoteProvider = new LiveDexScreenerQuoteProvider(
+      budgetManager,
+      mockFetch,
+      () => virtualClock,
+      5_000,
+    );
+
     const runner = new ShadowObservationRunner(
       {
         sessionId: "test-429-stop",
@@ -438,29 +469,54 @@ describe("ShadowObservationRunner Integration Suite", () => {
         minProviderSpacingMs: 1_000,
         clock: () => virtualClock,
       },
-      { marketDataProvider: mockProvider },
+      { marketDataProvider: quoteProvider, budgetManager },
     );
 
+    // Ingest candidates to test error text alone vs genuine consecutive HTTP 429s
+    runner.ingestCandidate(createCandidate({ mintAddress: "MINT_ERR_TEXT" }));
     runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_1" }));
     runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_2" }));
     runner.ingestCandidate(createCandidate({ mintAddress: "MINT_429_3" }));
 
+    // Tick 0: Error text alone containing "HTTP 429" does NOT trigger status 429 recording or circuit breaker
     virtualClock = 1_300_000;
-    // 1st 429
-    mockProvider.failNextWith = new Error("HTTP 429 Too Many Requests");
+    mockFetchError = new Error("HTTP 429 Rate Limit in error text only");
     await runner.processDueObservations();
 
+    expect(budgetManager.getStats().consecutive429sEncountered).toBe(0);
+    expect(budgetManager.is429HaltRequired()).toBe(false);
+    expect(runner.getEarlyStopReason()).toBeNull();
+
+    // Tick 1: 1st genuine HTTP 429 response
     virtualClock = 1_301_500;
-    // 2nd 429
-    mockProvider.failNextWith = new Error("HTTP 429 Rate Limit");
+    mockHttpStatus = 429;
     await runner.processDueObservations();
 
+    expect(budgetManager.getStats().consecutive429sEncountered).toBe(1);
+    expect(budgetManager.is429HaltRequired()).toBe(false);
+    expect(runner.getEarlyStopReason()).toBeNull();
+
+    // Tick 2: 2nd genuine HTTP 429 response
     virtualClock = 1_303_000;
-    // 3rd consecutive 429 -> triggers halt
-    mockProvider.failNextWith = new Error("HTTP 429 Rate Limit Exceeded");
+    mockHttpStatus = 429;
     await runner.processDueObservations();
 
+    expect(budgetManager.getStats().consecutive429sEncountered).toBe(2);
+    expect(budgetManager.is429HaltRequired()).toBe(false);
+    expect(runner.getEarlyStopReason()).toBeNull();
+
+    // Tick 3: 3rd consecutive genuine HTTP 429 response -> triggers circuit breaker
+    virtualClock = 1_304_500;
+    mockHttpStatus = 429;
+    await runner.processDueObservations();
+
+    expect(budgetManager.getStats().consecutive429sEncountered).toBe(3);
+    expect(budgetManager.is429HaltRequired()).toBe(true);
     expect(runner.getEarlyStopReason()).toBe("CONSECUTIVE_HTTP_429_LIMIT_REACHED");
+
+    // Each HTTP 429 response was counted once
+    expect(budgetManager.getStats().consecutive429sEncountered).toBe(3);
+    expect(fetchCallCount).toBe(4);
 
     // Attempting to ingest candidates after 3 consecutive 429s must be rejected fail-closed
     const rejectedCand = runner.ingestCandidate(createCandidate({ mintAddress: "MINT_POST_429" }));
