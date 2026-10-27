@@ -35,6 +35,14 @@ export const CAPTURED_RAY_WSOL_IDENTITIES: RaydiumAmmV4SnapshotIdentities = Obje
 });
 
 /**
+ * Authentic raw JSON-RPC response body from Request 1 (getAccountInfo for pool)
+ * captured during the operator acquisition at 2026-10-27T06:35:09.209Z (slot 461970865).
+ * Contains the 752-byte Raydium AMM v4 pool account state.
+ */
+export const RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE =
+  '{"jsonrpc":"2.0","result":{"context":{"apiVersion":"4.3.2","slot":461970865},"value":{"data":["BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAGAAAAAAAAAAkAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAADh9QUAAAAA9AEAAAAAAAAAAAAAAAAAAKCGAQAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJhaSWJIPAAAjxiBlGQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMafnauQpgMAAAAAAAAAAAABjw9ewXRbAAAAAAAAAAAAck+IIuI5AABHNWonL2RaAAAAAAAAAAAAgL2DzTScAwAAAAAAAAAAACXLJUlWAgAAzHQZm0W6z5gtNl5Gv+9qEaF6ncdTHhcqZ+JK5m9xrTgpC+u4fXOeAokTezrBH8HXOQDwoprFtmZgW2UdHz+okTeZjMvy0EWLYVy8xrGjZ8R0np/vcwZiLhsbWJEBILyaBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFqMv4mOSymgSzqTuW7xGS2KUFu76GQUO/5CQz7TceLMVDs2n3OBDb+pbbsf+iadatphbqjzsmfRgoRiu8VJW2LpPMK+KyZYVVWsVJclPiChTagQVyUjjWUvlWIklITutGFDy1uAqR6+CTQmradxC1wyyjL+iSft+5XudJWwSdi70W4rNNW1x2wUtECxs3PS5jJI1apzZ2OkGDr5PnM+dS9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh6PW7gFQAAADmGxEAAAAAAC0EAAAAAAAAAAAAAAAAAAA=","base64"],"executable":false,"lamports":28329939,"owner":"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8","rentEpoch":18446744073709551615,"space":752}},"id":1}\n';
+
+/**
  * Authentic raw JSON-RPC response body from Request 2 (getMultipleAccounts)
  * captured during the operator acquisition at 2026-10-27T06:35:11.779Z (slot 461970878).
  * Contains the 4 accounts: [poolId (752B), lpMint (82B), baseVault (165B), quoteVault (165B)].
@@ -193,12 +201,11 @@ export const CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE: SnapshotAcquisitionEvi
         responseTimestampIso: "2026-10-27T06:35:09.209Z",
         elapsedMs: 173,
         httpStatus: 200,
-        rawResponseBody:
-          '{"jsonrpc":"2.0","result":{"context":{"apiVersion":"4.3.2","slot":461970865},"value":{"data":["BgAA...","base64"],"executable":false,"lamports":28329939,"owner":"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8","rentEpoch":18446744073709551615,"space":752}},"id":1}\n',
+        rawResponseBody: RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
         wireResponseSha256: "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
         storedResponseSha256: "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
         wasRedacted: false,
-        parsedJson: {},
+        parsedJson: JSON.parse(RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE),
         error: null,
       }),
       Object.freeze({
@@ -218,10 +225,10 @@ export const CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE: SnapshotAcquisitionEvi
         elapsedMs: 69,
         httpStatus: 200,
         rawResponseBody: RAW_CAPTURED_RAY_WSOL_ACCOUNT_BATCH_RPC_RESPONSE,
-        wireResponseSha256: "c3d1b72e50523287664ffce4589d3115451cb9c10f8a846c4293f0b09489fdf2",
-        storedResponseSha256: "c3d1b72e50523287664ffce4589d3115451cb9c10f8a846c4293f0b09489fdf2",
+        wireResponseSha256: "621735cd561b0cffe9aa7ff4fc5847c6e026950508fec023869cba5c6277feaf",
+        storedResponseSha256: "621735cd561b0cffe9aa7ff4fc5847c6e026950508fec023869cba5c6277feaf",
         wasRedacted: false,
-        parsedJson: {},
+        parsedJson: JSON.parse(RAW_CAPTURED_RAY_WSOL_ACCOUNT_BATCH_RPC_RESPONSE),
         error: null,
       }),
     ],
@@ -458,11 +465,11 @@ export function buildSyntheticAcquisitionEvidence(
         responseTimestampIso: "2026-10-27T06:35:09.183Z",
         elapsedMs: 157,
         httpStatus: 200,
-        rawResponseBody: null,
-        wireResponseSha256: "0000000000000000000000000000000000000000000000000000000000000000",
-        storedResponseSha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        rawResponseBody: RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
+        wireResponseSha256: "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
+        storedResponseSha256: "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
         wasRedacted: false,
-        parsedJson: null,
+        parsedJson: JSON.parse(RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE),
         error: null,
       }),
       Object.freeze({

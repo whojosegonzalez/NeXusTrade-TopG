@@ -26,6 +26,7 @@
  *    Preserves exact 90% comparison via BigInt cross-multiplication: 100n * (L - S) >= 90n * L.
  */
 
+import { createHash } from "node:crypto";
 import type {
   CandidateScannerFilterEvaluation,
   CandidateScannerRejectionReason,
@@ -39,6 +40,8 @@ import {
   isValidIsoCalendarTimestamp,
   validateRaydiumAmmV4Snapshot,
   type EvidenceOrigin,
+  type RaydiumAmmV4SnapshotIdentities,
+  type RaydiumAmmV4SnapshotValidationResult,
   type RaydiumAmmV4SnapshotValidationSuccess,
 } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
 import { WSOL_MINT } from "../research/pilot/RaydiumAmmParser.js";
@@ -226,9 +229,50 @@ function toBigIntSafe(val: unknown): bigint | null {
 }
 
 /**
- * Extracts and strictly verifies that the evidence input comes from the accepted validator path.
- * Rejects loose scalar dictionaries or acquisition objects with missing/omitted assertions.
+ * Detects if an input evidence is an acquisition wrapper or contains HTTP transport records.
  */
+export function isAcquisitionEvidence(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const raw: unknown =
+    "evidence" in input && (input as { evidence: unknown }).evidence
+      ? (input as { evidence: unknown }).evidence
+      : input;
+  if (typeof raw !== "object" || raw === null) return false;
+  const obj = raw as Record<string, unknown>;
+  return (
+    obj.command === "RaydiumAmmV4SnapshotAcquisition" ||
+    ("config" in obj && "outcomes" in obj && "contextSlots" in obj) ||
+    ("requests" in obj && Array.isArray((obj as { requests: unknown }).requests))
+  );
+}
+
+/**
+ * Deep equality helper for verifying cached JSON against parsed stored response body.
+ */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null) return false;
+  if (typeof a !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const keysA = Object.keys(a as Record<string, unknown>);
+  const keysB = Object.keys(b as Record<string, unknown>);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Extracts and strictly verifies that the evidence input comes from the accepted validator path.
  *
@@ -239,7 +283,8 @@ function toBigIntSafe(val: unknown): bigint | null {
  * 4. Rejects any inconsistency between decoded account states, validationResult, and acquisition wrapper accounting.
  * 5. Identifies the pool's authoritative token mint from decoded poolState.baseMint / poolState.quoteMint,
  *    and rejects requestedIdentities.expectedTokenMint if it does not match the decoded pool tokens.
- * 6. Rejects loose scalar dictionaries or acquisition objects with missing/omitted assertions.
+ * 6. Rejects loose scalar dictionaries or acquisition objects on direct extraction (acquisition evidence
+ *    must be evaluated through evaluateLpScreeningBridge).
  */
 function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedValidatedEvidence {
   if (input === null || input === undefined) {
@@ -247,6 +292,16 @@ function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedVal
       ok: false,
       category: "UNAVAILABLE",
       error: "No LP accounting evidence provided",
+    };
+  }
+
+  // Acquisition evidence must be evaluated via evaluateLpScreeningBridge with raw response validation
+  if (isAcquisitionEvidence(input)) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error:
+        "Acquisition evidence requires raw-response revalidation via evaluateLpScreeningBridge; direct extraction is prohibited",
     };
   }
 
@@ -694,7 +749,39 @@ export function evaluateLpScreeningBridgeSync(
     };
   }
 
-  // 2. Extract and Validate Evidence from the Verified Path
+  // 2. Reject Acquisition Evidence on Synchronous Path
+  // "Keep acquisition evidence on one authoritative public evaluation path.
+  // The exported synchronous helper must not provide an alternate path that bypasses required raw-response checks."
+  if (isAcquisitionEvidence(evidence)) {
+    const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+      status: "INVALID_EVIDENCE",
+      reason:
+        "Acquisition evidence requires raw-response revalidation via evaluateLpScreeningBridge; synchronous helper does not evaluate raw transport evidence",
+    });
+
+    return {
+      status: "INVALID_EVIDENCE",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: null,
+      retrievedAtIso: null,
+      contextSlot: null,
+      evidenceOrigin: null,
+      isSyntheticFixture: null,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation,
+      diagnosticMessage:
+        "Acquisition evidence must be evaluated asynchronously via evaluateLpScreeningBridge to verify raw response hashes and decoded accounts",
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  // 3. Extract and Validate Evidence from the Verified Path
   const extracted = extractValidatedEvidence(evidence);
   if (!extracted.ok) {
     const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
@@ -955,27 +1042,92 @@ export function evaluateLpScreeningBridgeSync(
   };
 }
 
+function buildInvalidEvidenceResult(
+  candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
+  message: string,
+): LpBridgeScreeningResult {
+  const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+    status: "INVALID_EVIDENCE",
+    reason: message,
+  });
+
+  return {
+    status: "INVALID_EVIDENCE",
+    available: false,
+    passed: false,
+    lpFilterPassed: false,
+    evaluatedCandidate: { poolId: candidate.poolId, mintAddress: candidate.mintAddress },
+    lpBurnPct: null,
+    meetsNinetyPercentThreshold: false,
+    rawAccounting: null,
+    derivationMethod: null,
+    retrievedAtIso: null,
+    contextSlot: null,
+    evidenceOrigin: null,
+    isSyntheticFixture: null,
+    metricProvenance: "UNAVAILABLE",
+    filterEvaluation,
+    diagnosticMessage: `LP accounting evidence is invalid: ${message}`,
+    evidenceBoundary: { strategyGateAdmitted: false },
+  };
+}
+
 /**
- * Asynchronous evaluation function for the offline LP-screening bridge.
+ * Authoritative evaluation path for acquisition evidence.
  *
- * Runs full synchronous account state binding and consistency checks, and
- * where appropriate, re-validates the retained raw batch RPC payload from
- * acquisition evidence against validateRaydiumAmmV4Snapshot().
+ * Rules:
+ * 1. Stored response body (rawResponseBody) is the authoritative representation.
+ * 2. Verifies storedResponseSha256 and wireResponseSha256.
+ * 3. Catches malformed JSON safely without throwing and returns INVALID_EVIDENCE.
+ * 4. Compares retained parsedJson with the decoded response and rejects divergence.
+ * 5. Revalidates the decoded accounts via the accepted validator validateRaydiumAmmV4Snapshot.
+ * 6. Rejects slot disagreements between recorded response slot and reported context slots.
+ * 7. Rejects quantity and identity disagreements.
+ * 8. Evaluates freshness and the 90% threshold.
  */
-export async function evaluateLpScreeningBridge(
+async function evaluateAcquisitionEvidenceAsync(
   candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
   evidence: ValidatedLpEvidenceInput,
   freshnessPolicy: LpFreshnessPolicy,
 ): Promise<LpBridgeScreeningResult> {
-  const syncResult = evaluateLpScreeningBridgeSync(candidate, evidence, freshnessPolicy);
-  if (
-    syncResult.status !== "AVAILABLE_QUALIFIED" &&
-    syncResult.status !== "AVAILABLE_BELOW_THRESHOLD"
-  ) {
-    return syncResult;
+  const candPoolId = typeof candidate?.poolId === "string" ? candidate.poolId.trim() : "";
+  const candMintAddress =
+    typeof candidate?.mintAddress === "string" ? candidate.mintAddress.trim() : "";
+
+  const evaluatedCandidate = Object.freeze({
+    poolId: candPoolId,
+    mintAddress: candMintAddress,
+  });
+
+  if (!candPoolId || !candMintAddress) {
+    const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+      status: "IDENTITY_MISMATCH",
+      reason: "Candidate poolId or mintAddress is empty or invalid",
+      candidatePoolId: candPoolId,
+      candidateMintAddress: candMintAddress,
+    });
+    return {
+      status: "IDENTITY_MISMATCH",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: null,
+      retrievedAtIso: null,
+      contextSlot: null,
+      evidenceOrigin: null,
+      isSyntheticFixture: null,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation,
+      diagnosticMessage: "Candidate has missing poolId or mintAddress",
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
   }
 
-  // Check if raw batch is present in acquisition evidence requests
+  // Unwrap wrapped acquisition evidence
   const raw: unknown =
     typeof evidence === "object" &&
     evidence !== null &&
@@ -984,93 +1136,530 @@ export async function evaluateLpScreeningBridge(
       ? (evidence as { evidence: unknown }).evidence
       : evidence;
 
+  if (typeof raw !== "object" || raw === null) {
+    return buildInvalidEvidenceResult(evaluatedCandidate, "Acquisition evidence is not an object");
+  }
+
+  const acq = raw as SnapshotAcquisitionEvidence;
+
+  // 1. Verify acquisition outcomes
+  const outcomes = acq.outcomes as Record<string, unknown> | undefined;
+  if (!outcomes || outcomes.structuralValidationOk !== true || outcomes.retrievalOk !== true) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition outcomes indicate structural validation or retrieval failure (or outcomes omitted)",
+    );
+  }
+
+  // 1b. Verify validationResult and accounting assertions
+  const valRes = acq.validationResult as unknown as Record<string, unknown> | undefined;
+  if (!valRes || typeof valRes !== "object" || valRes.ok !== true) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition evidence lacks a verified successful validationResult assertion",
+    );
+  }
+
+  const acqAcc = acq.accounting as unknown as Record<string, unknown> | undefined;
+  if (!acqAcc || typeof acqAcc !== "object" || acqAcc.ok !== true) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition evidence lacks a verified successful accounting assertion",
+    );
+  }
+
+  // 2. Verify requests array
+  if (!Array.isArray(acq.requests) || acq.requests.length < 2) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition evidence missing required HTTP requests record [getAccountInfo, getMultipleAccounts]",
+    );
+  }
+
+  const req1 = acq.requests[0];
+  const req2 = acq.requests[1];
+
+  if (!req2 || typeof req2 !== "object") {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition request 2 record is missing or invalid",
+    );
+  }
+
+  if (req2.method !== "getMultipleAccounts") {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition request 2 method must be getMultipleAccounts, received '${req2.method}'`,
+    );
+  }
+
+  // 3. Stored response body is authoritative
+  if (typeof req2.rawResponseBody !== "string" || req2.rawResponseBody.trim().length === 0) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition evidence request 2 missing rawResponseBody string",
+    );
+  }
+
+  // 4. Verify storedResponseSha256 and wireResponseSha256
+  const computedStoredSha256 = createHash("sha256").update(req2.rawResponseBody).digest("hex");
+
   if (
-    typeof raw === "object" &&
-    raw !== null &&
-    "requests" in raw &&
-    Array.isArray((raw as { requests: unknown }).requests)
+    typeof req2.storedResponseSha256 !== "string" ||
+    req2.storedResponseSha256 !== computedStoredSha256
   ) {
-    const acq = raw as SnapshotAcquisitionEvidence;
-    const req2 = acq.requests?.[1];
-    if (req2 && (req2.parsedJson || req2.rawResponseBody)) {
-      const hasParsedResult =
-        req2.parsedJson && typeof req2.parsedJson === "object" && "result" in req2.parsedJson;
-      const rawPayload = hasParsedResult
-        ? (req2.parsedJson as Record<string, unknown>)
-        : typeof req2.rawResponseBody === "string"
-          ? (JSON.parse(req2.rawResponseBody) as Record<string, unknown>)
-          : null;
-      if (rawPayload) {
-        const fallbackIdentities = acq.discoveredIdentities ??
-          (acq.validationResult && acq.validationResult.ok
-            ? acq.validationResult.diagnostics.requestedIdentities
-            : null) ?? {
-            poolId: syncResult.evaluatedCandidate.poolId,
-            lpMint: "",
-            baseVault: "",
-            quoteVault: "",
-            expectedTokenMint: syncResult.evaluatedCandidate.mintAddress,
-          };
-        const revalidated = await validateRaydiumAmmV4Snapshot(fallbackIdentities, rawPayload, {
-          evidenceOrigin: acq.evidenceOrigin ?? undefined,
-          isSyntheticFixture: acq.isSyntheticFixture ?? undefined,
-          retrievedAtIso: acq.retrievedAtIso ?? undefined,
-        });
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Stored response hash mismatch for request 2: expected '${req2.storedResponseSha256}', computed '${computedStoredSha256}'`,
+    );
+  }
 
-        if (!revalidated.ok) {
-          const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
-            status: "INVALID_EVIDENCE",
-            reason: `Retained final raw batch failed validation against accepted validator: ${revalidated.message}`,
-          });
-
-          return {
-            ...syncResult,
-            status: "INVALID_EVIDENCE",
-            available: false,
-            passed: false,
-            lpFilterPassed: false,
-            lpBurnPct: null,
-            meetsNinetyPercentThreshold: false,
-            rawAccounting: null,
-            derivationMethod: null,
-            metricProvenance: "UNAVAILABLE",
-            filterEvaluation,
-            diagnosticMessage: `Retained final raw batch failed validation: ${revalidated.message}`,
-          };
-        }
-
-        // Verify revalidated accounts match authoritative claims
-        if (
-          revalidated.diagnostics.poolState.lpReserve !== syncResult.rawAccounting?.protocolLp ||
-          revalidated.diagnostics.lpMintState.supply !== syncResult.rawAccounting?.circulatingSupply
-        ) {
-          const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
-            status: "INVALID_EVIDENCE",
-            reason:
-              "Inconsistency detected: retained final raw batch accounts do not match decoded account claims",
-          });
-
-          return {
-            ...syncResult,
-            status: "INVALID_EVIDENCE",
-            available: false,
-            passed: false,
-            lpFilterPassed: false,
-            lpBurnPct: null,
-            meetsNinetyPercentThreshold: false,
-            rawAccounting: null,
-            derivationMethod: null,
-            metricProvenance: "UNAVAILABLE",
-            filterEvaluation,
-            diagnosticMessage:
-              "Retained final raw batch accounts do not match decoded account claims",
-          };
-        }
-      }
+  if (!req2.wasRedacted) {
+    if (
+      typeof req2.wireResponseSha256 !== "string" ||
+      req2.wireResponseSha256 !== req2.storedResponseSha256 ||
+      req2.wireResponseSha256 !== computedStoredSha256
+    ) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        `Wire response hash mismatch for unredacted request 2: wire '${req2.wireResponseSha256}' does not match stored hash '${req2.storedResponseSha256}'`,
+      );
+    }
+  } else {
+    if (
+      typeof req2.wireResponseSha256 !== "string" ||
+      !/^[0-9a-f]{64}$/i.test(req2.wireResponseSha256)
+    ) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Invalid wireResponseSha256 format for redacted request 2",
+      );
     }
   }
 
-  return syncResult;
+  // Verify Request 1 if rawResponseBody is retained
+  if (req1 && typeof req1.rawResponseBody === "string" && req1.rawResponseBody.length > 0) {
+    const computedReq1Sha256 = createHash("sha256").update(req1.rawResponseBody).digest("hex");
+    if (req1.storedResponseSha256 !== computedReq1Sha256) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        `Stored response hash mismatch for request 1: expected '${req1.storedResponseSha256}', computed '${computedReq1Sha256}'`,
+      );
+    }
+    if (!req1.wasRedacted && req1.wireResponseSha256 !== req1.storedResponseSha256) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        `Wire response hash mismatch for unredacted request 1: wire '${req1.wireResponseSha256}' does not match stored hash '${req1.storedResponseSha256}'`,
+      );
+    }
+  }
+
+  // 5. Safely parse rawResponseBody
+  let decodedPayload: Record<string, unknown>;
+  try {
+    decodedPayload = JSON.parse(req2.rawResponseBody);
+    if (typeof decodedPayload !== "object" || decodedPayload === null) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Decoded request 2 payload is not a valid JSON object",
+      );
+    }
+  } catch (parseErr) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Malformed JSON in stored response body for request 2: ${(parseErr as Error).message}`,
+    );
+  }
+
+  // 6. If parsedJson is retained, reject disagreement between cache and decoded stored response
+  if (req2.parsedJson !== null && req2.parsedJson !== undefined) {
+    if (typeof req2.parsedJson !== "object") {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Retained parsedJson in request 2 must be an object",
+      );
+    }
+    if (!deepEqual(req2.parsedJson, decodedPayload)) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Retained parsedJson disagrees with decoded rawResponseBody in request 2",
+      );
+    }
+  }
+
+  // 7. Validate through accepted validator
+  const identities: RaydiumAmmV4SnapshotIdentities = acq.discoveredIdentities ??
+    (acq.validationResult && acq.validationResult.ok
+      ? acq.validationResult.diagnostics.requestedIdentities
+      : null) ?? {
+      poolId: candPoolId,
+      lpMint: "",
+      baseVault: "",
+      quoteVault: "",
+      expectedTokenMint: candMintAddress,
+    };
+
+  let revalidated: RaydiumAmmV4SnapshotValidationResult;
+  try {
+    revalidated = await validateRaydiumAmmV4Snapshot(identities, decodedPayload, {
+      evidenceOrigin: acq.evidenceOrigin ?? undefined,
+      isSyntheticFixture: acq.isSyntheticFixture ?? undefined,
+      retrievedAtIso: acq.retrievedAtIso ?? undefined,
+    });
+  } catch (valErr) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Revalidation against accepted validator threw error: ${(valErr as Error).message}`,
+    );
+  }
+
+  if (!revalidated.ok) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Retained final raw batch failed validation against accepted validator: ${revalidated.message}`,
+    );
+  }
+
+  // 8. Reject context slot inconsistency
+  const recordedSlot = revalidated.diagnostics.slot;
+  const acqBatchSlot = acq.contextSlots?.batchSlot;
+  const valResultSlot =
+    acq.validationResult && acq.validationResult.ok ? acq.validationResult.diagnostics.slot : null;
+
+  if (acqBatchSlot !== undefined && acqBatchSlot !== recordedSlot) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Context slot inconsistency: acquisition wrapper batchSlot (${acqBatchSlot}) disagrees with recorded response slot (${recordedSlot})`,
+    );
+  }
+
+  if (valResultSlot !== null && valResultSlot !== recordedSlot) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Context slot inconsistency: validationResult slot (${valResultSlot}) disagrees with recorded response slot (${recordedSlot})`,
+    );
+  }
+
+  // 9. Reject quantity inconsistency
+  const decodedPool = revalidated.diagnostics.poolState;
+  const decodedLpMint = revalidated.diagnostics.lpMintState;
+
+  const derivedAccounting = calculateAmmV4LpInaccessibleClaims(
+    decodedPool.lpReserve,
+    decodedLpMint.supply,
+  );
+
+  if (!derivedAccounting.ok) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Accounting calculation failed on recorded accounts: ${derivedAccounting.message}`,
+    );
+  }
+
+  if (acq.validationResult && acq.validationResult.ok) {
+    const valAcc = acq.validationResult.accounting;
+    if (
+      toBigIntSafe(valAcc.protocolLp) !== derivedAccounting.protocolLp ||
+      toBigIntSafe(valAcc.circulatingSupply) !== derivedAccounting.circulatingSupply ||
+      toBigIntSafe(valAcc.rawInaccessibleLp) !== derivedAccounting.rawInaccessibleLp ||
+      toBigIntSafe(valAcc.rawDenominator) !== derivedAccounting.rawDenominator ||
+      valAcc.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold
+    ) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Inconsistency detected: validationResult.accounting summary does not match recorded accounts",
+      );
+    }
+  }
+
+  if (acq.accounting) {
+    const acqAcc = acq.accounting;
+    if (
+      toBigIntSafe(acqAcc.protocolLp) !== derivedAccounting.protocolLp ||
+      toBigIntSafe(acqAcc.circulatingSupply) !== derivedAccounting.circulatingSupply ||
+      toBigIntSafe(acqAcc.rawInaccessibleLp) !== derivedAccounting.rawInaccessibleLp ||
+      toBigIntSafe(acqAcc.rawDenominator) !== derivedAccounting.rawDenominator ||
+      acqAcc.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold ||
+      (acq.outcomes &&
+        acq.outcomes.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold)
+    ) {
+      return buildInvalidEvidenceResult(
+        evaluatedCandidate,
+        "Inconsistency detected: acquisition.accounting wrapper does not match recorded accounts",
+      );
+    }
+  }
+
+  // 10. Reject identity mismatch
+  if (decodedPool.poolAddress !== candPoolId) {
+    return {
+      status: "IDENTITY_MISMATCH",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: null,
+      retrievedAtIso: null,
+      contextSlot: recordedSlot,
+      evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+      isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation: buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+        status: "IDENTITY_MISMATCH",
+        candidatePoolId: candPoolId,
+        evidencePoolId: decodedPool.poolAddress,
+      }),
+      diagnosticMessage: `Identity mismatch: candidate poolId (${candPoolId}) does not match recorded pool address (${decodedPool.poolAddress})`,
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  if (decodedPool.baseMint !== candMintAddress && decodedPool.quoteMint !== candMintAddress) {
+    return {
+      status: "IDENTITY_MISMATCH",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: null,
+      retrievedAtIso: null,
+      contextSlot: recordedSlot,
+      evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+      isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation: buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+        status: "IDENTITY_MISMATCH",
+        candidateMintAddress: candMintAddress,
+        evidenceBaseMint: decodedPool.baseMint,
+        evidenceQuoteMint: decodedPool.quoteMint,
+      }),
+      diagnosticMessage: `Identity mismatch: candidate mintAddress (${candMintAddress}) does not match decoded pool baseMint (${decodedPool.baseMint}) or quoteMint (${decodedPool.quoteMint})`,
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  if (acq.config?.poolId && acq.config.poolId !== candPoolId) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition config.poolId (${acq.config.poolId}) does not match candidate poolId (${candPoolId})`,
+    );
+  }
+
+  if (acq.config?.expectedTokenMint && acq.config.expectedTokenMint !== candMintAddress) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition config.expectedTokenMint (${acq.config.expectedTokenMint}) does not match candidate mint (${candMintAddress})`,
+    );
+  }
+
+  if (acq.discoveredIdentities?.poolId && acq.discoveredIdentities.poolId !== candPoolId) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition discoveredIdentities.poolId (${acq.discoveredIdentities.poolId}) does not match candidate poolId (${candPoolId})`,
+    );
+  }
+
+  if (
+    acq.discoveredIdentities?.expectedTokenMint &&
+    acq.discoveredIdentities.expectedTokenMint !== candMintAddress
+  ) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition discoveredIdentities.expectedTokenMint (${acq.discoveredIdentities.expectedTokenMint}) does not match candidate mint (${candMintAddress})`,
+    );
+  }
+
+  // 11. Freshness evaluation
+  const currentNowMs = freshnessPolicy.currentTimestampMs ?? Date.now();
+  const retrievedAtIso = revalidated.diagnostics.retrievedAtIso;
+
+  if (!retrievedAtIso || !isValidIsoCalendarTimestamp(retrievedAtIso)) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Missing or invalid retrievedAtIso in revalidated diagnostics: ${retrievedAtIso}`,
+    );
+  }
+
+  if (acq.retrievedAtIso && acq.retrievedAtIso !== retrievedAtIso) {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      `Acquisition retrievedAtIso (${acq.retrievedAtIso}) does not match validation diagnostics retrievedAtIso (${retrievedAtIso})`,
+    );
+  }
+
+  const retrievedAtMs = Date.parse(retrievedAtIso);
+  const ageMs = currentNowMs - retrievedAtMs;
+  const clockSkewToleranceMs =
+    freshnessPolicy.clockSkewToleranceMs ?? DEFAULT_CLOCK_SKEW_TOLERANCE_MS;
+
+  if (ageMs < -clockSkewToleranceMs) {
+    const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+      status: "INVALID_EVIDENCE",
+      reason: `Evidence retrieval timestamp is in the future beyond tolerance: age ${ageMs}ms`,
+      retrievedAtIso,
+    });
+    return {
+      status: "INVALID_EVIDENCE",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: LP_DERIVATION_METHOD,
+      retrievedAtIso,
+      contextSlot: recordedSlot,
+      evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+      isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation,
+      diagnosticMessage: `LP evidence timestamp is future-dated beyond tolerance (${ageMs}ms in future)`,
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  if (ageMs > freshnessPolicy.maxEvidenceAgeMs) {
+    const filterEvaluation = buildFilterEvaluation(false, "REJECTED_UNLOCKED_LP_RISK", {
+      status: "STALE_EVIDENCE",
+      ageMs,
+      maxEvidenceAgeMs: freshnessPolicy.maxEvidenceAgeMs,
+      retrievedAtIso,
+    });
+    return {
+      status: "STALE_EVIDENCE",
+      available: false,
+      passed: false,
+      lpFilterPassed: false,
+      evaluatedCandidate,
+      lpBurnPct: null,
+      meetsNinetyPercentThreshold: false,
+      rawAccounting: null,
+      derivationMethod: LP_DERIVATION_METHOD,
+      retrievedAtIso,
+      contextSlot: recordedSlot,
+      evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+      isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+      metricProvenance: "UNAVAILABLE",
+      filterEvaluation,
+      diagnosticMessage: `LP evidence is stale: age ${ageMs}ms exceeds maxEvidenceAgeMs ${freshnessPolicy.maxEvidenceAgeMs}ms`,
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  // 12. Threshold Result
+  const rawAccounting: RawLpAccountingValues = {
+    protocolLp: derivedAccounting.protocolLp,
+    circulatingSupply: derivedAccounting.circulatingSupply,
+    rawInaccessibleLp: derivedAccounting.rawInaccessibleLp,
+    rawDenominator: derivedAccounting.rawDenominator,
+  };
+
+  if (derivedAccounting.meetsNinetyPercentThreshold) {
+    const filterEvaluation = buildFilterEvaluation(true, undefined, {
+      status: "AVAILABLE_QUALIFIED",
+      lpBurnPct: derivedAccounting.displayInaccessiblePct,
+      meetsNinetyPercentThreshold: true,
+      protocolLp: derivedAccounting.protocolLp.toString(),
+      circulatingSupply: derivedAccounting.circulatingSupply.toString(),
+      rawInaccessibleLp: derivedAccounting.rawInaccessibleLp.toString(),
+    });
+
+    return {
+      status: "AVAILABLE_QUALIFIED",
+      available: true,
+      passed: true,
+      lpFilterPassed: true,
+      evaluatedCandidate,
+      lpBurnPct: derivedAccounting.displayInaccessiblePct,
+      meetsNinetyPercentThreshold: true,
+      rawAccounting,
+      derivationMethod: LP_DERIVATION_METHOD,
+      retrievedAtIso,
+      contextSlot: recordedSlot,
+      evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+      isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+      metricProvenance: "DERIVED",
+      filterEvaluation,
+      diagnosticMessage: `LP accounting qualified: ${derivedAccounting.displayInaccessiblePct.toFixed(6)}% inaccessible (>= 90% threshold)`,
+      evidenceBoundary: { strategyGateAdmitted: false },
+    };
+  }
+
+  const filterEvaluation = buildFilterEvaluation(false, "REJECTED_UNLOCKED_LP_RISK", {
+    status: "AVAILABLE_BELOW_THRESHOLD",
+    lpBurnPct: derivedAccounting.displayInaccessiblePct,
+    minLpBurnPct: 90.0,
+    meetsNinetyPercentThreshold: false,
+    protocolLp: derivedAccounting.protocolLp.toString(),
+    circulatingSupply: derivedAccounting.circulatingSupply.toString(),
+    rawInaccessibleLp: derivedAccounting.rawInaccessibleLp.toString(),
+  });
+
+  return {
+    status: "AVAILABLE_BELOW_THRESHOLD",
+    available: true,
+    passed: false,
+    lpFilterPassed: false,
+    evaluatedCandidate,
+    lpBurnPct: derivedAccounting.displayInaccessiblePct,
+    meetsNinetyPercentThreshold: false,
+    rawAccounting,
+    derivationMethod: LP_DERIVATION_METHOD,
+    retrievedAtIso,
+    contextSlot: recordedSlot,
+    evidenceOrigin: revalidated.diagnostics.evidenceOrigin,
+    isSyntheticFixture: revalidated.diagnostics.isSyntheticFixture,
+    metricProvenance: "DERIVED",
+    filterEvaluation,
+    diagnosticMessage: `LP accounting below threshold: ${derivedAccounting.displayInaccessiblePct.toFixed(6)}% inaccessible (< 90% threshold)`,
+    evidenceBoundary: { strategyGateAdmitted: false },
+  };
+}
+
+/**
+ * Asynchronous evaluation function for the offline LP-screening bridge.
+ *
+ * Authoritative Evaluation Architecture:
+ * 1. For Acquisition Evidence (SnapshotAcquisitionEvidence):
+ *    Executes the single authoritative async acquisition evaluation path.
+ *    - Uses the retained rawResponseBody as the authoritative recorded representation.
+ *    - Verifies storedResponseSha256 and wireResponseSha256.
+ *    - Catches malformed JSON safely without throwing, returning INVALID_EVIDENCE.
+ *    - Compares retained parsedJson with the decoded response and rejects divergence.
+ *    - Revalidates the decoded accounts via the accepted validator validateRaydiumAmmV4Snapshot.
+ *    - Rejects slot disagreements between recorded response slot and reported context slots.
+ *    - Rejects quantity and identity disagreements.
+ *    - Evaluates freshness and the 90% threshold.
+ * 2. For Direct Snapshot Validation Results (RaydiumAmmV4SnapshotValidationSuccess):
+ *    Evaluates decoded accounts and freshness via the synchronous path.
+ */
+export async function evaluateLpScreeningBridge(
+  candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
+  evidence: ValidatedLpEvidenceInput,
+  freshnessPolicy: LpFreshnessPolicy,
+): Promise<LpBridgeScreeningResult> {
+  // Validate entire freshness policy strictly (throws on NaN, nonfinite, negative skew)
+  validateLpFreshnessPolicy(freshnessPolicy);
+
+  // Missing evidence fails closed to UNAVAILABLE
+  if (evidence === null || evidence === undefined) {
+    return evaluateLpScreeningBridgeSync(candidate, evidence, freshnessPolicy);
+  }
+
+  // Acquisition evidence MUST run through authoritative async raw-response evaluation path
+  if (isAcquisitionEvidence(evidence)) {
+    return evaluateAcquisitionEvidenceAsync(candidate, evidence, freshnessPolicy);
+  }
+
+  // Direct snapshot validation result runs through synchronous evaluator
+  return evaluateLpScreeningBridgeSync(candidate, evidence, freshnessPolicy);
 }
 
 /**

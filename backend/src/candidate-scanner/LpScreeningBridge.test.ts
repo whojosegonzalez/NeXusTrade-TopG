@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,7 @@ import {
 } from "./fixtures/CapturedRaydiumAmmV4SnapshotFixture.js";
 import { AntiRugEvaluator } from "./evaluators/AntiRugEvaluator.js";
 import { CANDIDATE_SCANNER_DEFAULTS } from "./CandidateScannerConfig.js";
+import type { RaydiumAmmV4SnapshotValidationSuccess } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -839,6 +841,187 @@ describe("LpScreeningBridge", () => {
       expect(evaluation.passed).toBe(false);
       expect(evaluation.reason).toBe("REJECTED_UNLOCKED_LP_RISK");
       expect(evaluation.details?.lpBurnPct).toBe(0.135682);
+    });
+
+    it("REGRESSION 5: rejects conflicting cached parsedJson when rawResponseBody contains authentic data", async () => {
+      // Auditor case: modify requests[1].parsedJson and wrapper summaries to 98.5%,
+      // while rawResponseBody remains the unchanged 0.135682% authentic response.
+      const tamperedParsedJsonAcquisition = {
+        ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        accounting: {
+          ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.accounting,
+          displayInaccessiblePct: 98.5,
+          meetsNinetyPercentThreshold: true,
+        },
+        requests: [
+          CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[0],
+          {
+            ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[1],
+            parsedJson: {
+              tampered: true,
+              fakeClaim: 98.5,
+            },
+          },
+        ],
+      };
+
+      const result = await evaluateLpScreeningBridge(
+        baseCandidate,
+        tamperedParsedJsonAcquisition as unknown as ValidatedLpEvidenceInput,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result.status).toBe("INVALID_EVIDENCE");
+      expect(result.available).toBe(false);
+      expect(result.passed).toBe(false);
+      expect(result.lpBurnPct).toBeNull();
+      expect(result.diagnosticMessage).toContain(
+        "Retained parsedJson disagrees with decoded rawResponseBody",
+      );
+      const proj = projectBridgedLpPool(baseCandidate, result);
+      expect(proj.pool).toBeNull();
+    });
+
+    it("REGRESSION 6: rejects slot disagreement when wrapper/diagnostic slots are 461975878 while recorded response contains 461970878", async () => {
+      // Auditor case: changed wrapper batchSlot and diagnostic slot to 461975878
+      // while recorded response still contains 461970878.
+      const tamperedSlotAcquisition = {
+        ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        contextSlots: {
+          ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.contextSlots,
+          batchSlot: 461975878, // Tampered!
+        },
+        validationResult: {
+          ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.validationResult,
+          diagnostics: {
+            ...(
+              CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.validationResult as unknown as RaydiumAmmV4SnapshotValidationSuccess
+            ).diagnostics,
+            slot: 461975878, // Tampered!
+          },
+        },
+      };
+
+      const result = await evaluateLpScreeningBridge(
+        baseCandidate,
+        tamperedSlotAcquisition as unknown as ValidatedLpEvidenceInput,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result.status).toBe("INVALID_EVIDENCE");
+      expect(result.available).toBe(false);
+      expect(result.passed).toBe(false);
+      expect(result.lpBurnPct).toBeNull();
+      expect(result.diagnosticMessage).toContain("Context slot inconsistency");
+      const proj = projectBridgedLpPool(baseCandidate, result);
+      expect(proj.pool).toBeNull();
+    });
+
+    it("REGRESSION 7: returns structured INVALID_EVIDENCE and pool: null for malformed rawResponseBody (does not throw)", async () => {
+      const malformedJsonAcquisition = {
+        ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        requests: [
+          CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[0],
+          {
+            ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[1],
+            rawResponseBody: "not valid json {{{ corrupt",
+            storedResponseSha256: createHash("sha256")
+              .update("not valid json {{{ corrupt")
+              .digest("hex"),
+            wireResponseSha256: createHash("sha256")
+              .update("not valid json {{{ corrupt")
+              .digest("hex"),
+            parsedJson: null,
+          },
+        ],
+      };
+
+      // Must NOT throw uncaught syntax error; returns structured failure
+      const result = await evaluateLpScreeningBridge(
+        baseCandidate,
+        malformedJsonAcquisition as unknown as ValidatedLpEvidenceInput,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result.status).toBe("INVALID_EVIDENCE");
+      expect(result.available).toBe(false);
+      expect(result.passed).toBe(false);
+      expect(result.lpFilterPassed).toBe(false);
+      expect(result.lpBurnPct).toBeNull();
+      expect(result.diagnosticMessage).toContain("Malformed JSON in stored response body");
+      const proj = projectBridgedLpPool(baseCandidate, result);
+      expect(proj.pool).toBeNull();
+      expect(bridgeLpEvidenceToScannedPool(baseCandidate, result)).toBeNull();
+    });
+
+    it("REGRESSION 8: rejects incorrect storedResponseSha256 and wireResponseSha256", async () => {
+      // 1. Mismatched storedResponseSha256
+      const mismatchedStoredHashAcquisition = {
+        ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        requests: [
+          CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[0],
+          {
+            ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[1],
+            storedResponseSha256:
+              "0000000000000000000000000000000000000000000000000000000000000000",
+          },
+        ],
+      };
+
+      const result1 = await evaluateLpScreeningBridge(
+        baseCandidate,
+        mismatchedStoredHashAcquisition as unknown as ValidatedLpEvidenceInput,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result1.status).toBe("INVALID_EVIDENCE");
+      expect(result1.available).toBe(false);
+      expect(result1.diagnosticMessage).toContain("Stored response hash mismatch for request 2");
+
+      // 2. Mismatched wireResponseSha256 on unredacted response
+      const mismatchedWireHashAcquisition = {
+        ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        requests: [
+          CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[0],
+          {
+            ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE.requests[1],
+            wasRedacted: false,
+            wireResponseSha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          },
+        ],
+      };
+
+      const result2 = await evaluateLpScreeningBridge(
+        baseCandidate,
+        mismatchedWireHashAcquisition as unknown as ValidatedLpEvidenceInput,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result2.status).toBe("INVALID_EVIDENCE");
+      expect(result2.available).toBe(false);
+      expect(result2.diagnosticMessage).toContain(
+        "Wire response hash mismatch for unredacted request 2",
+      );
+    });
+
+    it("REGRESSION 9: synchronous helper rejects acquisition evidence to prevent raw-response bypass", () => {
+      const result = evaluateLpScreeningBridgeSync(
+        baseCandidate,
+        CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
+        defaultFreshnessPolicy,
+      );
+
+      expect(result.status).toBe("INVALID_EVIDENCE");
+      expect(result.available).toBe(false);
+      expect(result.passed).toBe(false);
+      expect(result.lpFilterPassed).toBe(false);
+      expect(result.lpBurnPct).toBeNull();
+      expect(result.diagnosticMessage).toContain(
+        "Acquisition evidence must be evaluated asynchronously",
+      );
+      const proj = projectBridgedLpPool(baseCandidate, result);
+      expect(proj.pool).toBeNull();
+      expect(bridgeLpEvidenceToScannedPool(baseCandidate, result)).toBeNull();
     });
   });
 });
