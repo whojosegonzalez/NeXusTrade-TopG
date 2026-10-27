@@ -39,6 +39,7 @@ export const RAYDIUM_V4_OFFSETS = {
   MARKET_ID: 528, // 32-byte pubkey (offset 528..560)
   MARKET_PROGRAM_ID: 560, // 32-byte pubkey (offset 560..592)
   TARGET_ORDERS: 592, // 32-byte pubkey (offset 592..624)
+  LP_RESERVE: 720, // u64 little-endian (offset 720..728) - amm.lp_amount
 } as const;
 
 export const SPL_VAULT_LAYOUT_LENGTH = 165;
@@ -199,6 +200,7 @@ export function parseRaydiumAmmV4Account(
     const quoteNeedTakePnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.QUOTE_NEED_TAKE_PNL, true);
     const quoteTotalPnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.QUOTE_TOTAL_PNL, true);
     const baseTotalPnl = view.getBigUint64(RAYDIUM_V4_OFFSETS.BASE_TOTAL_PNL, true);
+    const lpReserve = view.getBigUint64(RAYDIUM_V4_OFFSETS.LP_RESERVE, true);
 
     let orientation: RaydiumPairOrientation = "NON_SOL_PAIR";
     if (quoteMint === WSOL_MINT) {
@@ -224,6 +226,7 @@ export function parseRaydiumAmmV4Account(
       quoteNeedTakePnl,
       quoteTotalPnl,
       baseTotalPnl,
+      lpReserve,
       poolAddress,
       programId: RAYDIUM_AMM_V4_PROGRAM_ID,
       ...(accountSlot !== undefined ? { accountSlot } : {}),
@@ -391,3 +394,11 @@ export function computeReserveAccounting(
       : "VAULT_ONLY_RESERVES_INSUFFICIENT_FOR_FEASIBILITY",
   };
 }
+
+export {
+  calculateAmmV4LpInaccessibleClaims,
+  type AmmV4LpAccountingFailure,
+  type AmmV4LpAccountingFailureCategory,
+  type AmmV4LpAccountingResult,
+  type AmmV4LpAccountingSuccess,
+} from "./RaydiumAmmLpAccounting.js";

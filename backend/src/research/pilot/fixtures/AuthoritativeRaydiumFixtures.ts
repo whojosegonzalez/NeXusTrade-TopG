@@ -69,6 +69,7 @@ export interface RaydiumFixtureOptions {
   quoteMintBase58?: string;
   baseNeedTakePnl?: bigint;
   quoteNeedTakePnl?: bigint;
+  lpReserve?: bigint;
   customBufferLength?: number;
 }
 
@@ -110,6 +111,10 @@ export function createAuthoritativeRaydiumAmmV4Buffer(options: RaydiumFixtureOpt
   buffer.set(lpMintBytes, RAYDIUM_V4_OFFSETS.LP_MINT);
   buffer.set(openOrdersBytes, RAYDIUM_V4_OFFSETS.OPEN_ORDERS);
   buffer.set(marketIdBytes, RAYDIUM_V4_OFFSETS.MARKET_ID);
+
+  if (options.lpReserve !== undefined) {
+    buffer.writeBigUInt64LE(options.lpReserve, RAYDIUM_V4_OFFSETS.LP_RESERVE);
+  }
 
   return buffer;
 }

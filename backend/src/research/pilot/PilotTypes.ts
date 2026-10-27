@@ -57,6 +57,7 @@ export interface D23RaydiumAmmV4State {
   readonly quoteNeedTakePnl?: bigint | undefined;
   readonly baseTotalPnl?: bigint | undefined;
   readonly quoteTotalPnl?: bigint | undefined;
+  readonly lpReserve: bigint;
   readonly poolAddress: string;
   readonly programId: string;
   readonly accountSlot?: number | undefined;

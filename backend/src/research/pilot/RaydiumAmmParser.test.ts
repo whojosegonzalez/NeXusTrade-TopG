@@ -74,6 +74,24 @@ describe("RaydiumAmmParser - D23P-01 / D23P-02", () => {
       expect(result.state.quoteMint).toBe(FIXTURE_WSOL_MINT);
       expect(result.state.baseVault).toBe(FIXTURE_BASE_VAULT);
       expect(result.state.quoteVault).toBe(FIXTURE_QUOTE_VAULT);
+      expect(result.state.lpReserve).toBe(0n);
+    });
+
+    it("successfully decodes protocol-tracked lpReserve at offset 720", () => {
+      const buffer = createAuthoritativeRaydiumAmmV4Buffer({
+        lpReserve: 5_000_000_000_000n,
+      });
+
+      const result = parseRaydiumAmmV4Account(
+        buffer,
+        FIXTURE_POOL_ADDRESS,
+        RAYDIUM_AMM_V4_PROGRAM_ID,
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.state.lpReserve).toBe(5_000_000_000_000n);
     });
 
     it("successfully decodes an inverted Raydium AMM v4 pool buffer (SOL_BASE_TOKEN_QUOTE)", () => {
