@@ -374,6 +374,74 @@ describe("Phase 12.94-D Milestone D.3.3: Bounded Raydium AMM v4 Snapshot Acquisi
       expect(result.evidence.failureReason).not.toContain(dummySecret);
       expect(result.evidence.failureReason).toContain("[REDACTED]");
     });
+
+    it("redacts credentials when represented by JSON Unicode escapes in response bodies and decoded parsedJson", async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "raydium-test-redact-unicode-"));
+      try {
+        const dummySecret = "ALICE_SECRET_KEY_12345";
+        const rpcUrl = `https://solana-rpc.example.com/?api-key=${dummySecret}`;
+
+        const mockFetch = async (): Promise<Response> => {
+          // Upstream reflects the credential with its first char 'A' encoded as \u0041
+          const reflectedWireJson =
+            '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid access with credentials api-key=\\u0041LICE_SECRET_KEY_12345 for requested method"}}';
+          return new Response(reflectedWireJson, { status: 200 });
+        };
+
+        const result = await acquireRaydiumAmmV4Snapshot({
+          rpcUrl,
+          poolId: FIXTURE_POOL_ADDRESS,
+          outDir: tempDir,
+          fetch: mockFetch as typeof fetch,
+        });
+
+        expect(result.ok).toBe(false);
+        expect(result.httpAttempts).toBe(1);
+
+        const reqRecord = result.evidence.requests[0]!;
+        expect(reqRecord.wasRedacted).toBe(true);
+
+        // Verify wire digest vs stored digest distinction
+        expect(reqRecord.wireResponseSha256).toBeDefined();
+        expect(reqRecord.storedResponseSha256).toBeDefined();
+        expect(reqRecord.wireResponseSha256).not.toBe(reqRecord.storedResponseSha256);
+
+        // Raw body and decoded parsedJson must not contain secret in plain or escaped form
+        expect(reqRecord.rawResponseBody).not.toContain(dummySecret);
+        expect(reqRecord.rawResponseBody).not.toContain("\\u0041LICE");
+        expect(reqRecord.rawResponseBody).toContain("[REDACTED]");
+
+        const parsedJsonStr = JSON.stringify(reqRecord.parsedJson);
+        expect(parsedJsonStr).not.toContain(dummySecret);
+        expect(parsedJsonStr).toContain("[REDACTED]");
+
+        expect(result.evidence.failureReason).not.toContain(dummySecret);
+        expect(result.evidence.failureReason).toContain("[REDACTED]");
+
+        // Verify serialized public evidence
+        const serialized = serializeJsonPreservingBigInts(result.evidence);
+        expect(serialized).not.toContain(dummySecret);
+        expect(serialized).not.toContain("\\u0041LICE");
+
+        // Verify written evidence file on disk
+        const writtenEvidence = await fs.readFile(
+          result.evidence.artifacts!.evidenceFilePath,
+          "utf8",
+        );
+        expect(writtenEvidence).not.toContain(dummySecret);
+        expect(writtenEvidence).not.toContain("\\u0041LICE");
+
+        // Verify written manifest file on disk
+        const writtenManifest = await fs.readFile(
+          result.evidence.artifacts!.manifestFilePath,
+          "utf8",
+        );
+        expect(writtenManifest).not.toContain(dummySecret);
+        expect(writtenManifest).not.toContain("\\u0041LICE");
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("2. Argument & Numeric Configuration Validation", () => {
@@ -657,6 +725,82 @@ describe("Phase 12.94-D Milestone D.3.3: Bounded Raydium AMM v4 Snapshot Acquisi
       }
     });
 
+    it("seals partial evidence and manifest when pacing is interrupted by rejected sleeper", async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexustrade-seal-pacing-fail-"));
+
+      try {
+        const poolBuf = createAuthoritativeRaydiumAmmV4Buffer({
+          baseMintBase58: FIXTURE_MEME_MINT,
+          quoteMintBase58: FIXTURE_WSOL_MINT,
+        });
+
+        let fetchCalls = 0;
+        const mockFetch = async (): Promise<Response> => {
+          fetchCalls++;
+          return new Response(
+            JSON.stringify(
+              buildRpcResponse(
+                {
+                  data: [poolBuf.toString("base64"), "base64"],
+                  owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+                },
+                312500100,
+                1,
+              ),
+            ),
+            { status: 200 },
+          );
+        };
+
+        const result = await acquireRaydiumAmmV4Snapshot({
+          rpcUrl: "https://solana-rpc.example.com",
+          poolId: FIXTURE_POOL_ADDRESS,
+          expectedTokenMint: FIXTURE_MEME_MINT,
+          outDir: tempDir,
+          fetch: mockFetch as typeof fetch,
+          sleeper: async () => {
+            throw new Error("Pacing aborted: simulated sleeper rejection");
+          },
+        });
+
+        expect(result.ok).toBe(false);
+        // Crucial requirement: only Request 1 was dispatched; Request 2 was never called!
+        expect(result.httpAttempts).toBe(1);
+        expect(fetchCalls).toBe(1);
+
+        expect(result.evidence.failureReason).toContain("PACING_INTERRUPTED");
+        expect(result.evidence.failureReason).toContain("simulated sleeper rejection");
+        expect(result.evidence.pacingEnforcedMs).toBeNull();
+        expect(result.evidence.requests.length).toBe(1);
+
+        expect(result.manifest).toBeDefined();
+        expect(result.manifest?.status).toBe("RETRIEVAL_FAILED");
+        expect(result.manifest?.httpAttempts).toBe(1);
+
+        // Independently read and verify evidence file hash and byte size
+        const writtenEvidenceBytes = await fs.readFile(result.evidence.artifacts!.evidenceFilePath);
+        const actualEvidenceSha256 = crypto
+          .createHash("sha256")
+          .update(writtenEvidenceBytes)
+          .digest("hex");
+        expect(actualEvidenceSha256).toBe(result.manifest?.evidenceFileSha256);
+        expect(writtenEvidenceBytes.length).toBe(result.manifest?.evidenceByteSize);
+
+        // Independently read and verify manifest file on disk
+        const writtenManifestBytes = await fs.readFile(result.evidence.artifacts!.manifestFilePath);
+        const actualManifestSha256 = crypto
+          .createHash("sha256")
+          .update(writtenManifestBytes)
+          .digest("hex");
+        expect(actualManifestSha256).toBe(result.evidence.artifacts!.manifestFileSha256);
+        const parsedManifest = JSON.parse(writtenManifestBytes.toString("utf8"));
+        expect(parsedManifest.status).toBe("RETRIEVAL_FAILED");
+        expect(parsedManifest.httpAttempts).toBe(1);
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("fails closed when storage write fails and sets result.ok to false", async () => {
       // Provide an invalid unwritable path (e.g. attempting to create a file inside an existing file)
       const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexustrade-seal-fail-"));
@@ -718,6 +862,48 @@ describe("Phase 12.94-D Milestone D.3.3: Bounded Raydium AMM v4 Snapshot Acquisi
       expect(result.evidence.httpAttempts).toBe(0);
     });
 
+    it("defaults unmarked injected transports to UNKNOWN and null synthetic fixture throughout evidence and diagnostics", async () => {
+      const batchAccounts = createTestBatchAccounts();
+      let callCount = 0;
+      const mockFetch = async (): Promise<Response> => {
+        callCount++;
+        return new Response(
+          JSON.stringify(
+            buildRpcResponse(
+              callCount === 1
+                ? { data: [batchAccounts[0]!.data, "base64"], owner: RAYDIUM_AMM_V4_PROGRAM_ID }
+                : batchAccounts.map((a) => ({ data: [a.data, "base64"], owner: a.owner })),
+              312500100,
+              callCount,
+            ),
+          ),
+          { status: 200 },
+        );
+      };
+
+      // Injected transport WITHOUT provenance declarations
+      const result = await acquireRaydiumAmmV4Snapshot({
+        rpcUrl: "https://solana-rpc.example.com",
+        poolId: FIXTURE_POOL_ADDRESS,
+        expectedTokenMint: FIXTURE_MEME_MINT,
+        fetch: mockFetch as typeof fetch,
+        sleeper: async () => {},
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.evidence.evidenceOrigin).toBe("UNKNOWN");
+      expect(result.evidence.isSyntheticFixture).toBeNull();
+
+      const valDiag = (
+        result.evidence.validationResult as {
+          ok: true;
+          diagnostics: { evidenceOrigin: string; isSyntheticFixture: boolean | null };
+        }
+      ).diagnostics;
+      expect(valDiag.evidenceOrigin).toBe("UNKNOWN");
+      expect(valDiag.isSyntheticFixture).toBeNull();
+    });
+
     it("propagates explicit SYNTHETIC_FIXTURE provenance into nested validation diagnostics without defaulting to CAPTURED_RPC", async () => {
       const batchAccounts = createTestBatchAccounts();
       let callCount = 0;
@@ -759,6 +945,61 @@ describe("Phase 12.94-D Milestone D.3.3: Bounded Raydium AMM v4 Snapshot Acquisi
       ).diagnostics;
       expect(valDiag.evidenceOrigin).toBe("SYNTHETIC_FIXTURE");
       expect(valDiag.isSyntheticFixture).toBe(true);
+    });
+
+    it("rejects invalid or contradictory provenance declarations before any request dispatch with zero fetch calls", async () => {
+      let fetchCalls = 0;
+      const mockFetch = async (): Promise<Response> => {
+        fetchCalls++;
+        return new Response("{}", { status: 200 });
+      };
+
+      // 1. Invalid origin membership
+      await expect(
+        acquireRaydiumAmmV4Snapshot({
+          rpcUrl: "https://solana-rpc.example.com",
+          poolId: FIXTURE_POOL_ADDRESS,
+          evidenceOrigin: "INVALID_ORIGIN" as unknown as "CAPTURED_RPC",
+          fetch: mockFetch as typeof fetch,
+        }),
+      ).rejects.toThrow("INVALID_PROVENANCE_METADATA");
+      expect(fetchCalls).toBe(0);
+
+      // 2. Contradiction: CAPTURED_RPC with isSyntheticFixture = true
+      await expect(
+        acquireRaydiumAmmV4Snapshot({
+          rpcUrl: "https://solana-rpc.example.com",
+          poolId: FIXTURE_POOL_ADDRESS,
+          evidenceOrigin: "CAPTURED_RPC",
+          isSyntheticFixture: true,
+          fetch: mockFetch as typeof fetch,
+        }),
+      ).rejects.toThrow("INVALID_PROVENANCE_METADATA");
+      expect(fetchCalls).toBe(0);
+
+      // 3. Contradiction: SYNTHETIC_FIXTURE with isSyntheticFixture = false
+      await expect(
+        acquireRaydiumAmmV4Snapshot({
+          rpcUrl: "https://solana-rpc.example.com",
+          poolId: FIXTURE_POOL_ADDRESS,
+          evidenceOrigin: "SYNTHETIC_FIXTURE",
+          isSyntheticFixture: false,
+          fetch: mockFetch as typeof fetch,
+        }),
+      ).rejects.toThrow("INVALID_PROVENANCE_METADATA");
+      expect(fetchCalls).toBe(0);
+
+      // 4. Contradiction: UNKNOWN with isSyntheticFixture = true
+      await expect(
+        acquireRaydiumAmmV4Snapshot({
+          rpcUrl: "https://solana-rpc.example.com",
+          poolId: FIXTURE_POOL_ADDRESS,
+          evidenceOrigin: "UNKNOWN",
+          isSyntheticFixture: true,
+          fetch: mockFetch as typeof fetch,
+        }),
+      ).rejects.toThrow("INVALID_PROVENANCE_METADATA");
+      expect(fetchCalls).toBe(0);
     });
 
     it("preserves null retrievedAtIso when Request 1 fails before response", async () => {

@@ -275,9 +275,14 @@ export function serializeJsonPreservingBigInts(value: unknown, indent: number = 
 }
 
 /**
- * Redacts credential tokens from a string.
+ * Redacts credential tokens from a string. Handles plain text tokens, raw URLs,
+ * and JSON-encoded Unicode escape variants (such as \u0041 for A).
  */
-function redactString(text: string, sensitiveTokens: readonly string[], rawUrl?: string): string {
+export function redactString(
+  text: string,
+  sensitiveTokens: readonly string[],
+  rawUrl?: string,
+): string {
   let result = text;
   if (rawUrl && rawUrl.length > 0) {
     result = result.split(rawUrl).join("[REDACTED]");
@@ -287,7 +292,152 @@ function redactString(text: string, sensitiveTokens: readonly string[], rawUrl?:
       result = result.split(token).join("[REDACTED]");
     }
   }
+  if (result.includes("\\u")) {
+    for (const token of sensitiveTokens) {
+      if (!token || token.length === 0) continue;
+      const escapedPattern = Array.from(token)
+        .map((c) => {
+          const hex4 = c.charCodeAt(0).toString(16).padStart(4, "0");
+          const regexChar = c.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+          return `(?:${regexChar}|\\\\u${hex4})`;
+        })
+        .join("");
+      const re = new RegExp(escapedPattern, "gi");
+      result = result.replace(re, "[REDACTED]");
+    }
+  }
   return result;
+}
+
+/**
+ * Recursively sanitizes any decoded JSON value (string, array, or object) by redacting
+ * sensitive tokens and raw URLs from both string values and object keys.
+ */
+export function sanitizeJsonValue(
+  value: unknown,
+  sensitiveTokens: readonly string[],
+  rawUrl?: string,
+): { sanitized: unknown; changed: boolean } {
+  if (typeof value === "string") {
+    const redacted = redactString(value, sensitiveTokens, rawUrl);
+    return { sanitized: redacted, changed: redacted !== value };
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const sanitizedArr = value.map((item) => {
+      const res = sanitizeJsonValue(item, sensitiveTokens, rawUrl);
+      if (res.changed) changed = true;
+      return res.sanitized;
+    });
+    return { sanitized: sanitizedArr, changed };
+  }
+  if (value !== null && typeof value === "object") {
+    let changed = false;
+    const sanitizedObj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      const keyRes = sanitizeJsonValue(k, sensitiveTokens, rawUrl);
+      const valRes = sanitizeJsonValue(v, sensitiveTokens, rawUrl);
+      if (keyRes.changed || valRes.changed) changed = true;
+      sanitizedObj[keyRes.sanitized as string] = valRes.sanitized;
+    }
+    return { sanitized: sanitizedObj, changed };
+  }
+  return { sanitized: value, changed: false };
+}
+
+export const ALLOWED_EVIDENCE_ORIGINS = Object.freeze([
+  "SYNTHETIC_FIXTURE",
+  "CAPTURED_RPC",
+  "UNKNOWN",
+] as const);
+
+/**
+ * Validates and resolves provenance metadata upfront before any request dispatch.
+ * Enforces origin membership, type consistency, and contradiction rules.
+ * Defaults injected transports (config.fetch !== undefined) to UNKNOWN unless explicitly declared.
+ */
+export function resolveAcquisitionProvenance(config: {
+  readonly dryRun?: boolean | undefined;
+  readonly fetch?: typeof fetch | undefined;
+  readonly evidenceOrigin?: EvidenceOrigin | undefined;
+  readonly isSyntheticFixture?: boolean | undefined;
+}): {
+  effectiveEvidenceOrigin: EvidenceOrigin | null;
+  effectiveIsSyntheticFixture: boolean | null;
+} {
+  if (config.dryRun) {
+    return {
+      effectiveEvidenceOrigin: null,
+      effectiveIsSyntheticFixture: null,
+    };
+  }
+
+  // 1. Origin membership validation
+  if (config.evidenceOrigin !== undefined) {
+    if (
+      !ALLOWED_EVIDENCE_ORIGINS.includes(
+        config.evidenceOrigin as (typeof ALLOWED_EVIDENCE_ORIGINS)[number],
+      )
+    ) {
+      throw new Error(
+        `INVALID_PROVENANCE_METADATA: Invalid evidenceOrigin: '${config.evidenceOrigin}' is not a supported provenance origin`,
+      );
+    }
+  }
+
+  // 2. isSyntheticFixture type validation
+  if (config.isSyntheticFixture !== undefined && typeof config.isSyntheticFixture !== "boolean") {
+    throw new Error(
+      `INVALID_PROVENANCE_METADATA: Invalid isSyntheticFixture: expected boolean, received ${typeof config.isSyntheticFixture}`,
+    );
+  }
+
+  // 3. Contradictory provenance options validation
+  if (config.evidenceOrigin !== undefined && config.isSyntheticFixture !== undefined) {
+    if (
+      (config.evidenceOrigin === "SYNTHETIC_FIXTURE" && config.isSyntheticFixture !== true) ||
+      (config.evidenceOrigin === "CAPTURED_RPC" && config.isSyntheticFixture !== false) ||
+      (config.evidenceOrigin === "UNKNOWN" &&
+        config.isSyntheticFixture !== null &&
+        config.isSyntheticFixture !== undefined)
+    ) {
+      throw new Error(
+        `INVALID_PROVENANCE_METADATA: Contradictory provenance options: evidenceOrigin is '${config.evidenceOrigin}' but isSyntheticFixture is ${config.isSyntheticFixture}`,
+      );
+    }
+  }
+
+  // 4. Resolved provenance determination
+  if (config.evidenceOrigin !== undefined) {
+    const origin = config.evidenceOrigin;
+    const isSynthetic =
+      origin === "SYNTHETIC_FIXTURE" ? true : origin === "CAPTURED_RPC" ? false : null;
+    return {
+      effectiveEvidenceOrigin: origin,
+      effectiveIsSyntheticFixture: isSynthetic,
+    };
+  }
+
+  if (config.isSyntheticFixture !== undefined) {
+    return {
+      effectiveEvidenceOrigin: config.isSyntheticFixture ? "SYNTHETIC_FIXTURE" : "CAPTURED_RPC",
+      effectiveIsSyntheticFixture: config.isSyntheticFixture,
+    };
+  }
+
+  // Injected transport without explicit provenance declaration -> defaults to UNKNOWN!
+  if (config.fetch !== undefined) {
+    return {
+      effectiveEvidenceOrigin: "UNKNOWN",
+      effectiveIsSyntheticFixture: null,
+    };
+  }
+
+  // Default live runtime transport (globalThis.fetch)
+  return {
+    effectiveEvidenceOrigin: "CAPTURED_RPC",
+    effectiveIsSyntheticFixture: false,
+  };
 }
 
 /**
@@ -359,30 +509,13 @@ export async function acquireRaydiumAmmV4Snapshot(
 
   const sensitiveTokens = privateSanitizerInfo.sensitiveTokens;
 
-  // Provenance resolution
-  let effectiveEvidenceOrigin: EvidenceOrigin | null = null;
-  let effectiveIsSyntheticFixture: boolean | null = null;
-
-  if (dryRun) {
-    effectiveEvidenceOrigin = null;
-    effectiveIsSyntheticFixture = null;
-  } else if (config.evidenceOrigin !== undefined) {
-    effectiveEvidenceOrigin = config.evidenceOrigin;
-    effectiveIsSyntheticFixture =
-      config.isSyntheticFixture !== undefined
-        ? config.isSyntheticFixture
-        : effectiveEvidenceOrigin === "SYNTHETIC_FIXTURE"
-          ? true
-          : effectiveEvidenceOrigin === "CAPTURED_RPC"
-            ? false
-            : null;
-  } else if (config.isSyntheticFixture !== undefined) {
-    effectiveIsSyntheticFixture = config.isSyntheticFixture;
-    effectiveEvidenceOrigin = config.isSyntheticFixture ? "SYNTHETIC_FIXTURE" : "CAPTURED_RPC";
-  } else {
-    effectiveEvidenceOrigin = "CAPTURED_RPC";
-    effectiveIsSyntheticFixture = false;
-  }
+  // Validate and resolve provenance options upfront before any request dispatch
+  const { effectiveEvidenceOrigin, effectiveIsSyntheticFixture } = resolveAcquisitionProvenance({
+    dryRun,
+    fetch: config.fetch,
+    evidenceOrigin: config.evidenceOrigin,
+    isSyntheticFixture: config.isSyntheticFixture,
+  });
 
   // DRY-RUN MODE: Zero network calls, return planned sequence
   if (dryRun) {
@@ -575,29 +708,54 @@ export async function acquireRaydiumAmmV4Snapshot(
       });
 
       httpStatus = response.status;
-      rawResponseBody = await response.text();
-      wireResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
+      const wireResponseBody = await response.text();
+      wireResponseSha256 = crypto.createHash("sha256").update(wireResponseBody).digest("hex");
 
-      // Check whether response body reflects any private credentials or tokens
-      const hasReflectedSecret =
-        sensitiveTokens.some((t) => t.length > 0 && rawResponseBody!.includes(t)) ||
-        (rawRpcUrl.length > 0 && rawResponseBody.includes(rawRpcUrl));
+      // Parse JSON from wire response (unsanitized payload kept private in memory)
+      let rawParsedJson: unknown = null;
+      let jsonParseError: string | null = null;
+      try {
+        rawParsedJson = JSON.parse(wireResponseBody);
+      } catch (err) {
+        jsonParseError = err instanceof Error ? err.message : String(err);
+      }
 
-      if (hasReflectedSecret) {
-        rawResponseBody = redactString(rawResponseBody, sensitiveTokens, rawRpcUrl);
-        wasRedacted = true;
+      // Sanitize decoded parsed JSON structure if present
+      let sanitizedJson: Record<string, unknown> | null = null;
+      let jsonWasRedacted = false;
+      if (rawParsedJson !== null && typeof rawParsedJson === "object") {
+        const res = sanitizeJsonValue(rawParsedJson, sensitiveTokens, rawRpcUrl);
+        sanitizedJson = res.sanitized as Record<string, unknown>;
+        jsonWasRedacted = res.changed;
+      }
+
+      // Sanitize wire text representation
+      const textRedacted = redactString(wireResponseBody, sensitiveTokens, rawRpcUrl);
+      const textWasRedacted = textRedacted !== wireResponseBody;
+
+      wasRedacted = jsonWasRedacted || textWasRedacted;
+
+      if (wasRedacted) {
+        if (sanitizedJson !== null) {
+          rawResponseBody = JSON.stringify(sanitizedJson);
+        } else {
+          rawResponseBody = textRedacted;
+        }
         storedResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
       } else {
+        rawResponseBody = wireResponseBody;
         storedResponseSha256 = wireResponseSha256;
       }
 
       if (response.status !== 200) {
         errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
+        parsedJson = sanitizedJson;
       } else {
-        try {
-          parsedJson = JSON.parse(rawResponseBody) as Record<string, unknown>;
-        } catch (jsonErr) {
-          errMessage = `Malformed JSON response: ${jsonErr instanceof Error ? jsonErr.message : String(jsonErr)}`;
+        if (jsonParseError) {
+          errMessage = `Malformed JSON response: ${jsonParseError}`;
+          parsedJson = null;
+        } else {
+          parsedJson = sanitizedJson;
         }
       }
     } catch (fetchErr) {
@@ -829,8 +987,41 @@ export async function acquireRaydiumAmmV4Snapshot(
     });
   }
 
-  await sleeper(pacingMs);
-  pacingEnforcedMs = pacingMs;
+  try {
+    await sleeper(pacingMs);
+    pacingEnforcedMs = pacingMs;
+  } catch (pacingErr) {
+    const rawMsg = pacingErr instanceof Error ? pacingErr.message : String(pacingErr);
+    failureReason = `PACING_INTERRUPTED: ${redactString(rawMsg, sensitiveTokens, rawRpcUrl)}`;
+    return await finalizeAcquisition({
+      clock,
+      startedAt,
+      publicEndpoint,
+      poolId,
+      expectedTokenMint,
+      pacingMs,
+      timeoutMs,
+      overallTimeoutMs,
+      httpAttempts,
+      pacingEnforcedMs: null,
+      bootstrapSlot,
+      batchSlot: null,
+      staleSlotDetected: false,
+      requests,
+      discoveredIdentities,
+      derivedAuthority,
+      retrievalOk: false,
+      structuralValidationOk: false,
+      meetsNinetyPercentThreshold: false,
+      validationResult: null,
+      accounting: null,
+      failureReason,
+      effectiveEvidenceOrigin,
+      effectiveIsSyntheticFixture,
+      retrievedAtIso: req1Record.responseTimestampIso,
+      outDir: config.outDir,
+    });
+  }
 
   // Check deadline again after host pacing completes
   const remainingBeforeReq2 = getRemainingBudgetMs();
