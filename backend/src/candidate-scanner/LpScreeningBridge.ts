@@ -37,9 +37,11 @@ import {
 } from "../research/pilot/RaydiumAmmLpAccounting.js";
 import {
   isValidIsoCalendarTimestamp,
+  validateRaydiumAmmV4Snapshot,
   type EvidenceOrigin,
   type RaydiumAmmV4SnapshotValidationSuccess,
 } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
+import { WSOL_MINT } from "../research/pilot/RaydiumAmmParser.js";
 import type { SnapshotAcquisitionEvidence } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 
 export const LP_DERIVATION_METHOD = "RAYDIUM_AMM_V4_LP_RESERVE_VS_SUPPLY" as const;
@@ -122,7 +124,7 @@ export type BridgedPoolProjectionResult =
     }
   | {
       readonly ok: false;
-      readonly pool: ScannedPoolRecord;
+      readonly pool: null;
       readonly status: "UNAVAILABLE" | "INVALID_EVIDENCE" | "IDENTITY_MISMATCH" | "STALE_EVIDENCE";
       readonly lpBurnPct: null;
       readonly metricProvenance: "UNAVAILABLE";
@@ -227,6 +229,18 @@ function toBigIntSafe(val: unknown): bigint | null {
  * Extracts and strictly verifies that the evidence input comes from the accepted validator path.
  * Rejects loose scalar dictionaries or acquisition objects with missing/omitted assertions.
  */
+/**
+ * Extracts and strictly verifies that the evidence input comes from the accepted validator path.
+ *
+ * Authoritative Rules:
+ * 1. Binds quantities directly to the decoded account states (poolState.lpReserve, lpMintState.supply).
+ * 2. Computes derived accounting using the exact calculateAmmV4LpInaccessibleClaims arithmetic helper.
+ * 3. Rejects any inconsistency between decoded account states and validationResult.accounting summary.
+ * 4. Rejects any inconsistency between decoded account states, validationResult, and acquisition wrapper accounting.
+ * 5. Identifies the pool's authoritative token mint from decoded poolState.baseMint / poolState.quoteMint,
+ *    and rejects requestedIdentities.expectedTokenMint if it does not match the decoded pool tokens.
+ * 6. Rejects loose scalar dictionaries or acquisition objects with missing/omitted assertions.
+ */
 function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedValidatedEvidence {
   if (input === null || input === undefined) {
     return {
@@ -255,121 +269,15 @@ function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedVal
 
   const obj = raw as Record<string, unknown>;
 
-  // Branch A: Direct RaydiumAmmV4SnapshotValidationSuccess
-  if ("diagnostics" in obj && "accounting" in obj && "evidenceBoundary" in obj) {
-    if (obj.ok !== true) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: "Snapshot validation result indicates failure (ok !== true)",
-      };
-    }
-
-    const diag = obj.diagnostics as Record<string, unknown> | undefined;
-    const reqIdentities = diag?.requestedIdentities as Record<string, unknown> | undefined;
-    const accountingObj = obj.accounting as Record<string, unknown> | undefined;
-
-    const poolId =
-      typeof reqIdentities?.poolId === "string" && reqIdentities.poolId.trim().length > 0
-        ? reqIdentities.poolId.trim()
-        : null;
-    const tokenMint =
-      typeof reqIdentities?.expectedTokenMint === "string" &&
-      reqIdentities.expectedTokenMint.trim().length > 0
-        ? reqIdentities.expectedTokenMint.trim()
-        : null;
-
-    if (!poolId || !tokenMint) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error:
-          "Validated snapshot diagnostics missing required poolId or expectedTokenMint identity",
-      };
-    }
-
-    const slot = diag?.slot;
-    if (typeof slot !== "number" || !Number.isSafeInteger(slot) || slot <= 0) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: `Invalid context slot in snapshot diagnostics: ${slot}`,
-      };
-    }
-
-    const retrievedAtIso = diag?.retrievedAtIso;
-    if (typeof retrievedAtIso !== "string" || !isValidIsoCalendarTimestamp(retrievedAtIso)) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: `Missing or invalid retrievedAtIso in snapshot diagnostics: ${retrievedAtIso}`,
-      };
-    }
-
-    const evidenceOrigin = diag?.evidenceOrigin as EvidenceOrigin | undefined;
-    if (
-      evidenceOrigin !== "CAPTURED_RPC" &&
-      evidenceOrigin !== "SYNTHETIC_FIXTURE" &&
-      evidenceOrigin !== "UNKNOWN"
-    ) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: `Invalid evidenceOrigin in snapshot diagnostics: ${evidenceOrigin}`,
-      };
-    }
-
-    const isSyntheticFixture =
-      typeof diag?.isSyntheticFixture === "boolean" ? diag.isSyntheticFixture : null;
-    if (
-      (evidenceOrigin === "CAPTURED_RPC" && isSyntheticFixture === true) ||
-      (evidenceOrigin === "SYNTHETIC_FIXTURE" && isSyntheticFixture === false)
-    ) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: `Contradictory provenance in snapshot diagnostics: origin ${evidenceOrigin} with isSyntheticFixture ${isSyntheticFixture}`,
-      };
-    }
-
-    if (!accountingObj || accountingObj.ok !== true) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: "Snapshot validation accounting assertion is missing or not ok",
-      };
-    }
-
-    const protocolLp = toBigIntSafe(accountingObj.protocolLp);
-    const circulatingSupply = toBigIntSafe(accountingObj.circulatingSupply);
-
-    if (protocolLp === null || circulatingSupply === null) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: "Snapshot accounting contains invalid or unparseable protocolLp / circulatingSupply",
-      };
-    }
-
-    return {
-      ok: true,
-      poolId,
-      tokenMint,
-      protocolLp,
-      circulatingSupply,
-      retrievedAtIso,
-      contextSlot: slot,
-      evidenceOrigin,
-      isSyntheticFixture,
-      accounting: obj.accounting as AmmV4LpAccountingSuccess,
-    };
-  }
+  let validationResult: Record<string, unknown> | null = null;
+  let acquisitionWrapper: Record<string, unknown> | null = null;
 
   // Branch B: SnapshotAcquisitionEvidence
   if (
     obj.command === "RaydiumAmmV4SnapshotAcquisition" ||
     ("config" in obj && "outcomes" in obj && "contextSlots" in obj)
   ) {
+    acquisitionWrapper = obj;
     const outcomes = obj.outcomes as Record<string, unknown> | undefined;
     if (!outcomes || outcomes.structuralValidationOk !== true || outcomes.retrievalOk !== true) {
       return {
@@ -380,17 +288,244 @@ function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedVal
       };
     }
 
-    const validationResult = obj.validationResult as Record<string, unknown> | undefined;
-    if (!validationResult || typeof validationResult !== "object" || validationResult.ok !== true) {
+    const valRes = obj.validationResult as Record<string, unknown> | undefined;
+    if (!valRes || typeof valRes !== "object" || valRes.ok !== true) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
         error: "Acquisition evidence lacks a verified successful validationResult assertion",
       };
     }
+    validationResult = valRes;
+  } else if ("diagnostics" in obj && "accounting" in obj && "evidenceBoundary" in obj) {
+    // Branch A: Direct RaydiumAmmV4SnapshotValidationSuccess
+    if (obj.ok !== true) {
+      return {
+        ok: false,
+        category: "INVALID_EVIDENCE",
+        error: "Snapshot validation result indicates failure (ok !== true)",
+      };
+    }
+    validationResult = obj;
+  } else {
+    // Branch C: Loose flat objects or unvalidated dictionaries
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error:
+        "Input is an unvalidated or flat dictionary; arbitrary inputs must be validated via accepted snapshot validator",
+    };
+  }
 
-    const accountingObj = obj.accounting as Record<string, unknown> | undefined;
-    if (!accountingObj || typeof accountingObj !== "object" || accountingObj.ok !== true) {
+  // Extract and validate diagnostics
+  const diag = validationResult.diagnostics as Record<string, unknown> | undefined;
+  if (!diag || typeof diag !== "object") {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Snapshot validation result missing diagnostics",
+    };
+  }
+
+  const slot = diag.slot;
+  if (typeof slot !== "number" || !Number.isSafeInteger(slot) || slot <= 0) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Invalid context slot in snapshot diagnostics: ${slot}`,
+    };
+  }
+
+  const retrievedAtIso = diag.retrievedAtIso;
+  if (typeof retrievedAtIso !== "string" || !isValidIsoCalendarTimestamp(retrievedAtIso)) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Missing or invalid retrievedAtIso in snapshot diagnostics: ${retrievedAtIso}`,
+    };
+  }
+
+  const evidenceOrigin = diag.evidenceOrigin as EvidenceOrigin | undefined;
+  if (
+    evidenceOrigin !== "CAPTURED_RPC" &&
+    evidenceOrigin !== "SYNTHETIC_FIXTURE" &&
+    evidenceOrigin !== "UNKNOWN"
+  ) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Invalid evidenceOrigin in snapshot diagnostics: ${evidenceOrigin}`,
+    };
+  }
+
+  const isSyntheticFixture =
+    typeof diag.isSyntheticFixture === "boolean" ? diag.isSyntheticFixture : null;
+  if (
+    (evidenceOrigin === "CAPTURED_RPC" && isSyntheticFixture === true) ||
+    (evidenceOrigin === "SYNTHETIC_FIXTURE" && isSyntheticFixture === false)
+  ) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Contradictory provenance in snapshot diagnostics: origin ${evidenceOrigin} with isSyntheticFixture ${isSyntheticFixture}`,
+    };
+  }
+
+  // 1. Authoritative Decoded Account States
+  const poolState = diag.poolState as Record<string, unknown> | undefined;
+  const lpMintState = diag.lpMintState as Record<string, unknown> | undefined;
+  if (
+    !poolState ||
+    typeof poolState !== "object" ||
+    !lpMintState ||
+    typeof lpMintState !== "object"
+  ) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Diagnostics missing decoded poolState or lpMintState account states",
+    };
+  }
+
+  const poolAddress = typeof poolState.poolAddress === "string" ? poolState.poolAddress.trim() : "";
+  const baseMint = typeof poolState.baseMint === "string" ? poolState.baseMint.trim() : "";
+  const quoteMint = typeof poolState.quoteMint === "string" ? poolState.quoteMint.trim() : "";
+  const lpMintInPool = typeof poolState.lpMint === "string" ? poolState.lpMint.trim() : "";
+  const lpMintAddress =
+    typeof lpMintState.mintAddress === "string" ? lpMintState.mintAddress.trim() : "";
+
+  if (!poolAddress || !baseMint || !quoteMint || !lpMintInPool || !lpMintAddress) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Decoded account states contain missing or invalid public key fields",
+    };
+  }
+
+  if (lpMintInPool !== lpMintAddress) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Decoded poolState.lpMint (${lpMintInPool}) does not match lpMintState.mintAddress (${lpMintAddress})`,
+    };
+  }
+
+  const reqIdentities = (diag.requestedIdentities as Record<string, unknown> | undefined) ?? {};
+  const requestedPoolId =
+    typeof reqIdentities.poolId === "string" ? reqIdentities.poolId.trim() : "";
+  const requestedTokenMint =
+    typeof reqIdentities.expectedTokenMint === "string"
+      ? reqIdentities.expectedTokenMint.trim()
+      : "";
+
+  if (!requestedPoolId) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Snapshot diagnostics missing requested poolId identity",
+    };
+  }
+
+  if (!requestedTokenMint) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Snapshot diagnostics missing requested expectedTokenMint identity",
+    };
+  }
+
+  if (requestedPoolId !== poolAddress) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Requested poolId (${requestedPoolId}) does not match decoded poolAddress (${poolAddress})`,
+    };
+  }
+
+  // 2. Authoritative Token Mint from Decoded Pool State
+  let authoritativeTokenMint: string;
+  if (quoteMint === WSOL_MINT) {
+    authoritativeTokenMint = baseMint;
+  } else if (baseMint === WSOL_MINT) {
+    authoritativeTokenMint = quoteMint;
+  } else if (requestedTokenMint === baseMint || requestedTokenMint === quoteMint) {
+    authoritativeTokenMint = requestedTokenMint;
+  } else {
+    authoritativeTokenMint = baseMint;
+  }
+
+  // If requested expectedTokenMint is specified, it MUST match the decoded pool tokens and authoritative mint
+  if (requestedTokenMint !== baseMint && requestedTokenMint !== quoteMint) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Requested expectedTokenMint (${requestedTokenMint}) does not match decoded pool tokens (${baseMint} / ${quoteMint})`,
+    };
+  }
+  if (requestedTokenMint !== authoritativeTokenMint) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Requested expectedTokenMint (${requestedTokenMint}) does not match authoritative decoded token mint (${authoritativeTokenMint})`,
+    };
+  }
+
+  // 3. Authoritative LP Quantities from Decoded Account States
+  const protocolLp = toBigIntSafe(poolState.lpReserve);
+  const circulatingSupply = toBigIntSafe(lpMintState.supply);
+  if (protocolLp === null || circulatingSupply === null) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error:
+        "Decoded poolState.lpReserve or lpMintState.supply is not a valid non-negative integer",
+    };
+  }
+
+  // Calculate authoritative accounting using the pure arithmetic helper
+  const derivedAccounting = calculateAmmV4LpInaccessibleClaims(protocolLp, circulatingSupply);
+  if (!derivedAccounting.ok) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: `Accounting derivation from decoded accounts failed: ${derivedAccounting.message}`,
+    };
+  }
+
+  // 4. Inconsistency check with validationResult.accounting summary
+  const valAcc = validationResult.accounting as Record<string, unknown> | undefined;
+  if (!valAcc || typeof valAcc !== "object" || valAcc.ok !== true) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error: "Snapshot validation accounting assertion is missing or not ok",
+    };
+  }
+
+  const valProtoLp = toBigIntSafe(valAcc.protocolLp);
+  const valCircSupply = toBigIntSafe(valAcc.circulatingSupply);
+  const valInacc = toBigIntSafe(valAcc.rawInaccessibleLp);
+  const valDenom = toBigIntSafe(valAcc.rawDenominator);
+
+  if (
+    valProtoLp !== protocolLp ||
+    valCircSupply !== circulatingSupply ||
+    valInacc !== derivedAccounting.rawInaccessibleLp ||
+    valDenom !== derivedAccounting.rawDenominator ||
+    valAcc.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold
+  ) {
+    return {
+      ok: false,
+      category: "INVALID_EVIDENCE",
+      error:
+        "Inconsistency detected: validationResult.accounting summary does not match decoded account states (poolState.lpReserve / lpMintState.supply)",
+    };
+  }
+
+  // 5. Inconsistency check with acquisitionWrapper
+  if (acquisitionWrapper !== null) {
+    const acqAcc = acquisitionWrapper.accounting as Record<string, unknown> | undefined;
+    if (!acqAcc || typeof acqAcc !== "object" || acqAcc.ok !== true) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
@@ -398,125 +533,98 @@ function extractValidatedEvidence(input: ValidatedLpEvidenceInput): ExtractedVal
       };
     }
 
-    const discovered = obj.discoveredIdentities as Record<string, unknown> | undefined;
-    const diag = (validationResult.diagnostics as Record<string, unknown> | undefined) ?? {};
-    const diagReq = (diag.requestedIdentities as Record<string, unknown> | undefined) ?? {};
+    const acqProtoLp = toBigIntSafe(acqAcc.protocolLp);
+    const acqCircSupply = toBigIntSafe(acqAcc.circulatingSupply);
+    const acqInacc = toBigIntSafe(acqAcc.rawInaccessibleLp);
+    const acqDenom = toBigIntSafe(acqAcc.rawDenominator);
+    const acqOutcomes = acquisitionWrapper.outcomes as Record<string, unknown> | undefined;
 
-    const poolId =
-      typeof discovered?.poolId === "string" && discovered.poolId.trim().length > 0
-        ? discovered.poolId.trim()
-        : null;
-    const tokenMint =
-      typeof discovered?.expectedTokenMint === "string" &&
-      discovered.expectedTokenMint.trim().length > 0
-        ? discovered.expectedTokenMint.trim()
-        : null;
-
-    if (!poolId || !tokenMint) {
+    if (
+      acqProtoLp !== protocolLp ||
+      acqCircSupply !== circulatingSupply ||
+      acqInacc !== derivedAccounting.rawInaccessibleLp ||
+      acqDenom !== derivedAccounting.rawDenominator ||
+      acqAcc.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold ||
+      acqOutcomes?.meetsNinetyPercentThreshold !== derivedAccounting.meetsNinetyPercentThreshold
+    ) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
         error:
-          "Acquisition discoveredIdentities missing required poolId or expectedTokenMint identity",
+          "Inconsistency detected: acquisition wrapper accounting does not match decoded account states or validationResult",
       };
     }
 
-    // Verify identity consistency between discovered and validationResult
-    if (diagReq.poolId !== poolId || diagReq.expectedTokenMint !== tokenMint) {
+    const discovered = acquisitionWrapper.discoveredIdentities as
+      | Record<string, unknown>
+      | undefined;
+    if (!discovered || discovered.poolId !== poolAddress) {
+      return {
+        ok: false,
+        category: "INVALID_EVIDENCE",
+        error: "Acquisition discoveredIdentities.poolId does not match decoded poolAddress",
+      };
+    }
+    if (discovered.lpMint && discovered.lpMint !== lpMintInPool) {
+      return {
+        ok: false,
+        category: "INVALID_EVIDENCE",
+        error: "Acquisition discoveredIdentities.lpMint does not match decoded lpMint",
+      };
+    }
+    if (discovered.expectedTokenMint && discovered.expectedTokenMint !== authoritativeTokenMint) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
         error:
-          "Discovered identities conflict with validated snapshot diagnostics requestedIdentities",
+          "Acquisition discoveredIdentities.expectedTokenMint does not match decoded pool token mint",
       };
     }
 
-    const contextSlots = obj.contextSlots as Record<string, unknown> | undefined;
-    const batchSlot = contextSlots?.batchSlot;
-    if (
-      typeof batchSlot !== "number" ||
-      !Number.isSafeInteger(batchSlot) ||
-      batchSlot <= 0 ||
-      batchSlot !== diag.slot
-    ) {
+    const contextSlots = acquisitionWrapper.contextSlots as Record<string, unknown> | undefined;
+    if (contextSlots?.batchSlot !== slot) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
-        error: `Acquisition contextSlots.batchSlot (${batchSlot}) invalid or inconsistent with validated slot (${diag.slot})`,
+        error: `Acquisition contextSlots.batchSlot (${contextSlots?.batchSlot}) does not match validation slot (${slot})`,
       };
     }
 
-    const retrievedAtIso = typeof obj.retrievedAtIso === "string" ? obj.retrievedAtIso : null;
-    if (
-      !retrievedAtIso ||
-      !isValidIsoCalendarTimestamp(retrievedAtIso) ||
-      retrievedAtIso !== diag.retrievedAtIso
-    ) {
+    if (acquisitionWrapper.retrievedAtIso !== retrievedAtIso) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
-        error: `Acquisition retrievedAtIso (${retrievedAtIso}) invalid or inconsistent with validated diagnostics (${diag.retrievedAtIso})`,
+        error: "Acquisition retrievedAtIso does not match validation diagnostics retrievedAtIso",
       };
     }
-
-    const evidenceOrigin = obj.evidenceOrigin as EvidenceOrigin | undefined;
-    if (
-      evidenceOrigin !== "CAPTURED_RPC" &&
-      evidenceOrigin !== "SYNTHETIC_FIXTURE" &&
-      evidenceOrigin !== "UNKNOWN"
-    ) {
+    if (acquisitionWrapper.evidenceOrigin !== evidenceOrigin) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
-        error: `Invalid acquisition evidenceOrigin: ${evidenceOrigin}`,
+        error: "Acquisition evidenceOrigin does not match validation diagnostics evidenceOrigin",
       };
     }
-
-    const isSyntheticFixture =
-      typeof obj.isSyntheticFixture === "boolean" ? obj.isSyntheticFixture : null;
-    if (
-      (evidenceOrigin === "CAPTURED_RPC" && isSyntheticFixture === true) ||
-      (evidenceOrigin === "SYNTHETIC_FIXTURE" && isSyntheticFixture === false)
-    ) {
-      return {
-        ok: false,
-        category: "INVALID_EVIDENCE",
-        error: `Contradictory acquisition provenance: origin ${evidenceOrigin} with isSyntheticFixture ${isSyntheticFixture}`,
-      };
-    }
-
-    const protocolLp = toBigIntSafe(accountingObj.protocolLp);
-    const circulatingSupply = toBigIntSafe(accountingObj.circulatingSupply);
-
-    if (protocolLp === null || circulatingSupply === null) {
+    if (acquisitionWrapper.isSyntheticFixture !== isSyntheticFixture) {
       return {
         ok: false,
         category: "INVALID_EVIDENCE",
         error:
-          "Acquisition accounting contains invalid or unparseable protocolLp / circulatingSupply",
+          "Acquisition isSyntheticFixture does not match validation diagnostics isSyntheticFixture",
       };
     }
-
-    return {
-      ok: true,
-      poolId,
-      tokenMint,
-      protocolLp,
-      circulatingSupply,
-      retrievedAtIso,
-      contextSlot: batchSlot,
-      evidenceOrigin,
-      isSyntheticFixture,
-      accounting: validationResult.accounting as AmmV4LpAccountingSuccess,
-    };
   }
 
-  // Branch C: Loose flat objects or unvalidated dictionaries
   return {
-    ok: false,
-    category: "INVALID_EVIDENCE",
-    error:
-      "Input is an unvalidated or flat dictionary; arbitrary inputs must be validated via accepted snapshot validator",
+    ok: true,
+    poolId: poolAddress,
+    tokenMint: authoritativeTokenMint,
+    protocolLp,
+    circulatingSupply,
+    retrievedAtIso,
+    contextSlot: slot,
+    evidenceOrigin,
+    isSyntheticFixture,
+    accounting: derivedAccounting,
   };
 }
 
@@ -540,7 +648,7 @@ function buildFilterEvaluation(
  * anti-rug evaluation criteria while maintaining strict identity binding,
  * complete freshness policy verification, and exact integer arithmetic.
  */
-export function evaluateLpScreeningBridge(
+export function evaluateLpScreeningBridgeSync(
   candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
   evidence: ValidatedLpEvidenceInput,
   freshnessPolicy: LpFreshnessPolicy,
@@ -848,50 +956,132 @@ export function evaluateLpScreeningBridge(
 }
 
 /**
- * Projects a validated bridge screening result into a ScannedPoolRecord.
+ * Asynchronous evaluation function for the offline LP-screening bridge.
  *
- * Enforces identity re-checking at projection time:
- * If the candidate pool does not match the evaluated candidate identities,
- * projection fails closed to UNAVAILABLE with lpBurnPct: 0.
+ * Runs full synchronous account state binding and consistency checks, and
+ * where appropriate, re-validates the retained raw batch RPC payload from
+ * acquisition evidence against validateRaydiumAmmV4Snapshot().
  */
-export function bridgeLpEvidenceToScannedPool(
-  pool: ScannedPoolRecord,
-  bridgeResult: LpBridgeScreeningResult,
-): ScannedPoolRecord {
-  // Recheck evaluated identities at projection boundary to prevent cross-candidate pollution
+export async function evaluateLpScreeningBridge(
+  candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
+  evidence: ValidatedLpEvidenceInput,
+  freshnessPolicy: LpFreshnessPolicy,
+): Promise<LpBridgeScreeningResult> {
+  const syncResult = evaluateLpScreeningBridgeSync(candidate, evidence, freshnessPolicy);
   if (
-    !bridgeResult.evaluatedCandidate ||
-    pool.poolId !== bridgeResult.evaluatedCandidate.poolId ||
-    pool.mintAddress !== bridgeResult.evaluatedCandidate.mintAddress
+    syncResult.status !== "AVAILABLE_QUALIFIED" &&
+    syncResult.status !== "AVAILABLE_BELOW_THRESHOLD"
   ) {
-    return {
-      ...pool,
-      lpBurnPct: 0,
-      metricProvenance: {
-        ...pool.metricProvenance,
-        lpBurnPct: "UNAVAILABLE",
-      },
-    };
+    return syncResult;
   }
 
-  const isAvailable =
-    bridgeResult.available &&
-    (bridgeResult.status === "AVAILABLE_QUALIFIED" ||
-      bridgeResult.status === "AVAILABLE_BELOW_THRESHOLD") &&
-    bridgeResult.lpBurnPct !== null;
+  // Check if raw batch is present in acquisition evidence requests
+  const raw: unknown =
+    typeof evidence === "object" &&
+    evidence !== null &&
+    "evidence" in evidence &&
+    (evidence as { evidence: unknown }).evidence
+      ? (evidence as { evidence: unknown }).evidence
+      : evidence;
 
-  return {
-    ...pool,
-    lpBurnPct: isAvailable ? bridgeResult.lpBurnPct! : 0,
-    metricProvenance: {
-      ...pool.metricProvenance,
-      lpBurnPct: isAvailable ? "DERIVED" : "UNAVAILABLE",
-    },
-  };
+  if (
+    typeof raw === "object" &&
+    raw !== null &&
+    "requests" in raw &&
+    Array.isArray((raw as { requests: unknown }).requests)
+  ) {
+    const acq = raw as SnapshotAcquisitionEvidence;
+    const req2 = acq.requests?.[1];
+    if (req2 && (req2.parsedJson || req2.rawResponseBody)) {
+      const hasParsedResult =
+        req2.parsedJson && typeof req2.parsedJson === "object" && "result" in req2.parsedJson;
+      const rawPayload = hasParsedResult
+        ? (req2.parsedJson as Record<string, unknown>)
+        : typeof req2.rawResponseBody === "string"
+          ? (JSON.parse(req2.rawResponseBody) as Record<string, unknown>)
+          : null;
+      if (rawPayload) {
+        const fallbackIdentities = acq.discoveredIdentities ??
+          (acq.validationResult && acq.validationResult.ok
+            ? acq.validationResult.diagnostics.requestedIdentities
+            : null) ?? {
+            poolId: syncResult.evaluatedCandidate.poolId,
+            lpMint: "",
+            baseVault: "",
+            quoteVault: "",
+            expectedTokenMint: syncResult.evaluatedCandidate.mintAddress,
+          };
+        const revalidated = await validateRaydiumAmmV4Snapshot(fallbackIdentities, rawPayload, {
+          evidenceOrigin: acq.evidenceOrigin ?? undefined,
+          isSyntheticFixture: acq.isSyntheticFixture ?? undefined,
+          retrievedAtIso: acq.retrievedAtIso ?? undefined,
+        });
+
+        if (!revalidated.ok) {
+          const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+            status: "INVALID_EVIDENCE",
+            reason: `Retained final raw batch failed validation against accepted validator: ${revalidated.message}`,
+          });
+
+          return {
+            ...syncResult,
+            status: "INVALID_EVIDENCE",
+            available: false,
+            passed: false,
+            lpFilterPassed: false,
+            lpBurnPct: null,
+            meetsNinetyPercentThreshold: false,
+            rawAccounting: null,
+            derivationMethod: null,
+            metricProvenance: "UNAVAILABLE",
+            filterEvaluation,
+            diagnosticMessage: `Retained final raw batch failed validation: ${revalidated.message}`,
+          };
+        }
+
+        // Verify revalidated accounts match authoritative claims
+        if (
+          revalidated.diagnostics.poolState.lpReserve !== syncResult.rawAccounting?.protocolLp ||
+          revalidated.diagnostics.lpMintState.supply !== syncResult.rawAccounting?.circulatingSupply
+        ) {
+          const filterEvaluation = buildFilterEvaluation(false, "REJECTED_INVALID_POOL_METADATA", {
+            status: "INVALID_EVIDENCE",
+            reason:
+              "Inconsistency detected: retained final raw batch accounts do not match decoded account claims",
+          });
+
+          return {
+            ...syncResult,
+            status: "INVALID_EVIDENCE",
+            available: false,
+            passed: false,
+            lpFilterPassed: false,
+            lpBurnPct: null,
+            meetsNinetyPercentThreshold: false,
+            rawAccounting: null,
+            derivationMethod: null,
+            metricProvenance: "UNAVAILABLE",
+            filterEvaluation,
+            diagnosticMessage:
+              "Retained final raw batch accounts do not match decoded account claims",
+          };
+        }
+      }
+    }
+  }
+
+  return syncResult;
 }
 
 /**
  * Explicit typed projection helper that returns a discriminated union outcome.
+ *
+ * Boundary Guarantees:
+ * - For unavailable, stale, invalid, or mismatched evidence, returns ok: false and pool: null
+ *   with no normal numeric pool record (preventing unobserved data from posing as numeric 0).
+ * - For genuinely observed zero and available below-threshold measurements, returns ok: false
+ *   with a valid ScannedPoolRecord containing the observed percentage and metricProvenance: "DERIVED".
+ * - For available qualified measurements, returns ok: true with a valid ScannedPoolRecord.
  */
 export function projectBridgedLpPool(
   candidate: ScannedPoolRecord,
@@ -905,14 +1095,7 @@ export function projectBridgedLpPool(
   ) {
     return {
       ok: false,
-      pool: {
-        ...candidate,
-        lpBurnPct: 0,
-        metricProvenance: {
-          ...candidate.metricProvenance,
-          lpBurnPct: "UNAVAILABLE",
-        },
-      },
+      pool: null,
       status: "IDENTITY_MISMATCH",
       lpBurnPct: null,
       metricProvenance: "UNAVAILABLE",
@@ -955,16 +1138,11 @@ export function projectBridgedLpPool(
     };
   }
 
+  // Unavailable, stale, invalid, or mismatched evidence:
+  // Explicit failure with no normal numeric pool record (pool: null)
   return {
     ok: false,
-    pool: {
-      ...candidate,
-      lpBurnPct: 0,
-      metricProvenance: {
-        ...candidate.metricProvenance,
-        lpBurnPct: "UNAVAILABLE",
-      },
-    },
+    pool: null,
     status: bridgeResult.status as
       | "UNAVAILABLE"
       | "INVALID_EVIDENCE"
@@ -979,10 +1157,26 @@ export function projectBridgedLpPool(
 }
 
 /**
- * Checks whether LP accounting evidence is genuinely available on a candidate pool record.
- * Distinguishes observed 0% (DERIVED/OBSERVED) from unavailable data (UNAVAILABLE/missing).
+ * Projects a validated bridge screening result into a ScannedPoolRecord.
+ *
+ * Delegates to projectBridgedLpPool() to ensure the projection boundary cannot be bypassed.
+ * Returns null if evidence is unavailable, invalid, stale, or mismatched.
+ * Returns updated ScannedPoolRecord only when evidence is available (qualified or below-threshold).
  */
-export function isLpEvidenceAvailable(pool: ScannedPoolRecord): boolean {
+export function bridgeLpEvidenceToScannedPool(
+  pool: ScannedPoolRecord,
+  bridgeResult: LpBridgeScreeningResult,
+): ScannedPoolRecord | null {
+  const projection = projectBridgedLpPool(pool, bridgeResult);
+  return projection.pool;
+}
+
+/**
+ * Checks whether LP accounting evidence is genuinely available on a candidate pool record.
+ * Distinguishes observed 0% (DERIVED/OBSERVED) from unavailable data (UNAVAILABLE/missing/null).
+ */
+export function isLpEvidenceAvailable(pool: ScannedPoolRecord | null | undefined): boolean {
+  if (!pool) return false;
   return (
     pool.metricProvenance?.lpBurnPct === "DERIVED" ||
     pool.metricProvenance?.lpBurnPct === "OBSERVED"

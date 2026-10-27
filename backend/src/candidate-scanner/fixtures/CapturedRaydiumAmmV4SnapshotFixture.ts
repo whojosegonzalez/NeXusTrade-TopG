@@ -12,6 +12,8 @@
  * 6. Explicitly marked summaries labeled as summaries to avoid confusion with complete snapshots.
  */
 
+import { createHash } from "node:crypto";
+import { PublicKey } from "@solana/web3.js";
 import type { ScannedPoolRecord } from "../CandidateScannerTypes.js";
 import type { SnapshotAcquisitionEvidence } from "../../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 import {
@@ -19,6 +21,7 @@ import {
   type RaydiumAmmV4SnapshotIdentities,
   type RaydiumAmmV4SnapshotValidationSuccess,
 } from "../../research/pilot/RaydiumAmmV4SnapshotValidator.js";
+import { RAYDIUM_V4_OFFSETS, SPL_VAULT_OFFSETS } from "../../research/pilot/RaydiumAmmParser.js";
 
 /**
  * Authentic identities for the reference RAY/WSOL pair on Solana mainnet.
@@ -308,35 +311,201 @@ export function createSyntheticRayCandidatePool(
 }
 
 /**
- * [SYNTHETIC TEST CONTEXT]:
- * Synthetic qualified validation result representing an AMM v4 pool where 98.5% of LP tokens
- * are locked or burned (100n * (L - S) >= 90n * L).
+ * Creates a coherent synthetic raw JSON-RPC response payload by writing exact integer
+ * byte quantities into the authentic Raydium AMM v4 (752B) and SPL mint (82B) binary buffers.
  */
-export const SYNTHETIC_QUALIFIED_VALIDATION_RESULT: RaydiumAmmV4SnapshotValidationSuccess =
-  Object.freeze({
-    ok: true,
-    accounting: Object.freeze({
-      ok: true,
-      protocolLp: 1_000_000_000_000n,
-      circulatingSupply: 15_000_000_000n, // 1.5% circulating -> 98.5% inaccessible
-      rawInaccessibleLp: 985_000_000_000n,
-      rawDenominator: 1_000_000_000_000n,
-      meetsNinetyPercentThreshold: true,
-      displayInaccessiblePct: 98.5,
+export function createSyntheticRaydiumAmmV4RawBatchPayload(
+  lpReserve: bigint,
+  lpSupply: bigint,
+  options?: {
+    slot?: number | undefined;
+    baseMint?: string | undefined;
+  },
+): Record<string, unknown> {
+  const baseParsed = JSON.parse(RAW_CAPTURED_RAY_WSOL_ACCOUNT_BATCH_RPC_RESPONSE) as {
+    jsonrpc: string;
+    result: {
+      context: { apiVersion: string; slot: number };
+      value: Array<{
+        data: [string, string];
+        executable: boolean;
+        lamports: number;
+        owner: string;
+        rentEpoch: number;
+        space: number;
+      }>;
+    };
+    id: number;
+  };
+
+  const slot = options?.slot ?? 461970878;
+  baseParsed.result.context.slot = slot;
+
+  // Account 0: Pool account (752 bytes). Write lpReserve at offset 720.
+  const poolBuf = Buffer.from(baseParsed.result.value[0]!.data[0], "base64");
+  poolBuf.writeBigUInt64LE(lpReserve, RAYDIUM_V4_OFFSETS.LP_RESERVE);
+  if (options?.baseMint) {
+    const baseMintBytes = Buffer.from(new PublicKey(options.baseMint).toBytes());
+    baseMintBytes.copy(poolBuf, RAYDIUM_V4_OFFSETS.BASE_MINT);
+  }
+  baseParsed.result.value[0]!.data[0] = poolBuf.toString("base64");
+
+  // Account 1: LP Mint account (82 bytes). Write supply at offset 36.
+  const lpMintBuf = Buffer.from(baseParsed.result.value[1]!.data[0], "base64");
+  lpMintBuf.writeBigUInt64LE(lpSupply, 36);
+  baseParsed.result.value[1]!.data[0] = lpMintBuf.toString("base64");
+
+  // Account 2: Base Vault account (165 bytes). Write baseMint at offset 0 if overridden.
+  if (options?.baseMint) {
+    const baseVaultBuf = Buffer.from(baseParsed.result.value[2]!.data[0], "base64");
+    const baseMintBytes = Buffer.from(new PublicKey(options.baseMint).toBytes());
+    baseMintBytes.copy(baseVaultBuf, SPL_VAULT_OFFSETS.MINT);
+    baseParsed.result.value[2]!.data[0] = baseVaultBuf.toString("base64");
+  }
+
+  return baseParsed;
+}
+
+/**
+ * Validates a coherent synthetic raw accounts batch through the accepted snapshot validator.
+ * Derives diagnostics, account digests, authority, and accounting purely from raw accounts.
+ */
+export async function validateSyntheticRaydiumAmmV4Snapshot(
+  lpReserve: bigint,
+  lpSupply: bigint,
+  options?: {
+    slot?: number | undefined;
+    baseMint?: string | undefined;
+    expectedTokenMint?: string | undefined;
+    retrievedAtIso?: string | undefined;
+  },
+): Promise<RaydiumAmmV4SnapshotValidationSuccess> {
+  const payload = createSyntheticRaydiumAmmV4RawBatchPayload(lpReserve, lpSupply, options);
+  const identities: RaydiumAmmV4SnapshotIdentities = {
+    ...CAPTURED_RAY_WSOL_IDENTITIES,
+    ...(options?.expectedTokenMint !== undefined
+      ? { expectedTokenMint: options.expectedTokenMint }
+      : options?.baseMint !== undefined
+        ? { expectedTokenMint: options.baseMint }
+        : {}),
+  };
+
+  const result = await validateRaydiumAmmV4Snapshot(identities, payload, {
+    evidenceOrigin: "SYNTHETIC_FIXTURE",
+    isSyntheticFixture: true,
+    retrievedAtIso: options?.retrievedAtIso ?? "2026-10-27T06:35:11.779Z",
+  });
+
+  if (!result.ok) {
+    throw new Error(`Failed to validate synthetic raw snapshot: ${result.message}`);
+  }
+
+  return result;
+}
+
+/**
+ * Helper to build coherent SnapshotAcquisitionEvidence from a verified synthetic validation result
+ * and its underlying synthetic raw batch payload.
+ */
+export function buildSyntheticAcquisitionEvidence(
+  validationSuccess: RaydiumAmmV4SnapshotValidationSuccess,
+  rawPayload: Record<string, unknown>,
+): SnapshotAcquisitionEvidence {
+  const rawBodyStr = JSON.stringify(rawPayload);
+  const hash = createHash("sha256").update(rawBodyStr).digest("hex");
+  const retrievedAtIso = validationSuccess.diagnostics.retrievedAtIso ?? "2026-10-27T06:35:11.779Z";
+
+  return Object.freeze({
+    schemaVersion: "1.0",
+    command: "RaydiumAmmV4SnapshotAcquisition",
+    executionMode: "LIVE_ACQUISITION",
+    evidenceOrigin: "SYNTHETIC_FIXTURE",
+    isSyntheticFixture: true,
+    retrievedAtIso,
+    startedAtIso: "2026-10-27T06:35:09.026Z",
+    completedAtIso: retrievedAtIso,
+    endpoint: Object.freeze({
+      sanitizedUrl: "https://synthetic.rpc.provider.internal/",
+      host: "synthetic.rpc.provider.internal",
+      endpointFingerprint: "sha256:0000000000000000",
     }),
-    diagnostics: Object.freeze({
-      slot: 461970878,
-      evidenceOrigin: "SYNTHETIC_FIXTURE" as const,
-      isSyntheticFixture: true,
-      retrievedAtIso: "2026-10-27T06:35:11.779Z",
-      requestedIdentities: CAPTURED_RAY_WSOL_IDENTITIES,
-      poolState: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.poolState,
-      lpMintState: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.lpMintState,
-      baseVaultState: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.baseVaultState,
-      quoteVaultState: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.quoteVaultState,
-      derivedAmmAuthority: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.derivedAmmAuthority,
-      accountDigests: CAPTURED_RAY_WSOL_VALIDATION_RESULT.diagnostics.accountDigests,
+    config: Object.freeze({
+      poolId: validationSuccess.diagnostics.requestedIdentities.poolId,
+      expectedTokenMint:
+        validationSuccess.diagnostics.requestedIdentities.expectedTokenMint ?? null,
+      pacingMs: 2500,
+      timeoutMs: 10000,
+      overallTimeoutMs: 60000,
     }),
+    httpAttempts: 2,
+    maxHttpAttemptsAllowed: 2,
+    pacingEnforcedMs: 2500,
+    contextSlots: Object.freeze({
+      bootstrapSlot: 461970865,
+      batchSlot: validationSuccess.diagnostics.slot,
+      minContextSlotEnforced: true,
+      staleSlotDetected: false,
+    }),
+    requests: Object.freeze([
+      Object.freeze({
+        attempt: 1,
+        method: "getAccountInfo" as const,
+        params: Object.freeze([
+          validationSuccess.diagnostics.requestedIdentities.poolId,
+          Object.freeze({ encoding: "base64", commitment: "confirmed" }),
+        ]),
+        requestTimestampIso: "2026-10-27T06:35:09.026Z",
+        responseTimestampIso: "2026-10-27T06:35:09.183Z",
+        elapsedMs: 157,
+        httpStatus: 200,
+        rawResponseBody: null,
+        wireResponseSha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        storedResponseSha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        wasRedacted: false,
+        parsedJson: null,
+        error: null,
+      }),
+      Object.freeze({
+        attempt: 2,
+        method: "getMultipleAccounts" as const,
+        params: Object.freeze([
+          Object.freeze([
+            validationSuccess.diagnostics.requestedIdentities.poolId,
+            validationSuccess.diagnostics.requestedIdentities.lpMint,
+            validationSuccess.diagnostics.requestedIdentities.baseVault,
+            validationSuccess.diagnostics.requestedIdentities.quoteVault,
+          ]),
+          Object.freeze({
+            encoding: "base64",
+            commitment: "confirmed",
+            minContextSlot: 461970865,
+          }),
+        ]),
+        requestTimestampIso: "2026-10-27T06:35:11.721Z",
+        responseTimestampIso: retrievedAtIso,
+        elapsedMs: 58,
+        httpStatus: 200,
+        rawResponseBody: rawBodyStr,
+        wireResponseSha256: hash,
+        storedResponseSha256: hash,
+        wasRedacted: false,
+        parsedJson: rawPayload,
+        error: null,
+      }),
+    ]),
+    discoveredIdentities: Object.freeze(validationSuccess.diagnostics.requestedIdentities),
+    canonicalAmmAuthority: Object.freeze({
+      address: validationSuccess.diagnostics.derivedAmmAuthority.address,
+      bump: validationSuccess.diagnostics.derivedAmmAuthority.bump,
+    }),
+    outcomes: Object.freeze({
+      retrievalOk: true,
+      structuralValidationOk: true,
+      meetsNinetyPercentThreshold: validationSuccess.accounting.meetsNinetyPercentThreshold,
+    }),
+    validationResult: validationSuccess,
+    accounting: validationSuccess.accounting,
+    failureReason: null,
     evidenceBoundary: Object.freeze({
       bytecodeEquivalenceVerified: false,
       completeExecutableReservesVerified: false,
@@ -344,20 +513,41 @@ export const SYNTHETIC_QUALIFIED_VALIDATION_RESULT: RaydiumAmmV4SnapshotValidati
       strategyGateAdmitted: false,
     }),
   });
+}
 
 /**
  * [SYNTHETIC TEST CONTEXT]:
- * Synthetic qualified acquisition evidence wrapping the synthetic qualified validation result.
+ * Authentic raw batch payload for the synthetic 98.5% qualified fixture.
+ * 1_000_000_000_000n protocol LP, 15_000_000_000n circulating supply -> 985_000_000_000n inaccessible (98.5%).
  */
-export const SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE: SnapshotAcquisitionEvidence = Object.freeze({
-  ...CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
-  evidenceOrigin: "SYNTHETIC_FIXTURE",
-  isSyntheticFixture: true,
-  outcomes: Object.freeze({
-    retrievalOk: true,
-    structuralValidationOk: true,
-    meetsNinetyPercentThreshold: true,
-  }),
-  validationResult: SYNTHETIC_QUALIFIED_VALIDATION_RESULT,
-  accounting: SYNTHETIC_QUALIFIED_VALIDATION_RESULT.accounting,
-});
+export const SYNTHETIC_QUALIFIED_RAW_PAYLOAD = createSyntheticRaydiumAmmV4RawBatchPayload(
+  1_000_000_000_000n,
+  15_000_000_000n,
+);
+
+/**
+ * [SYNTHETIC TEST CONTEXT]:
+ * Synthetic qualified validation result rebuilt from coherent synthetic raw accounts
+ * passed through validateRaydiumAmmV4Snapshot().
+ */
+export const SYNTHETIC_QUALIFIED_VALIDATION_RESULT: RaydiumAmmV4SnapshotValidationSuccess =
+  (await validateRaydiumAmmV4Snapshot(
+    CAPTURED_RAY_WSOL_IDENTITIES,
+    SYNTHETIC_QUALIFIED_RAW_PAYLOAD,
+    {
+      evidenceOrigin: "SYNTHETIC_FIXTURE",
+      isSyntheticFixture: true,
+      retrievedAtIso: "2026-10-27T06:35:11.779Z",
+    },
+  )) as RaydiumAmmV4SnapshotValidationSuccess;
+
+/**
+ * [SYNTHETIC TEST CONTEXT]:
+ * Synthetic qualified acquisition evidence wrapping the synthetic qualified validation result
+ * and its matching raw batch RPC payload.
+ */
+export const SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE: SnapshotAcquisitionEvidence =
+  buildSyntheticAcquisitionEvidence(
+    SYNTHETIC_QUALIFIED_VALIDATION_RESULT,
+    SYNTHETIC_QUALIFIED_RAW_PAYLOAD,
+  );
