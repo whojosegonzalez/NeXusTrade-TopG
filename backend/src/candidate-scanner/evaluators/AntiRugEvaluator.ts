@@ -24,7 +24,7 @@ export class AntiRugEvaluator {
     config: CandidateScannerRuntimeConfig,
   ): CandidateScannerFilterEvaluation {
     // 1. LP Burn / Lock check
-    if (pool.lpBurnPct < config.minLpBurnPct) {
+    if (pool.lpBurnPct === null || pool.lpBurnPct < config.minLpBurnPct) {
       return {
         filterName: "ANTI_RUG_LP_SECURITY",
         passed: false,

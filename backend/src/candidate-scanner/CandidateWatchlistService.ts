@@ -73,7 +73,7 @@ export class CandidateWatchlistService {
         liquidityUsd: pool.liquidityUsd,
         marketCapUsd: pool.marketCapUsd,
         lmcRatio,
-        lpBurnPct: pool.lpBurnPct,
+        lpBurnPct: pool.lpBurnPct ?? existing.lpBurnPct,
         assetAgeSeconds: ageSeconds,
         volume5mUsd: pool.volume5mUsd,
         buys5m: pool.buys5m,
@@ -93,7 +93,7 @@ export class CandidateWatchlistService {
     if (pool.liquidityUsd < this.config.minLiquidityUsd) {
       return null;
     }
-    if (pool.lpBurnPct < this.config.minLpBurnPct) {
+    if (pool.lpBurnPct === null || pool.lpBurnPct < this.config.minLpBurnPct) {
       return null;
     }
     if (pool.mintAuthority !== null || pool.freezeAuthority !== null) {
@@ -126,7 +126,7 @@ export class CandidateWatchlistService {
       liquidityUsd: pool.liquidityUsd,
       marketCapUsd: pool.marketCapUsd,
       lmcRatio,
-      lpBurnPct: pool.lpBurnPct,
+      lpBurnPct: pool.lpBurnPct ?? 0,
       assetAgeSeconds: ageSeconds,
       volume5mUsd: pool.volume5mUsd,
       buys5m: pool.buys5m,

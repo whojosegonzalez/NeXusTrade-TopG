@@ -686,7 +686,11 @@ export async function run(): Promise<void> {
             liquidityUsd: pool.liquidityUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
             marketCapUsd: pool.marketCapUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
             lmcRatio: pool.marketCapUsd > 0 && pool.liquidityUsd > 0 ? "DERIVED" : "UNAVAILABLE",
-            lpBurnPct: pool.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE",
+            lpBurnPct:
+              pool.metricProvenance?.lpBurnPct ??
+              (pool.lpBurnPct !== undefined && pool.lpBurnPct !== null
+                ? "OBSERVED"
+                : "UNAVAILABLE"),
             spotPriceUsd: pool.spotPriceUsd > 0 ? "OBSERVED" : "UNAVAILABLE",
             spotPriceSol:
               pool.spotPriceSol !== undefined && pool.spotPriceSol !== null && pool.spotPriceSol > 0
@@ -849,7 +853,10 @@ export async function run(): Promise<void> {
           candProv.marketCapUsd ?? (candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE");
 
         const provLpBurn: MetricProvenance =
-          candProv.lpBurnPct ?? (candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE");
+          candProv.lpBurnPct ??
+          (candidate.lpBurnPct !== undefined && candidate.lpBurnPct !== null
+            ? "OBSERVED"
+            : "UNAVAILABLE");
 
         const observedSpotUsd = spotUsd && spotUsd > 0 ? spotUsd : null;
         const observedSpotSol = spotSol && spotSol > 0 ? spotSol : null;
@@ -2109,7 +2116,9 @@ export async function run(): Promise<void> {
                             lmcRatio: candidate.marketCapUsd > 0 ? "DERIVED" : "UNAVAILABLE",
                             lpBurnPct:
                               candidate.metricProvenance?.lpBurnPct ??
-                              (candidate.lpBurnPct !== undefined ? "OBSERVED" : "UNAVAILABLE"),
+                              (candidate.lpBurnPct !== undefined && candidate.lpBurnPct !== null
+                                ? "OBSERVED"
+                                : "UNAVAILABLE"),
                             spotPriceUsd:
                               spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
                                 ? "OBSERVED"

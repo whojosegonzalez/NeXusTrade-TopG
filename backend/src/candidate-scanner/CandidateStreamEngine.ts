@@ -38,11 +38,49 @@ export interface CandidateLpEvidenceResolver {
 
 export type LpEvidenceResolver = CandidateLpEvidenceResolver | LpEvidenceResolverFn;
 
-export type LpBridgeEvaluator = (
-  candidate: Pick<ScannedPoolRecord, "poolId" | "mintAddress">,
-  evidence: ValidatedLpEvidenceInput,
-  freshnessPolicy: LpFreshnessPolicy,
-) => Promise<LpBridgeScreeningResult>;
+function snapshotScannedPoolRecord(pool: ScannedPoolRecord): ScannedPoolRecord {
+  return Object.freeze({
+    poolId: pool.poolId,
+    mintAddress: pool.mintAddress,
+    symbol: pool.symbol,
+    decimals: pool.decimals,
+    baseMint: pool.baseMint,
+    liquidityUsd: pool.liquidityUsd,
+    marketCapUsd: pool.marketCapUsd,
+    openTimeSec: pool.openTimeSec,
+    lpBurnPct: pool.lpBurnPct,
+    mintAuthority: pool.mintAuthority,
+    freezeAuthority: pool.freezeAuthority,
+    volume5mUsd: pool.volume5mUsd,
+    txCount5m: pool.txCount5m,
+    buys5m: pool.buys5m,
+    sells5m: pool.sells5m,
+    spotPriceUsd: pool.spotPriceUsd,
+    spotPriceSol: pool.spotPriceSol,
+    fetchedAt: pool.fetchedAt,
+    metricProvenance: pool.metricProvenance
+      ? Object.freeze({ ...pool.metricProvenance })
+      : undefined,
+    rawProviderLpBurnPct: pool.rawProviderLpBurnPct ?? pool.lpBurnPct,
+  });
+}
+
+function buildRejectionDecisionPool(
+  snapshotPool: ScannedPoolRecord,
+  identities?: { canonicalPoolId: string; canonicalMint: string } | null,
+): ScannedPoolRecord {
+  return Object.freeze({
+    ...snapshotPool,
+    poolId: identities ? identities.canonicalPoolId : snapshotPool.poolId,
+    mintAddress: identities ? identities.canonicalMint : snapshotPool.mintAddress,
+    lpBurnPct: null,
+    rawProviderLpBurnPct: snapshotPool.rawProviderLpBurnPct ?? snapshotPool.lpBurnPct,
+    metricProvenance: Object.freeze({
+      ...(snapshotPool.metricProvenance ?? {}),
+      lpBurnPct: "UNAVAILABLE",
+    }),
+  });
+}
 
 export interface CandidateStreamEngineOptions {
   readonly config: CandidateScannerRuntimeConfig;
@@ -74,11 +112,6 @@ export interface CandidateStreamEngineOptions {
    * Explicit freshness policy applied by the LP screening bridge.
    */
   readonly lpFreshnessPolicy?: LpFreshnessPolicy | undefined;
-
-  /**
-   * Optional injected bridge evaluator (defaults to evaluateLpScreeningBridge).
-   */
-  readonly lpBridgeEvaluator?: LpBridgeEvaluator | undefined;
 }
 
 export class CandidateStreamEngine {
@@ -95,7 +128,6 @@ export class CandidateStreamEngine {
   private readonly requireValidatedLp: boolean;
   private readonly lpEvidenceResolver?: LpEvidenceResolver | undefined;
   private readonly lpFreshnessPolicy?: LpFreshnessPolicy | undefined;
-  private readonly lpBridgeEvaluator: LpBridgeEvaluator;
   private readonly seenMints = new Set<string>();
 
   public readonly stats: CandidateScannerStreamStats & {
@@ -132,7 +164,6 @@ export class CandidateStreamEngine {
     this.requireValidatedLp = options.requireValidatedLp ?? false;
     this.lpEvidenceResolver = options.lpEvidenceResolver;
     this.lpFreshnessPolicy = options.lpFreshnessPolicy;
-    this.lpBridgeEvaluator = options.lpBridgeEvaluator ?? evaluateLpScreeningBridge;
 
     if (this.requireValidatedLp && this.lpFreshnessPolicy !== undefined) {
       validateLpFreshnessPolicy(this.lpFreshnessPolicy);
@@ -202,6 +233,9 @@ export class CandidateStreamEngine {
         evidence = await this.lpEvidenceResolver(candidate);
       } else {
         evidence = await this.lpEvidenceResolver.resolveLpEvidence(candidate);
+      }
+      if (evidence === null || evidence === undefined) {
+        return { ok: false, error: "LP evidence resolver returned null or undefined" };
       }
       return { ok: true, evidence };
     } catch (err) {
@@ -813,8 +847,16 @@ export class CandidateStreamEngine {
     this.stats.scannedPools++;
     this.stats.totalEvaluationsAttempted++;
 
+    // ------------------------------------------------------------------------
+    // 0. Capture immutable evaluation inputs before awaiting
+    // ------------------------------------------------------------------------
+    const snapshotPool = snapshotScannedPoolRecord(pool);
+    const snapshotPolicy = this.lpFreshnessPolicy
+      ? Object.freeze({ ...this.lpFreshnessPolicy })
+      : undefined;
+
     if (!this.requireValidatedLp) {
-      return this.evaluatePoolLegacy(pool, nowSec);
+      return this.evaluatePoolLegacy(snapshotPool, nowSec);
     }
 
     // ------------------------------------------------------------------------
@@ -822,7 +864,7 @@ export class CandidateStreamEngine {
     // ------------------------------------------------------------------------
 
     // 1. Identity Resolution & Boundary Verification
-    const identities = this.resolveCanonicalIdentities(pool);
+    const identities = this.resolveCanonicalIdentities(snapshotPool);
     if (!identities) {
       const filterEvaluation: CandidateScannerFilterEvaluation = {
         filterName: "ANTI_RUG_LP_SECURITY",
@@ -832,10 +874,12 @@ export class CandidateStreamEngine {
           status: "UNAVAILABLE",
           reason:
             "Candidate poolId or mintAddress is not a verified canonical Solana base58 identity, or illegal pool substitution detected",
-          poolId: pool.poolId,
-          mintAddress: pool.mintAddress,
+          poolId: snapshotPool.poolId,
+          mintAddress: snapshotPool.mintAddress,
         },
       };
+
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, null);
 
       return this.recordRejection(
         {
@@ -843,12 +887,12 @@ export class CandidateStreamEngine {
           primaryRejectionReason: "REJECTED_INVALID_POOL_METADATA",
           filterEvaluations: [filterEvaluation],
         },
-        pool,
+        rejectionDecisionPool,
       );
     }
 
     // 2. Freshness Policy Verification
-    if (!this.lpFreshnessPolicy) {
+    if (!snapshotPolicy) {
       const filterEvaluation: CandidateScannerFilterEvaluation = {
         filterName: "ANTI_RUG_LP_SECURITY",
         passed: false,
@@ -859,13 +903,15 @@ export class CandidateStreamEngine {
         },
       };
 
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
+
       return this.recordRejection(
         {
           admitted: false,
           primaryRejectionReason: "REJECTED_INVALID_POOL_METADATA",
           filterEvaluations: [filterEvaluation],
         },
-        pool,
+        rejectionDecisionPool,
       );
     }
 
@@ -876,16 +922,24 @@ export class CandidateStreamEngine {
     };
 
     const resolveResult = await this.invokeLpResolver(candidateIdentity);
-    if (!resolveResult.ok) {
+    if (
+      !resolveResult.ok ||
+      resolveResult.evidence === null ||
+      resolveResult.evidence === undefined
+    ) {
       const filterEvaluation: CandidateScannerFilterEvaluation = {
         filterName: "ANTI_RUG_LP_SECURITY",
         passed: false,
         reason: "REJECTED_UNLOCKED_LP_RISK",
         details: {
           status: "UNAVAILABLE",
-          reason: resolveResult.error,
+          reason: resolveResult.ok
+            ? "LP evidence resolver returned null or undefined"
+            : resolveResult.error,
         },
       };
+
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
 
       return this.recordRejection(
         {
@@ -893,25 +947,73 @@ export class CandidateStreamEngine {
           primaryRejectionReason: "REJECTED_UNLOCKED_LP_RISK",
           filterEvaluations: [filterEvaluation],
         },
-        pool,
+        rejectionDecisionPool,
       );
     }
 
-    // 4. Asynchronous Evaluation via Accepted LP Bridge
-    const bridgeResult = await this.lpBridgeEvaluator(
-      candidateIdentity,
-      resolveResult.evidence,
-      this.lpFreshnessPolicy,
-    );
+    // 4. Asynchronous Evaluation via Accepted LP Bridge (Always runs accepted bridge; gate overrides removed)
+    let bridgeResult: LpBridgeScreeningResult;
+    try {
+      bridgeResult = await evaluateLpScreeningBridge(
+        candidateIdentity,
+        resolveResult.evidence,
+        snapshotPolicy,
+      );
+    } catch (bridgeErr) {
+      const filterEvaluation: CandidateScannerFilterEvaluation = {
+        filterName: "ANTI_RUG_LP_SECURITY",
+        passed: false,
+        reason: "REJECTED_UNLOCKED_LP_RISK",
+        details: {
+          status: "INVALID_EVIDENCE",
+          reason: `LP bridge evaluation threw an unexpected error: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`,
+        },
+      };
+
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
+
+      return this.recordRejection(
+        {
+          admitted: false,
+          primaryRejectionReason: "REJECTED_UNLOCKED_LP_RISK",
+          filterEvaluations: [filterEvaluation],
+        },
+        rejectionDecisionPool,
+      );
+    }
 
     // 5. Projection Guard
     const canonicalPoolRecord: ScannedPoolRecord = {
-      ...pool,
+      ...snapshotPool,
       poolId: identities.canonicalPoolId,
       mintAddress: identities.canonicalMint,
     };
 
-    const projection = projectBridgedLpPool(canonicalPoolRecord, bridgeResult);
+    let projection: ReturnType<typeof projectBridgedLpPool>;
+    try {
+      projection = projectBridgedLpPool(canonicalPoolRecord, bridgeResult);
+    } catch (projErr) {
+      const filterEvaluation: CandidateScannerFilterEvaluation = {
+        filterName: "ANTI_RUG_LP_SECURITY",
+        passed: false,
+        reason: "REJECTED_UNLOCKED_LP_RISK",
+        details: {
+          status: "INVALID_EVIDENCE",
+          reason: `LP bridge projection threw an unexpected error: ${projErr instanceof Error ? projErr.message : String(projErr)}`,
+        },
+      };
+
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
+
+      return this.recordRejection(
+        {
+          admitted: false,
+          primaryRejectionReason: "REJECTED_UNLOCKED_LP_RISK",
+          filterEvaluations: [filterEvaluation],
+        },
+        rejectionDecisionPool,
+      );
+    }
 
     // 6. Handle Non-Passing LP Bridge Outcomes
     if (!projection.ok) {
@@ -923,19 +1025,21 @@ export class CandidateStreamEngine {
             primaryRejectionReason: "REJECTED_UNLOCKED_LP_RISK",
             filterEvaluations: [bridgeResult.filterEvaluation],
           },
-          projection.pool, // Preserves DERIVED lpBurnPct: 0.135682%
+          projection.pool, // Preserves DERIVED lpBurnPct: 0.135682% and rawProviderLpBurnPct
         );
       }
 
       // Unavailable, Stale, Invalid, or Mismatched evidence
       // Respect null pool projection: DO NOT manufacture a numeric LP value
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
+
       return this.recordRejection(
         {
           admitted: false,
           primaryRejectionReason: projection.failureReason,
           filterEvaluations: [bridgeResult.filterEvaluation],
         },
-        pool, // Pass candidate for context without manufacturing lpBurnPct
+        rejectionDecisionPool,
       );
     }
 
@@ -1023,6 +1127,7 @@ export class CandidateStreamEngine {
       case "REJECTED_UNLOCKED_LP_RISK":
       case "REJECTED_ACTIVE_MINT_AUTHORITY":
       case "REJECTED_ACTIVE_FREEZE_AUTHORITY":
+      case "REJECTED_INVALID_POOL_METADATA":
         this.stats.rejectedRug++;
         break;
       case "REJECTED_INSUFFICIENT_TRANSACTION_COUNT":
@@ -1078,6 +1183,7 @@ export class CandidateStreamEngine {
         case "REJECTED_UNLOCKED_LP_RISK":
         case "REJECTED_ACTIVE_MINT_AUTHORITY":
         case "REJECTED_ACTIVE_FREEZE_AUTHORITY":
+        case "REJECTED_INVALID_POOL_METADATA":
           this.stats.rejectedRug++;
           break;
         case "REJECTED_INSUFFICIENT_TRANSACTION_COUNT":
@@ -1097,10 +1203,14 @@ export class CandidateStreamEngine {
     pool: ScannedPoolRecord,
     nowSec: number = Math.floor(Date.now() / 1000),
   ): CandidateScannerEvaluationResult {
+    this.stats.scannedPools++;
+    this.stats.totalEvaluationsAttempted++;
+
+    const snapshotPool = snapshotScannedPoolRecord(pool);
+
     if (this.requireValidatedLp) {
       // In validated-LP mode, synchronous evaluation cannot validate LP evidence and must fail closed.
-      this.stats.scannedPools++;
-      this.stats.totalEvaluationsAttempted++;
+      const identities = this.resolveCanonicalIdentities(snapshotPool);
       const filterEvaluation: CandidateScannerFilterEvaluation = {
         filterName: "ANTI_RUG_LP_SECURITY",
         passed: false,
@@ -1112,19 +1222,19 @@ export class CandidateStreamEngine {
         },
       };
 
+      const rejectionDecisionPool = buildRejectionDecisionPool(snapshotPool, identities);
+
       return this.recordRejection(
         {
           admitted: false,
           primaryRejectionReason: "REJECTED_UNLOCKED_LP_RISK",
           filterEvaluations: [filterEvaluation],
         },
-        pool,
+        rejectionDecisionPool,
       );
     }
 
-    this.stats.scannedPools++;
-    this.stats.totalEvaluationsAttempted++;
-    return this.evaluatePoolLegacy(pool, nowSec);
+    return this.evaluatePoolLegacy(snapshotPool, nowSec);
   }
 
   public async scanOnce(
@@ -1144,7 +1254,12 @@ export class CandidateStreamEngine {
       if (this.seenMints.has(pool.mintAddress)) {
         continue;
       }
-      results.push(await this.evaluatePoolAsync(pool, nowSec));
+      try {
+        results.push(await this.evaluatePoolAsync(pool, nowSec));
+      } catch (err) {
+        this.stats.errors++;
+        console.error("[CandidateStreamEngine] Unexpected error evaluating pool:", err);
+      }
     }
 
     return results;

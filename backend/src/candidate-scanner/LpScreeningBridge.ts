@@ -1160,6 +1160,13 @@ async function evaluateAcquisitionEvidenceAsync(
       "Acquisition evidence lacks a verified successful validationResult assertion",
     );
   }
+  const valDiag = valRes.diagnostics as Record<string, unknown> | undefined;
+  if (!valDiag || typeof valDiag !== "object") {
+    return buildInvalidEvidenceResult(
+      evaluatedCandidate,
+      "Acquisition evidence validationResult is missing valid diagnostics object",
+    );
+  }
 
   const acqAcc = acq.accounting as unknown as Record<string, unknown> | undefined;
   if (!acqAcc || typeof acqAcc !== "object" || acqAcc.ok !== true) {
@@ -1290,8 +1297,13 @@ async function evaluateAcquisitionEvidenceAsync(
 
   // 7. Validate through accepted validator
   const identities: RaydiumAmmV4SnapshotIdentities = acq.discoveredIdentities ??
-    (acq.validationResult && acq.validationResult.ok
-      ? acq.validationResult.diagnostics.requestedIdentities
+    (acq.validationResult &&
+    typeof acq.validationResult === "object" &&
+    acq.validationResult.ok === true &&
+    acq.validationResult.diagnostics &&
+    typeof acq.validationResult.diagnostics === "object"
+      ? ((acq.validationResult.diagnostics as Record<string, unknown>)
+          .requestedIdentities as RaydiumAmmV4SnapshotIdentities)
       : null) ?? {
       poolId: candPoolId,
       lpMint: "",
@@ -1325,7 +1337,13 @@ async function evaluateAcquisitionEvidenceAsync(
   const recordedSlot = revalidated.diagnostics.slot;
   const acqBatchSlot = acq.contextSlots?.batchSlot;
   const valResultSlot =
-    acq.validationResult && acq.validationResult.ok ? acq.validationResult.diagnostics.slot : null;
+    acq.validationResult &&
+    typeof acq.validationResult === "object" &&
+    acq.validationResult.ok === true &&
+    acq.validationResult.diagnostics &&
+    typeof acq.validationResult.diagnostics === "object"
+      ? (acq.validationResult.diagnostics as Record<string, unknown>).slot
+      : null;
 
   if (acqBatchSlot !== undefined && acqBatchSlot !== recordedSlot) {
     return buildInvalidEvidenceResult(
@@ -1699,6 +1717,7 @@ export function projectBridgedLpPool(
       pool: {
         ...candidate,
         lpBurnPct: bridgeResult.lpBurnPct,
+        rawProviderLpBurnPct: candidate.rawProviderLpBurnPct ?? candidate.lpBurnPct,
         metricProvenance: {
           ...candidate.metricProvenance,
           lpBurnPct: "DERIVED",
@@ -1716,6 +1735,7 @@ export function projectBridgedLpPool(
       pool: {
         ...candidate,
         lpBurnPct: bridgeResult.lpBurnPct,
+        rawProviderLpBurnPct: candidate.rawProviderLpBurnPct ?? candidate.lpBurnPct,
         metricProvenance: {
           ...candidate.metricProvenance,
           lpBurnPct: "DERIVED",

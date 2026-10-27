@@ -1,14 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseCandidateScannerConfigArgs } from "./CandidateScannerConfig.js";
-import { CandidateStreamEngine } from "./CandidateStreamEngine.js";
-import type { CandidateScannerCandidate, ScannedPoolRecord } from "./CandidateScannerTypes.js";
+import {
+  CandidateStreamEngine,
+  type CandidateStreamEngineOptions,
+} from "./CandidateStreamEngine.js";
+import type {
+  CandidateScannerCandidate,
+  CandidateScannerEvaluationResult,
+  ScannedPoolRecord,
+} from "./CandidateScannerTypes.js";
 import {
   CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
   CAPTURED_RAY_WSOL_IDENTITIES,
   createSyntheticRayCandidatePool,
   SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE,
 } from "./fixtures/CapturedRaydiumAmmV4SnapshotFixture.js";
-import type { LpFreshnessPolicy } from "./LpScreeningBridge.js";
+import type { LpFreshnessPolicy, ValidatedLpEvidenceInput } from "./LpScreeningBridge.js";
 
 describe("CandidateStreamEngine", () => {
   const config = parseCandidateScannerConfigArgs([]);
@@ -399,7 +406,7 @@ describe("CandidateStreamEngine", () => {
 
     it("rejects captured RAY/WSOL evidence with below-threshold LP rejection (0.135682% < 90%)", async () => {
       const admitted: CandidateScannerCandidate[] = [];
-      const decisions: Array<{ status: string; admitted: boolean }> = [];
+      const decisions: Array<{ status: string; admitted: boolean; pool: ScannedPoolRecord }> = [];
 
       const engine = new CandidateStreamEngine({
         config,
@@ -407,10 +414,11 @@ describe("CandidateStreamEngine", () => {
         lpEvidenceResolver: async () => CAPTURED_RAY_WSOL_FULL_ACQUISITION_EVIDENCE,
         lpFreshnessPolicy: freshnessPolicy,
         onCandidate: (c) => admitted.push(c),
-        onDecision: (evalResult) => {
+        onDecision: (evalResult, pool) => {
           decisions.push({
             status: String(evalResult.filterEvaluations[0]?.details?.status ?? "UNKNOWN"),
             admitted: evalResult.admitted,
+            pool,
           });
         },
       });
@@ -424,6 +432,7 @@ describe("CandidateStreamEngine", () => {
         txCount5m: 30,
         buys5m: 18,
         sells5m: 12,
+        lpBurnPct: 100.0,
       });
 
       const evalResult = await engine.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
@@ -443,6 +452,10 @@ describe("CandidateStreamEngine", () => {
       expect(decisions.length).toBe(1);
       expect(decisions[0]?.status).toBe("AVAILABLE_BELOW_THRESHOLD");
       expect(decisions[0]?.admitted).toBe(false);
+      // Callback assertions: real measurement preserved with DERIVED provenance
+      expect(decisions[0]?.pool.lpBurnPct).toBeCloseTo(0.135682, 4);
+      expect(decisions[0]?.pool.metricProvenance?.lpBurnPct).toBe("DERIVED");
+      expect(decisions[0]?.pool.rawProviderLpBurnPct).toBe(100.0);
       expect(engine.stats.rejectedRug).toBe(1);
       expect(engine.stats.admittedCandidates).toBe(0);
     });
@@ -554,6 +567,10 @@ describe("CandidateStreamEngine", () => {
 
     it("fails closed when lpEvidenceResolver is missing in validated-LP mode", async () => {
       const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
 
       const engine = new CandidateStreamEngine({
         config,
@@ -561,10 +578,14 @@ describe("CandidateStreamEngine", () => {
         // No resolver provided
         lpFreshnessPolicy: freshnessPolicy,
         onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ evalResult, pool });
+        },
       });
 
       const pool = createSyntheticRayCandidatePool({
         openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        lpBurnPct: 100.0,
       });
 
       const evalResult = await engine.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
@@ -573,10 +594,20 @@ describe("CandidateStreamEngine", () => {
       expect(evalResult.primaryRejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
       expect(evalResult.filterEvaluations[0]?.details?.status).toBe("UNAVAILABLE");
       expect(admitted.length).toBe(0);
+
+      // Decision callback receives safe nullable LP decision view
+      expect(recordedDecisions.length).toBe(1);
+      expect(recordedDecisions[0]?.pool.lpBurnPct).toBeNull();
+      expect(recordedDecisions[0]?.pool.metricProvenance?.lpBurnPct).toBe("UNAVAILABLE");
+      expect(recordedDecisions[0]?.pool.rawProviderLpBurnPct).toBe(100.0);
     });
 
     it("fails closed when resolver returns null evidence", async () => {
       const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
 
       const engine = new CandidateStreamEngine({
         config,
@@ -584,10 +615,14 @@ describe("CandidateStreamEngine", () => {
         lpEvidenceResolver: async () => null,
         lpFreshnessPolicy: freshnessPolicy,
         onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ evalResult, pool });
+        },
       });
 
       const pool = createSyntheticRayCandidatePool({
         openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        lpBurnPct: 100.0,
       });
 
       const evalResult = await engine.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
@@ -596,6 +631,12 @@ describe("CandidateStreamEngine", () => {
       expect(evalResult.primaryRejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
       expect(evalResult.filterEvaluations[0]?.details?.status).toBe("UNAVAILABLE");
       expect(admitted.length).toBe(0);
+
+      // Decision callback receives safe nullable LP decision view
+      expect(recordedDecisions.length).toBe(1);
+      expect(recordedDecisions[0]?.pool.lpBurnPct).toBeNull();
+      expect(recordedDecisions[0]?.pool.metricProvenance?.lpBurnPct).toBe("UNAVAILABLE");
+      expect(recordedDecisions[0]?.pool.rawProviderLpBurnPct).toBe(100.0);
     });
 
     it("fails closed when LP evidence is stale", async () => {
@@ -826,6 +867,303 @@ describe("CandidateStreamEngine", () => {
       expect(result.primaryRejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
       expect(result.filterEvaluations[0]?.details?.status).toBe("UNAVAILABLE");
       expect(admitted.length).toBe(0);
+    });
+
+    it("proves missing evidence cannot qualify through an alternate evaluator or gate override", async () => {
+      const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
+
+      // Attempting to bypass by passing resolver returning null and attempting an override
+      const engineOptions: CandidateStreamEngineOptions = {
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async () => null,
+        lpFreshnessPolicy: freshnessPolicy,
+        onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ evalResult, pool });
+        },
+      };
+
+      // Even if an adversary injects an arbitrary bypass property at runtime:
+      (engineOptions as unknown as Record<string, unknown>).lpBridgeEvaluator = async () => ({
+        ok: true,
+        status: "AVAILABLE_QUALIFIED",
+        lpBurnPct: 99.9,
+        retrievedAtIso: new Date(CAPTURED_REPLAY_TIME_MS).toISOString(),
+        contextSlot: 461970878,
+        evidenceOrigin: "CAPTURED_RPC",
+        isSyntheticFixture: false,
+        metricProvenance: "DERIVED",
+        filterEvaluation: {
+          filterName: "ANTI_RUG_LP_SECURITY",
+          passed: true,
+          details: { status: "AVAILABLE_QUALIFIED", lpBurnPct: 99.9 },
+        },
+        evidenceBoundary: { strategyGateAdmitted: true },
+      });
+
+      const engine = new CandidateStreamEngine(engineOptions);
+
+      const pool = createSyntheticRayCandidatePool({
+        openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        lpBurnPct: 100.0,
+      });
+
+      const evalResult = await engine.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
+
+      // Must fail closed; cannot qualify
+      expect(evalResult.admitted).toBe(false);
+      expect(evalResult.primaryRejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+      expect(evalResult.filterEvaluations[0]?.details?.status).toBe("UNAVAILABLE");
+      expect(admitted.length).toBe(0);
+      expect(engine.stats.admittedCandidates).toBe(0);
+      expect(recordedDecisions.length).toBe(1);
+      expect(recordedDecisions[0]?.pool.lpBurnPct).toBeNull();
+      expect(recordedDecisions[0]?.pool.metricProvenance?.lpBurnPct).toBe("UNAVAILABLE");
+    });
+
+    it("proves caller mutation during async resolution cannot alter original screening outcome", async () => {
+      const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
+
+      // Initial pool has liquidityUsd = 1 (far below minLiquidityUsd = $5,000)
+      const mutablePool = {
+        ...createSyntheticRayCandidatePool({
+          openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+          liquidityUsd: 1, // Below minimum threshold
+          marketCapUsd: 100_000,
+          volume5mUsd: 5000,
+          txCount5m: 30,
+          buys5m: 18,
+          sells5m: 12,
+        }),
+      };
+
+      const engine = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async () => {
+          // Simulate latency and caller mutating the pool while LP resolution is pending
+          await new Promise((r) => setTimeout(r, 10));
+          (mutablePool as { liquidityUsd: number }).liquidityUsd = 125_000; // Mutated to pass
+          (mutablePool as { marketCapUsd: number }).marketCapUsd = 500_000;
+          return SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE;
+        },
+        lpFreshnessPolicy: freshnessPolicy,
+        onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ evalResult, pool });
+        },
+      });
+
+      const evalResult = await engine.evaluatePoolAsync(mutablePool, CAPTURED_REPLAY_NOW_SEC);
+
+      // Must reject because evaluation captured liquidityUsd = 1 at the beginning
+      expect(evalResult.admitted).toBe(false);
+      expect(evalResult.primaryRejectionReason).toBe("REJECTED_IMBALANCED_LIQUIDITY_DEPTH");
+      expect(admitted.length).toBe(0);
+      expect(engine.stats.admittedCandidates).toBe(0);
+      expect(engine.stats.rejectedLmc).toBe(1);
+
+      // Decision callback must receive the snapshot with liquidityUsd = 1, NOT 125,000
+      expect(recordedDecisions.length).toBe(1);
+      expect(recordedDecisions[0]?.pool.liquidityUsd).toBe(1);
+    });
+
+    it("contains malformed validationResult at intake boundary without throwing and produces structured rejection", async () => {
+      const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
+
+      // Construct acquisition object with malformed validationResult (e.g. ok: true but missing diagnostics)
+      const malformedAcquisition = {
+        ...SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE,
+        validationResult: {
+          ok: true,
+          // Missing diagnostics object entirely (reproducing auditor's TypeError on diagnostics.slot)
+        },
+      };
+
+      const engine = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async () => malformedAcquisition as unknown as ValidatedLpEvidenceInput,
+        lpFreshnessPolicy: freshnessPolicy,
+        onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ evalResult, pool });
+        },
+      });
+
+      const pool = createSyntheticRayCandidatePool({
+        openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+      });
+
+      // Must not throw!
+      const evalResult = await engine.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
+
+      expect(evalResult.admitted).toBe(false);
+      expect(evalResult.primaryRejectionReason).toBe("REJECTED_INVALID_POOL_METADATA");
+      expect(evalResult.filterEvaluations[0]?.details?.status).toBe("INVALID_EVIDENCE");
+      expect(admitted.length).toBe(0);
+      expect(engine.stats.admittedCandidates).toBe(0);
+      expect(engine.stats.rejectedRug).toBe(1);
+
+      // Exactly one rejection callback with safe nullable LP
+      expect(recordedDecisions.length).toBe(1);
+      expect(recordedDecisions[0]?.evalResult.admitted).toBe(false);
+      expect(recordedDecisions[0]?.pool.lpBurnPct).toBeNull();
+      expect(recordedDecisions[0]?.pool.metricProvenance?.lpBurnPct).toBe("UNAVAILABLE");
+    });
+
+    it("continues processing subsequent candidates in scanOnce after encountering a candidate with malformed evidence", async () => {
+      const admitted: CandidateScannerCandidate[] = [];
+      const recordedDecisions: Array<{ mint: string; admitted: boolean }> = [];
+
+      const candidate1Mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+      const candidate2Mint = CAPTURED_RAY_WSOL_IDENTITIES.expectedTokenMint!; // RAY (matches SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE)
+
+      // Pool 1 has malformed evidence
+      const malformedAcquisition = {
+        ...SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE,
+        validationResult: { ok: true }, // Malformed!
+      };
+
+      const engine = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async (cand) => {
+          if (cand.mintAddress === candidate1Mint) {
+            return malformedAcquisition as unknown as ValidatedLpEvidenceInput;
+          }
+          return SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE;
+        },
+        lpFreshnessPolicy: freshnessPolicy,
+        onCandidate: (c) => admitted.push(c),
+        onDecision: (evalResult, pool) => {
+          recordedDecisions.push({ mint: pool.mintAddress, admitted: evalResult.admitted });
+        },
+      });
+
+      const pool1 = createSyntheticRayCandidatePool({
+        mintAddress: candidate1Mint,
+        openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+      });
+
+      const pool2 = createSyntheticRayCandidatePool({
+        mintAddress: candidate2Mint,
+        openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        mintAuthority: null,
+        freezeAuthority: null,
+      });
+
+      // Mock fetchRawPools by mocking fetchRaydiumPools
+      vi.spyOn(engine, "fetchRaydiumPools").mockResolvedValue([pool1, pool2]);
+      vi.spyOn(engine, "fetchDexScreenerPools").mockResolvedValue([]);
+      vi.spyOn(engine, "fetchDexScreenerBoostedPools").mockResolvedValue([]);
+      vi.spyOn(engine, "fetchRaydiumTopTradedPools").mockResolvedValue([]);
+      vi.spyOn(engine, "fetchDexScreenerRecentUpdates").mockResolvedValue([]);
+
+      const results = await engine.scanOnce(CAPTURED_REPLAY_NOW_SEC);
+
+      expect(results.length).toBe(2);
+      expect(results[0]?.admitted).toBe(false);
+      expect(results[1]?.admitted).toBe(true);
+      expect(admitted.length).toBe(1);
+      expect(admitted[0]?.canonicalMint).toBe(candidate2Mint);
+      expect(recordedDecisions.length).toBe(2);
+      expect(recordedDecisions[0]?.mint).toBe(candidate1Mint);
+      expect(recordedDecisions[0]?.admitted).toBe(false);
+      expect(recordedDecisions[1]?.mint).toBe(candidate2Mint);
+      expect(recordedDecisions[1]?.admitted).toBe(true);
+      expect(engine.stats.scannedPools).toBe(2);
+      expect(engine.stats.rejectedRug).toBe(1);
+      expect(engine.stats.admittedCandidates).toBe(1);
+    });
+
+    it("preserves unavailable LP semantics (lpBurnPct: null, UNAVAILABLE provenance) and separates raw provider context in callbacks", async () => {
+      const callbacks: Array<{
+        name: string;
+        evalResult: CandidateScannerEvaluationResult;
+        pool: ScannedPoolRecord;
+      }> = [];
+
+      const pool = createSyntheticRayCandidatePool({
+        openTimeSec: CAPTURED_REPLAY_NOW_SEC - 600,
+        lpBurnPct: 100.0, // Original provider percentage
+        metricProvenance: {
+          lpBurnPct: "OBSERVED",
+          liquidityUsd: "OBSERVED",
+          marketCapUsd: "OBSERVED",
+        },
+      });
+
+      // 1. Missing resolver
+      const engineMissingResolver = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpFreshnessPolicy: freshnessPolicy,
+        onDecision: (evalResult, p) =>
+          callbacks.push({ name: "missingResolver", evalResult, pool: p }),
+      });
+      await engineMissingResolver.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
+
+      // 2. Resolver returning null
+      const engineNullEvidence = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async () => null,
+        lpFreshnessPolicy: freshnessPolicy,
+        onDecision: (evalResult, p) =>
+          callbacks.push({ name: "nullEvidence", evalResult, pool: p }),
+      });
+      await engineNullEvidence.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
+
+      // 3. Stale evidence
+      const engineStale = new CandidateStreamEngine({
+        config,
+        requireValidatedLp: true,
+        lpEvidenceResolver: async () => SYNTHETIC_QUALIFIED_ACQUISITION_EVIDENCE,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: CAPTURED_REPLAY_TIME_MS + 120_000, // Stale!
+          clockSkewToleranceMs: 5000,
+        },
+        onDecision: (evalResult, p) =>
+          callbacks.push({ name: "staleEvidence", evalResult, pool: p }),
+      });
+      await engineStale.evaluatePoolAsync(pool, CAPTURED_REPLAY_NOW_SEC);
+
+      expect(callbacks.length).toBe(3);
+      for (const cb of callbacks) {
+        expect(cb.evalResult.admitted).toBe(false);
+        // The decision's LP measurement must be null (never exposed as 100)
+        expect(cb.pool.lpBurnPct).toBeNull();
+        // Provenance must be UNAVAILABLE
+        expect(cb.pool.metricProvenance?.lpBurnPct).toBe("UNAVAILABLE");
+        // Raw provider percentage must be clearly separated
+        expect(cb.pool.rawProviderLpBurnPct).toBe(100.0);
+        // Candidate identities must be preserved
+        expect(cb.pool.mintAddress).toBe(pool.mintAddress);
+        expect(cb.pool.poolId).toBe(pool.poolId);
+      }
     });
   });
 });

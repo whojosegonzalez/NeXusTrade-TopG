@@ -19,7 +19,7 @@ export interface ScannedPoolRecord {
   readonly liquidityUsd: number;
   readonly marketCapUsd: number;
   readonly openTimeSec: number;
-  readonly lpBurnPct: number;
+  readonly lpBurnPct: number | null;
   readonly mintAuthority: string | null;
   readonly freezeAuthority: string | null;
   readonly volume5mUsd: number;
@@ -32,6 +32,7 @@ export interface ScannedPoolRecord {
   readonly metricProvenance?:
     | Record<string, "OBSERVED" | "DERIVED" | "PLACEHOLDER" | "UNAVAILABLE">
     | undefined;
+  readonly rawProviderLpBurnPct?: number | null | undefined;
 }
 
 export interface CandidateScannerFilterEvaluation {
@@ -50,7 +51,7 @@ export interface CandidateScannerCandidate {
   readonly liquidityUsd: number;
   readonly marketCapUsd: number;
   readonly lmcRatio: number;
-  readonly lpBurnPct: number;
+  readonly lpBurnPct: number | null;
   readonly spotPriceUsd: number;
   readonly filterEvaluations: readonly CandidateScannerFilterEvaluation[];
   readonly metricProvenance?:

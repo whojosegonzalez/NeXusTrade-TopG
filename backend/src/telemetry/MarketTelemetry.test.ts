@@ -347,7 +347,7 @@ describe("Phase 12.94-B Market Telemetry Engine", () => {
                   id: p.poolId,
                   openTime: p.openTimeSec,
                   tvl: p.liquidityUsd,
-                  burnPercent: p.lpBurnPct / 100,
+                  burnPercent: (p.lpBurnPct ?? 0) / 100,
                   mintA: { address: p.mintAddress, symbol: p.symbol, decimals: p.decimals },
                   mintB: {
                     address: "So11111111111111111111111111111111111111112",
