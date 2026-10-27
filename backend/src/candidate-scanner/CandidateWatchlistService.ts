@@ -41,13 +41,22 @@ export class CandidateWatchlistService {
         ? 3600
         : this.config.maxWatchlistAgeSec;
 
+    const isLpEligible =
+      typeof pool.lpBurnPct === "number" &&
+      Number.isFinite(pool.lpBurnPct) &&
+      pool.lpBurnPct >= this.config.minLpBurnPct;
+
     const existing = this.items.get(pool.poolId);
     if (existing) {
-      // Check if age expired while on watchlist
+      // Check if age expired while on watchlist or if LP eligibility fails
       let updatedStatus = existing.status;
       let rejectionReason = existing.rejectionReason;
 
-      if (existing.status === "WATCHING" && ageSeconds > effectiveMaxAgeSec) {
+      if (!isLpEligible) {
+        // Missing, invalid, or below-threshold current LP data explicitly deactivates existing entry
+        updatedStatus = "DROPPED";
+        rejectionReason = "REJECTED_UNLOCKED_LP_RISK";
+      } else if (existing.status === "WATCHING" && ageSeconds > effectiveMaxAgeSec) {
         updatedStatus = "DROPPED";
         rejectionReason =
           pool.liquidityUsd >= 50000 && ageSeconds > 7200
@@ -56,7 +65,7 @@ export class CandidateWatchlistService {
               ? "EXCEEDED_MAX_WATCHLIST_AGE_60M"
               : "EXCEEDED_MAX_WATCHLIST_AGE_20M";
       } else if (existing.status === "DROPPED") {
-        // Check for fresh bullish reversal / dip-bounce
+        // Check for fresh bullish reversal / dip-bounce (only allowed if LP is qualifying)
         if (
           pool.buys5m >= 25 &&
           pool.buys5m / Math.max(1, pool.sells5m) >= 1.8 &&
@@ -68,12 +77,16 @@ export class CandidateWatchlistService {
         }
       }
 
+      const historicalLpBurnPct =
+        existing.lpBurnPct !== null ? existing.lpBurnPct : (existing.historicalLpBurnPct ?? null);
+
       const updated: WatchlistCandidateItem = {
         ...existing,
         liquidityUsd: pool.liquidityUsd,
         marketCapUsd: pool.marketCapUsd,
         lmcRatio,
-        lpBurnPct: pool.lpBurnPct ?? existing.lpBurnPct,
+        lpBurnPct: pool.lpBurnPct,
+        historicalLpBurnPct,
         assetAgeSeconds: ageSeconds,
         volume5mUsd: pool.volume5mUsd,
         buys5m: pool.buys5m,
@@ -93,7 +106,7 @@ export class CandidateWatchlistService {
     if (pool.liquidityUsd < this.config.minLiquidityUsd) {
       return null;
     }
-    if (pool.lpBurnPct === null || pool.lpBurnPct < this.config.minLpBurnPct) {
+    if (!isLpEligible) {
       return null;
     }
     if (pool.mintAuthority !== null || pool.freezeAuthority !== null) {
@@ -126,7 +139,8 @@ export class CandidateWatchlistService {
       liquidityUsd: pool.liquidityUsd,
       marketCapUsd: pool.marketCapUsd,
       lmcRatio,
-      lpBurnPct: pool.lpBurnPct ?? 0,
+      lpBurnPct: pool.lpBurnPct,
+      historicalLpBurnPct: null,
       assetAgeSeconds: ageSeconds,
       volume5mUsd: pool.volume5mUsd,
       buys5m: pool.buys5m,
@@ -148,6 +162,14 @@ export class CandidateWatchlistService {
 
   public getActiveWatchingItems(): readonly WatchlistCandidateItem[] {
     return Array.from(this.items.values()).filter((item) => item.status === "WATCHING");
+  }
+
+  public getActiveWatchlist(): readonly WatchlistCandidateItem[] {
+    return this.getActiveWatchingItems();
+  }
+
+  public getActiveCandidates(): readonly WatchlistCandidateItem[] {
+    return this.getActiveWatchingItems();
   }
 
   public getItem(poolId: string): WatchlistCandidateItem | undefined {

@@ -782,7 +782,7 @@ export async function run(): Promise<void> {
         liquidityUsd: number;
         marketCapUsd: number;
         assetAgeSeconds: number;
-        lpBurnPct?: number;
+        lpBurnPct?: number | null;
         volume5mUsd?: number;
         buys5m: number;
         sells5m: number;

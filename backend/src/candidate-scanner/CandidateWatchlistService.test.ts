@@ -213,4 +213,122 @@ describe("CandidateWatchlistService", () => {
     expect(droppedAt3700[0]?.status).toBe("DROPPED");
     expect(droppedAt3700[0]?.rejectionReason).toBe("EXCEEDED_MAX_ESTABLISHED_AGE_2H");
   });
+
+  describe("LP eligibility enforcement and deactivation regressions", () => {
+    it("deactivates WATCHING entry to DROPPED when current LP becomes unavailable (lpBurnPct: null)", () => {
+      const service = new CandidateWatchlistService();
+      const initial = service.admitOrUpdate(validPool, nowSec);
+      expect(initial?.status).toBe("WATCHING");
+      expect(initial?.lpBurnPct).toBe(99.0);
+      expect(service.getActiveWatchlist().length).toBe(1);
+
+      // Subsequent scan provides null LP (unavailable/unverified)
+      const unavailableLpPool: ScannedPoolRecord = {
+        ...validPool,
+        lpBurnPct: null,
+        metricProvenance: {
+          lpBurnPct: "UNAVAILABLE",
+        },
+      };
+
+      const updated = service.admitOrUpdate(unavailableLpPool, nowSec + 30);
+      expect(updated).not.toBeNull();
+      expect(updated?.status).toBe("DROPPED");
+      expect(updated?.rejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+      expect(updated?.lpBurnPct).toBeNull();
+      expect(updated?.historicalLpBurnPct).toBe(99.0);
+
+      // Verify active-watchlist exclusion across all accessors
+      expect(service.getActiveWatchingItems()).toHaveLength(0);
+      expect(service.getActiveWatchlist()).toHaveLength(0);
+      expect(service.getActiveCandidates()).toHaveLength(0);
+    });
+
+    it("prevents resurrection of DROPPED entry when current LP is null despite strong bullish flow", () => {
+      const service = new CandidateWatchlistService();
+      service.admitOrUpdate(validPool, nowSec);
+
+      // Transition to DROPPED
+      service.updateStatus(validPool.poolId, "DROPPED", "MOMENTUM_STALLED");
+      expect(service.getItem(validPool.poolId)?.status).toBe("DROPPED");
+
+      // Attempt resurrection with strong bullish flow but unavailable LP
+      const bullishFlowUnavailableLp: ScannedPoolRecord = {
+        ...validPool,
+        lpBurnPct: null,
+        buys5m: 35,
+        sells5m: 5,
+        volume5mUsd: 12_000,
+        metricProvenance: {
+          lpBurnPct: "UNAVAILABLE",
+        },
+      };
+
+      const updated = service.admitOrUpdate(bullishFlowUnavailableLp, nowSec + 60);
+      expect(updated).not.toBeNull();
+      expect(updated?.status).toBe("DROPPED");
+      expect(updated?.rejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+      expect(updated?.lpBurnPct).toBeNull();
+      expect(updated?.historicalLpBurnPct).toBe(99.0);
+
+      // Verify active-watchlist exclusion across all accessors
+      expect(service.getActiveWatchingItems()).toHaveLength(0);
+      expect(service.getActiveWatchlist()).toHaveLength(0);
+      expect(service.getActiveCandidates()).toHaveLength(0);
+    });
+
+    it("deactivates existing entry when observed LP is below threshold (0.135682% < 90%)", () => {
+      const service = new CandidateWatchlistService();
+      service.admitOrUpdate(validPool, nowSec);
+      expect(service.getActiveWatchlist().length).toBe(1);
+
+      // Observed below-threshold Raydium LP result
+      const belowThresholdPool: ScannedPoolRecord = {
+        ...validPool,
+        lpBurnPct: 0.135682,
+        metricProvenance: {
+          lpBurnPct: "DERIVED",
+        },
+      };
+
+      const updated = service.admitOrUpdate(belowThresholdPool, nowSec + 30);
+      expect(updated).not.toBeNull();
+      expect(updated?.status).toBe("DROPPED");
+      expect(updated?.rejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+      expect(updated?.lpBurnPct).toBe(0.135682);
+      expect(updated?.historicalLpBurnPct).toBe(99.0);
+
+      // Verify active-watchlist exclusion across all accessors
+      expect(service.getActiveWatchingItems()).toHaveLength(0);
+      expect(service.getActiveWatchlist()).toHaveLength(0);
+      expect(service.getActiveCandidates()).toHaveLength(0);
+    });
+
+    it("preserves WATCHING status and updates LP measurement when current evidence is qualifying (>= 90%)", () => {
+      const service = new CandidateWatchlistService();
+      service.admitOrUpdate(validPool, nowSec);
+
+      // Subsequent scan with qualifying 95% LP
+      const qualifyingPool: ScannedPoolRecord = {
+        ...validPool,
+        lpBurnPct: 95.0,
+        metricProvenance: {
+          lpBurnPct: "DERIVED",
+        },
+      };
+
+      const updated = service.admitOrUpdate(qualifyingPool, nowSec + 30);
+      expect(updated).not.toBeNull();
+      expect(updated?.status).toBe("WATCHING");
+      expect(updated?.rejectionReason).toBeUndefined();
+      expect(updated?.lpBurnPct).toBe(95.0);
+      expect(updated?.historicalLpBurnPct).toBe(99.0);
+
+      // Verify inclusion in active watchlist accessors
+      expect(service.getActiveWatchingItems()).toHaveLength(1);
+      expect(service.getActiveWatchlist()).toHaveLength(1);
+      expect(service.getActiveCandidates()).toHaveLength(1);
+      expect(service.getActiveCandidates()[0]?.poolId).toBe(validPool.poolId);
+    });
+  });
 });
