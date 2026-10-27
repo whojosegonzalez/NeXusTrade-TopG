@@ -137,6 +137,182 @@ describe("BuyGateTriggerService", () => {
     expect(result.rejectionReason).toBe("RUGCHECK_HIGH_RISK_SCORE_FAILED");
   });
 
+  it("preserves genuine observed zero scores (score: 0) and parsed risks", async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          topHolders: [{ pct: 2.0 }, { pct: 1.5 }],
+          risks: [{ name: "Minor warning", level: "info", score: 0 }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintWithGenuineZeroScore111111111111111",
+      mockFetch,
+    );
+    expect(metrics).not.toBeNull();
+    expect(metrics?.rugScore).toBe(0);
+    expect(metrics?.hasDangerRisk).toBe(false);
+    expect(metrics?.holdersCount).toBe(500);
+
+    // Final eligibility passes when score is genuinely 0 and no danger risks
+    const service = new BuyGateTriggerService();
+    const result = service.evaluateCandidate(candidate, {
+      rugScore: metrics?.rugScore,
+      hasDangerRisk: metrics?.hasDangerRisk,
+      holdersCount: metrics?.holdersCount,
+      top10HolderPct: metrics?.top10HolderPct,
+      requireVerifiedHolders: true,
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 50,
+    });
+    expect(result.triggered).toBe(true);
+  });
+
+  it("fails closed (returns null) when score is missing instead of defaulting to 0", async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          // score is missing entirely
+          totalHolders: 500,
+          risks: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintMissingScore1111111111111111111111",
+      mockFetch,
+    );
+    expect(metrics).toBeNull();
+  });
+
+  it("fails closed (returns null) when score is non-numeric or negative", async () => {
+    const mockFetchNegative: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: -50,
+          totalHolders: 500,
+          risks: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metricsNegative = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintNegativeScore111111111111111111111",
+      mockFetchNegative,
+    );
+    expect(metricsNegative).toBeNull();
+
+    const mockFetchString: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: "0", // string, not number
+          totalHolders: 500,
+          risks: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metricsString = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintStringScore11111111111111111111111",
+      mockFetchString,
+    );
+    expect(metricsString).toBeNull();
+  });
+
+  it("fails closed (returns null) when risks list is absent or malformed", async () => {
+    const mockFetchMissingRisks: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 100,
+          totalHolders: 500,
+          // risks missing
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metricsMissingRisks = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintMissingRisks1111111111111111111111",
+      mockFetchMissingRisks,
+    );
+    expect(metricsMissingRisks).toBeNull();
+
+    const mockFetchMalformedRisks: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 100,
+          totalHolders: 500,
+          risks: "danger", // not an array
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metricsMalformedRisks = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintMalformedRisks111111111111111111111",
+      mockFetchMalformedRisks,
+    );
+    expect(metricsMalformedRisks).toBeNull();
+  });
+
+  it("verifies that unavailable required security evidence cannot pass final eligibility path while preliminary screening remains distinct", async () => {
+    const service = new BuyGateTriggerService();
+
+    // 1. Mocked provider returns null due to missing security score
+    const mockFetchNoScore: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          totalHolders: 500,
+          risks: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "UnverifiedToken1111111111111111111111111111111",
+      mockFetchNoScore,
+    );
+    expect(metrics).toBeNull();
+
+    // 2. Preliminary screening path (requireVerifiedHolders: false) assesses candidate metrics without RugCheck
+    const preliminaryResult = service.evaluateCandidate(candidate, {
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 50,
+      requireVerifiedHolders: false,
+    });
+    // Candidate passes preliminary screening (ready to be watched and enriched)
+    expect(preliminaryResult.triggered).toBe(true);
+
+    // 3. Final eligibility path (requireVerifiedHolders: true) fails closed because metrics are null
+    const finalEligibilityResult = service.evaluateCandidate(candidate, {
+      rugScore: metrics?.rugScore,
+      hasDangerRisk: metrics?.hasDangerRisk,
+      holdersCount: metrics?.holdersCount,
+      bundlerPct: metrics?.bundlerPct,
+      top10HolderPct: metrics?.top10HolderPct,
+      requireVerifiedHolders: true,
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 50,
+    });
+    expect(finalEligibilityResult.triggered).toBe(false);
+    expect(finalEligibilityResult.rejectionReason).toBe(
+      "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN",
+    );
+  });
+
   it("permits established pool with $100k liquidity and $1.5M market cap (L/MC 6.6%) via adaptive depth gate", () => {
     const service = new BuyGateTriggerService();
     const establishedPool: WatchlistCandidateItem = {

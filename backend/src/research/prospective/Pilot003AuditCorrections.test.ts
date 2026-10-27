@@ -218,7 +218,7 @@ describe("D.3.3 Pilot 003 Consolidated Audit Corrections", () => {
     expect(baselineDiag).toBeDefined();
     expect(baselineDiag?.evidenceType).toBe("BASELINE_SEEDED_LOOKUP");
     expect(baselineDiag?.rawResponseSha256).toBeTruthy();
-    expect(baselineDiag?.requestStartMs).toBeLessThan(baselineDiag!.responseCompleteMs);
+    expect(baselineDiag?.requestStartMs).toBeLessThan(baselineDiag!.responseCompleteMs!);
     expect(baselineDiag?.preservedPairData).toBeDefined();
     expect((baselineDiag?.preservedPairData as Record<string, unknown>)?.pairAddress).toBe(
       VALID_POOL,
@@ -901,7 +901,7 @@ describe("D.3.3 Pilot 003 Consolidated Audit Corrections", () => {
 
     // Close session and verify manifest file digests include forward-quote-evidence.json
     const { manifest } = runner.closeSession(10_365_000);
-    expect(manifest.files.some((f) => f.filename === "forward-quote-evidence.json")).toBe(true);
+    expect(manifest!.files.some((f) => f.filename === "forward-quote-evidence.json")).toBe(true);
 
     const fwdEvidenceDisk = JSON.parse(
       fs.readFileSync(path.join(tmpDir, "forward-quote-evidence.json"), "utf8"),

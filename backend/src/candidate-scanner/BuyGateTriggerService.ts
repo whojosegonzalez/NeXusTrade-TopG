@@ -419,18 +419,38 @@ export class BuyGateTriggerService {
       });
       if (!res.ok) return null;
       const data = (await res.json()) as {
-        score?: number;
-        score_normalised?: number;
-        risks?: Array<{ name?: string; value?: string; score?: number; level?: string }>;
+        score?: unknown;
+        score_normalised?: unknown;
+        risks?: unknown;
         tokenMeta?: { mutable?: boolean };
         topHolders?: Array<{ pct?: number; address?: string }>;
-        totalHolders?: number;
+        totalHolders?: unknown;
       };
 
-      const rugScore = typeof data.score === "number" ? data.score : 0;
-      const hasDangerRisk =
-        Array.isArray(data.risks) && data.risks.some((r) => r.level === "danger");
-      const holdersCount = typeof data.totalHolders === "number" ? data.totalHolders : undefined;
+      if (!data || typeof data !== "object") {
+        return null;
+      }
+
+      // Require an explicitly supplied, finite, non-negative score. Preserve genuine observed 0 scores.
+      if (typeof data.score !== "number" || !Number.isFinite(data.score) || data.score < 0) {
+        return null;
+      }
+      const rugScore = data.score;
+
+      // An absent or malformed risk list must not silently become an observed "no danger" result.
+      // Use existing failure contract (return null) on malformed/absent risks.
+      if (!Array.isArray(data.risks)) {
+        return null;
+      }
+      const hasDangerRisk = data.risks.some(
+        (r) => r && typeof r === "object" && (r as { level?: string }).level === "danger",
+      );
+      const holdersCount =
+        typeof data.totalHolders === "number" &&
+        Number.isFinite(data.totalHolders) &&
+        data.totalHolders >= 0
+          ? data.totalHolders
+          : undefined;
 
       let top10HolderPct: number | undefined;
       if (Array.isArray(data.topHolders) && data.topHolders.length > 0) {
@@ -440,15 +460,16 @@ export class BuyGateTriggerService {
       }
 
       let bundlerPct: number | undefined;
-      if (Array.isArray(data.risks)) {
-        for (const risk of data.risks) {
-          const riskName = (risk.name || "").toLowerCase();
+      for (const risk of data.risks) {
+        if (risk && typeof risk === "object") {
+          const rObj = risk as { name?: string; value?: string };
+          const riskName = (rObj.name || "").toLowerCase();
           if (
             riskName.includes("bundled") ||
             riskName.includes("insider") ||
             riskName.includes("dev holding")
           ) {
-            const rawVal = parseFloat(risk.value || "0");
+            const rawVal = parseFloat(rObj.value || "0");
             if (!Number.isNaN(rawVal)) {
               bundlerPct = rawVal > 1 ? rawVal / 100 : rawVal;
             }

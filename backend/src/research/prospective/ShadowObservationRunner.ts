@@ -46,7 +46,7 @@ export interface ShadowQuoteResult {
   readonly quoteSource: string;
   readonly isExecutableQuote: boolean;
   readonly isPoolDrained?: boolean | undefined;
-  readonly httpStatus?: number | undefined;
+  readonly httpStatus?: number | null | undefined;
   readonly missingReason?: string | undefined;
   readonly httpEvidence?: HttpObservationEvidence | undefined;
 }

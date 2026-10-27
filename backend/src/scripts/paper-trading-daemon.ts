@@ -34,6 +34,7 @@ import {
   BuyGateTriggerService,
   type ArmedPullbackState,
 } from "../candidate-scanner/BuyGateTriggerService.js";
+import { evaluateRetestGate } from "../candidate-scanner/RetestGateEvaluator.js";
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
@@ -1868,185 +1869,98 @@ export async function run(): Promise<void> {
                     rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
 
                   // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
-                  const armed = armedPullbackCandidates.get(candidate.mintAddress);
-                  if (!armed) {
-                    armedPullbackCandidates.set(candidate.mintAddress, {
-                      mintAddress: candidate.mintAddress,
-                      armedAtMs: currentNow,
-                      peakPriceSol: spotInfo.spotPriceSol,
-                      peakPriceUsd: spotInfo.spotPriceUsd ?? 0,
-                      ticksObserved: 1,
-                    });
-                    const cohortLabel = isEstablished ? "ESTABLISHED" : "MICRO_CAP";
-                    const targetWait = isEstablished
-                      ? "4-8% pullback or consolidation"
-                      : "10-18% pullback or consolidation";
+                  const existingArmed = armedPullbackCandidates.get(candidate.mintAddress);
+                  const retestResult = evaluateRetestGate({
+                    mintAddress: candidate.mintAddress,
+                    isEstablished,
+                    currentNowMs: currentNow,
+                    spotInfo,
+                    existingArmedState: existingArmed,
+                  });
+
+                  if (retestResult.status === "ARMED_FIRST_TICK") {
+                    armedPullbackCandidates.set(
+                      candidate.mintAddress,
+                      retestResult.updatedArmedState,
+                    );
                     console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${(spotInfo.spotPriceUsd ?? 0).toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
+                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${(spotInfo.spotPriceUsd ?? 0).toFixed(6)}) [${retestResult.cohortLabel}]. Awaiting ${retestResult.targetWait}...`,
                     );
                     addActivityLog(
                       "INFO",
-                      `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${cohortLabel}]. Awaiting retest/pullback...`,
+                      `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${retestResult.cohortLabel}]. Awaiting retest/pullback...`,
                       candidate.mintAddress,
                       candidate.symbol,
                     );
                     continue;
                   }
 
-                  // Candidate already armed: update ticks & peak price
-                  const newPeakSol = Math.max(armed.peakPriceSol, spotInfo.spotPriceSol);
-                  const newPeakUsd =
-                    spotInfo.spotPriceSol >= armed.peakPriceSol
-                      ? (spotInfo.spotPriceUsd ?? armed.peakPriceUsd)
-                      : armed.peakPriceUsd;
-                  const updatedArmed: ArmedPullbackState = {
-                    ...armed,
-                    peakPriceSol: newPeakSol,
-                    peakPriceUsd: newPeakUsd,
-                    ticksObserved: armed.ticksObserved + 1,
-                  };
-                  armedPullbackCandidates.set(candidate.mintAddress, updatedArmed);
+                  // Update armed candidate state in map
+                  armedPullbackCandidates.set(
+                    candidate.mintAddress,
+                    retestResult.updatedArmedState,
+                  );
 
-                  // Cohort parameters for Retest Gate (Phase 12.92 Flow-Aware Retest Gate):
-                  // Established: Flow-aware crater drop ceiling: 12% if buyers absorbing (>= 1.15x), 8% if unabsorbed.
-                  // Micro-Cap: max 15% crater drop ceiling, 90s expiry.
-                  const isFlowAbsorbing =
-                    spotInfo.recentBuys60s >= 1.15 * Math.max(1, spotInfo.recentSells60s);
-                  const maxCraterDropPct = isEstablished ? (isFlowAbsorbing ? 0.12 : 0.08) : 0.15;
-                  const maxExpiryMs = isEstablished ? 120_000 : 90_000;
-
-                  // Rule C: Plunged below crater threshold (anti-falling knife)
-                  if (spotInfo.spotPriceSol < updatedArmed.peakPriceSol * (1 - maxCraterDropPct)) {
+                  if (retestResult.status === "REJECTED") {
                     armedPullbackCandidates.delete(candidate.mintAddress);
                     watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    const rejectReason = isEstablished
-                      ? "REJECTED_EXCESSIVE_PULLBACK"
-                      : "REJECTED_PULLBACK_CRATERED";
+
                     recordTriggerRejection(
                       candidate,
-                      rejectReason,
+                      retestResult.rejectReason,
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
                       spotInfo.liquidityUsd,
                       spotInfo.recentBuys60s,
                       spotInfo.recentSells60s,
-                      "RetestCraterDrop",
+                      retestResult.rejectionGateName,
                       currentNow,
                       spotInfo,
                     );
+
+                    if (retestResult.rejectionGateName === "RetestCraterDrop") {
+                      const maxDropPct =
+                        retestResult.maxCraterDropPct ?? (isEstablished ? 0.08 : 0.15);
+                      console.log(
+                        `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(retestResult.updatedArmedState.peakPriceSol * (1 - maxDropPct)).toFixed(6)} SOL). Dropping candidate.`,
+                      );
+                      addActivityLog(
+                        "ALERT",
+                        `⚠️ ${candidate.symbol} dropped: pullback >${(maxDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
+                        candidate.mintAddress,
+                        candidate.symbol,
+                      );
+                    } else if (retestResult.rejectionGateName === "RetestSellerSurge") {
+                      console.log(
+                        `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
+                      );
+                      addActivityLog(
+                        "ALERT",
+                        `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
+                        candidate.mintAddress,
+                        candidate.symbol,
+                      );
+                    } else if (retestResult.rejectionGateName === "RetestTimeout") {
+                      const expirySec = (
+                        (retestResult.maxExpiryMs ?? (isEstablished ? 120_000 : 90_000)) / 1000
+                      ).toFixed(0);
+                      console.log(
+                        `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${expirySec}s without entry confirmation. Dropping candidate.`,
+                      );
+                    }
+                    continue;
+                  }
+
+                  if (retestResult.status === "WAITING") {
                     console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(updatedArmed.peakPriceSol * (1 - maxCraterDropPct)).toFixed(6)} SOL). Dropping candidate.`,
-                    );
-                    addActivityLog(
-                      "ALERT",
-                      `⚠️ ${candidate.symbol} dropped: pullback >${(maxCraterDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol.toFixed(6)} SOL)`,
-                      candidate.mintAddress,
-                      candidate.symbol,
+                      `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${retestResult.updatedArmedState.peakPriceSol} SOL, Pullback: ${retestResult.pullbackPct.toFixed(1)}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${retestResult.updatedArmedState.ticksObserved}`,
                     );
                     continue;
                   }
 
-                  // Rule E: In-Flight Seller Surge (Anti-Cabal exit wave while awaiting pullback)
-                  if (
-                    spotInfo.recentSells60s >= 25 &&
-                    spotInfo.recentSells60s >= 2.5 * Math.max(1, spotInfo.recentBuys60s)
-                  ) {
-                    armedPullbackCandidates.delete(candidate.mintAddress);
-                    watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    recordTriggerRejection(
-                      candidate,
-                      "REJECTED_IN_FLIGHT_SELLER_SURGE",
-                      spotInfo.spotPriceSol,
-                      spotInfo.spotPriceUsd,
-                      spotInfo.liquidityUsd,
-                      spotInfo.recentBuys60s,
-                      spotInfo.recentSells60s,
-                      "RetestSellerSurge",
-                      currentNow,
-                      spotInfo,
-                    );
-                    console.log(
-                      `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
-                    );
-                    addActivityLog(
-                      "ALERT",
-                      `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
-                      candidate.mintAddress,
-                      candidate.symbol,
-                    );
-                    continue;
-                  }
-
-                  // Rule D: Expiry after timeout
-                  if (currentNow - updatedArmed.armedAtMs > maxExpiryMs) {
-                    armedPullbackCandidates.delete(candidate.mintAddress);
-                    watchlistService.updateStatus(candidate.poolId, "DROPPED");
-                    recordTriggerRejection(
-                      candidate,
-                      "REJECTED_PULLBACK_EXPIRED",
-                      spotInfo.spotPriceSol,
-                      spotInfo.spotPriceUsd,
-                      spotInfo.liquidityUsd,
-                      spotInfo.recentBuys60s,
-                      spotInfo.recentSells60s,
-                      "RetestTimeout",
-                      currentNow,
-                      spotInfo,
-                    );
-                    console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${(maxExpiryMs / 1000).toFixed(0)}s without entry confirmation. Dropping candidate.`,
-                    );
-                    continue;
-                  }
-
-                  // Rule A: Retest Pullback Discount with flow absorption
-                  // Established: 4% to 10% pullback discount with recentBuys60s >= 1.15 * recentSells60s
-                  // Micro-Cap: 10% to 15% pullback discount with recentBuys60s >= 1.25 * recentSells60s
-                  const minPullbackRatio = isEstablished ? 0.9 : 0.85;
-                  const maxPullbackRatio = isEstablished ? 0.96 : 0.9;
-                  const minPullbackFlowRatio = isEstablished ? 1.15 : 1.25;
-
-                  const isPullbackDiscount =
-                    spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * maxPullbackRatio &&
-                    spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * minPullbackRatio;
-                  const hasPullbackFlow =
-                    spotInfo.recentBuys60s >= minPullbackFlowRatio * spotInfo.recentSells60s;
-                  const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
-
-                  // Rule B: Consolidation Breakout
-                  // Established: within 4% of peak for >= 30s with buyer dominance (>= 1.25 * sells)
-                  // Micro-Cap: within 5% of peak for >= 30s or >= 3 ticks with strong flow (>= 1.5 * sells)
-                  const maxConsolidationDropPct = isEstablished ? 0.04 : 0.05;
-                  const minConsolidationFlowRatio = isEstablished ? 1.25 : 1.5;
-
-                  const isConsolidatingNearPeak =
-                    spotInfo.spotPriceSol >=
-                    updatedArmed.peakPriceSol * (1 - maxConsolidationDropPct);
-                  const hasConsolidationDuration =
-                    currentNow - updatedArmed.armedAtMs >= 30_000 ||
-                    updatedArmed.ticksObserved >= 3;
-                  const hasConsolidationFlow =
-                    spotInfo.recentBuys60s >= minConsolidationFlowRatio * spotInfo.recentSells60s;
-                  const ruleBConfirmed =
-                    isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
-
-                  if (!ruleAConfirmed && !ruleBConfirmed) {
-                    const pullbackPct = (
-                      ((spotInfo.spotPriceSol - updatedArmed.peakPriceSol) /
-                        updatedArmed.peakPriceSol) *
-                      100
-                    ).toFixed(1);
-                    console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL, Pullback: ${pullbackPct}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${updatedArmed.ticksObserved}`,
-                    );
-                    continue;
-                  }
-
-                  const confirmReason = ruleAConfirmed
-                    ? "RETEST_PULLBACK_DISCOUNT"
-                    : "CONSOLIDATION_BREAKOUT";
+                  // retestResult.status === "CONFIRMED"
                   console.log(
-                    `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${updatedArmed.peakPriceSol} SOL)`,
+                    `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${retestResult.confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${retestResult.updatedArmedState.peakPriceSol} SOL)`,
                   );
                   armedPullbackCandidates.delete(candidate.mintAddress);
 
