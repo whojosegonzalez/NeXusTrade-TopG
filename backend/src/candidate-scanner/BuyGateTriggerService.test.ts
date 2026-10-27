@@ -265,6 +265,199 @@ describe("BuyGateTriggerService", () => {
     expect(metricsMalformedRisks).toBeNull();
   });
 
+  it("fails closed (returns null) when risk entries are malformed or have unsupported severity", async () => {
+    // 1. Missing severity level (e.g. empty object)
+    const mockMissingLevel: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [{}],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintEmptyRiskObj1111111111111111111",
+        mockMissingLevel,
+      ),
+    ).toBeNull();
+
+    // 2. Null entry in risks array
+    const mockNullEntry: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [null],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintNullRiskEntry111111111111111111",
+        mockNullEntry,
+      ),
+    ).toBeNull();
+
+    // 3. Primitive entry in risks array
+    const mockPrimitiveEntry: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: ["danger"],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintPrimitiveRiskEntry11111111111111",
+        mockPrimitiveEntry,
+      ),
+    ).toBeNull();
+
+    // 4. Incorrectly typed severity (number instead of string)
+    const mockNumericLevel: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [{ name: "Numeric level", level: 123 }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintNumericLevel1111111111111111111",
+        mockNumericLevel,
+      ),
+    ).toBeNull();
+
+    // 5. Unsupported severity value (e.g. "critical" or "unknown")
+    const mockUnsupportedLevel: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [{ name: "Critical issue", level: "critical" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintUnsupportedLevel111111111111111",
+        mockUnsupportedLevel,
+      ),
+    ).toBeNull();
+
+    // 6. Empty string severity value
+    const mockEmptyLevel: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [{ name: "Empty level", level: "" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintEmptyLevel111111111111111111111",
+        mockEmptyLevel,
+      ),
+    ).toBeNull();
+
+    // 7. Nested array entry
+    const mockNestedArrayEntry: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [[]],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    expect(
+      await BuyGateTriggerService.fetchRugCheckMetrics(
+        "TestMintNestedArray11111111111111111111",
+        mockNestedArrayEntry,
+      ),
+    ).toBeNull();
+  });
+
+  it("preserves genuine empty risk arrays and supported non-danger risks without triggering danger", async () => {
+    // 1. Genuinely empty risk array with explicit score: 0
+    const mockEmptyRisks: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const emptyMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintEmptyRisks1111111111111111111111",
+      mockEmptyRisks,
+    );
+    expect(emptyMetrics).not.toBeNull();
+    expect(emptyMetrics?.rugScore).toBe(0);
+    expect(emptyMetrics?.hasDangerRisk).toBe(false);
+
+    // 2. Supported non-danger risks (warn and info)
+    const mockNonDangerRisks: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 50,
+          totalHolders: 350,
+          risks: [
+            { name: "Low liquidity warning", level: "warn" },
+            { name: "Metadata info", level: "info" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const nonDangerMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintNonDangerRisks1111111111111111111",
+      mockNonDangerRisks,
+    );
+    expect(nonDangerMetrics).not.toBeNull();
+    expect(nonDangerMetrics?.rugScore).toBe(50);
+    expect(nonDangerMetrics?.hasDangerRisk).toBe(false);
+
+    // 3. Supported danger risk correctly triggers hasDangerRisk: true
+    const mockDangerRisk: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 50,
+          totalHolders: 350,
+          risks: [
+            { name: "Low liquidity warning", level: "warn" },
+            { name: "Honeypot danger", level: "danger" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const dangerMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "TestMintDangerRisk11111111111111111111111",
+      mockDangerRisk,
+    );
+    expect(dangerMetrics).not.toBeNull();
+    expect(dangerMetrics?.rugScore).toBe(50);
+    expect(dangerMetrics?.hasDangerRisk).toBe(true);
+  });
+
   it("verifies that unavailable required security evidence cannot pass final eligibility path while preliminary screening remains distinct", async () => {
     const service = new BuyGateTriggerService();
 
@@ -311,6 +504,52 @@ describe("BuyGateTriggerService", () => {
     expect(finalEligibilityResult.rejectionReason).toBe(
       "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN",
     );
+  });
+
+  it("verifies that malformed risk entries fail closed and prevent passing final eligibility", async () => {
+    const service = new BuyGateTriggerService();
+
+    // 1. Mocked provider returns report with malformed risk entry (empty object missing level)
+    const mockFetchMalformedRisk: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          score: 0,
+          totalHolders: 500,
+          risks: [{}], // malformed entry
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+      "MalformedRiskToken11111111111111111111111111",
+      mockFetchMalformedRisk,
+    );
+    expect(metrics).toBeNull();
+
+    // 2. Preliminary screening path remains distinct
+    const preliminaryResult = service.evaluateCandidate(candidate, {
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 50,
+      requireVerifiedHolders: false,
+    });
+    expect(preliminaryResult.triggered).toBe(true);
+
+    // 3. Final eligibility path fails closed because metrics are null
+    const finalResult = service.evaluateCandidate(candidate, {
+      rugScore: metrics?.rugScore,
+      hasDangerRisk: metrics?.hasDangerRisk,
+      holdersCount: metrics?.holdersCount,
+      bundlerPct: metrics?.bundlerPct,
+      top10HolderPct: metrics?.top10HolderPct,
+      requireVerifiedHolders: true,
+      recentBuysCount60s: 8,
+      recentSellsCount60s: 3,
+      momentum1mBps: 50,
+    });
+    expect(finalResult.triggered).toBe(false);
+    expect(finalResult.rejectionReason).toBe("REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN");
   });
 
   it("permits established pool with $100k liquidity and $1.5M market cap (L/MC 6.6%) via adaptive depth gate", () => {

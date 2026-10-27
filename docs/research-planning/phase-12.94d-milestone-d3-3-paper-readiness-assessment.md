@@ -120,39 +120,41 @@ Option A is **explicitly marked UNAVAILABLE for live-data PAPER evaluation**:
 - However, historical captures contain zero live data: no current reserves, no live spot price, no current 60s flow, no current holder distribution, and no ongoing LP lock/burn verification.
 - Conflating historical genesis initialization with live market conditions violates provenance. Authentic historical fixtures support separately labeled offline regression replay, and **cannot substitute for live data in a forward evaluation**.
 
-### 2.2 LP Security & SPL Token Program Burn Accounting
+### 2.2 LP Security & SPL Token Program Burn Accounting (Formula Withdrawn — UNRESOLVED)
 
 The strategy's Stage 1 screening gate `ANTI_RUG_LP_SECURITY` requires $\text{lpBurnPct} \ge 90.0\%$.
 
-#### How SPL Token `Burn` Actually Works
+#### Explicit Withdrawal of Unsupported LP Reduction Formula
 
-Under the Solana SPL Token program (see [Solana Token Basics: Burn](https://solana.com/docs/tokens/basics/burn-tokens)):
+The previously proposed formula:
+$$\frac{L_{\text{initial}} - L_{\text{circulating}}}{L_{\text{initial}}} \times 100\%$$
+is **formally withdrawn as unsound**.
 
-1. The `Burn` instruction decreases the token holder account's balance **and simultaneously decreases the mint's total `supply`**.
-2. Burned tokens are **not** held at a dead or incinerator address (e.g. `11111111111111111111111111111111`); they are permanently removed from the ledger, and `mint.supply` drops.
-3. Conversely, if a pool deployer transfers LP tokens to an unspendable address without invoking the SPL `Burn` instruction, `mint.supply` remains unchanged while the dead address holds the tokens.
-4. **Why Current Supply Plus Dead Balance Is Insufficient**:
-   - Because SPL `Burn` reduces `supply`, reading the current `mint.supply` and dead-address balance at block time $t$ cannot determine how many LP tokens were originally created!
-   - Without knowing the historical initial LP tokens minted at pool creation ($L_{\text{initial}}$), one cannot calculate the burned fraction.
+In the official Raydium AMM v4 withdrawal implementation (`withdraw` instruction), liquidity redemptions burn LP tokens while returning the underlying base and quote token reserves from the pool vaults to the withdrawing liquidity providers. A formula that equates every reduction in LP tokens with burned or locked liquidity conflates routine withdrawal with true liquidity destruction.
 
-#### Required Evidence & Formal Calculation for `lpBurnPct`
+#### Unresolved Acquisition & Calculation Contract
 
-To calculate authentic LP security:
-$$\text{lpBurnPct} = \frac{L_{\text{initial}} - L_{\text{circulating}}}{L_{\text{initial}}} \times 100\%$$
-where:
+The acquisition and calculation contract for `lpBurnPct` is marked **UNRESOLVED** until it distinguishes:
 
-- $L_{\text{initial}}$: Total LP tokens minted at pool initialization (obtained from pool initialization transaction logs or historical mint event records).
-- $L_{\text{circulating}}$: Active circulating LP tokens held in spendable user accounts (equal to $\text{currentMintSupply} - \text{deadAddressBalance}$).
+1. **Routine Liquidity Redemption**: LP tokens burned while returning underlying vault reserves to the withdrawing owner.
+2. **Irrevocable Destruction of Withdrawal Rights**: LP tokens permanently destroyed or transferred to an unspendable burn address without reserve redemption.
+3. **Subsequent Issuance & Withdrawals**: Subsequent liquidity deposits minting new LP tokens, and subsequent withdrawals burning them.
+4. **Separately Supported Third-Party Lock Mechanisms**: Escrowed, timelocked, or vesting LP vaults (e.g. Streamflow, Unicrypt).
 
-Until $L_{\text{initial}}$ and $L_{\text{circulating}}$ are verified from authentic on-chain logs or an authenticated provider payload, candidates correctly fail closed at Stage 1.
+No burn calculator is implemented, and the strategy's $\ge 90.0\%$ threshold remains unaltered. Candidates lacking authentic, verified LP lock/burn evidence fail closed at Stage 1.
 
-### 2.3 Corrected Security Score Handling in `fetchRugCheckMetrics()`
+### 2.3 Corrected Security Score & Complete Malformed-Risk Validation
 
-The implementation in [`BuyGateTriggerService.ts:402-475`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts#L402-L475) has been corrected:
+The implementation in [`BuyGateTriggerService.ts:402-520`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts#L402-L520) has been fully hardened:
 
 1. **Removed Favorable Fallback**: The silent `score ?? 0` default has been removed. An explicitly supplied, finite, non-negative number (`score >= 0`) is strictly required. Genuine observed zero scores are preserved.
-2. **Strict Risk List Validation**: An absent or malformed `risks` field (not an Array) fails closed and returns `null` under the existing failure contract. It cannot silently evaluate to "no danger".
-3. **Fail-Closed Final Eligibility**: When `fetchRugCheckMetrics()` returns `null`, `rugMetrics` is `null`. In the final security-qualified eligibility path (`requireVerifiedHolders: true`), `holdersCount === undefined` immediately triggers `REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN`, preventing unverified candidates from passing. Preliminary screening (`requireVerifiedHolders: false`) remains distinct.
+2. **Complete Malformed-Risk Validation**:
+   - `data.risks` must be an Array (`!Array.isArray(data.risks) -> return null;`).
+   - Every risk entry is validated against the supported schema (`level: "danger" | "warn" | "info"`).
+   - Null entries, primitives (e.g. `["danger"]`), missing severity fields (e.g. `[{}]`), incorrectly typed severity (e.g. `{ level: 123 }`), empty strings (`{ level: "" }`), and unsupported severity values (e.g. `{ level: "critical" }`) fail closed (`return null;`).
+   - Genuine empty risk arrays (`[]`) and supported non-danger risks (`warn`, `info`) are preserved (`hasDangerRisk: false`).
+   - Valid danger risks (`danger`) correctly set `hasDangerRisk: true`.
+3. **Fail-Closed Final Eligibility**: When `fetchRugCheckMetrics()` returns `null` (due to missing score or malformed risk entries), `rugMetrics` is `null`. In the final security-qualified eligibility path (`requireVerifiedHolders: true`), `holdersCount === undefined` immediately triggers `REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN`, preventing unverified candidates from passing. Preliminary screening (`requireVerifiedHolders: false`) remains distinct.
 
 ---
 
@@ -297,12 +299,12 @@ const entryFill = simulateFill(entryQuote, {
 
 LP burn is not the only remaining data gap. The remaining acquisition dependencies are classified below:
 
-| Dimension                                   | Required Evidence / Threshold                                                                                                                                                                 | Existing Preserved Evidence                                                                       | Precise Missing Source & Acquisition Path                                                                                                                                                                           |
-| :------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **LP Security (`lpBurnPct`)**               | $L_{\text{initial}}$ and $L_{\text{circulating}}$ proving $\ge 90.0\%$ LP burn under SPL Token burn semantics.                                                                                | C3 historical pool initialization account layout.                                                 | On-chain pool creation transaction logs (to establish $L_{\text{initial}}$) and LP mint supply/dead balance (to establish $L_{\text{circulating}}$), or authenticated security report with verified LP burn schema. |
-| **Verified Pool Reserves & Token Decimals** | Atomic base token reserve (`baseReserveTokens`), quote reserve (`quoteReserveSol`), and token decimals (`tokenDecimals`).                                                                     | DexScreener indicative spot price (`priceNative`); canonical WSOL (9 decimals); RAY (6 decimals). | Direct on-chain SPL token vault account balances (`baseVault`, `quoteVault`) for candidate pool to support constant-product execution math.                                                                         |
-| **Security Metrics**                        | Risk score ($\le 700$), danger flags (`false`), verified holder count ($\ge 250$ established, $\ge 100$ micro), top 10 concentration ($\le 30\%$), bundler concentration ($\le 85\% / 50\%$). | RugCheck `/tokens/{mint}/report` response parser in `BuyGateTriggerService.ts`.                   | Live, metered RugCheck provider adapter registered under `GlobalResourceBudgetManager` with strict rate accounting.                                                                                                 |
-| **Micro-Flow Observations**                 | 60-second rolling transaction counts (`recentBuys60s`, `recentSells60s`) to evaluate flow-absorption rules (1.15x / 1.25x / 1.5x) and anti-surge rules.                                       | DexScreener 5-minute transaction aggregates (`txns.m5.buys`, `txns.m5.sells`).                    | Sub-minute trade stream or websocket trade ingestion to derive authentic 60-second rolling buy/sell transaction counts.                                                                                             |
+| Dimension                                   | Required Evidence / Threshold                                                                                                                                                                 | Existing Preserved Evidence                                                                       | Precise Missing Source & Acquisition Path                                                                                                                                                                       |
+| :------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LP Security (`lpBurnPct`)**               | $\ge 90.0\%$ LP burn/lock (**contract UNRESOLVED** pending distinction between redemption vs burn without redemption).                                                                        | C3 historical pool initialization account layout.                                                 | **UNRESOLVED**: Requires verification contract distinguishing liquidity redemption, destruction of withdrawal rights without redemption, subsequent minting/withdrawals, and supported third-party lock vaults. |
+| **Verified Pool Reserves & Token Decimals** | Atomic base token reserve (`baseReserveTokens`), quote reserve (`quoteReserveSol`), and token decimals (`tokenDecimals`).                                                                     | DexScreener indicative spot price (`priceNative`); canonical WSOL (9 decimals); RAY (6 decimals). | Direct on-chain SPL token vault account balances (`baseVault`, `quoteVault`) for candidate pool to support constant-product execution math.                                                                     |
+| **Security Metrics**                        | Risk score ($\le 700$), danger flags (`false`), verified holder count ($\ge 250$ established, $\ge 100$ micro), top 10 concentration ($\le 30\%$), bundler concentration ($\le 85\% / 50\%$). | RugCheck `/tokens/{mint}/report` response parser in `BuyGateTriggerService.ts`.                   | Live, metered RugCheck provider adapter registered under `GlobalResourceBudgetManager` with strict rate accounting.                                                                                             |
+| **Micro-Flow Observations**                 | 60-second rolling transaction counts (`recentBuys60s`, `recentSells60s`) to evaluate flow-absorption rules (1.15x / 1.25x / 1.5x) and anti-surge rules.                                       | DexScreener 5-minute transaction aggregates (`txns.m5.buys`, `txns.m5.sells`).                    | Sub-minute trade stream or websocket trade ingestion to derive authentic 60-second rolling buy/sell transaction counts.                                                                                         |
 
 ---
 
@@ -316,7 +318,8 @@ The two approved offline implementation items are completed:
    - 20 deterministic tests passing in [`backend/src/candidate-scanner/RetestGateEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.test.ts).
 2. **Missing Security Score & Risk Handling**:
    - Implemented in [`backend/src/candidate-scanner/BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts).
-   - 51 deterministic tests passing in [`backend/src/candidate-scanner/BuyGateTriggerService.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.test.ts).
+   - Validates explicit non-negative score, strict array type, supported risk severity (`danger`, `warn`, `info`), and fail-closed handling for malformed risk entries.
+   - 54 deterministic tests passing in [`backend/src/candidate-scanner/BuyGateTriggerService.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.test.ts).
 3. **Larger Changes Quarantined**:
    - No quote caching or observation schedule alterations.
    - No PAPER fills inside prospective runner.

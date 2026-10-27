@@ -437,14 +437,6 @@ export class BuyGateTriggerService {
       }
       const rugScore = data.score;
 
-      // An absent or malformed risk list must not silently become an observed "no danger" result.
-      // Use existing failure contract (return null) on malformed/absent risks.
-      if (!Array.isArray(data.risks)) {
-        return null;
-      }
-      const hasDangerRisk = data.risks.some(
-        (r) => r && typeof r === "object" && (r as { level?: string }).level === "danger",
-      );
       const holdersCount =
         typeof data.totalHolders === "number" &&
         Number.isFinite(data.totalHolders) &&
@@ -459,20 +451,48 @@ export class BuyGateTriggerService {
           .reduce((acc, h) => acc + (typeof h.pct === "number" ? h.pct / 100 : 0), 0);
       }
 
+      // An absent or malformed risk list or malformed risk entries must not silently become an observed "no danger" result.
+      // Validate each entry and the severity field used for danger classification against supported schema ("danger" | "warn" | "info").
+      // Null entries, primitives, missing or incorrectly typed severity, and unsupported severity values fail closed (return null).
+      if (!Array.isArray(data.risks)) {
+        return null;
+      }
+
+      const SUPPORTED_RISK_LEVELS = new Set(["danger", "warn", "info"]);
+      let hasDangerRisk = false;
       let bundlerPct: number | undefined;
+
       for (const risk of data.risks) {
-        if (risk && typeof risk === "object") {
-          const rObj = risk as { name?: string; value?: string };
-          const riskName = (rObj.name || "").toLowerCase();
-          if (
-            riskName.includes("bundled") ||
-            riskName.includes("insider") ||
-            riskName.includes("dev holding")
-          ) {
-            const rawVal = parseFloat(rObj.value || "0");
-            if (!Number.isNaN(rawVal)) {
-              bundlerPct = rawVal > 1 ? rawVal / 100 : rawVal;
-            }
+        if (!risk || typeof risk !== "object" || Array.isArray(risk)) {
+          return null;
+        }
+        const level = (risk as { level?: unknown }).level;
+        if (typeof level !== "string") {
+          return null;
+        }
+        const normalizedLevel = level.trim().toLowerCase();
+        if (!SUPPORTED_RISK_LEVELS.has(normalizedLevel)) {
+          return null;
+        }
+        if (normalizedLevel === "danger") {
+          hasDangerRisk = true;
+        }
+
+        const rObj = risk as { name?: unknown; value?: unknown };
+        const riskName = typeof rObj.name === "string" ? rObj.name.toLowerCase() : "";
+        if (
+          riskName.includes("bundled") ||
+          riskName.includes("insider") ||
+          riskName.includes("dev holding")
+        ) {
+          const rawVal =
+            typeof rObj.value === "string"
+              ? parseFloat(rObj.value)
+              : typeof rObj.value === "number"
+                ? rObj.value
+                : NaN;
+          if (!Number.isNaN(rawVal)) {
+            bundlerPct = rawVal > 1 ? rawVal / 100 : rawVal;
           }
         }
       }
