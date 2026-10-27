@@ -36,6 +36,7 @@
     "research:measurement-cohort:collect": "tsx src/scripts/research-measurement-cohort-collect.ts",
     "research:measurement-cohort:analyze": "tsx src/scripts/research-measurement-cohort-analyze.ts",
     "research:protocol:validate": "tsx src/scripts/research-protocol-validate.ts",
+    "research:raydium-amm-v4-snapshot": "tsx src/research/pilot/RaydiumAmmV4SnapshotCli.ts",
     "research:review-gate": "tsx src/scripts/research-review-gate.ts",
     "research:truth": "tsx src/scripts/research-truth.ts",
     "risk:evaluate": "tsx src/scripts/risk-evaluate.ts",

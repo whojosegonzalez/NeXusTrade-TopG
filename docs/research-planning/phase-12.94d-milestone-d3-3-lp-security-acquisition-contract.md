@@ -324,10 +324,29 @@ The offline implementation approved by the independent review is complete:
    - Preserves evidence without inventing provenance: missing provenance is represented as `UNKNOWN` (never defaulted to captured RPC), missing retrieval timestamps remain `null` (never substituted with validation time), valid calendar timestamps are verified against actual days in month (rejecting impossible dates like February 30), contradictory provenance flags are rejected with `INVALID_PROVENANCE_METADATA`, and requested identities are captured in a frozen snapshot at function entry before asynchronous suspension.
    - Evaluates pure mathematical LP accounting via `calculateAmmV4LpInaccessibleClaims`.
    - Returns separate raw LP accounting, provenance diagnostics, SHA-256 digests, and strict evidence boundaries (`bytecodeEquivalenceVerified: false`, `completeExecutableReservesVerified: false`, `generalTokenSafetyVerified: false`, `strategyGateAdmitted: false`).
-4. **Deterministic Offline Test Suites (73 tests passing)**:
+4. **Bounded Snapshot Acquisition & Standalone CLI ([`RaydiumAmmV4SnapshotAcquisition.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotAcquisition.ts), [`RaydiumAmmV4SnapshotCli.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotCli.ts))**:
+   - Implements bounded two-step sequence for legacy Raydium AMM v4:
+     - Request 1: `getAccountInfo(poolId)` (`confirmed`, `base64`) validating bootstrap account layout (752B), program owner, valid status, WSOL orientation, and expected token mint before discovering `lpMint`, `baseVault`, `quoteVault`.
+     - Host pacing: enforces $\ge 2,500$ ms delay between outbound requests.
+     - Request 2: `getMultipleAccounts([poolId, lpMint, baseVault, quoteVault])` (`confirmed`, `base64`) passing `minContextSlot = bootstrapSlot`.
+   - Enforces bounded execution constraints:
+     - Strictly capped at 2 outbound HTTP attempts (tracked on both success and failure).
+     - Retries = 0, redirects = 0, fallback providers = 0, auto-discovery = 0.
+     - Terminate immediately after attempt 1 if bootstrap validation fails (no second request).
+     - Independently rejects stale batch context slot (`batchSlot < bootstrapSlot`).
+     - Verifies final batch retains discovered account references.
+   - Sealed evidence & BigInt serialization:
+     - Serializes all integer quantities (`bigint`) as exact decimal strings in JSON (`serializeJsonPreservingBigInts`).
+     - Computes deterministic SHA-256 evidence digests.
+     - Separates retrieval success, structural validation success, and 90% threshold qualification.
+     - Statically enforces evidence boundaries (`bytecodeEquivalenceVerified: false`, `completeExecutableReservesVerified: false`, `generalTokenSafetyVerified: false`, `strategyGateAdmitted: false`).
+   - Standalone CLI entrypoint with `--dry-run` support:
+     - Verified dry-run execution making zero network requests (`pnpm --filter @nexustrade/backend research:raydium-amm-v4-snapshot --dry-run`).
+5. **Deterministic Offline Test Suites (93 tests passing across 4 suites)**:
    - [`RaydiumAmmParser.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.test.ts): 16 tests verifying offset 720 decoding, nonce decoding, zeroed default safety, round-trip parsing, and rejection of 33-byte addresses.
    - [`RaydiumAmmLpAccounting.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmLpAccounting.test.ts): 14 tests covering all 5 lifecycle scenarios, exact boundary testing ($89.999999\%$, $90.0\%$, $90.000001\%$), zero denominator, $S > L$, negative inputs, and magnitudes above JavaScript's safe integer limit ($> 2^{53} - 1$).
-   - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 43 tests covering authority derivation, cache mutation protection, pool nonce consistency, provenance/timestamp integrity (omitted provenance, explicit flags, null timestamp preservation, contradictory flag rejection, invalid timestamp and impossible calendar date rejection, entry identity capture against pending async mutation), rejection of 33-byte public keys, rejection of Base64 strings with trailing `!`, rejection of unsafe integer slots (`Number.MAX_SAFE_INTEGER + 1`), positive control validations, negative structural checks, and arithmetic bounds.
+   - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 43 tests covering authority derivation, cache mutation protection, pool nonce consistency, provenance/timestamp integrity, rejection of 33-byte public keys, Base64 syntax checks, safe integer slot checks, positive controls, negative structural checks, and arithmetic bounds.
+   - [`RaydiumAmmV4SnapshotAcquisition.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotAcquisition.test.ts): 20 tests verifying successful 2-request acquisition with $\ge 2,500$ ms host pacing, attempt-1 termination on bootstrap failure (null account, unauthorized owner, corrupted layout, orientation mismatch, token mismatch, invalid status, malformed base64), network/RPC error handling (HTTP 500, timeout, malformed JSON, RPC error), stale context slot rejection, changed account reference rejection, request counting ceiling ($2$), BigInt decimal string serialization, SHA-256 evidence sealing, and CLI dry-run/help execution.
 
 ---
 
@@ -335,7 +354,6 @@ The offline implementation approved by the independent review is complete:
 
 The following items are **explicitly pending** and remain unapproved:
 
-1. **Solana RPC Client Acquisition**: Outbound RPC network retrieval of live pool and mint accounts.
-2. **RPC Commitment Policy**: Selection and enforcement of commitment levels (`confirmed` vs `finalized`) during live queries.
-3. **Pipeline & Strategy Gate Wiring**: Live integration into `AntiRugEvaluator.ts`, scanner pipeline, candidate watchlist, or trading daemon.
-4. **Execution & Live Market Runs**: Live market sessions, wallet mutations, or live token purchases remain strictly prohibited (virtual wallet balance frozen at `7.9259 SOL`).
+1. **Live Network Acquisition**: Execution against live mainnet RPC endpoints requires explicit operator execution using the provided CLI command. Zero live network requests have been made by the automated assistant.
+2. **Strategy Gate & Pipeline Integration**: Integration of the verified LP-accounting value into `AntiRugEvaluator.ts`, scanner pipeline, candidate watchlist, or trading daemon remains deferred.
+3. **Execution & Live Market Runs**: Live market sessions, wallet mutations, or live token purchases remain strictly prohibited (virtual wallet balance frozen at `7.9259 SOL`).
