@@ -249,11 +249,18 @@
         "backend/src/candidate-scanner/evaluators/LiquidityMarketCapEvaluator.ts",
         "backend/src/candidate-scanner/evaluators/OrganicFlowEvaluator.ts",
         "backend/src/candidate-scanner/CounterfactualOpportunityTracker.ts",
+        "backend/src/candidate-scanner/LpScreeningBridge.ts",
+        "backend/src/research/pilot/RaydiumAmmLpAccounting.ts",
+        "backend/src/research/pilot/RaydiumAmmParser.ts",
+        "backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcMintAccountParser.ts",
         "shared/src/index.ts",
         "shared/src/phase11-schemas.ts",
         "shared/src/phase12-dashboard-schemas.ts"
       ],
       "external": {
+        "@solana/web3.js": "AUDITED_PACKAGE",
+        "node:crypto": ["createHash"],
         "node:fs": ["existsSync", "mkdirSync", "writeFileSync"],
         "node:path": ["dirname"],
         "zod": "AUDITED_PACKAGE"
@@ -263,6 +270,13 @@
         "backend/src/candidate-scanner/CandidateWatchlistService.ts",
         "backend/src/candidate-scanner/BuyGateTriggerService.ts",
         "backend/src/candidate-scanner/CounterfactualOpportunityTracker.ts",
+        "backend/src/candidate-scanner/LpScreeningBridge.ts",
+        "backend/src/research/pilot/RaydiumAmmLpAccounting.ts",
+        "backend/src/research/pilot/RaydiumAmmParser.ts",
+        "backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.ts",
+        "backend/src/research/pilot/RaydiumAmmV4SnapshotAcquisition.ts",
+        "backend/src/research/pilot/PilotTypes.ts",
+        "backend/src/providers/solana-rpc/SolanaRpcMintAccountParser.ts",
         "shared/src/index.ts",
         "shared/src/phase11-schemas.ts",
         "shared/src/phase12-dashboard-schemas.ts"

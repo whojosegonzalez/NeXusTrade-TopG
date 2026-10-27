@@ -44,7 +44,8 @@ import {
   type RaydiumAmmV4SnapshotValidationResult,
   type RaydiumAmmV4SnapshotValidationSuccess,
 } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
-import { WSOL_MINT } from "../research/pilot/RaydiumAmmParser.js";
+import { WSOL_MINT, isCanonicalSolanaBase58 } from "../research/pilot/RaydiumAmmParser.js";
+export { isCanonicalSolanaBase58 };
 import type { SnapshotAcquisitionEvidence } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 
 export const LP_DERIVATION_METHOD = "RAYDIUM_AMM_V4_LP_RESERVE_VS_SUPPLY" as const;

@@ -340,11 +340,20 @@ The approved offline implementation items are completed:
    - Fails closed on missing/invalid/mismatched/stale evidence with `pool: null` (no numeric 0 placeholders returned for unavailable projections).
    - Bridges to `ScannedPoolRecord` and seamlessly integrates with `AntiRugEvaluator.evaluate()` and `CandidateScannerFilterEvaluation`.
    - 34 deterministic unit tests passing in [`backend/src/candidate-scanner/LpScreeningBridge.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/LpScreeningBridge.test.ts) (covering all auditor reproduction cases).
-4. **Larger Changes Quarantined**:
-   - No quote caching or observation schedule alterations.
-   - No PAPER fills inside prospective runner.
-   - No changes to execution-realism engine or recorder.
-   - Zero live network calls, RPC queries, daemon activation, or operator sessions.
+4. **Guarded Candidate Intake Integration (`CandidateStreamEngine.ts`)**:
+   - Implemented in [`backend/src/candidate-scanner/CandidateStreamEngine.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateStreamEngine.ts).
+   - Connects the accepted `LpScreeningBridge` to candidate intake via an injected resolver (`lpEvidenceResolver?: LpEvidenceResolver`) and explicit freshness policy (`lpFreshnessPolicy?: LpFreshnessPolicy`).
+   - Implemented explicitly enabled validated-LP mode (`requireValidatedLp?: boolean`). In validated mode, candidates must pass the accepted asynchronous bridge before LP-dependent admission can proceed.
+   - Strict canonical identity extraction (`resolveCanonicalIdentities`): strips provider display prefix `dexscreener-` only when suffix is a valid 32-byte Solana base58 public key, and rejects illegal token mint substitutions as pool addresses.
+   - Missing resolver, missing evidence, stale evidence, identity mismatch, invalid evidence, or unsupported protocol strictly fail closed. Calling synchronous `evaluatePool()` in validated mode immediately fails closed with `UNAVAILABLE` (`REJECTED_UNLOCKED_LP_RISK`), ensuring callers cannot bypass asynchronous cryptographic checks.
+   - Preserves `DERIVED` provenance and the distinction between observed below-threshold results (`AVAILABLE_BELOW_THRESHOLD` with derived `lpBurnPct`) and unavailable evidence (respecting `projection.pool === null` and recording structured rejections without manufacturing numeric LP placeholders).
+   - Legacy provider percentages and `lpBurnPct = 100` placeholders fail to bypass validated-LP mode.
+   - Passing the LP filter (`AVAILABLE_QUALIFIED`) only permits existing remaining checks to continue (`PAIR_MATURITY_WINDOW`, `ANTI_RUG_MINT_AUTHORITY`, `ANTI_RUG_FREEZE_AUTHORITY`, `LIQUIDITY_MARKET_CAP`, `ORGANIC_FLOW`). Candidate admitted only if all remaining checks pass.
+   - 20 comprehensive deterministic unit tests passing in [`backend/src/candidate-scanner/CandidateStreamEngine.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateStreamEngine.test.ts).
+5. **Larger Changes Quarantined**:
+   - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
+   - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
+   - Virtual wallet balance strictly frozen at 7.9259 SOL.
 
 ---
 
@@ -352,9 +361,9 @@ The approved offline implementation items are completed:
 
 Before end-to-end PAPER execution can be scheduled or authorized, the following concrete integration gaps remain:
 
-1. **Runtime Bridge Pipeline Wiring**:
-   - Wire `LpScreeningBridge` into `CandidateStreamEngine.ts` and `paper-trading-daemon.ts` intake pipeline.
-   - Connect the bounded 2-request acquisition client to resolve candidate LP accounts upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings.
+1. **Live Acquisition Wiring in Production Daemon**:
+   - `CandidateStreamEngine.ts` intake integration with injected resolver and validated-LP mode is complete and verified offline.
+   - Live daemon wiring in `paper-trading-daemon.ts` connecting the bounded 2-request acquisition client to live Solana RPC endpoints upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings remains pending authorization.
 2. **Sub-Minute Micro-Flow Observations**:
    - Implement an authentic sub-minute rolling transaction stream (`recentBuys60s`, `recentSells60s`) via websocket or high-frequency polling adapter to satisfy Retest Gate Rules A/B/C/E (1.15x / 1.25x / 1.5x flow-absorption and seller-surge protection).
 3. **Live Metered RugCheck Security Provider Integration**:
