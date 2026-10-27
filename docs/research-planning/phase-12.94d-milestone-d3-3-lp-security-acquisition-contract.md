@@ -44,61 +44,82 @@ where:
 
 ## 2. Correct Account & Withdrawal Model in Raydium AMM v4
 
-### 2.1 Pinned Official Source Revisions
+### 2.1 Verified Official Source Revisions
 
-The protocol accounting is verified against official upstream Raydium source code pinned to exact commit SHAs:
+The protocol accounting is verified against official upstream Raydium source code pinned to accessible, auditor-verified commit SHAs:
 
-1. **On-Chain Program**: [`raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm/tree/c03264c92131970258cbde51a70ff569b9f91a26) (commit `c03264c92131970258cbde51a70ff569b9f91a26`)
-   - [`program/src/state.rs#L85-L105`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/state.rs#L85-L105): Struct `AmmInfo` defines `pub lp_amount: u64` at offset 720.
-   - [`program/src/state.rs#L12-L28`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/state.rs#L12-L28): Enum `AmmStatus` bitflags defining independent protocol permissions.
-   - [`program/src/processor.rs#L400-L460`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/processor.rs#L400-L460): `process_withdraw` uses `amm.lp_amount` as the redemption denominator.
-   - [`program/src/processor.rs#L340-L390`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/processor.rs#L340-L390): `process_deposit` increments `amm.lp_amount` on deposits.
-   - [`program/src/processor.rs#L180-L240`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/processor.rs#L180-L240): `process_initialize2` calculates initial liquidity and withholds the unminted minimum.
-2. **TypeScript SDK Layout**: [`raydium-io/raydium-sdk`](https://github.com/raydium-io/raydium-sdk/tree/2e6a92ec2c4a30e463567882200ecf95a8f4c47f) (commit `2e6a92ec2c4a30e463567882200ecf95a8f4c47f`)
-   - [`src/raydium/liquidity/layout.ts#L45-L75`](https://github.com/raydium-io/raydium-sdk/blob/2e6a92ec2c4a30e463567882200ecf95a8f4c47f/src/raydium/liquidity/layout.ts#L45-L75): `liquidityStateV4Layout` defines `u64("lpReserve")` at byte offset **720..728**.
+1. **On-Chain Program**: [`raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm/tree/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6) (commit `91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6`)
+   - [`program/src/state.rs`](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/state.rs):
+     - `AmmStatus` enum (`#[repr(u64)]`) defining discrete lifecycle states (0..7) and permission methods (`valid_status`, `deposit_permission`, `withdraw_permission`, `swap_permission`, `orderbook_permission`).
+     - `AmmInfo` struct layout containing `pub lp_amount: u64` (preceded by `pub amm_owner: Pubkey` and followed by `pub client_order_id: u64`).
+   - [`program/src/processor.rs`](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/processor.rs):
+     - `process_initialize2`: Computes initial liquidity from atomic token units and initializes `amm.lp_amount = liquidity;`, withholding the unminted minimum.
+     - `process_deposit`: Adds tokens and increments `amm.lp_amount`.
+     - `process_withdraw`: Computes pro-rata redemption using `amm.lp_amount` as denominator and decrements `amm.lp_amount`.
+2. **TypeScript SDK Layout**: [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2/tree/73e95fcb3cf5df55637286a573655e5f64182b62) (commit `73e95fcb3cf5df55637286a573655e5f64182b62`)
+   - [`src/raydium/liquidity/layout.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/73e95fcb3cf5df55637286a573655e5f64182b62/src/raydium/liquidity/layout.ts):
+     - `liquidityStateV4Layout` defines `u64("lpReserve")` at byte offset **720..728** (`// true circulating supply without lock up`) following `publicKey("owner")` (688..720) and preceding `seq(u64(), 3, "padding")` (728..752).
+
+> [!NOTE]
+> **Source-Revision Verification vs. Deployed Program Verification**  
+> Pinned source revisions provide authoritative documentation of binary layouts, memory offsets, and instruction semantics. However, source-code verification is strictly distinct from verification of the on-chain bytecode deployed at `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` on Solana Mainnet-Beta. The deployed program is verified on-chain via runtime execution, deterministic layout offsets, and account ownership checks, not assumed merely from Git repository commits.
 
 ### 2.2 Layout Location & Units of `lpReserve`
 
 The 752-byte Raydium AMM v4 account layout contains `lpReserve` at offset **720..728**:
 
-| Offset Range   | Field Name in SDK / Program   | Rust Data Type   | TypeScript Decoding    | Purpose                                |
-| :------------- | :---------------------------- | :--------------- | :--------------------- | :------------------------------------- |
-| `0..8`         | `status`                      | `u64`            | `BigUInt64LE(0)`       | Pool status bitflags (see Section 2.3) |
-| `32..40`       | `baseDecimal`                 | `u64`            | `BigUInt64LE(32)`      | Base token decimals                    |
-| `40..48`       | `quoteDecimal`                | `u64`            | `BigUInt64LE(40)`      | Quote token decimals                   |
-| `336..368`     | `baseVault`                   | `Pubkey` (32B)   | `subarray(336, 368)`   | Base SPL token vault                   |
-| `368..400`     | `quoteVault`                  | `Pubkey` (32B)   | `subarray(368, 400)`   | Quote SPL token vault                  |
-| `400..432`     | `baseMint`                    | `Pubkey` (32B)   | `subarray(400, 432)`   | Base token mint                        |
-| `432..464`     | `quoteMint`                   | `Pubkey` (32B)   | `subarray(432, 464)`   | Quote token mint                       |
-| `464..496`     | `lpMint`                      | `Pubkey` (32B)   | `subarray(464, 496)`   | Pool LP token mint                     |
-| `496..528`     | `openOrders`                  | `Pubkey` (32B)   | `subarray(496, 528)`   | OpenOrders account                     |
-| `528..560`     | `marketId`                    | `Pubkey` (32B)   | `subarray(528, 560)`   | Serum/OpenBook market ID               |
-| `560..592`     | `marketProgramId`             | `Pubkey` (32B)   | `subarray(560, 592)`   | Market program ID                      |
-| `592..624`     | `targetOrders`                | `Pubkey` (32B)   | `subarray(592, 624)`   | Target orders account                  |
-| `624..656`     | `withdrawQueue`               | `Pubkey` (32B)   | `subarray(624, 656)`   | Withdraw queue                         |
-| `656..688`     | `lpVault`                     | `Pubkey` (32B)   | `subarray(656, 688)`   | LP vault                               |
-| `688..720`     | `ammOwner` / `owner`          | `Pubkey` (32B)   | `subarray(688, 720)`   | AMM pool owner                         |
-| **`720..728`** | **`lpReserve` (`lp_amount`)** | **`u64`**        | **`BigUInt64LE(720)`** | **Protocol-tracked LP supply**         |
-| `728..752`     | `padding` (3 $\times$ `u64`)  | `[u64; 3]` (24B) | `subarray(728, 752)`   | Layout trailing padding                |
+| Offset Range   | Field Name in SDK / Program   | Rust Data Type   | TypeScript Decoding    | Purpose                                  |
+| :------------- | :---------------------------- | :--------------- | :--------------------- | :--------------------------------------- |
+| `0..8`         | `status`                      | `u64`            | `BigUInt64LE(0)`       | Pool enumerated status (see Section 2.3) |
+| `32..40`       | `baseDecimal`                 | `u64`            | `BigUInt64LE(32)`      | Base token decimals                      |
+| `40..48`       | `quoteDecimal`                | `u64`            | `BigUInt64LE(40)`      | Quote token decimals                     |
+| `336..368`     | `baseVault`                   | `Pubkey` (32B)   | `subarray(336, 368)`   | Base SPL token vault                     |
+| `368..400`     | `quoteVault`                  | `Pubkey` (32B)   | `subarray(368, 400)`   | Quote SPL token vault                    |
+| `400..432`     | `baseMint`                    | `Pubkey` (32B)   | `subarray(400, 432)`   | Base token mint                          |
+| `432..464`     | `quoteMint`                   | `Pubkey` (32B)   | `subarray(432, 464)`   | Quote token mint                         |
+| `464..496`     | `lpMint`                      | `Pubkey` (32B)   | `subarray(464, 496)`   | Pool LP token mint                       |
+| `496..528`     | `openOrders`                  | `Pubkey` (32B)   | `subarray(496, 528)`   | OpenOrders account                       |
+| `528..560`     | `marketId`                    | `Pubkey` (32B)   | `subarray(528, 560)`   | Serum/OpenBook market ID                 |
+| `560..592`     | `marketProgramId`             | `Pubkey` (32B)   | `subarray(560, 592)`   | Market program ID                        |
+| `592..624`     | `targetOrders`                | `Pubkey` (32B)   | `subarray(592, 624)`   | Target orders account                    |
+| `624..656`     | `withdrawQueue`               | `Pubkey` (32B)   | `subarray(624, 656)`   | Withdraw queue                           |
+| `656..688`     | `lpVault`                     | `Pubkey` (32B)   | `subarray(656, 688)`   | LP vault                                 |
+| `688..720`     | `ammOwner` / `owner`          | `Pubkey` (32B)   | `subarray(688, 720)`   | AMM pool owner                           |
+| **`720..728`** | **`lpReserve` (`lp_amount`)** | **`u64`**        | **`BigUInt64LE(720)`** | **Protocol-tracked LP supply**           |
+| `728..752`     | `padding` (3 $\times$ `u64`)  | `[u64; 3]` (24B) | `subarray(728, 752)`   | Layout trailing padding                  |
 
 **Total Length**: Exactly **752 bytes** (`RAYDIUM_AMM_V4_LAYOUT_LENGTH`).  
 **Units**: Atomic integer LP units (`bigint`), matching `lpMint.decimals`.
 
-### 2.3 Pool Status Bitflags: Separation of Permissions
+### 2.3 Pool Status: Enumerated State, Not a Bitmask
 
-In upstream Raydium AMM v4 ([`program/src/state.rs#L12-L28`](https://github.com/raydium-io/raydium-amm/blob/c03264c92131970258cbde51a70ff569b9f91a26/program/src/state.rs#L12-L28)), the `status: u64` field represents an enum of bitflags, not a single monolithic status code:
+In upstream Raydium AMM v4 ([`program/src/state.rs`](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/state.rs)), `AmmStatus` is an **enumerated state machine representation**, not a bitmask:
 
-| Bit Position | Bitmask | Flag Name       | Semantic Meaning in On-Chain Program                     |
-| :----------- | :------ | :-------------- | :------------------------------------------------------- |
-| Bit 0        | `1`     | `Uninitialized` | `0` = Uninitialized, `status & 1 !== 0` = Initialized    |
-| Bit 1        | `2`     | `Swap`          | Swap instruction enabled (`(status & 2) !== 0`)          |
-| Bit 2        | `4`     | `Withdraw`      | Withdraw instruction enabled (`(status & 4) !== 0`)      |
-| Bit 3        | `8`     | `Deposit`       | Deposit instruction enabled (`(status & 8) !== 0`)       |
-| Bit 4        | `16`    | `CancelOrder`   | Cancel order instruction enabled (`(status & 16) !== 0`) |
+```rust
+#[repr(u64)]
+pub enum AmmStatus {
+    Uninitialized = 0u64,
+    Initialized = 1u64,
+    Disabled = 2u64,
+    WithdrawOnly = 3u64,      // Pool only allows adding/removing liquidity; cannot swap or plan orders
+    LiquidityOnly = 4u64,     // Pool only allows adding/removing liquidity and planning orders; cannot swap
+    OrderBookOnly = 5u64,     // Pool only allows adding/removing liquidity and swapping; cannot plan orders
+    SwapOnly = 6u64,          // Pool status after creation; auto-updates to SwapOnly during swap after open_time
+    WaitingTrade = 7u64,      // Pool is active and waiting for trades
+}
+```
 
-> [!NOTE]
-> **No Conflation of Permissions**  
-> Pool initialization (`status & 1 !== 0`), withdrawal permissions (`status & 4 !== 0`), and swap eligibility (`status & 2 !== 0`) are distinct protocol flags and must **not** be conflated into an artificial `status === 1` check. Fully operational pools permitting swaps and withdrawals typically carry compound values (e.g. `status = 6` or `7`). The parser decodes and exposes raw `status: bigint` without restricting candidates via a new `status === 1` constraint.
+The upstream implementation controls operational permissions via explicit match methods on the enum variants:
+
+- `valid_status(status: u64) -> bool`: Returns `true` for statuses `1..=7`, `false` otherwise.
+- `deposit_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `LiquidityOnly` (4), `OrderBookOnly` (5), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3).
+- `withdraw_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `WithdrawOnly` (3), `LiquidityOnly` (4), `OrderBookOnly` (5), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2).
+- `swap_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3), `LiquidityOnly` (4), `OrderBookOnly` (5).
+- `orderbook_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `LiquidityOnly` (4), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3), `OrderBookOnly` (5).
+
+> [!IMPORTANT]
+> **Preservation of Raw Status Output Without New Eligibility Filters**  
+> Bitwise operations (such as `status & 1`, `status & 2`, or `status & 4`) are invalid descriptions of `AmmStatus`. The parser exposes the raw decoded `status: bigint` directly from byte offset 0. No artificial `status === 1` filter or eligibility restriction is introduced.
 
 ### 2.4 Pool Initialization & The Unminted Minimum
 
@@ -141,9 +162,9 @@ When a Raydium AMM v4 pool is initialized via `initialize2`:
 - AMM protocol state $\text{amm.lp\_amount}$ is **completely unchanged** ($L_{\text{protocol}}$ remains constant).
 - Vault reserves in `baseVault` and `quoteVault` are **completely unchanged**.
 - **Result**: The difference $(L_{\text{protocol}} - S_{\text{current}})$ **increases by exactly $L_{\text{burned}}$**.
-- **Crucial AMM Consequence**: Because the AMM `withdraw` instruction divides by $\text{amm.lp\_amount}$ ($L_{\text{protocol}}$), the maximum tokens all remaining circulating LP holders combined can ever withdraw is:
-  $$\text{Max Circulating Claim} = \frac{S_{\text{current}}}{L_{\text{protocol}}}$$
-  The remaining fraction $\frac{L_{\text{protocol}} - S_{\text{current}}}{L_{\text{protocol}}}$ cannot be withdrawn via the standard AMM withdrawal instruction.
+- **Point-in-Time Protocol Consequence**: Under legacy Raydium AMM v4 withdrawal instruction rules, at the recorded snapshot slot, the maximum fraction of vault reserves claimable by all circulating LP holders combined is:
+  $$\text{Max Circulating Claim Snapshot} = \frac{S_{\text{current}}}{L_{\text{protocol}}}$$
+  Under these stated protocol mechanics, the remaining fraction $\frac{L_{\text{protocol}} - S_{\text{current}}}{L_{\text{protocol}}}$ cannot be redeemed via the standard AMM withdrawal instruction at that recorded snapshot.
 
 ---
 
@@ -164,18 +185,18 @@ Under validated Raydium AMM v4 assumptions, the pure calculation evaluates:
 3. **Exact 90.0% Threshold Comparison**:
    Using exact integer cross-multiplication with no floating-point arithmetic:
    $$100n \times (L_{\text{protocol}} - S_{\text{current}}) \ge 90n \times L_{\text{protocol}}$$
-4. **Display Value Conversion**:
-   Converted to floating-point solely for presentation and logging after integer pre-scaling:
+4. **Presentation Percentage Conversion (Six Decimal Places)**:
+   Converted to floating-point solely for presentation and logging using integer truncation to six decimal places:
    $$\text{displayInaccessiblePct} = \frac{\text{Number}\left(\frac{(L - S) \times 100,000,000n}{L}\right)}{1,000,000}$$
 
 ### 3.2 Protocol Lifecycle Behaviors
 
 | Event                     | $L_{\text{protocol}}$ | $S_{\text{current}}$ | Difference $(L_{\text{protocol}} - S_{\text{current}})$ | $\text{displayPct}$ | Evaluation Outcome                                                    |
 | :------------------------ | :-------------------: | :------------------: | :-----------------------------------------------------: | :-----------------: | :-------------------------------------------------------------------- |
-| **Genesis Pool Init**     |   $316,227,766,016$   |  $316,226,766,016$   |               $1,000,000$ (unminted min)                |     $0.0003\%$      | $\mathbf{0.0003\% < 90\%} \rightarrow$ **REJECTED** (Unprotected)     |
-| **90% Normal Redemption** |     $100,000,000$     |     $99,000,000$     |                 $1,000,000$ (constant)                  |      $1.00\%$       | $\mathbf{1.0\% < 90\%} \rightarrow$ **REJECTED** (Unprotected)        |
-| **95% Direct SPL Burn**   |    $1,000,000,000$    |     $49,000,000$     |                      $951,000,000$                      |      $95.10\%$      | $\mathbf{95.1\% \ge 90\%} \rightarrow$ **PASSED** (Meets threshold)   |
-| **Subsequent Deposit**    |    $1,500,000,000$    |    $549,000,000$     |                 $951,000,000$ (diluted)                 |      $63.40\%$      | $\mathbf{63.4\% < 90\%} \rightarrow$ **REJECTED** (Diluted below 90%) |
+| **Genesis Pool Init**     |   $316,227,766,016$   |  $316,226,766,016$   |               $1,000,000$ (unminted min)                |    $0.000316\%$     | $\mathbf{0.000316\% < 90\%} \rightarrow$ **REJECTED** (Unprotected)   |
+| **90% Normal Redemption** |     $100,000,000$     |     $99,000,000$     |                 $1,000,000$ (constant)                  |    $1.000000\%$     | $\mathbf{1.0\% < 90\%} \rightarrow$ **REJECTED** (Unprotected)        |
+| **95% Direct SPL Burn**   |    $1,000,000,000$    |     $49,000,000$     |                      $951,000,000$                      |    $95.100000\%$    | $\mathbf{95.1\% \ge 90\%} \rightarrow$ **PASSED** (Meets threshold)   |
+| **Subsequent Deposit**    |    $1,500,000,000$    |    $549,000,000$     |                 $951,000,000$ (diluted)                 |    $63.400000\%$    | $\mathbf{63.4\% < 90\%} \rightarrow$ **REJECTED** (Diluted below 90%) |
 | **Inconsistent State**    |     $100,000,000$     |    $120,000,000$     |                 $-20,000,000$ ($S > L$)                 |         N/A         | **REJECTED** (`SUPPLY_EXCEEDS_PROTOCOL_LP`)                           |
 
 ---
@@ -231,13 +252,13 @@ sequenceDiagram
   $$S_{\text{current}} = 316,227,766,016n - 1,000,000n = 316,226,766,016n$$
 - Inaccessible LP claims:
   $$L_{\text{protocol}} - S_{\text{current}} = 1,000,000n$$
-  $$\text{Fraction} = \frac{1,000,000n}{316,227,766,016n} \approx 0.0003162277\%$$
+  $$\text{Presentation Percentage} = \frac{\lfloor (1,000,000 \times 100,000,000) / 316,227,766,016 \rfloor}{1,000,000} = \frac{316}{1,000,000} = 0.000316\%$$
 - Exact cross-multiplication comparison with 90%:
   `100n * (L - S) >= 90n * L`
   $$100n \times 1,000,000n = 100,000,000n$$
   $$90n \times 316,227,766,016n = 28,460,498,941,440n$$
   $$100,000,000n < 28,460,498,941,440n \rightarrow \mathbf{false}$$
-- **Outcome**: **REJECTED** ($0.0003\% < 90.0\%$). The deployer controls $99.999684\%$ of pool claims. Correctly identified as unprotected.
+- **Outcome**: **REJECTED** ($0.000316\% < 90.0\%$). The deployer controls $99.999684\%$ of pool claims at genesis. Correctly identified as unprotected.
 
 ### Scenario 2: 90% Liquidity Withdrawal (Ordinary Rug Pull)
 
@@ -248,11 +269,11 @@ sequenceDiagram
   - $S_{\text{current}} \leftarrow 999,000,000 - 900,000,000 = 99,000,000n$.
   - Reserves drop to $10\text{ SOL}$.
 - Calculation:
-  $$\frac{100,000,000 - 99,000,000}{100,000,000} \times 100\% = 1.0\%$$
+  $$\text{displayPct} = \frac{\lfloor (1,000,000 \times 100,000,000) / 100,000,000 \rfloor}{1,000,000} = 1.000000\%$$
 - Exact comparison:
   `100n * 1,000,000n >= 90n * 100,000,000n`
   $$100,000,000n < 9,000,000,000n \rightarrow \mathbf{false}$$
-- **Outcome**: **REJECTED** ($1.0\% < 90.0\%$). The model correctly prevents ordinary redemptions from qualifying.
+- **Outcome**: **REJECTED** ($1.000000\% < 90.0\%$). The model correctly prevents ordinary redemptions from qualifying.
 
 ### Scenario 3: 95% Direct SPL Burn Outside AMM
 
@@ -262,11 +283,11 @@ sequenceDiagram
   - $L_{\text{protocol}}$ remains $1,000,000,000n$.
   - $S_{\text{current}} \leftarrow 999,000,000 - 950,000,000 = 49,000,000n$.
 - Calculation:
-  $$\frac{1,000,000,000 - 49,000,000}{1,000,000,000} \times 100\% = 95.1\%$$
+  $$\text{displayPct} = \frac{\lfloor (951,000,000 \times 100,000,000) / 1,000,000,000 \rfloor}{1,000,000} = 95.100000\%$$
 - Exact comparison:
   `100n * 951,000,000n >= 90n * 1,000,000,000n`
   $$95,100,000,000n \ge 90,000,000,000n \rightarrow \mathbf{true}$$
-- **Outcome**: **PASSED** ($95.1\% \ge 90.0\%$).
+- **Outcome**: **PASSED** ($95.100000\% \ge 90.0\%$).
 
 ---
 
@@ -283,6 +304,7 @@ The offline implementation approved by the auditor is complete:
    - Validates unsigned 64-bit bounds (`0 <= val <= 2^64 - 1`).
    - Requires $L > 0$ and rejects $S > L$.
    - Performs exact 90% comparison via integer cross-multiplication: `100n * (L - S) >= 90n * L`.
+   - Formats display presentation to six decimal places using `Number(((L - S) * 100_000_000n) / L) / 1_000_000`.
    - Returns raw numerator (`rawInaccessibleLp`) and denominator (`rawDenominator`).
    - Re-exported from `RaydiumAmmParser.ts`.
 3. **Deterministic Offline Test Suites**:

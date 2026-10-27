@@ -102,10 +102,10 @@ export function calculateAmmV4LpInaccessibleClaims(
   // Exact integer cross-multiplication for the 90% threshold: 100n * (L - S) >= 90n * L
   const meetsNinetyPercentThreshold = 100n * rawInaccessibleLp >= 90n * protocolLp;
 
-  // Compute display floating-point percentage using 100_000n integer pre-scaling to prevent
-  // precision loss for values exceeding Number.MAX_SAFE_INTEGER
-  const scaledBps = (rawInaccessibleLp * 100_000n) / protocolLp;
-  const displayInaccessiblePct = Number(scaledBps) / 1_000;
+  // Compute presentation percentage to six decimal places using integer truncation:
+  // Number(((L - S) * 100_000_000n) / L) / 1_000_000
+  const scaledNumerator = (rawInaccessibleLp * 100_000_000n) / protocolLp;
+  const displayInaccessiblePct = Number(scaledNumerator) / 1_000_000;
 
   return {
     ok: true,

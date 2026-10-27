@@ -85,7 +85,7 @@ describe("Raydium AMM v4 LP Accounting & Inaccessible Claims", () => {
       expect(result.rawInaccessibleLp).toBe(unmintedMinimum);
       expect(result.rawDenominator).toBe(protocolLp);
       expect(result.meetsNinetyPercentThreshold).toBe(false);
-      expect(result.displayInaccessiblePct).toBeCloseTo(0.0003, 3);
+      expect(result.displayInaccessiblePct).toBe(0.000316);
     });
 
     it("Scenario 2: Ordinary 90% redemption reduces both L and S equally and fails the 90% threshold", () => {
@@ -174,7 +174,7 @@ describe("Raydium AMM v4 LP Accounting & Inaccessible Claims", () => {
       if (!result.ok) return;
 
       expect(result.meetsNinetyPercentThreshold).toBe(false);
-      expect(result.displayInaccessiblePct).toBeCloseTo(89.999, 2);
+      expect(result.displayInaccessiblePct).toBe(89.999999);
     });
 
     it("immediately above 90.0% (90.0000001%) strictly passes", () => {
@@ -187,7 +187,7 @@ describe("Raydium AMM v4 LP Accounting & Inaccessible Claims", () => {
       if (!result.ok) return;
 
       expect(result.meetsNinetyPercentThreshold).toBe(true);
-      expect(result.displayInaccessiblePct).toBeCloseTo(90.0, 2);
+      expect(result.displayInaccessiblePct).toBe(90.0);
     });
   });
 
