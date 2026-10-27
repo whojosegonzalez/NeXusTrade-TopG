@@ -293,6 +293,84 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       expect(result.diagnostics.retrievedAtIso).toBeNull();
     });
 
+    it("rejects contradictory provenance fields (e.g. CAPTURED_RPC with isSyntheticFixture=true)", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        evidenceOrigin: "CAPTURED_RPC",
+        isSyntheticFixture: true, // Contradicts CAPTURED_RPC!
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+      expect(result.message).toContain("Contradictory provenance options");
+    });
+
+    it("rejects contradictory provenance fields (e.g. SYNTHETIC_FIXTURE with isSyntheticFixture=false)", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        evidenceOrigin: "SYNTHETIC_FIXTURE",
+        isSyntheticFixture: false, // Contradicts SYNTHETIC_FIXTURE!
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+    });
+
+    it("rejects unsupported evidenceOrigin values at runtime", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        // @ts-expect-error - testing invalid runtime provenance string
+        evidenceOrigin: "INVALID",
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+      expect(result.message).toContain("Invalid evidenceOrigin: 'INVALID'");
+    });
+
+    it("rejects impossible calendar dates (e.g. February 30) that Date.parse normalizes into another month", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        retrievedAtIso: "2026-02-30T21:00:00.000Z", // Impossible date!
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+      expect(result.message).toContain("2026-02-30T21:00:00.000Z");
+    });
+
+    it("rejects February 29 in non-leap years (e.g. 2026-02-29)", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        retrievedAtIso: "2026-02-29T21:00:00.000Z", // 2026 is not a leap year!
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+    });
+
+    it("accepts February 29 in leap years (e.g. 2024-02-29)", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        retrievedAtIso: "2024-02-29T21:00:00.000Z", // 2024 is a leap year!
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.diagnostics.retrievedAtIso).toBe("2024-02-29T21:00:00.000Z");
+    });
+
     it("rejects invalid retrieval timestamps", async () => {
       const accounts = createValidBatchAccounts();
       const payload = buildRpcPayload(accounts, 289500100);
@@ -305,7 +383,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
     });
 
-    it("defensively copies requested identities so post-validation caller mutations cannot change recorded evidence", async () => {
+    it("captures identities at entry so mutating caller object while validation is pending does not affect decoded labels or diagnostics", async () => {
       const mutableIdentities: RaydiumAmmV4SnapshotIdentities = {
         poolId: FIXTURE_POOL_ADDRESS,
         lpMint: FIXTURE_LP_MINT,
@@ -317,16 +395,24 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       const accounts = createValidBatchAccounts();
       const payload = buildRpcPayload(accounts, 289500100);
 
-      const result = await validateRaydiumAmmV4Snapshot(mutableIdentities, payload);
+      // Start validation asynchronously
+      const promise = validateRaydiumAmmV4Snapshot(mutableIdentities, payload);
+
+      // Mutate original object immediately while validation is pending (before awaiting)
+      // @ts-expect-error - mutating object for test
+      mutableIdentities.baseVault = "MutatedBaseVault111111111111111111111111";
+      // @ts-expect-error - mutating object for test
+      mutableIdentities.poolId = "MutatedPool11111111111111111111111111111111";
+
+      const result = await promise;
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
-      // Caller attempts to mutate the original identities object
-      // @ts-expect-error - mutating object for test
-      mutableIdentities.poolId = "MutatedPoolAddress111111111111111111111111111";
-
-      // Recorded diagnostics must remain intact and frozen
+      // Every returned identity and decoded account label must remain consistent with original validated request
+      expect(result.diagnostics.requestedIdentities.baseVault).toBe(FIXTURE_BASE_VAULT);
       expect(result.diagnostics.requestedIdentities.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      expect(result.diagnostics.baseVaultState.vaultAddress).toBe(FIXTURE_BASE_VAULT);
+      expect(result.diagnostics.poolState.poolAddress).toBe(FIXTURE_POOL_ADDRESS);
       expect(Object.isFrozen(result.diagnostics.requestedIdentities)).toBe(true);
     });
   });

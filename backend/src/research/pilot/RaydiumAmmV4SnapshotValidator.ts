@@ -212,16 +212,61 @@ export function isValidStrictBase64(str: unknown): boolean {
 }
 
 /**
+ * Strictly validates that a string is a valid ISO 8601 timestamp representing an actual calendar date.
+ * Rejects impossible dates (e.g. February 30) that Date.parse normalizes into another month.
+ */
+export function isValidIsoCalendarTimestamp(ts: unknown): boolean {
+  if (typeof ts !== "string" || ts.trim() !== ts) {
+    return false;
+  }
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(ts);
+  if (!match) {
+    return false;
+  }
+  const [, yearStr, monthStr, dayStr, hourStr, minStr, secStr] = match;
+  const year = parseInt(yearStr!, 10);
+  const month = parseInt(monthStr!, 10);
+  const day = parseInt(dayStr!, 10);
+  const hour = parseInt(hourStr!, 10);
+  const min = parseInt(minStr!, 10);
+  const sec = parseInt(secStr!, 10);
+
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59) {
+    return false;
+  }
+
+  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const daysInMonths = [0, 31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day > daysInMonths[month]!) {
+    return false;
+  }
+
+  return !Number.isNaN(Date.parse(ts));
+}
+
+/**
  * Validates a coherent offline snapshot batch response for a legacy Raydium AMM v4 pool.
  *
  * Expects the raw getMultipleAccounts response corresponding to requested identities:
  *   [poolId, lpMint, baseVault, quoteVault]
  */
 export async function validateRaydiumAmmV4Snapshot(
-  identities: RaydiumAmmV4SnapshotIdentities,
+  callerIdentities: RaydiumAmmV4SnapshotIdentities,
   payload: unknown,
   options?: RaydiumAmmV4SnapshotOptions,
 ): Promise<RaydiumAmmV4SnapshotValidationResult> {
+  // Capture an immutable, frozen identity snapshot at entry before any asynchronous suspension
+  const identities: RaydiumAmmV4SnapshotIdentities = Object.freeze({
+    poolId: callerIdentities?.poolId,
+    lpMint: callerIdentities?.lpMint,
+    baseVault: callerIdentities?.baseVault,
+    quoteVault: callerIdentities?.quoteVault,
+    ...(callerIdentities?.expectedTokenMint !== undefined
+      ? { expectedTokenMint: callerIdentities.expectedTokenMint }
+      : {}),
+  });
+
   // 1. Validate requested identities: actual 32-byte public-key decoding and canonical round-trip
   if (
     !isCanonicalSolanaBase58(identities.poolId) ||
@@ -247,7 +292,35 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 2. Validate provenance options without inventing evidence
+  // 2. Validate provenance options consistently without inventing evidence
+  const ALLOWED_EVIDENCE_ORIGINS = new Set(["SYNTHETIC_FIXTURE", "CAPTURED_RPC", "UNKNOWN"]);
+
+  if (
+    options?.evidenceOrigin !== undefined &&
+    !ALLOWED_EVIDENCE_ORIGINS.has(options.evidenceOrigin)
+  ) {
+    return {
+      ok: false,
+      category: "INVALID_PROVENANCE_METADATA",
+      message: `Invalid evidenceOrigin: '${options.evidenceOrigin}' is not a supported provenance origin`,
+    };
+  }
+
+  // Check contradiction between evidenceOrigin and isSyntheticFixture
+  if (options?.evidenceOrigin !== undefined && options?.isSyntheticFixture !== undefined) {
+    if (
+      (options.evidenceOrigin === "SYNTHETIC_FIXTURE" && options.isSyntheticFixture !== true) ||
+      (options.evidenceOrigin === "CAPTURED_RPC" && options.isSyntheticFixture !== false) ||
+      (options.evidenceOrigin === "UNKNOWN" && options.isSyntheticFixture !== undefined)
+    ) {
+      return {
+        ok: false,
+        category: "INVALID_PROVENANCE_METADATA",
+        message: `Contradictory provenance options: evidenceOrigin is '${options.evidenceOrigin}' but isSyntheticFixture is ${options.isSyntheticFixture}`,
+      };
+    }
+  }
+
   let evidenceOrigin: EvidenceOrigin = "UNKNOWN";
   let isSyntheticFixture: boolean | null = null;
 
@@ -259,42 +332,31 @@ export async function validateRaydiumAmmV4Snapshot(
         : evidenceOrigin === "CAPTURED_RPC"
           ? false
           : null;
-  } else if (options?.isSyntheticFixture === true) {
-    evidenceOrigin = "SYNTHETIC_FIXTURE";
-    isSyntheticFixture = true;
-  } else if (options?.isSyntheticFixture === false) {
-    evidenceOrigin = "CAPTURED_RPC";
-    isSyntheticFixture = false;
-  }
-
-  let retrievedAtIso: string | null = null;
-  if (options?.retrievedAtIso !== undefined && options?.retrievedAtIso !== null) {
-    const ts = options.retrievedAtIso;
-    const isIsoFormat =
-      typeof ts === "string" &&
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(ts);
-    const parsedDate = typeof ts === "string" ? Date.parse(ts) : NaN;
-
-    if (!isIsoFormat || Number.isNaN(parsedDate)) {
+  } else if (options?.isSyntheticFixture !== undefined) {
+    if (typeof options.isSyntheticFixture !== "boolean") {
       return {
         ok: false,
         category: "INVALID_PROVENANCE_METADATA",
-        message: `Invalid retrievedAtIso timestamp: '${ts}' is not a valid ISO 8601 string`,
+        message: `Invalid isSyntheticFixture: expected boolean, received ${typeof options.isSyntheticFixture}`,
+      };
+    }
+    evidenceOrigin = options.isSyntheticFixture ? "SYNTHETIC_FIXTURE" : "CAPTURED_RPC";
+    isSyntheticFixture = options.isSyntheticFixture;
+  }
+
+  // Validate retrievedAtIso timestamp: must be null if omitted, or a valid ISO 8601 calendar string if supplied
+  let retrievedAtIso: string | null = null;
+  if (options?.retrievedAtIso !== undefined && options?.retrievedAtIso !== null) {
+    const ts = options.retrievedAtIso;
+    if (!isValidIsoCalendarTimestamp(ts)) {
+      return {
+        ok: false,
+        category: "INVALID_PROVENANCE_METADATA",
+        message: `Invalid retrievedAtIso timestamp: '${ts}' is not a valid ISO 8601 calendar date`,
       };
     }
     retrievedAtIso = ts;
   }
-
-  // Defensive copy of requested identities to protect recorded evidence against caller mutation
-  const requestedIdentitiesCopy: RaydiumAmmV4SnapshotIdentities = Object.freeze({
-    poolId: identities.poolId,
-    lpMint: identities.lpMint,
-    baseVault: identities.baseVault,
-    quoteVault: identities.quoteVault,
-    ...(identities.expectedTokenMint !== undefined
-      ? { expectedTokenMint: identities.expectedTokenMint }
-      : {}),
-  });
 
   // 3. Extract context slot and account value array from JSON-RPC payload
   const extracted = extractRpcValueAndSlot(payload);
@@ -760,7 +822,7 @@ export async function validateRaydiumAmmV4Snapshot(
       evidenceOrigin,
       isSyntheticFixture,
       retrievedAtIso,
-      requestedIdentities: requestedIdentitiesCopy,
+      requestedIdentities: identities,
       poolState,
       lpMintState,
       baseVaultState: baseVaultParse.state,

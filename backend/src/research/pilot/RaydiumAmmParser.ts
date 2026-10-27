@@ -420,6 +420,7 @@ export {
 export {
   deriveRaydiumAmmAuthority,
   validateRaydiumAmmV4Snapshot,
+  isValidIsoCalendarTimestamp,
   isValidStrictBase64,
   RAYDIUM_AMM_AUTHORITY_SEED,
   SPL_MINT_LAYOUT_LENGTH,
