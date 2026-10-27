@@ -6,27 +6,28 @@
  *   [poolId, lpMint, baseVault, quoteVault]
  *
  * Validates:
- * 1. Complete, correctly ordered 4 account results and valid shared response context slot (slot > 0).
- * 2. Exact pool identity, expected token/WSOL pair, canonical program ownership:
+ * 1. Positive safe integer context slot (slot > 0 and Number.isSafeInteger(slot)).
+ * 2. Complete, correctly ordered 4 account results.
+ * 3. Exact 32-byte public-key canonical round-trip validation for all identities.
+ * 4. Strict Base64 syntax and canonical encoding verification before decoding.
+ * 5. Exact pool identity, expected token/WSOL pair, canonical program ownership:
  *    - RAYDIUM_AMM_V4_PROGRAM_ID (675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8)
  *    - SPL_TOKEN_PROGRAM_ID (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA)
  *    - Supported account layouts: 752B pool, 82B mint, 165B vaults.
- * 3. Pool references matching requested LP mint, base vault, quote vault.
- * 4. Initialized legacy SPL LP mint, correctly decoded supply, decimals, and authority fields.
- * 5. Source-backed AMM authority derivation using @solana/web3.js:
+ * 6. Pool references matching requested LP mint, base vault, quote vault.
+ * 7. Pool stored nonce at byte offset 8 matching derived AMM authority bump.
+ * 8. Initialized legacy SPL LP mint, correctly decoded supply, decimals, and authority fields.
+ * 9. Source-backed AMM authority derivation with mutation-protected cache:
  *    PublicKey.findProgramAddress([Buffer.from("amm authority")], programId) -> 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1, bump 254.
- * 6. Vault owners and LP mint authority matching derived AMM authority (or LP mint authority null/renounced).
- * 7. Correct vault mints and initialized, unfrozen vault accounts (accountState === 1).
- * 8. Pure mathematical BigInt LP calculation via calculateAmmV4LpInaccessibleClaims.
+ * 10. Vault owners and LP mint authority matching derived AMM authority (or LP mint authority null/renounced).
+ * 11. Correct vault mints and initialized, unfrozen vault accounts (accountState === 1).
+ * 12. Pure mathematical BigInt LP calculation via calculateAmmV4LpInaccessibleClaims.
  *
  * Strict Evidence Boundary:
- * Returns raw LP numerator/denominator and mathematical threshold result separately from
- * validation diagnostics and provenance. Preserves response context slot, requested identities,
- * available retrieval metadata, and raw-data digests (SHA-256). Clearly distinguishes synthetic
- * fixtures from captured RPC evidence.
- *
- * Does NOT claim deployed-bytecode equivalence, complete executable reserves, or general token safety.
- * Does NOT populate strategy gates or admit candidates.
+ * Preserves evidence without inventing provenance: missing provenance is represented
+ * as UNKNOWN (not defaulted to captured RPC). Missing retrieval timestamps remain null
+ * (validation time is never substituted). Requested identities are defensibly copied.
+ * Statically guarantees evidenceBoundary assertions are false.
  */
 
 import { createHash } from "node:crypto";
@@ -34,6 +35,7 @@ import { PublicKey } from "@solana/web3.js";
 import {
   RAYDIUM_AMM_V4_LAYOUT_LENGTH,
   RAYDIUM_AMM_V4_PROGRAM_ID,
+  RAYDIUM_V4_OFFSETS,
   SPL_TOKEN_PROGRAM_ID,
   SPL_VAULT_LAYOUT_LENGTH,
   WSOL_MINT,
@@ -51,6 +53,8 @@ import type { D23RaydiumAmmV4State, D23SplTokenVaultState } from "./PilotTypes.j
 export const SPL_MINT_LAYOUT_LENGTH = 82;
 export const RAYDIUM_AMM_AUTHORITY_SEED = "amm authority";
 
+export type EvidenceOrigin = "SYNTHETIC_FIXTURE" | "CAPTURED_RPC" | "UNKNOWN";
+
 export interface RaydiumAmmV4SnapshotIdentities {
   readonly poolId: string;
   readonly lpMint: string;
@@ -61,7 +65,8 @@ export interface RaydiumAmmV4SnapshotIdentities {
 
 export interface RaydiumAmmV4SnapshotOptions {
   readonly isSyntheticFixture?: boolean | undefined;
-  readonly retrievedAtIso?: string | undefined;
+  readonly evidenceOrigin?: EvidenceOrigin | undefined;
+  readonly retrievedAtIso?: string | null | undefined;
   readonly programId?: string | undefined;
 }
 
@@ -74,15 +79,22 @@ export interface DecodedSplLpMint {
   readonly freezeAuthority: string | null;
 }
 
+export interface DerivedAmmAuthority {
+  readonly address: string;
+  readonly bump: number;
+}
+
 export type RaydiumAmmV4SnapshotFailureCategory =
   | "INVALID_IDENTITIES"
   | "INVALID_RPC_PAYLOAD"
   | "INVALID_CONTEXT_SLOT"
+  | "INVALID_PROVENANCE_METADATA"
   | "INCOMPLETE_ACCOUNT_BATCH"
   | "ACCOUNT_NOT_FOUND"
   | "ACCOUNT_BUFFER_EXTRACTION_FAILED"
   | "UNAUTHORIZED_PROGRAM_OWNER"
   | "INVALID_ACCOUNT_LAYOUT"
+  | "INCONSISTENT_POOL_NONCE"
   | "POOL_REFERENCE_MISMATCH"
   | "NON_SOL_PAIR"
   | "TOKEN_MINT_MISMATCH"
@@ -100,17 +112,15 @@ export interface RaydiumAmmV4SnapshotValidationSuccess {
   /** Comprehensive evidence, provenance, and decoded state diagnostics */
   readonly diagnostics: {
     readonly slot: number;
-    readonly isSyntheticFixture: boolean;
-    readonly retrievedAtIso: string;
+    readonly evidenceOrigin: EvidenceOrigin;
+    readonly isSyntheticFixture: boolean | null;
+    readonly retrievedAtIso: string | null;
     readonly requestedIdentities: RaydiumAmmV4SnapshotIdentities;
     readonly poolState: D23RaydiumAmmV4State;
     readonly lpMintState: DecodedSplLpMint;
     readonly baseVaultState: D23SplTokenVaultState;
     readonly quoteVaultState: D23SplTokenVaultState;
-    readonly derivedAmmAuthority: {
-      readonly address: string;
-      readonly bump: number;
-    };
+    readonly derivedAmmAuthority: DerivedAmmAuthority;
     readonly accountDigests: {
       readonly poolSha256: string;
       readonly lpMintSha256: string;
@@ -144,7 +154,7 @@ export type RaydiumAmmV4SnapshotValidationResult =
   | RaydiumAmmV4SnapshotValidationSuccess
   | RaydiumAmmV4SnapshotValidationFailure;
 
-const ammAuthorityCache = new Map<string, { address: string; bump: number }>();
+const ammAuthorityCache = new Map<string, DerivedAmmAuthority>();
 
 /**
  * Derives the canonical Raydium AMM authority PDA using official Solana tooling:
@@ -152,13 +162,15 @@ const ammAuthorityCache = new Map<string, { address: string; bump: number }>();
  *
  * For canonical program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8,
  * this returns address 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1 with bump 254.
+ *
+ * Returns an immutable, frozen defensive copy to prevent caller mutation of internal cache.
  */
 export async function deriveRaydiumAmmAuthority(
   programId: string = RAYDIUM_AMM_V4_PROGRAM_ID,
-): Promise<{ address: string; bump: number }> {
+): Promise<DerivedAmmAuthority> {
   const cached = ammAuthorityCache.get(programId);
   if (cached) {
-    return cached;
+    return Object.freeze({ address: cached.address, bump: cached.bump });
   }
 
   try {
@@ -167,13 +179,35 @@ export async function deriveRaydiumAmmAuthority(
       [Buffer.from(RAYDIUM_AMM_AUTHORITY_SEED)],
       programPubkey,
     );
-    const result = { address: pda.toBase58(), bump };
+    const result: DerivedAmmAuthority = Object.freeze({ address: pda.toBase58(), bump });
     ammAuthorityCache.set(programId, result);
-    return result;
+    return Object.freeze({ address: result.address, bump: result.bump });
   } catch (err) {
     throw new Error(
       `Failed to derive Raydium AMM authority for programId '${programId}': ${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+}
+
+/**
+ * Strictly validates Base64 syntax and canonical encoding before decoding.
+ * Prevents Node.js Buffer from silently accepting malformed characters (e.g. trailing '!').
+ */
+export function isValidStrictBase64(str: unknown): boolean {
+  if (typeof str !== "string" || str.length === 0) {
+    return false;
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(str)) {
+    return false;
+  }
+  if (str.length % 4 !== 0) {
+    return false;
+  }
+  try {
+    const buf = Buffer.from(str, "base64");
+    return buf.toString("base64") === str;
+  } catch {
+    return false;
   }
 }
 
@@ -188,7 +222,7 @@ export async function validateRaydiumAmmV4Snapshot(
   payload: unknown,
   options?: RaydiumAmmV4SnapshotOptions,
 ): Promise<RaydiumAmmV4SnapshotValidationResult> {
-  // 1. Validate requested identities format
+  // 1. Validate requested identities: actual 32-byte public-key decoding and canonical round-trip
   if (
     !isCanonicalSolanaBase58(identities.poolId) ||
     !isCanonicalSolanaBase58(identities.lpMint) ||
@@ -213,26 +247,77 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 2. Extract context slot and account value array from JSON-RPC payload
+  // 2. Validate provenance options without inventing evidence
+  let evidenceOrigin: EvidenceOrigin = "UNKNOWN";
+  let isSyntheticFixture: boolean | null = null;
+
+  if (options?.evidenceOrigin !== undefined) {
+    evidenceOrigin = options.evidenceOrigin;
+    isSyntheticFixture =
+      evidenceOrigin === "SYNTHETIC_FIXTURE"
+        ? true
+        : evidenceOrigin === "CAPTURED_RPC"
+          ? false
+          : null;
+  } else if (options?.isSyntheticFixture === true) {
+    evidenceOrigin = "SYNTHETIC_FIXTURE";
+    isSyntheticFixture = true;
+  } else if (options?.isSyntheticFixture === false) {
+    evidenceOrigin = "CAPTURED_RPC";
+    isSyntheticFixture = false;
+  }
+
+  let retrievedAtIso: string | null = null;
+  if (options?.retrievedAtIso !== undefined && options?.retrievedAtIso !== null) {
+    const ts = options.retrievedAtIso;
+    const isIsoFormat =
+      typeof ts === "string" &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(ts);
+    const parsedDate = typeof ts === "string" ? Date.parse(ts) : NaN;
+
+    if (!isIsoFormat || Number.isNaN(parsedDate)) {
+      return {
+        ok: false,
+        category: "INVALID_PROVENANCE_METADATA",
+        message: `Invalid retrievedAtIso timestamp: '${ts}' is not a valid ISO 8601 string`,
+      };
+    }
+    retrievedAtIso = ts;
+  }
+
+  // Defensive copy of requested identities to protect recorded evidence against caller mutation
+  const requestedIdentitiesCopy: RaydiumAmmV4SnapshotIdentities = Object.freeze({
+    poolId: identities.poolId,
+    lpMint: identities.lpMint,
+    baseVault: identities.baseVault,
+    quoteVault: identities.quoteVault,
+    ...(identities.expectedTokenMint !== undefined
+      ? { expectedTokenMint: identities.expectedTokenMint }
+      : {}),
+  });
+
+  // 3. Extract context slot and account value array from JSON-RPC payload
   const extracted = extractRpcValueAndSlot(payload);
   if (extracted.error || extracted.value === null) {
     return {
       ok: false,
       category: "INVALID_RPC_PAYLOAD",
       message: extracted.error ?? "Failed to parse JSON-RPC payload",
-      ...(extracted.slot !== null ? { slot: extracted.slot } : {}),
+      ...(extracted.slot !== null && typeof extracted.slot === "number"
+        ? { slot: extracted.slot }
+        : {}),
     };
   }
 
   const { slot, value } = extracted;
 
-  // Validate context slot: strictly positive integer
-  if (slot === null || !Number.isInteger(slot) || slot <= 0) {
+  // Validate context slot: strictly positive safe integer
+  if (slot === null || typeof slot !== "number" || !Number.isSafeInteger(slot) || slot <= 0) {
     return {
       ok: false,
       category: "INVALID_CONTEXT_SLOT",
-      message: `Invalid RPC response context slot: expected integer > 0, received ${slot ?? "null"}`,
-      ...(slot !== null ? { slot } : {}),
+      message: `Invalid RPC response context slot: expected positive safe integer, received ${slot ?? "null"}`,
+      ...(slot !== null && typeof slot === "number" ? { slot } : {}),
     };
   }
 
@@ -253,7 +338,7 @@ export async function validateRaydiumAmmV4Snapshot(
     { name: "quoteVault", address: identities.quoteVault },
   ] as const;
 
-  // 3. Extract raw account buffers and verify presence
+  // 4. Extract raw account buffers with strict Base64 verification
   const rawBuffers: Buffer[] = [];
   const rawOwners: string[] = [];
 
@@ -312,7 +397,7 @@ export async function validateRaydiumAmmV4Snapshot(
     string,
   ];
 
-  // 4. Validate Account 0: Pool (`poolId`)
+  // 5. Validate Account 0: Pool (`poolId`)
   if (poolOwner !== effectiveProgramId) {
     return {
       ok: false,
@@ -414,8 +499,8 @@ export async function validateRaydiumAmmV4Snapshot(
     }
   }
 
-  // 5. Derive canonical AMM authority PDA
-  let derivedAmmAuthority: { address: string; bump: number };
+  // 6. Derive canonical AMM authority PDA
+  let derivedAmmAuthority: DerivedAmmAuthority;
   try {
     derivedAmmAuthority = await deriveRaydiumAmmAuthority(effectiveProgramId);
   } catch (err) {
@@ -427,7 +512,20 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 6. Validate Account 1: LP Mint (`lpMint`)
+  // 7. Bind authority validation to pool state: decode pool's stored nonce at offset 8 and verify consistency
+  const poolNonce = poolBuffer.readBigUInt64LE(RAYDIUM_V4_OFFSETS.NONCE);
+  if (poolNonce !== BigInt(derivedAmmAuthority.bump)) {
+    return {
+      ok: false,
+      category: "INCONSISTENT_POOL_NONCE",
+      message: `Pool stored nonce (${poolNonce}) is inconsistent with derived AMM authority bump (${derivedAmmAuthority.bump})`,
+      slot,
+      accountIndex: 0,
+      accountAddress: identities.poolId,
+    };
+  }
+
+  // 8. Validate Account 1: LP Mint (`lpMint`)
   if (lpMintOwner !== SPL_TOKEN_PROGRAM_ID) {
     return {
       ok: false,
@@ -533,7 +631,7 @@ export async function validateRaydiumAmmV4Snapshot(
     freezeAuthority,
   };
 
-  // 7. Validate Account 2: Base Vault (`baseVault`)
+  // 9. Validate Account 2: Base Vault (`baseVault`)
   if (baseVaultOwner !== SPL_TOKEN_PROGRAM_ID) {
     return {
       ok: false,
@@ -584,7 +682,7 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 8. Validate Account 3: Quote Vault (`quoteVault`)
+  // 10. Validate Account 3: Quote Vault (`quoteVault`)
   if (quoteVaultOwner !== SPL_TOKEN_PROGRAM_ID) {
     return {
       ok: false,
@@ -635,7 +733,7 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 9. Pure Mathematical LP Accounting Calculation
+  // 11. Pure Mathematical LP Accounting Calculation
   const accounting = calculateAmmV4LpInaccessibleClaims(poolState.lpReserve, lpMintState.supply);
   if (!accounting.ok) {
     return {
@@ -646,7 +744,7 @@ export async function validateRaydiumAmmV4Snapshot(
     };
   }
 
-  // 10. Compute deterministic SHA-256 digests for all 4 raw buffers
+  // 12. Compute deterministic SHA-256 digests for all 4 raw buffers
   const accountDigests = {
     poolSha256: createHash("sha256").update(poolBuffer).digest("hex"),
     lpMintSha256: createHash("sha256").update(lpMintBuffer).digest("hex"),
@@ -659,14 +757,18 @@ export async function validateRaydiumAmmV4Snapshot(
     accounting,
     diagnostics: {
       slot,
-      isSyntheticFixture: options?.isSyntheticFixture ?? false,
-      retrievedAtIso: options?.retrievedAtIso ?? new Date().toISOString(),
-      requestedIdentities: identities,
+      evidenceOrigin,
+      isSyntheticFixture,
+      retrievedAtIso,
+      requestedIdentities: requestedIdentitiesCopy,
       poolState,
       lpMintState,
       baseVaultState: baseVaultParse.state,
       quoteVaultState: quoteVaultParse.state,
-      derivedAmmAuthority,
+      derivedAmmAuthority: Object.freeze({
+        address: derivedAmmAuthority.address,
+        bump: derivedAmmAuthority.bump,
+      }),
       accountDigests,
     },
     evidenceBoundary: {
@@ -726,7 +828,7 @@ function extractRpcValueAndSlot(payload: unknown): {
 }
 
 /**
- * Extracts raw Buffer from base64 account data representation.
+ * Extracts raw Buffer from base64 account data representation with strict syntax validation.
  */
 function extractAccountBuffer(data: unknown): Buffer | null {
   if (Array.isArray(data) && typeof data[0] === "string") {
@@ -734,9 +836,16 @@ function extractAccountBuffer(data: unknown): Buffer | null {
     if (encoding !== undefined && encoding !== "base64") {
       return null;
     }
-    return Buffer.from(data[0], "base64");
+    const encoded = data[0];
+    if (!isValidStrictBase64(encoded)) {
+      return null;
+    }
+    return Buffer.from(encoded, "base64");
   }
   if (typeof data === "string") {
+    if (!isValidStrictBase64(data)) {
+      return null;
+    }
     return Buffer.from(data, "base64");
   }
   if (Buffer.isBuffer(data) || data instanceof Uint8Array) {

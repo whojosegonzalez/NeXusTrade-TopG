@@ -2,14 +2,17 @@
  * Phase 12.94-D Milestone D.3.3: Raydium AMM v4 Offline Snapshot Validator Tests
  *
  * Deterministic offline tests verifying:
- * 1. Authority derivation using @solana/web3.js (address + bump) and caching.
- * 2. Coherent batch RPC validation across [pool, lpMint, baseVault, quoteVault].
- * 3. Context slot checks (slot > 0, rejection of zero/negative/missing).
- * 4. Account layout, ownership, and reference integrity.
- * 5. LP mint decoding, authority matching (derived AMM authority or renounced), uninitialized rejection.
- * 6. Vault status checks (accountState === 1, rejection of uninitialized or frozen vaults).
- * 7. Pure BigInt calculation integration (L > S, 90% threshold, genesis unminted min failure, S > L rejection).
- * 8. Strict evidence boundary (all four assurance fields statically false, digests computed, synthetic flags preserved).
+ * 1. Authority derivation using @solana/web3.js (address + bump) and cache mutation protection.
+ * 2. Pool stored nonce binding at byte offset 8 (rejection of inconsistent nonces, acceptance of coherent bump).
+ * 3. Provenance preservation: missing provenance represented as UNKNOWN (never defaulted to captured RPC),
+ *    missing retrieval timestamps remain null (never substituted), valid timestamps preserved, invalid timestamps rejected.
+ * 4. Defensive copying of requested identities against post-validation caller mutation.
+ * 5. Rejection of 33-byte public keys ("1".repeat(33)) via canonical 32-byte round-trip checks.
+ * 6. Rejection of malformed Base64 data (e.g. valid Base64 with '!' appended) via strict syntax and canonical checks.
+ * 7. Rejection of unsafe integer slots (context.slot = Number.MAX_SAFE_INTEGER + 1).
+ * 8. Positive control snapshot validation and accounting thresholds (Genesis unminted min vs 95% burned LP).
+ * 9. Vault status checks (accountState === 1, rejection of uninitialized or frozen vaults).
+ * 10. Strict evidence boundary (all four assurance fields statically false, digests computed).
  */
 
 import { describe, expect, it } from "vitest";
@@ -72,6 +75,7 @@ function buildRpcPayload(
 
 function createValidBatchAccounts(
   overrides: {
+    poolNonce?: bigint;
     lpReserve?: bigint;
     lpSupply?: bigint;
     mintAuthority?: string | null;
@@ -96,6 +100,7 @@ function createValidBatchAccounts(
   } = {},
 ) {
   const poolBuf = createAuthoritativeRaydiumAmmV4Buffer({
+    nonce: overrides.poolNonce ?? 254n,
     lpReserve: overrides.lpReserve ?? 1_000_000_000n,
     lpMintBase58: overrides.poolLpMint ?? FIXTURE_LP_MINT,
     baseVaultBase58: overrides.poolBaseVault ?? FIXTURE_BASE_VAULT,
@@ -141,26 +146,237 @@ function createValidBatchAccounts(
 }
 
 describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => {
-  describe("Authority Derivation", () => {
+  describe("1. Authority Derivation & Cache Mutation Protection", () => {
     it("derives the canonical AMM authority address and bump from the program ID", async () => {
       const derived = await deriveRaydiumAmmAuthority(RAYDIUM_AMM_V4_PROGRAM_ID);
       expect(derived.address).toBe(CANONICAL_AMM_AUTHORITY);
       expect(derived.bump).toBe(CANONICAL_AMM_BUMP);
-    });
-
-    it("returns cached authority instance on repeated calls", async () => {
-      const first = await deriveRaydiumAmmAuthority(RAYDIUM_AMM_V4_PROGRAM_ID);
-      const second = await deriveRaydiumAmmAuthority(RAYDIUM_AMM_V4_PROGRAM_ID);
-      expect(first).toBe(second);
+      expect(Object.isFrozen(derived)).toBe(true);
     });
 
     it("uses 'amm authority' as the canonical seed", () => {
       expect(RAYDIUM_AMM_AUTHORITY_SEED).toBe("amm authority");
     });
+
+    it("protects cached authority from caller mutation", async () => {
+      const first = await deriveRaydiumAmmAuthority(RAYDIUM_AMM_V4_PROGRAM_ID);
+
+      // Attempt mutating the returned authority object
+      expect(() => {
+        // @ts-expect-error - testing caller mutation attempt
+        first.address = "HackedAddress1111111111111111111111111111";
+      }).toThrow();
+
+      // Subsequent call must return the untouched canonical authority
+      const second = await deriveRaydiumAmmAuthority(RAYDIUM_AMM_V4_PROGRAM_ID);
+      expect(second.address).toBe(CANONICAL_AMM_AUTHORITY);
+      expect(second.bump).toBe(CANONICAL_AMM_BUMP);
+    });
+
+    it("ensures returned diagnostics authority cannot be mutated to poison subsequent validations", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(Object.isFrozen(result.diagnostics.derivedAmmAuthority)).toBe(true);
+      expect(() => {
+        // @ts-expect-error - testing diagnostic mutation attempt
+        result.diagnostics.derivedAmmAuthority.address =
+          "HackedAddress1111111111111111111111111111";
+      }).toThrow();
+
+      // Subsequent validation is unaffected
+      const secondResult = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(secondResult.ok).toBe(true);
+      if (!secondResult.ok) return;
+      expect(secondResult.diagnostics.derivedAmmAuthority.address).toBe(CANONICAL_AMM_AUTHORITY);
+    });
   });
 
-  describe("Positive Snapshot Validation", () => {
-    it("validates a standard snapshot with >= 90% inaccessible LP (95.1% burn)", async () => {
+  describe("2. Pool Stored Nonce Consistency", () => {
+    it("accepts a pool with stored nonce matching the derived AMM authority bump (254)", async () => {
+      const accounts = createValidBatchAccounts({ poolNonce: 254n });
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(true);
+    });
+
+    it("rejects a pool with an uninitialized or zero stored nonce", async () => {
+      const accounts = createValidBatchAccounts({ poolNonce: 0n });
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INCONSISTENT_POOL_NONCE");
+      expect(result.message).toContain(
+        "Pool stored nonce (0) is inconsistent with derived AMM authority bump (254)",
+      );
+      expect(result.accountIndex).toBe(0);
+      expect(result.accountAddress).toBe(FIXTURE_POOL_ADDRESS);
+    });
+
+    it("rejects a pool with a non-canonical bump nonce (e.g. 253)", async () => {
+      const accounts = createValidBatchAccounts({ poolNonce: 253n });
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INCONSISTENT_POOL_NONCE");
+      expect(result.message).toContain(
+        "Pool stored nonce (253) is inconsistent with derived AMM authority bump (254)",
+      );
+    });
+  });
+
+  describe("3. Provenance and Timestamp Integrity", () => {
+    it("represents omitted provenance as UNKNOWN and isSyntheticFixture as null (never defaults to captured RPC)", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.diagnostics.evidenceOrigin).toBe("UNKNOWN");
+      expect(result.diagnostics.isSyntheticFixture).toBeNull();
+      expect(result.diagnostics.retrievedAtIso).toBeNull();
+    });
+
+    it("preserves explicit synthetic fixture provenance", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        isSyntheticFixture: true,
+        retrievedAtIso: "2026-10-26T21:00:00.000Z",
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.diagnostics.evidenceOrigin).toBe("SYNTHETIC_FIXTURE");
+      expect(result.diagnostics.isSyntheticFixture).toBe(true);
+      expect(result.diagnostics.retrievedAtIso).toBe("2026-10-26T21:00:00.000Z");
+    });
+
+    it("preserves explicit captured RPC provenance", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        evidenceOrigin: "CAPTURED_RPC",
+        retrievedAtIso: "2026-10-26T20:30:00.000Z",
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.diagnostics.evidenceOrigin).toBe("CAPTURED_RPC");
+      expect(result.diagnostics.isSyntheticFixture).toBe(false);
+      expect(result.diagnostics.retrievedAtIso).toBe("2026-10-26T20:30:00.000Z");
+    });
+
+    it("leaves missing retrieval timestamp null and does not substitute validation time", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        evidenceOrigin: "CAPTURED_RPC",
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      expect(result.diagnostics.retrievedAtIso).toBeNull();
+    });
+
+    it("rejects invalid retrieval timestamps", async () => {
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload, {
+        retrievedAtIso: "not-a-valid-iso-timestamp",
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_PROVENANCE_METADATA");
+    });
+
+    it("defensively copies requested identities so post-validation caller mutations cannot change recorded evidence", async () => {
+      const mutableIdentities: RaydiumAmmV4SnapshotIdentities = {
+        poolId: FIXTURE_POOL_ADDRESS,
+        lpMint: FIXTURE_LP_MINT,
+        baseVault: FIXTURE_BASE_VAULT,
+        quoteVault: FIXTURE_QUOTE_VAULT,
+        expectedTokenMint: FIXTURE_MEME_MINT,
+      };
+
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, 289500100);
+
+      const result = await validateRaydiumAmmV4Snapshot(mutableIdentities, payload);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      // Caller attempts to mutate the original identities object
+      // @ts-expect-error - mutating object for test
+      mutableIdentities.poolId = "MutatedPoolAddress111111111111111111111111111";
+
+      // Recorded diagnostics must remain intact and frozen
+      expect(result.diagnostics.requestedIdentities.poolId).toBe(FIXTURE_POOL_ADDRESS);
+      expect(Object.isFrozen(result.diagnostics.requestedIdentities)).toBe(true);
+    });
+  });
+
+  describe("4. Rejection of Malformed Identities and Response Data", () => {
+    it("rejects 33-byte public keys ('1'.repeat(33)) via canonical 32-byte round-trip verification", async () => {
+      const thirtyThreeBytePoolId = "1".repeat(33);
+      const malformedIdentities: RaydiumAmmV4SnapshotIdentities = {
+        ...STANDARD_IDENTITIES,
+        poolId: thirtyThreeBytePoolId,
+      };
+
+      const result = await validateRaydiumAmmV4Snapshot(malformedIdentities, {});
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_IDENTITIES");
+    });
+
+    it("rejects Base64 account strings with '!' appended before decoding", async () => {
+      const accounts = createValidBatchAccounts();
+      // Append '!' to the pool account's Base64 data string
+      accounts[0] = {
+        data: `${accounts[0]!.data}!`,
+        owner: RAYDIUM_AMM_V4_PROGRAM_ID,
+      };
+
+      const payload = buildRpcPayload(accounts, 289500100);
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("ACCOUNT_BUFFER_EXTRACTION_FAILED");
+      expect(result.accountIndex).toBe(0);
+    });
+
+    it("rejects unsafe integer context slots (slot = Number.MAX_SAFE_INTEGER + 1)", async () => {
+      const unsafeSlot = Number.MAX_SAFE_INTEGER + 1; // 9007199254740992
+      const accounts = createValidBatchAccounts();
+      const payload = buildRpcPayload(accounts, unsafeSlot);
+
+      const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.category).toBe("INVALID_CONTEXT_SLOT");
+      expect(result.message).toContain("expected positive safe integer");
+    });
+  });
+
+  describe("5. Positive Control Snapshot & Threshold Accounting", () => {
+    it("validates a control snapshot with >= 90% inaccessible LP (95.1% burn)", async () => {
       const accounts = createValidBatchAccounts({
         lpReserve: 1_000_000_000n,
         lpSupply: 49_000_000n,
@@ -182,14 +398,6 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       expect(result.accounting.rawInaccessibleLp).toBe(951_000_000n);
       expect(result.accounting.meetsNinetyPercentThreshold).toBe(true);
       expect(result.accounting.displayInaccessiblePct).toBe(95.1);
-
-      // Provenance and diagnostics
-      expect(result.diagnostics.slot).toBe(289500100);
-      expect(result.diagnostics.isSyntheticFixture).toBe(true);
-      expect(result.diagnostics.retrievedAtIso).toBe("2026-10-26T21:00:00.000Z");
-      expect(result.diagnostics.requestedIdentities).toEqual(STANDARD_IDENTITIES);
-      expect(result.diagnostics.derivedAmmAuthority.address).toBe(CANONICAL_AMM_AUTHORITY);
-      expect(result.diagnostics.derivedAmmAuthority.bump).toBe(CANONICAL_AMM_BUMP);
 
       // Decoded account states
       expect(result.diagnostics.poolState.poolAddress).toBe(FIXTURE_POOL_ADDRESS);
@@ -216,13 +424,12 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       const accounts = createValidBatchAccounts({
         lpReserve: 1_000_000_000n,
         lpSupply: 49_000_000n,
-        mintAuthority: null, // renounced
-        freezeAuthority: null, // renounced
+        mintAuthority: null,
+        freezeAuthority: null,
       });
       const payload = buildRpcPayload(accounts, 289500101);
 
       const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
-
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
@@ -232,7 +439,6 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
     });
 
     it("correctly identifies unprotected pool at Genesis unminted min (< 90% threshold)", async () => {
-      // Genesis pool initialization scenario: 0.000316% inaccessible
       const accounts = createValidBatchAccounts({
         lpReserve: 316_227_766_016n,
         lpSupply: 316_226_766_016n, // diff = 1_000_000n unminted minimum
@@ -240,7 +446,6 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       const payload = buildRpcPayload(accounts, 289500102);
 
       const result = await validateRaydiumAmmV4Snapshot(STANDARD_IDENTITIES, payload);
-
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
@@ -263,7 +468,6 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
       };
 
       const result = await validateRaydiumAmmV4Snapshot(invertedIdentities, payload);
-
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
@@ -272,19 +476,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
     });
   });
 
-  describe("Negative / Failure Validations", () => {
-    it("rejects invalid base58 public keys in requested identities", async () => {
-      const invalidIdentities: RaydiumAmmV4SnapshotIdentities = {
-        ...STANDARD_IDENTITIES,
-        poolId: "not_a_valid_base58_address!@#",
-      };
-      const result = await validateRaydiumAmmV4Snapshot(invalidIdentities, {});
-
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-      expect(result.category).toBe("INVALID_IDENTITIES");
-    });
-
+  describe("6. Negative Structural and Account Validations", () => {
     it("rejects non-object or error JSON-RPC payloads", async () => {
       const errorPayload = {
         jsonrpc: "2.0",
@@ -374,7 +566,6 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
     });
 
     it("rejects invalid buffer lengths for pool, mint, or vaults", async () => {
-      // Corrupt pool buffer length
       const corruptPoolBuf = Buffer.alloc(500);
       const accounts = createValidBatchAccounts();
       accounts[0] = { data: corruptPoolBuf.toString("base64"), owner: RAYDIUM_AMM_V4_PROGRAM_ID };
@@ -453,7 +644,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
 
     it("rejects unauthorized LP mint authority not matching AMM authority", async () => {
       const accounts = createValidBatchAccounts({
-        mintAuthority: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", // Rogue keypair
+        mintAuthority: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
       });
       const result = await validateRaydiumAmmV4Snapshot(
         STANDARD_IDENTITIES,
@@ -468,7 +659,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
 
     it("rejects unauthorized LP freeze authority not matching AMM authority or null", async () => {
       const accounts = createValidBatchAccounts({
-        freezeAuthority: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", // Rogue freeze authority
+        freezeAuthority: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
       });
       const result = await validateRaydiumAmmV4Snapshot(
         STANDARD_IDENTITIES,
@@ -483,7 +674,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
 
     it("rejects vault authority not matching derived AMM authority", async () => {
       const accounts = createValidBatchAccounts({
-        baseVaultOwner: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", // Rogue vault owner
+        baseVaultOwner: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
       });
       const result = await validateRaydiumAmmV4Snapshot(
         STANDARD_IDENTITIES,
@@ -497,7 +688,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
 
     it("rejects vault mint mismatch", async () => {
       const accounts = createValidBatchAccounts({
-        baseVaultMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // Different mint than pool base
+        baseVaultMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       });
       const result = await validateRaydiumAmmV4Snapshot(
         STANDARD_IDENTITIES,
@@ -540,7 +731,7 @@ describe("RaydiumAmmV4SnapshotValidator - Phase 12.94-D Milestone D.3.3", () => 
     it("rejects mathematical LP calculation failure when circulating supply exceeds protocol LP (S > L)", async () => {
       const accounts = createValidBatchAccounts({
         lpReserve: 100_000_000n,
-        lpSupply: 120_000_000n, // S > L
+        lpSupply: 120_000_000n,
       });
       const result = await validateRaydiumAmmV4Snapshot(
         STANDARD_IDENTITIES,

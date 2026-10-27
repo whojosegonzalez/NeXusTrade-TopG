@@ -62,6 +62,8 @@ export function decodeBase58To32Bytes(base58String: string): Uint8Array {
 }
 
 export interface RaydiumFixtureOptions {
+  status?: bigint;
+  nonce?: bigint;
   baseDecimal?: bigint;
   quoteDecimal?: bigint;
   baseVaultBase58?: string;
@@ -89,7 +91,8 @@ export function createAuthoritativeRaydiumAmmV4Buffer(options: RaydiumFixtureOpt
   const baseDec = options.baseDecimal ?? 6n;
   const quoteDec = options.quoteDecimal ?? 9n;
 
-  buffer.writeBigUInt64LE(1n, RAYDIUM_V4_OFFSETS.STATUS);
+  buffer.writeBigUInt64LE(options.status ?? 1n, RAYDIUM_V4_OFFSETS.STATUS);
+  buffer.writeBigUInt64LE(options.nonce ?? 254n, RAYDIUM_V4_OFFSETS.NONCE);
   buffer.writeBigUInt64LE(baseDec, RAYDIUM_V4_OFFSETS.BASE_DECIMAL);
   buffer.writeBigUInt64LE(quoteDec, RAYDIUM_V4_OFFSETS.QUOTE_DECIMAL);
 

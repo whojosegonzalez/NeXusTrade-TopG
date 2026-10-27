@@ -42,6 +42,7 @@ export type CanonicalSessionStatus = "ACTIVE" | "FINALIZED" | "INTERRUPTED";
  */
 export interface D23RaydiumAmmV4State {
   readonly status: bigint;
+  readonly nonce?: bigint | undefined;
   readonly baseDecimal: bigint;
   readonly quoteDecimal: bigint;
   readonly baseVault: string; // 32-byte pubkey in base58

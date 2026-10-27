@@ -299,9 +299,10 @@ sequenceDiagram
 The offline implementation approved by the independent review is complete:
 
 1. **Parser Extension in [`RaydiumAmmParser.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.ts)**:
-   - Added `LP_RESERVE: 720` to `RAYDIUM_V4_OFFSETS`.
-   - Decodes `view.getBigUint64(RAYDIUM_V4_OFFSETS.LP_RESERVE, true)`.
-   - Exposes `lpReserve: bigint` in `D23RaydiumAmmV4State`.
+   - Added `NONCE: 8` and `LP_RESERVE: 720` to `RAYDIUM_V4_OFFSETS`.
+   - Decodes `view.getBigUint64(RAYDIUM_V4_OFFSETS.NONCE, true)` and `view.getBigUint64(RAYDIUM_V4_OFFSETS.LP_RESERVE, true)`.
+   - Exposes `nonce: bigint` and `lpReserve: bigint` in `D23RaydiumAmmV4State`.
+   - Upgraded `isCanonicalSolanaBase58` to require exact 32-byte public-key decoding and canonical round-trip checks (rejecting non-32-byte addresses such as `"1".repeat(33)`).
    - Preserves all existing validation without adding an artificial `status === 1` constraint.
 2. **Pure Calculation Helper in [`RaydiumAmmLpAccounting.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmLpAccounting.ts)**:
    - Validates unsigned 64-bit bounds (`0 <= val <= 2^64 - 1`).
@@ -311,19 +312,22 @@ The offline implementation approved by the independent review is complete:
    - Returns raw numerator (`rawInaccessibleLp`) and denominator (`rawDenominator`).
    - Re-exported from `RaydiumAmmParser.ts`.
 3. **Offline Snapshot Validator in [`RaydiumAmmV4SnapshotValidator.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.ts)**:
-   - Derives canonical AMM authority PDA using official Solana tooling (`PublicKey.findProgramAddress([Buffer.from("amm authority")], programId)` $\rightarrow$ `5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1`, bump 254).
+   - Derives canonical AMM authority PDA using official Solana tooling (`PublicKey.findProgramAddress([Buffer.from("amm authority")], programId)` $\rightarrow$ `5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1`, bump 254) with mutation-protected defensive frozen cache.
    - Validates coherent batch RPC response for `[poolId, lpMint, baseVault, quoteVault]`.
-   - Strictly enforces shared context slot `slot > 0`.
+   - Strictly enforces safe positive integer context slot (`slot > 0` and `Number.isSafeInteger(slot)`, rejecting `Number.MAX_SAFE_INTEGER + 1`).
+   - Strictly validates Base64 syntax and canonical encoding before decoding (rejecting corrupted strings with trailing characters like `!`).
    - Verifies exact pool identity, token/WSOL orientation, canonical program ownership (`RAYDIUM_AMM_V4_PROGRAM_ID`, `SPL_TOKEN_PROGRAM_ID`), supported layouts (752B pool, 82B mint, 165B vaults).
+   - Verifies pool stored nonce at byte offset 8 matching derived AMM authority bump (`254`).
    - Verifies pool references matching requested LP mint, base vault, quote vault.
    - Decodes initialized SPL LP mint, validates LP mint authority matches derived AMM authority or is renounced (`null`), and freeze authority matches derived AMM authority or is `null`.
    - Validates vault owners match derived AMM authority and vault states are initialized (`accountState === 1`).
+   - Preserves evidence without inventing provenance: missing provenance is represented as `UNKNOWN` (never defaulted to captured RPC), missing retrieval timestamps remain `null` (never substituted with validation time), valid timestamps are verified, and requested identities are defensibly copied.
    - Evaluates pure mathematical LP accounting via `calculateAmmV4LpInaccessibleClaims`.
    - Returns separate raw LP accounting, provenance diagnostics, SHA-256 digests, and strict evidence boundaries (`bytecodeEquivalenceVerified: false`, `completeExecutableReservesVerified: false`, `generalTokenSafetyVerified: false`, `strategyGateAdmitted: false`).
-4. **Deterministic Offline Test Suites (54 tests passing)**:
-   - [`RaydiumAmmParser.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.test.ts): 15 tests verifying offset 720 decoding, zeroed default safety, and round-trip parsing.
+4. **Deterministic Offline Test Suites (67 tests passing)**:
+   - [`RaydiumAmmParser.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.test.ts): 16 tests verifying offset 720 decoding, nonce decoding, zeroed default safety, round-trip parsing, and rejection of 33-byte addresses.
    - [`RaydiumAmmLpAccounting.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmLpAccounting.test.ts): 14 tests covering all 5 lifecycle scenarios, exact boundary testing ($89.999999\%$, $90.0\%$, $90.000001\%$), zero denominator, $S > L$, negative inputs, and magnitudes above JavaScript's safe integer limit ($> 2^{53} - 1$).
-   - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 25 tests covering authority derivation, positive validation (burned LP, renounced mint authority, inverted pairs, genesis unminted minimum), negative validation (corrupted payloads, bad slots, incomplete batches, missing accounts, unauthorized owners, layout truncations, pool reference mismatches, non-SOL pairs, token mint mismatches, uninitialized/rogue mint authorities, rogue vault owners, uninitialized/frozen vaults, and arithmetic violations).
+   - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 37 tests covering authority derivation, cache mutation protection, pool nonce consistency, provenance/timestamp integrity (omitted provenance, explicit flags, null timestamp preservation, invalid timestamp rejection, defensive identity copying), rejection of 33-byte public keys, rejection of Base64 strings with trailing `!`, rejection of unsafe integer slots (`Number.MAX_SAFE_INTEGER + 1`), positive control validations, negative structural checks, and arithmetic bounds.
 
 ---
 

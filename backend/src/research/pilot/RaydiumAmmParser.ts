@@ -8,6 +8,7 @@
  * Offsets strictly corrected per independent audit finding D23P-01.
  */
 
+import { PublicKey } from "@solana/web3.js";
 import { encodeBase58 } from "../../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import type {
   D23RaydiumAmmV4State,
@@ -24,6 +25,7 @@ export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 // Correct Offsets per Raydium SDK liquidityStateV4Layout (D23P-01, D23F-01)
 export const RAYDIUM_V4_OFFSETS = {
   STATUS: 0,
+  NONCE: 8, // u64 little-endian (offset 8..16) - amm.nonce (authority bump)
   BASE_DECIMAL: 32, // u64 little-endian (offset 32..40)
   QUOTE_DECIMAL: 40, // u64 little-endian (offset 40..48)
   BASE_NEED_TAKE_PNL: 192, // u64 little-endian (offset 192..200)
@@ -90,13 +92,23 @@ export interface SplVaultParseFailure {
 export type SplVaultParseResult = SplVaultParseSuccess | SplVaultParseFailure;
 
 /**
- * Validates that a string is a canonical case-sensitive Solana base58 address.
+ * Validates that a string is a canonical 32-byte Solana base58 public key.
+ * Requires actual 32-byte public-key decoding and canonical round-trip verification.
  */
-export function isCanonicalSolanaBase58(value: string): boolean {
+export function isCanonicalSolanaBase58(value: unknown): boolean {
   if (typeof value !== "string") {
     return false;
   }
-  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value.trim());
+  const trimmed = value.trim();
+  if (trimmed !== value || trimmed.length < 32 || trimmed.length > 44) {
+    return false;
+  }
+  try {
+    const pubkey = new PublicKey(value);
+    return pubkey.toBytes().length === 32 && pubkey.toBase58() === value;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -128,6 +140,7 @@ export function parseRaydiumAmmV4Account(
 
   try {
     const status = view.getBigUint64(RAYDIUM_V4_OFFSETS.STATUS, true);
+    const nonce = view.getBigUint64(RAYDIUM_V4_OFFSETS.NONCE, true);
     const baseDecimal = view.getBigUint64(RAYDIUM_V4_OFFSETS.BASE_DECIMAL, true);
     const quoteDecimal = view.getBigUint64(RAYDIUM_V4_OFFSETS.QUOTE_DECIMAL, true);
 
@@ -211,6 +224,7 @@ export function parseRaydiumAmmV4Account(
 
     const state: D23RaydiumAmmV4State = {
       status,
+      nonce,
       baseDecimal,
       quoteDecimal,
       baseVault,
@@ -406,9 +420,12 @@ export {
 export {
   deriveRaydiumAmmAuthority,
   validateRaydiumAmmV4Snapshot,
+  isValidStrictBase64,
   RAYDIUM_AMM_AUTHORITY_SEED,
   SPL_MINT_LAYOUT_LENGTH,
   type DecodedSplLpMint,
+  type DerivedAmmAuthority,
+  type EvidenceOrigin,
   type RaydiumAmmV4SnapshotFailureCategory,
   type RaydiumAmmV4SnapshotIdentities,
   type RaydiumAmmV4SnapshotOptions,

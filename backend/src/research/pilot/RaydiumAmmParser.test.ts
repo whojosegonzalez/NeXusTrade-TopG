@@ -41,6 +41,13 @@ describe("RaydiumAmmParser - D23P-01 / D23P-02", () => {
       expect(isCanonicalSolanaBase58("invalid_0OIl_address")).toBe(false); // 0, O, I, l are invalid in base58
       expect(isCanonicalSolanaBase58("short")).toBe(false);
     });
+
+    it("rejects public keys that do not decode to exactly 32 bytes (e.g. 33 ones)", () => {
+      // 32 ones decode to exactly 32 zero bytes (valid canonical 32-byte address)
+      expect(isCanonicalSolanaBase58("1".repeat(32))).toBe(true);
+      // 33 ones decode to 33 bytes (invalid Solana public key)
+      expect(isCanonicalSolanaBase58("1".repeat(33))).toBe(false);
+    });
   });
 
   describe("Raydium AMM v4 Binary Decoder", () => {
