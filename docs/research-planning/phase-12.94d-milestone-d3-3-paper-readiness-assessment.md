@@ -301,20 +301,20 @@ const entryFill = simulateFill(entryQuote, {
 
 ## 5. Remaining Acquisition Dependencies
 
-LP burn is not the only remaining data gap. The remaining acquisition dependencies are classified below:
+LP burn is no longer an unverified hypothesis; it has been acquired and validated on-chain via the operator snapshot. The updated status of all acquisition dependencies is summarized below:
 
-| Dimension                                   | Required Evidence / Threshold                                                                                                                                                                        | Existing Preserved Evidence                                                                       | Precise Missing Source & Acquisition Path                                                                                                                                                                                                                    |
-| :------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **LP Security (`lpBurnPct`)**               | $\ge 90.0\%$ LP burn (**PROPOSED / UNAPPROVED** contract in [`phase-12.94d-milestone-d3-3-lp-security-acquisition-contract.md`](./phase-12.94d-milestone-d3-3-lp-security-acquisition-contract.md)). | C3 historical pool initialization account layout; SPL Token Mint parser.                          | Exactly 1 coherent batch RPC call `getMultipleAccounts([poolId, lpMint, baseVault, quoteVault])` following bootstrap `lpMint` resolution. Calculates $(L_{\text{protocol}} - S_{\text{current}}) / L_{\text{protocol}}$ using `lpReserve` (offset 720..728). |
-| **Verified Pool Reserves & Token Decimals** | Atomic base token reserve (`baseReserveTokens`), quote reserve (`quoteReserveSol`), and token decimals (`tokenDecimals`).                                                                            | DexScreener indicative spot price (`priceNative`); canonical WSOL (9 decimals); RAY (6 decimals). | Direct on-chain SPL token vault account balances (`baseVault`, `quoteVault`) for candidate pool to support constant-product execution math.                                                                                                                  |
-| **Security Metrics**                        | Risk score ($\le 700$), danger flags (`false`), verified holder count ($\ge 250$ established, $\ge 100$ micro), top 10 concentration ($\le 30\%$), bundler concentration ($\le 85\% / 50\%$).        | RugCheck `/tokens/{mint}/report` response parser in `BuyGateTriggerService.ts`.                   | Live, metered RugCheck provider adapter registered under `GlobalResourceBudgetManager` with strict rate accounting.                                                                                                                                          |
-| **Micro-Flow Observations**                 | 60-second rolling transaction counts (`recentBuys60s`, `recentSells60s`) to evaluate flow-absorption rules (1.15x / 1.25x / 1.5x) and anti-surge rules.                                              | DexScreener 5-minute transaction aggregates (`txns.m5.buys`, `txns.m5.sells`).                    | Sub-minute trade stream or websocket trade ingestion to derive authentic 60-second rolling buy/sell transaction counts.                                                                                                                                      |
+| Dimension                                   | Required Evidence / Threshold                                                                                                                                                                 | Existing Preserved Evidence                                                                                                                   | Status & Remaining Path                                                                                                                                                                                                                                                                                                                        |
+| :------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LP Security (`lpBurnPct`)**               | $\ge 90.0\%$ LP burn derived from on-chain accounts.                                                                                                                                          | **ACQUIRED & VALIDATED VIA BOUNDED CLIENT** (RAY/WSOL Reference Pair snapshot at `2026-10-27T06:35:11.779Z`, slot `461970878`).               | **ACQUISITION COMPLETED (Below Threshold)**: Verified $L = 362937054696$, $S = 362444613518$, $L - S = 492441178$, $0.135682\%$ inaccessible, 90% threshold: `false`. Sealed artifacts preserved at `data/research/snapshots/raydium-amm-v4-snapshot-AVs9TA4n-2026-10-27T06-35-11-779Z.json` and `-manifest.json`. Offline bridge implemented. |
+| **Verified Pool Reserves & Token Decimals** | Atomic base token reserve (`baseReserveTokens`), quote reserve (`quoteReserveSol`), and token decimals (`tokenDecimals`).                                                                     | DexScreener indicative spot price (`priceNative`); canonical WSOL (9 decimals); RAY (6 decimals). Validated vault accounts in batch snapshot. | Direct on-chain SPL token vault account balances (`baseVault`, `quoteVault`) for candidate pool to support constant-product execution math.                                                                                                                                                                                                    |
+| **Security Metrics**                        | Risk score ($\le 700$), danger flags (`false`), verified holder count ($\ge 250$ established, $\ge 100$ micro), top 10 concentration ($\le 30\%$), bundler concentration ($\le 85\% / 50\%$). | RugCheck `/tokens/{mint}/report` response parser in `BuyGateTriggerService.ts`.                                                               | Live, metered RugCheck provider adapter registered under `GlobalResourceBudgetManager` with strict rate accounting.                                                                                                                                                                                                                            |
+| **Micro-Flow Observations**                 | 60-second rolling transaction counts (`recentBuys60s`, `recentSells60s`) to evaluate flow-absorption rules (1.15x / 1.25x / 1.5x) and anti-surge rules.                                       | DexScreener 5-minute transaction aggregates (`txns.m5.buys`, `txns.m5.sells`).                                                                | Sub-minute trade stream or websocket trade ingestion to derive authentic 60-second rolling buy/sell transaction counts.                                                                                                                                                                                                                        |
 
 ---
 
 ## 6. Offline Implementation Status
 
-The two approved offline implementation items are completed:
+The approved offline implementation items are completed:
 
 1. **Retest Gate Evaluator Extraction**:
    - Implemented in [`backend/src/candidate-scanner/RetestGateEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.ts).
@@ -324,8 +324,37 @@ The two approved offline implementation items are completed:
    - Implemented in [`backend/src/candidate-scanner/BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts).
    - Validates explicit non-negative score, strict array type, supported risk severity (`danger`, `warn`, `info`), and fail-closed handling for malformed risk entries.
    - 54 deterministic tests passing in [`backend/src/candidate-scanner/BuyGateTriggerService.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.test.ts).
-3. **Larger Changes Quarantined**:
+3. **Offline LP-Screening Bridge & Regression Fixture**:
+   - Implemented in [`backend/src/candidate-scanner/LpScreeningBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/LpScreeningBridge.ts).
+   - Regression fixture in [`backend/src/candidate-scanner/fixtures/CapturedRaydiumAmmV4SnapshotFixture.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/fixtures/CapturedRaydiumAmmV4SnapshotFixture.ts) wrapping authentic operator results with explicitly labeled synthetic candidate market context.
+   - Binds evidence strictly to candidate pool and token mint (`IDENTITY_MISMATCH`).
+   - Requires explicit freshness policy (`STALE_EVIDENCE`; historical captures cannot qualify candidate).
+   - Classifies validated percentage as `DERIVED` from account observations (`metricProvenance.lpBurnPct = "DERIVED"`).
+   - Evaluates pure integer cross-multiplication (`100n * (L - S) >= 90n * L`).
+   - Fails closed on missing/invalid evidence with `UNAVAILABLE` / `INVALID_EVIDENCE` and `passed = false` without substituting 100%.
+   - Bridges to `ScannedPoolRecord` and seamlessly integrates with `AntiRugEvaluator.evaluate()` and `CandidateScannerFilterEvaluation`.
+   - 18 deterministic unit tests passing in [`backend/src/candidate-scanner/LpScreeningBridge.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/LpScreeningBridge.test.ts).
+4. **Larger Changes Quarantined**:
    - No quote caching or observation schedule alterations.
    - No PAPER fills inside prospective runner.
    - No changes to execution-realism engine or recorder.
-   - Zero live network calls, RPC queries, or operator sessions.
+   - Zero live network calls, RPC queries, daemon activation, or operator sessions.
+
+---
+
+## 7. Remaining PAPER Integration Gaps
+
+Before end-to-end PAPER execution can be scheduled or authorized, the following concrete integration gaps remain:
+
+1. **Runtime Bridge Pipeline Wiring**:
+   - Wire `LpScreeningBridge` into `CandidateStreamEngine.ts` and `paper-trading-daemon.ts` intake pipeline.
+   - Connect the bounded 2-request acquisition client to resolve candidate LP accounts upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings.
+2. **Sub-Minute Micro-Flow Observations**:
+   - Implement an authentic sub-minute rolling transaction stream (`recentBuys60s`, `recentSells60s`) via websocket or high-frequency polling adapter to satisfy Retest Gate Rules A/B/C/E (1.15x / 1.25x / 1.5x flow-absorption and seller-surge protection).
+3. **Live Metered RugCheck Security Provider Integration**:
+   - Register a live RugCheck provider client under `GlobalResourceBudgetManager` with strict rate-limiting, error handling, and budget accounting to supply verified security scores, danger flags, holder counts, and bundler concentrations.
+4. **Verified Reserve Spot Pricing & Slippage Math**:
+   - Wire atomic reserve balances (`baseReserveTokens`, `quoteReserveSol`) from validated vault accounts into `createDeterministicAmmQuote()` to enable precise constant-product pricing and arrival slippage simulation during order execution.
+5. **Execution Quarantine Maintained**:
+   - Virtual wallet strictly frozen at **7.9259 SOL**.
+   - Zero live network requests, reruns, daemon activation, wallet mutations, or market sessions.
