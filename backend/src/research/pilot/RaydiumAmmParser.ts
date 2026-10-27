@@ -402,3 +402,19 @@ export {
   type AmmV4LpAccountingResult,
   type AmmV4LpAccountingSuccess,
 } from "./RaydiumAmmLpAccounting.js";
+
+export {
+  deriveRaydiumAmmAuthority,
+  validateRaydiumAmmV4Snapshot,
+  RAYDIUM_AMM_AUTHORITY_SEED,
+  SPL_MINT_LAYOUT_LENGTH,
+  type DecodedSplLpMint,
+  type RaydiumAmmV4SnapshotFailureCategory,
+  type RaydiumAmmV4SnapshotIdentities,
+  type RaydiumAmmV4SnapshotOptions,
+  type RaydiumAmmV4SnapshotValidationFailure,
+  type RaydiumAmmV4SnapshotValidationResult,
+  type RaydiumAmmV4SnapshotValidationSuccess,
+} from "./RaydiumAmmV4SnapshotValidator.js";
+
+export { encodeBase58 } from "../../providers/solana-rpc/SolanaRpcMintAccountParser.js";

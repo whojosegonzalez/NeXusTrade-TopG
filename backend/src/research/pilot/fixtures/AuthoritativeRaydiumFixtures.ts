@@ -23,6 +23,7 @@ export const FIXTURE_MEME_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 export const FIXTURE_POOL_ADDRESS = "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA";
 export const FIXTURE_BASE_VAULT = "9UYjh9A2dE1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8F";
 export const FIXTURE_QUOTE_VAULT = "3v2A2E1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8Fwz3v";
+export const FIXTURE_LP_MINT = "So11111111111111111111111111111111111111113";
 
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -67,6 +68,7 @@ export interface RaydiumFixtureOptions {
   quoteVaultBase58?: string;
   baseMintBase58?: string;
   quoteMintBase58?: string;
+  lpMintBase58?: string;
   baseNeedTakePnl?: bigint;
   quoteNeedTakePnl?: bigint;
   lpReserve?: bigint;
@@ -100,7 +102,7 @@ export function createAuthoritativeRaydiumAmmV4Buffer(options: RaydiumFixtureOpt
   const quoteVaultBytes = decodeBase58To32Bytes(options.quoteVaultBase58 ?? FIXTURE_QUOTE_VAULT);
   const baseMintBytes = decodeBase58To32Bytes(options.baseMintBase58 ?? FIXTURE_MEME_MINT);
   const quoteMintBytes = decodeBase58To32Bytes(options.quoteMintBase58 ?? FIXTURE_WSOL_MINT);
-  const lpMintBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111113");
+  const lpMintBytes = decodeBase58To32Bytes(options.lpMintBase58 ?? FIXTURE_LP_MINT);
   const openOrdersBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111114");
   const marketIdBytes = decodeBase58To32Bytes("So11111111111111111111111111111111111111115");
 
@@ -146,6 +148,53 @@ export function createAuthoritativeSplVaultBuffer(options: SplVaultFixtureOption
 
   buffer.writeBigUInt64LE(options.rawAmount ?? 1_000_000_000_000n, SPL_VAULT_OFFSETS.AMOUNT);
   buffer[SPL_VAULT_OFFSETS.STATE] = options.state ?? 1; // Default to 1: Initialized (BREADY-03)
+
+  return buffer;
+}
+
+export interface SplMintFixtureOptions {
+  mintAuthorityOption?: number;
+  mintAuthorityBase58?: string | null;
+  supply?: bigint;
+  decimals?: number;
+  isInitialized?: boolean;
+  freezeAuthorityOption?: number;
+  freezeAuthorityBase58?: string | null;
+  customBufferLength?: number;
+}
+
+/**
+ * Creates an authoritative 82-byte SPL Token Mint buffer.
+ */
+export function createAuthoritativeSplMintBuffer(options: SplMintFixtureOptions = {}): Buffer {
+  const length = options.customBufferLength ?? 82;
+  const buffer = Buffer.alloc(length);
+
+  if (length < 82) {
+    return buffer;
+  }
+
+  const hasMintAuth =
+    options.mintAuthorityBase58 !== undefined && options.mintAuthorityBase58 !== null;
+  const mintAuthOption = options.mintAuthorityOption ?? (hasMintAuth ? 1 : 0);
+  buffer.writeUInt32LE(mintAuthOption, 0);
+
+  if (mintAuthOption === 1 && options.mintAuthorityBase58) {
+    buffer.set(decodeBase58To32Bytes(options.mintAuthorityBase58), 4);
+  }
+
+  buffer.writeBigUInt64LE(options.supply ?? 1_000_000_000n, 36);
+  buffer.writeUInt8(options.decimals ?? 6, 44);
+  buffer.writeUInt8((options.isInitialized ?? true) ? 1 : 0, 45);
+
+  const hasFreezeAuth =
+    options.freezeAuthorityBase58 !== undefined && options.freezeAuthorityBase58 !== null;
+  const freezeAuthOption = options.freezeAuthorityOption ?? (hasFreezeAuth ? 1 : 0);
+  buffer.writeUInt32LE(freezeAuthOption, 46);
+
+  if (freezeAuthOption === 1 && options.freezeAuthorityBase58) {
+    buffer.set(decodeBase58To32Bytes(options.freezeAuthorityBase58), 50);
+  }
 
   return buffer;
 }

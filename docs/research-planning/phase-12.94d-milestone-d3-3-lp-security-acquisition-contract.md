@@ -62,7 +62,7 @@ The protocol accounting is verified against official upstream Raydium source cod
 
 > [!NOTE]
 > **Source-Revision Verification vs. Deployed Program Verification**  
-> Pinned source revisions provide authoritative documentation of binary layouts, memory offsets, and instruction semantics. However, source-code verification is strictly distinct from verification of the on-chain bytecode deployed at `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` on Solana Mainnet-Beta. The deployed program is verified on-chain via runtime execution, deterministic layout offsets, and account ownership checks, not assumed merely from Git repository commits.
+> Pinned source revisions provide authoritative documentation of binary layouts, memory offsets, and instruction semantics. However, correspondence between the pinned source repository and the deployed on-chain bytecode at `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` on Solana Mainnet-Beta has not been formally verified in this work. Verification of account ownership, layout lengths, memory offsets, and account relationships validates the structural integrity of observable accounts under stated assumptions, but must not be presented as proof of deployed bytecode equivalence.
 
 ### 2.2 Layout Location & Units of `lpReserve`
 
@@ -101,11 +101,14 @@ pub enum AmmStatus {
     Uninitialized = 0u64,
     Initialized = 1u64,
     Disabled = 2u64,
-    WithdrawOnly = 3u64,      // Pool only allows adding/removing liquidity; cannot swap or plan orders
-    LiquidityOnly = 4u64,     // Pool only allows adding/removing liquidity and planning orders; cannot swap
-    OrderBookOnly = 5u64,     // Pool only allows adding/removing liquidity and swapping; cannot plan orders
-    SwapOnly = 6u64,          // Pool status after creation; auto-updates to SwapOnly during swap after open_time
-    WaitingTrade = 7u64,      // Pool is active and waiting for trades
+    WithdrawOnly = 3u64,
+    /// pool only can add or remove liquidity, can't swap and plan orders
+    LiquidityOnly = 4u64,
+    /// pool only can add or remove liquidity and plan orders, can't swap
+    OrderBookOnly = 5u64,
+    /// pool only can add or remove liquidity and swap, can't plan orders
+    SwapOnly = 6u64,
+    WaitingTrade = 7u64,
 }
 ```
 
@@ -115,7 +118,7 @@ The upstream implementation controls operational permissions via explicit match 
 - `deposit_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `LiquidityOnly` (4), `OrderBookOnly` (5), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3).
 - `withdraw_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `WithdrawOnly` (3), `LiquidityOnly` (4), `OrderBookOnly` (5), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2).
 - `swap_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3), `LiquidityOnly` (4), `OrderBookOnly` (5).
-- `orderbook_permission(&self) -> bool`: Returns `true` for `Initialized` (1), `LiquidityOnly` (4), `SwapOnly` (6), `WaitingTrade` (7); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3), `OrderBookOnly` (5).
+- `orderbook_permission(&self) -> bool`: Returns `true` only for `Initialized` (1) and `OrderBookOnly` (5); returns `false` for `Uninitialized` (0), `Disabled` (2), `WithdrawOnly` (3), `LiquidityOnly` (4), `SwapOnly` (6), `WaitingTrade` (7).
 
 > [!IMPORTANT]
 > **Preservation of Raw Status Output Without New Eligibility Filters**  
@@ -293,7 +296,7 @@ sequenceDiagram
 
 ## 6. Implementation Status & Offline Regression Coverage
 
-The offline implementation approved by the auditor is complete:
+The offline implementation approved by the independent review is complete:
 
 1. **Parser Extension in [`RaydiumAmmParser.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.ts)**:
    - Added `LP_RESERVE: 720` to `RAYDIUM_V4_OFFSETS`.
@@ -307,9 +310,20 @@ The offline implementation approved by the auditor is complete:
    - Formats display presentation to six decimal places using `Number(((L - S) * 100_000_000n) / L) / 1_000_000`.
    - Returns raw numerator (`rawInaccessibleLp`) and denominator (`rawDenominator`).
    - Re-exported from `RaydiumAmmParser.ts`.
-3. **Deterministic Offline Test Suites**:
+3. **Offline Snapshot Validator in [`RaydiumAmmV4SnapshotValidator.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.ts)**:
+   - Derives canonical AMM authority PDA using official Solana tooling (`PublicKey.findProgramAddress([Buffer.from("amm authority")], programId)` $\rightarrow$ `5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1`, bump 254).
+   - Validates coherent batch RPC response for `[poolId, lpMint, baseVault, quoteVault]`.
+   - Strictly enforces shared context slot `slot > 0`.
+   - Verifies exact pool identity, token/WSOL orientation, canonical program ownership (`RAYDIUM_AMM_V4_PROGRAM_ID`, `SPL_TOKEN_PROGRAM_ID`), supported layouts (752B pool, 82B mint, 165B vaults).
+   - Verifies pool references matching requested LP mint, base vault, quote vault.
+   - Decodes initialized SPL LP mint, validates LP mint authority matches derived AMM authority or is renounced (`null`), and freeze authority matches derived AMM authority or is `null`.
+   - Validates vault owners match derived AMM authority and vault states are initialized (`accountState === 1`).
+   - Evaluates pure mathematical LP accounting via `calculateAmmV4LpInaccessibleClaims`.
+   - Returns separate raw LP accounting, provenance diagnostics, SHA-256 digests, and strict evidence boundaries (`bytecodeEquivalenceVerified: false`, `completeExecutableReservesVerified: false`, `generalTokenSafetyVerified: false`, `strategyGateAdmitted: false`).
+4. **Deterministic Offline Test Suites (54 tests passing)**:
    - [`RaydiumAmmParser.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.test.ts): 15 tests verifying offset 720 decoding, zeroed default safety, and round-trip parsing.
    - [`RaydiumAmmLpAccounting.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmLpAccounting.test.ts): 14 tests covering all 5 lifecycle scenarios, exact boundary testing ($89.999999\%$, $90.0\%$, $90.000001\%$), zero denominator, $S > L$, negative inputs, and magnitudes above JavaScript's safe integer limit ($> 2^{53} - 1$).
+   - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 25 tests covering authority derivation, positive validation (burned LP, renounced mint authority, inverted pairs, genesis unminted minimum), negative validation (corrupted payloads, bad slots, incomplete batches, missing accounts, unauthorized owners, layout truncations, pool reference mismatches, non-SOL pairs, token mint mismatches, uninitialized/rogue mint authorities, rogue vault owners, uninitialized/frozen vaults, and arithmetic violations).
 
 ---
 
@@ -317,9 +331,7 @@ The offline implementation approved by the auditor is complete:
 
 The following items are **explicitly pending** and remain unapproved:
 
-1. **Solana RPC Client Acquisition**: Direct RPC network retrieval of live pool and mint accounts.
-2. **RPC Commitment Policy**: Selection and enforcement of commitment levels (`confirmed` vs `finalized`).
-3. **On-Chain Authority & Ownership Validation**: Live validation that `lpMintAccount.owner` is SPL Token Program and `lpMint.mintAuthority` matches authorized AMM PDA or is renounced.
-4. **Slot Skew & Batch Coherence Enforcement**: Rejecting snapshots where pool and mint accounts do not originate from identical context slots.
-5. **Strategy Gate Qualification**: Feeding computed LP inaccessible percentages into `AntiRugEvaluator.ts` or admitting live candidates.
-6. **Daemon & Pipeline Wiring**: Modifying discovery intervals, position monitoring loops, or candidate watchlists.
+1. **Solana RPC Client Acquisition**: Outbound RPC network retrieval of live pool and mint accounts.
+2. **RPC Commitment Policy**: Selection and enforcement of commitment levels (`confirmed` vs `finalized`) during live queries.
+3. **Pipeline & Strategy Gate Wiring**: Live integration into `AntiRugEvaluator.ts`, scanner pipeline, candidate watchlist, or trading daemon.
+4. **Execution & Live Market Runs**: Live market sessions, wallet mutations, or live token purchases remain strictly prohibited (virtual wallet balance frozen at `7.9259 SOL`).
