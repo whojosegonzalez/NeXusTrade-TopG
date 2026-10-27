@@ -360,7 +360,16 @@ The approved offline implementation items are completed:
    - Explicitly records current LP measurement (`lpBurnPct: pool.lpBurnPct`) on deactivated and updated items, preserving previous passing values strictly in separate historical context (`historicalLpBurnPct`).
    - Added active-watchlist accessors `getActiveWatchlist()` and `getActiveCandidates()` (aliasing `getActiveWatchingItems()`) to ensure complete exclusion of deactivated or non-qualifying entries.
    - 13 comprehensive unit tests passing in [`backend/src/candidate-scanner/CandidateWatchlistService.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateWatchlistService.test.ts).
-6. **Larger Changes Quarantined**:
+6. **Metered Raydium AMM v4 LP Evidence Adapter (`RaydiumAmmV4LpEvidenceAdapter.ts`)**:
+   - Implemented in [`backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.ts).
+   - Composes the bounded 2-request acquisition client (`acquireRaydiumAmmV4Snapshot`) to `CandidateStreamEngine`'s injected `CandidateLpEvidenceResolver` interface.
+   - Binds each acquisition strictly to the canonical candidate pool address and token mint with zero reference-pool fallback or substitution.
+   - Requires an explicitly supplied transport; rejects instantiation without transport to prohibit accidental live networking.
+   - Meters every actual outbound HTTP dispatch through a shared `GlobalResourceBudgetManager`, enforcing global ceilings, purpose reservations (`CANDIDATE_ENRICHMENT`), and provider pacing ($\ge 2,500\text{ ms}$) across candidates.
+   - Counts failed dispatched requests against the shared budget; budget denial strictly prevents dispatch, including denial between Request 1 and Request 2.
+   - Preserves truthful provenance (`SYNTHETIC_FIXTURE` vs `CAPTURED_RPC`) and explicit freshness policies.
+   - 12 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.test.ts).
+7. **Larger Changes Quarantined**:
    - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
    - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
    - Virtual wallet balance strictly frozen at 7.9259 SOL.
@@ -372,7 +381,7 @@ The approved offline implementation items are completed:
 Before end-to-end PAPER execution can be scheduled or authorized, the following concrete integration gaps remain:
 
 1. **Live Acquisition Wiring in Production Daemon**:
-   - `CandidateStreamEngine.ts` intake integration with injected resolver and validated-LP mode is complete and verified offline.
+   - `CandidateStreamEngine.ts` intake integration with injected resolver, `RaydiumAmmV4LpEvidenceAdapter.ts`, and validated-LP mode is complete and verified offline.
    - Live daemon wiring in `paper-trading-daemon.ts` connecting the bounded 2-request acquisition client to live Solana RPC endpoints upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings remains pending authorization.
 2. **Sub-Minute Micro-Flow Observations**:
    - Implement an authentic sub-minute rolling transaction stream (`recentBuys60s`, `recentSells60s`) via websocket or high-frequency polling adapter to satisfy Retest Gate Rules A/B/C/E (1.15x / 1.25x / 1.5x flow-absorption and seller-surge protection).
@@ -380,6 +389,7 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
    - Register a live RugCheck provider client under `GlobalResourceBudgetManager` with strict rate-limiting, error handling, and budget accounting to supply verified security scores, danger flags, holder counts, and bundler concentrations.
 4. **Verified Reserve Spot Pricing & Slippage Math**:
    - Wire atomic reserve balances (`baseReserveTokens`, `quoteReserveSol`) from validated vault accounts into `createDeterministicAmmQuote()` to enable precise constant-product pricing and arrival slippage simulation during order execution.
+   - Crucially, raw vault balances alone are strictly insufficient for executable pricing as they omit OpenOrders balances, unsettled PnL, protocol fees, and dynamic swap state. Full constant-product execution math requires verified total executable reserves, not raw vault balances alone.
 5. **Execution Quarantine Maintained**:
    - Virtual wallet strictly frozen at **7.9259 SOL**.
    - Zero live network requests, reruns, daemon activation, wallet mutations, or market sessions.
