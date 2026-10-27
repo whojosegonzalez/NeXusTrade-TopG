@@ -7,11 +7,14 @@
  *
  * Enforces:
  * - Read-only execution: zero wallet access, zero signing, zero trading daemon wiring.
+ * - Strict argument validation: rejects unrecognized options (e.g. --dryRun) and missing values fail-closed.
  * - Max 2 outbound HTTP requests: exactly 1 getAccountInfo + 1 getMultipleAccounts.
+ * - Single acquisition deadline (<= 60,000 ms) across pacing, requests, and reads.
  * - Pacing >= 2,500 ms between requests.
  * - Pre-flight identity verification and canonical AMM authority derivation.
  * - Dry-run mode (--dry-run) making zero network requests.
- * - Output evidence sealing with SHA-256 digest in JSON format preserving BigInt decimal strings.
+ * - Evidence sealing: finalized evidence file + separate manifest with exact SHA-256 and byte sizes.
+ * - Provider-neutral operator interface.
  */
 
 import path from "node:path";
@@ -22,6 +25,7 @@ import {
   MIN_HOST_PACING_MS,
   REFERENCE_RAY_TOKEN_MINT,
   REFERENCE_RAY_WSOL_POOL_ID,
+  validateNumericConfig,
   type SnapshotAcquisitionConfig,
 } from "./RaydiumAmmV4SnapshotAcquisition.js";
 
@@ -38,22 +42,28 @@ OPTIONS:
   --rpc-url <url>              RPC endpoint URL (Mandatory unless --dry-run)
   --pool-id <pubkey>           Pool address (Default: ${REFERENCE_RAY_WSOL_POOL_ID} [RAY/WSOL])
   --expected-token-mint <mint> Expected token mint (Default: ${REFERENCE_RAY_TOKEN_MINT} [RAY])
-  --pacing-ms <ms>             Host pacing between Request 1 and 2 (Default: ${MIN_HOST_PACING_MS} ms)
+  --pacing-ms <ms>             Host pacing between Request 1 and 2 (Default: ${MIN_HOST_PACING_MS} ms, min: 2500)
   --timeout-ms <ms>            Per-request timeout in ms (Default: ${DEFAULT_REQUEST_TIMEOUT_MS} ms)
-  --overall-timeout-ms <ms>    Overall execution ceiling in ms (Default: ${DEFAULT_OVERALL_TIMEOUT_MS} ms)
-  --out-dir <path>             Directory to seal output evidence JSON (Default: data/research/snapshots)
+  --overall-timeout-ms <ms>    Overall execution ceiling in ms (Default: ${DEFAULT_OVERALL_TIMEOUT_MS} ms, max: 60000)
+  --out-dir <path>             Directory to seal output evidence JSON and manifest (Default: data/research/snapshots)
   --dry-run                    Verify parameters, derive authority, output planned sequence; ZERO network calls
   -h, --help                   Display this help message
+
+EXAMPLE (Provider-Neutral):
+  pnpm --filter @nexustrade/backend research:raydium-amm-v4-snapshot \\
+    --rpc-url "https://<YOUR_SOLANA_RPC_HOST>/?api-key=<OPERATOR_SECRET_KEY>"
 
 SAFETY & CONSTRAINTS:
   - Network requests: Max 2 outbound calls (1 bootstrap + 1 batch).
   - Pacing: Strictly enforced >= 2,500 ms pause before batch request.
   - Retries: 0 (Zero retries, zero redirects, zero fallback providers).
+  - Ceiling: Max 60,000 ms overall acquisition deadline.
+  - Credential Hygiene: Transport credentials kept private in memory; never saved to disk.
   - Wallet state: Strictly frozen at 7.9259 SOL (No wallet mutation, zero signing).
 `);
 }
 
-interface ParsedCliArgs {
+export interface ParsedCliArgs {
   rpcUrl?: string | undefined;
   poolId?: string | undefined;
   expectedTokenMint?: string | undefined;
@@ -65,58 +75,136 @@ interface ParsedCliArgs {
   help: boolean;
 }
 
-function parseArgs(args: string[]): ParsedCliArgs {
+export function parseCliArgs(args: readonly string[]): ParsedCliArgs {
   const result: ParsedCliArgs = {
     dryRun: false,
     help: false,
   };
 
+  const knownValuedFlags = new Set([
+    "--rpc-url",
+    "--pool-id",
+    "--expected-token-mint",
+    "--pacing-ms",
+    "--timeout-ms",
+    "--overall-timeout-ms",
+    "--out-dir",
+  ]);
+
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
+
     if (arg === "-h" || arg === "--help") {
       result.help = true;
-    } else if (arg === "--dry-run") {
-      result.dryRun = true;
-    } else if (arg === "--rpc-url" && i + 1 < args.length) {
-      result.rpcUrl = args[++i];
-    } else if (arg.startsWith("--rpc-url=")) {
-      result.rpcUrl = arg.slice("--rpc-url=".length);
-    } else if (arg === "--pool-id" && i + 1 < args.length) {
-      result.poolId = args[++i];
-    } else if (arg.startsWith("--pool-id=")) {
-      result.poolId = arg.slice("--pool-id=".length);
-    } else if (arg === "--expected-token-mint" && i + 1 < args.length) {
-      result.expectedTokenMint = args[++i];
-    } else if (arg.startsWith("--expected-token-mint=")) {
-      result.expectedTokenMint = arg.slice("--expected-token-mint=".length);
-    } else if (arg === "--pacing-ms" && i + 1 < args.length) {
-      result.pacingMs = parseInt(args[++i]!, 10);
-    } else if (arg.startsWith("--pacing-ms=")) {
-      result.pacingMs = parseInt(arg.slice("--pacing-ms=".length), 10);
-    } else if (arg === "--timeout-ms" && i + 1 < args.length) {
-      result.timeoutMs = parseInt(args[++i]!, 10);
-    } else if (arg.startsWith("--timeout-ms=")) {
-      result.timeoutMs = parseInt(arg.slice("--timeout-ms=".length), 10);
-    } else if (arg === "--overall-timeout-ms" && i + 1 < args.length) {
-      result.overallTimeoutMs = parseInt(args[++i]!, 10);
-    } else if (arg.startsWith("--overall-timeout-ms=")) {
-      result.overallTimeoutMs = parseInt(arg.slice("--overall-timeout-ms=".length), 10);
-    } else if (arg === "--out-dir" && i + 1 < args.length) {
-      result.outDir = args[++i];
-    } else if (arg.startsWith("--out-dir=")) {
-      result.outDir = arg.slice("--out-dir=".length);
+      continue;
     }
+    if (arg === "--dry-run") {
+      result.dryRun = true;
+      continue;
+    }
+
+    // Handle --flag=value syntax
+    if (arg.startsWith("--")) {
+      const eqIdx = arg.indexOf("=");
+      if (eqIdx !== -1) {
+        const flag = arg.slice(0, eqIdx);
+        const val = arg.slice(eqIdx + 1);
+        if (!knownValuedFlags.has(flag)) {
+          throw new Error(
+            `Unrecognized CLI option: '${arg}'. For supported options, run with --help.`,
+          );
+        }
+        if (val.trim() === "") {
+          throw new Error(`Option '${flag}' requires a non-empty value.`);
+        }
+        assignValuedOption(result, flag, val);
+        continue;
+      }
+    }
+
+    // Handle --flag value syntax
+    if (knownValuedFlags.has(arg)) {
+      if (i + 1 >= args.length) {
+        throw new Error(`Option '${arg}' requires a value.`);
+      }
+      const nextArg = args[++i]!;
+      if (nextArg.startsWith("--")) {
+        throw new Error(`Option '${arg}' requires a value, but received flag '${nextArg}'.`);
+      }
+      assignValuedOption(result, arg, nextArg);
+      continue;
+    }
+
+    // Reject all other arguments, misspellings, or unexpected positional parameters
+    throw new Error(`Unrecognized CLI argument: '${arg}'. For supported options, run with --help.`);
   }
 
   return result;
 }
 
+function assignValuedOption(target: ParsedCliArgs, flag: string, value: string): void {
+  switch (flag) {
+    case "--rpc-url":
+      target.rpcUrl = value;
+      break;
+    case "--pool-id":
+      target.poolId = value;
+      break;
+    case "--expected-token-mint":
+      target.expectedTokenMint = value;
+      break;
+    case "--pacing-ms":
+      target.pacingMs = Number(value);
+      break;
+    case "--timeout-ms":
+      target.timeoutMs = Number(value);
+      break;
+    case "--overall-timeout-ms":
+      target.overallTimeoutMs = Number(value);
+      break;
+    case "--out-dir":
+      target.outDir = value;
+      break;
+    default:
+      throw new Error(`Unrecognized CLI option: '${flag}'`);
+  }
+}
+
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<number> {
-  const args = parseArgs(argv);
+  let args: ParsedCliArgs;
+  try {
+    args = parseCliArgs(argv);
+  } catch (parseErr) {
+    console.error(
+      `\n[ARGUMENT ERROR] ${parseErr instanceof Error ? parseErr.message : String(parseErr)}\n`,
+    );
+    return 1;
+  }
 
   if (args.help) {
     printUsage();
     return 0;
+  }
+
+  // Validate numeric parameters strictly
+  let pacingMs: number;
+  let timeoutMs: number;
+  let overallTimeoutMs: number;
+
+  try {
+    const validated = validateNumericConfig({
+      pacingMs: args.pacingMs,
+      timeoutMs: args.timeoutMs,
+      overallTimeoutMs: args.overallTimeoutMs,
+    });
+    pacingMs = validated.pacingMs;
+    timeoutMs = validated.timeoutMs;
+    overallTimeoutMs = validated.overallTimeoutMs;
+  } catch (numErr) {
+    console.error(
+      `\n[CONFIGURATION ERROR] ${numErr instanceof Error ? numErr.message : String(numErr)}\n`,
+    );
+    return 1;
   }
 
   const defaultOutDir = path.resolve(process.cwd(), "data", "research", "snapshots");
@@ -126,9 +214,9 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     rpcUrl: args.rpcUrl,
     poolId: args.poolId ?? REFERENCE_RAY_WSOL_POOL_ID,
     expectedTokenMint: args.expectedTokenMint ?? REFERENCE_RAY_TOKEN_MINT,
-    pacingMs: args.pacingMs ?? MIN_HOST_PACING_MS,
-    timeoutMs: args.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-    overallTimeoutMs: args.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS,
+    pacingMs,
+    timeoutMs,
+    overallTimeoutMs,
     outDir,
     dryRun: args.dryRun,
   };
@@ -224,16 +312,21 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       console.log(`Meets 90.0% Threshold       : ${ev.accounting.meetsNinetyPercentThreshold}`);
     }
 
-    if (ev.evidenceFilePath) {
+    if (ev.artifacts) {
       console.log(
         "\n--------------------------------------------------------------------------------",
       );
-      console.log("  SEALED EVIDENCE ARTIFACT");
+      console.log("  SEALED EVIDENCE & MANIFEST ARTIFACTS");
       console.log(
         "--------------------------------------------------------------------------------",
       );
-      console.log(`File Path : ${ev.evidenceFilePath}`);
-      console.log(`SHA-256   : ${ev.evidenceDigestSha256}`);
+      console.log(`Evidence File Path : ${ev.artifacts.evidenceFilePath}`);
+      console.log(`Evidence File SHA  : ${ev.artifacts.evidenceFileSha256}`);
+      console.log(`Evidence Size      : ${ev.artifacts.evidenceByteSize} bytes`);
+      console.log(`Manifest File Path : ${ev.artifacts.manifestFilePath}`);
+      console.log(`Manifest File SHA  : ${ev.artifacts.manifestFileSha256}`);
+      console.log(`Manifest Size      : ${ev.artifacts.manifestByteSize} bytes`);
+      console.log(`Payload Digest SHA : ${ev.payloadDigestSha256}`);
     }
 
     console.log("\n[EVIDENCE BOUNDARIES ENFORCED]");
@@ -243,12 +336,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     console.log("  - Strategy gate admitted               : false");
     console.log("  - Wallet balance strictly frozen       : 7.9259 SOL");
 
-    if (!ev.outcomes.retrievalOk) {
+    if (!result.ok) {
+      if (!ev.outcomes.retrievalOk) {
+        return 1;
+      }
+      if (!ev.outcomes.structuralValidationOk) {
+        return 2;
+      }
       return 1;
     }
-    if (!ev.outcomes.structuralValidationOk) {
-      return 2;
-    }
+
     return 0;
   } catch (err) {
     console.error(`\n[EXECUTION ERROR] ${err instanceof Error ? err.message : String(err)}`);

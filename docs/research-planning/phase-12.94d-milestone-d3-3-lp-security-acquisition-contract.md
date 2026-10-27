@@ -329,24 +329,30 @@ The offline implementation approved by the independent review is complete:
      - Request 1: `getAccountInfo(poolId)` (`confirmed`, `base64`) validating bootstrap account layout (752B), program owner, valid status, WSOL orientation, and expected token mint before discovering `lpMint`, `baseVault`, `quoteVault`.
      - Host pacing: enforces $\ge 2,500$ ms delay between outbound requests.
      - Request 2: `getMultipleAccounts([poolId, lpMint, baseVault, quoteVault])` (`confirmed`, `base64`) passing `minContextSlot = bootstrapSlot`.
-   - Enforces bounded execution constraints:
-     - Strictly capped at 2 outbound HTTP attempts (tracked on both success and failure).
-     - Retries = 0, redirects = 0, fallback providers = 0, auto-discovery = 0.
-     - Terminate immediately after attempt 1 if bootstrap validation fails (no second request).
-     - Independently rejects stale batch context slot (`batchSlot < bootstrapSlot`).
-     - Verifies final batch retains discovered account references.
-   - Sealed evidence & BigInt serialization:
-     - Serializes all integer quantities (`bigint`) as exact decimal strings in JSON (`serializeJsonPreservingBigInts`).
-     - Computes deterministic SHA-256 evidence digests.
-     - Separates retrieval success, structural validation success, and 90% threshold qualification.
-     - Statically enforces evidence boundaries (`bytecodeEquivalenceVerified: false`, `completeExecutableReservesVerified: false`, `generalTokenSafetyVerified: false`, `strategyGateAdmitted: false`).
-   - Standalone CLI entrypoint with `--dry-run` support:
-     - Verified dry-run execution making zero network requests (`pnpm --filter @nexustrade/backend research:raydium-amm-v4-snapshot --dry-run`).
-5. **Deterministic Offline Test Suites (93 tests passing across 4 suites)**:
+   - Credential privacy & non-exposure:
+     - Transport credentials and raw URLs are kept strictly private in local memory scope.
+     - Public evidence surfaces only `PublicRpcEndpointInfo` (`sanitizedUrl`, `host`, `endpointFingerprint`).
+     - Reflected credentials and transport error messages are strictly redacted (`[REDACTED]`).
+     - Altered response bodies are labeled (`wasRedacted: true`), and the pre-redaction `wireResponseSha256` is strictly distinguished from `storedResponseSha256`.
+     - Dummy credentials are verified absent from returned evidence, written files, manifest, and CLI output.
+   - Strict argument, deadline, and attempt accounting:
+     - Strict CLI argument parser (`parseCliArgs`) rejects unknown options (such as `--dryRun`) and missing values, failing closed with exit code 1 and 0 fetch dispatches.
+     - Strict numeric config validator (`validateNumericConfig`) enforces $\ge 2,500$ ms pacing, $\le 60,000$ ms request timeout, $\le 60,000$ ms overall ceiling, rejecting NaN, floats, and negative numbers.
+     - Single acquisition deadline budget (`deadlineEpoch = startedAt + overallTimeoutMs`) governs host pacing, requests, and reads.
+     - Remaining budget is verified before host pacing and before request dispatch. If remaining budget is insufficient for host pacing, Request 2 is not dispatched and `httpAttempts` remains strictly 1.
+   - Evidence file sealing & separate manifest:
+     - Finalized evidence bytes are written to disk with anti-overwrite protection (`flag: "wx"`).
+     - A separate manifest file (`SnapshotAcquisitionManifest`) records the exact written file SHA-256 (`evidenceFileSha256`), file byte size (`evidenceByteSize`), and payload digest (`payloadDigestSha256`).
+     - Storage write failures fail closed, recording `EVIDENCE_STORAGE_FAILED`, rendering `result.ok = false`, and returning exit code 1.
+     - Interrupted acquisitions seal partial evidence and manifest with status `INTERRUPTED` or `RETRIEVAL_FAILED`.
+   - Provenance preservation:
+     - Dry-runs represent an execution plan with `evidenceOrigin: null`, `isSyntheticFixture: null`, and `retrievedAtIso: null`.
+     - Injected fixture transports accept explicit `evidenceOrigin: "SYNTHETIC_FIXTURE"` and propagate faithfully into validator diagnostics without defaulting to `CAPTURED_RPC`.
+5. **Deterministic Offline Test Suites (102 tests passing across 4 suites)**:
    - [`RaydiumAmmParser.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmParser.test.ts): 16 tests verifying offset 720 decoding, nonce decoding, zeroed default safety, round-trip parsing, and rejection of 33-byte addresses.
    - [`RaydiumAmmLpAccounting.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmLpAccounting.test.ts): 14 tests covering all 5 lifecycle scenarios, exact boundary testing ($89.999999\%$, $90.0\%$, $90.000001\%$), zero denominator, $S > L$, negative inputs, and magnitudes above JavaScript's safe integer limit ($> 2^{53} - 1$).
    - [`RaydiumAmmV4SnapshotValidator.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotValidator.test.ts): 43 tests covering authority derivation, cache mutation protection, pool nonce consistency, provenance/timestamp integrity, rejection of 33-byte public keys, Base64 syntax checks, safe integer slot checks, positive controls, negative structural checks, and arithmetic bounds.
-   - [`RaydiumAmmV4SnapshotAcquisition.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotAcquisition.test.ts): 20 tests verifying successful 2-request acquisition with $\ge 2,500$ ms host pacing, attempt-1 termination on bootstrap failure (null account, unauthorized owner, corrupted layout, orientation mismatch, token mismatch, invalid status, malformed base64), network/RPC error handling (HTTP 500, timeout, malformed JSON, RPC error), stale context slot rejection, changed account reference rejection, request counting ceiling ($2$), BigInt decimal string serialization, SHA-256 evidence sealing, and CLI dry-run/help execution.
+   - [`RaydiumAmmV4SnapshotAcquisition.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/RaydiumAmmV4SnapshotAcquisition.test.ts): 29 tests verifying credential non-exposure, wire vs stored digest distinction, redaction of transport errors and reflected secrets, strict argument rejection, numeric range and type enforcement, single deadline budget, attempt counter accuracy (preventing the 70s mismatch), exact manifest file hashing, anti-overwrite, fail-closed storage handling, provenance preservation, attempt-1 termination on bootstrap failures, and zero-network CLI dry-run/help.
 
 ---
 

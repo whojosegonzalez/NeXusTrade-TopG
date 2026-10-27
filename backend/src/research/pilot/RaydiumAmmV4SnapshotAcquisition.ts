@@ -9,13 +9,17 @@
  * 5. LP-Accounting calculation: derived strictly from the final batch.
  *
  * Operational & Safety Constraints:
- * - At most 2 outbound HTTP attempts; strictly counted.
+ * - At most 2 outbound HTTP attempts; strictly counted on actual dispatch.
+ * - Single deadline across pacing, requests, and body reads; overall ceiling <= 60,000 ms.
  * - Zero retries, zero redirects, zero fallback providers, zero auto-discovery.
  * - Terminate immediately after attempt 1 if bootstrap validation fails.
- * - Require explicitly supplied RPC endpoint; credentials sanitized via sanitizeSolanaRpcUrl.
- * - Dry-run mode making zero network calls.
- * - Preserves evidence without inventing provenance (CAPTURED_RPC, isSyntheticFixture: false).
- * - BigInts serialized as decimal strings in JSON.
+ * - Credential hygiene: transport credentials kept private in memory; public projection only.
+ * - Credential redaction in error messages and reflected responses; original wire digests preserved.
+ * - Evidence sealing: evidence written to disk, and exact file SHA-256 + byte size recorded in a separate manifest.
+ * - Anti-overwrite protection: existing sealed artifacts are never overwritten.
+ * - Mandatory storage success: write failures cause the operation to fail closed.
+ * - Dry-run mode represents a plan with no captured RPC evidence.
+ * - BigInts serialized as exact decimal strings in JSON.
  * - Explicit evidence boundaries statically false (zero candidate admission / zero token safety claims).
  */
 
@@ -34,6 +38,7 @@ import {
   isValidStrictBase64,
   validateRaydiumAmmV4Snapshot,
   type DerivedAmmAuthority,
+  type EvidenceOrigin,
   type RaydiumAmmV4SnapshotIdentities,
   type RaydiumAmmV4SnapshotValidationResult,
 } from "./RaydiumAmmV4SnapshotValidator.js";
@@ -48,7 +53,18 @@ export const REFERENCE_RAY_TOKEN_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3Q
 export const MIN_HOST_PACING_MS = 2500;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 export const DEFAULT_OVERALL_TIMEOUT_MS = 60000;
+export const MAX_OVERALL_TIMEOUT_MS = 60000;
 export const MAX_HTTP_ATTEMPTS_ALLOWED = 2;
+
+/**
+ * Public endpoint projection containing only sanitized URL, host, and fingerprint.
+ * Transport credentials, raw URLs, and sensitive tokens are strictly excluded.
+ */
+export interface PublicRpcEndpointInfo {
+  readonly sanitizedUrl: string;
+  readonly host: string;
+  readonly endpointFingerprint: string;
+}
 
 export interface SnapshotAcquisitionConfig {
   readonly rpcUrl?: string | undefined;
@@ -59,6 +75,8 @@ export interface SnapshotAcquisitionConfig {
   readonly overallTimeoutMs?: number | undefined;
   readonly outDir?: string | undefined;
   readonly dryRun?: boolean | undefined;
+  readonly evidenceOrigin?: EvidenceOrigin | undefined;
+  readonly isSyntheticFixture?: boolean | undefined;
   readonly fetch?: typeof fetch | undefined;
   readonly clock?: (() => Date) | undefined;
   readonly sleeper?: ((ms: number) => Promise<void>) | undefined;
@@ -73,21 +91,34 @@ export interface BoundedRpcRequestRecord {
   readonly elapsedMs: number;
   readonly httpStatus: number | null;
   readonly rawResponseBody: string | null;
-  readonly responseSha256: string | null;
+  readonly wireResponseSha256: string | null;
+  readonly storedResponseSha256: string | null;
+  readonly wasRedacted: boolean;
   readonly parsedJson: Record<string, unknown> | null;
   readonly error: string | null;
+}
+
+export interface SnapshotFileArtifacts {
+  readonly evidenceFileName: string;
+  readonly evidenceFilePath: string;
+  readonly evidenceFileSha256: string;
+  readonly evidenceByteSize: number;
+  readonly manifestFileName: string;
+  readonly manifestFilePath: string;
+  readonly manifestFileSha256: string;
+  readonly manifestByteSize: number;
 }
 
 export interface SnapshotAcquisitionEvidence {
   readonly schemaVersion: "1.0";
   readonly command: "RaydiumAmmV4SnapshotAcquisition";
   readonly executionMode: "LIVE_ACQUISITION" | "DRY_RUN";
-  readonly evidenceOrigin: "CAPTURED_RPC";
-  readonly isSyntheticFixture: false;
+  readonly evidenceOrigin: EvidenceOrigin | null;
+  readonly isSyntheticFixture: boolean | null;
   readonly retrievedAtIso: string | null;
   readonly startedAtIso: string;
   readonly completedAtIso: string;
-  readonly endpoint: SanitizedRpcEndpointInfo;
+  readonly endpoint: PublicRpcEndpointInfo;
   readonly config: {
     readonly poolId: string;
     readonly expectedTokenMint: string | null;
@@ -121,8 +152,37 @@ export interface SnapshotAcquisitionEvidence {
     readonly generalTokenSafetyVerified: false;
     readonly strategyGateAdmitted: false;
   };
-  evidenceDigestSha256?: string | undefined;
-  evidenceFilePath?: string | undefined;
+  payloadDigestSha256?: string | undefined;
+  artifacts?: SnapshotFileArtifacts | undefined;
+}
+
+export interface SnapshotAcquisitionManifest {
+  readonly manifestVersion: "1.0";
+  readonly manifestType: "RAYDIUM_AMM_V4_SNAPSHOT_MANIFEST";
+  readonly createdAtIso: string;
+  readonly poolId: string;
+  readonly status:
+    | "SUCCESS"
+    | "STRUCTURAL_VALIDATION_FAILED"
+    | "RETRIEVAL_FAILED"
+    | "INTERRUPTED"
+    | "DRY_RUN";
+  readonly httpAttempts: number;
+  readonly evidenceFileName: string;
+  readonly evidenceFilePath: string;
+  readonly evidenceFileSha256: string;
+  readonly evidenceByteSize: number;
+  readonly payloadDigestSha256: string;
+  readonly contextSlots: {
+    readonly bootstrapSlot: number | null;
+    readonly batchSlot: number | null;
+  };
+  readonly outcomes: {
+    readonly retrievalOk: boolean;
+    readonly structuralValidationOk: boolean;
+    readonly meetsNinetyPercentThreshold: boolean;
+  };
+  readonly failureReason: string | null;
 }
 
 export interface SnapshotAcquisitionResult {
@@ -130,6 +190,71 @@ export interface SnapshotAcquisitionResult {
   readonly dryRun: boolean;
   readonly httpAttempts: number;
   readonly evidence: SnapshotAcquisitionEvidence;
+  readonly manifest?: SnapshotAcquisitionManifest | undefined;
+}
+
+/**
+ * Validates numeric acquisition configuration strictly.
+ * Rejects NaN, Infinity, negative numbers, non-integers, and out-of-range bounds.
+ */
+export function validateNumericConfig(config: {
+  pacingMs?: unknown;
+  timeoutMs?: unknown;
+  overallTimeoutMs?: unknown;
+}): {
+  pacingMs: number;
+  timeoutMs: number;
+  overallTimeoutMs: number;
+} {
+  const rawPacing = config.pacingMs !== undefined ? config.pacingMs : MIN_HOST_PACING_MS;
+  const rawTimeout = config.timeoutMs !== undefined ? config.timeoutMs : DEFAULT_REQUEST_TIMEOUT_MS;
+  const rawOverall =
+    config.overallTimeoutMs !== undefined ? config.overallTimeoutMs : DEFAULT_OVERALL_TIMEOUT_MS;
+
+  const parseAndValidate = (val: unknown, name: string, min: number, max: number): number => {
+    let num: number;
+    if (typeof val === "number") {
+      num = val;
+    } else if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (!/^\d+$/.test(trimmed)) {
+        throw new Error(`Invalid ${name}: '${val}' must be a positive integer`);
+      }
+      num = Number(trimmed);
+    } else {
+      throw new Error(`Invalid ${name}: expected number, received ${typeof val}`);
+    }
+
+    if (!Number.isFinite(num) || !Number.isSafeInteger(num) || Number.isNaN(num)) {
+      throw new Error(`Invalid ${name}: value must be a safe finite integer`);
+    }
+    if (num < min || num > max) {
+      throw new Error(`Invalid ${name}: ${num} is out of allowed range [${min}, ${max}]`);
+    }
+    return num;
+  };
+
+  const pacingMs = parseAndValidate(
+    rawPacing,
+    "pacingMs",
+    MIN_HOST_PACING_MS,
+    MAX_OVERALL_TIMEOUT_MS,
+  );
+  const timeoutMs = parseAndValidate(rawTimeout, "timeoutMs", 100, MAX_OVERALL_TIMEOUT_MS);
+  const overallTimeoutMs = parseAndValidate(
+    rawOverall,
+    "overallTimeoutMs",
+    MIN_HOST_PACING_MS,
+    MAX_OVERALL_TIMEOUT_MS,
+  );
+
+  if (overallTimeoutMs < pacingMs) {
+    throw new Error(
+      `Invalid timeout configuration: overallTimeoutMs (${overallTimeoutMs}) cannot be less than pacingMs (${pacingMs})`,
+    );
+  }
+
+  return { pacingMs, timeoutMs, overallTimeoutMs };
 }
 
 /**
@@ -150,6 +275,22 @@ export function serializeJsonPreservingBigInts(value: unknown, indent: number = 
 }
 
 /**
+ * Redacts credential tokens from a string.
+ */
+function redactString(text: string, sensitiveTokens: readonly string[], rawUrl?: string): string {
+  let result = text;
+  if (rawUrl && rawUrl.length > 0) {
+    result = result.split(rawUrl).join("[REDACTED]");
+  }
+  for (const token of sensitiveTokens) {
+    if (token && token.length > 0) {
+      result = result.split(token).join("[REDACTED]");
+    }
+  }
+  return result;
+}
+
+/**
  * Executes bounded Raydium AMM v4 LP-accounting snapshot acquisition.
  */
 export async function acquireRaydiumAmmV4Snapshot(
@@ -160,6 +301,15 @@ export async function acquireRaydiumAmmV4Snapshot(
     config.sleeper ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const fetchImpl = config.fetch ?? globalThis.fetch;
   const startedAt = clock();
+  const startEpoch = startedAt.getTime();
+
+  // Validate numeric parameters strictly
+  const { pacingMs, timeoutMs, overallTimeoutMs } = validateNumericConfig(config);
+  const deadlineEpoch = startEpoch + overallTimeoutMs;
+
+  function getRemainingBudgetMs(): number {
+    return deadlineEpoch - clock().getTime();
+  }
 
   const poolId = config.poolId ?? REFERENCE_RAY_WSOL_POOL_ID;
   const expectedTokenMint =
@@ -169,9 +319,6 @@ export async function acquireRaydiumAmmV4Snapshot(
         ? REFERENCE_RAY_TOKEN_MINT
         : null;
 
-  const pacingMs = Math.max(MIN_HOST_PACING_MS, config.pacingMs ?? MIN_HOST_PACING_MS);
-  const timeoutMs = config.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const overallTimeoutMs = config.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS;
   const dryRun = Boolean(config.dryRun);
 
   // Validate identity syntax upfront
@@ -189,30 +336,67 @@ export async function acquireRaydiumAmmV4Snapshot(
 
   // Endpoint sanitization
   const rawRpcUrl = config.rpcUrl ?? "";
-  const sanitizedEndpoint: SanitizedRpcEndpointInfo =
-    rawRpcUrl.length > 0
-      ? sanitizeSolanaRpcUrl(rawRpcUrl)
-      : {
-          rawUrl: "",
-          sanitizedUrl: "[DRY_RUN_ENDPOINT_UNSPECIFIED]",
-          host: "dry-run",
-          endpointFingerprint: "sha256:0000000000000000",
-          sensitiveTokens: [],
-        };
+  let privateSanitizerInfo: SanitizedRpcEndpointInfo;
 
-  // DRY-RUN MODE: Zero network calls, return planned sequence and evidence template
+  if (rawRpcUrl.length > 0) {
+    privateSanitizerInfo = sanitizeSolanaRpcUrl(rawRpcUrl);
+  } else {
+    privateSanitizerInfo = {
+      rawUrl: "",
+      sanitizedUrl: "[DRY_RUN_ENDPOINT_UNSPECIFIED]",
+      host: "dry-run",
+      endpointFingerprint: "sha256:0000000000000000",
+      sensitiveTokens: [],
+    };
+  }
+
+  // Keep transport credentials strictly private in memory; expose only public projection
+  const publicEndpoint: PublicRpcEndpointInfo = Object.freeze({
+    sanitizedUrl: privateSanitizerInfo.sanitizedUrl,
+    host: privateSanitizerInfo.host,
+    endpointFingerprint: privateSanitizerInfo.endpointFingerprint,
+  });
+
+  const sensitiveTokens = privateSanitizerInfo.sensitiveTokens;
+
+  // Provenance resolution
+  let effectiveEvidenceOrigin: EvidenceOrigin | null = null;
+  let effectiveIsSyntheticFixture: boolean | null = null;
+
+  if (dryRun) {
+    effectiveEvidenceOrigin = null;
+    effectiveIsSyntheticFixture = null;
+  } else if (config.evidenceOrigin !== undefined) {
+    effectiveEvidenceOrigin = config.evidenceOrigin;
+    effectiveIsSyntheticFixture =
+      config.isSyntheticFixture !== undefined
+        ? config.isSyntheticFixture
+        : effectiveEvidenceOrigin === "SYNTHETIC_FIXTURE"
+          ? true
+          : effectiveEvidenceOrigin === "CAPTURED_RPC"
+            ? false
+            : null;
+  } else if (config.isSyntheticFixture !== undefined) {
+    effectiveIsSyntheticFixture = config.isSyntheticFixture;
+    effectiveEvidenceOrigin = config.isSyntheticFixture ? "SYNTHETIC_FIXTURE" : "CAPTURED_RPC";
+  } else {
+    effectiveEvidenceOrigin = "CAPTURED_RPC";
+    effectiveIsSyntheticFixture = false;
+  }
+
+  // DRY-RUN MODE: Zero network calls, return planned sequence
   if (dryRun) {
     const completedAt = clock();
     const dryRunEvidence: SnapshotAcquisitionEvidence = {
       schemaVersion: "1.0",
       command: "RaydiumAmmV4SnapshotAcquisition",
       executionMode: "DRY_RUN",
-      evidenceOrigin: "CAPTURED_RPC",
-      isSyntheticFixture: false,
+      evidenceOrigin: null,
+      isSyntheticFixture: null,
       retrievedAtIso: null,
       startedAtIso: startedAt.toISOString(),
       completedAtIso: completedAt.toISOString(),
-      endpoint: sanitizedEndpoint,
+      endpoint: publicEndpoint,
       config: {
         poolId,
         expectedTokenMint,
@@ -248,10 +432,10 @@ export async function acquireRaydiumAmmV4Snapshot(
       },
     };
 
-    const serializedDryRun = serializeJsonPreservingBigInts(dryRunEvidence);
-    dryRunEvidence.evidenceDigestSha256 = crypto
+    const preDigestJson = serializeJsonPreservingBigInts(dryRunEvidence);
+    dryRunEvidence.payloadDigestSha256 = crypto
       .createHash("sha256")
-      .update(serializedDryRun)
+      .update(preDigestJson)
       .digest("hex");
 
     return {
@@ -283,10 +467,9 @@ export async function acquireRaydiumAmmV4Snapshot(
   let structuralValidationOk = false;
   let meetsNinetyPercentThreshold = false;
 
-  const startEpoch = startedAt.getTime();
-
   /**
    * Helper to execute a strictly counted, timeout-bounded outbound JSON-RPC POST request.
+   * Checks deadline BEFORE incrementing the attempt counter and dispatching.
    */
   async function executeRpcCall(
     method: "getAccountInfo" | "getMultipleAccounts",
@@ -295,38 +478,72 @@ export async function acquireRaydiumAmmV4Snapshot(
     record: BoundedRpcRequestRecord;
     json: Record<string, unknown> | null;
   }> {
-    if (httpAttempts >= MAX_HTTP_ATTEMPTS_ALLOWED) {
-      throw new Error(
-        `[BOUNDED_EXECUTION_BREACH] Exceeded maximum allowed HTTP attempts (${MAX_HTTP_ATTEMPTS_ALLOWED})`,
-      );
+    const remainingMs = getRemainingBudgetMs();
+    if (remainingMs <= 0) {
+      const rec: BoundedRpcRequestRecord = {
+        attempt: httpAttempts + 1,
+        method,
+        params,
+        requestTimestampIso: clock().toISOString(),
+        responseTimestampIso: null,
+        elapsedMs: 0,
+        httpStatus: null,
+        rawResponseBody: null,
+        wireResponseSha256: null,
+        storedResponseSha256: null,
+        wasRedacted: false,
+        parsedJson: null,
+        error: `Acquisition deadline reached before ${method} dispatch (${overallTimeoutMs}ms ceiling exceeded)`,
+      };
+      // Do NOT increment httpAttempts because no fetch was dispatched!
+      return { record: rec, json: null };
     }
 
+    if (httpAttempts >= MAX_HTTP_ATTEMPTS_ALLOWED) {
+      const rec: BoundedRpcRequestRecord = {
+        attempt: httpAttempts + 1,
+        method,
+        params,
+        requestTimestampIso: clock().toISOString(),
+        responseTimestampIso: null,
+        elapsedMs: 0,
+        httpStatus: null,
+        rawResponseBody: null,
+        wireResponseSha256: null,
+        storedResponseSha256: null,
+        wasRedacted: false,
+        parsedJson: null,
+        error: `Maximum allowed HTTP attempts (${MAX_HTTP_ATTEMPTS_ALLOWED}) reached`,
+      };
+      return { record: rec, json: null };
+    }
+
+    const effectiveTimeout = Math.min(timeoutMs, remainingMs);
+    if (effectiveTimeout <= 0) {
+      const rec: BoundedRpcRequestRecord = {
+        attempt: httpAttempts + 1,
+        method,
+        params,
+        requestTimestampIso: clock().toISOString(),
+        responseTimestampIso: null,
+        elapsedMs: 0,
+        httpStatus: null,
+        rawResponseBody: null,
+        wireResponseSha256: null,
+        storedResponseSha256: null,
+        wasRedacted: false,
+        parsedJson: null,
+        error: `Insufficient remaining timeout budget (${remainingMs}ms) for ${method} dispatch`,
+      };
+      return { record: rec, json: null };
+    }
+
+    // Only increment httpAttempts when fetchImpl is actually about to be dispatched
     httpAttempts++;
     const currentAttempt = httpAttempts;
     const reqTimestamp = clock();
     const requestTimestampIso = reqTimestamp.toISOString();
 
-    const elapsedSoFar = reqTimestamp.getTime() - startEpoch;
-    const remainingOverall = overallTimeoutMs - elapsedSoFar;
-    if (remainingOverall <= 0) {
-      const rec: BoundedRpcRequestRecord = {
-        attempt: currentAttempt,
-        method,
-        params,
-        requestTimestampIso,
-        responseTimestampIso: clock().toISOString(),
-        elapsedMs: 0,
-        httpStatus: null,
-        rawResponseBody: null,
-        responseSha256: null,
-        parsedJson: null,
-        error: `Overall acquisition timeout ceiling of ${overallTimeoutMs}ms exceeded`,
-      };
-      requests.push(rec);
-      return { record: rec, json: null };
-    }
-
-    const effectiveTimeout = Math.min(timeoutMs, remainingOverall);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), effectiveTimeout);
 
@@ -339,7 +556,9 @@ export async function acquireRaydiumAmmV4Snapshot(
 
     let httpStatus: number | null = null;
     let rawResponseBody: string | null = null;
-    let responseSha256: string | null = null;
+    let wireResponseSha256: string | null = null;
+    let storedResponseSha256: string | null = null;
+    let wasRedacted = false;
     let parsedJson: Record<string, unknown> | null = null;
     let errMessage: string | null = null;
 
@@ -357,7 +576,20 @@ export async function acquireRaydiumAmmV4Snapshot(
 
       httpStatus = response.status;
       rawResponseBody = await response.text();
-      responseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
+      wireResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
+
+      // Check whether response body reflects any private credentials or tokens
+      const hasReflectedSecret =
+        sensitiveTokens.some((t) => t.length > 0 && rawResponseBody!.includes(t)) ||
+        (rawRpcUrl.length > 0 && rawResponseBody.includes(rawRpcUrl));
+
+      if (hasReflectedSecret) {
+        rawResponseBody = redactString(rawResponseBody, sensitiveTokens, rawRpcUrl);
+        wasRedacted = true;
+        storedResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
+      } else {
+        storedResponseSha256 = wireResponseSha256;
+      }
 
       if (response.status !== 200) {
         errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
@@ -378,6 +610,10 @@ export async function acquireRaydiumAmmV4Snapshot(
       clearTimeout(timer);
     }
 
+    if (errMessage) {
+      errMessage = redactString(errMessage, sensitiveTokens, rawRpcUrl);
+    }
+
     const respTimestamp = clock();
     const elapsedMs = respTimestamp.getTime() - reqTimestamp.getTime();
 
@@ -386,11 +622,13 @@ export async function acquireRaydiumAmmV4Snapshot(
       method,
       params,
       requestTimestampIso,
-      responseTimestampIso: respTimestamp.toISOString(),
+      responseTimestampIso: rawResponseBody !== null ? respTimestamp.toISOString() : null,
       elapsedMs,
       httpStatus,
       rawResponseBody,
-      responseSha256,
+      wireResponseSha256,
+      storedResponseSha256,
+      wasRedacted,
       parsedJson,
       error: errMessage,
     };
@@ -418,7 +656,9 @@ export async function acquireRaydiumAmmV4Snapshot(
   if (req1Record.error !== null || !req1Json) {
     failureReason = `Bootstrap Request 1 failed: ${req1Record.error ?? "Empty response"}`;
   } else if (req1Json.error) {
-    failureReason = `Bootstrap Request 1 RPC error: ${typeof req1Json.error === "object" ? JSON.stringify(req1Json.error) : String(req1Json.error)}`;
+    const errorStr =
+      typeof req1Json.error === "object" ? JSON.stringify(req1Json.error) : String(req1Json.error);
+    failureReason = `Bootstrap Request 1 RPC error: ${redactString(errorStr, sensitiveTokens, rawRpcUrl)}`;
   } else {
     // Validate bootstrap context slot
     const resultRecord = req1Json.result as Record<string, unknown> | undefined;
@@ -491,67 +731,140 @@ export async function acquireRaydiumAmmV4Snapshot(
 
   // If bootstrap failed: terminate immediately. HTTP attempts remains 1. Zero second call!
   if (failureReason !== null || discoveredIdentities === null || bootstrapSlot === null) {
-    const completedAt = clock();
-    const evidence: SnapshotAcquisitionEvidence = {
-      schemaVersion: "1.0",
-      command: "RaydiumAmmV4SnapshotAcquisition",
-      executionMode: "LIVE_ACQUISITION",
-      evidenceOrigin: "CAPTURED_RPC",
-      isSyntheticFixture: false,
-      retrievedAtIso: req1Record.responseTimestampIso,
-      startedAtIso: startedAt.toISOString(),
-      completedAtIso: completedAt.toISOString(),
-      endpoint: sanitizedEndpoint,
-      config: {
-        poolId,
-        expectedTokenMint,
-        pacingMs,
-        timeoutMs,
-        overallTimeoutMs,
-      },
+    return await finalizeAcquisition({
+      clock,
+      startedAt,
+      publicEndpoint,
+      poolId,
+      expectedTokenMint,
+      pacingMs,
+      timeoutMs,
+      overallTimeoutMs,
       httpAttempts,
-      maxHttpAttemptsAllowed: MAX_HTTP_ATTEMPTS_ALLOWED,
       pacingEnforcedMs: null,
-      contextSlots: {
-        bootstrapSlot,
-        batchSlot: null,
-        minContextSlotEnforced: true,
-        staleSlotDetected: false,
-      },
+      bootstrapSlot,
+      batchSlot: null,
+      staleSlotDetected: false,
       requests,
-      discoveredIdentities,
-      canonicalAmmAuthority: derivedAuthority,
-      outcomes: {
-        retrievalOk: false,
-        structuralValidationOk: false,
-        meetsNinetyPercentThreshold: false,
-      },
+      discoveredIdentities: null,
+      derivedAuthority,
+      retrievalOk: false,
+      structuralValidationOk: false,
+      meetsNinetyPercentThreshold: false,
       validationResult: null,
       accounting: null,
       failureReason,
-      evidenceBoundary: {
-        bytecodeEquivalenceVerified: false,
-        completeExecutableReservesVerified: false,
-        generalTokenSafetyVerified: false,
-        strategyGateAdmitted: false,
-      },
-    };
-
-    await maybeWriteEvidenceFile(evidence, config.outDir);
-
-    return {
-      ok: false,
-      dryRun: false,
-      httpAttempts,
-      evidence,
-    };
+      effectiveEvidenceOrigin,
+      effectiveIsSyntheticFixture,
+      retrievedAtIso: req1Record.responseTimestampIso,
+      outDir: config.outDir,
+    });
   }
 
   // =========================================================================
   // HOST PACING: Enforce at least 2,500 ms pause before Request 2
   // =========================================================================
+  const remainingBeforePacing = getRemainingBudgetMs();
+  if (remainingBeforePacing <= 0) {
+    failureReason = `DEADLINE_EXCEEDED: Acquisition deadline of ${overallTimeoutMs}ms reached before host pacing`;
+    return await finalizeAcquisition({
+      clock,
+      startedAt,
+      publicEndpoint,
+      poolId,
+      expectedTokenMint,
+      pacingMs,
+      timeoutMs,
+      overallTimeoutMs,
+      httpAttempts,
+      pacingEnforcedMs: null,
+      bootstrapSlot,
+      batchSlot: null,
+      staleSlotDetected: false,
+      requests,
+      discoveredIdentities,
+      derivedAuthority,
+      retrievalOk: false,
+      structuralValidationOk: false,
+      meetsNinetyPercentThreshold: false,
+      validationResult: null,
+      accounting: null,
+      failureReason,
+      effectiveEvidenceOrigin,
+      effectiveIsSyntheticFixture,
+      retrievedAtIso: req1Record.responseTimestampIso,
+      outDir: config.outDir,
+    });
+  }
+
+  if (remainingBeforePacing < pacingMs) {
+    failureReason = `DEADLINE_EXCEEDED: Remaining budget (${remainingBeforePacing}ms) is insufficient for required ${pacingMs}ms host pacing`;
+    return await finalizeAcquisition({
+      clock,
+      startedAt,
+      publicEndpoint,
+      poolId,
+      expectedTokenMint,
+      pacingMs,
+      timeoutMs,
+      overallTimeoutMs,
+      httpAttempts,
+      pacingEnforcedMs: null,
+      bootstrapSlot,
+      batchSlot: null,
+      staleSlotDetected: false,
+      requests,
+      discoveredIdentities,
+      derivedAuthority,
+      retrievalOk: false,
+      structuralValidationOk: false,
+      meetsNinetyPercentThreshold: false,
+      validationResult: null,
+      accounting: null,
+      failureReason,
+      effectiveEvidenceOrigin,
+      effectiveIsSyntheticFixture,
+      retrievedAtIso: req1Record.responseTimestampIso,
+      outDir: config.outDir,
+    });
+  }
+
   await sleeper(pacingMs);
   pacingEnforcedMs = pacingMs;
+
+  // Check deadline again after host pacing completes
+  const remainingBeforeReq2 = getRemainingBudgetMs();
+  if (remainingBeforeReq2 <= 0) {
+    failureReason = `DEADLINE_EXCEEDED: Acquisition deadline of ${overallTimeoutMs}ms reached during host pacing`;
+    return await finalizeAcquisition({
+      clock,
+      startedAt,
+      publicEndpoint,
+      poolId,
+      expectedTokenMint,
+      pacingMs,
+      timeoutMs,
+      overallTimeoutMs,
+      httpAttempts,
+      pacingEnforcedMs,
+      bootstrapSlot,
+      batchSlot: null,
+      staleSlotDetected: false,
+      requests,
+      discoveredIdentities,
+      derivedAuthority,
+      retrievalOk: false,
+      structuralValidationOk: false,
+      meetsNinetyPercentThreshold: false,
+      validationResult: null,
+      accounting: null,
+      failureReason,
+      effectiveEvidenceOrigin,
+      effectiveIsSyntheticFixture,
+      retrievedAtIso: req1Record.responseTimestampIso,
+      outDir: config.outDir,
+    });
+  }
 
   // =========================================================================
   // REQUEST 2: getMultipleAccounts([pool, lpMint, baseVault, quoteVault])
@@ -580,7 +893,9 @@ export async function acquireRaydiumAmmV4Snapshot(
   if (req2Record.error !== null || !req2Json) {
     failureReason = `Batch Request 2 failed: ${req2Record.error ?? "Empty response"}`;
   } else if (req2Json.error) {
-    failureReason = `Batch Request 2 RPC error: ${typeof req2Json.error === "object" ? JSON.stringify(req2Json.error) : String(req2Json.error)}`;
+    const errorStr =
+      typeof req2Json.error === "object" ? JSON.stringify(req2Json.error) : String(req2Json.error);
+    failureReason = `Batch Request 2 RPC error: ${redactString(errorStr, sensitiveTokens, rawRpcUrl)}`;
   } else {
     // Extract batch context slot
     const resultRecord = req2Json.result as Record<string, unknown> | undefined;
@@ -600,7 +915,8 @@ export async function acquireRaydiumAmmV4Snapshot(
 
         // Perform strict offline snapshot validation on final batch payload
         validationResult = await validateRaydiumAmmV4Snapshot(discoveredIdentities, req2Json, {
-          evidenceOrigin: "CAPTURED_RPC",
+          evidenceOrigin: effectiveEvidenceOrigin ?? undefined,
+          isSyntheticFixture: effectiveIsSyntheticFixture ?? undefined,
           retrievedAtIso: req2Record.responseTimestampIso,
         });
 
@@ -628,43 +944,109 @@ export async function acquireRaydiumAmmV4Snapshot(
     }
   }
 
-  const completedAt = clock();
+  return await finalizeAcquisition({
+    clock,
+    startedAt,
+    publicEndpoint,
+    poolId,
+    expectedTokenMint,
+    pacingMs,
+    timeoutMs,
+    overallTimeoutMs,
+    httpAttempts,
+    pacingEnforcedMs,
+    bootstrapSlot,
+    batchSlot,
+    staleSlotDetected,
+    requests,
+    discoveredIdentities,
+    derivedAuthority,
+    retrievalOk,
+    structuralValidationOk,
+    meetsNinetyPercentThreshold,
+    validationResult,
+    accounting,
+    failureReason,
+    effectiveEvidenceOrigin,
+    effectiveIsSyntheticFixture,
+    retrievedAtIso: req2Record?.responseTimestampIso ?? req1Record.responseTimestampIso,
+    outDir: config.outDir,
+  });
+}
+
+/**
+ * Seals the snapshot acquisition evidence with an overall SHA-256 digest, writes evidence bytes,
+ * and records the exact file SHA-256 and byte size in a separate manifest.
+ * Write failures fail closed and render the operation unsuccessful.
+ */
+async function finalizeAcquisition(params: {
+  clock: () => Date;
+  startedAt: Date;
+  publicEndpoint: PublicRpcEndpointInfo;
+  poolId: string;
+  expectedTokenMint: string | null;
+  pacingMs: number;
+  timeoutMs: number;
+  overallTimeoutMs: number;
+  httpAttempts: number;
+  pacingEnforcedMs: number | null;
+  bootstrapSlot: number | null;
+  batchSlot: number | null;
+  staleSlotDetected: boolean;
+  requests: readonly BoundedRpcRequestRecord[];
+  discoveredIdentities: RaydiumAmmV4SnapshotIdentities | null;
+  derivedAuthority: DerivedAmmAuthority;
+  retrievalOk: boolean;
+  structuralValidationOk: boolean;
+  meetsNinetyPercentThreshold: boolean;
+  validationResult: RaydiumAmmV4SnapshotValidationResult | null;
+  accounting: AmmV4LpAccountingSuccess | null;
+  failureReason: string | null;
+  effectiveEvidenceOrigin: EvidenceOrigin | null;
+  effectiveIsSyntheticFixture: boolean | null;
+  retrievedAtIso: string | null;
+  outDir?: string | undefined;
+}): Promise<SnapshotAcquisitionResult> {
+  const completedAt = params.clock();
+  let failureReason = params.failureReason;
+  let finalOk = params.structuralValidationOk;
+
   const evidence: SnapshotAcquisitionEvidence = {
     schemaVersion: "1.0",
     command: "RaydiumAmmV4SnapshotAcquisition",
     executionMode: "LIVE_ACQUISITION",
-    evidenceOrigin: "CAPTURED_RPC",
-    isSyntheticFixture: false,
-    retrievedAtIso: req2Record?.responseTimestampIso ?? req1Record.responseTimestampIso,
-    startedAtIso: startedAt.toISOString(),
+    evidenceOrigin: params.effectiveEvidenceOrigin,
+    isSyntheticFixture: params.effectiveIsSyntheticFixture,
+    retrievedAtIso: params.retrievedAtIso,
+    startedAtIso: params.startedAt.toISOString(),
     completedAtIso: completedAt.toISOString(),
-    endpoint: sanitizedEndpoint,
+    endpoint: params.publicEndpoint,
     config: {
-      poolId,
-      expectedTokenMint,
-      pacingMs,
-      timeoutMs,
-      overallTimeoutMs,
+      poolId: params.poolId,
+      expectedTokenMint: params.expectedTokenMint,
+      pacingMs: params.pacingMs,
+      timeoutMs: params.timeoutMs,
+      overallTimeoutMs: params.overallTimeoutMs,
     },
-    httpAttempts,
+    httpAttempts: params.httpAttempts,
     maxHttpAttemptsAllowed: MAX_HTTP_ATTEMPTS_ALLOWED,
-    pacingEnforcedMs,
+    pacingEnforcedMs: params.pacingEnforcedMs,
     contextSlots: {
-      bootstrapSlot,
-      batchSlot,
+      bootstrapSlot: params.bootstrapSlot,
+      batchSlot: params.batchSlot,
       minContextSlotEnforced: true,
-      staleSlotDetected,
+      staleSlotDetected: params.staleSlotDetected,
     },
-    requests,
-    discoveredIdentities,
-    canonicalAmmAuthority: derivedAuthority,
+    requests: params.requests,
+    discoveredIdentities: params.discoveredIdentities,
+    canonicalAmmAuthority: params.derivedAuthority,
     outcomes: {
-      retrievalOk,
-      structuralValidationOk,
-      meetsNinetyPercentThreshold,
+      retrievalOk: params.retrievalOk,
+      structuralValidationOk: params.structuralValidationOk,
+      meetsNinetyPercentThreshold: params.meetsNinetyPercentThreshold,
     },
-    validationResult,
-    accounting,
+    validationResult: params.validationResult,
+    accounting: params.accounting,
     failureReason,
     evidenceBoundary: {
       bytecodeEquivalenceVerified: false,
@@ -674,45 +1056,117 @@ export async function acquireRaydiumAmmV4Snapshot(
     },
   };
 
-  await maybeWriteEvidenceFile(evidence, config.outDir);
+  // Compute canonical payload digest prior to file writing
+  const payloadJson = serializeJsonPreservingBigInts(evidence);
+  const payloadDigestSha256 = crypto.createHash("sha256").update(payloadJson).digest("hex");
+  evidence.payloadDigestSha256 = payloadDigestSha256;
 
-  return {
-    ok: structuralValidationOk,
-    dryRun: false,
-    httpAttempts,
-    evidence,
-  };
-}
+  let manifest: SnapshotAcquisitionManifest | undefined;
 
-/**
- * Seals the snapshot acquisition evidence with an overall SHA-256 digest and writes it to disk if requested.
- */
-async function maybeWriteEvidenceFile(
-  evidence: SnapshotAcquisitionEvidence,
-  outDir?: string | undefined,
-): Promise<void> {
-  const serialized = serializeJsonPreservingBigInts(evidence);
-  const digest = crypto.createHash("sha256").update(serialized).digest("hex");
-  evidence.evidenceDigestSha256 = digest;
-
-  if (outDir && outDir.trim() !== "") {
+  // Persist evidence and separate manifest if outDir is provided
+  if (params.outDir && params.outDir.trim() !== "") {
     try {
-      await fs.mkdir(outDir, { recursive: true });
-      const safePoolPrefix = evidence.config.poolId.slice(0, 8);
+      await fs.mkdir(params.outDir, { recursive: true });
+      const safePoolPrefix = params.poolId.slice(0, 8);
       const timestampTag = (evidence.retrievedAtIso ?? evidence.completedAtIso).replace(
         /[:.]/g,
         "-",
       );
-      const filename = `raydium-amm-v4-snapshot-${safePoolPrefix}-${timestampTag}.json`;
-      const fullPath = path.resolve(outDir, filename);
 
-      await fs.writeFile(fullPath, serializeJsonPreservingBigInts(evidence), "utf-8");
-      evidence.evidenceFilePath = fullPath;
+      let baseName = `raydium-amm-v4-snapshot-${safePoolPrefix}-${timestampTag}`;
+      let evidencePath = path.resolve(params.outDir, `${baseName}.json`);
+      let manifestPath = path.resolve(params.outDir, `${baseName}-manifest.json`);
+
+      // Anti-overwrite check: if either artifact exists, find unique filename
+      let counter = 1;
+      while ((await fileExists(evidencePath)) || (await fileExists(manifestPath))) {
+        baseName = `raydium-amm-v4-snapshot-${safePoolPrefix}-${timestampTag}-${counter++}`;
+        evidencePath = path.resolve(params.outDir, `${baseName}.json`);
+        manifestPath = path.resolve(params.outDir, `${baseName}-manifest.json`);
+      }
+
+      // Serialize finalized evidence bytes and compute exact file hash + size
+      const evidenceBytes = Buffer.from(
+        serializeJsonPreservingBigInts(evidence, 2) + "\n",
+        "utf-8",
+      );
+      const evidenceFileSha256 = crypto.createHash("sha256").update(evidenceBytes).digest("hex");
+      const evidenceByteSize = evidenceBytes.length;
+
+      // Write evidence file exclusively
+      await fs.writeFile(evidencePath, evidenceBytes, { flag: "wx" });
+
+      const status = evidence.outcomes.structuralValidationOk
+        ? "SUCCESS"
+        : evidence.outcomes.retrievalOk
+          ? "STRUCTURAL_VALIDATION_FAILED"
+          : params.requests.length > 0
+            ? "RETRIEVAL_FAILED"
+            : "INTERRUPTED";
+
+      manifest = {
+        manifestVersion: "1.0",
+        manifestType: "RAYDIUM_AMM_V4_SNAPSHOT_MANIFEST",
+        createdAtIso: completedAt.toISOString(),
+        poolId: params.poolId,
+        status,
+        httpAttempts: params.httpAttempts,
+        evidenceFileName: path.basename(evidencePath),
+        evidenceFilePath: evidencePath,
+        evidenceFileSha256,
+        evidenceByteSize,
+        payloadDigestSha256,
+        contextSlots: {
+          bootstrapSlot: params.bootstrapSlot,
+          batchSlot: params.batchSlot,
+        },
+        outcomes: evidence.outcomes,
+        failureReason: evidence.failureReason,
+      };
+
+      const manifestBytes = Buffer.from(
+        serializeJsonPreservingBigInts(manifest, 2) + "\n",
+        "utf-8",
+      );
+      const manifestFileSha256 = crypto.createHash("sha256").update(manifestBytes).digest("hex");
+      const manifestByteSize = manifestBytes.length;
+
+      // Write manifest file exclusively
+      await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
+
+      evidence.artifacts = {
+        evidenceFileName: path.basename(evidencePath),
+        evidenceFilePath: evidencePath,
+        evidenceFileSha256,
+        evidenceByteSize,
+        manifestFileName: path.basename(manifestPath),
+        manifestFilePath: manifestPath,
+        manifestFileSha256,
+        manifestByteSize,
+      };
     } catch (writeErr) {
-      // Do not crash execution if filesystem write fails; preserve error in manifest
-      evidence.failureReason =
-        (evidence.failureReason ? `${evidence.failureReason}; ` : "") +
-        `Failed to write evidence file: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`;
+      // Storage failures make the operation unsuccessful
+      finalOk = false;
+      const storageErrMsg = `EVIDENCE_STORAGE_FAILED: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`;
+      failureReason = failureReason ? `${failureReason}; ${storageErrMsg}` : storageErrMsg;
+      evidence.failureReason = failureReason;
     }
+  }
+
+  return {
+    ok: finalOk,
+    dryRun: false,
+    httpAttempts: params.httpAttempts,
+    evidence,
+    manifest,
+  };
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
