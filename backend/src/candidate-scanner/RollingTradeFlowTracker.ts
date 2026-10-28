@@ -9,19 +9,23 @@
  * 1. Complete window coverage verification:
  *    - Rejects recent-heartbeat false passes. Requires continuous, gapless observation
  *      across the entire [now - 60s, now] window with maximum inactivity ceilings.
+ *    - Separates trade time from observation timeline: trade events populate counts
+ *      within the window, but NEVER fabricate observation checkpoints or bridge silence gaps.
  *    - Accounts for processing backlog, collection gaps, warm-up, and silence intervals.
- * 2. Capacity bounds & fail-closed protection:
+ * 2. Strict capacity bounds on events, deduplication, and gap metadata:
  *    - Enforces max retention capacity during ingestion.
  *    - Never silently drops active-window events; records capacity loss and marks coverage
  *      unavailable until the affected interval has fully expired.
- *    - Bounds deduplication keys and gap metadata storage.
+ *    - Bounds gap metadata during insertion: coalesces overlapping intervals and conservatively
+ *      merges closest adjacent intervals to enforce maxGapsRetained without discarding missing-data information.
  * 3. Immutable snapshotting & input validation:
  *    - Snapshots and freezes accepted events and gap records to prevent external caller mutation.
  *    - Derives and validates canonical swap identity (${signature}:${outerInstructionIndex}:${swapIndex})
  *      preventing double-counting via altered eventId labels.
- *    - Validates signature, swapIndex, outerInstructionIndex, slot, timestamps, provenance,
- *      and windowDurationMs (strictly 60,000 ms).
- *    - Validates evaluateWindow arguments; rejects NaN or invalid evaluation times.
+ *    - Strictly validates all configuration options (rejects NaN, Infinity, non-integers, out-of-range).
+ *    - Validates signature, indices, slot, timestamps, provenance, and temporal coherence.
+ *    - Cross-validates eventTimestampMs, receiptTimestampMs, blockTimeSec, and provenance.
+ *    - Rejects evaluateWindow arguments that are NaN, negative, or non-integer.
  * 4. Narrow integration with RetestGateEvaluator:
  *    - Unavailable flow never produces entry confirmation.
  *    - Distinguishes honest zero (sufficient coverage, zero trades) from unavailable flow.
@@ -70,6 +74,8 @@ export type IngestTradeFailureReason =
   | "INVALID_SIDE"
   | "INVALID_TIMESTAMP"
   | "INVALID_RECEIPT_TIMESTAMP"
+  | "FUTURE_DATED_RECEIPT_TIMESTAMP"
+  | "CONTRADICTORY_TIMESTAMPS"
   | "INVALID_SLOT"
   | "INVALID_PROVENANCE"
   | "FUTURE_DATED_TIMESTAMP"
@@ -182,10 +188,11 @@ export class RollingTradeFlowTracker {
       if (
         typeof options.windowDurationMs !== "number" ||
         !Number.isFinite(options.windowDurationMs) ||
+        !Number.isInteger(options.windowDurationMs) ||
         options.windowDurationMs !== 60_000
       ) {
         throw new Error(
-          `[ROLLING_FLOW_INIT] Invalid windowDurationMs: ${options.windowDurationMs}. The strategy requires an exact 60,000 ms window for recentBuys60s/recentSells60s.`,
+          `[ROLLING_FLOW_INIT] Invalid windowDurationMs: ${String(options.windowDurationMs)}. The strategy requires an exact 60,000 ms window for recentBuys60s/recentSells60s.`,
         );
       }
     }
@@ -217,15 +224,72 @@ export class RollingTradeFlowTracker {
       }
     }
 
+    if (options.maxFutureSkewMs !== undefined) {
+      if (
+        typeof options.maxFutureSkewMs !== "number" ||
+        !Number.isFinite(options.maxFutureSkewMs) ||
+        !Number.isInteger(options.maxFutureSkewMs) ||
+        options.maxFutureSkewMs < 1_000 ||
+        options.maxFutureSkewMs > 60_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid maxFutureSkewMs: expected integer between 1,000 and 60,000, received: ${String(options.maxFutureSkewMs)}`,
+        );
+      }
+    }
+
+    if (options.retentionWindowMs !== undefined) {
+      if (
+        typeof options.retentionWindowMs !== "number" ||
+        !Number.isFinite(options.retentionWindowMs) ||
+        !Number.isInteger(options.retentionWindowMs) ||
+        options.retentionWindowMs < 120_000 ||
+        options.retentionWindowMs > 3_600_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid retentionWindowMs: expected integer between 120,000 and 3,600,000, received: ${String(options.retentionWindowMs)}`,
+        );
+      }
+    }
+
     if (options.maxEventsRetained !== undefined) {
       if (
         typeof options.maxEventsRetained !== "number" ||
         !Number.isFinite(options.maxEventsRetained) ||
         !Number.isInteger(options.maxEventsRetained) ||
-        options.maxEventsRetained < 10
+        options.maxEventsRetained < 10 ||
+        options.maxEventsRetained > 100_000
       ) {
         throw new Error(
-          `[ROLLING_FLOW_INIT] Invalid maxEventsRetained: expected integer >= 10, received: ${String(options.maxEventsRetained)}`,
+          `[ROLLING_FLOW_INIT] Invalid maxEventsRetained: expected integer between 10 and 100,000, received: ${String(options.maxEventsRetained)}`,
+        );
+      }
+    }
+
+    if (options.maxGapsRetained !== undefined) {
+      if (
+        typeof options.maxGapsRetained !== "number" ||
+        !Number.isFinite(options.maxGapsRetained) ||
+        !Number.isInteger(options.maxGapsRetained) ||
+        options.maxGapsRetained < 2 ||
+        options.maxGapsRetained > 10_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid maxGapsRetained: expected integer between 2 and 10,000, received: ${String(options.maxGapsRetained)}`,
+        );
+      }
+    }
+
+    if (options.maxDeduplicationKeys !== undefined) {
+      if (
+        typeof options.maxDeduplicationKeys !== "number" ||
+        !Number.isFinite(options.maxDeduplicationKeys) ||
+        !Number.isInteger(options.maxDeduplicationKeys) ||
+        options.maxDeduplicationKeys < 50 ||
+        options.maxDeduplicationKeys > 200_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid maxDeduplicationKeys: expected integer between 50 and 200,000, received: ${String(options.maxDeduplicationKeys)}`,
         );
       }
     }
@@ -258,6 +322,10 @@ export class RollingTradeFlowTracker {
 
   public getEventsCount(): number {
     return this.events.length;
+  }
+
+  public getGapsCount(): number {
+    return this.recordedGaps.length;
   }
 
   public getLastObservedSlot(): number | null {
@@ -302,6 +370,11 @@ export class RollingTradeFlowTracker {
       return;
     }
 
+    const currentNow = this.clock();
+    if (heartbeatMs > currentNow + this.maxFutureSkewMs) {
+      return;
+    }
+
     if (options?.isBacklogged !== undefined) {
       this.hasActiveBacklog = Boolean(options.isBacklogged);
     }
@@ -316,8 +389,54 @@ export class RollingTradeFlowTracker {
   }
 
   /**
+   * Explicitly records an observation checkpoint to prove stream liveness.
+   */
+  public recordObservationCheckpoint(checkpointMs: number): void {
+    if (
+      typeof checkpointMs !== "number" ||
+      !Number.isFinite(checkpointMs) ||
+      !Number.isInteger(checkpointMs) ||
+      checkpointMs <= 0
+    ) {
+      return;
+    }
+    const currentNow = this.clock();
+    if (checkpointMs > currentNow + this.maxFutureSkewMs) {
+      return;
+    }
+    this.updateObservationTimeline(checkpointMs);
+  }
+
+  /**
+   * Explicitly records a completed, gapless observed time range (e.g. from a verified block range poll).
+   */
+  public recordCompletedRange(rangeStartMs: number, rangeEndMs: number): void {
+    if (
+      typeof rangeStartMs !== "number" ||
+      typeof rangeEndMs !== "number" ||
+      !Number.isFinite(rangeStartMs) ||
+      !Number.isFinite(rangeEndMs) ||
+      !Number.isInteger(rangeStartMs) ||
+      !Number.isInteger(rangeEndMs) ||
+      rangeStartMs > rangeEndMs ||
+      rangeStartMs <= 0
+    ) {
+      return;
+    }
+
+    if (rangeStartMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
+      this.insertAndBoundGap(
+        this.lastObservationTimestampMs,
+        rangeStartMs,
+        "STREAM_INACTIVITY_BEFORE_RANGE",
+      );
+    }
+    this.lastObservationTimestampMs = Math.max(this.lastObservationTimestampMs, rangeEndMs);
+  }
+
+  /**
    * Explicitly records an unobserved stream outage or collection gap.
-   * Copies and freezes the gap object.
+   * Copies, freezes, and bounds the gap record.
    */
   public recordCollectionGap(gap: StreamGap): void {
     if (!gap || typeof gap !== "object") return;
@@ -333,7 +452,7 @@ export class RollingTradeFlowTracker {
     ) {
       return;
     }
-    this.recordGapInternal(gap.gapStartMs, gap.gapEndMs, gap.reason);
+    this.insertAndBoundGap(gap.gapStartMs, gap.gapEndMs, gap.reason);
   }
 
   /**
@@ -345,8 +464,11 @@ export class RollingTradeFlowTracker {
 
   /**
    * Ingests an authentic or synthetic trade event.
-   * Enforces strict validation, canonical coordinate deduplication, storage bounds,
-   * capacity-loss recording, and immutable snapshot freezing.
+   * Enforces strict validation, temporal coherence, canonical coordinate deduplication,
+   * storage bounds, capacity-loss recording, and immutable snapshot freezing.
+   *
+   * CRITICAL GUARANTEE: Ingesting trade events populates candidate trade counts,
+   * but NEVER updates the observation timeline or fabricates stream coverage.
    */
   public ingestTrade(event: TradeEvent): IngestTradeResult {
     if (!event || typeof event !== "object") {
@@ -455,6 +577,15 @@ export class RollingTradeFlowTracker {
       };
     }
 
+    const currentNow = this.clock();
+    if (event.receiptTimestampMs > currentNow + this.maxFutureSkewMs) {
+      return {
+        ok: false,
+        reason: "FUTURE_DATED_RECEIPT_TIMESTAMP",
+        message: `Receipt timestamp ${event.receiptTimestampMs} exceeds current clock plus allowable skew (${currentNow + this.maxFutureSkewMs})`,
+      };
+    }
+
     if (
       typeof event.eventTimestampMs !== "number" ||
       !Number.isFinite(event.eventTimestampMs) ||
@@ -465,6 +596,23 @@ export class RollingTradeFlowTracker {
         ok: false,
         reason: "INVALID_TIMESTAMP",
         message: `Event timestamp must be a positive finite integer, received: ${String(event.eventTimestampMs)}`,
+      };
+    }
+
+    if (event.eventTimestampMs > currentNow + this.maxFutureSkewMs) {
+      return {
+        ok: false,
+        reason: "FUTURE_DATED_TIMESTAMP",
+        message: `Event timestamp ${event.eventTimestampMs} exceeds allowable future skew (${currentNow + this.maxFutureSkewMs})`,
+      };
+    }
+
+    // Temporal relationship: trade execution time cannot be significantly in the future relative to local receipt time
+    if (event.eventTimestampMs > event.receiptTimestampMs + this.maxFutureSkewMs) {
+      return {
+        ok: false,
+        reason: "CONTRADICTORY_TIMESTAMPS",
+        message: `eventTimestampMs (${event.eventTimestampMs}) cannot exceed receiptTimestampMs (${event.receiptTimestampMs}) plus future skew`,
       };
     }
 
@@ -480,13 +628,50 @@ export class RollingTradeFlowTracker {
       };
     }
 
-    const currentNow = this.clock();
-    if (event.eventTimestampMs > currentNow + this.maxFutureSkewMs) {
-      return {
-        ok: false,
-        reason: "FUTURE_DATED_TIMESTAMP",
-        message: `Event timestamp ${event.eventTimestampMs} exceeds allowable future skew (${currentNow + this.maxFutureSkewMs})`,
-      };
+    // Provenance temporal consistency
+    if (event.timestampProvenance === "ON_CHAIN_BLOCK_TIME") {
+      if (
+        typeof event.blockTimeSec !== "number" ||
+        !Number.isFinite(event.blockTimeSec) ||
+        !Number.isInteger(event.blockTimeSec) ||
+        event.blockTimeSec <= 0
+      ) {
+        return {
+          ok: false,
+          reason: "INVALID_TIMESTAMP",
+          message: "ON_CHAIN_BLOCK_TIME provenance requires positive integer blockTimeSec",
+        };
+      }
+      const blockTimeMs = event.blockTimeSec * 1000;
+      if (Math.abs(event.eventTimestampMs - blockTimeMs) > 2_000) {
+        return {
+          ok: false,
+          reason: "CONTRADICTORY_TIMESTAMPS",
+          message: `eventTimestampMs (${event.eventTimestampMs}) contradicts blockTimeSec (${event.blockTimeSec}) by > 2000ms`,
+        };
+      }
+    } else if (event.timestampProvenance === "HOST_OBSERVED") {
+      if (
+        Math.abs(event.eventTimestampMs - event.receiptTimestampMs) >
+        this.maxFutureSkewMs + 5_000
+      ) {
+        return {
+          ok: false,
+          reason: "CONTRADICTORY_TIMESTAMPS",
+          message: `HOST_OBSERVED eventTimestampMs (${event.eventTimestampMs}) contradicts receiptTimestampMs (${event.receiptTimestampMs})`,
+        };
+      }
+    } else if (event.timestampProvenance === "SYNTHETIC_FIXTURE") {
+      if (
+        event.blockTimeSec !== null &&
+        Math.abs(event.eventTimestampMs - event.blockTimeSec * 1000) > 2_000
+      ) {
+        return {
+          ok: false,
+          reason: "CONTRADICTORY_TIMESTAMPS",
+          message: `Synthetic eventTimestampMs contradicts blockTimeSec by > 2000ms`,
+        };
+      }
     }
 
     // Derive stable canonical swap identity coordinates
@@ -528,8 +713,8 @@ export class RollingTradeFlowTracker {
       };
     }
 
-    // Update continuous observation timeline with this event timestamp
-    this.updateObservationTimeline(event.eventTimestampMs);
+    // NOTE: ingestTrade explicitly DOES NOT update the observation timeline.
+    // Stream liveness must be proven via continuous heartbeats/checkpoints.
 
     // Create an immutable frozen snapshot to prevent caller mutation of ingested state
     const frozenEvent: TradeEvent = Object.freeze({
@@ -590,7 +775,7 @@ export class RollingTradeFlowTracker {
 
     // Check observation timeline up to nowMs
     if (nowMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
-      this.recordGapInternal(
+      this.insertAndBoundGap(
         this.lastObservationTimestampMs,
         nowMs,
         "STREAM_INACTIVITY_AT_EVALUATION",
@@ -688,7 +873,7 @@ export class RollingTradeFlowTracker {
 
     // If silence exceeded maxStreamInactivityMs, an unobserved gap occurred
     if (observationMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
-      this.recordGapInternal(
+      this.insertAndBoundGap(
         this.lastObservationTimestampMs,
         observationMs,
         "STREAM_INACTIVITY_GAP",
@@ -703,34 +888,107 @@ export class RollingTradeFlowTracker {
       this.latestCapacityLossTimestampMs ?? 0,
       lossTimestampMs,
     );
-    this.recordGapInternal(
+    this.insertAndBoundGap(
       lossTimestampMs,
       lossTimestampMs + this.windowDurationMs,
       `CAPACITY_LOSS:${reason}`,
     );
   }
 
-  private recordGapInternal(startMs: number, endMs: number, reason?: string): void {
-    const frozenGap: StreamGap = Object.freeze({
+  private insertAndBoundGap(startMs: number, endMs: number, reason?: string): void {
+    if (startMs >= endMs || startMs <= 0 || !Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      return;
+    }
+
+    // 1. First prune expired gaps beyond retention window
+    const nowMs = this.clock();
+    const cutoffMs = nowMs - this.retentionWindowMs;
+    this.pruneExpiredGaps(cutoffMs);
+
+    // 2. Insert new gap
+    const newGap: StreamGap = Object.freeze({
       gapStartMs: startMs,
       gapEndMs: endMs,
       reason: reason ?? undefined,
     });
-    this.recordedGaps.push(frozenGap);
+    this.recordedGaps.push(newGap);
 
-    if (this.recordedGaps.length > this.maxGapsRetained) {
-      // Prune gaps that ended before retention cutoff
-      const cutoff = (this.clock?.() ?? Date.now()) - this.retentionWindowMs;
-      let removeCount = 0;
-      while (
-        removeCount < this.recordedGaps.length &&
-        this.recordedGaps[removeCount]!.gapEndMs < cutoff
-      ) {
-        removeCount++;
+    // 3. Sort gaps chronologically by gapStartMs
+    this.recordedGaps.sort((a, b) => a.gapStartMs - b.gapStartMs || a.gapEndMs - b.gapEndMs);
+
+    // 4. Coalesce overlapping or touching gaps
+    this.coalesceOverlappingGaps();
+
+    // 5. Enforce maxGapsRetained ceiling: merge closest adjacent pairs until length <= maxGapsRetained
+    while (this.recordedGaps.length > this.maxGapsRetained) {
+      let minDistance = Infinity;
+      let bestMergeIndex = 0;
+
+      for (let i = 0; i < this.recordedGaps.length - 1; i++) {
+        const dist = this.recordedGaps[i + 1]!.gapStartMs - this.recordedGaps[i]!.gapEndMs;
+        if (dist < minDistance) {
+          minDistance = dist;
+          bestMergeIndex = i;
+        }
       }
-      if (removeCount > 0) {
-        this.recordedGaps.splice(0, removeCount);
+
+      const g1 = this.recordedGaps[bestMergeIndex]!;
+      const g2 = this.recordedGaps[bestMergeIndex + 1]!;
+      const mergedReason =
+        g1.reason && g2.reason && g1.reason !== g2.reason
+          ? `${g1.reason}; ${g2.reason}`
+          : (g1.reason ?? g2.reason);
+
+      const mergedGap: StreamGap = Object.freeze({
+        gapStartMs: g1.gapStartMs,
+        gapEndMs: Math.max(g1.gapEndMs, g2.gapEndMs),
+        reason: mergedReason,
+      });
+
+      this.recordedGaps.splice(bestMergeIndex, 2, mergedGap);
+    }
+  }
+
+  private coalesceOverlappingGaps(): void {
+    if (this.recordedGaps.length <= 1) return;
+
+    const merged: StreamGap[] = [];
+    let current = this.recordedGaps[0]!;
+
+    for (let i = 1; i < this.recordedGaps.length; i++) {
+      const next = this.recordedGaps[i]!;
+      if (current.gapEndMs >= next.gapStartMs) {
+        // Overlapping or touching: merge
+        const mergedReason =
+          current.reason && next.reason && current.reason !== next.reason
+            ? `${current.reason}; ${next.reason}`
+            : (current.reason ?? next.reason);
+        current = Object.freeze({
+          gapStartMs: current.gapStartMs,
+          gapEndMs: Math.max(current.gapEndMs, next.gapEndMs),
+          reason: mergedReason,
+        });
+      } else {
+        merged.push(current);
+        current = next;
       }
+    }
+    merged.push(current);
+
+    this.recordedGaps.length = 0;
+    this.recordedGaps.push(...merged);
+  }
+
+  private pruneExpiredGaps(cutoffMs: number): void {
+    let removeCount = 0;
+    while (
+      removeCount < this.recordedGaps.length &&
+      this.recordedGaps[removeCount]!.gapEndMs < cutoffMs
+    ) {
+      removeCount++;
+    }
+    if (removeCount > 0) {
+      this.recordedGaps.splice(0, removeCount);
     }
   }
 
@@ -818,16 +1076,7 @@ export class RollingTradeFlowTracker {
       this.events.splice(0, removeCount);
     }
 
-    // Prune gaps that ended before retention cutoff
-    let gapRemoveCount = 0;
-    while (
-      gapRemoveCount < this.recordedGaps.length &&
-      this.recordedGaps[gapRemoveCount]!.gapEndMs < cutoffMs
-    ) {
-      gapRemoveCount++;
-    }
-    if (gapRemoveCount > 0) {
-      this.recordedGaps.splice(0, gapRemoveCount);
-    }
+    // Prune expired gaps
+    this.pruneExpiredGaps(cutoffMs);
   }
 }
