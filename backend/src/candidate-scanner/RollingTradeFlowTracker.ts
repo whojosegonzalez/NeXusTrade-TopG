@@ -141,6 +141,81 @@ export function deriveCanonicalSwapKey(
   return `${signature}:${outerInstructionIndex}:${swapIndex}`;
 }
 
+/**
+ * Maximum character length for stream gap diagnostic reasons.
+ * Caps diagnostic text size across insertion and merged gap intervals.
+ */
+export const MAX_STREAM_GAP_REASON_CHARS = 256;
+
+/**
+ * Normalizes and bounds a gap diagnostic reason string to MAX_STREAM_GAP_REASON_CHARS.
+ * Returns undefined for non-strings or empty/whitespace-only strings.
+ */
+export function boundGapReason(reason?: string | undefined): string | undefined {
+  if (typeof reason !== "string") {
+    return undefined;
+  }
+  const trimmed = reason.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  if (trimmed.length <= MAX_STREAM_GAP_REASON_CHARS) {
+    return trimmed;
+  }
+  return trimmed.slice(0, MAX_STREAM_GAP_REASON_CHARS);
+}
+
+/**
+ * Merges two gap reason strings into a bounded unique set of reason codes.
+ * Deduplicates individual reason tokens delimited by "; " and limits total
+ * string length to MAX_STREAM_GAP_REASON_CHARS.
+ */
+export function mergeGapReasons(
+  reason1?: string | undefined,
+  reason2?: string | undefined,
+): string | undefined {
+  const r1 = boundGapReason(reason1);
+  const r2 = boundGapReason(reason2);
+
+  if (!r1) return r2;
+  if (!r2) return r1;
+  if (r1 === r2) return r1;
+
+  // Split into unique reason tokens delimited by "; "
+  const uniqueTokens = new Set<string>();
+  for (const token of r1.split("; ")) {
+    const trimmed = token.trim();
+    if (trimmed.length > 0) {
+      uniqueTokens.add(trimmed);
+    }
+  }
+  for (const token of r2.split("; ")) {
+    const trimmed = token.trim();
+    if (trimmed.length > 0) {
+      uniqueTokens.add(trimmed);
+    }
+  }
+
+  // Construct bounded reason string preserving unique tokens up to MAX_STREAM_GAP_REASON_CHARS
+  const acceptedTokens: string[] = [];
+  let currentLength = 0;
+
+  for (const token of uniqueTokens) {
+    const additionalLength = acceptedTokens.length === 0 ? token.length : 2 + token.length;
+    if (currentLength + additionalLength <= MAX_STREAM_GAP_REASON_CHARS) {
+      acceptedTokens.push(token);
+      currentLength += additionalLength;
+    } else {
+      if (acceptedTokens.length === 0) {
+        return token.slice(0, MAX_STREAM_GAP_REASON_CHARS);
+      }
+      break;
+    }
+  }
+
+  return acceptedTokens.join("; ");
+}
+
 export class RollingTradeFlowTracker {
   private readonly poolId: string;
   private readonly tokenMint: string;
@@ -328,6 +403,13 @@ export class RollingTradeFlowTracker {
     return this.recordedGaps.length;
   }
 
+  /**
+   * Returns a snapshot of currently retained gap records.
+   */
+  public getRecordedGaps(): readonly StreamGap[] {
+    return [...this.recordedGaps];
+  }
+
   public getLastObservedSlot(): number | null {
     return this.lastObservedSlot;
   }
@@ -409,6 +491,8 @@ export class RollingTradeFlowTracker {
 
   /**
    * Explicitly records a completed, gapless observed time range (e.g. from a verified block range poll).
+   * Validates both range endpoints against current clock and allowed skew before any state mutation.
+   * Rejecting invalid or future-dated ranges prevents advancing coverage or inserting invalid gaps.
    */
   public recordCompletedRange(rangeStartMs: number, rangeEndMs: number): void {
     if (
@@ -419,8 +503,15 @@ export class RollingTradeFlowTracker {
       !Number.isInteger(rangeStartMs) ||
       !Number.isInteger(rangeEndMs) ||
       rangeStartMs > rangeEndMs ||
-      rangeStartMs <= 0
+      rangeStartMs <= 0 ||
+      rangeEndMs <= 0
     ) {
+      return;
+    }
+
+    const currentNow = this.clock();
+    const maxAllowedTimestampMs = currentNow + this.maxFutureSkewMs;
+    if (rangeStartMs > maxAllowedTimestampMs || rangeEndMs > maxAllowedTimestampMs) {
       return;
     }
 
@@ -905,11 +996,11 @@ export class RollingTradeFlowTracker {
     const cutoffMs = nowMs - this.retentionWindowMs;
     this.pruneExpiredGaps(cutoffMs);
 
-    // 2. Insert new gap
+    // 2. Insert new gap with bounded reason
     const newGap: StreamGap = Object.freeze({
       gapStartMs: startMs,
       gapEndMs: endMs,
-      reason: reason ?? undefined,
+      reason: boundGapReason(reason),
     });
     this.recordedGaps.push(newGap);
 
@@ -934,10 +1025,7 @@ export class RollingTradeFlowTracker {
 
       const g1 = this.recordedGaps[bestMergeIndex]!;
       const g2 = this.recordedGaps[bestMergeIndex + 1]!;
-      const mergedReason =
-        g1.reason && g2.reason && g1.reason !== g2.reason
-          ? `${g1.reason}; ${g2.reason}`
-          : (g1.reason ?? g2.reason);
+      const mergedReason = mergeGapReasons(g1.reason, g2.reason);
 
       const mergedGap: StreamGap = Object.freeze({
         gapStartMs: g1.gapStartMs,
@@ -959,10 +1047,7 @@ export class RollingTradeFlowTracker {
       const next = this.recordedGaps[i]!;
       if (current.gapEndMs >= next.gapStartMs) {
         // Overlapping or touching: merge
-        const mergedReason =
-          current.reason && next.reason && current.reason !== next.reason
-            ? `${current.reason}; ${next.reason}`
-            : (current.reason ?? next.reason);
+        const mergedReason = mergeGapReasons(current.reason, next.reason);
         current = Object.freeze({
           gapStartMs: current.gapStartMs,
           gapEndMs: Math.max(current.gapEndMs, next.gapEndMs),

@@ -20,7 +20,10 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  boundGapReason,
   deriveCanonicalSwapKey,
+  MAX_STREAM_GAP_REASON_CHARS,
+  mergeGapReasons,
   RollingTradeFlowTracker,
   type TradeEvent,
   type TradeTimestampProvenance,
@@ -239,6 +242,94 @@ describe("RollingTradeFlowTracker — Audited Corrections", () => {
       expect(evalResult.recentSells60s).toBe(0);
     });
 
+    it("rejects completed-range with future rangeEndMs without advancing coverage or inserting gaps (Auditor Follow-up 1)", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        maxStreamInactivityMs: 15_000,
+        clock: () => nowMs,
+      });
+
+      // Tracking started at T - 60s (1,000,000)
+      expect(tracker.getLastObservationTimestampMs()).toBe(1_000_000);
+      expect(tracker.getGapsCount()).toBe(0);
+
+      // Auditor reproduction: attempt to record completed range into the future (T + 1 day)
+      tracker.recordCompletedRange(nowMs - 60_000, nowMs + 86_400_000);
+
+      // Observation and coverage state MUST remain completely unchanged
+      expect(tracker.getLastObservationTimestampMs()).toBe(1_000_000);
+      expect(tracker.getGapsCount()).toBe(0);
+
+      // Evaluation at nowMs must detect silence from 1,000,000 to 1,060,000 and report COLLECTION_GAP
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("COLLECTION_GAP");
+      expect(evalResult.isCoverageSufficient).toBe(false);
+      expect(evalResult.recentBuys60s).toBeNull();
+      expect(evalResult.recentSells60s).toBeNull();
+      expect(evalResult.flowRatio).toBeNull();
+    });
+
+    it("rejects completed-range with future rangeStartMs without advancing observation", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        maxStreamInactivityMs: 15_000,
+        clock: () => nowMs,
+      });
+
+      tracker.recordCompletedRange(nowMs + 10_000, nowMs + 20_000);
+
+      expect(tracker.getLastObservationTimestampMs()).toBe(1_000_000);
+      expect(tracker.getGapsCount()).toBe(0);
+    });
+
+    it("enforces maxFutureSkewMs boundary on completed-range endpoints", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        maxFutureSkewMs: 5_000,
+        clock: () => nowMs,
+      });
+
+      // Range exceeding skew (nowMs + 6_000 > nowMs + 5_000) is rejected
+      tracker.recordCompletedRange(nowMs - 30_000, nowMs + 6_000);
+      expect(tracker.getLastObservationTimestampMs()).toBe(1_000_000);
+
+      // Range within skew (nowMs + 4_000 <= nowMs + 5_000) is accepted
+      tracker.recordCompletedRange(nowMs - 30_000, nowMs + 4_000);
+      expect(tracker.getLastObservationTimestampMs()).toBe(nowMs + 4_000);
+    });
+
+    it("rejects malformed completed-range inputs without state mutation", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        clock: () => nowMs,
+      });
+
+      const initialObs = tracker.getLastObservationTimestampMs();
+      const initialGaps = tracker.getGapsCount();
+
+      tracker.recordCompletedRange(100, 50); // start > end
+      tracker.recordCompletedRange(-10, 50); // start <= 0
+      tracker.recordCompletedRange(50, -10); // end <= 0
+      tracker.recordCompletedRange(NaN, 50); // NaN
+      tracker.recordCompletedRange(50, Infinity); // Infinity
+      tracker.recordCompletedRange(50.5, 100); // float
+
+      expect(tracker.getLastObservationTimestampMs()).toBe(initialObs);
+      expect(tracker.getGapsCount()).toBe(initialGaps);
+    });
+
     it("rejects receipt timestamp one day in the future with FUTURE_DATED_RECEIPT_TIMESTAMP", () => {
       const nowMs = 1_000_000;
       const tracker = new RollingTradeFlowTracker({
@@ -429,11 +520,100 @@ describe("RollingTradeFlowTracker — Audited Corrections", () => {
       // CRITICAL GUARANTEE: Array length must be <= maxGapsRetained (5) at all times!
       expect(tracker.getGapsCount()).toBeLessThanOrEqual(5);
 
+      // Diagnostic text bounding: every retained gap's reason must not exceed MAX_STREAM_GAP_REASON_CHARS
+      const retainedGaps = tracker.getRecordedGaps();
+      expect(retainedGaps.length).toBeLessThanOrEqual(5);
+      for (const gap of retainedGaps) {
+        expect(gap.reason).toBeDefined();
+        expect(gap.reason!.length).toBeLessThanOrEqual(MAX_STREAM_GAP_REASON_CHARS);
+      }
+
       // Coverage must remain COLLECTION_GAP
       const evalResult = tracker.evaluateWindow(nowMs);
       expect(evalResult.coverage).toBe("COLLECTION_GAP");
       expect(evalResult.isCoverageSufficient).toBe(false);
       expect(evalResult.recentBuys60s).toBeNull();
+      expect(evalResult.recentSells60s).toBeNull();
+      expect(evalResult.flowRatio).toBeNull();
+    });
+
+    it("bounds merged diagnostic text when 1,000 overlapping gaps are coalesced (Auditor Follow-up 2)", () => {
+      const nowMs = 1_000_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 120_000,
+        clock: () => nowMs,
+      });
+
+      // Insert 1,000 overlapping gaps with distinct short reasons
+      for (let i = 0; i < 1_000; i++) {
+        tracker.recordCollectionGap({
+          gapStartMs: nowMs - 50_000 + i * 10,
+          gapEndMs: nowMs - 50_000 + (i + 1) * 10 + 40,
+          reason: `OUTAGE_${i}`,
+        });
+      }
+
+      // Overlapping intervals coalesce into a single retained gap
+      expect(tracker.getGapsCount()).toBe(1);
+
+      const retainedGaps = tracker.getRecordedGaps();
+      expect(retainedGaps.length).toBe(1);
+      const singleGap = retainedGaps[0]!;
+      expect(singleGap.reason).toBeDefined();
+      expect(singleGap.reason!.length).toBeLessThanOrEqual(MAX_STREAM_GAP_REASON_CHARS);
+      expect(singleGap.reason!.length).toBeGreaterThan(0);
+
+      // Inserting 500 further overlapping records must continue respecting bounds
+      for (let i = 1_000; i < 1_500; i++) {
+        tracker.recordCollectionGap({
+          gapStartMs: nowMs - 40_000 + (i - 1_000) * 5,
+          gapEndMs: nowMs - 40_000 + (i - 1_000 + 1) * 5 + 40,
+          reason: `FURTHER_OUTAGE_${i}`,
+        });
+      }
+
+      expect(tracker.getGapsCount()).toBe(1);
+      const afterFurtherGaps = tracker.getRecordedGaps();
+      expect(afterFurtherGaps[0]!.reason!.length).toBeLessThanOrEqual(MAX_STREAM_GAP_REASON_CHARS);
+
+      // Coverage must remain fail-closed with unavailable counts
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("COLLECTION_GAP");
+      expect(evalResult.isCoverageSufficient).toBe(false);
+      expect(evalResult.recentBuys60s).toBeNull();
+      expect(evalResult.recentSells60s).toBeNull();
+      expect(evalResult.flowRatio).toBeNull();
+    });
+
+    it("verifies boundGapReason and mergeGapReasons helper functions", () => {
+      // boundGapReason
+      expect(boundGapReason(undefined)).toBeUndefined();
+      expect(boundGapReason("")).toBeUndefined();
+      expect(boundGapReason("   ")).toBeUndefined();
+      expect(boundGapReason("NORMAL_REASON")).toBe("NORMAL_REASON");
+
+      const hugeReason = "A".repeat(1000);
+      const boundedHuge = boundGapReason(hugeReason);
+      expect(boundedHuge).toBeDefined();
+      expect(boundedHuge!.length).toBe(MAX_STREAM_GAP_REASON_CHARS);
+
+      // mergeGapReasons
+      expect(mergeGapReasons(undefined, undefined)).toBeUndefined();
+      expect(mergeGapReasons("REASON_A", undefined)).toBe("REASON_A");
+      expect(mergeGapReasons(undefined, "REASON_B")).toBe("REASON_B");
+      expect(mergeGapReasons("SAME", "SAME")).toBe("SAME");
+
+      const merged = mergeGapReasons("REASON_A; REASON_B", "REASON_B; REASON_C");
+      expect(merged).toBe("REASON_A; REASON_B; REASON_C");
+
+      // Repeated merge with many tokens does not exceed MAX_STREAM_GAP_REASON_CHARS
+      let accumulator: string | undefined = "INITIAL";
+      for (let i = 0; i < 200; i++) {
+        accumulator = mergeGapReasons(accumulator, `CODE_${i}`);
+        expect(accumulator!.length).toBeLessThanOrEqual(MAX_STREAM_GAP_REASON_CHARS);
+      }
     });
   });
 
