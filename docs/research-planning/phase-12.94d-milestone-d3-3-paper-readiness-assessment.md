@@ -376,16 +376,12 @@ The approved offline implementation items are completed:
 7. **Authentic Rolling 60-Second Trade Flow Tracker (`RollingTradeFlowTracker.ts`) & Retest Gate Hardening**:
    - Implemented in [`backend/src/candidate-scanner/RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts) and [`backend/src/candidate-scanner/RetestGateEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.ts).
    - Replaced naive estimation (dividing 5-minute totals by 5) with an authentic event-driven rolling trade flow tracker.
-   - Binds trade events strictly to canonical `poolId` and candidate `tokenMint`, rejecting identity mismatches (`IDENTITY_MISMATCH_POOL`, `IDENTITY_MISMATCH_MINT`).
-   - Defines BUY and SELL strictly relative to the candidate token: receiving candidate token = BUY; depositing candidate token = SELL.
-   - Stable event identifiers (`${signature}:${outerInstructionIndex}:${swapIndex}`) uniquely distinguish multiple swaps within the same transaction.
-   - Recalculates dynamically over `[evaluationTimestampMs - 60_000, evaluationTimestampMs]` on every evaluation without enforcing a rigid 60-second polling cadence.
-   - Preserves event block/execution timestamps separately from local ingestion receipt times, tracking clock skew, precision, and provenance (`ON_CHAIN_BLOCK_TIME`, `HOST_OBSERVED`, `SYNTHETIC_FIXTURE`).
-   - Distinguishes complete observed coverage (`SUFFICIENT`) from incomplete states (`WARM_UP`, `COLLECTION_GAP`, `STALE_DATA`). Elapsed time alone never assumes coverage.
-   - Returns `null` when flow coverage is insufficient. Returns `0` only for a sufficiently observed window containing zero qualifying trades.
-   - Hardened `RetestGateEvaluator`: handles nullable flow metrics (`recentBuys60s: number | null`, `recentSells60s: number | null`). Incomplete or missing flow coverage keeps the gate in `WAITING` status, preventing unverified trade flow from confirming entry while preserving stop-loss / crater drop protections.
-   - Bounded retention: automatically prunes trades older than retention horizon (3 minutes) and caps memory at 2,000 events.
-   - 26 comprehensive unit tests passing in [`backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts).
+   - **Complete Window Coverage Verification**: Rejects single-heartbeat false passes. Tracks continuous observation checkpoints; intervals between observations exceeding `maxStreamInactivityMs` (15s) or silences at evaluation time are recorded as collection gaps. Requires unbroken observation across the entire 60s window before reporting `SUFFICIENT`.
+   - **Capacity Bounds & Fail-Closed Protection**: Enforces storage capacity limits during ingestion. Never silently drops active-window events to report skewed ratios. If capacity loss occurs, records the affected interval and keeps flow coverage unavailable (`CAPACITY_LOSS`) until the interval has fully expired beyond the lookback window.
+   - **Immutable Snapshotting & Input Validation**: Snapshots and freezes accepted events and gap records to prevent caller mutation of stored state. Derives and validates canonical swap coordinates (`${signature}:${outerInstructionIndex}:${swapIndex}`), preventing double-counting with altered event IDs. Strictly validates signature, non-negative swap/instruction indices, slot, positive integer timestamps (no fractions), and allowed provenance (`ON_CHAIN_BLOCK_TIME`, `HOST_OBSERVED`, `SYNTHETIC_FIXTURE`).
+   - **Strict Lookback Configuration**: Strategy-facing counts are strictly tied to an exact 60,000 ms window; non-60,000 ms configurations and invalid evaluation timestamps (`NaN`, non-integers) fail closed with explicit errors.
+   - **Retest Boundary Enforcement**: Typed `FlowCoverageStatus` (`SUFFICIENT`, `WARM_UP`, `COLLECTION_GAP`, `STALE_DATA`, `CAPACITY_LOSS`, `PROCESSING_BACKLOG`, `UNINITIALIZED`). Requires trustworthy sufficient coverage and finite, non-negative integer counts before flow can support confirmation. Unverified legacy inputs fail closed (`WAITING`), while preserving protective crater drop ceilings (8% unabsorbed, 12% absorbed, 15% micro-cap) and timeout expirations.
+   - 18 comprehensive unit tests passing in [`backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts).
    - 20 unit tests passing in [`backend/src/candidate-scanner/RetestGateEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.test.ts).
 8. **Ubuntu CI Duplicate Decision ID Collision Resolution (`PilotLiveCollector.test.ts`)**:
    - In `makeCanonicalTestPubkey`, updated byte offset for writing test IDs from byte 0 to byte 2.
@@ -405,35 +401,27 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
 1. **Live Acquisition Wiring in Production Daemon**:
    - `CandidateStreamEngine.ts` intake integration with injected resolver, `RaydiumAmmV4LpEvidenceAdapter.ts`, and validated-LP mode is complete and verified offline.
    - Live daemon wiring in `paper-trading-daemon.ts` connecting the bounded 2-request acquisition client to live Solana RPC endpoints upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings remains pending authorization.
-2. **Live Trade Stream Ingestion Adapter & Decoder (Source-Backed Proposal)**:
-   - `RollingTradeFlowTracker.ts` dynamic windowing and `RetestGateEvaluator.ts` flow gating are fully verified offline.
-   - **Intended Live Trade Source**:
-     - _Primary_: Solana WebSocket log subscription (`SolanaWebSocketSubscriptionClient.ts`) via `logsSubscribe` filtered by `{ mentions: [candidatePoolId] }`. Each notification delivers a transaction signature referencing the candidate pool.
-     - _Fallback / Reconciliation_: Read-only `getTransaction` via `SolanaRpcTransactionFetcher.ts` or polling `getSignaturesForAddress` if WebSocket drops or during high-traffic burst validation.
-   - **Swap Classification**:
-     - Raydium AMM v4 instruction decoding: inspect compiled instructions or inner CPI instructions referencing `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`. Instruction discriminator byte 9 = `SwapBaseIn`, byte 11 = `SwapBaseOut`.
-     - Candidate token orientation: Check whether candidate token is `baseMint` or `quoteMint` of the pool. Receiving candidate token (`postTokenBalances - preTokenBalances > 0`) = `BUY`; depositing candidate token (`preTokenBalances - postTokenBalances > 0`) = `SELL`.
-     - Stable event identifier: `${signature}:${outerInstructionIndex}:${swapIndex}` uniquely distinguishing multiple swaps within one multi-pool or routed transaction (e.g. Jupiter routing).
-   - **Coverage Guarantees**:
-     - Strict 60-second observation window: Tracking must be active for $\ge 60\text{ seconds}$ before `SUFFICIENT` coverage is granted; otherwise classified as `WARM_UP` and returns `null`.
-     - Disconnection / gap detection: Any WebSocket disconnect/reconnect interval intersecting `[now - 60s, now]` is flagged as `COLLECTION_GAP` and returns `null`.
-     - Stale data detection: Heartbeats or trade events must occur within `maxStreamInactivityMs` (15s); if silence exceeds this limit, classified as `STALE_DATA` and returns `null`.
-     - Honest empty window: If and only if the window is `SUFFICIENT` with continuous liveness and zero trades occurred, reports honest `0` buys and `0` sells (allowing `RetestGateEvaluator` to distinguish inactive tokens from missing data).
-   - **Expected Latency**:
+2. **Live Trade Stream Ingestion Adapter & Decoder (Corrected Source Proposal)**:
+   - `RollingTradeFlowTracker.ts` dynamic windowing, complete coverage verification, and `RetestGateEvaluator.ts` flow gating are fully verified offline.
+   - **Solana RPC Protocol Mechanics (`logsSubscribe` & `getTransaction`)**:
+     - Official `logsSubscribe` delivers only `{ signature, err, logs }`; it does _not_ provide transaction instructions, compiled accounts, or `preTokenBalances` / `postTokenBalances`.
+     - Therefore, for any instruction- or balance-based decoding, full transaction retrieval via `getTransaction` is _normal acquisition work for every transaction_, not an occasional fallback.
+     - The only alternative avoiding per-trade HTTP RPC calls is a log-only decoding path that parses Raydium's base64-encoded `ray_log` events from the logs array directly. This log-only path is protocol-specific, subject to log truncation on complex transactions, and currently unvalidated.
+   - **Request-Budget & Achievable Coverage under Existing Budget**:
+     - The existing `GlobalResourceBudgetManager` enforces a shared provider pacing of $\ge 2,500\text{ ms}$ between RPC calls to the same host.
+     - At $2,500\text{ ms}$ pacing, a single RPC endpoint can fetch at most 24 transactions per minute.
+     - Consequently, active candidate pools experiencing $> 24\text{ trades/minute}$ cannot achieve complete 60-second coverage via `getTransaction` without inducing severe processing backlogs and quickly exhausting session request ceilings (e.g., a 50-request budget exhausted in 2 minutes).
+     - Under existing constraints, complete coverage via `getTransaction` is achievable only for low-activity pools ($\le 10\text{ trades/min}$), or requires a dedicated high-throughput RPC tier without pacing limits, or a validated zero-RPC log-only parsing path.
+   - **Current WebSocket Implementation vs Proposed Per-Candidate Subscriptions**:
+     - The existing `SolanaWebSocketSubscriptionClient.ts` manages protocol-level subscriptions to program IDs (`RAYDIUM_AMM_V4_PROGRAM_ID`, `RAYDIUM_CPMM_PROGRAM_ID`).
+     - Per-candidate pool subscriptions (`{ mentions: [candidatePoolId] }`) represent proposed work not yet implemented or wired in production.
+   - **Swap-Side Attribution per Instruction/Account Context**:
+     - In routed and multi-swap transactions (e.g., Jupiter routes), transaction-wide net token balances alone cannot correctly classify individual swaps.
+     - Attribution must be resolved per instruction context: inspecting the specific instruction referencing the candidate pool, matching `poolCoinVault` (base) vs `poolPcVault` (quote) against user source/destination token accounts, or instruction `amountIn` / `minAmountOut`.
+   - **Latency Characterization**:
      - In-memory rolling window recalculation: $< 1\text{ ms}$ on evaluation.
-     - Live WebSocket push latency from Solana block confirmation: ~400–1,200 ms.
-   - **Request-Budget Cost**:
-     - WebSocket subscription: 1 active persistent WebSocket connection / subscription per monitored watchlist candidate (0 continuous HTTP requests).
-     - RPC getTransaction fallback: If needed for balance delta or log reconciliation, 1 request per transaction metered through `GlobalResourceBudgetManager` under the candidate enrichment ceiling.
+     - Live WebSocket notification latency and `getTransaction` round-trip delays are unmeasured assumptions and must be empirically profiled under real network conditions.
    - **Capabilities Still Missing for Live Execution**:
-     - Live WebSocket activation remains quarantined under Phase 12.94-D rules.
-     - Binary instruction decoder for Raydium AMM v4 `SwapBaseIn` (tag 9) and `SwapBaseOut` (tag 11) in transaction payloads.
-     - Balance delta parser analyzing `preTokenBalances` / `postTokenBalances` for complex multi-hop routed transactions where Raydium instruction logs are truncated or nested.
-3. **Live Metered RugCheck Security Provider Integration**:
-   - Register a live RugCheck provider client under `GlobalResourceBudgetManager` with strict rate-limiting, error handling, and budget accounting to supply verified security scores, danger flags, holder counts, and bundler concentrations.
-4. **Verified Reserve Spot Pricing & Slippage Math**:
-   - Wire atomic reserve balances (`baseReserveTokens`, `quoteReserveSol`) from validated vault accounts into `createDeterministicAmmQuote()` to enable precise constant-product pricing and arrival slippage simulation during order execution.
-   - Crucially, raw vault balances alone are strictly insufficient for executable pricing as they omit OpenOrders balances, unsettled PnL, protocol fees, and dynamic swap state. Full constant-product execution math requires verified total executable reserves, not raw vault balances alone.
-5. **Execution Quarantine Maintained**:
-   - Virtual wallet strictly frozen at **7.9259 SOL**.
-   - Zero live network requests, reruns, daemon activation, wallet mutations, or market sessions.
+     - Live WebSocket per-candidate subscription management and stream reconnection handling.
+     - Validated transaction instruction/account parser or zero-RPC `ray_log` binary event decoder.
+     - Backlog monitoring and capacity reconciliation mechanisms.

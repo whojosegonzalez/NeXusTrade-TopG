@@ -5,24 +5,32 @@
  * from injected timestamped trade events, with strict coverage verification,
  * deduplication, and integration with RetestGateEvaluator.
  *
- * Requirements:
- * 1. Binds trade events strictly to exact candidate poolId and tokenMint.
- * 2. Defines BUY and SELL relative to candidate token:
- *    - BUY: trader swaps quote token for candidate token (candidate token bought/received).
- *    - SELL: trader swaps candidate token for quote token (candidate token sold/given).
- * 3. Stable event identifiers: e.g. `${signature}:${swapIndex}` distinguishing multiple swaps in one tx.
- * 4. Recalculates latest 60-second window whenever evaluated; no fixed evaluation intervals.
- * 5. Handles duplicates, out-of-order arrivals, boundaries, and invalid timestamps explicitly.
- * 6. Preserves event timestamps separately from local receipt times, with provenance.
- * 7. Distinguishes complete coverage from warm-up (< 60s), stale data, and collection gaps.
- * 8. Returns unavailable counts (null) when coverage is insufficient. Reports zero only for
- *    a sufficiently observed window containing no qualifying trades.
- * 9. Narrow integration path to RetestGateEvaluator (unavailable flow never confirms entry).
- * 10. Bounded storage: automatic eviction of expired events and max capacity ceilings.
+ * Requirements & Audited Safeguards:
+ * 1. Complete window coverage verification:
+ *    - Rejects recent-heartbeat false passes. Requires continuous, gapless observation
+ *      across the entire [now - 60s, now] window with maximum inactivity ceilings.
+ *    - Accounts for processing backlog, collection gaps, warm-up, and silence intervals.
+ * 2. Capacity bounds & fail-closed protection:
+ *    - Enforces max retention capacity during ingestion.
+ *    - Never silently drops active-window events; records capacity loss and marks coverage
+ *      unavailable until the affected interval has fully expired.
+ *    - Bounds deduplication keys and gap metadata storage.
+ * 3. Immutable snapshotting & input validation:
+ *    - Snapshots and freezes accepted events and gap records to prevent external caller mutation.
+ *    - Derives and validates canonical swap identity (${signature}:${outerInstructionIndex}:${swapIndex})
+ *      preventing double-counting via altered eventId labels.
+ *    - Validates signature, swapIndex, outerInstructionIndex, slot, timestamps, provenance,
+ *      and windowDurationMs (strictly 60,000 ms).
+ *    - Validates evaluateWindow arguments; rejects NaN or invalid evaluation times.
+ * 4. Narrow integration with RetestGateEvaluator:
+ *    - Unavailable flow never produces entry confirmation.
+ *    - Distinguishes honest zero (sufficient coverage, zero trades) from unavailable flow.
  */
 
 import { isCanonicalSolanaBase58 } from "./LpScreeningBridge.js";
-import type { RetestSpotInfo } from "./RetestGateEvaluator.js";
+import { type FlowCoverageStatus, type RetestSpotInfo } from "./RetestGateEvaluator.js";
+
+export type { FlowCoverageStatus } from "./RetestGateEvaluator.js";
 
 export type TradeSide = "BUY" | "SELL";
 
@@ -32,18 +40,19 @@ export type TradeTimestampProvenance =
   | "SYNTHETIC_FIXTURE";
 
 export interface TradeEvent {
-  /** Stable identifier distinguishing multiple swaps within one transaction: e.g. `${signature}:${swapIndex}` */
+  /** Stable identifier: e.g. `${signature}:${swapIndex}` or `${signature}:${outerInstructionIndex}:${swapIndex}` */
   readonly eventId: string;
   readonly signature: string;
   readonly swapIndex: number;
+  readonly outerInstructionIndex?: number | undefined;
   readonly poolId: string;
   readonly tokenMint: string;
   readonly side: TradeSide;
   readonly slot: number;
   readonly blockTimeSec: number | null;
-  /** Authoritative event timestamp in milliseconds */
+  /** Authoritative event timestamp in integer milliseconds */
   readonly eventTimestampMs: number;
-  /** Host local receipt timestamp in milliseconds */
+  /** Host local receipt timestamp in integer milliseconds */
   readonly receiptTimestampMs: number;
   readonly timestampProvenance: TradeTimestampProvenance;
   readonly tokenAmount?: bigint | number | undefined;
@@ -53,23 +62,23 @@ export interface TradeEvent {
 export type IngestTradeFailureReason =
   | "INVALID_EVENT_OBJECT"
   | "MISSING_EVENT_ID"
+  | "INVALID_SIGNATURE"
+  | "INVALID_SWAP_INDEX"
+  | "INVALID_INSTRUCTION_INDEX"
   | "IDENTITY_MISMATCH_POOL"
   | "IDENTITY_MISMATCH_MINT"
   | "INVALID_SIDE"
   | "INVALID_TIMESTAMP"
+  | "INVALID_RECEIPT_TIMESTAMP"
+  | "INVALID_SLOT"
+  | "INVALID_PROVENANCE"
   | "FUTURE_DATED_TIMESTAMP"
-  | "DUPLICATE_EVENT";
+  | "DUPLICATE_EVENT"
+  | "CAPACITY_EXCEEDED";
 
 export type IngestTradeResult =
-  | { readonly ok: true; readonly eventId: string }
+  | { readonly ok: true; readonly eventId: string; readonly canonicalSwapKey: string }
   | { readonly ok: false; readonly reason: IngestTradeFailureReason; readonly message: string };
-
-export type FlowCoverageStatus =
-  | "SUFFICIENT"
-  | "WARM_UP"
-  | "COLLECTION_GAP"
-  | "STALE_DATA"
-  | "UNINITIALIZED";
 
 export interface StreamGap {
   readonly gapStartMs: number;
@@ -99,6 +108,8 @@ export interface RollingFlowEvaluationResult {
     readonly gapCount: number;
     readonly timeSinceLastEventMs: number | null;
     readonly timeSinceLastHeartbeatMs: number | null;
+    readonly latestCapacityLossMs: number | null;
+    readonly hasActiveBacklog: boolean;
   };
 }
 
@@ -106,31 +117,47 @@ export interface RollingTradeFlowTrackerOptions {
   readonly poolId: string;
   readonly tokenMint: string;
   readonly trackingStartedMs?: number | undefined;
-  readonly windowDurationMs?: number | undefined; // Default: 60_000 ms (60 seconds)
+  readonly windowDurationMs?: number | undefined; // Must be exactly 60_000 ms if provided
   readonly maxStreamInactivityMs?: number | undefined; // Default: 15_000 ms (15 seconds)
   readonly maxFutureSkewMs?: number | undefined; // Default: 5_000 ms (5 seconds)
   readonly retentionWindowMs?: number | undefined; // Default: 180_000 ms (3 minutes)
   readonly maxEventsRetained?: number | undefined; // Default: 2_000 events
+  readonly maxGapsRetained?: number | undefined; // Default: 100 gaps
+  readonly maxDeduplicationKeys?: number | undefined; // Default: 5_000 keys
   readonly clock?: (() => number) | undefined;
+}
+
+export function deriveCanonicalSwapKey(
+  signature: string,
+  outerInstructionIndex: number,
+  swapIndex: number,
+): string {
+  return `${signature}:${outerInstructionIndex}:${swapIndex}`;
 }
 
 export class RollingTradeFlowTracker {
   private readonly poolId: string;
   private readonly tokenMint: string;
-  private readonly windowDurationMs: number;
+  private readonly windowDurationMs: number = 60_000;
   private readonly maxStreamInactivityMs: number;
   private readonly maxFutureSkewMs: number;
   private readonly retentionWindowMs: number;
   private readonly maxEventsRetained: number;
+  private readonly maxGapsRetained: number;
+  private readonly maxDeduplicationKeys: number;
   private readonly clock: () => number;
 
   private trackingStartedMs: number;
   private lastEventTimestampMs = 0;
   private lastHeartbeatMs = 0;
   private lastObservedSlot: number | null = null;
+  private lastObservationTimestampMs: number;
+  private hasActiveBacklog = false;
+  private latestCapacityLossTimestampMs: number | null = null;
 
   private readonly events: TradeEvent[] = [];
   private readonly seenEventIds = new Set<string>();
+  private readonly seenSwapKeys = new Set<string>();
   private readonly recordedGaps: StreamGap[] = [];
 
   private totalEventsIngested = 0;
@@ -151,18 +178,70 @@ export class RollingTradeFlowTracker {
       );
     }
 
+    if (options.windowDurationMs !== undefined) {
+      if (
+        typeof options.windowDurationMs !== "number" ||
+        !Number.isFinite(options.windowDurationMs) ||
+        options.windowDurationMs !== 60_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid windowDurationMs: ${options.windowDurationMs}. The strategy requires an exact 60,000 ms window for recentBuys60s/recentSells60s.`,
+        );
+      }
+    }
+
+    if (options.trackingStartedMs !== undefined) {
+      if (
+        typeof options.trackingStartedMs !== "number" ||
+        !Number.isFinite(options.trackingStartedMs) ||
+        !Number.isInteger(options.trackingStartedMs) ||
+        options.trackingStartedMs <= 0
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid trackingStartedMs: expected positive finite integer, received: ${String(options.trackingStartedMs)}`,
+        );
+      }
+    }
+
+    if (options.maxStreamInactivityMs !== undefined) {
+      if (
+        typeof options.maxStreamInactivityMs !== "number" ||
+        !Number.isFinite(options.maxStreamInactivityMs) ||
+        !Number.isInteger(options.maxStreamInactivityMs) ||
+        options.maxStreamInactivityMs < 1_000 ||
+        options.maxStreamInactivityMs > 60_000
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid maxStreamInactivityMs: expected integer between 1,000 and 60,000, received: ${String(options.maxStreamInactivityMs)}`,
+        );
+      }
+    }
+
+    if (options.maxEventsRetained !== undefined) {
+      if (
+        typeof options.maxEventsRetained !== "number" ||
+        !Number.isFinite(options.maxEventsRetained) ||
+        !Number.isInteger(options.maxEventsRetained) ||
+        options.maxEventsRetained < 10
+      ) {
+        throw new Error(
+          `[ROLLING_FLOW_INIT] Invalid maxEventsRetained: expected integer >= 10, received: ${String(options.maxEventsRetained)}`,
+        );
+      }
+    }
+
     this.poolId = options.poolId;
     this.tokenMint = options.tokenMint;
     this.clock = options.clock ?? Date.now;
     this.trackingStartedMs = options.trackingStartedMs ?? this.clock();
-    this.windowDurationMs = Math.max(10_000, options.windowDurationMs ?? 60_000);
-    this.maxStreamInactivityMs = Math.max(5_000, options.maxStreamInactivityMs ?? 15_000);
-    this.maxFutureSkewMs = Math.max(1_000, options.maxFutureSkewMs ?? 5_000);
-    this.retentionWindowMs = Math.max(
-      this.windowDurationMs * 2,
-      options.retentionWindowMs ?? 180_000,
-    );
-    this.maxEventsRetained = Math.max(100, options.maxEventsRetained ?? 2_000);
+    this.lastObservationTimestampMs = this.trackingStartedMs;
+    this.windowDurationMs = 60_000;
+    this.maxStreamInactivityMs = options.maxStreamInactivityMs ?? 15_000;
+    this.maxFutureSkewMs = options.maxFutureSkewMs ?? 5_000;
+    this.retentionWindowMs = Math.max(120_000, options.retentionWindowMs ?? 180_000);
+    this.maxEventsRetained = options.maxEventsRetained ?? 2_000;
+    this.maxGapsRetained = options.maxGapsRetained ?? 100;
+    this.maxDeduplicationKeys = options.maxDeduplicationKeys ?? 5_000;
   }
 
   public getPoolId(): string {
@@ -185,32 +264,60 @@ export class RollingTradeFlowTracker {
     return this.lastObservedSlot;
   }
 
+  public getLastObservationTimestampMs(): number {
+    return this.lastObservationTimestampMs;
+  }
+
   /**
    * Resets tracking start time to a specific epoch millisecond.
    */
   public setTrackingStartedMs(timestampMs: number): void {
-    if (typeof timestampMs !== "number" || !Number.isFinite(timestampMs) || timestampMs <= 0) {
+    if (
+      typeof timestampMs !== "number" ||
+      !Number.isFinite(timestampMs) ||
+      !Number.isInteger(timestampMs) ||
+      timestampMs <= 0
+    ) {
       throw new Error(`[INVALID_TRACKING_START] Invalid timestamp: ${timestampMs}`);
     }
     this.trackingStartedMs = timestampMs;
+    this.lastObservationTimestampMs = timestampMs;
   }
 
   /**
    * Records a stream heartbeat checkpoint.
-   * Proves continuous stream liveness when trade volume is low or zero.
+   * Proves continuous stream liveness across the requested window.
    */
-  public recordHeartbeat(heartbeatMs: number, slot?: number | undefined): void {
-    if (typeof heartbeatMs !== "number" || !Number.isFinite(heartbeatMs) || heartbeatMs <= 0) {
+  public recordHeartbeat(
+    heartbeatMs: number,
+    slot?: number | undefined,
+    options?: { readonly isBacklogged?: boolean | undefined },
+  ): void {
+    if (
+      typeof heartbeatMs !== "number" ||
+      !Number.isFinite(heartbeatMs) ||
+      !Number.isInteger(heartbeatMs) ||
+      heartbeatMs <= 0
+    ) {
       return;
     }
+
+    if (options?.isBacklogged !== undefined) {
+      this.hasActiveBacklog = Boolean(options.isBacklogged);
+    }
+
+    // Check for silence gap prior to this heartbeat
+    this.updateObservationTimeline(heartbeatMs);
+
     this.lastHeartbeatMs = Math.max(this.lastHeartbeatMs, heartbeatMs);
-    if (typeof slot === "number" && Number.isFinite(slot) && slot > 0) {
+    if (typeof slot === "number" && Number.isInteger(slot) && slot >= 0) {
       this.lastObservedSlot = slot;
     }
   }
 
   /**
    * Explicitly records an unobserved stream outage or collection gap.
+   * Copies and freezes the gap object.
    */
   public recordCollectionGap(gap: StreamGap): void {
     if (!gap || typeof gap !== "object") return;
@@ -219,16 +326,27 @@ export class RollingTradeFlowTracker {
       typeof gap.gapEndMs !== "number" ||
       !Number.isFinite(gap.gapStartMs) ||
       !Number.isFinite(gap.gapEndMs) ||
-      gap.gapStartMs > gap.gapEndMs
+      !Number.isInteger(gap.gapStartMs) ||
+      !Number.isInteger(gap.gapEndMs) ||
+      gap.gapStartMs > gap.gapEndMs ||
+      gap.gapStartMs <= 0
     ) {
       return;
     }
-    this.recordedGaps.push(gap);
+    this.recordGapInternal(gap.gapStartMs, gap.gapEndMs, gap.reason);
+  }
+
+  /**
+   * Explicitly sets stream processing backlog state.
+   */
+  public recordProcessingBacklog(isBacklogged: boolean): void {
+    this.hasActiveBacklog = Boolean(isBacklogged);
   }
 
   /**
    * Ingests an authentic or synthetic trade event.
-   * Validates identity binding, timestamp sanity, and stable event deduplication.
+   * Enforces strict validation, canonical coordinate deduplication, storage bounds,
+   * capacity-loss recording, and immutable snapshot freezing.
    */
   public ingestTrade(event: TradeEvent): IngestTradeResult {
     if (!event || typeof event !== "object") {
@@ -239,11 +357,50 @@ export class RollingTradeFlowTracker {
       };
     }
 
+    if (
+      !event.signature ||
+      typeof event.signature !== "string" ||
+      event.signature.trim().length === 0
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_SIGNATURE",
+        message: "Trade event must have a non-empty signature string",
+      };
+    }
+
+    if (
+      typeof event.swapIndex !== "number" ||
+      !Number.isFinite(event.swapIndex) ||
+      !Number.isInteger(event.swapIndex) ||
+      event.swapIndex < 0
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_SWAP_INDEX",
+        message: `Trade event swapIndex must be a non-negative integer, received: ${String(event.swapIndex)}`,
+      };
+    }
+
+    const outerInstructionIndex = event.outerInstructionIndex ?? 0;
+    if (
+      typeof outerInstructionIndex !== "number" ||
+      !Number.isFinite(outerInstructionIndex) ||
+      !Number.isInteger(outerInstructionIndex) ||
+      outerInstructionIndex < 0
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_INSTRUCTION_INDEX",
+        message: `Trade event outerInstructionIndex must be a non-negative integer, received: ${String(outerInstructionIndex)}`,
+      };
+    }
+
     if (!event.eventId || typeof event.eventId !== "string" || event.eventId.trim().length === 0) {
       return {
         ok: false,
         reason: "MISSING_EVENT_ID",
-        message: "Trade event must have a non-empty stable eventId",
+        message: "Trade event must have a non-empty eventId",
       };
     }
 
@@ -273,14 +430,53 @@ export class RollingTradeFlowTracker {
     }
 
     if (
+      typeof event.slot !== "number" ||
+      !Number.isFinite(event.slot) ||
+      !Number.isInteger(event.slot) ||
+      event.slot < 0
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_SLOT",
+        message: `Trade slot must be a non-negative integer, received: ${String(event.slot)}`,
+      };
+    }
+
+    if (
+      typeof event.receiptTimestampMs !== "number" ||
+      !Number.isFinite(event.receiptTimestampMs) ||
+      !Number.isInteger(event.receiptTimestampMs) ||
+      event.receiptTimestampMs <= 0
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_RECEIPT_TIMESTAMP",
+        message: `Trade receiptTimestampMs must be a positive finite integer, received: ${String(event.receiptTimestampMs)}`,
+      };
+    }
+
+    if (
       typeof event.eventTimestampMs !== "number" ||
       !Number.isFinite(event.eventTimestampMs) ||
+      !Number.isInteger(event.eventTimestampMs) ||
       event.eventTimestampMs <= 0
     ) {
       return {
         ok: false,
         reason: "INVALID_TIMESTAMP",
-        message: `Event timestamp must be a positive finite integer, received: ${event.eventTimestampMs}`,
+        message: `Event timestamp must be a positive finite integer, received: ${String(event.eventTimestampMs)}`,
+      };
+    }
+
+    if (
+      event.timestampProvenance !== "ON_CHAIN_BLOCK_TIME" &&
+      event.timestampProvenance !== "HOST_OBSERVED" &&
+      event.timestampProvenance !== "SYNTHETIC_FIXTURE"
+    ) {
+      return {
+        ok: false,
+        reason: "INVALID_PROVENANCE",
+        message: `Invalid or missing timestampProvenance: '${String(event.timestampProvenance)}'`,
       };
     }
 
@@ -293,27 +489,78 @@ export class RollingTradeFlowTracker {
       };
     }
 
-    // Deduplication check
-    if (this.seenEventIds.has(event.eventId)) {
+    // Derive stable canonical swap identity coordinates
+    const canonicalSwapKey = deriveCanonicalSwapKey(
+      event.signature,
+      outerInstructionIndex,
+      event.swapIndex,
+    );
+
+    // Deduplication check across canonical coordinates AND supplied eventId
+    if (this.seenSwapKeys.has(canonicalSwapKey) || this.seenEventIds.has(event.eventId)) {
       this.deduplicatedEventsCount++;
       return {
         ok: false,
         reason: "DUPLICATE_EVENT",
-        message: `Event '${event.eventId}' has already been ingested and deduplicated`,
+        message: `Event '${event.eventId}' (canonical '${canonicalSwapKey}') has already been ingested and deduplicated`,
       };
     }
 
-    this.seenEventIds.add(event.eventId);
-    this.totalEventsIngested++;
-    this.lastEventTimestampMs = Math.max(this.lastEventTimestampMs, event.eventTimestampMs);
-    if (typeof event.slot === "number" && Number.isFinite(event.slot) && event.slot > 0) {
-      this.lastObservedSlot = Math.max(this.lastObservedSlot ?? 0, event.slot);
+    // Prune expired entries before capacity evaluation
+    this.pruneExpired(currentNow);
+
+    // Enforce storage capacity limits during ingestion
+    if (this.events.length >= this.maxEventsRetained) {
+      this.recordCapacityLoss(event.eventTimestampMs, "MAX_EVENTS_RETAINED_REACHED");
+      return {
+        ok: false,
+        reason: "CAPACITY_EXCEEDED",
+        message: `Maximum event capacity (${this.maxEventsRetained}) reached; active-window event rejected and capacity loss recorded`,
+      };
     }
 
-    // Insert in chronological order (binary insert or linear scan from end since events usually arrive mostly sorted)
-    this.insertChronologically(event);
+    if (this.seenSwapKeys.size >= this.maxDeduplicationKeys) {
+      this.recordCapacityLoss(event.eventTimestampMs, "MAX_DEDUP_KEYS_REACHED");
+      return {
+        ok: false,
+        reason: "CAPACITY_EXCEEDED",
+        message: `Maximum deduplication key capacity (${this.maxDeduplicationKeys}) reached; event rejected and capacity loss recorded`,
+      };
+    }
 
-    return { ok: true, eventId: event.eventId };
+    // Update continuous observation timeline with this event timestamp
+    this.updateObservationTimeline(event.eventTimestampMs);
+
+    // Create an immutable frozen snapshot to prevent caller mutation of ingested state
+    const frozenEvent: TradeEvent = Object.freeze({
+      eventId: event.eventId,
+      signature: event.signature,
+      swapIndex: event.swapIndex,
+      outerInstructionIndex,
+      poolId: event.poolId,
+      tokenMint: event.tokenMint,
+      side: event.side,
+      slot: event.slot,
+      blockTimeSec: event.blockTimeSec ?? null,
+      eventTimestampMs: event.eventTimestampMs,
+      receiptTimestampMs: event.receiptTimestampMs,
+      timestampProvenance: event.timestampProvenance,
+      tokenAmount: event.tokenAmount,
+      solAmount: event.solAmount,
+    });
+
+    this.seenSwapKeys.add(canonicalSwapKey);
+    this.seenEventIds.add(frozenEvent.eventId);
+    this.totalEventsIngested++;
+    this.lastEventTimestampMs = Math.max(this.lastEventTimestampMs, frozenEvent.eventTimestampMs);
+    if (frozenEvent.slot > 0) {
+      this.lastObservedSlot = Math.max(this.lastObservedSlot ?? 0, frozenEvent.slot);
+    }
+
+    // Insert in chronological order
+    this.insertChronologically(frozenEvent);
+
+    return { ok: true, eventId: frozenEvent.eventId, canonicalSwapKey };
   }
 
   /**
@@ -321,6 +568,19 @@ export class RollingTradeFlowTracker {
    * Dynamic recalculation: does not impose a 60-second evaluation interval.
    */
   public evaluateWindow(evaluationTimestampMs?: number | undefined): RollingFlowEvaluationResult {
+    if (evaluationTimestampMs !== undefined) {
+      if (
+        typeof evaluationTimestampMs !== "number" ||
+        !Number.isFinite(evaluationTimestampMs) ||
+        !Number.isInteger(evaluationTimestampMs) ||
+        evaluationTimestampMs <= 0
+      ) {
+        throw new Error(
+          `[EVALUATE_WINDOW] Invalid evaluationTimestampMs: expected positive finite integer, received: ${String(evaluationTimestampMs)}`,
+        );
+      }
+    }
+
     const nowMs = evaluationTimestampMs ?? this.clock();
     const windowStartMs = nowMs - this.windowDurationMs;
     const windowEndMs = nowMs;
@@ -328,7 +588,16 @@ export class RollingTradeFlowTracker {
     // Prune expired events and gaps beyond retention window
     this.pruneExpired(nowMs);
 
-    // Determine coverage
+    // Check observation timeline up to nowMs
+    if (nowMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
+      this.recordGapInternal(
+        this.lastObservationTimestampMs,
+        nowMs,
+        "STREAM_INACTIVITY_AT_EVALUATION",
+      );
+    }
+
+    // Determine coverage across [windowStartMs, windowEndMs]
     const coverage = this.determineCoverage(nowMs, windowStartMs, windowEndMs);
     const isCoverageSufficient = coverage === "SUFFICIENT";
 
@@ -381,6 +650,8 @@ export class RollingTradeFlowTracker {
         gapCount: this.recordedGaps.length,
         timeSinceLastEventMs,
         timeSinceLastHeartbeatMs,
+        latestCapacityLossMs: this.latestCapacityLossTimestampMs,
+        hasActiveBacklog: this.hasActiveBacklog,
       },
     };
   }
@@ -409,6 +680,60 @@ export class RollingTradeFlowTracker {
     };
   }
 
+  private updateObservationTimeline(observationMs: number): void {
+    if (observationMs < this.lastObservationTimestampMs) {
+      // Out-of-order observation from earlier timestamp; does not bridge forward silence
+      return;
+    }
+
+    // If silence exceeded maxStreamInactivityMs, an unobserved gap occurred
+    if (observationMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
+      this.recordGapInternal(
+        this.lastObservationTimestampMs,
+        observationMs,
+        "STREAM_INACTIVITY_GAP",
+      );
+    }
+
+    this.lastObservationTimestampMs = Math.max(this.lastObservationTimestampMs, observationMs);
+  }
+
+  private recordCapacityLoss(lossTimestampMs: number, reason: string): void {
+    this.latestCapacityLossTimestampMs = Math.max(
+      this.latestCapacityLossTimestampMs ?? 0,
+      lossTimestampMs,
+    );
+    this.recordGapInternal(
+      lossTimestampMs,
+      lossTimestampMs + this.windowDurationMs,
+      `CAPACITY_LOSS:${reason}`,
+    );
+  }
+
+  private recordGapInternal(startMs: number, endMs: number, reason?: string): void {
+    const frozenGap: StreamGap = Object.freeze({
+      gapStartMs: startMs,
+      gapEndMs: endMs,
+      reason: reason ?? undefined,
+    });
+    this.recordedGaps.push(frozenGap);
+
+    if (this.recordedGaps.length > this.maxGapsRetained) {
+      // Prune gaps that ended before retention cutoff
+      const cutoff = (this.clock?.() ?? Date.now()) - this.retentionWindowMs;
+      let removeCount = 0;
+      while (
+        removeCount < this.recordedGaps.length &&
+        this.recordedGaps[removeCount]!.gapEndMs < cutoff
+      ) {
+        removeCount++;
+      }
+      if (removeCount > 0) {
+        this.recordedGaps.splice(0, removeCount);
+      }
+    }
+  }
+
   private determineCoverage(
     nowMs: number,
     windowStartMs: number,
@@ -419,26 +744,33 @@ export class RollingTradeFlowTracker {
       return "UNINITIALIZED";
     }
 
-    // 2. Warm-up: elapsed tracking duration is less than the required window
+    // 2. Warm-up: elapsed tracking duration is less than the required 60s window
     if (nowMs - this.trackingStartedMs < this.windowDurationMs) {
       return "WARM_UP";
     }
 
-    // 3. Collection Gaps: check if any recorded outage intersects [windowStartMs, windowEndMs]
+    // 3. Processing Backlog
+    if (this.hasActiveBacklog) {
+      return "PROCESSING_BACKLOG";
+    }
+
+    // 4. Capacity Loss affecting window
+    if (
+      this.latestCapacityLossTimestampMs !== null &&
+      this.latestCapacityLossTimestampMs >= windowStartMs
+    ) {
+      return "CAPACITY_LOSS";
+    }
+
+    // 5. Collection Gaps intersecting [windowStartMs, windowEndMs]
     for (const gap of this.recordedGaps) {
-      if (gap.gapStartMs <= windowEndMs && gap.gapEndMs >= windowStartMs) {
+      if (gap.gapStartMs < windowEndMs && gap.gapEndMs > windowStartMs) {
         return "COLLECTION_GAP";
       }
     }
 
-    // 4. Stale Data: check stream liveness
-    // Stream is active if a heartbeat, event, or recent connection occurred within maxStreamInactivityMs
-    const latestActivityMs = Math.max(
-      this.lastHeartbeatMs,
-      this.lastEventTimestampMs,
-      this.trackingStartedMs,
-    );
-    if (nowMs - latestActivityMs > this.maxStreamInactivityMs) {
+    // 6. Stale Data: silence since last observation exceeds threshold
+    if (nowMs - this.lastObservationTimestampMs > this.maxStreamInactivityMs) {
       return "STALE_DATA";
     }
 
@@ -473,6 +805,12 @@ export class RollingTradeFlowTracker {
     ) {
       const expiredEvent = this.events[removeCount]!;
       this.seenEventIds.delete(expiredEvent.eventId);
+      const canonicalKey = deriveCanonicalSwapKey(
+        expiredEvent.signature,
+        expiredEvent.outerInstructionIndex ?? 0,
+        expiredEvent.swapIndex,
+      );
+      this.seenSwapKeys.delete(canonicalKey);
       removeCount++;
     }
 
@@ -480,16 +818,7 @@ export class RollingTradeFlowTracker {
       this.events.splice(0, removeCount);
     }
 
-    // Enforce max capacity ceiling
-    if (this.events.length > this.maxEventsRetained) {
-      const excess = this.events.length - this.maxEventsRetained;
-      for (let j = 0; j < excess; j++) {
-        this.seenEventIds.delete(this.events[j]!.eventId);
-      }
-      this.events.splice(0, excess);
-    }
-
-    // Prune gaps that are completely older than retention cutoff
+    // Prune gaps that ended before retention cutoff
     let gapRemoveCount = 0;
     while (
       gapRemoveCount < this.recordedGaps.length &&

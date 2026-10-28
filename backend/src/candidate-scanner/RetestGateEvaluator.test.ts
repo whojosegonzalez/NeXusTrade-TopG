@@ -10,6 +10,7 @@ describe("RetestGateEvaluator", () => {
     spotPriceUsd: 150.0,
     recentBuys60s: 20,
     recentSells60s: 10,
+    flowCoverage: "SUFFICIENT",
     liquidityUsd: 50_000,
   };
 

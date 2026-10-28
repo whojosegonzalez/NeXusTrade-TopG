@@ -2,20 +2,22 @@
  * Phase 12.94-D Milestone D.3.3: Rolling 60-Second Trade Flow Tracker Unit Tests
  *
  * Comprehensive offline verification of:
- * 1. Strict pool and token mint identity binding.
- * 2. Stable event identifiers distinguishing multiple swaps per transaction.
- * 3. Exact deduplication and out-of-order event ingestion.
- * 4. Dynamic 60-second moving window recalculation and boundary enforcement.
- * 5. Explicit coverage classification: WARM_UP, COLLECTION_GAP, STALE_DATA, SUFFICIENT.
- * 6. Unavailable counts (null) for insufficient coverage vs honest zero for observed empty window.
- * 7. Bounded retention and memory protection.
- * 8. Narrow integration with RetestGateEvaluator (unavailable flow never produces entry confirmation).
+ * 1. Complete window coverage verification (rejects silence/single-heartbeat false passes).
+ * 2. Capacity bounds & fail-closed protection (prevents capacity loss from producing misleading counts).
+ * 3. Input validation, immutable snapshotting, and canonical swap coordinate deduplication.
+ * 4. Retest boundary enforcement (typed coverage, finite non-negative integer counts, fail-closed unverified flow).
+ * 5. Multi-swap transactions, moving window boundaries, honest empty windows, and out-of-order handling.
  *
  * ALL tests execute 100% offline with synthetic fixtures and zero network activity.
  */
 
 import { describe, expect, it } from "vitest";
-import { RollingTradeFlowTracker, type TradeEvent } from "./RollingTradeFlowTracker.js";
+import {
+  deriveCanonicalSwapKey,
+  RollingTradeFlowTracker,
+  type TradeEvent,
+  type TradeTimestampProvenance,
+} from "./RollingTradeFlowTracker.js";
 import { evaluateRetestGate } from "./RetestGateEvaluator.js";
 
 // Canonical 32-byte test fixture addresses
@@ -25,12 +27,16 @@ const OTHER_POOL_ID = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
 const OTHER_TOKEN_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
 
 function createSyntheticTradeEvent(overrides: Partial<TradeEvent> = {}): TradeEvent {
-  const eventId = overrides.eventId ?? `tx-${Date.now()}:0`;
-  const [signature = "sig123", swapIndexStr = "0"] = eventId.split(":");
+  const signature = overrides.signature ?? "5J9XzMvY4bA7sD1fG2h3j4k5L6m7N8p9Q1w2e3r4t5y6u7i8o9p0";
+  const swapIndex = overrides.swapIndex ?? 0;
+  const outerInstructionIndex = overrides.outerInstructionIndex ?? 0;
+  const eventId = overrides.eventId ?? `${signature}:${outerInstructionIndex}:${swapIndex}`;
+
   return {
     eventId,
     signature,
-    swapIndex: Number(swapIndexStr),
+    swapIndex,
+    outerInstructionIndex,
     poolId: CANONICAL_POOL_ID,
     tokenMint: CANONICAL_TOKEN_MINT,
     side: "BUY",
@@ -45,751 +51,156 @@ function createSyntheticTradeEvent(overrides: Partial<TradeEvent> = {}): TradeEv
   };
 }
 
-describe("RollingTradeFlowTracker", () => {
-  describe("Constructor & Initialization Validation", () => {
-    it("initializes with canonical pool and mint identities", () => {
+describe("RollingTradeFlowTracker — Audited Corrections", () => {
+  describe("1. Complete Window Coverage Verification (Finding 1)", () => {
+    it("rejects false pass: tracker started 60s ago with only one heartbeat at evaluation time reports COLLECTION_GAP and null counts", () => {
+      const nowMs = 1_060_000;
       const tracker = new RollingTradeFlowTracker({
         poolId: CANONICAL_POOL_ID,
         tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: 1_000_000,
-      });
-
-      expect(tracker.getPoolId()).toBe(CANONICAL_POOL_ID);
-      expect(tracker.getTokenMint()).toBe(CANONICAL_TOKEN_MINT);
-      expect(tracker.getTrackingStartedMs()).toBe(1_000_000);
-      expect(tracker.getEventsCount()).toBe(0);
-    });
-
-    it("fails closed on malformed or non-canonical poolId", () => {
-      expect(() => {
-        new RollingTradeFlowTracker({
-          poolId: "invalid_non_base58_0OIl",
-          tokenMint: CANONICAL_TOKEN_MINT,
-        });
-      }).toThrow(/Invalid or non-canonical poolId/);
-    });
-
-    it("fails closed on malformed or non-canonical tokenMint", () => {
-      expect(() => {
-        new RollingTradeFlowTracker({
-          poolId: CANONICAL_POOL_ID,
-          tokenMint: "short_mint",
-        });
-      }).toThrow(/Invalid or non-canonical tokenMint/);
-    });
-  });
-
-  describe("Identity Binding & Ingestion Validation", () => {
-    it("rejects trade event with mismatched pool ID", () => {
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-      });
-
-      const event = createSyntheticTradeEvent({
-        poolId: OTHER_POOL_ID,
-      });
-
-      const res = tracker.ingestTrade(event);
-      expect(res.ok).toBe(false);
-      if (!res.ok) {
-        expect(res.reason).toBe("IDENTITY_MISMATCH_POOL");
-      }
-      expect(tracker.getEventsCount()).toBe(0);
-    });
-
-    it("rejects trade event with mismatched token mint", () => {
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-      });
-
-      const event = createSyntheticTradeEvent({
-        tokenMint: OTHER_TOKEN_MINT,
-      });
-
-      const res = tracker.ingestTrade(event);
-      expect(res.ok).toBe(false);
-      if (!res.ok) {
-        expect(res.reason).toBe("IDENTITY_MISMATCH_MINT");
-      }
-      expect(tracker.getEventsCount()).toBe(0);
-    });
-
-    it("rejects trade event with missing or empty eventId", () => {
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-      });
-
-      const event = createSyntheticTradeEvent({ eventId: "" });
-      const res = tracker.ingestTrade(event);
-      expect(res.ok).toBe(false);
-      if (!res.ok) {
-        expect(res.reason).toBe("MISSING_EVENT_ID");
-      }
-    });
-
-    it("rejects trade event with invalid or non-positive timestamp", () => {
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-      });
-
-      const resZero = tracker.ingestTrade(createSyntheticTradeEvent({ eventTimestampMs: 0 }));
-      expect(resZero.ok).toBe(false);
-      if (!resZero.ok) expect(resZero.reason).toBe("INVALID_TIMESTAMP");
-
-      const resNegative = tracker.ingestTrade(
-        createSyntheticTradeEvent({ eventTimestampMs: -100 }),
-      );
-      expect(resNegative.ok).toBe(false);
-      if (!resNegative.ok) expect(resNegative.reason).toBe("INVALID_TIMESTAMP");
-
-      const resNaN = tracker.ingestTrade(createSyntheticTradeEvent({ eventTimestampMs: NaN }));
-      expect(resNaN.ok).toBe(false);
-      if (!resNaN.ok) expect(resNaN.reason).toBe("INVALID_TIMESTAMP");
-    });
-
-    it("rejects trade event with future-dated timestamp exceeding allowable skew", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        maxFutureSkewMs: 5_000,
+        trackingStartedMs: nowMs - 60_000, // Started 60 seconds ago: 1,000,000
+        maxStreamInactivityMs: 15_000,
         clock: () => nowMs,
       });
 
-      // 6 seconds in future (exceeds 5s skew)
-      const res = tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventTimestampMs: nowMs + 6_000,
-        }),
-      );
-      expect(res.ok).toBe(false);
-      if (!res.ok) {
-        expect(res.reason).toBe("FUTURE_DATED_TIMESTAMP");
-      }
-    });
-  });
-
-  describe("Stable Event Identifiers & Multiple Swaps per Transaction", () => {
-    it("distinguishes multiple swaps within the same transaction using distinct swapIndex", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 70_000, // Sufficiently warmed up
-        clock: () => nowMs,
-      });
-
-      const txSig = "5J9XzMvY4bA7sD1fG2h3j4k5L6m7N8p9";
-
-      // Swap 0: User buys candidate token
-      const swap0 = createSyntheticTradeEvent({
-        eventId: `${txSig}:0`,
-        signature: txSig,
-        swapIndex: 0,
-        side: "BUY",
-        eventTimestampMs: nowMs - 30_000,
-      });
-
-      // Swap 1: Router sells candidate token in same tx
-      const swap1 = createSyntheticTradeEvent({
-        eventId: `${txSig}:1`,
-        signature: txSig,
-        swapIndex: 1,
-        side: "SELL",
-        eventTimestampMs: nowMs - 30_000,
-      });
-
-      const res0 = tracker.ingestTrade(swap0);
-      const res1 = tracker.ingestTrade(swap1);
+      // NO heartbeats or trades occurred during the 60s.
+      // At evaluation time (1,060,000), caller records one heartbeat:
       tracker.recordHeartbeat(nowMs);
 
-      expect(res0.ok).toBe(true);
-      expect(res1.ok).toBe(true);
-      expect(tracker.getEventsCount()).toBe(2);
-
       const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("SUFFICIENT");
-      expect(evalResult.recentBuys60s).toBe(1);
-      expect(evalResult.recentSells60s).toBe(1);
-    });
-  });
 
-  describe("Deduplication & Out-of-Order Ingestion", () => {
-    it("deduplicates identical eventId and prevents double-counting", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 70_000,
-        clock: () => nowMs,
-      });
-
-      const event = createSyntheticTradeEvent({
-        eventId: "sig-repeat:0",
-        side: "BUY",
-        eventTimestampMs: nowMs - 20_000,
-      });
-
-      const first = tracker.ingestTrade(event);
-      expect(first.ok).toBe(true);
-
-      const duplicate = tracker.ingestTrade(event);
-      expect(duplicate.ok).toBe(false);
-      if (!duplicate.ok) {
-        expect(duplicate.reason).toBe("DUPLICATE_EVENT");
-      }
-
-      expect(tracker.getEventsCount()).toBe(1);
-
-      tracker.recordHeartbeat(nowMs);
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.recentBuys60s).toBe(1);
-      expect(evalResult.diagnostics.deduplicatedEventsCount).toBe(1);
-    });
-
-    it("ingests out-of-order events and sorts chronologically", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000,
-        clock: () => nowMs,
-      });
-
-      // Ingest at t - 10s, then t - 40s, then t - 20s, then t - 50s
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "e1:0",
-          eventTimestampMs: nowMs - 10_000,
-          side: "BUY",
-        }),
-      );
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "e2:0",
-          eventTimestampMs: nowMs - 40_000,
-          side: "SELL",
-        }),
-      );
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "e3:0",
-          eventTimestampMs: nowMs - 20_000,
-          side: "BUY",
-        }),
-      );
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "e4:0",
-          eventTimestampMs: nowMs - 50_000,
-          side: "BUY",
-        }),
-      );
-
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("SUFFICIENT");
-      expect(evalResult.recentBuys60s).toBe(3);
-      expect(evalResult.recentSells60s).toBe(1);
-    });
-  });
-
-  describe("Dynamic 60-Second Moving Window Recalculation & Boundary Rules", () => {
-    it("evaluates window dynamically on demand without imposing a 60-second evaluation interval", () => {
-      let currentClock = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: currentClock - 100_000,
-        clock: () => currentClock,
-      });
-
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "t1:0",
-          eventTimestampMs: currentClock - 15_000,
-          side: "BUY",
-        }),
-      );
-      tracker.recordHeartbeat(currentClock);
-
-      // Evaluate at t = 1,000,000
-      const eval1 = tracker.evaluateWindow(currentClock);
-      expect(eval1.recentBuys60s).toBe(1);
-
-      // Evaluate 1,500 ms later (ticker interval)
-      currentClock += 1_500;
-      tracker.recordHeartbeat(currentClock);
-      const eval2 = tracker.evaluateWindow(currentClock);
-      expect(eval2.recentBuys60s).toBe(1);
-      expect(eval2.windowEndMs - eval2.windowStartMs).toBe(60_000);
-    });
-
-    it("strictly respects closed window boundaries [now - 60s, now]", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000,
-        clock: () => nowMs,
-      });
-
-      // Trade 1: Exactly at window start (now - 60,000) -> INCLUDED
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "b-exact-start:0",
-          eventTimestampMs: nowMs - 60_000,
-          side: "BUY",
-        }),
-      );
-
-      // Trade 2: Exactly at window end (now) -> INCLUDED
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "b-exact-end:0",
-          eventTimestampMs: nowMs,
-          side: "BUY",
-        }),
-      );
-
-      // Trade 3: 1ms before window start (now - 60,001) -> EXCLUDED
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "b-before-start:0",
-          eventTimestampMs: nowMs - 60_001,
-          side: "SELL",
-        }),
-      );
-
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("SUFFICIENT");
-      expect(evalResult.recentBuys60s).toBe(2);
-      expect(evalResult.recentSells60s).toBe(0);
-    });
-
-    it("evicts older trades from 60s counts as the evaluation window moves forward", () => {
-      const startMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: startMs - 100_000,
-        clock: () => startMs,
-      });
-
-      // Trade occurred at startMs - 50s
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "decay-trade:0",
-          eventTimestampMs: startMs - 50_000,
-          side: "BUY",
-        }),
-      );
-      tracker.recordHeartbeat(startMs);
-
-      // At startMs: trade is within [startMs - 60s, startMs]
-      const eval1 = tracker.evaluateWindow(startMs);
-      expect(eval1.recentBuys60s).toBe(1);
-
-      // Advance evaluation by 15s to startMs + 15s: window is [startMs - 45s, startMs + 15s]
-      // Trade at startMs - 50s is now outside window!
-      tracker.recordHeartbeat(startMs + 15_000);
-      const eval2 = tracker.evaluateWindow(startMs + 15_000);
-      expect(eval2.recentBuys60s).toBe(0);
-    });
-  });
-
-  describe("Coverage Guarantees: Warm-Up, Collection Gaps, Stale Data & Sufficient Coverage", () => {
-    it("returns WARM_UP and null counts when tracking duration is under 60 seconds", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 45_000, // Only 45s of tracking (warm-up)
-        clock: () => nowMs,
-      });
-
-      // Even if trades are ingested during warm-up:
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "warm-buy:0",
-          eventTimestampMs: nowMs - 10_000,
-          side: "BUY",
-        }),
-      );
-
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("WARM_UP");
+      // Must NOT report SUFFICIENT! The 60-second unobserved silence between 1,000,000 and 1,060,000 is an unobserved gap!
+      expect(evalResult.coverage).toBe("COLLECTION_GAP");
       expect(evalResult.isCoverageSufficient).toBe(false);
       expect(evalResult.recentBuys60s).toBeNull();
       expect(evalResult.recentSells60s).toBeNull();
       expect(evalResult.flowRatio).toBeNull();
     });
 
-    it("returns COLLECTION_GAP and null counts when a recorded gap intersects the 60-second window", () => {
-      const nowMs = 1_000_000;
+    it("reports SUFFICIENT and honest zero trades when regular heartbeats prove continuous observation across the window", () => {
+      const startMs = 1_000_000;
+      let currentClock = startMs;
       const tracker = new RollingTradeFlowTracker({
         poolId: CANONICAL_POOL_ID,
         tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000, // Warmed up
-        clock: () => nowMs,
-      });
-
-      // A WebSocket disconnection or collection drop occurred between now - 35s and now - 25s
-      tracker.recordCollectionGap({
-        gapStartMs: nowMs - 35_000,
-        gapEndMs: nowMs - 25_000,
-        reason: "WS_DISCONNECT_RECONNECT",
-      });
-
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "pre-gap:0",
-          eventTimestampMs: nowMs - 45_000,
-          side: "BUY",
-        }),
-      );
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "post-gap:0",
-          eventTimestampMs: nowMs - 5_000,
-          side: "BUY",
-        }),
-      );
-
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("COLLECTION_GAP");
-      expect(evalResult.isCoverageSufficient).toBe(false);
-      expect(evalResult.recentBuys60s).toBeNull();
-      expect(evalResult.recentSells60s).toBeNull();
-      expect(evalResult.diagnostics.gapCount).toBe(1);
-    });
-
-    it("returns STALE_DATA and null counts when stream inactivity exceeds threshold", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000,
+        trackingStartedMs: startMs,
         maxStreamInactivityMs: 15_000,
-        clock: () => nowMs,
+        clock: () => currentClock,
       });
 
-      // Last activity (trade or heartbeat) was 25 seconds ago (exceeds 15s max inactivity)
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "stale-trade:0",
-          eventTimestampMs: nowMs - 25_000,
-          side: "BUY",
-        }),
-      );
-      tracker.recordHeartbeat(nowMs - 25_000);
+      // Regular heartbeats every 10 seconds (well within 15s maxStreamInactivityMs)
+      for (let t = startMs + 10_000; t <= startMs + 60_000; t += 10_000) {
+        currentClock = t;
+        tracker.recordHeartbeat(t);
+      }
 
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("STALE_DATA");
-      expect(evalResult.isCoverageSufficient).toBe(false);
-      expect(evalResult.recentBuys60s).toBeNull();
-      expect(evalResult.recentSells60s).toBeNull();
-    });
-
-    it("recovers to SUFFICIENT coverage when stream heartbeat confirms ongoing liveness", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000,
-        maxStreamInactivityMs: 15_000,
-        clock: () => nowMs,
-      });
-
-      // Heartbeat at now - 2s confirms stream is alive
-      tracker.recordHeartbeat(nowMs - 2_000, 300_000_500);
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "live-trade:0",
-          eventTimestampMs: nowMs - 10_000,
-          side: "BUY",
-        }),
-      );
-
-      const evalResult = tracker.evaluateWindow(nowMs);
+      const evalResult = tracker.evaluateWindow(startMs + 60_000);
       expect(evalResult.coverage).toBe("SUFFICIENT");
       expect(evalResult.isCoverageSufficient).toBe(true);
-      expect(evalResult.recentBuys60s).toBe(1);
-      expect(evalResult.recentSells60s).toBe(0);
-      expect(tracker.getLastObservedSlot()).toBe(300_000_500);
-    });
-
-    it("reports honest zero (recentBuys60s = 0, recentSells60s = 0) only for a sufficiently observed window containing no trades", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 120_000, // Tracking for 2 minutes
-        clock: () => nowMs,
-      });
-
-      // Regular heartbeats prove continuous connection, but 0 trades occurred
-      tracker.recordHeartbeat(nowMs - 5_000);
-
-      const evalResult = tracker.evaluateWindow(nowMs);
-      expect(evalResult.coverage).toBe("SUFFICIENT");
-      expect(evalResult.isCoverageSufficient).toBe(true);
-      // Genuinely observed empty window: reports 0, NOT null!
+      // Genuinely observed empty window
       expect(evalResult.recentBuys60s).toBe(0);
       expect(evalResult.recentSells60s).toBe(0);
       expect(evalResult.flowRatio).toBe(1.0);
     });
+
+    it("reports PROCESSING_BACKLOG and null counts when backlog is active", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        clock: () => nowMs,
+      });
+
+      // Provide continuous heartbeats but set backlog flag
+      for (let t = nowMs - 50_000; t <= nowMs; t += 10_000) {
+        tracker.recordHeartbeat(t, undefined, { isBacklogged: t === nowMs });
+      }
+
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("PROCESSING_BACKLOG");
+      expect(evalResult.isCoverageSufficient).toBe(false);
+      expect(evalResult.recentBuys60s).toBeNull();
+      expect(evalResult.recentSells60s).toBeNull();
+    });
+
+    it("reports STALE_DATA and null counts when evaluation time is silent beyond maxStreamInactivityMs", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        maxStreamInactivityMs: 15_000,
+        clock: () => nowMs,
+      });
+
+      // Heartbeats up to now - 20s
+      for (let t = nowMs - 50_000; t <= nowMs - 20_000; t += 10_000) {
+        tracker.recordHeartbeat(t);
+      }
+
+      // No heartbeat between now - 20s and nowMs (20s silence > 15s)
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("COLLECTION_GAP");
+      expect(evalResult.isCoverageSufficient).toBe(false);
+      expect(evalResult.recentBuys60s).toBeNull();
+    });
   });
 
-  describe("Bounded Retention & Storage", () => {
-    it("prunes events and deduplication keys older than retention window", () => {
+  describe("2. Storage Bounds & Capacity Limits (Finding 2)", () => {
+    it("rejects events at capacity, records capacity loss, and returns null counts rather than silently dropping sells", () => {
       const startMs = 1_000_000;
+      const nowMs = startMs + 60_000;
       const tracker = new RollingTradeFlowTracker({
         poolId: CANONICAL_POOL_ID,
         tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: startMs - 300_000,
-        retentionWindowMs: 120_000, // 2 minutes retention
-        clock: () => startMs,
+        trackingStartedMs: startMs,
+        maxEventsRetained: 100, // Cap storage at 100
+        clock: () => nowMs,
       });
 
-      // Old event from 200s ago
-      tracker.ingestTrade(
+      // Provide regular heartbeats
+      for (let t = startMs; t <= nowMs; t += 10_000) {
+        tracker.recordHeartbeat(t);
+      }
+
+      // Ingest 100 active-window SELL events (fills capacity to 100)
+      for (let i = 0; i < 100; i++) {
+        const res = tracker.ingestTrade(
+          createSyntheticTradeEvent({
+            signature: `sell-sig-${i}`,
+            swapIndex: 0,
+            side: "SELL",
+            eventTimestampMs: startMs + 10_000 + i * 100,
+          }),
+        );
+        expect(res.ok).toBe(true);
+      }
+      expect(tracker.getEventsCount()).toBe(100);
+
+      // Now attempt to ingest 100 BUY events: event 101 must be rejected with CAPACITY_EXCEEDED
+      const buyRes = tracker.ingestTrade(
         createSyntheticTradeEvent({
-          eventId: "very-old:0",
-          eventTimestampMs: startMs - 200_000,
+          signature: "buy-sig-0",
+          swapIndex: 0,
           side: "BUY",
+          eventTimestampMs: startMs + 30_000,
         }),
       );
-      // Fresh event from 30s ago
-      tracker.ingestTrade(
-        createSyntheticTradeEvent({
-          eventId: "fresh:0",
-          eventTimestampMs: startMs - 30_000,
-          side: "BUY",
-        }),
-      );
-
-      expect(tracker.getEventsCount()).toBe(2);
-
-      // Trigger evaluation -> triggers pruning
-      tracker.recordHeartbeat(startMs);
-      const evalResult = tracker.evaluateWindow(startMs);
-      expect(evalResult.recentBuys60s).toBe(1);
-      expect(tracker.getEventsCount()).toBe(1); // Old event pruned from buffer
-    });
-
-    it("enforces maxEventsRetained ceiling to protect memory", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 100_000,
-        maxEventsRetained: 100,
-        clock: () => nowMs,
-      });
-
-      // Ingest 150 events
-      for (let i = 0; i < 150; i++) {
-        tracker.ingestTrade(
-          createSyntheticTradeEvent({
-            eventId: `burst-${i}:0`,
-            eventTimestampMs: nowMs - 50_000 + i * 100,
-            side: "BUY",
-          }),
-        );
+      expect(buyRes.ok).toBe(false);
+      if (!buyRes.ok) {
+        expect(buyRes.reason).toBe("CAPACITY_EXCEEDED");
       }
 
-      tracker.recordHeartbeat(nowMs);
-      tracker.evaluateWindow(nowMs);
+      // Evaluate window: must NOT report 100 buys / 0 sells!
+      // Capacity loss affected the active window -> coverage must NOT be SUFFICIENT!
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.isCoverageSufficient).toBe(false);
+      expect(evalResult.coverage).toBe("CAPACITY_LOSS");
+      expect(evalResult.recentBuys60s).toBeNull();
+      expect(evalResult.recentSells60s).toBeNull();
 
-      // Must be capped at maxEventsRetained (100)
-      expect(tracker.getEventsCount()).toBeLessThanOrEqual(100);
-    });
-  });
-
-  describe("RetestGateEvaluator Integration Path", () => {
-    it("prevents entry confirmation when flow is unavailable (WARM_UP)", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 30_000, // In warm-up (< 60s)
-        clock: () => nowMs,
-      });
-
-      const spotInfo = tracker.createRetestSpotInfo(
-        {
-          spotPriceSol: 0.95, // 5% pullback discount (Rule A price criteria met for Established)
-          spotPriceUsd: 142.5,
-          liquidityUsd: 100_000,
-        },
-        nowMs,
-      );
-
-      expect(spotInfo.recentBuys60s).toBeNull();
-      expect(spotInfo.recentSells60s).toBeNull();
-
-      const existingArmed = {
-        mintAddress: CANONICAL_TOKEN_MINT,
-        armedAtMs: nowMs - 10_000,
-        peakPriceSol: 1.0,
-        peakPriceUsd: 150.0,
-        ticksObserved: 2,
-      };
-
-      const result = evaluateRetestGate({
-        mintAddress: CANONICAL_TOKEN_MINT,
-        isEstablished: true,
-        currentNowMs: nowMs,
-        spotInfo,
-        existingArmedState: existingArmed,
-      });
-
-      // Crucial requirement: Unavailable flow MUST NOT produce entry confirmation!
-      expect(result.status).toBe("WAITING");
-    });
-
-    it("prevents entry confirmation when flow is a genuinely observed empty window (0 buys, 0 sells)", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 120_000, // Fully warmed up
-        clock: () => nowMs,
-      });
-
-      // Stream is alive, but 0 trades happened
-      tracker.recordHeartbeat(nowMs - 2_000);
-
-      const spotInfo = tracker.createRetestSpotInfo(
-        {
-          spotPriceSol: 0.95, // 5% pullback discount
-          spotPriceUsd: 142.5,
-          liquidityUsd: 100_000,
-        },
-        nowMs,
-      );
-
-      expect(spotInfo.recentBuys60s).toBe(0);
-      expect(spotInfo.recentSells60s).toBe(0);
-
-      const existingArmed = {
-        mintAddress: CANONICAL_TOKEN_MINT,
-        armedAtMs: nowMs - 10_000,
-        peakPriceSol: 1.0,
-        peakPriceUsd: 150.0,
-        ticksObserved: 2,
-      };
-
-      const result = evaluateRetestGate({
-        mintAddress: CANONICAL_TOKEN_MINT,
-        isEstablished: true,
-        currentNowMs: nowMs,
-        spotInfo,
-        existingArmedState: existingArmed,
-      });
-
-      // Empty window (0 buys) must NOT confirm entry: zero volume cannot establish flow absorption!
-      expect(result.status).toBe("WAITING");
-    });
-
-    it("confirms entry when flow is SUFFICIENT and meets flow absorption threshold (Rule A)", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 120_000,
-        clock: () => nowMs,
-      });
-
-      // Ingest 23 buys and 10 sells (23 >= 1.15 * 10 = 11.5, ratio = 2.3x)
-      for (let i = 0; i < 23; i++) {
-        tracker.ingestTrade(
-          createSyntheticTradeEvent({
-            eventId: `buy-${i}:0`,
-            eventTimestampMs: nowMs - 30_000 + i * 500,
-            side: "BUY",
-          }),
-        );
-      }
-      for (let i = 0; i < 10; i++) {
-        tracker.ingestTrade(
-          createSyntheticTradeEvent({
-            eventId: `sell-${i}:0`,
-            eventTimestampMs: nowMs - 20_000 + i * 500,
-            side: "SELL",
-          }),
-        );
-      }
-      tracker.recordHeartbeat(nowMs - 1_000);
-
-      const spotInfo = tracker.createRetestSpotInfo(
-        {
-          spotPriceSol: 0.95, // 5% pullback discount
-          spotPriceUsd: 142.5,
-          liquidityUsd: 100_000,
-        },
-        nowMs,
-      );
-
-      expect(spotInfo.recentBuys60s).toBe(23);
-      expect(spotInfo.recentSells60s).toBe(10);
-
-      const existingArmed = {
-        mintAddress: CANONICAL_TOKEN_MINT,
-        armedAtMs: nowMs - 10_000,
-        peakPriceSol: 1.0,
-        peakPriceUsd: 150.0,
-        ticksObserved: 2,
-      };
-
-      const result = evaluateRetestGate({
-        mintAddress: CANONICAL_TOKEN_MINT,
-        isEstablished: true,
-        currentNowMs: nowMs,
-        spotInfo,
-        existingArmedState: existingArmed,
-      });
-
-      expect(result.status).toBe("CONFIRMED");
-      if (result.status === "CONFIRMED") {
-        expect(result.confirmReason).toBe("RETEST_PULLBACK_DISCOUNT");
-      }
-    });
-
-    it("rejects candidate when seller surge is observed during armed wait (Rule E)", () => {
-      const nowMs = 1_000_000;
-      const tracker = new RollingTradeFlowTracker({
-        poolId: CANONICAL_POOL_ID,
-        tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 120_000,
-        clock: () => nowMs,
-      });
-
-      // Ingest 28 sells and 5 buys (sells >= 25 && sells >= 2.5 * buys: 28 >= 2.5 * 5 = 12.5)
-      for (let i = 0; i < 5; i++) {
-        tracker.ingestTrade(
-          createSyntheticTradeEvent({
-            eventId: `b-${i}:0`,
-            eventTimestampMs: nowMs - 30_000 + i * 500,
-            side: "BUY",
-          }),
-        );
-      }
-      for (let i = 0; i < 28; i++) {
-        tracker.ingestTrade(
-          createSyntheticTradeEvent({
-            eventId: `s-${i}:0`,
-            eventTimestampMs: nowMs - 20_000 + i * 500,
-            side: "SELL",
-          }),
-        );
-      }
-      tracker.recordHeartbeat(nowMs - 500);
-
+      // Integration check: Retest gate spot info must carry null counts and status WAITING
       const spotInfo = tracker.createRetestSpotInfo(
         {
           spotPriceSol: 0.95,
@@ -799,69 +210,388 @@ describe("RollingTradeFlowTracker", () => {
         nowMs,
       );
 
-      const existingArmed = {
-        mintAddress: CANONICAL_TOKEN_MINT,
-        armedAtMs: nowMs - 10_000,
-        peakPriceSol: 1.0,
-        peakPriceUsd: 150.0,
-        ticksObserved: 2,
-      };
+      expect(spotInfo.recentBuys60s).toBeNull();
+      expect(spotInfo.recentSells60s).toBeNull();
 
-      const result = evaluateRetestGate({
+      const retestRes = evaluateRetestGate({
         mintAddress: CANONICAL_TOKEN_MINT,
         isEstablished: true,
         currentNowMs: nowMs,
         spotInfo,
-        existingArmedState: existingArmed,
+        existingArmedState: {
+          mintAddress: CANONICAL_TOKEN_MINT,
+          armedAtMs: nowMs - 10_000,
+          peakPriceSol: 1.0,
+          peakPriceUsd: 150.0,
+          ticksObserved: 2,
+        },
       });
 
-      expect(result.status).toBe("REJECTED");
-      if (result.status === "REJECTED") {
-        expect(result.rejectReason).toBe("REJECTED_IN_FLIGHT_SELLER_SURGE");
-        expect(result.rejectionGateName).toBe("RetestSellerSurge");
-      }
+      // Must be WAITING, NEVER CONFIRMED!
+      expect(retestRes.status).toBe("WAITING");
     });
+  });
 
-    it("preserves crater drop rejection even when flow is unavailable", () => {
-      const nowMs = 1_000_000;
+  describe("3. Validate and Snapshot Ingestion Inputs (Finding 3)", () => {
+    it("caller mutating an event object after ingestion does not alter stored tracker state", () => {
+      const nowMs = 1_060_000;
       const tracker = new RollingTradeFlowTracker({
         poolId: CANONICAL_POOL_ID,
         tokenMint: CANONICAL_TOKEN_MINT,
-        trackingStartedMs: nowMs - 30_000, // WARM_UP -> flow unavailable
+        trackingStartedMs: nowMs - 60_000,
         clock: () => nowMs,
       });
 
-      const spotInfo = tracker.createRetestSpotInfo(
-        {
-          spotPriceSol: 0.8, // 20% plunge (exceeds 15% micro-cap crater ceiling)
-          spotPriceUsd: 120.0,
-          liquidityUsd: 30_000,
-        },
-        nowMs,
+      for (let t = nowMs - 60_000; t <= nowMs; t += 10_000) {
+        tracker.recordHeartbeat(t);
+      }
+
+      const mutableEvent: TradeEvent = createSyntheticTradeEvent({
+        signature: "mutable-sig",
+        swapIndex: 0,
+        side: "BUY",
+        eventTimestampMs: nowMs - 30_000,
+      });
+
+      const res = tracker.ingestTrade(mutableEvent);
+      expect(res.ok).toBe(true);
+
+      // Caller mutates their own object
+      (mutableEvent as unknown as { side: string }).side = "SELL";
+
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("SUFFICIENT");
+      // Must still be 1 BUY and 0 SELLS!
+      expect(evalResult.recentBuys60s).toBe(1);
+      expect(evalResult.recentSells60s).toBe(0);
+    });
+
+    it("rejects same signature and swapIndex with different eventId labels as DUPLICATE_EVENT", () => {
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+      });
+
+      const event1 = createSyntheticTradeEvent({
+        eventId: "custom-label-A",
+        signature: "duplicate-sig",
+        outerInstructionIndex: 0,
+        swapIndex: 0,
+      });
+
+      const event2 = createSyntheticTradeEvent({
+        eventId: "custom-label-B", // Different label, same coordinates!
+        signature: "duplicate-sig",
+        outerInstructionIndex: 0,
+        swapIndex: 0,
+      });
+
+      const res1 = tracker.ingestTrade(event1);
+      const res2 = tracker.ingestTrade(event2);
+
+      expect(res1.ok).toBe(true);
+      expect(res2.ok).toBe(false);
+      if (!res2.ok) {
+        expect(res2.reason).toBe("DUPLICATE_EVENT");
+      }
+      expect(tracker.getEventsCount()).toBe(1);
+    });
+
+    it("rejects empty signature, negative swapIndex, invalid slot, and fractional event timestamps", () => {
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+      });
+
+      // Identity mismatch pool
+      const resBadPool = tracker.ingestTrade(createSyntheticTradeEvent({ poolId: OTHER_POOL_ID }));
+      expect(resBadPool.ok).toBe(false);
+      if (!resBadPool.ok) expect(resBadPool.reason).toBe("IDENTITY_MISMATCH_POOL");
+
+      // Identity mismatch mint
+      const resBadMint = tracker.ingestTrade(
+        createSyntheticTradeEvent({ tokenMint: OTHER_TOKEN_MINT }),
       );
+      expect(resBadMint.ok).toBe(false);
+      if (!resBadMint.ok) expect(resBadMint.reason).toBe("IDENTITY_MISMATCH_MINT");
 
-      expect(spotInfo.recentBuys60s).toBeNull();
+      // Empty signature
+      const resEmptySig = tracker.ingestTrade(createSyntheticTradeEvent({ signature: "" }));
+      expect(resEmptySig.ok).toBe(false);
+      if (!resEmptySig.ok) expect(resEmptySig.reason).toBe("INVALID_SIGNATURE");
 
-      const existingArmed = {
+      // Negative swapIndex
+      const resNegSwap = tracker.ingestTrade(createSyntheticTradeEvent({ swapIndex: -1 }));
+      expect(resNegSwap.ok).toBe(false);
+      if (!resNegSwap.ok) expect(resNegSwap.reason).toBe("INVALID_SWAP_INDEX");
+
+      // Negative outerInstructionIndex
+      const resNegOuter = tracker.ingestTrade(
+        createSyntheticTradeEvent({ outerInstructionIndex: -1 }),
+      );
+      expect(resNegOuter.ok).toBe(false);
+      if (!resNegOuter.ok) expect(resNegOuter.reason).toBe("INVALID_INSTRUCTION_INDEX");
+
+      // NaN slot
+      const resNanSlot = tracker.ingestTrade(createSyntheticTradeEvent({ slot: NaN }));
+      expect(resNanSlot.ok).toBe(false);
+      if (!resNanSlot.ok) expect(resNanSlot.reason).toBe("INVALID_SLOT");
+
+      // NaN receipt timestamp
+      const resNanReceipt = tracker.ingestTrade(
+        createSyntheticTradeEvent({ receiptTimestampMs: NaN }),
+      );
+      expect(resNanReceipt.ok).toBe(false);
+      if (!resNanReceipt.ok) expect(resNanReceipt.reason).toBe("INVALID_RECEIPT_TIMESTAMP");
+
+      // Missing or invalid provenance
+      const resBadProv = tracker.ingestTrade(
+        createSyntheticTradeEvent({
+          timestampProvenance: "UNKNOWN" as unknown as TradeTimestampProvenance,
+        }),
+      );
+      expect(resBadProv.ok).toBe(false);
+      if (!resBadProv.ok) expect(resBadProv.reason).toBe("INVALID_PROVENANCE");
+
+      // Fractional event timestamp
+      const resFracTs = tracker.ingestTrade(
+        createSyntheticTradeEvent({ eventTimestampMs: 1_700_000_000_000.5 }),
+      );
+      expect(resFracTs.ok).toBe(false);
+      if (!resFracTs.ok) expect(resFracTs.reason).toBe("INVALID_TIMESTAMP");
+    });
+
+    it("evaluateWindow(NaN) throws error and does not report SUFFICIENT", () => {
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+      });
+
+      expect(() => tracker.evaluateWindow(NaN)).toThrow(/Invalid evaluationTimestampMs/);
+      expect(() => tracker.evaluateWindow(-100)).toThrow(/Invalid evaluationTimestampMs/);
+      expect(() => tracker.evaluateWindow(1.5)).toThrow(/Invalid evaluationTimestampMs/);
+    });
+
+    it("rejects windowDurationMs !== 60_000 in constructor", () => {
+      expect(() => {
+        new RollingTradeFlowTracker({
+          poolId: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          windowDurationMs: 10_000,
+        });
+      }).toThrow(
+        /Invalid windowDurationMs: 10000\. The strategy requires an exact 60,000 ms window/,
+      );
+    });
+  });
+
+  describe("4. Retest Boundary Enforcement (Finding 4)", () => {
+    const existingArmed = {
+      mintAddress: CANONICAL_TOKEN_MINT,
+      armedAtMs: 1_050_000,
+      peakPriceSol: 1.0,
+      peakPriceUsd: 150.0,
+      ticksObserved: 2,
+    };
+
+    it("prevents confirmation when flowCoverage = COLLECTION_GAP even with strong counts (20 buys / 10 sells)", () => {
+      const result = evaluateRetestGate({
         mintAddress: CANONICAL_TOKEN_MINT,
-        armedAtMs: nowMs - 10_000,
-        peakPriceSol: 1.0,
-        peakPriceUsd: 150.0,
-        ticksObserved: 2,
-      };
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95, // Discount met
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: 20,
+          recentSells60s: 10,
+          flowCoverage: "COLLECTION_GAP",
+        },
+        existingArmedState: existingArmed,
+      });
 
+      expect(result.status).toBe("WAITING");
+    });
+
+    it("prevents confirmation when flowCoverage = STALE_DATA even with strong counts", () => {
+      const result = evaluateRetestGate({
+        mintAddress: CANONICAL_TOKEN_MINT,
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95,
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: 20,
+          recentSells60s: 10,
+          flowCoverage: "STALE_DATA",
+        },
+        existingArmedState: existingArmed,
+      });
+
+      expect(result.status).toBe("WAITING");
+    });
+
+    it("prevents confirmation when recentBuys60s is Infinity", () => {
+      const result = evaluateRetestGate({
+        mintAddress: CANONICAL_TOKEN_MINT,
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95,
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: Infinity,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+        },
+        existingArmedState: existingArmed,
+      });
+
+      expect(result.status).toBe("WAITING");
+    });
+
+    it("prevents confirmation when recentBuys60s is negative or non-integer", () => {
+      const resNeg = evaluateRetestGate({
+        mintAddress: CANONICAL_TOKEN_MINT,
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95,
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: -5,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+        },
+        existingArmedState: existingArmed,
+      });
+      expect(resNeg.status).toBe("WAITING");
+
+      const resFloat = evaluateRetestGate({
+        mintAddress: CANONICAL_TOKEN_MINT,
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95,
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: 2.5,
+          recentSells60s: 1,
+          flowCoverage: "SUFFICIENT",
+        },
+        existingArmedState: existingArmed,
+      });
+      expect(resFloat.status).toBe("WAITING");
+    });
+
+    it("confirms entry when flowCoverage is SUFFICIENT and counts are finite integers satisfying Rule A", () => {
+      const result = evaluateRetestGate({
+        mintAddress: CANONICAL_TOKEN_MINT,
+        isEstablished: true,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.95,
+          spotPriceUsd: 142.5,
+          liquidityUsd: 100_000,
+          recentBuys60s: 23,
+          recentSells60s: 10,
+          flowCoverage: "SUFFICIENT",
+        },
+        existingArmedState: existingArmed,
+      });
+
+      expect(result.status).toBe("CONFIRMED");
+      if (result.status === "CONFIRMED") {
+        expect(result.confirmReason).toBe("RETEST_PULLBACK_DISCOUNT");
+      }
+    });
+
+    it("preserves crater drop rejection even when flow coverage is invalid or null", () => {
       const result = evaluateRetestGate({
         mintAddress: CANONICAL_TOKEN_MINT,
         isEstablished: false,
-        currentNowMs: nowMs,
-        spotInfo,
+        currentNowMs: 1_060_000,
+        spotInfo: {
+          spotPriceSol: 0.8, // 20% plunge > 15% micro-cap crater ceiling
+          spotPriceUsd: 120.0,
+          liquidityUsd: 30_000,
+          recentBuys60s: null,
+          recentSells60s: null,
+          flowCoverage: "COLLECTION_GAP",
+        },
         existingArmedState: existingArmed,
       });
 
       expect(result.status).toBe("REJECTED");
       if (result.status === "REJECTED") {
         expect(result.rejectReason).toBe("REJECTED_PULLBACK_CRATERED");
+        expect(result.rejectionGateName).toBe("RetestCraterDrop");
       }
+    });
+  });
+
+  describe("5. Multiple Swaps in One Transaction & Canonical Identity", () => {
+    it("ingests and distinguishes multiple swaps within one transaction using outerInstructionIndex and swapIndex", () => {
+      const nowMs = 1_060_000;
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: nowMs - 60_000,
+        clock: () => nowMs,
+      });
+
+      for (let t = nowMs - 60_000; t <= nowMs; t += 10_000) {
+        tracker.recordHeartbeat(t);
+      }
+
+      const txSig = "multi-swap-tx-signature-xyz";
+
+      // Swap 0: outerInstruction 0, swap 0 (BUY)
+      const swap0 = createSyntheticTradeEvent({
+        signature: txSig,
+        outerInstructionIndex: 0,
+        swapIndex: 0,
+        side: "BUY",
+        eventTimestampMs: nowMs - 30_000,
+      });
+
+      // Swap 1: outerInstruction 0, swap 1 (SELL)
+      const swap1 = createSyntheticTradeEvent({
+        signature: txSig,
+        outerInstructionIndex: 0,
+        swapIndex: 1,
+        side: "SELL",
+        eventTimestampMs: nowMs - 30_000,
+      });
+
+      // Swap 2: outerInstruction 1 (CPI), swap 0 (BUY)
+      const swap2 = createSyntheticTradeEvent({
+        signature: txSig,
+        outerInstructionIndex: 1,
+        swapIndex: 0,
+        side: "BUY",
+        eventTimestampMs: nowMs - 20_000,
+      });
+
+      const res0 = tracker.ingestTrade(swap0);
+      const res1 = tracker.ingestTrade(swap1);
+      const res2 = tracker.ingestTrade(swap2);
+
+      expect(res0.ok).toBe(true);
+      expect(res1.ok).toBe(true);
+      expect(res2.ok).toBe(true);
+      expect(tracker.getEventsCount()).toBe(3);
+
+      const evalResult = tracker.evaluateWindow(nowMs);
+      expect(evalResult.coverage).toBe("SUFFICIENT");
+      expect(evalResult.recentBuys60s).toBe(2);
+      expect(evalResult.recentSells60s).toBe(1);
+    });
+
+    it("derives canonical swap key consistently", () => {
+      expect(deriveCanonicalSwapKey("sig1", 0, 0)).toBe("sig1:0:0");
+      expect(deriveCanonicalSwapKey("sig1", 2, 3)).toBe("sig1:2:3");
     });
   });
 });

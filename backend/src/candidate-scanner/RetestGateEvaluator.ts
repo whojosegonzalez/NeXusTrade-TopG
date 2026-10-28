@@ -1,12 +1,45 @@
 import type { ArmedPullbackState } from "./BuyGateTriggerService.js";
 
+export type FlowCoverageStatus =
+  | "SUFFICIENT"
+  | "WARM_UP"
+  | "COLLECTION_GAP"
+  | "STALE_DATA"
+  | "CAPACITY_LOSS"
+  | "PROCESSING_BACKLOG"
+  | "UNINITIALIZED";
+
 export interface RetestSpotInfo {
   readonly spotPriceSol: number;
   readonly spotPriceUsd?: number | null | undefined;
   readonly recentBuys60s: number | null;
   readonly recentSells60s: number | null;
-  readonly flowCoverage?: string | undefined;
+  readonly flowCoverage?: FlowCoverageStatus | string | undefined;
   readonly liquidityUsd?: number | null | undefined;
+}
+
+export function isFlowValidAndSufficient(spotInfo: RetestSpotInfo): boolean {
+  if (spotInfo.flowCoverage !== "SUFFICIENT") {
+    return false;
+  }
+  if (spotInfo.recentBuys60s === null || spotInfo.recentSells60s === null) {
+    return false;
+  }
+  if (
+    !Number.isFinite(spotInfo.recentBuys60s) ||
+    !Number.isInteger(spotInfo.recentBuys60s) ||
+    spotInfo.recentBuys60s < 0
+  ) {
+    return false;
+  }
+  if (
+    !Number.isFinite(spotInfo.recentSells60s) ||
+    !Number.isInteger(spotInfo.recentSells60s) ||
+    spotInfo.recentSells60s < 0
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export interface EvaluateRetestGateParams {
@@ -92,11 +125,11 @@ export function evaluateRetestGate(params: EvaluateRetestGateParams): RetestGate
   // Cohort parameters for Retest Gate (Phase 12.92 Flow-Aware Retest Gate):
   // Established: Flow-aware crater drop ceiling: 12% if buyers absorbing (>= 1.15x), 8% if unabsorbed.
   // Micro-Cap: max 15% crater drop ceiling, 90s expiry.
+  const flowVerified = isFlowValidAndSufficient(spotInfo);
   const isFlowAbsorbing =
-    spotInfo.recentBuys60s !== null &&
-    spotInfo.recentSells60s !== null &&
-    spotInfo.recentBuys60s > 0 &&
-    spotInfo.recentBuys60s >= 1.15 * Math.max(1, spotInfo.recentSells60s);
+    flowVerified &&
+    spotInfo.recentBuys60s! > 0 &&
+    spotInfo.recentBuys60s! >= 1.15 * Math.max(1, spotInfo.recentSells60s!);
   const maxCraterDropPct = isEstablished ? (isFlowAbsorbing ? 0.12 : 0.08) : 0.15;
   const maxExpiryMs = isEstablished ? 120_000 : 90_000;
 
@@ -116,10 +149,9 @@ export function evaluateRetestGate(params: EvaluateRetestGateParams): RetestGate
 
   // Rule E: In-Flight Seller Surge (Anti-Cabal exit wave while awaiting pullback)
   if (
-    spotInfo.recentSells60s !== null &&
-    spotInfo.recentBuys60s !== null &&
-    spotInfo.recentSells60s >= 25 &&
-    spotInfo.recentSells60s >= 2.5 * Math.max(1, spotInfo.recentBuys60s)
+    flowVerified &&
+    spotInfo.recentSells60s! >= 25 &&
+    spotInfo.recentSells60s! >= 2.5 * Math.max(1, spotInfo.recentBuys60s!)
   ) {
     return {
       status: "REJECTED",
@@ -151,10 +183,9 @@ export function evaluateRetestGate(params: EvaluateRetestGateParams): RetestGate
     spotInfo.spotPriceSol <= updatedArmed.peakPriceSol * maxPullbackRatio &&
     spotInfo.spotPriceSol >= updatedArmed.peakPriceSol * minPullbackRatio;
   const hasPullbackFlow =
-    spotInfo.recentBuys60s !== null &&
-    spotInfo.recentSells60s !== null &&
-    spotInfo.recentBuys60s > 0 &&
-    spotInfo.recentBuys60s >= minPullbackFlowRatio * spotInfo.recentSells60s;
+    flowVerified &&
+    spotInfo.recentBuys60s! > 0 &&
+    spotInfo.recentBuys60s! >= minPullbackFlowRatio * spotInfo.recentSells60s!;
   const ruleAConfirmed = isPullbackDiscount && hasPullbackFlow;
 
   // Rule B: Consolidation Breakout
@@ -168,10 +199,9 @@ export function evaluateRetestGate(params: EvaluateRetestGateParams): RetestGate
   const hasConsolidationDuration =
     currentNowMs - updatedArmed.armedAtMs >= 30_000 || updatedArmed.ticksObserved >= 3;
   const hasConsolidationFlow =
-    spotInfo.recentBuys60s !== null &&
-    spotInfo.recentSells60s !== null &&
-    spotInfo.recentBuys60s > 0 &&
-    spotInfo.recentBuys60s >= minConsolidationFlowRatio * spotInfo.recentSells60s;
+    flowVerified &&
+    spotInfo.recentBuys60s! > 0 &&
+    spotInfo.recentBuys60s! >= minConsolidationFlowRatio * spotInfo.recentSells60s!;
   const ruleBConfirmed =
     isConsolidatingNearPeak && hasConsolidationDuration && hasConsolidationFlow;
 
