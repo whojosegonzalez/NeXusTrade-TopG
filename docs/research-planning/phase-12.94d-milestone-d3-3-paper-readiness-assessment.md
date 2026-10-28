@@ -383,14 +383,23 @@ The approved offline implementation items are completed:
    - **Retest Boundary Enforcement**: Typed `FlowCoverageStatus` (`SUFFICIENT`, `WARM_UP`, `COLLECTION_GAP`, `STALE_DATA`, `CAPACITY_LOSS`, `PROCESSING_BACKLOG`, `UNINITIALIZED`). Requires trustworthy sufficient coverage and finite, non-negative integer counts before flow can support confirmation. Unverified legacy inputs fail closed (`WAITING`), while preserving protective crater drop ceilings (8% unabsorbed, 12% absorbed, 15% micro-cap) and timeout expirations.
    - 40 comprehensive unit tests passing in [`backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts).
    - 20 unit tests passing in [`backend/src/candidate-scanner/RetestGateEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.test.ts).
-8. **Ubuntu CI Duplicate Decision ID Collision Resolution (`PilotLiveCollector.test.ts`)**:
+8. **Offline Raydium AMM v4 Swap Decoder & Normalization Adapter (`RaydiumAmmV4SwapDecoder.ts`)**:
+   - Implemented in [`backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts).
+   - Authoritative instruction parsing grounded in pinned Raydium AMM v4 source (`raydium-io/raydium-amm`): supports standard 17/18-account layout (`SwapBaseIn` tag 9, `SwapBaseOut` tag 11) and clean 8-account layout (`SwapBaseInV2` tag 16, `SwapBaseOutV2` tag 17).
+   - **Per-Swap Direction Attribution**: Determines `Coin2PC` vs `PC2Coin` via inner SPL Token transfer routing (`baseVault` vs `quoteVault` destinations), on-chain `ray_log` base64 program events, and `preTokenBalances` / `postTokenBalances` mint mappings; attributes `BUY`/`SELL` per swap relative to candidate token without inferring from transaction-wide net balances.
+   - **Deterministic Coordinate Preservation**: Derives unique swap coordinates (`${signature}:${outerInstructionIndex}:${swapIndex}`) preserving distinct identities for multiple swaps in a single transaction and inner CPI calls (e.g. Jupiter router calls).
+   - **Temporal & Success Validation**: Counts successful swaps only (`meta.err === null`); preserves slot, block time, source precision, and local receipt time. Rejects missing upstream timestamps (`MISSING_UPSTREAM_TIMESTAMP`) without manufacturing time.
+   - **Fail-Closed Coverage Guarantee**: Normalization adapter bridges decoded events into `RollingTradeFlowTracker`; ingesting transactions strictly populates trade events and never fabricates stream checkpoints or advances window coverage.
+   - 19 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts).
+9. **Ubuntu CI Duplicate Decision ID Collision Resolution (`PilotLiveCollector.test.ts`)**:
    - In `makeCanonicalTestPubkey`, updated byte offset for writing test IDs from byte 0 to byte 2.
    - Eliminated identical 8-character Base58 prefixes (`3JEw2Z6V`) across distinct test mints (`pumpMint1` vs `pumpMint2`) that previously triggered duplicate decision event ID collisions (`evt-ds-${mint.slice(0, 8)}-${decisionEpochMs}`) and caused test timeouts on Ubuntu CI runners.
    - All 82 tests in [`backend/src/research/pilot/PilotLiveCollector.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/PilotLiveCollector.test.ts) pass cleanly.
-9. **Larger Changes Quarantined**:
-   - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
-   - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
-   - Virtual wallet balance strictly frozen at 7.9259 SOL.
+10. **Larger Changes Quarantined**:
+
+- No live resolver connected, no daemon startup, no live network requests or operator market sessions.
+- Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
+- Virtual wallet balance strictly frozen at 7.9259 SOL.
 
 ---
 
@@ -401,12 +410,14 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
 1. **Live Acquisition Wiring in Production Daemon**:
    - `CandidateStreamEngine.ts` intake integration with injected resolver, `RaydiumAmmV4LpEvidenceAdapter.ts`, and validated-LP mode is complete and verified offline.
    - Live daemon wiring in `paper-trading-daemon.ts` connecting the bounded 2-request acquisition client to live Solana RPC endpoints upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings remains pending authorization.
-2. **Live Trade Stream Ingestion Adapter & Decoder (Corrected Source Proposal)**:
+2. **Live Trade Stream Ingestion Wiring & Subscription Management**:
    - `RollingTradeFlowTracker.ts` dynamic windowing, complete coverage verification, and `RetestGateEvaluator.ts` flow gating are fully verified offline.
+   - `RaydiumAmmV4SwapDecoder.ts` and `RaydiumAmmV4SwapNormalizationAdapter` decode and normalize transactions into immutable `TradeEvent` inputs offline without live connections.
+   - Connecting the decoder to live trade sources (`logsSubscribe` or polling `getSignaturesForAddress`/`getTransaction`) with explicit observation checkpoints remains a separate integration step.
    - **Solana RPC Protocol Mechanics (`logsSubscribe` & `getTransaction`)**:
      - Official `logsSubscribe` delivers only `{ signature, err, logs }`; it does _not_ provide transaction instructions, compiled accounts, or `preTokenBalances` / `postTokenBalances`.
-     - Therefore, for any instruction- or balance-based decoding, full transaction retrieval via `getTransaction` is _normal acquisition work for every transaction_, not an occasional fallback.
-     - The only alternative avoiding per-trade HTTP RPC calls is a log-only decoding path that parses Raydium's base64-encoded `ray_log` events from the logs array directly. This log-only path is protocol-specific, subject to log truncation on complex transactions, and currently unvalidated.
+     - Therefore, for instruction- or balance-based decoding without log-only decoding, full transaction retrieval via `getTransaction` is _normal acquisition work for every transaction_, not an occasional fallback.
+     - The zero-RPC alternative parsing base64-encoded `ray_log` events directly from `logs` is now supported by `parseRayLog` in `RaydiumAmmV4SwapDecoder.ts`, but live log subscription wiring remains separate.
    - **Request-Budget & Achievable Coverage under Existing Budget**:
      - The existing `GlobalResourceBudgetManager` enforces a shared provider pacing of $\ge 2,500\text{ ms}$ between RPC calls to the same host, alongside strict session request ceilings (25-50 requests).
      - At $2,500\text{ ms}$ pacing, a single RPC endpoint can fetch at most 24 transactions per minute.
