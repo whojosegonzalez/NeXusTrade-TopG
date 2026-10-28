@@ -75,6 +75,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
   function makeCanonicalTestPubkey(id: number, prefix = 0x55aa): string {
     const buf = Buffer.alloc(32, 0);
     buf.writeUInt16BE(prefix, 0);
+    buf.writeUInt32BE(id, 2);
     buf.writeUInt32BE(id, 28);
     return new PublicKey(buf).toBase58();
   }

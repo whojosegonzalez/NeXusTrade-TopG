@@ -373,7 +373,25 @@ The approved offline implementation items are completed:
    - **CI Test Suite Isolation & Canonical Fixture Hygiene**: Resolved git-ignore exclusions for authentic operator snapshots in `data/research/snapshots/` to guarantee deterministic offline replay in fresh CI checkouts. Hardened synthetic test fixtures in `RaydiumLiveDiscoveryClient.test.ts` and `PilotLiveCollector.test.ts` to generate strictly valid 32-byte canonical Solana base58 public keys, preserving schema adapter contracts.
    - Preserves truthful provenance (`SYNTHETIC_FIXTURE` vs `CAPTURED_RPC`) and explicit freshness policies.
    - 22 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4LpEvidenceAdapter.test.ts).
-7. **Larger Changes Quarantined**:
+7. **Authentic Rolling 60-Second Trade Flow Tracker (`RollingTradeFlowTracker.ts`) & Retest Gate Hardening**:
+   - Implemented in [`backend/src/candidate-scanner/RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts) and [`backend/src/candidate-scanner/RetestGateEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.ts).
+   - Replaced naive estimation (dividing 5-minute totals by 5) with an authentic event-driven rolling trade flow tracker.
+   - Binds trade events strictly to canonical `poolId` and candidate `tokenMint`, rejecting identity mismatches (`IDENTITY_MISMATCH_POOL`, `IDENTITY_MISMATCH_MINT`).
+   - Defines BUY and SELL strictly relative to the candidate token: receiving candidate token = BUY; depositing candidate token = SELL.
+   - Stable event identifiers (`${signature}:${outerInstructionIndex}:${swapIndex}`) uniquely distinguish multiple swaps within the same transaction.
+   - Recalculates dynamically over `[evaluationTimestampMs - 60_000, evaluationTimestampMs]` on every evaluation without enforcing a rigid 60-second polling cadence.
+   - Preserves event block/execution timestamps separately from local ingestion receipt times, tracking clock skew, precision, and provenance (`ON_CHAIN_BLOCK_TIME`, `HOST_OBSERVED`, `SYNTHETIC_FIXTURE`).
+   - Distinguishes complete observed coverage (`SUFFICIENT`) from incomplete states (`WARM_UP`, `COLLECTION_GAP`, `STALE_DATA`). Elapsed time alone never assumes coverage.
+   - Returns `null` when flow coverage is insufficient. Returns `0` only for a sufficiently observed window containing zero qualifying trades.
+   - Hardened `RetestGateEvaluator`: handles nullable flow metrics (`recentBuys60s: number | null`, `recentSells60s: number | null`). Incomplete or missing flow coverage keeps the gate in `WAITING` status, preventing unverified trade flow from confirming entry while preserving stop-loss / crater drop protections.
+   - Bounded retention: automatically prunes trades older than retention horizon (3 minutes) and caps memory at 2,000 events.
+   - 26 comprehensive unit tests passing in [`backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts).
+   - 20 unit tests passing in [`backend/src/candidate-scanner/RetestGateEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.test.ts).
+8. **Ubuntu CI Duplicate Decision ID Collision Resolution (`PilotLiveCollector.test.ts`)**:
+   - In `makeCanonicalTestPubkey`, updated byte offset for writing test IDs from byte 0 to byte 2.
+   - Eliminated identical 8-character Base58 prefixes (`3JEw2Z6V`) across distinct test mints (`pumpMint1` vs `pumpMint2`) that previously triggered duplicate decision event ID collisions (`evt-ds-${mint.slice(0, 8)}-${decisionEpochMs}`) and caused test timeouts on Ubuntu CI runners.
+   - All 82 tests in [`backend/src/research/pilot/PilotLiveCollector.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/PilotLiveCollector.test.ts) pass cleanly.
+9. **Larger Changes Quarantined**:
    - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
    - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
    - Virtual wallet balance strictly frozen at 7.9259 SOL.
@@ -387,8 +405,30 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
 1. **Live Acquisition Wiring in Production Daemon**:
    - `CandidateStreamEngine.ts` intake integration with injected resolver, `RaydiumAmmV4LpEvidenceAdapter.ts`, and validated-LP mode is complete and verified offline.
    - Live daemon wiring in `paper-trading-daemon.ts` connecting the bounded 2-request acquisition client to live Solana RPC endpoints upon pool discovery while enforcing host pacing ($\ge 2,500\text{ ms}$) and global request ceilings remains pending authorization.
-2. **Sub-Minute Micro-Flow Observations**:
-   - Implement an authentic sub-minute rolling transaction stream (`recentBuys60s`, `recentSells60s`) via websocket or high-frequency polling adapter to satisfy Retest Gate Rules A/B/C/E (1.15x / 1.25x / 1.5x flow-absorption and seller-surge protection).
+2. **Live Trade Stream Ingestion Adapter & Decoder (Source-Backed Proposal)**:
+   - `RollingTradeFlowTracker.ts` dynamic windowing and `RetestGateEvaluator.ts` flow gating are fully verified offline.
+   - **Intended Live Trade Source**:
+     - _Primary_: Solana WebSocket log subscription (`SolanaWebSocketSubscriptionClient.ts`) via `logsSubscribe` filtered by `{ mentions: [candidatePoolId] }`. Each notification delivers a transaction signature referencing the candidate pool.
+     - _Fallback / Reconciliation_: Read-only `getTransaction` via `SolanaRpcTransactionFetcher.ts` or polling `getSignaturesForAddress` if WebSocket drops or during high-traffic burst validation.
+   - **Swap Classification**:
+     - Raydium AMM v4 instruction decoding: inspect compiled instructions or inner CPI instructions referencing `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`. Instruction discriminator byte 9 = `SwapBaseIn`, byte 11 = `SwapBaseOut`.
+     - Candidate token orientation: Check whether candidate token is `baseMint` or `quoteMint` of the pool. Receiving candidate token (`postTokenBalances - preTokenBalances > 0`) = `BUY`; depositing candidate token (`preTokenBalances - postTokenBalances > 0`) = `SELL`.
+     - Stable event identifier: `${signature}:${outerInstructionIndex}:${swapIndex}` uniquely distinguishing multiple swaps within one multi-pool or routed transaction (e.g. Jupiter routing).
+   - **Coverage Guarantees**:
+     - Strict 60-second observation window: Tracking must be active for $\ge 60\text{ seconds}$ before `SUFFICIENT` coverage is granted; otherwise classified as `WARM_UP` and returns `null`.
+     - Disconnection / gap detection: Any WebSocket disconnect/reconnect interval intersecting `[now - 60s, now]` is flagged as `COLLECTION_GAP` and returns `null`.
+     - Stale data detection: Heartbeats or trade events must occur within `maxStreamInactivityMs` (15s); if silence exceeds this limit, classified as `STALE_DATA` and returns `null`.
+     - Honest empty window: If and only if the window is `SUFFICIENT` with continuous liveness and zero trades occurred, reports honest `0` buys and `0` sells (allowing `RetestGateEvaluator` to distinguish inactive tokens from missing data).
+   - **Expected Latency**:
+     - In-memory rolling window recalculation: $< 1\text{ ms}$ on evaluation.
+     - Live WebSocket push latency from Solana block confirmation: ~400–1,200 ms.
+   - **Request-Budget Cost**:
+     - WebSocket subscription: 1 active persistent WebSocket connection / subscription per monitored watchlist candidate (0 continuous HTTP requests).
+     - RPC getTransaction fallback: If needed for balance delta or log reconciliation, 1 request per transaction metered through `GlobalResourceBudgetManager` under the candidate enrichment ceiling.
+   - **Capabilities Still Missing for Live Execution**:
+     - Live WebSocket activation remains quarantined under Phase 12.94-D rules.
+     - Binary instruction decoder for Raydium AMM v4 `SwapBaseIn` (tag 9) and `SwapBaseOut` (tag 11) in transaction payloads.
+     - Balance delta parser analyzing `preTokenBalances` / `postTokenBalances` for complex multi-hop routed transactions where Raydium instruction logs are truncated or nested.
 3. **Live Metered RugCheck Security Provider Integration**:
    - Register a live RugCheck provider client under `GlobalResourceBudgetManager` with strict rate-limiting, error handling, and budget accounting to supply verified security scores, danger flags, holder counts, and bundler concentrations.
 4. **Verified Reserve Spot Pricing & Slippage Math**:
