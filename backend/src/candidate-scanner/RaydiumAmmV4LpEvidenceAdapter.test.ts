@@ -1080,5 +1080,170 @@ describe("RaydiumAmmV4LpEvidenceAdapter", () => {
       expect(budgetManager.getStats().totalRequests).toBe(0);
       expect(adapter.getLastResult()).toBeNull();
     });
+
+    // =========================================================================
+    // RESPONSE-BODY TIMEOUT COVERAGE: Stalled stream prompt termination regressions
+    // =========================================================================
+    it("aborts stalled bootstrap response body at request timeout, terminates promptly, and fails closed", async () => {
+      let nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+      const sleepFn = async (ms: number) => {
+        nowMs += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 10 });
+      let transportCallCount = 0;
+
+      const mockTransport: typeof fetch = async (_input, init) => {
+        transportCallCount++;
+        // Headers 200 returned promptly, body stream stalls and reacts to abort signal
+        const stream = new ReadableStream({
+          start(controller) {
+            if (init?.signal) {
+              if (init.signal.aborted) {
+                controller.error(new Error("The operation was aborted"));
+                return;
+              }
+              init.signal.addEventListener("abort", () => {
+                controller.error(new Error("The operation was aborted"));
+              });
+            }
+          },
+        });
+        return new Response(stream, { status: 200 });
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        timeoutMs: 100, // 100ms per-request timeout
+        overallTimeoutMs: 2500, // 2500ms overall timeout
+        clock,
+        sleepFn,
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const startTest = Date.now();
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+      const elapsedTestMs = Date.now() - startTest;
+
+      // 1. Must fail closed and not admit candidate
+      expect(evalResult.admitted).toBe(false);
+
+      // 2. Must terminate promptly at request timeout (~100ms), NOT wait for 2500ms
+      expect(elapsedTestMs).toBeLessThan(1500);
+
+      // 3. Request 1 was dispatched, Request 2 was NEVER dispatched
+      expect(transportCallCount).toBe(1);
+      expect(budgetManager.getStats().totalRequests).toBe(1);
+
+      // 4. Classify timed-out body read as dispatched request failure: attempt remains counted
+      const lastResult = adapter.getLastResult();
+      expect(lastResult).toBeDefined();
+      expect(lastResult?.ok).toBe(false);
+      expect(lastResult?.httpAttempts).toBe(1);
+      expect(lastResult?.evidence.httpAttempts).toBe(1);
+
+      const req1 = lastResult?.evidence.requests[0];
+      expect(req1).toBeDefined();
+      expect(req1?.httpStatus).toBe(200);
+      expect(req1?.error).toContain("Request timed out after 100ms");
+    });
+
+    it("aborts stalled batch response body at request timeout, terminates promptly, and fails closed", async () => {
+      let nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+      const sleepFn = async (ms: number) => {
+        nowMs += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 10 });
+      let transportCallCount = 0;
+
+      const mockTransport: typeof fetch = async (_input, init) => {
+        transportCallCount++;
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.method === "getAccountInfo") {
+          // Request 1 succeeds promptly
+          return new Response(RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE, {
+            status: 200,
+          });
+        }
+
+        // Request 2 (batch): Headers 200 returned promptly, body stream stalls and reacts to abort signal
+        const stream = new ReadableStream({
+          start(controller) {
+            if (init?.signal) {
+              if (init.signal.aborted) {
+                controller.error(new Error("The operation was aborted"));
+                return;
+              }
+              init.signal.addEventListener("abort", () => {
+                controller.error(new Error("The operation was aborted"));
+              });
+            }
+          },
+        });
+        return new Response(stream, { status: 200 });
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 2500,
+        timeoutMs: 100, // 100ms per-request timeout
+        overallTimeoutMs: 10_000,
+        clock,
+        sleepFn, // Advance nowMs so Request 2 pacing succeeds
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const startTest = Date.now();
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+      const elapsedTestMs = Date.now() - startTest;
+
+      // 1. Must fail closed and not admit candidate
+      expect(evalResult.admitted).toBe(false);
+
+      // 2. Must terminate promptly at request timeout (~100ms)
+      expect(elapsedTestMs).toBeLessThan(1500);
+
+      const lastResult = adapter.getLastResult();
+      expect(transportCallCount).toBe(2);
+      expect(budgetManager.getStats().totalRequests).toBe(2);
+
+      // 4. Classify timed-out body read as dispatched request failure: attempt remains counted
+      expect(lastResult).toBeDefined();
+      expect(lastResult?.ok).toBe(false);
+      expect(lastResult?.httpAttempts).toBe(2);
+      expect(lastResult?.evidence.httpAttempts).toBe(2);
+
+      const req2 = lastResult?.evidence.requests[1];
+      expect(req2).toBeDefined();
+      expect(req2?.httpStatus).toBe(200);
+      expect(req2?.error).toContain("Request timed out after 100ms");
+    });
   });
 });

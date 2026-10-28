@@ -11,6 +11,7 @@
  * ALL tests execute 100% offline with zero outbound network requests and zero Fedora laptop interaction.
  */
 
+import { PublicKey } from "@solana/web3.js";
 import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -69,6 +70,13 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
     const tmpBase = path.join(os.tmpdir(), "nexustrade-d24-tests");
     await fs.mkdir(tmpBase, { recursive: true });
     return await fs.mkdtemp(path.join(tmpBase, `${prefix}-`));
+  }
+
+  function makeCanonicalTestPubkey(id: number, prefix = 0x55aa): string {
+    const buf = Buffer.alloc(32, 0);
+    buf.writeUInt16BE(prefix, 0);
+    buf.writeUInt32BE(id, 28);
+    return new PublicKey(buf).toBase58();
   }
 
   // --------------------------------------------------------------------------
@@ -1443,7 +1451,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
   describe("Operational Observability & Negative Control Persistence", () => {
     it("records non-Raydium and ineligible candidates honestly as FILTERED_REJECTED without dropping negative controls", async () => {
       const testDir = await makeTestDir("neg-controls");
-      const pumpMint = "PumpM111111111111111111111111111111111111111";
+      const pumpMint = makeCanonicalTestPubkey(9999, 0x1111);
 
       const mockHttp: ILiveHttpTransport = {
         fetch: async (url: string) => {
@@ -1473,7 +1481,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
                   {
                     chainId: "solana",
                     dexId: "pump",
-                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    pairAddress: FIXTURE_CPMM_POOL_ADDRESS,
                     baseToken: { address: pumpMint, symbol: "PUMP" },
                     quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
                     priceUsd: "0.0001",
@@ -4081,8 +4089,8 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
     it("Task 3A: session-summary.json correctly aggregates topRejectionReasons matching candidate-decisions", async () => {
       const testDir = await makeTestDir("rejection-summary-test");
-      const pumpMint1 = "Pump111111111111111111111111111111111111111";
-      const pumpMint2 = "Pump222222222222222222222222222222222222222";
+      const pumpMint1 = makeCanonicalTestPubkey(1111, 0x2222);
+      const pumpMint2 = makeCanonicalTestPubkey(2222, 0x2222);
 
       const mockHttp: ILiveHttpTransport = {
         fetch: async (url: string) => {
@@ -4102,7 +4110,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
                   {
                     chainId: "solana",
                     dexId: "pumpfun",
-                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    pairAddress: FIXTURE_CPMM_POOL_ADDRESS,
                     baseToken: { address: pumpMint1, symbol: "PUMP1" },
                     quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
                   },
@@ -4188,7 +4196,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
 
     it("Task 4: stops on TARGET_YIELD_REACHED when target diagnostic yield is reached before max candidates", async () => {
       const testDir = await makeTestDir("target-yield-stop");
-      const pumpMint = "Pump111111111111111111111111111111111111111";
+      const pumpMint = makeCanonicalTestPubkey(3333, 0x3333);
 
       const mockHttp: ILiveHttpTransport = {
         fetch: async (url: string) => {
@@ -4208,7 +4216,7 @@ describe("Milestone D.2.4: Pilot Live Collector Offline Integration Tests", () =
                   {
                     chainId: "solana",
                     dexId: "pump",
-                    pairAddress: "PumpPair11111111111111111111111111111111111",
+                    pairAddress: FIXTURE_CPMM_POOL_ADDRESS,
                     baseToken: { address: pumpMint, symbol: "PUMP" },
                     quoteToken: { address: FIXTURE_WSOL_MINT, symbol: "SOL" },
                   },

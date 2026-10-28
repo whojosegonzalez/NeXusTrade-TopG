@@ -1,0 +1,275 @@
+{
+  "schemaVersion": "1.0",
+  "command": "RaydiumAmmV4SnapshotAcquisition",
+  "executionMode": "LIVE_ACQUISITION",
+  "evidenceOrigin": "CAPTURED_RPC",
+  "isSyntheticFixture": false,
+  "retrievedAtIso": "2026-10-27T06:35:11.779Z",
+  "startedAtIso": "2026-10-27T06:35:09.029Z",
+  "completedAtIso": "2026-10-27T06:35:11.782Z",
+  "endpoint": {
+    "sanitizedUrl": "https://api.mainnet.solana.com",
+    "host": "api.mainnet.solana.com",
+    "endpointFingerprint": "sha256:df2f872946a6a34c"
+  },
+  "config": {
+    "poolId": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+    "expectedTokenMint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "pacingMs": 2500,
+    "timeoutMs": 10000,
+    "overallTimeoutMs": 60000
+  },
+  "httpAttempts": 2,
+  "maxHttpAttemptsAllowed": 2,
+  "pacingEnforcedMs": 2500,
+  "contextSlots": {
+    "bootstrapSlot": 461970865,
+    "batchSlot": 461970878,
+    "minContextSlotEnforced": true,
+    "staleSlotDetected": false
+  },
+  "requests": [
+    {
+      "attempt": 1,
+      "method": "getAccountInfo",
+      "params": [
+        "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+        {
+          "encoding": "base64",
+          "commitment": "confirmed"
+        }
+      ],
+      "requestTimestampIso": "2026-10-27T06:35:09.036Z",
+      "responseTimestampIso": "2026-10-27T06:35:09.209Z",
+      "elapsedMs": 173,
+      "httpStatus": 200,
+      "rawResponseBody": "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"4.3.2\",\"slot\":461970865},\"value\":{\"data\":[\"BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAGAAAAAAAAAAkAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAADh9QUAAAAA9AEAAAAAAAAAAAAAAAAAAKCGAQAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJhaSWJIPAAAjxiBlGQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMafnauQpgMAAAAAAAAAAAABjw9ewXRbAAAAAAAAAAAAck+IIuI5AABHNWonL2RaAAAAAAAAAAAAgL2DzTScAwAAAAAAAAAAACXLJUlWAgAAzHQZm0W6z5gtNl5Gv+9qEaF6ncdTHhcqZ+JK5m9xrTgpC+u4fXOeAokTezrBH8HXOQDwoprFtmZgW2UdHz+okTeZjMvy0EWLYVy8xrGjZ8R0np/vcwZiLhsbWJEBILyaBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFqMv4mOSymgSzqTuW7xGS2KUFu76GQUO/5CQz7TceLMVDs2n3OBDb+pbbsf+iadatphbqjzsmfRgoRiu8VJW2LpPMK+KyZYVVWsVJclPiChTagQVyUjjWUvlWIklITutGFDy1uAqR6+CTQmradxC1wyyjL+iSft+5XudJWwSdi70W4rNNW1x2wUtECxs3PS5jJI1apzZ2OkGDr5PnM+dS9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh6PW7gFQAAADmGxEAAAAAAC0EAAAAAAAAAAAAAAAAAAA=\",\"base64\"],\"executable\":false,\"lamports\":28329939,\"owner\":\"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8\",\"rentEpoch\":18446744073709551615,\"space\":752}},\"id\":1}\n",
+      "wireResponseSha256": "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
+      "storedResponseSha256": "b4c316f82fc3a48acdcd7394391c3c3d989c08c2e8aa2312a37860bced896719",
+      "wasRedacted": false,
+      "parsedJson": {
+        "jsonrpc": "2.0",
+        "result": {
+          "context": {
+            "apiVersion": "4.3.2",
+            "slot": 461970865
+          },
+          "value": {
+            "data": [
+              "BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAGAAAAAAAAAAkAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAADh9QUAAAAA9AEAAAAAAAAAAAAAAAAAAKCGAQAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJhaSWJIPAAAjxiBlGQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMafnauQpgMAAAAAAAAAAAABjw9ewXRbAAAAAAAAAAAAck+IIuI5AABHNWonL2RaAAAAAAAAAAAAgL2DzTScAwAAAAAAAAAAACXLJUlWAgAAzHQZm0W6z5gtNl5Gv+9qEaF6ncdTHhcqZ+JK5m9xrTgpC+u4fXOeAokTezrBH8HXOQDwoprFtmZgW2UdHz+okTeZjMvy0EWLYVy8xrGjZ8R0np/vcwZiLhsbWJEBILyaBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFqMv4mOSymgSzqTuW7xGS2KUFu76GQUO/5CQz7TceLMVDs2n3OBDb+pbbsf+iadatphbqjzsmfRgoRiu8VJW2LpPMK+KyZYVVWsVJclPiChTagQVyUjjWUvlWIklITutGFDy1uAqR6+CTQmradxC1wyyjL+iSft+5XudJWwSdi70W4rNNW1x2wUtECxs3PS5jJI1apzZ2OkGDr5PnM+dS9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh6PW7gFQAAADmGxEAAAAAAC0EAAAAAAAAAAAAAAAAAAA=",
+              "base64"
+            ],
+            "executable": false,
+            "lamports": 28329939,
+            "owner": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+            "rentEpoch": 18446744073709552000,
+            "space": 752
+          }
+        },
+        "id": 1
+      },
+      "error": null
+    },
+    {
+      "attempt": 2,
+      "method": "getMultipleAccounts",
+      "params": [
+        [
+          "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+          "89ZKE4aoyfLBe2RuV6jM3JGNhaV18Nxh8eNtjRcndBip",
+          "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX",
+          "3mEFzHsJyu2Cpjrz6zPmTzP7uoLFj9SbbecGVzzkL1mJ"
+        ],
+        {
+          "encoding": "base64",
+          "commitment": "confirmed",
+          "minContextSlot": 461970865
+        }
+      ],
+      "requestTimestampIso": "2026-10-27T06:35:11.721Z",
+      "responseTimestampIso": "2026-10-27T06:35:11.779Z",
+      "elapsedMs": 58,
+      "httpStatus": 200,
+      "rawResponseBody": "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"4.3.2\",\"slot\":461970878},\"value\":[{\"data\":[\"BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAGAAAAAAAAAAkAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAADh9QUAAAAA9AEAAAAAAAAAAAAAAAAAAKCGAQAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJhaSWJIPAAAjxiBlGQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMafnauQpgMAAAAAAAAAAAABjw9ewXRbAAAAAAAAAAAAck+IIuI5AABHNWonL2RaAAAAAAAAAAAAgL2DzTScAwAAAAAAAAAAACXLJUlWAgAAzHQZm0W6z5gtNl5Gv+9qEaF6ncdTHhcqZ+JK5m9xrTgpC+u4fXOeAokTezrBH8HXOQDwoprFtmZgW2UdHz+okTeZjMvy0EWLYVy8xrGjZ8R0np/vcwZiLhsbWJEBILyaBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFqMv4mOSymgSzqTuW7xGS2KUFu76GQUO/5CQz7TceLMVDs2n3OBDb+pbbsf+iadatphbqjzsmfRgoRiu8VJW2LpPMK+KyZYVVWsVJclPiChTagQVyUjjWUvlWIklITutGFDy1uAqR6+CTQmradxC1wyyjL+iSft+5XudJWwSdi70W4rNNW1x2wUtECxs3PS5jJI1apzZ2OkGDr5PnM+dS9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh6PW7gFQAAADmGxEAAAAAAC0EAAAAAAAAAAAAAAAAAAA=\",\"base64\"],\"executable\":false,\"lamports\":28329939,\"owner\":\"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8\",\"rentEpoch\":18446744073709551615,\"space\":752},{\"data\":[\"AQAAAEFXsFgPMcX85EpiWC28+deO51lDoISjk7NQNo0iiZMIjudhY1QAAAAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\",\"base64\"],\"executable\":false,\"lamports\":11461600,\"owner\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"rentEpoch\":18446744073709551615,\"space\":82},{\"data\":[\"N5mMy/LQRYthXLzGsaNnxHSen+9zBmIuGxtYkQEgvJpBV7BYDzHF/ORKYlgtvPnXjudZQ6CEo5OzUDaNIomTCBjdIaM5AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"base64\"],\"executable\":false,\"lamports\":2040792,\"owner\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"rentEpoch\":18446744073709551615,\"space\":165},{\"data\":[\"BpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFBV7BYDzHF/ORKYlgtvPnXjudZQ6CEo5OzUDaNIomTCBL5CP//FQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAAA4thYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"base64\"],\"executable\":false,\"lamports\":24189241110346,\"owner\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"rentEpoch\":18446744073709551615,\"space\":165}]},\"id\":2}\n",
+      "wireResponseSha256": "621735cd561b0cffe9aa7ff4fc5847c6e026950508fec023869cba5c6277feaf",
+      "storedResponseSha256": "621735cd561b0cffe9aa7ff4fc5847c6e026950508fec023869cba5c6277feaf",
+      "wasRedacted": false,
+      "parsedJson": {
+        "jsonrpc": "2.0",
+        "result": {
+          "context": {
+            "apiVersion": "4.3.2",
+            "slot": 461970878
+          },
+          "value": [
+            {
+              "data": [
+                "BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAGAAAAAAAAAAkAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAADh9QUAAAAA9AEAAAAAAAAAAAAAAAAAAKCGAQAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJhaSWJIPAAAjxiBlGQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMafnauQpgMAAAAAAAAAAAABjw9ewXRbAAAAAAAAAAAAck+IIuI5AABHNWonL2RaAAAAAAAAAAAAgL2DzTScAwAAAAAAAAAAACXLJUlWAgAAzHQZm0W6z5gtNl5Gv+9qEaF6ncdTHhcqZ+JK5m9xrTgpC+u4fXOeAokTezrBH8HXOQDwoprFtmZgW2UdHz+okTeZjMvy0EWLYVy8xrGjZ8R0np/vcwZiLhsbWJEBILyaBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFqMv4mOSymgSzqTuW7xGS2KUFu76GQUO/5CQz7TceLMVDs2n3OBDb+pbbsf+iadatphbqjzsmfRgoRiu8VJW2LpPMK+KyZYVVWsVJclPiChTagQVyUjjWUvlWIklITutGFDy1uAqR6+CTQmradxC1wyyjL+iSft+5XudJWwSdi70W4rNNW1x2wUtECxs3PS5jJI1apzZ2OkGDr5PnM+dS9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh6PW7gFQAAADmGxEAAAAAAC0EAAAAAAAAAAAAAAAAAAA=",
+                "base64"
+              ],
+              "executable": false,
+              "lamports": 28329939,
+              "owner": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+              "rentEpoch": 18446744073709552000,
+              "space": 752
+            },
+            {
+              "data": [
+                "AQAAAEFXsFgPMcX85EpiWC28+deO51lDoISjk7NQNo0iiZMIjudhY1QAAAAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                "base64"
+              ],
+              "executable": false,
+              "lamports": 11461600,
+              "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "rentEpoch": 18446744073709552000,
+              "space": 82
+            },
+            {
+              "data": [
+                "N5mMy/LQRYthXLzGsaNnxHSen+9zBmIuGxtYkQEgvJpBV7BYDzHF/ORKYlgtvPnXjudZQ6CEo5OzUDaNIomTCBjdIaM5AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "base64"
+              ],
+              "executable": false,
+              "lamports": 2040792,
+              "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "rentEpoch": 18446744073709552000,
+              "space": 165
+            },
+            {
+              "data": [
+                "BpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAFBV7BYDzHF/ORKYlgtvPnXjudZQ6CEo5OzUDaNIomTCBL5CP//FQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAAA4thYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "base64"
+              ],
+              "executable": false,
+              "lamports": 24189241110346,
+              "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "rentEpoch": 18446744073709552000,
+              "space": 165
+            }
+          ]
+        },
+        "id": 2
+      },
+      "error": null
+    }
+  ],
+  "discoveredIdentities": {
+    "poolId": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+    "lpMint": "89ZKE4aoyfLBe2RuV6jM3JGNhaV18Nxh8eNtjRcndBip",
+    "baseVault": "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX",
+    "quoteVault": "3mEFzHsJyu2Cpjrz6zPmTzP7uoLFj9SbbecGVzzkL1mJ",
+    "expectedTokenMint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+  },
+  "canonicalAmmAuthority": {
+    "address": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+    "bump": 254
+  },
+  "outcomes": {
+    "retrievalOk": true,
+    "structuralValidationOk": true,
+    "meetsNinetyPercentThreshold": false
+  },
+  "validationResult": {
+    "ok": true,
+    "accounting": {
+      "ok": true,
+      "protocolLp": "362937054696",
+      "circulatingSupply": "362444613518",
+      "rawInaccessibleLp": "492441178",
+      "rawDenominator": "362937054696",
+      "meetsNinetyPercentThreshold": false,
+      "displayInaccessiblePct": 0.135682
+    },
+    "diagnostics": {
+      "slot": 461970878,
+      "evidenceOrigin": "CAPTURED_RPC",
+      "isSyntheticFixture": false,
+      "retrievedAtIso": "2026-10-27T06:35:11.779Z",
+      "requestedIdentities": {
+        "poolId": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+        "lpMint": "89ZKE4aoyfLBe2RuV6jM3JGNhaV18Nxh8eNtjRcndBip",
+        "baseVault": "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX",
+        "quoteVault": "3mEFzHsJyu2Cpjrz6zPmTzP7uoLFj9SbbecGVzzkL1mJ",
+        "expectedTokenMint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+      },
+      "poolState": {
+        "status": "6",
+        "nonce": "254",
+        "baseDecimal": "6",
+        "quoteDecimal": "9",
+        "baseVault": "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX",
+        "quoteVault": "3mEFzHsJyu2Cpjrz6zPmTzP7uoLFj9SbbecGVzzkL1mJ",
+        "baseMint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+        "quoteMint": "So11111111111111111111111111111111111111112",
+        "lpMint": "89ZKE4aoyfLBe2RuV6jM3JGNhaV18Nxh8eNtjRcndBip",
+        "openOrders": "6Su6Ea97dBxecd5W92KcVvv6SzCurE2BXGgFe9LNGMpE",
+        "marketId": "C6tp2RVZnxBPFbnAsfTjis8BN9tycESAT4SgDQgbbrsA",
+        "marketProgramId": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+        "targetOrders": "5hATcCfvhVwAjNExvrg8rRkXmYyksHhVajWLa46iRsmE",
+        "baseNeedTakePnl": "0",
+        "quoteNeedTakePnl": "0",
+        "quoteTotalPnl": "66281584286360",
+        "baseTotalPnl": "2631011473551",
+        "lpReserve": "362937054696",
+        "poolAddress": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+        "programId": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+        "accountSlot": 461970878
+      },
+      "lpMintState": {
+        "mintAddress": "89ZKE4aoyfLBe2RuV6jM3JGNhaV18Nxh8eNtjRcndBip",
+        "mintAuthority": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+        "supply": "362444613518",
+        "decimals": 6,
+        "isInitialized": true,
+        "freezeAuthority": null
+      },
+      "baseVaultState": {
+        "vaultAddress": "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX",
+        "mintAddress": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+        "ownerAddress": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+        "rawAmount": "1347061669144",
+        "slot": 461970878
+      },
+      "quoteVaultState": {
+        "vaultAddress": "3mEFzHsJyu2Cpjrz6zPmTzP7uoLFj9SbbecGVzzkL1mJ",
+        "mintAddress": "So11111111111111111111111111111111111111112",
+        "ownerAddress": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+        "rawAmount": "24189239621906",
+        "slot": 461970878
+      },
+      "derivedAmmAuthority": {
+        "address": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+        "bump": 254
+      },
+      "accountDigests": {
+        "poolSha256": "c71c33a496ed6f03e420efe44fe0197b1be6e10b33783ed7ee4ce54121d1d253",
+        "lpMintSha256": "11c42010b870ab4aa55c88687ef3b009854374908a2bdfdcd76decf3b7f3d864",
+        "baseVaultSha256": "36bb05bcf00685a296d2e4b1ad2fd6cb3aa3cf1f17945fea30f8f514dfc180a1",
+        "quoteVaultSha256": "347dc3f75a1e2bc36bb4aceb461efc2ffa55ed5ed7d57ffab9f771c6108637dd"
+      }
+    },
+    "evidenceBoundary": {
+      "bytecodeEquivalenceVerified": false,
+      "completeExecutableReservesVerified": false,
+      "generalTokenSafetyVerified": false,
+      "strategyGateAdmitted": false
+    }
+  },
+  "accounting": {
+    "ok": true,
+    "protocolLp": "362937054696",
+    "circulatingSupply": "362444613518",
+    "rawInaccessibleLp": "492441178",
+    "rawDenominator": "362937054696",
+    "meetsNinetyPercentThreshold": false,
+    "displayInaccessiblePct": 0.135682
+  },
+  "failureReason": null,
+  "evidenceBoundary": {
+    "bytecodeEquivalenceVerified": false,
+    "completeExecutableReservesVerified": false,
+    "generalTokenSafetyVerified": false,
+    "strategyGateAdmitted": false
+  },
+  "payloadDigestSha256": "2c419bb320a6a6e11e896409d59d9ac7bd6922784dbcf7e3e2eab5cb2a934c82"
+}

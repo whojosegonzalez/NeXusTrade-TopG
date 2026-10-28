@@ -46,12 +46,11 @@ lerna-debug.log*
 # Research & Exploratory Data Archives
 data/archive/
 backend/data/archive/
-**/data/archive/
 **/data/archive/**
-data/research/
-backend/data/research/
-**/data/research/
 **/data/research/**
+!data/research/snapshots/
+!data/research/snapshots/**
+backend/data/research/**
 **/data/phase*/
 data/phase*/
 backend/data/phase*/

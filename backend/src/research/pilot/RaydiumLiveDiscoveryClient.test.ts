@@ -21,6 +21,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { PublicKey } from "@solana/web3.js";
 import {
   isAllowlistedRaydiumUrl,
   parseRaydiumApiPoolListResponse,
@@ -1045,12 +1046,13 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
     });
 
     it("G2-F1: verifies discovery funnel denominator consistency across 3 repeated catalog polls", async () => {
-      // Helper to generate valid 38-character base58 pool IDs using strictly base58 characters
-      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-      const makePoolId = (idx: number) =>
-        "11111111111111111111111111111111AAAA" +
-        B58[Math.floor(idx / B58.length)]! +
-        B58[idx % B58.length]!;
+      // Helper to generate canonical 32-byte base58 pool IDs
+      const makePoolId = (idx: number, prefix = 1) => {
+        const buf = Buffer.alloc(32, 0);
+        buf.writeUInt16BE(prefix, 0);
+        buf.writeUInt32BE(idx, 28);
+        return new PublicKey(buf).toBase58();
+      };
 
       // Construct 50 standard AMM v4 pools
       const basePools = Array.from({ length: 50 }, (_, i) => ({
@@ -1185,11 +1187,12 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
     });
 
     it("G2-F6: establishes initial catalog snapshot from first usable response after errors/empty polls, preserving poll attempt provenance", async () => {
-      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-      const makePoolId = (idx: number) =>
-        "11111111111111111111111111111111BBBB" +
-        B58[Math.floor(idx / B58.length)]! +
-        B58[idx % B58.length]!;
+      const makePoolId = (idx: number, prefix = 2) => {
+        const buf = Buffer.alloc(32, 0);
+        buf.writeUInt16BE(prefix, 0);
+        buf.writeUInt32BE(idx, 28);
+        return new PublicKey(buf).toBase58();
+      };
 
       const poolA = {
         type: "Standard",
@@ -1352,11 +1355,12 @@ describe("Milestone D.2.5: Raydium API v3 Discovery Adapter & Client Tests", () 
     });
 
     it("G2-F7: preserves strict mathematical invariants when catalog responses contain malformed entries across multiple polls", async () => {
-      const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-      const makePoolId = (idx: number) =>
-        "11111111111111111111111111111111CCCC" +
-        B58[Math.floor(idx / B58.length)]! +
-        B58[idx % B58.length]!;
+      const makePoolId = (idx: number, prefix = 3) => {
+        const buf = Buffer.alloc(32, 0);
+        buf.writeUInt16BE(prefix, 0);
+        buf.writeUInt32BE(idx, 28);
+        return new PublicKey(buf).toBase58();
+      };
 
       // 10 valid base pools
       const baseValidPools = Array.from({ length: 10 }, (_, i) => ({

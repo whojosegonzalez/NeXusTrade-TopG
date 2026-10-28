@@ -763,101 +763,110 @@ export async function acquireRaydiumAmmV4Snapshot(
 
     let response: Response | null = null;
     try {
-      response = await fetchImpl(rawRpcUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify(rpcPayload),
-        signal: controller.signal,
-        redirect: "error",
-      });
-    } catch (fetchErr) {
-      const isDispatched = config.dispatchTracker ? config.dispatchTracker.isDispatched() : true;
+      try {
+        response = await fetchImpl(rawRpcUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify(rpcPayload),
+          signal: controller.signal,
+          redirect: "error",
+        });
+      } catch (fetchErr) {
+        const isDispatched = config.dispatchTracker ? config.dispatchTracker.isDispatched() : true;
 
-      if (!isDispatched) {
-        // Genuine pre-dispatch failure: The underlying transport was never called.
-        // Roll back httpAttempts because no transport dispatch occurred!
-        httpAttempts--;
-        const rawMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        if (fetchErr instanceof BudgetDeniedError || rawMsg.startsWith("BUDGET_DENIED")) {
-          errMessage = `PRE_DISPATCH_BUDGET_DENIED: ${rawMsg}`;
+        if (!isDispatched) {
+          // Genuine pre-dispatch failure: The underlying transport was never called.
+          // Roll back httpAttempts because no transport dispatch occurred!
+          httpAttempts--;
+          const rawMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+          if (fetchErr instanceof BudgetDeniedError || rawMsg.startsWith("BUDGET_DENIED")) {
+            errMessage = `PRE_DISPATCH_BUDGET_DENIED: ${rawMsg}`;
+          } else {
+            errMessage = `PRE_DISPATCH_DENIED: ${rawMsg}`;
+          }
+        } else if (controller.signal.aborted) {
+          errMessage = `Request timed out after ${effectiveTimeout}ms`;
         } else {
-          errMessage = `PRE_DISPATCH_DENIED: ${rawMsg}`;
+          errMessage = `Network error: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`;
         }
-      } else if (controller.signal.aborted) {
-        errMessage = `Request timed out after ${effectiveTimeout}ms`;
-      } else {
-        errMessage = `Network error: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`;
+      }
+
+      if (response !== null) {
+        httpStatus = response.status;
+        let wireResponseBody: string | null = null;
+        try {
+          wireResponseBody = await response.text();
+        } catch (readErr) {
+          // Once the transport has been invoked, its attempt must remain counted,
+          // including response body read failure or timeout.
+          if (controller.signal.aborted) {
+            errMessage = `Request timed out after ${effectiveTimeout}ms`;
+          } else {
+            const rawMsg = readErr instanceof Error ? readErr.message : String(readErr);
+            errMessage = `Network error: Response body read failure: ${rawMsg}`;
+          }
+        }
+
+        if (wireResponseBody !== null) {
+          wireResponseSha256 = crypto.createHash("sha256").update(wireResponseBody).digest("hex");
+
+          // Parse JSON from wire response (unsanitized payload kept private in memory)
+          let rawParsedJson: unknown = null;
+          let jsonParseError: string | null = null;
+          try {
+            rawParsedJson = JSON.parse(wireResponseBody);
+          } catch (err) {
+            jsonParseError = err instanceof Error ? err.message : String(err);
+          }
+
+          // Sanitize decoded parsed JSON structure if present
+          let sanitizedJson: Record<string, unknown> | null = null;
+          let jsonWasRedacted = false;
+          if (rawParsedJson !== null && typeof rawParsedJson === "object") {
+            const res = sanitizeJsonValue(rawParsedJson, sensitiveTokens, rawRpcUrl);
+            sanitizedJson = res.sanitized as Record<string, unknown>;
+            jsonWasRedacted = res.changed;
+          }
+
+          // Sanitize wire text representation
+          const textRedacted = redactString(wireResponseBody, sensitiveTokens, rawRpcUrl);
+          const textWasRedacted = textRedacted !== wireResponseBody;
+
+          wasRedacted = jsonWasRedacted || textWasRedacted;
+
+          if (wasRedacted) {
+            if (sanitizedJson !== null) {
+              rawResponseBody = JSON.stringify(sanitizedJson);
+            } else {
+              rawResponseBody = textRedacted;
+            }
+            storedResponseSha256 = crypto
+              .createHash("sha256")
+              .update(rawResponseBody)
+              .digest("hex");
+          } else {
+            rawResponseBody = wireResponseBody;
+            storedResponseSha256 = wireResponseSha256;
+          }
+
+          if (response.status !== 200) {
+            errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
+            parsedJson = sanitizedJson;
+          } else {
+            if (jsonParseError) {
+              errMessage = `Malformed JSON response: ${jsonParseError}`;
+              parsedJson = null;
+            } else {
+              parsedJson = sanitizedJson;
+            }
+          }
+        }
       }
     } finally {
       clearTimeout(timer);
-    }
-
-    if (response !== null) {
-      httpStatus = response.status;
-      let wireResponseBody: string | null = null;
-      try {
-        wireResponseBody = await response.text();
-      } catch (readErr) {
-        // Once the transport has been invoked, its attempt must remain counted,
-        // including response body read failure.
-        const rawMsg = readErr instanceof Error ? readErr.message : String(readErr);
-        errMessage = `Network error: Response body read failure: ${rawMsg}`;
-      }
-
-      if (wireResponseBody !== null) {
-        wireResponseSha256 = crypto.createHash("sha256").update(wireResponseBody).digest("hex");
-
-        // Parse JSON from wire response (unsanitized payload kept private in memory)
-        let rawParsedJson: unknown = null;
-        let jsonParseError: string | null = null;
-        try {
-          rawParsedJson = JSON.parse(wireResponseBody);
-        } catch (err) {
-          jsonParseError = err instanceof Error ? err.message : String(err);
-        }
-
-        // Sanitize decoded parsed JSON structure if present
-        let sanitizedJson: Record<string, unknown> | null = null;
-        let jsonWasRedacted = false;
-        if (rawParsedJson !== null && typeof rawParsedJson === "object") {
-          const res = sanitizeJsonValue(rawParsedJson, sensitiveTokens, rawRpcUrl);
-          sanitizedJson = res.sanitized as Record<string, unknown>;
-          jsonWasRedacted = res.changed;
-        }
-
-        // Sanitize wire text representation
-        const textRedacted = redactString(wireResponseBody, sensitiveTokens, rawRpcUrl);
-        const textWasRedacted = textRedacted !== wireResponseBody;
-
-        wasRedacted = jsonWasRedacted || textWasRedacted;
-
-        if (wasRedacted) {
-          if (sanitizedJson !== null) {
-            rawResponseBody = JSON.stringify(sanitizedJson);
-          } else {
-            rawResponseBody = textRedacted;
-          }
-          storedResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
-        } else {
-          rawResponseBody = wireResponseBody;
-          storedResponseSha256 = wireResponseSha256;
-        }
-
-        if (response.status !== 200) {
-          errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
-          parsedJson = sanitizedJson;
-        } else {
-          if (jsonParseError) {
-            errMessage = `Malformed JSON response: ${jsonParseError}`;
-            parsedJson = null;
-          } else {
-            parsedJson = sanitizedJson;
-          }
-        }
-      }
     }
 
     if (errMessage) {

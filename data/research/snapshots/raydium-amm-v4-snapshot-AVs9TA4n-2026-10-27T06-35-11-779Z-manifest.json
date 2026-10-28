@@ -1,0 +1,23 @@
+{
+  "manifestVersion": "1.0",
+  "manifestType": "RAYDIUM_AMM_V4_SNAPSHOT_MANIFEST",
+  "createdAtIso": "2026-10-27T06:35:11.782Z",
+  "poolId": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
+  "status": "SUCCESS",
+  "httpAttempts": 2,
+  "evidenceFileName": "raydium-amm-v4-snapshot-AVs9TA4n-2026-10-27T06-35-11-779Z.json",
+  "evidenceFilePath": "U:\\Projects\\TopG\\data\\research\\snapshots\\raydium-amm-v4-snapshot-AVs9TA4n-2026-10-27T06-35-11-779Z.json",
+  "evidenceFileSha256": "e7819a28be6cf6a5cf7aaacfdda3d794a7078d4ffbf9e7136c4d1d80198b78dd",
+  "evidenceByteSize": 15765,
+  "payloadDigestSha256": "2c419bb320a6a6e11e896409d59d9ac7bd6922784dbcf7e3e2eab5cb2a934c82",
+  "contextSlots": {
+    "bootstrapSlot": 461970865,
+    "batchSlot": 461970878
+  },
+  "outcomes": {
+    "retrievalOk": true,
+    "structuralValidationOk": true,
+    "meetsNinetyPercentThreshold": false
+  },
+  "failureReason": null
+}
