@@ -1,5 +1,5 @@
 /**
- * Phase 12.94-D Milestone D.3.3: Raydium AMM v4 LP Evidence Adapter
+ * Phase 12.94-D Milestone D.3.3: Raydium AMM v4 LP Evidence Adapter (Hardened)
  *
  * Composition adapter connecting the bounded Raydium AMM v4 snapshot acquisition
  * client to CandidateStreamEngine's injected LpEvidenceResolver interface.
@@ -13,10 +13,15 @@
  * 4. Metered request accounting: meters every outbound request attempt through a shared
  *    GlobalResourceBudgetManager, preserving global ceilings, purpose reservations,
  *    and shared host pacing across candidates.
- * 5. Dispatched failure counting: dispatched attempts are counted regardless of HTTP outcome;
- *    budget denial prevents dispatch, including denial between Request 1 and Request 2.
- * 6. Truthful provenance: passes explicit origin and synthetic flags through to evidence.
- * 7. Fail-closed: invalid identities, transport exceptions, and budget denials strictly fail closed.
+ * 5. Dispatched failure counting & pre-dispatch reconciliation: dispatched attempts are counted
+ *    regardless of HTTP outcome; pre-dispatch budget denials and deadline denials prevent dispatch
+ *    and do not increment dispatched attempt counts.
+ * 6. Single effective deadline: one unified deadline covers initial shared pacing, acquisition,
+ *    and transport-wrapper pacing waits. Pacing waits respect abort signals and remaining time.
+ * 7. Respect unsuccessful acquisition results: fails closed on acquisition failure (e.g. storage error)
+ *    while preserving diagnostics, without allowing failed results to qualify candidates.
+ * 8. Truthful provenance: passes explicit origin and synthetic flags through to evidence.
+ * 9. Fail-closed: invalid identities, transport exceptions, and budget denials strictly fail closed.
  */
 
 import { isCanonicalSolanaBase58 } from "./LpScreeningBridge.js";
@@ -29,12 +34,47 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   DEFAULT_OVERALL_TIMEOUT_MS,
   type SnapshotAcquisitionResult,
+  BudgetDeniedError,
+  PreDispatchError,
 } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 import type { EvidenceOrigin } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
 import type {
   GlobalResourceBudgetManager,
   RequestPurpose,
 } from "../research/prospective/GlobalResourceBudgetManager.js";
+
+/**
+ * Helper to race a pacing wait against an optional AbortSignal.
+ */
+async function sleepWithSignal(
+  ms: number,
+  sleepFn: (ms: number) => Promise<void>,
+  signal?: AbortSignal | null | undefined,
+): Promise<void> {
+  if (signal?.aborted) {
+    throw new PreDispatchError("ABORTED: Request was cancelled before pacing wait");
+  }
+  if (!signal) {
+    await sleepFn(ms);
+    return;
+  }
+  let abortListener: (() => void) | undefined;
+  try {
+    await Promise.race([
+      sleepFn(ms),
+      new Promise<never>((_, reject) => {
+        abortListener = () => {
+          reject(new PreDispatchError("ABORTED: Request was cancelled during pacing wait"));
+        };
+        signal.addEventListener("abort", abortListener, { once: true });
+      }),
+    ]);
+  } finally {
+    if (abortListener) {
+      signal.removeEventListener("abort", abortListener);
+    }
+  }
+}
 
 export interface RaydiumAmmV4LpEvidenceAdapterOptions {
   /**
@@ -119,6 +159,7 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
   private readonly isSyntheticFixture: boolean | undefined;
   private readonly clock: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private lastResult: SnapshotAcquisitionResult | null = null;
 
   constructor(options: RaydiumAmmV4LpEvidenceAdapterOptions) {
     if (!options.transport) {
@@ -166,11 +207,23 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       return null;
     }
 
-    // 2. Pre-check budget permission and pacing across candidates before initiating acquisition
-    const now = this.clock();
+    // 2. Establish one effective deadline covering initial shared pacing, acquisition, and transport wrapper waits
+    const startEpoch = this.clock();
+    const effectiveDeadlineEpoch = startEpoch + this.overallTimeoutMs;
+
+    const getRemainingEffectiveBudgetMs = (): number => {
+      return effectiveDeadlineEpoch - this.clock();
+    };
+
+    let remainingBudget = getRemainingEffectiveBudgetMs();
+    if (remainingBudget <= 0) {
+      return null;
+    }
+
+    // 3. Pre-check budget permission and pacing across candidates before initiating acquisition
     let initialCheck = this.budgetManager.canMakeRequest(
       this.providerName,
-      now,
+      this.clock(),
       this.requestPurpose,
     );
 
@@ -180,7 +233,15 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       typeof initialCheck.waitMs === "number" &&
       initialCheck.waitMs > 0
     ) {
+      if (initialCheck.waitMs >= remainingBudget) {
+        // Insufficient time for initial pacing within effective deadline
+        return null;
+      }
       await this.sleepFn(initialCheck.waitMs);
+      remainingBudget = getRemainingEffectiveBudgetMs();
+      if (remainingBudget <= 0) {
+        return null;
+      }
       initialCheck = this.budgetManager.canMakeRequest(
         this.providerName,
         this.clock(),
@@ -193,8 +254,21 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       return null;
     }
 
-    // 3. Construct metered fetch transport bound to shared session budget
+    // 4. Construct metered fetch transport bound to shared session budget and effective deadline
     const meteredFetch: typeof fetch = async (input, init) => {
+      // Check cancellation upfront
+      if (init?.signal?.aborted) {
+        throw new PreDispatchError("ABORTED: Request was cancelled before dispatch");
+      }
+
+      // Check remaining effective budget
+      let remaining = getRemainingEffectiveBudgetMs();
+      if (remaining <= 0) {
+        throw new PreDispatchError(
+          `DEADLINE_EXCEEDED: Overall timeout of ${this.overallTimeoutMs}ms exceeded before dispatch`,
+        );
+      }
+
       const callNow = this.clock();
       let check = this.budgetManager.canMakeRequest(
         this.providerName,
@@ -208,7 +282,29 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
         typeof check.waitMs === "number" &&
         check.waitMs > 0
       ) {
-        await this.sleepFn(check.waitMs);
+        if (check.waitMs >= remaining) {
+          throw new PreDispatchError(
+            `DEADLINE_EXCEEDED: Remaining budget (${remaining}ms) is insufficient for shared pacing wait (${check.waitMs}ms)`,
+          );
+        }
+
+        if (init?.signal?.aborted) {
+          throw new PreDispatchError("ABORTED: Request was cancelled before pacing wait");
+        }
+
+        await sleepWithSignal(check.waitMs, this.sleepFn, init?.signal);
+
+        if (init?.signal?.aborted) {
+          throw new PreDispatchError("ABORTED: Request was cancelled during pacing wait");
+        }
+
+        remaining = getRemainingEffectiveBudgetMs();
+        if (remaining <= 0) {
+          throw new PreDispatchError(
+            `DEADLINE_EXCEEDED: Overall timeout of ${this.overallTimeoutMs}ms exceeded during shared pacing wait`,
+          );
+        }
+
         check = this.budgetManager.canMakeRequest(
           this.providerName,
           this.clock(),
@@ -218,8 +314,17 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
 
       if (!check.allowed) {
         // Budget denial must prevent dispatch!
-        throw new Error(
+        throw new BudgetDeniedError(
           `BUDGET_DENIED: ${check.reason ?? "Request denied by shared session budget"}`,
+        );
+      }
+
+      if (init?.signal?.aborted) {
+        throw new PreDispatchError("ABORTED: Request was cancelled before dispatch recording");
+      }
+      if (getRemainingEffectiveBudgetMs() <= 0) {
+        throw new PreDispatchError(
+          `DEADLINE_EXCEEDED: Overall timeout of ${this.overallTimeoutMs}ms exceeded before dispatch recording`,
         );
       }
 
@@ -231,7 +336,9 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       );
 
       if (!recorded) {
-        throw new Error("BUDGET_DENIED: Failed to record request attempt in shared session budget");
+        throw new BudgetDeniedError(
+          "BUDGET_DENIED: Failed to record request attempt in shared session budget",
+        );
       }
 
       const response = await this.underlyingTransport(input, init);
@@ -242,6 +349,7 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       return response;
     };
 
+    const remainingForAcquisition = Math.max(0, getRemainingEffectiveBudgetMs());
     const acquisitionClock = () => new Date(this.clock());
 
     try {
@@ -251,14 +359,33 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
         expectedTokenMint: candidate.mintAddress,
         pacingMs: this.pacingMs,
         timeoutMs: this.timeoutMs,
-        overallTimeoutMs: this.overallTimeoutMs,
+        overallTimeoutMs: remainingForAcquisition,
         outDir: this.outDir,
         evidenceOrigin: this.evidenceOrigin,
         isSyntheticFixture: this.isSyntheticFixture,
         fetch: meteredFetch,
         clock: acquisitionClock,
-        sleeper: this.sleepFn,
+        sleeper: (ms) => sleepWithSignal(ms, this.sleepFn),
       });
+
+      this.lastResult = result;
+
+      // 1. Respect unsuccessful acquisition results (storage failures, network drops, deadline expirations)
+      if (!result.ok) {
+        // Fail closed at adapter boundary while preserving diagnostics without allowing failed acquisition results to qualify candidates.
+        if (result.evidence) {
+          return {
+            ...result.evidence,
+            outcomes: {
+              ...result.evidence.outcomes,
+              structuralValidationOk: false,
+              meetsNinetyPercentThreshold: false,
+            },
+            failureReason: result.evidence.failureReason ?? "ACQUISITION_UNSUCCESSFUL",
+          };
+        }
+        return null;
+      }
 
       return result.evidence;
     } catch {
@@ -268,5 +395,9 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
 
   public getBudgetManager(): GlobalResourceBudgetManager {
     return this.budgetManager;
+  }
+
+  public getLastResult(): SnapshotAcquisitionResult | null {
+    return this.lastResult;
   }
 }

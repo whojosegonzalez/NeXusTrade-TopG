@@ -57,6 +57,56 @@ export const MAX_OVERALL_TIMEOUT_MS = 60000;
 export const MAX_HTTP_ATTEMPTS_ALLOWED = 2;
 
 /**
+ * Error indicating that a request attempt was cancelled or failed pre-flight
+ * before any outbound HTTP transport dispatch occurred.
+ */
+export class PreDispatchError extends Error {
+  readonly isPreDispatch = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "PreDispatchError";
+  }
+}
+
+/**
+ * Error indicating that a request attempt was denied by resource budget constraints
+ * before any outbound HTTP transport dispatch occurred.
+ */
+export class BudgetDeniedError extends PreDispatchError {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetDeniedError";
+  }
+}
+
+/**
+ * Checks whether an error is an identified pre-dispatch failure that must not
+ * be counted as a dispatched HTTP attempt.
+ */
+export function isPreDispatchError(err: unknown): boolean {
+  if (!err) return false;
+  if (typeof err === "object") {
+    if ("isPreDispatch" in err && (err as { isPreDispatch: unknown }).isPreDispatch === true) {
+      return true;
+    }
+    const name = (err as Error).name;
+    if (name === "PreDispatchError" || name === "BudgetDeniedError") {
+      return true;
+    }
+    const msg = (err as Error).message;
+    if (typeof msg === "string") {
+      return (
+        msg.startsWith("BUDGET_DENIED") ||
+        msg.startsWith("PRE_DISPATCH") ||
+        msg.includes("BUDGET_DENIED") ||
+        msg.includes("PRE_DISPATCH")
+      );
+    }
+  }
+  return false;
+}
+
+/**
  * Public endpoint projection containing only sanitized URL, host, and fingerprint.
  * Transport credentials, raw URLs, and sensitive tokens are strictly excluded.
  */
@@ -759,7 +809,17 @@ export async function acquireRaydiumAmmV4Snapshot(
         }
       }
     } catch (fetchErr) {
-      if (controller.signal.aborted) {
+      const isPreDispatch = isPreDispatchError(fetchErr);
+      if (isPreDispatch) {
+        // Roll back httpAttempts because no transport dispatch occurred!
+        httpAttempts--;
+        const rawMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+        if (rawMsg.includes("BUDGET_DENIED")) {
+          errMessage = `PRE_DISPATCH_BUDGET_DENIED: ${rawMsg}`;
+        } else {
+          errMessage = `PRE_DISPATCH_DENIED: ${rawMsg}`;
+        }
+      } else if (controller.signal.aborted) {
         errMessage = `Request timed out after ${effectiveTimeout}ms`;
       } else {
         errMessage = `Network error: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`;
@@ -812,7 +872,13 @@ export async function acquireRaydiumAmmV4Snapshot(
   );
 
   if (req1Record.error !== null || !req1Json) {
-    failureReason = `Bootstrap Request 1 failed: ${req1Record.error ?? "Empty response"}`;
+    if (req1Record.error?.startsWith("PRE_DISPATCH_BUDGET_DENIED")) {
+      failureReason = `Bootstrap Request 1 pre-dispatch budget denial: ${req1Record.error}`;
+    } else if (req1Record.error?.startsWith("PRE_DISPATCH_DENIED")) {
+      failureReason = `Bootstrap Request 1 pre-dispatch denial: ${req1Record.error}`;
+    } else {
+      failureReason = `Bootstrap Request 1 failed: ${req1Record.error ?? "Empty response"}`;
+    }
   } else if (req1Json.error) {
     const errorStr =
       typeof req1Json.error === "object" ? JSON.stringify(req1Json.error) : String(req1Json.error);
@@ -1082,7 +1148,13 @@ export async function acquireRaydiumAmmV4Snapshot(
   );
 
   if (req2Record.error !== null || !req2Json) {
-    failureReason = `Batch Request 2 failed: ${req2Record.error ?? "Empty response"}`;
+    if (req2Record.error?.startsWith("PRE_DISPATCH_BUDGET_DENIED")) {
+      failureReason = `Batch Request 2 pre-dispatch budget denial: ${req2Record.error}`;
+    } else if (req2Record.error?.startsWith("PRE_DISPATCH_DENIED")) {
+      failureReason = `Batch Request 2 pre-dispatch denial: ${req2Record.error}`;
+    } else {
+      failureReason = `Batch Request 2 failed: ${req2Record.error ?? "Empty response"}`;
+    }
   } else if (req2Json.error) {
     const errorStr =
       typeof req2Json.error === "object" ? JSON.stringify(req2Json.error) : String(req2Json.error);
@@ -1201,6 +1273,15 @@ async function finalizeAcquisition(params: {
   const completedAt = params.clock();
   let failureReason = params.failureReason;
   let finalOk = params.structuralValidationOk;
+
+  if (
+    params.requests.length > 0 &&
+    completedAt.getTime() > params.startedAt.getTime() + params.overallTimeoutMs
+  ) {
+    finalOk = false;
+    const deadlineMsg = `DEADLINE_EXCEEDED: Overall acquisition deadline of ${params.overallTimeoutMs}ms exceeded`;
+    failureReason = failureReason ? `${failureReason}; ${deadlineMsg}` : deadlineMsg;
+  }
 
   const evidence: SnapshotAcquisitionEvidence = {
     schemaVersion: "1.0",
@@ -1338,6 +1419,9 @@ async function finalizeAcquisition(params: {
     } catch (writeErr) {
       // Storage failures make the operation unsuccessful
       finalOk = false;
+      (evidence.outcomes as { structuralValidationOk: boolean }).structuralValidationOk = false;
+      (evidence.outcomes as { meetsNinetyPercentThreshold: boolean }).meetsNinetyPercentThreshold =
+        false;
       const storageErrMsg = `EVIDENCE_STORAGE_FAILED: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`;
       failureReason = failureReason ? `${failureReason}; ${storageErrMsg}` : storageErrMsg;
       evidence.failureReason = failureReason;
