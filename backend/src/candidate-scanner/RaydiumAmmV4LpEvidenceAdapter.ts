@@ -36,6 +36,7 @@ import {
   type SnapshotAcquisitionResult,
   BudgetDeniedError,
   PreDispatchError,
+  createTransportDispatchTracker,
 } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 import type { EvidenceOrigin } from "../research/pilot/RaydiumAmmV4SnapshotValidator.js";
 import type {
@@ -254,7 +255,10 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
       return null;
     }
 
-    // 4. Construct metered fetch transport bound to shared session budget and effective deadline
+    // 4. Create explicit execution dispatch tracker for trusted wrapper contract
+    const dispatchTracker = createTransportDispatchTracker();
+
+    // 5. Construct metered fetch transport bound to shared session budget and effective deadline
     const meteredFetch: typeof fetch = async (input, init) => {
       // Check cancellation upfront
       if (init?.signal?.aborted) {
@@ -341,6 +345,9 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
         );
       }
 
+      // Explicit execution state: Mark transport as dispatched immediately before invocation
+      dispatchTracker.markDispatched();
+
       const response = await this.underlyingTransport(input, init);
 
       // Record response status in budgetManager (tracks consecutive 429 halts)
@@ -364,6 +371,7 @@ export class RaydiumAmmV4LpEvidenceAdapter implements CandidateLpEvidenceResolve
         evidenceOrigin: this.evidenceOrigin,
         isSyntheticFixture: this.isSyntheticFixture,
         fetch: meteredFetch,
+        dispatchTracker,
         clock: acquisitionClock,
         sleeper: (ms) => sleepWithSignal(ms, this.sleepFn),
       });

@@ -80,30 +80,42 @@ export class BudgetDeniedError extends PreDispatchError {
 }
 
 /**
- * Checks whether an error is an identified pre-dispatch failure that must not
- * be counted as a dispatched HTTP attempt.
+ * Trusted contract interface for tracking whether underlying transport dispatch
+ * has officially commenced.
  */
-export function isPreDispatchError(err: unknown): boolean {
-  if (!err) return false;
-  if (typeof err === "object") {
-    if ("isPreDispatch" in err && (err as { isPreDispatch: unknown }).isPreDispatch === true) {
-      return true;
-    }
-    const name = (err as Error).name;
-    if (name === "PreDispatchError" || name === "BudgetDeniedError") {
-      return true;
-    }
-    const msg = (err as Error).message;
-    if (typeof msg === "string") {
-      return (
-        msg.startsWith("BUDGET_DENIED") ||
-        msg.startsWith("PRE_DISPATCH") ||
-        msg.includes("BUDGET_DENIED") ||
-        msg.includes("PRE_DISPATCH")
-      );
-    }
-  }
-  return false;
+export interface TransportDispatchTracker {
+  /** Returns whether underlying transport invocation has commenced for the current attempt. */
+  isDispatched(): boolean;
+  /** Marks that underlying transport invocation has officially commenced. */
+  markDispatched(): void;
+  /** Resets dispatch state before initiating a new attempt. */
+  reset(): void;
+}
+
+/**
+ * Creates a standard trusted TransportDispatchTracker instance.
+ */
+export function createTransportDispatchTracker(): TransportDispatchTracker {
+  let dispatched = false;
+  return {
+    isDispatched: () => dispatched,
+    markDispatched: () => {
+      dispatched = true;
+    },
+    reset: () => {
+      dispatched = false;
+    },
+  };
+}
+
+/**
+ * Checks whether an error is an instance of PreDispatchError.
+ * Note: Dispatch status is determined by explicit execution state (e.g. TransportDispatchTracker),
+ * not error message text.
+ */
+export function isPreDispatchError(err: unknown): err is PreDispatchError {
+  if (!err || typeof err !== "object") return false;
+  return err instanceof PreDispatchError;
 }
 
 /**
@@ -128,6 +140,7 @@ export interface SnapshotAcquisitionConfig {
   readonly evidenceOrigin?: EvidenceOrigin | undefined;
   readonly isSyntheticFixture?: boolean | undefined;
   readonly fetch?: typeof fetch | undefined;
+  readonly dispatchTracker?: TransportDispatchTracker | undefined;
   readonly clock?: (() => Date) | undefined;
   readonly sleeper?: ((ms: number) => Promise<void>) | undefined;
 }
@@ -721,7 +734,10 @@ export async function acquireRaydiumAmmV4Snapshot(
       return { record: rec, json: null };
     }
 
-    // Only increment httpAttempts when fetchImpl is actually about to be dispatched
+    // Reset dispatch tracker state before attempting this RPC call
+    config.dispatchTracker?.reset();
+
+    // Increment httpAttempts when fetchImpl is about to be called
     httpAttempts++;
     const currentAttempt = httpAttempts;
     const reqTimestamp = clock();
@@ -745,8 +761,9 @@ export async function acquireRaydiumAmmV4Snapshot(
     let parsedJson: Record<string, unknown> | null = null;
     let errMessage: string | null = null;
 
+    let response: Response | null = null;
     try {
-      const response = await fetchImpl(rawRpcUrl, {
+      response = await fetchImpl(rawRpcUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -756,65 +773,15 @@ export async function acquireRaydiumAmmV4Snapshot(
         signal: controller.signal,
         redirect: "error",
       });
-
-      httpStatus = response.status;
-      const wireResponseBody = await response.text();
-      wireResponseSha256 = crypto.createHash("sha256").update(wireResponseBody).digest("hex");
-
-      // Parse JSON from wire response (unsanitized payload kept private in memory)
-      let rawParsedJson: unknown = null;
-      let jsonParseError: string | null = null;
-      try {
-        rawParsedJson = JSON.parse(wireResponseBody);
-      } catch (err) {
-        jsonParseError = err instanceof Error ? err.message : String(err);
-      }
-
-      // Sanitize decoded parsed JSON structure if present
-      let sanitizedJson: Record<string, unknown> | null = null;
-      let jsonWasRedacted = false;
-      if (rawParsedJson !== null && typeof rawParsedJson === "object") {
-        const res = sanitizeJsonValue(rawParsedJson, sensitiveTokens, rawRpcUrl);
-        sanitizedJson = res.sanitized as Record<string, unknown>;
-        jsonWasRedacted = res.changed;
-      }
-
-      // Sanitize wire text representation
-      const textRedacted = redactString(wireResponseBody, sensitiveTokens, rawRpcUrl);
-      const textWasRedacted = textRedacted !== wireResponseBody;
-
-      wasRedacted = jsonWasRedacted || textWasRedacted;
-
-      if (wasRedacted) {
-        if (sanitizedJson !== null) {
-          rawResponseBody = JSON.stringify(sanitizedJson);
-        } else {
-          rawResponseBody = textRedacted;
-        }
-        storedResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
-      } else {
-        rawResponseBody = wireResponseBody;
-        storedResponseSha256 = wireResponseSha256;
-      }
-
-      if (response.status !== 200) {
-        errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
-        parsedJson = sanitizedJson;
-      } else {
-        if (jsonParseError) {
-          errMessage = `Malformed JSON response: ${jsonParseError}`;
-          parsedJson = null;
-        } else {
-          parsedJson = sanitizedJson;
-        }
-      }
     } catch (fetchErr) {
-      const isPreDispatch = isPreDispatchError(fetchErr);
-      if (isPreDispatch) {
+      const isDispatched = config.dispatchTracker ? config.dispatchTracker.isDispatched() : true;
+
+      if (!isDispatched) {
+        // Genuine pre-dispatch failure: The underlying transport was never called.
         // Roll back httpAttempts because no transport dispatch occurred!
         httpAttempts--;
         const rawMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        if (rawMsg.includes("BUDGET_DENIED")) {
+        if (fetchErr instanceof BudgetDeniedError || rawMsg.startsWith("BUDGET_DENIED")) {
           errMessage = `PRE_DISPATCH_BUDGET_DENIED: ${rawMsg}`;
         } else {
           errMessage = `PRE_DISPATCH_DENIED: ${rawMsg}`;
@@ -826,6 +793,71 @@ export async function acquireRaydiumAmmV4Snapshot(
       }
     } finally {
       clearTimeout(timer);
+    }
+
+    if (response !== null) {
+      httpStatus = response.status;
+      let wireResponseBody: string | null = null;
+      try {
+        wireResponseBody = await response.text();
+      } catch (readErr) {
+        // Once the transport has been invoked, its attempt must remain counted,
+        // including response body read failure.
+        const rawMsg = readErr instanceof Error ? readErr.message : String(readErr);
+        errMessage = `Network error: Response body read failure: ${rawMsg}`;
+      }
+
+      if (wireResponseBody !== null) {
+        wireResponseSha256 = crypto.createHash("sha256").update(wireResponseBody).digest("hex");
+
+        // Parse JSON from wire response (unsanitized payload kept private in memory)
+        let rawParsedJson: unknown = null;
+        let jsonParseError: string | null = null;
+        try {
+          rawParsedJson = JSON.parse(wireResponseBody);
+        } catch (err) {
+          jsonParseError = err instanceof Error ? err.message : String(err);
+        }
+
+        // Sanitize decoded parsed JSON structure if present
+        let sanitizedJson: Record<string, unknown> | null = null;
+        let jsonWasRedacted = false;
+        if (rawParsedJson !== null && typeof rawParsedJson === "object") {
+          const res = sanitizeJsonValue(rawParsedJson, sensitiveTokens, rawRpcUrl);
+          sanitizedJson = res.sanitized as Record<string, unknown>;
+          jsonWasRedacted = res.changed;
+        }
+
+        // Sanitize wire text representation
+        const textRedacted = redactString(wireResponseBody, sensitiveTokens, rawRpcUrl);
+        const textWasRedacted = textRedacted !== wireResponseBody;
+
+        wasRedacted = jsonWasRedacted || textWasRedacted;
+
+        if (wasRedacted) {
+          if (sanitizedJson !== null) {
+            rawResponseBody = JSON.stringify(sanitizedJson);
+          } else {
+            rawResponseBody = textRedacted;
+          }
+          storedResponseSha256 = crypto.createHash("sha256").update(rawResponseBody).digest("hex");
+        } else {
+          rawResponseBody = wireResponseBody;
+          storedResponseSha256 = wireResponseSha256;
+        }
+
+        if (response.status !== 200) {
+          errMessage = `HTTP error ${response.status}: ${response.statusText || "Non-200 response"}`;
+          parsedJson = sanitizedJson;
+        } else {
+          if (jsonParseError) {
+            errMessage = `Malformed JSON response: ${jsonParseError}`;
+            parsedJson = null;
+          } else {
+            parsedJson = sanitizedJson;
+          }
+        }
+      }
     }
 
     if (errMessage) {
@@ -840,7 +872,8 @@ export async function acquireRaydiumAmmV4Snapshot(
       method,
       params,
       requestTimestampIso,
-      responseTimestampIso: rawResponseBody !== null ? respTimestamp.toISOString() : null,
+      responseTimestampIso:
+        rawResponseBody !== null || httpStatus !== null ? respTimestamp.toISOString() : null,
       elapsedMs,
       httpStatus,
       rawResponseBody,

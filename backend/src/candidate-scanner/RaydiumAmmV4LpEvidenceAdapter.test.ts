@@ -855,5 +855,230 @@ describe("RaydiumAmmV4LpEvidenceAdapter", () => {
       expect(transportCallCount).toBe(0);
       expect(budgetManager.getStats().totalRequests).toBe(0);
     });
+
+    // =========================================================================
+    // AUDIT CORRECTION 3 (HARDENED): Explicit dispatch execution state regressions
+    // =========================================================================
+    it("reconciles dispatch counts when transport throws an error containing BUDGET_DENIED after dispatch (Auditor Reproduction 1)", async () => {
+      let nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+      const sleepFn = async (ms: number) => {
+        nowMs += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 10 });
+      let transportCallCount = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCallCount++;
+        // Throws an error whose message mentions BUDGET_DENIED after dispatch has commenced
+        throw new Error("Upstream gateway BUDGET_DENIED after dispatch");
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+        sleepFn,
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+
+      expect(evalResult.admitted).toBe(false);
+
+      // Reconciled dispatch accounting:
+      // Underlying transport: 1 call
+      // Shared budget attempts: 1 attempt
+      // Acquisition evidence httpAttempts: 1 attempt (NOT 0!)
+      expect(transportCallCount).toBe(1);
+      expect(budgetManager.getStats().totalRequests).toBe(1);
+
+      const lastResult = adapter.getLastResult();
+      expect(lastResult).toBeDefined();
+      expect(lastResult?.ok).toBe(false);
+      expect(lastResult?.httpAttempts).toBe(1);
+      expect(lastResult?.evidence.httpAttempts).toBe(1);
+
+      const req1 = lastResult?.evidence.requests[0];
+      expect(req1).toBeDefined();
+      expect(req1?.attempt).toBe(1);
+      expect(req1?.error).toContain("Network error: Upstream gateway BUDGET_DENIED after dispatch");
+      expect(req1?.error).not.toContain("PRE_DISPATCH");
+    });
+
+    it("reconciles dispatch counts when transport returns HTTP 200 but reading response body throws an error containing PRE_DISPATCH (Auditor Reproduction 2)", async () => {
+      let nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+      const sleepFn = async (ms: number) => {
+        nowMs += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 10 });
+      let transportCallCount = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCallCount++;
+        // Returns Response whose text() method throws an error mentioning PRE_DISPATCH
+        const brokenResponse = new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error("Upstream body PRE_DISPATCH read failure"));
+            },
+          }),
+          { status: 200 },
+        );
+        return brokenResponse;
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+        sleepFn,
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+
+      expect(evalResult.admitted).toBe(false);
+
+      // Reconciled dispatch accounting:
+      // Underlying transport: 1 call
+      // Shared budget attempts: 1 attempt
+      // Acquisition evidence httpAttempts: 1 attempt (NOT 0!)
+      expect(transportCallCount).toBe(1);
+      expect(budgetManager.getStats().totalRequests).toBe(1);
+
+      const lastResult = adapter.getLastResult();
+      expect(lastResult).toBeDefined();
+      expect(lastResult?.ok).toBe(false);
+      expect(lastResult?.httpAttempts).toBe(1);
+      expect(lastResult?.evidence.httpAttempts).toBe(1);
+
+      const req1 = lastResult?.evidence.requests[0];
+      expect(req1).toBeDefined();
+      expect(req1?.attempt).toBe(1);
+      expect(req1?.httpStatus).toBe(200);
+      expect(req1?.error).toContain(
+        "Response body read failure: Upstream body PRE_DISPATCH read failure",
+      );
+      expect(req1?.error).not.toContain("PRE_DISPATCH_DENIED");
+      expect(req1?.error).not.toContain("PRE_DISPATCH_BUDGET_DENIED");
+    });
+
+    it("reconciles dispatch counts on ordinary dispatched transport failures (network disconnect)", async () => {
+      let nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+      const sleepFn = async (ms: number) => {
+        nowMs += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 10 });
+      let transportCallCount = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCallCount++;
+        throw new Error("ECONNRESET: socket hang up");
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+        sleepFn,
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+
+      expect(evalResult.admitted).toBe(false);
+
+      // Reconciled dispatch accounting:
+      expect(transportCallCount).toBe(1);
+      expect(budgetManager.getStats().totalRequests).toBe(1);
+
+      const lastResult = adapter.getLastResult();
+      expect(lastResult).toBeDefined();
+      expect(lastResult?.ok).toBe(false);
+      expect(lastResult?.httpAttempts).toBe(1);
+      expect(lastResult?.evidence.httpAttempts).toBe(1);
+
+      const req1 = lastResult?.evidence.requests[0];
+      expect(req1).toBeDefined();
+      expect(req1?.error).toContain("Network error: ECONNRESET: socket hang up");
+    });
+
+    it("reconciles dispatch counts on genuine pre-dispatch budget denial before Request 1", async () => {
+      const nowMs = 1_700_000_000_000;
+      const clock = () => nowMs;
+
+      // Budget manager with maxTotalRequests = 0 (immediately denies)
+      const budgetManager = new GlobalResourceBudgetManager({ clock, maxTotalRequests: 0 });
+      let transportCallCount = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCallCount++;
+        return new Response("{}", { status: 200 });
+      };
+
+      const adapter = new RaydiumAmmV4LpEvidenceAdapter({
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+      });
+
+      const engine = new CandidateStreamEngine({
+        config: createConfig(),
+        requireValidatedLp: true,
+        lpEvidenceResolver: adapter,
+        lpFreshnessPolicy: {
+          maxEvidenceAgeMs: 60_000,
+          currentTimestampMs: nowMs + 1000,
+        },
+      });
+
+      const pool = createSyntheticRayCandidatePool();
+      const evalResult = await engine.evaluatePoolAsync(pool, Math.floor(nowMs / 1000));
+
+      expect(evalResult.admitted).toBe(false);
+
+      // In genuine pre-dispatch denial upfront, transport is NEVER called:
+      // Underlying transport: 0 calls
+      // Shared budget attempts: 0 attempts
+      expect(transportCallCount).toBe(0);
+      expect(budgetManager.getStats().totalRequests).toBe(0);
+      expect(adapter.getLastResult()).toBeNull();
+    });
   });
 });
