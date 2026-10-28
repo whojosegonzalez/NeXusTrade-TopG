@@ -4,46 +4,65 @@
  * Comprehensive offline verification of:
  * 1. Single BUY swaps (standard TOKEN_BASE_SOL_QUOTE and inverted SOL_BASE_TOKEN_QUOTE).
  * 2. Single SELL swaps (standard and inverted pair orientations).
- * 3. Exact 8-account (SwapBaseInV2/SwapBaseOutV2) and 17-account (SwapBaseIn/SwapBaseOut) layouts.
- * 4. Multiple swaps in one transaction with distinct coordinates (${sig}:${outer}:${swap}).
- * 5. Supported routed/CPI cases (inner instructions under aggregator/router programs).
- * 6. Identity mismatch handling:
- *    - Unrelated Raydium pool swaps in the same transaction are skipped.
- *    - Vault account mismatch produces explicit VAULT_MISMATCH failure.
- * 7. Failed transaction handling (meta.err present -> TRANSACTION_FAILED, 0 events emitted).
- * 8. Malformed / unsupported instruction handling:
- *    - Instruction data underflow (< 17 bytes) -> MALFORMED_INSTRUCTION_DATA.
- *    - Non-swap Raydium instruction tags -> UNSUPPORTED_INSTRUCTION.
- *    - Ambiguous swap direction without transfers or logs -> AMBIGUOUS_DIRECTION.
- * 9. Missing upstream blockTime handling (MISSING_UPSTREAM_TIMESTAMP; time is never manufactured).
- * 10. Normalization adapter integration & tracker deduplication:
- *     - Ingestion into RollingTradeFlowTracker via RaydiumAmmV4SwapNormalizationAdapter.
- *     - Duplicate ingestion yields DUPLICATE_EVENT and keeps counts stable.
- * 11. Complete window coverage guard:
- *     - Transaction ingestion populates trade counts, but NEVER establishes window coverage.
+ * 3. Exact instruction tag to account layout matrix (commit 91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6):
+ *    - 17-account legacy layout (SwapBaseIn tag 9 / SwapBaseOut tag 11).
+ *    - 18-account shifted legacy layout with optional target_orders at index 4.
+ *    - 8-account clean V2 layout (SwapBaseInV2 tag 16 / SwapBaseOutV2 tag 17).
+ *    - Rejection of tag 9/11 with 8 accounts (UNSUPPORTED_LAYOUT).
+ *    - Rejection of tag 16/17 with 17 or 18 accounts (UNSUPPORTED_LAYOUT).
+ * 4. Invocation-scoped evidence attribution:
+ *    - Call-stack parsing of logMessages with depth tracking.
+ *    - Strict binding of ray_log events to originating call frame.
+ *    - Isolation of inner SPL transfers by matching exact source/dest/vaults.
+ *    - Consumed transfer index tracking preventing transfer reuse across routed swaps.
+ *    - Rejection of cross-pool or sibling log corruption.
+ *    - Fail closed on conflicting or unassignable evidence (CONFLICTING_EVIDENCE, AMBIGUOUS_DIRECTION).
+ * 5. Proven successful on-chain execution:
+ *    - Explicit meta presence and meta.err === null requirement (TRANSACTION_NOT_SUCCESSFUL).
+ *    - Proven invocation success via logMessages (Program 675k... success).
+ *    - Caught CPI failures produce INVOCATION_FAILED.
+ * 6. Pool boundary validation & context protection:
+ *    - createTrackedRaydiumPoolContext enforces mandatory Base58 poolAddress (no substitution).
+ *    - validateTrackedPoolContext enforces orientation and mint consistency.
+ *    - Normalization adapter freezes context against caller mutation.
+ *    - Non-WSOL quote tokens leave solAmount undefined.
+ * 7. Malformed payload & temporal integrity handling:
+ *    - Non-object / null payloads return INVALID_PAYLOAD without throwing.
+ *    - Out-of-bounds instruction account indices return MALFORMED_INSTRUCTION_DATA.
+ *    - Missing, non-finite, or non-positive blockTime returns MISSING_UPSTREAM_TIMESTAMP.
+ * 8. Tracker integration & window coverage preservation:
+ *    - Normalization adapter ingests into RollingTradeFlowTracker.
+ *    - Deduplication via canonical key (${sig}:${outer}:${swap}) keeps counts stable.
+ *    - Ingestion populates trade counts but NEVER manufactures observation coverage.
  *
- * NOTE: All tests in this file execute strictly offline using labeled synthetic fixtures.
+ * NOTE: All tests execute strictly offline using labeled synthetic fixtures.
  * Synthetic decoding tests do NOT represent live-cluster validation.
  */
 
 import { describe, expect, it } from "vitest";
 import {
+  createTrackedRaydiumPoolContext,
   decodeInstructionData,
   decodeRaydiumTransactionSwaps,
+  matchSupportedSwapLayout,
+  parseInvocationFrames,
   parseRayLog,
   RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES,
   RaydiumAmmV4SwapNormalizationAdapter,
   resolveTransactionAccounts,
   type TrackedRaydiumPoolContext,
+  validateTrackedPoolContext,
 } from "./RaydiumAmmV4SwapDecoder.js";
 import { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
 import {
   RAYDIUM_AMM_V4_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
 } from "../research/pilot/RaydiumAmmParser.js";
+import type { D23RaydiumAmmV4State } from "../research/pilot/PilotTypes.js";
 
 // Canonical Base58 Public Key Fixtures (Synthetic Fixtures)
 const SYNTHETIC_WSOL_MINT = "So11111111111111111111111111111111111111112";
+const SYNTHETIC_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SYNTHETIC_CANDIDATE_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"; // BONK
 const SYNTHETIC_POOL_ID = "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA";
 const SYNTHETIC_OTHER_POOL_ID = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
@@ -79,6 +98,18 @@ const INVERTED_POOL_CONTEXT: TrackedRaydiumPoolContext = Object.freeze({
   orientation: "SOL_BASE_TOKEN_QUOTE",
 });
 
+// USDC Quoted Tracked Pool Context (Non-WSOL quote token)
+const USDC_QUOTED_POOL_CONTEXT: TrackedRaydiumPoolContext = Object.freeze({
+  poolId: SYNTHETIC_POOL_ID,
+  candidateTokenMint: SYNTHETIC_CANDIDATE_MINT,
+  quoteTokenMint: SYNTHETIC_USDC_MINT,
+  baseVault: SYNTHETIC_BASE_VAULT,
+  quoteVault: SYNTHETIC_QUOTE_VAULT,
+  baseMint: SYNTHETIC_CANDIDATE_MINT,
+  quoteMint: SYNTHETIC_USDC_MINT,
+  orientation: "NON_SOL_PAIR",
+});
+
 // Helper functions to create synthetic instruction payloads
 function makeSwapBaseInData(amountIn: bigint, minimumOut: bigint): Uint8Array {
   const buf = new Uint8Array(17);
@@ -101,6 +132,15 @@ function makeSwapBaseInV2Data(amountIn: bigint, minimumOut: bigint): Uint8Array 
 function makeSwapBaseOutData(maxAmountIn: bigint, amountOut: bigint): Uint8Array {
   const buf = new Uint8Array(17);
   buf[0] = 11; // SwapBaseOut tag
+  const view = new DataView(buf.buffer);
+  view.setBigUint64(1, maxAmountIn, true);
+  view.setBigUint64(9, amountOut, true);
+  return buf;
+}
+
+function makeSwapBaseOutV2Data(maxAmountIn: bigint, amountOut: bigint): Uint8Array {
+  const buf = new Uint8Array(17);
+  buf[0] = 17; // SwapBaseOutV2 tag
   const view = new DataView(buf.buffer);
   view.setBigUint64(1, maxAmountIn, true);
   view.setBigUint64(9, amountOut, true);
@@ -134,8 +174,28 @@ function makeRayLogLine(
   return `Program log: ray_log: ${buf.toString("base64")}`;
 }
 
+function makeRaydiumLogs(
+  logType: 3 | 4,
+  direction: "Coin2PC" | "PC2Coin",
+  amountIn: bigint,
+  amountOut: bigint,
+  depth = 1,
+): string[] {
+  return [
+    `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [${depth}]`,
+    makeRayLogLine(logType, direction, amountIn, amountOut),
+    `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+  ];
+}
+
 describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", () => {
-  it("verifies pinned official Raydium source code references", () => {
+  it("verifies pinned official Raydium source code references and immutable commit", () => {
+    expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.repository).toBe(
+      "https://github.com/raydium-io/raydium-amm",
+    );
+    expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.pinnedCommit).toBe(
+      "91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6",
+    );
     expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.programId).toBe(RAYDIUM_AMM_V4_PROGRAM_ID);
     expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN).toBe(9);
     expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT).toBe(11);
@@ -143,14 +203,18 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT_V2).toBe(17);
   });
 
-  it("decodes a top-level standard BUY swap (PC2Coin: SOL -> Candidate Token)", () => {
+  // =========================================================================
+  // AUDIT AREA 1: Match instruction tags to source-verified account layouts
+  // =========================================================================
+
+  it("decodes a standard legacy 17-account BUY swap (SwapBaseIn tag 9)", () => {
     const signature = "5jW84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
     const slot = 280_000_100;
-    const blockTime = 1_700_000_020; // epoch seconds
+    const blockTime = 1_700_000_020;
     const solIn = 100_000_000n; // 0.1 SOL
     const candidateOut = 50_000_000_000n; // 50,000 BONK
 
-    // 17-account layout for SwapBaseIn
+    // Standard 17-account layout for SwapBaseIn
     const accountKeys = [
       SPL_TOKEN_PROGRAM_ID, // 0
       SYNTHETIC_POOL_ID, // 1: amm
@@ -175,9 +239,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     const instructionAccounts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     const data = makeSwapBaseInData(solIn, candidateOut);
 
-    // Inner SPL token transfers:
-    // Transfer 1: user_source -> quote_vault (SOL in)
-    // Transfer 2: base_vault -> user_dest (Candidate out)
     const innerInstructions = [
       {
         programId: SPL_TOKEN_PROGRAM_ID,
@@ -215,7 +276,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             instructions: innerInstructions,
           },
         ],
-        logMessages: [makeRayLogLine(3, "PC2Coin", solIn, candidateOut)],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", solIn, candidateOut),
       },
     };
 
@@ -248,50 +309,62 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(Object.isFrozen(event)).toBe(true);
   });
 
-  it("decodes a top-level standard SELL swap (Coin2PC: Candidate Token -> SOL)", () => {
-    const signature = "4kP84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
-    const slot = 280_000_105;
-    const blockTime = 1_700_000_025;
-    const candidateIn = 25_000_000_000n; // 25,000 BONK
-    const solOut = 49_500_000n; // 0.0495 SOL
+  it("decodes a shifted legacy 18-account layout with optional target_orders at index 4 without VAULT_MISMATCH", () => {
+    // Official processor.rs @ 91739d8d:
+    // If accounts.len() == 18, target_orders is consumed at index 4, shifting all subsequent positions +1.
+    const signature = "8tY84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_102;
+    const blockTime = 1_700_000_022;
+    const solIn = 150_000_000n;
+    const candidateOut = 75_000_000_000n;
 
+    // 18-account layout:
+    // 0: token_program
+    // 1: amm
+    // 2: amm_authority
+    // 3: amm_open_orders
+    // 4: amm_target_orders (shifts subsequent accounts)
+    // 5: amm_coin_vault (baseVault)
+    // 6: amm_pc_vault (quoteVault)
+    // 7..14: market accounts (8 accounts)
+    // 15: user_source
+    // 16: user_destination
+    // 17: user_source_owner
     const accountKeys = [
-      SPL_TOKEN_PROGRAM_ID,
-      SYNTHETIC_POOL_ID,
-      SYNTHETIC_AMM_AUTHORITY,
-      "OpenOrdersAccount1111111111111111111111111111",
-      SYNTHETIC_BASE_VAULT, // 4: amm_coin_vault (Candidate Vault)
-      SYNTHETIC_QUOTE_VAULT, // 5: amm_pc_vault (SOL Vault)
-      "MarketProgram1111111111111111111111111111111",
-      "MarketAccount1111111111111111111111111111111",
-      "MarketBids1111111111111111111111111111111111",
-      "MarketAsks1111111111111111111111111111111111",
-      "MarketEventQueue1111111111111111111111111111",
-      "MarketCoinVault11111111111111111111111111111",
-      "MarketPcVault1111111111111111111111111111111",
-      "MarketVaultSigner111111111111111111111111111",
-      SYNTHETIC_USER_SOURCE_ATA, // 14: Candidate ATA
-      SYNTHETIC_USER_DEST_ATA, // 15: SOL ATA
-      SYNTHETIC_USER_WALLET,
-      RAYDIUM_AMM_V4_PROGRAM_ID,
+      SPL_TOKEN_PROGRAM_ID, // 0
+      SYNTHETIC_POOL_ID, // 1: amm
+      SYNTHETIC_AMM_AUTHORITY, // 2: amm_authority
+      "OpenOrdersAccount1111111111111111111111111111", // 3: open_orders
+      "TargetOrdersAccount1111111111111111111111111", // 4: target_orders (index 4!)
+      SYNTHETIC_BASE_VAULT, // 5: amm_coin_vault (shifted to 5!)
+      SYNTHETIC_QUOTE_VAULT, // 6: amm_pc_vault (shifted to 6!)
+      "MarketProgram1111111111111111111111111111111", // 7
+      "MarketAccount1111111111111111111111111111111", // 8
+      "MarketBids1111111111111111111111111111111111", // 9
+      "MarketAsks1111111111111111111111111111111111", // 10
+      "MarketEventQueue1111111111111111111111111111", // 11
+      "MarketCoinVault11111111111111111111111111111", // 12
+      "MarketPcVault1111111111111111111111111111111", // 13
+      "MarketVaultSigner111111111111111111111111111", // 14
+      SYNTHETIC_USER_SOURCE_ATA, // 15: user_source (shifted to 15!)
+      SYNTHETIC_USER_DEST_ATA, // 16: user_destination (shifted to 16!)
+      SYNTHETIC_USER_WALLET, // 17: user_source_owner (shifted to 17!)
+      RAYDIUM_AMM_V4_PROGRAM_ID, // 18
     ];
 
-    const instructionAccounts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-    const data = makeSwapBaseInData(candidateIn, solOut);
+    const instructionAccounts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+    const data = makeSwapBaseInData(solIn, candidateOut);
 
-    // Inner SPL token transfers:
-    // Transfer 1: user_source -> base_vault (Candidate in)
-    // Transfer 2: quote_vault -> user_dest (SOL out)
     const innerInstructions = [
       {
         programId: SPL_TOKEN_PROGRAM_ID,
-        accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_WALLET],
-        data: makeSplTransferData(candidateIn),
+        accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
+        data: makeSplTransferData(solIn),
       },
       {
         programId: SPL_TOKEN_PROGRAM_ID,
-        accounts: [SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
-        data: makeSplTransferData(solOut),
+        accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+        data: makeSplTransferData(candidateOut),
       },
     ];
 
@@ -304,7 +377,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
           accountKeys,
           instructions: [
             {
-              programIdIndex: 17,
+              programIdIndex: 18,
               accounts: instructionAccounts,
               data,
             },
@@ -319,7 +392,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             instructions: innerInstructions,
           },
         ],
-        logMessages: [makeRayLogLine(3, "Coin2PC", candidateIn, solOut)],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", solIn, candidateOut),
       },
     };
 
@@ -329,9 +402,9 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
 
     expect(res.events.length).toBe(1);
     const event = res.events[0]!;
-    expect(event.side).toBe("SELL");
-    expect(event.tokenAmount).toBe(candidateIn);
-    expect(event.solAmount).toBe(solOut);
+    expect(event.side).toBe("BUY");
+    expect(event.tokenAmount).toBe(candidateOut);
+    expect(event.solAmount).toBe(solIn);
   });
 
   it("decodes SwapBaseInV2 using clean 8-account layout", () => {
@@ -389,7 +462,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             ],
           },
         ],
-        logMessages: [makeRayLogLine(3, "PC2Coin", solIn, candidateOut)],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", solIn, candidateOut),
       },
     };
 
@@ -403,6 +476,1100 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(res.events[0]!.solAmount).toBe(solIn);
   });
 
+  it("decodes SwapBaseOutV2 (exact output swap, tag 17) using clean 8-account layout", () => {
+    const signature = "5kR84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_245;
+    const blockTime = 1_700_000_155;
+    const maxSolIn = 200_000_000n;
+    const exactCandidateOut = 100_000_000_000n;
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+    ];
+
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+              data: makeSwapBaseOutV2Data(maxSolIn, exactCandidateOut),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
+                data: makeSplTransferData(190_000_000n),
+              },
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+                data: makeSplTransferData(exactCandidateOut),
+              },
+            ],
+          },
+        ],
+        logMessages: makeRaydiumLogs(4, "PC2Coin", 190_000_000n, exactCandidateOut),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.events[0]!.side).toBe("BUY");
+    expect(res.events[0]!.tokenAmount).toBe(exactCandidateOut);
+    expect(res.events[0]!.solAmount).toBe(190_000_000n);
+  });
+  it("decodes SwapBaseOut (exact output swap, tag 11)", () => {
+    const signature = "6hR84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_240;
+    const blockTime = 1_700_000_150;
+    const maxSolIn = 200_000_000n;
+    const exactCandidateOut = 100_000_000_000n;
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      "OpenOrdersAccount1111111111111111111111111111",
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      "MarketProgram1111111111111111111111111111111",
+      "MarketAccount1111111111111111111111111111111",
+      "MarketBids1111111111111111111111111111111111",
+      "MarketAsks1111111111111111111111111111111111",
+      "MarketEventQueue1111111111111111111111111111",
+      "MarketCoinVault11111111111111111111111111111",
+      "MarketPcVault1111111111111111111111111111111",
+      "MarketVaultSigner111111111111111111111111111",
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 17,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+              data: makeSwapBaseOutData(maxSolIn, exactCandidateOut),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
+                data: makeSplTransferData(195_000_000n), // Actual deducted in
+              },
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+                data: makeSplTransferData(exactCandidateOut),
+              },
+            ],
+          },
+        ],
+        logMessages: makeRaydiumLogs(4, "PC2Coin", 195_000_000n, exactCandidateOut),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.events[0]!.side).toBe("BUY");
+    expect(res.events[0]!.tokenAmount).toBe(exactCandidateOut);
+    expect(res.events[0]!.solAmount).toBe(195_000_000n);
+  });
+
+  it("decodes a standard SELL swap (Coin2PC: Candidate Token -> SOL)", () => {
+    const signature = "4kP84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_105;
+    const blockTime = 1_700_000_025;
+    const candidateIn = 25_000_000_000n; // 25,000 BONK
+    const solOut = 49_500_000n; // 0.0495 SOL
+
+    const accountKeys = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      "OpenOrdersAccount1111111111111111111111111111",
+      SYNTHETIC_BASE_VAULT, // 4: amm_coin_vault (Candidate Vault)
+      SYNTHETIC_QUOTE_VAULT, // 5: amm_pc_vault (SOL Vault)
+      "MarketProgram1111111111111111111111111111111",
+      "MarketAccount1111111111111111111111111111111",
+      "MarketBids1111111111111111111111111111111111",
+      "MarketAsks1111111111111111111111111111111111",
+      "MarketEventQueue1111111111111111111111111111",
+      "MarketCoinVault11111111111111111111111111111",
+      "MarketPcVault1111111111111111111111111111111",
+      "MarketVaultSigner111111111111111111111111111",
+      SYNTHETIC_USER_SOURCE_ATA, // 14: Candidate ATA
+      SYNTHETIC_USER_DEST_ATA, // 15: SOL ATA
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    const instructionAccounts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const data = makeSwapBaseInData(candidateIn, solOut);
+
+    const innerInstructions = [
+      {
+        programId: SPL_TOKEN_PROGRAM_ID,
+        accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_WALLET],
+        data: makeSplTransferData(candidateIn),
+      },
+      {
+        programId: SPL_TOKEN_PROGRAM_ID,
+        accounts: [SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+        data: makeSplTransferData(solOut),
+      },
+    ];
+
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys,
+          instructions: [
+            {
+              programIdIndex: 17,
+              accounts: instructionAccounts,
+              data,
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: innerInstructions,
+          },
+        ],
+        logMessages: makeRaydiumLogs(3, "Coin2PC", candidateIn, solOut),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.events.length).toBe(1);
+    const event = res.events[0]!;
+    expect(event.side).toBe("SELL");
+    expect(event.tokenAmount).toBe(candidateIn);
+    expect(event.solAmount).toBe(solOut);
+  });
+
+  it("rejects legacy instruction tag 9 with 8-account layout as UNSUPPORTED_LAYOUT", () => {
+    const signature = "7qA84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_115;
+    const blockTime = 1_700_000_035;
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+    ];
+
+    // Instruction tag 9 passed with only 8 accounts (requires 17 or 18)
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programId: RAYDIUM_AMM_V4_PROGRAM_ID,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+              data: makeSwapBaseInData(100_000_000n, 50_000_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        logMessages: makeRaydiumLogs(3, "PC2Coin", 100_000_000n, 50_000_000_000n),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("UNSUPPORTED_LAYOUT");
+    expect(res.message).toMatch(/Unsupported account count 8 for Raydium instruction tag 9/);
+  });
+
+  it("rejects V2 instruction tag 16 with 17-account layout as UNSUPPORTED_LAYOUT", () => {
+    const signature = "2zQ84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_116;
+    const blockTime = 1_700_000_036;
+
+    const accountKeys = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      "OpenOrdersAccount1111111111111111111111111111",
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      "MarketProgram1111111111111111111111111111111",
+      "MarketAccount1111111111111111111111111111111",
+      "MarketBids1111111111111111111111111111111111",
+      "MarketAsks1111111111111111111111111111111111",
+      "MarketEventQueue1111111111111111111111111111",
+      "MarketCoinVault11111111111111111111111111111",
+      "MarketPcVault1111111111111111111111111111111",
+      "MarketVaultSigner111111111111111111111111111",
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    // Instruction tag 16 passed with 17 accounts (requires exactly 8)
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys,
+          instructions: [
+            {
+              programIdIndex: 17,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+              data: makeSwapBaseInV2Data(100_000_000n, 50_000_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        logMessages: makeRaydiumLogs(3, "PC2Coin", 100_000_000n, 50_000_000_000n),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("UNSUPPORTED_LAYOUT");
+    expect(res.message).toMatch(/Unsupported account count 17 for Raydium instruction tag 16/);
+  });
+
+  it("source-derived layout matrix independently verifies positions against commit 91739d8d", () => {
+    // Tag 9 & 11: only 17 and 18 supported
+    expect(matchSupportedSwapLayout(9, 8)).toBeNull();
+    expect(matchSupportedSwapLayout(9, 16)).toBeNull();
+    expect(matchSupportedSwapLayout(9, 19)).toBeNull();
+
+    const legacy17 = matchSupportedSwapLayout(9, 17);
+    expect(legacy17).not.toBeNull();
+    expect(legacy17?.layout).toBe("LEGACY_17_ACCOUNTS");
+    expect(legacy17?.poolIdIndex).toBe(1);
+    expect(legacy17?.baseVaultIndex).toBe(4);
+    expect(legacy17?.quoteVaultIndex).toBe(5);
+    expect(legacy17?.userSourceIndex).toBe(14);
+    expect(legacy17?.userDestinationIndex).toBe(15);
+    expect(legacy17?.userOwnerIndex).toBe(16);
+
+    const legacy18 = matchSupportedSwapLayout(9, 18);
+    expect(legacy18).not.toBeNull();
+    expect(legacy18?.layout).toBe("LEGACY_18_ACCOUNTS_TARGET_ORDERS");
+    expect(legacy18?.poolIdIndex).toBe(1);
+    expect(legacy18?.baseVaultIndex).toBe(5); // shifted by target_orders
+    expect(legacy18?.quoteVaultIndex).toBe(6); // shifted by target_orders
+    expect(legacy18?.userSourceIndex).toBe(15); // shifted by target_orders
+    expect(legacy18?.userDestinationIndex).toBe(16); // shifted by target_orders
+    expect(legacy18?.userOwnerIndex).toBe(17); // shifted by target_orders
+
+    // Tag 16 & 17: only 8 supported
+    expect(matchSupportedSwapLayout(16, 17)).toBeNull();
+    expect(matchSupportedSwapLayout(16, 18)).toBeNull();
+    expect(matchSupportedSwapLayout(16, 7)).toBeNull();
+
+    const v2_8 = matchSupportedSwapLayout(16, 8);
+    expect(v2_8).not.toBeNull();
+    expect(v2_8?.layout).toBe("V2_8_ACCOUNTS");
+    expect(v2_8?.poolIdIndex).toBe(1);
+    expect(v2_8?.baseVaultIndex).toBe(3);
+    expect(v2_8?.quoteVaultIndex).toBe(4);
+    expect(v2_8?.userSourceIndex).toBe(5);
+    expect(v2_8?.userDestinationIndex).toBe(6);
+    expect(v2_8?.userOwnerIndex).toBe(7);
+  });
+
+  // =========================================================================
+  // AUDIT AREA 2: Attribute evidence to the exact invocation
+  // =========================================================================
+
+  it("correctly decodes SELL when preceded by another pool's BUY ray_log (invocation isolation)", () => {
+    const signature = "4pL84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_125;
+    const blockTime = 1_700_000_045;
+
+    // Transaction executes two swaps:
+    // Outer 0: Other pool swap (BUY)
+    // Outer 1: Tracked pool swap (SELL)
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID, // 0
+      SYNTHETIC_OTHER_POOL_ID, // 1: Other pool
+      SYNTHETIC_AMM_AUTHORITY, // 2
+      "OtherBaseVault111111111111111111111111111111", // 3
+      "OtherQuoteVault11111111111111111111111111111", // 4
+      SYNTHETIC_USER_SOURCE_ATA, // 5
+      SYNTHETIC_USER_DEST_ATA, // 6
+      SYNTHETIC_USER_WALLET, // 7
+      RAYDIUM_AMM_V4_PROGRAM_ID, // 8
+      SYNTHETIC_POOL_ID, // 9: Tracked pool
+      SYNTHETIC_BASE_VAULT, // 10: Tracked base vault
+      SYNTHETIC_QUOTE_VAULT, // 11: Tracked quote vault
+    ];
+
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            // Outer 0: Other pool BUY
+            {
+              programIdIndex: 8,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+              data: makeSwapBaseInV2Data(10_000_000n, 100_000_000n),
+            },
+            // Outer 1: Tracked pool SELL
+            {
+              programIdIndex: 8,
+              accounts: [0, 9, 2, 10, 11, 5, 6, 7],
+              data: makeSwapBaseInV2Data(25_000_000_000n, 50_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_USER_SOURCE_ATA, accounts[4]!, SYNTHETIC_USER_WALLET],
+                data: makeSplTransferData(10_000_000n),
+              },
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [accounts[3]!, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+                data: makeSplTransferData(100_000_000n),
+              },
+            ],
+          },
+          {
+            index: 1,
+            instructions: [
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_WALLET],
+                data: makeSplTransferData(25_000_000_000n),
+              },
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+                data: makeSplTransferData(50_000_000n),
+              },
+            ],
+          },
+        ],
+        // Two separate invocation frames:
+        // Frame 0: PC2Coin (BUY) for other pool
+        // Frame 1: Coin2PC (SELL) for tracked pool
+        logMessages: [
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+          makeRayLogLine(3, "PC2Coin", 10_000_000n, 100_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+          makeRayLogLine(3, "Coin2PC", 25_000_000_000n, 50_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+        ],
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    // Must isolate to the tracked pool and decode as SELL (not corrupted into BUY by prior ray_log!)
+    expect(res.events.length).toBe(1);
+    const event = res.events[0]!;
+    expect(event.outerInstructionIndex).toBe(1);
+    expect(event.side).toBe("SELL");
+    expect(event.tokenAmount).toBe(25_000_000_000n);
+    expect(event.solAmount).toBe(50_000_000n);
+  });
+
+  it("correctly decodes two routed same-pool swaps (BUY then SELL) in one transaction without transfer reuse", () => {
+    const signature = "3wR84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_128;
+    const blockTime = 1_700_000_048;
+
+    const accounts = [
+      SYNTHETIC_ROUTER_PROGRAM_ID, // 0: Jupiter
+      SPL_TOKEN_PROGRAM_ID, // 1
+      SYNTHETIC_POOL_ID, // 2: Raydium AMM
+      SYNTHETIC_AMM_AUTHORITY, // 3
+      SYNTHETIC_BASE_VAULT, // 4
+      SYNTHETIC_QUOTE_VAULT, // 5
+      SYNTHETIC_USER_SOURCE_ATA, // 6
+      SYNTHETIC_USER_DEST_ATA, // 7
+      SYNTHETIC_USER_WALLET, // 8
+      RAYDIUM_AMM_V4_PROGRAM_ID, // 9
+    ];
+
+    // Single top-level router instruction containing TWO inner Raydium swaps
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [6, 7, 8],
+              data: new Uint8Array([1, 2, 3]),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              // Swap 1: BUY
+              {
+                programIdIndex: 9,
+                accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+              },
+              {
+                programIdIndex: 1,
+                accounts: [6, 5, 8], // user -> quote vault (SOL in)
+                data: makeSplTransferData(50_000_000n),
+              },
+              {
+                programIdIndex: 1,
+                accounts: [4, 7, 3], // base vault -> user (Candidate out)
+                data: makeSplTransferData(25_000_000_000n),
+              },
+              // Swap 2: SELL
+              {
+                programIdIndex: 9,
+                accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                data: makeSwapBaseInV2Data(10_000_000_000n, 19_000_000n),
+              },
+              {
+                programIdIndex: 1,
+                accounts: [6, 4, 8], // user -> base vault (Candidate in)
+                data: makeSplTransferData(10_000_000_000n),
+              },
+              {
+                programIdIndex: 1,
+                accounts: [5, 7, 3], // quote vault -> user (SOL out)
+                data: makeSplTransferData(19_000_000n),
+              },
+            ],
+          },
+        ],
+        logMessages: [
+          `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+          makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+          makeRayLogLine(3, "Coin2PC", 10_000_000_000n, 19_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+        ],
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.events.length).toBe(2);
+
+    const buyEvent = res.events[0]!;
+    expect(buyEvent.outerInstructionIndex).toBe(0);
+    expect(buyEvent.swapIndex).toBe(0);
+    expect(buyEvent.eventId).toBe(`${signature}:0:0`);
+    expect(buyEvent.side).toBe("BUY");
+    expect(buyEvent.tokenAmount).toBe(25_000_000_000n);
+    expect(buyEvent.solAmount).toBe(50_000_000n);
+
+    const sellEvent = res.events[1]!;
+    expect(sellEvent.outerInstructionIndex).toBe(0);
+    expect(sellEvent.swapIndex).toBe(3);
+    expect(sellEvent.eventId).toBe(`${signature}:0:3`);
+    expect(sellEvent.side).toBe("SELL");
+    expect(sellEvent.tokenAmount).toBe(10_000_000_000n);
+    expect(sellEvent.solAmount).toBe(19_000_000n);
+  });
+
+  it("fails closed with CONFLICTING_EVIDENCE when inner transfers contradict ray_log direction", () => {
+    const signature = "9aX84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_129;
+    const blockTime = 1_700_000_049;
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    // Transfers indicate SELL (user sends Candidate to Base Vault, receives SOL from Quote Vault)
+    const innerInstructions = [
+      {
+        programId: SPL_TOKEN_PROGRAM_ID,
+        accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_WALLET],
+        data: makeSplTransferData(25_000_000_000n),
+      },
+      {
+        programId: SPL_TOKEN_PROGRAM_ID,
+        accounts: [SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+        data: makeSplTransferData(50_000_000n),
+      },
+    ];
+
+    // But ray_log indicates PC2Coin (BUY)!
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 8,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+              data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: innerInstructions,
+          },
+        ],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("CONFLICTING_EVIDENCE");
+    expect(res.message).toMatch(
+      /Transfer direction \(Coin2PC\) contradicts ray_log direction \(PC2Coin\)/,
+    );
+  });
+
+  // =========================================================================
+  // AUDIT AREA 3: Require proven successful execution
+  // =========================================================================
+
+  it("fails closed with TRANSACTION_NOT_SUCCESSFUL when meta.err is missing or undefined", () => {
+    const signature = "1qT84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_135;
+    const blockTime = 1_700_000_055;
+
+    // meta object has no err property (err: undefined)
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: [SYNTHETIC_POOL_ID],
+          instructions: [],
+        },
+      },
+      meta: {
+        // err is omitted/undefined!
+      } as unknown as { err: null },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("TRANSACTION_NOT_SUCCESSFUL");
+    expect(res.message).toMatch(/explicit successful status \(err: null\) is required/);
+  });
+
+  it("fails closed with INVOCATION_FAILED when caught Raydium CPI swap failed even if outer tx succeeded", () => {
+    const signature = "6uM84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_142;
+    const blockTime = 1_700_000_062;
+
+    const accounts = [
+      SYNTHETIC_ROUTER_PROGRAM_ID,
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    // Outer transaction succeeds (meta.err === null), but inner Raydium call failed and was caught by router!
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [6, 7, 8],
+              data: new Uint8Array([1, 2, 3]),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programIdIndex: 9,
+                accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+              },
+            ],
+          },
+        ],
+        logMessages: [
+          `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} failed: custom program error: 0x1772`,
+          `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+        ],
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("INVOCATION_FAILED");
+    expect(res.message).toMatch(/did not complete successfully in log messages/);
+  });
+
+  it("fails closed with INVOCATION_FAILED when inner CPI swap lacks logMessages to prove execution", () => {
+    const signature = "5jK84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_144;
+    const blockTime = 1_700_000_064;
+
+    const accounts = [
+      SYNTHETIC_ROUTER_PROGRAM_ID,
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    // Inner CPI instruction without logMessages
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [6, 7, 8],
+              data: new Uint8Array([1, 2, 3]),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programIdIndex: 9,
+                accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+              },
+            ],
+          },
+        ],
+        // logMessages omitted!
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("INVOCATION_FAILED");
+    expect(res.message).toMatch(
+      /Cannot prove successful execution of inner CPI swap without transaction logMessages/,
+    );
+  });
+
+  // =========================================================================
+  // AUDIT AREA 4: Remove pool-context substitution and validate boundaries
+  // =========================================================================
+
+  it("createTrackedRaydiumPoolContext throws when poolAddress is missing or invalid Base58 (no substitution)", () => {
+    const mockState = {
+      baseVault: SYNTHETIC_BASE_VAULT,
+      quoteVault: SYNTHETIC_QUOTE_VAULT,
+      baseMint: SYNTHETIC_CANDIDATE_MINT,
+      quoteMint: SYNTHETIC_WSOL_MINT,
+    } as unknown as D23RaydiumAmmV4State;
+
+    // Missing poolAddress: throws error without falling back to state.baseVault!
+    expect(() =>
+      createTrackedRaydiumPoolContext(
+        mockState,
+        undefined as unknown as string,
+        SYNTHETIC_CANDIDATE_MINT,
+        SYNTHETIC_WSOL_MINT,
+        "TOKEN_BASE_SOL_QUOTE",
+      ),
+    ).toThrow(/explicit.*poolAddress is mandatory/i);
+
+    // Invalid Base58 poolAddress: throws error
+    expect(() =>
+      createTrackedRaydiumPoolContext(
+        mockState,
+        "Not-A-Base58-Key!",
+        SYNTHETIC_CANDIDATE_MINT,
+        SYNTHETIC_WSOL_MINT,
+        "TOKEN_BASE_SOL_QUOTE",
+      ),
+    ).toThrow(/explicit.*poolAddress is mandatory/i);
+  });
+
+  it("validateTrackedPoolContext rejects contradictory mints or invalid orientation", () => {
+    // Contradictory orientation: TOKEN_BASE_SOL_QUOTE requires candidateTokenMint to equal baseMint
+    const contradictoryContext: TrackedRaydiumPoolContext = {
+      poolId: SYNTHETIC_POOL_ID,
+      candidateTokenMint: SYNTHETIC_CANDIDATE_MINT,
+      quoteTokenMint: SYNTHETIC_WSOL_MINT,
+      baseVault: SYNTHETIC_BASE_VAULT,
+      quoteVault: SYNTHETIC_QUOTE_VAULT,
+      baseMint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", // Different mint!
+      quoteMint: SYNTHETIC_WSOL_MINT,
+      orientation: "TOKEN_BASE_SOL_QUOTE",
+    };
+
+    expect(() => validateTrackedPoolContext(contradictoryContext)).toThrow(
+      /TOKEN_BASE_SOL_QUOTE requires candidateTokenMint/,
+    );
+  });
+
+  it("leaves solAmount undefined when quoteTokenMint is not WSOL (e.g. USDC quote)", () => {
+    const signature = "8mU84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_152;
+    const blockTime = 1_700_000_072;
+    const usdcIn = 10_000_000n; // 10 USDC (6 decimals)
+    const candidateOut = 50_000_000_000n; // 50,000 BONK
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT, // BONK vault
+      SYNTHETIC_QUOTE_VAULT, // USDC vault
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 8,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+              data: makeSwapBaseInV2Data(usdcIn, candidateOut),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
+                data: makeSplTransferData(usdcIn),
+              },
+              {
+                programId: SPL_TOKEN_PROGRAM_ID,
+                accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
+                data: makeSplTransferData(candidateOut),
+              },
+            ],
+          },
+        ],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", usdcIn, candidateOut),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, USDC_QUOTED_POOL_CONTEXT);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    expect(res.events.length).toBe(1);
+    const event = res.events[0]!;
+    expect(event.side).toBe("BUY");
+    expect(event.tokenAmount).toBe(candidateOut);
+    // Non-WSOL quote quantity must NEVER be labeled as SOL
+    expect(event.solAmount).toBeUndefined();
+  });
+
+  it("adapter freezes pool context against caller mutation", () => {
+    const mutableContext: TrackedRaydiumPoolContext = {
+      poolId: SYNTHETIC_POOL_ID,
+      candidateTokenMint: SYNTHETIC_CANDIDATE_MINT,
+      quoteTokenMint: SYNTHETIC_WSOL_MINT,
+      baseVault: SYNTHETIC_BASE_VAULT,
+      quoteVault: SYNTHETIC_QUOTE_VAULT,
+      baseMint: SYNTHETIC_CANDIDATE_MINT,
+      quoteMint: SYNTHETIC_WSOL_MINT,
+      orientation: "TOKEN_BASE_SOL_QUOTE",
+    };
+
+    const adapter = new RaydiumAmmV4SwapNormalizationAdapter(mutableContext);
+    const retrieved = adapter.getPoolContext();
+
+    expect(Object.isFrozen(retrieved)).toBe(true);
+    expect(retrieved.poolId).toBe(SYNTHETIC_POOL_ID);
+  });
+
+  // =========================================================================
+  // AUDIT AREA 5: Fail cleanly on malformed payloads and missing time
+  // =========================================================================
+
+  it("returns INVALID_PAYLOAD without throwing on null or non-object payloads", () => {
+    // Null payload
+    const nullRes = decodeRaydiumTransactionSwaps(null, STANDARD_POOL_CONTEXT);
+    expect(nullRes.ok).toBe(false);
+    if (!nullRes.ok) {
+      expect(nullRes.reason).toBe("INVALID_PAYLOAD");
+    }
+
+    // String payload
+    const strRes = decodeRaydiumTransactionSwaps("not-a-payload", STANDARD_POOL_CONTEXT);
+    expect(strRes.ok).toBe(false);
+    if (!strRes.ok) {
+      expect(strRes.reason).toBe("INVALID_PAYLOAD");
+    }
+
+    // Number payload
+    const numRes = decodeRaydiumTransactionSwaps(12345, STANDARD_POOL_CONTEXT);
+    expect(numRes.ok).toBe(false);
+    if (!numRes.ok) {
+      expect(numRes.reason).toBe("INVALID_PAYLOAD");
+    }
+
+    // Adapter ingestTransaction with null
+    const tracker = new RollingTradeFlowTracker({
+      poolId: SYNTHETIC_POOL_ID,
+      tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      trackingStartedMs: 1_700_000_000_000,
+    });
+    const adapter = new RaydiumAmmV4SwapNormalizationAdapter(STANDARD_POOL_CONTEXT);
+    const ingestRes = adapter.ingestTransaction(null, tracker);
+    expect(ingestRes.decodeResult.ok).toBe(false);
+    if (!ingestRes.decodeResult.ok) {
+      expect(ingestRes.decodeResult.reason).toBe("INVALID_PAYLOAD");
+    }
+  });
+
+  it("returns MALFORMED_INSTRUCTION_DATA when instruction account index is out of bounds", () => {
+    const signature = "4pB84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_155;
+    const blockTime = 1_700_000_075;
+
+    const accounts = [
+      SPL_TOKEN_PROGRAM_ID,
+      SYNTHETIC_POOL_ID,
+      SYNTHETIC_AMM_AUTHORITY,
+      SYNTHETIC_BASE_VAULT,
+      SYNTHETIC_QUOTE_VAULT,
+      SYNTHETIC_USER_SOURCE_ATA,
+      SYNTHETIC_USER_DEST_ATA,
+      SYNTHETIC_USER_WALLET,
+      RAYDIUM_AMM_V4_PROGRAM_ID,
+    ];
+
+    // Account index 999 is out of bounds (resolved accounts length is 9)
+    const payload = {
+      slot,
+      blockTime,
+      transaction: {
+        signatures: [signature],
+        message: {
+          accountKeys: accounts,
+          instructions: [
+            {
+              programIdIndex: 8,
+              accounts: [0, 1, 2, 3, 4, 5, 6, 999], // Index 999 is out of bounds!
+              data: makeSwapBaseInV2Data(10_000_000n, 50_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        logMessages: makeRaydiumLogs(3, "PC2Coin", 10_000_000n, 50_000_000n),
+      },
+    };
+
+    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+
+    expect(res.reason).toBe("MALFORMED_INSTRUCTION_DATA");
+    expect(res.message).toMatch(/Instruction account indices are invalid or out of bounds/);
+  });
+
+  it("rejects transactions with missing, non-finite, or non-positive blockTime (MISSING_UPSTREAM_TIMESTAMP)", () => {
+    const signature = "7uT84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const slot = 280_000_210;
+
+    const testMissingTime = (blockTime: unknown) => {
+      const payload = {
+        slot,
+        blockTime: blockTime as number | null,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: [SYNTHETIC_POOL_ID],
+            instructions: [],
+          },
+        },
+        meta: {
+          err: null,
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+
+      expect(res.reason).toBe("MISSING_UPSTREAM_TIMESTAMP");
+      expect(res.message).toMatch(/cannot manufacture upstream timestamp/);
+    };
+
+    testMissingTime(null);
+    testMissingTime(undefined);
+    testMissingTime(NaN);
+    testMissingTime(0);
+    testMissingTime(-100);
+  });
+
+  // =========================================================================
+  // ADDITIONAL BASELINE & SYSTEM BEHAVIOR REGRESSIONS
+  // =========================================================================
+
   it("handles inverted pair orientation (SOL_BASE_TOKEN_QUOTE) correctly", () => {
     const signature = "2bA84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
     const slot = 280_000_120;
@@ -410,11 +1577,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     const solIn = 150_000_000n;
     const candidateOut = 75_000_000_000n;
 
-    // In SOL_BASE_TOKEN_QUOTE:
-    // Base vault is SOL, Quote vault is Candidate.
-    // User puts in SOL (Base) and gets Candidate (Quote).
-    // Swap direction is Coin2PC!
-    // Relative to Candidate token, this is a BUY!
     const accounts = [
       SPL_TOKEN_PROGRAM_ID,
       SYNTHETIC_POOL_ID,
@@ -461,7 +1623,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             ],
           },
         ],
-        logMessages: [makeRayLogLine(3, "Coin2PC", solIn, candidateOut)],
+        logMessages: makeRaydiumLogs(3, "Coin2PC", solIn, candidateOut),
       },
     };
 
@@ -490,9 +1652,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
       SYNTHETIC_USER_WALLET,
     ];
 
-    // Transaction has two top-level swaps:
-    // Outer 0: BUY 10,000 BONK for 0.02 SOL
-    // Outer 1: SELL 5,000 BONK for 0.009 SOL
     const payload = {
       slot,
       blockTime,
@@ -549,8 +1708,12 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
           },
         ],
         logMessages: [
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
           makeRayLogLine(3, "PC2Coin", 20_000_000n, 10_000_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
           makeRayLogLine(3, "Coin2PC", 5_000_000_000n, 9_000_000n),
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
         ],
       },
     };
@@ -561,7 +1724,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
 
     expect(res.events.length).toBe(2);
 
-    // Swap 1 (BUY)
     expect(res.events[0]!.outerInstructionIndex).toBe(0);
     expect(res.events[0]!.swapIndex).toBe(0);
     expect(res.events[0]!.eventId).toBe(`${signature}:0:0`);
@@ -569,98 +1731,12 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(res.events[0]!.tokenAmount).toBe(10_000_000_000n);
     expect(res.events[0]!.solAmount).toBe(20_000_000n);
 
-    // Swap 2 (SELL)
     expect(res.events[1]!.outerInstructionIndex).toBe(1);
     expect(res.events[1]!.swapIndex).toBe(0);
     expect(res.events[1]!.eventId).toBe(`${signature}:1:0`);
     expect(res.events[1]!.side).toBe("SELL");
     expect(res.events[1]!.tokenAmount).toBe(5_000_000_000n);
     expect(res.events[1]!.solAmount).toBe(9_000_000n);
-  });
-
-  it("decodes routed / CPI swaps invoked via router program (e.g. Jupiter)", () => {
-    const signature = "8yT84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
-    const slot = 280_000_140;
-    const blockTime = 1_700_000_060;
-
-    const accounts = [
-      SYNTHETIC_ROUTER_PROGRAM_ID, // 0: Jupiter
-      SPL_TOKEN_PROGRAM_ID, // 1
-      SYNTHETIC_POOL_ID, // 2: Raydium AMM
-      SYNTHETIC_AMM_AUTHORITY, // 3
-      SYNTHETIC_BASE_VAULT, // 4
-      SYNTHETIC_QUOTE_VAULT, // 5
-      SYNTHETIC_USER_SOURCE_ATA, // 6
-      SYNTHETIC_USER_DEST_ATA, // 7
-      SYNTHETIC_USER_WALLET, // 8
-      RAYDIUM_AMM_V4_PROGRAM_ID, // 9
-    ];
-
-    // Top-level instruction is Jupiter router call
-    // Inner instruction 0 is Raydium AMM v4 swap
-    // Inner instructions 1 and 2 are SPL token transfers
-    const payload = {
-      slot,
-      blockTime,
-      transaction: {
-        signatures: [signature],
-        message: {
-          accountKeys: accounts,
-          instructions: [
-            {
-              programIdIndex: 0, // Jupiter
-              accounts: [6, 7, 8],
-              data: new Uint8Array([1, 2, 3]), // dummy router data
-            },
-          ],
-        },
-      },
-      meta: {
-        err: null,
-        innerInstructions: [
-          {
-            index: 0,
-            instructions: [
-              {
-                programIdIndex: 9, // Raydium AMM v4
-                accounts: [1, 2, 3, 4, 5, 6, 7, 8],
-                data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
-              },
-              {
-                programIdIndex: 1, // SPL Token
-                accounts: [6, 5, 8], // user -> quote vault
-                data: makeSplTransferData(50_000_000n),
-              },
-              {
-                programIdIndex: 1, // SPL Token
-                accounts: [4, 7, 3], // base vault -> user
-                data: makeSplTransferData(25_000_000_000n),
-              },
-            ],
-          },
-        ],
-        logMessages: [
-          "Program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 invoke [1]",
-          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [2]",
-          makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
-          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
-          "Program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 success",
-        ],
-      },
-    };
-
-    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
-    expect(res.ok).toBe(true);
-    if (!res.ok) return;
-
-    expect(res.events.length).toBe(1);
-    const event = res.events[0]!;
-    expect(event.outerInstructionIndex).toBe(0);
-    expect(event.swapIndex).toBe(0);
-    expect(event.eventId).toBe(`${signature}:0:0`);
-    expect(event.side).toBe("BUY");
-    expect(event.tokenAmount).toBe(25_000_000_000n);
-    expect(event.solAmount).toBe(50_000_000n);
   });
 
   it("skips Raydium swaps targeting a different pool in the same transaction", () => {
@@ -716,7 +1792,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
 
     const accounts = [
       SPL_TOKEN_PROGRAM_ID,
-      SYNTHETIC_POOL_ID, // matches poolId
+      SYNTHETIC_POOL_ID,
       SYNTHETIC_AMM_AUTHORITY,
       "SpoofedBaseVault1111111111111111111111111111", // wrong vault!
       SYNTHETIC_QUOTE_VAULT,
@@ -771,7 +1847,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
         },
       },
       meta: {
-        err: { InstructionError: [0, "Custom: 1"] }, // On-chain execution failed!
+        err: { InstructionError: [0, "Custom: 1"] },
       },
     };
 
@@ -876,7 +1952,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(res.reason).toBe("UNSUPPORTED_INSTRUCTION");
   });
 
-  it("fails closed with AMBIGUOUS_DIRECTION when direction cannot be determined from transfers, logs, or balances", () => {
+  it("fails closed with AMBIGUOUS_DIRECTION when direction cannot be determined from transfers or logs", () => {
     const signature = "8mQ84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
     const slot = 280_000_200;
     const blockTime = 1_700_000_120;
@@ -893,7 +1969,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
       RAYDIUM_AMM_V4_PROGRAM_ID,
     ];
 
-    // No inner transfers, no ray_log, no preTokenBalances
     const payload = {
       slot,
       blockTime,
@@ -913,7 +1988,10 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
       meta: {
         err: null,
         innerInstructions: [],
-        logMessages: [],
+        logMessages: [
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+          `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+        ],
       },
     };
 
@@ -922,34 +2000,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     if (res.ok) return;
 
     expect(res.reason).toBe("AMBIGUOUS_DIRECTION");
-  });
-
-  it("rejects transactions with missing upstream blockTime (MISSING_UPSTREAM_TIMESTAMP)", () => {
-    const signature = "7uT84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
-    const slot = 280_000_210;
-
-    // Upstream blockTime is null!
-    const payload = {
-      slot,
-      blockTime: null,
-      transaction: {
-        signatures: [signature],
-        message: {
-          accountKeys: [SYNTHETIC_POOL_ID],
-          instructions: [],
-        },
-      },
-      meta: {
-        err: null,
-      },
-    };
-
-    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-
-    expect(res.reason).toBe("MISSING_UPSTREAM_TIMESTAMP");
-    expect(res.message).toMatch(/cannot manufacture upstream timestamp/);
   });
 
   it("integrates with RollingTradeFlowTracker via NormalizationAdapter and verifies deduplication", () => {
@@ -961,17 +2011,17 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
       clock: () => nowMs,
     });
 
-    // Provide verified observation range across window so tracker can evaluate SUFFICIENT
+    // Establish complete window coverage with explicit historical range and heartbeat
     tracker.recordCompletedRange(nowMs - 60_000, nowMs);
     tracker.recordHeartbeat(nowMs);
 
     const adapter = new RaydiumAmmV4SwapNormalizationAdapter(STANDARD_POOL_CONTEXT);
 
-    const signature = "3wX84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
+    const signature = "4pA84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
     const slot = 280_000_220;
-    const blockTime = Math.floor((nowMs - 30_000) / 1000); // 30s ago
-    const solIn = 100_000_000n;
-    const candidateOut = 50_000_000_000n;
+    const blockTime = Math.floor((nowMs - 10_000) / 1000);
+    const solIn = 50_000_000n;
+    const candidateOut = 20_000_000_000n;
 
     const accounts = [
       SPL_TOKEN_PROGRAM_ID,
@@ -1019,7 +2069,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             ],
           },
         ],
-        logMessages: [makeRayLogLine(3, "PC2Coin", solIn, candidateOut)],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", solIn, candidateOut),
       },
     };
 
@@ -1114,7 +2164,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
             ],
           },
         ],
-        logMessages: [makeRayLogLine(3, "PC2Coin", 10_000_000n, 5_000_000_000n)],
+        logMessages: makeRaydiumLogs(3, "PC2Coin", 10_000_000n, 5_000_000_000n),
       },
     };
 
@@ -1129,82 +2179,6 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(evalResult.recentBuys60s).toBeNull();
     expect(evalResult.recentSells60s).toBeNull();
     expect(evalResult.flowRatio).toBeNull();
-  });
-
-  it("decodes SwapBaseOut (exact output swap, tag 11)", () => {
-    const signature = "6hR84qB1sN6yK4xM8jD4vR7kP2qT9uV1wX3yZ5aB7cE9gH1jK3mN5pQ7sU9wX2yZ";
-    const slot = 280_000_240;
-    const blockTime = 1_700_000_150;
-    const maxSolIn = 200_000_000n;
-    const exactCandidateOut = 100_000_000_000n;
-
-    const accounts = [
-      SPL_TOKEN_PROGRAM_ID,
-      SYNTHETIC_POOL_ID,
-      SYNTHETIC_AMM_AUTHORITY,
-      "OpenOrdersAccount1111111111111111111111111111",
-      SYNTHETIC_BASE_VAULT,
-      SYNTHETIC_QUOTE_VAULT,
-      "MarketProgram1111111111111111111111111111111",
-      "MarketAccount1111111111111111111111111111111",
-      "MarketBids1111111111111111111111111111111111",
-      "MarketAsks1111111111111111111111111111111111",
-      "MarketEventQueue1111111111111111111111111111",
-      "MarketCoinVault11111111111111111111111111111",
-      "MarketPcVault1111111111111111111111111111111",
-      "MarketVaultSigner111111111111111111111111111",
-      SYNTHETIC_USER_SOURCE_ATA,
-      SYNTHETIC_USER_DEST_ATA,
-      SYNTHETIC_USER_WALLET,
-      RAYDIUM_AMM_V4_PROGRAM_ID,
-    ];
-
-    const payload = {
-      slot,
-      blockTime,
-      transaction: {
-        signatures: [signature],
-        message: {
-          accountKeys: accounts,
-          instructions: [
-            {
-              programIdIndex: 17,
-              accounts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-              data: makeSwapBaseOutData(maxSolIn, exactCandidateOut),
-            },
-          ],
-        },
-      },
-      meta: {
-        err: null,
-        innerInstructions: [
-          {
-            index: 0,
-            instructions: [
-              {
-                programId: SPL_TOKEN_PROGRAM_ID,
-                accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
-                data: makeSplTransferData(195_000_000n), // Actual deducted in
-              },
-              {
-                programId: SPL_TOKEN_PROGRAM_ID,
-                accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
-                data: makeSplTransferData(exactCandidateOut),
-              },
-            ],
-          },
-        ],
-        logMessages: [makeRayLogLine(4, "PC2Coin", 195_000_000n, exactCandidateOut)],
-      },
-    };
-
-    const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
-    expect(res.ok).toBe(true);
-    if (!res.ok) return;
-
-    expect(res.events[0]!.side).toBe("BUY");
-    expect(res.events[0]!.tokenAmount).toBe(exactCandidateOut);
-    expect(res.events[0]!.solAmount).toBe(195_000_000n);
   });
 
   it("verifies resolveTransactionAccounts with versioned loadedAddresses", () => {
@@ -1229,7 +2203,7 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
     expect(resolved[3]).toBe("ReadonlyLookupKey11111111111111111111111111111");
   });
 
-  it("verifies decodeInstructionData and parseRayLog helpers", () => {
+  it("verifies decodeInstructionData, parseRayLog, and parseInvocationFrames helpers", () => {
     // decodeInstructionData
     expect(decodeInstructionData(new Uint8Array([1, 2, 3]))).toEqual(new Uint8Array([1, 2, 3]));
     expect(decodeInstructionData([4, 5, 6])).toEqual(new Uint8Array([4, 5, 6]));
@@ -1247,5 +2221,15 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
 
     expect(parseRayLog("Random log without ray_log")).toBeNull();
     expect(parseRayLog("Program log: ray_log: not-base-64!")).toBeNull();
+
+    // parseInvocationFrames
+    const frames = parseInvocationFrames([
+      "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+      validLog,
+      "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success",
+    ]);
+    expect(frames.length).toBe(1);
+    expect(frames[0]!.success).toBe(true);
+    expect(frames[0]!.rayLogs.length).toBe(1);
   });
 });

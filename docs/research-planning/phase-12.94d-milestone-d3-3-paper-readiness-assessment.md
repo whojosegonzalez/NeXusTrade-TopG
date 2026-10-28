@@ -383,14 +383,30 @@ The approved offline implementation items are completed:
    - **Retest Boundary Enforcement**: Typed `FlowCoverageStatus` (`SUFFICIENT`, `WARM_UP`, `COLLECTION_GAP`, `STALE_DATA`, `CAPACITY_LOSS`, `PROCESSING_BACKLOG`, `UNINITIALIZED`). Requires trustworthy sufficient coverage and finite, non-negative integer counts before flow can support confirmation. Unverified legacy inputs fail closed (`WAITING`), while preserving protective crater drop ceilings (8% unabsorbed, 12% absorbed, 15% micro-cap) and timeout expirations.
    - 40 comprehensive unit tests passing in [`backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.test.ts).
    - 20 unit tests passing in [`backend/src/candidate-scanner/RetestGateEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.test.ts).
-8. **Offline Raydium AMM v4 Swap Decoder & Normalization Adapter (`RaydiumAmmV4SwapDecoder.ts`)**:
+8. **Offline Raydium AMM v4 Swap Decoder & Normalization Adapter (`RaydiumAmmV4SwapDecoder.ts`) & Audit Hardening**:
    - Implemented in [`backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts).
-   - Authoritative instruction parsing grounded in pinned Raydium AMM v4 source (`raydium-io/raydium-amm`): supports standard 17/18-account layout (`SwapBaseIn` tag 9, `SwapBaseOut` tag 11) and clean 8-account layout (`SwapBaseInV2` tag 16, `SwapBaseOutV2` tag 17).
-   - **Per-Swap Direction Attribution**: Determines `Coin2PC` vs `PC2Coin` via inner SPL Token transfer routing (`baseVault` vs `quoteVault` destinations), on-chain `ray_log` base64 program events, and `preTokenBalances` / `postTokenBalances` mint mappings; attributes `BUY`/`SELL` per swap relative to candidate token without inferring from transaction-wide net balances.
-   - **Deterministic Coordinate Preservation**: Derives unique swap coordinates (`${signature}:${outerInstructionIndex}:${swapIndex}`) preserving distinct identities for multiple swaps in a single transaction and inner CPI calls (e.g. Jupiter router calls).
-   - **Temporal & Success Validation**: Counts successful swaps only (`meta.err === null`); preserves slot, block time, source precision, and local receipt time. Rejects missing upstream timestamps (`MISSING_UPSTREAM_TIMESTAMP`) without manufacturing time.
+   - **Immutable Pinned Source Reference & Tag/Layout Matrix**: Pinned strictly to immutable official commit `91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6` (`raydium-io/raydium-amm` `program/src/processor.rs`). Enforces a strict layout matrix matching instruction tags to verified account counts:
+     - Legacy tags 9 (`SwapBaseIn`) & 11 (`SwapBaseOut`): Exactly 17 accounts (`LEGACY_17_ACCOUNTS`: `amm: 1, baseVault: 4, quoteVault: 5, userSource: 14, userDestination: 15, userOwner: 16`) or 18 accounts (`LEGACY_18_ACCOUNTS_TARGET_ORDERS`: conditionally consumes optional `target_orders` at index 4, shifting all subsequent positions +1: `baseVault: 5, quoteVault: 6, userSource: 15, userDestination: 16, userOwner: 17`). Rejects 8-account layout with `UNSUPPORTED_LAYOUT`.
+     - Clean V2 tags 16 (`SwapBaseInV2`) & 17 (`SwapBaseOutV2`): Exactly 8 accounts (`V2_8_ACCOUNTS`: `amm: 1, baseVault: 3, quoteVault: 4, userSource: 5, userDestination: 6, userOwner: 7`). Rejects 17 or 18-account layouts with `UNSUPPORTED_LAYOUT`.
+   - **Invocation-Scoped Evidence Attribution & Transfer Isolation**:
+     - Discarded global `rayLogCursor` and unbounded log slices. Parses `logMessages` into structured call frames (`Program ... invoke [depth]` ... `success/failed`) with call-stack depth tracking.
+     - Strictly binds `ray_log` events to originating invocation frame; eliminates cross-pool log leakage (e.g. prior pool's BUY log preceding tracked pool's SELL log).
+     - Isolates inner SPL transfers by matching exact `userSource`, `userDestination`, `baseVault`, and `quoteVault` accounts, and tracks consumed transfer indices (`consumedTransferIndices: Set<number>`) to prevent sibling transfers or routed swaps from reusing events.
+     - Reconciles transfer direction against bound `ray_log` direction; fails closed on contradictions (`CONFLICTING_EVIDENCE`) or ambiguity (`AMBIGUOUS_DIRECTION`).
+   - **Proven Successful Execution**:
+     - Requires explicit `meta` presence and explicit `meta.err === null`; missing or undefined `meta.err` fails closed with `TRANSACTION_NOT_SUCCESSFUL`.
+     - Requires proven invocation success in execution logs (`Program 675k... success`); caught CPI errors fail closed with `INVOCATION_FAILED`. Inner CPI calls without log messages fail closed with `INVOCATION_FAILED`.
+   - **Pool Boundary Validation & Context Freezing**:
+     - `createTrackedRaydiumPoolContext`: `poolAddress` is mandatory and must be a canonical Solana Base58 key; rejects missing or invalid keys with zero fallback to vault accounts.
+     - `validateTrackedPoolContext`: strictly validates mint consistency, vault differentiation, and orientation (`TOKEN_BASE_SOL_QUOTE`, `SOL_BASE_TOKEN_QUOTE`, `NON_SOL_PAIR`).
+     - Adapter freezes context against caller mutation (`Object.freeze`).
+     - Non-WSOL quote tokens leave `solAmount` undefined; non-WSOL quantities are never labeled as SOL.
+   - **Malformed Payload & Temporal Integrity**:
+     - Non-object or `null` payloads return structured `INVALID_PAYLOAD` without throwing.
+     - Out-of-bounds instruction account indices fail closed with `MALFORMED_INSTRUCTION_DATA` without dropping or shifting positions.
+     - Missing, non-finite, or non-positive `blockTime` fails closed with `MISSING_UPSTREAM_TIMESTAMP` without manufacturing time from receipt time.
    - **Fail-Closed Coverage Guarantee**: Normalization adapter bridges decoded events into `RollingTradeFlowTracker`; ingesting transactions strictly populates trade events and never fabricates stream checkpoints or advances window coverage.
-   - 19 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts).
+   - 35 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.test.ts).
 9. **Ubuntu CI Duplicate Decision ID Collision Resolution (`PilotLiveCollector.test.ts`)**:
    - In `makeCanonicalTestPubkey`, updated byte offset for writing test IDs from byte 0 to byte 2.
    - Eliminated identical 8-character Base58 prefixes (`3JEw2Z6V`) across distinct test mints (`pumpMint1` vs `pumpMint2`) that previously triggered duplicate decision event ID collisions (`evt-ds-${mint.slice(0, 8)}-${decisionEpochMs}`) and caused test timeouts on Ubuntu CI runners.
@@ -435,5 +451,5 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
      - Live WebSocket notification latency and `getTransaction` round-trip delays are unmeasured assumptions and must be empirically profiled under real network conditions.
    - **Capabilities Still Missing for Live Execution**:
      - Live WebSocket per-candidate subscription management and stream reconnection handling.
-     - Validated transaction instruction/account parser or zero-RPC `ray_log` binary event decoder.
-     - Backlog monitoring and capacity reconciliation mechanisms.
+     - Live transaction fetch transport wiring (`getTransaction`) or live `logsSubscribe` stream intake feeding `RaydiumAmmV4SwapDecoder.ts`.
+     - Backlog monitoring and capacity reconciliation mechanisms for live trade streams.

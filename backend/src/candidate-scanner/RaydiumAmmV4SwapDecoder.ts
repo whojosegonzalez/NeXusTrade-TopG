@@ -4,34 +4,40 @@
  * Implements authoritative, strictly offline transaction swap decoding and normalization
  * producing immutable TradeEvent inputs for RollingTradeFlowTracker.
  *
- * Pinned Official Raydium Source Code References:
+ * Pinned Official Raydium Source Code References (Immutable Commit):
  * - Repository: https://github.com/raydium-io/raydium-amm
+ * - Pinned Commit: 91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6
  * - Program ID: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (RAYDIUM_AMM_V4_PROGRAM_ID)
- * - Instruction Definitions (program/src/instruction.rs):
+ * - Instruction Definitions (program/src/instruction.rs @ 91739d8d):
  *     - SwapBaseIn: tag 9 (u8), amount_in (u64 LE, offset 1..9), minimum_out (u64 LE, offset 9..17)
  *     - SwapBaseOut: tag 11 (u8), max_in (u64 LE, offset 1..9), amount_out (u64 LE, offset 9..17)
  *     - SwapBaseInV2: tag 16 (u8), amount_in (u64 LE, offset 1..9), minimum_out (u64 LE, offset 9..17)
  *     - SwapBaseOutV2: tag 17 (u8), max_in (u64 LE, offset 1..9), amount_out (u64 LE, offset 9..17)
- * - Instruction Account Layouts (program/src/processor.rs):
- *     - Standard 17/18-account layout (process_swap_base_in / process_swap_base_out):
+ * - Instruction Account Layouts (program/src/processor.rs @ 91739d8d):
+ *     - Standard 17-account layout (process_swap_base_in / process_swap_base_out):
  *         0: token_program
  *         1: amm (pool state account / poolId)
  *         2: amm_authority
  *         3: amm_open_orders
  *         4: amm_coin_vault (baseVault)
  *         5: amm_pc_vault (quoteVault)
- *         6: market_program
- *         7: market
- *         8: market_bids
- *         9: market_asks
- *         10: market_event_queue
- *         11: market_coin_vault
- *         12: market_pc_vault
- *         13: market_vault_signer
+ *         6..13: market accounts
  *         14: user_source (user source token account)
  *         15: user_destination (user destination token account)
  *         16: user_source_owner (user wallet signer)
- *     - Clean 8-account layout (SwapBaseInV2 / SwapBaseOutV2):
+ *     - Shifted 18-account layout (process_swap_base_in / process_swap_base_out with optional target_orders):
+ *         0: token_program
+ *         1: amm (pool state account / poolId)
+ *         2: amm_authority
+ *         3: amm_open_orders
+ *         4: amm_target_orders (conditionally consumed, shifting all subsequent positions +1)
+ *         5: amm_coin_vault (baseVault)
+ *         6: amm_pc_vault (quoteVault)
+ *         7..14: market accounts
+ *         15: user_source
+ *         16: user_destination
+ *         17: user_source_owner
+ *     - Clean 8-account layout (process_swap_base_in_v2 / process_swap_base_out_v2):
  *         0: token_program
  *         1: amm (pool state account / poolId)
  *         2: amm_authority
@@ -40,24 +46,12 @@
  *         5: user_source
  *         6: user_destination
  *         7: user_source_owner
- * - Swap Directions (program/src/math.rs):
+ * - Swap Directions (program/src/math.rs @ 91739d8d):
  *     - SwapDirection::PC2Coin = 1u64 (Quote -> Coin/Base)
  *     - SwapDirection::Coin2PC = 2u64 (Coin/Base -> Quote)
- * - Program Logs (program/src/log.rs):
+ * - Program Logs (program/src/log.rs @ 91739d8d):
  *     - SwapBaseInLog: log_type: 3 (u8), direction: u64 LE at offset 17..25 (1 = PC2Coin, 2 = Coin2PC)
  *     - SwapBaseOutLog: log_type: 4 (u8), direction: u64 LE at offset 17..25 (1 = PC2Coin, 2 = Coin2PC)
- *
- * CRITICAL INVARIANTS:
- * 1. Offline Execution: Accepts injected/retained transaction payloads only; zero networking or live subscriptions.
- * 2. Strict Pool Binding: Binds every swap to exact tracked pool, candidate mint, quote mint, and vault accounts.
- * 3. Direction Attribution: Attributes BUY/SELL per individual swap and account context relative to candidate token;
- *    NEVER infers direction from transaction-wide net balances.
- * 4. Coordinate Preservation: Unique coordinates (${signature}:${outerInstructionIndex}:${swapIndex}) distinguish
- *    multiple swaps within one transaction, including inner/CPI instructions and versioned transactions.
- * 5. Temporal Integrity: Preserves upstream slot, block time, source precision, and host receipt time.
- *    Missing upstream block time is NEVER manufactured.
- * 6. Coverage Preservation: Decoding transactions populates trade events, but NEVER advances observation
- *    checkpoints or fabricates complete window coverage.
  */
 
 import { decodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
@@ -66,6 +60,7 @@ import {
   isCanonicalSolanaBase58,
   RAYDIUM_AMM_V4_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
+  WSOL_MINT,
 } from "../research/pilot/RaydiumAmmParser.js";
 import type {
   IngestTradeResult,
@@ -75,13 +70,17 @@ import type {
   TradeTimestampProvenance,
 } from "./RollingTradeFlowTracker.js";
 
+export const RAYDIUM_AMM_V4_IMMUTABLE_COMMIT = "91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6";
+
 export const RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES = Object.freeze({
   repository: "https://github.com/raydium-io/raydium-amm",
+  commit: RAYDIUM_AMM_V4_IMMUTABLE_COMMIT,
+  pinnedCommit: RAYDIUM_AMM_V4_IMMUTABLE_COMMIT,
   programId: RAYDIUM_AMM_V4_PROGRAM_ID,
-  instructionFile: "program/src/instruction.rs",
-  processorFile: "program/src/processor.rs",
-  mathFile: "program/src/math.rs",
-  logFile: "program/src/log.rs",
+  instructionFile: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_AMM_V4_IMMUTABLE_COMMIT}/program/src/instruction.rs`,
+  processorFile: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_AMM_V4_IMMUTABLE_COMMIT}/program/src/processor.rs`,
+  mathFile: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_AMM_V4_IMMUTABLE_COMMIT}/program/src/math.rs`,
+  logFile: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_AMM_V4_IMMUTABLE_COMMIT}/program/src/log.rs`,
   supportedTags: Object.freeze({
     SWAP_BASE_IN: 9,
     SWAP_BASE_OUT: 11,
@@ -103,57 +102,137 @@ export interface TrackedRaydiumPoolContext {
   readonly orientation: RaydiumPairOrientation;
 }
 
-export function createTrackedRaydiumPoolContext(
-  state: D23RaydiumAmmV4State,
-  candidateTokenMint: string,
-  quoteTokenMint: string,
-  orientation: RaydiumPairOrientation,
-  poolAddress?: string,
-): TrackedRaydiumPoolContext {
-  if (
-    !isCanonicalSolanaBase58(candidateTokenMint) ||
-    !isCanonicalSolanaBase58(quoteTokenMint) ||
-    !isCanonicalSolanaBase58(state.baseVault) ||
-    !isCanonicalSolanaBase58(state.quoteVault) ||
-    !isCanonicalSolanaBase58(state.baseMint) ||
-    !isCanonicalSolanaBase58(state.quoteMint)
-  ) {
-    throw new Error(
-      "[SWAP_DECODER_INIT] Invalid canonical Solana Base58 public key in pool context",
-    );
+/**
+ * Validates public boundary consistency for a TrackedRaydiumPoolContext.
+ * Rejects contradictory mints, identical vaults, invalid base58 keys, or mismatched orientations.
+ */
+export function validateTrackedPoolContext(
+  context: unknown,
+): asserts context is TrackedRaydiumPoolContext {
+  if (!context || typeof context !== "object") {
+    throw new Error("[POOL_CONTEXT_INVALID] Pool context must be a non-null object");
   }
 
-  // Cross-validate orientation and mint identities
-  if (orientation === "TOKEN_BASE_SOL_QUOTE") {
-    if (state.baseMint !== candidateTokenMint) {
+  const ctx = context as Record<string, unknown>;
+
+  const fields = [
+    "poolId",
+    "candidateTokenMint",
+    "quoteTokenMint",
+    "baseVault",
+    "quoteVault",
+    "baseMint",
+    "quoteMint",
+  ] as const;
+
+  for (const field of fields) {
+    const val = ctx[field];
+    if (typeof val !== "string" || !isCanonicalSolanaBase58(val)) {
       throw new Error(
-        `[SWAP_DECODER_INIT] TOKEN_BASE_SOL_QUOTE orientation expects baseMint to match candidate (${candidateTokenMint}), got: ${state.baseMint}`,
+        `[POOL_CONTEXT_INVALID] Field '${field}' must be a valid canonical Solana Base58 public key`,
       );
     }
-    if (state.quoteMint !== quoteTokenMint) {
+  }
+
+  const {
+    poolId,
+    candidateTokenMint,
+    quoteTokenMint,
+    baseVault,
+    quoteVault,
+    baseMint,
+    quoteMint,
+    orientation,
+  } = ctx as unknown as TrackedRaydiumPoolContext;
+
+  if (baseVault === quoteVault) {
+    throw new Error("[POOL_CONTEXT_INVALID] baseVault and quoteVault cannot be identical");
+  }
+  if (baseMint === quoteMint) {
+    throw new Error("[POOL_CONTEXT_INVALID] baseMint and quoteMint cannot be identical");
+  }
+
+  if (orientation === "TOKEN_BASE_SOL_QUOTE") {
+    if (candidateTokenMint !== baseMint) {
       throw new Error(
-        `[SWAP_DECODER_INIT] TOKEN_BASE_SOL_QUOTE orientation expects quoteMint to match quote (${quoteTokenMint}), got: ${state.quoteMint}`,
+        `[POOL_CONTEXT_INVALID] TOKEN_BASE_SOL_QUOTE requires candidateTokenMint (${candidateTokenMint}) to equal baseMint (${baseMint})`,
+      );
+    }
+    if (quoteTokenMint !== quoteMint) {
+      throw new Error(
+        `[POOL_CONTEXT_INVALID] TOKEN_BASE_SOL_QUOTE requires quoteTokenMint (${quoteTokenMint}) to equal quoteMint (${quoteMint})`,
+      );
+    }
+    if (quoteTokenMint !== WSOL_MINT) {
+      throw new Error(
+        `[POOL_CONTEXT_INVALID] TOKEN_BASE_SOL_QUOTE requires quoteTokenMint to be canonical WSOL (${WSOL_MINT})`,
       );
     }
   } else if (orientation === "SOL_BASE_TOKEN_QUOTE") {
-    if (state.baseMint !== quoteTokenMint) {
+    if (quoteTokenMint !== baseMint) {
       throw new Error(
-        `[SWAP_DECODER_INIT] SOL_BASE_TOKEN_QUOTE orientation expects baseMint to match quote (${quoteTokenMint}), got: ${state.baseMint}`,
+        `[POOL_CONTEXT_INVALID] SOL_BASE_TOKEN_QUOTE requires quoteTokenMint (${quoteTokenMint}) to equal baseMint (${baseMint})`,
       );
     }
-    if (state.quoteMint !== candidateTokenMint) {
+    if (candidateTokenMint !== quoteMint) {
       throw new Error(
-        `[SWAP_DECODER_INIT] SOL_BASE_TOKEN_QUOTE orientation expects quoteMint to match candidate (${candidateTokenMint}), got: ${state.quoteMint}`,
+        `[POOL_CONTEXT_INVALID] SOL_BASE_TOKEN_QUOTE requires candidateTokenMint (${candidateTokenMint}) to equal quoteMint (${quoteMint})`,
+      );
+    }
+    if (quoteTokenMint !== WSOL_MINT) {
+      throw new Error(
+        `[POOL_CONTEXT_INVALID] SOL_BASE_TOKEN_QUOTE requires quoteTokenMint to be canonical WSOL (${WSOL_MINT})`,
+      );
+    }
+  } else if (orientation === "NON_SOL_PAIR") {
+    if (baseMint === WSOL_MINT || quoteMint === WSOL_MINT) {
+      throw new Error(
+        "[POOL_CONTEXT_INVALID] NON_SOL_PAIR cannot have WSOL as baseMint or quoteMint",
+      );
+    }
+    const isBaseCandidate = candidateTokenMint === baseMint && quoteTokenMint === quoteMint;
+    const isQuoteCandidate = candidateTokenMint === quoteMint && quoteTokenMint === baseMint;
+    if (!isBaseCandidate && !isQuoteCandidate) {
+      throw new Error(
+        "[POOL_CONTEXT_INVALID] NON_SOL_PAIR requires candidateTokenMint and quoteTokenMint to match pool mints",
       );
     }
   } else {
-    throw new Error(`[SWAP_DECODER_INIT] Unsupported orientation: ${orientation}`);
+    throw new Error(`[POOL_CONTEXT_INVALID] Unsupported pair orientation: ${String(orientation)}`);
   }
 
-  const poolId = poolAddress ?? state.baseVault; // if explicit pool address not provided
+  // Pool ID must not be identical to any vault or mint
+  if (
+    poolId === baseVault ||
+    poolId === quoteVault ||
+    poolId === baseMint ||
+    poolId === quoteMint
+  ) {
+    throw new Error(
+      "[POOL_CONTEXT_INVALID] poolId cannot be substituted by or equal to vault or mint accounts",
+    );
+  }
+}
 
-  return Object.freeze({
-    poolId,
+/**
+ * Creates and freezes a verified TrackedRaydiumPoolContext from state and explicit identities.
+ * Explicit canonical pool address is mandatory; NO fallback to vault accounts is permitted.
+ */
+export function createTrackedRaydiumPoolContext(
+  state: D23RaydiumAmmV4State,
+  poolAddress: string,
+  candidateTokenMint: string,
+  quoteTokenMint: string,
+  orientation: RaydiumPairOrientation,
+): TrackedRaydiumPoolContext {
+  if (typeof poolAddress !== "string" || !isCanonicalSolanaBase58(poolAddress)) {
+    throw new Error(
+      "[SWAP_DECODER_INIT] An explicit, canonical Solana Base58 poolAddress is mandatory",
+    );
+  }
+
+  const context: TrackedRaydiumPoolContext = Object.freeze({
+    poolId: poolAddress,
     candidateTokenMint,
     quoteTokenMint,
     baseVault: state.baseVault,
@@ -162,17 +241,102 @@ export function createTrackedRaydiumPoolContext(
     quoteMint: state.quoteMint,
     orientation,
   });
+
+  validateTrackedPoolContext(context);
+  return context;
+}
+
+export type RaydiumSwapLayoutName =
+  | "LEGACY_17_ACCOUNTS"
+  | "LEGACY_18_ACCOUNTS_TARGET_ORDERS"
+  | "V2_8_ACCOUNTS";
+
+export interface RaydiumSwapAccountPositions {
+  readonly layout: RaydiumSwapLayoutName;
+  readonly poolIdIndex: number;
+  readonly baseVaultIndex: number;
+  readonly quoteVaultIndex: number;
+  readonly userSourceIndex: number;
+  readonly userDestinationIndex: number;
+  readonly userOwnerIndex: number;
+}
+
+/**
+ * Strict Tag/Account-Layout Matrix (Ground Truth: program/src/processor.rs @ 91739d8d)
+ *
+ * Tag 9 (SwapBaseIn) & Tag 11 (SwapBaseOut):
+ * - Exactly 17 accounts: LEGACY_17_ACCOUNTS (baseVault: 4, quoteVault: 5, userSrc: 14, userDst: 15, userOwner: 16)
+ * - Exactly 18 accounts: LEGACY_18_ACCOUNTS_TARGET_ORDERS (target_orders conditionally consumed at index 4,
+ *   shifting baseVault: 5, quoteVault: 6, userSrc: 15, userDst: 16, userOwner: 17)
+ * - Any other count (e.g. 8) is strictly unsupported for tags 9 and 11.
+ *
+ * Tag 16 (SwapBaseInV2) & Tag 17 (SwapBaseOutV2):
+ * - Exactly 8 accounts: V2_8_ACCOUNTS (baseVault: 3, quoteVault: 4, userSrc: 5, userDst: 6, userOwner: 7)
+ * - Any other count (e.g. 17, 18) is strictly unsupported for tags 16 and 17.
+ */
+export function matchSupportedSwapLayout(
+  tag: number,
+  accountCount: number,
+): RaydiumSwapAccountPositions | null {
+  if (
+    tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN ||
+    tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT
+  ) {
+    if (accountCount === 17) {
+      return {
+        layout: "LEGACY_17_ACCOUNTS",
+        poolIdIndex: 1,
+        baseVaultIndex: 4,
+        quoteVaultIndex: 5,
+        userSourceIndex: 14,
+        userDestinationIndex: 15,
+        userOwnerIndex: 16,
+      };
+    }
+    if (accountCount === 18) {
+      return {
+        layout: "LEGACY_18_ACCOUNTS_TARGET_ORDERS",
+        poolIdIndex: 1,
+        baseVaultIndex: 5,
+        quoteVaultIndex: 6,
+        userSourceIndex: 15,
+        userDestinationIndex: 16,
+        userOwnerIndex: 17,
+      };
+    }
+    return null;
+  }
+
+  if (
+    tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN_V2 ||
+    tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT_V2
+  ) {
+    if (accountCount === 8) {
+      return {
+        layout: "V2_8_ACCOUNTS",
+        poolIdIndex: 1,
+        baseVaultIndex: 3,
+        quoteVaultIndex: 4,
+        userSourceIndex: 5,
+        userDestinationIndex: 6,
+        userOwnerIndex: 7,
+      };
+    }
+    return null;
+  }
+
+  return null;
 }
 
 export interface DecodableInstruction {
   readonly programIdIndex?: number | undefined;
   readonly programId?: string | undefined;
-  readonly accounts: readonly number[] | readonly string[];
+  readonly accounts: readonly (number | string)[];
   readonly data: string | Uint8Array | readonly number[];
 }
 
 export interface DecodableInnerInstructionsGroup {
-  readonly index: number; // outerInstructionIndex
+  readonly index: number;
   readonly instructions: readonly DecodableInstruction[];
 }
 
@@ -199,38 +363,41 @@ export interface DecodableTransactionPayload {
       readonly addressTableLookups?: readonly unknown[] | undefined;
     };
   };
-  readonly meta?:
-    | {
-        readonly err: unknown | null | undefined;
-        readonly fee?: number | undefined;
-        readonly preBalances?: readonly number[] | undefined;
-        readonly postBalances?: readonly number[] | undefined;
-        readonly preTokenBalances?: readonly DecodableTokenBalance[] | undefined;
-        readonly postTokenBalances?: readonly DecodableTokenBalance[] | undefined;
-        readonly innerInstructions?: readonly DecodableInnerInstructionsGroup[] | undefined;
-        readonly logMessages?: readonly string[] | undefined;
-        readonly loadedAddresses?:
-          | {
-              readonly writable?: readonly string[] | undefined;
-              readonly readonly?: readonly string[] | undefined;
-            }
-          | undefined;
-      }
-    | null
-    | undefined;
+  readonly meta: {
+    readonly err: unknown | null;
+    readonly fee?: number | undefined;
+    readonly preBalances?: readonly number[] | undefined;
+    readonly postBalances?: readonly number[] | undefined;
+    readonly preTokenBalances?: readonly DecodableTokenBalance[] | undefined;
+    readonly postTokenBalances?: readonly DecodableTokenBalance[] | undefined;
+    readonly innerInstructions?: readonly DecodableInnerInstructionsGroup[] | undefined;
+    readonly logMessages?: readonly string[] | undefined;
+    readonly loadedAddresses?:
+      | {
+          readonly writable?: readonly string[] | undefined;
+          readonly readonly?: readonly string[] | undefined;
+        }
+      | undefined;
+  };
 }
 
 export type DecodeRaydiumSwapFailureReason =
-  | "TRANSACTION_FAILED"
+  | "INVALID_PAYLOAD"
+  | "INVALID_POOL_CONTEXT"
   | "MISSING_SIGNATURE"
   | "INVALID_SLOT"
+  | "TRANSACTION_NOT_SUCCESSFUL"
+  | "TRANSACTION_FAILED"
+  | "INVOCATION_FAILED"
   | "MISSING_UPSTREAM_TIMESTAMP"
   | "NO_MATCHING_SWAPS_FOUND"
   | "IDENTITY_MISMATCH"
   | "VAULT_MISMATCH"
   | "UNSUPPORTED_INSTRUCTION"
+  | "UNSUPPORTED_LAYOUT"
   | "MALFORMED_INSTRUCTION_DATA"
-  | "AMBIGUOUS_DIRECTION";
+  | "AMBIGUOUS_DIRECTION"
+  | "CONFLICTING_EVIDENCE";
 
 export interface DecodedSwapEventResult {
   readonly ok: true;
@@ -256,11 +423,8 @@ export interface DecodeSwapFailureResult {
 export type DecodeRaydiumTransactionResult = DecodedSwapEventResult | DecodeSwapFailureResult;
 
 export interface DecodeSwapOptions {
-  /** Local clock function for receipt timestamps (defaults to Date.now) */
   readonly clock?: (() => number) | undefined;
-  /** Explicit receipt timestamp (overrides clock reading) */
   readonly receiptTimestampMs?: number | undefined;
-  /** Explicit provenance for synthetic fixtures (e.g. "SYNTHETIC_FIXTURE") */
   readonly fallbackProvenance?: TradeTimestampProvenance | undefined;
 }
 
@@ -276,8 +440,7 @@ export interface IngestTransactionResult {
 }
 
 /**
- * Normalizes instruction data to a Uint8Array.
- * Handles Uint8Array, Buffer, number arrays, base58 strings, and base64 strings.
+ * Decodes instruction data into a Uint8Array.
  */
 export function decodeInstructionData(data: unknown): Uint8Array | null {
   if (data instanceof Uint8Array) {
@@ -291,12 +454,10 @@ export function decodeInstructionData(data: unknown): Uint8Array | null {
     if (trimmed.length === 0) {
       return new Uint8Array(0);
     }
-    // Attempt base58 decoding first (standard for Solana RPC compiled instructions)
     try {
       const b58 = decodeBase58(trimmed);
       return new Uint8Array(b58.buffer, b58.byteOffset, b58.byteLength);
     } catch {
-      // Fallback: try base64 decoding
       try {
         const b64 = Buffer.from(trimmed, "base64");
         return new Uint8Array(b64.buffer, b64.byteOffset, b64.byteLength);
@@ -309,7 +470,7 @@ export function decodeInstructionData(data: unknown): Uint8Array | null {
 }
 
 /**
- * Resolves static and lookup-table accounts from message and meta into a flat array of base58 public keys.
+ * Resolves static and lookup-table accounts from message and meta into a flat array of Base58 strings.
  */
 export function resolveTransactionAccounts(
   message: {
@@ -328,11 +489,13 @@ export function resolveTransactionAccounts(
     | undefined,
 ): string[] {
   const accounts: string[] = [];
-  for (const key of message.accountKeys) {
-    if (typeof key === "string") {
-      accounts.push(key);
-    } else if (key && typeof key.pubkey === "string") {
-      accounts.push(key.pubkey);
+  if (Array.isArray(message.accountKeys)) {
+    for (const key of message.accountKeys) {
+      if (typeof key === "string") {
+        accounts.push(key);
+      } else if (key && typeof key.pubkey === "string") {
+        accounts.push(key.pubkey);
+      }
     }
   }
   if (meta?.loadedAddresses) {
@@ -354,11 +517,12 @@ function resolveProgramId(
   instruction: DecodableInstruction,
   resolvedAccounts: readonly string[],
 ): string | null {
-  if (instruction.programId) {
+  if (typeof instruction.programId === "string") {
     return instruction.programId;
   }
   if (
     typeof instruction.programIdIndex === "number" &&
+    Number.isInteger(instruction.programIdIndex) &&
     instruction.programIdIndex >= 0 &&
     instruction.programIdIndex < resolvedAccounts.length
   ) {
@@ -367,16 +531,28 @@ function resolveProgramId(
   return null;
 }
 
-function resolveInstructionAccounts(
+function resolveInstructionAccountsStrict(
   instruction: DecodableInstruction,
   resolvedAccounts: readonly string[],
-): string[] {
+): string[] | null {
+  if (!Array.isArray(instruction.accounts)) {
+    return null;
+  }
   const result: string[] = [];
-  for (const acc of instruction.accounts) {
+  for (let i = 0; i < instruction.accounts.length; i++) {
+    const acc = instruction.accounts[i];
     if (typeof acc === "string") {
       result.push(acc);
-    } else if (typeof acc === "number" && acc >= 0 && acc < resolvedAccounts.length) {
+    } else if (
+      typeof acc === "number" &&
+      Number.isInteger(acc) &&
+      acc >= 0 &&
+      acc < resolvedAccounts.length
+    ) {
       result.push(resolvedAccounts[acc]!);
+    } else {
+      // Out of bounds or invalid account index: do NOT drop or shift, fail closed
+      return null;
     }
   }
   return result;
@@ -399,10 +575,6 @@ export interface DecodedRayLogSwap {
   readonly amountOut: bigint;
 }
 
-/**
- * Parses Raydium program event log (`ray_log: <base64>`) emitted in logMessages.
- * Extracts official Raydium SwapDirection (1 = PC2Coin, 2 = Coin2PC) and exact amounts.
- */
 export function parseRayLog(logLine: string): DecodedRayLogSwap | null {
   const match = logLine.match(/ray_log:\s*([A-Za-z0-9+/=]+)/);
   if (!match || !match[1]) return null;
@@ -437,6 +609,7 @@ export function parseRayLog(logLine: string): DecodedRayLogSwap | null {
 }
 
 export interface DecodedSplTransfer {
+  readonly transferIndex: number;
   readonly source: string;
   readonly destination: string;
   readonly authority: string;
@@ -446,6 +619,7 @@ export interface DecodedSplTransfer {
 function parseSplTokenTransfer(
   instruction: DecodableInstruction,
   resolvedAccounts: readonly string[],
+  transferIndex: number,
 ): DecodedSplTransfer | null {
   const progId = resolveProgramId(instruction, resolvedAccounts);
   if (progId !== SPL_TOKEN_PROGRAM_ID && progId !== TOKEN_2022_PROGRAM_ID) {
@@ -456,14 +630,15 @@ function parseSplTokenTransfer(
   if (!rawData || rawData.length < 9) return null;
 
   const tag = rawData[0];
-  const accounts = resolveInstructionAccounts(instruction, resolvedAccounts);
+  const accounts = resolveInstructionAccountsStrict(instruction, resolvedAccounts);
+  if (!accounts) return null;
 
   if (tag === 3) {
-    // SPL Token Transfer: [source, destination, authority]
     if (accounts.length < 3) return null;
     try {
       const amount = readU64LE(rawData, 1);
       return {
+        transferIndex,
         source: accounts[0]!,
         destination: accounts[1]!,
         authority: accounts[2]!,
@@ -473,11 +648,11 @@ function parseSplTokenTransfer(
       return null;
     }
   } else if (tag === 12) {
-    // SPL Token TransferChecked: [source, mint, destination, authority]
     if (accounts.length < 4) return null;
     try {
       const amount = readU64LE(rawData, 1);
       return {
+        transferIndex,
         source: accounts[0]!,
         destination: accounts[2]!,
         authority: accounts[3]!,
@@ -491,19 +666,115 @@ function parseSplTokenTransfer(
   return null;
 }
 
+export interface RaydiumInvocationFrame {
+  readonly invocationIndex: number;
+  readonly programId: string;
+  readonly depth: number;
+  success: boolean;
+  failed: boolean;
+  readonly rayLogs: DecodedRayLogSwap[];
+}
+
+/**
+ * Parses logMessages into an execution call-stack structure to isolate each
+ * program invocation and bind ray_log events strictly to their originating invocation.
+ */
+export function parseInvocationFrames(
+  logMessages: readonly string[],
+): readonly RaydiumInvocationFrame[] {
+  const raydiumFrames: RaydiumInvocationFrame[] = [];
+  const activeStack: { programId: string; depth: number; frame?: RaydiumInvocationFrame }[] = [];
+  let raydiumCounter = 0;
+
+  for (const line of logMessages) {
+    // 1. Program invocation: Program <ProgramId> invoke [<depth>]
+    const invokeMatch = line.match(/^Program\s+([A-Za-z0-9]{32,44})\s+invoke\s+\[(\d+)\]/);
+    if (invokeMatch) {
+      const programId = invokeMatch[1]!;
+      const depth = parseInt(invokeMatch[2]!, 10);
+
+      if (programId === RAYDIUM_AMM_V4_PROGRAM_ID) {
+        const frame: RaydiumInvocationFrame = {
+          invocationIndex: raydiumCounter++,
+          programId,
+          depth,
+          success: false,
+          failed: false,
+          rayLogs: [],
+        };
+        raydiumFrames.push(frame);
+        activeStack.push({ programId, depth, frame });
+      } else {
+        activeStack.push({ programId, depth });
+      }
+      continue;
+    }
+
+    // 2. Program success: Program <ProgramId> success
+    const successMatch = line.match(/^Program\s+([A-Za-z0-9]{32,44})\s+success/);
+    if (successMatch) {
+      const programId = successMatch[1]!;
+      // Find matching frame from top of stack
+      for (let i = activeStack.length - 1; i >= 0; i--) {
+        if (activeStack[i]!.programId === programId) {
+          const entry = activeStack[i]!;
+          if (entry.frame) {
+            entry.frame.success = true;
+          }
+          activeStack.splice(i, 1);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // 3. Program failed: Program <ProgramId> failed:
+    const failMatch = line.match(/^Program\s+([A-Za-z0-9]{32,44})\s+failed:/);
+    if (failMatch) {
+      const programId = failMatch[1]!;
+      for (let i = activeStack.length - 1; i >= 0; i--) {
+        if (activeStack[i]!.programId === programId) {
+          const entry = activeStack[i]!;
+          if (entry.frame) {
+            entry.frame.failed = true;
+          }
+          activeStack.splice(i, 1);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // 4. Raydium ray_log line: attribute to current active Raydium frame on stack
+    const rayLog = parseRayLog(line);
+    if (rayLog) {
+      for (let i = activeStack.length - 1; i >= 0; i--) {
+        const entry = activeStack[i]!;
+        if (entry.frame && entry.programId === RAYDIUM_AMM_V4_PROGRAM_ID) {
+          entry.frame.rayLogs.push(rayLog);
+          break;
+        }
+      }
+    }
+  }
+
+  return raydiumFrames;
+}
+
 function attributeTradeSide(
   direction: "Coin2PC" | "PC2Coin",
   orientation: RaydiumPairOrientation,
+  candidateTokenMint?: string,
+  baseMint?: string,
 ): TradeSide {
   if (orientation === "TOKEN_BASE_SOL_QUOTE") {
-    // Base is Candidate, Quote is SOL
-    // Coin2PC: Candidate -> SOL = SELL
-    // PC2Coin: SOL -> Candidate = BUY
     return direction === "Coin2PC" ? "SELL" : "BUY";
   } else if (orientation === "SOL_BASE_TOKEN_QUOTE") {
-    // Base is SOL, Quote is Candidate
-    // Coin2PC: SOL -> Candidate = BUY
-    // PC2Coin: Candidate -> SOL = SELL
+    return direction === "Coin2PC" ? "BUY" : "SELL";
+  } else if (orientation === "NON_SOL_PAIR") {
+    if (candidateTokenMint && baseMint && candidateTokenMint === baseMint) {
+      return direction === "Coin2PC" ? "SELL" : "BUY";
+    }
     return direction === "Coin2PC" ? "BUY" : "SELL";
   } else {
     throw new Error(`[SWAP_DECODER] Unsupported pair orientation: ${orientation}`);
@@ -515,15 +786,36 @@ function attributeTradeSide(
  * bound strictly to the given Raydium pool context.
  */
 export function decodeRaydiumTransactionSwaps(
-  payload: DecodableTransactionPayload,
+  payload: DecodableTransactionPayload | unknown,
   poolContext: TrackedRaydiumPoolContext,
   options?: DecodeSwapOptions,
 ): DecodeRaydiumTransactionResult {
-  const clock = options?.clock ?? Date.now;
-  const receiptTimestampMs = options?.receiptTimestampMs ?? clock();
+  // 1. Validate payload existence
+  if (!payload || typeof payload !== "object") {
+    return {
+      ok: false,
+      reason: "INVALID_PAYLOAD",
+      message: "Transaction payload must be a non-null object",
+      events: [],
+    };
+  }
 
-  // 1. Validate signature presence
-  const signature = payload.transaction?.signatures?.[0];
+  // 2. Validate pool context at boundary
+  try {
+    validateTrackedPoolContext(poolContext);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "INVALID_POOL_CONTEXT",
+      message: err instanceof Error ? err.message : String(err),
+      events: [],
+    };
+  }
+
+  const txPayload = payload as DecodableTransactionPayload;
+
+  // 3. Validate signature presence
+  const signature = txPayload.transaction?.signatures?.[0];
   if (!signature || typeof signature !== "string" || signature.trim().length === 0) {
     return {
       ok: false,
@@ -533,8 +825,8 @@ export function decodeRaydiumTransactionSwaps(
     };
   }
 
-  // 2. Validate slot
-  const slot = payload.slot;
+  // 4. Validate slot
+  const slot = txPayload.slot;
   if (typeof slot !== "number" || !Number.isFinite(slot) || !Number.isInteger(slot) || slot < 0) {
     return {
       ok: false,
@@ -545,68 +837,111 @@ export function decodeRaydiumTransactionSwaps(
     };
   }
 
-  // 3. Check transaction success status
-  if (payload.meta?.err !== null && payload.meta?.err !== undefined) {
+  // 5. Require explicit transaction-success metadata
+  if (!txPayload.meta || typeof txPayload.meta !== "object") {
+    return {
+      ok: false,
+      reason: "TRANSACTION_NOT_SUCCESSFUL",
+      message: `Transaction ${signature} lacks required meta object confirming execution success`,
+      signature,
+      slot,
+      events: [],
+    };
+  }
+
+  // Transaction must have explicit meta.err === null
+  if (txPayload.meta.err !== null) {
+    if (txPayload.meta.err === undefined) {
+      return {
+        ok: false,
+        reason: "TRANSACTION_NOT_SUCCESSFUL",
+        message: `Transaction ${signature} meta.err is undefined; explicit successful status (err: null) is required`,
+        signature,
+        slot,
+        events: [],
+      };
+    }
     return {
       ok: false,
       reason: "TRANSACTION_FAILED",
-      message: `Transaction ${signature} failed on-chain with error: ${JSON.stringify(payload.meta.err)}`,
+      message: `Transaction ${signature} failed on-chain with error: ${JSON.stringify(txPayload.meta.err)}`,
       signature,
       slot,
       events: [],
     };
   }
 
-  // 4. Resolve upstream timestamp and provenance
-  let blockTimeSec: number | null = null;
-  let eventTimestampMs: number;
-  let timestampProvenance: TradeTimestampProvenance;
-
+  // 6. Upstream timestamp validation: missing time is NEVER manufactured
   if (
-    typeof payload.blockTime === "number" &&
-    Number.isFinite(payload.blockTime) &&
-    payload.blockTime > 0
+    typeof txPayload.blockTime !== "number" ||
+    !Number.isFinite(txPayload.blockTime) ||
+    txPayload.blockTime <= 0
   ) {
-    blockTimeSec = Math.floor(payload.blockTime);
-    eventTimestampMs = blockTimeSec * 1000;
-    timestampProvenance = options?.fallbackProvenance ?? "ON_CHAIN_BLOCK_TIME";
-  } else if (options?.fallbackProvenance === "SYNTHETIC_FIXTURE") {
-    // Explicit synthetic fixture allows local simulated time
-    eventTimestampMs = receiptTimestampMs;
-    blockTimeSec = Math.floor(eventTimestampMs / 1000);
-    timestampProvenance = "SYNTHETIC_FIXTURE";
-  } else {
-    // Missing upstream time must remain unavailable; do not manufacture it
     return {
       ok: false,
       reason: "MISSING_UPSTREAM_TIMESTAMP",
-      message: `Transaction ${signature} lacks an on-chain blockTime and cannot manufacture upstream timestamp`,
+      message: `Transaction ${signature} lacks an on-chain blockTime; upstream timestamp is unavailable (cannot manufacture upstream timestamp)`,
       signature,
       slot,
       events: [],
     };
   }
 
-  // 5. Resolve transaction accounts (static + lookup tables)
-  const resolvedAccounts = resolveTransactionAccounts(payload.transaction.message, payload.meta);
+  const blockTimeSec = Math.floor(txPayload.blockTime);
+  const eventTimestampMs = blockTimeSec * 1000;
+  const timestampProvenance: TradeTimestampProvenance =
+    options?.fallbackProvenance ?? "ON_CHAIN_BLOCK_TIME";
 
-  // 6. Index inner instructions by outer instruction index
-  const innerGroups = new Map<number, readonly DecodableInstruction[]>();
-  if (Array.isArray(payload.meta?.innerInstructions)) {
-    for (const group of payload.meta.innerInstructions) {
-      if (typeof group.index === "number" && Array.isArray(group.instructions)) {
-        innerGroups.set(group.index, group.instructions);
-      }
-    }
+  const clock = options?.clock ?? Date.now;
+  const receiptTimestampMs = options?.receiptTimestampMs ?? clock();
+
+  // 7. Validate transaction message structure
+  if (
+    !txPayload.transaction.message ||
+    !Array.isArray(txPayload.transaction.message.accountKeys) ||
+    !Array.isArray(txPayload.transaction.message.instructions)
+  ) {
+    return {
+      ok: false,
+      reason: "MALFORMED_INSTRUCTION_DATA",
+      message: `Transaction ${signature} has malformed message structure`,
+      signature,
+      slot,
+      events: [],
+    };
   }
 
-  // 7. Parse ray_log entries from logMessages if present
-  const rayLogs: DecodedRayLogSwap[] = [];
-  if (Array.isArray(payload.meta?.logMessages)) {
-    for (const line of payload.meta.logMessages) {
-      const parsed = parseRayLog(line);
-      if (parsed) {
-        rayLogs.push(parsed);
+  // 8. Resolve transaction accounts (static + lookup tables)
+  const resolvedAccounts = resolveTransactionAccounts(
+    txPayload.transaction.message,
+    txPayload.meta,
+  );
+
+  // 9. Parse invocation frames from logMessages to isolate ray_log events and proven success
+  const logMessages = txPayload.meta.logMessages;
+  const hasLogMessages = Array.isArray(logMessages) && logMessages.length > 0;
+  const raydiumFrames = hasLogMessages ? parseInvocationFrames(logMessages) : [];
+  let raydiumInvocationCursor = 0;
+
+  // Track consumed transfers to ensure distinct invocation attribution
+  const consumedTransferIndices = new Set<number>();
+
+  // 10. Parse all SPL token transfers across all inner instructions
+  const allSplTransfers: DecodedSplTransfer[] = [];
+  let globalTransferCounter = 0;
+  if (Array.isArray(txPayload.meta.innerInstructions)) {
+    for (const group of txPayload.meta.innerInstructions) {
+      if (Array.isArray(group.instructions)) {
+        for (const innerInst of group.instructions) {
+          const transfer = parseSplTokenTransfer(
+            innerInst,
+            resolvedAccounts,
+            globalTransferCounter++,
+          );
+          if (transfer) {
+            allSplTransfers.push(transfer);
+          }
+        }
       }
     }
   }
@@ -615,14 +950,13 @@ export function decodeRaydiumTransactionSwaps(
   let totalInstructionsScanned = 0;
   let matchingSwapsCount = 0;
   let nonMatchingPoolSwapsCount = 0;
-  let rayLogCursor = 0;
 
-  // Helper to decode a single Raydium swap instruction
+  // Instruction decoder closure
   const decodeInstructionIfRaydiumSwap = (
     inst: DecodableInstruction,
     outerInstructionIndex: number,
     swapIndex: number,
-    relevantInnerInstructions: readonly DecodableInstruction[],
+    isInnerCpi: boolean,
   ): {
     readonly isRaydium: boolean;
     readonly error?: { readonly reason: DecodeRaydiumSwapFailureReason; readonly message: string };
@@ -633,22 +967,44 @@ export function decodeRaydiumTransactionSwaps(
       return { isRaydium: false };
     }
 
-    const accounts = resolveInstructionAccounts(inst, resolvedAccounts);
-    if (accounts.length < 8) {
+    // Next Raydium invocation frame
+    const currentFrame =
+      raydiumFrames.length > raydiumInvocationCursor
+        ? raydiumFrames[raydiumInvocationCursor++]
+        : null;
+
+    // Verify invocation success when logs are present
+    if (hasLogMessages) {
+      if (!currentFrame || !currentFrame.success || currentFrame.failed) {
+        return {
+          isRaydium: true,
+          error: {
+            reason: "INVOCATION_FAILED",
+            message: `Raydium AMM v4 invocation at index ${raydiumInvocationCursor - 1} did not complete successfully in log messages`,
+          },
+        };
+      }
+    } else if (isInnerCpi) {
+      // For inner CPI without log messages, success of inner execution cannot be proven
       return {
         isRaydium: true,
         error: {
-          reason: "MALFORMED_INSTRUCTION_DATA",
-          message: `Raydium instruction has insufficient accounts: ${accounts.length} (minimum 8)`,
+          reason: "INVOCATION_FAILED",
+          message:
+            "Cannot prove successful execution of inner CPI swap without transaction logMessages",
         },
       };
     }
 
-    // Account 1 is always the AMM pool account
-    const instructionPoolId = accounts[1]!;
-    if (instructionPoolId !== poolContext.poolId) {
-      nonMatchingPoolSwapsCount++;
-      return { isRaydium: true }; // Raydium swap for another pool in the same transaction
+    const accounts = resolveInstructionAccountsStrict(inst, resolvedAccounts);
+    if (!accounts) {
+      return {
+        isRaydium: true,
+        error: {
+          reason: "MALFORMED_INSTRUCTION_DATA",
+          message: "Instruction account indices are invalid or out of bounds",
+        },
+      };
     }
 
     // Decode instruction data
@@ -663,56 +1019,48 @@ export function decodeRaydiumTransactionSwaps(
       };
     }
 
-    const tag = rawData[0];
-    const isStandardLayout = accounts.length >= 17;
-    const isV2Layout = accounts.length === 8;
+    const tag = rawData[0]!;
 
-    let baseVaultAccount: string;
-    let quoteVaultAccount: string;
-    let userSourceAccount: string;
-    let userDestinationAccount: string;
+    // Strict Layout Matrix Match
+    const positions = matchSupportedSwapLayout(tag, accounts.length);
+    if (!positions) {
+      const isKnownTag =
+        tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN ||
+        tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT ||
+        tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN_V2 ||
+        tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT_V2;
 
-    if (isStandardLayout) {
-      // 17-account layout: 4: coin_vault, 5: pc_vault, 14: user_source, 15: user_dest
-      baseVaultAccount = accounts[4]!;
-      quoteVaultAccount = accounts[5]!;
-      userSourceAccount = accounts[14]!;
-      userDestinationAccount = accounts[15]!;
-    } else if (isV2Layout) {
-      // 8-account layout: 3: coin_vault, 4: pc_vault, 5: user_source, 6: user_dest
-      baseVaultAccount = accounts[3]!;
-      quoteVaultAccount = accounts[4]!;
-      userSourceAccount = accounts[5]!;
-      userDestinationAccount = accounts[6]!;
-    } else {
+      if (isKnownTag) {
+        return {
+          isRaydium: true,
+          error: {
+            reason: "UNSUPPORTED_LAYOUT",
+            message: `Unsupported account count ${accounts.length} for Raydium instruction tag ${tag}`,
+          },
+        };
+      }
       return {
         isRaydium: true,
         error: {
           reason: "UNSUPPORTED_INSTRUCTION",
-          message: `Unexpected Raydium account count: ${accounts.length} (expected 8 or >= 17)`,
+          message: `Unsupported Raydium instruction tag: ${tag}`,
         },
       };
     }
 
-    // Validate instruction tag
-    const isSwapBaseIn =
-      tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN ||
-      tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_IN_V2;
-    const isSwapBaseOut =
-      tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT ||
-      tag === RAYDIUM_AMM_V4_SWAP_SOURCE_REFERENCES.supportedTags.SWAP_BASE_OUT_V2;
-
-    if (!isSwapBaseIn && !isSwapBaseOut) {
-      return {
-        isRaydium: true,
-        error: {
-          reason: "UNSUPPORTED_INSTRUCTION",
-          message: `Unsupported Raydium instruction tag: ${String(tag)} (expected 9, 11, 16, or 17)`,
-        },
-      };
+    // Account positions verified from layout
+    const instructionPoolId = accounts[positions.poolIdIndex]!;
+    if (instructionPoolId !== poolContext.poolId) {
+      nonMatchingPoolSwapsCount++;
+      return { isRaydium: true }; // Swap on a different pool
     }
 
-    // Strict vault binding: vault accounts must match the validated pool
+    const baseVaultAccount = accounts[positions.baseVaultIndex]!;
+    const quoteVaultAccount = accounts[positions.quoteVaultIndex]!;
+    const userSourceAccount = accounts[positions.userSourceIndex]!;
+    const userDestinationAccount = accounts[positions.userDestinationIndex]!;
+
+    // Strict Vault Binding
     if (
       baseVaultAccount !== poolContext.baseVault ||
       quoteVaultAccount !== poolContext.quoteVault
@@ -726,97 +1074,132 @@ export function decodeRaydiumTransactionSwaps(
       };
     }
 
-    // Determine direction and exact amounts
-    let direction: "Coin2PC" | "PC2Coin" | null = null;
-    let tokenAmount: bigint | undefined;
-    let solAmount: bigint | undefined;
+    // Determine direction and exact amounts from scoped evidence
+    let directionFromTransfers: "Coin2PC" | "PC2Coin" | null = null;
+    let tokenAmountFromTransfers: bigint | undefined;
+    let solAmountFromTransfers: bigint | undefined;
 
-    // Method 1: Inspect inner SPL Token transfers executed under this swap
-    const splTransfers: DecodedSplTransfer[] = [];
-    for (const innerInst of relevantInnerInstructions) {
-      const transfer = parseSplTokenTransfer(innerInst, resolvedAccounts);
-      if (transfer) {
-        splTransfers.push(transfer);
-      }
-    }
+    // Search for unconsumed transfers matching this invocation's userSource, userDestination, baseVault, quoteVault
+    let matchedInIdx = -1;
+    let matchedOutIdx = -1;
 
-    const transferIntoBase = splTransfers.find((t) => t.destination === poolContext.baseVault);
-    const transferIntoQuote = splTransfers.find((t) => t.destination === poolContext.quoteVault);
-    const transferOutOfBase = splTransfers.find((t) => t.source === poolContext.baseVault);
-    const transferOutOfQuote = splTransfers.find((t) => t.source === poolContext.quoteVault);
+    for (let i = 0; i < allSplTransfers.length; i++) {
+      if (consumedTransferIndices.has(i)) continue;
+      const t = allSplTransfers[i]!;
 
-    if (transferIntoBase && transferOutOfQuote) {
-      direction = "Coin2PC";
-      const amountBase = transferIntoBase.amount;
-      const amountQuote = transferOutOfQuote.amount;
-      if (poolContext.orientation === "TOKEN_BASE_SOL_QUOTE") {
-        tokenAmount = amountBase;
-        solAmount = amountQuote;
-      } else {
-        tokenAmount = amountQuote;
-        solAmount = amountBase;
-      }
-    } else if (transferIntoQuote && transferOutOfBase) {
-      direction = "PC2Coin";
-      const amountBase = transferOutOfBase.amount;
-      const amountQuote = transferIntoQuote.amount;
-      if (poolContext.orientation === "TOKEN_BASE_SOL_QUOTE") {
-        tokenAmount = amountBase;
-        solAmount = amountQuote;
-      } else {
-        tokenAmount = amountQuote;
-        solAmount = amountBase;
-      }
-    }
-
-    // Method 2: Inspect Raydium ray_log if inner transfers did not resolve direction
-    if (!direction && rayLogs.length > rayLogCursor) {
-      const rayLog = rayLogs[rayLogCursor++];
-      if (rayLog) {
-        direction = rayLog.direction;
-        if (poolContext.orientation === "TOKEN_BASE_SOL_QUOTE") {
-          tokenAmount = direction === "Coin2PC" ? rayLog.amountIn : rayLog.amountOut;
-          solAmount = direction === "Coin2PC" ? rayLog.amountOut : rayLog.amountIn;
-        } else {
-          tokenAmount = direction === "Coin2PC" ? rayLog.amountOut : rayLog.amountIn;
-          solAmount = direction === "Coin2PC" ? rayLog.amountIn : rayLog.amountOut;
+      // Transfer into pool: source must be userSource, destination must be baseVault or quoteVault
+      if (t.source === userSourceAccount) {
+        if (t.destination === poolContext.baseVault) {
+          matchedInIdx = i;
+        } else if (t.destination === poolContext.quoteVault) {
+          matchedInIdx = i;
         }
       }
-    }
 
-    // Method 3: Inspect preTokenBalances / postTokenBalances for user source/dest accounts
-    if (!direction && Array.isArray(payload.meta?.preTokenBalances)) {
-      const sourceBalance = payload.meta.preTokenBalances.find(
-        (b) => resolvedAccounts[b.accountIndex] === userSourceAccount,
-      );
-      const destBalance = payload.meta.preTokenBalances.find(
-        (b) => resolvedAccounts[b.accountIndex] === userDestinationAccount,
-      );
+      // Transfer out of pool: destination must be userDestination, source must be quoteVault or baseVault
+      if (t.destination === userDestinationAccount) {
+        if (t.source === poolContext.quoteVault) {
+          matchedOutIdx = i;
+        } else if (t.source === poolContext.baseVault) {
+          matchedOutIdx = i;
+        }
+      }
 
-      if (sourceBalance?.mint === poolContext.baseMint) {
-        direction = "Coin2PC";
-      } else if (sourceBalance?.mint === poolContext.quoteMint) {
-        direction = "PC2Coin";
-      } else if (destBalance?.mint === poolContext.quoteMint) {
-        direction = "Coin2PC";
-      } else if (destBalance?.mint === poolContext.baseMint) {
-        direction = "PC2Coin";
+      if (matchedInIdx !== -1 && matchedOutIdx !== -1) {
+        break;
       }
     }
 
-    // Fail closed if direction cannot be determined unambiguously
+    if (matchedInIdx !== -1 && matchedOutIdx !== -1) {
+      const inTransfer = allSplTransfers[matchedInIdx]!;
+      const outTransfer = allSplTransfers[matchedOutIdx]!;
+
+      const isCandidateBase = poolContext.candidateTokenMint === poolContext.baseMint;
+      if (
+        inTransfer.destination === poolContext.baseVault &&
+        outTransfer.source === poolContext.quoteVault
+      ) {
+        directionFromTransfers = "Coin2PC";
+        const amountBase = inTransfer.amount;
+        const amountQuote = outTransfer.amount;
+        tokenAmountFromTransfers = isCandidateBase ? amountBase : amountQuote;
+        const quoteAmt = isCandidateBase ? amountQuote : amountBase;
+        solAmountFromTransfers = poolContext.quoteTokenMint === WSOL_MINT ? quoteAmt : undefined;
+        consumedTransferIndices.add(matchedInIdx);
+        consumedTransferIndices.add(matchedOutIdx);
+      } else if (
+        inTransfer.destination === poolContext.quoteVault &&
+        outTransfer.source === poolContext.baseVault
+      ) {
+        directionFromTransfers = "PC2Coin";
+        const amountBase = outTransfer.amount;
+        const amountQuote = inTransfer.amount;
+        tokenAmountFromTransfers = isCandidateBase ? amountBase : amountQuote;
+        const quoteAmt = isCandidateBase ? amountQuote : amountBase;
+        solAmountFromTransfers = poolContext.quoteTokenMint === WSOL_MINT ? quoteAmt : undefined;
+        consumedTransferIndices.add(matchedInIdx);
+        consumedTransferIndices.add(matchedOutIdx);
+      }
+    }
+
+    // Inspect ray_log strictly bound to this invocation frame
+    let directionFromRayLog: "Coin2PC" | "PC2Coin" | null = null;
+    let tokenAmountFromRayLog: bigint | undefined;
+    let solAmountFromRayLog: bigint | undefined;
+
+    if (currentFrame && currentFrame.rayLogs.length > 0) {
+      const rayLog = currentFrame.rayLogs[0]!;
+      directionFromRayLog = rayLog.direction;
+      const isCandidateBase = poolContext.candidateTokenMint === poolContext.baseMint;
+      if (isCandidateBase) {
+        tokenAmountFromRayLog =
+          directionFromRayLog === "Coin2PC" ? rayLog.amountIn : rayLog.amountOut;
+        const quoteAmt = directionFromRayLog === "Coin2PC" ? rayLog.amountOut : rayLog.amountIn;
+        solAmountFromRayLog = poolContext.quoteTokenMint === WSOL_MINT ? quoteAmt : undefined;
+      } else {
+        tokenAmountFromRayLog =
+          directionFromRayLog === "Coin2PC" ? rayLog.amountOut : rayLog.amountIn;
+        const quoteAmt = directionFromRayLog === "Coin2PC" ? rayLog.amountIn : rayLog.amountOut;
+        solAmountFromRayLog = poolContext.quoteTokenMint === WSOL_MINT ? quoteAmt : undefined;
+      }
+    }
+
+    // Reconcile evidence and fail closed on conflict
+    if (
+      directionFromTransfers &&
+      directionFromRayLog &&
+      directionFromTransfers !== directionFromRayLog
+    ) {
+      return {
+        isRaydium: true,
+        error: {
+          reason: "CONFLICTING_EVIDENCE",
+          message: `Transfer direction (${directionFromTransfers}) contradicts ray_log direction (${directionFromRayLog}) for invocation ${currentFrame?.invocationIndex}`,
+        },
+      };
+    }
+
+    const direction = directionFromTransfers ?? directionFromRayLog;
+    const tokenAmount = tokenAmountFromTransfers ?? tokenAmountFromRayLog;
+    const solAmount = solAmountFromTransfers ?? solAmountFromRayLog;
+
     if (!direction) {
       return {
         isRaydium: true,
         error: {
           reason: "AMBIGUOUS_DIRECTION",
           message:
-            "Cannot determine swap direction from inner transfers, ray_log, or account context",
+            "Cannot unambiguously determine swap direction from bound invocation transfers or ray_log",
         },
       };
     }
 
-    const side = attributeTradeSide(direction, poolContext.orientation);
+    const side = attributeTradeSide(
+      direction,
+      poolContext.orientation,
+      poolContext.candidateTokenMint,
+      poolContext.baseMint,
+    );
     const eventId = `${signature}:${outerInstructionIndex}:${swapIndex}`;
 
     const tradeEvent: TradeEvent = Object.freeze({
@@ -841,13 +1224,21 @@ export function decodeRaydiumTransactionSwaps(
   };
 
   // Scan top-level instructions
-  const topLevelInstructions = payload.transaction.message.instructions ?? [];
+  const topLevelInstructions = txPayload.transaction.message.instructions ?? [];
+  const innerGroups = new Map<number, readonly DecodableInstruction[]>();
+  if (Array.isArray(txPayload.meta.innerInstructions)) {
+    for (const group of txPayload.meta.innerInstructions) {
+      if (typeof group.index === "number" && Array.isArray(group.instructions)) {
+        innerGroups.set(group.index, group.instructions);
+      }
+    }
+  }
+
   for (let outerIdx = 0; outerIdx < topLevelInstructions.length; outerIdx++) {
     totalInstructionsScanned++;
     const inst = topLevelInstructions[outerIdx]!;
-    const relevantInners = innerGroups.get(outerIdx) ?? [];
 
-    const result = decodeInstructionIfRaydiumSwap(inst, outerIdx, 0, relevantInners);
+    const result = decodeInstructionIfRaydiumSwap(inst, outerIdx, 0, false);
     if (result.isRaydium) {
       if (result.error) {
         return {
@@ -864,19 +1255,13 @@ export function decodeRaydiumTransactionSwaps(
       }
     }
 
-    // In addition, scan any inner instructions under this outer instruction (routed / CPI swaps)
+    // Scan inner instructions under this outer instruction
+    const relevantInners = innerGroups.get(outerIdx) ?? [];
     for (let innerIdx = 0; innerIdx < relevantInners.length; innerIdx++) {
       totalInstructionsScanned++;
       const innerInst = relevantInners[innerIdx]!;
-      // Relevant inners for this inner instruction are subsequent inners
-      const subsequentInners = relevantInners.slice(innerIdx + 1);
 
-      const innerResult = decodeInstructionIfRaydiumSwap(
-        innerInst,
-        outerIdx,
-        innerIdx,
-        subsequentInners,
-      );
+      const innerResult = decodeInstructionIfRaydiumSwap(innerInst, outerIdx, innerIdx, true);
       if (innerResult.isRaydium) {
         if (innerResult.error) {
           return {
@@ -930,7 +1315,8 @@ export class RaydiumAmmV4SwapNormalizationAdapter {
   private readonly poolContext: TrackedRaydiumPoolContext;
 
   public constructor(poolContext: TrackedRaydiumPoolContext) {
-    this.poolContext = poolContext;
+    validateTrackedPoolContext(poolContext);
+    this.poolContext = Object.freeze({ ...poolContext });
   }
 
   public getPoolContext(): TrackedRaydiumPoolContext {
@@ -941,11 +1327,12 @@ export class RaydiumAmmV4SwapNormalizationAdapter {
    * Decodes a transaction payload and ingests any matching swaps into the provided tracker.
    */
   public ingestTransaction(
-    payload: DecodableTransactionPayload,
+    payload: DecodableTransactionPayload | unknown,
     tracker: RollingTradeFlowTracker,
     options?: DecodeSwapOptions,
   ): IngestTransactionResult {
-    const signature = payload.transaction?.signatures?.[0] ?? "unknown-signature";
+    const rawTx = payload as DecodableTransactionPayload | undefined;
+    const signature = rawTx?.transaction?.signatures?.[0] ?? "unknown-signature";
     const decodeResult = decodeRaydiumTransactionSwaps(payload, this.poolContext, options);
 
     if (!decodeResult.ok) {
