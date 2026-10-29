@@ -418,7 +418,19 @@ The approved offline implementation items are completed:
    - In `makeCanonicalTestPubkey`, updated byte offset for writing test IDs from byte 0 to byte 2.
    - Eliminated identical 8-character Base58 prefixes (`3JEw2Z6V`) across distinct test mints (`pumpMint1` vs `pumpMint2`) that previously triggered duplicate decision event ID collisions (`evt-ds-${mint.slice(0, 8)}-${decisionEpochMs}`) and caused test timeouts on Ubuntu CI runners.
    - All 82 tests in [`backend/src/research/pilot/PilotLiveCollector.test.ts`](file:///u:/Projects/TopG/backend/src/research/pilot/PilotLiveCollector.test.ts) pass cleanly.
-10. **Larger Changes Quarantined**:
+10. **Bounded Raydium AMM v4 Transaction Source Adapter (`RaydiumAmmV4TransactionSourceAdapter.ts`)**:
+    - Implemented in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts).
+    - Connects injected transaction-signature notifications to bounded `getTransaction` retrieval, `RaydiumAmmV4SwapNormalizationAdapter` decoding, and `RollingTradeFlowTracker` ingestion strictly offline.
+    - **Explicit Transport Guard**: Strictly requires an injected transport (`typeof fetch`). Ambient networking, default live fetches, and ambient subscriptions are strictly prohibited.
+    - **Strict Identity Binding**: Binds all processing strictly to the exact tracked pool context (`poolId`, `baseVault`, `quoteVault`, `baseMint`, `quoteMint`, `candidateTokenMint`).
+    - **Shared Session Budget & Pacing**: Meters every outbound HTTP dispatch through `GlobalResourceBudgetManager`. LP snapshot acquisition and trade retrieval on the same provider (`SOLANA_RPC`) strictly share host pacing ($\ge 2,500\text{ ms}$) and session request ceilings.
+    - **Dispatched Failure Counting & Pre-Dispatch Reconciliation**: Dispatched HTTP attempts are counted regardless of outcome (network errors, 500 status, RPC errors, timeouts, stalled streams). Pre-dispatch budget denials (`PRE_DISPATCH_BUDGET_DENIED`) and deadline expirations (`PRE_DISPATCH_DEADLINE_EXCEEDED`) prevent dispatch and remain strictly uncounted (`httpAttempts: 0`).
+    - **Deadlines & Response-Body Timeout Protection**: Combined request timeout and overall deadline remain active through transport invocation and complete response-body stream reading (`response.text()`). Stalled body reads are aborted promptly via `AbortController`.
+    - **Bounded Backlog & Deduplication**: Hard ceiling on pending notifications (`maxPendingQueueSize = 100`, rejecting overflows with `QUEUE_OVERFLOW`) and bounded FIFO deduplication (`maxDeduplicationKeys = 1,000`). Duplicate notifications are rejected with zero HTTP dispatches and zero duplicate trade counts.
+    - **Fail-Closed Coverage Guarantee**: Successful retrieval, an empty queue, or notification receipt alone NEVER establishes complete 60-second window coverage. Ingesting transactions strictly populates trade events and never fabricates stream checkpoints or advances window coverage (`status` remains non-`SUFFICIENT` without explicit observation checkpoints).
+    - **Honest Throughput Disclosure**: Under $\ge 2,500\text{ ms}$ spacing, a single RPC provider sustains $\le 24\text{ requests/min}$. High-frequency candidate pools cannot achieve complete coverage via `getTransaction` without high-throughput RPC tiers or zero-RPC log parsing.
+    - 20 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts).
+11. **Larger Changes Quarantined**:
 
 - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
 - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
