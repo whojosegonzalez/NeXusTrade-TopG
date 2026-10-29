@@ -4,33 +4,34 @@
  * Minimal, offline-tested adapter connecting injected transaction-signature
  * notifications to bounded getTransaction retrieval, decoding, and tracker ingestion.
  *
- * Operational and Safety Invariants:
+ * Operational and Safety Invariants (Audit-Corrected):
  * 1. Explicit Transport Injection: Strictly requires an injected transport (fetch).
  *    Default live networking, automated daemon wiring, and ambient subscriptions are prohibited.
- * 2. Strict Identity Binding: Binds all processing strictly to the exact tracked
- *    pool context (poolId, baseVault, quoteVault, baseMint, quoteMint, candidateTokenMint).
- * 3. Shared Session Budget & Pacing: Meters every outbound HTTP dispatch through the
- *    shared GlobalResourceBudgetManager. LP and trade retrieval on the same provider
- *    strictly share pacing (>= 2,500 ms) and session request ceilings.
- * 4. Dispatched Failure Counting & Pre-Dispatch Reconciliation: Dispatched attempts are
- *    counted regardless of HTTP outcome (network error, 500, 429, timeout, stalled body).
- *    Pre-dispatch budget denials and deadline expirations prevent dispatch and remain uncounted.
- * 5. Deadlines & Timeout Protection: Preserves request timeout and overall deadline
- *    through response-body reading and any shared pacing waits. Stalled response streams
- *    are terminated promptly via AbortController.
- * 6. Bounded Backlog & Deduplication: Strictly bounds pending notification queue size and
- *    deduplication keys (FIFO eviction). Duplicate notifications never trigger duplicate
- *    fetches or trade counts.
- * 7. Zero Heuristic Retries / Fallback: Strictly 1 getTransaction call per unique signature.
- *    No automatic retries, fallback providers, or hidden discovery requests.
- * 8. Explicit Processing Outcomes: Missing transactions, decode failures, malformed responses,
- *    timeouts, queue overflows, and budget denials are returned as explicit, typed outcomes.
- * 9. Fail-Closed Coverage Guarantee: Successful retrieval, an empty queue, or notification
- *    receipt alone NEVER establishes complete 60-second window coverage. Coverage remains
- *    strictly dependent on separately verified source checkpoints or completed ranges.
- * 10. Honest Throughput Limits: At >= 2,500 ms spacing, a single provider endpoint sustains
- *     at most 24 requests/minute. Active pools (> 24 trades/min) cannot achieve full coverage
- *     via getTransaction without dedicated high-throughput RPC tiers or log-only decoding.
+ * 2. Immutable Identity Binding & Response Envelope Validation:
+ *    - Validates and deep-freezes notification snapshots immediately before queueing or awaiting.
+ *    - Rejects null, undefined, or non-object notifications fail-closed without throwing.
+ *    - Validates returned JSON-RPC transaction signature against requested signature.
+ *    - Detects slot/time contradictions between notification and response, producing zero ingested events.
+ * 3. Shared Session Budget, Pacing & Capacity Reservation:
+ *    - Default request purpose is CANDIDATE_ENRICHMENT, preserving reserved forward observation capacity.
+ *    - Adapter enforces effective provider pacing (>= 2,500 ms) regardless of budget spacing settings.
+ *    - Transport specifies redirect: "error" to prevent uncounted chained dispatches.
+ * 4. Active Deduplication Protection & Workload Bounds:
+ *    - Queued and in-flight signatures are strictly protected from FIFO eviction.
+ *    - Completed historical signatures are bounded separately up to maxDeduplicationKeys (FIFO).
+ *    - Direct processNotification calls and queued items share a unified active workload limit
+ *      (pendingQueue.length + inFlightCount < maxPendingQueueSize).
+ * 5. Loss Preservation, Backlog Reporting & Partial Failure Accounting:
+ *    - Propagates stream processing backlog to tracker.
+ *    - Records collection gaps in tracker on queue overflow, retrieval failures, and partial ingestions.
+ *    - Buffers pending gaps when enqueue occurs before a tracker is supplied; flushes to tracker on intake.
+ *    - Accurately classifies and reports partial ingestion failures (e.g. tracker capacity limit).
+ * 6. Deadlines & Timeout Protection:
+ *    - Validates constructor and per-operation numeric options (rejecting NaN, non-integers, ceiling violations).
+ *    - Rechecks remaining deadline before dispatch AND immediately before tracker ingestion.
+ *    - Cleans up abort listeners in all execution paths.
+ * 7. Sanitized Diagnostics:
+ *    - Endpoint credentials, API keys, and sensitive tokens are redacted to [REDACTED] in all error messages.
  */
 
 import {
@@ -42,6 +43,7 @@ import {
 import {
   type RollingTradeFlowTracker,
   type TradeTimestampProvenance,
+  type StreamGap,
 } from "./RollingTradeFlowTracker.js";
 import {
   MIN_HOST_PACING_MS,
@@ -49,6 +51,7 @@ import {
   DEFAULT_OVERALL_TIMEOUT_MS,
   PreDispatchError,
 } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
+import { sanitizeSolanaRpcUrl } from "../research/pilot/SolanaRpcLiveObservationClient.js";
 import type {
   GlobalResourceBudgetManager,
   RequestPurpose,
@@ -78,8 +81,11 @@ export type TransactionProcessingOutcome =
   | "MALFORMED_RESPONSE"
   | "RPC_ERROR"
   | "TRANSACTION_NOT_FOUND"
+  | "RESPONSE_SIGNATURE_MISMATCH"
+  | "CONTRADICTORY_METADATA"
   | "DECODE_FAILED"
-  | "INGEST_FAILED";
+  | "INGEST_FAILED"
+  | "PARTIAL_INGEST_FAILED";
 
 export interface TransactionSourceDiagnostics {
   readonly signature: string;
@@ -140,7 +146,7 @@ export interface RaydiumAmmV4TransactionSourceAdapterOptions {
   /** Provider identifier for shared pacing and ceilings. Default: "SOLANA_RPC". */
   readonly providerName?: string | undefined;
 
-  /** Request purpose for budget accounting. Default: "FORWARD_OBSERVATION". */
+  /** Request purpose for budget accounting. Default: "CANDIDATE_ENRICHMENT" (preserves reserved forward capacity). */
   readonly requestPurpose?: RequestPurpose | undefined;
 
   /** Minimum host pacing in ms between calls to same provider. Default: 2,500 ms (MIN_HOST_PACING_MS). */
@@ -155,7 +161,7 @@ export interface RaydiumAmmV4TransactionSourceAdapterOptions {
   /** Maximum pending notification queue capacity. Default: 100. */
   readonly maxPendingQueueSize?: number | undefined;
 
-  /** Maximum deduplication signatures retained. Default: 1,000. */
+  /** Maximum deduplication signatures retained in completed history. Default: 1,000. */
   readonly maxDeduplicationKeys?: number | undefined;
 
   /** RPC commitment level. Default: "confirmed". */
@@ -206,20 +212,90 @@ async function sleepWithSignal(
 
 const BASE58_REGEX = /^[1-9A-HJ-NP-Za-km-z]+$/;
 
+const VALID_PURPOSES = new Set<RequestPurpose>([
+  "DISCOVERY_POLL",
+  "CANDIDATE_ENRICHMENT",
+  "INITIAL_QUOTE",
+  "FORWARD_OBSERVATION",
+  "RETRY",
+]);
+
 /**
- * Validates a signature string for basic Solana signature structure (non-empty Base58).
+ * Safely validates and deeply freezes an injected notification snapshot.
+ * Rejects null, undefined, non-objects, and invalid signatures fail-closed without throwing.
  */
-function isValidSignatureString(sig: unknown): sig is string {
-  if (typeof sig !== "string") return false;
-  const trimmed = sig.trim();
-  if (trimmed.length < 32 || trimmed.length > 128) return false;
-  return BASE58_REGEX.test(trimmed);
+function validateAndSnapshotNotification(
+  input: unknown,
+):
+  | { ok: true; notification: InjectedTransactionNotification }
+  | { ok: false; signature: string; reason: "INVALID_NOTIFICATION" } {
+  if (!input || (typeof input !== "object" && typeof input !== "string")) {
+    return { ok: false, signature: "invalid", reason: "INVALID_NOTIFICATION" };
+  }
+
+  const rawSig = typeof input === "string" ? input : (input as Record<string, unknown>).signature;
+  if (typeof rawSig !== "string") {
+    return { ok: false, signature: "invalid", reason: "INVALID_NOTIFICATION" };
+  }
+
+  const trimmedSig = rawSig.trim();
+  if (trimmedSig.length < 32 || trimmedSig.length > 128 || !BASE58_REGEX.test(trimmedSig)) {
+    return { ok: false, signature: trimmedSig || "invalid", reason: "INVALID_NOTIFICATION" };
+  }
+
+  let slot: number | undefined;
+  if (typeof input === "object" && (input as Record<string, unknown>).slot !== undefined) {
+    const s = (input as Record<string, unknown>).slot;
+    if (typeof s !== "number" || !Number.isInteger(s) || s < 0) {
+      return { ok: false, signature: trimmedSig, reason: "INVALID_NOTIFICATION" };
+    }
+    slot = s;
+  }
+
+  let blockTime: number | null | undefined;
+  if (typeof input === "object" && (input as Record<string, unknown>).blockTime !== undefined) {
+    const bt = (input as Record<string, unknown>).blockTime;
+    if (bt !== null && (typeof bt !== "number" || !Number.isFinite(bt) || bt <= 0)) {
+      return { ok: false, signature: trimmedSig, reason: "INVALID_NOTIFICATION" };
+    }
+    blockTime = bt;
+  }
+
+  let receivedAtMs: number | undefined;
+  if (typeof input === "object" && (input as Record<string, unknown>).receivedAtMs !== undefined) {
+    const r = (input as Record<string, unknown>).receivedAtMs;
+    if (typeof r !== "number" || !Number.isFinite(r) || r <= 0) {
+      return { ok: false, signature: trimmedSig, reason: "INVALID_NOTIFICATION" };
+    }
+    receivedAtMs = r;
+  }
+
+  let provenance: TradeTimestampProvenance | string | undefined;
+  if (typeof input === "object" && (input as Record<string, unknown>).provenance !== undefined) {
+    const p = (input as Record<string, unknown>).provenance;
+    if (typeof p !== "string" || p.trim().length === 0) {
+      return { ok: false, signature: trimmedSig, reason: "INVALID_NOTIFICATION" };
+    }
+    provenance = p.trim();
+  }
+
+  const frozenSnapshot: InjectedTransactionNotification = Object.freeze({
+    signature: trimmedSig,
+    slot,
+    blockTime,
+    receivedAtMs,
+    provenance,
+  });
+
+  return { ok: true, notification: frozenSnapshot };
 }
 
 export class RaydiumAmmV4TransactionSourceAdapter {
   private readonly poolContext: TrackedRaydiumPoolContext;
   private readonly normalizationAdapter: RaydiumAmmV4SwapNormalizationAdapter;
   private readonly rpcUrl: string;
+  private readonly sanitizedRpcUrl: string;
+  private readonly sensitiveTokens: readonly string[];
   private readonly budgetManager: GlobalResourceBudgetManager;
   private readonly underlyingTransport: typeof fetch;
   private readonly providerName: string;
@@ -234,8 +310,17 @@ export class RaydiumAmmV4TransactionSourceAdapter {
   private readonly clock: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
 
+  // Workload and active deduplication tracking
   private readonly pendingQueue: InjectedTransactionNotification[] = [];
-  private readonly seenSignatures = new Set<string>();
+  private readonly activeSignatures = new Set<string>(); // Queued or in-flight (protected from eviction)
+  private readonly completedSignatures = new Set<string>(); // Historical completions (bounded FIFO cache)
+  private inFlightCount = 0;
+
+  // Unprocessed gap buffer for losses occurring before or between tracker intake
+  private readonly pendingGaps: StreamGap[] = [];
+
+  // Provider dispatch tracking for effective pacing enforcement
+  private readonly lastDispatchTimeByProvider = new Map<string, number>();
 
   // Diagnostic counters
   private totalEnqueued = 0;
@@ -257,7 +342,11 @@ export class RaydiumAmmV4TransactionSourceAdapter {
         "Shared GlobalResourceBudgetManager is required for RaydiumAmmV4TransactionSourceAdapter",
       );
     }
-    if (!options.rpcUrl || options.rpcUrl.trim().length === 0) {
+    if (
+      !options.rpcUrl ||
+      typeof options.rpcUrl !== "string" ||
+      options.rpcUrl.trim().length === 0
+    ) {
       throw new Error("rpcUrl is required for RaydiumAmmV4TransactionSourceAdapter");
     }
 
@@ -266,22 +355,71 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     this.normalizationAdapter = new RaydiumAmmV4SwapNormalizationAdapter(this.poolContext);
 
     this.rpcUrl = options.rpcUrl;
+    const endpointInfo = sanitizeSolanaRpcUrl(options.rpcUrl);
+    this.sanitizedRpcUrl = endpointInfo.sanitizedUrl;
+    this.sensitiveTokens = Object.freeze([...endpointInfo.sensitiveTokens]);
+
     this.budgetManager = options.budgetManager;
     this.underlyingTransport = options.transport;
     this.providerName = options.providerName ?? "SOLANA_RPC";
-    this.requestPurpose = options.requestPurpose ?? "FORWARD_OBSERVATION";
+
+    const purpose = options.requestPurpose ?? "CANDIDATE_ENRICHMENT";
+    if (!VALID_PURPOSES.has(purpose)) {
+      throw new Error(`Invalid requestPurpose: ${String(purpose)}`);
+    }
+    this.requestPurpose = purpose;
+
+    if (
+      options.pacingMs !== undefined &&
+      (typeof options.pacingMs !== "number" ||
+        !Number.isFinite(options.pacingMs) ||
+        !Number.isInteger(options.pacingMs) ||
+        options.pacingMs < 0)
+    ) {
+      throw new Error("pacingMs must be a non-negative integer");
+    }
     this.pacingMs = Math.max(MIN_HOST_PACING_MS, options.pacingMs ?? MIN_HOST_PACING_MS);
+
+    if (
+      options.timeoutMs !== undefined &&
+      (typeof options.timeoutMs !== "number" ||
+        !Number.isFinite(options.timeoutMs) ||
+        !Number.isInteger(options.timeoutMs) ||
+        options.timeoutMs <= 0)
+    ) {
+      throw new Error("timeoutMs must be a positive integer");
+    }
     this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+
+    if (
+      options.overallTimeoutMs !== undefined &&
+      (typeof options.overallTimeoutMs !== "number" ||
+        !Number.isFinite(options.overallTimeoutMs) ||
+        !Number.isInteger(options.overallTimeoutMs) ||
+        options.overallTimeoutMs <= 0)
+    ) {
+      throw new Error("overallTimeoutMs must be a positive integer");
+    }
     this.overallTimeoutMs = options.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS;
 
     const maxQueue = options.maxPendingQueueSize ?? 100;
-    if (!Number.isInteger(maxQueue) || maxQueue < 1) {
+    if (
+      typeof maxQueue !== "number" ||
+      !Number.isFinite(maxQueue) ||
+      !Number.isInteger(maxQueue) ||
+      maxQueue < 1
+    ) {
       throw new Error("maxPendingQueueSize must be an integer >= 1");
     }
     this.maxPendingQueueSize = maxQueue;
 
     const maxDedup = options.maxDeduplicationKeys ?? 1000;
-    if (!Number.isInteger(maxDedup) || maxDedup < 1) {
+    if (
+      typeof maxDedup !== "number" ||
+      !Number.isFinite(maxDedup) ||
+      !Number.isInteger(maxDedup) ||
+      maxDedup < 1
+    ) {
       throw new Error("maxDeduplicationKeys must be an integer >= 1");
     }
     this.maxDeduplicationKeys = maxDedup;
@@ -301,8 +439,24 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     return this.pendingQueue.length;
   }
 
+  public getInFlightCount(): number {
+    return this.inFlightCount;
+  }
+
+  public getActiveWorkload(): number {
+    return this.pendingQueue.length + this.inFlightCount;
+  }
+
   public getDeduplicationKeysCount(): number {
-    return this.seenSignatures.size;
+    return this.activeSignatures.size + this.completedSignatures.size;
+  }
+
+  public getCompletedDeduplicationKeysCount(): number {
+    return this.completedSignatures.size;
+  }
+
+  public getPendingGapsCount(): number {
+    return this.pendingGaps.length;
   }
 
   public getMetrics(): {
@@ -325,68 +479,141 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     };
   }
 
-  public isDuplicate(signature: string): boolean {
-    return this.seenSignatures.has(signature);
-  }
-
-  private recordSeenSignature(signature: string): void {
-    if (this.seenSignatures.has(signature)) return;
-    if (this.seenSignatures.size >= this.maxDeduplicationKeys) {
-      // Bounded FIFO eviction
-      const oldest = this.seenSignatures.values().next().value;
-      if (oldest !== undefined) {
-        this.seenSignatures.delete(oldest);
+  /**
+   * Sanitizes diagnostic text by redacting RPC URL credentials, query secrets, and sensitive tokens.
+   */
+  public sanitizeErrorMessage(text: string | undefined): string {
+    if (!text) return "";
+    let out = text.split(this.rpcUrl).join(this.sanitizedRpcUrl);
+    for (const token of this.sensitiveTokens) {
+      if (token && token.length > 0) {
+        out = out.split(token).join("[REDACTED]");
       }
     }
-    this.seenSignatures.add(signature);
+    out = out.replace(/(?:api[-_]?key|token|secret|password|auth)=([^&\s]+)/gi, "$1=[REDACTED]");
+    return out;
+  }
+
+  /**
+   * Checks whether a signature is already queued, in flight, or recorded in historical deduplication cache.
+   */
+  public isDuplicate(signature: string): boolean {
+    return this.activeSignatures.has(signature) || this.completedSignatures.has(signature);
+  }
+
+  /**
+   * Records a completed signature in the bounded FIFO historical cache.
+   * Evicts only from completed history, strictly protecting queued/in-flight signatures.
+   */
+  private recordCompletedSignature(signature: string): void {
+    if (this.completedSignatures.has(signature)) return;
+    if (this.completedSignatures.size >= this.maxDeduplicationKeys) {
+      const oldest = this.completedSignatures.values().next().value;
+      if (oldest !== undefined) {
+        this.completedSignatures.delete(oldest);
+      }
+    }
+    this.completedSignatures.add(signature);
+  }
+
+  /**
+   * Creates and records a collection gap for unobserved or lost trade events,
+   * protecting established tracker coverage.
+   */
+  private recordLossGap(
+    notification: InjectedTransactionNotification,
+    reason: string,
+    tracker?: RollingTradeFlowTracker | undefined,
+  ): void {
+    const now = this.clock();
+    const candidateTime =
+      notification.receivedAtMs ??
+      (notification.blockTime !== null && notification.blockTime !== undefined
+        ? notification.blockTime * 1000
+        : undefined);
+
+    let lossStart: number;
+    let lossEnd: number;
+
+    if (candidateTime !== undefined) {
+      lossStart = Math.min(candidateTime, now);
+      lossEnd = Math.max(candidateTime, now);
+      if (lossStart >= lossEnd) {
+        lossStart = Math.max(1, lossEnd - 1_000);
+      }
+    } else {
+      lossStart = Math.max(1, now - 1_000);
+      lossEnd = now;
+    }
+
+    const gap: StreamGap = Object.freeze({
+      gapStartMs: lossStart,
+      gapEndMs: lossEnd,
+      reason: `SOURCE_ADAPTER_LOSS:${reason}`,
+    });
+
+    if (tracker) {
+      tracker.recordCollectionGap(gap);
+    } else {
+      this.pendingGaps.push(gap);
+    }
+  }
+
+  /**
+   * Flushes all buffered pending gaps into the supplied tracker.
+   */
+  public flushPendingGaps(tracker: RollingTradeFlowTracker): void {
+    while (this.pendingGaps.length > 0) {
+      const gap = this.pendingGaps.shift()!;
+      tracker.recordCollectionGap(gap);
+    }
   }
 
   /**
    * Enqueues an injected transaction notification into the bounded pending queue.
-   * Rejects invalid signatures, duplicates, and queue overflow fail-closed.
+   * Snapshots and validates notification before queueing; protects active keys and bounds workload.
    */
-  public enqueueNotification(
-    notification: string | InjectedTransactionNotification,
-  ): EnqueueNotificationResult {
-    const normalized: InjectedTransactionNotification =
-      typeof notification === "string" ? { signature: notification } : notification;
-
-    if (!isValidSignatureString(normalized.signature)) {
+  public enqueueNotification(notification: unknown): EnqueueNotificationResult {
+    const validated = validateAndSnapshotNotification(notification);
+    if (!validated.ok) {
       return {
         ok: false,
-        signature: typeof normalized?.signature === "string" ? normalized.signature : "invalid",
+        signature: validated.signature,
         queued: false,
         reason: "INVALID_NOTIFICATION",
       };
     }
 
-    if (this.isDuplicate(normalized.signature)) {
+    const snapshot = validated.notification;
+
+    if (this.isDuplicate(snapshot.signature)) {
       this.totalDuplicatesSkipped++;
       return {
         ok: false,
-        signature: normalized.signature,
+        signature: snapshot.signature,
         queued: false,
         reason: "DUPLICATE_NOTIFICATION",
       };
     }
 
-    if (this.pendingQueue.length >= this.maxPendingQueueSize) {
+    if (this.getActiveWorkload() >= this.maxPendingQueueSize) {
       this.totalQueueOverflows++;
+      this.recordLossGap(snapshot, "QUEUE_OVERFLOW");
       return {
         ok: false,
-        signature: normalized.signature,
+        signature: snapshot.signature,
         queued: false,
         reason: "QUEUE_OVERFLOW",
       };
     }
 
-    this.recordSeenSignature(normalized.signature);
-    this.pendingQueue.push(normalized);
+    this.activeSignatures.add(snapshot.signature);
+    this.pendingQueue.push(snapshot);
     this.totalEnqueued++;
 
     return {
       ok: true,
-      signature: normalized.signature,
+      signature: snapshot.signature,
       queued: true,
     };
   }
@@ -396,21 +623,21 @@ export class RaydiumAmmV4TransactionSourceAdapter {
    * Enforces deduplication, shared budget pacing, timeouts, and failure classification.
    */
   public async processNotification(
-    notification: string | InjectedTransactionNotification,
+    notification: unknown,
     tracker: RollingTradeFlowTracker,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult> {
-    const normalized: InjectedTransactionNotification =
-      typeof notification === "string" ? { signature: notification } : notification;
+    this.flushPendingGaps(tracker);
 
-    if (!isValidSignatureString(normalized.signature)) {
+    const validated = validateAndSnapshotNotification(notification);
+    if (!validated.ok) {
       return {
         ok: false,
-        signature: typeof normalized?.signature === "string" ? normalized.signature : "invalid",
+        signature: validated.signature,
         outcome: "INVALID_NOTIFICATION",
         ingestedEventsCount: 0,
         diagnostics: {
-          signature: typeof normalized?.signature === "string" ? normalized.signature : "invalid",
+          signature: validated.signature,
           httpAttempts: 0,
           durationMs: 0,
           outcome: "INVALID_NOTIFICATION",
@@ -421,27 +648,49 @@ export class RaydiumAmmV4TransactionSourceAdapter {
       };
     }
 
-    if (this.isDuplicate(normalized.signature)) {
+    const snapshot = validated.notification;
+
+    if (this.isDuplicate(snapshot.signature)) {
       this.totalDuplicatesSkipped++;
       return {
         ok: false,
-        signature: normalized.signature,
+        signature: snapshot.signature,
         outcome: "DUPLICATE_NOTIFICATION",
         ingestedEventsCount: 0,
         diagnostics: {
-          signature: normalized.signature,
+          signature: snapshot.signature,
           httpAttempts: 0,
           durationMs: 0,
           outcome: "DUPLICATE_NOTIFICATION",
           decodedEventsCount: 0,
           ingestedCount: 0,
-          error: `Transaction ${normalized.signature} has already been processed or enqueued`,
+          error: `Transaction ${snapshot.signature} is already queued, in flight, or recorded in deduplication cache`,
         },
       };
     }
 
-    this.recordSeenSignature(normalized.signature);
-    return this.processNotificationInternal(normalized, tracker, options);
+    if (this.getActiveWorkload() >= this.maxPendingQueueSize) {
+      this.totalQueueOverflows++;
+      this.recordLossGap(snapshot, "QUEUE_OVERFLOW", tracker);
+      return {
+        ok: false,
+        signature: snapshot.signature,
+        outcome: "QUEUE_OVERFLOW",
+        ingestedEventsCount: 0,
+        diagnostics: {
+          signature: snapshot.signature,
+          httpAttempts: 0,
+          durationMs: 0,
+          outcome: "QUEUE_OVERFLOW",
+          decodedEventsCount: 0,
+          ingestedCount: 0,
+          error: `Active workload limit (${this.maxPendingQueueSize}) exceeded; notification rejected`,
+        },
+      };
+    }
+
+    this.activeSignatures.add(snapshot.signature);
+    return this.processNotificationInternal(snapshot, tracker, options);
   }
 
   /**
@@ -451,6 +700,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     tracker: RollingTradeFlowTracker,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult | null> {
+    this.flushPendingGaps(tracker);
     if (this.pendingQueue.length === 0) {
       return null;
     }
@@ -460,13 +710,34 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
   /**
    * Drains and processes all pending notifications currently in the queue.
-   * Stops early if overall deadline is exceeded or budget is denied.
+   * Accurately updates tracker backlog status; queue draining alone does not erase gaps.
    */
   public async processAllPending(
     tracker: RollingTradeFlowTracker,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessBatchResult> {
+    this.flushPendingGaps(tracker);
     const startEpoch = this.clock();
+
+    // Validate overallTimeoutMs override if passed
+    if (options?.overallTimeoutMs !== undefined) {
+      if (
+        typeof options.overallTimeoutMs !== "number" ||
+        !Number.isFinite(options.overallTimeoutMs) ||
+        !Number.isInteger(options.overallTimeoutMs) ||
+        options.overallTimeoutMs <= 0 ||
+        options.overallTimeoutMs > this.overallTimeoutMs
+      ) {
+        return {
+          totalProcessed: 0,
+          totalSucceeded: 0,
+          totalFailed: 0,
+          totalIngestedEvents: 0,
+          results: Object.freeze([]),
+        };
+      }
+    }
+
     const effectiveOverallDeadline =
       startEpoch + (options?.overallTimeoutMs ?? this.overallTimeoutMs);
 
@@ -476,35 +747,46 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     let totalIngestedEvents = 0;
     const results: ProcessNotificationResult[] = [];
 
-    while (this.pendingQueue.length > 0) {
-      const remainingOverall = effectiveOverallDeadline - this.clock();
-      if (remainingOverall <= 0) {
-        break;
-      }
+    // Mark active backlog in tracker while queue is non-empty
+    if (this.pendingQueue.length > 0) {
+      tracker.recordProcessingBacklog(true);
+    }
 
-      const res = await this.processNextPending(tracker, {
-        overallTimeoutMs: remainingOverall,
-        signal: options?.signal,
-      });
-
-      if (!res) {
-        break;
-      }
-
-      totalProcessed++;
-      results.push(res);
-      if (res.ok) {
-        totalSucceeded++;
-        totalIngestedEvents += res.ingestedEventsCount;
-      } else {
-        totalFailed++;
-        if (
-          res.outcome === "PRE_DISPATCH_BUDGET_DENIED" ||
-          res.outcome === "PRE_DISPATCH_DEADLINE_EXCEEDED"
-        ) {
-          // Stop batch immediately on global budget exhaustion or deadline expiry
+    try {
+      while (this.pendingQueue.length > 0) {
+        const remainingOverall = effectiveOverallDeadline - this.clock();
+        if (remainingOverall <= 0) {
           break;
         }
+
+        const res = await this.processNextPending(tracker, {
+          overallTimeoutMs: remainingOverall,
+          signal: options?.signal,
+        });
+
+        if (!res) {
+          break;
+        }
+
+        totalProcessed++;
+        results.push(res);
+        if (res.ok) {
+          totalSucceeded++;
+          totalIngestedEvents += res.ingestedEventsCount;
+        } else {
+          totalFailed++;
+          if (
+            res.outcome === "PRE_DISPATCH_BUDGET_DENIED" ||
+            res.outcome === "PRE_DISPATCH_DEADLINE_EXCEEDED"
+          ) {
+            break;
+          }
+        }
+      }
+    } finally {
+      // Clear backlog only if active workload is completely clear
+      if (this.getActiveWorkload() === 0) {
+        tracker.recordProcessingBacklog(false);
       }
     }
 
@@ -525,92 +807,76 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     tracker: RollingTradeFlowTracker,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult> {
-    this.totalProcessed++;
+    this.inFlightCount++;
     const startEpoch = this.clock();
     const signature = notification.signature;
-    const overallTimeout = options?.overallTimeoutMs ?? this.overallTimeoutMs;
-    const effectiveDeadlineEpoch = startEpoch + overallTimeout;
 
-    const getRemainingEffectiveBudgetMs = (): number => {
-      return effectiveDeadlineEpoch - this.clock();
-    };
+    try {
+      this.totalProcessed++;
+      this.flushPendingGaps(tracker);
 
-    let remainingBudget = getRemainingEffectiveBudgetMs();
-    if (remainingBudget <= 0) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts: 0,
-          durationMs: this.clock() - startEpoch,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: "Overall deadline exceeded before dispatch",
-        },
+      // Validate per-operation overallTimeoutMs override against configured ceiling
+      if (options?.overallTimeoutMs !== undefined) {
+        if (
+          typeof options.overallTimeoutMs !== "number" ||
+          !Number.isFinite(options.overallTimeoutMs) ||
+          !Number.isInteger(options.overallTimeoutMs) ||
+          options.overallTimeoutMs <= 0
+        ) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "INVALID_OVERALL_TIMEOUT_OVERRIDE", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: 0,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `Invalid per-operation overallTimeoutMs override: ${String(options.overallTimeoutMs)}`,
+              ),
+            },
+          };
+        }
+        if (options.overallTimeoutMs > this.overallTimeoutMs) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "OVERALL_TIMEOUT_EXCEEDS_CEILING", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: 0,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `Per-operation overallTimeoutMs override (${options.overallTimeoutMs}ms) exceeds configured adapter ceiling (${this.overallTimeoutMs}ms)`,
+              ),
+            },
+          };
+        }
+      }
+
+      const overallTimeout = options?.overallTimeoutMs ?? this.overallTimeoutMs;
+      const effectiveDeadlineEpoch = startEpoch + overallTimeout;
+
+      const getRemainingEffectiveBudgetMs = (): number => {
+        return effectiveDeadlineEpoch - this.clock();
       };
-    }
 
-    // 1. Shared Pacing & Pre-dispatch Budget Check
-    let budgetCheck = this.budgetManager.canMakeRequest(
-      this.providerName,
-      this.clock(),
-      this.requestPurpose,
-    );
-
-    if (
-      !budgetCheck.allowed &&
-      budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
-      typeof budgetCheck.waitMs === "number" &&
-      budgetCheck.waitMs > 0
-    ) {
-      if (budgetCheck.waitMs >= remainingBudget) {
-        this.totalFailures++;
-        return {
-          ok: false,
-          signature,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-          ingestedEventsCount: 0,
-          diagnostics: {
-            signature,
-            httpAttempts: 0,
-            durationMs: this.clock() - startEpoch,
-            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-            decodedEventsCount: 0,
-            ingestedCount: 0,
-            error: `Pacing wait of ${budgetCheck.waitMs}ms would exceed remaining deadline (${remainingBudget}ms)`,
-          },
-        };
-      }
-
-      try {
-        await sleepWithSignal(budgetCheck.waitMs, this.sleepFn, options?.signal);
-      } catch (err) {
-        this.totalFailures++;
-        return {
-          ok: false,
-          signature,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-          ingestedEventsCount: 0,
-          diagnostics: {
-            signature,
-            httpAttempts: 0,
-            durationMs: this.clock() - startEpoch,
-            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-            decodedEventsCount: 0,
-            ingestedCount: 0,
-            error: `Pacing wait cancelled: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        };
-      }
-
-      remainingBudget = getRemainingEffectiveBudgetMs();
+      let remainingBudget = getRemainingEffectiveBudgetMs();
       if (remainingBudget <= 0) {
         this.totalFailures++;
+        this.recordLossGap(notification, "PRE_DISPATCH_DEADLINE_EXCEEDED", tracker);
         return {
           ok: false,
           signature,
@@ -623,348 +889,603 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
             decodedEventsCount: 0,
             ingestedCount: 0,
-            error: "Overall deadline exceeded during shared pacing wait",
+            error: "Overall deadline exceeded before dispatch",
           },
         };
       }
 
-      budgetCheck = this.budgetManager.canMakeRequest(
+      // 1. Effective Provider Pacing & Pre-dispatch Budget Check
+      const lastDispatch = this.lastDispatchTimeByProvider.get(this.providerName) ?? 0;
+      const elapsedSinceLastDispatch = this.clock() - lastDispatch;
+      const adapterWaitMs = Math.max(0, this.pacingMs - elapsedSinceLastDispatch);
+
+      let budgetCheck = this.budgetManager.canMakeRequest(
         this.providerName,
         this.clock(),
         this.requestPurpose,
       );
-    }
 
-    if (!budgetCheck.allowed) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "PRE_DISPATCH_BUDGET_DENIED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts: 0,
-          durationMs: this.clock() - startEpoch,
-          outcome: "PRE_DISPATCH_BUDGET_DENIED",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: `Budget denied before dispatch: ${budgetCheck.reason ?? "Ceiling reached"}`,
-        },
-      };
-    }
+      const budgetWaitMs =
+        !budgetCheck.allowed &&
+        budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+        typeof budgetCheck.waitMs === "number" &&
+        budgetCheck.waitMs > 0
+          ? budgetCheck.waitMs
+          : 0;
 
-    if (options?.signal?.aborted) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts: 0,
-          durationMs: this.clock() - startEpoch,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: "Request cancelled by caller before dispatch",
-        },
-      };
-    }
+      const effectivePacingWaitMs = Math.max(adapterWaitMs, budgetWaitMs);
 
-    // 2. Record Attempt in Shared Session Budget
-    const recorded = this.budgetManager.recordRequestAttempt(
-      this.providerName,
-      this.requestPurpose,
-      this.clock(),
-    );
-
-    if (!recorded) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "PRE_DISPATCH_BUDGET_DENIED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts: 0,
-          durationMs: this.clock() - startEpoch,
-          outcome: "PRE_DISPATCH_BUDGET_DENIED",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: "Failed to record request attempt in shared session budget",
-        },
-      };
-    }
-
-    // 3. Dispatch HTTP getTransaction with Combined Timeout Controller
-    const effectiveTimeoutMs = Math.min(this.timeoutMs, remainingBudget);
-    const abortController = new AbortController();
-    if (options?.signal) {
-      options.signal.addEventListener(
-        "abort",
-        () => abortController.abort(options.signal?.reason),
-        { once: true },
-      );
-    }
-
-    const timeoutTimer = setTimeout(() => {
-      abortController.abort(
-        new Error(`REQUEST_TIMEOUT: Exceeded timeout of ${effectiveTimeoutMs}ms`),
-      );
-    }, effectiveTimeoutMs);
-
-    const httpAttempts = 1;
-    this.totalDispatchedAttempts++;
-    let httpStatus: number | undefined;
-    let bodyText = "";
-
-    try {
-      const rpcPayload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTransaction",
-        params: [
-          signature,
-          {
-            encoding: "json",
-            commitment: this.commitment,
-            maxSupportedTransactionVersion: this.maxSupportedTransactionVersion,
-          },
-        ],
-      };
-
-      const response = await this.underlyingTransport(this.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rpcPayload),
-        signal: abortController.signal,
-      });
-
-      httpStatus = response.status;
-      this.budgetManager.recordResponseStatus(response.status);
-
-      if (!response.ok) {
-        try {
-          await response.text();
-        } catch {
-          // ignore error reading error body
+      if (effectivePacingWaitMs > 0) {
+        if (effectivePacingWaitMs >= remainingBudget) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "PACING_WAIT_EXCEEDS_DEADLINE", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: `Pacing wait of ${effectivePacingWaitMs}ms would exceed remaining deadline (${remainingBudget}ms)`,
+            },
+          };
         }
+
+        try {
+          await sleepWithSignal(effectivePacingWaitMs, this.sleepFn, options?.signal);
+        } catch (err) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "PACING_WAIT_CANCELLED", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `Pacing wait cancelled: ${err instanceof Error ? err.message : String(err)}`,
+              ),
+            },
+          };
+        }
+
+        remainingBudget = getRemainingEffectiveBudgetMs();
+        if (remainingBudget <= 0) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "PRE_DISPATCH_DEADLINE_EXCEEDED", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: "Overall deadline exceeded during shared pacing wait",
+            },
+          };
+        }
+
+        budgetCheck = this.budgetManager.canMakeRequest(
+          this.providerName,
+          this.clock(),
+          this.requestPurpose,
+        );
+      }
+
+      if (!budgetCheck.allowed) {
         this.totalFailures++;
+        this.recordLossGap(notification, budgetCheck.reason ?? "BUDGET_DENIED", tracker);
         return {
           ok: false,
           signature,
-          outcome: "HTTP_ERROR",
+          outcome: "PRE_DISPATCH_BUDGET_DENIED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts: 0,
+            durationMs: this.clock() - startEpoch,
+            outcome: "PRE_DISPATCH_BUDGET_DENIED",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(
+              `Budget denied before dispatch: ${budgetCheck.reason ?? "Ceiling reached"}`,
+            ),
+          },
+        };
+      }
+
+      if (options?.signal?.aborted) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "CALLER_ABORTED_BEFORE_DISPATCH", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts: 0,
+            durationMs: this.clock() - startEpoch,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: "Request cancelled by caller before dispatch",
+          },
+        };
+      }
+
+      // 2. Record Attempt in Shared Session Budget
+      const recorded = this.budgetManager.recordRequestAttempt(
+        this.providerName,
+        this.requestPurpose,
+        this.clock(),
+      );
+
+      if (!recorded) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "BUDGET_RECORD_ATTEMPT_DENIED", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "PRE_DISPATCH_BUDGET_DENIED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts: 0,
+            durationMs: this.clock() - startEpoch,
+            outcome: "PRE_DISPATCH_BUDGET_DENIED",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: "Failed to record request attempt in shared session budget",
+          },
+        };
+      }
+
+      // 3. Dispatch HTTP getTransaction with Combined Timeout Controller
+      const effectiveTimeoutMs = Math.min(this.timeoutMs, remainingBudget);
+      const abortController = new AbortController();
+      let abortListener: (() => void) | undefined;
+
+      if (options?.signal) {
+        abortListener = () => abortController.abort(options.signal?.reason);
+        options.signal.addEventListener("abort", abortListener, { once: true });
+      }
+
+      const timeoutTimer = setTimeout(() => {
+        abortController.abort(
+          new Error(`REQUEST_TIMEOUT: Exceeded timeout of ${effectiveTimeoutMs}ms`),
+        );
+      }, effectiveTimeoutMs);
+
+      const httpAttempts = 1;
+      this.totalDispatchedAttempts++;
+      let httpStatus: number | undefined;
+      let bodyText = "";
+
+      try {
+        const rpcPayload = {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getTransaction",
+          params: [
+            signature,
+            {
+              encoding: "json",
+              commitment: this.commitment,
+              maxSupportedTransactionVersion: this.maxSupportedTransactionVersion,
+            },
+          ],
+        };
+
+        this.lastDispatchTimeByProvider.set(this.providerName, this.clock());
+
+        const response = await this.underlyingTransport(this.rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(rpcPayload),
+          signal: abortController.signal,
+          redirect: "error", // Prohibit silent follow-up requests
+        });
+
+        httpStatus = response.status;
+        this.budgetManager.recordResponseStatus(response.status);
+
+        if (!response.ok) {
+          try {
+            await response.text();
+          } catch {
+            // ignore error reading error body
+          }
+          this.totalFailures++;
+          this.recordLossGap(notification, `HTTP_ERROR_${response.status}`, tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "HTTP_ERROR",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts,
+              httpStatus,
+              durationMs: this.clock() - startEpoch,
+              outcome: "HTTP_ERROR",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `HTTP error ${response.status}: ${response.statusText}`,
+              ),
+            },
+          };
+        }
+
+        // Keep timeout protection active through complete response body reading
+        bodyText = await response.text();
+      } catch (err) {
+        this.totalFailures++;
+        const isAbortOrTimeout =
+          abortController.signal.aborted ||
+          (err instanceof Error &&
+            (err.name === "AbortError" || err.message.includes("REQUEST_TIMEOUT")));
+
+        const outcome: TransactionProcessingOutcome = isAbortOrTimeout
+          ? "REQUEST_TIMEOUT"
+          : "NETWORK_ERROR";
+        const errorMsg = this.sanitizeErrorMessage(
+          err instanceof Error ? err.message : String(err),
+        );
+        this.recordLossGap(notification, outcome, tracker);
+
+        return {
+          ok: false,
+          signature,
+          outcome,
           ingestedEventsCount: 0,
           diagnostics: {
             signature,
             httpAttempts,
             httpStatus,
             durationMs: this.clock() - startEpoch,
-            outcome: "HTTP_ERROR",
+            outcome,
             decodedEventsCount: 0,
             ingestedCount: 0,
-            error: `HTTP error ${response.status}: ${response.statusText}`,
+            error: errorMsg,
+          },
+        };
+      } finally {
+        clearTimeout(timeoutTimer);
+        if (abortListener && options?.signal) {
+          options.signal.removeEventListener("abort", abortListener);
+        }
+      }
+
+      // Recheck overall deadline immediately before tracker ingestion
+      if (
+        this.clock() >= effectiveDeadlineEpoch ||
+        abortController.signal.aborted ||
+        options?.signal?.aborted
+      ) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "DEADLINE_EXCEEDED_BEFORE_INGESTION", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "REQUEST_TIMEOUT",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "REQUEST_TIMEOUT",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: `Deadline exceeded before tracker ingestion: elapsed ${this.clock() - startEpoch}ms >= limit ${effectiveTimeoutMs}ms`,
           },
         };
       }
 
-      // Keep timeout protection active through complete response body reading
-      bodyText = await response.text();
-    } catch (err) {
-      this.totalFailures++;
-      const isAbortOrTimeout =
-        abortController.signal.aborted ||
-        (err instanceof Error &&
-          (err.name === "AbortError" || err.message.includes("REQUEST_TIMEOUT")));
+      // 4. Parse & Validate JSON-RPC Envelope
+      let rpcResponse: unknown;
+      try {
+        rpcResponse = JSON.parse(bodyText);
+      } catch (err) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "MALFORMED_JSON_RESPONSE", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(
+              `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          },
+        };
+      }
 
-      const outcome: TransactionProcessingOutcome = isAbortOrTimeout
-        ? "REQUEST_TIMEOUT"
-        : "NETWORK_ERROR";
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      if (!rpcResponse || typeof rpcResponse !== "object") {
+        this.totalFailures++;
+        this.recordLossGap(notification, "NON_OBJECT_RPC_RESPONSE", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: "RPC response must be a non-null object",
+          },
+        };
+      }
 
+      const rpcObj = rpcResponse as Record<string, unknown>;
+
+      if (rpcObj.error !== undefined && rpcObj.error !== null) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "RPC_ERROR_RETURNED", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "RPC_ERROR",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "RPC_ERROR",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(`RPC returned error: ${JSON.stringify(rpcObj.error)}`),
+          },
+        };
+      }
+
+      if (rpcObj.result === null || rpcObj.result === undefined) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "TRANSACTION_NOT_FOUND", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "TRANSACTION_NOT_FOUND",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "TRANSACTION_NOT_FOUND",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: `Transaction ${signature} not found on-chain (result: null)`,
+          },
+        };
+      }
+
+      // Validate returned transaction signature matches requested signature
+      const payloadObj = rpcObj.result as Record<string, unknown>;
+      const returnedSig = (payloadObj?.transaction as Record<string, unknown>)?.signatures;
+      const primaryReturnedSig = Array.isArray(returnedSig) ? returnedSig[0] : undefined;
+
+      if (typeof primaryReturnedSig !== "string" || primaryReturnedSig.trim() !== signature) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "RESPONSE_SIGNATURE_MISMATCH", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "RESPONSE_SIGNATURE_MISMATCH",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "RESPONSE_SIGNATURE_MISMATCH",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(
+              `RPC returned signature mismatch: requested '${signature}', received '${String(primaryReturnedSig)}'`,
+            ),
+          },
+        };
+      }
+
+      // Validate slot contradiction if supplied in notification
+      if (notification.slot !== undefined) {
+        const payloadSlot = payloadObj.slot;
+        if (typeof payloadSlot === "number" && payloadSlot !== notification.slot) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "CONTRADICTORY_SLOT", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "CONTRADICTORY_METADATA",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts,
+              httpStatus,
+              durationMs: this.clock() - startEpoch,
+              outcome: "CONTRADICTORY_METADATA",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `Slot contradiction: notification specified slot ${notification.slot}, but response contains slot ${payloadSlot}`,
+              ),
+            },
+          };
+        }
+      }
+
+      // Validate blockTime contradiction if supplied in notification
+      if (notification.blockTime !== undefined && notification.blockTime !== null) {
+        const payloadBlockTime = payloadObj.blockTime;
+        if (typeof payloadBlockTime === "number" && payloadBlockTime !== notification.blockTime) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "CONTRADICTORY_BLOCK_TIME", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "CONTRADICTORY_METADATA",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts,
+              httpStatus,
+              durationMs: this.clock() - startEpoch,
+              outcome: "CONTRADICTORY_METADATA",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              error: this.sanitizeErrorMessage(
+                `BlockTime contradiction: notification specified blockTime ${notification.blockTime}, but response contains blockTime ${payloadBlockTime}`,
+              ),
+            },
+          };
+        }
+      }
+
+      // 5. Decode Swaps & Ingest Into Tracker
+      const decodeOptions: DecodeSwapOptions = {
+        clock: this.clock,
+        receiptTimestampMs: notification.receivedAtMs ?? this.clock(),
+        fallbackProvenance: notification.provenance as TradeTimestampProvenance | undefined,
+      };
+
+      const ingestResult = this.normalizationAdapter.ingestTransaction(
+        rpcObj.result,
+        tracker,
+        decodeOptions,
+      );
+
+      if (!ingestResult.decodeResult.ok) {
+        this.totalFailures++;
+        this.recordLossGap(
+          notification,
+          `DECODE_FAILED_${ingestResult.decodeResult.reason}`,
+          tracker,
+        );
+        return {
+          ok: false,
+          signature,
+          outcome: "DECODE_FAILED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "DECODE_FAILED",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(
+              `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}`,
+            ),
+          },
+        };
+      }
+
+      const decodedEventsCount = ingestResult.decodeResult.events.length;
+      const ingestedCount = ingestResult.ingestedCount;
+
+      if (ingestedCount === 0 && ingestResult.ingestFailures.length > 0) {
+        this.totalFailures++;
+        const firstFailure = ingestResult.ingestFailures[0]!;
+        this.recordLossGap(notification, `INGEST_FAILED_${firstFailure.reason}`, tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "INGEST_FAILED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "INGEST_FAILED",
+            decodedEventsCount,
+            ingestedCount: 0,
+            error: this.sanitizeErrorMessage(
+              `Tracker ingestion failed [${firstFailure.reason}]: ${firstFailure.message}`,
+            ),
+          },
+        };
+      }
+
+      if (ingestedCount < decodedEventsCount && ingestResult.ingestFailures.length > 0) {
+        // Partial ingestion failure: report failure accurately, preserve partial count, protect coverage
+        this.totalFailures++;
+        const firstFailure = ingestResult.ingestFailures[0]!;
+        this.recordLossGap(notification, `PARTIAL_INGEST_FAILED_${firstFailure.reason}`, tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "PARTIAL_INGEST_FAILED",
+          ingestedEventsCount: ingestedCount,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "PARTIAL_INGEST_FAILED",
+            decodedEventsCount,
+            ingestedCount,
+            error: this.sanitizeErrorMessage(
+              `Partial tracker ingestion failure: ${ingestedCount}/${decodedEventsCount} swaps ingested; failed [${firstFailure.reason}]: ${firstFailure.message}`,
+            ),
+          },
+        };
+      }
+
+      this.totalSuccesses++;
       return {
-        ok: false,
+        ok: true,
         signature,
-        outcome,
-        ingestedEventsCount: 0,
+        outcome: "SUCCESS",
+        ingestedEventsCount: ingestedCount,
         diagnostics: {
           signature,
           httpAttempts,
           httpStatus,
           durationMs: this.clock() - startEpoch,
-          outcome,
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: errorMsg,
+          outcome: "SUCCESS",
+          decodedEventsCount,
+          ingestedCount,
         },
       };
     } finally {
-      if (timeoutTimer !== undefined) {
-        clearTimeout(timeoutTimer);
-      }
+      this.inFlightCount--;
+      this.activeSignatures.delete(signature);
+      this.recordCompletedSignature(signature);
     }
-
-    // 4. Parse JSON-RPC Payload
-    let rpcResponse: unknown;
-    try {
-      rpcResponse = JSON.parse(bodyText);
-    } catch (err) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "MALFORMED_RESPONSE",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "MALFORMED_RESPONSE",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
-        },
-      };
-    }
-
-    if (!rpcResponse || typeof rpcResponse !== "object") {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "MALFORMED_RESPONSE",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "MALFORMED_RESPONSE",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: "RPC response must be a non-null object",
-        },
-      };
-    }
-
-    const rpcObj = rpcResponse as Record<string, unknown>;
-
-    if (rpcObj.error !== undefined && rpcObj.error !== null) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "RPC_ERROR",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "RPC_ERROR",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: `RPC returned error: ${JSON.stringify(rpcObj.error)}`,
-        },
-      };
-    }
-
-    if (rpcObj.result === null || rpcObj.result === undefined) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "TRANSACTION_NOT_FOUND",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "TRANSACTION_NOT_FOUND",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: `Transaction ${signature} not found on-chain (result: null)`,
-        },
-      };
-    }
-
-    // 5. Decode Swaps & Ingest Into Tracker
-    const decodeOptions: DecodeSwapOptions = {
-      clock: this.clock,
-      receiptTimestampMs: notification.receivedAtMs ?? this.clock(),
-      fallbackProvenance: notification.provenance as TradeTimestampProvenance | undefined,
-    };
-
-    const ingestResult = this.normalizationAdapter.ingestTransaction(
-      rpcObj.result,
-      tracker,
-      decodeOptions,
-    );
-
-    if (!ingestResult.decodeResult.ok) {
-      this.totalFailures++;
-      return {
-        ok: false,
-        signature,
-        outcome: "DECODE_FAILED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "DECODE_FAILED",
-          decodedEventsCount: 0,
-          ingestedCount: 0,
-          error: `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}`,
-        },
-      };
-    }
-
-    const decodedEventsCount = ingestResult.decodeResult.events.length;
-    const ingestedCount = ingestResult.ingestedCount;
-
-    if (ingestedCount === 0 && ingestResult.ingestFailures.length > 0) {
-      this.totalFailures++;
-      const firstFailure = ingestResult.ingestFailures[0]!;
-      return {
-        ok: false,
-        signature,
-        outcome: "INGEST_FAILED",
-        ingestedEventsCount: 0,
-        diagnostics: {
-          signature,
-          httpAttempts,
-          httpStatus,
-          durationMs: this.clock() - startEpoch,
-          outcome: "INGEST_FAILED",
-          decodedEventsCount,
-          ingestedCount: 0,
-          error: `Tracker ingestion failed [${firstFailure.reason}]: ${firstFailure.message}`,
-        },
-      };
-    }
-
-    this.totalSuccesses++;
-    return {
-      ok: true,
-      signature,
-      outcome: "SUCCESS",
-      ingestedEventsCount: ingestedCount,
-      diagnostics: {
-        signature,
-        httpAttempts,
-        httpStatus,
-        durationMs: this.clock() - startEpoch,
-        outcome: "SUCCESS",
-        decodedEventsCount,
-        ingestedCount,
-      },
-    };
   }
 }

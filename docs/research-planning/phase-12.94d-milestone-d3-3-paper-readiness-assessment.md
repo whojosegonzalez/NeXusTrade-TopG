@@ -421,15 +421,33 @@ The approved offline implementation items are completed:
 10. **Bounded Raydium AMM v4 Transaction Source Adapter (`RaydiumAmmV4TransactionSourceAdapter.ts`)**:
     - Implemented in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts).
     - Connects injected transaction-signature notifications to bounded `getTransaction` retrieval, `RaydiumAmmV4SwapNormalizationAdapter` decoding, and `RollingTradeFlowTracker` ingestion strictly offline.
-    - **Explicit Transport Guard**: Strictly requires an injected transport (`typeof fetch`). Ambient networking, default live fetches, and ambient subscriptions are strictly prohibited.
-    - **Strict Identity Binding**: Binds all processing strictly to the exact tracked pool context (`poolId`, `baseVault`, `quoteVault`, `baseMint`, `quoteMint`, `candidateTokenMint`).
-    - **Shared Session Budget & Pacing**: Meters every outbound HTTP dispatch through `GlobalResourceBudgetManager`. LP snapshot acquisition and trade retrieval on the same provider (`SOLANA_RPC`) strictly share host pacing ($\ge 2,500\text{ ms}$) and session request ceilings.
-    - **Dispatched Failure Counting & Pre-Dispatch Reconciliation**: Dispatched HTTP attempts are counted regardless of outcome (network errors, 500 status, RPC errors, timeouts, stalled streams). Pre-dispatch budget denials (`PRE_DISPATCH_BUDGET_DENIED`) and deadline expirations (`PRE_DISPATCH_DEADLINE_EXCEEDED`) prevent dispatch and remain strictly uncounted (`httpAttempts: 0`).
-    - **Deadlines & Response-Body Timeout Protection**: Combined request timeout and overall deadline remain active through transport invocation and complete response-body stream reading (`response.text()`). Stalled body reads are aborted promptly via `AbortController`.
-    - **Bounded Backlog & Deduplication**: Hard ceiling on pending notifications (`maxPendingQueueSize = 100`, rejecting overflows with `QUEUE_OVERFLOW`) and bounded FIFO deduplication (`maxDeduplicationKeys = 1,000`). Duplicate notifications are rejected with zero HTTP dispatches and zero duplicate trade counts.
+    - **Independent Audit Corrections (Findings 1 - 6 Resolved)**:
+      1. _Immutable Identity Binding & Envelope Validation_:
+         - Injected notifications are validated and deeply frozen on intake (`validateAndSnapshotNotification`), guaranteeing caller object mutation cannot alter fetched signatures.
+         - Null, undefined, or non-object notifications fail closed with `INVALID_NOTIFICATION` without throwing.
+         - Validates returned JSON-RPC transaction signature against requested signature (`RESPONSE_SIGNATURE_MISMATCH`).
+         - Detects contradictory slot or blockTime metadata between notification and RPC response, failing closed with zero ingested events (`CONTRADICTORY_METADATA`).
+      2. _Loss Preservation, Backlog Reporting & Partial Ingestion Accounting_:
+         - Connects `TRANSACTION_NOT_FOUND` (`result: null`) directly to tracker collection gaps, invalidating false `SUFFICIENT` window coverage.
+         - Buffers loss gaps occurring before tracker injection (`pendingGaps` buffer) and flushes them into the tracker on intake (`flushPendingGaps`).
+         - Verifies that queue draining alone never erases recorded collection gaps.
+         - Accurately classifies and reports partial ingestion failures (e.g. tracker capacity limits) with `PARTIAL_INGEST_FAILED`, `ok: false`, preserving actual ingested count and recording a collection gap.
+      3. _Active Deduplication Protection & Workload Bounds_:
+         - Partitions deduplication into `activeSignatures` (protected queued + in-flight set, immune to FIFO eviction) and `completedSignatures` (bounded FIFO historical cache up to `maxDeduplicationKeys`).
+         - Enforces a unified active workload ceiling across direct and queued calls (`pendingQueue.length + inFlightCount < maxPendingQueueSize`), rejecting overflows fail-closed with `QUEUE_OVERFLOW`.
+      4. _Deadlines & Timeout Protection_:
+         - Validates constructor and per-operation numeric options (rejecting `NaN`, non-integers, and ceiling violations).
+         - Rechecks remaining deadline before dispatch AND immediately before tracker ingestion (post-body read).
+         - Aborts stalled response-body reads promptly via timeout controller (`REQUEST_TIMEOUT`, `httpAttempts: 1`).
+      5. _Effective Pacing, Capacity Reservation & Transport Policy_:
+         - Adapter enforces its own provider pacing ($\ge 2,500\text{ ms}$) regardless of budget manager spacing settings.
+         - Routine trade retrieval defaults to purpose `CANDIDATE_ENRICHMENT`, strictly preserving reserved forward observation requests (`minReservedForwardRequests = 4`).
+         - Sets `redirect: "error"` transport policy on fetch to prevent unmetered redirect loops.
+      6. _Sanitized Diagnostics_:
+         - Redacts endpoint API keys, secret URL paths, and query credentials to `[REDACTED]` across all diagnostics and error messages.
     - **Fail-Closed Coverage Guarantee**: Successful retrieval, an empty queue, or notification receipt alone NEVER establishes complete 60-second window coverage. Ingesting transactions strictly populates trade events and never fabricates stream checkpoints or advances window coverage (`status` remains non-`SUFFICIENT` without explicit observation checkpoints).
     - **Honest Throughput Disclosure**: Under $\ge 2,500\text{ ms}$ spacing, a single RPC provider sustains $\le 24\text{ requests/min}$. High-frequency candidate pools cannot achieve complete coverage via `getTransaction` without high-throughput RPC tiers or zero-RPC log parsing.
-    - 20 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts).
+    - 28 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts).
 11. **Larger Changes Quarantined**:
 
 - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
@@ -448,27 +466,31 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
 2. **Live Trade Stream Ingestion Wiring & Subscription Management**:
    - `RollingTradeFlowTracker.ts` dynamic windowing, complete coverage verification, and `RetestGateEvaluator.ts` flow gating are fully verified offline.
    - `RaydiumAmmV4SwapDecoder.ts` and `RaydiumAmmV4SwapNormalizationAdapter` decode and normalize transactions into immutable `TradeEvent` inputs offline without live connections.
-   - Connecting the decoder to live trade sources (`logsSubscribe` or polling `getSignaturesForAddress`/`getTransaction`) with explicit observation checkpoints remains a separate integration step.
+   - `RaydiumAmmV4TransactionSourceAdapter.ts` provides bounded, paced, deduplicated retrieval from injected transaction notifications to tracker ingestion offline.
+   - Connecting the adapter to live trade notification sources (`logsSubscribe` or polling `getSignaturesForAddress`/`getTransaction`) with explicit observation checkpoints remains a separate integration step.
    - **Solana RPC Protocol Mechanics (`logsSubscribe` & `getTransaction`)**:
      - Official `logsSubscribe` delivers only `{ signature, err, logs }`; it does _not_ provide transaction instructions, compiled accounts, or `preTokenBalances` / `postTokenBalances`.
      - Therefore, for instruction- or balance-based decoding without log-only decoding, full transaction retrieval via `getTransaction` is _normal acquisition work for every transaction_, not an occasional fallback.
-     - The zero-RPC alternative parsing base64-encoded `ray_log` events directly from `logs` is now supported by `parseRayLog` in `RaydiumAmmV4SwapDecoder.ts`, but live log subscription wiring remains separate.
+   - **Explicit Unverification of Zero-RPC Log-Only Parsing Claims**:
+     - While offline binary decoding of base64 `ray_log` slices is implemented via `parseRayLog` in `RaydiumAmmV4SwapDecoder.ts`, **zero-RPC log-only parsing is NOT a verified or accepted production acquisition path**.
+     - Specifically, log-only parsing:
+       1. _Lacks Authenticated Pool Address Binding_: The `ray_log` structure emits swap amounts and token account indices, but does NOT contain the pool account address itself. In transactions with multiple Raydium pools or routed multi-hop swaps, a `ray_log` cannot be bound to a specific candidate pool without transaction account keys from `getTransaction`.
+       2. _Lacks Timestamp & Slot Provenance_: `logsSubscribe` notifications do not contain on-chain `blockTime` or validated slot provenance within the log payload.
+       3. _Lacks Completeness & Ordering Guarantees_: Log streaming alone cannot prove complete 60-second window coverage or detect dropped notifications without sequence numbering or continuous observation heartbeats.
+     - Therefore, full transaction retrieval via `getTransaction` remains the only verified acquisition path for Raydium AMM v4 swap decoding.
    - **Request-Budget & Achievable Coverage under Existing Budget**:
      - The existing `GlobalResourceBudgetManager` enforces a shared provider pacing of $\ge 2,500\text{ ms}$ between RPC calls to the same host, alongside strict session request ceilings (25-50 requests).
      - At $2,500\text{ ms}$ pacing, a single RPC endpoint can fetch at most 24 transactions per minute.
      - _Throughput & Coverage Conditioning_: Live throughput estimates and complete 60-second coverage are strictly conditional on shared node traffic, overall block transaction volume, RPC retrieval success/error rates, and upstream source completeness. A low candidate swap rate alone does not guarantee coverage: if the pool is situated in dense blocks, or if network jitter/node rate-limiting occurs, retrieval failures or queue drops will trigger `COLLECTION_GAP`.
      - Consequently, active candidate pools experiencing $> 24\text{ trades/minute}$ cannot achieve complete 60-second coverage via `getTransaction` without inducing severe processing backlogs and quickly exhausting session request ceilings (e.g., a 50-request budget exhausted in 2 minutes).
-     - Under existing constraints, complete coverage via `getTransaction` is achievable only for low-activity pools ($\le 10\text{ trades/min}$), or requires a dedicated high-throughput RPC tier without pacing limits, or a validated zero-RPC log-only parsing path.
+     - Under existing constraints, complete coverage via `getTransaction` is achievable only for low-activity pools ($\le 10\text{ trades/min}$), or requires a dedicated high-throughput RPC tier without pacing limits.
    - **Current WebSocket Implementation vs Proposed Per-Candidate Subscriptions**:
      - The existing `SolanaWebSocketSubscriptionClient.ts` manages protocol-level subscriptions to program IDs (`RAYDIUM_AMM_V4_PROGRAM_ID`, `RAYDIUM_CPMM_PROGRAM_ID`).
      - Per-candidate pool subscriptions (`{ mentions: [candidatePoolId] }`) represent proposed work not yet implemented or wired in production.
-   - **Swap-Side Attribution per Instruction/Account Context**:
-     - In routed and multi-swap transactions (e.g., Jupiter routes), transaction-wide net token balances alone cannot correctly classify individual swaps.
-     - Attribution must be resolved per instruction context: inspecting the specific instruction referencing the candidate pool, matching `poolCoinVault` (base) vs `poolPcVault` (quote) against user source/destination token accounts, or instruction `amountIn` / `minAmountOut`.
    - **Latency Characterization**:
      - In-memory rolling window recalculation: $< 1\text{ ms}$ on evaluation.
      - Live WebSocket notification latency and `getTransaction` round-trip delays are unmeasured assumptions and must be empirically profiled under real network conditions.
    - **Capabilities Still Missing for Live Execution**:
      - Live WebSocket per-candidate subscription management and stream reconnection handling.
-     - Live transaction fetch transport wiring (`getTransaction`) or live `logsSubscribe` stream intake feeding `RaydiumAmmV4SwapDecoder.ts`.
+     - Live transaction fetch transport wiring (`getTransaction`) feeding `RaydiumAmmV4TransactionSourceAdapter.ts`.
      - Backlog monitoring and capacity reconciliation mechanisms for live trade streams.

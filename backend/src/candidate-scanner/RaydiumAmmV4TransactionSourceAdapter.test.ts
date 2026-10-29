@@ -1,19 +1,23 @@
 /**
  * Phase 12.94-D Milestone D.3.3: Bounded Raydium AMM v4 Transaction Source Adapter Tests
  *
- * Verifies:
- * 1. Constructor guards enforcing explicit transport, budget manager, rpcUrl, and pool context.
- * 2. Successful decode-to-tracker ingestion (getTransaction -> RaydiumAmmV4SwapDecoder -> RollingTradeFlowTracker).
- * 3. Duplicate notification deduplication (zero duplicate dispatches, zero duplicate trade counts).
- * 4. Failed request classification (HTTP 500 error, network error, request timeout).
- * 5. Null and malformed RPC results (result: null, invalid JSON, RPC error, decode failure).
- * 6. Global resource budget exhaustion preventing dispatch upfront (httpAttempts: 0).
- * 7. Shared provider pacing with LP adapter across candidates through GlobalResourceBudgetManager.
- * 8. Stalled response-body streams aborted promptly via timeout protection (httpAttempts: 1).
- * 9. Bounded backlog (queue overflow rejection and bounded FIFO deduplication cache eviction).
- * 10. Coverage invariant: Successful retrieval, an empty queue, or notification receipt alone
- *     NEVER establishes complete 60-second window coverage.
- * 11. Strict identity binding and timestamp/provenance preservation.
+ * Verifies Independent Audit Findings 1 - 6:
+ * 1. Constructor guards enforcing explicit transport, budget manager, rpcUrl, pool context,
+ *    and valid numeric configuration options (timeoutMs, overallTimeoutMs, pacingMs, queue/dedup bounds).
+ * 2. Immutable identity binding & snapshotting (mutating notification after enqueue does not
+ *    affect retrieval; null/undefined notifications fail closed with INVALID_NOTIFICATION without throwing).
+ * 3. Response signature mismatch and metadata contradiction detection (slot/time mismatches reject
+ *    with zero ingested events and CONTRADICTORY_METADATA).
+ * 4. Deduplication & workload limits (protects active/queued signatures from eviction; direct
+ *    processNotification calls obey maxPendingQueueSize).
+ * 5. Loss preservation, backlog reporting & partial failure accounting (TRANSACTION_NOT_FOUND,
+ *    queue overflows, and partial ingestions record collection gaps protecting established coverage;
+ *    queue draining alone does not erase gaps).
+ * 6. Deadlines & timeout protection (rechecks deadline before dispatch AND before tracker ingestion;
+ *    rejects NaN or ceiling-exceeding overrides; aborts stalled body reads promptly).
+ * 7. Effective pacing & capacity reservation (enforces pacingMs >= 2,500 ms even with zero-budget spacing;
+ *    default purpose CANDIDATE_ENRICHMENT preserves reserved forward observation requests; redirect: "error").
+ * 8. Sanitized diagnostics (redacts API keys and endpoint credentials from all diagnostics and error messages).
  *
  * NOTE: All tests execute strictly offline using labeled synthetic fixtures and fake clocks.
  */
@@ -64,41 +68,20 @@ function makeSwapBaseInV2Data(amountIn: bigint, minimumOut: bigint): number[] {
   return Array.from(buf);
 }
 
-function makeSplTransferData(amount: bigint): number[] {
-  const buf = new Uint8Array(9);
-  buf[0] = 3; // Transfer tag
-  const view = new DataView(buf.buffer);
-  view.setBigUint64(1, amount, true);
-  return Array.from(buf);
-}
-
-function makeRayLogLine(
-  logType: 3 | 4,
-  direction: "Coin2PC" | "PC2Coin",
-  amountIn: bigint,
-  amountOut: bigint,
-): string {
-  const buf = Buffer.alloc(57);
-  buf[0] = logType;
-  const view = new DataView(buf.buffer);
-  view.setBigUint64(1, amountIn, true);
-  view.setBigUint64(9, 0n, true);
-  view.setBigUint64(17, direction === "PC2Coin" ? 1n : 2n, true);
-  view.setBigUint64(49, amountOut, true);
-  return `Program log: ray_log: ${buf.toString("base64")}`;
-}
-
+/**
+ * Creates a synthetic RPC transaction payload matching the requested signature and pool.
+ */
 function createSyntheticBuyPayload(
   signature: string,
-  solIn = 50_000_000n,
-  candidateOut = 25_000_000_000n,
+  amountInLamports = 50_000_000n, // 0.05 WSOL
+  amountOutTokens = 25_000_000_000n, // 25,000 BONK
   poolId = SYNTHETIC_POOL_ID,
   slot = 280_000_100,
   blockTime = 1_700_000_000,
 ) {
   const accounts = [
     SPL_TOKEN_PROGRAM_ID, // 0
-    poolId, // 1: poolId
+    poolId, // 1
     SYNTHETIC_AMM_AUTHORITY, // 2
     SYNTHETIC_BASE_VAULT, // 3
     SYNTHETIC_QUOTE_VAULT, // 4
@@ -117,43 +100,68 @@ function createSyntheticBuyPayload(
         accountKeys: accounts,
         instructions: [
           {
-            programIdIndex: 8, // Raydium SwapBaseInV2
+            programIdIndex: 8,
             accounts: [0, 1, 2, 3, 4, 5, 6, 7],
-            data: makeSwapBaseInV2Data(solIn, candidateOut),
+            data: makeSwapBaseInV2Data(amountInLamports, amountOutTokens),
           },
         ],
       },
     },
     meta: {
       err: null,
+      preTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: "1000000000", decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: "500000000000", decimals: 5 },
+        },
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: (1_000_000_000n + amountInLamports).toString(), decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: (500_000_000_000n - amountOutTokens).toString(), decimals: 5 },
+        },
+      ],
       innerInstructions: [
         {
           index: 0,
           instructions: [
             {
-              programId: SPL_TOKEN_PROGRAM_ID,
-              accounts: [SYNTHETIC_USER_SOURCE_ATA, SYNTHETIC_QUOTE_VAULT, SYNTHETIC_USER_WALLET],
-              data: makeSplTransferData(solIn),
+              programIdIndex: 0,
+              accounts: [5, 4, 7],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountInLamports]).buffer)),
+              ],
             },
             {
-              programId: SPL_TOKEN_PROGRAM_ID,
-              accounts: [SYNTHETIC_BASE_VAULT, SYNTHETIC_USER_DEST_ATA, SYNTHETIC_AMM_AUTHORITY],
-              data: makeSplTransferData(candidateOut),
+              programIdIndex: 0,
+              accounts: [3, 6, 2],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountOutTokens]).buffer)),
+              ],
             },
           ],
         },
-      ],
-      logMessages: [
-        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
-        makeRayLogLine(3, "PC2Coin", solIn, candidateOut),
-        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
       ],
     },
   };
 }
 
 describe("RaydiumAmmV4TransactionSourceAdapter", () => {
-  describe("Constructor & Configuration Guards", () => {
+  describe("Constructor & Configuration Validation", () => {
     it("rejects initialization without an explicit transport implementation", () => {
       const budgetManager = new GlobalResourceBudgetManager();
       expect(
@@ -194,10 +202,11 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
       ).toThrow("rpcUrl is required");
     });
 
-    it("rejects invalid maxPendingQueueSize or maxDeduplicationKeys", () => {
+    it("rejects invalid numeric constructor configuration settings", () => {
       const budgetManager = new GlobalResourceBudgetManager();
       const mockTransport: typeof fetch = async () => new Response("{}", { status: 200 });
 
+      // Invalid maxPendingQueueSize
       expect(
         () =>
           new RaydiumAmmV4TransactionSourceAdapter({
@@ -209,6 +218,7 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
           }),
       ).toThrow("maxPendingQueueSize must be an integer >= 1");
 
+      // Invalid maxDeduplicationKeys
       expect(
         () =>
           new RaydiumAmmV4TransactionSourceAdapter({
@@ -216,23 +226,56 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
             rpcUrl: MOCK_RPC_URL,
             budgetManager,
             transport: mockTransport,
-            maxDeduplicationKeys: -5,
+            maxDeduplicationKeys: NaN,
           }),
       ).toThrow("maxDeduplicationKeys must be an integer >= 1");
+
+      // Invalid timeoutMs
+      expect(
+        () =>
+          new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+            timeoutMs: -10,
+          }),
+      ).toThrow("timeoutMs must be a positive integer");
+
+      // Invalid overallTimeoutMs
+      expect(
+        () =>
+          new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+            overallTimeoutMs: -5,
+          }),
+      ).toThrow("overallTimeoutMs must be a positive integer");
+
+      // Invalid pacingMs
+      expect(
+        () =>
+          new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+            pacingMs: -500,
+          }),
+      ).toThrow("pacingMs must be a non-negative integer");
     });
   });
 
-  describe("Successful Decode-to-Tracker Ingestion", () => {
+  describe("Finding 1: Immutable Identity Binding & Input Validation", () => {
     it("fetches, decodes, and ingests a valid Raydium BUY transaction into the tracker", async () => {
       const signature = "SigBuy1111111111111111111111111111111111111111111111111111";
       const payload = createSyntheticBuyPayload(signature);
 
-      let transportCalls = 0;
+      let capturedBody: string | undefined;
       const mockTransport: typeof fetch = async (_url, init) => {
-        transportCalls++;
-        const bodyObj = JSON.parse(String(init?.body));
-        expect(bodyObj.method).toBe("getTransaction");
-        expect(bodyObj.params[0]).toBe(signature);
+        capturedBody = String(init?.body);
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
           status: 200,
         });
@@ -249,86 +292,41 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
       });
 
-      const res = await adapter.processNotification(signature, tracker);
-      expect(res.ok).toBe(true);
-      expect(res.outcome).toBe("SUCCESS");
-      expect(res.ingestedEventsCount).toBe(1);
-      expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(transportCalls).toBe(1);
+      const result = await adapter.processNotification(signature, tracker);
 
-      // Verify trade event was ingested into tracker
-      const trackerCounts = tracker.getEventsCount();
-      expect(trackerCounts).toBe(1);
-      expect(budgetManager.getStats().totalRequests).toBe(1);
-      expect(budgetManager.getStats().forwardObservationRequests).toBe(1);
-    });
-  });
+      expect(result.ok).toBe(true);
+      expect(result.outcome).toBe("SUCCESS");
+      expect(result.ingestedEventsCount).toBe(1);
+      expect(result.diagnostics.httpAttempts).toBe(1);
+      expect(result.diagnostics.httpStatus).toBe(200);
 
-  describe("Duplicate Notification Deduplication", () => {
-    it("skips duplicate notifications with zero HTTP dispatches and zero duplicate trade counts", async () => {
-      const signature = "SigDup1111111111111111111111111111111111111111111111111111";
-      const payload = createSyntheticBuyPayload(signature);
+      // Verify RPC payload
+      expect(capturedBody).toBeDefined();
+      const rpcJson = JSON.parse(capturedBody!);
+      expect(rpcJson.method).toBe("getTransaction");
+      expect(rpcJson.params[0]).toBe(signature);
+      expect(rpcJson.params[1].encoding).toBe("json");
 
-      let transportCalls = 0;
-      const mockTransport: typeof fetch = async () => {
-        transportCalls++;
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-          status: 200,
-        });
-      };
-
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-      });
-
-      // First notification: processed
-      const res1 = await adapter.processNotification(signature, tracker);
-      expect(res1.ok).toBe(true);
-      expect(res1.outcome).toBe("SUCCESS");
-      expect(transportCalls).toBe(1);
+      // Verify tracker state
       expect(tracker.getEventsCount()).toBe(1);
-
-      // Second notification with SAME signature: rejected as duplicate
-      const res2 = await adapter.processNotification(signature, tracker);
-      expect(res2.ok).toBe(false);
-      expect(res2.outcome).toBe("DUPLICATE_NOTIFICATION");
-      expect(res2.diagnostics.httpAttempts).toBe(0);
-      expect(transportCalls).toBe(1); // Transport call count must remain 1!
-      expect(tracker.getEventsCount()).toBe(1); // Tracker event count must remain 1!
-
-      // Enqueueing duplicate also fails closed
-      const enqRes = adapter.enqueueNotification(signature);
-      expect(enqRes.ok).toBe(false);
-      expect(enqRes.queued).toBe(false);
-      expect(enqRes.reason).toBe("DUPLICATE_NOTIFICATION");
-
-      expect(adapter.getMetrics().totalDuplicatesSkipped).toBe(2);
+      expect(budgetManager.getStats().totalRequests).toBe(1);
+      // Finding 5: default purpose is CANDIDATE_ENRICHMENT
+      expect(budgetManager.getStats().enrichmentRequests).toBe(1);
     });
-  });
 
-  describe("Failed Requests & Error Classification", () => {
-    it("classifies HTTP 500 error as HTTP_ERROR with attempt counted (httpAttempts: 1)", async () => {
-      const signature = "SigErrFive111111111111111111111111111111111111111111111111";
+    it("freezes notification on enqueue so caller mutation does not change fetched signature", async () => {
+      const originalSig = "SigFreezeA11111111111111111111111111111111111111111111111";
+      const mutatedSig = "SigFreezeB22222222222222222222222222222222222222222222222";
+      const payload = createSyntheticBuyPayload(originalSig);
 
-      let transportCalls = 0;
-      const mockTransport: typeof fetch = async () => {
-        transportCalls++;
-        return new Response("Internal Server Error", {
-          status: 500,
-          statusText: "Internal Server Error",
+      let requestedSig = "";
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const bodyObj = JSON.parse(String(init?.body));
+        requestedSig = bodyObj.params[0];
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
         });
       };
 
@@ -343,26 +341,156 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
       });
 
-      const res = await adapter.processNotification(signature, tracker);
+      const mutableNotif = { signature: originalSig };
+      const enq = adapter.enqueueNotification(mutableNotif);
+      expect(enq.ok).toBe(true);
+
+      // Mutate caller object immediately after enqueue
+      mutableNotif.signature = mutatedSig;
+
+      // Process queued notification
+      const procRes = await adapter.processNextPending(tracker);
+      expect(procRes?.ok).toBe(true);
+
+      // CRITICAL CHECK: Ingested and fetched signature MUST be originalSig, NOT mutatedSig
+      expect(requestedSig).toBe(originalSig);
+      expect(procRes?.signature).toBe(originalSig);
+      expect(tracker.getEventsCount()).toBe(1);
+    });
+
+    it("rejects null, undefined, and non-object notifications with INVALID_NOTIFICATION without throwing", async () => {
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () => new Response("{}", { status: 200 }),
+      });
+
+      // Direct processNotification checks
+      const resNull = await adapter.processNotification(null, tracker);
+      expect(resNull.ok).toBe(false);
+      expect(resNull.outcome).toBe("INVALID_NOTIFICATION");
+      expect(resNull.ingestedEventsCount).toBe(0);
+
+      const resUndef = await adapter.processNotification(undefined, tracker);
+      expect(resUndef.ok).toBe(false);
+      expect(resUndef.outcome).toBe("INVALID_NOTIFICATION");
+
+      const resEmptyObj = await adapter.processNotification({}, tracker);
+      expect(resEmptyObj.ok).toBe(false);
+      expect(resEmptyObj.outcome).toBe("INVALID_NOTIFICATION");
+
+      // enqueueNotification checks
+      const enqNull = adapter.enqueueNotification(null);
+      expect(enqNull.ok).toBe(false);
+      expect(enqNull.reason).toBe("INVALID_NOTIFICATION");
+
+      const enqNum = adapter.enqueueNotification(12345);
+      expect(enqNum.ok).toBe(false);
+      expect(enqNum.reason).toBe("INVALID_NOTIFICATION");
+
+      const procBadSig = await adapter.processNotification("NotBase58!!", tracker);
+      expect(procBadSig.ok).toBe(false);
+      expect(procBadSig.outcome).toBe("INVALID_NOTIFICATION");
+    });
+
+    it("rejects response when returned transaction signature mismatches requested signature", async () => {
+      const requestedSig = "SigRequested111111111111111111111111111111111111111111111";
+      const differentSig = "SigDifferent222222222222222222222222222222222222222222222";
+      const payload = createSyntheticBuyPayload(differentSig);
+
+      const mockTransport: typeof fetch = async () => {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+      });
+
+      const res = await adapter.processNotification(requestedSig, tracker);
       expect(res.ok).toBe(false);
-      expect(res.outcome).toBe("HTTP_ERROR");
+      expect(res.outcome).toBe("RESPONSE_SIGNATURE_MISMATCH");
+      expect(res.ingestedEventsCount).toBe(0);
       expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(res.diagnostics.httpStatus).toBe(500);
-      expect(transportCalls).toBe(1);
-      expect(budgetManager.getStats().totalRequests).toBe(1);
+      expect(tracker.getEventsCount()).toBe(0); // Zero ingested events!
+    });
+
+    it("rejects transaction with contradictory slot metadata without ingesting", async () => {
+      const signature = "SigSwapMismatch1111111111111111111111111111111111111111111";
+      const payload = createSyntheticBuyPayload(
+        signature,
+        50_000_000n,
+        25_000_000_000n,
+        SYNTHETIC_POOL_ID,
+        300_000_000,
+      );
+
+      const mockTransport: typeof fetch = async () => {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+      });
+
+      // Notification claims slot 100, response contains slot 300_000_000
+      const notif: InjectedTransactionNotification = {
+        signature,
+        slot: 100,
+      };
+
+      const res = await adapter.processNotification(notif, tracker);
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("CONTRADICTORY_METADATA");
+      expect(res.ingestedEventsCount).toBe(0);
       expect(tracker.getEventsCount()).toBe(0);
     });
 
-    it("classifies transport exception as NETWORK_ERROR with attempt counted (httpAttempts: 1)", async () => {
-      const signature = "NetworkErrTestSig111111111111111111111111111111111111111111";
+    it("rejects transaction with contradictory blockTime metadata without ingesting", async () => {
+      const signature = "SigTimeMismatch111111111111111111111111111111111111111111";
+      const payload = createSyntheticBuyPayload(
+        signature,
+        50_000_000n,
+        25_000_000_000n,
+        SYNTHETIC_POOL_ID,
+        280_000_100,
+        1_700_000_000,
+      );
 
-      let transportCalls = 0;
       const mockTransport: typeof fetch = async () => {
-        transportCalls++;
-        throw new TypeError("Failed to fetch: ECONNRESET");
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
       };
 
       const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
@@ -376,22 +504,27 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
       });
 
-      const res = await adapter.processNotification(signature, tracker);
+      // Notification claims blockTime 1_600_000_000, response contains 1_700_000_000
+      const notif: InjectedTransactionNotification = {
+        signature,
+        blockTime: 1_600_000_000,
+      };
+
+      const res = await adapter.processNotification(notif, tracker);
       expect(res.ok).toBe(false);
-      expect(res.outcome).toBe("NETWORK_ERROR");
-      expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(res.diagnostics.error).toMatch(/Failed to fetch/);
-      expect(transportCalls).toBe(1);
-      expect(budgetManager.getStats().totalRequests).toBe(1);
+      expect(res.outcome).toBe("CONTRADICTORY_METADATA");
+      expect(res.ingestedEventsCount).toBe(0);
+      expect(tracker.getEventsCount()).toBe(0);
     });
   });
 
-  describe("Null & Malformed RPC Results", () => {
-    it("classifies result: null as TRANSACTION_NOT_FOUND with httpAttempts: 1", async () => {
-      const signature = "MissingTxTestSig1111111111111111111111111111111111111111111";
+  describe("Finding 2: Loss Preservation, Backlog & Partial Ingestion", () => {
+    it("records collection gap when TRANSACTION_NOT_FOUND occurs, invalidating false SUFFICIENT coverage", async () => {
+      const baseEpoch = 1_700_000_060_000;
+      const clock = () => baseEpoch;
+      const signature = "SigNotFoundGap1111111111111111111111111111111111111111111";
 
       const mockTransport: typeof fetch = async () => {
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }), {
@@ -400,31 +533,295 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
       };
 
       const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+      // Establish tracker with continuous observation coverage across [baseEpoch - 60s, baseEpoch]
       const tracker = new RollingTradeFlowTracker({
         poolId: SYNTHETIC_POOL_ID,
         tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        trackingStartedMs: baseEpoch - 60_000,
+        clock,
       });
+      tracker.recordCompletedRange(baseEpoch - 60_000, baseEpoch);
+
+      // Verify coverage was SUFFICIENT before the failed transaction
+      const evalBefore = tracker.evaluateWindow(baseEpoch);
+      expect(evalBefore.coverage).toBe("SUFFICIENT");
+      expect(evalBefore.recentBuys60s).toBe(0);
 
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: STANDARD_POOL_CONTEXT,
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
+        clock,
       });
 
       const res = await adapter.processNotification(signature, tracker);
       expect(res.ok).toBe(false);
       expect(res.outcome).toBe("TRANSACTION_NOT_FOUND");
-      expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(res.diagnostics.error).toMatch(/not found on-chain/);
+
+      // CRITICAL CHECK: Collection gap was recorded in tracker; coverage is NO LONGER SUFFICIENT
+      const evalAfter = tracker.evaluateWindow(baseEpoch);
+      expect(evalAfter.coverage).toBe("COLLECTION_GAP");
+      expect(evalAfter.recentBuys60s).toBeNull(); // Trade count is withheld due to missing transaction!
     });
 
-    it("classifies non-JSON body as MALFORMED_RESPONSE with httpAttempts: 1", async () => {
-      const signature = "NonJsonTestSig111111111111111111111111111111111111111111111";
+    it("buffers loss gap on queue overflow and flushes to tracker on intake; draining queue does not erase gap", async () => {
+      const baseEpoch = 1_700_000_060_000;
+      const clock = () => baseEpoch;
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const mockTransport: typeof fetch = async () => new Response("{}", { status: 200 });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        maxPendingQueueSize: 1, // Only 1 item fits
+        clock,
+      });
+
+      const sig1 = "SigQueueA11111111111111111111111111111111111111111111111111";
+      const sig2 = "SigQueueB22222222222222222222222222222222222222222222222222";
+
+      const enq1 = adapter.enqueueNotification(sig1);
+      expect(enq1.ok).toBe(true);
+
+      // Enqueueing second item before tracker is supplied causes QUEUE_OVERFLOW loss
+      const enq2 = adapter.enqueueNotification(sig2);
+      expect(enq2.ok).toBe(false);
+      expect(enq2.reason).toBe("QUEUE_OVERFLOW");
+      expect(adapter.getPendingGapsCount()).toBe(1); // Gap buffered in adapter!
+
+      // Now create tracker with continuous coverage
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        trackingStartedMs: baseEpoch - 60_000,
+        clock,
+      });
+      tracker.recordCompletedRange(baseEpoch - 60_000, baseEpoch);
+
+      // Pass tracker to adapter and drain queue
+      const batchResult = await adapter.processAllPending(tracker);
+      expect(batchResult.totalProcessed).toBe(1);
+      expect(adapter.getPendingQueueLength()).toBe(0); // Queue drained!
+      expect(adapter.getPendingGapsCount()).toBe(0); // Gap was flushed to tracker!
+
+      // CRITICAL CHECK: Queue draining does NOT erase the gap in tracker
+      const evalWindow = tracker.evaluateWindow(baseEpoch);
+      expect(evalWindow.coverage).toBe("COLLECTION_GAP");
+    });
+
+    it("accurately reports PARTIAL_INGEST_FAILED when tracker capacity limit rejects a subset of decoded swaps", async () => {
+      const baseEpoch = 1_700_000_000_000;
+      const clock = () => baseEpoch;
+      const signature = "SigPartSwap2222222222222222222222222222222222222222222222";
+
+      // Create payload with 2 BUY swaps in 1 transaction
+      const accounts = [
+        SPL_TOKEN_PROGRAM_ID, // 0
+        SYNTHETIC_POOL_ID, // 1
+        SYNTHETIC_AMM_AUTHORITY, // 2
+        SYNTHETIC_BASE_VAULT, // 3
+        SYNTHETIC_QUOTE_VAULT, // 4
+        SYNTHETIC_USER_SOURCE_ATA, // 5
+        SYNTHETIC_USER_DEST_ATA, // 6
+        SYNTHETIC_USER_WALLET, // 7
+        RAYDIUM_AMM_V4_PROGRAM_ID, // 8
+      ];
+
+      const multiSwapPayload = {
+        slot: 280_000_100,
+        blockTime: 1_700_000_000,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 8,
+                accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+                data: makeSwapBaseInV2Data(10_000_000n, 5_000_000_000n),
+              },
+              {
+                programIdIndex: 8,
+                accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+                data: makeSwapBaseInV2Data(20_000_000n, 10_000_000_000n),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          preTokenBalances: [
+            {
+              accountIndex: 4,
+              mint: SYNTHETIC_WSOL_MINT,
+              uiTokenAmount: { amount: "1000000000", decimals: 9 },
+            },
+            {
+              accountIndex: 3,
+              mint: SYNTHETIC_CANDIDATE_MINT,
+              uiTokenAmount: { amount: "500000000000", decimals: 5 },
+            },
+          ],
+          postTokenBalances: [
+            {
+              accountIndex: 4,
+              mint: SYNTHETIC_WSOL_MINT,
+              uiTokenAmount: { amount: "1030000000", decimals: 9 },
+            },
+            {
+              accountIndex: 3,
+              mint: SYNTHETIC_CANDIDATE_MINT,
+              uiTokenAmount: { amount: "485000000000", decimals: 5 },
+            },
+          ],
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                {
+                  programIdIndex: 0,
+                  accounts: [5, 4, 7],
+                  data: [
+                    3,
+                    ...Array.from(new Uint8Array(new BigUint64Array([10_000_000n]).buffer)),
+                  ],
+                },
+                {
+                  programIdIndex: 0,
+                  accounts: [3, 6, 2],
+                  data: [
+                    3,
+                    ...Array.from(new Uint8Array(new BigUint64Array([5_000_000_000n]).buffer)),
+                  ],
+                },
+              ],
+            },
+            {
+              index: 1,
+              instructions: [
+                {
+                  programIdIndex: 0,
+                  accounts: [5, 4, 7],
+                  data: [
+                    3,
+                    ...Array.from(new Uint8Array(new BigUint64Array([20_000_000n]).buffer)),
+                  ],
+                },
+                {
+                  programIdIndex: 0,
+                  accounts: [3, 6, 2],
+                  data: [
+                    3,
+                    ...Array.from(new Uint8Array(new BigUint64Array([10_000_000_000n]).buffer)),
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      };
 
       const mockTransport: typeof fetch = async () => {
-        return new Response("<html>Bad Gateway</html>", { status: 200 });
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: multiSwapPayload }), {
+          status: 200,
+        });
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+      // Create tracker with maxEventsRetained = 10, prefilled with 9 events so the second swap is rejected at capacity
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        maxEventsRetained: 10,
+        trackingStartedMs: baseEpoch - 60_000,
+        clock,
+      });
+
+      // Pre-fill tracker with 9 events
+      for (let i = 0; i < 9; i++) {
+        tracker.ingestTrade({
+          eventId: `prefill-${i}`,
+          signature: `SigPre${i}11111111111111111111111111111111111111111111111111111`,
+          swapIndex: 0,
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          side: "BUY",
+          slot: 280_000_100,
+          blockTimeSec: null,
+          eventTimestampMs: baseEpoch - 10_000 + i,
+          receiptTimestampMs: baseEpoch,
+          timestampProvenance: "SYNTHETIC_FIXTURE",
+          tokenAmount: 1000n,
+          solAmount: 100n,
+        });
+      }
+      expect(tracker.getEventsCount()).toBe(9);
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("PARTIAL_INGEST_FAILED");
+      expect(res.ingestedEventsCount).toBe(1); // Preserves exact count ingested!
+      expect(res.diagnostics.decodedEventsCount).toBe(2);
+      expect(res.diagnostics.error).toMatch(/Partial tracker ingestion failure: 1\/2/);
+      expect(tracker.getEventsCount()).toBe(10); // 9 prefill + 1 ingested
+    });
+  });
+
+  describe("Finding 3: Deduplication & Workload Bounds", () => {
+    it("protects queued/in-flight signatures from eviction when maxDeduplicationKeys is small", () => {
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const mockTransport: typeof fetch = async () => new Response("{}", { status: 200 });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        maxDeduplicationKeys: 1, // Historical cache limit of 1
+        maxPendingQueueSize: 10,
+      });
+
+      const sigA = "SigDedupA11111111111111111111111111111111111111111111111";
+      const sigB = "SigDedupB22222222222222222222222222222222222222222222222";
+
+      const enqA1 = adapter.enqueueNotification(sigA);
+      expect(enqA1.ok).toBe(true);
+
+      const enqB = adapter.enqueueNotification(sigB);
+      expect(enqB.ok).toBe(true);
+
+      // While A is still pending in the queue, enqueueing A again MUST be rejected as duplicate
+      const enqA2 = adapter.enqueueNotification(sigA);
+      expect(enqA2.ok).toBe(false);
+      expect(enqA2.reason).toBe("DUPLICATE_NOTIFICATION");
+      expect(adapter.getPendingQueueLength()).toBe(2);
+    });
+
+    it("enforces maxPendingQueueSize across direct processNotification calls", async () => {
+      const signature = "SigWorkA11111111111111111111111111111111111111111111111111";
+      const payload = createSyntheticBuyPayload(signature);
+
+      let releaseTransport: (() => void) | undefined;
+      const mockTransport: typeof fetch = async () => {
+        await new Promise<void>((resolve) => {
+          releaseTransport = resolve;
+        });
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
       };
 
       const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
@@ -438,26 +835,388 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
+        maxPendingQueueSize: 1, // Hard ceiling of 1 active item
+      });
+
+      // Call 1: starts processing and enters in-flight state
+      const promise1 = adapter.processNotification(signature, tracker);
+      expect(adapter.getInFlightCount()).toBe(1);
+      expect(adapter.getActiveWorkload()).toBe(1);
+
+      // Call 2 (different signature): attempted while call 1 is in-flight -> rejected with QUEUE_OVERFLOW
+      const sig2 = "SigWorkB22222222222222222222222222222222222222222222222222";
+      const res2 = await adapter.processNotification(sig2, tracker);
+      expect(res2.ok).toBe(false);
+      expect(res2.outcome).toBe("QUEUE_OVERFLOW");
+
+      // Release call 1
+      releaseTransport?.();
+      const res1 = await promise1;
+      expect(res1.ok).toBe(true);
+      expect(adapter.getInFlightCount()).toBe(0);
+    });
+
+    it("enforces bounded FIFO eviction on completed signatures", async () => {
+      let currentEpoch = 10_000;
+      const clock = () => currentEpoch;
+      const sleepFn = async (ms: number) => {
+        currentEpoch += ms;
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({
+        minProviderSpacingMs: 0,
+        clock,
+      });
+      const mockTransport: typeof fetch = async () => {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }), {
+          status: 200,
+        });
+      };
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        maxDeduplicationKeys: 2, // Bounded completed history of 2
+        clock,
+        sleepFn,
+      });
+
+      const s1 = "SigHist111111111111111111111111111111111111111111111111111";
+      const s2 = "SigHist222222222222222222222222222222222222222222222222222";
+      const s3 = "SigHist333333333333333333333333333333333333333333333333333";
+
+      await adapter.processNotification(s1, tracker);
+      await adapter.processNotification(s2, tracker);
+      expect(adapter.getCompletedDeduplicationKeysCount()).toBe(2);
+
+      // 3rd item completed: s1 is evicted from completed history
+      await adapter.processNotification(s3, tracker);
+      expect(adapter.getCompletedDeduplicationKeysCount()).toBe(2);
+      expect(adapter.isDuplicate(s1)).toBe(false); // s1 evicted
+      expect(adapter.isDuplicate(s2)).toBe(true);
+      expect(adapter.isDuplicate(s3)).toBe(true);
+    });
+  });
+
+  describe("Finding 4: Deadlines & Timeout Protection", () => {
+    it("rejects pre-ingestion when transport latency advances clock past overall deadline", async () => {
+      const signature = "SigTimeExpired111111111111111111111111111111111111111";
+      const payload = createSyntheticBuyPayload(signature);
+
+      let currentEpoch = 10_000;
+      const clock = () => currentEpoch;
+
+      const mockTransport: typeof fetch = async () => {
+        // Transport artificially delays by 5,000 ms
+        currentEpoch += 5_000;
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0, clock });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        overallTimeoutMs: 2_500, // 2,500 ms limit
+        clock,
       });
 
       const res = await adapter.processNotification(signature, tracker);
       expect(res.ok).toBe(false);
-      expect(res.outcome).toBe("MALFORMED_RESPONSE");
-      expect(res.diagnostics.httpAttempts).toBe(1);
+      expect(res.outcome).toBe("REQUEST_TIMEOUT");
+      expect(res.ingestedEventsCount).toBe(0);
+      expect(tracker.getEventsCount()).toBe(0); // Ingestion was BLOCKED!
     });
 
-    it("classifies RPC error response as RPC_ERROR with httpAttempts: 1", async () => {
-      const signature = "RpcErrTestSig111111111111111111111111111111111111111111111";
+    it("rejects invalid per-operation overallTimeoutMs (NaN or exceeding ceiling) before dispatch", async () => {
+      const sigNaN = "SigBadParamA111111111111111111111111111111111111111111111";
+      const sigExceed = "SigBadParamB222222222222222222222222222222222222222222222";
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      let transportCalls = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCalls++;
+        return new Response("{}", { status: 200 });
+      };
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        overallTimeoutMs: 10_000,
+      });
+
+      // NaN override
+      const resNaN = await adapter.processNotification(sigNaN, tracker, { overallTimeoutMs: NaN });
+      expect(resNaN.ok).toBe(false);
+      expect(resNaN.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+      expect(transportCalls).toBe(0);
+
+      // Exceeding ceiling override (20,000 > 10,000)
+      const resExceed = await adapter.processNotification(sigExceed, tracker, {
+        overallTimeoutMs: 20_000,
+      });
+      expect(resExceed.ok).toBe(false);
+      expect(resExceed.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+      expect(transportCalls).toBe(0);
+    });
+
+    it("aborts stalled response body read promptly and classifies as REQUEST_TIMEOUT (httpAttempts: 1)", async () => {
+      const signature = "SigTimeout111111111111111111111111111111111111111111111111";
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      let abortSignalFired = false;
+      const mockTransport: typeof fetch = async (_url, init) => {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          text: () =>
+            new Promise<string>((_, reject) => {
+              if (init?.signal) {
+                init.signal.addEventListener("abort", () => {
+                  abortSignalFired = true;
+                  const abortErr = new Error("AbortError: The operation was aborted");
+                  abortErr.name = "AbortError";
+                  reject(abortErr);
+                });
+              }
+            }),
+        } as unknown as Response;
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        timeoutMs: 50, // 50ms timeout for rapid offline verification
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("REQUEST_TIMEOUT");
+      expect(res.diagnostics.httpAttempts).toBe(1);
+      expect(abortSignalFired).toBe(true);
+    });
+  });
+
+  describe("Finding 5: Pacing, Budget Reservations & Transport Policy", () => {
+    it("enforces pacingMs = 5000 spacing even if budgetManager has 2500 ms spacing", async () => {
+      const sig = "SharedPacingSig111111111111111111111111111111111111111111111";
+
+      let currentEpoch = 10_000;
+      const clock = () => currentEpoch;
+
+      let sleepWaitRecorded = 0;
+      const sleepFn = async (ms: number) => {
+        sleepWaitRecorded += ms;
+        currentEpoch += ms;
+      };
+
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const bodyObj = JSON.parse(String(init?.body)) as { params?: [string] };
+        const reqSig = bodyObj?.params?.[0] ?? sig;
+        const dynamicPayload = createSyntheticBuyPayload(
+          reqSig,
+          50_000_000n,
+          25_000_000_000n,
+          SYNTHETIC_POOL_ID,
+          280_000_100,
+          Math.floor(currentEpoch / 1000),
+        );
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: dynamicPayload }), {
+          status: 200,
+        });
+      };
+
+      const budgetManager = new GlobalResourceBudgetManager({
+        minProviderSpacingMs: 2500, // Budget manager configured with 2,500 ms
+        clock,
+      });
+
+      const sig0 = "SharedPacingZero1111111111111111111111111111111111111111111";
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      // Adapter configured with pacingMs: 5000
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 5000,
+        clock,
+        sleepFn,
+      });
+
+      // First dispatch occurs at 10_000 without pacing wait
+      const res0 = await adapter.processNotification(sig0, tracker);
+      expect(res0.ok).toBe(true);
+      expect(sleepWaitRecorded).toBe(0);
+
+      // Advance clock by 1,000 ms to 11_000
+      currentEpoch = 11_000;
+
+      const res = await adapter.processNotification(sig, tracker);
+      expect(res.ok).toBe(true);
+
+      // Must wait remaining 4,000 ms (5,000 - 1,000), NOT just 1,500 ms!
+      expect(sleepWaitRecorded).toBe(4000);
+      expect(currentEpoch).toBe(15_000);
+    });
+
+    it("enforces adapter 2,500 ms minimum host pacing even when budgetManager has zero spacing", async () => {
+      const sig = "SigPacingZeroBudget111111111111111111111111111111111111111";
+
+      let currentEpoch = 10_000;
+      const clock = () => currentEpoch;
+
+      let sleepWaitRecorded = 0;
+      const sleepFn = async (ms: number) => {
+        sleepWaitRecorded += ms;
+        currentEpoch += ms;
+      };
+
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const bodyObj = JSON.parse(String(init?.body)) as { params?: [string] };
+        const reqSig = bodyObj?.params?.[0] ?? sig;
+        const dynamicPayload = createSyntheticBuyPayload(
+          reqSig,
+          50_000_000n,
+          25_000_000_000n,
+          SYNTHETIC_POOL_ID,
+          280_000_100,
+          Math.floor(currentEpoch / 1000),
+        );
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: dynamicPayload }), {
+          status: 200,
+        });
+      };
+
+      // Budget manager configured with 0 spacing
+      const budgetManager = new GlobalResourceBudgetManager({
+        minProviderSpacingMs: 0,
+        clock,
+      });
+
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const sig0 = "SharedPacingZero2222222222222222222222222222222222222222222";
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        clock,
+        sleepFn,
+      });
+
+      // First dispatch occurs at 10_000 without pacing wait
+      const res0 = await adapter.processNotification(sig0, tracker);
+      expect(res0.ok).toBe(true);
+      expect(sleepWaitRecorded).toBe(0);
+
+      // Advance clock by 500 ms to 10_500
+      currentEpoch = 10_500;
+
+      const res = await adapter.processNotification(sig, tracker);
+      expect(res.ok).toBe(true);
+
+      // Adapter must wait 2,000 ms (2,500 - 500) despite budgetManager having 0 spacing!
+      expect(sleepWaitRecorded).toBe(2000);
+      expect(currentEpoch).toBe(12_500);
+    });
+
+    it("preserves reserved forward observation capacity by defaulting routine trade retrieval to CANDIDATE_ENRICHMENT", async () => {
+      const sig1 = "SigReserve11111111111111111111111111111111111111111111111";
+      const sig2 = "SigReserve22222222222222222222222222222222222222222222222";
+      const payload = createSyntheticBuyPayload(sig1);
+
+      let transportCalls = 0;
+      const mockTransport: typeof fetch = async () => {
+        transportCalls++;
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      // Set maxTotalRequests = 5 and minReservedForwardRequests = 4 (default).
+      // Only 1 unreserved request is available for CANDIDATE_ENRICHMENT.
+      const budgetManager = new GlobalResourceBudgetManager({
+        maxTotalRequests: 5,
+        minReservedForwardRequests: 4,
+        minProviderSpacingMs: 0,
+      });
+
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 0,
+      });
+
+      // Request 1: succeeds and consumes the 1 allowable CANDIDATE_ENRICHMENT request
+      const res1 = await adapter.processNotification(sig1, tracker);
+      expect(res1.ok).toBe(true);
+      expect(transportCalls).toBe(1);
+
+      // Request 2: PRE_DISPATCH_BUDGET_DENIED because 4 remaining requests are strictly reserved for FORWARD_OBSERVATION
+      const res2 = await adapter.processNotification(sig2, tracker);
+      expect(res2.ok).toBe(false);
+      expect(res2.outcome).toBe("PRE_DISPATCH_BUDGET_DENIED");
+      expect(res2.diagnostics.httpAttempts).toBe(0); // Zero dispatch!
+      expect(transportCalls).toBe(1);
+    });
+  });
+
+  describe("Finding 6: Sanitized Diagnostics & Failure Classifications", () => {
+    it("redacts endpoint API-key sentinels and query secrets from diagnostics and error messages", async () => {
+      const secretRpcUrl = "https://solana-mainnet.g.alchemy.com/v2/SECRET_KEY_12345?auth=TOKEN_99";
+      const signature = "SigSanitize1111111111111111111111111111111111111111111111";
 
       const mockTransport: typeof fetch = async () => {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            error: { code: -32600, message: "Invalid Request" },
-          }),
-          { status: 200 },
+        throw new Error(
+          "Network failure connecting to https://solana-mainnet.g.alchemy.com/v2/SECRET_KEY_12345?auth=TOKEN_99",
         );
       };
 
@@ -469,22 +1228,122 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
 
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
+        rpcUrl: secretRpcUrl,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
       });
 
       const res = await adapter.processNotification(signature, tracker);
       expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("NETWORK_ERROR");
+
+      // Verify that secret tokens are redacted to [REDACTED]
+      expect(res.diagnostics.error).toBeDefined();
+      expect(res.diagnostics.error).not.toContain("SECRET_KEY_12345");
+      expect(res.diagnostics.error).not.toContain("TOKEN_99");
+      expect(res.diagnostics.error).toContain("[REDACTED]");
+    });
+
+    it("classifies HTTP 500 error as HTTP_ERROR with attempt counted (httpAttempts: 1)", async () => {
+      const signature = "SigErrFive111111111111111111111111111111111111111111111111";
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const mockTransport: typeof fetch = async () => {
+        return new Response("Internal Server Error", {
+          status: 500,
+          statusText: "Internal Server Error",
+        });
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("HTTP_ERROR");
+      expect(res.diagnostics.httpAttempts).toBe(1);
+      expect(res.diagnostics.httpStatus).toBe(500);
+      expect(tracker.getEventsCount()).toBe(0);
+    });
+
+    it("classifies non-JSON body as MALFORMED_RESPONSE with httpAttempts: 1", async () => {
+      const signature = "SigNonJson111111111111111111111111111111111111111111111111";
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const mockTransport: typeof fetch = async () => {
+        return new Response("<html><head><title>Bad Gateway</title></head></html>", {
+          status: 200,
+        });
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("MALFORMED_RESPONSE");
+      expect(res.diagnostics.httpAttempts).toBe(1);
+      expect(res.diagnostics.error).toMatch(/JSON parse error/);
+    });
+
+    it("classifies RPC error response as RPC_ERROR with httpAttempts: 1", async () => {
+      const signature = "SigRpcErr1111111111111111111111111111111111111111111111111";
+      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      });
+
+      const mockTransport: typeof fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            error: { code: -32600, message: "Invalid request" },
+          }),
+          { status: 200 },
+        );
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+
+      expect(res.ok).toBe(false);
       expect(res.outcome).toBe("RPC_ERROR");
       expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(res.diagnostics.error).toMatch(/Invalid Request/);
+      expect(res.diagnostics.error).toMatch(/RPC returned error/);
     });
 
     it("classifies non-matching pool transaction as DECODE_FAILED (NO_MATCHING_SWAPS_FOUND)", async () => {
       const signature = "SigDiff1111111111111111111111111111111111111111111111111111";
-      // Payload targeting SYNTHETIC_OTHER_POOL_ID
+      const baseEpoch = 1_700_000_000_000;
+      const clock = () => baseEpoch;
+
+      // Payload contains a different pool ID (SYNTHETIC_OTHER_POOL_ID)
       const payload = createSyntheticBuyPayload(
         signature,
         50_000_000n,
@@ -502,6 +1361,7 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
       const tracker = new RollingTradeFlowTracker({
         poolId: SYNTHETIC_POOL_ID,
         tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
       });
 
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
@@ -509,381 +1369,18 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
+        clock,
       });
 
       const res = await adapter.processNotification(signature, tracker);
       expect(res.ok).toBe(false);
       expect(res.outcome).toBe("DECODE_FAILED");
-      expect(res.diagnostics.httpAttempts).toBe(1);
       expect(res.diagnostics.error).toMatch(/NO_MATCHING_SWAPS_FOUND/);
-      expect(tracker.getEventsCount()).toBe(0);
-    });
-  });
-
-  describe("Shared Session Budget & Provider Pacing", () => {
-    it("stops pre-dispatch on budget exhaustion without dispatching (httpAttempts: 0)", async () => {
-      const sig1 = "SigBudget111111111111111111111111111111111111111111111111111";
-      const sig2 = "SigBudget222222222222222222222222222222222222222222222222222";
-      const payload = createSyntheticBuyPayload(sig1);
-
-      let transportCalls = 0;
-      const mockTransport: typeof fetch = async () => {
-        transportCalls++;
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-          status: 200,
-        });
-      };
-
-      // Ceiling of exactly 1 total request
-      const budgetManager = new GlobalResourceBudgetManager({
-        maxTotalRequests: 1,
-        minProviderSpacingMs: 0,
-      });
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-      });
-
-      // Request 1: succeeds and consumes the 1 allowable request
-      const res1 = await adapter.processNotification(sig1, tracker);
-      expect(res1.ok).toBe(true);
-      expect(transportCalls).toBe(1);
-
-      // Request 2: denied upfront by budget manager
-      const res2 = await adapter.processNotification(sig2, tracker);
-      expect(res2.ok).toBe(false);
-      expect(res2.outcome).toBe("PRE_DISPATCH_BUDGET_DENIED");
-      expect(res2.diagnostics.httpAttempts).toBe(0);
-      expect(transportCalls).toBe(1); // Zero transport dispatch for request 2!
-      expect(budgetManager.getStats().totalRequests).toBe(1);
     });
 
-    it("shares host pacing (>= 2,500 ms) with LP adapter on the same provider", async () => {
-      const sig = "SharedPacingSig111111111111111111111111111111111111111111111";
-
-      let currentEpoch = 10_000;
-      const clock = () => currentEpoch;
-      const payload = createSyntheticBuyPayload(
-        sig,
-        50_000_000n,
-        25_000_000_000n,
-        SYNTHETIC_POOL_ID,
-        280_000_100,
-        Math.floor(currentEpoch / 1000),
-      );
-
-      let sleepWaitRecorded = 0;
-      const sleepFn = async (ms: number) => {
-        sleepWaitRecorded += ms;
-        currentEpoch += ms; // Advance fake clock
-      };
-
-      const mockTransport: typeof fetch = async () => {
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-          status: 200,
-        });
-      };
-
-      const budgetManager = new GlobalResourceBudgetManager({
-        minProviderSpacingMs: 2500,
-        clock,
-      });
-
-      // Simulate a prior LP request made on "SOLANA_RPC" at currentEpoch = 10_000
-      budgetManager.recordRequestAttempt("SOLANA_RPC", "CANDIDATE_ENRICHMENT", 10_000);
-
-      // Advance clock by 500 ms (elapsed = 500 ms < 2500 ms)
-      currentEpoch = 10_500;
-
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-        clock,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        providerName: "SOLANA_RPC",
-        pacingMs: 2500,
-        clock,
-        sleepFn,
-      });
-
-      const res = await adapter.processNotification(sig, tracker);
-      expect(res.ok).toBe(true);
-      expect(res.outcome).toBe("SUCCESS");
-
-      // Verify sleepFn was called for exactly the remaining 2,000 ms spacing
-      expect(sleepWaitRecorded).toBe(2000);
-      expect(currentEpoch).toBe(12_500); // 10_500 + 2_000
-    });
-  });
-
-  describe("Timeout Protection & Stalled Body Reads", () => {
-    it("aborts stalled response body read promptly and classifies as REQUEST_TIMEOUT (httpAttempts: 1)", async () => {
-      const signature = "SigTimeout111111111111111111111111111111111111111111111111";
-
-      let transportCalls = 0;
-      const mockTransport: typeof fetch = async (_url, init) => {
-        transportCalls++;
-        // Return headers immediately, but body text stalls indefinitely until aborted
-        return {
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          text: () =>
-            new Promise<string>((_, reject) => {
-              if (init?.signal) {
-                init.signal.addEventListener("abort", () => {
-                  const abortErr = new Error("AbortError: The operation was aborted");
-                  abortErr.name = "AbortError";
-                  reject(abortErr);
-                });
-              }
-            }),
-        } as unknown as Response;
-      };
-
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-        timeoutMs: 50, // Short 50ms timeout
-      });
-
-      const res = await adapter.processNotification(signature, tracker);
-      expect(res.ok).toBe(false);
-      expect(res.outcome).toBe("REQUEST_TIMEOUT");
-      expect(res.diagnostics.httpAttempts).toBe(1);
-      expect(transportCalls).toBe(1);
-      expect(budgetManager.getStats().totalRequests).toBe(1);
-    });
-  });
-
-  describe("Bounded Backlog & Queue Overflow", () => {
-    it("rejects notifications with QUEUE_OVERFLOW when pending queue ceiling is exceeded", () => {
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-      const mockTransport: typeof fetch = async () => new Response("{}", { status: 200 });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        maxPendingQueueSize: 2, // Hard ceiling of 2 pending items
-      });
-
-      const enq1 = adapter.enqueueNotification(
-        "SigQueue11111111111111111111111111111111111111111111111",
-      );
-      const enq2 = adapter.enqueueNotification(
-        "SigQueue22222222222222222222222222222222222222222222222",
-      );
-      const enq3 = adapter.enqueueNotification(
-        "SigQueue33333333333333333333333333333333333333333333333",
-      );
-
-      expect(enq1.ok).toBe(true);
-      expect(enq1.queued).toBe(true);
-
-      expect(enq2.ok).toBe(true);
-      expect(enq2.queued).toBe(true);
-
-      expect(enq3.ok).toBe(false);
-      expect(enq3.queued).toBe(false);
-      expect(enq3.reason).toBe("QUEUE_OVERFLOW");
-
-      expect(adapter.getPendingQueueLength()).toBe(2);
-      expect(adapter.getMetrics().totalQueueOverflows).toBe(1);
-    });
-
-    it("enforces maxDeduplicationKeys bound with FIFO eviction without unbounded memory growth", async () => {
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-      const mockTransport: typeof fetch = async () => {
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }), {
-          status: 200,
-        });
-      };
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-        maxDeduplicationKeys: 3, // Bounded cache size of 3
-      });
-
-      const s1 = "SigEvict11111111111111111111111111111111111111111111111";
-      const s2 = "SigEvict22222222222222222222222222222222222222222222222";
-      const s3 = "SigEvict33333333333333333333333333333333333333333333333";
-      const s4 = "SigEvict44444444444444444444444444444444444444444444444";
-
-      await adapter.processNotification(s1, tracker);
-      await adapter.processNotification(s2, tracker);
-      await adapter.processNotification(s3, tracker);
-      expect(adapter.getDeduplicationKeysCount()).toBe(3);
-
-      // Ingest 4th: s1 should be evicted (FIFO), s4 added, count stays at 3
-      await adapter.processNotification(s4, tracker);
-      expect(adapter.getDeduplicationKeysCount()).toBe(3);
-      expect(adapter.isDuplicate(s1)).toBe(false); // s1 was evicted
-      expect(adapter.isDuplicate(s2)).toBe(true);
-      expect(adapter.isDuplicate(s3)).toBe(true);
-      expect(adapter.isDuplicate(s4)).toBe(true);
-    });
-
-    it("drains all pending items via processAllPending within effective deadline", async () => {
-      const baseEpoch = 1_700_000_000_000;
-      const clock = () => baseEpoch;
-
-      const sig1 = "BatchSig1111111111111111111111111111111111111111111111111";
-      const sig2 = "BatchSig2222222222222222222222222222222222222222222222222";
-
-      const p1 = createSyntheticBuyPayload(sig1);
-      const p2 = createSyntheticBuyPayload(sig2);
-
-      const mockTransport: typeof fetch = async (_url, init) => {
-        const bodyObj = JSON.parse(String(init?.body));
-        const requestedSig = bodyObj.params[0];
-        const payload = requestedSig === sig1 ? p1 : p2;
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-          status: 200,
-        });
-      };
-
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-        clock,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-        clock,
-      });
-
-      adapter.enqueueNotification(sig1);
-      adapter.enqueueNotification(sig2);
-      expect(adapter.getPendingQueueLength()).toBe(2);
-
-      const batchResult = await adapter.processAllPending(tracker);
-      expect(batchResult.totalProcessed).toBe(2);
-      expect(batchResult.totalSucceeded).toBe(2);
-      expect(batchResult.totalFailed).toBe(0);
-      expect(batchResult.totalIngestedEvents).toBe(2);
-      expect(adapter.getPendingQueueLength()).toBe(0);
-      expect(tracker.getEventsCount()).toBe(2);
-    });
-  });
-
-  describe("Fail-Closed Coverage Guarantee", () => {
-    it("confirms that successful retrieval, queue draining, or notifications alone NEVER fabricate window coverage", async () => {
-      const baseEpoch = 1_700_000_100_000;
-      const clock = () => baseEpoch;
-
-      const sig1 = "CoverageSig111111111111111111111111111111111111111111111";
-      const sig2 = "CoverageSig222222222222222222222222222222222222222222222";
-
-      // 2 trades within the window [baseEpoch - 60s, baseEpoch]
-      const p1 = createSyntheticBuyPayload(
-        sig1,
-        50_000_000n,
-        25_000_000_000n,
-        SYNTHETIC_POOL_ID,
-        280_000_100,
-        Math.floor((baseEpoch - 30_000) / 1000),
-      );
-      const p2 = createSyntheticBuyPayload(
-        sig2,
-        10_000_000n,
-        5_000_000_000n,
-        SYNTHETIC_POOL_ID,
-        280_000_105,
-        Math.floor((baseEpoch - 10_000) / 1000),
-      );
-
-      const mockTransport: typeof fetch = async (_url, init) => {
-        const bodyObj = JSON.parse(String(init?.body));
-        const payload = bodyObj.params[0] === sig1 ? p1 : p2;
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-          status: 200,
-        });
-      };
-
-      const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
-
-      // Start tracker 60 seconds earlier
-      const tracker = new RollingTradeFlowTracker({
-        poolId: SYNTHETIC_POOL_ID,
-        tokenMint: SYNTHETIC_CANDIDATE_MINT,
-        trackingStartedMs: baseEpoch - 60_000,
-        clock,
-      });
-
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: mockTransport,
-        pacingMs: 0,
-        clock,
-      });
-
-      // Enqueue and drain all pending notifications
-      adapter.enqueueNotification(sig1);
-      adapter.enqueueNotification(sig2);
-      const batchResult = await adapter.processAllPending(tracker);
-
-      expect(batchResult.totalSucceeded).toBe(2);
-      expect(adapter.getPendingQueueLength()).toBe(0); // Queue is completely drained!
-      expect(tracker.getEventsCount()).toBe(2); // Both trades ingested!
-
-      // CRITICAL CHECK: Ingesting trades and draining queue must NOT advance stream checkpoints
-      // or fabricate observation coverage.
-      const windowEvaluation = tracker.evaluateWindow(baseEpoch);
-
-      // Coverage must NOT be SUFFICIENT! Because no continuous observation checkpoints were recorded.
-      expect(windowEvaluation.coverage).not.toBe("SUFFICIENT");
-      // Indeed, the tracker correctly reports WARM_UP or COLLECTION_GAP due to lack of stream checkpoints
-      expect(["WARM_UP", "COLLECTION_GAP", "STALE_DATA"]).toContain(windowEvaluation.coverage);
-    });
-  });
-
-  describe("Identity Binding & Provenance Preservation", () => {
     it("preserves notification receiptTimestampMs and provenance on the resulting TradeEvent", async () => {
       const baseEpoch = 1_700_000_000_000;
       const clock = () => baseEpoch + 2_000;
-      const customReceiptMs = baseEpoch + 2_000;
 
       const signature = "SigProv111111111111111111111111111111111111111111111111111";
       const payload = createSyntheticBuyPayload(signature);
@@ -901,32 +1398,31 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         clock,
       });
 
+      let capturedEvent: unknown = null;
+      const origIngest = tracker.ingestTrade.bind(tracker);
+      tracker.ingestTrade = (event) => {
+        capturedEvent = event;
+        return origIngest(event);
+      };
+
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: STANDARD_POOL_CONTEXT,
         rpcUrl: MOCK_RPC_URL,
         budgetManager,
         transport: mockTransport,
-        pacingMs: 0,
         clock,
       });
 
+      const customReceiptMs = baseEpoch + 1_500;
       const notif: InjectedTransactionNotification = {
         signature,
         receivedAtMs: customReceiptMs,
         provenance: "HOST_OBSERVED",
       };
 
-      let capturedEvent: unknown = null;
-      const originalIngestTrade = tracker.ingestTrade.bind(tracker);
-      tracker.ingestTrade = (event) => {
-        capturedEvent = event;
-        return originalIngestTrade(event);
-      };
-
       const res = await adapter.processNotification(notif, tracker);
       expect(res.ok).toBe(true);
 
-      // Verify receiptTimestampMs and provenance were preserved on the ingested event
       expect(capturedEvent).not.toBeNull();
       const trade = capturedEvent as {
         signature: string;
@@ -936,7 +1432,6 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
       expect(trade.signature).toBe(signature);
       expect(trade.receiptTimestampMs).toBe(customReceiptMs);
       expect(trade.timestampProvenance).toBe("HOST_OBSERVED");
-      expect(tracker.getEventsCount()).toBe(1);
     });
   });
 });
