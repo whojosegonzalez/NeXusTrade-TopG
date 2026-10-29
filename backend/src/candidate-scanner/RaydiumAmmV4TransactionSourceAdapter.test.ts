@@ -1745,6 +1745,196 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         }
         await Promise.all([p1, p2]);
       });
+
+      it("cancellation of a middle waiter preserves predecessor ordering and spacing", async () => {
+        const baseEpoch = 1_700_000_000_000;
+        let currentEpoch = baseEpoch;
+        const clock = () => currentEpoch;
+
+        let resolveASleep!: () => void;
+        let aSleepStarted = false;
+        const aSleepPromise = new Promise<void>((resolve) => {
+          resolveASleep = resolve;
+        });
+
+        // sleepFn intercepts Request A's 5000ms pacing wait so A holds admission while B and C queue
+        const sleepFn = async (ms: number) => {
+          if (!aSleepStarted && ms === 5000) {
+            aSleepStarted = true;
+            await aSleepPromise;
+          }
+          currentEpoch += ms;
+        };
+
+        const recordedDispatchOffsets: number[] = [];
+
+        const mockTransport: typeof fetch = async (_url, init) => {
+          recordedDispatchOffsets.push(clock() - baseEpoch);
+          const reqBody = JSON.parse(String(init?.body));
+          const requestedSig = reqBody.params[0];
+          const payload = createSyntheticBuyPayload(requestedSig);
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          clock,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+          pacingMs: 5000,
+          maxPendingQueueSize: 10,
+          clock,
+          sleepFn,
+        });
+
+        const sigInit = "SigPaceHead111111111111111111111111111111111111111111111";
+        const sigA = "SigPaceA111111111111111111111111111111111111111111111111";
+        const sigB = "SigPaceB222222222222222222222222222222222222222222222222";
+        const sigC = "SigPaceC333333333333333333333333333333333333333333333333";
+
+        // 1. Complete initial dispatch at offset 0
+        const initRes = await adapter.processNotification(sigInit, tracker);
+        expect(initRes.ok).toBe(true);
+        expect(recordedDispatchOffsets).toEqual([0]);
+
+        // 2. Request A enters its 5000 ms pacing wait and holds admission
+        const promiseA = adapter.processNotification(sigA, tracker);
+
+        // 3. Request B waits behind A with an AbortController
+        const abortB = new AbortController();
+        const promiseB = adapter.processNotification(sigB, tracker, { signal: abortB.signal });
+
+        // 4. Request C waits behind B
+        const promiseC = adapter.processNotification(sigC, tracker);
+
+        expect(adapter.getInFlightCount()).toBe(3);
+
+        // 5. Cancel B before A releases admission
+        abortB.abort();
+
+        const resB = await promiseB;
+        expect(resB.ok).toBe(false);
+        expect(resB.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+        expect(resB.diagnostics.httpAttempts).toBe(0);
+        // B's workload is released promptly!
+        expect(adapter.getInFlightCount()).toBe(2);
+
+        // Assert that C has NOT bypassed A while A still holds admission
+        expect(recordedDispatchOffsets).toEqual([0]);
+
+        // 6. Release A's pacing wait
+        resolveASleep();
+
+        const [resA, resC] = await Promise.all([promiseA, promiseC]);
+        expect(resA.ok).toBe(true);
+        expect(resC.ok).toBe(true);
+
+        // Verified dispatch offsets: 0, 5000, 10000 ms (NEVER 0, 5000, 5000 ms)
+        expect(recordedDispatchOffsets).toEqual([0, 5000, 10000]);
+        expect(adapter.getInFlightCount()).toBe(0);
+      });
+
+      it("admission waiting expires at operation's own deadline and releases workload capacity promptly", async () => {
+        const baseEpoch = 1_700_000_000_000;
+        let currentEpoch = baseEpoch;
+        const clock = () => currentEpoch;
+
+        let releaseASleep!: () => void;
+        let aSleepStarted = false;
+        const aSleepPromise = new Promise<void>((resolve) => {
+          releaseASleep = resolve;
+        });
+
+        // sleepFn intercepts predecessor A so A remains in its 5000 ms pacing wait
+        const sleepFn = async (ms: number) => {
+          if (!aSleepStarted && ms > 0) {
+            aSleepStarted = true;
+            await aSleepPromise;
+          }
+          currentEpoch += ms;
+        };
+
+        let transportCalls = 0;
+        const mockTransport: typeof fetch = async (_url, init) => {
+          transportCalls++;
+          const reqBody = JSON.parse(String(init?.body));
+          const requestedSig = reqBody.params[0];
+          const payload = createSyntheticBuyPayload(requestedSig);
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          clock,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+          pacingMs: 5000,
+          maxPendingQueueSize: 10,
+          clock,
+          sleepFn,
+        });
+
+        const sigInit = "SigDeadHead111111111111111111111111111111111111111111111";
+        const sigA = "SigDeadA111111111111111111111111111111111111111111111111";
+        const sigB = "SigDeadB222222222222222222222222222222222222222222222222";
+        const sigC = "SigDeadC333333333333333333333333333333333333333333333333";
+
+        // Complete initial dispatch
+        await adapter.processNotification(sigInit, tracker);
+        expect(transportCalls).toBe(1);
+
+        // Predecessor A enters 5000 ms pacing wait and is held
+        const promiseA = adapter.processNotification(sigA, tracker);
+
+        // Operation B has overallTimeoutMs = 50 and waits behind A
+        const promiseB = adapter.processNotification(sigB, tracker, { overallTimeoutMs: 50 });
+
+        // Operation C waits behind B
+        const promiseC = adapter.processNotification(sigC, tracker);
+
+        expect(adapter.getInFlightCount()).toBe(3);
+
+        // Operation B must expire promptly at its 50 ms deadline while A is STILL waiting!
+        const resB = await promiseB;
+        expect(resB.ok).toBe(false);
+        expect(resB.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+        expect(resB.diagnostics.httpAttempts).toBe(0);
+        expect(resB.diagnostics.durationMs).toBeLessThan(1000); // Exited at ~50 ms, NOT 5000 ms
+
+        // B released its workload bookkeeping immediately
+        expect(adapter.getInFlightCount()).toBe(2);
+
+        // Neither B nor C dispatched while A is unresolved
+        expect(transportCalls).toBe(1);
+
+        // Release predecessor A
+        releaseASleep();
+
+        const [resA, resC] = await Promise.all([promiseA, promiseC]);
+        expect(resA.ok).toBe(true);
+        expect(resC.ok).toBe(true);
+        expect(transportCalls).toBe(3);
+
+        expect(adapter.getInFlightCount()).toBe(0);
+      });
     });
 
     // Finding 3: Bounded Pending Gaps & Ingested Events Count

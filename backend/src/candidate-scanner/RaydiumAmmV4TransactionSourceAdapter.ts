@@ -477,35 +477,51 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
   /**
    * Waits for the previous dispatch turn to release admission.
-   * Raced against caller abort signal.
+   * Raced against remaining overall deadline and caller abort signal.
    */
   private async waitForTurn(
     prevAdmission: Promise<void>,
+    remainingMs: number,
     signal?: AbortSignal | null | undefined,
   ): Promise<void> {
     if (signal?.aborted) {
       throw new PreDispatchError("ABORTED: Request was cancelled before dispatch admission");
     }
-    if (!signal) {
-      await prevAdmission;
-      return;
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+      throw new PreDispatchError(
+        "DEADLINE_EXCEEDED: Overall deadline exceeded before dispatch admission",
+      );
     }
 
     let abortListener: (() => void) | undefined;
+    let timer: NodeJS.Timeout | undefined;
+
     try {
       await Promise.race([
         prevAdmission,
-        new Promise<void>((_, reject) => {
-          abortListener = () => {
+        new Promise<never>((_, reject) => {
+          if (signal) {
+            abortListener = () => {
+              reject(
+                new PreDispatchError("ABORTED: Request was cancelled before dispatch admission"),
+              );
+            };
+            signal.addEventListener("abort", abortListener, { once: true });
+          }
+          timer = setTimeout(() => {
             reject(
-              new PreDispatchError("ABORTED: Request was cancelled before dispatch admission"),
+              new PreDispatchError(
+                `DEADLINE_EXCEEDED: Overall deadline exceeded before dispatch admission (limit ${remainingMs}ms)`,
+              ),
             );
-          };
-          signal.addEventListener("abort", abortListener, { once: true });
+          }, remainingMs);
         }),
       ]);
     } finally {
-      if (abortListener) {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      if (abortListener && signal) {
         signal.removeEventListener("abort", abortListener);
       }
     }
@@ -1103,16 +1119,21 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             );
           }
 
-          await this.waitForTurn(prevAdmission, options?.signal);
+          await this.waitForTurn(prevAdmission, waitBudgetMs, options?.signal);
         } catch (err) {
-          releaseAdmission();
-          if (this.dispatchChainByProvider.get(this.providerName) === currentAdmission) {
-            this.dispatchChainByProvider.delete(this.providerName);
-          }
+          // Preserve predecessor ordering: downstream successors must wait until prevAdmission completes!
+          void prevAdmission.finally(() => {
+            releaseAdmission();
+            if (this.dispatchChainByProvider.get(this.providerName) === currentAdmission) {
+              this.dispatchChainByProvider.delete(this.providerName);
+            }
+          });
+
           this.totalFailures++;
-          const reason = options?.signal?.aborted
-            ? "PACING_WAIT_CANCELLED"
-            : "PRE_DISPATCH_DEADLINE_EXCEEDED";
+          const isAbort =
+            Boolean(options?.signal?.aborted) ||
+            (err instanceof PreDispatchError && err.message.includes("ABORTED"));
+          const reason = isAbort ? "PACING_WAIT_CANCELLED" : "PRE_DISPATCH_DEADLINE_EXCEEDED";
           this.recordLossGap(notification, reason, tracker);
           return {
             ok: false,
