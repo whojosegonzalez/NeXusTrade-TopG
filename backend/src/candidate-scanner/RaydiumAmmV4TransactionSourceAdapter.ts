@@ -34,6 +34,7 @@
  *    - Endpoint credentials, API keys, and sensitive tokens are redacted to [REDACTED] in all error messages.
  */
 
+import { createHash } from "node:crypto";
 import {
   type TrackedRaydiumPoolContext,
   validateTrackedPoolContext,
@@ -96,6 +97,10 @@ export interface TransactionSourceDiagnostics {
   readonly decodedEventsCount: number;
   readonly ingestedCount: number;
   readonly error?: string | undefined;
+  readonly endpointUrl?: string | undefined;
+  readonly requestSentAtMs?: number | undefined;
+  readonly responseReceivedAtMs?: number | undefined;
+  readonly responseSha256?: string | undefined;
 }
 
 export interface ProcessNotificationResult {
@@ -169,6 +174,9 @@ export interface RaydiumAmmV4TransactionSourceAdapterOptions {
 
   /** Max supported transaction version for RPC. Default: 0. */
   readonly maxSupportedTransactionVersion?: number | undefined;
+
+  /** Optional associated RollingTradeFlowTracker for immediate backlog propagation and gap flushing. */
+  readonly tracker?: RollingTradeFlowTracker | undefined;
 
   /** Monotonic clock function. Default: Date.now. */
   readonly clock?: (() => number) | undefined;
@@ -316,6 +324,12 @@ export class RaydiumAmmV4TransactionSourceAdapter {
   private readonly completedSignatures = new Set<string>(); // Historical completions (bounded FIFO cache)
   private inFlightCount = 0;
 
+  // Associated tracker for immediate backlog reporting and loss flushing
+  private associatedTracker?: RollingTradeFlowTracker | undefined;
+
+  // Provider dispatch chain for safe concurrent admission
+  private readonly dispatchChainByProvider = new Map<string, Promise<void>>();
+
   // Unprocessed gap buffer for losses occurring before or between tracker intake
   private readonly pendingGaps: StreamGap[] = [];
 
@@ -429,6 +443,72 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     this.clock = options.clock ?? (() => Date.now());
     this.sleepFn =
       options.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+    if (options.tracker) {
+      this.associatedTracker = options.tracker;
+      this.flushPendingGaps(this.associatedTracker);
+      this.updateTrackerBacklog();
+    }
+  }
+
+  /**
+   * Associates a RollingTradeFlowTracker with this adapter.
+   * Immediately flushes any buffered loss gaps and synchronizes backlog status.
+   */
+  public associateTracker(tracker: RollingTradeFlowTracker): void {
+    this.associatedTracker = tracker;
+    this.flushPendingGaps(tracker);
+    this.updateTrackerBacklog();
+  }
+
+  public getAssociatedTracker(): RollingTradeFlowTracker | undefined {
+    return this.associatedTracker;
+  }
+
+  /**
+   * Synchronizes active stream processing backlog state with the associated tracker.
+   * Backlog is true if any queued notifications or in-flight requests remain unresolved.
+   */
+  private updateTrackerBacklog(): void {
+    if (this.associatedTracker) {
+      this.associatedTracker.recordProcessingBacklog(this.getActiveWorkload() > 0);
+    }
+  }
+
+  /**
+   * Waits for the previous dispatch turn to release admission.
+   * Raced against caller abort signal.
+   */
+  private async waitForTurn(
+    prevAdmission: Promise<void>,
+    signal?: AbortSignal | null | undefined,
+  ): Promise<void> {
+    if (signal?.aborted) {
+      throw new PreDispatchError("ABORTED: Request was cancelled before dispatch admission");
+    }
+    if (!signal) {
+      await prevAdmission;
+      return;
+    }
+
+    let abortListener: (() => void) | undefined;
+    try {
+      await Promise.race([
+        prevAdmission,
+        new Promise<void>((_, reject) => {
+          abortListener = () => {
+            reject(
+              new PreDispatchError("ABORTED: Request was cancelled before dispatch admission"),
+            );
+          };
+          signal.addEventListener("abort", abortListener, { once: true });
+        }),
+      ]);
+    } finally {
+      if (abortListener) {
+        signal.removeEventListener("abort", abortListener);
+      }
+    }
   }
 
   public getPoolContext(): TrackedRaydiumPoolContext {
@@ -525,6 +605,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     reason: string,
     tracker?: RollingTradeFlowTracker | undefined,
   ): void {
+    const targetTracker = tracker ?? this.associatedTracker;
     const now = this.clock();
     const candidateTime =
       notification.receivedAtMs ??
@@ -552,11 +633,82 @@ export class RaydiumAmmV4TransactionSourceAdapter {
       reason: `SOURCE_ADAPTER_LOSS:${reason}`,
     });
 
-    if (tracker) {
-      tracker.recordCollectionGap(gap);
+    if (targetTracker) {
+      targetTracker.recordCollectionGap(gap);
     } else {
-      this.pendingGaps.push(gap);
+      this.insertAndBoundPendingGap(gap);
     }
+  }
+
+  /**
+   * Bounds and coalesces pending gaps during queue buffering.
+   * Enforces maxPendingQueueSize ceiling by merging closest adjacent pairs [min(start), max(end)],
+   * preserving full loss window uncertainty fail-closed.
+   */
+  private insertAndBoundPendingGap(gap: StreamGap): void {
+    if (
+      gap.gapStartMs >= gap.gapEndMs ||
+      gap.gapStartMs <= 0 ||
+      !Number.isFinite(gap.gapStartMs) ||
+      !Number.isFinite(gap.gapEndMs)
+    ) {
+      return;
+    }
+
+    this.pendingGaps.push(gap);
+    this.pendingGaps.sort((a, b) => a.gapStartMs - b.gapStartMs || a.gapEndMs - b.gapEndMs);
+    this.coalescePendingGaps();
+
+    while (this.pendingGaps.length > this.maxPendingQueueSize) {
+      let minDistance = Infinity;
+      let bestMergeIndex = 0;
+
+      for (let i = 0; i < this.pendingGaps.length - 1; i++) {
+        const dist = this.pendingGaps[i + 1]!.gapStartMs - this.pendingGaps[i]!.gapEndMs;
+        if (dist < minDistance) {
+          minDistance = dist;
+          bestMergeIndex = i;
+        }
+      }
+
+      const g1 = this.pendingGaps[bestMergeIndex]!;
+      const g2 = this.pendingGaps[bestMergeIndex + 1]!;
+      const mergedReason = `${g1.reason ?? ""};${g2.reason ?? ""}`.slice(0, 256);
+
+      const mergedGap: StreamGap = Object.freeze({
+        gapStartMs: Math.min(g1.gapStartMs, g2.gapStartMs),
+        gapEndMs: Math.max(g1.gapEndMs, g2.gapEndMs),
+        reason: mergedReason,
+      });
+
+      this.pendingGaps.splice(bestMergeIndex, 2, mergedGap);
+    }
+  }
+
+  private coalescePendingGaps(): void {
+    if (this.pendingGaps.length <= 1) return;
+
+    const merged: StreamGap[] = [];
+    let current = this.pendingGaps[0]!;
+
+    for (let i = 1; i < this.pendingGaps.length; i++) {
+      const next = this.pendingGaps[i]!;
+      if (current.gapEndMs >= next.gapStartMs) {
+        const mergedReason = `${current.reason ?? ""};${next.reason ?? ""}`.slice(0, 256);
+        current = Object.freeze({
+          gapStartMs: Math.min(current.gapStartMs, next.gapStartMs),
+          gapEndMs: Math.max(current.gapEndMs, next.gapEndMs),
+          reason: mergedReason,
+        });
+      } else {
+        merged.push(current);
+        current = next;
+      }
+    }
+    merged.push(current);
+
+    this.pendingGaps.length = 0;
+    this.pendingGaps.push(...merged);
   }
 
   /**
@@ -573,7 +725,14 @@ export class RaydiumAmmV4TransactionSourceAdapter {
    * Enqueues an injected transaction notification into the bounded pending queue.
    * Snapshots and validates notification before queueing; protects active keys and bounds workload.
    */
-  public enqueueNotification(notification: unknown): EnqueueNotificationResult {
+  public enqueueNotification(
+    notification: unknown,
+    tracker?: RollingTradeFlowTracker | undefined,
+  ): EnqueueNotificationResult {
+    if (tracker) {
+      this.associateTracker(tracker);
+    }
+
     const validated = validateAndSnapshotNotification(notification);
     if (!validated.ok) {
       return {
@@ -610,6 +769,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     this.activeSignatures.add(snapshot.signature);
     this.pendingQueue.push(snapshot);
     this.totalEnqueued++;
+    this.updateTrackerBacklog();
 
     return {
       ok: true,
@@ -624,10 +784,19 @@ export class RaydiumAmmV4TransactionSourceAdapter {
    */
   public async processNotification(
     notification: unknown,
-    tracker: RollingTradeFlowTracker,
+    tracker?: RollingTradeFlowTracker | undefined,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult> {
-    this.flushPendingGaps(tracker);
+    if (tracker) {
+      this.associateTracker(tracker);
+    }
+    const targetTracker = tracker ?? this.associatedTracker;
+    if (!targetTracker) {
+      throw new Error(
+        "RollingTradeFlowTracker must be provided to processNotification or associated with adapter",
+      );
+    }
+    this.flushPendingGaps(targetTracker);
 
     const validated = validateAndSnapshotNotification(notification);
     if (!validated.ok) {
@@ -643,6 +812,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           outcome: "INVALID_NOTIFICATION",
           decodedEventsCount: 0,
           ingestedCount: 0,
+          endpointUrl: this.sanitizedRpcUrl,
           error: "Signature must be a valid non-empty Base58 Solana signature string",
         },
       };
@@ -664,6 +834,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           outcome: "DUPLICATE_NOTIFICATION",
           decodedEventsCount: 0,
           ingestedCount: 0,
+          endpointUrl: this.sanitizedRpcUrl,
           error: `Transaction ${snapshot.signature} is already queued, in flight, or recorded in deduplication cache`,
         },
       };
@@ -671,7 +842,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
     if (this.getActiveWorkload() >= this.maxPendingQueueSize) {
       this.totalQueueOverflows++;
-      this.recordLossGap(snapshot, "QUEUE_OVERFLOW", tracker);
+      this.recordLossGap(snapshot, "QUEUE_OVERFLOW", targetTracker);
       return {
         ok: false,
         signature: snapshot.signature,
@@ -684,28 +855,38 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           outcome: "QUEUE_OVERFLOW",
           decodedEventsCount: 0,
           ingestedCount: 0,
+          endpointUrl: this.sanitizedRpcUrl,
           error: `Active workload limit (${this.maxPendingQueueSize}) exceeded; notification rejected`,
         },
       };
     }
 
     this.activeSignatures.add(snapshot.signature);
-    return this.processNotificationInternal(snapshot, tracker, options);
+    return this.processNotificationInternal(snapshot, targetTracker, options);
   }
 
   /**
    * Pops and processes the next pending notification from the queue.
    */
   public async processNextPending(
-    tracker: RollingTradeFlowTracker,
+    tracker?: RollingTradeFlowTracker | undefined,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult | null> {
-    this.flushPendingGaps(tracker);
+    if (tracker) {
+      this.associateTracker(tracker);
+    }
+    const targetTracker = tracker ?? this.associatedTracker;
+    if (!targetTracker) {
+      throw new Error(
+        "RollingTradeFlowTracker must be provided to processNextPending or associated with adapter",
+      );
+    }
+    this.flushPendingGaps(targetTracker);
     if (this.pendingQueue.length === 0) {
       return null;
     }
     const notification = this.pendingQueue.shift()!;
-    return this.processNotificationInternal(notification, tracker, options);
+    return this.processNotificationInternal(notification, targetTracker, options);
   }
 
   /**
@@ -713,10 +894,19 @@ export class RaydiumAmmV4TransactionSourceAdapter {
    * Accurately updates tracker backlog status; queue draining alone does not erase gaps.
    */
   public async processAllPending(
-    tracker: RollingTradeFlowTracker,
+    tracker?: RollingTradeFlowTracker | undefined,
     options?: ProcessTransactionOptions,
   ): Promise<ProcessBatchResult> {
-    this.flushPendingGaps(tracker);
+    if (tracker) {
+      this.associateTracker(tracker);
+    }
+    const targetTracker = tracker ?? this.associatedTracker;
+    if (!targetTracker) {
+      throw new Error(
+        "RollingTradeFlowTracker must be provided to processAllPending or associated with adapter",
+      );
+    }
+    this.flushPendingGaps(targetTracker);
     const startEpoch = this.clock();
 
     // Validate overallTimeoutMs override if passed
@@ -747,10 +937,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     let totalIngestedEvents = 0;
     const results: ProcessNotificationResult[] = [];
 
-    // Mark active backlog in tracker while queue is non-empty
-    if (this.pendingQueue.length > 0) {
-      tracker.recordProcessingBacklog(true);
-    }
+    this.updateTrackerBacklog();
 
     try {
       while (this.pendingQueue.length > 0) {
@@ -759,7 +946,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           break;
         }
 
-        const res = await this.processNextPending(tracker, {
+        const res = await this.processNextPending(targetTracker, {
           overallTimeoutMs: remainingOverall,
           signal: options?.signal,
         });
@@ -770,9 +957,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
         totalProcessed++;
         results.push(res);
+        totalIngestedEvents += res.ingestedEventsCount; // Accumulated even when res.ok === false
         if (res.ok) {
           totalSucceeded++;
-          totalIngestedEvents += res.ingestedEventsCount;
         } else {
           totalFailed++;
           if (
@@ -784,10 +971,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
         }
       }
     } finally {
-      // Clear backlog only if active workload is completely clear
-      if (this.getActiveWorkload() === 0) {
-        tracker.recordProcessingBacklog(false);
-      }
+      this.updateTrackerBacklog();
     }
 
     return {
@@ -808,6 +992,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     options?: ProcessTransactionOptions,
   ): Promise<ProcessNotificationResult> {
     this.inFlightCount++;
+    this.updateTrackerBacklog();
     const startEpoch = this.clock();
     const signature = notification.signature;
 
@@ -837,6 +1022,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
               decodedEventsCount: 0,
               ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
               error: this.sanitizeErrorMessage(
                 `Invalid per-operation overallTimeoutMs override: ${String(options.overallTimeoutMs)}`,
               ),
@@ -858,6 +1044,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
               decodedEventsCount: 0,
               ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
               error: this.sanitizeErrorMessage(
                 `Per-operation overallTimeoutMs override (${options.overallTimeoutMs}ms) exceeds configured adapter ceiling (${this.overallTimeoutMs}ms)`,
               ),
@@ -889,58 +1076,44 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
             error: "Overall deadline exceeded before dispatch",
           },
         };
       }
 
-      // 1. Effective Provider Pacing & Pre-dispatch Budget Check
-      const lastDispatch = this.lastDispatchTimeByProvider.get(this.providerName) ?? 0;
-      const elapsedSinceLastDispatch = this.clock() - lastDispatch;
-      const adapterWaitMs = Math.max(0, this.pacingMs - elapsedSinceLastDispatch);
+      // 1. Safe Dispatch Admission Under Concurrency
+      const prevAdmission = this.dispatchChainByProvider.get(this.providerName);
 
-      let budgetCheck = this.budgetManager.canMakeRequest(
-        this.providerName,
-        this.clock(),
-        this.requestPurpose,
-      );
+      let releaseAdmission!: () => void;
+      const currentAdmission = new Promise<void>((resolve) => {
+        releaseAdmission = resolve;
+      });
+      this.dispatchChainByProvider.set(this.providerName, currentAdmission);
 
-      const budgetWaitMs =
-        !budgetCheck.allowed &&
-        budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
-        typeof budgetCheck.waitMs === "number" &&
-        budgetCheck.waitMs > 0
-          ? budgetCheck.waitMs
-          : 0;
-
-      const effectivePacingWaitMs = Math.max(adapterWaitMs, budgetWaitMs);
-
-      if (effectivePacingWaitMs > 0) {
-        if (effectivePacingWaitMs >= remainingBudget) {
-          this.totalFailures++;
-          this.recordLossGap(notification, "PACING_WAIT_EXCEEDS_DEADLINE", tracker);
-          return {
-            ok: false,
-            signature,
-            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-            ingestedEventsCount: 0,
-            diagnostics: {
-              signature,
-              httpAttempts: 0,
-              durationMs: this.clock() - startEpoch,
-              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-              decodedEventsCount: 0,
-              ingestedCount: 0,
-              error: `Pacing wait of ${effectivePacingWaitMs}ms would exceed remaining deadline (${remainingBudget}ms)`,
-            },
-          };
-        }
-
+      if (prevAdmission) {
         try {
-          await sleepWithSignal(effectivePacingWaitMs, this.sleepFn, options?.signal);
+          if (options?.signal?.aborted) {
+            throw new PreDispatchError("ABORTED: Request was cancelled before dispatch admission");
+          }
+          const waitBudgetMs = getRemainingEffectiveBudgetMs();
+          if (waitBudgetMs <= 0) {
+            throw new PreDispatchError(
+              "DEADLINE_EXCEEDED: Overall deadline exceeded before dispatch admission",
+            );
+          }
+
+          await this.waitForTurn(prevAdmission, options?.signal);
         } catch (err) {
+          releaseAdmission();
+          if (this.dispatchChainByProvider.get(this.providerName) === currentAdmission) {
+            this.dispatchChainByProvider.delete(this.providerName);
+          }
           this.totalFailures++;
-          this.recordLossGap(notification, "PACING_WAIT_CANCELLED", tracker);
+          const reason = options?.signal?.aborted
+            ? "PACING_WAIT_CANCELLED"
+            : "PRE_DISPATCH_DEADLINE_EXCEEDED";
+          this.recordLossGap(notification, reason, tracker);
           return {
             ok: false,
             signature,
@@ -953,13 +1126,15 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
               decodedEventsCount: 0,
               ingestedCount: 0,
-              error: this.sanitizeErrorMessage(
-                `Pacing wait cancelled: ${err instanceof Error ? err.message : String(err)}`,
-              ),
+              endpointUrl: this.sanitizedRpcUrl,
+              error: this.sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
             },
           };
         }
+      }
 
+      // Admitted to dispatch pacing: calculate wait and record attempt exclusively
+      try {
         remainingBudget = getRemainingEffectiveBudgetMs();
         if (remainingBudget <= 0) {
           this.totalFailures++;
@@ -976,85 +1151,188 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
               decodedEventsCount: 0,
               ingestedCount: 0,
-              error: "Overall deadline exceeded during shared pacing wait",
+              endpointUrl: this.sanitizedRpcUrl,
+              error: "Overall deadline exceeded before dispatch",
             },
           };
         }
 
-        budgetCheck = this.budgetManager.canMakeRequest(
+        const lastDispatch = this.lastDispatchTimeByProvider.get(this.providerName) ?? 0;
+        const elapsedSinceLastDispatch = this.clock() - lastDispatch;
+        const adapterWaitMs = Math.max(0, this.pacingMs - elapsedSinceLastDispatch);
+
+        let budgetCheck = this.budgetManager.canMakeRequest(
           this.providerName,
           this.clock(),
           this.requestPurpose,
         );
-      }
 
-      if (!budgetCheck.allowed) {
-        this.totalFailures++;
-        this.recordLossGap(notification, budgetCheck.reason ?? "BUDGET_DENIED", tracker);
-        return {
-          ok: false,
-          signature,
-          outcome: "PRE_DISPATCH_BUDGET_DENIED",
-          ingestedEventsCount: 0,
-          diagnostics: {
+        const budgetWaitMs =
+          !budgetCheck.allowed &&
+          budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+          typeof budgetCheck.waitMs === "number" &&
+          budgetCheck.waitMs > 0
+            ? budgetCheck.waitMs
+            : 0;
+
+        const effectivePacingWaitMs = Math.max(adapterWaitMs, budgetWaitMs);
+
+        if (effectivePacingWaitMs > 0) {
+          if (effectivePacingWaitMs >= remainingBudget) {
+            this.totalFailures++;
+            this.recordLossGap(notification, "PACING_WAIT_EXCEEDS_DEADLINE", tracker);
+            return {
+              ok: false,
+              signature,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              ingestedEventsCount: 0,
+              diagnostics: {
+                signature,
+                httpAttempts: 0,
+                durationMs: this.clock() - startEpoch,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                decodedEventsCount: 0,
+                ingestedCount: 0,
+                endpointUrl: this.sanitizedRpcUrl,
+                error: `Pacing wait of ${effectivePacingWaitMs}ms would exceed remaining deadline (${remainingBudget}ms)`,
+              },
+            };
+          }
+
+          try {
+            await sleepWithSignal(effectivePacingWaitMs, this.sleepFn, options?.signal);
+          } catch (err) {
+            this.totalFailures++;
+            this.recordLossGap(notification, "PACING_WAIT_CANCELLED", tracker);
+            return {
+              ok: false,
+              signature,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              ingestedEventsCount: 0,
+              diagnostics: {
+                signature,
+                httpAttempts: 0,
+                durationMs: this.clock() - startEpoch,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                decodedEventsCount: 0,
+                ingestedCount: 0,
+                endpointUrl: this.sanitizedRpcUrl,
+                error: this.sanitizeErrorMessage(
+                  `Pacing wait cancelled: ${err instanceof Error ? err.message : String(err)}`,
+                ),
+              },
+            };
+          }
+
+          remainingBudget = getRemainingEffectiveBudgetMs();
+          if (remainingBudget <= 0) {
+            this.totalFailures++;
+            this.recordLossGap(notification, "PRE_DISPATCH_DEADLINE_EXCEEDED", tracker);
+            return {
+              ok: false,
+              signature,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              ingestedEventsCount: 0,
+              diagnostics: {
+                signature,
+                httpAttempts: 0,
+                durationMs: this.clock() - startEpoch,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                decodedEventsCount: 0,
+                ingestedCount: 0,
+                endpointUrl: this.sanitizedRpcUrl,
+                error: "Overall deadline exceeded during shared pacing wait",
+              },
+            };
+          }
+
+          budgetCheck = this.budgetManager.canMakeRequest(
+            this.providerName,
+            this.clock(),
+            this.requestPurpose,
+          );
+        }
+
+        if (!budgetCheck.allowed) {
+          this.totalFailures++;
+          this.recordLossGap(notification, budgetCheck.reason ?? "BUDGET_DENIED", tracker);
+          return {
+            ok: false,
             signature,
-            httpAttempts: 0,
-            durationMs: this.clock() - startEpoch,
             outcome: "PRE_DISPATCH_BUDGET_DENIED",
-            decodedEventsCount: 0,
-            ingestedCount: 0,
-            error: this.sanitizeErrorMessage(
-              `Budget denied before dispatch: ${budgetCheck.reason ?? "Ceiling reached"}`,
-            ),
-          },
-        };
-      }
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_BUDGET_DENIED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              error: this.sanitizeErrorMessage(
+                `Budget denied before dispatch: ${budgetCheck.reason ?? "Ceiling reached"}`,
+              ),
+            },
+          };
+        }
 
-      if (options?.signal?.aborted) {
-        this.totalFailures++;
-        this.recordLossGap(notification, "CALLER_ABORTED_BEFORE_DISPATCH", tracker);
-        return {
-          ok: false,
-          signature,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-          ingestedEventsCount: 0,
-          diagnostics: {
+        if (options?.signal?.aborted) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "CALLER_ABORTED_BEFORE_DISPATCH", tracker);
+          return {
+            ok: false,
             signature,
-            httpAttempts: 0,
-            durationMs: this.clock() - startEpoch,
             outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
-            decodedEventsCount: 0,
-            ingestedCount: 0,
-            error: "Request cancelled by caller before dispatch",
-          },
-        };
-      }
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              error: "Request cancelled by caller before dispatch",
+            },
+          };
+        }
 
-      // 2. Record Attempt in Shared Session Budget
-      const recorded = this.budgetManager.recordRequestAttempt(
-        this.providerName,
-        this.requestPurpose,
-        this.clock(),
-      );
+        // Record attempt in shared session budget
+        const recorded = this.budgetManager.recordRequestAttempt(
+          this.providerName,
+          this.requestPurpose,
+          this.clock(),
+        );
 
-      if (!recorded) {
-        this.totalFailures++;
-        this.recordLossGap(notification, "BUDGET_RECORD_ATTEMPT_DENIED", tracker);
-        return {
-          ok: false,
-          signature,
-          outcome: "PRE_DISPATCH_BUDGET_DENIED",
-          ingestedEventsCount: 0,
-          diagnostics: {
+        if (!recorded) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "BUDGET_RECORD_ATTEMPT_DENIED", tracker);
+          return {
+            ok: false,
             signature,
-            httpAttempts: 0,
-            durationMs: this.clock() - startEpoch,
             outcome: "PRE_DISPATCH_BUDGET_DENIED",
-            decodedEventsCount: 0,
-            ingestedCount: 0,
-            error: "Failed to record request attempt in shared session budget",
-          },
-        };
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_BUDGET_DENIED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              error: "Failed to record request attempt in shared session budget",
+            },
+          };
+        }
+
+        // Mark dispatch time
+        this.lastDispatchTimeByProvider.set(this.providerName, this.clock());
+      } finally {
+        // Release admission for next request in chain
+        releaseAdmission();
+        if (this.dispatchChainByProvider.get(this.providerName) === currentAdmission) {
+          this.dispatchChainByProvider.delete(this.providerName);
+        }
       }
 
       // 3. Dispatch HTTP getTransaction with Combined Timeout Controller
@@ -1077,6 +1355,8 @@ export class RaydiumAmmV4TransactionSourceAdapter {
       this.totalDispatchedAttempts++;
       let httpStatus: number | undefined;
       let bodyText = "";
+      let requestSentAtMs: number | undefined;
+      let responseReceivedAtMs: number | undefined;
 
       try {
         const rpcPayload = {
@@ -1093,7 +1373,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           ],
         };
 
-        this.lastDispatchTimeByProvider.set(this.providerName, this.clock());
+        requestSentAtMs = this.clock();
 
         const response = await this.underlyingTransport(this.rpcUrl, {
           method: "POST",
@@ -1108,10 +1388,14 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
         if (!response.ok) {
           try {
-            await response.text();
+            bodyText = await response.text();
           } catch {
             // ignore error reading error body
           }
+          responseReceivedAtMs = this.clock();
+          const responseSha256 =
+            bodyText.length > 0 ? createHash("sha256").update(bodyText).digest("hex") : undefined;
+
           this.totalFailures++;
           this.recordLossGap(notification, `HTTP_ERROR_${response.status}`, tracker);
           return {
@@ -1127,6 +1411,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "HTTP_ERROR",
               decodedEventsCount: 0,
               ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              requestSentAtMs,
+              responseReceivedAtMs,
+              responseSha256,
               error: this.sanitizeErrorMessage(
                 `HTTP error ${response.status}: ${response.statusText}`,
               ),
@@ -1136,6 +1424,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
         // Keep timeout protection active through complete response body reading
         bodyText = await response.text();
+        responseReceivedAtMs = this.clock();
       } catch (err) {
         this.totalFailures++;
         const isAbortOrTimeout =
@@ -1164,6 +1453,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome,
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs: responseReceivedAtMs ?? this.clock(),
+            responseSha256: undefined,
             error: errorMsg,
           },
         };
@@ -1173,6 +1466,8 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           options.signal.removeEventListener("abort", abortListener);
         }
       }
+
+      const responseSha256 = createHash("sha256").update(bodyText).digest("hex");
 
       // Recheck overall deadline immediately before tracker ingestion
       if (
@@ -1195,6 +1490,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "REQUEST_TIMEOUT",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: `Deadline exceeded before tracker ingestion: elapsed ${this.clock() - startEpoch}ms >= limit ${effectiveTimeoutMs}ms`,
           },
         };
@@ -1220,6 +1519,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "MALFORMED_RESPONSE",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(
               `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
             ),
@@ -1243,6 +1546,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "MALFORMED_RESPONSE",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: "RPC response must be a non-null object",
           },
         };
@@ -1250,7 +1557,110 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
       const rpcObj = rpcResponse as Record<string, unknown>;
 
-      if (rpcObj.error !== undefined && rpcObj.error !== null) {
+      if (rpcObj.jsonrpc !== "2.0") {
+        this.totalFailures++;
+        this.recordLossGap(notification, "INVALID_JSONRPC_VERSION", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
+            error: `Invalid JSON-RPC version: expected '2.0', received '${String(rpcObj.jsonrpc)}'`,
+          },
+        };
+      }
+
+      if (rpcObj.id !== 1) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "RPC_ID_MISMATCH", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
+            error: `RPC response id mismatch: expected 1, received ${String(rpcObj.id)}`,
+          },
+        };
+      }
+
+      const hasResult = "result" in rpcObj && rpcObj.result !== undefined;
+      const hasError = "error" in rpcObj && rpcObj.error !== undefined && rpcObj.error !== null;
+
+      if (hasResult && hasError) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "CONTRADICTORY_RPC_ENVELOPE", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
+            error: "Contradictory JSON-RPC envelope: contains both 'result' and 'error'",
+          },
+        };
+      }
+
+      if (!hasResult && !hasError) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "MISSING_RESULT_AND_ERROR", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "MALFORMED_RESPONSE",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "MALFORMED_RESPONSE",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
+            error: "Malformed JSON-RPC envelope: contains neither 'result' nor 'error'",
+          },
+        };
+      }
+
+      if (hasError) {
         this.totalFailures++;
         this.recordLossGap(notification, "RPC_ERROR_RETURNED", tracker);
         return {
@@ -1266,12 +1676,16 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "RPC_ERROR",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(`RPC returned error: ${JSON.stringify(rpcObj.error)}`),
           },
         };
       }
 
-      if (rpcObj.result === null || rpcObj.result === undefined) {
+      if (rpcObj.result === null) {
         this.totalFailures++;
         this.recordLossGap(notification, "TRANSACTION_NOT_FOUND", tracker);
         return {
@@ -1287,6 +1701,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "TRANSACTION_NOT_FOUND",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: `Transaction ${signature} not found on-chain (result: null)`,
           },
         };
@@ -1313,6 +1731,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "RESPONSE_SIGNATURE_MISMATCH",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(
               `RPC returned signature mismatch: requested '${signature}', received '${String(primaryReturnedSig)}'`,
             ),
@@ -1339,6 +1761,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "CONTRADICTORY_METADATA",
               decodedEventsCount: 0,
               ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              requestSentAtMs,
+              responseReceivedAtMs,
+              responseSha256,
               error: this.sanitizeErrorMessage(
                 `Slot contradiction: notification specified slot ${notification.slot}, but response contains slot ${payloadSlot}`,
               ),
@@ -1366,6 +1792,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               outcome: "CONTRADICTORY_METADATA",
               decodedEventsCount: 0,
               ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              requestSentAtMs,
+              responseReceivedAtMs,
+              responseSha256,
               error: this.sanitizeErrorMessage(
                 `BlockTime contradiction: notification specified blockTime ${notification.blockTime}, but response contains blockTime ${payloadBlockTime}`,
               ),
@@ -1407,6 +1837,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "DECODE_FAILED",
             decodedEventsCount: 0,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(
               `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}`,
             ),
@@ -1434,6 +1868,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "INGEST_FAILED",
             decodedEventsCount,
             ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(
               `Tracker ingestion failed [${firstFailure.reason}]: ${firstFailure.message}`,
             ),
@@ -1459,6 +1897,10 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             outcome: "PARTIAL_INGEST_FAILED",
             decodedEventsCount,
             ingestedCount,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
             error: this.sanitizeErrorMessage(
               `Partial tracker ingestion failure: ${ingestedCount}/${decodedEventsCount} swaps ingested; failed [${firstFailure.reason}]: ${firstFailure.message}`,
             ),
@@ -1480,12 +1922,17 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           outcome: "SUCCESS",
           decodedEventsCount,
           ingestedCount,
+          endpointUrl: this.sanitizedRpcUrl,
+          requestSentAtMs,
+          responseReceivedAtMs,
+          responseSha256,
         },
       };
     } finally {
       this.inFlightCount--;
       this.activeSignatures.delete(signature);
       this.recordCompletedSignature(signature);
+      this.updateTrackerBacklog();
     }
   }
 }

@@ -446,8 +446,8 @@ The approved offline implementation items are completed:
       6. _Sanitized Diagnostics_:
          - Redacts endpoint API keys, secret URL paths, and query credentials to `[REDACTED]` across all diagnostics and error messages.
     - **Fail-Closed Coverage Guarantee**: Successful retrieval, an empty queue, or notification receipt alone NEVER establishes complete 60-second window coverage. Ingesting transactions strictly populates trade events and never fabricates stream checkpoints or advances window coverage (`status` remains non-`SUFFICIENT` without explicit observation checkpoints).
-    - **Honest Throughput Disclosure**: Under $\ge 2,500\text{ ms}$ spacing, a single RPC provider sustains $\le 24\text{ requests/min}$. High-frequency candidate pools cannot achieve complete coverage via `getTransaction` without high-throughput RPC tiers or zero-RPC log parsing.
-    - 28 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts).
+    - **Honest Throughput Disclosure**: Under $\ge 2,500\text{ ms}$ spacing, a single RPC provider sustains $\le 24\text{ transaction retrievals/min}$. Because multiple candidate swaps can occur within a single transaction, request capacity is measured in transaction retrievals, not individual trades. High-frequency pools with transaction arrival rates exceeding this ceiling cannot maintain complete coverage via paced `getTransaction` retrievals, as processing backlogs or queue drops will trigger `PROCESSING_BACKLOG` or `COLLECTION_GAP`. Paid providers, relaxed pacing, and unverified log-only parsing are not approved solutions.
+    - 40 comprehensive unit tests passing in [`backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.test.ts).
 11. **Larger Changes Quarantined**:
 
 - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
@@ -480,10 +480,13 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
      - Therefore, full transaction retrieval via `getTransaction` remains the only verified acquisition path for Raydium AMM v4 swap decoding.
    - **Request-Budget & Achievable Coverage under Existing Budget**:
      - The existing `GlobalResourceBudgetManager` enforces a shared provider pacing of $\ge 2,500\text{ ms}$ between RPC calls to the same host, alongside strict session request ceilings (25-50 requests).
-     - At $2,500\text{ ms}$ pacing, a single RPC endpoint can fetch at most 24 transactions per minute.
-     - _Throughput & Coverage Conditioning_: Live throughput estimates and complete 60-second coverage are strictly conditional on shared node traffic, overall block transaction volume, RPC retrieval success/error rates, and upstream source completeness. A low candidate swap rate alone does not guarantee coverage: if the pool is situated in dense blocks, or if network jitter/node rate-limiting occurs, retrieval failures or queue drops will trigger `COLLECTION_GAP`.
-     - Consequently, active candidate pools experiencing $> 24\text{ trades/minute}$ cannot achieve complete 60-second coverage via `getTransaction` without inducing severe processing backlogs and quickly exhausting session request ceilings (e.g., a 50-request budget exhausted in 2 minutes).
-     - Under existing constraints, complete coverage via `getTransaction` is achievable only for low-activity pools ($\le 10\text{ trades/min}$), or requires a dedicated high-throughput RPC tier without pacing limits.
+     - At $2,500\text{ ms}$ pacing, a single RPC endpoint can fetch at most 24 transactions per minute. Request capacity is strictly measured in transaction retrievals, not individual candidate swaps, since multiple swaps can occur within a single transaction.
+     - _Throughput & Coverage Conditioning_: A low candidate trade rate (such as $\le 10\text{ trades/minute}$) does NOT independently guarantee complete 60-second coverage. Complete coverage is strictly conditional on four interdependent factors:
+       1. _Source Completeness_: The upstream notification feed must capture all relevant pool transactions without silent drops.
+       2. _Shared Request Demand_: Concurrent requests to the same provider (e.g., LP screening, metadata enrichment, other pools) consume the shared session budget and pacing intervals.
+       3. _Retrieval Success_: Any RPC network failure, timeout, or transaction-not-found outcome immediately records a collection gap, invalidating coverage.
+       4. _Processing Capacity_: Total active workload (queued plus in-flight retrievals) must remain strictly within adapter queue and deadline bounds without backlogging.
+     - Active candidate pools where transaction arrival demand exceeds 24 transaction retrievals per minute will accumulate backlog and exhaust session request ceilings (e.g., a 50-request budget exhausted in ~2 minutes). Paid providers, relaxed host pacing, and unverified log-only parsing are not approved solutions; unverified shortcuts cannot bypass these architectural constraints.
    - **Current WebSocket Implementation vs Proposed Per-Candidate Subscriptions**:
      - The existing `SolanaWebSocketSubscriptionClient.ts` manages protocol-level subscriptions to program IDs (`RAYDIUM_AMM_V4_PROGRAM_ID`, `RAYDIUM_CPMM_PROGRAM_ID`).
      - Per-candidate pool subscriptions (`{ mentions: [candidatePoolId] }`) represent proposed work not yet implemented or wired in production.
