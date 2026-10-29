@@ -333,6 +333,7 @@ export interface DecodableInstruction {
   readonly programId?: string | undefined;
   readonly accounts: readonly (number | string)[];
   readonly data: string | Uint8Array | readonly number[];
+  readonly stackHeight?: number | undefined;
 }
 
 export interface DecodableInnerInstructionsGroup {
@@ -395,6 +396,7 @@ export type DecodeRaydiumSwapFailureReason =
   | "VAULT_MISMATCH"
   | "UNSUPPORTED_INSTRUCTION"
   | "UNSUPPORTED_LAYOUT"
+  | "UNSUPPORTED_CALL_TREE"
   | "MALFORMED_INSTRUCTION_DATA"
   | "AMBIGUOUS_DIRECTION"
   | "CONFLICTING_EVIDENCE";
@@ -711,14 +713,16 @@ export interface RaydiumInvocationFrame {
   success: boolean;
   failed: boolean;
   isAmbiguous: boolean;
+  descendantInvocationsCount: number;
   readonly rayLogs: DecodedRayLogSwap[];
 }
 
 /**
  * Parses logMessages into an execution call-stack structure to isolate each
  * program invocation and bind ray_log events strictly to their originating invocation.
- * Attributes ray_log strictly to the currently executing program frame (activeStack top),
- * not nearest Raydium ancestor, preventing child program logs from corrupting parent frames.
+ * Enforces strict LIFO execution: success/failed logs must match the active stack top.
+ * Incomplete stacks, depth zero, invalid depth transitions, or unclosed child frames
+ * fail closed and invalidate all Raydium frames.
  */
 export function parseInvocationFrames(
   logMessages: readonly string[],
@@ -726,6 +730,7 @@ export function parseInvocationFrames(
   const raydiumFrames: RaydiumInvocationFrame[] = [];
   const activeStack: { programId: string; depth: number; frame?: RaydiumInvocationFrame }[] = [];
   let raydiumCounter = 0;
+  let stackInconsistent = false;
 
   for (const line of logMessages) {
     if (typeof line !== "string") {
@@ -738,14 +743,29 @@ export function parseInvocationFrames(
       const programId = invokeMatch[1]!;
       const depth = parseInt(invokeMatch[2]!, 10);
 
+      // Validate depth: must be integer >= 1 and transition correctly
+      const expectedDepth =
+        activeStack.length === 0 ? 1 : activeStack[activeStack.length - 1]!.depth + 1;
+      if (!Number.isInteger(depth) || depth < 1 || depth !== expectedDepth) {
+        stackInconsistent = true;
+      }
+
+      // Any active Raydium frame on stack counts this new invoke as a descendant
+      for (const entry of activeStack) {
+        if (entry.frame) {
+          entry.frame.descendantInvocationsCount++;
+        }
+      }
+
       if (programId === RAYDIUM_AMM_V4_PROGRAM_ID) {
         const frame: RaydiumInvocationFrame = {
           invocationIndex: raydiumCounter++,
           programId,
           depth,
           success: false,
-          failed: false,
+          failed: stackInconsistent,
           isAmbiguous: false,
+          descendantInvocationsCount: 0,
           rayLogs: [],
         };
         raydiumFrames.push(frame);
@@ -760,23 +780,15 @@ export function parseInvocationFrames(
     const successMatch = line.match(/^Program\s+([A-Za-z0-9]{32,44})\s+success/);
     if (successMatch) {
       const programId = successMatch[1]!;
-      // Find matching frame from top of stack
+      // Strict LIFO: success must match the top active frame
       if (activeStack.length > 0 && activeStack[activeStack.length - 1]!.programId === programId) {
         const entry = activeStack.pop()!;
-        if (entry.frame) {
+        if (entry.frame && !stackInconsistent) {
           entry.frame.success = true;
         }
       } else {
-        for (let i = activeStack.length - 1; i >= 0; i--) {
-          if (activeStack[i]!.programId === programId) {
-            const entry = activeStack[i]!;
-            if (entry.frame) {
-              entry.frame.success = true;
-            }
-            activeStack.splice(i, 1);
-            break;
-          }
-        }
+        // Strict LIFO violation (parent completing before child, or unexpected frame)
+        stackInconsistent = true;
       }
       continue;
     }
@@ -789,18 +801,10 @@ export function parseInvocationFrames(
         const entry = activeStack.pop()!;
         if (entry.frame) {
           entry.frame.failed = true;
+          entry.frame.success = false;
         }
       } else {
-        for (let i = activeStack.length - 1; i >= 0; i--) {
-          if (activeStack[i]!.programId === programId) {
-            const entry = activeStack[i]!;
-            if (entry.frame) {
-              entry.frame.failed = true;
-            }
-            activeStack.splice(i, 1);
-            break;
-          }
-        }
+        stackInconsistent = true;
       }
       continue;
     }
@@ -816,16 +820,15 @@ export function parseInvocationFrames(
           }
           topOfStack.frame.rayLogs.push(rayLog);
         }
-        // If top of stack is NOT Raydium (e.g. child program), do NOT attribute log to Raydium
       }
     }
   }
 
-  // Any frames remaining unclosed on stack did not cleanly terminate
-  for (const entry of activeStack) {
-    if (entry.frame) {
-      entry.frame.failed = true;
-      entry.frame.success = false;
+  // Any inconsistency or unclosed frames remaining on stack invalidates all frames
+  if (stackInconsistent || activeStack.length > 0) {
+    for (const frame of raydiumFrames) {
+      frame.failed = true;
+      frame.success = false;
     }
   }
 
@@ -850,6 +853,138 @@ function attributeTradeSide(
   } else {
     throw new Error(`[SWAP_DECODER] Unsupported pair orientation: ${orientation}`);
   }
+}
+
+interface SubtreeResolutionResult {
+  readonly ok: boolean;
+  readonly subtreeEnd?: number;
+  readonly error?: {
+    readonly reason: DecodeRaydiumSwapFailureReason;
+    readonly message: string;
+  };
+}
+
+/**
+ * Resolves the invocation subtree boundary for an inner CPI Raydium instruction.
+ * Distinguishes descendant instructions from later siblings or ancestors using
+ * stackHeight (Solana CPI execution structure) and verified execution log depth/counts.
+ * Does NOT rely on "next Raydium instruction".
+ * Discrepancies fail closed with CONFLICTING_EVIDENCE; unresolvable boundaries fail with UNSUPPORTED_CALL_TREE.
+ */
+function resolveInvocationSubtree(
+  innerInst: DecodableInstruction,
+  innerIdx: number,
+  relevantInners: readonly DecodableInstruction[],
+  currentFrame: RaydiumInvocationFrame | null,
+): SubtreeResolutionResult {
+  let stackHeightEnd: number | null = null;
+  let stackHeightMalformed = false;
+
+  const hasStackHeight =
+    typeof innerInst.stackHeight === "number" &&
+    Number.isInteger(innerInst.stackHeight) &&
+    innerInst.stackHeight >= 1;
+
+  if (innerInst.stackHeight !== undefined && !hasStackHeight) {
+    return {
+      ok: false,
+      error: {
+        reason: "MALFORMED_INSTRUCTION_DATA",
+        message: `Invalid stackHeight ${String(innerInst.stackHeight)} on inner instruction at index ${innerIdx}`,
+      },
+    };
+  }
+
+  if (hasStackHeight) {
+    const raydiumHeight = innerInst.stackHeight!;
+    for (let k = innerIdx + 1; k < relevantInners.length; k++) {
+      const nextInst = relevantInners[k]!;
+      if (
+        typeof nextInst.stackHeight === "number" &&
+        Number.isInteger(nextInst.stackHeight) &&
+        nextInst.stackHeight >= 1
+      ) {
+        if (nextInst.stackHeight <= raydiumHeight) {
+          stackHeightEnd = k;
+          break;
+        }
+      } else {
+        // Subsequent instruction lacks valid stackHeight
+        stackHeightMalformed = true;
+        break;
+      }
+    }
+    if (!stackHeightMalformed && stackHeightEnd === null) {
+      stackHeightEnd = relevantInners.length;
+    }
+  }
+
+  let logEnd: number | null = null;
+  if (currentFrame) {
+    if (hasStackHeight && currentFrame.depth !== innerInst.stackHeight) {
+      return {
+        ok: false,
+        error: {
+          reason: "CONFLICTING_EVIDENCE",
+          message: `Instruction stackHeight (${innerInst.stackHeight}) contradicts execution log depth (${currentFrame.depth}) for Raydium invocation at inner ${innerIdx}`,
+        },
+      };
+    }
+
+    const calculatedLogEnd = innerIdx + 1 + currentFrame.descendantInvocationsCount;
+    if (calculatedLogEnd > relevantInners.length) {
+      return {
+        ok: false,
+        error: {
+          reason: "CONFLICTING_EVIDENCE",
+          message: `Execution log reports ${currentFrame.descendantInvocationsCount} descendant invocations, but only ${relevantInners.length - (innerIdx + 1)} inner instructions remain`,
+        },
+      };
+    }
+    logEnd = calculatedLogEnd;
+  }
+
+  // Cross-check stackHeight and log evidence if both available
+  if (stackHeightEnd !== null && logEnd !== null) {
+    if (stackHeightEnd !== logEnd) {
+      return {
+        ok: false,
+        error: {
+          reason: "CONFLICTING_EVIDENCE",
+          message: `Call-tree boundary from stackHeight (${stackHeightEnd}) contradicts execution log boundary (${logEnd}) for Raydium invocation at inner ${innerIdx}`,
+        },
+      };
+    }
+    return { ok: true, subtreeEnd: stackHeightEnd };
+  }
+
+  if (stackHeightEnd !== null) {
+    return { ok: true, subtreeEnd: stackHeightEnd };
+  }
+
+  if (logEnd !== null) {
+    if (currentFrame && currentFrame.descendantInvocationsCount > 0) {
+      return { ok: true, subtreeEnd: logEnd };
+    }
+    if (innerIdx + 1 === relevantInners.length) {
+      return { ok: true, subtreeEnd: logEnd };
+    }
+    return {
+      ok: false,
+      error: {
+        reason: "UNSUPPORTED_CALL_TREE",
+        message: `Execution logs report zero child invocations for inner instruction at index ${innerIdx}, but remaining instructions exist without stackHeight`,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    error: {
+      reason: "UNSUPPORTED_CALL_TREE",
+      message: `Cannot reliably establish invocation subtree boundary for inner instruction at index ${innerIdx} without valid stackHeight or execution log depth`,
+    },
+  };
 }
 
 /**
@@ -1594,18 +1729,49 @@ export function decodeRaydiumTransactionSwaps(
     for (let innerIdx = 0; innerIdx < relevantInners.length; innerIdx++) {
       totalInstructionsScanned++;
       const innerInst = relevantInners[innerIdx]!;
-
-      // Determine invocation subtree for this inner instruction:
-      // Slice from innerIdx + 1 up to next Raydium swap instruction
-      let nextRaydiumIdx = relevantInners.length;
-      for (let k = innerIdx + 1; k < relevantInners.length; k++) {
-        const pId = resolveProgramId(relevantInners[k]!, resolvedAccounts);
-        if (pId === RAYDIUM_AMM_V4_PROGRAM_ID) {
-          nextRaydiumIdx = k;
-          break;
-        }
+      const progId = resolveProgramId(innerInst, resolvedAccounts);
+      if (progId !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+        continue;
       }
-      const invocationInnerSlice = relevantInners.slice(innerIdx + 1, nextRaydiumIdx);
+
+      // For inner CPI without log messages, success of inner execution cannot be proven
+      if (!hasLogMessages) {
+        return {
+          ok: false,
+          reason: "INVOCATION_FAILED",
+          message:
+            "Cannot prove successful execution of inner CPI swap without transaction logMessages",
+          signature,
+          slot,
+          events: [],
+        };
+      }
+
+      // Peek corresponding Raydium frame to evaluate invocation subtree boundary
+      const currentFrame =
+        raydiumFrames.length > raydiumInvocationCursor
+          ? raydiumFrames[raydiumInvocationCursor]!
+          : null;
+
+      const subtreeResult = resolveInvocationSubtree(
+        innerInst,
+        innerIdx,
+        relevantInners,
+        currentFrame,
+      );
+
+      if (!subtreeResult.ok) {
+        return {
+          ok: false,
+          reason: subtreeResult.error!.reason,
+          message: subtreeResult.error!.message,
+          signature,
+          slot,
+          events: [],
+        };
+      }
+
+      const invocationInnerSlice = relevantInners.slice(innerIdx + 1, subtreeResult.subtreeEnd);
 
       const innerResult = decodeInstructionIfRaydiumSwap(
         innerInst,

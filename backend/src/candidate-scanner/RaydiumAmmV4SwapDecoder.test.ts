@@ -1016,32 +1016,38 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
                 programIdIndex: 9,
                 accounts: [1, 2, 3, 4, 5, 6, 7, 8],
                 data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                stackHeight: 2,
               },
               {
                 programIdIndex: 1,
                 accounts: [6, 5, 8], // user -> quote vault (SOL in)
                 data: makeSplTransferData(50_000_000n),
+                stackHeight: 3,
               },
               {
                 programIdIndex: 1,
                 accounts: [4, 7, 3], // base vault -> user (Candidate out)
                 data: makeSplTransferData(25_000_000_000n),
+                stackHeight: 3,
               },
               // Swap 2: SELL
               {
                 programIdIndex: 9,
                 accounts: [1, 2, 3, 4, 5, 6, 7, 8],
                 data: makeSwapBaseInV2Data(10_000_000_000n, 19_000_000n),
+                stackHeight: 2,
               },
               {
                 programIdIndex: 1,
                 accounts: [6, 4, 8], // user -> base vault (Candidate in)
                 data: makeSplTransferData(10_000_000_000n),
+                stackHeight: 3,
               },
               {
                 programIdIndex: 1,
                 accounts: [5, 7, 3], // quote vault -> user (SOL out)
                 data: makeSplTransferData(19_000_000n),
+                stackHeight: 3,
               },
             ],
           },
@@ -1049,9 +1055,17 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
         logMessages: [
           `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
           `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} success`,
           makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
           `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
           `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+          `Program ${SPL_TOKEN_PROGRAM_ID} success`,
           makeRayLogLine(3, "Coin2PC", 10_000_000_000n, 19_000_000n),
           `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
           `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
@@ -3006,6 +3020,617 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
 
       expect(res.reason).toBe("INVOCATION_FAILED");
       expect(res.events.length).toBe(0);
+    });
+  });
+
+  describe("Call-Tree Boundaries & Strict LIFO Execution Stacks Audit Regressions", () => {
+    const slot = 280_000_400;
+    const blockTime = 1_700_000_100;
+    const accounts = [
+      SYNTHETIC_ROUTER_PROGRAM_ID, // 0
+      SPL_TOKEN_PROGRAM_ID, // 1
+      SYNTHETIC_POOL_ID, // 2
+      SYNTHETIC_AMM_AUTHORITY, // 3
+      SYNTHETIC_BASE_VAULT, // 4
+      SYNTHETIC_QUOTE_VAULT, // 5
+      SYNTHETIC_USER_SOURCE_ATA, // 6
+      SYNTHETIC_USER_DEST_ATA, // 7
+      SYNTHETIC_USER_WALLET, // 8
+      RAYDIUM_AMM_V4_PROGRAM_ID, // 9
+    ];
+
+    it("Regr 1: CPI swap followed by an unrelated sibling transfer decodes cleanly without borrowing sibling evidence", () => {
+      const signature = "SiblingTransferIsolationSig111111111111111111111111111111111";
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0, // Router outer instruction
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                // Inner 0: Raydium BUY (PC2Coin)
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  stackHeight: 2,
+                },
+                // Inner 1: User -> Quote Vault (SOL in, 50 SOL lamports)
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8],
+                  data: makeSplTransferData(50_000_000n),
+                  stackHeight: 3,
+                },
+                // Inner 2: Base Vault -> User (25 Candidate tokens)
+                {
+                  programIdIndex: 1,
+                  accounts: [4, 7, 3],
+                  data: makeSplTransferData(25_000_000_000n),
+                  stackHeight: 3,
+                },
+                // Inner 3: Router makes separate sibling transfer into quote vault after Raydium returns
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8], // Sibling transfer into SAME quote vault
+                  data: makeSplTransferData(10_000_000n),
+                  stackHeight: 2, // Sibling instruction at router stackHeight 2
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            // Sibling transfer executed by router after Raydium returns
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [2]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+          ],
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+
+      expect(res.events.length).toBe(1);
+      const ev = res.events[0]!;
+      expect(ev.side).toBe("BUY");
+      expect(ev.tokenAmount).toBe(25_000_000_000n);
+      expect(ev.solAmount).toBe(50_000_000n);
+      expect(ev.outerInstructionIndex).toBe(0);
+      expect(ev.swapIndex).toBe(0);
+      expect(ev.eventId).toBe(`${signature}:0:0`);
+    });
+
+    it("Regr 2: Valid sequential CPI swaps decode both swaps correctly with distinct coordinates", () => {
+      const signature = "SequentialCpiSwapsSig111111111111111111111111111111111111111";
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0,
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                // Swap 1: BUY
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  stackHeight: 2,
+                },
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8],
+                  data: makeSplTransferData(50_000_000n),
+                  stackHeight: 3,
+                },
+                {
+                  programIdIndex: 1,
+                  accounts: [4, 7, 3],
+                  data: makeSplTransferData(25_000_000_000n),
+                  stackHeight: 3,
+                },
+                // Swap 2: SELL
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(10_000_000_000n, 19_000_000n),
+                  stackHeight: 2,
+                },
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 4, 8],
+                  data: makeSplTransferData(10_000_000_000n),
+                  stackHeight: 3,
+                },
+                {
+                  programIdIndex: 1,
+                  accounts: [5, 7, 3],
+                  data: makeSplTransferData(19_000_000n),
+                  stackHeight: 3,
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            makeRayLogLine(3, "Coin2PC", 10_000_000_000n, 19_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+          ],
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+
+      expect(res.events.length).toBe(2);
+      expect(res.events[0]!.side).toBe("BUY");
+      expect(res.events[0]!.swapIndex).toBe(0);
+      expect(res.events[0]!.eventId).toBe(`${signature}:0:0`);
+      expect(res.events[0]!.tokenAmount).toBe(25_000_000_000n);
+      expect(res.events[0]!.solAmount).toBe(50_000_000n);
+
+      expect(res.events[1]!.side).toBe("SELL");
+      expect(res.events[1]!.swapIndex).toBe(3);
+      expect(res.events[1]!.eventId).toBe(`${signature}:0:3`);
+      expect(res.events[1]!.tokenAmount).toBe(10_000_000_000n);
+      expect(res.events[1]!.solAmount).toBe(19_000_000n);
+    });
+
+    it("Regr 3: Parent completion before child completion fails closed with INVOCATION_FAILED", () => {
+      const signature = "ParentClosedBeforeChildSig1111111111111111111111111111111";
+
+      const instruction = {
+        programIdIndex: 9,
+        accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+        data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+      };
+
+      // Raydium completes while child Token program is still open on stack
+      const logMessages = [
+        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+        `Program ${SPL_TOKEN_PROGRAM_ID} invoke [2]`,
+        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`, // Strict LIFO violation! Top is Token
+        `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+      ];
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [instruction],
+          },
+        },
+        meta: {
+          err: null,
+          logMessages,
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+
+      expect(res.reason).toBe("INVOCATION_FAILED");
+      expect(res.events.length).toBe(0);
+    });
+
+    it("Regr 4: Invalid depth zero and invalid depth transitions fail closed with INVOCATION_FAILED", () => {
+      const signature = "InvalidDepthTransitionsSig11111111111111111111111111111111";
+
+      const instruction = {
+        programIdIndex: 9,
+        accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+        data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+      };
+
+      // Case 4a: Depth 0 (invalid depth)
+      const payloadDepth0 = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [instruction],
+          },
+        },
+        meta: {
+          err: null,
+          logMessages: [
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [0]`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          ],
+        },
+      };
+      const res0 = decodeRaydiumTransactionSwaps(payloadDepth0, STANDARD_POOL_CONTEXT);
+      expect(res0.ok).toBe(false);
+      if (!res0.ok) {
+        expect(res0.reason).toBe("INVOCATION_FAILED");
+      }
+
+      // Case 4b: Skipping depth transitions (invoke [1] -> invoke [3])
+      const payloadSkipDepth = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [instruction],
+          },
+        },
+        meta: {
+          err: null,
+          logMessages: [
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`, // Skipped depth 2!
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          ],
+        },
+      };
+      const resSkip = decodeRaydiumTransactionSwaps(payloadSkipDepth, STANDARD_POOL_CONTEXT);
+      expect(resSkip.ok).toBe(false);
+      if (!resSkip.ok) {
+        expect(resSkip.reason).toBe("INVOCATION_FAILED");
+      }
+
+      // Case 4c: Empty stack starting at depth 2
+      const payloadEmptyStackDepth2 = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [instruction],
+          },
+        },
+        meta: {
+          err: null,
+          logMessages: [
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`, // Empty stack must start at 1
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+          ],
+        },
+      };
+      const resDepth2 = decodeRaydiumTransactionSwaps(
+        payloadEmptyStackDepth2,
+        STANDARD_POOL_CONTEXT,
+      );
+      expect(resDepth2.ok).toBe(false);
+      if (!resDepth2.ok) {
+        expect(resDepth2.reason).toBe("INVOCATION_FAILED");
+      }
+    });
+
+    it("Regr 5: Truncated traces with an open non-Raydium child fail closed with INVOCATION_FAILED", () => {
+      const signature = "TruncatedTraceWithOpenChildSig11111111111111111111111111111";
+
+      const instruction = {
+        programIdIndex: 9,
+        accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+        data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+      };
+
+      // Case 5a: Raydium opens child Token, trace terminates
+      const payload5a = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [instruction],
+          },
+        },
+        meta: {
+          err: null,
+          logMessages: [
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [2]`,
+            // Trace ends abruptly with open child!
+          ],
+        },
+      };
+      const res5a = decodeRaydiumTransactionSwaps(payload5a, STANDARD_POOL_CONTEXT);
+      expect(res5a.ok).toBe(false);
+      if (!res5a.ok) {
+        expect(res5a.reason).toBe("INVOCATION_FAILED");
+      }
+
+      // Case 5b: Raydium completes, router opens child Token, trace terminates without closing Token or Router
+      const payload5b = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0,
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  stackHeight: 2,
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [2]`,
+            // Trace ends abruptly! Token and Router remain unclosed on activeStack
+          ],
+        },
+      };
+      const res5b = decodeRaydiumTransactionSwaps(payload5b, STANDARD_POOL_CONTEXT);
+      expect(res5b.ok).toBe(false);
+      if (!res5b.ok) {
+        expect(res5b.reason).toBe("INVOCATION_FAILED");
+      }
+    });
+
+    it("Regr 6: Inner CPI swap with unresolvable call tree fails with UNSUPPORTED_CALL_TREE", () => {
+      const signature = "UnresolvableCallTreeSig1111111111111111111111111111111111111";
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0,
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                // Inner Raydium instruction without stackHeight
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  // stackHeight missing
+                },
+                // Subsequent inner instruction without stackHeight
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8],
+                  data: makeSplTransferData(50_000_000n),
+                  // stackHeight missing
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`, // 0 child invocations reported
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+          ],
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+
+      expect(res.reason).toBe("UNSUPPORTED_CALL_TREE");
+      expect(res.message).toMatch(/zero child invocations.*without stackHeight/);
+    });
+
+    it("Regr 7: Discrepancy between stackHeight and execution log depth fails with CONFLICTING_EVIDENCE", () => {
+      const signature = "ContradictoryDepthSig1111111111111111111111111111111111111111";
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0,
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  stackHeight: 2, // stackHeight says 2
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [2]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [3]`, // Log depth says 3!
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+          ],
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+
+      expect(res.reason).toBe("CONFLICTING_EVIDENCE");
+      expect(res.message).toMatch(/contradicts execution log depth/);
+    });
+
+    it("Regr 8: Discrepancy between stackHeight boundary and log boundary fails with CONFLICTING_EVIDENCE", () => {
+      const signature = "ContradictorySubtreeBoundarySig11111111111111111111111111111";
+
+      const payload = {
+        slot,
+        blockTime,
+        transaction: {
+          signatures: [signature],
+          message: {
+            accountKeys: accounts,
+            instructions: [
+              {
+                programIdIndex: 0,
+                accounts: [6, 7, 8],
+                data: new Uint8Array([1, 2, 3]),
+              },
+            ],
+          },
+        },
+        meta: {
+          err: null,
+          innerInstructions: [
+            {
+              index: 0,
+              instructions: [
+                {
+                  programIdIndex: 9,
+                  accounts: [1, 2, 3, 4, 5, 6, 7, 8],
+                  data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  stackHeight: 2,
+                },
+                // stackHeight says only 1 descendant (ends before index 2)
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8],
+                  data: makeSplTransferData(50_000_000n),
+                  stackHeight: 3,
+                },
+                {
+                  programIdIndex: 1,
+                  accounts: [6, 5, 8],
+                  data: makeSplTransferData(10_000_000n),
+                  stackHeight: 2, // Sibling cutoff at index 2!
+                },
+              ],
+            },
+          ],
+          logMessages: [
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} invoke [1]`,
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [2]`,
+            // Log claims 2 child invokes occurred under Raydium!
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} invoke [3]`,
+            `Program ${SPL_TOKEN_PROGRAM_ID} success`,
+            makeRayLogLine(3, "PC2Coin", 50_000_000n, 25_000_000_000n),
+            `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} success`,
+            `Program ${SYNTHETIC_ROUTER_PROGRAM_ID} success`,
+          ],
+        },
+      };
+
+      const res = decodeRaydiumTransactionSwaps(payload, STANDARD_POOL_CONTEXT);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+
+      expect(res.reason).toBe("CONFLICTING_EVIDENCE");
+      expect(res.message).toMatch(/contradicts execution log boundary/);
     });
   });
 });
