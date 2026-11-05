@@ -51,7 +51,7 @@ sequenceDiagram
     end
 
     rect rgb(230, 255, 230)
-    Note over Recon: CORRECT PROTOCOL:<br/>Freezes target C from history batch.<br/>Queries until: S_verified (A).<br/>Retrieves [C, B], discovers B, fetches both,<br/>then advances S_verified to C.
+    Note over Recon: CORRECT PROTOCOL:<br/>Page 1 query returns [C, B, A].<br/>Head C is frozen as target from RPC page.<br/>Anchor A is witnessed directly.<br/>Discovers [C, B] without WebSocket hint dependency.
     end
 ```
 
@@ -125,10 +125,8 @@ Per the official Solana specification ([Solana `getSignaturesForAddress` Documen
 
 To establish positive boundary evidence connecting a new batch to an existing anchor $S_{\text{verified}}$:
 
-1. **Explicit Ingestion or Linkage**: The pagination traversal must either:
-   - Paginate backward using `before` without an exclusionary `until` until a page is returned that **actually contains the known anchor $S_{\text{verified}}$**, OR
-   - Query a contiguous signature window where the oldest returned signature's parent block/slot linkage is independently confirmed.
-2. **Fail-Closed on Unreached Boundary**: If pagination terminates without explicitly returning or confirming the known anchor (e.g. ledger pruned, timeout, or boundary missing), the reconciler **must return `UNKNOWN`** and record `UNRESOLVABLE_HISTORY_GAP`. The boundary is unestablished, and $S_{\text{verified}}$ **must not advance**.
+1. **Actual Anchor Appearance**: The backward pagination traversal using `before` must continue until a page is returned that **actually contains the known anchor $S_{\text{verified}}$ in its records**. (The alternative parent-block/linkage proof route is excluded from this implementation).
+2. **Fail-Closed on Unreached Boundary**: If pagination terminates without explicitly returning the known anchor (e.g. ledger pruned, short/empty page, timeout, or boundary missing), the reconciler **must return `UNKNOWN`** with `anchorWitnessed = false`. The boundary is unestablished, and $S_{\text{verified}}$ **must not advance**.
 
 ---
 
@@ -208,10 +206,11 @@ In accordance with [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Pro
 - Backfill success does **not** automatically erase recorded `StreamGap` records in the tracker.
 - In the accepted architecture, collection gaps represent permanent historical telemetry; backfilling transactions recovers trade flow data, but does not retroactively claim uninterrupted WebSocket liveness.
 
-#### 5. Explicit Retry Budget Policy:
+#### 5. Strict Accounting Policy (No Purpose Switching, No Retries):
 
-- Any retry of a failed `getTransaction` or `getSignaturesForAddress` query must explicitly specify `purpose: "RETRY"`.
-- Retries consume global requests, respect $\ge 2,500\text{ ms}$ spacing, and are capped at $\le 1$ attempt. If denied by the budget manager, the transaction is marked unresolved immediately.
+- History enumeration requests are strictly accounted under `CANDIDATE_ENRICHMENT`.
+- When an enumeration query is rejected by the budget manager (e.g. `MAX_ENRICHMENT_ATTEMPTS_REACHED`, `RESERVED_FOR_FORWARD_OBSERVATIONS`, `GLOBAL_REQUEST_CEILING_REACHED`, or `PROVIDER_PACING_NOT_MET`), the enumerator **must not switch purposes** (e.g. attempting to re-classify as `RETRY` or `FORWARD_OBSERVATION` is prohibited).
+- No automatic budget resets or retries: a denied request immediately terminates enumeration with a typed budget rejection outcome.
 
 ---
 
@@ -273,44 +272,39 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
 
 #### Scenario 1: Quiet Candidate Pool (0 Transactions during 5m window)
 
-- Proposed Purpose: History queries proposed as `FORWARD_OBSERVATION`.
-- $N_{\text{baseline\_RPC}} = 1$ `getSignaturesForAddress`.
-- $N_{\text{history\_RPC}} = 5$ periodic checks (1 every 60s, each returning positive boundary proof or `UNKNOWN`).
+- Request Purpose: History queries strictly accounted as **`CANDIDATE_ENRICHMENT`** (preserving enrichment cap, global ceiling, reserved quote capacity, and pacing; no switching purposes).
+- $N_{\text{baseline\_RPC}} = 1$ `getSignaturesForAddress` (Enrichment attempt 1).
+- $N_{\text{history\_RPC}} = 4$ periodic checks (Enrichment attempts 2, 3, 4, 5).
 - $N_{\text{tx\_retrieval\_RPC}} = 0$.
 - $N_{\text{boundary\_RPC}} = 0$.
-- **Solana RPC Subtotal**: **6 calls**.
-- **Global Session Total**: $15\text{ prior} + 6\text{ RPC} = \mathbf{21\text{ requests}}$ (fits within 50-request ceiling).
-- **Pacing Feasibility**: 6 dispatches require at least $(6 - 1) \times 2.5\text{ s} = \mathbf{12.5\text{ seconds}}$ of pacing spread over 300s. **Feasible**.
+- **Solana RPC Subtotal**: **5 calls**.
+- **Global Session Total**: $15\text{ prior} + 5\text{ RPC} = \mathbf{20\text{ requests}}$ (fits within 50-request ceiling; enrichment attempts = 5, well within 10 cap).
+- **Pacing Feasibility**: 5 dispatches require at least $(5 - 1) \times 2.5\text{ s} = \mathbf{10.0\text{ seconds}}$ of pacing spread over 300s. **Feasible**.
 - **Coverage Outcome**: Zero trades observed; upper boundary uncertified $\rightarrow$ **`UNKNOWN`** (`isProductionCompletenessEstablished = false`).
 
 #### Scenario 2: Moderate Activity Pool (3 Transactions over 5m window)
 
-- Proposed Purpose:
-  - History queries: `FORWARD_OBSERVATION`.
-  - Transaction retrievals: `CANDIDATE_ENRICHMENT` (3 attempts, within the 10-attempt cap).
-- $N_{\text{baseline\_RPC}} = 1$.
-- $N_{\text{history\_RPC}} = 5$.
-- $N_{\text{tx\_retrieval\_RPC}} = 3$ `getTransaction`.
+- Request Purpose: History queries and transaction retrievals strictly accounted as **`CANDIDATE_ENRICHMENT`**.
+- $N_{\text{baseline\_RPC}} = 1$ (Enrichment attempt 1).
+- $N_{\text{history\_RPC}} = 3$ periodic checks (Enrichment attempts 2, 3, 4).
+- $N_{\text{tx\_retrieval\_RPC}} = 3$ `getTransaction` calls (Enrichment attempts 5, 6, 7).
 - $N_{\text{boundary\_RPC}} = 0$.
-- **Solana RPC Subtotal**: **9 calls**.
-- **Global Session Total**: $15\text{ prior} + 9\text{ RPC} = \mathbf{24\text{ requests}}$ (within 50 ceiling; enrichment requests = 3, within 10 cap).
-- **Pacing Feasibility**: 9 dispatches require $(9 - 1) \times 2.5\text{ s} = \mathbf{20.0\text{ seconds}}$ pacing spread over 300s. **Feasible**.
+- **Solana RPC Subtotal**: **7 calls**.
+- **Global Session Total**: $15\text{ prior} + 7\text{ RPC} = \mathbf{22\text{ requests}}$ (within 50 ceiling; total enrichment attempts = 7, within 10 cap).
+- **Pacing Feasibility**: 7 dispatches require $(7 - 1) \times 2.5\text{ s} = \mathbf{15.0\text{ seconds}}$ pacing spread over 300s. **Feasible**.
 - **Coverage Outcome**: 3 trades recovered and ingested; window uncertified $\rightarrow$ **`RECOVERY_ONLY`** (`isProductionCompletenessEstablished = false`).
 
 #### Scenario 3: Volatile Retest Surge (15 Transactions in a 60-Second Surge)
 
-- **Immediate Blocker under Defaults**:
-  - If transaction retrievals default to `CANDIDATE_ENRICHMENT`, the 11th transaction is **blocked immediately** by `MAX_ENRICHMENT_ATTEMPTS_REACHED` ($10 \text{ cap}$).
-  - Declaring a 15-transaction retrieval feasible under default adapter configuration is **factually false**.
-- **Analysis Even If Configured as `FORWARD_OBSERVATION`**:
-  - $N_{\text{history\_RPC}} = 2$ signature queries.
-  - $N_{\text{tx\_retrieval\_RPC}} = 15$ `getTransaction` calls.
-  - Solana RPC Subtotal = 17 calls.
-  - Global Total = $15\text{ prior} + 17\text{ RPC} = \mathbf{32\text{ requests}}$.
-  - Pacing Requirement: 17 dispatches require at least $(17 - 1) \times 2.5\text{ s} = \mathbf{40.0\text{ seconds}}$ of serialized pacing intervals alone!
-  - Adding response latency ($\sim 200\text{ ms} \times 17 = 3.4\text{ s}$), total dispatch time is $\mathbf{\approx 43.4\text{ seconds}}$.
-  - Consumes 32 of 50 requests. If another candidate surges or if discovery continues, `minReservedForwardRequests = 4` blocks non-quote requests at 46 calls.
-- **Feasibility Conclusion**: **Infeasible under default `CANDIDATE_ENRICHMENT`**; marginal/severely delayed under `FORWARD_OBSERVATION`.
+- **Immediate Hard Blocker**:
+  - History queries and transaction retrievals require $1\text{ baseline} + 2\text{ history} + 15\text{ tx} = \mathbf{18\text{ enrichment requests}}$.
+  - Under `maxEnrichmentAttempts = 10`, the 11th request is **blocked immediately** with `MAX_ENRICHMENT_ATTEMPTS_REACHED`.
+  - Switching purposes to evade limits is strictly prohibited; no retries or automatic budget resets exist.
+  - Declaring a 15-transaction retrieval feasible under existing controls is **factually false**.
+- **Pacing & Ceiling Realities**:
+  - Even if an operator were to separate enrichment and observation budgets in a future design, 18 dispatches require at least $(18 - 1) \times 2.5\text{ s} = \mathbf{42.5\text{ seconds}}$ of serialized pacing intervals alone (plus response latencies $\approx 46\text{ s}$ total dispatch time).
+  - Global Total: $15\text{ prior} + 18\text{ RPC} = \mathbf{33\text{ requests}}$ against a 50 ceiling, leaving only 17 requests before hitting reserved forward capacity ($50 - 4 = 46$).
+- **Feasibility Conclusion**: **Infeasible under enforced `CANDIDATE_ENRICHMENT` cap ($10$)**.
 
 ---
 
@@ -320,13 +314,13 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
 
 - Context: Baseline cut established at $A$. WebSocket drops notification for $B$, but receives $C$.
 
-| Step  | On-Chain Event     | WebSocket Event         | Coordinator State      | Reconciler Action         | RPC Query & Parameters                               | Result Returned | Cursors & Tracker State                                                                                       |
-| :---- | :----------------- | :---------------------- | :--------------------- | :------------------------ | :--------------------------------------------------- | :-------------- | :------------------------------------------------------------------------------------------------------------ |
-| **1** | Baseline cut       | None                    | `SUBSCRIBED` (Epoch 1) | Baseline established      | `getSignaturesForAddress(P, {limit: 1})`             | `[A]`           | $S_{\text{verified}} = A$. **buys = 0** (A is cut, not decoded).                                              |
-| **2** | Tx B confirmed     | **DROPPED**             | `SUBSCRIBED` (Epoch 1) | None                      | None                                                 | None            | $S_{\text{verified}} = A$. Tx B unobserved.                                                                   |
-| **3** | Tx C confirmed     | Notification C received | `SUBSCRIBED` (Epoch 1) | Reconcile triggered       | `getSignaturesForAddress(P, {before: C, limit: 10})` | `[B, A]`        | **Positive boundary proof**: Array contains known anchor $A$.                                                 |
-| **4** | Fetch transactions | None                    | `SUBSCRIBED` (Epoch 1) | Dispatch `getTransaction` | `getTransaction(B)` then `getTransaction(C)`         | Swaps returned  | Validated pool context; calls `tracker.ingestTrade(B)` then `ingestTrade(C)`.                                 |
-| **5** | Cursor advance     | None                    | `SUBSCRIBED` (Epoch 1) | Advance watermark         | None                                                 | None            | All resolved. $S_{\text{verified}}$ advances to $C$. **Missed B recovered**. Window status remains `UNKNOWN`. |
+| Step  | On-Chain Event     | WebSocket Event         | Coordinator State      | Reconciler Action         | RPC Query & Parameters                       | Result Returned | Cursors & Tracker State                                                                                                                    |
+| :---- | :----------------- | :---------------------- | :--------------------- | :------------------------ | :------------------------------------------- | :-------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | Baseline cut       | None                    | `SUBSCRIBED` (Epoch 1) | Baseline established      | `getSignaturesForAddress(P, {limit: 1})`     | `[A]`           | $S_{\text{verified}} = A$. **buys = 0** (A is cut, not decoded).                                                                           |
+| **2** | Tx B confirmed     | **DROPPED**             | `SUBSCRIBED` (Epoch 1) | None                      | None                                         | None            | $S_{\text{verified}} = A$. Tx B unobserved.                                                                                                |
+| **3** | Tx C confirmed     | Notification C received | `SUBSCRIBED` (Epoch 1) | Reconcile triggered       | `getSignaturesForAddress(P, {limit: 10})`    | `[C, B, A]`     | **Head C frozen as target from RPC page** (`frozenTarget = C`). **Anchor A witnessed** (`records[2].signature === A`). Discovers `[C, B]`. |
+| **4** | Fetch transactions | None                    | `SUBSCRIBED` (Epoch 1) | Dispatch `getTransaction` | `getTransaction(B)` then `getTransaction(C)` | Swaps returned  | Validated pool context; calls `tracker.ingestTrade(B)` then `ingestTrade(C)`.                                                              |
+| **5** | Cursor advance     | None                    | `SUBSCRIBED` (Epoch 1) | Advance watermark         | None                                         | None            | All resolved. $S_{\text{verified}}$ advances to $C$. **Missed B recovered**. Window status remains `UNKNOWN`.                              |
 
 ---
 
@@ -381,14 +375,16 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
 
 ### 7.2 Smallest Proposed Implementation Patch
 
-When implementation is authorized, the smallest isolated offline patch consists of:
+The first isolated offline patch implements bounded history enumeration:
 
-1. **Isolated Offline Helper**: Create `backend/src/candidate-scanner/ExactPoolSignatureReconciler.ts` containing only:
-   - The dual-cursor state machine ($S_{\text{verified}}$ and frozen targets).
-   - Bounded backward pagination requiring positive anchor confirmation.
-   - Dispatch of `getTransaction` using explicit purpose and budget accounting.
-   - Ingestion of decoded swaps via `tracker.ingestTrade()`.
-2. **Deterministic Offline Unit Tests**: Create `ExactPoolSignatureReconciler.test.ts` testing Fixtures 1–4 using deterministic mock RPC transports and synthetic clocks.
+1. **Isolated Offline Helper**: Create `backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts` containing only:
+   - Input validation: immutable pool context (`TrackedRaydiumPoolContext`), base-58 known anchor signature, injected page fetcher, shared `GlobalResourceBudgetManager`, clock, bounded options, and lifecycle validator.
+   - Bounded backward pagination using `before` requiring positive anchor appearance in returned records.
+   - Target freezing: freezes the newest signature from the first RPC page as `frozenTargetSignature`.
+   - Strict `CANDIDATE_ENRICHMENT` accounting with zero retries, no purpose switching, and no budget resets.
+   - Evidence-only return contract: returns discovered signatures between anchor and frozen target, positive boundary witness flag (`anchorWitnessed`), and permanently `isProductionCompletenessEstablished = false`.
+   - Zero transaction retrieval, zero swap ingestion, zero cursor advancement, zero gap clearing, and zero production retest inputs.
+2. **Deterministic Offline Unit Tests**: Create `backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts` testing Fixtures 1–3, empty/short responses, repeated pages, bounds, timeouts, lifecycle/epoch cancellation, budget rejections, and malformed records using deterministic mock page fetchers and synthetic clocks.
 3. **No Live Execution**: Keep the helper offline; do not wire it to live daemon loops or modify `isProductionCompletenessEstablished`.
 
 ---

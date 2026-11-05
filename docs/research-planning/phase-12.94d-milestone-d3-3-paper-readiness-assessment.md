@@ -485,7 +485,18 @@ The approved offline implementation items are completed:
          - Sanitizes transport errors, close reasons, and URLs, redacting API keys, secrets, and credentials in `onLog`.
     - 30 comprehensive unit and regression tests passing in [`backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.test.ts).
 
-12. **Larger Changes Quarantined**:
+12. **Bounded Exact-Pool History Enumerator (`ExactPoolHistoryEnumerator.ts`)**:
+    - Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts).
+    - Specification: [`docs/research-planning/exact-pool-signature-reconciliation-spec.md`](file:///u:/Projects/TopG/docs/research-planning/exact-pool-signature-reconciliation-spec.md).
+    - Provides an isolated offline helper discovering transaction signatures between witnessed on-chain boundaries for a single validated pool context (`TrackedRaydiumPoolContext`).
+    - **Strictly Scoped First Patch**: Signature discovery only. Full transaction retrieval (`getTransaction`) and trade flow ingestion (`RollingTradeFlowTracker.ingestTrade`) remain separate integration work.
+    - **Enforced Budget Accounting**: Accounts all queries strictly under `CANDIDATE_ENRICHMENT` via `GlobalResourceBudgetManager`, respecting the 10-enrichment cap (`maxEnrichmentAttempts = 10`), global ceiling (`maxTotalRequests = 50`), reserved forward quote capacity (`minReservedForwardRequests = 4`), and provider pacing ($\ge 2,500\text{ ms}$). Prohibits purpose switching; zero unbudgeted retries or automatic budget resets.
+    - **Frozen Target & Positive Boundary Rule**: Freezes newest signature from the first RPC page as `frozenTargetSignature`. Traverses backward with `before` requiring actual anchor appearance in returned records (`anchorWitnessed = true`). Empty or short pages without the anchor remain unresolved (`anchorWitnessed = false`, `ANCHOR_NOT_FOUND`).
+    - **Coordinator Lifecycle Isolation**: Validates coordinator `SUBSCRIBED` status and connection epoch before dispatch and after await; discards in-flight results immediately if transport drops or epoch changes.
+    - **Evidence-Only Contract**: Returns immutable `HistoryEnumerationResult` with `isProductionCompletenessEstablished = false` permanently. Does not advance persistent watermark cursors, clear tracker stream gaps, or enable production retest inputs. Production source completeness remains an unresolved readiness gap.
+    - 36 comprehensive offline tests passing in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts).
+
+13. **Larger Changes Quarantined**:
 
 - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
 - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
