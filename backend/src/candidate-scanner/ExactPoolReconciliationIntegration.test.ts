@@ -847,7 +847,7 @@ describe("Exact-Pool Offline Reconciliation Integration", () => {
         knownAnchorSignature: SIG_ANCHOR,
         frozenTargetSignature: SIG_B,
         discoveredSignatures: [
-          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000040 },
         ],
         pagesQueried: 1,
         requestCount: 1,
@@ -868,6 +868,92 @@ describe("Exact-Pool Offline Reconciliation Integration", () => {
       expect(res.outcome).toBe("LIFECYCLE_CANCELLED");
       expect(res.totalIngestedSwaps).toBe(0);
       expect(tracker.getEventsCount()).toBe(0); // Ingestion strictly aborted!
+      expect(res.perSignatureResults).toHaveLength(1);
+      expect(res.perSignatureResults[0]?.status).toBe("LIFECYCLE_CANCELLED");
+      expect(res.perSignatureResults[0]?.adapterOutcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+      expect(res.perSignatureResults[0]?.error).toContain(
+        "Coordinator lifecycle invalidated during transaction processing (status: DISCONNECTED, epoch: 1)",
+      );
+    });
+
+    it("ingests swap successfully when lifecycle remains active with identical valid payload", async () => {
+      const budgetManager = new GlobalResourceBudgetManager({
+        minProviderSpacingMs: 0,
+        maxTotalRequests: 10,
+        maxEnrichmentAttempts: 5,
+        minReservedForwardRequests: 2,
+      });
+
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const fakeWs = new FakeWebSocketTransport();
+      const fakeTransport: typeof fetch = async () => {
+        // Lifecycle remains SUBSCRIBED throughout fetch
+        const payload = createSyntheticBuyPayload(SIG_B);
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: fakeTransport,
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+
+      const coordinator = new RaydiumCandidateSubscriptionCoordinator({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        transport: fakeWs,
+        clock,
+      });
+
+      fakeWs.triggerOpen();
+      fakeWs.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      expect(coordinator.getStatus()).toBe("SUBSCRIBED");
+
+      const enumResult = {
+        outcome: "ANCHOR_WITNESSED" as const,
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000040 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false as const,
+      };
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: coordinator,
+        expectedEpoch: 1,
+        clock,
+      });
+
+      const res = await bridge.resolve(enumResult);
+      expect(res.outcome).toBe("ALL_RESOLVED");
+      expect(res.totalIngestedSwaps).toBe(1);
+      expect(tracker.getEventsCount()).toBe(1);
+      expect(res.perSignatureResults).toHaveLength(1);
+      expect(res.perSignatureResults[0]?.status).toBe("RESOLVED");
+      expect(res.perSignatureResults[0]?.adapterOutcome).toBe("SUCCESS");
+      expect(coordinator.getStatus()).toBe("SUBSCRIBED");
     });
   });
 

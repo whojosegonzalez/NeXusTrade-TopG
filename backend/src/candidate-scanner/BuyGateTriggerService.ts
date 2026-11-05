@@ -165,9 +165,15 @@ export class BuyGateTriggerService {
     //     permit the candidate to qualify preliminarily so spot info and RugCheck can be queried.
     //   - If requireVerifiedHolders is true: fail-closed (cannot be established).
     const minHoldersRequired = isCandidateViralRunner ? 1000 : this.config.minEstablishedHolders;
+    const isSafeNonNegativeInteger = (v: unknown): v is number =>
+      typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+    const isValidConcentration = (v: unknown): v is number =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1.0;
+
     const hasEstablishedHolders =
       marketContext.holdersCount !== undefined
-        ? marketContext.holdersCount >= minHoldersRequired
+        ? isSafeNonNegativeInteger(marketContext.holdersCount) &&
+          marketContext.holdersCount >= minHoldersRequired
         : !marketContext.requireVerifiedHolders;
 
     const isEstablished =
@@ -324,29 +330,58 @@ export class BuyGateTriggerService {
       rugCheckFailureReason = "RUGCHECK_HIGH_RISK_SCORE_FAILED";
     } else if (this.config.rejectDangerRisks && hasDangerRisk) {
       rugCheckFailureReason = "RUGCHECK_DANGER_FLAG_FAILED";
-    } else if (marketContext.requireVerifiedHolders && holdersCount === undefined) {
-      rugCheckFailureReason = "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN";
-    } else if (
-      marketContext.requireVerifiedHolders &&
-      holdersCount !== undefined &&
-      holdersCount <
+    } else if (marketContext.requireVerifiedHolders) {
+      // Final security-qualified evaluation: require valid evidence for each required metric.
+      // Missing or invalid evidence fails closed with explicit rejection reasons.
+      if (holdersCount === undefined || !isSafeNonNegativeInteger(holdersCount)) {
+        rugCheckFailureReason = "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN";
+      } else if (
+        holdersCount <
         (isEstablishedRunner
           ? isCandidateViralRunner
             ? 1000
             : this.config.minEstablishedHolders
           : 100)
-    ) {
-      rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
-    } else if (
-      !marketContext.requireVerifiedHolders &&
-      holdersCount !== undefined &&
-      holdersCount < effectiveMinHolders
-    ) {
-      rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
-    } else if (top10HolderPct !== undefined && top10HolderPct > this.config.maxTop10HolderPct) {
-      rugCheckFailureReason = "TOP_10_CONCENTRATION_FAILED";
-    } else if (bundlerPct !== undefined && bundlerPct > maxBundlerAllowed) {
-      rugCheckFailureReason = "BUNDLER_CONCENTRATION_GATE_FAILED";
+      ) {
+        rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
+      } else if (
+        rugScore === undefined ||
+        typeof rugScore !== "number" ||
+        !Number.isFinite(rugScore) ||
+        rugScore < 0 ||
+        hasDangerRisk === undefined ||
+        typeof hasDangerRisk !== "boolean"
+      ) {
+        rugCheckFailureReason = "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN";
+      } else if (top10HolderPct === undefined || !isValidConcentration(top10HolderPct)) {
+        rugCheckFailureReason = "TOP_10_CONCENTRATION_UNKNOWN";
+      } else if (top10HolderPct > this.config.maxTop10HolderPct) {
+        rugCheckFailureReason = "TOP_10_CONCENTRATION_FAILED";
+      } else if (bundlerPct === undefined || !isValidConcentration(bundlerPct)) {
+        rugCheckFailureReason = "BUNDLER_CONCENTRATION_UNKNOWN";
+      } else if (bundlerPct > maxBundlerAllowed) {
+        rugCheckFailureReason = "BUNDLER_CONCENTRATION_GATE_FAILED";
+      }
+    } else {
+      // Preliminary in-memory screening path (requireVerifiedHolders: false or undefined)
+      if (holdersCount !== undefined) {
+        if (!isSafeNonNegativeInteger(holdersCount) || holdersCount < effectiveMinHolders) {
+          rugCheckFailureReason = "INSUFFICIENT_HOLDERS_COUNT_FAILED";
+        }
+      }
+      if (!rugCheckFailureReason && top10HolderPct !== undefined) {
+        if (
+          !isValidConcentration(top10HolderPct) ||
+          top10HolderPct > this.config.maxTop10HolderPct
+        ) {
+          rugCheckFailureReason = "TOP_10_CONCENTRATION_FAILED";
+        }
+      }
+      if (!rugCheckFailureReason && bundlerPct !== undefined) {
+        if (!isValidConcentration(bundlerPct) || bundlerPct > maxBundlerAllowed) {
+          rugCheckFailureReason = "BUNDLER_CONCENTRATION_GATE_FAILED";
+        }
+      }
     }
 
     const bundlerPassed = !rugCheckFailureReason;
@@ -439,16 +474,31 @@ export class BuyGateTriggerService {
 
       const holdersCount =
         typeof data.totalHolders === "number" &&
-        Number.isFinite(data.totalHolders) &&
+        Number.isSafeInteger(data.totalHolders) &&
         data.totalHolders >= 0
           ? data.totalHolders
           : undefined;
 
       let top10HolderPct: number | undefined;
       if (Array.isArray(data.topHolders) && data.topHolders.length > 0) {
-        top10HolderPct = data.topHolders
-          .slice(0, 10)
-          .reduce((acc, h) => acc + (typeof h.pct === "number" ? h.pct / 100 : 0), 0);
+        let valid = true;
+        let sumRaw = 0;
+        const topSlice = data.topHolders.slice(0, 10);
+        for (const h of topSlice) {
+          if (!h || typeof h !== "object" || Array.isArray(h)) {
+            valid = false;
+            break;
+          }
+          const pct = (h as { pct?: unknown }).pct;
+          if (typeof pct !== "number" || !Number.isFinite(pct) || pct < 0 || pct > 100) {
+            valid = false;
+            break;
+          }
+          sumRaw += pct;
+        }
+        if (valid && sumRaw <= 100.0001) {
+          top10HolderPct = Math.min(1.0, Math.max(0.0, sumRaw / 100));
+        }
       }
 
       // An absent or malformed risk list or malformed risk entries must not silently become an observed "no danger" result.
@@ -480,20 +530,32 @@ export class BuyGateTriggerService {
 
         const rObj = risk as { name?: unknown; value?: unknown };
         const riskName = typeof rObj.name === "string" ? rObj.name.toLowerCase() : "";
-        if (
-          riskName.includes("bundled") ||
-          riskName.includes("insider") ||
-          riskName.includes("dev holding")
-        ) {
-          const rawVal =
-            typeof rObj.value === "string"
-              ? parseFloat(rObj.value)
-              : typeof rObj.value === "number"
-                ? rObj.value
-                : NaN;
-          if (!Number.isNaN(rawVal)) {
-            bundlerPct = rawVal > 1 ? rawVal / 100 : rawVal;
+        // Only extract bundler metrics from risks explicitly matching "bundled" or "bundler".
+        // Do NOT infer bundler ownership from unrelated risk labels (e.g. "insider", "dev holding").
+        // Units must be explicitly established (e.g. percentage string ending with "%"); magnitude guessing is prohibited.
+        if (riskName.includes("bundled") || riskName.includes("bundler")) {
+          if (typeof rObj.value === "string" && rObj.value.trim().endsWith("%")) {
+            const rawVal = parseFloat(rObj.value.trim().slice(0, -1));
+            if (Number.isFinite(rawVal) && rawVal >= 0 && rawVal <= 100) {
+              bundlerPct = rawVal / 100;
+            }
           }
+        }
+      }
+
+      // If root report provides an explicit, typed bundler concentration metric with established normalized range [0.0, 1.0]
+      if (
+        bundlerPct === undefined &&
+        typeof (data as { bundlerPct?: unknown }).bundlerPct === "number"
+      ) {
+        const rootBundler = (data as { bundlerPct?: number }).bundlerPct;
+        if (
+          typeof rootBundler === "number" &&
+          Number.isFinite(rootBundler) &&
+          rootBundler >= 0 &&
+          rootBundler <= 1.0
+        ) {
+          bundlerPct = rootBundler;
         }
       }
 
