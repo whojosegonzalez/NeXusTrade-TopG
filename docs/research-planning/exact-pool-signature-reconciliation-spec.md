@@ -1,8 +1,8 @@
 # NeXusTrade — Exact-Pool Signature-History Reconciliation Specification
 
-**Document ID**: `NXT-SPEC-SIG-RECONCILIATION-V1`  
+**Document ID**: `NXT-SPEC-SIG-RECONCILIATION-V2`  
 **Location**: `docs/research-planning/exact-pool-signature-reconciliation-spec.md`  
-**Status**: **OFFLINE DESIGN PROPOSAL (DOCUMENTATION ONLY. NO IMPLEMENTATION OR LIVE EXECUTION AUTHORIZED)**  
+**Status**: **OFFLINE DESIGN SPECIFICATION (READ-ONLY / NO CODE MODIFICATIONS AUTHORIZED)**  
 **Verification Date**: November 2026  
 **Execution Authority**: **READ-ONLY DOCUMENTATION REPOSITORY. PRODUCTION SOURCE COMPLETENESS REMAINS UNPROVEN. ZERO RUNTIME MODIFICATIONS AUTHORIZED.**
 
@@ -10,15 +10,19 @@
 
 ## 1. Executive Summary & Purpose
 
-This design specification defines the architecture, cursor mechanics, failure modes, and budget feasibility for **Exact-Pool Signature-History Reconciliation**. It establishes a rigorous method to audit and backfill transactions touching a specific liquidity pool using the official Solana JSON-RPC method `getSignaturesForAddress`.
+This design specification defines the architecture, cursor mechanics, failure modes, and budget feasibility for **Exact-Pool Signature-History Reconciliation** using Solana JSON-RPC `getSignaturesForAddress`.
 
-### Core Design Constraints
+### Core Architectural Separation & Verdict
 
-1. **Dual-Cursor Independence**: The latest received WebSocket notification signature ($S_{\text{latestWS}}$) represents an unverified forward notification hint; it has _zero_ authority to establish historical completeness. A separate verified-history cursor ($S_{\text{verified}}$) must be maintained independently.
-2. **Batching vs. Completeness**: A history page size ($L$, e.g. 20 or 50) is an arbitrary batching parameter, not a completeness guarantee. Completeness requires paginating backward until explicitly terminating at the verified boundary.
-3. **Separation of History Enumeration from Trade Resolution**: Enumerating signatures via `getSignaturesForAddress` proves only that transactions occurred on-chain. Trade flow coverage cannot advance until each enumerated transaction is successfully fetched via `getTransaction`, confirmed against the exact 8-field pool context, and decoded into the `RollingTradeFlowTracker`.
-4. **Honest Coverage Boundaries**: Host response receipt time, empty history pages, and open sockets do not prove observation through current host wall-clock time. If indexing lag or RPC inconsistency prevents establishing the boundary, the reconciler must return `UNKNOWN` and fail closed.
-5. **Strict Budget Compliance**: The protocol must operate entirely within active NeXusTrade resource controls ($\ge 2,500\text{ ms}$ provider spacing, 25–50 request session ceilings). No traffic may be unmetered, and no budget ceilings may be bypassed.
+This specification establishes a strict technical distinction between three separate capabilities:
+
+1. **Recovery of Specific Missed Transactions**: **FEASIBLE**. When WebSocket notifications are dropped, targeted signature queries can identify and backfill specific missing transactions.
+2. **Conditional History Enumeration Between Witnessed Boundaries**: **FEASIBLE**. If two on-chain boundaries $S_{\text{start}}$ and $S_{\text{end}}$ are positively connected by verified signatures, intervening transactions can be enumerated and resolved.
+3. **Certification of a Complete Rolling Time Window**: **UNSUPPORTED / UNPROVEN**. Indexer replication lag, multi-node RPC inconsistency, unverified upper time boundaries, and nullable/coarse timestamps prevent certifying that _every_ transaction in a sliding $[T - 60\text{s}, T]$ window was observed.
+
+> [!IMPORTANT]
+> **Defensible Architectural Conclusion: `RECOVERY_ONLY`**:  
+> Exact-pool signature reconciliation is specified strictly as an **offline recovery and backfill mechanism** between witnessed boundaries. It does **not** certify production source completeness. The production completeness gate remains firmly closed: `isProductionCompletenessEstablished = false`.
 
 ---
 
@@ -26,7 +30,7 @@ This design specification defines the architecture, cursor mechanics, failure mo
 
 ### 2.1 The Critical Anchor Pitfall: The Missed-B Counter-Example
 
-A foundational defect in naive reconciliation protocols is treating the most recently received WebSocket notification as proof that all prior transactions were captured.
+A foundational defect in naive reconciliation protocols is treating the most recently received WebSocket notification ($S_{\text{latestWS}}$) as proof that all prior history was captured.
 
 ```mermaid
 sequenceDiagram
@@ -35,47 +39,47 @@ sequenceDiagram
     participant Coord as Subscription Coordinator
     participant Recon as Signature Reconciler
 
-    Note over Chain: T0: Transaction A confirmed
-    Chain->>Coord: Notification A received (S_verified = A)
-    Note over Chain: T1: Transaction B confirmed (DROPPED BY NETWORK)
+    Note over Chain: T0: Baseline signature A established
+    Note over Coord: S_verified = A (buys=0; cut established)
+    Note over Chain: T1: Transaction B confirmed (DROPPED BY SOCKET)
     Chain--xCoord: [Frame Dropped / Disconnect Gap]
     Note over Chain: T2: Transaction C confirmed
     Chain->>Coord: Notification C received (S_latestWS = C)
 
     rect rgb(255, 230, 230)
-    Note over Recon: FLAWED PROTOCOL:<br/>Queries until: C (or anchors to C).<br/>Transaction B is skipped and concealed!
+    Note over Recon: FLAWED PROTOCOL:<br/>Queries until: C (or anchors to C).<br/>Transaction B is skipped and permanently concealed!
     end
 
     rect rgb(230, 255, 230)
-    Note over Recon: CORRECT PROTOCOL:<br/>Queries until: S_verified (A).<br/>Retrieves [C, B], discovers B, fetches both,<br/>then advances S_verified to C.
+    Note over Recon: CORRECT PROTOCOL:<br/>Freezes target C from history batch.<br/>Queries until: S_verified (A).<br/>Retrieves [C, B], discovers B, fetches both,<br/>then advances S_verified to C.
     end
 ```
 
 #### Detailed Failure Mechanics:
 
-1. Candidate pool $P$ experiences three transactions in chronological order: $A \rightarrow B \rightarrow C$.
-2. Transaction $A$ is the last independently reconciled boundary ($S_{\text{verified}} = A$).
-3. Transaction $B$ is confirmed on-chain at slot $S_B$. The WebSocket notification for $B$ is dropped due to transient socket buffer overflow, TCP reset, or RPC publisher lag.
+1. Candidate pool $P$ experiences three confirmed transactions in chronological order: $A \rightarrow B \rightarrow C$.
+2. Transaction $A$ is the established, independently verified history boundary ($S_{\text{verified}} = A$).
+3. Transaction $B$ is confirmed on-chain at slot $S_B$. The WebSocket notification for $B$ is dropped due to socket buffer overflow, TCP reset, or RPC publisher lag.
 4. Transaction $C$ is confirmed on-chain at slot $S_C$. The WebSocket notification for $C$ is received by the coordinator ($S_{\text{latestWS}} = C$).
-5. **The Pitfall**: If reconciliation anchors to $C$ as "already observed" and only queries for signatures _after_ $C$ (or queries backward stopping at $C$), **missed transaction $B$ is completely concealed**. The flow tracker will calculate micro-flow ratios without $B$, violating the fail-closed absorption invariant.
+5. **The Pitfall**: If reconciliation anchors to $C$ as "already observed" and only queries for signatures _after_ $C$ (or queries backward stopping at $C$), **missed transaction $B$ is completely concealed**. The flow tracker will evaluate absorption ratios with missing volume, violating fail-closed safety.
 
 ---
 
 ### 2.2 Dual-Cursor Architecture & Official RPC Contract
 
-To guarantee that missed transactions are detected, the protocol maintains two distinct cursors:
+To ensure that dropped notifications do not conceal history, the protocol maintains two distinct, non-fungible cursors:
 
 1. **$S_{\text{latestWS}}$ (Unverified Observation Hint)**:
    - The newest signature received via `logsSubscribe`.
-   - Used only to trigger proactive reconciliation checks or update intake telemetry.
-   - **Never** advances trade coverage or marks history complete.
+   - Represents an unverified forward notification hint.
+   - **Never** advances trade coverage, establishes a verified boundary, or certifies history completeness.
 2. **$S_{\text{verified}}$ (Verified-History Watermark)**:
-   - The newest transaction signature up to which _every_ preceding transaction has been enumerated via RPC, fetched via `getTransaction`, and successfully decoded.
-   - Initialized at candidate admission baseline ($S_0$) and advanced strictly by the reconciler.
+   - The newest confirmed transaction signature up to which _every_ preceding transaction has been enumerated via RPC, fetched via `getTransaction`, and successfully decoded.
+   - Initialized at candidate admission baseline ($S_0$) and advanced strictly by the reconciler upon positive boundary verification.
 
 #### Solana JSON-RPC Contract: `getSignaturesForAddress`
 
-Per the official Solana specification ([Solana `getSignaturesForAddress` RPC Documentation](https://solana.com/docs/rpc/http/getsignaturesforaddress)):
+Per the official Solana specification ([Solana `getSignaturesForAddress` Documentation](https://solana.com/docs/rpc/http/getsignaturesforaddress)):
 
 ```json
 {
@@ -85,8 +89,9 @@ Per the official Solana specification ([Solana `getSignaturesForAddress` RPC Doc
   "params": [
     "<candidatePoolId>",
     {
-      "limit": 50,
-      "until": "<S_verified>",
+      "limit": 20,
+      "before": "<signature>",
+      "until": "<signature>",
       "commitment": "confirmed"
     }
   ]
@@ -94,308 +99,305 @@ Per the official Solana specification ([Solana `getSignaturesForAddress` RPC Doc
 ```
 
 - **Sort Order**: Results are returned ordered from **newest to oldest**.
-- **`until` Parameter**: Search stops backward in time when it encounters this signature (exclusive). Thus, setting `until: S_verified` retrieves all transactions that occurred _after_ $S_{\text{verified}}$ down to $S_{\text{verified}}$.
-- **`before` Parameter**: Start searching backward starting _before_ this signature (exclusive). Used for multi-page backward pagination.
+- **Returned Fields per Record**:
+  - `signature`: string (base58 transaction signature).
+  - `slot`: number (slot in which transaction was processed).
+  - `err`: TransactionError | null.
+  - `memo`: string | null.
+  - `blockTime`: number | null (estimated production Unix timestamp in seconds; nullable).
+  - `confirmationStatus`: "processed" | "confirmed" | "finalized".
+  - _(Note: There is NO transaction index field returned in `getSignaturesForAddress`)_.
+- **`until` Parameter Mechanics**: Search stops backward in time when it encounters this signature (exclusive). If found, the search stops and returns results up to (but not including) this signature.
+- **`before` Parameter Mechanics**: Search starts backward in time _before_ this signature (exclusive). Used for backward pagination.
 
 ---
 
-### 2.3 Strict Cursor Advance Rules
+### 2.3 Positive Boundary Proof vs. Short Pages
 
-$S_{\text{verified}}$ may advance from $S_A$ to $S_{\text{target}}$ **if and only if** all of the following conditions are met:
+> [!CAUTION]
+> **A Short Page or Empty Response Does NOT Prove Boundary Termination**:
+>
+> - The `until` parameter excludes the boundary signature from the returned records.
+> - The JSON-RPC response format supplies **no explicit boolean flag** indicating whether the search stopped because `until` was encountered, or because available ledger history was exhausted/pruned, or because the queried node had indexed no records.
+> - Therefore, receiving fewer than `limit` records (or an empty array `[]`) does **not** independently prove that $S_{\text{verified}}$ was reached or that the chain is complete.
 
-1. **Contiguous Chain Proof**: A contiguous series of signatures $[S_{\text{target}}, S_{k}, \dots, S_{1}]$ connecting to $S_A$ was returned by `getSignaturesForAddress` with zero pagination gaps or truncation.
-2. **Complete Resolution**: For every signature $S_i$ in the chain:
-   - `getTransaction(S_i)` was dispatched and returned confirmed transaction data.
-   - The transaction was validated against the exact 8-field pool context (`poolId`, `baseVault`, `quoteVault`, etc.).
-   - If identified as a relevant AMM swap, the vault balance deltas were processed into `RollingTradeFlowTracker`.
-   - If confirmed as an unrelated instruction (e.g. pool administrative update with zero vault balance change), it is marked resolved without affecting flow counters.
-3. **Zero Unresolved Exceptions**: If any transaction in the chain fails to retrieve (e.g. transient 429, timeout, or ledger pruning), $S_{\text{verified}}$ **must not advance** past the unresolved signature.
+#### Rule for Positive Boundary Evidence:
 
----
+To establish positive boundary evidence connecting a new batch to an existing anchor $S_{\text{verified}}$:
 
-## 3. The Bounded Reconciliation Protocol
-
-### 3.1 Protocol State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> Uninitialized
-    Uninitialized --> BaselinePending: Candidate Admitted
-    BaselinePending --> VerifiedIdle: Baseline S_0 Established (Coverage Window Starts)
-
-    VerifiedIdle --> Reconciling: Periodic Tick OR Reconnect OR S_latestWS Ahead
-
-    state Reconciling {
-        FetchPage: getSignaturesForAddress(until=S_verified)
-        CheckBoundary: Verified Boundary S_verified Reached?
-        PaginateBackward: getSignaturesForAddress(before=S_oldest, until=S_verified)
-        ResolveTransactions: getTransaction() for all new signatures
-
-        FetchPage --> CheckBoundary
-        CheckBoundary --> PaginateBackward: Page Full & S_verified not found
-        PaginateBackward --> CheckBoundary
-        CheckBoundary --> ResolveTransactions: S_verified reached OR batch exhausted
-    }
-
-    ResolveTransactions --> VerifiedIdle: All Resolved (S_verified advances)
-    ResolveTransactions --> HistoryGap: Missing Sig / Null Tx / Boundary Pruned
-    HistoryGap --> [*]: Fail-Closed (Coverage UNAVAILABLE)
-```
+1. **Explicit Ingestion or Linkage**: The pagination traversal must either:
+   - Paginate backward using `before` without an exclusionary `until` until a page is returned that **actually contains the known anchor $S_{\text{verified}}$**, OR
+   - Query a contiguous signature window where the oldest returned signature's parent block/slot linkage is independently confirmed.
+2. **Fail-Closed on Unreached Boundary**: If pagination terminates without explicitly returning or confirming the known anchor (e.g. ledger pruned, timeout, or boundary missing), the reconciler **must return `UNKNOWN`** and record `UNRESOLVABLE_HISTORY_GAP`. The boundary is unestablished, and $S_{\text{verified}}$ **must not advance**.
 
 ---
 
-### 3.2 Step-by-Step Execution Sequence
+## 3. Bounded Protocol Specification
 
-#### Step 1: Exact Pool & Connection-Epoch Binding
+### 3.1 Lifecycle States & Epoch Cancellation
 
-- The reconciler is instantiated with an immutable `candidatePoolId` and bound to the active coordinator `connectionEpoch`.
-- If a WebSocket disconnect occurs, the coordinator increments `connectionEpoch` ($E \rightarrow E+1$) and marks coverage `SUBSCRIPTION_DISCONNECT`.
-- Any reconciliation job initiated during epoch $E$ is discarded; a new reconciliation cycle begins in epoch $E+1$ anchoring to persistent $S_{\text{verified}}$.
+In accordance with [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts#L65-L142):
 
-#### Step 2: Baseline Establishment ($S_0$)
-
-- At candidate admission tick $T_0$, before opening candidate micro-flow observation, the reconciler queries:
-  `getSignaturesForAddress(candidatePoolId, { limit: 1, commitment: "confirmed" })`.
-- If a signature is returned, it becomes $S_0 = S_{\text{verified}}$. If the pool has zero confirmed transactions, $S_0 = \text{GENESIS\_ANCHOR}$.
-- **Honest Pre-Admission Boundary**: Establishing $S_0$ does **not** claim observation of pre-admission history. History prior to $S_0$ is marked `NOT_OBSERVED`. The rolling 60-second window begins accumulating valid observation time strictly from $T_0$ forward.
-
-#### Step 3: Backward Pagination & Boundary Verification
-
-- The reconciler sets upper boundary target $S_{\text{top}} = S_{\text{latestWS}}$ (or the newest signature returned in the first page).
-- The reconciler issues:
-  `getSignaturesForAddress(candidatePoolId, { limit: L, until: S_verified, commitment: "confirmed" })` (with $L = 20$).
-- **Case 3A: Empty Response (`[]`)**:
-  - Zero transactions occurred on the pool between $S_{\text{verified}}$ and the query execution.
-  - Quiet period confirmed. $S_{\text{verified}}$ remains current; coverage remains complete up to the confirmed slot of the query.
-- **Case 3B: Batch Terminates at $S_{\text{verified}}$ (Count $< L$ or `until` satisfied)**:
-  - All transactions between $S_{\text{verified}}$ and the newest returned signature have been enumerated.
-  - Proceed to Step 4 (Resolution).
-- **Case 3C: Batch Full ($= L$) and $S_{\text{verified}}$ Not Yet Reached**:
-  - The number of intervening transactions exceeds batch size $L$.
-  - Record oldest signature in batch $S_{\text{batchOldest}}$.
-  - Issue paginated backward query:
-    `getSignaturesForAddress(candidatePoolId, { limit: L, before: S_batchOldest, until: S_verified, commitment: "confirmed" })`.
-  - Repeat until the batch reaches $S_{\text{verified}}$.
-
-#### Step 4: Transaction Retrieval & Resolution
-
-- For each discovered signature $S_i$ that is not already present in the flow tracker:
-  - Dispatch `getTransaction(S_i, { commitment: "confirmed", maxSupportedTransactionVersion: 0 })`.
-  - Verify exact 8-field pool binding in instructions/innerInstructions.
-  - If valid AMM swap: pass decoded amounts to `RollingTradeFlowTracker.recordTrade()`.
-- Once _all_ discovered transactions up to $S_{\text{top}}$ are resolved, $S_{\text{verified}}$ advances to $S_{\text{top}}$.
-
-#### Step 5: Handling Concurrency During Pagination
-
-- If new WebSocket notifications ($S_{\text{new1}}, S_{\text{new2}}$) arrive while backward pagination is in-flight, they are appended to an unverified intake queue.
-- They do not interrupt backward pagination.
-- Once the in-flight reconciliation batch resolves and $S_{\text{verified}}$ advances to $S_{\text{top}}$, the next reconciliation cycle will query `until: S_top`, seamlessly capturing $S_{\text{new1}}, S_{\text{new2}}$ and any transactions that arrived between them.
+- **Lifecycle State Machine**: `DISCONNECTED` $\rightarrow$ `CONNECTING` $\rightarrow$ `SUBSCRIBING` $\rightarrow$ `SUBSCRIBED` $\rightarrow$ `CLOSED`.
+- **Connection Epoch**: The coordinator increments `connectionEpoch` inside `attachTransport(transport: ISolanaWebSocketTransport)` when attaching a new or replacement transport, **not** immediately on disconnect.
+- **Disconnect Tracking**: When a transport closes or encounters an error, the coordinator enters `DISCONNECTED`, records `disconnectedAtMs`, and logs a `SUBSCRIPTION_DISCONNECT` gap.
+- **Job Cancellation Invariant**: Any in-flight reconciliation job is cancelled and its results discarded if:
+  1. The coordinator status is no longer `SUBSCRIBED` (e.g. `DISCONNECTED`, `CONNECTING`, or `CLOSED`), OR
+  2. The coordinator's active `connectionEpoch` does not exactly match the epoch in which the reconciliation request was dispatched.
 
 ---
 
-### 3.3 Failure Modes & Edge Cases
+### 3.2 Baseline Establishment Semantics ($S_0$)
 
-| Edge Case / Failure Condition               | System Impact                                                                                                   | Required Protocol Handling                                                                                         | Fail-Closed Coverage Status                                                              |
-| :------------------------------------------ | :-------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- |
-| **Pruned Ledger / Boundary Not Found**      | Reconciler paginates backward to RPC node history retention limit without encountering $S_{\text{verified}}$.   | The chain of continuity is permanently broken. Halt candidate tracking; emit `UNRESOLVABLE_HISTORY_GAP`.           | **`UNAVAILABLE`**                                                                        |
-| **`getTransaction` Returns `null`**         | RPC node has indexed signature but purged or failed to locate transaction data, or transaction dropped in fork. | Retry bounded $\le 2$ attempts. If still `null`, transaction cannot be audited.                                    | **`INSUFFICIENT`** ($S_{\text{verified}}$ cannot advance)                                |
-| **WebSocket Disconnect / Reconnect**        | Notification stream interrupted; intermediate frames lost.                                                      | Increment `connectionEpoch`. Paced query `getSignaturesForAddress(until: S_verified)` backfills missed signatures. | **`UNAVAILABLE`** during disconnect; transitions to **`SUFFICIENT`** only after backfill |
-| **Quiet Pool (Skipped Notification Slots)** | Zero transactions touch the pool across 50 consecutive slots.                                                   | `getSignaturesForAddress(until: S_verified)` returns `[]`. Reconciler verifies no transactions were missed.        | **`SUFFICIENT`** (No lost data)                                                          |
-| **Duplicate Signatures**                    | Same signature received via WebSocket and returned in reconciliation page.                                      | Flow tracker and reconciler deduplicate by cryptographic signature string (`txSignature`).                         | **`SUFFICIENT`** (Idempotent ignore)                                                     |
-| **Same-Slot Multiple Transactions**         | Multiple swaps occur within the same Solana block/slot for candidate pool.                                      | Signatures within the same slot are sorted by transaction index or `blockTime`.                                    | **`SUFFICIENT`** (All decoded in order)                                                  |
+1. **Initial History Cut**:
+   - At candidate admission, the reconciler executes:
+     `getSignaturesForAddress(candidatePoolId, { limit: 1, commitment: "confirmed" })`.
+   - The returned signature (if present) establishes the baseline history cut $S_0 = S_{\text{verified}}$.
+2. **Honest Baseline Accounting**:
+   - Establishing $S_0$ does **not** retrieve or decode transaction $S_0$, and does **not** count it as a trade (e.g. `buys = 0`).
+   - Establishing $S_0$ does **not** claim observation from admission tick $T_{\text{admit}}$. Any transactions occurring between admission and baseline lookup are unobserved unless explicitly backfilled. The start boundary is strictly the confirmed slot/blockTime of $S_0$, and pre-$S_0$ history is marked `NOT_OBSERVED`.
+3. **Empty Initial Response**:
+   - If the baseline lookup returns an empty array `[]`, the baseline is marked **`BASELINE_UNESTABLISHED`**.
+   - An empty response does not prove the pool was newly initialized or that history is complete. No synthetic "genesis anchor" may be invented. Observation cannot begin until a positive baseline is established.
 
 ---
 
-## 4. Honest Coverage Boundary Evaluation
+### 3.3 Traversal, Freezing Targets & Pagination
+
+1. **Target Freezing**:
+   - When a reconciliation check runs, the target signature $S_{\text{target}}$ is **frozen from the newest signature returned in the RPC history batch**.
+   - $S_{\text{latestWS}}$ is only an unverified hint; it never becomes a reconciliation target until RPC actually returns it.
+2. **Pagination with Batch Size $L$**:
+   - Batch size $L = 20$ is an **explicit batching parameter**, not a completeness guarantee.
+   - Initial query: `getSignaturesForAddress(candidatePoolId, { limit: L, commitment: "confirmed" })`.
+   - If the known anchor $S_{\text{verified}}$ is not present in the returned array, the reconciler paginates backward:
+     `getSignaturesForAddress(candidatePoolId, { limit: L, before: S_oldestInPage, commitment: "confirmed" })`.
+   - Traversal continues until a page is returned containing $S_{\text{verified}}$, providing positive proof of boundary continuity.
+3. **Concurrent Notifications During Traversal**:
+   - While backward pagination is in progress, new live WebSocket notifications may arrive.
+   - The coordinator queues incoming notifications in an unverified buffer without interrupting the backward pagination job.
+   - Once the batch resolving back to $S_{\text{verified}}$ completes, $S_{\text{verified}}$ advances to the frozen $S_{\text{target}}$. The next cycle then queries backward from the newly frozen target, naturally capturing the buffered arrivals.
+
+---
+
+### 3.4 Data Models & Separation of Concerns
+
+#### 1. RPC Data Realities (No Transaction Indexes, Nullable blockTime):
+
+- `getSignaturesForAddress` returns only `{ err, memo, signature, slot, blockTime, confirmationStatus }`.
+- It does **not** return transaction indexes within a block.
+- `blockTime` is nullable and represents coarse integer seconds. Multiple transactions in the same block/slot share identical slot and blockTime values.
+- **Ordering Rule**: Transactions within the same slot are processed in the order returned by RPC (matching validator ledger execution order). No unbudgeted `getBlock` calls may be made to extract transaction indexes.
+
+#### 2. Distinct Deduplication Layers:
+
+- **Transaction Deduplication**: The reconciler maintains a set of processed transaction signatures (`txSignature`) to prevent fetching the same Solana transaction twice.
+- **Swap Deduplication**: [`RollingTradeFlowTracker`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts#L46-L60) maintains its own canonical swap identity key:
+  $$\text{eventId} = \$\{ \text{signature} \} : \$\{ \text{outerInstructionIndex} \} : \$\{ \text{swapIndex} \}$$
+  This accounts for multiple swaps within a single transaction without double-counting.
+
+#### 3. Actual Integration Methods:
+
+- Transactions are fetched via `getTransaction(signature)`.
+- Valid swaps are ingested using the actual accepted method:
+  [`RollingTradeFlowTracker.ingestTrade(event: TradeEvent)`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts#L564).
+  _(Note: `recordTrade()` does not exist)_.
+
+#### 4. Immutable Stream Gaps:
+
+- Backfill success does **not** automatically erase recorded `StreamGap` records in the tracker.
+- In the accepted architecture, collection gaps represent permanent historical telemetry; backfilling transactions recovers trade flow data, but does not retroactively claim uninterrupted WebSocket liveness.
+
+#### 5. Explicit Retry Budget Policy:
+
+- Any retry of a failed `getTransaction` or `getSignaturesForAddress` query must explicitly specify `purpose: "RETRY"`.
+- Retries consume global requests, respect $\ge 2,500\text{ ms}$ spacing, and are capped at $\le 1$ attempt. If denied by the budget manager, the transaction is marked unresolved immediately.
+
+---
+
+## 4. Honest Coverage Boundary & Environmental Constraints
 
 ### 4.1 What Evidence Establishes a Completed Observation Interval?
 
-To declare an observation interval $[T_{\text{start}}, T_{\text{end}}]$ "complete" for strategy absorption evaluation, the system must hold verifiable evidence:
+To declare an observation interval $[T_{\text{start}}, T_{\text{end}}]$ complete, the system must possess verifiable positive evidence:
 
-1. **Lower Boundary ($T_{\text{start}}$)**: Anchored to a verified transaction signature $S_{\text{start}}$ with on-chain `blockTime` $\le T_{\text{start}}$, or candidate baseline $S_0$.
-2. **Upper Boundary ($T_{\text{end}}$)**: Anchored to a confirmed transaction signature $S_{\text{end}}$ whose on-chain `blockTime` and slot are $\ge T_{\text{end}}$, OR a confirmed slot watermark queried from `getSlot(commitment: "confirmed")`.
-3. **Internal Contiguity**: Proof that `getSignaturesForAddress` from $S_{\text{end}}$ down to $S_{\text{start}}$ was enumerated with zero dropped records, and every transaction was decoded.
+1. **Lower Boundary**: Anchored to a confirmed transaction signature $S_{\text{start}}$ with verified `blockTime` $\le T_{\text{start}}$.
+2. **Upper Boundary**: Anchored to a confirmed transaction signature $S_{\text{end}}$ with verified `blockTime` $\ge T_{\text{end}}$.
+3. **Contiguous Chain**: Positive boundary proof connecting $S_{\text{end}}$ to $S_{\text{start}}$ via explicit signature pagination.
+4. **Complete Resolution**: Every transaction in the chain fetched via `getTransaction` and decoded via `ingestTrade()`.
 
-### 4.2 What Does NOT Establish Completeness?
+### 4.2 Prohibited Coverage Proxies & RPC Realities
 
 > [!CAUTION]
 > **Prohibited Proxies for Coverage**:
 >
-> - **Host Response Receipt Time**: The millisecond timestamp when the HTTP response arrives at the node host does _not_ prove observation through that host timestamp.
-> - **Empty History Response (`[]`)**: An empty response indicates no transactions were found on the queried node; it does not prove the absence of transactions if the node is lagging behind cluster consensus.
-> - **Active WebSocket Connection**: A healthy, open WebSocket socket does not prove zero dropped frames. Frame drops can occur in OS socket buffers or intermediate proxies without terminating the TCP session.
+> 1. **Empty History Response (`[]`)**: Does not prove the absence of transactions; multi-node replication lag can cause a node to return empty results for newly confirmed slots.
+> 2. **Short Page ($< L$)**: Does not prove boundary termination; ledger pruning or query constraints produce short pages without reaching the anchor.
+> 3. **Host HTTP Response Time**: Receipt timestamp at the host does not certify that the RPC node has indexed transactions up to that host timestamp.
+> 4. **`getSlot` Call**: Reports the node's current slot height ([Solana `getSlot`](https://solana.com/docs/rpc/http/getslot)), but does **not** certify that secondary indexers servicing `getSignaturesForAddress` have indexed all transactions through that slot.
+> 5. **Open WebSocket**: Socket liveness does not prove zero dropped frames.
 
-### 4.3 Environmental Assumptions & Inconsistencies
+### 4.3 Environmental Constraints
 
-- **Commitment Mismatch**: All WebSocket subscriptions (`logsSubscribe`) and RPC queries (`getSignaturesForAddress`, `getTransaction`) must strictly specify `commitment: "confirmed"`. Using `processed` risks ingesting forked transactions; mixing commitments produces unresolvable signature ordering contradictions.
-- **Multi-Node Cluster Replication Lag**: Standard commercial RPC providers route requests across load-balanced clusters. A WebSocket notification emitted by Node 1 may arrive at the host before Node 2 (servicing the subsequent HTTP RPC request) has indexed the block. A reconciliation query executed immediately upon WebSocket receipt can return stale results. A minimum cooldown spacing is required before reconciliation queries.
-- **On-Chain Clock Skew**: Validator `blockTime` estimates can drift by $\pm 2$ to $5$ seconds relative to UTC wall-clock time. Bounded skew validation ($\le 2,000\text{ ms}$) must remain active.
-- **Honest Verdict**: If available RPC evidence cannot verify complete observation through the required window, the system must return **`UNKNOWN`** and maintain `isProductionCompletenessEstablished = false`.
-
----
-
-## 5. Feasibility Under Existing NeXusTrade Controls
-
-### 5.1 Enforced Code Controls & Budget Limits
-
-The reconciliation protocol must operate strictly within existing limits configured in [`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts) and [`providerConfig.ts`](file:///u:/Projects/TopG/backend/src/providers/config/providerConfig.ts):
-
-- **Provider Spacing**: $\ge 2,500\text{ ms}$ minimum interval between calls to the same provider (`minProviderSpacingMs = 2500`). Maximum sustained dispatch rate: **$\le 24\text{ requests/minute}$**.
-- **Session Ceilings**: Hard ceiling of **25–50 total requests** in prospective pilot configurations (default `maxTotalRequests = 120`).
-- **Enrichment Limit**: `maxEnrichmentAttempts = 10`.
-- **Reserved Capacity**: `minReservedForwardRequests = 4` (reserved for forward quotes).
-- **Policy Invariant**: No limits may be increased, no traffic may be unmetered, and no automated budget resets are permitted.
+- **Commitment Parity**: All RPC queries (`getSignaturesForAddress`, `getTransaction`, `getAccountInfo`) and WebSocket streams (`logsSubscribe`) must strictly use `commitment: "confirmed"`. Mixing `processed` and `confirmed` produces unresolvable fork contradictions.
+- **Multi-Node Cluster Replication Lag**: Load-balanced RPC endpoints route requests across heterogeneous nodes. A WebSocket notification emitted by Node 1 can be received at the host while Node 2 (servicing HTTP RPC) lags by 1–3 slots. Reconciliation queries dispatched immediately upon WebSocket receipt risk reading stale state.
+- **Nullable blockTime**: When `blockTime` is null or identical across same-slot transactions, wall-clock duration cannot be mathematically proven.
+- **Unproven Upper Boundary Verdict**: Because node progress does not prove complete pool history indexing through host wall-clock time, **the upper time boundary remains unproven**. The system must return **`UNKNOWN`** and keep `isProductionCompletenessEstablished = false`.
 
 ---
 
-### 5.2 Scenario Workload Models (Assumed, Not Measured)
+## 5. Feasibility Recalculation Under Enforced Controls
 
-To evaluate feasibility, we calculate RPC demand across three assumed candidate tracking profiles over a 5-minute ($300\text{ s}$) observation window:
+### 5.1 Enforced Budget Controls
 
-$$\text{Total RPC Calls} = N_{\text{baseline}} + N_{\text{history\_queries}} + N_{\text{tx\_retrievals}} + N_{\text{shared\_intake}}$$
+The protocol must operate strictly within active constraints in [`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts#L66-L129):
 
-Where:
+1. **Provider Pacing**: $\ge 2,500\text{ ms}$ minimum spacing between dispatches to the same provider (`minProviderSpacingMs = 2500`).
+2. **Pacing Dispatch Formula**: For $N$ serial dispatches to the same provider, the minimum elapsed time between the 1st dispatch and the $N$-th dispatch is:
+   $$\Delta T_{\text{pacing}} \ge (N - 1) \times 2,500\text{ ms} = (N - 1) \times 2.5\text{ seconds}$$
+   Total elapsed wall-clock time is:
+   $$T_{\text{total}} = T_{\text{initial\_wait}} + \Delta T_{\text{pacing}} + \sum_{i=1}^{N} T_{\text{latency}, i}$$
+3. **Session Ceilings**: Hard ceiling of **25–50 total requests** in pilot configurations (default `maxTotalRequests = 120`).
+4. **Enrichment Limit**: `maxEnrichmentAttempts = 10`.
+   - **Critical Constraint**: In [`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts#L380), the default purpose is `CANDIDATE_ENRICHMENT`. Under this default, **at most 10 requests total** can be made across the entire session before the manager rejects calls with `MAX_ENRICHMENT_ATTEMPTS_REACHED`.
+5. **Reserved Forward Capacity**: `minReservedForwardRequests = 4` (stops non-quote requests when within 4 calls of `maxTotalRequests`).
+6. **Global Scope**: All external calls (Solana RPC, RugCheck, DexScreener) count toward `totalRequests`.
 
-- $N_{\text{baseline}} = 1$ `getSignaturesForAddress` call.
-- $N_{\text{history\_queries}} = \frac{300\text{ s}}{\text{Reconciliation Interval (e.g. 30s)}} = 10$ calls.
-- $N_{\text{shared\_intake}} = 1$ `getAccountInfo` (mint auth) $+ 1$ RugCheck (free external).
+---
+
+### 5.2 Scenario Workload Recalculation
+
+We evaluate demand across three assumed candidate tracking profiles over a 5-minute ($300\text{ s}$) observation window, assuming prior discovery/screening has already consumed **15 global requests** (10 DexScreener polls, 3 RugCheck reports, 2 RPC mint checks):
+
+$$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\text{history\_RPC}} + N_{\text{tx\_retrieval\_RPC}} + N_{\text{boundary\_RPC}} + N_{\text{external}}$$
 
 #### Scenario 1: Quiet Candidate Pool (0 Transactions during 5m window)
 
-- $N_{\text{baseline}} = 1$
-- $N_{\text{history\_queries}} = 10$ (each returning `[]`)
-- $N_{\text{tx\_retrievals}} = 0$
-- $N_{\text{shared\_intake}} = 1$ (`getAccountInfo`)
-- **Total Solana RPC Calls**: **12 calls** over 300 seconds (1 call every 25 seconds).
-- **Feasibility**: **Fully Feasible**. Consumes 12 requests ($\le 24\%$ of a 50-request session budget). Spacing well above $2,500\text{ ms}$.
+- Proposed Purpose: History queries proposed as `FORWARD_OBSERVATION`.
+- $N_{\text{baseline\_RPC}} = 1$ `getSignaturesForAddress`.
+- $N_{\text{history\_RPC}} = 5$ periodic checks (1 every 60s, each returning positive boundary proof or `UNKNOWN`).
+- $N_{\text{tx\_retrieval\_RPC}} = 0$.
+- $N_{\text{boundary\_RPC}} = 0$.
+- **Solana RPC Subtotal**: **6 calls**.
+- **Global Session Total**: $15\text{ prior} + 6\text{ RPC} = \mathbf{21\text{ requests}}$ (fits within 50-request ceiling).
+- **Pacing Feasibility**: 6 dispatches require at least $(6 - 1) \times 2.5\text{ s} = \mathbf{12.5\text{ seconds}}$ of pacing spread over 300s. **Feasible**.
+- **Coverage Outcome**: Zero trades observed; upper boundary uncertified $\rightarrow$ **`UNKNOWN`** (`isProductionCompletenessEstablished = false`).
 
-#### Scenario 2: Moderate Activity Pool (1 Transaction/minute = 5 Transactions over 5m window)
+#### Scenario 2: Moderate Activity Pool (3 Transactions over 5m window)
 
-- $N_{\text{baseline}} = 1$
-- $N_{\text{history\_queries}} = 10$
-- $N_{\text{tx\_retrievals}} = 5$ (`getTransaction`)
-- $N_{\text{shared\_intake}} = 1$ (`getAccountInfo`)
-- **Total Solana RPC Calls**: **17 calls** over 300 seconds.
-- **Feasibility**: **Feasible**. Consumes 17 requests ($34\%$ of a 50-request budget). Required dispatch time: $17 \times 2.5\text{ s} = 42.5\text{ seconds}$ total spread across 300 seconds.
+- Proposed Purpose:
+  - History queries: `FORWARD_OBSERVATION`.
+  - Transaction retrievals: `CANDIDATE_ENRICHMENT` (3 attempts, within the 10-attempt cap).
+- $N_{\text{baseline\_RPC}} = 1$.
+- $N_{\text{history\_RPC}} = 5$.
+- $N_{\text{tx\_retrieval\_RPC}} = 3$ `getTransaction`.
+- $N_{\text{boundary\_RPC}} = 0$.
+- **Solana RPC Subtotal**: **9 calls**.
+- **Global Session Total**: $15\text{ prior} + 9\text{ RPC} = \mathbf{24\text{ requests}}$ (within 50 ceiling; enrichment requests = 3, within 10 cap).
+- **Pacing Feasibility**: 9 dispatches require $(9 - 1) \times 2.5\text{ s} = \mathbf{20.0\text{ seconds}}$ pacing spread over 300s. **Feasible**.
+- **Coverage Outcome**: 3 trades recovered and ingested; window uncertified $\rightarrow$ **`RECOVERY_ONLY`** (`isProductionCompletenessEstablished = false`).
 
 #### Scenario 3: Volatile Retest Surge (15 Transactions in a 60-Second Surge)
 
-- $N_{\text{baseline}} = 1$
-- $N_{\text{history\_queries}} = 2$ (in that minute)
-- $N_{\text{tx\_retrievals}} = 15$ (`getTransaction`)
-- $N_{\text{shared\_intake}} = 1$
-- **Total Solana RPC Calls**: **19 calls in 60 seconds**.
-- **Feasibility**: **Marginal / Bottlenecked by Host Pacing**:
-  - Dispatching 19 calls at $\ge 2,500\text{ ms}$ spacing requires **$47.5\text{ seconds}$** of continuous serialized queue time.
-  - Consumes 19 requests ($38\%$ of a 50-request ceiling) in a single candidate surge.
-  - If two candidates surge simultaneously (38 calls), the 50-request session ceiling is nearly exhausted, triggering `GLOBAL_REQUEST_CEILING_REACHED`.
+- **Immediate Blocker under Defaults**:
+  - If transaction retrievals default to `CANDIDATE_ENRICHMENT`, the 11th transaction is **blocked immediately** by `MAX_ENRICHMENT_ATTEMPTS_REACHED` ($10 \text{ cap}$).
+  - Declaring a 15-transaction retrieval feasible under default adapter configuration is **factually false**.
+- **Analysis Even If Configured as `FORWARD_OBSERVATION`**:
+  - $N_{\text{history\_RPC}} = 2$ signature queries.
+  - $N_{\text{tx\_retrieval\_RPC}} = 15$ `getTransaction` calls.
+  - Solana RPC Subtotal = 17 calls.
+  - Global Total = $15\text{ prior} + 17\text{ RPC} = \mathbf{32\text{ requests}}$.
+  - Pacing Requirement: 17 dispatches require at least $(17 - 1) \times 2.5\text{ s} = \mathbf{40.0\text{ seconds}}$ of serialized pacing intervals alone!
+  - Adding response latency ($\sim 200\text{ ms} \times 17 = 3.4\text{ s}$), total dispatch time is $\mathbf{\approx 43.4\text{ seconds}}$.
+  - Consumes 32 of 50 requests. If another candidate surges or if discovery continues, `minReservedForwardRequests = 4` blocks non-quote requests at 46 calls.
+- **Feasibility Conclusion**: **Infeasible under default `CANDIDATE_ENRICHMENT`**; marginal/severely delayed under `FORWARD_OBSERVATION`.
 
 ---
 
-## 6. Illustrative Protocol Fixture Scenarios
+## 6. Protocol Fixture Scenarios
 
 ### Fixture 1: The Missed-B Resolution ($A \rightarrow B \rightarrow C$)
 
-| Step  | On-Chain Event            | WebSocket Event         | Coordinator State         | Reconciler Action   | RPC Query & Parameters                              | Result Returned | Cursors & Tracker State                                                           |
-| :---- | :------------------------ | :---------------------- | :------------------------ | :------------------ | :-------------------------------------------------- | :-------------- | :-------------------------------------------------------------------------------- |
-| **1** | Tx A confirmed (Slot 100) | Notification A received | $S_{\text{latestWS}} = A$ | Baseline check      | `getSignaturesForAddress(P, {limit: 1})`            | `[A]`           | $S_{\text{verified}} = A$. Tracker: `buys=1`.                                     |
-| **2** | Tx B confirmed (Slot 101) | **DROPPED BY SOCKET**   | $S_{\text{latestWS}} = A$ | None                | None                                                | None            | $S_{\text{verified}} = A$. Tx B unobserved.                                       |
-| **3** | Tx C confirmed (Slot 103) | Notification C received | $S_{\text{latestWS}} = C$ | Reconcile triggered | `getSignaturesForAddress(P, {until: A, limit: 20})` | `[C, B]`        | Discovers missed B! Fetches `getTransaction(C)` and `getTransaction(B)`.          |
-| **4** | Tx C & B decoded          | None                    | Active tracking           | Ingest into tracker | None                                                | Swaps decoded   | Tracker: `buys=3`. $S_{\text{verified}}$ advances to $C$. **Missed B recovered**. |
+- Context: Baseline cut established at $A$. WebSocket drops notification for $B$, but receives $C$.
+
+| Step  | On-Chain Event     | WebSocket Event         | Coordinator State      | Reconciler Action         | RPC Query & Parameters                               | Result Returned | Cursors & Tracker State                                                                                       |
+| :---- | :----------------- | :---------------------- | :--------------------- | :------------------------ | :--------------------------------------------------- | :-------------- | :------------------------------------------------------------------------------------------------------------ |
+| **1** | Baseline cut       | None                    | `SUBSCRIBED` (Epoch 1) | Baseline established      | `getSignaturesForAddress(P, {limit: 1})`             | `[A]`           | $S_{\text{verified}} = A$. **buys = 0** (A is cut, not decoded).                                              |
+| **2** | Tx B confirmed     | **DROPPED**             | `SUBSCRIBED` (Epoch 1) | None                      | None                                                 | None            | $S_{\text{verified}} = A$. Tx B unobserved.                                                                   |
+| **3** | Tx C confirmed     | Notification C received | `SUBSCRIBED` (Epoch 1) | Reconcile triggered       | `getSignaturesForAddress(P, {before: C, limit: 10})` | `[B, A]`        | **Positive boundary proof**: Array contains known anchor $A$.                                                 |
+| **4** | Fetch transactions | None                    | `SUBSCRIBED` (Epoch 1) | Dispatch `getTransaction` | `getTransaction(B)` then `getTransaction(C)`         | Swaps returned  | Validated pool context; calls `tracker.ingestTrade(B)` then `ingestTrade(C)`.                                 |
+| **5** | Cursor advance     | None                    | `SUBSCRIBED` (Epoch 1) | Advance watermark         | None                                                 | None            | All resolved. $S_{\text{verified}}$ advances to $C$. **Missed B recovered**. Window status remains `UNKNOWN`. |
 
 ---
 
 ### Fixture 2: Multi-Page Backward Pagination ($L = 10$, 25 New Transactions)
 
-- Context: $S_{\text{verified}} = S_0$. High volume creates 25 transactions ($S_{25} \dots S_1$) since $S_0$.
+- Context: $S_{\text{verified}} = S_0$. 25 transactions ($S_{25} \dots S_1$) occurred since $S_0$.
 
-| Query Step     | Method Call & Parameters                                            | Signatures Returned                          | Boundary Check                         | Action Taken                                                                    |
-| :------------- | :------------------------------------------------------------------ | :------------------------------------------- | :------------------------------------- | :------------------------------------------------------------------------------ |
-| **Page 1**     | `getSignaturesForAddress(P, {limit: 10, until: S_0})`               | $[S_{25}, S_{24}, \dots, S_{16}]$ (10 items) | $S_0$ not reached; page full ($= 10$). | Store batch. Prepare backward pagination with `before: S_16`.                   |
-| **Page 2**     | `getSignaturesForAddress(P, {limit: 10, before: S_16, until: S_0})` | $[S_{15}, S_{14}, \dots, S_6]$ (10 items)    | $S_0$ not reached; page full ($= 10$). | Store batch. Prepare backward pagination with `before: S_6`.                    |
-| **Page 3**     | `getSignaturesForAddress(P, {limit: 10, before: S_6, until: S_0})`  | $[S_5, S_4, S_3, S_2, S_1]$ (5 items)        | Terminated at $S_0$ (5 items $< 10$).  | **Boundary Reached**. Complete contiguous chain $[S_{25} \dots S_1]$ confirmed. |
-| **Resolution** | Dispatch `getTransaction` for $S_1 \dots S_{25}$ in bounded order   | 25 transactions decoded                      | All resolved                           | $S_{\text{verified}}$ advances to $S_{25}$.                                     |
+| Query Step     | Method Call & Parameters                                | Signatures Returned                          | Boundary Check                                | Action Taken                                                                                   |
+| :------------- | :------------------------------------------------------ | :------------------------------------------- | :-------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| **Page 1**     | `getSignaturesForAddress(P, {limit: 10})`               | $[S_{25}, S_{24}, \dots, S_{16}]$ (10 items) | Anchor $S_0$ not in page; page full ($= 10$). | Buffer signatures. Prepare backward query with `before: S_16`.                                 |
+| **Page 2**     | `getSignaturesForAddress(P, {limit: 10, before: S_16})` | $[S_{15}, S_{14}, \dots, S_6]$ (10 items)    | Anchor $S_0$ not in page; page full ($= 10$). | Buffer signatures. Prepare backward query with `before: S_6`.                                  |
+| **Page 3**     | `getSignaturesForAddress(P, {limit: 10, before: S_6})`  | $[S_5, S_4, S_3, S_2, S_1, S_0]$ (6 items)   | **Anchor $S_0$ Found** in returned records!   | **Positive Boundary Established**. Complete contiguous chain confirmed.                        |
+| **Resolution** | Dispatch `getTransaction` for $S_1 \dots S_{25}$        | 25 transactions fetched                      | Dispatched under budget policy                | Calls `tracker.ingestTrade()` for each valid swap. $S_{\text{verified}}$ advances to $S_{25}$. |
 
 ---
 
-### Fixture 3: Quiet Period Across Skipped Slots
+### Fixture 3: Quiet Period Across Skipped Slots (Honest `UNKNOWN` Verdict)
 
-- Context: $S_{\text{verified}} = A$ at Slot 100. Slots 101–105 contain transactions for other programs, but zero transactions mention candidate pool $P$.
+- Context: $S_{\text{verified}} = A$ at Slot 100. Zero pool transactions occur in Slots 101–105.
 
-| Step  | Slot Sequence | Pool P Activity           | Reconciler Query                                    | Result             | Interpretation & State                                                                                              |
-| :---- | :------------ | :------------------------ | :-------------------------------------------------- | :----------------- | :------------------------------------------------------------------------------------------------------------------ |
-| **1** | Slot 100      | Tx A confirmed            | Baseline query                                      | `[A]`              | $S_{\text{verified}} = A$.                                                                                          |
-| **2** | Slots 101–105 | Zero transactions for $P$ | None                                                | None               | No notifications received.                                                                                          |
-| **3** | Slot 106 tick | Periodic audit check      | `getSignaturesForAddress(P, {until: A, limit: 20})` | `[]` (Empty array) | **Valid Quiet Period**. Verified zero transactions touched $P$ between Slot 100 and 106. Coverage remains complete. |
+| Step  | Slot Sequence       | Pool P Activity           | Reconciler Query                          | Result                         | Interpretation & State                                                                                                                                                        |
+| :---- | :------------------ | :------------------------ | :---------------------------------------- | :----------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | Slot 100            | Baseline cut              | Baseline query                            | `[A]`                          | $S_{\text{verified}} = A$.                                                                                                                                                    |
+| **2** | Slots 101–105       | Zero transactions for $P$ | None                                      | None                           | No notifications received.                                                                                                                                                    |
+| **3** | Slot 106 tick       | Periodic audit check      | `getSignaturesForAddress(P, {limit: 10})` | `[A]` (Only anchor A returned) | **Anchor Witnessed**. Proof that zero transactions occurred between A and query execution.                                                                                    |
+| **4** | Coverage Evaluation | Window check              | Evaluate observation window               | Upper boundary unproven        | **Honest Verdict**: Node progress does not certify unindexed pool history through host time. Window coverage = **`UNKNOWN`** (`isProductionCompletenessEstablished = false`). |
 
 ---
 
 ### Fixture 4: Interrupted Reconciliation During WebSocket Disconnect
 
-- Context: Reconciler is paginating when WebSocket disconnects at Host Time $T_{\text{drop}}$.
+- Context: Reconciler is paginating when transport drops. Coordinator enters `DISCONNECTED`.
 
-| Step  | System Event       | Reconciler State                              | In-Flight Job Handling                    | Recovery Action on Reconnect                                                                   |
-| :---- | :----------------- | :-------------------------------------------- | :---------------------------------------- | :--------------------------------------------------------------------------------------------- |
-| **1** | Active pagination  | In-flight Page 2 query pending                | Job bound to Epoch $E_1$                  | Disconnect detected by coordinator.                                                            |
-| **2** | WebSocket Drops    | Coordinator enters `DISCONNECTED`             | Epoch advances to $E_2$                   | In-flight Page 2 response arrives; discarded because epoch $E_1 \ne E_2$.                      |
-| **3** | Socket Reconnects  | Coordinator enters `SUBSCRIBED` (Epoch $E_2$) | Coverage marked `SUBSCRIPTION_DISCONNECT` | Reconciler triggers fresh query: `getSignaturesForAddress(P, {until: S_verified, limit: 20})`. |
-| **4** | Backfill Completes | Backfill retrieved and decoded                | $S_{\text{verified}}$ advances            | Disconnect collection gap resolved; coverage restored to `SUFFICIENT`.                         |
-
----
-
-## 7. Feasibility Assessment, Evidence Gaps & Implementation Recommendation
-
-### 7.1 Feasibility Assessment Under Stated Assumptions
-
-Exact-Pool Signature-History Reconciliation is **architecturally sound and mathematically feasible** for low-to-moderate activity pools within NeXusTrade's design constraints:
-
-1. **Exact-Pool Affinity**: It operates exclusively on `candidatePoolId`, avoiding the massive data waste of full block downloads.
-2. **Quiet-Slot Resilience**: It naturally ignores slots where no candidate trades occurred, eliminating false drop alarms.
-3. **Cursor Rigor**: The dual-cursor model ($S_{\text{verified}}$ vs. $S_{\text{latestWS}}$) guarantees that dropped WebSocket frames cannot conceal missed trades.
-4. **Budget Reality**: For a single candidate, tracking consumes 12–17 calls over 5 minutes, easily fitting within host pacing and request caps. However, **concurrent bursts across multiple candidates will rapidly exhaust a 25–50 request session ceiling**.
+| Step  | System Event               | Coordinator State                          | In-Flight Job Handling        | Recovery Action on Reconnect                                                                                                                                   |
+| :---- | :------------------------- | :----------------------------------------- | :---------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | Active pagination          | `SUBSCRIBED` (Epoch 1)                     | Page 2 query in-flight        | Network drops.                                                                                                                                                 |
+| **2** | Transport Closes           | Enters `DISCONNECTED`                      | Status no longer `SUBSCRIBED` | In-flight Page 2 response arrives; **cancelled and discarded** due to status check. `StreamGap` recorded.                                                      |
+| **3** | `attachTransport()` called | Increments to Epoch 2; enters `SUBSCRIBED` | Clean reconciler state        | New reconciliation job triggered anchoring to persistent $S_{\text{verified}} = A$.                                                                            |
+| **4** | Backfill Dispatched        | `SUBSCRIBED` (Epoch 2)                     | Dispatches fresh pagination   | Missing transactions recovered and ingested via `ingestTrade()`. Recorded `StreamGap` **remains in tracker history**. Production completeness remains `false`. |
 
 ---
 
-### 7.2 Unresolved Evidence & Entitlement Requirements
+## 7. Defensible Conclusion & Implementation Recommendation
 
-Before this specification can transition from an offline design proposal to an implementation patch, the following unresolved items must be addressed:
+### 7.1 Defensible Outcome: `RECOVERY_ONLY`
 
-1. **RPC Provider Latency & Indexing Lag under Load**:
-   - `getSignaturesForAddress` response latency on public Solana RPC under mainnet congestion is unmeasured.
-   - Replication lag across load-balanced RPC endpoints must be empirically characterized to prevent querying nodes that have not yet indexed the confirmed slot.
-2. **Signature Retention & Pruning Depth**:
-   - The exact historical signature depth supported on free and trial tiers (Solana public RPC, QuickNode trial, Alchemy Starter) must be confirmed to establish maximum allowable disconnect duration before an unresolvable history gap occurs.
-3. **Budget Ceiling Governance**:
-   - Operator decision required: Can session ceilings (`maxTotalRequests = 50`) support multi-candidate tracking with reconciliation, or must sessions be strictly segmented into short 15-minute evaluation bursts?
+1. **Recovery is Feasible**: Detecting and retrieving specific missed transactions between witnessed on-chain anchors using `getSignaturesForAddress` and `getTransaction` is technically and mathematically sound.
+2. **Certification is Unsupported**: Certifying that an entire continuous rolling 60-second time window has been observed with 100% gapless completeness cannot be established via polling alone due to multi-node replication lag, unverified upper time boundaries, and nullable timestamps.
+3. **Verdict**: The protocol must be designated strictly as **`RECOVERY_ONLY`**. The production completeness gate must **remain closed** (`isProductionCompletenessEstablished = false`).
 
 ---
 
-### 7.3 Implementation Recommendation
+### 7.2 Smallest Proposed Implementation Patch
 
-> [!IMPORTANT]
-> **Recommendation: DO NOT IMPLEMENT IN RUNTIME CODE YET**.  
-> Production source completeness remains an **unresolved readiness gap**.
+When implementation is authorized, the smallest isolated offline patch consists of:
 
-#### Reason Not to Implement Immediately:
-
-1. **Pacing Bottleneck in Bursts**: Under current `minProviderSpacingMs = 2500`, reconciling a 15-transaction burst takes 40+ seconds of serialized dispatch time. Implementing this against a 25–50 request ceiling without multi-session chunking or coordinator rate-limit refactoring risks stalling the paper daemon.
-2. **Offline Completeness Separation**: The accepted coordinator (`cbf2cf5`) cleanly enforces fail-closed behavior via `COMPLETENESS_MECHANISM_UNAVAILABLE`. Adding a partially wired reconciler without live network profiling would weaken the existing offline boundary.
-
-#### Smallest Proposed Future Implementation Patch (When Authorized):
-
-When implementation is authorized by operator decision, the smallest non-disruptive patch consists of:
-
-1. Creating an isolated offline utility class `ExactPoolSignatureReconciler.ts` implementing the state machine in Section 3.
-2. Writing a focused unit test suite using deterministic offline mock RPC transports validating Fixtures 1–4.
-3. Keeping live network wiring disabled until operator entitlement confirmation and budget governance decisions are finalized.
+1. **Isolated Offline Helper**: Create `backend/src/candidate-scanner/ExactPoolSignatureReconciler.ts` containing only:
+   - The dual-cursor state machine ($S_{\text{verified}}$ and frozen targets).
+   - Bounded backward pagination requiring positive anchor confirmation.
+   - Dispatch of `getTransaction` using explicit purpose and budget accounting.
+   - Ingestion of decoded swaps via `tracker.ingestTrade()`.
+2. **Deterministic Offline Unit Tests**: Create `ExactPoolSignatureReconciler.test.ts` testing Fixtures 1–4 using deterministic mock RPC transports and synthetic clocks.
+3. **No Live Execution**: Keep the helper offline; do not wire it to live daemon loops or modify `isProductionCompletenessEstablished`.
 
 ---
 
 ## 8. Document Lineage & Historical References
 
-- [`api-provider-capabilities-and-cost-roadmap.md`](file:///u:/Projects/TopG/docs/research-planning/api-provider-capabilities-and-cost-roadmap.md): Provider capability matrix and rate limits.
-- [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts): Active offline coordinator implementation.
+- [`api-provider-capabilities-and-cost-roadmap.md`](file:///u:/Projects/TopG/docs/research-planning/api-provider-capabilities-and-cost-roadmap.md): API provider matrix and rate limits.
+- [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts): Active coordinator lifecycle and gap tracking.
 - [`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts): Accepted transaction adapter and context validation.
-- [`RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts): Rolling 60s micro-flow accumulator.
+- [`RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts): Rolling 60s micro-flow accumulator and `ingestTrade()` method.
 - [`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts): Enforced provider pacing and session request ceilings.
 - [`phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`](file:///u:/Projects/TopG/docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md): Phase 12.94-D Milestone D.3.3 source-accurate readiness assessment.
