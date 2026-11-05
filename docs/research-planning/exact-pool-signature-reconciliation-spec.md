@@ -373,21 +373,32 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
 
 ---
 
-### 7.2 Smallest Proposed Implementation Patch
+### 7.2 Implemented Offline Patches
 
-The first isolated offline patch implements bounded history enumeration:
-
-1. **Isolated Offline Helper**: Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
+1. **Isolated Offline Enumeration Helper**: Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
    - Input validation: immutable pool context (`TrackedRaydiumPoolContext`), canonical 64-byte Ed25519 known anchor signature, injected page fetcher, shared `GlobalResourceBudgetManager` under canonical `"SOLANA_RPC"` provider identity, clock, bounded options, and lifecycle validator.
    - Bounded backward pagination using `before` requiring positive anchor appearance in returned records.
    - Shared pacing handling: automatically handles recoverable pacing waits (`PROVIDER_PACING_NOT_MET`) within the operation deadline, re-checking admission after waiting. Quota and reservation denials remain terminal.
    - In-flight deadline & cancellation race: races in-flight fetches against operation deadlines, caller signals, cancellation callbacks, and coordinator lifecycle transitions; discards late/stalled responses.
-   - Schema & traversal validation: enforces 64-byte Ed25519 signatures, requires documented `err` property, rejects contradictory `confirmationStatus` (e.g. `processed` under `confirmed`), and rejects within-page and across-page slot ordering and before-boundary violations.
-   - Capacity bound & deep-freezing: checks capacity before insertion, rejects oversized pages exceeding `pageSize`, and deeply clones and freezes retained metadata.
-   - Evidence-only return contract: returns discovered signatures between anchor and frozen target, positive boundary witness flag (`anchorWitnessed`), and permanently `isProductionCompletenessEstablished = false`.
-   - Zero transaction retrieval, zero swap ingestion, zero cursor advancement, zero gap clearing, and zero production retest inputs.
-2. **Deterministic Offline Unit Tests**: Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts) covering shared pacing, stalled-fetch timeouts, caller cancellation, lifecycle invalidation, bounded retention, schema validation, slot inversions, duplicate metadata conflicts, and protocol fixtures with synthetic clocks.
-3. **No Live Execution**: Keep the helper offline; do not wire it to live daemon loops or modify `isProductionCompletenessEstablished`.
+   - Post-await state validation: rechecks caller cancellation, clock deadline, coordinator lifecycle status, and connection epoch immediately post-await before inspecting, validating, or retaining any fetched records.
+   - Schema & traversal validation: enforces 64-byte Ed25519 signatures, requires documented `err` property (safely handling cyclic/non-serializable errors), preserves nullable `confirmationStatus` without string coercion, rejects contradictory `confirmationStatus` (e.g. `processed` under `confirmed`), and rejects within-page and across-page slot ordering and before-boundary violations.
+   - Capacity bound & deep-freezing: checks capacity before insertion, rejects oversized pages exceeding `pageSize`, snapshots traversal control metadata (`OldestRecordSnapshot`) immutably, and deeply clones and freezes retained metadata.
+   - Evidence-only return contract: returns discovered signatures between anchor and frozen target, positive boundary witness flag (`anchorWitnessed`), candidate provenance metadata (`candidatePoolId`, `connectionEpoch`), and permanently `isProductionCompletenessEstablished = false`.
+   - 44 comprehensive offline unit tests passing in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts).
+
+2. **Bounded Exact-Pool Transaction Resolution Bridge**: Implemented in [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts):
+   - Consumes witnessed enumeration results and resolves discovered transaction signatures through the accepted `RaydiumAmmV4TransactionSourceAdapter` into decoded swaps and `RollingTradeFlowTracker` ingestion.
+   - Exact Candidate Binding: Bound strictly to validated `TrackedRaydiumPoolContext`, associated `RollingTradeFlowTracker`, and lifecycle target/epoch.
+   - Provenance & Anchor Guards: Rejects enumeration results if `candidatePoolId` does not match pool context, if `connectionEpoch` does not match expected epoch (`PROVENANCE_MISMATCH`), or if positive anchor proof is absent (`UNWITNESSED_ANCHOR_REJECTED`) with zero outbound requests.
+   - Ingestion Path: Resolves signatures exclusively via `adapter.processNotification()`; no duplicate or separate `getTransaction` queries. Preserves shared `CANDIDATE_ENRICHMENT` accounting, host pacing ($\ge 2,500\text{ ms}$), capacity reservation, and session ceilings via shared `GlobalResourceBudgetManager`.
+   - Chronological Replay: Dispatches discovered signatures in chronological (oldest-first) order from anchor forward to target.
+   - Honest Duplicate Resolution: Adapter `DUPLICATE_NOTIFICATION` outcomes require explicit prior success evidence (`priorSuccessfulSignatures`) to classify as `DUPLICATE_RESOLVED`; otherwise classified as `DUPLICATE_UNRESOLVED` and counted as failed without crediting recovery.
+   - Partial Ingestion Preservation: Preserves partial-ingestion counts (`PARTIAL_INGEST_FAILED`) without classifying decode failures, unavailable transactions, or budget exhaustion as successful recovery.
+   - In-Flight Bounds & State Recheck: Enforces `maxTransactionsToProcess` and `operationDeadlineMs`. Rechecks cancellation, deadline, lifecycle status, and connection epoch before dispatch and immediately post-await around in-flight adapter operations. Zero retries and no background polling.
+   - Production Completeness Separation: Does not advance verified cursors, does not clear tracker stream gaps, does not call coverage-advancement methods, and permanently returns `isProductionCompletenessEstablished = false`.
+   - 26 focused offline unit tests passing in [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts).
+
+3. **No Live Execution**: Keep the helper and bridge offline; do not wire to live daemon loops or modify `isProductionCompletenessEstablished`.
 
 ---
 

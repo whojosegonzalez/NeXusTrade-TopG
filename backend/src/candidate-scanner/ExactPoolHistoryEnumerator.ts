@@ -74,7 +74,7 @@ export interface HistorySignatureRecord {
   readonly err: unknown | null;
   readonly memo?: string | null | undefined;
   readonly blockTime: number | null;
-  readonly confirmationStatus?: string | undefined;
+  readonly confirmationStatus?: string | null | undefined;
 }
 
 /**
@@ -155,6 +155,8 @@ export interface ExactPoolHistoryEnumeratorOptions {
  */
 export interface HistoryEnumerationResult {
   readonly outcome: HistoryEnumerationOutcome;
+  readonly candidatePoolId: string;
+  readonly connectionEpoch: number;
   readonly anchorWitnessed: boolean;
   readonly knownAnchorSignature: string;
   readonly frozenTargetSignature: string | null;
@@ -243,7 +245,10 @@ function cloneAndDeepFreezeRecord(
     memo: rec.memo !== undefined && rec.memo !== null ? String(rec.memo) : null,
     blockTime: rec.blockTime !== null ? Number(rec.blockTime) : null,
     ...(rec.confirmationStatus !== undefined
-      ? { confirmationStatus: String(rec.confirmationStatus) }
+      ? {
+          confirmationStatus:
+            rec.confirmationStatus === null ? null : String(rec.confirmationStatus),
+        }
       : {}),
   };
 
@@ -682,6 +687,8 @@ export class ExactPoolHistoryEnumerator {
     ): HistoryEnumerationResult => {
       return deepFreeze({
         outcome,
+        candidatePoolId: this.poolContext.poolId,
+        connectionEpoch: expectedEpoch,
         anchorWitnessed: false,
         knownAnchorSignature: this.knownAnchorSignature,
         frozenTargetSignature,
@@ -1003,6 +1010,8 @@ export class ExactPoolHistoryEnumerator {
 
         return deepFreeze({
           outcome: "ANCHOR_WITNESSED",
+          candidatePoolId: this.poolContext.poolId,
+          connectionEpoch: expectedEpoch,
           anchorWitnessed: true,
           knownAnchorSignature: this.knownAnchorSignature,
           frozenTargetSignature,

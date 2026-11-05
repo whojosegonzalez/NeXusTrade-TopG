@@ -1035,5 +1035,93 @@ describe("ExactPoolHistoryEnumerator", () => {
         expect(result.anchorWitnessed).toBe(false);
       });
     });
+
+    describe("Nullable ConfirmationStatus Preservation", () => {
+      it("preserves null confirmationStatus without string coercion in returned immutable records", async () => {
+        mockFetcher.queuedPages = [
+          [
+            {
+              signature: SIG_B,
+              slot: 101,
+              err: null,
+              memo: null,
+              blockTime: 1700000010,
+              confirmationStatus: null,
+            },
+            {
+              signature: SIG_A,
+              slot: 100,
+              err: null,
+              memo: null,
+              blockTime: 1700000000,
+              confirmationStatus: "confirmed",
+            },
+          ],
+        ];
+
+        const enumerator = createHelper();
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("ANCHOR_WITNESSED");
+        expect(result.anchorWitnessed).toBe(true);
+        expect(result.candidatePoolId).toBe(CANONICAL_POOL_ID);
+        expect(result.connectionEpoch).toBe(1);
+        expect(result.discoveredSignatures).toHaveLength(1);
+        expect(result.discoveredSignatures[0]?.signature).toBe(SIG_B);
+        expect(result.discoveredSignatures[0]?.confirmationStatus).toBeNull();
+        expect(result.discoveredSignatures[0]?.confirmationStatus).not.toBe("null");
+      });
+
+      it("handles overlapping pages containing identical null-status records without duplicate conflict", async () => {
+        const page1: HistorySignatureRecord[] = [
+          {
+            signature: SIG_C,
+            slot: 102,
+            err: null,
+            memo: null,
+            blockTime: 1700000020,
+            confirmationStatus: null,
+          },
+          {
+            signature: SIG_B,
+            slot: 101,
+            err: null,
+            memo: null,
+            blockTime: 1700000010,
+            confirmationStatus: null,
+          },
+        ];
+        const page2: HistorySignatureRecord[] = [
+          {
+            signature: SIG_B,
+            slot: 101,
+            err: null,
+            memo: null,
+            blockTime: 1700000010,
+            confirmationStatus: null,
+          },
+          {
+            signature: SIG_A,
+            slot: 100,
+            err: null,
+            memo: null,
+            blockTime: 1700000000,
+            confirmationStatus: null,
+          },
+        ];
+        mockFetcher.queuedPages = [page1, page2];
+
+        const enumerator = createHelper({ pageSize: 2 });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("ANCHOR_WITNESSED");
+        expect(result.anchorWitnessed).toBe(true);
+        expect(result.discoveredSignatures).toHaveLength(2);
+        expect(result.discoveredSignatures[0]?.signature).toBe(SIG_C);
+        expect(result.discoveredSignatures[0]?.confirmationStatus).toBeNull();
+        expect(result.discoveredSignatures[1]?.signature).toBe(SIG_B);
+        expect(result.discoveredSignatures[1]?.confirmationStatus).toBeNull();
+      });
+    });
   });
 });
