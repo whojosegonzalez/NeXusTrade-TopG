@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   ExactPoolTransactionResolutionBridge,
   type TransactionResolutionBridgeOptions,
+  type TransactionResolutionResult,
 } from "./ExactPoolTransactionResolutionBridge.js";
 import {
   RaydiumAmmV4TransactionSourceAdapter,
@@ -455,6 +456,156 @@ describe("ExactPoolTransactionResolutionBridge", () => {
           }),
       ).toThrow(/operationDeadlineMs must be a positive integer <= 120000/);
     });
+
+    it("snapshots and deep freezes poolContext so caller mutations after construction do not alter validation", () => {
+      const mutableContext: TrackedRaydiumPoolContext = { ...STANDARD_POOL_CONTEXT };
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () => new Response("{}", { status: 200 }),
+        sleepFn,
+      });
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: mutableContext,
+        adapter,
+        tracker,
+        budgetManager,
+      });
+
+      // Mutate original context
+      (mutableContext as { poolId: string }).poolId = OTHER_POOL_ID;
+
+      // Bridge internal poolContext remains immutable and bound to original poolId
+      expect(bridge.getPoolContext().poolId).toBe(SYNTHETIC_POOL_ID);
+      expect(Object.isFrozen(bridge.getPoolContext())).toBe(true);
+    });
+
+    it("rejects adapter with mismatched candidate pool context identity fields", () => {
+      const testCases: { field: keyof TrackedRaydiumPoolContext; value: unknown }[] = [
+        { field: "candidateTokenMint", value: "3v2A2E1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8Fwz3v" },
+        { field: "quoteTokenMint", value: "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6C" },
+        { field: "baseVault", value: "2Q1nNwSZnnxTwCvfK8frYnLRDGJ61R1Nd4vvuBcEnVMyD" },
+        { field: "quoteVault", value: "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnb" },
+        { field: "baseMint", value: "So11111111111111111111111111111111111111112" },
+        { field: "quoteMint", value: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" },
+        { field: "orientation", value: "SOL_BASE_TOKEN_QUOTE" },
+      ];
+
+      for (const { field, value } of testCases) {
+        const mismatchedAdapter = {
+          getPoolContext: () => ({
+            ...STANDARD_POOL_CONTEXT,
+            [field]: value,
+          }),
+          getBudgetManager: () => budgetManager,
+          getProviderName: () => "SOLANA_RPC",
+          getRequestPurpose: () => "CANDIDATE_ENRICHMENT",
+        } as unknown as RaydiumAmmV4TransactionSourceAdapter;
+
+        expect(
+          () =>
+            new ExactPoolTransactionResolutionBridge({
+              poolContext: STANDARD_POOL_CONTEXT,
+              adapter: mismatchedAdapter,
+              tracker,
+              budgetManager,
+            }),
+        ).toThrow(
+          new RegExp(
+            `\\[RESOLUTION_BRIDGE_INIT\\] Adapter pool context field '${field}' .* does not match bridge pool context`,
+          ),
+        );
+      }
+    });
+
+    it("rejects tracker with mismatched token mint", () => {
+      const mismatchedTracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_WSOL_MINT, // Quote mint instead of candidateTokenMint
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () => new Response("{}", { status: 200 }),
+        sleepFn,
+      });
+
+      expect(
+        () =>
+          new ExactPoolTransactionResolutionBridge({
+            poolContext: STANDARD_POOL_CONTEXT,
+            adapter,
+            tracker: mismatchedTracker,
+            budgetManager,
+          }),
+      ).toThrow(/Tracker token mint .* does not match bridge candidateTokenMint/);
+    });
+
+    it("rejects adapter configured with a different GlobalResourceBudgetManager instance", () => {
+      const otherBudgetManager = new GlobalResourceBudgetManager();
+      const otherAdapter = {
+        getPoolContext: () => STANDARD_POOL_CONTEXT,
+        getBudgetManager: () => otherBudgetManager,
+        getProviderName: () => "SOLANA_RPC",
+        getRequestPurpose: () => "CANDIDATE_ENRICHMENT",
+      } as unknown as RaydiumAmmV4TransactionSourceAdapter;
+
+      expect(
+        () =>
+          new ExactPoolTransactionResolutionBridge({
+            poolContext: STANDARD_POOL_CONTEXT,
+            adapter: otherAdapter,
+            tracker,
+            budgetManager,
+          }),
+      ).toThrow(
+        "[RESOLUTION_BRIDGE_INIT] Adapter must share the identical GlobalResourceBudgetManager instance supplied to the bridge",
+      );
+    });
+
+    it("rejects adapter configured with non-canonical providerName or requestPurpose", () => {
+      const nonCanonicalProviderAdapter = {
+        getPoolContext: () => STANDARD_POOL_CONTEXT,
+        getBudgetManager: () => budgetManager,
+        getProviderName: () => "solana-rpc", // Non-canonical lowercase
+        getRequestPurpose: () => "CANDIDATE_ENRICHMENT",
+      } as unknown as RaydiumAmmV4TransactionSourceAdapter;
+
+      expect(
+        () =>
+          new ExactPoolTransactionResolutionBridge({
+            poolContext: STANDARD_POOL_CONTEXT,
+            adapter: nonCanonicalProviderAdapter,
+            tracker,
+            budgetManager,
+          }),
+      ).toThrow(
+        "[RESOLUTION_BRIDGE_INIT] Adapter providerName must be canonical 'SOLANA_RPC', received: 'solana-rpc'",
+      );
+
+      const nonCanonicalPurposeAdapter = {
+        getPoolContext: () => STANDARD_POOL_CONTEXT,
+        getBudgetManager: () => budgetManager,
+        getProviderName: () => "SOLANA_RPC",
+        getRequestPurpose: () => "DISCOVERY_POLL", // Non-canonical purpose for resolution
+      } as unknown as RaydiumAmmV4TransactionSourceAdapter;
+
+      expect(
+        () =>
+          new ExactPoolTransactionResolutionBridge({
+            poolContext: STANDARD_POOL_CONTEXT,
+            adapter: nonCanonicalPurposeAdapter,
+            tracker,
+            budgetManager,
+          }),
+      ).toThrow(
+        "[RESOLUTION_BRIDGE_INIT] Adapter requestPurpose must be 'CANDIDATE_ENRICHMENT', received: 'DISCOVERY_POLL'",
+      );
+    });
   });
 
   describe("2. Provenance & Unwitnessed Anchor Guards", () => {
@@ -527,6 +678,40 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       expect(result.outcome).toBe("PROVENANCE_MISMATCH");
       expect(result.totalProcessed).toBe(0);
       expect(result.error).toMatch(/Connection epoch mismatch/);
+    });
+
+    it("rejects enumeration result when connectionEpoch is missing, negative, or non-integer", async () => {
+      const baseEnumResult = {
+        outcome: "ANCHOR_WITNESSED" as const,
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const invalidEpochCases = [undefined, -1, 1.5, Number.NaN, "1" as unknown as number];
+
+      for (const invalidEpoch of invalidEpochCases) {
+        const enumResult = {
+          ...baseEnumResult,
+          connectionEpoch: invalidEpoch as unknown as number,
+        } as HistoryEnumerationResult;
+
+        const result = await bridge.resolve(enumResult);
+
+        expect(result.outcome).toBe("PROVENANCE_MISMATCH");
+        expect(result.totalProcessed).toBe(0);
+        expect(result.totalResolved).toBe(0);
+        expect(result.error).toMatch(
+          /Enumeration result must explicitly specify a valid non-negative integer connectionEpoch/,
+        );
+      }
     });
 
     it("rejects enumeration result without a witnessed anchor before making requests", async () => {
@@ -824,6 +1009,35 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       );
 
       // Now bridge configured with matching prior evidence for SIG_B
+      const priorEvidence: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 1,
+        totalFailed: 0,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 1,
+        perSignatureResults: [
+          {
+            signature: SIG_B,
+            slot: 101,
+            blockTime: 1700000010,
+            status: "RESOLVED",
+            adapterOutcome: "SUCCESS",
+            decodedEventsCount: 1,
+            ingestedEventsCount: 1,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 10,
+      };
+
       const bridge = new ExactPoolTransactionResolutionBridge({
         poolContext: STANDARD_POOL_CONTEXT,
         adapter,
@@ -832,7 +1046,7 @@ describe("ExactPoolTransactionResolutionBridge", () => {
         lifecycleTarget: mockLifecycle,
         expectedEpoch: 1,
         clock,
-        priorSuccessfulSignatures: [SIG_B],
+        priorResolutionEvidence: priorEvidence,
       });
 
       const enumResult: HistoryEnumerationResult = {
@@ -858,6 +1072,241 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       expect(result.totalDuplicatesResolved).toBe(1);
       expect(result.totalDuplicatesUnresolved).toBe(0);
       expect(result.perSignatureResults[0]?.status).toBe("DUPLICATE_RESOLVED");
+    });
+
+    it("rejects duplicate notification as DUPLICATE_UNRESOLVED when prior evidence has mismatched candidatePoolId or connectionEpoch", async () => {
+      const originalPayload = createSyntheticBuyPayload(
+        SIG_B,
+        50_000_000n,
+        25_000_000_000n,
+        SYNTHETIC_POOL_ID,
+        101,
+        1700000010,
+      );
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () =>
+          new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: originalPayload }), {
+            status: 200,
+          }),
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+      await adapter.processNotification(
+        { signature: SIG_B, slot: 101, blockTime: 1700000010 },
+        tracker,
+      );
+
+      // Prior evidence with mismatched candidatePoolId
+      const wrongPoolEvidence: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: OTHER_POOL_ID, // wrong pool
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 1,
+        totalFailed: 0,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 1,
+        perSignatureResults: [
+          {
+            signature: SIG_B,
+            slot: 101,
+            blockTime: 1700000010,
+            status: "RESOLVED",
+            adapterOutcome: "SUCCESS",
+            decodedEventsCount: 1,
+            ingestedEventsCount: 1,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 10,
+      };
+
+      const wrongPoolBridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        priorResolutionEvidence: wrongPoolEvidence,
+      });
+
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const wrongPoolResult = await wrongPoolBridge.resolve(enumResult);
+      expect(wrongPoolResult.outcome).toBe("PARTIAL_RESOLUTION");
+      expect(wrongPoolResult.totalResolved).toBe(0);
+      expect(wrongPoolResult.totalFailed).toBe(1);
+      expect(wrongPoolResult.totalDuplicatesUnresolved).toBe(1);
+      expect(wrongPoolResult.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
+
+      // Prior evidence with mismatched connectionEpoch
+      const wrongEpochEvidence: TransactionResolutionResult = {
+        ...wrongPoolEvidence,
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 2, // wrong epoch (expected: 1)
+      };
+
+      const wrongEpochBridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        priorResolutionEvidence: wrongEpochEvidence,
+      });
+
+      const wrongEpochResult = await wrongEpochBridge.resolve(enumResult);
+      expect(wrongEpochResult.outcome).toBe("PARTIAL_RESOLUTION");
+      expect(wrongEpochResult.totalResolved).toBe(0);
+      expect(wrongEpochResult.totalFailed).toBe(1);
+      expect(wrongEpochResult.totalDuplicatesUnresolved).toBe(1);
+      expect(wrongEpochResult.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
+    });
+
+    it("rejects duplicate notification as DUPLICATE_UNRESOLVED when prior evidence has 0 ingested swaps or failed status", async () => {
+      const originalPayload = createSyntheticBuyPayload(
+        SIG_B,
+        50_000_000n,
+        25_000_000_000n,
+        SYNTHETIC_POOL_ID,
+        101,
+        1700000010,
+      );
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () =>
+          new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: originalPayload }), {
+            status: 200,
+          }),
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+      await adapter.processNotification(
+        { signature: SIG_B, slot: 101, blockTime: 1700000010 },
+        tracker,
+      );
+
+      // Prior evidence record with 0 ingested swaps
+      const zeroIngestedEvidence: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 0,
+        totalFailed: 1,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 0,
+        perSignatureResults: [
+          {
+            signature: SIG_B,
+            slot: 101,
+            blockTime: 1700000010,
+            status: "RESOLVED",
+            adapterOutcome: "TRANSACTION_NOT_FOUND",
+            decodedEventsCount: 0,
+            ingestedEventsCount: 0, // 0 ingested swaps!
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 10,
+      };
+
+      const bridgeZero = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        priorResolutionEvidence: zeroIngestedEvidence,
+      });
+
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const resultZero = await bridgeZero.resolve(enumResult);
+      expect(resultZero.outcome).toBe("PARTIAL_RESOLUTION");
+      expect(resultZero.totalResolved).toBe(0);
+      expect(resultZero.totalDuplicatesUnresolved).toBe(1);
+
+      // Prior evidence with status !== "RESOLVED"
+      const failedEvidence: TransactionResolutionResult = {
+        ...zeroIngestedEvidence,
+        perSignatureResults: [
+          {
+            signature: SIG_B,
+            slot: 101,
+            blockTime: 1700000010,
+            status: "FAILED_DECODE",
+            adapterOutcome: "DECODE_FAILED",
+            decodedEventsCount: 0,
+            ingestedEventsCount: 0,
+          },
+        ],
+      };
+
+      const bridgeFailed = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        priorResolutionEvidence: failedEvidence,
+      });
+
+      const resultFailed = await bridgeFailed.resolve(enumResult);
+      expect(resultFailed.outcome).toBe("PARTIAL_RESOLUTION");
+      expect(resultFailed.totalResolved).toBe(0);
+      expect(resultFailed.totalDuplicatesUnresolved).toBe(1);
     });
   });
 
@@ -973,6 +1422,9 @@ describe("ExactPoolTransactionResolutionBridge", () => {
     it("preserves partial-ingestion counts on PARTIAL_INGEST_FAILED without classifying as successful recovery", async () => {
       const mockAdapter = {
         getPoolContext: () => STANDARD_POOL_CONTEXT,
+        getBudgetManager: () => budgetManager,
+        getProviderName: () => "SOLANA_RPC",
+        getRequestPurpose: () => "CANDIDATE_ENRICHMENT",
         processNotification: async (): Promise<ProcessNotificationResult> => {
           return {
             ok: false,
@@ -1151,6 +1603,165 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       expect(result.totalFailed).toBe(1);
       expect(result.perSignatureResults[0]?.status).toBe("BUDGET_DENIED");
     });
+
+    it("enforces that per-call overrides can reduce limits but never raise constructor ceilings", async () => {
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        const sig = body.params[0] as string;
+        const slot = sig === SIG_B ? 101 : 102;
+        const blockTime = sig === SIG_B ? 1700000010 : 1700000020;
+        const payload = createSyntheticBuyPayload(
+          sig,
+          50_000_000n,
+          25_000_000_000n,
+          SYNTHETIC_POOL_ID,
+          slot,
+          blockTime,
+        );
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+
+      // Constructor configured with maxTransactionsToProcess: 1
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        maxTransactionsToProcess: 1,
+      });
+
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_C,
+        discoveredSignatures: [
+          { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      // Attempting to raise limit to 2 via call overrides must be clamped to constructor ceiling 1
+      const result = await bridge.resolve(enumResult, { maxTransactionsToProcess: 2 });
+      expect(result.outcome).toBe("MAX_TRANSACTIONS_EXCEEDED");
+      expect(result.totalProcessed).toBe(1); // Clamped to 1!
+
+      // Bridge with constructor limit 5 can be reduced to 1 via call overrides
+      const adapter2 = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+      const tracker2 = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const higherCeilingBridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter: adapter2,
+        tracker: tracker2,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        maxTransactionsToProcess: 5,
+      });
+
+      const reducedResult = await higherCeilingBridge.resolve(enumResult, {
+        maxTransactionsToProcess: 1,
+      });
+      expect(reducedResult.outcome).toBe("MAX_TRANSACTIONS_EXCEEDED");
+      expect(reducedResult.totalProcessed).toBe(1); // Reduced to 1!
+    });
+
+    it("rejects invalid per-call numeric limits as RESOLUTION_CALL_INVALID", async () => {
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () => new Response("{}", { status: 200 }),
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+      });
+
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      // Invalid maxTransactionsToProcess
+      await expect(() =>
+        bridge.resolve(enumResult, { maxTransactionsToProcess: 0 }),
+      ).rejects.toThrow(/\[RESOLUTION_CALL_INVALID\] per-call maxTransactionsToProcess/);
+
+      await expect(() =>
+        bridge.resolve(enumResult, { maxTransactionsToProcess: -1 }),
+      ).rejects.toThrow(/\[RESOLUTION_CALL_INVALID\] per-call maxTransactionsToProcess/);
+
+      await expect(() =>
+        bridge.resolve(enumResult, { maxTransactionsToProcess: 1.5 }),
+      ).rejects.toThrow(/\[RESOLUTION_CALL_INVALID\] per-call maxTransactionsToProcess/);
+
+      // Invalid operationDeadlineMs
+      await expect(() => bridge.resolve(enumResult, { operationDeadlineMs: 0 })).rejects.toThrow(
+        /\[RESOLUTION_CALL_INVALID\] per-call operationDeadlineMs/,
+      );
+
+      await expect(() => bridge.resolve(enumResult, { operationDeadlineMs: -50 })).rejects.toThrow(
+        /\[RESOLUTION_CALL_INVALID\] per-call operationDeadlineMs/,
+      );
+
+      await expect(() =>
+        bridge.resolve(enumResult, { operationDeadlineMs: 100.5 }),
+      ).rejects.toThrow(/\[RESOLUTION_CALL_INVALID\] per-call operationDeadlineMs/);
+    });
   });
 
   describe("8. Cancellation, Deadlines & Stale Lifecycle (Around Awaited Work)", () => {
@@ -1306,12 +1917,99 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       expect(result.totalResolved).toBe(0);
       expect(result.totalFailed).toBe(1);
       expect(result.perSignatureResults[0]?.status).toBe("LIFECYCLE_CANCELLED");
+      expect(result.totalIngestedSwaps).toBe(0);
+      expect(tracker.getEventsCount()).toBe(0);
+      expect(result.perSignatureResults[0]?.ingestedEventsCount).toBe(0);
     });
 
-    it("returns LIFECYCLE_CANCELLED post-await when coordinator epoch increments during in-flight fetch", async () => {
+    it("prevents HTTP dispatch and swap ingestion when epoch increments during provider pacing wait", async () => {
+      let httpDispatchedForC = false;
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        const sig = body.params[0] as string;
+        if (sig === SIG_C) {
+          httpDispatchedForC = true;
+        }
+        const slot = sig === SIG_B ? 101 : 102;
+        const blockTime = sig === SIG_B ? 1700000010 : 1700000020;
+        const payload = createSyntheticBuyPayload(
+          sig,
+          50_000_000n,
+          25_000_000_000n,
+          SYNTHETIC_POOL_ID,
+          slot,
+          blockTime,
+        );
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      // Custom sleepFn that simulates connection epoch increment during pacing wait for second transaction
+      const pacingSleepFn = async (ms: number) => {
+        if (ms > 0) {
+          mockLifecycle.connectionEpoch = 2; // Invalidate epoch during pacing wait!
+        }
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 2500,
+        clock,
+        sleepFn: pacingSleepFn,
+      });
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+      });
+
+      // Discovered signatures: [C, B] -> chronological order processes B first, then C
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_C,
+        discoveredSignatures: [
+          { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = await bridge.resolve(enumResult);
+
+      expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
+      expect(httpDispatchedForC).toBe(false); // HTTP dispatch for SIG_C was prevented!
+      expect(result.totalProcessed).toBe(2);
+      expect(result.totalResolved).toBe(1);
+      expect(result.totalFailed).toBe(1);
+      // Work for SIG_B is preserved
+      expect(result.totalIngestedSwaps).toBe(1);
+      expect(tracker.getEventsCount()).toBe(1);
+      expect(result.perSignatureResults[0]?.signature).toBe(SIG_B);
+      expect(result.perSignatureResults[0]?.ingestedEventsCount).toBe(1);
+      expect(result.perSignatureResults[1]?.signature).toBe(SIG_C);
+      expect(result.perSignatureResults[1]?.ingestedEventsCount).toBe(0);
+    });
+
+    it("prevents swap ingestion when caller cancels via callback during in-flight fetch and preserves zero count parity", async () => {
+      let isCancelledFlag = false;
       const mockTransport: typeof fetch = async () => {
-        // Increment epoch during in-flight fetch before returning
-        mockLifecycle.connectionEpoch = 2;
+        // Caller cancels during in-flight fetch
+        isCancelledFlag = true;
         const payload = createSyntheticBuyPayload(
           SIG_B,
           50_000_000n,
@@ -1343,6 +2041,7 @@ describe("ExactPoolTransactionResolutionBridge", () => {
         lifecycleTarget: mockLifecycle,
         expectedEpoch: 1,
         clock,
+        isCancelled: () => isCancelledFlag,
       });
 
       const enumResult: HistoryEnumerationResult = {
@@ -1362,11 +2061,141 @@ describe("ExactPoolTransactionResolutionBridge", () => {
 
       const result = await bridge.resolve(enumResult);
 
+      expect(result.outcome).toBe("OPERATION_CANCELLED");
+      expect(result.totalIngestedSwaps).toBe(0);
+      expect(tracker.getEventsCount()).toBe(0);
+      expect(result.perSignatureResults[0]?.ingestedEventsCount).toBe(0);
+    });
+
+    it("preserves all work that actually occurred in totalIngestedSwaps and tracker when operation terminates prematurely on second signature", async () => {
+      const mockTransport: typeof fetch = async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        const sig = body.params[0] as string;
+
+        if (sig === SIG_C) {
+          // Invalidate lifecycle during second transaction fetch
+          mockLifecycle.connectionEpoch = 2;
+        }
+
+        const slot = sig === SIG_B ? 101 : 102;
+        const blockTime = sig === SIG_B ? 1700000010 : 1700000020;
+        const payload = createSyntheticBuyPayload(
+          sig,
+          50_000_000n,
+          25_000_000_000n,
+          SYNTHETIC_POOL_ID,
+          slot,
+          blockTime,
+        );
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+          status: 200,
+        });
+      };
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+      });
+
+      // Discovered signatures: [C, B] -> chronological order processes B first, then C
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_C,
+        discoveredSignatures: [
+          { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = await bridge.resolve(enumResult);
+
       expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
-      expect(result.totalProcessed).toBe(1);
-      expect(result.totalResolved).toBe(0);
+      expect(result.totalProcessed).toBe(2);
+      expect(result.totalResolved).toBe(1);
       expect(result.totalFailed).toBe(1);
-      expect(result.perSignatureResults[0]?.status).toBe("LIFECYCLE_CANCELLED");
+      // Signature B work is preserved in aggregate totalIngestedSwaps and tracker
+      expect(result.totalIngestedSwaps).toBe(1);
+      expect(tracker.getEventsCount()).toBe(1);
+      expect(result.perSignatureResults[0]?.signature).toBe(SIG_B);
+      expect(result.perSignatureResults[0]?.status).toBe("RESOLVED");
+      expect(result.perSignatureResults[0]?.ingestedEventsCount).toBe(1);
+      expect(result.perSignatureResults[1]?.signature).toBe(SIG_C);
+      expect(result.perSignatureResults[1]?.status).toBe("LIFECYCLE_CANCELLED");
+      expect(result.perSignatureResults[1]?.ingestedEventsCount).toBe(0);
+    });
+
+    it("ensures an un-aborted per-call signal or callback cannot override an already-aborted constructor signal", async () => {
+      const constructorController = new AbortController();
+      constructorController.abort(new Error("Pre-aborted in constructor"));
+
+      const freshPerCallController = new AbortController();
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: async () => new Response("{}", { status: 200 }),
+        pacingMs: 0,
+        clock,
+        sleepFn,
+      });
+
+      const bridge = new ExactPoolTransactionResolutionBridge({
+        poolContext: STANDARD_POOL_CONTEXT,
+        adapter,
+        tracker,
+        budgetManager,
+        lifecycleTarget: mockLifecycle,
+        expectedEpoch: 1,
+        clock,
+        signal: constructorController.signal,
+      });
+
+      const enumResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: SYNTHETIC_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: SIG_ANCHOR,
+        frozenTargetSignature: SIG_B,
+        discoveredSignatures: [
+          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        ],
+        pagesQueried: 1,
+        requestCount: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = await bridge.resolve(enumResult, {
+        signal: freshPerCallController.signal,
+        isCancelled: () => false,
+      });
+
+      expect(result.outcome).toBe("OPERATION_CANCELLED");
+      expect(result.totalProcessed).toBe(0);
+      expect(result.totalIngestedSwaps).toBe(0);
     });
   });
 

@@ -133,6 +133,7 @@ export interface ProcessBatchResult {
 export interface ProcessTransactionOptions {
   readonly overallTimeoutMs?: number | undefined;
   readonly signal?: AbortSignal | undefined;
+  readonly validateState?: (() => void) | undefined;
 }
 
 export interface RaydiumAmmV4TransactionSourceAdapterOptions {
@@ -529,6 +530,18 @@ export class RaydiumAmmV4TransactionSourceAdapter {
 
   public getPoolContext(): TrackedRaydiumPoolContext {
     return this.poolContext;
+  }
+
+  public getBudgetManager(): GlobalResourceBudgetManager {
+    return this.budgetManager;
+  }
+
+  public getProviderName(): string {
+    return this.providerName;
+  }
+
+  public getRequestPurpose(): RequestPurpose {
+    return this.requestPurpose;
   }
 
   public getPendingQueueLength(): number {
@@ -1318,6 +1331,33 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           };
         }
 
+        if (options?.validateState) {
+          try {
+            options.validateState();
+          } catch (validateErr) {
+            this.totalFailures++;
+            this.recordLossGap(notification, "VALIDATION_FAILED_BEFORE_DISPATCH", tracker);
+            return {
+              ok: false,
+              signature,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              ingestedEventsCount: 0,
+              diagnostics: {
+                signature,
+                httpAttempts: 0,
+                durationMs: this.clock() - startEpoch,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                decodedEventsCount: 0,
+                ingestedCount: 0,
+                endpointUrl: this.sanitizedRpcUrl,
+                error: this.sanitizeErrorMessage(
+                  validateErr instanceof Error ? validateErr.message : String(validateErr),
+                ),
+              },
+            };
+          }
+        }
+
         // Record attempt in shared session budget
         const recorded = this.budgetManager.recordRequestAttempt(
           this.providerName,
@@ -1819,6 +1859,62 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               responseSha256,
               error: this.sanitizeErrorMessage(
                 `BlockTime contradiction: notification specified blockTime ${notification.blockTime}, but response contains blockTime ${payloadBlockTime}`,
+              ),
+            },
+          };
+        }
+      }
+
+      if (options?.signal?.aborted) {
+        this.totalFailures++;
+        this.recordLossGap(notification, "CANCELLED_BEFORE_INGESTION", tracker);
+        return {
+          ok: false,
+          signature,
+          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+          ingestedEventsCount: 0,
+          diagnostics: {
+            signature,
+            httpAttempts,
+            httpStatus,
+            durationMs: this.clock() - startEpoch,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            decodedEventsCount: 0,
+            ingestedCount: 0,
+            endpointUrl: this.sanitizedRpcUrl,
+            requestSentAtMs,
+            responseReceivedAtMs,
+            responseSha256,
+            error: "Operation cancelled before tracker ingestion",
+          },
+        };
+      }
+
+      if (options?.validateState) {
+        try {
+          options.validateState();
+        } catch (validateErr) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "VALIDATION_FAILED_BEFORE_INGESTION", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts,
+              httpStatus,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              requestSentAtMs,
+              responseReceivedAtMs,
+              responseSha256,
+              error: this.sanitizeErrorMessage(
+                validateErr instanceof Error ? validateErr.message : String(validateErr),
               ),
             },
           };
