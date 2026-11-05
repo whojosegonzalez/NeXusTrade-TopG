@@ -35,13 +35,12 @@
  * 5. Ceiling Invariant for Per-Call Limits:
  *    - Validates per-call maxTransactionsToProcess and operationDeadlineMs as positive safe integers.
  *    - Per-call options may reduce constructor ceilings, but can never raise them.
- * 6. Honest Duplicate Resolution:
- *    - Bare signature allowlists are prohibited.
- *    - DUPLICATE_NOTIFICATION is classified as DUPLICATE_RESOLVED only when immutable prior resolution
- *      evidence (TransactionResolutionResult) proves the signature was successfully resolved with
- *      ingested swaps (> 0) bound to the exact candidate pool and applicable connection epoch.
- *    - Signatures previously processed as TRANSACTION_NOT_FOUND, DECODE_FAILED, or from other pools/epochs
- *      remain strictly DUPLICATE_UNRESOLVED and fail resolution.
+ * 6. Conservative Duplicate Resolution:
+ *    - Bare signature allowlists and prior-evidence success shortcuts are prohibited.
+ *    - An adapter DUPLICATE_NOTIFICATION outcome is conservatively classified as DUPLICATE_UNRESOLVED
+ *      and counted as failed without crediting recovery, because prior resolution results do not
+ *      establish successful swap ingestion into the current tracker instance.
+ *    - Preserves all work actually ingested into the current tracker without false success promotion.
  * 7. Production Completeness Separation:
  *    - Does NOT advance a persisted verified cursor.
  *    - Does NOT clear tracker stream gaps.
@@ -192,17 +191,6 @@ export interface TransactionResolutionBridgeOptions {
 
   /** Optional caller cancellation AbortSignal. */
   readonly signal?: AbortSignal | undefined;
-
-  /**
-   * Prior resolution evidence bound to the same candidate pool and applicable lifecycle epoch.
-   * If adapter reports DUPLICATE_NOTIFICATION, it is classified as DUPLICATE_RESOLVED
-   * only if this evidence proves the signature was successfully resolved with ingested swaps (> 0).
-   * Bare signature allowlists are prohibited.
-   */
-  readonly priorResolutionEvidence?:
-    | TransactionResolutionResult
-    | readonly TransactionResolutionResult[]
-    | undefined;
 }
 
 /**
@@ -227,7 +215,6 @@ export class ExactPoolTransactionResolutionBridge {
   private readonly operationDeadlineMs: number;
   private readonly isCancelled?: (() => boolean) | undefined;
   private readonly signal?: AbortSignal | undefined;
-  private readonly verifiedResolvedSignatures: ReadonlySet<string>;
 
   public constructor(options: TransactionResolutionBridgeOptions) {
     if (!options || typeof options !== "object") {
@@ -349,48 +336,6 @@ export class ExactPoolTransactionResolutionBridge {
 
     this.isCancelled = options.isCancelled;
     this.signal = options.signal;
-
-    // Process prior resolution evidence: only genuine prior successful resolutions count
-    const verifiedSigs = new Set<string>();
-    if (options.priorResolutionEvidence !== undefined) {
-      if (
-        typeof options.priorResolutionEvidence !== "object" ||
-        options.priorResolutionEvidence === null
-      ) {
-        throw new Error(
-          "[RESOLUTION_BRIDGE_INIT] priorResolutionEvidence must be a TransactionResolutionResult or array of TransactionResolutionResult instances",
-        );
-      }
-      const evidenceList = Array.isArray(options.priorResolutionEvidence)
-        ? options.priorResolutionEvidence
-        : [options.priorResolutionEvidence];
-
-      for (const ev of evidenceList) {
-        if (!ev || typeof ev !== "object" || typeof ev.candidatePoolId !== "string") {
-          throw new Error(
-            "[RESOLUTION_BRIDGE_INIT] Each priorResolutionEvidence item must be a valid TransactionResolutionResult",
-          );
-        }
-        // Bind to same candidate pool
-        if (ev.candidatePoolId !== this.poolContext.poolId) continue;
-        // Bind to applicable connection epoch
-        if (ev.connectionEpoch !== this.expectedEpoch) continue;
-        // Must have witnessed anchor
-        if (!ev.anchorWitnessed) continue;
-
-        for (const rec of ev.perSignatureResults ?? []) {
-          // Must have been genuinely RESOLVED and actually ingested swaps (> 0)
-          if (
-            rec.status === "RESOLVED" &&
-            typeof rec.ingestedEventsCount === "number" &&
-            rec.ingestedEventsCount > 0
-          ) {
-            verifiedSigs.add(rec.signature);
-          }
-        }
-      }
-    }
-    this.verifiedResolvedSignatures = Object.freeze(verifiedSigs);
   }
 
   /**
@@ -659,7 +604,7 @@ export class ExactPoolTransactionResolutionBridge {
       let totalResolved = 0;
       let totalFailed = 0;
       let totalDuplicatesUnresolved = 0;
-      let totalDuplicatesResolved = 0;
+      const totalDuplicatesResolved = 0;
       let totalIngestedSwaps = 0;
       let prematureTerminationOutcome: ResolutionBridgeOutcome | null = null;
       let terminationError: string | undefined = undefined;
@@ -827,33 +772,19 @@ export class ExactPoolTransactionResolutionBridge {
           });
           totalResolved++;
         } else if (adapterResult.outcome === "DUPLICATE_NOTIFICATION") {
-          if (this.verifiedResolvedSignatures.has(record.signature)) {
-            perSigResults.push({
-              signature: record.signature,
-              slot: record.slot,
-              blockTime: record.blockTime,
-              status: "DUPLICATE_RESOLVED",
-              adapterOutcome: adapterResult.outcome,
-              decodedEventsCount: decodedCount,
-              ingestedEventsCount: 0,
-            });
-            totalDuplicatesResolved++;
-            totalResolved++;
-          } else {
-            perSigResults.push({
-              signature: record.signature,
-              slot: record.slot,
-              blockTime: record.blockTime,
-              status: "DUPLICATE_UNRESOLVED",
-              adapterOutcome: adapterResult.outcome,
-              decodedEventsCount: decodedCount,
-              ingestedEventsCount: 0,
-              error:
-                "Duplicate reported by adapter without matching prior resolution evidence proving swap ingestion for this candidate and epoch",
-            });
-            totalDuplicatesUnresolved++;
-            totalFailed++;
-          }
+          perSigResults.push({
+            signature: record.signature,
+            slot: record.slot,
+            blockTime: record.blockTime,
+            status: "DUPLICATE_UNRESOLVED",
+            adapterOutcome: adapterResult.outcome,
+            decodedEventsCount: decodedCount,
+            ingestedEventsCount: 0,
+            error:
+              "Duplicate notification reported by adapter; conservative duplicate policy does not credit recovery without direct tracker ingestion",
+          });
+          totalDuplicatesUnresolved++;
+          totalFailed++;
         } else if (adapterResult.outcome === "PARTIAL_INGEST_FAILED") {
           perSigResults.push({
             signature: record.signature,

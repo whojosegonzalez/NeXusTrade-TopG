@@ -9,7 +9,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   ExactPoolTransactionResolutionBridge,
   type TransactionResolutionBridgeOptions,
-  type TransactionResolutionResult,
 } from "./ExactPoolTransactionResolutionBridge.js";
 import {
   RaydiumAmmV4TransactionSourceAdapter,
@@ -982,7 +981,7 @@ describe("ExactPoolTransactionResolutionBridge", () => {
       expect(result.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
     });
 
-    it("classifies duplicate notification as DUPLICATE_RESOLVED when prior evidence matches", async () => {
+    it("prevents prior success on Tracker A from falsely resolving duplicate on fresh Tracker B", async () => {
       const originalPayload = createSyntheticBuyPayload(
         SIG_B,
         50_000_000n,
@@ -1003,50 +1002,22 @@ describe("ExactPoolTransactionResolutionBridge", () => {
         clock,
         sleepFn,
       });
-      await adapter.processNotification(
-        { signature: SIG_B, slot: 101, blockTime: 1700000010 },
-        tracker,
-      );
 
-      // Now bridge configured with matching prior evidence for SIG_B
-      const priorEvidence: TransactionResolutionResult = {
-        outcome: "ALL_RESOLVED",
-        candidatePoolId: SYNTHETIC_POOL_ID,
-        connectionEpoch: 1,
-        anchorWitnessed: true,
-        knownAnchorSignature: SIG_ANCHOR,
-        frozenTargetSignature: SIG_B,
-        totalDiscoveredSignatures: 1,
-        totalProcessed: 1,
-        totalResolved: 1,
-        totalFailed: 0,
-        totalDuplicatesUnresolved: 0,
-        totalDuplicatesResolved: 0,
-        totalIngestedSwaps: 1,
-        perSignatureResults: [
-          {
-            signature: SIG_B,
-            slot: 101,
-            blockTime: 1700000010,
-            status: "RESOLVED",
-            adapterOutcome: "SUCCESS",
-            decodedEventsCount: 1,
-            ingestedEventsCount: 1,
-          },
-        ],
-        isProductionCompletenessEstablished: false,
-        durationMs: 10,
-      };
+      // 1. Tracker A resolves SIG_B and ingests one swap
+      const trackerA = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
 
-      const bridge = new ExactPoolTransactionResolutionBridge({
+      const bridgeA = new ExactPoolTransactionResolutionBridge({
         poolContext: STANDARD_POOL_CONTEXT,
         adapter,
-        tracker,
+        tracker: trackerA,
         budgetManager,
         lifecycleTarget: mockLifecycle,
         expectedEpoch: 1,
         clock,
-        priorResolutionEvidence: priorEvidence,
       });
 
       const enumResult: HistoryEnumerationResult = {
@@ -1064,249 +1035,48 @@ describe("ExactPoolTransactionResolutionBridge", () => {
         isProductionCompletenessEstablished: false,
       };
 
-      const result = await bridge.resolve(enumResult);
-      expect(result.outcome).toBe("ALL_RESOLVED");
-      expect(result.totalProcessed).toBe(1);
-      expect(result.totalResolved).toBe(1);
-      expect(result.totalFailed).toBe(0);
-      expect(result.totalDuplicatesResolved).toBe(1);
-      expect(result.totalDuplicatesUnresolved).toBe(0);
-      expect(result.perSignatureResults[0]?.status).toBe("DUPLICATE_RESOLVED");
-    });
+      const resultA = await bridgeA.resolve(enumResult);
+      expect(resultA.outcome).toBe("ALL_RESOLVED");
+      expect(resultA.totalProcessed).toBe(1);
+      expect(resultA.totalResolved).toBe(1);
+      expect(resultA.totalFailed).toBe(0);
+      expect(resultA.totalIngestedSwaps).toBe(1);
+      expect(trackerA.getEventsCount()).toBe(1);
 
-    it("rejects duplicate notification as DUPLICATE_UNRESOLVED when prior evidence has mismatched candidatePoolId or connectionEpoch", async () => {
-      const originalPayload = createSyntheticBuyPayload(
-        SIG_B,
-        50_000_000n,
-        25_000_000_000n,
-        SYNTHETIC_POOL_ID,
-        101,
-        1700000010,
-      );
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: async () =>
-          new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: originalPayload }), {
-            status: 200,
-          }),
-        pacingMs: 0,
+      // 2. Create fresh Tracker B for the same pool and mint
+      const trackerB = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
         clock,
-        sleepFn,
       });
-      await adapter.processNotification(
-        { signature: SIG_B, slot: 101, blockTime: 1700000010 },
-        tracker,
-      );
+      expect(trackerB.getEventsCount()).toBe(0);
 
-      // Prior evidence with mismatched candidatePoolId
-      const wrongPoolEvidence: TransactionResolutionResult = {
-        outcome: "ALL_RESOLVED",
-        candidatePoolId: OTHER_POOL_ID, // wrong pool
-        connectionEpoch: 1,
-        anchorWitnessed: true,
-        knownAnchorSignature: SIG_ANCHOR,
-        frozenTargetSignature: SIG_B,
-        totalDiscoveredSignatures: 1,
-        totalProcessed: 1,
-        totalResolved: 1,
-        totalFailed: 0,
-        totalDuplicatesUnresolved: 0,
-        totalDuplicatesResolved: 0,
-        totalIngestedSwaps: 1,
-        perSignatureResults: [
-          {
-            signature: SIG_B,
-            slot: 101,
-            blockTime: 1700000010,
-            status: "RESOLVED",
-            adapterOutcome: "SUCCESS",
-            decodedEventsCount: 1,
-            ingestedEventsCount: 1,
-          },
-        ],
-        isProductionCompletenessEstablished: false,
-        durationMs: 10,
-      };
-
-      const wrongPoolBridge = new ExactPoolTransactionResolutionBridge({
+      // 3. Resolve same enumeration with Tracker B using the same adapter (which cached SIG_B)
+      const bridgeB = new ExactPoolTransactionResolutionBridge({
         poolContext: STANDARD_POOL_CONTEXT,
         adapter,
-        tracker,
+        tracker: trackerB,
         budgetManager,
         lifecycleTarget: mockLifecycle,
         expectedEpoch: 1,
         clock,
-        priorResolutionEvidence: wrongPoolEvidence,
       });
 
-      const enumResult: HistoryEnumerationResult = {
-        outcome: "ANCHOR_WITNESSED",
-        candidatePoolId: SYNTHETIC_POOL_ID,
-        connectionEpoch: 1,
-        anchorWitnessed: true,
-        knownAnchorSignature: SIG_ANCHOR,
-        frozenTargetSignature: SIG_B,
-        discoveredSignatures: [
-          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
-        ],
-        pagesQueried: 1,
-        requestCount: 1,
-        isProductionCompletenessEstablished: false,
-      };
+      const resultB = await bridgeB.resolve(enumResult);
 
-      const wrongPoolResult = await wrongPoolBridge.resolve(enumResult);
-      expect(wrongPoolResult.outcome).toBe("PARTIAL_RESOLUTION");
-      expect(wrongPoolResult.totalResolved).toBe(0);
-      expect(wrongPoolResult.totalFailed).toBe(1);
-      expect(wrongPoolResult.totalDuplicatesUnresolved).toBe(1);
-      expect(wrongPoolResult.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
+      // Conservative DUPLICATE_UNRESOLVED: Must NOT return ALL_RESOLVED or DUPLICATE_RESOLVED!
+      expect(resultB.outcome).toBe("PARTIAL_RESOLUTION");
+      expect(resultB.totalProcessed).toBe(1);
+      expect(resultB.totalResolved).toBe(0); // Not resolved for Tracker B!
+      expect(resultB.totalFailed).toBe(1);
+      expect(resultB.totalDuplicatesUnresolved).toBe(1);
+      expect(resultB.totalDuplicatesResolved).toBe(0);
+      expect(resultB.totalIngestedSwaps).toBe(0);
+      expect(resultB.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
 
-      // Prior evidence with mismatched connectionEpoch
-      const wrongEpochEvidence: TransactionResolutionResult = {
-        ...wrongPoolEvidence,
-        candidatePoolId: SYNTHETIC_POOL_ID,
-        connectionEpoch: 2, // wrong epoch (expected: 1)
-      };
-
-      const wrongEpochBridge = new ExactPoolTransactionResolutionBridge({
-        poolContext: STANDARD_POOL_CONTEXT,
-        adapter,
-        tracker,
-        budgetManager,
-        lifecycleTarget: mockLifecycle,
-        expectedEpoch: 1,
-        clock,
-        priorResolutionEvidence: wrongEpochEvidence,
-      });
-
-      const wrongEpochResult = await wrongEpochBridge.resolve(enumResult);
-      expect(wrongEpochResult.outcome).toBe("PARTIAL_RESOLUTION");
-      expect(wrongEpochResult.totalResolved).toBe(0);
-      expect(wrongEpochResult.totalFailed).toBe(1);
-      expect(wrongEpochResult.totalDuplicatesUnresolved).toBe(1);
-      expect(wrongEpochResult.perSignatureResults[0]?.status).toBe("DUPLICATE_UNRESOLVED");
-    });
-
-    it("rejects duplicate notification as DUPLICATE_UNRESOLVED when prior evidence has 0 ingested swaps or failed status", async () => {
-      const originalPayload = createSyntheticBuyPayload(
-        SIG_B,
-        50_000_000n,
-        25_000_000_000n,
-        SYNTHETIC_POOL_ID,
-        101,
-        1700000010,
-      );
-      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-        poolContext: STANDARD_POOL_CONTEXT,
-        rpcUrl: MOCK_RPC_URL,
-        budgetManager,
-        transport: async () =>
-          new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: originalPayload }), {
-            status: 200,
-          }),
-        pacingMs: 0,
-        clock,
-        sleepFn,
-      });
-      await adapter.processNotification(
-        { signature: SIG_B, slot: 101, blockTime: 1700000010 },
-        tracker,
-      );
-
-      // Prior evidence record with 0 ingested swaps
-      const zeroIngestedEvidence: TransactionResolutionResult = {
-        outcome: "ALL_RESOLVED",
-        candidatePoolId: SYNTHETIC_POOL_ID,
-        connectionEpoch: 1,
-        anchorWitnessed: true,
-        knownAnchorSignature: SIG_ANCHOR,
-        frozenTargetSignature: SIG_B,
-        totalDiscoveredSignatures: 1,
-        totalProcessed: 1,
-        totalResolved: 0,
-        totalFailed: 1,
-        totalDuplicatesUnresolved: 0,
-        totalDuplicatesResolved: 0,
-        totalIngestedSwaps: 0,
-        perSignatureResults: [
-          {
-            signature: SIG_B,
-            slot: 101,
-            blockTime: 1700000010,
-            status: "RESOLVED",
-            adapterOutcome: "TRANSACTION_NOT_FOUND",
-            decodedEventsCount: 0,
-            ingestedEventsCount: 0, // 0 ingested swaps!
-          },
-        ],
-        isProductionCompletenessEstablished: false,
-        durationMs: 10,
-      };
-
-      const bridgeZero = new ExactPoolTransactionResolutionBridge({
-        poolContext: STANDARD_POOL_CONTEXT,
-        adapter,
-        tracker,
-        budgetManager,
-        lifecycleTarget: mockLifecycle,
-        expectedEpoch: 1,
-        clock,
-        priorResolutionEvidence: zeroIngestedEvidence,
-      });
-
-      const enumResult: HistoryEnumerationResult = {
-        outcome: "ANCHOR_WITNESSED",
-        candidatePoolId: SYNTHETIC_POOL_ID,
-        connectionEpoch: 1,
-        anchorWitnessed: true,
-        knownAnchorSignature: SIG_ANCHOR,
-        frozenTargetSignature: SIG_B,
-        discoveredSignatures: [
-          { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
-        ],
-        pagesQueried: 1,
-        requestCount: 1,
-        isProductionCompletenessEstablished: false,
-      };
-
-      const resultZero = await bridgeZero.resolve(enumResult);
-      expect(resultZero.outcome).toBe("PARTIAL_RESOLUTION");
-      expect(resultZero.totalResolved).toBe(0);
-      expect(resultZero.totalDuplicatesUnresolved).toBe(1);
-
-      // Prior evidence with status !== "RESOLVED"
-      const failedEvidence: TransactionResolutionResult = {
-        ...zeroIngestedEvidence,
-        perSignatureResults: [
-          {
-            signature: SIG_B,
-            slot: 101,
-            blockTime: 1700000010,
-            status: "FAILED_DECODE",
-            adapterOutcome: "DECODE_FAILED",
-            decodedEventsCount: 0,
-            ingestedEventsCount: 0,
-          },
-        ],
-      };
-
-      const bridgeFailed = new ExactPoolTransactionResolutionBridge({
-        poolContext: STANDARD_POOL_CONTEXT,
-        adapter,
-        tracker,
-        budgetManager,
-        lifecycleTarget: mockLifecycle,
-        expectedEpoch: 1,
-        clock,
-        priorResolutionEvidence: failedEvidence,
-      });
-
-      const resultFailed = await bridgeFailed.resolve(enumResult);
-      expect(resultFailed.outcome).toBe("PARTIAL_RESOLUTION");
-      expect(resultFailed.totalResolved).toBe(0);
-      expect(resultFailed.totalDuplicatesUnresolved).toBe(1);
+      // Invariant: Tracker B must contain zero swaps, Tracker A's work is preserved
+      expect(trackerB.getEventsCount()).toBe(0);
+      expect(trackerA.getEventsCount()).toBe(1);
     });
   });
 

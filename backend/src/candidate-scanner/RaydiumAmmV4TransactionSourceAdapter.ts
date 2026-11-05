@@ -978,6 +978,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
         const res = await this.processNextPending(targetTracker, {
           overallTimeoutMs: remainingOverall,
           signal: options?.signal,
+          validateState: options?.validateState,
         });
 
         if (!res) {

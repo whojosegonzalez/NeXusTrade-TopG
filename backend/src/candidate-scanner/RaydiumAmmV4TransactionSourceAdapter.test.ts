@@ -2180,5 +2180,99 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         expect(res.diagnostics.responseSha256).toBe(expectedSha256);
       });
     });
+
+    describe("Batch Guard Propagation (processAllPending)", () => {
+      it("prevents HTTP dispatch when validateState guard throws before dispatch in processAllPending", async () => {
+        let httpCalls = 0;
+        const mockTransport: typeof fetch = async () => {
+          httpCalls++;
+          return new Response("{}", { status: 200 });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const sig = "SigBatchGuardPreDispatch11111111111111111111111111111111";
+        adapter.enqueueNotification(sig);
+
+        let guardCalls = 0;
+        const validateState = () => {
+          guardCalls++;
+          throw new Error("Guard rejected: invalid lifecycle state before dispatch");
+        };
+
+        const batchRes = await adapter.processAllPending(tracker, { validateState });
+
+        expect(guardCalls).toBeGreaterThanOrEqual(1);
+        expect(httpCalls).toBe(0); // HTTP dispatch strictly prevented!
+        expect(tracker.getEventsCount()).toBe(0);
+        expect(batchRes.totalProcessed).toBe(1);
+        expect(batchRes.totalSucceeded).toBe(0);
+        expect(batchRes.totalFailed).toBe(1);
+        expect(batchRes.totalIngestedEvents).toBe(0);
+        expect(batchRes.results[0]?.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+      });
+
+      it("prevents swap ingestion when validateState throws during awaited work in processAllPending", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6B";
+        let httpCalls = 0;
+        let invalidateDuringFetch = false;
+
+        const mockTransport: typeof fetch = async () => {
+          httpCalls++;
+          invalidateDuringFetch = true; // State becomes invalid while HTTP request is in-flight
+          const payload = createSyntheticBuyPayload(sig);
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        adapter.enqueueNotification(sig);
+
+        let guardCalls = 0;
+        const validateState = () => {
+          guardCalls++;
+          if (invalidateDuringFetch) {
+            throw new Error("Guard rejected: epoch incremented during in-flight fetch");
+          }
+        };
+
+        const batchRes = await adapter.processAllPending(tracker, { validateState });
+
+        expect(guardCalls).toBe(2); // 1 before dispatch, 1 immediately before ingestion
+        expect(httpCalls).toBe(1); // Fetch completed
+        expect(tracker.getEventsCount()).toBe(0); // Swap ingestion strictly aborted!
+        expect(batchRes.totalProcessed).toBe(1);
+        expect(batchRes.totalSucceeded).toBe(0);
+        expect(batchRes.totalFailed).toBe(1);
+        expect(batchRes.totalIngestedEvents).toBe(0);
+        expect(batchRes.results[0]?.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+        expect(batchRes.results[0]?.ingestedEventsCount).toBe(0);
+      });
+    });
   });
 });
