@@ -377,14 +377,16 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
 
 The first isolated offline patch implements bounded history enumeration:
 
-1. **Isolated Offline Helper**: Create `backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts` containing only:
-   - Input validation: immutable pool context (`TrackedRaydiumPoolContext`), base-58 known anchor signature, injected page fetcher, shared `GlobalResourceBudgetManager`, clock, bounded options, and lifecycle validator.
+1. **Isolated Offline Helper**: Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
+   - Input validation: immutable pool context (`TrackedRaydiumPoolContext`), canonical 64-byte Ed25519 known anchor signature, injected page fetcher, shared `GlobalResourceBudgetManager` under canonical `"SOLANA_RPC"` provider identity, clock, bounded options, and lifecycle validator.
    - Bounded backward pagination using `before` requiring positive anchor appearance in returned records.
-   - Target freezing: freezes the newest signature from the first RPC page as `frozenTargetSignature`.
-   - Strict `CANDIDATE_ENRICHMENT` accounting with zero retries, no purpose switching, and no budget resets.
+   - Shared pacing handling: automatically handles recoverable pacing waits (`PROVIDER_PACING_NOT_MET`) within the operation deadline, re-checking admission after waiting. Quota and reservation denials remain terminal.
+   - In-flight deadline & cancellation race: races in-flight fetches against operation deadlines, caller signals, cancellation callbacks, and coordinator lifecycle transitions; discards late/stalled responses.
+   - Schema & traversal validation: enforces 64-byte Ed25519 signatures, requires documented `err` property, rejects contradictory `confirmationStatus` (e.g. `processed` under `confirmed`), and rejects within-page and across-page slot ordering and before-boundary violations.
+   - Capacity bound & deep-freezing: checks capacity before insertion, rejects oversized pages exceeding `pageSize`, and deeply clones and freezes retained metadata.
    - Evidence-only return contract: returns discovered signatures between anchor and frozen target, positive boundary witness flag (`anchorWitnessed`), and permanently `isProductionCompletenessEstablished = false`.
    - Zero transaction retrieval, zero swap ingestion, zero cursor advancement, zero gap clearing, and zero production retest inputs.
-2. **Deterministic Offline Unit Tests**: Create `backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts` testing Fixtures 1–3, empty/short responses, repeated pages, bounds, timeouts, lifecycle/epoch cancellation, budget rejections, and malformed records using deterministic mock page fetchers and synthetic clocks.
+2. **Deterministic Offline Unit Tests**: Implemented in [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts) covering shared pacing, stalled-fetch timeouts, caller cancellation, lifecycle invalidation, bounded retention, schema validation, slot inversions, duplicate metadata conflicts, and protocol fixtures with synthetic clocks.
 3. **No Live Execution**: Keep the helper offline; do not wire it to live daemon loops or modify `isProductionCompletenessEstablished`.
 
 ---

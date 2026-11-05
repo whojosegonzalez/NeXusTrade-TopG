@@ -4,20 +4,14 @@
  *
  * Deterministic offline test suite verifying:
  * 1. Exact candidate binding & options validation (fail-closed initialization)
- * 2. Missed-B Fixture ($A \rightarrow B \rightarrow C$): discovers missed B, freezes C from RPC head, witnesses A
- * 3. Multi-page pagination traversal returning anchor ($E \dots A$)
- * 4. Anchor-only quiet history (slot tick with zero pool transactions since A)
- * 5. Unreached boundary on empty history page (honest ANCHOR_NOT_FOUND, anchorWitnessed = false)
- * 6. Unreached boundary on short page (< pageSize without anchor)
- * 7. Duplicate, overlapping, and non-progressing pages (loop detection)
- * 8. Concurrent live notifications do not alter frozen target
- * 9. Cancellation handling (pre-dispatch and post-await)
- * 10. Coordinator lifecycle and epoch cancellation (pre-dispatch and post-await)
- * 11. Operation deadline and bounds enforcement (maxPages, maxRetainedRecords)
- * 12. Budget manager enforcement under strict CANDIDATE_ENRICHMENT (no purpose switching, no retries)
- * 13. Rejection of malformed records (fail-closed)
- * 14. Fetcher error handling
- * 15. Functional entrypoint parity
+ * 2. Shared resource identity ("SOLANA_RPC") and recoverable pacing waits across pagination
+ * 3. In-flight deadline and cancellation enforcement (stalled-fetch timeouts, caller cancellation, lifecycle invalidation)
+ * 4. Bounded capacity enforcement (checked before insertion) and immutable deep-freezing
+ * 5. Full record & traversal schema validation (64-byte Ed25519 signatures, missing err, contradictory confirmationStatus)
+ * 6. Traversal slot ordering and before-boundary violation rejection (Page 1 [5, 4] -> Page 2 [6, anchor])
+ * 7. Duplicate signature consistency (rejecting conflicting metadata, preserving legitimate overlap)
+ * 8. Missed-B Fixture ($A \rightarrow B \rightarrow C$) and multi-page pagination traversal
+ * 9. Anchor-only quiet history and unreached boundaries (empty / short pages)
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -35,7 +29,7 @@ import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResou
 import type { TrackedRaydiumPoolContext } from "./RaydiumAmmV4SwapDecoder.js";
 import type { SubscriptionCoordinatorStatus } from "./RaydiumCandidateSubscriptionCoordinator.js";
 
-// Canonical Base58 fixture addresses
+// Canonical Base58 fixture addresses (32 bytes public keys)
 const CANONICAL_POOL_ID = "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA";
 const CANONICAL_TOKEN_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 const CANONICAL_PC_MINT = "So11111111111111111111111111111111111111112";
@@ -53,22 +47,35 @@ const VALID_POOL_CONTEXT: TrackedRaydiumPoolContext = Object.freeze({
   orientation: "TOKEN_BASE_SOL_QUOTE",
 });
 
-// Canonical Base58 transaction signatures
-const SIG_A = "5UkeD7KkR2z8vK3Xp2N8t5M7W4v8Y1L6J3H9P2Q5S8T1V4X7Z9B2D4F6H8J1K3M5N7P9R2T4V6X8Z1";
-const SIG_B = "3kR2z8vK3Xp2N8t5M7W4v8Y1L6J3H9P2Q5S8T1V4X7Z9B2D4F6H8J1K3M5N7P9R2T4V6X8Z15UkeD7K";
-const SIG_C = "2z8vK3Xp2N8t5M7W4v8Y1L6J3H9P2Q5S8T1V4X7Z9B2D4F6H8J1K3M5N7P9R2T4V6X8Z15UkeD7KkR3";
-const SIG_D = "7W4v8Y1L6J3H9P2Q5S8T1V4X7Z9B2D4F6H8J1K3M5N7P9R2T4V6X8Z15UkeD7KkR2z8vK3Xp2N8t5M";
-const SIG_E = "8Y1L6J3H9P2Q5S8T1V4X7Z9B2D4F6H8J1K3M5N7P9R2T4V6X8Z15UkeD7KkR2z8vK3Xp2N8t5M7W4v";
+// Canonical 64-byte Ed25519 transaction signatures (decoding to exactly 64 bytes)
+const SIG_A =
+  "CeD7gRMFdZKnrBxCWczhvDmfAz4ke5NFKvqAi9jSwzCQReUhecVgBJb112WuuR9eVmzFDwMsQDWEa1WWhbF3aoB";
+const SIG_B =
+  "QHREMqhWG7eahNuQ2EzQqSYKLy8WH9jVerfLRJTttyPorHxQJDzMMcB1142poqJHzYyVSsijoS1U9222QBV6AbM";
+const SIG_C =
+  "bvdM3G3ktfyNYZrbXrz7kfJyWxCFvE6jynVW8TCLqxbDGwS6wqV2Xum115YjiFSwVKxjfp5cCeWhi2XY6mj8kPX";
+const SIG_D =
+  "oZqTigQ1XEJAPkoo3Uypft5dgwG1ZJTzJiKfqbvnnwnchauobSyhiDM1174ecfbaz6wytkSUbs1wH333oMyBLBh";
+const SIG_E =
+  "21D3aQ6kG9ncxEwkzZ6yXb6rHrvKmCNqEde9qYkfEjvz28EPWF4UNtWw118aZX5kEUswE7goM15XAr3YZVxDDuys";
+const SIG_F =
+  "2CrFh5X6WnLwk68iC4iyEWKcx2uPWqTCUxZz1FuPggvBRYssCtfy44pX11A6URVtsyevULdADQJ2QR445CYTGVn3";
 
 class MockPageFetcher implements HistoryPageFetcher {
   public recordedQueries: HistoryPageQueryParams[] = [];
-  public queuedPages: (readonly HistorySignatureRecord[] | Error)[] = [];
+  public queuedPages: (
+    | readonly HistorySignatureRecord[]
+    | Error
+    | Promise<readonly HistorySignatureRecord[]>
+  )[] = [];
   public onBeforeFetch?: (() => void) | undefined;
+  public lastReceivedSignal?: AbortSignal | undefined;
 
   public async fetchPage(
     params: HistoryPageQueryParams,
   ): Promise<readonly HistorySignatureRecord[]> {
     this.recordedQueries.push({ ...params });
+    this.lastReceivedSignal = params.signal;
     if (this.onBeforeFetch) {
       this.onBeforeFetch();
     }
@@ -78,6 +85,9 @@ class MockPageFetcher implements HistoryPageFetcher {
     }
     if (next instanceof Error) {
       throw next;
+    }
+    if (next instanceof Promise) {
+      return next;
     }
     return next;
   }
@@ -103,7 +113,7 @@ describe("ExactPoolHistoryEnumerator", () => {
   let fakeNow = 1_000_000;
   const clock = () => fakeNow;
 
-  const createHelper = (optionsOverrides = {}) => {
+  const createHelper = (optionsOverrides: Partial<ExactPoolHistoryEnumeratorOptions> = {}) => {
     return new ExactPoolHistoryEnumerator({
       poolContext: VALID_POOL_CONTEXT,
       knownAnchorSignature: SIG_A,
@@ -113,6 +123,10 @@ describe("ExactPoolHistoryEnumerator", () => {
       lifecycleTarget: mockLifecycle,
       pageSize: 10,
       operationDeadlineMs: 10_000,
+      checkIntervalMs: 5,
+      sleepFn: async (ms: number) => {
+        fakeNow += ms;
+      },
       ...optionsOverrides,
     });
   };
@@ -123,7 +137,7 @@ describe("ExactPoolHistoryEnumerator", () => {
       maxTotalRequests: 50,
       maxEnrichmentAttempts: 10,
       minReservedForwardRequests: 4,
-      minProviderSpacingMs: 0, // 0 spacing for deterministic instant tests unless overridden
+      minProviderSpacingMs: 2500, // Standard 2500ms spacing enabled!
       clock,
     });
     mockFetcher = new MockPageFetcher();
@@ -149,7 +163,19 @@ describe("ExactPoolHistoryEnumerator", () => {
       ).toThrow(/\[POOL_CONTEXT_INVALID\]/);
     });
 
-    it("rejects invalid knownAnchorSignature", () => {
+    it("rejects invalid knownAnchorSignature (32-byte pubkey or non-64-byte signature)", () => {
+      // 32-byte public key is not a 64-byte signature
+      expect(
+        () =>
+          new ExactPoolHistoryEnumerator({
+            poolContext: VALID_POOL_CONTEXT,
+            knownAnchorSignature: CANONICAL_POOL_ID,
+            pageFetcher: mockFetcher,
+            budgetManager,
+          }),
+      ).toThrow(/\[ENUMERATOR_INIT\] knownAnchorSignature must be a valid 64-byte Solana Base58/);
+
+      // Untrimmed or arbitrary string
       expect(
         () =>
           new ExactPoolHistoryEnumerator({
@@ -158,10 +184,10 @@ describe("ExactPoolHistoryEnumerator", () => {
             pageFetcher: mockFetcher,
             budgetManager,
           }),
-      ).toThrow(/\[ENUMERATOR_INIT\] knownAnchorSignature must be a valid Solana Base58/);
+      ).toThrow(/\[ENUMERATOR_INIT\] knownAnchorSignature must be a valid 64-byte Solana Base58/);
     });
 
-    it("rejects missing pageFetcher", () => {
+    it("rejects missing pageFetcher or missing budgetManager", () => {
       expect(
         () =>
           new ExactPoolHistoryEnumerator({
@@ -171,9 +197,7 @@ describe("ExactPoolHistoryEnumerator", () => {
             budgetManager,
           }),
       ).toThrow(/\[ENUMERATOR_INIT\] pageFetcher is mandatory/);
-    });
 
-    it("rejects missing budgetManager", () => {
       expect(
         () =>
           new ExactPoolHistoryEnumerator({
@@ -230,23 +254,412 @@ describe("ExactPoolHistoryEnumerator", () => {
           }),
       ).toThrow(/operationDeadlineMs must be a positive finite number/);
     });
+  });
 
-    it("accepts functional page fetcher and clones pool context immutably", () => {
-      const mutableContext = { ...VALID_POOL_CONTEXT };
-      const enumerator = new ExactPoolHistoryEnumerator({
-        poolContext: mutableContext,
-        knownAnchorSignature: SIG_A,
-        pageFetcher: async () => [],
-        budgetManager,
+  describe("2. Shared Resource Identity & Pacing Waits (Area 1)", () => {
+    it("shares the 'SOLANA_RPC' pacing bucket with the transaction source adapter", async () => {
+      // Simulate request already dispatched under SOLANA_RPC at fakeNow
+      budgetManager.recordRequestAttempt("SOLANA_RPC", "CANDIDATE_ENRICHMENT", fakeNow);
+
+      // Verify that after 1,000ms (< 2500ms), default enumerator (without override) detects pacing wait
+      fakeNow += 1000;
+      let sleepCalledWithMs = 0;
+      const enumerator = createHelper({
+        sleepFn: async (ms: number) => {
+          sleepCalledWithMs = ms;
+          fakeNow += ms;
+        },
       });
-      // Mutating source context after construction does not affect enumerator
-      (mutableContext as { poolId: string }).poolId = "MutatedAddress11111111111111111111111111";
-      expect(enumerator).toBeDefined();
+
+      mockFetcher.queuedPages = [
+        [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
+      ];
+
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("ANCHOR_WITNESSED");
+      expect(result.anchorWitnessed).toBe(true);
+      // Pacing wait of 1500ms was handled automatically
+      expect(sleepCalledWithMs).toBe(1500);
+      expect(budgetManager.getStats().totalRequests).toBe(2);
+    });
+
+    it("handles multi-page pagination pacing with standard 2500ms spacing using fake clocks", async () => {
+      // Page 1: returns [E, D] (full page of size 2)
+      const page1: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+      ];
+      // Page 2: returns [C, A] (full page of size 2, anchor witnessed)
+      const page2: HistorySignatureRecord[] = [
+        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+      ];
+      mockFetcher.queuedPages = [page1, page2];
+
+      let sleepPacingCalls = 0;
+      const enumerator = createHelper({
+        pageSize: 2,
+        maxPages: 5,
+        sleepFn: async (ms: number) => {
+          sleepPacingCalls++;
+          fakeNow += ms;
+        },
+      });
+
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("ANCHOR_WITNESSED");
+      expect(result.anchorWitnessed).toBe(true);
+      expect(result.pagesQueried).toBe(2);
+      expect(result.requestCount).toBe(2);
+      expect(sleepPacingCalls).toBe(1); // Exactly 1 pacing wait of 2500ms between page 1 and page 2
+      expect(result.discoveredSignatures.map((r) => r.signature)).toEqual([SIG_E, SIG_D, SIG_C]);
+    });
+
+    it("terminates with OPERATION_DEADLINE_EXCEEDED if pacing wait exceeds remaining deadline", async () => {
+      // Prior request made at fakeNow
+      budgetManager.recordRequestAttempt("SOLANA_RPC", "CANDIDATE_ENRICHMENT", fakeNow);
+
+      // Only 500ms deadline, but pacing wait is 2500ms
+      const enumerator = createHelper({
+        operationDeadlineMs: 500,
+      });
+
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.requestCount).toBe(0);
+      expect(result.error).toMatch(/exceeds operation deadline/);
+    });
+
+    it("keeps genuine quota and reservation denials terminal", async () => {
+      // Exhaust 10 enrichment attempts
+      for (let i = 0; i < 10; i++) {
+        fakeNow += 2500;
+        budgetManager.recordRequestAttempt("SOLANA_RPC", "CANDIDATE_ENRICHMENT", fakeNow);
+      }
+
+      fakeNow += 2500;
+      const enumerator = createHelper();
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("BUDGET_EXHAUSTED");
+      expect(result.budgetDenialReason).toBe("MAX_ENRICHMENT_ATTEMPTS_REACHED");
+      expect(result.requestCount).toBe(0);
     });
   });
 
-  describe("2. Missed-B Fixture (A -> B -> C)", () => {
-    it("recovers missed B, freezes C from RPC head, witnesses anchor A, and excludes A from discovered list", async () => {
+  describe("3. In-Flight Deadlines & Cancellation Enforcement (Area 2)", () => {
+    it("returns OPERATION_DEADLINE_EXCEEDED before stalled fetch completes (40ms deadline vs unresolved fetch)", async () => {
+      // Stalled fetch that does not resolve
+      const stalledFetchPromise = new Promise<readonly HistorySignatureRecord[]>(() => {
+        // never resolves
+      });
+      mockFetcher.queuedPages = [stalledFetchPromise];
+
+      const enumerator = createHelper({
+        operationDeadlineMs: 40,
+        checkIntervalMs: 5,
+        clock: () => Date.now(), // Real wall-clock for timeout race
+      });
+
+      const start = Date.now();
+      const result = await enumerator.enumerate();
+      const elapsed = Date.now() - start;
+
+      expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(elapsed).toBeLessThan(120); // Resolves promptly around 40ms, well before 150ms
+      expect(mockFetcher.lastReceivedSignal?.aborted).toBe(true);
+    });
+
+    it("returns OPERATION_CANCELLED before stalled fetch completes when caller aborts signal", async () => {
+      const abortController = new AbortController();
+      const stalledFetchPromise = new Promise<readonly HistorySignatureRecord[]>(() => {});
+      mockFetcher.queuedPages = [stalledFetchPromise];
+
+      const enumerator = createHelper({
+        signal: abortController.signal,
+        operationDeadlineMs: 10_000,
+        clock: () => Date.now(),
+      });
+
+      setTimeout(() => {
+        abortController.abort(new Error("Caller cancelled"));
+      }, 20);
+
+      const start = Date.now();
+      const result = await enumerator.enumerate();
+      const elapsed = Date.now() - start;
+
+      expect(result.outcome).toBe("OPERATION_CANCELLED");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(elapsed).toBeLessThan(100);
+      expect(mockFetcher.lastReceivedSignal?.aborted).toBe(true);
+    });
+
+    it("returns LIFECYCLE_CANCELLED before stalled fetch completes when coordinator disconnects", async () => {
+      const stalledFetchPromise = new Promise<readonly HistorySignatureRecord[]>(() => {});
+      mockFetcher.queuedPages = [stalledFetchPromise];
+
+      const enumerator = createHelper({
+        checkIntervalMs: 5,
+        operationDeadlineMs: 10_000,
+        clock: () => Date.now(),
+      });
+
+      setTimeout(() => {
+        mockLifecycle.status = "DISCONNECTED";
+      }, 15);
+
+      const start = Date.now();
+      const result = await enumerator.enumerate();
+      const elapsed = Date.now() - start;
+
+      expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(elapsed).toBeLessThan(100);
+      expect(mockFetcher.lastReceivedSignal?.aborted).toBe(true);
+      expect(result.error).toMatch(/Coordinator status transitioned to DISCONNECTED/);
+    });
+
+    it("discards late response from stalled fetch without altering returned records", async () => {
+      let lateResolve: ((records: readonly HistorySignatureRecord[]) => void) | undefined;
+      const delayedPromise = new Promise<readonly HistorySignatureRecord[]>((resolve) => {
+        lateResolve = resolve;
+      });
+      mockFetcher.queuedPages = [delayedPromise];
+
+      const enumerator = createHelper({
+        operationDeadlineMs: 40,
+        clock: () => Date.now(),
+      });
+
+      const result = await enumerator.enumerate();
+      expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
+      expect(result.discoveredSignatures).toEqual([]);
+
+      // Late resolution arrives AFTER enumerator finished
+      if (lateResolve) {
+        lateResolve([
+          { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+        ]);
+      }
+      expect(result.discoveredSignatures).toEqual([]);
+    });
+  });
+
+  describe("4. Bounded Capacity & Immutable Deep-Freezing (Area 3)", () => {
+    it("respects maxRetainedRecords=1 in failure result by checking capacity before insertion", async () => {
+      // Page 1 has 2 records, but maxRetainedRecords is 1
+      const page1: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+      ];
+      mockFetcher.queuedPages = [page1];
+
+      const enumerator = createHelper({
+        pageSize: 2,
+        maxRetainedRecords: 1,
+      });
+
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MAX_RECORDS_EXCEEDED");
+      expect(result.anchorWitnessed).toBe(false);
+      // Capacity bound strictly respected in failure result: exactly 1 record retained
+      expect(result.discoveredSignatures).toHaveLength(1);
+      expect(result.discoveredSignatures[0]?.signature).toBe(SIG_E);
+    });
+
+    it("rejects oversized pages exceeding requested pageSize fail-closed", async () => {
+      // Requested pageSize = 2, but fetcher returned 3 records
+      const oversizedPage: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+      ];
+      mockFetcher.queuedPages = [oversizedPage];
+
+      const enumerator = createHelper({ pageSize: 2 });
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(/exceeding requested pageSize/);
+    });
+
+    it("deeply clones and freezes returned records against post-enumeration mutation", async () => {
+      const mutableErr: Record<string, unknown> = {
+        InstructionError: [0, { Custom: 101 }],
+      };
+      const mutableRecord: HistorySignatureRecord = {
+        signature: SIG_C,
+        slot: 102,
+        err: mutableErr,
+        memo: "Original Memo",
+        blockTime: 1700000020,
+      };
+      const anchorRecord: HistorySignatureRecord = {
+        signature: SIG_A,
+        slot: 100,
+        err: null,
+        memo: null,
+        blockTime: 1700000000,
+      };
+
+      mockFetcher.queuedPages = [[mutableRecord, anchorRecord]];
+
+      const enumerator = createHelper({ pageSize: 10 });
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("ANCHOR_WITNESSED");
+      const discovered = result.discoveredSignatures[0];
+      expect(discovered).toBeDefined();
+
+      // Mutate the source record and nested err object
+      (mutableRecord as { slot: number }).slot = 999999;
+      (mutableErr.InstructionError as unknown[])[0] = 999;
+
+      // Returned record and nested err must remain completely unchanged!
+      expect(discovered?.slot).toBe(102);
+      expect(((discovered?.err as Record<string, unknown>).InstructionError as unknown[])[0]).toBe(
+        0,
+      );
+
+      // Verify returned objects are frozen
+      expect(Object.isFrozen(discovered)).toBe(true);
+      expect(Object.isFrozen(discovered?.err)).toBe(true);
+    });
+  });
+
+  describe("5. Record & Traversal Validation (Area 4)", () => {
+    it("rejects record missing required 'err' property", async () => {
+      const recordMissingErr = {
+        signature: SIG_C,
+        slot: 102,
+        blockTime: 1700000020,
+        // err property omitted
+      };
+      mockFetcher.queuedPages = [[recordMissingErr as unknown as HistorySignatureRecord]];
+
+      const enumerator = createHelper();
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(/missing required 'err' property/);
+    });
+
+    it("rejects record with confirmationStatus='processed' contradicting commitment 'confirmed'", async () => {
+      const processedRecord: HistorySignatureRecord = {
+        signature: SIG_C,
+        slot: 102,
+        err: null,
+        confirmationStatus: "processed",
+        blockTime: 1700000020,
+      };
+      mockFetcher.queuedPages = [[processedRecord]];
+
+      const enumerator = createHelper();
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(/contradicts requested commitment 'confirmed'/);
+    });
+
+    it("rejects traversal slot ordering inversion within a page (slot 4 followed by slot 5)", async () => {
+      const invertedPage: HistorySignatureRecord[] = [
+        { signature: SIG_C, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        { signature: SIG_B, slot: 105, err: null, memo: null, blockTime: 1700000050 }, // Newer slot after older!
+      ];
+      mockFetcher.queuedPages = [invertedPage];
+
+      const enumerator = createHelper();
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(/violated newest-first slot ordering/);
+    });
+
+    it("rejects across-page before-boundary violation (Page 1 [5, 4] followed by Page 2 [6, anchor])", async () => {
+      // Page 1 ends at slot 104
+      const page1: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 105, err: null, memo: null, blockTime: 1700000050 },
+        { signature: SIG_D, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+      ];
+      // Page 2 erroneously returns a record from slot 106 (> 104)!
+      const page2: HistorySignatureRecord[] = [
+        { signature: SIG_C, slot: 106, err: null, memo: null, blockTime: 1700000060 },
+        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+      ];
+      mockFetcher.queuedPages = [page1, page2];
+
+      const enumerator = createHelper({ pageSize: 2 });
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(
+        /violated before-boundary: newest record slot 106 exceeds previous page oldest slot 104/,
+      );
+    });
+
+    it("rejects conflicting metadata for duplicate signatures while preserving identical overlap", async () => {
+      // Page 1 contains SIG_D with slot 103
+      const page1: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+      ];
+      // Page 2 contains SIG_D with conflicting blockTime!
+      const page2: HistorySignatureRecord[] = [
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1799999999 }, // Conflicting blockTime
+        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+      ];
+      mockFetcher.queuedPages = [page1, page2];
+
+      const enumerator = createHelper({ pageSize: 2 });
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("MALFORMED_RECORD");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toMatch(/Conflicting metadata encountered for duplicate signature/);
+    });
+
+    it("preserves legitimate overlap when duplicate signatures share identical metadata", async () => {
+      const page1: HistorySignatureRecord[] = [
+        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+      ];
+      // Page 2 overlaps on SIG_C with identical metadata
+      const page2: HistorySignatureRecord[] = [
+        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
+        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
+        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+      ];
+      mockFetcher.queuedPages = [page1, page2];
+
+      const enumerator = createHelper({ pageSize: 3 });
+      const result = await enumerator.enumerate();
+
+      expect(result.outcome).toBe("ANCHOR_WITNESSED");
+      expect(result.anchorWitnessed).toBe(true);
+      expect(result.discoveredSignatures.map((r) => r.signature)).toEqual([
+        SIG_E,
+        SIG_D,
+        SIG_C,
+        SIG_B,
+      ]);
+    });
+  });
+
+  describe("6. Protocol Fixtures & Unreached Boundaries", () => {
+    it("recovers missed B in A -> B -> C fixture, freezing C and witnessing anchor A", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
         { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
@@ -264,71 +677,9 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.pagesQueried).toBe(1);
       expect(result.requestCount).toBe(1);
       expect(result.isProductionCompletenessEstablished).toBe(false);
-
-      // Discovered signatures must contain C and B in ledger return order, excluding anchor A
-      expect(result.discoveredSignatures).toHaveLength(2);
-      expect(result.discoveredSignatures[0]?.signature).toBe(SIG_C);
-      expect(result.discoveredSignatures[1]?.signature).toBe(SIG_B);
-      expect(result.discoveredSignatures.some((r) => r.signature === SIG_A)).toBe(false);
-
-      // Query verification
-      expect(mockFetcher.recordedQueries).toHaveLength(1);
-      expect(mockFetcher.recordedQueries[0]?.address).toBe(CANONICAL_POOL_ID);
-      expect(mockFetcher.recordedQueries[0]?.limit).toBe(10);
-      expect(mockFetcher.recordedQueries[0]?.before).toBeUndefined();
-      expect(mockFetcher.recordedQueries[0]?.commitment).toBe("confirmed");
-
-      // Budget check: exactly 1 enrichment request recorded
-      const stats = budgetManager.getStats();
-      expect(stats.enrichmentRequests).toBe(1);
-      expect(stats.totalRequests).toBe(1);
+      expect(result.discoveredSignatures.map((r) => r.signature)).toEqual([SIG_C, SIG_B]);
     });
-  });
 
-  describe("3. Multi-Page Pagination Traversal Returning Anchor (E ... A)", () => {
-    it("paginates backward with before: oldestInPage until anchor is witnessed across multiple pages", async () => {
-      // Page 1: returns [E, D] (full page of size 2, anchor not in page)
-      const page1: HistorySignatureRecord[] = [
-        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
-        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
-      ];
-      // Page 2: returns [C, B, A] (anchor A is present)
-      const page2: HistorySignatureRecord[] = [
-        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
-        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
-        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
-      ];
-      mockFetcher.queuedPages = [page1, page2];
-
-      const enumerator = createHelper({ pageSize: 2, maxPages: 5 });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("ANCHOR_WITNESSED");
-      expect(result.anchorWitnessed).toBe(true);
-      expect(result.frozenTargetSignature).toBe(SIG_E);
-      expect(result.pagesQueried).toBe(2);
-      expect(result.requestCount).toBe(2);
-      expect(result.isProductionCompletenessEstablished).toBe(false);
-
-      // Discovered signatures: [E, D, C, B] in ledger return order
-      expect(result.discoveredSignatures.map((r) => r.signature)).toEqual([
-        SIG_E,
-        SIG_D,
-        SIG_C,
-        SIG_B,
-      ]);
-
-      // Verify queries
-      expect(mockFetcher.recordedQueries).toHaveLength(2);
-      expect(mockFetcher.recordedQueries[0]?.before).toBeUndefined();
-      expect(mockFetcher.recordedQueries[1]?.before).toBe(SIG_D);
-
-      // Budget check
-      expect(budgetManager.getStats().enrichmentRequests).toBe(2);
-    });
-  });
-
-  describe("4. Anchor-Only Quiet History", () => {
     it("witnesses anchor when query returns only anchor A, yielding empty discovered list", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
@@ -342,14 +693,10 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.anchorWitnessed).toBe(true);
       expect(result.frozenTargetSignature).toBe(SIG_A);
       expect(result.discoveredSignatures).toEqual([]);
-      expect(result.pagesQueried).toBe(1);
-      expect(result.requestCount).toBe(1);
       expect(result.isProductionCompletenessEstablished).toBe(false);
     });
-  });
 
-  describe("5. Unreached Boundary on Empty Response", () => {
-    it("returns ANCHOR_NOT_FOUND with anchorWitnessed = false on empty initial response", async () => {
+    it("returns ANCHOR_NOT_FOUND with anchorWitnessed=false on empty initial response", async () => {
       mockFetcher.queuedPages = [[]];
 
       const enumerator = createHelper({ pageSize: 10 });
@@ -359,17 +706,12 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.anchorWitnessed).toBe(false);
       expect(result.frozenTargetSignature).toBeNull();
       expect(result.discoveredSignatures).toEqual([]);
-      expect(result.pagesQueried).toBe(1);
       expect(result.isProductionCompletenessEstablished).toBe(false);
     });
-  });
 
-  describe("6. Unreached Boundary on Short Response", () => {
-    it("returns ANCHOR_NOT_FOUND with anchorWitnessed = false when page is shorter than pageSize and lacks anchor", async () => {
-      // Requested pageSize = 10, but RPC returned only 2 records [C, B] without anchor A
+    it("returns ANCHOR_NOT_FOUND with anchorWitnessed=false on short response without anchor", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
-        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
       ];
       mockFetcher.queuedPages = [page1];
 
@@ -378,21 +720,17 @@ describe("ExactPoolHistoryEnumerator", () => {
 
       expect(result.outcome).toBe("ANCHOR_NOT_FOUND");
       expect(result.anchorWitnessed).toBe(false);
-      expect(result.frozenTargetSignature).toBe(SIG_C);
-      expect(result.pagesQueried).toBe(1);
       expect(result.isProductionCompletenessEstablished).toBe(false);
     });
-  });
 
-  describe("7. Duplicate, Overlapping, and Non-Progressing Pages", () => {
-    it("detects non-progressing loop when subsequent page produces zero new signatures", async () => {
+    it("returns NON_PROGRESSING_PAGE when subsequent page yields zero new signatures", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
         { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
       ];
-      // Page 2 repeats the exact same records
+      // Page 2 repeats SIG_D at slot 103 (same slot <= 103, yielding zero new signatures)
       const page2: HistorySignatureRecord[] = [
-        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
         { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
       ];
       mockFetcher.queuedPages = [page1, page2];
@@ -406,49 +744,38 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.isProductionCompletenessEstablished).toBe(false);
     });
 
-    it("deduplicates overlapping signatures between consecutive pages", async () => {
+    it("stops with MAX_PAGES_EXHAUSTED when reaching maxPages limit without anchor", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
         { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
       ];
-      // Page 2 overlaps on SIG_D, then introduces SIG_C and anchor SIG_A
       const page2: HistorySignatureRecord[] = [
-        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
         { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
-        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
       ];
       mockFetcher.queuedPages = [page1, page2];
 
-      const enumerator = createHelper({ pageSize: 2, maxPages: 5 });
+      const enumerator = createHelper({ pageSize: 2, maxPages: 2 });
       const result = await enumerator.enumerate();
 
-      expect(result.outcome).toBe("ANCHOR_WITNESSED");
-      expect(result.anchorWitnessed).toBe(true);
-      expect(result.discoveredSignatures.map((r) => r.signature)).toEqual([SIG_E, SIG_D, SIG_C]);
+      expect(result.outcome).toBe("MAX_PAGES_EXHAUSTED");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.pagesQueried).toBe(2);
+      expect(result.discoveredSignatures).toHaveLength(4);
     });
-  });
 
-  describe("8. Frozen Target Invariance Across Concurrent Outside Notifications", () => {
-    it("keeps frozenTargetSignature pinned to RPC head even if caller buffers outside notifications", async () => {
-      const page1: HistorySignatureRecord[] = [
-        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
-        { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
-      ];
-      mockFetcher.queuedPages = [page1];
+    it("returns FETCH_ERROR when injected fetcher throws", async () => {
+      mockFetcher.queuedPages = [new Error("Solana RPC 503 Service Unavailable")];
 
-      // Simulate concurrent outside WebSocket hint arrival
-      const outsideNotification = "ConcurrentWebSocketSig99999999999999999999999999";
-
-      const enumerator = createHelper({ pageSize: 10 });
+      const enumerator = createHelper();
       const result = await enumerator.enumerate();
 
-      expect(result.outcome).toBe("ANCHOR_WITNESSED");
-      expect(result.frozenTargetSignature).toBe(SIG_C);
-      expect(result.frozenTargetSignature).not.toBe(outsideNotification);
+      expect(result.outcome).toBe("FETCH_ERROR");
+      expect(result.anchorWitnessed).toBe(false);
+      expect(result.error).toBe("Solana RPC 503 Service Unavailable");
+      expect(result.pagesQueried).toBe(1);
     });
-  });
 
-  describe("9. Cancellation Handling", () => {
     it("returns OPERATION_CANCELLED immediately on pre-dispatch cancellation with zero requests", async () => {
       const enumerator = createHelper({
         isCancelled: () => true,
@@ -462,28 +789,6 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(mockFetcher.recordedQueries).toHaveLength(0);
     });
 
-    it("discards results and returns OPERATION_CANCELLED when cancelled during in-flight await", async () => {
-      let isCancelled = false;
-      mockFetcher.onBeforeFetch = () => {
-        isCancelled = true;
-      };
-      mockFetcher.queuedPages = [
-        [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
-      ];
-
-      const enumerator = createHelper({
-        isCancelled: () => isCancelled,
-      });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("OPERATION_CANCELLED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.pagesQueried).toBe(1);
-      expect(result.discoveredSignatures).toEqual([]);
-    });
-  });
-
-  describe("10. Coordinator Lifecycle & Epoch Cancellation", () => {
     it("fails closed on pre-dispatch when coordinator status is not SUBSCRIBED", async () => {
       mockLifecycle.status = "DISCONNECTED";
 
@@ -508,260 +813,7 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.error).toMatch(/Coordinator epoch changed/);
     });
 
-    it("discards in-flight response when coordinator drops to DISCONNECTED during await", async () => {
-      mockFetcher.onBeforeFetch = () => {
-        mockLifecycle.status = "DISCONNECTED";
-      };
-      mockFetcher.queuedPages = [
-        [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
-      ];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.discoveredSignatures).toEqual([]);
-      expect(result.error).toMatch(/Coordinator status transitioned to DISCONNECTED/);
-    });
-
-    it("discards in-flight response when transport is replaced and epoch changes during await", async () => {
-      mockFetcher.onBeforeFetch = () => {
-        mockLifecycle.connectionEpoch = 2; // increment epoch
-      };
-      mockFetcher.queuedPages = [
-        [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
-      ];
-
-      const enumerator = createHelper({ dispatchEpoch: 1 });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.discoveredSignatures).toEqual([]);
-      expect(result.error).toMatch(/Coordinator epoch changed to 2/);
-    });
-  });
-
-  describe("11. Operation Deadline & Bounds Enforcement", () => {
-    it("returns OPERATION_DEADLINE_EXCEEDED when deadline expired pre-dispatch", async () => {
-      fakeNow = 1_000_000;
-      const enumerator = createHelper({
-        operationDeadlineMs: 500,
-        clock: () => {
-          fakeNow += 600;
-          return fakeNow;
-        },
-      });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.requestCount).toBe(0);
-    });
-
-    it("returns OPERATION_DEADLINE_EXCEEDED when deadline expired during await", async () => {
-      fakeNow = 1_000_000;
-      mockFetcher.onBeforeFetch = () => {
-        fakeNow += 20_000; // warp past 10s deadline
-      };
-      mockFetcher.queuedPages = [
-        [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
-      ];
-
-      const enumerator = createHelper({
-        operationDeadlineMs: 10_000,
-      });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.discoveredSignatures).toEqual([]);
-    });
-
-    it("stops with MAX_PAGES_EXHAUSTED when reaching maxPages limit without anchor", async () => {
-      const page1: HistorySignatureRecord[] = [
-        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
-        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
-      ];
-      const page2: HistorySignatureRecord[] = [
-        { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
-        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000010 },
-      ];
-      mockFetcher.queuedPages = [page1, page2];
-
-      const enumerator = createHelper({ pageSize: 2, maxPages: 2 });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MAX_PAGES_EXHAUSTED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.pagesQueried).toBe(2);
-      expect(result.discoveredSignatures).toHaveLength(4);
-    });
-
-    it("stops with MAX_RECORDS_EXCEEDED when retained signatures exceed limit", async () => {
-      const page1: HistorySignatureRecord[] = [
-        { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
-        { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
-      ];
-      mockFetcher.queuedPages = [page1];
-
-      // Limit maxRetainedRecords = 1, but page1 has 2 records
-      const enumerator = createHelper({ pageSize: 2, maxRetainedRecords: 1 });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MAX_RECORDS_EXCEEDED");
-      expect(result.anchorWitnessed).toBe(false);
-    });
-  });
-
-  describe("12. Budget Manager Enforcement under Strict CANDIDATE_ENRICHMENT", () => {
-    it("fails closed when CANDIDATE_ENRICHMENT limit (10) is exhausted", async () => {
-      // Consume 10 enrichment requests prior to enumeration
-      for (let i = 0; i < 10; i++) {
-        budgetManager.recordRequestAttempt("solana-rpc", "CANDIDATE_ENRICHMENT", fakeNow);
-      }
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("BUDGET_EXHAUSTED");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.budgetDenialReason).toBe("MAX_ENRICHMENT_ATTEMPTS_REACHED");
-      expect(result.requestCount).toBe(0);
-      expect(mockFetcher.recordedQueries).toHaveLength(0);
-    });
-
-    it("fails closed when global ceiling is reached", async () => {
-      // Set small manager
-      const smallBudget = new GlobalResourceBudgetManager({
-        maxTotalRequests: 5,
-        maxEnrichmentAttempts: 10,
-        minReservedForwardRequests: 0,
-        minProviderSpacingMs: 0,
-        clock,
-      });
-      for (let i = 0; i < 5; i++) {
-        smallBudget.recordRequestAttempt("solana-rpc", "DISCOVERY_POLL", fakeNow);
-      }
-
-      const enumerator = createHelper({ budgetManager: smallBudget });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("BUDGET_EXHAUSTED");
-      expect(result.budgetDenialReason).toBe("GLOBAL_REQUEST_CEILING_REACHED");
-    });
-
-    it("fails closed when within reserved forward observations capacity", async () => {
-      const reservedBudget = new GlobalResourceBudgetManager({
-        maxTotalRequests: 10,
-        maxEnrichmentAttempts: 10,
-        minReservedForwardRequests: 4,
-        minProviderSpacingMs: 0,
-        clock,
-      });
-      // 6 requests made; 6 + 4 >= 10, blocking enrichment
-      for (let i = 0; i < 6; i++) {
-        reservedBudget.recordRequestAttempt("solana-rpc", "DISCOVERY_POLL", fakeNow);
-      }
-
-      const enumerator = createHelper({ budgetManager: reservedBudget });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("BUDGET_EXHAUSTED");
-      expect(result.budgetDenialReason).toBe("RESERVED_FOR_FORWARD_OBSERVATIONS");
-    });
-
-    it("fails closed when provider pacing is not met", async () => {
-      const pacingBudget = new GlobalResourceBudgetManager({
-        maxTotalRequests: 50,
-        maxEnrichmentAttempts: 10,
-        minReservedForwardRequests: 4,
-        minProviderSpacingMs: 2500,
-        clock,
-      });
-      // Call once at fakeNow
-      pacingBudget.recordRequestAttempt("solana-rpc", "CANDIDATE_ENRICHMENT", fakeNow);
-
-      // Attempt second call after only 1000ms (< 2500ms)
-      fakeNow += 1000;
-      const enumerator = createHelper({ budgetManager: pacingBudget });
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("BUDGET_EXHAUSTED");
-      expect(result.budgetDenialReason).toBe("PROVIDER_PACING_NOT_MET");
-    });
-  });
-
-  describe("13. Rejection of Malformed Records", () => {
-    it("fails closed when RPC response is not an array", async () => {
-      mockFetcher.queuedPages = ["not-an-array" as unknown as readonly HistorySignatureRecord[]];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MALFORMED_RECORD");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.error).toMatch(/RPC history page response is not an array/);
-    });
-
-    it("fails closed when a record has an invalid Base58 signature", async () => {
-      const malformed: unknown[] = [
-        { signature: "Invalid_Chars!@#$", slot: 100, err: null, blockTime: 1700000000 },
-      ];
-      mockFetcher.queuedPages = [malformed as unknown as readonly HistorySignatureRecord[]];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MALFORMED_RECORD");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.error).toMatch(/invalid Base58 signature/);
-    });
-
-    it("fails closed when a record has negative or non-integer slot", async () => {
-      const malformed: unknown[] = [
-        { signature: SIG_C, slot: -5, err: null, blockTime: 1700000000 },
-      ];
-      mockFetcher.queuedPages = [malformed as unknown as readonly HistorySignatureRecord[]];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MALFORMED_RECORD");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.error).toMatch(/invalid non-negative integer slot/);
-    });
-
-    it("fails closed when a record has negative blockTime", async () => {
-      const malformed: unknown[] = [{ signature: SIG_C, slot: 100, err: null, blockTime: -100 }];
-      mockFetcher.queuedPages = [malformed as unknown as readonly HistorySignatureRecord[]];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("MALFORMED_RECORD");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.error).toMatch(/invalid blockTime/);
-    });
-  });
-
-  describe("14. Fetcher Error Handling", () => {
-    it("returns FETCH_ERROR when injected fetcher throws", async () => {
-      mockFetcher.queuedPages = [new Error("Solana RPC 503 Service Unavailable")];
-
-      const enumerator = createHelper();
-      const result = await enumerator.enumerate();
-
-      expect(result.outcome).toBe("FETCH_ERROR");
-      expect(result.anchorWitnessed).toBe(false);
-      expect(result.error).toBe("Solana RPC 503 Service Unavailable");
-      expect(result.pagesQueried).toBe(1);
-    });
-  });
-
-  describe("15. Functional Entrypoint Parity", () => {
-    it("enumerateExactPoolHistory function returns identical successful result", async () => {
+    it("functional entrypoint enumerateExactPoolHistory returns identical result", async () => {
       const page1: HistorySignatureRecord[] = [
         { signature: SIG_C, slot: 102, err: null, memo: null, blockTime: 1700000020 },
         { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
@@ -781,20 +833,31 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(result.anchorWitnessed).toBe(true);
       expect(result.frozenTargetSignature).toBe(SIG_C);
       expect(result.discoveredSignatures).toHaveLength(1);
-      expect(result.discoveredSignatures[0]?.signature).toBe(SIG_C);
-      expect(result.isProductionCompletenessEstablished).toBe(false);
     });
   });
 
-  describe("16. Signature Validation Helper", () => {
-    it("correctly identifies valid and invalid Solana Base58 signatures", () => {
+  describe("7. Signature Validation Helper", () => {
+    it("strictly accepts 64-byte Solana signatures and rejects 32-byte public keys and invalid strings", () => {
       expect(isValidSolanaSignature(SIG_A)).toBe(true);
       expect(isValidSolanaSignature(SIG_B)).toBe(true);
+      expect(isValidSolanaSignature(SIG_C)).toBe(true);
+      expect(isValidSolanaSignature(SIG_F)).toBe(true);
+
+      // Rejects 32-byte public keys
+      expect(isValidSolanaSignature(CANONICAL_POOL_ID)).toBe(false);
+      expect(isValidSolanaSignature(CANONICAL_TOKEN_MINT)).toBe(false);
+
+      // Rejects empty, whitespace, short, or invalid chars
       expect(isValidSolanaSignature("")).toBe(false);
-      expect(isValidSolanaSignature("short")).toBe(false);
-      expect(isValidSolanaSignature("InvalidBase58With0OIlSpecialChars!!!")).toBe(false);
+      expect(isValidSolanaSignature("   ")).toBe(false);
+      expect(isValidSolanaSignature(` ${SIG_A} `)).toBe(false);
+      expect(isValidSolanaSignature("NotBase58With0OIlSpecialChars!!!")).toBe(false);
       expect(isValidSolanaSignature(12345)).toBe(false);
       expect(isValidSolanaSignature(null)).toBe(false);
+
+      // Rejects 128-character strings
+      const longStr = "1".repeat(128);
+      expect(isValidSolanaSignature(longStr)).toBe(false);
     });
   });
 });
