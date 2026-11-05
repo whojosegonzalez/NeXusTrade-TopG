@@ -144,10 +144,7 @@ describe("BuyGateTriggerService", () => {
           score: 0,
           totalHolders: 500,
           topHolders: [{ pct: 2.0 }, { pct: 1.5 }],
-          risks: [
-            { name: "Minor warning", level: "info", score: 0 },
-            { name: "Bundled supply", level: "info", value: "5%" },
-          ],
+          risks: [{ name: "Minor warning", level: "info", score: 0 }],
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -161,17 +158,17 @@ describe("BuyGateTriggerService", () => {
     expect(metrics?.rugScore).toBe(0);
     expect(metrics?.hasDangerRisk).toBe(false);
     expect(metrics?.holdersCount).toBe(500);
-    expect(metrics?.bundlerPct).toBe(0.05);
+    expect(metrics?.bundlerPct).toBeUndefined();
     expect(metrics?.top10HolderPct).toBeCloseTo(0.035, 3);
 
-    // Final eligibility passes when score is genuinely 0 and no danger risks
+    // Final eligibility passes when score is genuinely 0 and no danger risks (with synthetic bundler control)
     const service = new BuyGateTriggerService();
     const result = service.evaluateCandidate(candidate, {
       rugScore: metrics?.rugScore,
       hasDangerRisk: metrics?.hasDangerRisk,
       holdersCount: metrics?.holdersCount,
       top10HolderPct: metrics?.top10HolderPct,
-      bundlerPct: metrics?.bundlerPct,
+      bundlerPct: 0.05, // Synthetic evaluator control
       requireVerifiedHolders: true,
       recentBuysCount60s: 8,
       recentSellsCount60s: 3,
@@ -1596,16 +1593,13 @@ describe("BuyGateTriggerService", () => {
       );
     });
 
-    it("rejects inferring bundler concentration from unrelated risk labels (insider, dev holding)", async () => {
-      // Synthetic fixture: risks with "insider" and "dev holding", but no bundled risk
-      const mockFetchUnrelatedRisks: typeof fetch = async () => {
+    it("reproduction: does not map 'Bundler transaction failure rate' (value '0%') to concentration and fails closed", async () => {
+      // Synthetic fixture: risk with "Bundler transaction failure rate" and value "0%"
+      const mockFetchFailureRateRisk: typeof fetch = async () => {
         return new Response(
           JSON.stringify({
             score: 100,
-            risks: [
-              { name: "High insider holdings", level: "warn", value: "25%" },
-              { name: "Dev holding substantial supply", level: "warn", value: "30%" },
-            ],
+            risks: [{ name: "Bundler transaction failure rate", level: "info", value: "0%" }],
             totalHolders: 300,
             topHolders: [{ pct: 15.0 }],
           }),
@@ -1614,12 +1608,12 @@ describe("BuyGateTriggerService", () => {
       };
 
       const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
-        "SyntheticUnrelatedRisksMint111111111111111",
-        mockFetchUnrelatedRisks,
+        "SyntheticBundlerFailureRateMint11111111111",
+        mockFetchFailureRateRisk,
       );
       expect(metrics).not.toBeNull();
-      expect(metrics?.bundlerPct).toBeUndefined(); // Must NOT infer bundler from insider / dev!
-      expect(metrics?.top10HolderPct).toBe(0.15);
+      // Must NOT extract bundler ownership concentration from unrelated operational failure rate
+      expect(metrics?.bundlerPct).toBeUndefined();
 
       const finalResult = service.evaluateCandidate(candidate, {
         rugScore: metrics?.rugScore,
@@ -1636,13 +1630,55 @@ describe("BuyGateTriggerService", () => {
       expect(finalResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
     });
 
-    it("rejects out-of-range or malformed bundler risk values without unit guessing", async () => {
-      // Synthetic fixture: negative bundler percentage
-      const mockFetchMalformedBundler: typeof fetch = async () => {
+    it("reproduction: malformed percentage strings ('0garbage%', '0.1.2%') are not parsed or accepted as valid concentration", async () => {
+      // Synthetic fixtures with malformed percentage values
+      for (const malformedVal of ["0garbage%", "0.1.2%"]) {
+        const mockFetch: typeof fetch = async () => {
+          return new Response(
+            JSON.stringify({
+              score: 100,
+              risks: [{ name: "Bundler supply", level: "warn", value: malformedVal }],
+              totalHolders: 300,
+              topHolders: [{ pct: 15.0 }],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        };
+
+        const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+          "SyntheticMalformedPrefixMint1111111111111",
+          mockFetch,
+        );
+        expect(metrics).not.toBeNull();
+        expect(metrics?.bundlerPct).toBeUndefined();
+
+        // Direct synthetic evaluator control passing malformed string fails closed
+        const directEvalResult = service.evaluateCandidate(candidate, {
+          rugScore: 100,
+          hasDangerRisk: false,
+          holdersCount: 300,
+          top10HolderPct: 0.15,
+          bundlerPct: malformedVal as unknown as number,
+          requireVerifiedHolders: true,
+          recentBuysCount60s: 8,
+          recentSellsCount60s: 3,
+          momentum1mBps: 50,
+        });
+        expect(directEvalResult.triggered).toBe(false);
+        expect(directEvalResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+      }
+    });
+
+    it("reproduction: conflicting risk entries ('95%' then '0%' vs '0%' then '95%') yield identical fail-closed verdicts without order dependence", async () => {
+      // Order 1: 95% followed by 0%
+      const mockFetchOrder1: typeof fetch = async () => {
         return new Response(
           JSON.stringify({
             score: 100,
-            risks: [{ name: "Bundled supply", level: "warn", value: "-15%" }],
+            risks: [
+              { name: "Bundled supply", level: "warn", value: "95%" },
+              { name: "Bundled supply", level: "info", value: "0%" },
+            ],
             totalHolders: 300,
             topHolders: [{ pct: 15.0 }],
           }),
@@ -1650,38 +1686,112 @@ describe("BuyGateTriggerService", () => {
         );
       };
 
-      const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
-        "SyntheticMalformedBundlerMint1111111111111",
-        mockFetchMalformedBundler,
-      );
-      expect(metrics).not.toBeNull();
-      expect(metrics?.bundlerPct).toBeUndefined(); // Out-of-bounds value rejected!
+      // Order 2: 0% followed by 95% (reversed)
+      const mockFetchOrder2: typeof fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            score: 100,
+            risks: [
+              { name: "Bundled supply", level: "info", value: "0%" },
+              { name: "Bundled supply", level: "warn", value: "95%" },
+            ],
+            totalHolders: 300,
+            topHolders: [{ pct: 15.0 }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      };
 
-      // Direct caller passing out-of-range bundlerPct (> 1.0 or < 0)
-      const outOfRangeResult = service.evaluateCandidate(candidate, {
-        rugScore: 100,
-        hasDangerRisk: false,
-        holdersCount: 300,
-        top10HolderPct: 0.15,
-        bundlerPct: -0.05,
+      const metrics1 = await BuyGateTriggerService.fetchRugCheckMetrics(
+        "SyntheticOrder1Mint1111111111111111111111",
+        mockFetchOrder1,
+      );
+      const metrics2 = await BuyGateTriggerService.fetchRugCheckMetrics(
+        "SyntheticOrder2Mint1111111111111111111111",
+        mockFetchOrder2,
+      );
+
+      // In both orders, bundler concentration remains unavailable (undefined)
+      expect(metrics1?.bundlerPct).toBeUndefined();
+      expect(metrics2?.bundlerPct).toBeUndefined();
+
+      const eval1 = service.evaluateCandidate(candidate, {
+        rugScore: metrics1?.rugScore,
+        hasDangerRisk: metrics1?.hasDangerRisk,
+        holdersCount: metrics1?.holdersCount,
+        top10HolderPct: metrics1?.top10HolderPct,
+        bundlerPct: metrics1?.bundlerPct,
         requireVerifiedHolders: true,
         recentBuysCount60s: 8,
         recentSellsCount60s: 3,
         momentum1mBps: 50,
       });
-      expect(outOfRangeResult.triggered).toBe(false);
-      expect(outOfRangeResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+
+      const eval2 = service.evaluateCandidate(candidate, {
+        rugScore: metrics2?.rugScore,
+        hasDangerRisk: metrics2?.hasDangerRisk,
+        holdersCount: metrics2?.holdersCount,
+        top10HolderPct: metrics2?.top10HolderPct,
+        bundlerPct: metrics2?.bundlerPct,
+        requireVerifiedHolders: true,
+        recentBuysCount60s: 8,
+        recentSellsCount60s: 3,
+        momentum1mBps: 50,
+      });
+
+      // Both orders produce identical verdicts; reordering identical evidence cannot turn rejection into approval
+      expect(eval1.triggered).toBe(false);
+      expect(eval2.triggered).toBe(false);
+      expect(eval1.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+      expect(eval2.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
     });
 
-    it("preserves genuine observed zero boundary values (0 holders, 0% top10, 0% bundler)", async () => {
-      // Synthetic fixture: explicitly observed zero boundary metrics
+    it("reproduction: does not accept undocumented root bundlerPct field from RugCheck JSON", async () => {
+      // Synthetic fixture: undocumented root bundlerPct field
+      const mockFetchRootBundler: typeof fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            score: 100,
+            risks: [],
+            totalHolders: 300,
+            topHolders: [{ pct: 15.0 }],
+            bundlerPct: 0.15,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      };
+
+      const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+        "SyntheticRootBundlerMint111111111111111111",
+        mockFetchRootBundler,
+      );
+      expect(metrics).not.toBeNull();
+      expect(metrics?.bundlerPct).toBeUndefined(); // Undocumented field must NOT be accepted!
+
+      const finalResult = service.evaluateCandidate(candidate, {
+        rugScore: metrics?.rugScore,
+        hasDangerRisk: metrics?.hasDangerRisk,
+        holdersCount: metrics?.holdersCount,
+        top10HolderPct: metrics?.top10HolderPct,
+        bundlerPct: metrics?.bundlerPct,
+        requireVerifiedHolders: true,
+        recentBuysCount60s: 8,
+        recentSellsCount60s: 3,
+        momentum1mBps: 50,
+      });
+      expect(finalResult.triggered).toBe(false);
+      expect(finalResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+    });
+
+    it("preserves genuine observed zero boundary values only through supported schema mappings", async () => {
+      // Synthetic fixture: explicitly observed zero boundary metrics on supported RugCheck fields
       const mockFetchZeroBoundaries: typeof fetch = async () => {
         return new Response(
           JSON.stringify({
             score: 0,
             totalHolders: 0,
             topHolders: [{ pct: 0 }],
-            risks: [{ name: "Bundled supply", level: "info", value: "0%" }],
+            risks: [],
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1696,33 +1806,34 @@ describe("BuyGateTriggerService", () => {
       expect(metrics?.hasDangerRisk).toBe(false);
       expect(metrics?.holdersCount).toBe(0);
       expect(metrics?.top10HolderPct).toBe(0);
-      expect(metrics?.bundlerPct).toBe(0);
+      expect(metrics?.bundlerPct).toBeUndefined(); // Unsupported mapping leaves bundlerPct unavailable
 
-      // Fails on holder count floor (0 < 100), but concentration gates pass cleanly
+      // In synthetic evaluator control, passing bundlerPct: 0 preserves genuine zero concentration
       const evalResult = service.evaluateCandidate(candidate, {
         rugScore: metrics?.rugScore,
         hasDangerRisk: metrics?.hasDangerRisk,
         holdersCount: metrics?.holdersCount,
         top10HolderPct: metrics?.top10HolderPct,
-        bundlerPct: metrics?.bundlerPct,
+        bundlerPct: 0, // Synthetic evaluator control verifying genuine 0 concentration is valid
         requireVerifiedHolders: true,
         recentBuysCount60s: 8,
         recentSellsCount60s: 3,
         momentum1mBps: 50,
       });
+      // Fails on holder count floor (0 < 100), but concentration gates pass cleanly
       expect(evalResult.triggered).toBe(false);
       expect(evalResult.rejectionReason).toBe("INSUFFICIENT_HOLDERS_COUNT_FAILED");
     });
 
-    it("passes final evaluation when all five required security metrics are verified within thresholds", async () => {
-      // Synthetic fixture: healthy candidate with all 5 verified security metrics
+    it("separates synthetic evaluator controls from provider responses to verify Gate 11 logic", async () => {
+      // Synthetic fixture: supported RugCheck provider fields
       const mockFetchHealthy: typeof fetch = async () => {
         return new Response(
           JSON.stringify({
             score: 50,
             totalHolders: 350,
             topHolders: [{ pct: 2.5 }, { pct: 1.5 }],
-            risks: [{ name: "Bundled supply", level: "info", value: "10%" }],
+            risks: [],
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1737,9 +1848,10 @@ describe("BuyGateTriggerService", () => {
       expect(metrics?.hasDangerRisk).toBe(false);
       expect(metrics?.holdersCount).toBe(350);
       expect(metrics?.top10HolderPct).toBeCloseTo(0.04, 3);
-      expect(metrics?.bundlerPct).toBe(0.1);
+      expect(metrics?.bundlerPct).toBeUndefined(); // Provider does NOT supply bundler concentration
 
-      const result = service.evaluateCandidate(candidate, {
+      // When relying solely on provider metrics, final evaluation fails closed on unavailable bundler
+      const providerOnlyResult = service.evaluateCandidate(candidate, {
         rugScore: metrics?.rugScore,
         hasDangerRisk: metrics?.hasDangerRisk,
         holdersCount: metrics?.holdersCount,
@@ -1750,8 +1862,23 @@ describe("BuyGateTriggerService", () => {
         recentSellsCount60s: 3,
         momentum1mBps: 50,
       });
-      expect(result.triggered).toBe(true);
-      expect(result.rejectionReason).toBeUndefined();
+      expect(providerOnlyResult.triggered).toBe(false);
+      expect(providerOnlyResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+
+      // With synthetic evaluator control, Gate 11 logic is verified independently
+      const syntheticResult = service.evaluateCandidate(candidate, {
+        rugScore: metrics?.rugScore,
+        hasDangerRisk: metrics?.hasDangerRisk,
+        holdersCount: metrics?.holdersCount,
+        top10HolderPct: metrics?.top10HolderPct,
+        bundlerPct: 0.1, // Synthetic evaluator control (separate from provider response)
+        requireVerifiedHolders: true,
+        recentBuysCount60s: 8,
+        recentSellsCount60s: 3,
+        momentum1mBps: 50,
+      });
+      expect(syntheticResult.triggered).toBe(true);
+      expect(syntheticResult.rejectionReason).toBeUndefined();
     });
   });
 });

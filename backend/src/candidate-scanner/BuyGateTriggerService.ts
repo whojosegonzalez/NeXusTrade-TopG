@@ -510,7 +510,6 @@ export class BuyGateTriggerService {
 
       const SUPPORTED_RISK_LEVELS = new Set(["danger", "warn", "info"]);
       let hasDangerRisk = false;
-      let bundlerPct: number | undefined;
 
       for (const risk of data.risks) {
         if (!risk || typeof risk !== "object" || Array.isArray(risk)) {
@@ -527,38 +526,15 @@ export class BuyGateTriggerService {
         if (normalizedLevel === "danger") {
           hasDangerRisk = true;
         }
-
-        const rObj = risk as { name?: unknown; value?: unknown };
-        const riskName = typeof rObj.name === "string" ? rObj.name.toLowerCase() : "";
-        // Only extract bundler metrics from risks explicitly matching "bundled" or "bundler".
-        // Do NOT infer bundler ownership from unrelated risk labels (e.g. "insider", "dev holding").
-        // Units must be explicitly established (e.g. percentage string ending with "%"); magnitude guessing is prohibited.
-        if (riskName.includes("bundled") || riskName.includes("bundler")) {
-          if (typeof rObj.value === "string" && rObj.value.trim().endsWith("%")) {
-            const rawVal = parseFloat(rObj.value.trim().slice(0, -1));
-            if (Number.isFinite(rawVal) && rawVal >= 0 && rawVal <= 100) {
-              bundlerPct = rawVal / 100;
-            }
-          }
-        }
       }
 
-      // If root report provides an explicit, typed bundler concentration metric with established normalized range [0.0, 1.0]
-      if (
-        bundlerPct === undefined &&
-        typeof (data as { bundlerPct?: unknown }).bundlerPct === "number"
-      ) {
-        const rootBundler = (data as { bundlerPct?: number }).bundlerPct;
-        if (
-          typeof rootBundler === "number" &&
-          Number.isFinite(rootBundler) &&
-          rootBundler >= 0 &&
-          rootBundler <= 1.0
-        ) {
-          bundlerPct = rootBundler;
-        }
-      }
-
+      // Note on Bundler Concentration:
+      // The official RugCheck OpenAPI specification (https://api.rugcheck.xyz/swagger/doc.json) does not define
+      // a root bundler concentration field, nor does it establish an authoritative label-to-concentration
+      // mapping for free-text risk descriptions (e.g. "Bundler transaction failure rate" is an operational failure rate,
+      // not ownership concentration). Free-text label matching, string prefix parsing, and magnitude guessing
+      // are strictly prohibited. Bundler concentration remains unavailable (undefined) from RugCheck reports
+      // until an authoritative provider contract is established.
       const result: {
         rugScore?: number;
         hasDangerRisk?: boolean;
@@ -569,7 +545,6 @@ export class BuyGateTriggerService {
         rugScore,
         hasDangerRisk,
       };
-      if (bundlerPct !== undefined) result.bundlerPct = bundlerPct;
       if (top10HolderPct !== undefined) result.top10HolderPct = top10HolderPct;
       if (holdersCount !== undefined) result.holdersCount = holdersCount;
 
