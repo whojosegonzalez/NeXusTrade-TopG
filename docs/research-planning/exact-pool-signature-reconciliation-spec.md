@@ -399,7 +399,20 @@ $$\text{Global Total} = N_{\text{prior}} (15) + N_{\text{baseline\_RPC}} + N_{\t
    - Production Completeness Separation: Does not advance verified cursors, does not clear tracker stream gaps, does not call coverage-advancement methods, and permanently returns `isProductionCompletenessEstablished = false`.
    - 37 focused offline unit tests passing in [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts).
 
-3. **No Live Execution**: Keep the helper and bridge offline; do not wire to live daemon loops or modify `isProductionCompletenessEstablished`.
+3. **Exact-Pool Offline Reconciliation Integration Suite**: Implemented in [`backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts):
+   - Verifies all 5 core components working together in an isolated, offline integration suite with one shared `GlobalResourceBudgetManager`:
+     - `RaydiumCandidateSubscriptionCoordinator`
+     - `ExactPoolHistoryEnumerator`
+     - `ExactPoolTransactionResolutionBridge`
+     - `RaydiumAmmV4TransactionSourceAdapter`
+     - `RollingTradeFlowTracker`
+   - Scenario 1 (Missed Transaction Recovery): Recovers missed transaction B after anchor A and delivered notification C; adapter detects C as duplicate, bridge reports DUPLICATE_UNRESOLVED and honest PARTIAL_RESOLUTION without double counting C in tracker (`tracker.getEventsCount() === 2`).
+   - Scenario 2 (Lifecycle Isolation): Disconnects and connection epoch advances prevent stale recovery dispatch; mid-resolution disconnects preserve prior ingested swaps; in-flight invalidations abort ingestion via `validateState`.
+   - Scenario 3 (Combined Resource Accounting): Enumeration and retrieval share budget under `"SOLANA_RPC"` / `CANDIDATE_ENRICHMENT`; shared pacing ($\ge 2,500\text{ ms}$) enforced across components; forward reservations preserved on enrichment exhaustion; bounded budget denial fails closed with 0 HTTP calls and 0 retries.
+   - Scenario 4 (Preserve Unavailable Production Coverage): Existing collection gaps are not erased by recovery; cursors are not advanced; production completeness remains unproven (`isProductionCompletenessEstablished: false`); production flow counts remain unavailable (`null`).
+   - 11 comprehensive offline integration tests passing. Total candidate scanner test count: 261 passing offline tests across 7 dedicated test suites.
+
+4. **No Live Execution**: Keep the helper and bridge offline; do not wire to live daemon loops or modify `isProductionCompletenessEstablished`.
 
 ---
 

@@ -514,7 +514,37 @@ The approved offline implementation items are completed:
     - **Production Completeness Separation**: Does not advance verified cursors, does not clear tracker stream gaps, does not call coverage-advancement methods, and permanently returns `isProductionCompletenessEstablished = false`.
     - 37 focused offline tests passing in [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.test.ts).
 
-14. **Larger Changes Quarantined**:
+14. **Exact-Pool Offline Reconciliation Integration Suite (`ExactPoolReconciliationIntegration.test.ts`)**:
+    - Implemented in [`backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts).
+    - Verifies all 5 core components working together in an isolated, offline integration suite with one shared `GlobalResourceBudgetManager`:
+      - `RaydiumCandidateSubscriptionCoordinator`
+      - `ExactPoolHistoryEnumerator`
+      - `ExactPoolTransactionResolutionBridge`
+      - `RaydiumAmmV4TransactionSourceAdapter`
+      - `RollingTradeFlowTracker`
+    - **Scenario 1: Missed Transaction Recovery**:
+      - Uses baseline anchor $A$, missed transaction $B$, and normally delivered WebSocket notification $C$.
+      - Normal notification $C$ is ingested into the tracker.
+      - Enumerator witnesses anchor $A$, freezes target $C$, and discovers signatures $[C, B]$.
+      - Bridge resolves $B$ in chronological order, ingesting $B$'s swap into the same tracker (`tracker.getEventsCount() === 2`).
+      - Resolving $C$ against the adapter's deduplication cache returns `DUPLICATE_NOTIFICATION`, which the bridge honestly classifies as `DUPLICATE_UNRESOLVED` without double-counting $C$ or manufacturing false `ALL_RESOLVED` (`outcome: "PARTIAL_RESOLUTION"`, `totalResolved: 1`, `totalDuplicatesUnresolved: 1`).
+    - **Scenario 2: Lifecycle Isolation**:
+      - Transport drops and connection-epoch increments immediately prevent stale recovery dispatch (`LIFECYCLE_CANCELLED`, 0 HTTP calls).
+      - Mid-resolution disconnect strictly preserves all swaps completed before invalidation (`totalIngestedSwaps: 1`, `tracker.getEventsCount() === 1`).
+      - Invalidation during in-flight fetch triggers the injected `validateState` callback, aborting ingestion before tracker mutation.
+    - **Scenario 3: Combined Resource Accounting**:
+      - History enumeration and transaction retrieval consume from the same shared `GlobalResourceBudgetManager` instance, accounted 1-to-1 against `CANDIDATE_ENRICHMENT` for canonical provider identity `"SOLANA_RPC"`.
+      - Shared provider pacing ($\ge 2,500\text{ ms}$) is strictly enforced across enumeration and retrieval.
+      - Forward observation capacity is strictly preserved (`minReservedForwardRequests = 4`): enrichment budget exhaustion halts recovery fail-closed (`BUDGET_EXHAUSTED`, 0 outbound HTTP calls, forward reservation intact).
+      - Exhausted total budget terminates fail-closed with zero network dispatches and zero retries.
+    - **Scenario 4: Preserve Unavailable Production Coverage**:
+      - Successful transaction recovery does not erase existing tracker stream/collection gaps (`tracker.getRecordedGaps().length === 1`).
+      - Recovery does not advance persistent cursors or establish production completeness (`isProductionCompletenessEstablished = false` permanently).
+      - Default coordinator completeness protections remain enabled (`allowSyntheticCompletenessProofs = false`), and production flow counts remain unavailable (`null` buys/sells/ratio across `getCoverageDiagnostic()`, `evaluateFlow()`, and `createRetestSpotInfo()`).
+    - 11 comprehensive offline integration tests passing in [`backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolReconciliationIntegration.test.ts).
+    - Total candidate scanner offline tests: **261 passing tests** across 7 dedicated test suites (55 decoder, 40 rolling tracker, 30 coordinator, 37 bridge, 44 enumerator, 44 adapter, 11 reconciliation integration).
+
+15. **Larger Changes Quarantined**:
 
 - No live resolver connected, no daemon startup, no live network requests or operator market sessions.
 - Unvalidated legacy behavior is not presented as PAPER-ready; validated-LP mode is required for the prospective PAPER path.
