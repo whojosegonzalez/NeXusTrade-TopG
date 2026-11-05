@@ -860,4 +860,180 @@ describe("ExactPoolHistoryEnumerator", () => {
       expect(isValidSolanaSignature(longStr)).toBe(false);
     });
   });
+
+  describe("8. Independent Review Follow-up Regressions", () => {
+    describe("Post-Await Validity Checks (Fast Responses)", () => {
+      it("discards response and returns OPERATION_DEADLINE_EXCEEDED when fetch callback advances clock past deadline", async () => {
+        fakeNow = 1_000_000;
+        mockFetcher.onBeforeFetch = () => {
+          fakeNow += 20_000; // Warp past 10,000ms deadline before returning
+        };
+        mockFetcher.queuedPages = [
+          [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
+        ];
+
+        const enumerator = createHelper({ operationDeadlineMs: 10_000 });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("OPERATION_DEADLINE_EXCEEDED");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.discoveredSignatures).toEqual([]);
+      });
+
+      it("discards response and returns LIFECYCLE_CANCELLED when fetch callback disconnects coordinator", async () => {
+        mockFetcher.onBeforeFetch = () => {
+          mockLifecycle.status = "DISCONNECTED"; // Disconnect before returning
+        };
+        mockFetcher.queuedPages = [
+          [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
+        ];
+
+        const enumerator = createHelper();
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.discoveredSignatures).toEqual([]);
+        expect(result.error).toMatch(/Coordinator status transitioned to DISCONNECTED/);
+      });
+
+      it("discards response and returns OPERATION_CANCELLED when fetch callback sets isCancelled to true", async () => {
+        let isCancelled = false;
+        mockFetcher.onBeforeFetch = () => {
+          isCancelled = true; // Cancel before returning
+        };
+        mockFetcher.queuedPages = [
+          [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
+        ];
+
+        const enumerator = createHelper({ isCancelled: () => isCancelled });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("OPERATION_CANCELLED");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.discoveredSignatures).toEqual([]);
+        expect(result.error).toMatch(/Operation cancelled by caller/);
+      });
+
+      it("discards response and returns LIFECYCLE_CANCELLED when fetch callback replaces transport epoch", async () => {
+        mockFetcher.onBeforeFetch = () => {
+          mockLifecycle.connectionEpoch = 2; // Increment epoch before returning
+        };
+        mockFetcher.queuedPages = [
+          [{ signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 }],
+        ];
+
+        const enumerator = createHelper({ dispatchEpoch: 1 });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("LIFECYCLE_CANCELLED");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.discoveredSignatures).toEqual([]);
+        expect(result.error).toMatch(/Coordinator epoch changed to 2/);
+      });
+    });
+
+    describe("Pagination Control State Freezing", () => {
+      it("preserves immutable slot boundary decision even when fetcher mutates prior page source record", async () => {
+        const sourceRecSlot5: HistorySignatureRecord = {
+          signature: SIG_E,
+          slot: 5,
+          err: null,
+          memo: null,
+          blockTime: 1700000050,
+        };
+        const sourceRecSlot4: HistorySignatureRecord = {
+          signature: SIG_D,
+          slot: 4,
+          err: null,
+          memo: null,
+          blockTime: 1700000040,
+        };
+
+        const page1 = [sourceRecSlot5, sourceRecSlot4];
+        // Page 2 erroneously sends slot 6 (> slot 4) followed by anchor
+        const page2: HistorySignatureRecord[] = [
+          { signature: SIG_C, slot: 6, err: null, memo: null, blockTime: 1700000060 },
+          { signature: SIG_A, slot: 1, err: null, memo: null, blockTime: 1700000010 },
+        ];
+        mockFetcher.queuedPages = [page1, page2];
+
+        const enumerator = createHelper({
+          pageSize: 2,
+          sleepFn: async (ms: number) => {
+            fakeNow += ms;
+            // Caller attempts to mutate the source record from page 1 to slot 999 during pacing wait!
+            (sourceRecSlot4 as { slot: number }).slot = 999;
+          },
+        });
+
+        const result = await enumerator.enumerate();
+
+        // The boundary violation must STILL be caught because previousOldestRecord was snapshotted at slot 4
+        expect(result.outcome).toBe("MALFORMED_RECORD");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.error).toMatch(
+          /violated before-boundary: newest record slot 6 exceeds previous page oldest slot 4/,
+        );
+      });
+    });
+
+    describe("Exception Containment (Synchronous Throws & Cyclic Metadata)", () => {
+      it("contains synchronously thrown fetchPage error within FETCH_ERROR outcome", async () => {
+        const syncThrowFetcher: HistoryPageFetcher = {
+          fetchPage: () => {
+            throw new Error("Immediate synchronous network failure");
+          },
+        };
+
+        const enumerator = createHelper({ pageFetcher: syncThrowFetcher });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("FETCH_ERROR");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.error).toBe("Immediate synchronous network failure");
+      });
+
+      it("contains cyclic err metadata within MALFORMED_RECORD outcome without throwing", async () => {
+        const cyclicErr: Record<string, unknown> = {};
+        cyclicErr.self = cyclicErr;
+
+        const cyclicRecord: HistorySignatureRecord = {
+          signature: SIG_C,
+          slot: 102,
+          err: cyclicErr,
+          blockTime: 1700000020,
+        };
+        mockFetcher.queuedPages = [[cyclicRecord]];
+
+        const enumerator = createHelper();
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("MALFORMED_RECORD");
+        expect(result.anchorWitnessed).toBe(false);
+        expect(result.error).toMatch(/could not be serialized or cloned/);
+      });
+
+      it("contains duplicate signature with cyclic err metadata within MALFORMED_RECORD outcome", async () => {
+        const page1: HistorySignatureRecord[] = [
+          { signature: SIG_E, slot: 104, err: null, memo: null, blockTime: 1700000040 },
+          { signature: SIG_D, slot: 103, err: null, memo: null, blockTime: 1700000030 },
+        ];
+
+        const cyclicErr: Record<string, unknown> = {};
+        cyclicErr.self = cyclicErr;
+        const page2: HistorySignatureRecord[] = [
+          { signature: SIG_D, slot: 103, err: cyclicErr, memo: null, blockTime: 1700000030 },
+          { signature: SIG_A, slot: 100, err: null, memo: null, blockTime: 1700000000 },
+        ];
+        mockFetcher.queuedPages = [page1, page2];
+
+        const enumerator = createHelper({ pageSize: 2 });
+        const result = await enumerator.enumerate();
+
+        expect(result.outcome).toBe("MALFORMED_RECORD");
+        expect(result.anchorWitnessed).toBe(false);
+      });
+    });
+  });
 });

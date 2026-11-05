@@ -188,22 +188,72 @@ function deepFreeze<T>(obj: T): Readonly<T> {
 }
 
 /**
+ * Safely clones the err payload, catching cyclic structures or serialization errors.
+ */
+function safeCloneErr(err: unknown): { ok: true; cloned: unknown } | { ok: false; error: string } {
+  if (err === null || typeof err !== "object") {
+    return { ok: true, cloned: err };
+  }
+  try {
+    const json = JSON.stringify(err);
+    if (json === undefined) {
+      return { ok: false, error: "Record err payload is not serializable to JSON" };
+    }
+    return { ok: true, cloned: JSON.parse(json) };
+  } catch (e: unknown) {
+    return {
+      ok: false,
+      error: `Record err payload could not be serialized or cloned: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+/**
+ * Safely compares two err payloads for equivalence.
+ */
+function safeCompareErr(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Clones and deeply freezes a signature record so external mutations cannot alter retained data.
  */
-function cloneAndDeepFreezeRecord(rec: HistorySignatureRecord): Readonly<HistorySignatureRecord> {
-  const clonedErr =
-    rec.err !== null && typeof rec.err === "object" ? JSON.parse(JSON.stringify(rec.err)) : rec.err;
+function cloneAndDeepFreezeRecord(
+  rec: HistorySignatureRecord,
+  sanitizedErr?: unknown,
+): Readonly<HistorySignatureRecord> {
+  let clonedErr: unknown;
+  if (sanitizedErr !== undefined) {
+    clonedErr = sanitizedErr;
+  } else {
+    const res = safeCloneErr(rec.err);
+    clonedErr = res.ok ? res.cloned : null;
+  }
 
   const cloned: HistorySignatureRecord = {
-    signature: rec.signature,
-    slot: rec.slot,
+    signature: String(rec.signature),
+    slot: Number(rec.slot),
     err: clonedErr,
-    memo: rec.memo !== undefined ? rec.memo : null,
-    blockTime: rec.blockTime,
-    ...(rec.confirmationStatus !== undefined ? { confirmationStatus: rec.confirmationStatus } : {}),
+    memo: rec.memo !== undefined && rec.memo !== null ? String(rec.memo) : null,
+    blockTime: rec.blockTime !== null ? Number(rec.blockTime) : null,
+    ...(rec.confirmationStatus !== undefined
+      ? { confirmationStatus: String(rec.confirmationStatus) }
+      : {}),
   };
 
   return deepFreeze(cloned);
+}
+
+interface OldestRecordSnapshot {
+  readonly signature: string;
+  readonly slot: number;
+  readonly blockTime: number | null;
 }
 
 interface InFlightRaceResult {
@@ -573,24 +623,31 @@ export class ExactPoolHistoryEnumerator {
           }
         }, this.checkIntervalMs);
 
-        this.pageFetcher
-          .fetchPage({
+        try {
+          const fetchPromise = this.pageFetcher.fetchPage({
             address: this.poolContext.poolId,
             limit: this.pageSize,
             before: cursorBefore,
             commitment: this.commitment,
             signal: fetchAbortController.signal,
-          })
-          .then((records) => {
-            if (isSettled) return;
-            isSettled = true;
-            resolve({ outcome: "SUCCESS", records });
-          })
-          .catch((error: unknown) => {
-            if (isSettled) return;
-            isSettled = true;
-            resolve({ outcome: "FETCH_ERROR", error });
           });
+
+          Promise.resolve(fetchPromise)
+            .then((records) => {
+              if (isSettled) return;
+              isSettled = true;
+              resolve({ outcome: "SUCCESS", records });
+            })
+            .catch((error: unknown) => {
+              if (isSettled) return;
+              isSettled = true;
+              resolve({ outcome: "FETCH_ERROR", error });
+            });
+        } catch (syncError: unknown) {
+          if (isSettled) return;
+          isSettled = true;
+          resolve({ outcome: "FETCH_ERROR", error: syncError });
+        }
       });
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
@@ -613,7 +670,7 @@ export class ExactPoolHistoryEnumerator {
     let frozenTargetSignature: string | null = null;
     const accumulatedRecords: HistorySignatureRecord[] = [];
     const seenSignatures = new Map<string, HistorySignatureRecord>();
-    let previousOldestRecord: HistorySignatureRecord | null = null;
+    let previousOldestRecord: OldestRecordSnapshot | null = null;
     let cursorBefore: string | undefined = undefined;
     let pagesQueried = 0;
     let requestCount = 0;
@@ -736,6 +793,37 @@ export class ExactPoolHistoryEnumerator {
       }
 
       pagesQueried++;
+
+      // Post-await state validation: recheck before inspecting, validating, or retaining any records
+      if (this.isCancelled?.() || this.signal?.aborted) {
+        return createFailureResult("OPERATION_CANCELLED", "Operation cancelled by caller");
+      }
+
+      const postNow = this.clock();
+      if (postNow >= deadlineMs) {
+        return createFailureResult(
+          "OPERATION_DEADLINE_EXCEEDED",
+          `Operation deadline exceeded (${this.operationDeadlineMs}ms)`,
+        );
+      }
+
+      if (this.lifecycleTarget) {
+        const postStatus = this.lifecycleTarget.getStatus();
+        if (postStatus !== "SUBSCRIBED") {
+          return createFailureResult(
+            "LIFECYCLE_CANCELLED",
+            `Coordinator status transitioned to ${postStatus} during fetch; results discarded`,
+          );
+        }
+        const postEpoch = this.lifecycleTarget.getConnectionEpoch();
+        if (postEpoch !== expectedEpoch) {
+          return createFailureResult(
+            "LIFECYCLE_CANCELLED",
+            `Coordinator epoch changed to ${postEpoch} (expected: ${expectedEpoch}) during fetch; results discarded`,
+          );
+        }
+      }
+
       const rawRecords = fetchRace.records;
 
       // 3. Record integrity and schema validation
@@ -779,6 +867,12 @@ export class ExactPoolHistoryEnumerator {
             "MALFORMED_RECORD",
             `Record at index ${i} has invalid err payload representation`,
           );
+        }
+
+        // Test serializability / detect cyclic or throwing err metadata
+        const errCloneCheck = safeCloneErr(rec.err);
+        if (!errCloneCheck.ok) {
+          return createFailureResult("MALFORMED_RECORD", errCloneCheck.error);
         }
 
         if (typeof rec.slot !== "number" || !Number.isSafeInteger(rec.slot) || rec.slot < 0) {
@@ -866,7 +960,7 @@ export class ExactPoolHistoryEnumerator {
           const isSlotMatch = existing.slot === r.slot;
           const isBlockTimeMatch = existing.blockTime === r.blockTime;
           const isStatusMatch = existing.confirmationStatus === r.confirmationStatus;
-          const isErrMatch = JSON.stringify(existing.err) === JSON.stringify(r.err);
+          const isErrMatch = safeCompareErr(existing.err, r.err);
 
           if (!isSlotMatch || !isBlockTimeMatch || !isStatusMatch || !isErrMatch) {
             return createFailureResult(
@@ -960,8 +1054,12 @@ export class ExactPoolHistoryEnumerator {
         );
       }
 
-      previousOldestRecord = oldestRec;
-      cursorBefore = oldestRec.signature;
+      previousOldestRecord = deepFreeze({
+        signature: String(oldestRec.signature),
+        slot: Number(oldestRec.slot),
+        blockTime: oldestRec.blockTime !== null ? Number(oldestRec.blockTime) : null,
+      });
+      cursorBefore = String(oldestRec.signature);
     }
   }
 }
