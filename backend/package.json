@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json --noEmit",
     "analytics:report": "tsx src/scripts/analytics-report.ts",
     "calibration:report": "tsx src/scripts/calibration-report.ts",
+    "capture:solana-tracker-bundlers": "tsx src/scripts/capture-solana-tracker-bundlers.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate:paper": "tsx src/db/migratePaper.ts",
     "db:reset:paper": "tsx src/db/resetPaper.ts",
