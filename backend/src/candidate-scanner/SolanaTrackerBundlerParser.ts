@@ -8,7 +8,7 @@
  * Strict Architectural Guarantees:
  * 1. Top-Level Field Validation:
  *    Validates documented top-level fields: total, balance, percentage, initialBalance,
- *    initialPercentage, and optional wallets sample array.
+ *    initialPercentage, and required wallets sample array.
  * 2. Distinct Metric Separation:
  *    Preserves current holdings percentage and initial launch percentage separately.
  *    Never substitutes one for the other.
@@ -17,21 +17,30 @@
  * 4. Zero Preservation without Auto-Coercion:
  *    Preserves genuine reported zeros. Rejects numeric strings, non-finite values (NaN, Infinity),
  *    negative values, and out-of-range percentages without manufacturing favorable defaults.
- * 5. Explicit Request-Mint Binding:
+ * 5. Strict Wallet Sample Validation:
+ *    Requires wallets to be present and an array (up to 500 entries). Genuinely supplied empty arrays
+ *    are preserved without manufacturing from missing or null data. Requires and validates each
+ *    wallet's documented fields: wallet (canonical base58), balance (finite non-negative),
+ *    percentage ([0, 100]), initialBalance (finite non-negative), initialPercentage ([0, 100]),
+ *    and bundleTime (non-negative safe integer in milliseconds). Rejects malformed entries with
+ *    an explicit parse failure instead of silently dropping fields.
+ * 6. Explicit Request-Mint Binding:
  *    Binds the snapshot to the requested token mint via request metadata and canonical Solana
  *    base58 validation. Does NOT claim the response payload self-authenticates the mint.
- * 6. Timestamp Separation:
+ * 7. Timestamp Separation:
  *    Records local retrieval timestamp from request metadata. Leaves upstream snapshot as-of
  *    time strictly null (wallet bundleTime represents individual transaction execution, not snapshot time).
- * 7. No Wallet List Aggregation:
+ * 8. No Wallet List Aggregation:
  *    Does NOT reconstruct concentration by summing wallet list entries; the endpoint documents
  *    a limited sample, not an exhaustive registry.
- * 8. Strategy Isolation:
+ * 9. Strategy Isolation:
  *    Classified as PROVIDER_REPORTED_UNVERIFIED. Does NOT populate strategy bundlerPct,
  *    does NOT alter Gate 11, and does NOT permit candidate admission.
  */
 
 import { isCanonicalSolanaBase58 } from "./LpScreeningBridge.js";
+
+export const MAX_SOLANA_TRACKER_WALLETS_SAMPLE_LIMIT = 500;
 
 export type SolanaTrackerBundlerParseErrorCode =
   | "INVALID_REQUEST_METADATA"
@@ -52,12 +61,12 @@ export interface SolanaTrackerBundlerParseRequestMetadata {
 }
 
 export interface SolanaTrackerWalletSampleEntry {
-  readonly wallet?: string | undefined;
-  readonly balance?: number | undefined;
-  readonly percentage?: number | undefined;
-  readonly initialBalance?: number | undefined;
-  readonly initialPercentage?: number | undefined;
-  readonly bundleTime?: number | undefined;
+  readonly wallet: string;
+  readonly balance: number;
+  readonly percentage: number;
+  readonly initialBalance: number;
+  readonly initialPercentage: number;
+  readonly bundleTime: number;
 }
 
 export interface SolanaTrackerBundlerSnapshot {
@@ -148,7 +157,14 @@ export function parseSolanaTrackerBundlersResponse(
   const payload = raw as Record<string, unknown>;
 
   // 3. Validate missing required top-level fields
-  const requiredFields = ["total", "balance", "percentage", "initialBalance", "initialPercentage"];
+  const requiredFields = [
+    "total",
+    "balance",
+    "percentage",
+    "initialBalance",
+    "initialPercentage",
+    "wallets",
+  ];
   for (const field of requiredFields) {
     if (!(field in payload) || payload[field] === undefined || payload[field] === null) {
       return {
@@ -223,64 +239,119 @@ export function parseSolanaTrackerBundlersResponse(
     };
   }
 
-  // 9. Validate optional wallets sample array
-  let frozenWallets: readonly SolanaTrackerWalletSampleEntry[] = Object.freeze([]);
-  if ("wallets" in payload && payload.wallets !== undefined && payload.wallets !== null) {
-    if (!Array.isArray(payload.wallets)) {
+  // 9. Validate wallets sample array (present, array, bounded <= 500 entries)
+  if (!Array.isArray(payload.wallets)) {
+    return {
+      success: false,
+      error: "INVALID_WALLETS_SAMPLE",
+      message: "Field 'wallets' must be an array.",
+    };
+  }
+
+  if (payload.wallets.length > MAX_SOLANA_TRACKER_WALLETS_SAMPLE_LIMIT) {
+    return {
+      success: false,
+      error: "INVALID_WALLETS_SAMPLE",
+      message: `Field 'wallets' exceeds maximum documented sample limit of ${MAX_SOLANA_TRACKER_WALLETS_SAMPLE_LIMIT} entries.`,
+    };
+  }
+
+  const parsedWallets: SolanaTrackerWalletSampleEntry[] = [];
+  for (let i = 0; i < payload.wallets.length; i++) {
+    const w = payload.wallets[i];
+    if (!w || typeof w !== "object" || Array.isArray(w)) {
       return {
         success: false,
         error: "INVALID_WALLETS_SAMPLE",
-        message: "Field 'wallets', if provided, must be an array.",
+        message: `Wallet sample entry at index ${i} must be a non-null object.`,
+      };
+    }
+    const wObj = w as Record<string, unknown>;
+
+    // 9.1 Required wallet address (canonical Solana base58)
+    if (typeof wObj.wallet !== "string" || !isCanonicalSolanaBase58(wObj.wallet)) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a canonical Solana base58 'wallet' address.`,
       };
     }
 
-    const parsedWallets: SolanaTrackerWalletSampleEntry[] = [];
-    for (const w of payload.wallets) {
-      if (!w || typeof w !== "object" || Array.isArray(w)) {
-        return {
-          success: false,
-          error: "INVALID_WALLETS_SAMPLE",
-          message: "Wallet sample entries must be non-null objects.",
-        };
-      }
-      const wObj = w as Record<string, unknown>;
-      const entry: SolanaTrackerWalletSampleEntry = Object.freeze({
-        wallet: typeof wObj.wallet === "string" ? wObj.wallet : undefined,
-        balance:
-          typeof wObj.balance === "number" && Number.isFinite(wObj.balance) && wObj.balance >= 0
-            ? wObj.balance
-            : undefined,
-        percentage:
-          typeof wObj.percentage === "number" &&
-          Number.isFinite(wObj.percentage) &&
-          wObj.percentage >= 0 &&
-          wObj.percentage <= 100
-            ? wObj.percentage
-            : undefined,
-        initialBalance:
-          typeof wObj.initialBalance === "number" &&
-          Number.isFinite(wObj.initialBalance) &&
-          wObj.initialBalance >= 0
-            ? wObj.initialBalance
-            : undefined,
-        initialPercentage:
-          typeof wObj.initialPercentage === "number" &&
-          Number.isFinite(wObj.initialPercentage) &&
-          wObj.initialPercentage >= 0 &&
-          wObj.initialPercentage <= 100
-            ? wObj.initialPercentage
-            : undefined,
-        bundleTime:
-          typeof wObj.bundleTime === "number" &&
-          Number.isSafeInteger(wObj.bundleTime) &&
-          wObj.bundleTime >= 0
-            ? wObj.bundleTime
-            : undefined,
-      });
-      parsedWallets.push(entry);
+    // 9.2 Required current balance (finite non-negative number)
+    if (typeof wObj.balance !== "number" || !Number.isFinite(wObj.balance) || wObj.balance < 0) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a finite non-negative 'balance'.`,
+      };
     }
-    frozenWallets = Object.freeze(parsedWallets);
+
+    // 9.3 Required current percentage (finite number in [0, 100])
+    if (
+      typeof wObj.percentage !== "number" ||
+      !Number.isFinite(wObj.percentage) ||
+      wObj.percentage < 0 ||
+      wObj.percentage > 100
+    ) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a finite 'percentage' between 0 and 100 inclusive.`,
+      };
+    }
+
+    // 9.4 Required initial balance (finite non-negative number)
+    if (
+      typeof wObj.initialBalance !== "number" ||
+      !Number.isFinite(wObj.initialBalance) ||
+      wObj.initialBalance < 0
+    ) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a finite non-negative 'initialBalance'.`,
+      };
+    }
+
+    // 9.5 Required initial percentage (finite number in [0, 100])
+    if (
+      typeof wObj.initialPercentage !== "number" ||
+      !Number.isFinite(wObj.initialPercentage) ||
+      wObj.initialPercentage < 0 ||
+      wObj.initialPercentage > 100
+    ) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a finite 'initialPercentage' between 0 and 100 inclusive.`,
+      };
+    }
+
+    // 9.6 Required bundle execution timestamp (non-negative safe integer in milliseconds)
+    if (
+      typeof wObj.bundleTime !== "number" ||
+      !Number.isSafeInteger(wObj.bundleTime) ||
+      wObj.bundleTime < 0
+    ) {
+      return {
+        success: false,
+        error: "INVALID_WALLETS_SAMPLE",
+        message: `Wallet sample entry at index ${i} must contain a non-negative safe integer 'bundleTime'.`,
+      };
+    }
+
+    const entry: SolanaTrackerWalletSampleEntry = Object.freeze({
+      wallet: wObj.wallet,
+      balance: wObj.balance,
+      percentage: wObj.percentage,
+      initialBalance: wObj.initialBalance,
+      initialPercentage: wObj.initialPercentage,
+      bundleTime: wObj.bundleTime,
+    });
+    parsedWallets.push(entry);
   }
+
+  const frozenWallets: readonly SolanaTrackerWalletSampleEntry[] = Object.freeze(parsedWallets);
 
   // 10. Explicit normalization to [0.0, 1.0] by dividing by 100
   // Note: Never substitute currentPercentage for initialPercentage or vice-versa

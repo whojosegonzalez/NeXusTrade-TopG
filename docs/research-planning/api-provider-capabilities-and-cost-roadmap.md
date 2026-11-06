@@ -447,7 +447,7 @@ The following decision table summarizes acquisition feasibility across both bloc
      - `percentage`: number (current percentage of token supply held by bundler wallets)
      - `initialBalance`: number (initial total token balance held by bundler wallets at launch)
      - `initialPercentage`: number (initial percentage of token supply held by bundler wallets at launch)
-     - `wallets`: array of wallet objects/addresses
+     - `wallets`: required array of up to 500 wallet sample entries; each entry requires all 6 documented properties: `wallet` (canonical Solana base58 address), `balance` (finite non-negative number), `percentage` (finite number in [0, 100]), `initialBalance` (finite non-negative number), `initialPercentage` (finite number in [0, 100]), and `bundleTime` (non-negative safe integer timestamp in milliseconds). Genuinely supplied empty arrays (`wallets: []`) are preserved without manufacturing from missing or null data, while missing or null `wallets` payloads, malformed entries, and oversized samples (>500 entries) fail closed with explicit validation errors.
    - _Published Allowance_: The Data API Free plan lists **2,500 requests/month** and **3 requests/second** (with WebSocket access excluded), **not** 10,000 requests/month.
    - _Status_: **OFFLINE SCHEMA VALIDATED CANDIDATE SOURCE (NOT AN INTEGRATED SERVICE)**:
      - The pure offline parser module [`SolanaTrackerBundlerParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/SolanaTrackerBundlerParser.ts) and test suite [`SolanaTrackerBundlerParser.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/SolanaTrackerBundlerParser.test.ts) validate the documented schema against synthetic fixtures.
