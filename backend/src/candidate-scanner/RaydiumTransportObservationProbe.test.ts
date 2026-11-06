@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import * as diagnostics_channel from "node:diagnostics_channel";
 import {
   executeTransportObservationProbe,
   parseTransportProbeArgs,
@@ -70,9 +71,6 @@ class MockWebSocketTransport implements ISolanaWebSocketTransport {
     this.isClosed = true;
     this.closeCode = code ?? 1000;
     this.closeReason = reason ?? "Normal closure";
-    for (const listener of this.listeners.close) {
-      listener(this.closeCode, this.closeReason);
-    }
   }
 
   on(event: "open", listener: () => void): void;
@@ -1853,6 +1851,135 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(td.localCloseReason).toContain(
           "WebSocket closed: Connection dropped by upstream cluster gateway",
         );
+      }
+    });
+
+    it("preserves native Undici error-then-close(1006) sequence retaining both error cause and 1006 close code", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // 1. Native Undici emits TypeError first on socket drop
+      const nativeTypeError = new TypeError("");
+      const transportError = new Error("WebSocket transport error", { cause: nativeTypeError });
+      mockTransport.triggerError(transportError);
+
+      // 2. Native Undici immediately follows with close(1006, "")
+      mockTransport.triggerClose(1006, "");
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        const td = succ.metadata.transportDiagnostics;
+
+        // Preserves both the upstream error cause AND the subsequent observed 1006 code
+        expect(td.isUpstreamClosure).toBe(true);
+        expect(td.firstErrorMessage).toBe("WebSocket transport error");
+        expect(td.firstErrorCause).toBe("TypeError: ");
+        expect(td.closeCode).toBe(1006);
+        expect(td.localCloseCode).toBe(1000);
+        expect(td.observedCloseOrigin).toBe("UPSTREAM");
+      }
+    });
+
+    it("marks close origin as UNCERTAIN when intentional local close(1000) encounters abnormal transport close(1006)", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        maxMessages: 1, // Intentional message cap reached
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      // Frame 1 triggers MESSAGE_LIMIT_REACHED, requesting local close(1000)
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // Instead of clean close 1000, remote transport abruptly terminates with 1006
+      mockTransport.triggerClose(1006, "Abnormal socket reset during teardown");
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        const td = succ.metadata.transportDiagnostics;
+
+        expect(td.localCloseCode).toBe(1000);
+        expect(td.closeCode).toBe(1006);
+        expect(td.observedCloseOrigin).toBe("UNCERTAIN");
+      }
+    });
+
+    it("records server PING and PONG frames via scoped diagnostics_channel without generating network traffic", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeWs = {};
+      (mockTransport as unknown as { getUnderlyingSocket: () => unknown }).getUnderlyingSocket =
+        () => fakeWs;
+
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        streamingDurationMs: 50,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // Publish ping on diagnostics_channel for this fakeWs
+      diagnostics_channel.channel("undici:websocket:ping").publish({
+        websocket: fakeWs,
+        payload: Buffer.from("PING"),
+      });
+
+      // Publish pong on diagnostics_channel for this fakeWs
+      diagnostics_channel.channel("undici:websocket:pong").publish({
+        websocket: fakeWs,
+        payload: Buffer.from("PONG"),
+      });
+
+      // Publish ping on diagnostics_channel for an unrelated websocket (must NOT be counted)
+      diagnostics_channel.channel("undici:websocket:ping").publish({
+        websocket: {},
+        payload: Buffer.from("UNRELATED"),
+      });
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        const td = succ.metadata.transportDiagnostics;
+
+        expect(td.serverPingsReceivedCount).toBe(1);
+        expect(td.lastServerPingReceivedAtMs).toBe(fakeNow);
+        expect(td.serverPongsReceivedCount).toBe(1);
+        expect(td.lastServerPongReceivedAtMs).toBe(fakeNow);
       }
     });
   });

@@ -182,16 +182,18 @@ async function main(): Promise<void> {
         console.log(`First Error Cause:        ${td.firstErrorCause}`);
       }
       if (td.closeCode !== null) {
-        console.log(`Upstream Close Code/Reason: ${td.closeCode} / ${td.closeReason || "None"}`);
+        console.log(`Observed Close Code/Reason: ${td.closeCode} / ${td.closeReason || "None"}`);
       }
       if (td.localCloseCode !== null) {
         console.log(
           `Local Close Code/Reason:    ${td.localCloseCode} / ${td.localCloseReason || "None"}`,
         );
       }
-      console.log(
-        `Closure Origin:           ${td.isUpstreamClosure ? "UPSTREAM" : td.intentionalShutdownInitiated ? "INTENTIONAL_SHUTDOWN" : "UNKNOWN"}`,
-      );
+      console.log(`Server Pings Observed:     ${td.serverPingsReceivedCount}`);
+      if (td.lastServerPingReceivedAtMs !== null) {
+        console.log(`Last Server Ping (ms):     ${td.lastServerPingReceivedAtMs}`);
+      }
+      console.log(`Closure Origin:           ${td.observedCloseOrigin}`);
     }
 
     if (

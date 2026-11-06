@@ -79,6 +79,7 @@ import {
   redactSensitiveText,
   deepRedactSensitiveObject,
 } from "./SolanaTrackerBundlerCaptureTool.js";
+import * as diagnostics_channel from "node:diagnostics_channel";
 
 // ============================================================================
 // Constants and Ceilings
@@ -272,9 +273,9 @@ export interface TransportDiagnostics {
   readonly firstErrorCode: string | number | null;
   /** Sanitized error cause or cause chain if available, or null */
   readonly firstErrorCause: string | null;
-  /** Close code from genuine upstream transport close event, or null if no upstream close frame received */
+  /** Close code from observed transport close event, or null if no close frame received */
   readonly closeCode: number | null;
-  /** Sanitized close reason from genuine upstream transport close event, or null */
+  /** Sanitized close reason from observed transport close event, or null */
   readonly closeReason: string | null;
   /** True if closure or failure was initiated by upstream provider */
   readonly isUpstreamClosure: boolean;
@@ -284,6 +285,16 @@ export interface TransportDiagnostics {
   readonly localCloseCode: number | null;
   /** Local close reason requested by probe shutdown, or null if no local close requested */
   readonly localCloseReason: string | null;
+  /** Number of WebSocket PING frames received from server observed via diagnostics channel */
+  readonly serverPingsReceivedCount: number;
+  /** Timestamp of the most recent server PING frame received, or null */
+  readonly lastServerPingReceivedAtMs: number | null;
+  /** Number of WebSocket PONG frames received from server observed via diagnostics channel */
+  readonly serverPongsReceivedCount: number;
+  /** Timestamp of the most recent server PONG frame received, or null */
+  readonly lastServerPongReceivedAtMs: number | null;
+  /** Classification of close origin: UPSTREAM, INTENTIONAL_SHUTDOWN, UNCERTAIN, or NOT_CLOSED */
+  readonly observedCloseOrigin: "UPSTREAM" | "INTENTIONAL_SHUTDOWN" | "UNCERTAIN" | "NOT_CLOSED";
 }
 
 export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze({
@@ -304,6 +315,11 @@ export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze
   intentionalShutdownInitiated: false,
   localCloseCode: null,
   localCloseReason: null,
+  serverPingsReceivedCount: 0,
+  lastServerPingReceivedAtMs: null,
+  serverPongsReceivedCount: 0,
+  lastServerPongReceivedAtMs: null,
+  observedCloseOrigin: "NOT_CLOSED",
 });
 
 export interface HistoryQueryAuditRecord {
@@ -1246,6 +1262,7 @@ export async function executeTransportObservationProbe(
   let meteredTransport: MeteredWebSocketTransport | undefined;
   let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
   let removeCallerSignalListener: (() => void) | undefined;
+  let cleanupDiagnosticsChannel: (() => void) | undefined;
 
   const transportDiagnostics = {
     connectedAtMs: null as number | null,
@@ -1269,6 +1286,15 @@ export async function executeTransportObservationProbe(
     intentionalShutdownInitiated: false,
     localCloseCode: null as number | null,
     localCloseReason: null as string | null,
+    serverPingsReceivedCount: 0,
+    lastServerPingReceivedAtMs: null as number | null,
+    serverPongsReceivedCount: 0,
+    lastServerPongReceivedAtMs: null as number | null,
+    observedCloseOrigin: "NOT_CLOSED" as
+      | "UPSTREAM"
+      | "INTENTIONAL_SHUTDOWN"
+      | "UNCERTAIN"
+      | "NOT_CLOSED",
   };
 
   const probeState = {
@@ -1297,6 +1323,11 @@ export async function executeTransportObservationProbe(
     }
     try {
       coordinator?.close();
+    } catch {
+      // ignore
+    }
+    try {
+      cleanupDiagnosticsChannel?.();
     } catch {
       // ignore
     }
@@ -1371,6 +1402,64 @@ export async function executeTransportObservationProbe(
   if (!isProbeTerminated && !overallAbortController.signal.aborted) {
     baseTransport = config.transport ?? new NativeWebSocketTransport(wsUrl);
 
+    let underlyingWs: unknown = undefined;
+    if (
+      baseTransport &&
+      "getUnderlyingSocket" in baseTransport &&
+      typeof (baseTransport as { getUnderlyingSocket?: unknown }).getUnderlyingSocket === "function"
+    ) {
+      underlyingWs = (
+        baseTransport as { getUnderlyingSocket: () => unknown }
+      ).getUnderlyingSocket();
+    }
+
+    if (underlyingWs && typeof diagnostics_channel !== "undefined") {
+      try {
+        const pingChannel = diagnostics_channel.channel("undici:websocket:ping");
+        const pongChannel = diagnostics_channel.channel("undici:websocket:pong");
+
+        const onPing = (msg: unknown) => {
+          if (
+            msg &&
+            typeof msg === "object" &&
+            (msg as { websocket?: unknown }).websocket === underlyingWs
+          ) {
+            transportDiagnostics.serverPingsReceivedCount++;
+            transportDiagnostics.lastServerPingReceivedAtMs = clock();
+          }
+        };
+
+        const onPong = (msg: unknown) => {
+          if (
+            msg &&
+            typeof msg === "object" &&
+            (msg as { websocket?: unknown }).websocket === underlyingWs
+          ) {
+            transportDiagnostics.serverPongsReceivedCount++;
+            transportDiagnostics.lastServerPongReceivedAtMs = clock();
+          }
+        };
+
+        pingChannel.subscribe(onPing);
+        pongChannel.subscribe(onPong);
+
+        cleanupDiagnosticsChannel = () => {
+          try {
+            pingChannel.unsubscribe(onPing);
+          } catch {
+            // ignore
+          }
+          try {
+            pongChannel.unsubscribe(onPong);
+          } catch {
+            // ignore
+          }
+        };
+      } catch {
+        // ignore diagnostics channel errors
+      }
+    }
+
     meteredTransport = new MeteredWebSocketTransport(
       baseTransport,
       maxPayloadBytes,
@@ -1434,20 +1523,34 @@ export async function executeTransportObservationProbe(
     });
 
     meteredTransport.on("close", (code, reason) => {
-      // If local close was already requested, this close event is the consequence of our local close
-      if (transportDiagnostics.localCloseCode !== null || isIntentionalClosure) {
-        // Do not attribute local close code 1000 to an upstream failure or overwrite genuine upstream close
-        return;
-      }
-
-      // If we reach here, this is a genuine upstream closure event
-      transportDiagnostics.isUpstreamClosure = true;
+      // 1. Always record the observed close code and reason if not yet recorded
       if (transportDiagnostics.closeCode === null) {
         transportDiagnostics.closeCode = code;
         transportDiagnostics.closeReason = reason ? redactSensitiveText(reason) : null;
       }
-      if (!isProbeTerminated && probeActive) {
-        terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
+
+      // 2. Classify close origin
+      if (transportDiagnostics.firstErrorMessage !== null) {
+        // An upstream transport error preceded this close event (e.g. Undici TypeError followed by close 1006)
+        transportDiagnostics.isUpstreamClosure = true;
+        transportDiagnostics.observedCloseOrigin = "UPSTREAM";
+      } else if (transportDiagnostics.localCloseCode === null) {
+        // A genuine upstream close event occurred before any local shutdown request
+        transportDiagnostics.isUpstreamClosure = true;
+        transportDiagnostics.observedCloseOrigin = "UPSTREAM";
+        if (!isProbeTerminated && probeActive) {
+          terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
+        }
+      } else {
+        // Local shutdown was requested before this close event
+        if (code === 1000) {
+          transportDiagnostics.isUpstreamClosure = false;
+          transportDiagnostics.intentionalShutdownInitiated = true;
+          transportDiagnostics.observedCloseOrigin = "INTENTIONAL_SHUTDOWN";
+        } else {
+          // Local shutdown requested 1000, but transport observed an abnormal close code (e.g. 1006)
+          transportDiagnostics.observedCloseOrigin = "UNCERTAIN";
+        }
       }
     });
 
@@ -2158,6 +2261,7 @@ export async function executeTransportObservationProbe(
   );
 
   removeCallerSignalListener?.();
+  cleanupDiagnosticsChannel?.();
 
   return {
     success: isObservationSuccess,

@@ -99,6 +99,10 @@ export class NativeWebSocketTransport implements ISolanaWebSocketTransport {
     }
   }
 
+  public getUnderlyingSocket(): WebSocket | null {
+    return this.ws;
+  }
+
   public on(event: "open", listener: () => void): void;
   public on(event: "message", listener: (data: string | Buffer) => void): void;
   public on(event: "error", listener: (err: Error) => void): void;
