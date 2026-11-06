@@ -6,23 +6,29 @@
  *
  * Operational & Safety Invariants:
  * 1. Exactly One Mint: Operates on a single explicitly provided canonical Solana token mint.
- * 2. At Most One HTTP Request: Dispatches at most 1 HTTP GET request. Zero discovery, zero retries,
- *    zero redirects, zero polling, zero automatic reruns.
+ * 2. At Most One HTTP Request: Dispatches at most 1 HTTP GET request to the fixed, documented
+ *    HTTPS origin (https://data.solanatracker.io/tokens/{mint}/bundlers). No URL override in production.
+ *    Zero discovery, zero retries, zero redirects, zero polling, zero automatic reruns.
  * 3. Dry-Run by Default: Dry-run performs zero network requests and requires no API key.
  *    Live execution requires an explicit --live flag.
- * 4. Credential Hygiene: Reads API key strictly from the environment variable (SOLANA_TRACKER_API_KEY)
- *    during operator live execution. Never prints, saves, or logs the key, authorization headers,
- *    or credential-bearing error diagnostics.
- * 5. Budget Accounting: Uses GlobalResourceBudgetManager to enforce request limits, recording the
- *    attempt exactly once.
- * 6. Bounded Resources: Enforces strict request timeout (default 10,000 ms, max 15,000 ms) and
- *    response body size ceiling (default 2 MB).
- * 7. Schema Parsing: Passes raw response through the accepted SolanaTrackerBundlerParser.
- * 8. Evidence Sealing: Saves requested mint, exact provider URL, HTTP status, timestamps,
- *    received raw wire digest (SHA-256), sanitized response body, parser result, and a
- *    cryptographic manifest with exact file hashes and byte sizes.
- * 9. Anti-Overwrite Protection: Refuses to overwrite existing capture destinations.
- * 10. Fail-Closed Strategy Isolation: Provider data remains unverified (PROVIDER_REPORTED_UNVERIFIED);
+ * 4. Active Deadline Across Full Lifecycle: Request deadline remains active through header retrieval
+ *    and streaming response body reads. Awaited operations are raced against the deadline; late
+ *    completions are discarded on timeout or overflow.
+ * 5. Streaming Byte Limit Enforcement: Reads response bytes with an enforced size limit (default 2 MB,
+ *    max 10 MB); aborts reading immediately on overflow rather than buffering excess bytes first.
+ * 6. Authentic Wire Digest: Received byte count and SHA-256 wire digest are computed directly from raw
+ *    wire bytes before text decoding. Partial or truncated captures are labeled honestly.
+ * 7. Comprehensive Credential Hygiene: Reads API key strictly from SOLANA_TRACKER_API_KEY during
+ *    operator live execution. Redacts plain text, decoded JSON, and unicode-escaped JSON representations
+ *    across every saved artifact (sanitized-response.json, capture-metadata.json, parser-result.json),
+ *    returned diagnostics, and error paths.
+ * 8. Atomic Destination Reservation: Exclusively creates destination directory pre-dispatch to prevent
+ *    concurrent captures from competing or overwriting evidence. Uses exclusive file writes.
+ * 9. Accurate Manifest Labeling: Clearly separates and labels entriesDigestSha256 and manifestFileSha256.
+ * 10. Budget Accounting: Uses GlobalResourceBudgetManager in a standalone 1-request configuration
+ *     (maxTotalRequests = 1, maxEnrichmentAttempts = 1, minReservedForwardRequests = 0), recording the
+ *     attempt exactly once.
+ * 11. Fail-Closed Strategy Isolation: Provider data remains unverified (PROVIDER_REPORTED_UNVERIFIED);
  *     does not alter Gate 11 or admit candidates.
  */
 
@@ -36,11 +42,25 @@ import {
 } from "./SolanaTrackerBundlerParser.js";
 import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 
-export const DEFAULT_SOLANA_TRACKER_DATA_API_BASE_URL = "https://data.solanatracker.io";
+export const SOLANA_TRACKER_DATA_API_BASE_URL = "https://data.solanatracker.io";
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 export const MAX_REQUEST_TIMEOUT_MS = 15000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MB
+export const MAX_ALLOWED_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB ceiling
 export const SOLANA_TRACKER_API_KEY_ENV_VAR = "SOLANA_TRACKER_API_KEY";
+
+export type BundlerCaptureStatus =
+  | "SUCCESS"
+  | "DRY_RUN"
+  | "HTTP_ERROR"
+  | "PARSE_ERROR"
+  | "NETWORK_ERROR"
+  | "TIMEOUT"
+  | "REDIRECT_REJECTED"
+  | "RESPONSE_TOO_LARGE"
+  | "BUDGET_DENIED"
+  | "INVALID_INPUT"
+  | "DESTINATION_ALREADY_EXISTS";
 
 /**
  * Creates a standalone one-request budget manager for one-shot operator tools.
@@ -58,24 +78,11 @@ export function createStandaloneOneRequestBudget(
   });
 }
 
-export type BundlerCaptureStatus =
-  | "SUCCESS"
-  | "DRY_RUN"
-  | "HTTP_ERROR"
-  | "PARSE_ERROR"
-  | "NETWORK_ERROR"
-  | "TIMEOUT"
-  | "REDIRECT_REJECTED"
-  | "RESPONSE_TOO_LARGE"
-  | "BUDGET_DENIED"
-  | "INVALID_INPUT"
-  | "DESTINATION_ALREADY_EXISTS";
-
 export interface HttpTransportResponse {
   readonly status: number;
   readonly statusText: string;
   readonly headers: Record<string, string>;
-  readonly bodyText: () => Promise<string>;
+  readonly readBodyBytes: (maxBytes: number, signal?: AbortSignal) => Promise<Buffer>;
 }
 
 export type HttpTransport = (
@@ -87,6 +94,9 @@ export type HttpTransport = (
   },
 ) => Promise<HttpTransportResponse>;
 
+/**
+ * Production fetch transport wrapping global fetch with manual redirect rejection and streaming body reader.
+ */
 export const defaultFetchTransport: HttpTransport = async (url, options) => {
   const init: RequestInit = {
     method: options.method,
@@ -101,7 +111,41 @@ export const defaultFetchTransport: HttpTransport = async (url, options) => {
     status: resp.status,
     statusText: resp.statusText,
     headers: Object.fromEntries(resp.headers.entries()),
-    bodyText: () => resp.text(),
+    readBodyBytes: async (maxBytes: number, signal?: AbortSignal) => {
+      if (!resp.body) {
+        return Buffer.alloc(0);
+      }
+      const reader = resp.body.getReader();
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      try {
+        while (true) {
+          if (signal?.aborted) {
+            await reader.cancel();
+            const err = new Error("Operation aborted");
+            err.name = "AbortError";
+            throw err;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            totalBytes += value.byteLength;
+            if (totalBytes > maxBytes) {
+              await reader.cancel();
+              const err = new Error(
+                `Response body size exceeded maximum limit of ${maxBytes} bytes (read ${totalBytes} bytes).`,
+              );
+              err.name = "ResponseTooLargeError";
+              throw err;
+            }
+            chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+          }
+        }
+        return Buffer.concat(chunks);
+      } finally {
+        reader.releaseLock();
+      }
+    },
   };
 };
 
@@ -109,7 +153,6 @@ export interface BundlerCaptureConfig {
   readonly mint: string;
   readonly isLive?: boolean | undefined; // default: false (dry-run)
   readonly apiKey?: string | undefined; // Optional explicit key (defaults to process.env.SOLANA_TRACKER_API_KEY in live mode)
-  readonly baseUrl?: string | undefined; // default: https://data.solanatracker.io
   readonly timeoutMs?: number | undefined; // default: 10000 ms, max 15000 ms
   readonly maxResponseSizeBytes?: number | undefined; // default: 2 MB
   readonly outDir?: string | undefined; // destination directory for evidence
@@ -131,7 +174,8 @@ export interface CaptureManifest {
   readonly totalFiles: number;
   readonly totalBytes: number;
   readonly files: readonly CaptureManifestFileEntry[];
-  readonly manifestSha256: string;
+  readonly entriesDigestSha256: string; // SHA-256 of sorted 'filename:sha256\n' lines
+  readonly manifestFileSha256: string; // Actual SHA-256 of the sealed capture-manifest.json file on disk
 }
 
 export interface BundlerCaptureMetadata {
@@ -146,6 +190,10 @@ export interface BundlerCaptureMetadata {
   readonly receivedWireSha256: string;
   readonly wasRedacted: boolean;
   readonly savedEvidenceSha256: string;
+  readonly entriesDigestSha256: string | null;
+  readonly manifestFileSha256: string | null;
+  readonly isTruncated: boolean;
+  readonly isUtf8Valid: boolean;
   readonly status: BundlerCaptureStatus;
   readonly errorMessage: string | null;
   readonly disclaimer: string;
@@ -167,6 +215,7 @@ export interface BundlerCaptureDryRunResult {
   readonly status: "DRY_RUN";
   readonly mint: string;
   readonly plannedUrl: string;
+  readonly plannedDestinationDir: string;
   readonly limits: {
     readonly timeoutMs: number;
     readonly maxResponseSizeBytes: number;
@@ -200,16 +249,66 @@ export function computeSha256(content: string | Buffer): string {
 }
 
 /**
- * Sanitizes text by thoroughly redacting known secret keys and common auth token patterns.
+ * Resolves project root directory by traversing upwards to find the top-level package.json.
  */
-export function redactSensitiveText(text: string, secrets: string[] = []): string {
+export function resolveProjectRoot(): string {
+  let current = process.cwd();
+  for (let i = 0; i < 5; i++) {
+    const pkgPath = path.join(current, "package.json");
+    if (fsSync.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fsSync.readFileSync(pkgPath, "utf8")) as { name?: string };
+        if (pkg.name === "nexustrade-otis") {
+          return current;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return process.cwd();
+}
+
+/**
+ * Builds a regex that matches a secret string where characters may be plain or unicode-escaped (e.g. \u0061).
+ */
+export function buildEscapedSecretRegex(secret: string): RegExp {
+  const charPatterns = Array.from(secret).map((char) => {
+    const code = char.charCodeAt(0);
+    const hexLower = code.toString(16).padStart(4, "0").toLowerCase();
+    const hexUpper = hexLower.toUpperCase();
+    const escapedChar = char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return `(?:${escapedChar}|\\\\u00(?:${hexLower.slice(2)}|${hexUpper.slice(2)}))`;
+  });
+  return new RegExp(charPatterns.join(""), "gi");
+}
+
+/**
+ * Sanitizes plain text by redacting secret keys, unicode-escaped keys, and standard auth headers.
+ */
+export function redactSensitiveText(text: string, secrets: readonly string[] = []): string {
   if (!text) return "";
   let out = text;
+
   for (const s of secrets) {
     if (s && s.length >= 4) {
+      // 1. Literal replacement
       out = out.split(s).join("[REDACTED]");
+
+      // 2. Unicode-escaped replacement (e.g. \u0061\u0070\u0069...)
+      try {
+        const regex = buildEscapedSecretRegex(s);
+        out = out.replace(regex, "[REDACTED]");
+      } catch {
+        // Ignore regex construction errors on unusual input
+      }
     }
   }
+
+  // 3. Standard credential pattern replacements
   out = out.replace(
     /([?&])(api[-_]?key|token|secret|password|auth)=([^&\s'"]+)/gi,
     "$1$2=[REDACTED]",
@@ -227,6 +326,30 @@ export function redactSensitiveText(text: string, secrets: string[] = []): strin
 }
 
 /**
+ * Recursively walks and deeply redacts sensitive strings in any JSON-compatible object tree.
+ */
+export function deepRedactSensitiveObject<T>(value: T, secrets: readonly string[] = []): T {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return redactSensitiveText(value, secrets) as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => deepRedactSensitiveObject(item, secrets)) as unknown as T;
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const sanitizedKey = redactSensitiveText(k, secrets);
+      result[sanitizedKey] = deepRedactSensitiveObject(v, secrets);
+    }
+    return result as T;
+  }
+  return value;
+}
+
+/**
  * Builds and seals a cryptographic manifest for the capture directory.
  */
 function sealCaptureManifest(
@@ -234,7 +357,9 @@ function sealCaptureManifest(
   requestedMint: string,
   createdAtIso: string,
 ): CaptureManifest {
-  const fileNames = fsSync.readdirSync(targetDir).filter((f) => f !== "capture-manifest.json");
+  const fileNames = fsSync
+    .readdirSync(targetDir)
+    .filter((f) => f !== "capture-manifest.json" && !f.startsWith("."));
   const entries: CaptureManifestFileEntry[] = [];
   let totalBytes = 0;
 
@@ -253,21 +378,39 @@ function sealCaptureManifest(
   entries.sort((a, b) => a.filename.localeCompare(b.filename));
 
   const manifestPayload = entries.map((f) => `${f.filename}:${f.sha256}`).join("\n");
-  const manifestSha256 = computeSha256(manifestPayload);
+  const entriesDigestSha256 = computeSha256(manifestPayload);
 
-  const manifest: CaptureManifest = {
+  // Write capture-manifest.json to disk (exclusive creation)
+  const manifestPath = path.join(targetDir, "capture-manifest.json");
+  const manifestDataOnDisk = {
     manifestVersion: "1.0",
     capturedAtIso: createdAtIso,
     requestedMint,
     totalFiles: entries.length,
     totalBytes,
     files: entries,
-    manifestSha256,
+    entriesDigestSha256,
   };
 
-  const manifestPath = path.join(targetDir, "capture-manifest.json");
-  fsSync.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
-  return manifest;
+  fsSync.writeFileSync(manifestPath, JSON.stringify(manifestDataOnDisk, null, 2), {
+    encoding: "utf8",
+    flag: "wx",
+  });
+
+  // Calculate actual written manifest file SHA-256
+  const writtenManifestBytes = fsSync.readFileSync(manifestPath);
+  const manifestFileSha256 = computeSha256(writtenManifestBytes);
+
+  return {
+    manifestVersion: "1.0",
+    capturedAtIso: createdAtIso,
+    requestedMint,
+    totalFiles: entries.length,
+    totalBytes,
+    files: entries,
+    entriesDigestSha256,
+    manifestFileSha256,
+  };
 }
 
 /**
@@ -279,7 +422,7 @@ export async function captureSolanaTrackerBundlers(
   const clock = config.clock ?? (() => Date.now());
   const isLive = config.isLive === true;
 
-  // 1. Validate requested mint
+  // 1. Validate requested mint (canonical Solana base58)
   if (!config.mint || typeof config.mint !== "string" || !isCanonicalSolanaBase58(config.mint)) {
     return {
       success: false,
@@ -290,35 +433,53 @@ export async function captureSolanaTrackerBundlers(
   }
   const mint = config.mint;
 
-  // 2. Validate configuration limits
-  const timeoutMs = Math.min(
-    config.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-    MAX_REQUEST_TIMEOUT_MS,
-  );
-  if (timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
+  // 2. Validate configuration limits (safe positive integers within hard ceilings)
+  const timeoutMs = config.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > MAX_REQUEST_TIMEOUT_MS
+  ) {
     return {
       success: false,
       dryRun: !isLive,
       status: "INVALID_INPUT",
-      message: `Invalid timeoutMs: '${config.timeoutMs}'. Must be a positive safe number.`,
+      message: `Invalid timeoutMs: '${config.timeoutMs}'. Must be a safe positive integer between 1 and ${MAX_REQUEST_TIMEOUT_MS} ms.`,
     };
   }
 
   const maxResponseSizeBytes = config.maxResponseSizeBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
-  if (maxResponseSizeBytes <= 0 || !Number.isFinite(maxResponseSizeBytes)) {
+  if (
+    typeof maxResponseSizeBytes !== "number" ||
+    !Number.isSafeInteger(maxResponseSizeBytes) ||
+    maxResponseSizeBytes <= 0 ||
+    maxResponseSizeBytes > MAX_ALLOWED_RESPONSE_BYTES
+  ) {
     return {
       success: false,
       dryRun: !isLive,
       status: "INVALID_INPUT",
-      message: `Invalid maxResponseSizeBytes: '${config.maxResponseSizeBytes}'. Must be positive.`,
+      message: `Invalid maxResponseSizeBytes: '${config.maxResponseSizeBytes}'. Must be between 1 and ${MAX_ALLOWED_RESPONSE_BYTES} bytes.`,
     };
   }
 
-  const baseUrl = (config.baseUrl ?? DEFAULT_SOLANA_TRACKER_DATA_API_BASE_URL).replace(/\/+$/, "");
-  const providerUrl = `${baseUrl}/tokens/${mint}/bundlers`;
+  // Fixed HTTPS endpoint origin (no production URL override)
+  const providerUrl = `${SOLANA_TRACKER_DATA_API_BASE_URL}/tokens/${mint}/bundlers`;
+
+  // Determine exact absolute destination directory
+  const localRequestTimeMs = clock();
+  const localRequestTimeIso = new Date(localRequestTimeMs).toISOString();
+  const defaultDirName = `${localRequestTimeIso.replace(/[:.]/g, "-")}_${mint}`;
+  const targetDir = config.outDir
+    ? path.resolve(config.outDir)
+    : path.resolve(
+        resolveProjectRoot(),
+        "data/research/captures/solana-tracker-bundler",
+        defaultDirName,
+      );
 
   // 3. Initialize or reuse GlobalResourceBudgetManager
-  // Standalone one-request configuration: max 1 request, max 1 enrichment attempt, 0 reserved
   const budget = config.budget ?? createStandaloneOneRequestBudget(clock);
 
   // 4. DRY-RUN MODE: Zero network requests dispatched, no API key required
@@ -329,6 +490,7 @@ export async function captureSolanaTrackerBundlers(
       status: "DRY_RUN",
       mint,
       plannedUrl: providerUrl,
+      plannedDestinationDir: targetDir,
       limits: {
         timeoutMs,
         maxResponseSizeBytes,
@@ -364,15 +526,11 @@ export async function captureSolanaTrackerBundlers(
     };
   }
 
-  // 7. Determine and validate target output directory (Anti-overwrite protection)
-  const localRequestTimeMs = clock();
-  const localRequestTimeIso = new Date(localRequestTimeMs).toISOString();
-  const defaultDirName = `${localRequestTimeIso.replace(/[:.]/g, "-")}_${mint}`;
-  const targetDir = config.outDir
-    ? path.resolve(config.outDir)
-    : path.resolve("data/research/captures/solana-tracker-bundler", defaultDirName);
-
-  if (fsSync.existsSync(targetDir)) {
+  // 7. Atomic Pre-dispatch Destination Reservation (Exclusively create target directory before network call)
+  try {
+    fsSync.mkdirSync(path.dirname(targetDir), { recursive: true });
+    fsSync.mkdirSync(targetDir, { recursive: false });
+  } catch {
     return {
       success: false,
       dryRun: false,
@@ -389,6 +547,12 @@ export async function captureSolanaTrackerBundlers(
     localRequestTimeMs,
   );
   if (!attemptRecorded) {
+    // Clean up reserved directory if budget recording fails
+    try {
+      fsSync.rmdirSync(targetDir);
+    } catch {
+      // ignore
+    }
     return {
       success: false,
       dryRun: false,
@@ -397,22 +561,36 @@ export async function captureSolanaTrackerBundlers(
     };
   }
 
-  // 9. Prepare HTTP transport and abort controller
+  // 9. Prepare HTTP transport and deadline management
   const transport = config.transport ?? defaultFetchTransport;
   const abortController = new AbortController();
+  const deadlineMs = localRequestTimeMs + timeoutMs;
   let isTimedOut = false;
+  let timeoutHandle: NodeJS.Timeout | null = null;
 
-  const timer = setTimeout(() => {
-    isTimedOut = true;
-    abortController.abort(new Error(`Request timed out after ${timeoutMs} ms`));
-  }, timeoutMs);
+  // Deadline promise kept active through full request + body read lifecycle
+  const deadlinePromise = new Promise<never>((_, reject) => {
+    const delay = Math.max(0, deadlineMs - clock());
+    timeoutHandle = setTimeout(() => {
+      isTimedOut = true;
+      abortController.abort(new Error(`Request timed out after ${timeoutMs} ms`));
+      const err = new Error(`Request timed out after ${timeoutMs} ms`);
+      err.name = "TimeoutError";
+      reject(err);
+    }, delay);
+  });
 
-  let rawWireBody = "";
+  const raceWithDeadline = async <T>(operation: Promise<T>): Promise<T> => {
+    return Promise.race([operation, deadlinePromise]);
+  };
+
+  let rawWireBytes: Buffer = Buffer.alloc(0);
   let httpStatus: number | null = null;
   let localResponseTimeMs: number | null = null;
   let localResponseTimeIso: string | null = null;
   let captureStatus: BundlerCaptureStatus = "SUCCESS";
   let errorMessage: string | null = null;
+  let isTruncated = false;
 
   try {
     const headers: Record<string, string> = {
@@ -420,77 +598,132 @@ export async function captureSolanaTrackerBundlers(
       "x-api-key": apiKey,
     };
 
-    const response = await transport(providerUrl, {
-      method: "GET",
-      headers,
-      signal: abortController.signal,
-    });
+    // Race header acquisition against deadline
+    const response = await raceWithDeadline(
+      transport(providerUrl, {
+        method: "GET",
+        headers,
+        signal: abortController.signal,
+      }),
+    );
 
-    clearTimeout(timer);
-    localResponseTimeMs = clock();
-    localResponseTimeIso = new Date(localResponseTimeMs).toISOString();
+    // Verify deadline has not elapsed while awaiting transport
+    if (clock() >= deadlineMs || isTimedOut) {
+      const err = new Error(`Request timed out after ${timeoutMs} ms`);
+      err.name = "TimeoutError";
+      throw err;
+    }
+
     httpStatus = response.status;
-
-    // Record response status in budget manager (for 429 tracking)
     budget.recordResponseStatus(httpStatus);
 
-    // 9.1 Reject HTTP redirects
+    // Reject HTTP redirects immediately without following
     if (httpStatus >= 300 && httpStatus < 400) {
       captureStatus = "REDIRECT_REJECTED";
       errorMessage = `HTTP redirects are strictly prohibited. Received status: ${httpStatus}`;
     } else {
-      // 9.2 Check Content-Length header against max size before reading body
+      // Check Content-Length header against max size before reading body
       const contentLengthHeader = response.headers["content-length"];
       if (contentLengthHeader) {
         const contentLength = parseInt(contentLengthHeader, 10);
         if (Number.isFinite(contentLength) && contentLength > maxResponseSizeBytes) {
           captureStatus = "RESPONSE_TOO_LARGE";
           errorMessage = `Response Content-Length (${contentLength} bytes) exceeds limit of ${maxResponseSizeBytes} bytes.`;
+          isTruncated = true;
         }
       }
 
       if (captureStatus === "SUCCESS") {
-        rawWireBody = await response.bodyText();
+        // Race streaming body read against deadline with byte-level limit
+        rawWireBytes = await raceWithDeadline(
+          response.readBodyBytes(maxResponseSizeBytes, abortController.signal),
+        );
 
-        if (Buffer.byteLength(rawWireBody, "utf8") > maxResponseSizeBytes) {
-          captureStatus = "RESPONSE_TOO_LARGE";
-          errorMessage = `Response body size (${Buffer.byteLength(rawWireBody, "utf8")} bytes) exceeds limit of ${maxResponseSizeBytes} bytes.`;
-        } else if (httpStatus !== 200) {
+        if (clock() >= deadlineMs || isTimedOut) {
+          const err = new Error(`Request timed out after ${timeoutMs} ms`);
+          err.name = "TimeoutError";
+          throw err;
+        }
+
+        if (httpStatus !== 200) {
           captureStatus = "HTTP_ERROR";
           errorMessage = `Provider returned non-200 HTTP status: ${httpStatus} ${response.statusText}`;
         }
       }
     }
+
+    localResponseTimeMs = clock();
+    localResponseTimeIso = new Date(localResponseTimeMs).toISOString();
   } catch (err: unknown) {
-    clearTimeout(timer);
     localResponseTimeMs = clock();
     localResponseTimeIso = new Date(localResponseTimeMs).toISOString();
 
-    if (isTimedOut || (err instanceof Error && err.name === "AbortError")) {
+    const errName = err instanceof Error ? err.name : "";
+    if (isTimedOut || errName === "TimeoutError" || errName === "AbortError") {
       captureStatus = "TIMEOUT";
       errorMessage = `Request timed out after ${timeoutMs} ms.`;
+      isTruncated = true;
+    } else if (errName === "ResponseTooLargeError") {
+      captureStatus = "RESPONSE_TOO_LARGE";
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      errorMessage = redactSensitiveText(rawMsg, secretsToRedact);
+      isTruncated = true;
     } else {
       captureStatus = "NETWORK_ERROR";
       const rawMsg = err instanceof Error ? err.message : String(err);
       errorMessage = redactSensitiveText(rawMsg, secretsToRedact);
     }
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
 
-  // 10. Compute received raw wire digest (before any redaction)
-  const receivedWireSha256 = computeSha256(rawWireBody);
-  const receivedBytesCount = Buffer.byteLength(rawWireBody, "utf8");
+  // 10. Compute received byte count and raw wire digest directly from bytes before decoding
+  const receivedBytesCount = rawWireBytes.length;
+  const receivedWireSha256 = computeSha256(rawWireBytes);
 
-  // 11. Redact response body before saving to disk
-  const sanitizedResponseBody = redactSensitiveText(rawWireBody, secretsToRedact);
-  const wasRedacted = sanitizedResponseBody !== rawWireBody;
+  // 11. Decode text and redact response body before saving to disk
+  let rawWireText = "";
+  let isUtf8Valid = true;
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    rawWireText = decoder.decode(rawWireBytes);
+  } catch {
+    isUtf8Valid = false;
+    rawWireText = rawWireBytes.toString("latin1"); // Safe fallback for writing sanitized representation
+    if (captureStatus === "SUCCESS") {
+      captureStatus = "PARSE_ERROR";
+      errorMessage = "Response body is not valid UTF-8 text.";
+    }
+  }
+
+  // Sanitize response body:
+  // If valid JSON, deeply sanitize all string fields and serialize back (eliminating unicode escapes)
+  let sanitizedResponseBody = "";
+  let parsedJsonValue: unknown = undefined;
+  let isJson = false;
+
+  try {
+    parsedJsonValue = JSON.parse(rawWireText);
+    isJson = true;
+    const sanitizedObj = deepRedactSensitiveObject(parsedJsonValue, secretsToRedact);
+    sanitizedResponseBody = JSON.stringify(sanitizedObj, null, 2);
+    // Also run regex redaction on serialized string
+    sanitizedResponseBody = redactSensitiveText(sanitizedResponseBody, secretsToRedact);
+  } catch {
+    // Non-JSON response text: redact directly
+    sanitizedResponseBody = redactSensitiveText(rawWireText, secretsToRedact);
+  }
+
+  const wasRedacted = sanitizedResponseBody !== rawWireText;
   const savedEvidenceSha256 = computeSha256(sanitizedResponseBody);
 
-  // 12. Parse response through SolanaTrackerBundlerParser (if 200 OK)
+  // 12. Parse response through SolanaTrackerBundlerParser (if 200 OK and valid JSON)
   let parserResult: SolanaTrackerBundlerParseResult | undefined;
   if (captureStatus === "SUCCESS" && httpStatus === 200) {
-    try {
-      const parsedJson = JSON.parse(rawWireBody);
-      parserResult = parseSolanaTrackerBundlersResponse(parsedJson, {
+    if (isJson) {
+      parserResult = parseSolanaTrackerBundlersResponse(parsedJsonValue, {
         requestedMint: mint,
         localRetrievedAtMs: localResponseTimeMs ?? localRequestTimeMs,
       });
@@ -499,10 +732,9 @@ export async function captureSolanaTrackerBundlers(
         captureStatus = "PARSE_ERROR";
         errorMessage = `Parser failed validation with error [${parserResult.error}]: ${parserResult.message}`;
       }
-    } catch (parseErr: unknown) {
+    } else {
       captureStatus = "PARSE_ERROR";
-      const rawMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-      errorMessage = `JSON parsing failed: ${redactSensitiveText(rawMsg, secretsToRedact)}`;
+      errorMessage = "Response payload is not valid JSON.";
       parserResult = {
         success: false,
         error: "MALFORMED_PAYLOAD",
@@ -511,8 +743,27 @@ export async function captureSolanaTrackerBundlers(
     }
   }
 
-  // 13. Create destination directory and write sealed evidence
-  fsSync.mkdirSync(targetDir, { recursive: true });
+  // Deeply redact parser result object before persisting and returning
+  const sanitizedParserResult: SolanaTrackerBundlerParseResult | undefined = parserResult
+    ? deepRedactSensitiveObject(parserResult, secretsToRedact)
+    : undefined;
+
+  // 13. Write sanitized evidence files into exclusively reserved destination directory
+  fsSync.writeFileSync(path.join(targetDir, "sanitized-response.json"), sanitizedResponseBody, {
+    encoding: "utf8",
+    flag: "wx",
+  });
+
+  if (sanitizedParserResult) {
+    fsSync.writeFileSync(
+      path.join(targetDir, "parser-result.json"),
+      JSON.stringify(sanitizedParserResult, null, 2),
+      { encoding: "utf8", flag: "wx" },
+    );
+  }
+
+  // 14. Seal manifest with file hashes and accurate labeling
+  const manifest = sealCaptureManifest(targetDir, mint, localRequestTimeIso);
 
   const metadata: BundlerCaptureMetadata = {
     requestedMint: mint,
@@ -526,6 +777,10 @@ export async function captureSolanaTrackerBundlers(
     receivedWireSha256,
     wasRedacted,
     savedEvidenceSha256,
+    entriesDigestSha256: manifest.entriesDigestSha256,
+    manifestFileSha256: manifest.manifestFileSha256,
+    isTruncated,
+    isUtf8Valid,
     status: captureStatus,
     errorMessage: errorMessage ? redactSensitiveText(errorMessage, secretsToRedact) : null,
     disclaimer:
@@ -533,36 +788,19 @@ export async function captureSolanaTrackerBundlers(
   };
 
   fsSync.writeFileSync(
-    path.join(targetDir, "sanitized-response.json"),
-    sanitizedResponseBody,
-    "utf8",
-  );
-
-  fsSync.writeFileSync(
     path.join(targetDir, "capture-metadata.json"),
     JSON.stringify(metadata, null, 2),
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
 
-  if (parserResult) {
-    fsSync.writeFileSync(
-      path.join(targetDir, "parser-result.json"),
-      JSON.stringify(parserResult, null, 2),
-      "utf8",
-    );
-  }
-
-  // 14. Seal manifest with cryptographic hashes of all files in directory
-  const manifest = sealCaptureManifest(targetDir, mint, localRequestTimeIso);
-
-  if (captureStatus === "SUCCESS" && parserResult?.success) {
+  if (captureStatus === "SUCCESS" && sanitizedParserResult?.success) {
     return {
       success: true,
       dryRun: false,
       status: "SUCCESS",
       targetDir,
       metadata,
-      parserResult,
+      parserResult: sanitizedParserResult,
       manifest,
     };
   }
@@ -574,13 +812,14 @@ export async function captureSolanaTrackerBundlers(
     message: errorMessage ?? `Capture failed with status: ${captureStatus}`,
     targetDir,
     metadata,
-    parserResult,
+    parserResult: sanitizedParserResult,
     manifest,
   };
 }
 
 /**
- * Parses CLI arguments for the bundler capture tool.
+ * Parses and strictly validates CLI arguments for the bundler capture tool.
+ * Rejects malformed, missing, conflicting, duplicate, and unknown arguments.
  */
 export function parseBundlerCaptureArgs(args: readonly string[]): {
   readonly mint?: string | undefined;
@@ -588,45 +827,107 @@ export function parseBundlerCaptureArgs(args: readonly string[]): {
   readonly outDir?: string | undefined;
   readonly timeoutMs?: number | undefined;
   readonly maxResponseSizeBytes?: number | undefined;
-  readonly baseUrl?: string | undefined;
   readonly help: boolean;
 } {
+  const seenFlags = new Set<string>();
   let mint: string | undefined;
-  let isLive = false;
+  let isLive: boolean | undefined;
   let outDir: string | undefined;
   let timeoutMs: number | undefined;
   let maxResponseSizeBytes: number | undefined;
-  let baseUrl: string | undefined;
   let help = false;
+
+  const validFlagsWithValues = new Set(["--mint", "--out-dir", "--timeout-ms", "--max-bytes"]);
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
+
+    if (!arg.startsWith("-")) {
+      throw new Error(`Unexpected positional argument: '${arg}'. Options must begin with a flag.`);
+    }
+
+    if (seenFlags.has(arg)) {
+      throw new Error(`Duplicate argument: '${arg}'. Each option may only be specified once.`);
+    }
+    seenFlags.add(arg);
+
     if (arg === "-h" || arg === "--help") {
       help = true;
-    } else if (arg === "--live") {
+      continue;
+    }
+
+    if (arg === "--live") {
+      if (seenFlags.has("--dry-run")) {
+        throw new Error("Conflicting flags: cannot specify both --live and --dry-run.");
+      }
       isLive = true;
-    } else if (arg === "--dry-run") {
+      continue;
+    }
+
+    if (arg === "--dry-run") {
+      if (seenFlags.has("--live")) {
+        throw new Error("Conflicting flags: cannot specify both --live and --dry-run.");
+      }
       isLive = false;
-    } else if (arg === "--mint" && i + 1 < args.length) {
-      mint = args[++i];
-    } else if (arg === "--out-dir" && i + 1 < args.length) {
-      outDir = args[++i];
-    } else if (arg === "--timeout-ms" && i + 1 < args.length) {
-      timeoutMs = parseInt(args[++i]!, 10);
-    } else if (arg === "--max-bytes" && i + 1 < args.length) {
-      maxResponseSizeBytes = parseInt(args[++i]!, 10);
-    } else if (arg === "--base-url" && i + 1 < args.length) {
-      baseUrl = args[++i];
+      continue;
+    }
+
+    if (!validFlagsWithValues.has(arg)) {
+      throw new Error(`Unknown argument: '${arg}'. Run with --help for valid options.`);
+    }
+
+    // Argument requires a value
+    if (i + 1 >= args.length) {
+      throw new Error(`Missing required value for '${arg}'.`);
+    }
+
+    const value = args[++i]!;
+    if (value.startsWith("-") && value !== "-") {
+      throw new Error(`Missing required value for '${arg}'. Found flag '${value}' instead.`);
+    }
+
+    if (arg === "--mint") {
+      mint = value;
+    } else if (arg === "--out-dir") {
+      if (value.trim().length === 0) {
+        throw new Error("Value for --out-dir cannot be empty.");
+      }
+      outDir = value;
+    } else if (arg === "--timeout-ms") {
+      if (!/^\d+$/.test(value)) {
+        throw new Error(
+          `Invalid integer value for --timeout-ms: '${value}'. Must be a positive safe integer.`,
+        );
+      }
+      const num = Number(value);
+      if (num <= 0 || num > MAX_REQUEST_TIMEOUT_MS) {
+        throw new Error(
+          `Invalid --timeout-ms value: ${num}. Must be between 1 and ${MAX_REQUEST_TIMEOUT_MS} ms.`,
+        );
+      }
+      timeoutMs = num;
+    } else if (arg === "--max-bytes") {
+      if (!/^\d+$/.test(value)) {
+        throw new Error(
+          `Invalid integer value for --max-bytes: '${value}'. Must be a positive safe integer.`,
+        );
+      }
+      const num = Number(value);
+      if (num <= 0 || num > MAX_ALLOWED_RESPONSE_BYTES) {
+        throw new Error(
+          `Invalid --max-bytes value: ${num}. Must be between 1 and ${MAX_ALLOWED_RESPONSE_BYTES} bytes.`,
+        );
+      }
+      maxResponseSizeBytes = num;
     }
   }
 
   return {
     mint,
-    isLive,
+    isLive: isLive ?? false, // Defaults to dry-run
     outDir,
     timeoutMs,
     maxResponseSizeBytes,
-    baseUrl,
     help,
   };
 }

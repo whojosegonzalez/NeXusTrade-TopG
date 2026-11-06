@@ -18,7 +18,8 @@ import {
   captureSolanaTrackerBundlers,
   DEFAULT_MAX_RESPONSE_BYTES,
   DEFAULT_REQUEST_TIMEOUT_MS,
-  DEFAULT_SOLANA_TRACKER_DATA_API_BASE_URL,
+  MAX_ALLOWED_RESPONSE_BYTES,
+  MAX_REQUEST_TIMEOUT_MS,
   parseBundlerCaptureArgs,
   SOLANA_TRACKER_API_KEY_ENV_VAR,
 } from "../candidate-scanner/SolanaTrackerBundlerCaptureTool.js";
@@ -37,13 +38,12 @@ OPTIONS:
   --dry-run                Dry-run plan validation; ZERO network requests (Default)
   --live                   Execute single live HTTP GET request (Requires ${SOLANA_TRACKER_API_KEY_ENV_VAR})
   --out-dir <path>         Destination directory to seal evidence (Default: data/research/captures/solana-tracker-bundler/<timestamp>_<mint>)
-  --timeout-ms <ms>        Request timeout in milliseconds (Default: ${DEFAULT_REQUEST_TIMEOUT_MS} ms, max: 15000)
-  --max-bytes <bytes>      Maximum response body size in bytes (Default: ${DEFAULT_MAX_RESPONSE_BYTES} bytes [2 MB])
-  --base-url <url>         API base URL (Default: ${DEFAULT_SOLANA_TRACKER_DATA_API_BASE_URL})
+  --timeout-ms <ms>        Request timeout in milliseconds (Default: ${DEFAULT_REQUEST_TIMEOUT_MS} ms, max: ${MAX_REQUEST_TIMEOUT_MS})
+  --max-bytes <bytes>      Maximum response body size in bytes (Default: ${DEFAULT_MAX_RESPONSE_BYTES} bytes [2 MB], max: ${MAX_ALLOWED_RESPONSE_BYTES})
   -h, --help               Display this help message
 
 SAFETY & CONSTRAINTS:
-  - Network requests: At most 1 outbound HTTP GET request.
+  - Network requests: At most 1 outbound HTTP GET request to fixed HTTPS endpoint.
   - Zero retries, zero redirects, zero auto-polling, zero fallback providers.
   - API Key Hygiene: Loaded from ${SOLANA_TRACKER_API_KEY_ENV_VAR} only in live mode. Never printed, logged, or saved.
   - Wallet state: Strictly frozen at 7.9259 SOL (No wallet mutation, zero signing).
@@ -53,7 +53,14 @@ SAFETY & CONSTRAINTS:
 }
 
 async function main(): Promise<void> {
-  const args = parseBundlerCaptureArgs(process.argv.slice(2));
+  let args: ReturnType<typeof parseBundlerCaptureArgs>;
+  try {
+    args = parseBundlerCaptureArgs(process.argv.slice(2));
+  } catch (argErr: unknown) {
+    console.error(`Error: ${argErr instanceof Error ? argErr.message : String(argErr)}`);
+    printUsage();
+    process.exit(1);
+  }
 
   if (args.help) {
     printUsage();
@@ -72,26 +79,34 @@ async function main(): Promise<void> {
     outDir: args.outDir,
     timeoutMs: args.timeoutMs,
     maxResponseSizeBytes: args.maxResponseSizeBytes,
-    baseUrl: args.baseUrl,
   });
 
   if (result.dryRun) {
-    console.log("=== SOLANA TRACKER BUNDLERS CAPTURE: DRY-RUN PLAN ===");
-    console.log(JSON.stringify(result, null, 2));
-    process.exit(0);
+    if (result.success) {
+      console.log("=== SOLANA TRACKER BUNDLERS CAPTURE: DRY-RUN PLAN ===");
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    } else {
+      console.error("=== SOLANA TRACKER BUNDLERS CAPTURE: DRY-RUN FAILED ===");
+      console.error(`Status:           ${result.status}`);
+      console.error(`Message:          ${result.message}`);
+      process.exit(1);
+    }
   }
 
   if (result.success) {
     console.log("=== SOLANA TRACKER BUNDLERS CAPTURE: SUCCESS ===");
-    console.log(`Target Directory: ${result.targetDir}`);
-    console.log(`HTTP Status:      ${result.metadata.httpStatus}`);
-    console.log(`Duration:         ${result.metadata.executionDurationMs} ms`);
-    console.log(`Wire SHA-256:     ${result.metadata.receivedWireSha256}`);
-    console.log(`Manifest SHA-256: ${result.manifest.manifestSha256}`);
+    console.log(`Target Directory:     ${result.targetDir}`);
+    console.log(`HTTP Status:          ${result.metadata.httpStatus}`);
+    console.log(`Duration:             ${result.metadata.executionDurationMs} ms`);
+    console.log(`Received Wire SHA256: ${result.metadata.receivedWireSha256}`);
+    console.log(`Saved Evidence SHA256:${result.metadata.savedEvidenceSha256}`);
+    console.log(`Entries Digest:       ${result.manifest.entriesDigestSha256}`);
+    console.log(`Manifest File SHA256: ${result.manifest.manifestFileSha256}`);
     console.log(
-      `Files Sealed:     ${result.manifest.totalFiles} files (${result.manifest.totalBytes} bytes)`,
+      `Files Sealed:         ${result.manifest.totalFiles} files (${result.manifest.totalBytes} bytes)`,
     );
-    console.log(`Parser Status:    ${result.parserResult.success ? "VALID" : "INVALID"}`);
+    console.log(`Parser Status:        ${result.parserResult.success ? "VALID" : "INVALID"}`);
     process.exit(0);
   } else {
     console.error("=== SOLANA TRACKER BUNDLERS CAPTURE: FAILED ===");
