@@ -67,10 +67,14 @@ export class NativeWebSocketTransport implements ISolanaWebSocketTransport {
       for (const listener of this.listeners.message) listener(data);
     });
     this.ws.addEventListener("error", (event: Event) => {
-      const ev = event as { message?: string; error?: unknown };
+      const ev = event as { message?: string; error?: unknown; code?: unknown };
       const innerErr = ev.error instanceof Error ? ev.error : undefined;
       const msg = ev.message || innerErr?.message || "WebSocket transport error";
       const err = new Error(msg, { cause: ev.error });
+      const code = (innerErr as { code?: unknown })?.code ?? ev.code;
+      if (code !== undefined) {
+        (err as { code?: unknown }).code = code;
+      }
       for (const listener of this.listeners.error) listener(err);
     });
     this.ws.addEventListener("close", (event: CloseEvent) => {

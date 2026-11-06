@@ -75,7 +75,10 @@ import {
   NativeWebSocketTransport,
   DEFAULT_SOLANA_MAINNET_WSS,
 } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
-import { redactSensitiveText } from "./SolanaTrackerBundlerCaptureTool.js";
+import {
+  redactSensitiveText,
+  deepRedactSensitiveObject,
+} from "./SolanaTrackerBundlerCaptureTool.js";
 
 // ============================================================================
 // Constants and Ceilings
@@ -265,16 +268,22 @@ export interface TransportDiagnostics {
   readonly lastMessageReceivedAtMs: number | null;
   /** Sanitized first error message emitted by transport, or null */
   readonly firstErrorMessage: string | null;
-  /** Sanitized error cause if available, or null */
+  /** First error code if available (e.g. 'ECONNRESET', 'ETIMEDOUT', or numeric code), or null */
+  readonly firstErrorCode: string | number | null;
+  /** Sanitized error cause or cause chain if available, or null */
   readonly firstErrorCause: string | null;
-  /** Close code from transport close event, or null if not closed */
+  /** Close code from genuine upstream transport close event, or null if no upstream close frame received */
   readonly closeCode: number | null;
-  /** Sanitized close reason from transport close event, or null */
+  /** Sanitized close reason from genuine upstream transport close event, or null */
   readonly closeReason: string | null;
-  /** True if closure was initiated by upstream provider or unexpected transport failure */
+  /** True if closure or failure was initiated by upstream provider */
   readonly isUpstreamClosure: boolean;
   /** True if closure was initiated by probe shutdown (e.g. deadline expired, cap reached) */
   readonly intentionalShutdownInitiated: boolean;
+  /** Local close code requested by probe shutdown, or null if no local close requested */
+  readonly localCloseCode: number | null;
+  /** Local close reason requested by probe shutdown, or null if no local close requested */
+  readonly localCloseReason: string | null;
 }
 
 export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze({
@@ -287,11 +296,14 @@ export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze
   subscriptionError: null,
   lastMessageReceivedAtMs: null,
   firstErrorMessage: null,
+  firstErrorCode: null,
   firstErrorCause: null,
   closeCode: null,
   closeReason: null,
   isUpstreamClosure: false,
   intentionalShutdownInitiated: false,
+  localCloseCode: null,
+  localCloseReason: null,
 });
 
 export interface HistoryQueryAuditRecord {
@@ -469,6 +481,76 @@ export function serializeJsonSafe(value: unknown, indent: number = 2): string {
     },
     indent,
   );
+}
+
+/**
+ * Extracts available error code from Error or error-like object, traversing cause chains if present.
+ */
+export function extractErrorCode(err: unknown): string | number | null {
+  if (!err || (typeof err !== "object" && typeof err !== "function")) {
+    return null;
+  }
+  const obj = err as Record<string, unknown>;
+  if (typeof obj.code === "string" || typeof obj.code === "number") {
+    return obj.code;
+  }
+  if (typeof obj.status === "string" || typeof obj.status === "number") {
+    return obj.status;
+  }
+  if (typeof obj.statusCode === "number") {
+    return obj.statusCode;
+  }
+  if (obj.cause) {
+    return extractErrorCode(obj.cause);
+  }
+  return null;
+}
+
+/**
+ * Builds a bounded, sanitized error cause chain representation, preserving nested error codes and details.
+ */
+export function formatErrorCauseChain(
+  cause: unknown,
+  depth = 0,
+  maxDepth = 5,
+  secrets: readonly string[] = [],
+): string | null {
+  if (cause === null || cause === undefined || depth >= maxDepth) {
+    return null;
+  }
+
+  let formatted: string;
+  let nextCause: unknown = undefined;
+
+  if (cause instanceof Error) {
+    const errObj = cause as Error & { code?: unknown; cause?: unknown };
+    const codePart = errObj.code !== undefined ? ` [code: ${String(errObj.code)}]` : "";
+    const namePart = errObj.name && errObj.name !== "Error" ? `${errObj.name}: ` : "";
+    formatted = `${namePart}${errObj.message}${codePart}`;
+    nextCause = errObj.cause;
+  } else if (typeof cause === "object") {
+    const sanitized = deepRedactSensitiveObject(cause, secrets);
+    const obj = cause as Record<string, unknown>;
+    nextCause = obj.cause;
+    try {
+      formatted = JSON.stringify(sanitized);
+    } catch {
+      formatted = String(cause);
+    }
+  } else {
+    formatted = String(cause);
+  }
+
+  const sanitizedCurrent = redactSensitiveText(formatted, secrets);
+
+  if (nextCause !== undefined && nextCause !== null && depth + 1 < maxDepth) {
+    const child = formatErrorCauseChain(nextCause, depth + 1, maxDepth, secrets);
+    if (child) {
+      return `${sanitizedCurrent} -> ${child}`;
+    }
+  }
+
+  return sanitizedCurrent;
 }
 
 function sanitizeDestinationDirName(timestampIso: string, poolId: string): string {
@@ -767,6 +849,18 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
       ) => void)
     | undefined;
 
+  private readonly listeners: {
+    open: (() => void)[];
+    message: ((data: string | Buffer) => void)[];
+    error: ((err: Error) => void)[];
+    close: ((code: number, reason: string) => void)[];
+  } = {
+    open: [],
+    message: [],
+    error: [],
+    close: [],
+  };
+
   constructor(
     inner: ISolanaWebSocketTransport,
     maxPayloadBytes?: number | undefined,
@@ -783,6 +877,48 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
     this.inner = inner;
     this.maxPayloadBytes = maxPayloadBytes;
     this.onMessageIntercept = onMessageIntercept;
+
+    // Attach single ingress listeners on underlying transport
+    this.inner.on("open", () => {
+      for (const listener of [...this.listeners.open]) {
+        listener();
+      }
+    });
+
+    this.inner.on("message", (data: string | Buffer) => {
+      this.messageCount++;
+      const byteLen = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length;
+      this.applicationPayloadBytes += byteLen;
+      const isOversized =
+        this.maxPayloadBytes !== undefined && this.applicationPayloadBytes > this.maxPayloadBytes;
+
+      this.onMessageIntercept?.(
+        this.messageCount,
+        this.applicationPayloadBytes,
+        byteLen,
+        data,
+        isOversized,
+      );
+
+      // Distribute to all registered consumer listeners only if not oversized
+      if (!isOversized) {
+        for (const listener of [...this.listeners.message]) {
+          listener(data);
+        }
+      }
+    });
+
+    this.inner.on("error", (err: Error) => {
+      for (const listener of [...this.listeners.error]) {
+        listener(err);
+      }
+    });
+
+    this.inner.on("close", (code: number, reason: string) => {
+      for (const listener of [...this.listeners.close]) {
+        listener(code, reason);
+      }
+    });
   }
 
   public getMessageCount(): number {
@@ -809,34 +945,7 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
     event: "open" | "message" | "error" | "close",
     listener: any, // eslint-disable-line @typescript-eslint/no-explicit-any
   ): void {
-    if (event === "message") {
-      this.inner.on("message", (data: string | Buffer) => {
-        this.messageCount++;
-        const byteLen = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length;
-        this.applicationPayloadBytes += byteLen;
-        const isOversized =
-          this.maxPayloadBytes !== undefined && this.applicationPayloadBytes > this.maxPayloadBytes;
-
-        this.onMessageIntercept?.(
-          this.messageCount,
-          this.applicationPayloadBytes,
-          byteLen,
-          data,
-          isOversized,
-        );
-
-        // Do not continue parsing or queueing oversized messages
-        if (!isOversized) {
-          listener(data);
-        }
-      });
-    } else if (event === "open") {
-      this.inner.on("open", listener);
-    } else if (event === "error") {
-      this.inner.on("error", listener);
-    } else if (event === "close") {
-      this.inner.on("close", listener);
-    }
+    this.listeners[event].push(listener);
   }
 }
 
@@ -1152,11 +1261,14 @@ export async function executeTransportObservationProbe(
     subscriptionError: null as string | null,
     lastMessageReceivedAtMs: null as number | null,
     firstErrorMessage: null as string | null,
+    firstErrorCode: null as string | number | null,
     firstErrorCause: null as string | null,
     closeCode: null as number | null,
     closeReason: null as string | null,
     isUpstreamClosure: false,
     intentionalShutdownInitiated: false,
+    localCloseCode: null as number | null,
+    localCloseReason: null as string | null,
   };
 
   const probeState = {
@@ -1171,12 +1283,15 @@ export async function executeTransportObservationProbe(
     if (reason !== "TRANSPORT_ERROR" && reason !== "TRANSPORT_DISCONNECT") {
       transportDiagnostics.intentionalShutdownInitiated = true;
     }
+    const sanitizedCloseMsg = closeMsg ? redactSensitiveText(closeMsg) : undefined;
+    transportDiagnostics.localCloseCode = 1000;
+    transportDiagnostics.localCloseReason = sanitizedCloseMsg ?? reason;
     if (probeState.terminationReason === "UNKNOWN") {
       probeState.terminationReason = reason;
     }
-    overallAbortController.abort(new Error(closeMsg ?? reason));
+    overallAbortController.abort(new Error(sanitizedCloseMsg ?? reason));
     try {
-      meteredTransport?.close(1000, closeMsg ?? reason);
+      meteredTransport?.close(1000, sanitizedCloseMsg ?? reason);
     } catch {
       // ignore
     }
@@ -1304,10 +1419,11 @@ export async function executeTransportObservationProbe(
               transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
             } else if (parsed.error !== undefined && parsed.error !== null) {
               transportDiagnostics.subscriptionStatus = "REJECTED";
+              const sanitizedErrorObj = deepRedactSensitiveObject(parsed.error);
               const errStr =
-                typeof parsed.error === "object"
-                  ? JSON.stringify(parsed.error)
-                  : String(parsed.error);
+                typeof sanitizedErrorObj === "object"
+                  ? JSON.stringify(sanitizedErrorObj)
+                  : String(sanitizedErrorObj);
               transportDiagnostics.subscriptionError = redactSensitiveText(errStr);
             }
           }
@@ -1318,25 +1434,35 @@ export async function executeTransportObservationProbe(
     });
 
     meteredTransport.on("close", (code, reason) => {
+      // If local close was already requested, this close event is the consequence of our local close
+      if (transportDiagnostics.localCloseCode !== null || isIntentionalClosure) {
+        // Do not attribute local close code 1000 to an upstream failure or overwrite genuine upstream close
+        return;
+      }
+
+      // If we reach here, this is a genuine upstream closure event
+      transportDiagnostics.isUpstreamClosure = true;
       if (transportDiagnostics.closeCode === null) {
         transportDiagnostics.closeCode = code;
         transportDiagnostics.closeReason = reason ? redactSensitiveText(reason) : null;
       }
-      if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
-        transportDiagnostics.isUpstreamClosure = true;
+      if (!isProbeTerminated && probeActive) {
         terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
       }
     });
 
     meteredTransport.on("error", (err) => {
       const errMsg = err instanceof Error ? err.message : String(err);
-      let errCause: string | null = null;
-      if (err instanceof Error && "cause" in err && (err as { cause?: unknown }).cause) {
-        errCause = String((err as { cause?: unknown }).cause);
-      }
+      const errCode = extractErrorCode(err);
+      const errCause =
+        err instanceof Error && "cause" in err && (err as { cause?: unknown }).cause
+          ? formatErrorCauseChain((err as { cause?: unknown }).cause)
+          : null;
+
       if (transportDiagnostics.firstErrorMessage === null) {
         transportDiagnostics.firstErrorMessage = redactSensitiveText(errMsg);
-        transportDiagnostics.firstErrorCause = errCause ? redactSensitiveText(errCause) : null;
+        transportDiagnostics.firstErrorCode = errCode;
+        transportDiagnostics.firstErrorCause = errCause;
       }
       if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
         transportDiagnostics.isUpstreamClosure = true;
@@ -1503,6 +1629,8 @@ export async function executeTransportObservationProbe(
   if (!isProbeTerminated && probeActive) {
     isIntentionalClosure = true;
     transportDiagnostics.intentionalShutdownInitiated = true;
+    transportDiagnostics.localCloseCode = 1000;
+    transportDiagnostics.localCloseReason = "Streaming phase complete; proceeding to discovery";
     coordinator?.close();
     meteredTransport?.close(1000, "Streaming phase complete; proceeding to discovery");
   }

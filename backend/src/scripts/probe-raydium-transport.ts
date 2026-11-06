@@ -175,11 +175,19 @@ async function main(): Promise<void> {
       if (td.firstErrorMessage) {
         console.log(`First Transport Error:    ${td.firstErrorMessage}`);
       }
+      if (td.firstErrorCode !== null) {
+        console.log(`First Error Code:         ${td.firstErrorCode}`);
+      }
       if (td.firstErrorCause) {
         console.log(`First Error Cause:        ${td.firstErrorCause}`);
       }
       if (td.closeCode !== null) {
-        console.log(`Close Code/Reason:        ${td.closeCode} / ${td.closeReason || "None"}`);
+        console.log(`Upstream Close Code/Reason: ${td.closeCode} / ${td.closeReason || "None"}`);
+      }
+      if (td.localCloseCode !== null) {
+        console.log(
+          `Local Close Code/Reason:    ${td.localCloseCode} / ${td.localCloseReason || "None"}`,
+        );
       }
       console.log(
         `Closure Origin:           ${td.isUpstreamClosure ? "UPSTREAM" : td.intentionalShutdownInitiated ? "INTENTIONAL_SHUTDOWN" : "UNKNOWN"}`,

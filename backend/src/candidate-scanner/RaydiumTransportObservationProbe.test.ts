@@ -22,6 +22,7 @@ import {
   createBoundedFetchTransport,
   readBoundedStream,
   boundedCancel,
+  MeteredWebSocketTransport,
   DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT,
   MAX_TOTAL_HTTP_ATTEMPTS,
   resolveProjectRoot,
@@ -1512,6 +1513,8 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.status).toBe("TRANSPORT_ERROR");
         const td = succ.metadata.transportDiagnostics;
         expect(td.isUpstreamClosure).toBe(true);
+        expect(td.closeCode).toBeNull();
+        expect(td.localCloseCode).toBe(1000);
         expect(td.firstErrorMessage).toContain("api-key=[REDACTED]");
         expect(td.firstErrorMessage).not.toContain("supersecrettoken12345");
         expect(td.firstErrorCause).toContain("auth=[REDACTED]");
@@ -1609,6 +1612,247 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(td.subscriptionStatus).toBe("REJECTED");
         expect(td.subscriptionError).toContain("api-key=[REDACTED]");
         expect(td.subscriptionError).not.toContain("verysecretapikey999");
+      }
+    });
+
+    it("counts each incoming application message and bytes exactly once with two or more consumers", () => {
+      const mockTransport = new MockWebSocketTransport();
+      let interceptCount = 0;
+      let interceptBytes = 0;
+      const metered = new MeteredWebSocketTransport(mockTransport, 1024, (count, bytes) => {
+        interceptCount = count;
+        interceptBytes = bytes;
+      });
+
+      let c1Calls = 0;
+      let c2Calls = 0;
+      let c3Calls = 0;
+      metered.on("message", () => {
+        c1Calls++;
+      });
+      metered.on("message", () => {
+        c2Calls++;
+      });
+      metered.on("message", () => {
+        c3Calls++;
+      });
+
+      const frame37 = JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 });
+      const expectedByteLen = Buffer.byteLength(frame37, "utf8");
+
+      mockTransport.triggerMessage(frame37);
+
+      // Verify each consumer received the frame exactly once
+      expect(c1Calls).toBe(1);
+      expect(c2Calls).toBe(1);
+      expect(c3Calls).toBe(1);
+
+      // Ingress metering must count exactly 1 message and byte length despite 3 consumers
+      expect(metered.getMessageCount()).toBe(1);
+      expect(metered.getApplicationPayloadBytes()).toBe(expectedByteLen);
+      expect(interceptCount).toBe(1);
+      expect(interceptBytes).toBe(expectedByteLen);
+    });
+
+    it("enforces message cap correctly under multiple listeners without early termination", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        maxMessages: 2,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+
+      // Send 1st frame: 37-byte subscription acknowledgement
+      const frame1 = JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 });
+      mockTransport.triggerMessage(frame1);
+
+      // Give event loop a tick to process
+      await new Promise((r) => setTimeout(r, 10));
+
+      // In the buggy version, frame 1 produced count=2, immediately terminating probe with MESSAGE_LIMIT_REACHED.
+      // With ingress metering, probe must still be active and await frame 2.
+      const frame2 = JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: { result: { value: { logs: [], signature: SIG_ANCHOR } }, subscription: 1 },
+      });
+      mockTransport.triggerMessage(frame2);
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.metadata.terminationReason).toBe("MESSAGE_LIMIT_REACHED");
+        expect(succ.metadata.counts.inboundMessagesCount).toBe(2);
+        const expectedBytes = Buffer.byteLength(frame1, "utf8") + Buffer.byteLength(frame2, "utf8");
+        expect(succ.metadata.counts.applicationPayloadBytes).toBe(expectedBytes);
+      }
+    });
+
+    it("sanitizes nested JSON credential fields before serialization and verifies sealed artifacts", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const syntheticApiKey = "synthetic-nested-secret-apiKey-112233";
+      const syntheticClientSecret = "synthetic-deep-clientSecret-445566";
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        streamingDurationMs: 50,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            code: -32602,
+            message: "Authentication failure on cluster endpoint",
+            data: {
+              apiKey: syntheticApiKey,
+              details: {
+                clientSecret: syntheticClientSecret,
+                safeClusterId: "mainnet-beta-node-4",
+              },
+            },
+          },
+        }),
+      );
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        const td = succ.metadata.transportDiagnostics;
+        expect(td.subscriptionStatus).toBe("REJECTED");
+        expect(td.subscriptionError).toContain("[REDACTED]");
+        expect(td.subscriptionError).not.toContain(syntheticApiKey);
+        expect(td.subscriptionError).not.toContain(syntheticClientSecret);
+        expect(td.subscriptionError).toContain("safeClusterId");
+
+        // Verify sealed disk evidence contains NO unredacted secrets
+        const metaPath = path.join(testOutputDir, "capture-metadata.json");
+        const summaryPath = path.join(testOutputDir, "probe-summary.json");
+        const metaContent = fsSync.readFileSync(metaPath, "utf8");
+        const summaryContent = fsSync.readFileSync(summaryPath, "utf8");
+
+        expect(metaContent).not.toContain(syntheticApiKey);
+        expect(metaContent).not.toContain(syntheticClientSecret);
+        expect(summaryContent).not.toContain(syntheticApiKey);
+        expect(summaryContent).not.toContain(syntheticClientSecret);
+        expect(metaContent).toContain("[REDACTED]");
+        expect(summaryContent).toContain("[REDACTED]");
+      }
+    });
+
+    it("separates upstream error from subsequent local close(1000) and preserves error code & cause chain", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      const nestedCause = new Error("TLS handshake aborted", {
+        cause: { code: "ERR_TLS_RESET", detail: "Remote server dropped connection" },
+      });
+      const topError = new Error("WebSocket transport encountered a fatal socket error", {
+        cause: nestedCause,
+      });
+      (topError as unknown as { code: string }).code = "ECONNRESET";
+
+      mockTransport.triggerError(topError);
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        const td = succ.metadata.transportDiagnostics;
+
+        // Upstream failure details
+        expect(td.isUpstreamClosure).toBe(true);
+        expect(td.intentionalShutdownInitiated).toBe(false);
+        expect(td.firstErrorMessage).toContain(
+          "WebSocket transport encountered a fatal socket error",
+        );
+        expect(td.firstErrorCode).toBe("ECONNRESET");
+        expect(td.firstErrorCause).toContain("TLS handshake aborted");
+        expect(td.firstErrorCause).toContain("ERR_TLS_RESET");
+        expect(td.firstErrorCause).toContain("Remote server dropped connection");
+
+        // Code 1000 from local teardown close request must NOT be attributed to upstream failure
+        expect(td.closeCode).toBeNull();
+        expect(td.closeReason).toBeNull();
+        expect(td.localCloseCode).toBe(1000);
+        expect(td.localCloseReason).toContain("WebSocket error:");
+      }
+    });
+
+    it("retains genuine upstream closure code and reason without overwrite by local teardown", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const mockFetch: typeof fetch = async () => new Response("ok");
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // Genuine upstream close event with abnormal code 1006
+      mockTransport.triggerClose(1006, "Connection dropped by upstream cluster gateway");
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        const td = succ.metadata.transportDiagnostics;
+
+        // Upstream closure code & reason strictly preserved
+        expect(td.isUpstreamClosure).toBe(true);
+        expect(td.intentionalShutdownInitiated).toBe(false);
+        expect(td.closeCode).toBe(1006);
+        expect(td.closeReason).toBe("Connection dropped by upstream cluster gateway");
+
+        // Local teardown requested close code
+        expect(td.localCloseCode).toBe(1000);
+        expect(td.localCloseReason).toContain(
+          "WebSocket closed: Connection dropped by upstream cluster gateway",
+        );
       }
     });
   });

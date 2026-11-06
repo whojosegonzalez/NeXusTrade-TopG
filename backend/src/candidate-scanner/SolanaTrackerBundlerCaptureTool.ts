@@ -423,6 +423,45 @@ export function buildEscapedSecretRegex(secret: string): RegExp {
 }
 
 /**
+ * Detects whether an object property key represents a sensitive credential field
+ * (e.g. apiKey, token, clientSecret, password, privateKey, auth, authorization).
+ */
+export function isSensitiveKeyName(key: string): boolean {
+  if (!key) return false;
+  const tokens = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (
+      t === "token" ||
+      t === "secret" ||
+      t === "password" ||
+      t === "passwd" ||
+      t === "pwd" ||
+      t === "credential" ||
+      t === "credentials" ||
+      t === "apikey" ||
+      t === "privkey" ||
+      t === "auth" ||
+      t === "authorization" ||
+      t === "bearer"
+    ) {
+      return true;
+    }
+    if (t === "api" && i + 1 < tokens.length && tokens[i + 1] === "key") {
+      return true;
+    }
+    if (t === "private" && i + 1 < tokens.length && tokens[i + 1] === "key") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Sanitizes plain text by redacting secret keys, unicode-escaped keys, and standard auth headers.
  */
 export function redactSensitiveText(text: string, secrets: readonly string[] = []): string {
@@ -454,6 +493,10 @@ export function redactSensitiveText(text: string, secrets: readonly string[] = [
     "$1$2=[REDACTED]",
   );
   out = out.replace(
+    /(['"]?)(api[-_]?key|apikey|token|secret|client[-_]?secret|password|passwd|pwd|auth|authorization|x-api-key)(['"]?\s*:\s*['"]?)([^"',\s}]+)(['"]?)/gi,
+    "$1$2$3[REDACTED]$5",
+  );
+  out = out.replace(
     /(api[-_]?key|token|secret|password|auth|x-api-key):\s*['"]?([^&\s'"]+)['"]?/gi,
     "$1:[REDACTED]",
   );
@@ -462,7 +505,7 @@ export function redactSensitiveText(text: string, secrets: readonly string[] = [
 }
 
 /**
- * Recursively walks and deeply redacts sensitive strings in any JSON-compatible object tree.
+ * Recursively walks and deeply redacts sensitive strings and sensitive keys in any JSON-compatible object tree.
  */
 export function deepRedactSensitiveObject<T>(value: T, secrets: readonly string[] = []): T {
   if (value === null || value === undefined) {
@@ -471,14 +514,21 @@ export function deepRedactSensitiveObject<T>(value: T, secrets: readonly string[
   if (typeof value === "string") {
     return redactSensitiveText(value, secrets) as unknown as T;
   }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return value;
+  }
   if (Array.isArray(value)) {
     return value.map((item) => deepRedactSensitiveObject(item, secrets)) as unknown as T;
   }
   if (typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const sanitizedKey = redactSensitiveText(k, secrets);
-      result[sanitizedKey] = deepRedactSensitiveObject(v, secrets);
+      if (isSensitiveKeyName(k)) {
+        result[k] = "[REDACTED]";
+      } else {
+        const sanitizedKey = redactSensitiveText(k, secrets);
+        result[sanitizedKey] = deepRedactSensitiveObject(v, secrets);
+      }
     }
     return result as T;
   }
