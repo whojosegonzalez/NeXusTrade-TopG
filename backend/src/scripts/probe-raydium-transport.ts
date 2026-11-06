@@ -42,19 +42,22 @@ USAGE:
   tsx backend/src/scripts/probe-raydium-transport.ts [OPTIONS]
 
 OPTIONS:
-  --dry-run                Dry-run plan validation; ZERO network requests (Default)
-  --live                   Execute live WebSocket observation probe (Explicit opt-in)
-  --pool <poolId>          Target pool ID (Default: ${DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.poolId} [RAY/WSOL])
-  --out-dir <path>         Destination directory to seal evidence (Default: data/research/captures/transport-probe/<timestamp>_<poolId>)
-  --duration-ms <ms>       Maximum probe duration in milliseconds (Default: ${DEFAULT_PROBE_DURATION_MS} ms, max: ${MAX_ALLOWED_PROBE_DURATION_MS})
-  --max-messages <count>   Maximum inbound WebSocket messages (Default: ${MAX_INBOUND_MESSAGES_BUDGET}, max: ${MAX_INBOUND_MESSAGES_BUDGET})
-  --max-bytes <bytes>      Maximum application payload bytes (Default: ${MAX_APPLICATION_PAYLOAD_BYTES} bytes [2 MiB], max: ${MAX_APPLICATION_PAYLOAD_BYTES})
-  -h, --help               Display this help message
+  --dry-run                    Dry-run plan validation; ZERO network requests (Default)
+  --live                       Execute live WebSocket observation probe (Explicit opt-in)
+  --pool <poolId>              Target pool ID (Must match reference RAY/WSOL: ${DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.poolId})
+  --out-dir <path>             Destination directory (Must reside within data/research/captures/transport-probe/)
+  --duration-ms <ms>           Maximum probe duration in milliseconds (1..${MAX_ALLOWED_PROBE_DURATION_MS} ms, default: ${DEFAULT_PROBE_DURATION_MS})
+  --max-messages <count>       Maximum inbound WebSocket messages (1..${MAX_INBOUND_MESSAGES_BUDGET}, default: ${MAX_INBOUND_MESSAGES_BUDGET})
+  --max-bytes <bytes>          Maximum application payload bytes (1..${MAX_APPLICATION_PAYLOAD_BYTES} bytes [2 MiB], default: ${MAX_APPLICATION_PAYLOAD_BYTES})
+  --max-queue-depth <count>    Maximum active queue depth (1..${MAX_QUEUE_DEPTH_LIMIT}, default: ${MAX_QUEUE_DEPTH_LIMIT})
+  --max-history-queries <cnt>  Maximum bounded history RPC queries (1..${MAX_HISTORY_QUERIES_LIMIT}, default: ${MAX_HISTORY_QUERIES_LIMIT})
+  --max-tx-retrievals <count>  Maximum sampled transaction retrievals (1..${MAX_TRANSACTION_RETRIEVALS_LIMIT}, default: ${MAX_TRANSACTION_RETRIEVALS_LIMIT})
+  -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
   - Transport: Exactly 1 public-provider WebSocket connection; zero reconnects or provider fallback.
   - Queues & Retrievals: Max ${MAX_QUEUE_DEPTH_LIMIT} queue depth, at most ${MAX_TRANSACTION_RETRIEVALS_LIMIT} transaction retrievals.
-  - Bounded Reconciliation: At most ${MAX_HISTORY_QUERIES_LIMIT} history queries; max ${MAX_TOTAL_HTTP_ATTEMPTS} HTTP calls total.
+  - Bounded Discovery: At most ${MAX_HISTORY_QUERIES_LIMIT} history queries; max ${MAX_TOTAL_HTTP_ATTEMPTS} HTTP calls total.
   - Provider Pacing: Retains >= ${PROBE_MIN_PROVIDER_SPACING_MS} ms spacing via GlobalResourceBudgetManager.
   - Spending Ceiling: $0.00.
   - Wallet state: Strictly frozen at 7.9259 SOL (No wallet mutation, zero signing).
@@ -83,6 +86,9 @@ async function main(): Promise<void> {
     durationMs: args.durationMs,
     maxMessages: args.maxMessages,
     maxPayloadBytes: args.maxPayloadBytes,
+    maxQueueDepth: args.maxQueueDepth,
+    maxHistoryQueries: args.maxHistoryQueries,
+    maxTransactionRetrievals: args.maxTransactionRetrievals,
   });
 
   if (result.dryRun) {
@@ -98,9 +104,10 @@ async function main(): Promise<void> {
     }
   }
 
-  if (result.success) {
-    console.log("=== RAYDIUM TRANSPORT OBSERVATION PROBE: COMPLETE ===");
+  if ("manifest" in result) {
+    console.log("=== RAYDIUM TRANSPORT OBSERVATION PROBE: EVIDENCE SEALED ===");
     console.log(`Target Directory:         ${result.targetDir}`);
+    console.log(`Observation Success:      ${result.observationSuccess}`);
     console.log(`Status:                   ${result.status}`);
     console.log(`Termination Reason:       ${result.metadata.terminationReason}`);
     console.log(`Duration (ms):            ${result.metadata.durationMs}`);
@@ -108,6 +115,7 @@ async function main(): Promise<void> {
     console.log(`Application Bytes:        ${result.metadata.counts.applicationPayloadBytes}`);
     console.log(`Overshoot Bytes:          ${result.metadata.counts.overshootBytes}`);
     console.log(`Peak Queue Depth:         ${result.metadata.counts.peakQueueDepth}`);
+    console.log(`Queue Rejections:         ${result.metadata.counts.queueRejectionsCount}`);
     console.log(`Decoded Swaps:            ${result.metadata.counts.decodedSwapsCount}`);
     console.log(
       `Tx Retrievals Attempted:  ${result.metadata.counts.transactionRetrievalsAttempted}`,
@@ -116,6 +124,7 @@ async function main(): Promise<void> {
       `Tx Retrievals Succeeded:  ${result.metadata.counts.transactionRetrievalsSucceeded}`,
     );
     console.log(`History Queries:          ${result.metadata.counts.historyQueriesAttempted}`);
+    console.log(`History Signatures Found: ${result.metadata.counts.historySignaturesDiscovered}`);
     console.log(
       `Common Signatures:        ${result.summary.discrepancyAnalysis.commonSignaturesCount}`,
     );
@@ -125,11 +134,25 @@ async function main(): Promise<void> {
     console.log(
       `History-Only Signatures:  ${result.summary.discrepancyAnalysis.historyOnlySignaturesCount}`,
     );
+    console.log(
+      `Unretrieved WS Signatures:${result.summary.discrepancyAnalysis.unretrievedSampleSignaturesCount}`,
+    );
     console.log(`Completeness Established: ${result.metadata.isProductionCompletenessEstablished}`);
     console.log(`Gate 11 Status:           ${result.metadata.gate11Status}`);
     console.log(`Virtual Wallet:           ${result.metadata.virtualWalletBalanceSol}`);
     console.log(`Manifest File Hash:       ${result.manifest.manifestFileSha256}`);
     console.log(`Entries Digest:           ${result.manifest.entriesDigestSha256}`);
+
+    if (
+      !result.observationSuccess ||
+      result.status === "TRANSPORT_ERROR" ||
+      result.status === "QUEUE_OVERFLOW"
+    ) {
+      console.error("=== RAYDIUM TRANSPORT OBSERVATION PROBE: TERMINATED WITH ERROR ===");
+      console.error(`Termination Reason:       ${result.metadata.terminationReason}`);
+      process.exit(1);
+    }
+
     process.exit(0);
   } else {
     console.error("=== RAYDIUM TRANSPORT OBSERVATION PROBE: FAILED ===");
