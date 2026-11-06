@@ -918,7 +918,281 @@ describe("RaydiumTransportObservationProbe", () => {
         const manifestRaw = fsSync.readFileSync(manifestPath);
         const computedManifestSha = crypto.createHash("sha256").update(manifestRaw).digest("hex");
         expect(succ.manifest.manifestFileSha256).toBe(computedManifestSha);
-        expect(succ.manifest.files.length).toBe(3); // probe-summary, capture-metadata, witnessed-signatures
+        expect(succ.manifest.files.length).toBe(4); // probe-summary, capture-metadata, witnessed-signatures, sampled-transactions
+        const manifestFilenames = succ.manifest.files.map((f) => f.filename);
+        expect(manifestFilenames).toContain("capture-metadata.json");
+        expect(manifestFilenames).toContain("probe-summary.json");
+        expect(manifestFilenames).toContain("witnessed-signatures.json");
+        expect(manifestFilenames).toContain("sampled-transactions.json");
+      }
+    });
+  });
+
+  // ==========================================================================
+  // 7. Worker Settlement, Interruption & Post-Finalization Invariants
+  // ==========================================================================
+  describe("Worker Settlement, Interruption & Post-Finalization Invariants", () => {
+    it("enforces transaction cap under concurrent phase transition", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      let dispatchesCount = 0;
+
+      const mockFetch: typeof fetch = async () => {
+        dispatchesCount++;
+        await new Promise((r) => setTimeout(r, 15));
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: createSyntheticBuyPayload(SIG_C),
+          }),
+        );
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 5000,
+        streamingDurationMs: 20, // Overlapping phase transition while worker is active
+        maxTransactionRetrievals: 2,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // Send 4 notifications
+      for (let i = 0; i < 4; i++) {
+        mockTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              subscription: 1,
+              result: {
+                context: { slot: 100 + i },
+                value: {
+                  signature: `5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQU${i}`,
+                  logs: [],
+                  err: null,
+                },
+              },
+            },
+          }),
+        );
+      }
+
+      const result = await probePromise;
+      expect(result.dryRun).toBe(false);
+      expect(dispatchesCount).toBe(2);
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.metadata.counts.transactionRetrievalsAttempted).toBe(2);
+        expect(succ.metadata.terminationReason).toBe("TRANSACTION_LIMIT_REACHED");
+        expect(succ.status).toBe("CAP_LIMITED");
+      }
+    });
+
+    it("discards delayed transport completion after cancellation", async () => {
+      const mockTransport = new MockWebSocketTransport();
+
+      const mockFetch: typeof fetch = async (_input, init) => {
+        // Return a promise that only resolves after abort
+        return new Promise<Response>((resolve) => {
+          init?.signal?.addEventListener("abort", () => {
+            // Delay resolution past cancellation
+            setTimeout(() => {
+              resolve(
+                new Response(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    result: createSyntheticBuyPayload(SIG_C),
+                  }),
+                ),
+              );
+            }, 20);
+          });
+        });
+      };
+
+      const abortController = new AbortController();
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 5000,
+        signal: abortController.signal,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 100 },
+              value: { signature: SIG_C, logs: [], err: null },
+            },
+          },
+        }),
+      );
+
+      // Wait 10ms for dispatch, then abort
+      await new Promise((r) => setTimeout(r, 10));
+      abortController.abort(new Error("Manual abort"));
+
+      const result = await probePromise;
+      expect(result.dryRun).toBe(false);
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.metadata.terminationReason).toBe("MANUAL_CANCEL");
+        expect(succ.metadata.counts.transactionRetrievalsSucceeded).toBe(0);
+        expect(succ.summary.sampledTransactionAudits.length).toBe(0);
+      }
+    });
+
+    it("interrupts pending body read on abort including late EOF", async () => {
+      // 1. Pending read interrupted by abort
+      let streamCancelled = false;
+      const abortController = new AbortController();
+
+      const pendingStream = new ReadableStream<Uint8Array>({
+        start() {},
+        pull() {
+          // Never resolves spontaneously
+          return new Promise(() => {});
+        },
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const readPromise = readBoundedStream(pendingStream, 1024, abortController.signal);
+      abortController.abort(new Error("Test abort"));
+
+      await expect(readPromise).rejects.toThrow("Operation aborted");
+      expect(streamCancelled).toBe(true);
+
+      // 2. Late EOF arriving after abort
+      const eofStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Close immediately upon pull
+          controller.close();
+        },
+      });
+
+      const alreadyAborted = AbortSignal.abort(new Error("Pre-aborted"));
+      await expect(readBoundedStream(eofStream, 1024, alreadyAborted)).rejects.toThrow(
+        "Operation aborted",
+      );
+    });
+
+    it("cancels redirect response body on 301/302", async () => {
+      let bodyCancelled = false;
+      const mockRedirectFetch: typeof fetch = async () => {
+        const mockStream = new ReadableStream<Uint8Array>({
+          cancel() {
+            bodyCancelled = true;
+          },
+        });
+        return new Response(mockStream, {
+          status: 302,
+          headers: { Location: "https://redirect.example.com" },
+        });
+      };
+
+      const boundedFetch = createBoundedFetchTransport(mockRedirectFetch, 1024);
+      await expect(boundedFetch("https://api.example.com/rpc")).rejects.toThrow(
+        "HTTP_REDIRECT_REJECTED",
+      );
+      expect(bodyCancelled).toBe(true);
+    });
+
+    it("records failed history queries in audit log and prevents post-finalization audit mutations", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      let fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const sleepFn = async (ms: number) => {
+        if (ms >= 100) {
+          fakeNow += ms;
+        } else {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      };
+
+      const mockFetch: typeof fetch = async (_input, init) => {
+        const bodyStr = typeof init?.body === "string" ? init.body : "";
+        if (bodyStr.includes("getSignaturesForAddress")) {
+          // Simulate HTTP 500 error
+          return new Response("Internal Server Error", {
+            status: 500,
+            statusText: "Internal Error",
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: createSyntheticBuyPayload(SIG_ANCHOR, Math.floor(fakeNow / 1000)),
+          }),
+        );
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 60_000,
+        streamingDurationMs: 10,
+        maxHistoryQueries: 1,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+        sleepFn,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 100 },
+              value: { signature: SIG_ANCHOR, logs: [], err: null },
+            },
+          },
+        }),
+      );
+
+      const result = await probePromise;
+      expect(result.dryRun).toBe(false);
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        // Verify failed history query was audited in historyQueryAudits
+        expect(succ.summary.historyQueryAudits.length).toBe(1);
+        const audit = succ.summary.historyQueryAudits[0]!;
+        expect(audit.httpStatus).toBe(500);
+        expect(audit.error).toContain("HTTP 500");
+        expect(typeof audit.requestSentAtMs).toBe("number");
+        expect(typeof audit.headersReceivedAtMs).toBe("number");
+        expect(audit.responseReceivedAtMs).toBe(null);
+
+        // Verify array immutability (frozen)
+        expect(Object.isFrozen(succ.summary.sampledTransactionAudits)).toBe(true);
+        expect(Object.isFrozen(succ.summary.historyQueryAudits)).toBe(true);
+
+        // Verify sampled-transactions.json on disk matches returned summary
+        const sampledTxPath = path.join(testOutputDir, "sampled-transactions.json");
+        expect(fsSync.existsSync(sampledTxPath)).toBe(true);
+        const sampledTxData = JSON.parse(fsSync.readFileSync(sampledTxPath, "utf8"));
+        expect(sampledTxData).toEqual(succ.summary.sampledTransactionAudits);
       }
     });
   });

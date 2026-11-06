@@ -80,16 +80,33 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const result = await executeTransportObservationProbe({
-    isLive: args.isLive,
-    outDir: args.outDir,
-    durationMs: args.durationMs,
-    maxMessages: args.maxMessages,
-    maxPayloadBytes: args.maxPayloadBytes,
-    maxQueueDepth: args.maxQueueDepth,
-    maxHistoryQueries: args.maxHistoryQueries,
-    maxTransactionRetrievals: args.maxTransactionRetrievals,
-  });
+  const abortController = new AbortController();
+
+  const handleInterrupt = (sig: string) => {
+    console.warn(`\nReceived ${sig}. Initiating graceful shutdown and sealing partial evidence...`);
+    abortController.abort(new Error(`Interrupted by ${sig}`));
+  };
+
+  process.once("SIGINT", () => handleInterrupt("SIGINT"));
+  process.once("SIGTERM", () => handleInterrupt("SIGTERM"));
+
+  let result: Awaited<ReturnType<typeof executeTransportObservationProbe>>;
+  try {
+    result = await executeTransportObservationProbe({
+      isLive: args.isLive,
+      outDir: args.outDir,
+      durationMs: args.durationMs,
+      maxMessages: args.maxMessages,
+      maxPayloadBytes: args.maxPayloadBytes,
+      maxQueueDepth: args.maxQueueDepth,
+      maxHistoryQueries: args.maxHistoryQueries,
+      maxTransactionRetrievals: args.maxTransactionRetrievals,
+      signal: abortController.signal,
+    });
+  } finally {
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("SIGTERM");
+  }
 
   if (result.dryRun) {
     if (result.success) {

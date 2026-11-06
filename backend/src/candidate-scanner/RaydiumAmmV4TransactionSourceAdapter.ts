@@ -101,6 +101,8 @@ export interface TransactionSourceDiagnostics {
   readonly requestSentAtMs?: number | undefined;
   readonly responseReceivedAtMs?: number | undefined;
   readonly responseSha256?: string | undefined;
+  readonly decodedEvents?: readonly unknown[] | undefined;
+  readonly responseSnippet?: string | undefined;
 }
 
 export interface ProcessNotificationResult {
@@ -2044,6 +2046,8 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           requestSentAtMs,
           responseReceivedAtMs,
           responseSha256,
+          decodedEvents: ingestResult.decodeResult.events,
+          responseSnippet: bodyText.slice(0, 2048),
         },
       };
     } finally {

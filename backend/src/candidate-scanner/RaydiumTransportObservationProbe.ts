@@ -114,6 +114,8 @@ export type TransportProbeTerminationReason =
   | "DURATION_EXPIRED"
   | "MESSAGE_LIMIT_REACHED"
   | "PAYLOAD_LIMIT_REACHED"
+  | "TRANSACTION_LIMIT_REACHED"
+  | "COMPLETED"
   | "QUEUE_LIMIT_EXCEEDED"
   | "HTTP_BUDGET_EXHAUSTED"
   | "TRANSPORT_DISCONNECT"
@@ -141,6 +143,7 @@ export interface TransportProbeConfig {
   readonly wsUrl?: string | undefined;
   readonly rpcUrl?: string | undefined;
   readonly commitment?: "confirmed" | undefined;
+  readonly signal?: AbortSignal | undefined;
 
   // Injected test seams
   readonly transport?: ISolanaWebSocketTransport | undefined;
@@ -246,10 +249,11 @@ export interface HistoryQueryAuditRecord {
   readonly limit: number;
   readonly before?: string | undefined;
   readonly requestSentAtMs: number;
-  readonly responseReceivedAtMs: number;
+  readonly headersReceivedAtMs?: number | undefined;
+  readonly responseReceivedAtMs: number | null;
   readonly durationMs: number;
-  readonly httpStatus: number;
-  readonly responseSha256: string;
+  readonly httpStatus: number | null;
+  readonly responseSha256: string | null;
   readonly recordsDiscovered: number;
   readonly error?: string | undefined;
 }
@@ -402,6 +406,19 @@ export function computeSha256(content: Buffer | string): string {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
 
+export function serializeJsonSafe(value: unknown, indent: number = 2): string {
+  return JSON.stringify(
+    value,
+    (_key, val) => {
+      if (typeof val === "bigint") {
+        return val.toString();
+      }
+      return val;
+    },
+    indent,
+  );
+}
+
 function sanitizeDestinationDirName(timestampIso: string, poolId: string): string {
   const safeTimestamp = timestampIso.replace(/:/g, "-");
   const safePoolId = poolId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -443,6 +460,17 @@ export async function readBoundedStream(
   maxBytes: number,
   signal?: AbortSignal,
 ): Promise<{ bytes: Buffer; totalObservedBytes: number; overflow: boolean }> {
+  if (signal?.aborted) {
+    const err = new Error("Operation aborted");
+    err.name = "AbortError";
+    try {
+      await stream.cancel(signal.reason);
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+
   const reader = stream.getReader();
   const chunks: Buffer[] = [];
   let retainedBytes = 0;
@@ -451,14 +479,51 @@ export async function readBoundedStream(
   try {
     while (true) {
       if (signal?.aborted) {
-        await reader.cancel(signal.reason);
         const err = new Error("Operation aborted");
         err.name = "AbortError";
         throw err;
       }
 
-      const { done, value } = await reader.read();
-      if (done) break;
+      let cancelAbortListener: (() => void) | undefined;
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+
+      if (signal) {
+        const abortPromise = new Promise<never>((_, reject) => {
+          if (signal.aborted) {
+            const err = new Error("Operation aborted");
+            err.name = "AbortError";
+            reject(err);
+            return;
+          }
+          const handler = () => {
+            const err = new Error("Operation aborted");
+            err.name = "AbortError";
+            reject(err);
+          };
+          signal.addEventListener("abort", handler, { once: true });
+          cancelAbortListener = () => signal.removeEventListener("abort", handler);
+        });
+        abortPromise.catch(() => {});
+
+        try {
+          readResult = await Promise.race([reader.read(), abortPromise]);
+        } finally {
+          cancelAbortListener?.();
+        }
+      } else {
+        readResult = await reader.read();
+      }
+
+      const { done, value } = readResult;
+
+      if (done) {
+        if (signal?.aborted) {
+          const err = new Error("Operation aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        break;
+      }
 
       if (value && value.byteLength > 0) {
         totalObservedBytes += value.byteLength;
@@ -515,6 +580,13 @@ export function createBoundedFetchTransport(
 
     // 2. Reject redirect status
     if (resp.type === "opaqueredirect" || (resp.status >= 300 && resp.status < 400)) {
+      if (resp.body) {
+        try {
+          await resp.body.cancel(new Error("HTTP_REDIRECT_REJECTED"));
+        } catch {
+          // ignore
+        }
+      }
       throw new Error(`HTTP_REDIRECT_REJECTED: Redirect status ${resp.status} is prohibited`);
     }
 
@@ -978,6 +1050,20 @@ export async function executeTransportObservationProbe(
     }
   };
 
+  if (config.signal) {
+    if (config.signal.aborted) {
+      terminateProbe("MANUAL_CANCEL", "Probe cancelled by caller signal");
+    } else {
+      config.signal.addEventListener(
+        "abort",
+        () => {
+          terminateProbe("MANUAL_CANCEL", "Probe cancelled by caller signal");
+        },
+        { once: true },
+      );
+    }
+  }
+
   // 7. Bounded HTTP Transport Wrapper
   const boundedFetch = createBoundedFetchTransport(
     config.fetchTransport ?? globalThis.fetch,
@@ -1116,6 +1202,7 @@ export async function executeTransportObservationProbe(
   }, durationMs);
 
   // Drain Queue Worker Loop
+  let transactionRetrievalsReserved = 0;
   const drainWorker = async () => {
     while (!overallAbortController.signal.aborted) {
       const remainingMs = overallDeadlineEpoch - clock();
@@ -1124,11 +1211,22 @@ export async function executeTransportObservationProbe(
         break;
       }
 
-      if (adapter.getMetrics().totalDispatchedAttempts >= maxTransactionRetrievals) {
+      if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+        if (probeActive && !isProbeTerminated) {
+          terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+        }
         break;
       }
 
       if (adapter.getPendingQueueLength() > 0) {
+        if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+          if (probeActive && !isProbeTerminated) {
+            terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+          }
+          break;
+        }
+        transactionRetrievalsReserved++;
+
         try {
           const timeoutForReq = Math.min(10_000, remainingMs);
           const processRes = await adapter.processNextPending(tracker, {
@@ -1136,17 +1234,26 @@ export async function executeTransportObservationProbe(
             overallTimeoutMs: timeoutForReq,
           });
           if (processRes) {
-            sampledTransactionAudits.push(processRes.diagnostics);
-            if (processRes.ok && processRes.outcome === "SUCCESS") {
-              transactionRetrievalsSucceeded++;
-              decodedSwapsCount += processRes.diagnostics.ingestedCount ?? 1;
+            if (probeActive && !isProbeTerminated && !overallAbortController.signal.aborted) {
+              sampledTransactionAudits.push(processRes.diagnostics);
+              if (processRes.ok && processRes.outcome === "SUCCESS") {
+                transactionRetrievalsSucceeded++;
+                decodedSwapsCount += processRes.diagnostics.ingestedCount ?? 1;
+              }
             }
           }
         } catch {
           // Handled fail-closed inside adapter
         }
+
+        if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+          if (probeActive && !isProbeTerminated) {
+            terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+          }
+          break;
+        }
       } else {
-        if (!isStreamingActive || !probeActive) {
+        if (!isStreamingActive || !probeActive || isProbeTerminated) {
           // Streaming has ended and queue is drained
           break;
         }
@@ -1158,6 +1265,8 @@ export async function executeTransportObservationProbe(
       }
     }
   };
+
+  const drainWorkerPromise = drainWorker();
 
   // Allocate streaming duration within overall maximum
   const reconciliationReservationMs = Math.min(10_000, Math.floor(durationMs * 0.2));
@@ -1173,7 +1282,7 @@ export async function executeTransportObservationProbe(
   });
 
   // Race streaming phase against drain worker
-  await Promise.race([streamingPhasePromise, drainWorker()]);
+  await Promise.race([streamingPhasePromise, drainWorkerPromise]);
 
   if (streamingTimer) clearTimeout(streamingTimer);
 
@@ -1188,7 +1297,7 @@ export async function executeTransportObservationProbe(
   }
 
   // Settle any remaining queued transaction retrieval work within deadline
-  await drainWorker();
+  await drainWorkerPromise;
 
   // 9. Bounded History Discovery Phase (Strictly within overall deadline)
   let historyQueriesAttempted = 0;
@@ -1228,89 +1337,135 @@ export async function executeTransportObservationProbe(
         historyQueriesAttempted++;
 
         if (config.historyPageFetcher) {
-          const records = await config.historyPageFetcher.fetchPage(params);
-          for (const r of records) {
-            fetchedHistoryRecords.set(r.signature, r);
+          const reqSent = clock();
+          let recordsDiscovered = 0;
+          let auditError: string | undefined;
+          try {
+            const records = await config.historyPageFetcher.fetchPage(params);
+            recordsDiscovered = records.length;
+            for (const r of records) {
+              fetchedHistoryRecords.set(r.signature, r);
+            }
+            return records;
+          } catch (err: unknown) {
+            auditError = err instanceof Error ? err.message : String(err);
+            throw err;
+          } finally {
+            const reqEnd = clock();
+            historyQueryAudits.push({
+              pageIndex: historyQueriesAttempted,
+              address: params.address,
+              limit: params.limit,
+              ...(params.before ? { before: params.before } : {}),
+              requestSentAtMs: reqSent,
+              headersReceivedAtMs: reqEnd,
+              responseReceivedAtMs: reqEnd,
+              durationMs: reqEnd - reqSent,
+              httpStatus: auditError ? null : 200,
+              responseSha256: null,
+              recordsDiscovered,
+              ...(auditError ? { error: auditError } : {}),
+            });
           }
-          return records;
         }
 
         const reqSent = clock();
-        const body = JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignaturesForAddress",
-          params: [
-            params.address,
-            {
-              limit: params.limit,
-              before: params.before,
-              commitment: "confirmed",
-            },
-          ],
-        });
+        let headersReceivedAtMs: number | undefined;
+        let responseReceivedAtMs: number | null = null;
+        let httpStatus: number | null = null;
+        let responseSha256: string | null = null;
+        let recordsDiscovered = 0;
+        let auditError: string | undefined;
 
-        const resp = await boundedFetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          ...(params.signal ? { signal: params.signal } : {}),
-        });
-
-        const reqReceived = clock();
-        if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-        }
-
-        const rawText = await resp.text();
-        const responseSha256 = computeSha256(rawText);
-
-        let parsedJson: unknown;
         try {
-          parsedJson = JSON.parse(rawText);
-        } catch {
-          throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
+          const body = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getSignaturesForAddress",
+            params: [
+              params.address,
+              {
+                limit: params.limit,
+                before: params.before,
+                commitment: "confirmed",
+              },
+            ],
+          });
+
+          const resp = await boundedFetch(rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            ...(params.signal ? { signal: params.signal } : {}),
+          });
+
+          headersReceivedAtMs = clock();
+          httpStatus = resp.status;
+
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+          }
+
+          const rawText = await resp.text();
+          responseReceivedAtMs = clock();
+          responseSha256 = computeSha256(rawText);
+
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(rawText);
+          } catch {
+            throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
+          }
+
+          if (!parsedJson || typeof parsedJson !== "object") {
+            throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
+          }
+
+          const rpcObj = parsedJson as {
+            jsonrpc?: unknown;
+            error?: { code?: unknown; message?: unknown };
+            result?: unknown;
+          };
+
+          if (rpcObj.error) {
+            const msg =
+              typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
+            throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
+          }
+
+          if (!Array.isArray(rpcObj.result)) {
+            throw new Error(
+              "MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress",
+            );
+          }
+
+          const records = rpcObj.result as HistorySignatureRecord[];
+          recordsDiscovered = records.length;
+          for (const r of records) {
+            fetchedHistoryRecords.set(r.signature, r);
+          }
+
+          return records;
+        } catch (err: unknown) {
+          auditError = err instanceof Error ? err.message : String(err);
+          throw err;
+        } finally {
+          const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+          historyQueryAudits.push({
+            pageIndex: historyQueriesAttempted,
+            address: params.address,
+            limit: params.limit,
+            ...(params.before ? { before: params.before } : {}),
+            requestSentAtMs: reqSent,
+            ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+            responseReceivedAtMs,
+            durationMs: durationEnd - reqSent,
+            httpStatus,
+            responseSha256,
+            recordsDiscovered,
+            ...(auditError ? { error: auditError } : {}),
+          });
         }
-
-        if (!parsedJson || typeof parsedJson !== "object") {
-          throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
-        }
-
-        const rpcObj = parsedJson as {
-          jsonrpc?: unknown;
-          error?: { code?: unknown; message?: unknown };
-          result?: unknown;
-        };
-
-        if (rpcObj.error) {
-          const msg =
-            typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
-          throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
-        }
-
-        if (!Array.isArray(rpcObj.result)) {
-          throw new Error("MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress");
-        }
-
-        const records = rpcObj.result as HistorySignatureRecord[];
-        for (const r of records) {
-          fetchedHistoryRecords.set(r.signature, r);
-        }
-
-        historyQueryAudits.push({
-          pageIndex: historyQueriesAttempted,
-          address: params.address,
-          limit: params.limit,
-          before: params.before,
-          requestSentAtMs: reqSent,
-          responseReceivedAtMs: reqReceived,
-          durationMs: reqReceived - reqSent,
-          httpStatus: resp.status,
-          responseSha256,
-          recordsDiscovered: records.length,
-        });
-
-        return records;
       },
     };
 
@@ -1380,27 +1535,34 @@ export async function executeTransportObservationProbe(
 
   // Ensure Probe Termination and Settle Workers
   terminateProbe(
-    probeState.terminationReason === "UNKNOWN" ? "DURATION_EXPIRED" : probeState.terminationReason,
+    probeState.terminationReason === "UNKNOWN"
+      ? clock() >= overallDeadlineEpoch
+        ? "DURATION_EXPIRED"
+        : "COMPLETED"
+      : probeState.terminationReason,
   );
   clearTimeout(overallTimer);
-  await Promise.allSettled([drainWorker()]);
+  await drainWorkerPromise;
 
   // 10. Accurate Accounting & Outcome Classification
   const finalTerminationReason = probeState.terminationReason;
   const isCapTerminated =
     finalTerminationReason === "MESSAGE_LIMIT_REACHED" ||
     finalTerminationReason === "PAYLOAD_LIMIT_REACHED" ||
-    finalTerminationReason === "HTTP_BUDGET_EXHAUSTED";
+    finalTerminationReason === "HTTP_BUDGET_EXHAUSTED" ||
+    finalTerminationReason === "TRANSACTION_LIMIT_REACHED";
 
   const isObservationSuccess =
     finalTerminationReason !== "TRANSPORT_ERROR" &&
     finalTerminationReason !== "TRANSPORT_DISCONNECT" &&
-    finalTerminationReason !== "QUEUE_LIMIT_EXCEEDED";
+    finalTerminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
+    finalTerminationReason !== "MANUAL_CANCEL";
 
   let finalStatus: TransportProbeStatus;
   if (
     finalTerminationReason === "TRANSPORT_ERROR" ||
-    finalTerminationReason === "TRANSPORT_DISCONNECT"
+    finalTerminationReason === "TRANSPORT_DISCONNECT" ||
+    finalTerminationReason === "MANUAL_CANCEL"
   ) {
     finalStatus = "TRANSPORT_ERROR";
   } else if (finalTerminationReason === "QUEUE_LIMIT_EXCEEDED") {
@@ -1569,20 +1731,37 @@ export async function executeTransportObservationProbe(
     },
   });
 
+  // Freeze telemetry and audit arrays to prevent any post-finalization mutations
+  Object.freeze(sampledTransactionAudits);
+  for (const item of sampledTransactionAudits) {
+    Object.freeze(item);
+  }
+  Object.freeze(historyQueryAudits);
+  for (const item of historyQueryAudits) {
+    Object.freeze(item);
+  }
+  Object.freeze(wsWitnessedList);
+  Object.freeze(historyWitnessedList);
+
   // 12. Write and Seal Evidence Files
   fsSync.writeFileSync(
     path.join(targetDir, "capture-metadata.json"),
-    JSON.stringify(metadata, null, 2),
+    serializeJsonSafe(metadata, 2),
     "utf8",
   );
   fsSync.writeFileSync(
     path.join(targetDir, "probe-summary.json"),
-    JSON.stringify(summary, null, 2),
+    serializeJsonSafe(summary, 2),
     "utf8",
   );
   fsSync.writeFileSync(
     path.join(targetDir, "witnessed-signatures.json"),
-    JSON.stringify(witnessedEvidence, null, 2),
+    serializeJsonSafe(witnessedEvidence, 2),
+    "utf8",
+  );
+  fsSync.writeFileSync(
+    path.join(targetDir, "sampled-transactions.json"),
+    serializeJsonSafe(sampledTransactionAudits, 2),
     "utf8",
   );
 
