@@ -99,7 +99,7 @@ async function main(): Promise<void> {
     console.log(`Target Directory:     ${result.targetDir}`);
     console.log(`HTTP Status:          ${result.metadata.httpStatus}`);
     console.log(`Duration:             ${result.metadata.executionDurationMs} ms`);
-    console.log(`Received Wire SHA256: ${result.metadata.receivedWireSha256}`);
+    console.log(`Received Wire SHA256: ${result.metadata.receivedWireSha256 ?? "UNAVAILABLE"}`);
     console.log(`Saved Evidence SHA256:${result.metadata.savedEvidenceSha256}`);
     console.log(`Entries Digest:       ${result.manifest.entriesDigestSha256}`);
     console.log(`Manifest File SHA256: ${result.manifest.manifestFileSha256}`);
@@ -114,6 +114,9 @@ async function main(): Promise<void> {
     console.error(`Message:          ${result.message}`);
     if (result.targetDir) {
       console.error(`Evidence Dir:     ${result.targetDir}`);
+    }
+    if (result.manifest) {
+      console.error(`Manifest File SHA256: ${result.manifest.manifestFileSha256}`);
     }
     process.exit(1);
   }

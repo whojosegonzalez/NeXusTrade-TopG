@@ -6,6 +6,7 @@ import {
   captureSolanaTrackerBundlers,
   computeSha256,
   createStandaloneOneRequestBudget,
+  createTransportResponseFromFetchResponse,
   parseBundlerCaptureArgs,
   SOLANA_TRACKER_DATA_API_BASE_URL,
   type HttpTransport,
@@ -428,7 +429,7 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
       }
     });
 
-    it("accurately separates and labels entriesDigestSha256 and actual manifestFileSha256", async () => {
+    it("accurately separates and labels entriesDigestSha256 and actual manifestFileSha256 and seals all evidence", async () => {
       const payloadBuf = Buffer.from(JSON.stringify(createValidBundlerPayload()), "utf8");
       const transport = createFakeTransport(() => ({
         status: 200,
@@ -464,9 +465,30 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
         // The entries digest and the file hash must NOT be falsely equated
         expect(result.manifest.entriesDigestSha256).not.toBe(result.manifest.manifestFileSha256);
 
-        // Metadata records both
-        expect(result.metadata.entriesDigestSha256).toBe(result.manifest.entriesDigestSha256);
-        expect(result.metadata.manifestFileSha256).toBe(actualFileHash);
+        // Correction 1: Manifest covers every intended evidence file
+        const manifestFilenames = result.manifest.files.map((f) => f.filename).sort();
+        expect(manifestFilenames).toEqual([
+          "capture-metadata.json",
+          "parser-result.json",
+          "sanitized-response.json",
+        ]);
+
+        // Each recorded size and hash in manifest must match the final bytes on disk
+        for (const fileEntry of result.manifest.files) {
+          const filePath = path.join(outDir, fileEntry.filename);
+          const onDiskBytes = fsSync.readFileSync(filePath);
+          expect(onDiskBytes.length).toBe(fileEntry.byteSize);
+          expect(computeSha256(onDiskBytes)).toBe(fileEntry.sha256);
+        }
+
+        // Circular dependency prevention: capture-metadata.json on disk does NOT contain back-reference hashes
+        const savedMetaJson = fsSync.readFileSync(
+          path.join(outDir, "capture-metadata.json"),
+          "utf8",
+        );
+        const parsedMeta = JSON.parse(savedMetaJson);
+        expect(parsedMeta.entriesDigestSha256).toBeUndefined();
+        expect(parsedMeta.manifestFileSha256).toBeUndefined();
       } finally {
         fsSync.rmSync(outDir, { recursive: true, force: true });
       }
@@ -718,6 +740,273 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
         expect(fsSync.existsSync(path.join(outDir, "capture-metadata.json"))).toBe(true);
         expect(fsSync.existsSync(path.join(outDir, "parser-result.json"))).toBe(true);
         expect(fsSync.existsSync(path.join(outDir, "capture-manifest.json"))).toBe(true);
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("Correction 2: Sanitized Failure Messages & Precise wasRedacted Tracking", () => {
+    it("sanitizes returned failure message, statusText, and all saved artifacts when key is in statusText", async () => {
+      const secretStatusText = `Forbidden - unauthorized key: ${FAKE_API_KEY}`;
+      const transport = createFakeTransport(() => ({
+        status: 403,
+        statusText: secretStatusText,
+        headers: {},
+        readBodyBytes: async () => Buffer.from(`{"error":"access denied for ${FAKE_API_KEY}"}`),
+      }));
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          // Assert returned message is sanitized
+          expect(result.message).not.toContain(FAKE_API_KEY);
+          expect(result.message).toContain("[REDACTED]");
+        }
+
+        // Assert full returned object is sanitized
+        const resultStr = JSON.stringify(result);
+        expect(resultStr).not.toContain(FAKE_API_KEY);
+
+        // Assert all files on disk are sanitized
+        const files = fsSync.readdirSync(outDir);
+        for (const file of files) {
+          const content = fsSync.readFileSync(path.join(outDir, file), "utf8");
+          expect(content).not.toContain(FAKE_API_KEY);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("tracks wasRedacted: false on clean formatted JSON responses", async () => {
+      const cleanPayload = createValidBundlerPayload();
+      const payloadBuf = Buffer.from(JSON.stringify(cleanPayload), "utf8");
+      const transport = createFakeTransport(() => ({
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json" },
+        readBodyBytes: async () => payloadBuf,
+      }));
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(true);
+        if (!result.success || result.dryRun) return;
+
+        // Must report false because no secret was present or redacted
+        expect(result.metadata.wasRedacted).toBe(false);
+
+        const savedMeta = JSON.parse(
+          fsSync.readFileSync(path.join(outDir, "capture-metadata.json"), "utf8"),
+        );
+        expect(savedMeta.wasRedacted).toBe(false);
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("tracks wasRedacted: true when secrets are removed from JSON payload", async () => {
+      const dirtyPayload = {
+        ...createValidBundlerPayload(),
+        embeddedSecret: FAKE_API_KEY,
+      };
+      const payloadBuf = Buffer.from(JSON.stringify(dirtyPayload), "utf8");
+      const transport = createFakeTransport(() => ({
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json" },
+        readBodyBytes: async () => payloadBuf,
+      }));
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(true);
+        if (!result.success || result.dryRun) return;
+
+        expect(result.metadata.wasRedacted).toBe(true);
+        const savedMeta = JSON.parse(
+          fsSync.readFileSync(path.join(outDir, "capture-metadata.json"), "utf8"),
+        );
+        expect(savedMeta.wasRedacted).toBe(true);
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("Correction 3: Partial-Response Evidence & Unread Body Cancellation Regressions", () => {
+    it("retains bounded partial bytes, count, and wire digest on streaming overflow using production streaming reader", async () => {
+      let streamCancelled = false;
+
+      // Stream two 8-byte chunks (total 16 bytes) against a 12-byte limit
+      const chunk1 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const chunk2 = new Uint8Array([9, 10, 11, 12, 13, 14, 15, 16]);
+      const expected16Bytes = Buffer.concat([Buffer.from(chunk1), Buffer.from(chunk2)]);
+
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk1);
+          controller.enqueue(chunk2);
+        },
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: {},
+      });
+
+      const transport: HttpTransport = async () =>
+        createTransportResponseFromFetchResponse(response);
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          maxResponseSizeBytes: 12, // 12-byte limit
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.status).toBe("RESPONSE_TOO_LARGE");
+          expect(result.metadata?.isTruncated).toBe(true);
+          // Accurately records the 16 bytes read before overflow
+          expect(result.metadata?.receivedBytesCount).toBe(16);
+          expect(result.metadata?.receivedWireSha256).toBe(computeSha256(expected16Bytes));
+          // Proves it does NOT describe an empty-buffer digest
+          expect(result.metadata?.receivedWireSha256).not.toBe(computeSha256(Buffer.alloc(0)));
+
+          // Stream was cancelled on overflow
+          expect(streamCancelled).toBe(true);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancels unread body and aborts signal on early Content-Length rejection without empty-buffer hash", async () => {
+      let streamCancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start() {},
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "5000000" }, // 5 MB > 2 MB limit
+      });
+
+      let transportSignal: AbortSignal | undefined;
+      const transport: HttpTransport = async (_url, options) => {
+        transportSignal = options.signal;
+        return createTransportResponseFromFetchResponse(response);
+      };
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          maxResponseSizeBytes: 2000000,
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.status).toBe("RESPONSE_TOO_LARGE");
+          expect(result.metadata?.isTruncated).toBe(true);
+          expect(result.metadata?.receivedBytesCount).toBe(0);
+          // Explicitly reports unavailable capture information (null), NOT empty-buffer hash
+          expect(result.metadata?.receivedWireSha256).toBeNull();
+
+          // Body stream cancelled and transport signal aborted
+          expect(streamCancelled).toBe(true);
+          expect(transportSignal?.aborted).toBe(true);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancels unread body and aborts signal on early redirect rejection without empty-buffer hash", async () => {
+      let streamCancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start() {},
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 301,
+        statusText: "Moved Permanently",
+        headers: { location: "https://evil.com" },
+      });
+
+      let transportSignal: AbortSignal | undefined;
+      const transport: HttpTransport = async (_url, options) => {
+        transportSignal = options.signal;
+        return createTransportResponseFromFetchResponse(response);
+      };
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.status).toBe("REDIRECT_REJECTED");
+          expect(result.metadata?.receivedBytesCount).toBe(0);
+          expect(result.metadata?.receivedWireSha256).toBeNull();
+
+          // Stream was cancelled and signal was aborted
+          expect(streamCancelled).toBe(true);
+          expect(transportSignal?.aborted).toBe(true);
+        }
       } finally {
         fsSync.rmSync(outDir, { recursive: true, force: true });
       }

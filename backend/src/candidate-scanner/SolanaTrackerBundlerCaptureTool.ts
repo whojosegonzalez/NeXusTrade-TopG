@@ -78,11 +78,104 @@ export function createStandaloneOneRequestBudget(
   });
 }
 
+export class ResponseTooLargeError extends Error {
+  readonly partialBytes: Buffer;
+  readonly totalBytesRead: number;
+
+  constructor(message: string, partialBytes: Buffer, totalBytesRead: number) {
+    super(message);
+    this.name = "ResponseTooLargeError";
+    this.partialBytes = partialBytes;
+    this.totalBytesRead = totalBytesRead;
+  }
+}
+
+/**
+ * Reads bytes from a ReadableStream<Uint8Array> up to maxBytes, enforcing streaming bounds.
+ * Aborts and cancels the reader immediately if maxBytes is exceeded, retaining the partial bytes read.
+ */
+export async function readStreamWithLimit(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  let abortListener: (() => void) | undefined;
+  let abortPromise: Promise<never> | undefined;
+
+  if (signal) {
+    abortPromise = new Promise<never>((_, reject) => {
+      if (signal.aborted) {
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        reject(err);
+        return;
+      }
+      abortListener = () => {
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        reject(err);
+      };
+      signal.addEventListener("abort", abortListener, { once: true });
+    });
+  }
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        await reader.cancel(signal.reason);
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+
+      const readPromise = reader.read();
+      const { done, value } = abortPromise
+        ? await Promise.race([readPromise, abortPromise])
+        : await readPromise;
+
+      if (done) break;
+      if (value) {
+        totalBytes += value.byteLength;
+        chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+        if (totalBytes > maxBytes) {
+          const partialBytes = Buffer.concat(chunks);
+          await reader.cancel(
+            new Error(`Response body size exceeded maximum limit of ${maxBytes} bytes.`),
+          );
+          throw new ResponseTooLargeError(
+            `Response body size exceeded maximum limit of ${maxBytes} bytes (read ${totalBytes} bytes).`,
+            partialBytes,
+            totalBytes,
+          );
+        }
+      }
+    }
+    return Buffer.concat(chunks);
+  } catch (err) {
+    try {
+      await reader.cancel(err);
+    } catch {
+      // ignore
+    }
+    throw err;
+  } finally {
+    if (signal && abortListener) {
+      signal.removeEventListener("abort", abortListener);
+    }
+    reader.releaseLock();
+  }
+}
+
 export interface HttpTransportResponse {
   readonly status: number;
   readonly statusText: string;
   readonly headers: Record<string, string>;
   readonly readBodyBytes: (maxBytes: number, signal?: AbortSignal) => Promise<Buffer>;
+  readonly cancelBody?: (reason?: unknown) => Promise<void>;
 }
 
 export type HttpTransport = (
@@ -93,6 +186,32 @@ export type HttpTransport = (
     readonly signal?: AbortSignal;
   },
 ) => Promise<HttpTransportResponse>;
+
+/**
+ * Converts a standard Web API fetch Response into an HttpTransportResponse with streaming reader and cancelBody.
+ */
+export function createTransportResponseFromFetchResponse(resp: Response): HttpTransportResponse {
+  return {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: Object.fromEntries(resp.headers.entries()),
+    cancelBody: async (reason?: unknown) => {
+      if (resp.body && !resp.body.locked) {
+        try {
+          await resp.body.cancel(reason);
+        } catch {
+          // ignore
+        }
+      }
+    },
+    readBodyBytes: async (maxBytes: number, signal?: AbortSignal) => {
+      if (!resp.body) {
+        return Buffer.alloc(0);
+      }
+      return readStreamWithLimit(resp.body, maxBytes, signal);
+    },
+  };
+}
 
 /**
  * Production fetch transport wrapping global fetch with manual redirect rejection and streaming body reader.
@@ -107,46 +226,7 @@ export const defaultFetchTransport: HttpTransport = async (url, options) => {
     init.signal = options.signal;
   }
   const resp = await fetch(url, init);
-  return {
-    status: resp.status,
-    statusText: resp.statusText,
-    headers: Object.fromEntries(resp.headers.entries()),
-    readBodyBytes: async (maxBytes: number, signal?: AbortSignal) => {
-      if (!resp.body) {
-        return Buffer.alloc(0);
-      }
-      const reader = resp.body.getReader();
-      const chunks: Buffer[] = [];
-      let totalBytes = 0;
-      try {
-        while (true) {
-          if (signal?.aborted) {
-            await reader.cancel();
-            const err = new Error("Operation aborted");
-            err.name = "AbortError";
-            throw err;
-          }
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            totalBytes += value.byteLength;
-            if (totalBytes > maxBytes) {
-              await reader.cancel();
-              const err = new Error(
-                `Response body size exceeded maximum limit of ${maxBytes} bytes (read ${totalBytes} bytes).`,
-              );
-              err.name = "ResponseTooLargeError";
-              throw err;
-            }
-            chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-          }
-        }
-        return Buffer.concat(chunks);
-      } finally {
-        reader.releaseLock();
-      }
-    },
-  };
+  return createTransportResponseFromFetchResponse(resp);
 };
 
 export interface BundlerCaptureConfig {
@@ -187,11 +267,9 @@ export interface BundlerCaptureMetadata {
   readonly localRetrievedAtMs: number;
   readonly executionDurationMs: number;
   readonly receivedBytesCount: number;
-  readonly receivedWireSha256: string;
+  readonly receivedWireSha256: string | null;
   readonly wasRedacted: boolean;
   readonly savedEvidenceSha256: string;
-  readonly entriesDigestSha256: string | null;
-  readonly manifestFileSha256: string | null;
   readonly isTruncated: boolean;
   readonly isUtf8Valid: boolean;
   readonly status: BundlerCaptureStatus;
@@ -414,6 +492,34 @@ function sealCaptureManifest(
 }
 
 /**
+ * Safely cancels and aborts an unread or rejected HTTP response body, bounded by the capture deadline.
+ */
+async function cleanupUnreadBody(
+  response: HttpTransportResponse | undefined,
+  abortController: AbortController,
+  deadlinePromise: Promise<never>,
+): Promise<void> {
+  if (!abortController.signal.aborted) {
+    try {
+      abortController.abort(new Error("Capture terminated early; connection aborted"));
+    } catch {
+      // ignore
+    }
+  }
+
+  if (response && typeof response.cancelBody === "function") {
+    try {
+      await Promise.race([
+        response.cancelBody(new Error("Capture terminated early; unread body discarded")),
+        deadlinePromise,
+      ]);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
  * Executes a bounded one-shot bundler capture for an explicitly selected mint.
  */
 export async function captureSolanaTrackerBundlers(
@@ -584,6 +690,7 @@ export async function captureSolanaTrackerBundlers(
     return Promise.race([operation, deadlinePromise]);
   };
 
+  let response: HttpTransportResponse | undefined;
   let rawWireBytes: Buffer = Buffer.alloc(0);
   let httpStatus: number | null = null;
   let localResponseTimeMs: number | null = null;
@@ -599,7 +706,7 @@ export async function captureSolanaTrackerBundlers(
     };
 
     // Race header acquisition against deadline
-    const response = await raceWithDeadline(
+    response = await raceWithDeadline(
       transport(providerUrl, {
         method: "GET",
         headers,
@@ -620,7 +727,10 @@ export async function captureSolanaTrackerBundlers(
     // Reject HTTP redirects immediately without following
     if (httpStatus >= 300 && httpStatus < 400) {
       captureStatus = "REDIRECT_REJECTED";
-      errorMessage = `HTTP redirects are strictly prohibited. Received status: ${httpStatus}`;
+      const sanitizedStatusText = redactSensitiveText(response.statusText ?? "", secretsToRedact);
+      errorMessage =
+        `HTTP redirects are strictly prohibited. Received status: ${httpStatus} ${sanitizedStatusText}`.trim();
+      await cleanupUnreadBody(response, abortController, deadlinePromise);
     } else {
       // Check Content-Length header against max size before reading body
       const contentLengthHeader = response.headers["content-length"];
@@ -630,14 +740,20 @@ export async function captureSolanaTrackerBundlers(
           captureStatus = "RESPONSE_TOO_LARGE";
           errorMessage = `Response Content-Length (${contentLength} bytes) exceeds limit of ${maxResponseSizeBytes} bytes.`;
           isTruncated = true;
+          await cleanupUnreadBody(response, abortController, deadlinePromise);
         }
       }
 
       if (captureStatus === "SUCCESS") {
         // Race streaming body read against deadline with byte-level limit
-        rawWireBytes = await raceWithDeadline(
-          response.readBodyBytes(maxResponseSizeBytes, abortController.signal),
-        );
+        try {
+          rawWireBytes = await raceWithDeadline(
+            response.readBodyBytes(maxResponseSizeBytes, abortController.signal),
+          );
+        } catch (readErr: unknown) {
+          await cleanupUnreadBody(response, abortController, deadlinePromise);
+          throw readErr;
+        }
 
         if (clock() >= deadlineMs || isTimedOut) {
           const err = new Error(`Request timed out after ${timeoutMs} ms`);
@@ -647,7 +763,12 @@ export async function captureSolanaTrackerBundlers(
 
         if (httpStatus !== 200) {
           captureStatus = "HTTP_ERROR";
-          errorMessage = `Provider returned non-200 HTTP status: ${httpStatus} ${response.statusText}`;
+          const sanitizedStatusText = redactSensitiveText(
+            response.statusText ?? "",
+            secretsToRedact,
+          );
+          errorMessage =
+            `Provider returned non-200 HTTP status: ${httpStatus} ${sanitizedStatusText}`.trim();
         }
       }
     }
@@ -665,9 +786,19 @@ export async function captureSolanaTrackerBundlers(
       isTruncated = true;
     } else if (errName === "ResponseTooLargeError") {
       captureStatus = "RESPONSE_TOO_LARGE";
+      isTruncated = true;
+      if (err instanceof ResponseTooLargeError) {
+        rawWireBytes = err.partialBytes;
+      } else if (
+        err &&
+        typeof err === "object" &&
+        "partialBytes" in err &&
+        Buffer.isBuffer((err as { partialBytes: unknown }).partialBytes)
+      ) {
+        rawWireBytes = (err as { partialBytes: Buffer }).partialBytes;
+      }
       const rawMsg = err instanceof Error ? err.message : String(err);
       errorMessage = redactSensitiveText(rawMsg, secretsToRedact);
-      isTruncated = true;
     } else {
       captureStatus = "NETWORK_ERROR";
       const rawMsg = err instanceof Error ? err.message : String(err);
@@ -681,7 +812,12 @@ export async function captureSolanaTrackerBundlers(
 
   // 10. Compute received byte count and raw wire digest directly from bytes before decoding
   const receivedBytesCount = rawWireBytes.length;
-  const receivedWireSha256 = computeSha256(rawWireBytes);
+  const receivedWireSha256: string | null =
+    rawWireBytes.length > 0
+      ? computeSha256(rawWireBytes)
+      : captureStatus === "SUCCESS"
+        ? computeSha256(rawWireBytes)
+        : null;
 
   // 11. Decode text and redact response body before saving to disk
   let rawWireText = "";
@@ -703,20 +839,24 @@ export async function captureSolanaTrackerBundlers(
   let sanitizedResponseBody = "";
   let parsedJsonValue: unknown = undefined;
   let isJson = false;
+  let wasRedacted = false;
 
   try {
     parsedJsonValue = JSON.parse(rawWireText);
     isJson = true;
     const sanitizedObj = deepRedactSensitiveObject(parsedJsonValue, secretsToRedact);
     sanitizedResponseBody = JSON.stringify(sanitizedObj, null, 2);
-    // Also run regex redaction on serialized string
     sanitizedResponseBody = redactSensitiveText(sanitizedResponseBody, secretsToRedact);
+
+    // Track actual redaction separately from serialization formatting
+    const unredactedCanonical = JSON.stringify(parsedJsonValue, null, 2);
+    wasRedacted = unredactedCanonical !== sanitizedResponseBody;
   } catch {
     // Non-JSON response text: redact directly
     sanitizedResponseBody = redactSensitiveText(rawWireText, secretsToRedact);
+    wasRedacted = rawWireText !== sanitizedResponseBody;
   }
 
-  const wasRedacted = sanitizedResponseBody !== rawWireText;
   const savedEvidenceSha256 = computeSha256(sanitizedResponseBody);
 
   // 12. Parse response through SolanaTrackerBundlerParser (if 200 OK and valid JSON)
@@ -748,12 +888,17 @@ export async function captureSolanaTrackerBundlers(
     ? deepRedactSensitiveObject(parserResult, secretsToRedact)
     : undefined;
 
-  // 13. Write sanitized evidence files into exclusively reserved destination directory
+  const sanitizedErrorMessage = errorMessage
+    ? redactSensitiveText(errorMessage, secretsToRedact)
+    : null;
+
+  // 13. Write sanitized-response.json into exclusively reserved destination directory
   fsSync.writeFileSync(path.join(targetDir, "sanitized-response.json"), sanitizedResponseBody, {
     encoding: "utf8",
     flag: "wx",
   });
 
+  // 14. Write parser-result.json if present
   if (sanitizedParserResult) {
     fsSync.writeFileSync(
       path.join(targetDir, "parser-result.json"),
@@ -762,9 +907,7 @@ export async function captureSolanaTrackerBundlers(
     );
   }
 
-  // 14. Seal manifest with file hashes and accurate labeling
-  const manifest = sealCaptureManifest(targetDir, mint, localRequestTimeIso);
-
+  // 15. Write capture-metadata.json BEFORE sealing manifest to avoid circular hash dependency
   const metadata: BundlerCaptureMetadata = {
     requestedMint: mint,
     providerUrl,
@@ -777,12 +920,10 @@ export async function captureSolanaTrackerBundlers(
     receivedWireSha256,
     wasRedacted,
     savedEvidenceSha256,
-    entriesDigestSha256: manifest.entriesDigestSha256,
-    manifestFileSha256: manifest.manifestFileSha256,
     isTruncated,
     isUtf8Valid,
     status: captureStatus,
-    errorMessage: errorMessage ? redactSensitiveText(errorMessage, secretsToRedact) : null,
+    errorMessage: sanitizedErrorMessage,
     disclaimer:
       "PROVIDER_REPORTED_UNVERIFIED: Capture does not establish provider accuracy, complete launch history, strategy eligibility, or production trade-flow completeness. Gate 11 remains fail-closed.",
   };
@@ -793,8 +934,11 @@ export async function captureSolanaTrackerBundlers(
     { encoding: "utf8", flag: "wx" },
   );
 
+  // 16. Seal manifest with file hashes (covers sanitized-response.json, capture-metadata.json, and parser-result.json)
+  const manifest = sealCaptureManifest(targetDir, mint, localRequestTimeIso);
+
   if (captureStatus === "SUCCESS" && sanitizedParserResult?.success) {
-    return {
+    const successResult: BundlerCaptureSuccessResult = {
       success: true,
       dryRun: false,
       status: "SUCCESS",
@@ -803,18 +947,20 @@ export async function captureSolanaTrackerBundlers(
       parserResult: sanitizedParserResult,
       manifest,
     };
+    return deepRedactSensitiveObject(successResult, secretsToRedact);
   }
 
-  return {
+  const failureResult: BundlerCaptureFailureResult = {
     success: false,
     dryRun: false,
     status: captureStatus,
-    message: errorMessage ?? `Capture failed with status: ${captureStatus}`,
+    message: sanitizedErrorMessage ?? `Capture failed with status: ${captureStatus}`,
     targetDir,
     metadata,
     parserResult: sanitizedParserResult,
     manifest,
   };
+  return deepRedactSensitiveObject(failureResult, secretsToRedact);
 }
 
 /**
