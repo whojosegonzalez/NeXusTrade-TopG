@@ -216,14 +216,14 @@ Workload modeling must be based on explicit operational formulas, distinguishing
 
 To prevent provider pressure and avoid 429 throttling, NeXusTrade configures operating limits well below advertised provider maximums:
 
-| Provider        | Documented / Advertised Maximum                                                   | NeXusTrade Configured Limit                                                                                                             | Enforcing Component                            | Code Location                                                                                                     |
-| :-------------- | :-------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
-| **Solana RPC**  | 40 req/10s (public) or 50 RPS (paid)                                              | **$\ge 2,500\text{ ms}$ spacing** ($\le 24\text{ req/min}$), **25–50 req/session ceiling** (default 120)                                | `GlobalResourceBudgetManager`                  | `backend/src/research/prospective/GlobalResourceBudgetManager.ts`                                                 |
-| **Jupiter**     | 1 RPS (free) or 10 RPS (Dev $25/mo)                                               | **$\le 48\text{ live req/min}$**, **1,250 ms base interval**, priority queue with cooldown backoff                                      | `JupiterDemandController`, `providerConfig.ts` | `backend/src/providers/config/providerConfig.ts:590-596`                                                          |
-| **Raydium**     | Cloudflare throttled (sustained $> 120\text{ req/min}$ advised to run own engine) | **$\le 60\text{ req/min}$**, negative caching (30s TTL), venue guard preflight                                                          | `providerConfig.ts`, `QuoteProviderRouter`     | `backend/src/providers/config/providerConfig.ts:130`                                                              |
-| **Birdeye**     | 1 RPS, 30,000 CUs/month                                                           | **Per-run budget**: $\le 60\text{ req/run}$, $\le 1,200\text{ CUs/run}$; reserves **20 CUs/overview**, **3 CUs/price**; `minScore = 50` | `BirdeyeAdapter`, `BirdeyeBudgetTracker`       | `backend/src/providers/birdeye/BirdeyeAdapter.ts:164`<br>`backend/src/providers/config/providerConfig.ts:702-705` |
-| **DexScreener** | 60 req/min (profiles/boosts), 300 req/min (pairs)                                 | **5-second polling interval** for discovery intake scanner                                                                              | `CandidateStreamEngine`                        | `backend/src/candidate-scanner/CandidateStreamEngine.ts`                                                          |
-| **RugCheck**    | Cached reports only (public rate limits UNVERIFIED)                               | **Single call per preliminary candidate**                                                                                               | `BuyGateTriggerService`                        | `backend/src/candidate-scanner/BuyGateTriggerService.ts`                                                          |
+| Provider        | Documented / Advertised Maximum                                                   | NeXusTrade Configured Limit                                                                                                                                                                                                                                     | Enforcing Component                            | Code Location                                                                                                     |
+| :-------------- | :-------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **Solana RPC**  | 40 req/10s (public) or 50 RPS (paid)                                              | • **$\ge 2,500\text{ ms}$ spacing** ($\le 24\text{ req/min}$)<br>• **`maxTotalRequests`**: default 120 (pilot sessions configure 25–50)<br>• **`maxEnrichmentAttempts`**: **default 10**<br>• **`minReservedForwardRequests`**: default 4 (reserved for quotes) | `GlobalResourceBudgetManager`                  | `backend/src/research/prospective/GlobalResourceBudgetManager.ts`                                                 |
+| **Jupiter**     | 1 RPS (free) or 10 RPS (Dev $25/mo)                                               | **$\le 48\text{ live req/min}$**, **1,250 ms base interval**, priority queue with cooldown backoff                                                                                                                                                              | `JupiterDemandController`, `providerConfig.ts` | `backend/src/providers/config/providerConfig.ts:590-596`                                                          |
+| **Raydium**     | Cloudflare throttled (sustained $> 120\text{ req/min}$ advised to run own engine) | **$\le 60\text{ req/min}$**, negative caching (30s TTL), venue guard preflight                                                                                                                                                                                  | `providerConfig.ts`, `QuoteProviderRouter`     | `backend/src/providers/config/providerConfig.ts:130`                                                              |
+| **Birdeye**     | 1 RPS, 30,000 CUs/month                                                           | **Per-run budget**: $\le 60\text{ req/run}$, $\le 1,200\text{ CUs/run}$; reserves **20 CUs/overview**, **3 CUs/price**; `minScore = 50`                                                                                                                         | `BirdeyeAdapter`, `BirdeyeBudgetTracker`       | `backend/src/providers/birdeye/BirdeyeAdapter.ts:164`<br>`backend/src/providers/config/providerConfig.ts:702-705` |
+| **DexScreener** | 60 req/min (profiles/boosts), 300 req/min (pairs)                                 | **5-second polling interval** for discovery intake scanner                                                                                                                                                                                                      | `CandidateStreamEngine`                        | `backend/src/candidate-scanner/CandidateStreamEngine.ts`                                                          |
+| **RugCheck**    | Cached reports only (public rate limits UNVERIFIED)                               | **Single call per preliminary candidate**                                                                                                                                                                                                                       | `BuyGateTriggerService`                        | `backend/src/candidate-scanner/BuyGateTriggerService.ts`                                                          |
 
 ---
 
@@ -240,67 +240,73 @@ Where:
    (Profiles/boosts allow up to 60 req/min; pairs/search allow up to 300 req/min).
 2. **Candidate Enrichment ($N_{\text{enrichment}}$)**: For $K$ preliminary candidates:
    - RugCheck report: $K$ calls.
-   - Solana RPC `getAccountInfo` (mint & freeze auth): $K$ calls.
+   - Solana RPC `getAccountInfo` (mint & freeze auth): $K$ calls (classified under `CANDIDATE_ENRICHMENT`).
    - Birdeye overview (score $\ge 50$ only, fraction $f_{\text{bird}} \approx 0.25$): $f_{\text{bird}} \cdot K$ calls (reserving 20 internal CUs each).
 3. **Tracked-Pool Transactions ($N_{\text{transactions}}$)**:
-   - If candidate $i$ has an on-chain transaction arrival rate $\lambda_i(t)$ (transactions per minute) and is tracked for duration $W_i$ minutes:
+   - **Transaction Retrieval vs. Swap Counts**: A single on-chain transaction fetched via `getTransaction` can contain multiple Raydium AMM v4 swaps (or routed multi-hop swaps). Request budget is consumed 1-to-1 by **distinct transaction retrievals**, not individual decoded swaps.
+   - Distinct transaction retrievals are classified under `CANDIDATE_ENRICHMENT` and consume from the shared enrichment and total request allowances.
+   - If candidate $i$ has an on-chain transaction arrival rate $\lambda_i(t)$ (distinct transaction retrievals per minute) and is tracked for duration $W_i$ minutes:
      $$N_{\text{transactions}} = \sum_{i=1}^{M} \int_0^{W_i} \lambda_i(t) \, dt$$
-   - _Average vs. Burst Dynamics_: While the session average may be low (e.g. 2,000 transactions over 11 hours = $3.03\text{ fetches/min}$), candidate tracking experiences **burst peak concurrency** where 10–30 transactions arrive within a 60-second window.
+   - _Average vs. Burst Dynamics_: While the session average across hours may be low, candidate tracking experiences **burst peak concurrency** where 10–30 transaction retrievals arrive within a 60-second window.
 4. **Coverage Reconciliation ($N_{\text{reconciliation}}$)**:
-   - **Term: UNKNOWN**. Production source-completeness verification is unimplemented. The exact number of RPC calls needed to verify zero dropped transactions touching the pool cannot be determined until this protocol is selected and tested.
+   - Historical signature discovery queries (`getSignaturesForAddress`) in `ExactPoolHistoryEnumerator` are also classified under `CANDIDATE_ENRICHMENT`, consuming from the enrichment attempt ceiling alongside transaction retrievals.
 5. **Executable Quotes ($N_{\text{quotes}}$)**:
-   - For confirmed candidates entering retest or position phases: entry probe quote + multi-tier exit quotes (50% Tier 1, 25% Tier 2, 25% Moonbag). Typically 4–8 quotes per admitted position, paced via `JupiterDemandController` ($\le 48\text{ req/min}$, $\ge 1,250\text{ ms}$ interval).
+   - For confirmed candidates entering retest or position phases: entry probe quote + multi-tier exit quotes (50% Tier 1, 25% Tier 2, 25% Moonbag). Typically 4–8 quotes per admitted position, paced via `JupiterDemandController` ($\le 48\text{ req/min}$, $\ge 1,250\text{ ms}$ interval), drawing from the forward observation reservation (`minReservedForwardRequests = 4`).
 
 ---
 
-### 4.3 Explicit Operational Scenarios
+### 4.3 Explicit Operational Scenarios & Multi-Limit Interactions
 
-We model two explicit operational scenarios to evaluate demand against configured controls and provider quotas:
+Workload modeling must account for all active configuration limits in `GlobalResourceBudgetManager`:
+
+- `maxTotalRequests`: Session ceiling (default 120; proposed 25–50 for pilot sessions).
+- `maxEnrichmentAttempts`: **Default 10** (stops enrichment when `enrichmentRequests >= maxEnrichmentAttempts` with `MAX_ENRICHMENT_ATTEMPTS_REACHED`).
+- `minReservedForwardRequests`: **Default 4** (reserves capacity for forward observation/quotes, returning `RESERVED_FOR_FORWARD_OBSERVATIONS` when remaining capacity $\le 4$).
+- `minProviderSpacingMs`: **Default 2,500 ms** (enforcing $\le 24\text{ req/min}$ sustained per host).
 
 #### Scenario A: Bounded Exploration Run (2 Hours, ~20 Candidates Evaluated)
 
-- **Assumptions**: 2-hour duration; discovery identifies ~20 preliminary candidates; 5 candidates admitted to active micro-flow tracking; average tracking duration $W = 5\text{ minutes}$; average transaction arrival rate $\lambda = 6\text{ tx/minute}$; 2 candidates qualify for confirmed entry quotes; cache absorbs repeat metadata.
+- **Assumptions**: 2-hour duration; discovery identifies ~20 preliminary candidates; 5 candidates reach active tracking; average tracking duration $W = 5\text{ minutes}$; average transaction retrieval arrival rate $\lambda = 6\text{ retrievals/minute}$; 2 candidates qualify for confirmed entry quotes; cache absorbs repeat metadata.
 
-| Workload Component                           | Formula / Derivation                                              | Total Calls                    | Provider Quota & Configured Constraint Status                                                                                                                              |
-| :------------------------------------------- | :---------------------------------------------------------------- | :----------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **DexScreener Discovery**                    | $120\text{ min} \times 12\text{ req/min}$                         | 1,440 requests                 | **Fits Free**: Within 60 req/min (boosts) and 300 req/min (pairs) limits.                                                                                                  |
-| **RugCheck Gating**                          | 20 candidates $\times 1$ call                                     | 20 requests                    | **Fits Free**: Public cached endpoint; 20 calls over 2 hours (~0.17 req/min).                                                                                              |
-| **Solana RPC `getAccountInfo`**              | 20 candidates $\times 1$ call                                     | 20 requests                    | **Fits Free**: Paced $\ge 2,500\text{ ms}$; well within 40 req/10s public limit.                                                                                           |
-| **Birdeye Enrichment**                       | 5 high-score candidates $\times 20\text{ internal CUs}$           | 5 calls (**100 internal CUs**) | **Fits Free**: Spends 100 internal CUs ($\approx 0.33\%$ of 30,000 monthly quota).                                                                                         |
-| **Transaction Retrieval (`getTransaction`)** | $5 \text{ candidates} \times 5\text{ min} \times 6\text{ tx/min}$ | **150 transaction fetches**    | **Internal Ceiling Blocker**: A configured 25–50 request session ceiling halts intake regardless of vendor capacity. (Average demand: 1.25 tx/min; peak burst: ~6 tx/min). |
-| **Coverage Reconciliation**                  | Signature reconciliation protocol                                 | **UNKNOWN**                    | Unimplemented; traffic cannot be calculated.                                                                                                                               |
-| **Jupiter Quotes**                           | 2 confirmed candidates $\times 6$ quotes                          | 12 quote requests              | **Fits Free**: Paced at 1,250 ms spacing; fits 1 RPS keyed free tier.                                                                                                      |
+| Workload Component                                     | Formula / Derivation                                              | Total Calls                 | Active Code Limit & Constraint Interaction Status                                                                                                                                                                                                                  |
+| :----------------------------------------------------- | :---------------------------------------------------------------- | :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **DexScreener Discovery**                              | $120\text{ min} \times 12\text{ req/min}$                         | 1,440 requests              | **Fits Free**: Within 60 req/min (boosts) and 300 req/min (pairs) limits.                                                                                                                                                                                          |
+| **RugCheck Gating**                                    | 20 candidates $\times 1$ call                                     | 20 requests                 | **Fits Free**: Public cached endpoint; 20 calls over 2 hours (~0.17 req/min).                                                                                                                                                                                      |
+| **Solana RPC `getAccountInfo`**                        | 20 candidates $\times 1$ call                                     | 20 requests                 | **Enrichment Limit Blocker**: Classified as `CANDIDATE_ENRICHMENT`. Stops after **10 attempts** with `MAX_ENRICHMENT_ATTEMPTS_REACHED` unless `maxEnrichmentAttempts` is adjusted. Paced $\ge 2,500\text{ ms}$.                                                    |
+| **Birdeye Enrichment**                                 | 5 high-score candidates $\times 20\text{ internal CUs}$           | 5 calls (100 internal CUs)  | **Fits Free**: Spends 100 internal CUs ($\approx 0.33\%$ of 30,000 monthly quota).                                                                                                                                                                                 |
+| **Distinct Transaction Retrievals (`getTransaction`)** | $5 \text{ candidates} \times 5\text{ min} \times 6\text{ tx/min}$ | **150 transaction fetches** | **Immediate Limit Blocker**: Classified as `CANDIDATE_ENRICHMENT`. Under default `maxEnrichmentAttempts = 10`, candidate enrichment halts on retrieval 10. Under a pilot setting (`maxTotalRequests = 50`), enrichment halts at request 46 due to forward reserve. |
+| **Coverage Enumeration (`getSignaturesForAddress`)**   | Exact-pool signature backfill queries                             | 1–5 calls                   | **Enrichment Limit**: Shares the `CANDIDATE_ENRICHMENT` pool; subject to `maxEnrichmentAttempts = 10` and $\ge 2,500\text{ ms}$ pacing.                                                                                                                            |
+| **Jupiter Quotes**                                     | 2 confirmed candidates $\times 6$ quotes                          | 12 quote requests           | **Fits Free**: Paced at 1,250 ms spacing; protected by `minReservedForwardRequests = 4`.                                                                                                                                                                           |
 
 #### Scenario B: Extended Paper-Trading Run (11 Hours, ~110 Candidates Evaluated)
 
-- **Assumptions**: 11-hour continuous session; ~110 preliminary candidates screened; 25 candidates reach active tracking; average tracking window $W = 8\text{ minutes}$; average transaction arrival rate $\lambda = 10\text{ tx/minute}$; 8 candidates qualify for confirmed entry quotes.
+- **Assumptions**: 11-hour continuous session; ~110 preliminary candidates screened; 25 candidates reach active tracking; average tracking window $W = 8\text{ minutes}$; average transaction arrival rate $\lambda = 10\text{ retrievals/minute}$; 8 candidates qualify for confirmed entry quotes.
 
-| Workload Component                           | Formula / Derivation                                                | Total Calls                     | Provider Quota & Configured Constraint Status                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| :------------------------------------------- | :------------------------------------------------------------------ | :------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **DexScreener Discovery**                    | $660\text{ min} \times 12\text{ req/min}$                           | 7,920 requests                  | **Fits Free**: Free public endpoints; within rate limits.                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **RugCheck Gating**                          | 110 candidates $\times 1$ call                                      | 110 requests                    | **Fits Free**: ~10 calls/hour; low average demand.                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **Solana RPC `getAccountInfo`**              | 110 candidates $\times 1$ call                                      | 110 requests                    | **Fits Free**: Paced $\ge 2,500\text{ ms}$; below 40 req/10s.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **Birdeye Enrichment**                       | 25 high-score candidates $\times 20\text{ internal CUs}$            | 25 calls (**500 internal CUs**) | **Fits Free**: $25 \times 20 = 500\text{ internal CUs/day}$; $500 \times 7 = 3,500\text{ CUs/week}$ ($\approx 11.7\%$ of 30,000 monthly quota).                                                                                                                                                                                                                                                                                                                     |
-| **Transaction Retrieval (`getTransaction`)** | $25 \text{ candidates} \times 8\text{ min} \times 10\text{ tx/min}$ | **2,000 transaction fetches**   | **Multi-Layer Constraints**: (1) **Immediate Internal Stop**: A 25–50 request session ceiling halts intake on candidate 1 or 2. (2) **Average Rate**: $2,000 / 660 \approx 3.03\text{ fetches/min}$ average does _not_ exhaust monthly credit quotas, but (3) **Peak Burst Concurrency**: Bursts of 10–30 tx/min during active retest windows risk throttling if shared with intake `getAccountInfo`. (4) QuickNode is a 1-month trial, not a continuing free plan. |
-| **Coverage Reconciliation**                  | Signature reconciliation protocol                                   | **UNKNOWN**                     | Unimplemented; additional RPC load unknown.                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Jupiter Quotes**                           | 8 confirmed candidates $\times 6$ quotes                            | 48 quote requests               | **Fits Free**: Managed by `JupiterDemandController` ($\le 48\text{ req/min}$, 1,250 ms spacing).                                                                                                                                                                                                                                                                                                                                                                    |
+| Workload Component                                     | Formula / Derivation                                                | Total Calls                   | Active Code Limit & Constraint Interaction Status                                                                                                                                                                                                                                                                                                     |
+| :----------------------------------------------------- | :------------------------------------------------------------------ | :---------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **DexScreener Discovery**                              | $660\text{ min} \times 12\text{ req/min}$                           | 7,920 requests                | **Fits Free**: Free public endpoints; within rate limits.                                                                                                                                                                                                                                                                                             |
+| **RugCheck Gating**                                    | 110 candidates $\times 1$ call                                      | 110 requests                  | **Fits Free**: ~10 calls/hour; low average demand.                                                                                                                                                                                                                                                                                                    |
+| **Solana RPC `getAccountInfo`**                        | 110 candidates $\times 1$ call                                      | 110 requests                  | **Enrichment Limit Blocker**: Stops after **10 attempts** (`MAX_ENRICHMENT_ATTEMPTS_REACHED`).                                                                                                                                                                                                                                                        |
+| **Birdeye Enrichment**                                 | 25 high-score candidates $\times 20\text{ internal CUs}$            | 25 calls (500 internal CUs)   | **Fits Free**: $25 \times 20 = 500\text{ internal CUs/day}$; within monthly allowance.                                                                                                                                                                                                                                                                |
+| **Distinct Transaction Retrievals (`getTransaction`)** | $25 \text{ candidates} \times 8\text{ min} \times 10\text{ tx/min}$ | **2,000 transaction fetches** | **Immediate Blocker Across Layers**: (1) `maxEnrichmentAttempts = 10` stops enrichment on candidate 1. (2) Even if enrichment attempts were raised, a proposed 25–50 session ceiling stops at request 46. (3) Pacing of $\ge 2,500\text{ ms}$ limits throughput to $\le 24\text{ retrievals/min}$, causing queue backlogs during burst arrival rates. |
+| **Jupiter Quotes**                                     | 8 confirmed candidates $\times 6$ quotes                            | 48 quote requests             | **Fits Free**: Managed by `JupiterDemandController` ($\le 48\text{ req/min}$, 1,250 ms spacing).                                                                                                                                                                                                                                                      |
 
 ### 4.4 Disentangling Internal Ceilings from Provider Feasibility
 
-The scenario analysis requires separating internal controls from vendor feasibility:
+The scenario analysis demonstrates that failure to sustain a multi-hour session is driven by specific layered controls:
 
-1. **Internal Session Limits Are the Immediate Blocker**:  
-   If `GlobalResourceBudgetManager` is configured with `maxTotalRequests = 50`, `maxEnrichmentAttempts = 10`, and `minReservedForwardRequests = 4`, an 11-hour session stops after 50 calls regardless of how much quota remains on external providers.
-2. **All Traffic Must Remain Strictly Metered**:  
-   Transaction retrieval cannot be exempted from global resource accounting. Any future adjustment to session ceilings or request limits requires formal technical review and governance to maintain budget safety. No traffic may become unmetered.
-3. **Vendor Feasibility is Conditional, Not Guaranteed Broken**:  
-   An average demand of 3.03 fetches/minute does not inevitably exhaust monthly free allowances or trigger public RPC 429s. Rather, throttling is conditional upon:
-   - Burst concurrency during high-volatility candidate tracking windows.
-   - Shared-provider contention between `getAccountInfo` and `getTransaction`.
-   - Solana mainnet congestion and unannounced public cluster throttling.
-   - Account entitlement status (e.g. expiration of QuickNode's 1-month trial).
-4. **No Automatic Multi-Provider Routing**:  
-   The codebase does _not_ automatically load-balance requests across public RPC, QuickNode, and Alchemy. Providers are configured with fixed URLs and manual fallback priority.
+1. **`maxEnrichmentAttempts: 10` is the Earliest Blocker**:  
+   Because `RaydiumAmmV4TransactionSourceAdapter`, `ExactPoolHistoryEnumerator`, and mint `getAccountInfo` all classify requests as `CANDIDATE_ENRICHMENT`, an independent offline probe confirmed that even with `maxTotalRequests: 50`, enrichment requests stop after **exactly 10 attempts** with `MAX_ENRICHMENT_ATTEMPTS_REACHED`.
+2. **Forward Reservation Blocks at $N - 4$**:  
+   If `maxEnrichmentAttempts` were configured higher, non-forward requests halt when remaining session capacity reaches `minReservedForwardRequests = 4` (`RESERVED_FOR_FORWARD_OBSERVATIONS`), stopping at 46 requests under a 50-request ceiling.
+3. **Global Request Ceiling Stops All Traffic**:  
+   Once `totalRequests >= maxTotalRequests` (default 120, proposed 25–50 in pilot sessions), all network dispatches halt with `GLOBAL_REQUEST_CEILING_REACHED`.
+4. **Pacing Caps Peak Concurrency**:  
+   At $\ge 2,500\text{ ms}$ spacing, a single endpoint can process at most 24 requests per minute. Burst arrival rates of 10–30 distinct transaction retrievals per minute create queue backlogs regardless of quota limits.
+5. **Distinct Transaction Retrievals vs. Swaps**:  
+   A single transaction can bundle multiple AMM swaps. Internal budgets meter distinct RPC transaction fetches, not decoded swap counts.
+6. **No Traffic May Become Unmetered**:  
+   All transaction retrieval and history enumeration must remain strictly accounted within `GlobalResourceBudgetManager`. No limits may be bypassed or increased without formal review.
 
 ---
 
@@ -371,76 +377,85 @@ All paid upgrades are strictly **proposals for separate operator decision**. No 
 
 With the successful acceptance of `ExactPoolHistoryEnumerator.ts`, `ExactPoolTransactionResolutionBridge.ts`, and `ExactPoolReconciliationIntegration.test.ts` (commits `d35c61f` through `a9036b1`), bounded offline history recovery is fully verified under `CANDIDATE_ENRICHMENT` accounting and shared $\ge 2,500\text{ ms}$ pacing.
 
-However, end-to-end live PAPER execution remains blocked by two fundamental data acquisition dependencies:
+However, end-to-end live PAPER execution remains held on two data acquisition dependencies:
 
 1. **Authoritative Bundler Concentration**: No verified free path exists providing schema-backed bundler ownership concentration.
-2. **Production Trade-Flow Completeness**: Continuous 60-second micro-flow coverage cannot be guaranteed under public RPC delivery semantics and physical pacing limits ($\le 24\text{ calls/min}$).
+2. **Production Trade-Flow Completeness**: Continuous 60-second micro-flow coverage cannot be certified under public RPC delivery semantics and active budget controls.
 
-The following decision table summarizes the acquisition feasibility across both blockers:
+The following decision table summarizes acquisition feasibility across both blockers:
 
-| Blocker Dimension                          | Required Strategy Input                                                                                                   | Plausible Providers Evaluated (Primary Docs)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Verified Free Path?       | Technical & Architectural Bottlenecks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Bounded Acquisition Decision                                                                                                                                                                                                                                                                            |
-| :----------------------------------------- | :------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **1. Authoritative Bundler Concentration** | `bundlerPct \le 0.85` (Micro $\le 0.50$); probe downsizing if $> 0.60$; fail-closed under `requireVerifiedHolders: true`. | 1. **RugCheck** (`/v1/tokens/{mint}/report`): Public Swagger defines no root `bundlerPct` and no label-to-concentration contract; risk values are untyped free text.<br>2. **Birdeye** (`/defi/token_security`): Documents `top10HolderPercent` and raw holder lists (`/defi/v3/token/holder`), but lacks automated bundle/cluster detection.<br>3. **Solana Tracker** (`/tokens/{token}/bundlers`): Documents `risk.bundlers` with `totalPercentage` and `totalInitialPercentage` (10k req/mo free tier). **UNVERIFIED & BLOCKED**: External provider unintegrated in codebase; key entitlement unverified; rate-limit durability under load unmeasured. | **NO VERIFIED FREE PATH** | • RugCheck Swagger documents no bundler field or schema contract; untyped string parsing and keyword matching violate fail-closed safety and have been removed.<br>• Birdeye does not provide automated bundle identification.<br>• Strategy definition ambiguity: Strategy does not resolve whether Gate 11 evaluates _current holdings_ (residual dump risk) vs. _initial launch allocation_ (historical launch manipulation), nor how the denominator handles burned LP vaults.<br>• External providers remain unentitled and unmetered. | **HOLD / FAIL-CLOSED**.<br>Retain `bundlerPct: undefined` from provider responses. Enforce fail-closed `BUNDLER_CONCENTRATION_UNKNOWN` under `requireVerifiedHolders: true`. Resolve internal strategy definition before entertaining third-party provider acquisition.                                 |
-| **2. Production Trade-Flow Completeness**  | Continuous 60-second sliding window $[T-60\text{s}, T]$ with verifiable proof of zero dropped candidate-pool swaps.       | 1. **Public Solana RPC** (`logsSubscribe` + `getSignaturesForAddress` + `getTransaction`): Documented standard RPC.<br>2. **Commercial gRPC / Geyser** (Yellowstone, Helius Laser): Stream replay buffers and sequence numbers.<br>3. **Block-Range Polling** (`getBlock`): Full block transaction inspection.                                                                                                                                                                                                                                                                                                                                            | **NO VERIFIED FREE PATH** | • Public Solana RPC `logsSubscribe` provides no delivery SLA; notifications are dropped during load or leader skips.<br>• Polling `getSignaturesForAddress` under $\ge 2,500\text{ ms}$ pacing caps throughput at $24\text{ req/min}$; retrieving 10–30 tx/min exhausts 25–50 request session ceilings within 60–120 seconds.<br>• Replay-capable gRPC / Geyser streams require paid subscriptions and dedicated server infrastructure.<br>• Block-range polling is bandwidth-prohibitive on public RPC.                                    | **HOLD / RECOVERY_ONLY**.<br>Preserve accepted `RECOVERY_ONLY` scope (`isProductionCompletenessEstablished = false` permanently). Reject synthetic completeness proofs. Defer live trade-flow streaming until commercial streaming infrastructure and adjusted request budgets are formally authorized. |
+| Blocker Dimension                          | Required Strategy Input                                                                                                                                                                                                                                                             | Plausible Providers Evaluated (Primary Docs)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Verified Free Path?       | Technical & Architectural Bottlenecks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Bounded Acquisition Decision                                                                                                                                                                                                                                                                            |
+| :----------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **1. Authoritative Bundler Concentration** | • Micro cohort: `bundlerPct \le 0.50`<br>• Established cohort: `bundlerPct \le 0.85`<br>• Probe downsizing if $> 0.60$<br>• Fail-closed under `requireVerifiedHolders: true`<br>_(Note: Gate 11 is 1 of 11 sequential buy gates; passing Gate 11 alone does not admit a candidate)_ | 1. **RugCheck** (`/v1/tokens/{mint}/report`): Public Swagger defines no root `bundlerPct` and no label-to-concentration contract; risk values are untyped free text.<br>2. **Birdeye** (`/defi/token_security`): Documents `top10HolderPercent` and raw holder lists (`/defi/v3/token/holder`), but lacks automated bundle identification.<br>3. **Solana Tracker** (`/tokens/{token}/bundlers`): Documents top-level fields `total`, `balance`, `percentage`, `initialBalance`, `initialPercentage`, `wallets`. Published Data API Free plan lists **2,500 requests/month** and **3 requests/second**. **UNVERIFIED CANDIDATE SOURCE (NOT AN INTEGRATION)**: External provider unintegrated in codebase; operator account access, key entitlement, freshness, and observed accuracy remain unverified. | **NO VERIFIED FREE PATH** | • RugCheck Swagger documents no bundler field or schema contract; untyped string parsing and keyword matching violate fail-closed safety and have been removed.<br>• Birdeye does not provide automated bundle identification.<br>• Strategy definition ambiguity: Strategy historically established blocking tokens where deployers bundled >50% of _initial supply_ at launch via Jito, but does not resolve whether post-launch live evaluation should evaluate _initial launch allocation_ (`initialPercentage`) or _current holdings_ (`percentage`) after dumps.<br>• Candidate token supply and LP token supply are strictly separate; burning/locking LP tokens does not change the candidate token's supply denominator.<br>• External candidate source is not an integrated or entitled project dependency.                            | **HOLD / FAIL-CLOSED**.<br>Retain `bundlerPct: undefined` from provider responses. Enforce fail-closed `BUNDLER_CONCENTRATION_UNKNOWN` under `requireVerifiedHolders: true`. Maintain all 11 buy gates intact. Resolve strategy metric time-basis before entertaining third-party provider acquisition. |
+| **2. Production Trade-Flow Completeness**  | Continuous 60-second sliding window $[T-60\text{s}, T]$ with verifiable proof of zero dropped candidate-pool transactions.                                                                                                                                                          | 1. **Public Solana RPC** (`logsSubscribe` + `getSignaturesForAddress` + `getTransaction`): Standard RPC methods.<br>2. **Commercial gRPC / Streaming** (Yellowstone gRPC, Helius Laser): Published high-throughput streaming interfaces.<br>3. **Block-Range Polling** (`getBlock`): Contiguous slot inspection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **NO VERIFIED FREE PATH** | • Public Solana RPC `logsSubscribe` provides no delivery SLA; dropped notifications during network bursts are documented.<br>• `getSignaturesForAddress` documents signature-history pagination parameters, not a completeness certificate. Witnessing history boundaries does not prove complete provider indexing.<br>• Active budget limits: `maxEnrichmentAttempts = 10` (default) halts candidate enrichment on request 10 (`MAX_ENRICHMENT_ATTEMPTS_REACHED`), confirmed by independent probe. Even if raised, pacing ($\ge 2,500\text{ ms}$) caps throughput at $24\text{ retrievals/min}$, exhausting 25–50 request session ceilings rapidly.<br>• Commercial stream guarantees: Replay buffers, sequence numbering, and delivery SLAs vary by provider and plan; commercial streaming has not been entitled or verified for NeXusTrade. | **HOLD / RECOVERY_ONLY**.<br>Preserve accepted `RECOVERY_ONLY` scope (`isProductionCompletenessEstablished = false` permanently). Reject synthetic completeness proofs. Defer live trade-flow streaming until an authorized data-validation session or streaming architecture is established.           |
 
 ---
 
 ### 7.4 Detailed Analysis of Data Blockers
 
-#### 1. Authoritative Bundler Concentration: Metric Definition & Provider Analysis
+#### 1. Authoritative Bundler Concentration: Strategy History, Metric Definition, and Provider Primary Docs
 
-##### A. Strategy Metric Definition & Constituent Dimensions
+##### A. Strategy History & Constituent Dimensions
 
-In [`BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts):
-
-- **Thresholds**: Gate 11 rejects candidates if `bundlerPct > 0.85` (or $> 0.50$ for Micro-cap). Downsizes target cohort size to $\min(0.35, \text{targetCohortSize})$ if `bundlerPct > 0.60`.
-- **Enforcement**: Under `requireVerifiedHolders: true`, missing or out-of-range `bundlerPct` strictly fails closed with `BUNDLER_CONCENTRATION_UNKNOWN`.
-- **Mathematical Constituent Dimensions**:
-  - **Numerator**: The cumulative tokens owned or acquired by wallets identified as belonging to the coordinated launch bundle cluster.
-  - **Denominator**: Total token supply (or circulating supply net of burned/locked LP tokens).
-  - **Ownership Population**: Wallets participating in coordinated atomic launch transactions (e.g. Jito atomic bundles in slot 0 or immediate post-creation blocks).
-  - **Time Basis**:
-    - _Current Holdings_: $\frac{\sum_{w \in \text{Bundlers}} \text{balance}_{t}(w)}{\text{totalSupply}}$. Dynamically decays as bundlers dump tokens into market liquidity. Reflects _residual dump risk_.
-    - _Initial Launch Allocation_: $\frac{\sum_{w \in \text{Bundlers}} \text{tokensBought}_{\text{launch}}(w)}{\text{totalSupply}}$. Fixed at token launch. Reflects _initial centralization and sniper capture_.
-    - _Distinction from Insider Clusters & Transaction Statistics_:
-      - _Insider Clusters_: Wallets linked through off-chain funding trees (e.g., funded by a common exchange withdrawal or master wallet prior to launch); distinct from atomic block-0 bundles.
-      - _Transaction Statistics_: Operational network metrics such as "Bundler transaction failure rate" or "Bundles executed"; measures execution friction, not token ownership concentration.
-- **Unresolved Strategy Decision**:
-  - The NeXusTrade strategy specification does not define whether Gate 11 guards against _active remaining dump risk_ (current holdings) or _initial launch centralization_ (initial bundle allocation).
-  - If current holdings are evaluated, a token where bundlers acquired 80% at launch and dumped 70% would pass Gate 11 ($\text{current} = 10\% \le 85\%$), admitting a dumped asset.
-  - If initial allocation is evaluated, a token with an 86% launch bundle is permanently disqualified even if ownership subsequently broadened.
-  - Furthermore, the treatment of burned LP tokens in the denominator remains mathematically unspecified.
+1. **Historical Foundation in Sub-Phase 12.86**:
+   - The origin of bundler gating in NeXusTrade is formally established in [`phase-12-subphase-12.86-anti-cabal-wash-trading-and-sell-congestion-shield.md`](file:///u:/Projects/TopG/docs/research-planning/phase-12-subphase-12.86-anti-cabal-wash-trading-and-sell-congestion-shield.md) (Deliverable 3):
+     - _"Blocks tokens where deployers bundled >50% of the initial supply via Jito (`ST` 87%, `SB` 81%, `SE` 74%)."_
+     - Formally defined cohort-differentiated ceilings:
+       ```typescript
+       const maxBundlerAllowed = isEstablished ? this.config.maxBundlerPct : 0.5; // 50% ceiling on micro-caps, 85% on established
+       ```
+   - **Subsequent Hardening (Milestone D.3.3)**:
+     - Probe sizing risk adjustment: if `bundlerPct > 0.60` (or `top10HolderPct > 0.30`), downsize cohort to $\min(0.35, \text{targetCohortSize})$.
+     - Gate 11 fail-closed verification: under `requireVerifiedHolders: true`, missing or invalid `bundlerPct` strictly fails closed with `BUNDLER_CONCENTRATION_UNKNOWN`.
+     - In commit `a9036b1`, ad-hoc parsing of RugCheck free-text risk names (`"Bundler transaction failure rate"`) and undocumented root fields was removed because the RugCheck OpenAPI schema defines no bundler contract.
+2. **What Strategy History Establishes**:
+   - The metric was historically intended to measure **launch-time Jito bundling of the candidate token's initial supply** (`initialPercentage`), with a strict 50% ceiling on Micro-caps, an 85% ceiling on Established tokens, and downsizing if $>60\%$.
+   - **Gate 11 is Not Full Admission**: Passing Gate 11 alone does not admit a candidate into trading. It is merely 1 of 11 sequential buy gates (all 11 must pass, including RugScore $\le 700$, 0 danger flags, mint/freeze authority disabled, verified holders count $\ge 250$ or $\ge 100$, top-10 concentration $\le 30\%$, volume/liquidity, and retest absorption flow).
+3. **What Remains Unresolved**:
+   - _Time Basis (Initial Allocation vs. Current Holdings)_:
+     - While Phase 12.86 specified blocking tokens where deployers bundled $>50\%$ of _initial supply_, live candidate screening occurs post-launch (minutes to hours later).
+     - If the engine evaluates _initial launch allocation_ (`initialPercentage`), a token where deployers bundled $>50\%$ at launch remains permanently disqualified, even if the bundle dispersed.
+     - If the engine evaluates _current holdings_ (`percentage`), a token where bundlers acquired 85% at launch and dumped 75% onto retail would pass Gate 11 ($\text{current} = 10\% \le 50\% / 85\%$), admitting a dumped asset.
+     - The strategy has not formally specified whether Gate 11 guards against _historical launch centralization_ or _active residual dump risk_.
+   - _Separation of Candidate-Token Supply vs. LP-Token Supply_:
+     - Candidate-token supply is strictly distinct from Raydium LP-token supply.
+     - Burning or locking LP tokens (the pool liquidity proof, e.g. $\ge 90\%$ LP burn) affects only the LP mint balance. It does **not** justify subtracting LP-token quantities from the candidate token's supply denominator. The denominator is strictly the candidate token's supply.
 
 ##### B. Primary Documentation Review of Candidate Providers
 
 1. **RugCheck (`GET /v1/tokens/{mint}/report`)**:
    - _Documentation_: [RugCheck OpenAPI Spec](https://api.rugcheck.xyz/swagger/doc.json).
-   - _Fields_: `score`, `score_normalised`, `totalHolders`, `topHolders: Array<{ pct, address }>`, `risks: Array<{ name, level, description, score, value }>`.
+   - _Published Schema_: `score`, `score_normalised`, `totalHolders`, `topHolders: Array<{ pct, address }>`, `risks: Array<{ name, level, description, score, value }>`.
    - _Bundler Fields_: **None**. The official Swagger defines no root `bundlerPct`, no structured bundler object, and no label-to-concentration mappings for free-text risk descriptions.
    - _Units & Freshness_: Risk `value` is an untyped free string. Server-side caching TTL is undocumented.
    - _Access_: Public keyless HTTP GET.
-   - _Documented Free Path?_: **NO**. All unsupported extraction paths (string slicing, `parseFloat` prefix parsing) have been removed. RugCheck cannot supply an authoritative bundler metric.
+   - _Documented Free Path?_: **NO**. All unsupported extraction paths have been removed. RugCheck cannot supply an authoritative bundler metric.
 2. **Birdeye (`GET /defi/token_security?address={mint}`)**:
    - _Documentation_: [Birdeye API Docs](https://docs.birdeye.so).
-   - _Fields_: `top10HolderPercent`, `creatorAddress`, `isTrueToken`; `/defi/v3/token/holder` supplies paginated individual accounts (`ui_amount`).
-   - _Bundler Fields_: **None**. Birdeye documents top holder percentages and raw holder lists, but provides no automated bundle identification or launch bundle tagging.
+   - _Published Schema_: `top10HolderPercent`, `creatorAddress`, `isTrueToken`; `/defi/v3/token/holder` supplies paginated individual accounts (`ui_amount`).
+   - _Bundler Fields_: **None**. Birdeye documents top-holder percentages and raw holder lists, but provides no automated bundle identification or launch bundle tagging.
    - _Units & Freshness_: Percentage / token units. Near real-time on-chain indexing.
    - _Access_: Free tier provides 30,000 CUs/month and 1 RPS. Keyed header `X-API-KEY`.
    - _Documented Free Path?_: **NO**. Deriving bundler metrics would require custom off-chain transaction graph clustering.
 3. **Solana Tracker (`GET /tokens/{token}/bundlers`)**:
-   - _Documentation_: [Solana Tracker Data API Docs](https://docs.solanatracker.io).
-   - _Fields_: `risk.bundlers.count` (integer), `risk.bundlers.totalPercentage` (current holding %), `risk.bundlers.totalInitialPercentage` (launch allocation %), `risk.bundlers.wallets` (array).
-   - _Units & Freshness_: Percentages are floats. Indexed from launch transactions and updated wallet balances.
-   - _Access_: Requires `x-api-key` header. Free tier publishes 10,000 requests/month, 3 RPS.
-   - _Documented Free Path?_: **UNVERIFIED & BLOCKED**.
-     - Although a free tier (10k req/mo) and matching schema exist in documentation, this is an external third-party provider never integrated, entitled, or tested in NeXusTrade.
-     - Account entitlement is unverified (requires operator portal registration).
-     - Rate-limit durability, uptime, and indexing latency on newly launched pools are unmeasured.
-     - Integration is blocked pending operator authorization and strategy metric resolution.
+   - _Documentation_: [Solana Tracker Data API Endpoint Reference](https://docs.solanatracker.io/data-api/tokens/get-token-bundlers) and [Pricing Reference](https://docs.solanatracker.io/pricing).
+   - _Published Schema_: Documented response returns **top-level fields**:
+     - `total`: integer (number of detected bundler wallets)
+     - `balance`: number (current total token balance held by bundler wallets)
+     - `percentage`: number (current percentage of token supply held by bundler wallets)
+     - `initialBalance`: number (initial total token balance held by bundler wallets at launch)
+     - `initialPercentage`: number (initial percentage of token supply held by bundler wallets at launch)
+     - `wallets`: array of wallet objects/addresses
+   - _Published Allowance_: The Data API Free plan lists **2,500 requests/month** and **3 requests/second** (with WebSocket access excluded), **not** 10,000 requests/month.
+   - _Status_: **UNVERIFIED CANDIDATE SOURCE (NOT AN INTEGRATION)**:
+     - While Solana Tracker publishes an endpoint schema matching both initial and current allocation, it is an external candidate source that has **never been integrated, entitled, or tested in NeXusTrade**.
+     - Operator account access and key entitlement are unverified.
+     - Freshness, observed accuracy, and rate-limit durability under live market conditions are unmeasured.
+     - A documented external source does not constitute a verified project capability.
 
 ---
 
-#### 2. Production Trade-Flow Completeness: Evidence Requirements & Throughput Bottlenecks
+#### 2. Production Trade-Flow Completeness: Evidence Requirements, Active Budget Limits, and Workload Realities
 
 ##### A. Evidence Required for Complete Rolling Window
 
@@ -448,7 +463,7 @@ To certify that a sliding $[T - 60\text{s}, T]$ window is observationally comple
 
 1. _Lower Bound Witness_: An on-chain transaction or confirmed block height at or before $T - 60\text{s}$ proving the observation interval starts prior to the window.
 2. _Upper Bound Witness_: An on-chain transaction or confirmed block height at or after $T$ proving the observation interval reaches the evaluation tick.
-3. _Unbroken On-Chain Signature Continuity_: Cryptographic signature pagination (`getSignaturesForAddress` with `{ before, until }`) proving all consecutive signatures between Lower and Upper bounds are accounted for.
+3. _Unbroken On-Chain Signature Continuity_: Continuous signature traversal proving all consecutive signatures between Lower and Upper bounds are present.
 4. _Positive Boundary Confirmation_: Affirmative evidence that pagination reached the actual boundary signature rather than terminating on an arbitrary limit or empty page.
 5. _Continuous Slot / Range Integrity_: Verification that no unobserved slots touched the candidate pool.
 
@@ -460,47 +475,73 @@ The accepted reconciliation implementation (`ExactPoolHistoryEnumerator.ts`, `Ex
 - Strictly preserves `isProductionCompletenessEstablished = false` permanently.
 - Backfilling missed transactions into the tracker does not erase collection gaps (`tracker.getRecordedGaps().length >= 1`) or advance persistent cursors. Default coordinator safety rejects production completeness mode with `COMPLETENESS_MECHANISM_UNAVAILABLE`.
 
-##### C. Smallest Documented Path & Throughput Bottlenecks
+##### C. Recalculation of Budget Limits & Workload Capacity
 
-Under existing code controls:
+Accounting must include all active limits enforced by `GlobalResourceBudgetManager`:
 
-- **Provider Spacing**: `GlobalResourceBudgetManager` enforces $\ge 2,500\text{ ms}$ spacing per RPC call to `"SOLANA_RPC"`.
-- **Maximum Physical Throughput**: At $2,500\text{ ms}$ spacing, a single RPC endpoint can dispatch at most **24 requests per minute** ($60\text{s} / 2.5\text{s}$).
-- **Shared Budget Category**: All candidate operations (mint auth `getAccountInfo`, LP verification, history enumeration `getSignaturesForAddress`, and swap retrieval `getTransaction`) draw from the same `CANDIDATE_ENRICHMENT` bucket.
-- **Session Ceilings**: 25–50 total requests per pilot session; `minReservedForwardRequests = 4` reserved for quoting.
-- **Workload Demand Dynamics**:
-  - For a candidate pool with an arrival rate of $\lambda = 15\text{ trades/minute}$:
-    - Retrieving 15 transactions via `getTransaction` consumes 15 calls ($15 \times 2,500\text{ ms} = 37.5\text{ seconds}$).
-    - Running 1 polling check `getSignaturesForAddress` consumes 1 call ($2.5\text{ seconds}$).
-    - Total: 16 RPC calls per minute ($16 / 24 = 66.7\%$ of maximum endpoint capacity).
-    - A 25-request session ceiling is **exhausted in $\le 90\text{ seconds}$** on a single candidate pool.
-    - A 50-request ceiling is exhausted in under 3 minutes.
-  - For active meme pools where arrival rates spike to 30–50 trades/minute, arrival demand strictly exceeds the maximum physical pacing throughput of the endpoint ($24\text{ req/min}$), generating unbounded queue delays, deadline timeouts, and immediate `BUDGET_EXHAUSTED` halts.
+1. **`maxEnrichmentAttempts = 10` (Default)**:
+   - Both `ExactPoolHistoryEnumerator` and `RaydiumAmmV4TransactionSourceAdapter` classify their requests as `CANDIDATE_ENRICHMENT`.
+   - In `canMakeRequest`, when `enrichmentRequests >= maxEnrichmentAttempts`, requests are immediately denied with `MAX_ENRICHMENT_ATTEMPTS_REACHED`.
+   - **Empirical Probe Confirmation**: An independent offline probe configured with `maxTotalRequests: 50` confirmed that candidate enrichment halted after exactly **10 attempts** with `MAX_ENRICHMENT_ATTEMPTS_REACHED`.
+2. **`minReservedForwardRequests = 4` (Default)**:
+   - When remaining total request capacity reaches 4 (`totalRequests + 4 >= maxTotalRequests`), non-forward requests are denied with `RESERVED_FOR_FORWARD_OBSERVATIONS`.
+   - Under a proposed pilot session ceiling of `maxTotalRequests = 50`, enrichment would halt at request 46 even if `maxEnrichmentAttempts` were unconstrained.
+3. **`minProviderSpacingMs = 2,500 ms` (Default)**:
+   - Caps single-provider dispatch to $\le 24\text{ requests/minute}$.
+4. **Distinct Transaction Retrievals vs. Swaps**:
+   - A single on-chain transaction fetched via `getTransaction` can bundle multiple AMM swaps. Internal budgets meter distinct RPC transaction fetches, not decoded swap counts.
+5. **Workload Exhaustion Dynamics**:
+   - _Low-Activity Data-Validation Session_: For a short, low-activity observation (1 candidate pool, arrival rate $\lambda \le 2-3\text{ distinct retrievals/minute}$ over 2–3 minutes):
+     - Total distinct transaction retrievals: 4–9 calls.
+     - Enumeration queries: 1 call.
+     - Total enrichment calls: 5–10 calls.
+     - This fits tightly within `maxEnrichmentAttempts = 10` and $\ge 2,500\text{ ms}$ pacing.
+   - _Continuous PAPER Operation_: For active meme pools ($\lambda = 10-30\text{ distinct retrievals/minute}$):
+     - Candidate enrichment reaches `maxEnrichmentAttempts = 10` within **20–60 seconds** on the very first candidate pool.
+     - Pacing of $\ge 2,500\text{ ms}$ limits throughput to 24 retrievals/min, causing queue backlogs when burst arrival exceeds 24 tx/min.
 
-##### D. Rejection of Unsupported Completeness Inferences
+##### D. Rejection of Invalid Completeness Inferences
 
+- **Signature Pagination $\neq$ Completeness Certificate**: The [Solana RPC reference](https://solana.com/docs/rpc/http/getsignaturesforaddress) documents signature-history results and pagination parameters (`before`, `until`, `limit`), **not** a completeness certificate. Witnessing history boundaries does not prove that an upstream RPC node has indexed or returned 100% of historical transactions under network load or leader forks.
 - **Successful recovery $\neq$ Completeness**: Backfilling missed transaction $B$ between $A$ and $C$ proves only that $B$ was resolved; it does not prove notifications before $A$ or after $C$ were captured without drops.
 - **Socket liveness $\neq$ Completeness**: An open TCP/TLS connection does not guarantee zero dropped notifications. Solana RPC nodes drop WebSocket notifications under internal load.
 - **Empty queues $\neq$ Completeness**: An empty queue means initiated HTTP requests completed; it does not prove all on-chain transactions were observed.
 - **RPC head slot $\neq$ Completeness**: Knowing the cluster reached slot $S$ does not prove all transactions mentioning `candidatePoolId` in preceding slots were delivered.
 
-##### E. Separation of Supported Mechanisms from Unverified Provider Guarantees
+##### E. Separation of Accepted Implementation, Workload Capacity, and Unverified Commercial Claims
 
-- **Technically Supported Mechanism**: Solana RPC `getSignaturesForAddress` pagination with `{ before, until }` is an officially documented on-chain query for a single account. `ExactPoolHistoryEnumerator` demonstrates this mechanism works offline with injected transports.
-- **Unverified Provider Guarantees**:
-  - _Public RPC node consistency_: Nodes in a public round-robin cluster may lag by several slots; an `until` query sent to one node may not see signatures recently committed on another.
-  - _WebSocket delivery SLA_: Solana Foundation and commercial RPCs offer **no delivery SLA** for `logsSubscribe`.
-  - _Commercial gRPC / Geyser (Yellowstone, Helius Laser)_: Document guaranteed stream sequence numbers and replay buffers, but require paid accounts, dedicated infrastructure, and have not been entitled or verified in NeXusTrade.
+To maintain factual rigor, four distinct dimensions must be separated:
+
+1. _Limitations of Accepted Implementation_: `ExactPoolHistoryEnumerator` and `ExactPoolTransactionResolutionBridge` are strictly bounded offline helpers operating in `RECOVERY_ONLY` mode between witnessed anchors. They do not claim or establish production completeness.
+2. _Capacity Limits under Stated Workloads_: A low-activity validation session (1 candidate, few transactions) can fit within internal limits, while continuous multi-pool operation exhausts `maxEnrichmentAttempts = 10` and session ceilings rapidly.
+3. _Mechanisms Remaining Unimplemented_: An end-to-end production completeness verifier across unsegmented observation windows remains unimplemented.
+4. _Commercial Streaming Guarantees (Unverified)_: While commercial providers (Yellowstone gRPC, Helius Laser) document high-performance streaming interfaces, specific vendor guarantees regarding replay buffers, slot-gap detection, and delivery SLAs depend on provider infrastructure and contract terms, and remain **UNVERIFIED** for NeXusTrade. The present evidence does not establish that paid streaming is necessary for a short validation session, but high-throughput continuous PAPER trading requires validated streaming delivery or adjusted budget architecture.
 
 ---
 
-### 7.5 Single Recommended Next Action
+#### 3. Broader Backend Failures Retained as Reported
 
-**Formulate an Operator Strategy & Architecture Brief (Documentation Only)**:
+The 55 failures across 21 test files observed in the un-quarantined baseline run (`3862 passed`, `55 failed`) are retained as reported and uncleared:
 
-1. **Resolve Strategy Definition for Gate 11**: Prompt operator decision to define whether `bundlerPct` targets _current holdings_ (residual dump risk) or _initial launch allocation_ (historical manipulation risk), and specify denominator handling relative to burned LP vaults.
-2. **Formalize Streaming Infrastructure Requirements**: Document that continuous 60-second micro-flow coverage under the current $\ge 2,500\text{ ms}$ shared host pacing and 25–50 request session ceilings is structurally impossible for active meme pools without dedicated streaming infrastructure (e.g., Yellowstone gRPC) and an adjusted resource budget.
-3. **Preserve Complete Isolation & Frozen State**: Maintain wallet balance strictly frozen at 7.9259 SOL, keep all gates fail-closed, and do not execute live market sessions, purchases, or new infrastructure milestones until operator authorization is granted.
+- Passing focused candidate scanner suites (326/326 offline tests) does not independently clear or prove zero attribution for broader backend failures.
+- Baseline log evidence indicates:
+  1. 4 failures in `H4Boundary.test.ts` & `H3Boundary.test.ts` from unmocked host DNS lookups (`ENOTFOUND synthetic.invalid`) on Windows.
+  2. 1 failure in `PilotLiveCollector.test.ts` from missing build artifacts in `backend/dist/research/pilot/`.
+  3. 50 failures across pre-compiled `.js` test artifacts in `backend/dist/` matched by Vitest's search glob.
+- These failures remain documented and uncleared pending a dedicated clean-build and DNS-mocked verification run.
+
+---
+
+### 7.5 Concrete Decision & Smallest Supported Next Step
+
+1. **Concrete Acquisition Decision**:
+   - **Bundler Concentration**: **HOLD / FAIL-CLOSED**. Retain `bundlerPct: undefined` from provider responses. Enforce fail-closed `BUNDLER_CONCENTRATION_UNKNOWN` under `requireVerifiedHolders: true`. Maintain all 11 buy gates intact.
+   - **Trade-Flow Completeness**: **HOLD / RECOVERY_ONLY**. Retain `isProductionCompletenessEstablished = false` permanently. Reject synthetic completeness proofs.
+2. **Exact Unresolved Decisions**:
+   - _Strategy Metric Decision_: Formally confirm whether Gate 11 evaluates _initial launch allocation_ (`initialPercentage`) or _current holdings_ (`percentage`) after dumps.
+   - _Provider Access Decision_: Determine whether the operator authorizes acquiring and verifying a free API key for Solana Tracker (2,500 req/mo Data API Free plan) to evaluate observed accuracy and latency offline.
+3. **Smallest Supported Next Step (Documentation & Verification Only)**:
+   - Perform an offline-only schema and entitlement verification note checking operator access and data format for candidate bundler sources, while preserving the accepted `RECOVERY_ONLY` reconciliation scope, keeping production completeness explicitly unavailable, and maintaining wallet balance frozen at 7.9259 SOL.
 
 ---
 
