@@ -91,7 +91,7 @@ export type TransactionProcessingOutcome =
 export interface TransactionSourceDiagnostics {
   readonly signature: string;
   readonly httpAttempts: number;
-  readonly httpStatus?: number | undefined;
+  readonly httpStatus?: number | null | undefined;
   readonly durationMs: number;
   readonly outcome: TransactionProcessingOutcome;
   readonly decodedEventsCount: number;
@@ -99,10 +99,12 @@ export interface TransactionSourceDiagnostics {
   readonly error?: string | undefined;
   readonly endpointUrl?: string | undefined;
   readonly requestSentAtMs?: number | undefined;
-  readonly responseReceivedAtMs?: number | undefined;
-  readonly responseSha256?: string | undefined;
+  readonly responseReceivedAtMs?: number | null | undefined;
+  readonly responseSha256?: string | null | undefined;
   readonly decodedEvents?: readonly unknown[] | undefined;
   readonly responseSnippet?: string | undefined;
+  readonly responseBody?: string | undefined;
+  readonly isCompletePayload?: boolean | undefined;
 }
 
 export interface ProcessNotificationResult {
@@ -1512,15 +1514,16 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           diagnostics: {
             signature,
             httpAttempts,
-            httpStatus,
+            httpStatus: httpStatus ?? null,
             durationMs: this.clock() - startEpoch,
             outcome,
             decodedEventsCount: 0,
             ingestedCount: 0,
             endpointUrl: this.sanitizedRpcUrl,
             requestSentAtMs,
-            responseReceivedAtMs: responseReceivedAtMs ?? this.clock(),
-            responseSha256: undefined,
+            responseReceivedAtMs: null,
+            responseSha256: null,
+            isCompletePayload: false,
             error: errorMsg,
           },
         };
@@ -1874,20 +1877,21 @@ export class RaydiumAmmV4TransactionSourceAdapter {
         return {
           ok: false,
           signature,
-          outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+          outcome: "REQUEST_TIMEOUT",
           ingestedEventsCount: 0,
           diagnostics: {
             signature,
             httpAttempts,
-            httpStatus,
+            httpStatus: httpStatus ?? null,
             durationMs: this.clock() - startEpoch,
-            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            outcome: "REQUEST_TIMEOUT",
             decodedEventsCount: 0,
             ingestedCount: 0,
             endpointUrl: this.sanitizedRpcUrl,
             requestSentAtMs,
-            responseReceivedAtMs,
-            responseSha256,
+            responseReceivedAtMs: null,
+            responseSha256: null,
+            isCompletePayload: false,
             error: "Operation cancelled before tracker ingestion",
           },
         };
@@ -1961,6 +1965,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: this.sanitizeErrorMessage(
               `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}`,
             ),
@@ -1992,6 +1999,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: this.sanitizeErrorMessage(
               `Tracker ingestion failed [${firstFailure.reason}]: ${firstFailure.message}`,
             ),
@@ -2021,6 +2031,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: this.sanitizeErrorMessage(
               `Partial tracker ingestion failure: ${ingestedCount}/${decodedEventsCount} swaps ingested; failed [${firstFailure.reason}]: ${firstFailure.message}`,
             ),
@@ -2048,6 +2061,8 @@ export class RaydiumAmmV4TransactionSourceAdapter {
           responseSha256,
           decodedEvents: ingestResult.decodeResult.events,
           responseSnippet: bodyText.slice(0, 2048),
+          responseBody: bodyText,
+          isCompletePayload: true,
         },
       };
     } finally {

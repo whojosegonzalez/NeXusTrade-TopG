@@ -21,11 +21,13 @@ import {
   parseTransportProbeArgs,
   createBoundedFetchTransport,
   readBoundedStream,
+  boundedCancel,
   DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT,
   MAX_TOTAL_HTTP_ATTEMPTS,
   resolveProjectRoot,
   type TransportProbeSuccessResult,
 } from "./RaydiumTransportObservationProbe.js";
+import { decodeRaydiumTransactionSwaps } from "./RaydiumAmmV4SwapDecoder.js";
 import type { ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
 import type { HistoryPageFetcher, HistorySignatureRecord } from "./ExactPoolHistoryEnumerator.js";
 import {
@@ -1193,6 +1195,240 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(fsSync.existsSync(sampledTxPath)).toBe(true);
         const sampledTxData = JSON.parse(fsSync.readFileSync(sampledTxPath, "utf8"));
         expect(sampledTxData).toEqual(succ.summary.sampledTransactionAudits);
+      }
+    });
+
+    it("rejects cancellation before transport construction: pre-aborted signal returns OPERATION_CANCELLED with zero sockets and zero HTTP calls", async () => {
+      let httpCalls = 0;
+      const mockFetch: typeof fetch = async () => {
+        httpCalls++;
+        return new Response("ok");
+      };
+
+      const abortedSignal = AbortSignal.abort();
+      const nonExistentDir = path.join(testOutputDir, "pre-aborted-dir");
+
+      const result = await executeTransportObservationProbe({
+        isLive: true,
+        outDir: nonExistentDir,
+        durationMs: 5000,
+        signal: abortedSignal,
+        fetchTransport: mockFetch,
+      });
+
+      expect(result.success).toBe(false);
+      expect("message" in result).toBe(true);
+      if ("message" in result) {
+        expect(result.status).toBe("OPERATION_CANCELLED");
+        expect(result.message).toContain("caller signal already aborted");
+      }
+      expect(httpCalls).toBe(0);
+      expect(fsSync.existsSync(nonExistentDir)).toBe(false);
+    });
+
+    it("bounds header latency and honors cancellation promptly when headers are slow", async () => {
+      const slowFetch: typeof fetch = async () => {
+        // Slow headers: takes 300ms to arrive
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return new Response("delayed response", { status: 200 });
+      };
+
+      const boundedFetch = createBoundedFetchTransport(slowFetch, 1024 * 1024);
+      const controller = new AbortController();
+
+      // Trigger abort after 30ms
+      setTimeout(() => controller.abort(), 30);
+
+      const startTime = Date.now();
+      await expect(
+        boundedFetch("https://mock-rpc.solana.com", { signal: controller.signal }),
+      ).rejects.toThrow(/aborted/i);
+      const elapsed = Date.now() - startTime;
+
+      // Must abort promptly (well under 300ms, typically 30-80ms)
+      expect(elapsed).toBeLessThan(200);
+    });
+
+    it("boundedCancel terminates within timeout bound when stream cancel never settles", async () => {
+      let cancelCalled = false;
+      const neverResolvingTarget = {
+        cancel: async () => {
+          cancelCalled = true;
+          return new Promise(() => {}); // Never resolves
+        },
+      };
+
+      const startMs = Date.now();
+      await boundedCancel(neverResolvingTarget, new Error("timeout test"), 50);
+      const elapsed = Date.now() - startMs;
+
+      expect(cancelCalled).toBe(true);
+      expect(elapsed).toBeGreaterThanOrEqual(40);
+      expect(elapsed).toBeLessThan(300);
+    });
+
+    it("audits cancelled attempts in final accounting without retaining cancelled payloads as successful data", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const controller = new AbortController();
+
+      const mockFetch: typeof fetch = async (_input, init) => {
+        const bodyStr = typeof init?.body === "string" ? init.body : "";
+        if (bodyStr.includes("getTransaction")) {
+          // Abort caller controller directly while getTransaction is in flight
+          controller.abort();
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => {
+              // Late response after abort
+              resolve(
+                new Response(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    result: createSyntheticBuyPayload(SIG_C),
+                  }),
+                  { status: 200 },
+                ),
+              );
+            }, 50);
+          });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: [] }));
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 5000,
+        signal: controller.signal,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        maxTransactionRetrievals: 1,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 280_000_100 },
+              value: { signature: SIG_C, logs: [], err: null },
+            },
+          },
+        }),
+      );
+
+      const result = await probePromise;
+      expect(result.dryRun).toBe(false);
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.metadata.counts.transactionRetrievalsAttempted).toBe(1);
+        expect(succ.metadata.counts.transactionRetrievalsSucceeded).toBe(0);
+        expect(succ.summary.sampledTransactionAudits.length).toBe(1);
+
+        const audit = succ.summary.sampledTransactionAudits[0]!;
+        expect(audit.outcome).toBe("REQUEST_TIMEOUT");
+        expect(audit.decodedEventsCount).toBe(0);
+        expect(audit.ingestedCount).toBe(0);
+        expect(audit.responseReceivedAtMs).toBe(null);
+        expect(audit.responseSha256).toBe(null);
+        expect(audit.isCompletePayload).toBe(false);
+      }
+    });
+
+    it("replays a sampled transaction whose response exceeds 2,048 characters using retained complete body", async () => {
+      const mockTransport = new MockWebSocketTransport();
+
+      // Create a large synthetic payload > 2,048 bytes
+      const syntheticBuy = createSyntheticBuyPayload(SIG_C);
+      // Pad logs so the JSON payload exceeds 2,048 bytes
+      const largeLogs = [
+        ...syntheticBuy.meta.logMessages,
+        ...Array.from(
+          { length: 50 },
+          (_, i) => `Program log: synthetic padding log line #${i} ${"x".repeat(50)}`,
+        ),
+      ];
+      syntheticBuy.meta.logMessages = largeLogs;
+
+      const fullResponseBody = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: syntheticBuy,
+      });
+      expect(fullResponseBody.length).toBeGreaterThan(2048);
+
+      const expectedSha256 = crypto.createHash("sha256").update(fullResponseBody).digest("hex");
+
+      const mockFetch: typeof fetch = async () => {
+        return new Response(fullResponseBody, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        maxTransactionRetrievals: 1,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 280_000_100 },
+              value: { signature: SIG_C, logs: [], err: null },
+            },
+          },
+        }),
+      );
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.summary.sampledTransactionAudits.length).toBe(1);
+        const audit = succ.summary.sampledTransactionAudits[0]!;
+
+        // 1. Verify snippet is bounded to 2,048
+        expect(audit.responseSnippet?.length).toBeLessThanOrEqual(2048);
+
+        // 2. Verify complete body is retained and exceeds 2,048
+        expect(audit.responseBody).toBeDefined();
+        expect(audit.responseBody?.length).toBeGreaterThan(2048);
+        expect(audit.isCompletePayload).toBe(true);
+
+        // 3. Verify SHA-256 equivalence
+        expect(audit.responseSha256).toBe(expectedSha256);
+        const computedSha256 = crypto
+          .createHash("sha256")
+          .update(audit.responseBody!)
+          .digest("hex");
+        expect(computedSha256).toBe(audit.responseSha256);
+
+        // 4. Offline Replay: Parse the saved body and decode through Raydium decoder
+        const parsed = JSON.parse(audit.responseBody!);
+        const replayResult = decodeRaydiumTransactionSwaps(
+          parsed.result,
+          DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT,
+        );
+        expect(replayResult.ok).toBe(true);
+        if (replayResult.ok) {
+          expect(replayResult.events.length).toBe(1);
+          expect(replayResult.events[0]?.signature).toBe(SIG_C);
+          expect(replayResult.events[0]?.side).toBe("BUY");
+        }
       }
     });
   });

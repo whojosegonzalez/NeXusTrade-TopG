@@ -185,6 +185,7 @@ export interface TransportProbeFailureResult {
     | "INVALID_INPUT"
     | "BUDGET_DENIED"
     | "DESTINATION_ALREADY_EXISTS"
+    | "OPERATION_CANCELLED"
     | "EXECUTION_ERROR";
   readonly message: string;
   readonly targetDir?: string | undefined;
@@ -452,6 +453,31 @@ export function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void>
 }
 
 /**
+ * Safely cancels a stream or reader with an explicit timeout bound.
+ * Prevents hanging indefinitely if cancel() never settles.
+ */
+export async function boundedCancel(
+  target: { cancel: (reason?: unknown) => Promise<unknown> },
+  reason?: unknown,
+  timeoutMs = 1000,
+): Promise<void> {
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    const cancelPromise = Promise.resolve(target.cancel(reason)).then(
+      () => {},
+      () => {},
+    );
+    await Promise.race([cancelPromise, timeoutPromise]);
+    if (timer) clearTimeout(timer);
+  } catch {
+    // ignore
+  }
+}
+
+/**
  * Reads bytes from a ReadableStream up to maxBytes.
  * Cancels reader immediately and returns overflow if limit is exceeded.
  */
@@ -463,11 +489,7 @@ export async function readBoundedStream(
   if (signal?.aborted) {
     const err = new Error("Operation aborted");
     err.name = "AbortError";
-    try {
-      await stream.cancel(signal.reason);
-    } catch {
-      // ignore
-    }
+    await boundedCancel(stream, signal.reason, 500);
     throw err;
   }
 
@@ -537,7 +559,7 @@ export async function readBoundedStream(
         }
 
         if (totalObservedBytes > maxBytes) {
-          await reader.cancel(new Error("RESPONSE_TOO_LARGE"));
+          await boundedCancel(reader, new Error("RESPONSE_TOO_LARGE"), 500);
           return {
             bytes: Buffer.concat(chunks),
             totalObservedBytes,
@@ -547,11 +569,7 @@ export async function readBoundedStream(
       }
     }
   } catch (err) {
-    try {
-      await reader.cancel(err);
-    } catch {
-      // ignore
-    }
+    await boundedCancel(reader, err, 500);
     throw err;
   }
 
@@ -576,16 +594,46 @@ export function createBoundedFetchTransport(
       redirect: "manual",
     };
 
-    const resp = await underlyingFetch(input, boundedInit);
+    // Race header fetch against init.signal to guarantee prompt cancellation
+    let cancelFetchAbortListener: (() => void) | undefined;
+    const fetchAbortPromise = new Promise<never>((_, reject) => {
+      if (init?.signal?.aborted) {
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        reject(err);
+        return;
+      }
+      const handler = () => {
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        reject(err);
+      };
+      init?.signal?.addEventListener("abort", handler, { once: true });
+      cancelFetchAbortListener = () => init?.signal?.removeEventListener("abort", handler);
+    });
+    fetchAbortPromise.catch(() => {});
+
+    const fetchPromise = underlyingFetch(input, boundedInit);
+    fetchPromise.then(
+      async (lateResp) => {
+        if (init?.signal?.aborted && lateResp.body) {
+          await boundedCancel(lateResp.body, new Error("Operation aborted"), 500);
+        }
+      },
+      () => {},
+    );
+
+    let resp: Response;
+    try {
+      resp = await (init?.signal ? Promise.race([fetchPromise, fetchAbortPromise]) : fetchPromise);
+    } finally {
+      cancelFetchAbortListener?.();
+    }
 
     // 2. Reject redirect status
     if (resp.type === "opaqueredirect" || (resp.status >= 300 && resp.status < 400)) {
       if (resp.body) {
-        try {
-          await resp.body.cancel(new Error("HTTP_REDIRECT_REJECTED"));
-        } catch {
-          // ignore
-        }
+        await boundedCancel(resp.body, new Error("HTTP_REDIRECT_REJECTED"), 500);
       }
       throw new Error(`HTTP_REDIRECT_REJECTED: Redirect status ${resp.status} is prohibited`);
     }
@@ -1003,6 +1051,16 @@ export async function executeTransportObservationProbe(
     };
   }
 
+  // 4.5. Pre-dispatch cancellation check before ANY resource allocation or network setup
+  if (config.signal?.aborted) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "OPERATION_CANCELLED",
+      message: "Operation cancelled before execution: caller signal already aborted",
+    };
+  }
+
   // 5. LIVE EXECUTION MODE: Pre-dispatch Atomic Directory Reservation
   try {
     fsSync.mkdirSync(path.dirname(targetDir), { recursive: true });
@@ -1025,6 +1083,10 @@ export async function executeTransportObservationProbe(
   let isStreamingActive = true;
   let probeActive = true;
 
+  let meteredTransport: MeteredWebSocketTransport | undefined;
+  let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
+  let removeCallerSignalListener: (() => void) | undefined;
+
   const probeState = {
     terminationReason: "UNKNOWN" as TransportProbeTerminationReason,
   };
@@ -1039,12 +1101,12 @@ export async function executeTransportObservationProbe(
     }
     overallAbortController.abort(new Error(closeMsg ?? reason));
     try {
-      meteredTransport.close(1000, closeMsg ?? reason);
+      meteredTransport?.close(1000, closeMsg ?? reason);
     } catch {
       // ignore
     }
     try {
-      coordinator.close();
+      coordinator?.close();
     } catch {
       // ignore
     }
@@ -1054,13 +1116,13 @@ export async function executeTransportObservationProbe(
     if (config.signal.aborted) {
       terminateProbe("MANUAL_CANCEL", "Probe cancelled by caller signal");
     } else {
-      config.signal.addEventListener(
-        "abort",
-        () => {
-          terminateProbe("MANUAL_CANCEL", "Probe cancelled by caller signal");
-        },
-        { once: true },
-      );
+      const callerAbortHandler = () => {
+        terminateProbe("MANUAL_CANCEL", "Probe cancelled by caller signal");
+      };
+      config.signal.addEventListener("abort", callerAbortHandler, { once: true });
+      removeCallerSignalListener = () => {
+        config.signal?.removeEventListener("abort", callerAbortHandler);
+      };
     }
   }
 
@@ -1115,34 +1177,46 @@ export async function executeTransportObservationProbe(
   const historyQueryAudits: HistoryQueryAuditRecord[] = [];
 
   // Underlying WebSocket Transport
-  const baseTransport: ISolanaWebSocketTransport =
-    config.transport ?? new NativeWebSocketTransport(wsUrl);
+  let baseTransport: ISolanaWebSocketTransport | undefined;
+  if (!isProbeTerminated && !overallAbortController.signal.aborted) {
+    baseTransport = config.transport ?? new NativeWebSocketTransport(wsUrl);
 
-  // Metered WebSocket Wrapper
-  const meteredTransport = new MeteredWebSocketTransport(
-    baseTransport,
-    maxPayloadBytes,
-    (count, bytes, _byteLen, _data, isOversized) => {
-      if (isOversized && probeActive) {
-        terminateProbe("PAYLOAD_LIMIT_REACHED", "Application payload byte budget reached");
-      }
-      if (count >= maxMessages && probeActive) {
-        terminateProbe("MESSAGE_LIMIT_REACHED", "Inbound message budget reached");
-      }
-    },
-  );
+    meteredTransport = new MeteredWebSocketTransport(
+      baseTransport,
+      maxPayloadBytes,
+      (count, bytes, _byteLen, _data, isOversized) => {
+        if (isOversized && probeActive) {
+          terminateProbe("PAYLOAD_LIMIT_REACHED", "Application payload byte budget reached");
+        }
+        if (count >= maxMessages && probeActive) {
+          terminateProbe("MESSAGE_LIMIT_REACHED", "Inbound message budget reached");
+        }
+      },
+    );
 
-  // Subscription Coordinator
-  const coordinator = new RaydiumCandidateSubscriptionCoordinator({
-    poolContext,
-    adapter,
-    tracker,
-    transport: meteredTransport,
-    commitment,
-    clock,
-    maxNotificationsBudget: maxMessages,
-    allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
-  });
+    coordinator = new RaydiumCandidateSubscriptionCoordinator({
+      poolContext,
+      adapter,
+      tracker,
+      transport: meteredTransport,
+      commitment,
+      clock,
+      maxNotificationsBudget: maxMessages,
+      allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
+    });
+
+    meteredTransport.on("close", (code, reason) => {
+      if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
+        terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
+      }
+    });
+
+    meteredTransport.on("error", (err) => {
+      if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
+        terminateProbe("TRANSPORT_ERROR", `WebSocket error: ${err.message}`);
+      }
+    });
+  }
 
   // Intercept incoming notifications to record WS signatures and track queue depth
   const originalEnqueue = adapter.enqueueNotification.bind(adapter);
@@ -1183,19 +1257,6 @@ export async function executeTransportObservationProbe(
     return enqueueRes;
   };
 
-  // Socket Close and Error Listeners
-  meteredTransport.on("close", (code, reason) => {
-    if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
-      terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
-    }
-  });
-
-  meteredTransport.on("error", (err) => {
-    if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
-      terminateProbe("TRANSPORT_ERROR", `WebSocket error: ${err.message}`);
-    }
-  });
-
   // Overall Duration Timer
   const overallTimer = setTimeout(() => {
     terminateProbe("DURATION_EXPIRED", "Probe duration expired");
@@ -1234,7 +1295,26 @@ export async function executeTransportObservationProbe(
             overallTimeoutMs: timeoutForReq,
           });
           if (processRes) {
-            if (probeActive && !isProbeTerminated && !overallAbortController.signal.aborted) {
+            const isCancelled =
+              !probeActive || isProbeTerminated || overallAbortController.signal.aborted;
+            if (isCancelled) {
+              // Discard late payload ingestion; retain cancellation audit record
+              sampledTransactionAudits.push({
+                signature: processRes.diagnostics.signature,
+                httpAttempts: processRes.diagnostics.httpAttempts,
+                httpStatus: processRes.diagnostics.httpStatus ?? null,
+                durationMs: processRes.diagnostics.durationMs,
+                outcome: "REQUEST_TIMEOUT",
+                decodedEventsCount: 0,
+                ingestedCount: 0,
+                endpointUrl: processRes.diagnostics.endpointUrl,
+                requestSentAtMs: processRes.diagnostics.requestSentAtMs,
+                responseReceivedAtMs: null,
+                responseSha256: null,
+                isCompletePayload: false,
+                error: "Operation cancelled before attempt finalization",
+              });
+            } else {
               sampledTransactionAudits.push(processRes.diagnostics);
               if (processRes.ok && processRes.outcome === "SUCCESS") {
                 transactionRetrievalsSucceeded++;
@@ -1292,8 +1372,8 @@ export async function executeTransportObservationProbe(
   // Close streaming coordinator if probe not already terminated by limit
   if (!isProbeTerminated && probeActive) {
     isIntentionalClosure = true;
-    coordinator.close();
-    meteredTransport.close(1000, "Streaming phase complete; proceeding to discovery");
+    coordinator?.close();
+    meteredTransport?.close(1000, "Streaming phase complete; proceeding to discovery");
   }
 
   // Settle any remaining queued transaction retrieval work within deadline
@@ -1574,11 +1654,31 @@ export async function executeTransportObservationProbe(
   }
 
   // Overshoot Bytes: calculated independently of winning termination reason
-  const totalPayloadBytes = meteredTransport.getApplicationPayloadBytes();
+  const totalPayloadBytes = meteredTransport?.getApplicationPayloadBytes() ?? 0;
   const overshootBytes = Math.max(0, totalPayloadBytes - maxPayloadBytes);
 
   // Transaction attempt counts derived from actual dispatched diagnostics
   const transactionRetrievalsAttempted = adapter.getMetrics().totalDispatchedAttempts;
+
+  // Reconcile sampledTransactionAudits with totalDispatchedAttempts
+  while (sampledTransactionAudits.length < transactionRetrievalsAttempted) {
+    const missingIndex = sampledTransactionAudits.length;
+    sampledTransactionAudits.push({
+      signature: `dispatched-attempt-${missingIndex + 1}`,
+      httpAttempts: 1,
+      httpStatus: null,
+      durationMs: 0,
+      outcome: "REQUEST_TIMEOUT",
+      decodedEventsCount: 0,
+      ingestedCount: 0,
+      endpointUrl: rpcUrl,
+      requestSentAtMs: startTime,
+      responseReceivedAtMs: null,
+      responseSha256: null,
+      isCompletePayload: false,
+      error: "Dispatched attempt cancelled or timed out in flight",
+    });
+  }
 
   // Discrepancy Analysis (Explicitly bounded to witnessed data)
   const commonSignatures = wsWitnessedList
@@ -1618,7 +1718,7 @@ export async function executeTransportObservationProbe(
     terminationReason: finalTerminationReason,
     isCapTerminated,
     counts: {
-      inboundMessagesCount: meteredTransport.getMessageCount(),
+      inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
       applicationPayloadBytes: totalPayloadBytes,
       overshootBytes,
       peakQueueDepth,
@@ -1661,12 +1761,24 @@ export async function executeTransportObservationProbe(
       pendingAtShutdown: adapter.getPendingQueueLength(),
     },
     streamingTelemetry: {
-      inboundMessagesCount: meteredTransport.getMessageCount(),
+      inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
       maxMessagesCeiling: maxMessages,
       applicationPayloadBytes: totalPayloadBytes,
       maxPayloadBytesCeiling: maxPayloadBytes,
       overshootBytes,
-      coordinatorMetrics: coordinator.getMetrics(),
+      coordinatorMetrics: coordinator?.getMetrics() ?? {
+        totalNotificationsReceived: 0,
+        totalNotificationsRouted: 0,
+        totalDuplicatesSkipped: 0,
+        totalQueueOverflows: 0,
+        totalUnrelatedDropped: 0,
+        totalMalformedFramesDropped: 0,
+        totalStaleEpochMessagesDropped: 0,
+        totalDisconnectGapsRecorded: 0,
+        totalCoverageAdvancesAttempted: 0,
+        totalCoverageAdvancesSucceeded: 0,
+        totalCoverageAdvancesRejected: 0,
+      },
     },
     tradeFlowTelemetry: {
       decodedSwapsCount,
@@ -1771,6 +1883,8 @@ export async function executeTransportObservationProbe(
     poolContext.candidateTokenMint,
     endTimeIso,
   );
+
+  removeCallerSignalListener?.();
 
   return {
     success: isObservationSuccess,
