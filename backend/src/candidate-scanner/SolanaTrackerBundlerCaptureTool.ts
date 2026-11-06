@@ -41,6 +41,7 @@ import {
   type SolanaTrackerBundlerParseResult,
 } from "./SolanaTrackerBundlerParser.js";
 import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
+import { loadLocalEnvFile } from "../config/loadEnvFile.js";
 
 export const SOLANA_TRACKER_DATA_API_BASE_URL = "https://data.solanatracker.io";
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
@@ -665,6 +666,7 @@ export async function captureSolanaTrackerBundlers(
   }
 
   // 5. LIVE EXECUTION MODE: Verify API key from env or config
+  loadLocalEnvFile();
   const rawApiKey = config.apiKey ?? process.env[SOLANA_TRACKER_API_KEY_ENV_VAR];
   if (!rawApiKey || typeof rawApiKey !== "string" || rawApiKey.trim().length === 0) {
     return {

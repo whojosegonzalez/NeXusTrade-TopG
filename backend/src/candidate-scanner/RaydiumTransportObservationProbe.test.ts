@@ -96,6 +96,10 @@ class MockWebSocketTransport implements ISolanaWebSocketTransport {
   triggerError(err: Error): void {
     for (const listener of this.listeners.error) listener(err);
   }
+
+  triggerClose(code: number, reason: string): void {
+    for (const listener of this.listeners.close) listener(code, reason);
+  }
 }
 
 function makeSwapBaseInV2Data(amountIn: bigint, minimumOut: bigint): number[] {
@@ -953,7 +957,7 @@ describe("RaydiumTransportObservationProbe", () => {
       const probePromise = executeTransportObservationProbe({
         isLive: true,
         outDir: testOutputDir,
-        durationMs: 5000,
+        durationMs: 15_000,
         streamingDurationMs: 20, // Overlapping phase transition while worker is active
         maxTransactionRetrievals: 2,
         transport: mockTransport,
@@ -1429,6 +1433,182 @@ describe("RaydiumTransportObservationProbe", () => {
           expect(replayResult.events[0]?.signature).toBe(SIG_C);
           expect(replayResult.events[0]?.side).toBe("BUY");
         }
+      }
+    });
+
+    it("records connection open timing, subscription acknowledgement, and last message timestamp", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      let fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+
+      const mockFetch: typeof fetch = async () => {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: [] }));
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        streamingDurationMs: 50,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      fakeNow += 15;
+      mockTransport.triggerOpen();
+
+      fakeNow += 10;
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 888 }));
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        const td = succ.metadata.transportDiagnostics;
+        expect(td.connectedAtMs).toBe(1_700_000_000_015);
+        expect(td.connectDurationMs).toBe(15);
+        expect(td.subscriptionStatus).toBe("ACKNOWLEDGED");
+        expect(td.subscriptionId).toBe(888);
+        expect(td.subscriptionAcknowledgedAtMs).toBe(1_700_000_000_025);
+        expect(td.lastMessageReceivedAtMs).toBe(1_700_000_000_025);
+        expect(td.intentionalShutdownInitiated).toBe(true);
+        expect(td.isUpstreamClosure).toBe(false);
+
+        // Verify matches summary
+        expect(succ.summary.transportDiagnostics).toEqual(td);
+      }
+    });
+
+    it("captures upstream transport error and cause with synthetic secret redaction", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+
+      const mockFetch: typeof fetch = async () => {
+        return new Response("ok");
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      const syntheticError = new Error(
+        "Connection reset while querying endpoint api-key=supersecrettoken12345",
+        { cause: "Underlying TLS failure auth=sensitivepassword999" },
+      );
+      mockTransport.triggerError(syntheticError);
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        const td = succ.metadata.transportDiagnostics;
+        expect(td.isUpstreamClosure).toBe(true);
+        expect(td.firstErrorMessage).toContain("api-key=[REDACTED]");
+        expect(td.firstErrorMessage).not.toContain("supersecrettoken12345");
+        expect(td.firstErrorCause).toContain("auth=[REDACTED]");
+        expect(td.firstErrorCause).not.toContain("sensitivepassword999");
+
+        // Verify written disk files are redacted
+        const metaJson = fsSync.readFileSync(
+          path.join(testOutputDir, "capture-metadata.json"),
+          "utf8",
+        );
+        expect(metaJson).not.toContain("supersecrettoken12345");
+        expect(metaJson).not.toContain("sensitivepassword999");
+        expect(metaJson).toContain("[REDACTED]");
+      }
+    });
+
+    it("captures upstream close code and reason with synthetic secret redaction", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+
+      const mockFetch: typeof fetch = async () => {
+        return new Response("ok");
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+      // Upstream close with secret in reason
+      mockTransport.triggerClose(1006, "Abnormal termination upstream token=secretbearertoken777");
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        const td = succ.metadata.transportDiagnostics;
+        expect(td.closeCode).toBe(1006);
+        expect(td.closeReason).toContain("token=[REDACTED]");
+        expect(td.closeReason).not.toContain("secretbearertoken777");
+        expect(td.isUpstreamClosure).toBe(true);
+
+        const summaryJson = fsSync.readFileSync(
+          path.join(testOutputDir, "probe-summary.json"),
+          "utf8",
+        );
+        expect(summaryJson).not.toContain("secretbearertoken777");
+      }
+    });
+
+    it("captures subscription rejection error with synthetic secret redaction", async () => {
+      const mockTransport = new MockWebSocketTransport();
+      const fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+
+      const mockFetch: typeof fetch = async () => {
+        return new Response("ok");
+      };
+
+      const probePromise = executeTransportObservationProbe({
+        isLive: true,
+        outDir: testOutputDir,
+        durationMs: 500,
+        streamingDurationMs: 50,
+        transport: mockTransport,
+        fetchTransport: mockFetch,
+        clock,
+      });
+
+      mockTransport.triggerOpen();
+      // Provider returns JSON-RPC error with sensitive query string
+      mockTransport.triggerMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            code: -32600,
+            message: "Subscription rejected for api-key=verysecretapikey999",
+          },
+        }),
+      );
+
+      const result = await probePromise;
+      if ("manifest" in result) {
+        const succ = result as TransportProbeSuccessResult;
+        const td = succ.metadata.transportDiagnostics;
+        expect(td.subscriptionStatus).toBe("REJECTED");
+        expect(td.subscriptionError).toContain("api-key=[REDACTED]");
+        expect(td.subscriptionError).not.toContain("verysecretapikey999");
       }
     });
   });

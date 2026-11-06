@@ -23,6 +23,7 @@ import {
   parseBundlerCaptureArgs,
   SOLANA_TRACKER_API_KEY_ENV_VAR,
 } from "../candidate-scanner/SolanaTrackerBundlerCaptureTool.js";
+import { loadLocalEnvFile } from "../config/loadEnvFile.js";
 
 function printUsage(): void {
   console.log(`
@@ -71,6 +72,10 @@ async function main(): Promise<void> {
     console.error("Error: --mint <MINT_ADDRESS> is required.");
     printUsage();
     process.exit(1);
+  }
+
+  if (args.isLive) {
+    loadLocalEnvFile();
   }
 
   const result = await captureSolanaTrackerBundlers({

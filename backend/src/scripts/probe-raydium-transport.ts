@@ -160,6 +160,32 @@ async function main(): Promise<void> {
     console.log(`Manifest File Hash:       ${result.manifest.manifestFileSha256}`);
     console.log(`Entries Digest:           ${result.manifest.entriesDigestSha256}`);
 
+    if (result.metadata.transportDiagnostics) {
+      const td = result.metadata.transportDiagnostics;
+      console.log(`Connected At (ms):        ${td.connectedAtMs ?? "N/A"}`);
+      console.log(
+        `Subscription Status:      ${td.subscriptionStatus} (ID: ${td.subscriptionId ?? "N/A"})`,
+      );
+      if (td.subscriptionError) {
+        console.log(`Subscription Error:       ${td.subscriptionError}`);
+      }
+      console.log(
+        `Last Message Received:    ${td.lastMessageReceivedAtMs ? `${td.lastMessageReceivedAtMs} ms` : "None"}`,
+      );
+      if (td.firstErrorMessage) {
+        console.log(`First Transport Error:    ${td.firstErrorMessage}`);
+      }
+      if (td.firstErrorCause) {
+        console.log(`First Error Cause:        ${td.firstErrorCause}`);
+      }
+      if (td.closeCode !== null) {
+        console.log(`Close Code/Reason:        ${td.closeCode} / ${td.closeReason || "None"}`);
+      }
+      console.log(
+        `Closure Origin:           ${td.isUpstreamClosure ? "UPSTREAM" : td.intentionalShutdownInitiated ? "INTENTIONAL_SHUTDOWN" : "UNKNOWN"}`,
+      );
+    }
+
     if (
       !result.observationSuccess ||
       result.status === "TRANSPORT_ERROR" ||
@@ -167,6 +193,11 @@ async function main(): Promise<void> {
     ) {
       console.error("=== RAYDIUM TRANSPORT OBSERVATION PROBE: TERMINATED WITH ERROR ===");
       console.error(`Termination Reason:       ${result.metadata.terminationReason}`);
+      if (result.metadata.transportDiagnostics?.firstErrorMessage) {
+        console.error(
+          `Error Details:            ${result.metadata.transportDiagnostics.firstErrorMessage}`,
+        );
+      }
       process.exit(1);
     }
 

@@ -75,6 +75,7 @@ import {
   NativeWebSocketTransport,
   DEFAULT_SOLANA_MAINNET_WSS,
 } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
+import { redactSensitiveText } from "./SolanaTrackerBundlerCaptureTool.js";
 
 // ============================================================================
 // Constants and Ceilings
@@ -242,7 +243,56 @@ export interface TransportProbeMetadata {
   readonly virtualWalletBalanceSol: "7.9259 SOL";
   readonly spendingCeiling: "$0.00";
   readonly disclaimer: string;
+  readonly transportDiagnostics: TransportDiagnostics;
 }
+
+export interface TransportDiagnostics {
+  /** Timestamp when WebSocket emitted 'open', or null if never connected */
+  readonly connectedAtMs: number | null;
+  /** Duration from probe start to connection in ms, or null if never connected */
+  readonly connectDurationMs: number | null;
+  /** Timestamp when subscription request was dispatched, or null */
+  readonly subscriptionSentAtMs: number | null;
+  /** Timestamp when subscription acknowledgement was received, or null */
+  readonly subscriptionAcknowledgedAtMs: number | null;
+  /** Subscription ID assigned by provider on successful acknowledgement, or null */
+  readonly subscriptionId: number | null;
+  /** Status of candidate pool subscription */
+  readonly subscriptionStatus: "NOT_ATTEMPTED" | "PENDING" | "ACKNOWLEDGED" | "REJECTED";
+  /** Sanitized error returned in subscription response, or null */
+  readonly subscriptionError: string | null;
+  /** Timestamp when the most recent WebSocket message was received, or null */
+  readonly lastMessageReceivedAtMs: number | null;
+  /** Sanitized first error message emitted by transport, or null */
+  readonly firstErrorMessage: string | null;
+  /** Sanitized error cause if available, or null */
+  readonly firstErrorCause: string | null;
+  /** Close code from transport close event, or null if not closed */
+  readonly closeCode: number | null;
+  /** Sanitized close reason from transport close event, or null */
+  readonly closeReason: string | null;
+  /** True if closure was initiated by upstream provider or unexpected transport failure */
+  readonly isUpstreamClosure: boolean;
+  /** True if closure was initiated by probe shutdown (e.g. deadline expired, cap reached) */
+  readonly intentionalShutdownInitiated: boolean;
+}
+
+export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze({
+  connectedAtMs: null,
+  connectDurationMs: null,
+  subscriptionSentAtMs: null,
+  subscriptionAcknowledgedAtMs: null,
+  subscriptionId: null,
+  subscriptionStatus: "NOT_ATTEMPTED",
+  subscriptionError: null,
+  lastMessageReceivedAtMs: null,
+  firstErrorMessage: null,
+  firstErrorCause: null,
+  closeCode: null,
+  closeReason: null,
+  isUpstreamClosure: false,
+  intentionalShutdownInitiated: false,
+});
 
 export interface HistoryQueryAuditRecord {
   readonly pageIndex: number;
@@ -333,6 +383,7 @@ export interface TransportProbeSummary {
   };
   readonly sampledTransactionAudits: readonly TransactionSourceDiagnostics[];
   readonly historyQueryAudits: readonly HistoryQueryAuditRecord[];
+  readonly transportDiagnostics: TransportDiagnostics;
 }
 
 export interface TransportProbeManifestFileEntry {
@@ -1087,6 +1138,27 @@ export async function executeTransportObservationProbe(
   let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
   let removeCallerSignalListener: (() => void) | undefined;
 
+  const transportDiagnostics = {
+    connectedAtMs: null as number | null,
+    connectDurationMs: null as number | null,
+    subscriptionSentAtMs: null as number | null,
+    subscriptionAcknowledgedAtMs: null as number | null,
+    subscriptionId: null as number | null,
+    subscriptionStatus: "NOT_ATTEMPTED" as
+      | "NOT_ATTEMPTED"
+      | "PENDING"
+      | "ACKNOWLEDGED"
+      | "REJECTED",
+    subscriptionError: null as string | null,
+    lastMessageReceivedAtMs: null as number | null,
+    firstErrorMessage: null as string | null,
+    firstErrorCause: null as string | null,
+    closeCode: null as number | null,
+    closeReason: null as string | null,
+    isUpstreamClosure: false,
+    intentionalShutdownInitiated: false,
+  };
+
   const probeState = {
     terminationReason: "UNKNOWN" as TransportProbeTerminationReason,
   };
@@ -1096,6 +1168,9 @@ export async function executeTransportObservationProbe(
     isProbeTerminated = true;
     probeActive = false;
     isIntentionalClosure = true;
+    if (reason !== "TRANSPORT_ERROR" && reason !== "TRANSPORT_DISCONNECT") {
+      transportDiagnostics.intentionalShutdownInitiated = true;
+    }
     if (probeState.terminationReason === "UNKNOWN") {
       probeState.terminationReason = reason;
     }
@@ -1205,15 +1280,70 @@ export async function executeTransportObservationProbe(
       allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
     });
 
+    meteredTransport.on("open", () => {
+      if (transportDiagnostics.connectedAtMs === null) {
+        const now = clock();
+        transportDiagnostics.connectedAtMs = now;
+        transportDiagnostics.connectDurationMs = now - startTime;
+        transportDiagnostics.subscriptionStatus = "PENDING";
+        transportDiagnostics.subscriptionSentAtMs = now;
+      }
+    });
+
+    meteredTransport.on("message", (data: string | Buffer) => {
+      transportDiagnostics.lastMessageReceivedAtMs = clock();
+      try {
+        const text = typeof data === "string" ? data : data.toString("utf8");
+        const parsed = JSON.parse(text) as { id?: unknown; result?: unknown; error?: unknown };
+        if (parsed && typeof parsed === "object") {
+          const reqId = coordinator?.getCoverageDiagnostic().activeSubscriptionId ?? 1;
+          if (parsed.id === 1 || parsed.id === reqId) {
+            if (typeof parsed.result === "number") {
+              transportDiagnostics.subscriptionAcknowledgedAtMs = clock();
+              transportDiagnostics.subscriptionId = parsed.result;
+              transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
+            } else if (parsed.error !== undefined && parsed.error !== null) {
+              transportDiagnostics.subscriptionStatus = "REJECTED";
+              const errStr =
+                typeof parsed.error === "object"
+                  ? JSON.stringify(parsed.error)
+                  : String(parsed.error);
+              transportDiagnostics.subscriptionError = redactSensitiveText(errStr);
+            }
+          }
+        }
+      } catch {
+        // ignore JSON parse error in message interceptor
+      }
+    });
+
     meteredTransport.on("close", (code, reason) => {
+      if (transportDiagnostics.closeCode === null) {
+        transportDiagnostics.closeCode = code;
+        transportDiagnostics.closeReason = reason ? redactSensitiveText(reason) : null;
+      }
       if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
+        transportDiagnostics.isUpstreamClosure = true;
         terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
       }
     });
 
     meteredTransport.on("error", (err) => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      let errCause: string | null = null;
+      if (err instanceof Error && "cause" in err && (err as { cause?: unknown }).cause) {
+        errCause = String((err as { cause?: unknown }).cause);
+      }
+      if (transportDiagnostics.firstErrorMessage === null) {
+        transportDiagnostics.firstErrorMessage = redactSensitiveText(errMsg);
+        transportDiagnostics.firstErrorCause = errCause ? redactSensitiveText(errCause) : null;
+      }
       if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
-        terminateProbe("TRANSPORT_ERROR", `WebSocket error: ${err.message}`);
+        transportDiagnostics.isUpstreamClosure = true;
+        terminateProbe(
+          "TRANSPORT_ERROR",
+          `WebSocket error: ${transportDiagnostics.firstErrorMessage}`,
+        );
       }
     });
   }
@@ -1372,6 +1502,7 @@ export async function executeTransportObservationProbe(
   // Close streaming coordinator if probe not already terminated by limit
   if (!isProbeTerminated && probeActive) {
     isIntentionalClosure = true;
+    transportDiagnostics.intentionalShutdownInitiated = true;
     coordinator?.close();
     meteredTransport?.close(1000, "Streaming phase complete; proceeding to discovery");
   }
@@ -1703,6 +1834,18 @@ export async function executeTransportObservationProbe(
   const endTimeIso = new Date(endTime).toISOString();
   const actualDurationMs = endTime - startTime;
 
+  if (coordinator) {
+    const diag = coordinator.getCoverageDiagnostic();
+    if (diag.activeSubscriptionId !== null && transportDiagnostics.subscriptionId === null) {
+      transportDiagnostics.subscriptionId = diag.activeSubscriptionId;
+      transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
+    }
+  }
+
+  const frozenTransportDiagnostics: TransportDiagnostics = Object.freeze({
+    ...transportDiagnostics,
+  });
+
   // 11. Construct Metadata & Summary Evidence Artifacts
   const metadata: TransportProbeMetadata = Object.freeze({
     probeVersion: "1.0",
@@ -1737,6 +1880,7 @@ export async function executeTransportObservationProbe(
     spendingCeiling: "$0.00" as const,
     disclaimer:
       "Transport characterization evidence only. Production rolling-flow completeness remains unverified and unavailable.",
+    transportDiagnostics: frozenTransportDiagnostics,
   });
 
   const flowEval = tracker.evaluateWindow(endTime);
@@ -1827,6 +1971,7 @@ export async function executeTransportObservationProbe(
     },
     sampledTransactionAudits,
     historyQueryAudits,
+    transportDiagnostics: frozenTransportDiagnostics,
   });
 
   const witnessedEvidence: WitnessedSignaturesEvidence = Object.freeze({

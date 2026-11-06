@@ -13,6 +13,7 @@ import {
   type HttpTransportResponse,
 } from "./SolanaTrackerBundlerCaptureTool.js";
 import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
+import { loadLocalEnvFile, resetEnvFileLoadedForTesting } from "../config/loadEnvFile.js";
 
 const CANONICAL_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
 const CANONICAL_WALLET_1 = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
@@ -1185,6 +1186,152 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
       } finally {
         fsSync.rmSync(outDir, { recursive: true, force: true });
       }
+    });
+
+    describe("Local Environment Loading & Precedence", () => {
+      it("loads SOLANA_TRACKER_API_KEY from synthetic .env fixture via loadLocalEnvFile", () => {
+        const tempDir = getTempTestDir();
+        fsSync.mkdirSync(tempDir, { recursive: true });
+        const tempEnvFile = path.join(tempDir, ".env");
+        const originalEnv = process.env.SOLANA_TRACKER_API_KEY;
+        delete process.env.SOLANA_TRACKER_API_KEY;
+
+        try {
+          fsSync.writeFileSync(
+            tempEnvFile,
+            "SOLANA_TRACKER_API_KEY=synthetic-fixture-key-112233\n",
+            "utf8",
+          );
+          resetEnvFileLoadedForTesting();
+          loadLocalEnvFile(process.env, tempEnvFile);
+
+          expect(process.env.SOLANA_TRACKER_API_KEY).toBe("synthetic-fixture-key-112233");
+        } finally {
+          if (originalEnv !== undefined) {
+            process.env.SOLANA_TRACKER_API_KEY = originalEnv;
+          } else {
+            delete process.env.SOLANA_TRACKER_API_KEY;
+          }
+          fsSync.rmSync(tempDir, { recursive: true, force: true });
+        }
+      });
+
+      it("preserves explicitly supplied environment variable precedence over .env file", () => {
+        const tempDir = getTempTestDir();
+        fsSync.mkdirSync(tempDir, { recursive: true });
+        const tempEnvFile = path.join(tempDir, ".env");
+        const originalEnv = process.env.SOLANA_TRACKER_API_KEY;
+        process.env.SOLANA_TRACKER_API_KEY = "explicit-process-env-key-445566";
+
+        try {
+          fsSync.writeFileSync(
+            tempEnvFile,
+            "SOLANA_TRACKER_API_KEY=file-should-not-override\n",
+            "utf8",
+          );
+          resetEnvFileLoadedForTesting();
+          loadLocalEnvFile(process.env, tempEnvFile);
+
+          expect(process.env.SOLANA_TRACKER_API_KEY).toBe("explicit-process-env-key-445566");
+        } finally {
+          if (originalEnv !== undefined) {
+            process.env.SOLANA_TRACKER_API_KEY = originalEnv;
+          } else {
+            delete process.env.SOLANA_TRACKER_API_KEY;
+          }
+          fsSync.rmSync(tempDir, { recursive: true, force: true });
+        }
+      });
+
+      it("prioritizes explicit config.apiKey over both process.env and .env", async () => {
+        const originalEnv = process.env.SOLANA_TRACKER_API_KEY;
+        process.env.SOLANA_TRACKER_API_KEY = "env-key-should-be-ignored";
+
+        let capturedHeader: string | undefined;
+        const transport: HttpTransport = async (_url, options) => {
+          capturedHeader = options.headers?.["x-api-key"];
+          return createTransportResponseFromFetchResponse(
+            new Response(JSON.stringify(createValidBundlerPayload()), {
+              status: 200,
+            }),
+          );
+        };
+
+        const outDir = getTempTestDir();
+        try {
+          const result = await captureSolanaTrackerBundlers({
+            mint: CANONICAL_MINT,
+            isLive: true,
+            apiKey: "explicit-override-key-9999",
+            outDir,
+            transport,
+          });
+
+          expect(result.success).toBe(true);
+          expect(capturedHeader).toBe("explicit-override-key-9999");
+        } finally {
+          if (originalEnv !== undefined) {
+            process.env.SOLANA_TRACKER_API_KEY = originalEnv;
+          } else {
+            delete process.env.SOLANA_TRACKER_API_KEY;
+          }
+          fsSync.rmSync(outDir, { recursive: true, force: true });
+        }
+      });
+
+      it("live capture executes with process.env key and thoroughly redacts it from evidence", async () => {
+        const originalEnv = process.env.SOLANA_TRACKER_API_KEY;
+        const syntheticSecret = "super-secret-key-to-redact-8888";
+        process.env.SOLANA_TRACKER_API_KEY = syntheticSecret;
+
+        let capturedHeader: string | undefined;
+        const transport: HttpTransport = async (_url, options) => {
+          capturedHeader = options.headers?.["x-api-key"];
+          return createTransportResponseFromFetchResponse(
+            new Response(
+              JSON.stringify({
+                ...createValidBundlerPayload(),
+                debugInfo: `Leak: ${syntheticSecret}`,
+              }),
+              { status: 200 },
+            ),
+          );
+        };
+
+        const outDir = getTempTestDir();
+        try {
+          const result = await captureSolanaTrackerBundlers({
+            mint: CANONICAL_MINT,
+            isLive: true,
+            outDir,
+            transport,
+          });
+
+          expect(result.success).toBe(true);
+          expect(capturedHeader).toBe(syntheticSecret);
+
+          // Verify disk artifacts are thoroughly redacted
+          const metaPath = path.join(outDir, "capture-metadata.json");
+          const respPath = path.join(outDir, "sanitized-response.json");
+          const parserPath = path.join(outDir, "parser-result.json");
+
+          const metaText = fsSync.readFileSync(metaPath, "utf8");
+          const respText = fsSync.readFileSync(respPath, "utf8");
+          const parserText = fsSync.readFileSync(parserPath, "utf8");
+
+          expect(metaText).not.toContain(syntheticSecret);
+          expect(respText).not.toContain(syntheticSecret);
+          expect(parserText).not.toContain(syntheticSecret);
+          expect(respText).toContain("[REDACTED]");
+        } finally {
+          if (originalEnv !== undefined) {
+            process.env.SOLANA_TRACKER_API_KEY = originalEnv;
+          } else {
+            delete process.env.SOLANA_TRACKER_API_KEY;
+          }
+          fsSync.rmSync(outDir, { recursive: true, force: true });
+        }
+      });
     });
   });
 });
