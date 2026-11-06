@@ -301,11 +301,13 @@ The scenario analysis demonstrates that failure to sustain a multi-hour session 
    If `maxEnrichmentAttempts` were configured higher, non-forward requests halt when remaining session capacity reaches `minReservedForwardRequests = 4` (`RESERVED_FOR_FORWARD_OBSERVATIONS`), stopping at 46 requests under a 50-request ceiling.
 3. **Global Request Ceiling Stops All Traffic**:  
    Once `totalRequests >= maxTotalRequests` (default 120, proposed 25–50 in pilot sessions), all network dispatches halt with `GLOBAL_REQUEST_CEILING_REACHED`.
-4. **Pacing Caps Peak Concurrency**:  
-   At $\ge 2,500\text{ ms}$ spacing, a single endpoint can process at most 24 requests per minute. Burst arrival rates of 10–30 distinct transaction retrievals per minute create queue backlogs regardless of quota limits.
+4. **Pacing and Arrival Concurrency**:  
+   At $\ge 2,500\text{ ms}$ spacing, a single endpoint can dispatch at most 24 requests per minute. Whether arrival rates of 10–30 distinct transaction retrievals per minute create queue backlog is not an absolute certainty; backlog depends dynamically on arrival timing (micro-bursts vs. even spacing), concurrent shared demand (such as mint `getAccountInfo` and LP queries), and available processing capacity.
 5. **Distinct Transaction Retrievals vs. Swaps**:  
    A single transaction can bundle multiple AMM swaps. Internal budgets meter distinct RPC transaction fetches, not decoded swap counts.
-6. **No Traffic May Become Unmetered**:  
+6. **Prior Usage Consumes Budget**:  
+   In any operational session, candidate tracking does not begin with a fresh budget; prior candidate enrichment calls (mint auth, LP evidence, and preliminary screening) consume from `maxEnrichmentAttempts = 10` before trade retrieval begins.
+7. **No Traffic May Become Unmetered**:  
    All transaction retrieval and history enumeration must remain strictly accounted within `GlobalResourceBudgetManager`. No limits may be bypassed or increased without formal review.
 
 ---
@@ -447,11 +449,11 @@ The following decision table summarizes acquisition feasibility across both bloc
      - `initialPercentage`: number (initial percentage of token supply held by bundler wallets at launch)
      - `wallets`: array of wallet objects/addresses
    - _Published Allowance_: The Data API Free plan lists **2,500 requests/month** and **3 requests/second** (with WebSocket access excluded), **not** 10,000 requests/month.
-   - _Status_: **UNVERIFIED CANDIDATE SOURCE (NOT AN INTEGRATION)**:
-     - While Solana Tracker publishes an endpoint schema matching both initial and current allocation, it is an external candidate source that has **never been integrated, entitled, or tested in NeXusTrade**.
-     - Operator account access and key entitlement are unverified.
-     - Freshness, observed accuracy, and rate-limit durability under live market conditions are unmeasured.
-     - A documented external source does not constitute a verified project capability.
+   - _Status_: **OFFLINE SCHEMA VALIDATED CANDIDATE SOURCE (NOT AN INTEGRATED SERVICE)**:
+     - The pure offline parser module [`SolanaTrackerBundlerParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/SolanaTrackerBundlerParser.ts) and test suite [`SolanaTrackerBundlerParser.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/SolanaTrackerBundlerParser.test.ts) validate the documented schema against synthetic fixtures.
+     - Offline schema validation proves syntactic compliance, but does **not** establish operator account entitlement, network latency, rate-limit durability under load, or empirical accuracy against real on-chain launches.
+     - The parser output is classified as `PROVIDER_REPORTED_UNVERIFIED` with `isProviderAccuracyVerified: false` and `upstreamSnapshotTimeMs: null`.
+     - Output is strictly quarantined from strategy evaluation: it does **not** populate `marketContext.bundlerPct`, alter Gate 11, or permit candidate admission.
 
 ---
 
@@ -490,15 +492,16 @@ Accounting must include all active limits enforced by `GlobalResourceBudgetManag
    - Caps single-provider dispatch to $\le 24\text{ requests/minute}$.
 4. **Distinct Transaction Retrievals vs. Swaps**:
    - A single on-chain transaction fetched via `getTransaction` can bundle multiple AMM swaps. Internal budgets meter distinct RPC transaction fetches, not decoded swap counts.
-5. **Workload Exhaustion Dynamics**:
-   - _Low-Activity Data-Validation Session_: For a short, low-activity observation (1 candidate pool, arrival rate $\lambda \le 2-3\text{ distinct retrievals/minute}$ over 2–3 minutes):
-     - Total distinct transaction retrievals: 4–9 calls.
-     - Enumeration queries: 1 call.
-     - Total enrichment calls: 5–10 calls.
-     - This fits tightly within `maxEnrichmentAttempts = 10` and $\ge 2,500\text{ ms}$ pacing.
-   - _Continuous PAPER Operation_: For active meme pools ($\lambda = 10-30\text{ distinct retrievals/minute}$):
+5. **Workload Exhaustion Dynamics & Prior Usage**:
+   - _Short Low-Activity Data-Validation Session_: For a short observation of 1 candidate pool:
+     - Prior candidate enrichment calls (e.g. mint `getAccountInfo` and LP evidence verification) consume 1–3 enrichment attempts before trade observation starts.
+     - Distinct transaction retrievals at a low arrival rate ($\lambda \le 2-3\text{ distinct retrievals/minute}$ over 2 minutes): 4–6 calls.
+     - Enumeration/reconciliation query: 1 call.
+     - Total enrichment calls: 6–10 calls.
+     - This fits within `maxEnrichmentAttempts = 10` only if prior enrichment usage is minimal and no concurrent candidates compete for budget.
+   - _Continuous High-Activity PAPER Operation_: For active meme pools ($\lambda = 10-30\text{ distinct retrievals/minute}$):
      - Candidate enrichment reaches `maxEnrichmentAttempts = 10` within **20–60 seconds** on the very first candidate pool.
-     - Pacing of $\ge 2,500\text{ ms}$ limits throughput to 24 retrievals/min, causing queue backlogs when burst arrival exceeds 24 tx/min.
+     - While $\ge 2,500\text{ ms}$ spacing caps maximum throughput at 24 retrievals/min, whether higher arrival rates create a processing backlog depends on arrival timing (micro-bursts vs. even spacing), shared provider contention, and network response latency.
 
 ##### D. Rejection of Invalid Completeness Inferences
 
