@@ -861,13 +861,14 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
   });
 
   describe("Correction 3: Partial-Response Evidence & Unread Body Cancellation Regressions", () => {
-    it("retains bounded partial bytes, count, and wire digest on streaming overflow using production streaming reader", async () => {
+    it("retains at most 12 bytes prefix while observing 16 bytes on streaming overflow using production streaming reader", async () => {
       let streamCancelled = false;
 
       // Stream two 8-byte chunks (total 16 bytes) against a 12-byte limit
       const chunk1 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
       const chunk2 = new Uint8Array([9, 10, 11, 12, 13, 14, 15, 16]);
-      const expected16Bytes = Buffer.concat([Buffer.from(chunk1), Buffer.from(chunk2)]);
+      const expected16ObservedBytes = Buffer.concat([Buffer.from(chunk1), Buffer.from(chunk2)]);
+      const expected12PrefixBytes = expected16ObservedBytes.subarray(0, 12);
 
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -903,14 +904,188 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
         if (!result.success) {
           expect(result.status).toBe("RESPONSE_TOO_LARGE");
           expect(result.metadata?.isTruncated).toBe(true);
-          // Accurately records the 16 bytes read before overflow
-          expect(result.metadata?.receivedBytesCount).toBe(16);
-          expect(result.metadata?.receivedWireSha256).toBe(computeSha256(expected16Bytes));
-          // Proves it does NOT describe an empty-buffer digest
-          expect(result.metadata?.receivedWireSha256).not.toBe(computeSha256(Buffer.alloc(0)));
+
+          // Requirement 3: Separate observed-byte count from retained-prefix length
+          expect(result.metadata?.receivedBytesCount).toBe(16); // 16 observed
+          expect(result.metadata?.retainedBytesCount).toBe(12); // strictly 12 retained
+
+          // Requirement 4: Labeled digest scope
+          expect(result.metadata?.receivedWireSha256).toBe(computeSha256(expected16ObservedBytes));
+          expect(result.metadata?.retainedPrefixSha256).toBe(computeSha256(expected12PrefixBytes));
+          expect(result.metadata?.receivedWireSha256).not.toBe(
+            result.metadata?.retainedPrefixSha256,
+          );
+
+          // Requirement 1 & 2: A twelve-byte retention limit must NOT persist sixteen raw bytes
+          const savedResponseBytes = fsSync.readFileSync(
+            path.join(outDir, "sanitized-response.json"),
+          );
+          expect(savedResponseBytes.length).toBeLessThanOrEqual(12);
 
           // Stream was cancelled on overflow
           expect(streamCancelled).toBe(true);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("bounds retained prefix to maxResponseSizeBytes and creates owned copy when first chunk is 65536 bytes", async () => {
+      let streamCancelled = false;
+      const largeChunk = new Uint8Array(65536);
+      for (let i = 0; i < largeChunk.length; i++) {
+        largeChunk[i] = i % 256;
+      }
+      const expected16Prefix = Buffer.from(largeChunk.subarray(0, 16));
+
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(largeChunk);
+        },
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: {},
+      });
+
+      const transport: HttpTransport = async () =>
+        createTransportResponseFromFetchResponse(response);
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          maxResponseSizeBytes: 16, // 16-byte limit
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.status).toBe("RESPONSE_TOO_LARGE");
+          expect(result.metadata?.isTruncated).toBe(true);
+          expect(result.metadata?.receivedBytesCount).toBe(65536);
+          expect(result.metadata?.retainedBytesCount).toBe(16);
+
+          // Digests
+          expect(result.metadata?.receivedWireSha256).toBe(computeSha256(Buffer.from(largeChunk)));
+          expect(result.metadata?.retainedPrefixSha256).toBe(computeSha256(expected16Prefix));
+
+          // Retained file on disk must NOT contain 65536 bytes
+          const savedBytes = fsSync.readFileSync(path.join(outDir, "sanitized-response.json"));
+          expect(savedBytes.length).toBeLessThanOrEqual(16);
+
+          // Stream cancelled immediately
+          expect(streamCancelled).toBe(true);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("handles overflow after earlier chunks and bounds prefix precisely", async () => {
+      let streamCancelled = false;
+      const chunk1 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); // 10 bytes
+      const chunk2 = new Uint8Array(20); // 20 bytes
+      for (let i = 0; i < 20; i++) chunk2[i] = 100 + i;
+
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk1);
+          controller.enqueue(chunk2);
+        },
+        cancel() {
+          streamCancelled = true;
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: {},
+      });
+
+      const transport: HttpTransport = async () =>
+        createTransportResponseFromFetchResponse(response);
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          maxResponseSizeBytes: 15, // 15-byte limit
+          outDir,
+          transport,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.status).toBe("RESPONSE_TOO_LARGE");
+          expect(result.metadata?.isTruncated).toBe(true);
+          expect(result.metadata?.receivedBytesCount).toBe(30); // 10 + 20
+          expect(result.metadata?.retainedBytesCount).toBe(15); // 10 from chunk1 + 5 from chunk2
+
+          const expectedPrefix = Buffer.concat([
+            Buffer.from(chunk1),
+            Buffer.from(chunk2.subarray(0, 5)),
+          ]);
+          expect(result.metadata?.retainedPrefixSha256).toBe(computeSha256(expectedPrefix));
+
+          expect(streamCancelled).toBe(true);
+        }
+      } finally {
+        fsSync.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it("completes with exact-limit success without truncation", async () => {
+      const chunk1 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const chunk2 = new Uint8Array([9, 10, 11, 12, 13, 14, 15, 16]);
+      const expected16 = Buffer.concat([Buffer.from(chunk1), Buffer.from(chunk2)]);
+
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk1);
+          controller.enqueue(chunk2);
+          controller.close();
+        },
+      });
+
+      const response = new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: {},
+      });
+
+      const transport: HttpTransport = async () =>
+        createTransportResponseFromFetchResponse(response);
+
+      const outDir = getTempTestDir();
+      try {
+        const result = await captureSolanaTrackerBundlers({
+          mint: CANONICAL_MINT,
+          isLive: true,
+          apiKey: FAKE_API_KEY,
+          maxResponseSizeBytes: 16, // Exact limit: 16 bytes
+          outDir,
+          transport,
+        });
+
+        expect(result.dryRun).toBe(false);
+        if (!result.dryRun) {
+          expect(result.metadata?.isTruncated).toBe(false);
+          expect(result.metadata?.receivedBytesCount).toBe(16);
+          expect(result.metadata?.retainedBytesCount).toBe(16);
+          expect(result.metadata?.receivedWireSha256).toBe(computeSha256(expected16));
+          expect(result.metadata?.retainedPrefixSha256).toBe(computeSha256(expected16));
         }
       } finally {
         fsSync.rmSync(outDir, { recursive: true, force: true });

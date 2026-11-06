@@ -81,27 +81,48 @@ export function createStandaloneOneRequestBudget(
 export class ResponseTooLargeError extends Error {
   readonly partialBytes: Buffer;
   readonly totalBytesRead: number;
+  readonly incrementalWireSha256: string;
+  readonly prefixSha256: string;
 
-  constructor(message: string, partialBytes: Buffer, totalBytesRead: number) {
+  constructor(
+    message: string,
+    partialBytes: Buffer,
+    totalBytesRead: number,
+    incrementalWireSha256: string,
+    prefixSha256: string,
+  ) {
     super(message);
     this.name = "ResponseTooLargeError";
     this.partialBytes = partialBytes;
     this.totalBytesRead = totalBytesRead;
+    this.incrementalWireSha256 = incrementalWireSha256;
+    this.prefixSha256 = prefixSha256;
   }
+}
+
+export interface HttpTransportBodyResult {
+  readonly bytes: Buffer;
+  readonly totalObservedBytes: number;
+  readonly incrementalWireSha256: string;
 }
 
 /**
  * Reads bytes from a ReadableStream<Uint8Array> up to maxBytes, enforcing streaming bounds.
- * Aborts and cancels the reader immediately if maxBytes is exceeded, retaining the partial bytes read.
+ * Retains at most maxBytes of raw prefix data as bounded owned copies (independent memory allocation).
+ * Computes incremental wire SHA-256 across all observed bytes.
+ * Aborts and cancels the reader immediately if maxBytes is exceeded.
  */
 export async function readStreamWithLimit(
   stream: ReadableStream<Uint8Array>,
   maxBytes: number,
   signal?: AbortSignal,
-): Promise<Buffer> {
+): Promise<HttpTransportBodyResult> {
   const reader = stream.getReader();
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
+  const retainedChunks: Buffer[] = [];
+  let retainedBytes = 0;
+  let totalObservedBytes = 0;
+
+  const wireHasher = crypto.createHash("sha256");
 
   let abortListener: (() => void) | undefined;
   let abortPromise: Promise<never> | undefined;
@@ -138,23 +159,50 @@ export async function readStreamWithLimit(
         : await readPromise;
 
       if (done) break;
-      if (value) {
-        totalBytes += value.byteLength;
-        chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-        if (totalBytes > maxBytes) {
-          const partialBytes = Buffer.concat(chunks);
+      if (value && value.byteLength > 0) {
+        // 1. Accumulate total observed count and update wire digest incrementally
+        totalObservedBytes += value.byteLength;
+        wireHasher.update(value);
+
+        // 2. Check remaining retention capacity before copying
+        const remainingCapacity = maxBytes - retainedBytes;
+        if (remainingCapacity > 0) {
+          const bytesToCopy = Math.min(value.byteLength, remainingCapacity);
+          // Allocate an owned independent Buffer copy so backing ArrayBuffer of oversized chunks is not kept alive
+          const ownedCopy = Buffer.alloc(bytesToCopy);
+          ownedCopy.set(value.subarray(0, bytesToCopy));
+          retainedChunks.push(ownedCopy);
+          retainedBytes += bytesToCopy;
+        }
+
+        // 3. Immediately abort and cancel stream if observed bytes exceed limit
+        if (totalObservedBytes > maxBytes) {
+          const partialBytes = Buffer.concat(retainedChunks);
+          const incrementalWireSha256 = wireHasher.digest("hex");
+          const prefixSha256 = computeSha256(partialBytes);
+
           await reader.cancel(
             new Error(`Response body size exceeded maximum limit of ${maxBytes} bytes.`),
           );
+
           throw new ResponseTooLargeError(
-            `Response body size exceeded maximum limit of ${maxBytes} bytes (read ${totalBytes} bytes).`,
+            `Response body size exceeded maximum limit of ${maxBytes} bytes (observed ${totalObservedBytes} bytes, retained prefix of ${partialBytes.length} bytes).`,
             partialBytes,
-            totalBytes,
+            totalObservedBytes,
+            incrementalWireSha256,
+            prefixSha256,
           );
         }
       }
     }
-    return Buffer.concat(chunks);
+
+    const fullBuffer = Buffer.concat(retainedChunks);
+    const incrementalWireSha256 = wireHasher.digest("hex");
+    return {
+      bytes: fullBuffer,
+      totalObservedBytes,
+      incrementalWireSha256,
+    };
   } catch (err) {
     try {
       await reader.cancel(err);
@@ -174,7 +222,10 @@ export interface HttpTransportResponse {
   readonly status: number;
   readonly statusText: string;
   readonly headers: Record<string, string>;
-  readonly readBodyBytes: (maxBytes: number, signal?: AbortSignal) => Promise<Buffer>;
+  readonly readBodyBytes: (
+    maxBytes: number,
+    signal?: AbortSignal,
+  ) => Promise<HttpTransportBodyResult | Buffer>;
   readonly cancelBody?: (reason?: unknown) => Promise<void>;
 }
 
@@ -206,7 +257,11 @@ export function createTransportResponseFromFetchResponse(resp: Response): HttpTr
     },
     readBodyBytes: async (maxBytes: number, signal?: AbortSignal) => {
       if (!resp.body) {
-        return Buffer.alloc(0);
+        return {
+          bytes: Buffer.alloc(0),
+          totalObservedBytes: 0,
+          incrementalWireSha256: computeSha256(Buffer.alloc(0)),
+        };
       }
       return readStreamWithLimit(resp.body, maxBytes, signal);
     },
@@ -266,8 +321,10 @@ export interface BundlerCaptureMetadata {
   readonly localResponseTimeIso: string | null;
   readonly localRetrievedAtMs: number;
   readonly executionDurationMs: number;
-  readonly receivedBytesCount: number;
-  readonly receivedWireSha256: string | null;
+  readonly receivedBytesCount: number; // Observed wire bytes read from transport
+  readonly retainedBytesCount: number; // Bounded prefix bytes retained on disk (<= maxResponseSizeBytes)
+  readonly receivedWireSha256: string | null; // Incremental digest across all observed bytes
+  readonly retainedPrefixSha256: string | null; // Digest of bounded retained prefix bytes
   readonly wasRedacted: boolean;
   readonly savedEvidenceSha256: string;
   readonly isTruncated: boolean;
@@ -692,6 +749,8 @@ export async function captureSolanaTrackerBundlers(
 
   let response: HttpTransportResponse | undefined;
   let rawWireBytes: Buffer = Buffer.alloc(0);
+  let totalObservedBytes = 0;
+  let incrementalWireSha256: string | null = null;
   let httpStatus: number | null = null;
   let localResponseTimeMs: number | null = null;
   let localResponseTimeIso: string | null = null;
@@ -747,9 +806,18 @@ export async function captureSolanaTrackerBundlers(
       if (captureStatus === "SUCCESS") {
         // Race streaming body read against deadline with byte-level limit
         try {
-          rawWireBytes = await raceWithDeadline(
+          const bodyResult = await raceWithDeadline(
             response.readBodyBytes(maxResponseSizeBytes, abortController.signal),
           );
+          if (Buffer.isBuffer(bodyResult)) {
+            rawWireBytes = bodyResult;
+            totalObservedBytes = bodyResult.length;
+            incrementalWireSha256 = computeSha256(bodyResult);
+          } else {
+            rawWireBytes = bodyResult.bytes;
+            totalObservedBytes = bodyResult.totalObservedBytes;
+            incrementalWireSha256 = bodyResult.incrementalWireSha256;
+          }
         } catch (readErr: unknown) {
           await cleanupUnreadBody(response, abortController, deadlinePromise);
           throw readErr;
@@ -789,13 +857,22 @@ export async function captureSolanaTrackerBundlers(
       isTruncated = true;
       if (err instanceof ResponseTooLargeError) {
         rawWireBytes = err.partialBytes;
+        totalObservedBytes = err.totalBytesRead;
+        incrementalWireSha256 = err.incrementalWireSha256;
       } else if (
         err &&
         typeof err === "object" &&
         "partialBytes" in err &&
         Buffer.isBuffer((err as { partialBytes: unknown }).partialBytes)
       ) {
-        rawWireBytes = (err as { partialBytes: Buffer }).partialBytes;
+        const customErr = err as {
+          partialBytes: Buffer;
+          totalBytesRead?: number;
+          incrementalWireSha256?: string;
+        };
+        rawWireBytes = customErr.partialBytes;
+        totalObservedBytes = customErr.totalBytesRead ?? rawWireBytes.length;
+        incrementalWireSha256 = customErr.incrementalWireSha256 ?? computeSha256(rawWireBytes);
       }
       const rawMsg = err instanceof Error ? err.message : String(err);
       errorMessage = redactSensitiveText(rawMsg, secretsToRedact);
@@ -810,10 +887,19 @@ export async function captureSolanaTrackerBundlers(
     }
   }
 
-  // 10. Compute received byte count and raw wire digest directly from bytes before decoding
-  const receivedBytesCount = rawWireBytes.length;
+  // 10. Compute received byte count, retained prefix count, and digests
+  const retainedBytesCount = rawWireBytes.length;
+  const receivedBytesCount = totalObservedBytes;
+
   const receivedWireSha256: string | null =
-    rawWireBytes.length > 0
+    totalObservedBytes > 0
+      ? (incrementalWireSha256 ?? computeSha256(rawWireBytes))
+      : captureStatus === "SUCCESS"
+        ? computeSha256(rawWireBytes)
+        : null;
+
+  const retainedPrefixSha256: string | null =
+    retainedBytesCount > 0
       ? computeSha256(rawWireBytes)
       : captureStatus === "SUCCESS"
         ? computeSha256(rawWireBytes)
@@ -917,7 +1003,9 @@ export async function captureSolanaTrackerBundlers(
     localRetrievedAtMs: localResponseTimeMs ?? localRequestTimeMs,
     executionDurationMs: (localResponseTimeMs ?? clock()) - localRequestTimeMs,
     receivedBytesCount,
+    retainedBytesCount,
     receivedWireSha256,
+    retainedPrefixSha256,
     wasRedacted,
     savedEvidenceSha256,
     isTruncated,

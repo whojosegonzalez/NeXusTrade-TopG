@@ -100,9 +100,12 @@ async function main(): Promise<void> {
     console.log(`HTTP Status:          ${result.metadata.httpStatus}`);
     console.log(`Duration:             ${result.metadata.executionDurationMs} ms`);
     console.log(`Received Wire SHA256: ${result.metadata.receivedWireSha256 ?? "UNAVAILABLE"}`);
+    console.log(`Retained Prefix SHA:  ${result.metadata.retainedPrefixSha256 ?? "UNAVAILABLE"}`);
     console.log(`Saved Evidence SHA256:${result.metadata.savedEvidenceSha256}`);
     console.log(`Entries Digest:       ${result.manifest.entriesDigestSha256}`);
     console.log(`Manifest File SHA256: ${result.manifest.manifestFileSha256}`);
+    console.log(`Bytes Retained:       ${result.metadata.retainedBytesCount} bytes`);
+    console.log(`Wire Bytes Observed:  ${result.metadata.receivedBytesCount} bytes`);
     console.log(
       `Files Sealed:         ${result.manifest.totalFiles} files (${result.manifest.totalBytes} bytes)`,
     );
@@ -112,6 +115,10 @@ async function main(): Promise<void> {
     console.error("=== SOLANA TRACKER BUNDLERS CAPTURE: FAILED ===");
     console.error(`Status:           ${result.status}`);
     console.error(`Message:          ${result.message}`);
+    if (result.metadata) {
+      console.error(`Bytes Retained:   ${result.metadata.retainedBytesCount} bytes`);
+      console.error(`Bytes Observed:   ${result.metadata.receivedBytesCount} bytes`);
+    }
     if (result.targetDir) {
       console.error(`Evidence Dir:     ${result.targetDir}`);
     }
