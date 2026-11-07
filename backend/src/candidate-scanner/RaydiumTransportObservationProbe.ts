@@ -104,6 +104,8 @@ export const DEFAULT_KEEPALIVE_PING_INTERVAL_MS = 20_000;
 export const DEFAULT_KEEPALIVE_MAX_PINGS = 4;
 export const DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS = 10_000;
 export const MAX_KEEPALIVE_PAYLOAD_BYTES = 125;
+export const DEFAULT_MAX_CONTROL_FRAMES = 50;
+export const DEFAULT_MAX_CONTROL_FRAME_BYTES = 4096;
 
 /**
  * Authentic reference Raydium AMM v4 RAY/WSOL pool context on Solana mainnet.
@@ -127,6 +129,7 @@ export type TransportProbeTerminationReason =
   | "DURATION_EXPIRED"
   | "MESSAGE_LIMIT_REACHED"
   | "PAYLOAD_LIMIT_REACHED"
+  | "CONTROL_LIMIT_REACHED"
   | "TRANSACTION_LIMIT_REACHED"
   | "COMPLETED"
   | "QUEUE_LIMIT_EXCEEDED"
@@ -172,6 +175,8 @@ export interface TransportProbeConfig {
   readonly pingIntervalMs?: number | undefined;
   readonly maxPings?: number | undefined;
   readonly pongTimeoutMs?: number | undefined;
+  readonly maxControlFrames?: number | undefined;
+  readonly maxControlFrameBytes?: number | undefined;
 }
 
 export interface TransportProbeDryRunResult {
@@ -198,6 +203,8 @@ export interface TransportProbeDryRunResult {
     readonly pingIntervalMs: number | null;
     readonly maxPings: number | null;
     readonly pongTimeoutMs: number | null;
+    readonly maxControlFrames: number | null;
+    readonly maxControlFrameBytes: number | null;
   };
   readonly budgetStats: GlobalBudgetStats;
   readonly message: string;
@@ -323,6 +330,12 @@ export interface TransportDiagnostics {
   readonly clientPingsSentCount: number;
   /** Number of RFC 6455 client PONG frames received in response */
   readonly clientPongsReceivedCount: number;
+  /** Number of matched client PONG responses acknowledging an outstanding PING */
+  readonly matchedClientPongsCount: number;
+  /** Number of unmatched (unsolicited, duplicate, or mismatched) PONG frames received */
+  readonly unmatchedClientPongsCount: number;
+  /** Number of automatic PONG replies sent in response to server PING frames */
+  readonly automaticPongsSentCount: number;
   /** Timestamp when the most recent client PING was sent, or null */
   readonly lastClientPingSentAtMs: number | null;
   /** Timestamp when the most recent client PONG was received, or null */
@@ -335,9 +348,21 @@ export interface TransportDiagnostics {
   readonly maxPongLatencyMs: number | null;
   /** True if a client PING timed out without receiving a PONG within pongTimeoutMs */
   readonly missingPongDetected: boolean;
-  /** Total payload bytes sent in client RFC 6455 control frames */
-  readonly controlFrameBytesSent: number;
+  /** Total count of RFC 6455 control frames sent (client PINGs + automatic PONG replies) */
+  readonly controlFramesSentCount: number;
+  /** Total count of RFC 6455 control frames received (server PINGs + client PONGs + unsolicited PONGs) */
+  readonly controlFramesReceivedCount: number;
+  /** Total payload bytes sent in RFC 6455 control frames */
+  readonly controlFramePayloadBytesSent: number;
   /** Total payload bytes received in RFC 6455 control frames */
+  readonly controlFramePayloadBytesReceived: number;
+  /** Total estimated wire bytes sent in RFC 6455 control frames (including 6-byte masked frame headers) */
+  readonly controlFrameWireBytesSent: number;
+  /** Total estimated wire bytes received in RFC 6455 control frames (including 2-byte unmasked frame headers) */
+  readonly controlFrameWireBytesReceived: number;
+  /** Total payload bytes sent in client RFC 6455 control frames (compatibility alias) */
+  readonly controlFrameBytesSent: number;
+  /** Total payload bytes received in RFC 6455 control frames (compatibility alias) */
   readonly controlFrameBytesReceived: number;
 }
 
@@ -368,12 +393,21 @@ export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze
   keepaliveEnabled: false,
   clientPingsSentCount: 0,
   clientPongsReceivedCount: 0,
+  matchedClientPongsCount: 0,
+  unmatchedClientPongsCount: 0,
+  automaticPongsSentCount: 0,
   lastClientPingSentAtMs: null,
   lastClientPongReceivedAtMs: null,
   lastPongLatencyMs: null,
   minPongLatencyMs: null,
   maxPongLatencyMs: null,
   missingPongDetected: false,
+  controlFramesSentCount: 0,
+  controlFramesReceivedCount: 0,
+  controlFramePayloadBytesSent: 0,
+  controlFramePayloadBytesReceived: 0,
+  controlFrameWireBytesSent: 0,
+  controlFrameWireBytesReceived: 0,
   controlFrameBytesSent: 0,
   controlFrameBytesReceived: 0,
 });
@@ -1462,6 +1496,34 @@ export async function executeTransportObservationProbe(
     };
   }
 
+  const maxControlFrames = config.maxControlFrames ?? DEFAULT_MAX_CONTROL_FRAMES;
+  if (
+    typeof maxControlFrames !== "number" ||
+    !Number.isSafeInteger(maxControlFrames) ||
+    maxControlFrames <= 0
+  ) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid maxControlFrames: expected integer > 0, received ${String(maxControlFrames)}`,
+    };
+  }
+
+  const maxControlFrameBytes = config.maxControlFrameBytes ?? DEFAULT_MAX_CONTROL_FRAME_BYTES;
+  if (
+    typeof maxControlFrameBytes !== "number" ||
+    !Number.isSafeInteger(maxControlFrameBytes) ||
+    maxControlFrameBytes <= 0
+  ) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid maxControlFrameBytes: expected integer > 0, received ${String(maxControlFrameBytes)}`,
+    };
+  }
+
   // Output Directory Boundary Enforcement
   const projectRoot = resolveProjectRoot();
   const baseCapturesDir = path.resolve(
@@ -1535,6 +1597,8 @@ export async function executeTransportObservationProbe(
         pingIntervalMs: keepaliveEnabled ? pingIntervalMs : null,
         maxPings: keepaliveEnabled ? maxPings : null,
         pongTimeoutMs: keepaliveEnabled ? pongTimeoutMs : null,
+        maxControlFrames: keepaliveEnabled ? maxControlFrames : null,
+        maxControlFrameBytes: keepaliveEnabled ? maxControlFrameBytes : null,
       },
       budgetStats: budget.getStats(),
       message: "Dry-run plan validation succeeded. Zero network requests or sockets opened.",
@@ -1580,6 +1644,7 @@ export async function executeTransportObservationProbe(
 
   let pingTimer: ReturnType<typeof setTimeout> | undefined;
   let pongTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingPingPayload: Buffer | null = null;
   let pendingPingTimestamp: number | null = null;
   let keepaliveDisposed = false;
 
@@ -1594,6 +1659,8 @@ export async function executeTransportObservationProbe(
       clearTimeout(pongTimeoutTimer);
       pongTimeoutTimer = undefined;
     }
+    pendingPingPayload = null;
+    pendingPingTimestamp = null;
   };
 
   const transportDiagnostics = {
@@ -1631,12 +1698,21 @@ export async function executeTransportObservationProbe(
     keepaliveEnabled,
     clientPingsSentCount: 0,
     clientPongsReceivedCount: 0,
+    matchedClientPongsCount: 0,
+    unmatchedClientPongsCount: 0,
+    automaticPongsSentCount: 0,
     lastClientPingSentAtMs: null as number | null,
     lastClientPongReceivedAtMs: null as number | null,
     lastPongLatencyMs: null as number | null,
     minPongLatencyMs: null as number | null,
     maxPongLatencyMs: null as number | null,
     missingPongDetected: false,
+    controlFramesSentCount: 0,
+    controlFramesReceivedCount: 0,
+    controlFramePayloadBytesSent: 0,
+    controlFramePayloadBytesReceived: 0,
+    controlFrameWireBytesSent: 0,
+    controlFrameWireBytesReceived: 0,
     controlFrameBytesSent: 0,
     controlFrameBytesReceived: 0,
   };
@@ -1847,19 +1923,61 @@ export async function executeTransportObservationProbe(
       allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
     });
 
+    const checkControlTrafficCeiling = () => {
+      const totalControlFrames =
+        transportDiagnostics.controlFramesSentCount +
+        transportDiagnostics.controlFramesReceivedCount;
+      const totalControlPayloadBytes =
+        transportDiagnostics.controlFramePayloadBytesSent +
+        transportDiagnostics.controlFramePayloadBytesReceived;
+
+      if (totalControlFrames >= maxControlFrames) {
+        if (!isProbeTerminated && probeActive) {
+          terminateProbe(
+            "CONTROL_LIMIT_REACHED",
+            `Control frame message budget reached: ${totalControlFrames} >= ${maxControlFrames}`,
+          );
+        }
+      } else if (totalControlPayloadBytes >= maxControlFrameBytes) {
+        if (!isProbeTerminated && probeActive) {
+          terminateProbe(
+            "CONTROL_LIMIT_REACHED",
+            `Control frame payload byte budget reached: ${totalControlPayloadBytes} >= ${maxControlFrameBytes}`,
+          );
+        }
+      }
+    };
+
     const sendPing = () => {
       if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
       if (transportDiagnostics.clientPingsSentCount >= maxPings) return;
+      // Enforce single pending PING: do not dispatch another if one is already outstanding
+      if (pendingPingPayload !== null) return;
+
+      // Clear any pending pingTimer to ensure strictly one scheduler
+      if (pingTimer) {
+        clearTimeout(pingTimer);
+        pingTimer = undefined;
+      }
 
       const now = clock();
       pendingPingTimestamp = now;
       transportDiagnostics.clientPingsSentCount++;
+      transportDiagnostics.controlFramesSentCount++;
       transportDiagnostics.lastClientPingSentAtMs = now;
 
       // 8-byte epoch timestamp payload (<= 125 bytes)
       const pingPayload = Buffer.alloc(8);
       pingPayload.writeBigInt64BE(BigInt(now));
-      transportDiagnostics.controlFrameBytesSent += pingPayload.length;
+      pendingPingPayload = pingPayload;
+
+      // Track payload bytes and wire bytes (masked client frame = 6 header bytes + payload)
+      transportDiagnostics.controlFramePayloadBytesSent += pingPayload.length;
+      transportDiagnostics.controlFrameWireBytesSent += 6 + pingPayload.length;
+      transportDiagnostics.controlFrameBytesSent =
+        transportDiagnostics.controlFramePayloadBytesSent;
+
+      checkControlTrafficCeiling();
 
       try {
         meteredTransport?.ping?.(pingPayload);
@@ -1887,18 +2005,49 @@ export async function executeTransportObservationProbe(
     if (keepaliveEnabled) {
       meteredTransport.on("open", () => {
         if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+        if (pingTimer) {
+          clearTimeout(pingTimer);
+          pingTimer = undefined;
+        }
         pingTimer = setTimeout(() => {
           sendPing();
         }, pingIntervalMs);
       });
 
       meteredTransport.on("pong", (payload: Buffer) => {
+        if (keepaliveDisposed) return;
         const now = clock();
         const payloadBytes = payload ? payload.length : 0;
-        transportDiagnostics.controlFrameBytesReceived += payloadBytes;
+
         transportDiagnostics.clientPongsReceivedCount++;
+        transportDiagnostics.controlFramesReceivedCount++;
+        transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
+        // Server-to-client frame is unmasked: 2 bytes header + payload
+        transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
+        transportDiagnostics.controlFrameBytesReceived =
+          transportDiagnostics.controlFramePayloadBytesReceived;
+
+        checkControlTrafficCeiling();
+
+        // Correlate PONG with currently outstanding PING
+        const isExactMatch =
+          pendingPingPayload !== null &&
+          Buffer.isBuffer(payload) &&
+          payload.length === pendingPingPayload.length &&
+          payload.equals(pendingPingPayload);
+
+        if (!isExactMatch) {
+          // Record unsolicited, duplicate, stale, or mismatched PONG separately
+          transportDiagnostics.unmatchedClientPongsCount++;
+          // MUST NOT reset deadline or accelerate send interval
+          return;
+        }
+
+        // Exactly matched PONG acknowledged
+        transportDiagnostics.matchedClientPongsCount++;
         transportDiagnostics.lastClientPongReceivedAtMs = now;
 
+        // Clear missing-PONG timeout
         if (pongTimeoutTimer) {
           clearTimeout(pongTimeoutTimer);
           pongTimeoutTimer = undefined;
@@ -1934,8 +2083,18 @@ export async function executeTransportObservationProbe(
             transportDiagnostics.maxPongLatencyMs = rtt;
           }
         }
+
+        // Clear pending PING state
+        pendingPingPayload = null;
         pendingPingTimestamp = null;
 
+        // Clear any existing pingTimer to ensure strictly one scheduler
+        if (pingTimer) {
+          clearTimeout(pingTimer);
+          pingTimer = undefined;
+        }
+
+        // Schedule next heartbeat strictly after pingIntervalMs
         if (
           transportDiagnostics.clientPingsSentCount < maxPings &&
           !keepaliveDisposed &&
@@ -1950,9 +2109,30 @@ export async function executeTransportObservationProbe(
     }
 
     if (transportType === "ws") {
-      meteredTransport.on("ping", () => {
+      meteredTransport.on("ping", (data: Buffer) => {
+        if (keepaliveDisposed) return;
+        const now = clock();
+        const payloadBytes = data ? data.length : 0;
+
         transportDiagnostics.serverPingsReceivedCount++;
-        transportDiagnostics.lastServerPingReceivedAtMs = clock();
+        transportDiagnostics.controlFramesReceivedCount++;
+        transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
+        // Unmasked server-to-client frame: 2 header bytes + payload
+        transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
+        transportDiagnostics.controlFrameBytesReceived =
+          transportDiagnostics.controlFramePayloadBytesReceived;
+        transportDiagnostics.lastServerPingReceivedAtMs = now;
+
+        // In RFC 6455, ws client automatically responds with a masked PONG frame of the same payload
+        transportDiagnostics.automaticPongsSentCount++;
+        transportDiagnostics.controlFramesSentCount++;
+        transportDiagnostics.controlFramePayloadBytesSent += payloadBytes;
+        // Masked client-to-server frame: 6 header bytes + payload
+        transportDiagnostics.controlFrameWireBytesSent += 6 + payloadBytes;
+        transportDiagnostics.controlFrameBytesSent =
+          transportDiagnostics.controlFramePayloadBytesSent;
+
+        checkControlTrafficCeiling();
       });
     }
 
@@ -2199,6 +2379,9 @@ export async function executeTransportObservationProbe(
 
   // End streaming observation phase
   isStreamingActive = false;
+
+  // Stop keepalive timers and clear pending-response state before socket closure
+  cleanupKeepalive();
 
   // Close streaming coordinator if probe not already terminated by limit
   if (!isProbeTerminated && probeActive) {
@@ -2463,6 +2646,7 @@ export async function executeTransportObservationProbe(
   const isCapTerminated =
     finalTerminationReason === "MESSAGE_LIMIT_REACHED" ||
     finalTerminationReason === "PAYLOAD_LIMIT_REACHED" ||
+    finalTerminationReason === "CONTROL_LIMIT_REACHED" ||
     finalTerminationReason === "HTTP_BUDGET_EXHAUSTED" ||
     finalTerminationReason === "TRANSACTION_LIMIT_REACHED";
 
@@ -2777,6 +2961,8 @@ export interface TransportProbeCliArgs {
   readonly pingIntervalMs?: number | undefined;
   readonly maxPings?: number | undefined;
   readonly pongTimeoutMs?: number | undefined;
+  readonly maxControlFrames?: number | undefined;
+  readonly maxControlFrameBytes?: number | undefined;
 }
 
 export function parseTransportProbeArgs(argv: readonly string[]): TransportProbeCliArgs {
@@ -2796,6 +2982,8 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
   let pingIntervalMs: number | undefined;
   let maxPings: number | undefined;
   let pongTimeoutMs: number | undefined;
+  let maxControlFrames: number | undefined;
+  let maxControlFrameBytes: number | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -2954,6 +3142,26 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
         throw new Error(`--pong-timeout-ms must be a positive integer, received '${next}'`);
       }
       pongTimeoutMs = parsed;
+    } else if (arg === "--max-control-frames") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --max-control-frames");
+      }
+      const parsed = Number(next);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new Error(`--max-control-frames must be a positive integer, received '${next}'`);
+      }
+      maxControlFrames = parsed;
+    } else if (arg === "--max-control-bytes") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --max-control-bytes");
+      }
+      const parsed = Number(next);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new Error(`--max-control-bytes must be a positive integer, received '${next}'`);
+      }
+      maxControlFrameBytes = parsed;
     } else {
       throw new Error(`Unrecognized argument: '${arg}'`);
     }
@@ -2976,5 +3184,7 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
     pingIntervalMs,
     maxPings,
     pongTimeoutMs,
+    maxControlFrames,
+    maxControlFrameBytes,
   };
 }

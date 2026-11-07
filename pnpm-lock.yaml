@@ -43,9 +43,6 @@ importers:
       "@solana/web3.js":
         specifier: ^3.1.1
         version: 3.1.1(typescript@5.9.3)
-      "@types/ws":
-        specifier: ^8.18.2
-        version: 8.18.2
       better-sqlite3:
         specifier: ^12.11.1
         version: 12.11.1
@@ -62,6 +59,9 @@ importers:
       "@types/better-sqlite3":
         specifier: ^7.6.13
         version: 7.6.13
+      "@types/ws":
+        specifier: ^8.18.2
+        version: 8.18.2
       drizzle-kit:
         specifier: ^0.31.10
         version: 0.31.10

@@ -631,15 +631,15 @@ Two bounded operator transport captures executed at commit `6616751` have been i
 
 1. **Capture 1 (`2026-11-07T00-39-34.601Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
    - **Duration**: 80,174 ms (completed cleanly through streaming and discovery phases).
-   - **Ingress Telemetry**: 18 application messages, 8,973 application bytes, peak queue depth 1.
-   - **HTTP RPC Calls**: 4 total HTTP attempts (2 history discovery queries, 2 sampled transaction retrievals).
+   - **Ingress Telemetry**: 2 application messages, 1,828 application bytes, peak queue depth 1.
+   - **HTTP RPC Calls**: 2 total HTTP requests (1 transaction retrieval and 1 history query).
    - **Outcome**: Successfully decoded one Solana Version 0 swap.
    - **Integrity**: Manifest file sizes, SHA-256 hashes, and entries digest verified. Offline decoder replay reproduced recorded results.
 
 2. **Capture 2 (`2026-11-07T00-41-02.221Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
    - **Duration**: 62,820 ms.
-   - **Ingress Telemetry**: 13 application messages, 6,488 application bytes, peak queue depth 3.
-   - **HTTP RPC Calls**: 3 total HTTP attempts (3 sampled transaction retrievals, 0 history queries due to transport disconnect before discovery).
+   - **Ingress Telemetry**: 4 application messages, 12,029 application bytes, peak queue depth 3.
+   - **HTTP RPC Calls**: 3 total HTTP attempts (3 sampled transaction retrievals; zero history queries due to transport disconnect before discovery).
    - **Outcome**: Successfully retrieved and decoded one Solana Version 1 swap; correctly rejected two failed on-chain transactions; encountered upstream transport disconnect at 62.8s.
    - **Integrity**: Manifest file sizes, SHA-256 hashes, and entries digest verified. Offline decoder replay reproduced recorded results.
 
@@ -648,7 +648,7 @@ Two bounded operator transport captures executed at commit `6616751` have been i
 Capture 2 successfully retrieved and decoded signature `gDZqEQSKcxE6a7oinmELh95Vk1dXMn2cauP1LP9vjuU8A3zR1HzyxUXzkoYWfKuKo1qwqvnAsFywnpZAWCQrqGk`:
 
 - **Protocol Structure**: HTTP 200 response with `"version": 1`, inline account keys, empty address table lookups, and valid `transactionConfig`.
-- **Decoding Outcome**: Successfully normalized and decoded as an authentic Raydium AMM v4 BUY transaction of 1,406,466 candidate tokens for 28,073,671 lamports.
+- **Decoding Outcome**: Successfully normalized and decoded as an authentic Raydium AMM v4 BUY transaction of 1,406,466 raw token units for 28,073,671 lamports.
 - **Milestone Accepted**: Live on-chain Solana Version 1 transaction retrieval and swap decoding is established and verified offline against retained production RPC responses.
 
 ### 8.3 Critical Invariant: Successful HTTP Retrieval vs. Successful Swap Decoding

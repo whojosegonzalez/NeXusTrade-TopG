@@ -58,6 +58,8 @@ OPTIONS:
   --ping-interval-ms <ms>      Keepalive PING interval in milliseconds (default: 20000)
   --max-pings <count>          Maximum keepalive PINGs to send (default: 4)
   --pong-timeout-ms <ms>       Missing-PONG timeout in milliseconds (default: 10000)
+  --max-control-frames <count> Maximum RFC 6455 control frames budget (default: 50)
+  --max-control-bytes <bytes>  Maximum RFC 6455 control frame payload bytes budget (default: 4096)
   -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
@@ -112,6 +114,8 @@ async function main(): Promise<void> {
       pingIntervalMs: args.pingIntervalMs,
       maxPings: args.maxPings,
       pongTimeoutMs: args.pongTimeoutMs,
+      maxControlFrames: args.maxControlFrames,
+      maxControlFrameBytes: args.maxControlFrameBytes,
       signal: abortController.signal,
     });
   } finally {
@@ -209,6 +213,13 @@ async function main(): Promise<void> {
       if (td.keepaliveEnabled) {
         console.log(`Client Pings Sent:         ${td.clientPingsSentCount}`);
         console.log(`Client Pongs Received:     ${td.clientPongsReceivedCount}`);
+        console.log(`Matched Client Pongs:      ${td.matchedClientPongsCount}`);
+        if (td.unmatchedClientPongsCount > 0) {
+          console.log(`Unmatched Client Pongs:    ${td.unmatchedClientPongsCount}`);
+        }
+        if (td.automaticPongsSentCount > 0) {
+          console.log(`Automatic Pongs Sent:      ${td.automaticPongsSentCount}`);
+        }
         if (td.lastClientPingSentAtMs !== null) {
           console.log(`Last Ping Sent (ms):       ${td.lastClientPingSentAtMs}`);
         }
@@ -223,7 +234,13 @@ async function main(): Promise<void> {
         }
         console.log(`Missing Pong Detected:     ${td.missingPongDetected}`);
         console.log(
-          `Control Frame Bytes:       Sent: ${td.controlFrameBytesSent}, Recv: ${td.controlFrameBytesReceived}`,
+          `Control Frames Count:      Sent: ${td.controlFramesSentCount}, Recv: ${td.controlFramesReceivedCount}`,
+        );
+        console.log(
+          `Control Frame Payload:     Sent: ${td.controlFramePayloadBytesSent} B, Recv: ${td.controlFramePayloadBytesReceived} B`,
+        );
+        console.log(
+          `Control Frame Wire:        Sent: ${td.controlFrameWireBytesSent} B, Recv: ${td.controlFrameWireBytesReceived} B`,
         );
       }
       console.log(`Closure Origin:            ${td.observedCloseOrigin}`);

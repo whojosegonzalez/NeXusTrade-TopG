@@ -2240,6 +2240,8 @@ describe("RaydiumTransportObservationProbe", () => {
           expect(result.limits.pingIntervalMs).toBe(20_000);
           expect(result.limits.maxPings).toBe(4);
           expect(result.limits.pongTimeoutMs).toBe(10_000);
+          expect(result.limits.maxControlFrames).toBe(50);
+          expect(result.limits.maxControlFrameBytes).toBe(4096);
         }
       });
 
@@ -2255,12 +2257,18 @@ describe("RaydiumTransportObservationProbe", () => {
           "3",
           "--pong-timeout-ms",
           "8000",
+          "--max-control-frames",
+          "30",
+          "--max-control-bytes",
+          "2048",
         ]);
         expect(args1.transport).toBe("ws");
         expect(args1.keepalive).toBe(true);
         expect(args1.pingIntervalMs).toBe(15000);
         expect(args1.maxPings).toBe(3);
         expect(args1.pongTimeoutMs).toBe(8000);
+        expect(args1.maxControlFrames).toBe(30);
+        expect(args1.maxControlFrameBytes).toBe(2048);
 
         const args2 = parseTransportProbeArgs(["--transport", "ws", "--disable-keepalive"]);
         expect(args2.transport).toBe("ws");
@@ -2276,6 +2284,256 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(() => parseTransportProbeArgs(["--keepalive", "notabool"])).toThrow(
           "--keepalive must be 'true' or 'false'",
         );
+      });
+
+      it("rejects wrong-payload PONGs, preserves missing-PONG timeout, and records unmatched count", async () => {
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          const originalPong = socket.pong.bind(socket);
+          // Override pong: send mismatched payload instead of echoed payload
+          socket.pong = () => {
+            originalPong(Buffer.from("mismatched-payload-bytes"));
+          };
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 30,
+          pongTimeoutMs: 70,
+          durationMs: 400,
+          streamingDurationMs: 300,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          expect(succ.status).toBe("TRANSPORT_ERROR");
+          expect(succ.observationSuccess).toBe(false);
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(td.clientPingsSentCount).toBe(1);
+          expect(td.clientPongsReceivedCount).toBeGreaterThanOrEqual(1);
+          expect(td.matchedClientPongsCount).toBe(0);
+          expect(td.unmatchedClientPongsCount).toBeGreaterThanOrEqual(1);
+          expect(td.missingPongDetected).toBe(true);
+          expect(td.firstErrorMessage).toContain("Missing WebSocket keepalive PONG");
+        }
+      });
+
+      it("ignores unsolicited and duplicate PONGs without scheduling extra PINGs or resetting send interval", async () => {
+        let pingsReceivedAtServer = 0;
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          // Send 2 unsolicited pongs before client sends any ping
+          socket.pong(Buffer.from("unsolicited-1"));
+          socket.pong(Buffer.from("unsolicited-2"));
+
+          socket.on("ping", () => {
+            pingsReceivedAtServer++;
+            // Send additional duplicate pong
+            socket.pong(Buffer.from("duplicate-pong"));
+          });
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 50,
+          maxPings: 2,
+          pongTimeoutMs: 500,
+          durationMs: 140,
+          streamingDurationMs: 120,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(succ.observationSuccess).toBe(true);
+          expect(pingsReceivedAtServer).toBeLessThanOrEqual(2);
+          expect(td.unmatchedClientPongsCount).toBeGreaterThanOrEqual(2);
+          expect(td.matchedClientPongsCount).toBeGreaterThanOrEqual(1);
+        }
+      });
+
+      it("disposes keepalive before intentional socket closure during streaming completion with pending transaction retrieval", async () => {
+        let serverClosed = false;
+        let pingsAfterClose = 0;
+        let activeSocket: WebSocket | undefined;
+
+        const testWs = await createTestWebSocketServer((socket) => {
+          activeSocket = socket;
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          socket.on("ping", () => {
+            if (serverClosed) pingsAfterClose++;
+          });
+          socket.on("close", () => {
+            serverClosed = true;
+          });
+        });
+
+        let fetchDispatched = false;
+        const mockFetch: typeof fetch = async () => {
+          fetchDispatched = true;
+          await new Promise((r) => setTimeout(r, 60));
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: 1, result: createSyntheticBuyPayload(SIG_C) }),
+          );
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 20,
+          pongTimeoutMs: 200,
+          durationMs: 300,
+          streamingDurationMs: 40,
+          maxTransactionRetrievals: 1,
+          fetchTransport: mockFetch,
+        });
+
+        setTimeout(() => {
+          activeSocket?.send(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                subscription: 1,
+                result: {
+                  context: { slot: 100 },
+                  value: {
+                    signature: SIG_C,
+                    logs: [],
+                    err: null,
+                  },
+                },
+              },
+            }),
+          );
+        }, 10);
+
+        const result = await probePromise;
+        await testWs.close();
+
+        expect(result.dryRun).toBe(false);
+        expect(fetchDispatched).toBe(true);
+        expect(pingsAfterClose).toBe(0);
+        expect(result.status).not.toBe("TRANSPORT_ERROR");
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          expect(succ.observationSuccess).toBe(true);
+          expect(succ.metadata.transportDiagnostics.intentionalShutdownInitiated).toBe(true);
+          expect(succ.metadata.transportDiagnostics.missingPongDetected).toBe(false);
+          expect(succ.metadata.counts.transactionRetrievalsAttempted).toBe(1);
+        }
+      });
+
+      it("accurately accounts for server PINGs and automatic PONG replies in payload and wire byte metrics", async () => {
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          setTimeout(() => {
+            try {
+              socket.ping(Buffer.from("0123456789"));
+            } catch {
+              // ignore
+            }
+          }, 25);
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 50,
+          maxPings: 1,
+          pongTimeoutMs: 500,
+          durationMs: 200,
+          streamingDurationMs: 120,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(td.serverPingsReceivedCount).toBeGreaterThanOrEqual(1);
+          expect(td.automaticPongsSentCount).toBeGreaterThanOrEqual(1);
+          expect(td.controlFramesReceivedCount).toBeGreaterThanOrEqual(2);
+          expect(td.controlFramesSentCount).toBeGreaterThanOrEqual(2);
+          expect(td.controlFramePayloadBytesReceived).toBeGreaterThanOrEqual(18);
+          expect(td.controlFramePayloadBytesSent).toBeGreaterThanOrEqual(18);
+          expect(td.controlFrameWireBytesSent).toBeGreaterThanOrEqual(30);
+          expect(td.controlFrameWireBytesReceived).toBeGreaterThanOrEqual(22);
+        }
+      });
+
+      it("enforces bounded control-frame traffic ceiling by terminating with CONTROL_LIMIT_REACHED", async () => {
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          const floodInterval = setInterval(() => {
+            try {
+              socket.ping(Buffer.alloc(20));
+            } catch {
+              clearInterval(floodInterval);
+            }
+          }, 10);
+          socket.on("close", () => clearInterval(floodInterval));
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          maxControlFrames: 4,
+          pingIntervalMs: 100,
+          maxPings: 2,
+          pongTimeoutMs: 500,
+          durationMs: 500,
+          streamingDurationMs: 400,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          expect(succ.metadata.terminationReason).toBe("CONTROL_LIMIT_REACHED");
+          expect(succ.status).toBe("CAP_LIMITED");
+          expect(succ.observationSuccess).toBe(true);
+        }
       });
     });
   });
