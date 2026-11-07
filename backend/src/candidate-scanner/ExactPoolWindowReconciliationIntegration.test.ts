@@ -422,13 +422,11 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Integr
       clock,
     });
 
-    // Reconcile candidate window at decision time T = 66s
-    simulatedTime = 1_700_000_066_000;
+    // Reconcile candidate window using default decision timestamp (evaluated post-acquisition)
     const reconResult = await coordinator.reconcileCandidateWindow(sourceCutoff, {
       knownAnchorSignature: SIG_ANCHOR,
       historyEnumerator,
       resolutionBridge,
-      decisionTimestampMs: 1_700_000_066_000,
     });
 
     // Research result is RECONCILED with 2 BUYS
@@ -788,7 +786,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Integr
     expect(tracker.getGapsCount()).toBe(1); // Gap was NOT erased!
   });
 
-  it("6. Unresolved Transactions: fails closed with UNRESOLVED_TRANSACTIONS when in-window transaction decode fails", async () => {
+  it("6. Unresolved Transactions: fails closed with STREAM_GAP (collection loss) when in-window transaction decode fails", async () => {
     const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
     const tracker = new RollingTradeFlowTracker({
       poolId: SYNTHETIC_POOL_ID,
@@ -866,7 +864,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Integr
       decisionTimestampMs: 1_700_000_066_000,
     });
 
-    expect(reconResult.status).toBe("UNRESOLVED_TRANSACTIONS");
+    expect(reconResult.status).toBe("STREAM_GAP");
     expect(reconResult.flowCoverage).toBe("COLLECTION_GAP");
     expect(reconResult.flowCounts.recentBuys60s).toBeNull();
   });
@@ -1254,6 +1252,245 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Integr
 
     // Incomplete coverage strictly fails closed with UNRESOLVED_TRANSACTIONS
     expect(reconResult.status).toBe("UNRESOLVED_TRANSACTIONS");
+    expect(reconResult.flowCoverage).toBe("COLLECTION_GAP");
+    expect(reconResult.flowCounts.recentBuys60s).toBeNull();
+  });
+
+  it("12. Overlapping Queue Overflow Gap: fails closed with STREAM_GAP despite successful history and resolution evidence", async () => {
+    const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+    const tracker = new RollingTradeFlowTracker({
+      poolId: SYNTHETIC_POOL_ID,
+      tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      trackingStartedMs: 1_700_000_000_000,
+      clock,
+    });
+
+    const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+      poolContext: STANDARD_POOL_CONTEXT,
+      rpcUrl: MOCK_RPC_URL,
+      budgetManager,
+      transport: defaultFakeTransport,
+      clock,
+    });
+
+    const fakeWs = new FakeWebSocketTransport();
+    const coordinator = new RaydiumCandidateSubscriptionCoordinator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      transport: fakeWs,
+      clock,
+    });
+
+    fakeWs.triggerOpen();
+    fakeWs.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 42 }));
+
+    recordObservationRange(tracker, 1_700_000_010_000, 1_700_000_065_000);
+
+    // Record an overlapping queue overflow loss gap in the tracker
+    tracker.recordCollectionGap({
+      gapStartMs: 1_700_000_030_000,
+      gapEndMs: 1_700_000_035_000,
+      reason: "SOURCE_ADAPTER_LOSS:QUEUE_OVERFLOW",
+    });
+
+    simulatedTime = 1_700_000_065_000;
+    const sourceCutoff = createValidCutoff(105, 1700000065, 1_700_000_065_040);
+
+    const historyEnumerator = new ExactPoolHistoryEnumerator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      knownAnchorSignature: SIG_ANCHOR,
+      pageFetcher: async () => [
+        { signature: SIG_ANCHOR, slot: 100, err: null, memo: null, blockTime: 1700000004 },
+      ],
+      budgetManager,
+      clock,
+      lifecycleTarget: coordinator,
+    });
+
+    const resolutionBridge = new ExactPoolTransactionResolutionBridge({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      budgetManager,
+      lifecycleTarget: coordinator,
+      clock,
+    });
+
+    simulatedTime = 1_700_000_066_000;
+    const reconResult = await coordinator.reconcileCandidateWindow(sourceCutoff, {
+      knownAnchorSignature: SIG_ANCHOR,
+      historyEnumerator,
+      resolutionBridge,
+    });
+
+    // Invalidation due to overlapping collection gap strictly fails closed with STREAM_GAP
+    expect(reconResult.status).toBe("STREAM_GAP");
+    expect(reconResult.flowCoverage).toBe("COLLECTION_GAP");
+    expect(reconResult.flowCounts.recentBuys60s).toBeNull();
+    expect(reconResult.flowCounts.recentSells60s).toBeNull();
+  });
+
+  it("13. Delayed History Acquisition Causality: fails closed with FUTURE_DATED_EVIDENCE when history completes after explicit decision timestamp", async () => {
+    const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+    const tracker = new RollingTradeFlowTracker({
+      poolId: SYNTHETIC_POOL_ID,
+      tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      trackingStartedMs: 1_700_000_000_000,
+      clock,
+    });
+
+    const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+      poolContext: STANDARD_POOL_CONTEXT,
+      rpcUrl: MOCK_RPC_URL,
+      budgetManager,
+      transport: defaultFakeTransport,
+      clock,
+    });
+
+    const fakeWs = new FakeWebSocketTransport();
+    const coordinator = new RaydiumCandidateSubscriptionCoordinator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      transport: fakeWs,
+      clock,
+    });
+
+    fakeWs.triggerOpen();
+    fakeWs.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 42 }));
+
+    recordObservationRange(tracker, 1_700_000_010_000, 1_700_000_065_000);
+
+    simulatedTime = 1_700_000_065_000;
+    const sourceCutoff = createValidCutoff(105, 1700000065, 1_700_000_065_040);
+
+    // Page fetcher introduces delay past the explicit decision time
+    const delayedPageFetcher = async (): Promise<readonly HistorySignatureRecord[]> => {
+      simulatedTime = 1_700_000_070_000; // Advancing time to 70s
+      return [{ signature: SIG_ANCHOR, slot: 100, err: null, memo: null, blockTime: 1700000004 }];
+    };
+
+    const historyEnumerator = new ExactPoolHistoryEnumerator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      knownAnchorSignature: SIG_ANCHOR,
+      pageFetcher: delayedPageFetcher,
+      budgetManager,
+      clock,
+      lifecycleTarget: coordinator,
+    });
+
+    const resolutionBridge = new ExactPoolTransactionResolutionBridge({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      budgetManager,
+      lifecycleTarget: coordinator,
+      clock,
+    });
+
+    // Explicit decision timestamp set before history completion
+    const reconResult = await coordinator.reconcileCandidateWindow(sourceCutoff, {
+      knownAnchorSignature: SIG_ANCHOR,
+      historyEnumerator,
+      resolutionBridge,
+      decisionTimestampMs: 1_700_000_066_000, // 66s < 70s
+    });
+
+    expect(reconResult.status).toBe("FUTURE_DATED_EVIDENCE");
+    expect(reconResult.flowCoverage).toBe("COLLECTION_GAP");
+    expect(reconResult.flowCounts.recentBuys60s).toBeNull();
+  });
+
+  it("14. Delayed Resolution Acquisition Causality: fails closed with FUTURE_DATED_EVIDENCE when resolution completes after explicit decision timestamp", async () => {
+    const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+    const tracker = new RollingTradeFlowTracker({
+      poolId: SYNTHETIC_POOL_ID,
+      tokenMint: SYNTHETIC_CANDIDATE_MINT,
+      trackingStartedMs: 1_700_000_000_000,
+      clock,
+    });
+
+    const fakeTransport: typeof fetch = async () => {
+      simulatedTime = 1_700_000_072_000; // Advancing time during resolution to 72s
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: createSyntheticBuyPayload(
+            SIG_B,
+            50_000_000n,
+            25_000_000_000n,
+            SYNTHETIC_POOL_ID,
+            101,
+            1700000045,
+          ),
+        }),
+        { status: 200 },
+      );
+    };
+
+    const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+      poolContext: STANDARD_POOL_CONTEXT,
+      rpcUrl: MOCK_RPC_URL,
+      budgetManager,
+      transport: fakeTransport,
+      clock,
+    });
+
+    const fakeWs = new FakeWebSocketTransport();
+    const coordinator = new RaydiumCandidateSubscriptionCoordinator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      transport: fakeWs,
+      clock,
+    });
+
+    fakeWs.triggerOpen();
+    fakeWs.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 42 }));
+
+    recordObservationRange(tracker, 1_700_000_010_000, 1_700_000_065_000);
+
+    simulatedTime = 1_700_000_065_000;
+    const sourceCutoff = createValidCutoff(105, 1700000065, 1_700_000_065_040);
+
+    // History finishes on time at 65.5s with an in-window transaction (SIG_B) to resolve
+    const timelyPageFetcher = async (): Promise<readonly HistorySignatureRecord[]> => {
+      simulatedTime = 1_700_000_065_500;
+      return [
+        { signature: SIG_B, slot: 101, err: null, memo: null, blockTime: 1700000045 },
+        { signature: SIG_ANCHOR, slot: 100, err: null, memo: null, blockTime: 1700000004 },
+      ];
+    };
+
+    const historyEnumerator = new ExactPoolHistoryEnumerator({
+      poolContext: STANDARD_POOL_CONTEXT,
+      knownAnchorSignature: SIG_ANCHOR,
+      pageFetcher: timelyPageFetcher,
+      budgetManager,
+      clock,
+      lifecycleTarget: coordinator,
+    });
+
+    const resolutionBridge = new ExactPoolTransactionResolutionBridge({
+      poolContext: STANDARD_POOL_CONTEXT,
+      adapter,
+      tracker,
+      budgetManager,
+      lifecycleTarget: coordinator,
+      clock,
+    });
+
+    // Explicit decision timestamp set to 66s, but resolution completes at 72s
+    const reconResult = await coordinator.reconcileCandidateWindow(sourceCutoff, {
+      knownAnchorSignature: SIG_ANCHOR,
+      historyEnumerator,
+      resolutionBridge,
+      decisionTimestampMs: 1_700_000_066_000,
+    });
+
+    expect(reconResult.status).toBe("FUTURE_DATED_EVIDENCE");
     expect(reconResult.flowCoverage).toBe("COLLECTION_GAP");
     expect(reconResult.flowCounts.recentBuys60s).toBeNull();
   });

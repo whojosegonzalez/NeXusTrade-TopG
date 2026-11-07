@@ -1299,17 +1299,25 @@ A candidate pool experiences moderate activity during the first 50 seconds, foll
 - **Subscription Observation**: [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts) attaches an injected WebSocket transport (`{ mentions: [poolId] }`), manages connection epochs, and buffers live transaction notifications into [`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts).
 - **Asynchronous History Enumeration**: [`ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts) provides asynchronous `{ before: cursor }` pagination via `enumerate(): Promise<HistoryEnumerationResult>` until `knownAnchorSignature` is witnessed.
 - **Asynchronous Transaction Resolution**: [`ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts) resolves discovered transactions chronological oldest-first via `resolve(historyResult): Promise<TransactionResolutionResult>`. Resolution intentionally ingests recovered trade events into [`RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts); stream gaps recorded in the tracker remain strictly immutable.
-- **Read-Only Window Reconciliation**: [`ExactPoolWindowReconciliationEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.ts) evaluates the 4-dimensional temporal contract, validates evidence completeness, verifies boundary anchors, detects collection gaps/backlog read-only without mutating caller objects or tracker state, and reports accurate dispatch accounting (`WindowReconciliationResult`).
+- **Read-Only Window Reconciliation**: [`ExactPoolWindowReconciliationEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.ts) evaluates the 4-dimensional temporal contract, validates evidence completeness, verifies boundary anchors, detects collection gaps/backlog read-only without mutating caller objects or tracker state, enforces acquisition-time causality, and reports accurate dispatch accounting (`WindowReconciliationResult`).
 - **Orchestration Seam**: `reconcileCandidateWindow(sourceCutoff, options): Promise<WindowReconciliationResult>` on [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts):
   - Validates candidate pool and token mint identity binding.
+  - Snapshots caller options and clones `sourceCutoff` pre-await, locking research window boundaries against caller mutation.
   - Enforces active `SUBSCRIBED` lifecycle pre-await.
-  - Awaits `ExactPoolHistoryEnumerator.enumerate()`.
+  - Awaits `ExactPoolHistoryEnumerator.enumerate()` and records `historyRetrievedAtMs`.
   - Re-validates connection epoch and transport status post-enumeration await, failing closed if disconnected or epoch advanced.
-  - Awaits `ExactPoolTransactionResolutionBridge.resolve()`.
+  - Awaits `ExactPoolTransactionResolutionBridge.resolve()` and records `resolutionRetrievedAtMs` and `acquisitionCompletedAtMs`.
   - Re-validates connection epoch and transport status post-resolution await, failing closed if disconnected or epoch advanced.
+  - Enforces acquisition-time causality: explicit `decisionTimestampMs` preceding any acquisition timestamp fails closed with `FUTURE_DATED_EVIDENCE`. When omitted, `decisionTimestampMs` defaults to `acquisitionCompletedAtMs`, evaluating after acquisition completes.
   - Evaluates the cutoff-anchored research window via `evaluateExactPoolWindowReconciliation`.
   - Exposes the immutable research result in `CandidateFlowCoverageDiagnostic.lastReconciliationResult`.
   - **Production Flow Isolation**: Synchronous production flow getters (`createRetestSpotInfo`, `evaluateFlow`) remain completely free of reconciliation or network dispatch, strictly failing closed with unavailable counts (`recentBuys60s: null, recentSells60s: null, flowCoverage: "COLLECTION_GAP"`).
+- **Strict Collection-Gap Enforcement**:
+  - All stream gaps recorded in `RollingTradeFlowTracker` (including `SOURCE_ADAPTER_LOSS:QUEUE_OVERFLOW` and `SOURCE_ADAPTER_LOSS:DECODE_FAILED`) strictly invalidate overlapping evaluation windows fail-closed with `STREAM_GAP`, `COLLECTION_GAP`, and null counts.
+  - Blanket exemptions for adapter loss reasons are eliminated. Gap enforcement is never weakened to obtain `UNRESOLVED_TRANSACTIONS` instead of `STREAM_GAP`.
+- **Duplicate Boundary Transaction Reuse Limitation**:
+  - A second reconciliation of the same quiet fixture returns `UNRESOLVED_TRANSACTIONS` because the adapter reports the already-processed boundary transaction as `DUPLICATE_UNRESOLVED` under conservative duplicate policy.
+  - Completeness cannot be inferred from bare signature membership; incremental reuse cannot guarantee the live request schedule without demonstrating complete, validated reusable resolution evidence.
 
 ###### 2. Four-Dimensional Coverage & Time Policy
 
@@ -1321,36 +1329,39 @@ A candidate pool experiences moderate activity during the first 50 seconds, foll
   - `blockTime` is treated as an RPC-reported estimated block-production timestamp per official Solana documentation ([`getBlockTime`](https://solana.com/docs/rpc/http/getblocktime)). It is not an authenticated or cryptographic ledger timestamp.
 - **Decision Time ($T_{\text{decision}}$)**: Local host timestamp when evidence is available for evaluation ($T_{\text{decision}} \ge T_{\text{receipt}}$).
 - **Retrieval Time ($T_{\text{receipt}}$)**: Local host timestamp when source cutoff evidence was received.
-- **Freshness Ceiling**: $\Delta t_{\text{cutoffAge}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$. If collection delays cause cutoff age to exceed $15\text{s}$, the evaluator terminates fail-closed with `STALE_DATA` without adjusting timestamps or advancing the cutoff.
+- **Freshness Ceiling**: $\Delta t_{\text{cutoffAge}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$. Freshness is strictly measured from the source cutoff timestamp $T_{\text{cutoff}}$, not cutoff retrieval. If collection delays cause cutoff age to exceed $15\text{s}$, the evaluator terminates fail-closed with `STALE_DATA` without adjusting timestamps or advancing the cutoff.
 - **Request Limits as Hard Bounds**:
   - Request limits are limits, not completeness guarantees. Sampling never yields `RECONCILED`.
   - Every required in-window transaction must be fully resolved or the evaluator terminates fail-closed with `UNRESOLVED_TRANSACTIONS`.
   - At minimum host pacing of $2{,}500\text{ ms}$, 7 sequential requests span $> 15\text{s}$; freshness is achievable only via incremental in-stream resolution during observation, leaving at most $D \le 3$ transactions to resolve post-cutoff.
 
-###### 3. Verified Offline Integration Suite (11 Scenarios)
+###### 3. Verified Offline Integration Suite (14 Scenarios)
 
-The offline single-pool integration suite ([`ExactPoolWindowReconciliationIntegration.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationIntegration.test.ts)) provides 11 deterministic scenarios verified against synthetic clocks and mock transports:
+The offline single-pool integration suite ([`ExactPoolWindowReconciliationIntegration.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationIntegration.test.ts)) provides 14 deterministic scenarios verified against synthetic clocks and mock transports:
 
 1. **Complete Activity**: Burst of trades enumerated and resolved; reconciles to exact buy/sell counts and `SUFFICIENT` coverage in research diagnostic, while production flow remains strictly unavailable (`recentBuys60s: null`).
 2. **Quiet Window**: Zero transactions in evaluated 60s window witnessed via prior anchor; reconciles with 0 buys, 0 sells, 100% flow ratio, and counts evidenced dispatches for older boundary transactions outside the window.
 3. **Warm-Up Rejection**: Observation started $< 60\text{s}$ before cutoff terminates fail-closed with `WARM_UP` and null counts.
 4. **Processing Backlog**: Active adapter transaction queue backlog terminates fail-closed with `PROCESSING_BACKLOG`.
 5. **Disconnects & Gap Permanence**: Transport disconnect mid-window records immutable stream gap in tracker, failing closed with `STREAM_GAP` despite subsequent backfill.
-6. **Unresolved Transactions**: In-window transaction decode failure terminates fail-closed with `UNRESOLVED_TRANSACTIONS` and unavailable counts.
+6. **Collection Loss Gaps**: In-window transaction decode failure records adapter loss gap in tracker, failing closed with `STREAM_GAP` (collection loss) and unavailable counts.
 7. **Stale Evidence**: Decision timestamp exceeding $15\text{s}$ limit from cutoff terminates fail-closed with `STALE_DATA`.
 8. **Budget Exhaustion**: Quota exhaustion during enumeration/resolution terminates fail-closed with `BUDGET_EXHAUSTED`.
 9. **Epoch Changes During Awaits**: Transport replacement and connection epoch advance during awaited operations strictly rejects invalidated results fail-closed (`STREAM_GAP`).
 10. **Causality Violation**: Evidence retrieved after decision timestamp terminates fail-closed with `FUTURE_DATED_EVIDENCE`.
 11. **Capped Collection Incomplete**: Bridge transaction limit leaving in-window transactions unresolved strictly fails closed with `UNRESOLVED_TRANSACTIONS` (sampling never yields `RECONCILED`).
+12. **Overlapping Queue Overflow Gap**: Overlapping `SOURCE_ADAPTER_LOSS:QUEUE_OVERFLOW` gap in tracker strictly fails closed with `STREAM_GAP` despite successful history enumeration and resolution evidence.
+13. **Delayed History Acquisition Causality**: History enumeration completing after explicit decision timestamp strictly fails closed with `FUTURE_DATED_EVIDENCE`.
+14. **Delayed Resolution Acquisition Causality**: Transaction resolution completing after explicit decision timestamp strictly fails closed with `FUTURE_DATED_EVIDENCE`.
 
 ###### 4. Bounded Operator-Run Live Validation Requirements (Next Step)
 
 Before any bounded live execution on an operator machine, the following boundaries remain strictly defined:
 
-- **Single-Pool Scope**: Evaluation bounded to exactly one confirmed Raydium CPMM pool address.
+- **Single-Pool Scope**: Evaluation bounded to exactly one confirmed Raydium AMM v4 pool address (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`), not CPMM.
 - **Read-Only Diagnostic Probe**: Executed strictly as a diagnostic probe script with dry-run verification first; zero purchases, zero signing, zero daemon startup.
 - **Acquisition Ceilings**: Maximum 1 source cutoff query, 1 history enumeration page ($\le 10$ signatures), $\le 3$ transaction resolutions.
-- **Pacing & Freshness**: Minimum host pacing $\ge 2{,}500\text{ ms}$; cutoff retrieval to evaluation duration strictly $\le 15{,}000\text{ ms}$.
+- **Pacing & Freshness**: Minimum host pacing $\ge 2{,}500\text{ ms}$; source cutoff timestamp $T_{\text{cutoff}}$ to evaluation duration strictly $\le 15{,}000\text{ ms}$ ($T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$).
 - **Unproven Production Gaps Preserved**: Cryptographic completeness, multi-pool scalability, exit-path volume estimation, and Gate 11 bundler concentration remain explicitly unproven.
 
 ---

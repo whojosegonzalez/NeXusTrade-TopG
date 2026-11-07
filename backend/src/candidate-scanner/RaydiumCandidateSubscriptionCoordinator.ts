@@ -64,6 +64,7 @@ import type { RetestSpotInfo } from "./RetestGateEvaluator.js";
 import type { ExactPoolHistoryEnumerator } from "./ExactPoolHistoryEnumerator.js";
 import type { ExactPoolTransactionResolutionBridge } from "./ExactPoolTransactionResolutionBridge.js";
 import {
+  cloneSourceCutoff,
   evaluateExactPoolWindowReconciliation,
   type SourceCutoffEvidence,
   type WindowReconciliationResult,
@@ -1308,24 +1309,39 @@ export class RaydiumCandidateSubscriptionCoordinator {
     sourceCutoff: SourceCutoffEvidence,
     options: CandidateWindowReconciliationOptions,
   ): Promise<WindowReconciliationResult> {
+    // Snapshot cutoff and operation inputs before awaiting work to guarantee an immutable research window
+    const sourceCutoffSnapshot = cloneSourceCutoff(sourceCutoff);
+    const optionsSnapshot: CandidateWindowReconciliationOptions = {
+      knownAnchorSignature: options?.knownAnchorSignature,
+      historyEnumerator: options?.historyEnumerator,
+      resolutionBridge: options?.resolutionBridge,
+      decisionTimestampMs: options?.decisionTimestampMs,
+      observationStartMs: options?.observationStartMs,
+      observationEndMs: options?.observationEndMs,
+      budgetManager: options?.budgetManager,
+      hasActiveBacklog: options?.hasActiveBacklog,
+    };
+
     const initialEpoch = this.connectionEpoch;
     const initialStatus = this.status;
     const now = this.clock();
+    const cutoffTimestampMs = sourceCutoffSnapshot?.cutoffTimestampMs ?? now;
 
     // 1. Validate identity binding for candidate pool and mint
-    if (sourceCutoff.provenance === "ON_CHAIN_BLOCK_TIME") {
+    if (sourceCutoffSnapshot && sourceCutoffSnapshot.provenance === "ON_CHAIN_BLOCK_TIME") {
       if (
-        sourceCutoff.sourceMethod === "getSignaturesForAddress" &&
-        sourceCutoff.requestContext?.address &&
-        sourceCutoff.requestContext.address !== this.poolContext.poolId
+        sourceCutoffSnapshot.sourceMethod === "getSignaturesForAddress" &&
+        sourceCutoffSnapshot.requestContext?.address &&
+        sourceCutoffSnapshot.requestContext.address !== this.poolContext.poolId
       ) {
         return evaluateExactPoolWindowReconciliation({
           poolContext: this.poolContext,
-          decisionTimestampMs: options.decisionTimestampMs ?? now,
-          observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
-          observationEndMs: options.observationEndMs ?? now,
-          sourceCutoff,
-          budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+          decisionTimestampMs: optionsSnapshot.decisionTimestampMs ?? now,
+          observationStartMs:
+            optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+          observationEndMs: optionsSnapshot.observationEndMs ?? now,
+          sourceCutoff: sourceCutoffSnapshot,
+          budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
           clock: this.clock,
         });
       }
@@ -1335,79 +1351,87 @@ export class RaydiumCandidateSubscriptionCoordinator {
     if (initialStatus !== "SUBSCRIBED" || this.activeSubscriptionId === null) {
       return evaluateExactPoolWindowReconciliation({
         poolContext: this.poolContext,
-        decisionTimestampMs: options.decisionTimestampMs ?? now,
-        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
-        observationEndMs: options.observationEndMs ?? now,
-        sourceCutoff,
+        decisionTimestampMs: optionsSnapshot.decisionTimestampMs ?? now,
+        observationStartMs:
+          optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: optionsSnapshot.observationEndMs ?? now,
+        sourceCutoff: sourceCutoffSnapshot,
         tracker: this.tracker,
-        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
-        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        hasActiveBacklog:
+          optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
         recordedGaps: [
           {
-            gapStartMs: Math.min(now, sourceCutoff.cutoffTimestampMs - 1),
-            gapEndMs: Math.max(now + 1, sourceCutoff.cutoffTimestampMs),
+            gapStartMs: Math.min(now, cutoffTimestampMs - 1),
+            gapEndMs: Math.max(now + 1, cutoffTimestampMs),
             reason: `COORDINATOR_NOT_SUBSCRIBED (${initialStatus})`,
           },
         ],
       });
     }
 
-    // 3. Await history enumeration
-    const historyResult = await options.historyEnumerator.enumerate();
+    // 3. Await history enumeration and record retrieval completion timestamp
+    const historyResult = await optionsSnapshot.historyEnumerator.enumerate();
+    const historyRetrievedAtMs = this.clock();
 
     // 4. Post-history await lifecycle check: detect disconnect or epoch change during await
     if (this.connectionEpoch !== initialEpoch || this.status !== "SUBSCRIBED") {
       const postEnumNow = this.clock();
       return evaluateExactPoolWindowReconciliation({
         poolContext: this.poolContext,
-        decisionTimestampMs: options.decisionTimestampMs ?? postEnumNow,
-        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
-        observationEndMs: options.observationEndMs ?? postEnumNow,
-        sourceCutoff,
+        decisionTimestampMs: optionsSnapshot.decisionTimestampMs ?? postEnumNow,
+        observationStartMs:
+          optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: optionsSnapshot.observationEndMs ?? postEnumNow,
+        sourceCutoff: sourceCutoffSnapshot,
         historyResult,
+        historyRetrievedAtMs,
+        acquisitionCompletedAtMs: postEnumNow,
         tracker: this.tracker,
-        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
-        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        hasActiveBacklog:
+          optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
         recordedGaps: [
           {
-            gapStartMs: Math.min(
-              this.disconnectedAtMs ?? postEnumNow - 1,
-              sourceCutoff.cutoffTimestampMs - 1,
-            ),
-            gapEndMs: Math.max(postEnumNow + 1, sourceCutoff.cutoffTimestampMs),
+            gapStartMs: Math.min(this.disconnectedAtMs ?? postEnumNow - 1, cutoffTimestampMs - 1),
+            gapEndMs: Math.max(postEnumNow + 1, cutoffTimestampMs),
             reason: "LIFECYCLE_CANCELLED_DURING_ENUMERATION",
           },
         ],
       });
     }
 
-    // 5. Await transaction resolution (ingests discovered swaps into tracker)
-    const resolutionResult = await options.resolutionBridge.resolve(historyResult);
+    // 5. Await transaction resolution (ingests discovered swaps into tracker) and record completion timestamp
+    const resolutionResult = await optionsSnapshot.resolutionBridge.resolve(historyResult);
+    const resolutionRetrievedAtMs = this.clock();
+    const acquisitionCompletedAtMs = this.clock();
 
     // 6. Post-resolution await lifecycle check: detect disconnect or epoch change during await
     if (this.connectionEpoch !== initialEpoch || this.status !== "SUBSCRIBED") {
       const postResNow = this.clock();
       return evaluateExactPoolWindowReconciliation({
         poolContext: this.poolContext,
-        decisionTimestampMs: options.decisionTimestampMs ?? postResNow,
-        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
-        observationEndMs: options.observationEndMs ?? postResNow,
-        sourceCutoff,
+        decisionTimestampMs: optionsSnapshot.decisionTimestampMs ?? postResNow,
+        observationStartMs:
+          optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: optionsSnapshot.observationEndMs ?? postResNow,
+        sourceCutoff: sourceCutoffSnapshot,
         historyResult,
         resolutionResult,
+        historyRetrievedAtMs,
+        resolutionRetrievedAtMs,
+        acquisitionCompletedAtMs,
         tracker: this.tracker,
-        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
-        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        hasActiveBacklog:
+          optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
         recordedGaps: [
           {
-            gapStartMs: Math.min(
-              this.disconnectedAtMs ?? postResNow - 1,
-              sourceCutoff.cutoffTimestampMs - 1,
-            ),
-            gapEndMs: Math.max(postResNow + 1, sourceCutoff.cutoffTimestampMs),
+            gapStartMs: Math.min(this.disconnectedAtMs ?? postResNow - 1, cutoffTimestampMs - 1),
+            gapEndMs: Math.max(postResNow + 1, cutoffTimestampMs),
             reason: "LIFECYCLE_CANCELLED_DURING_RESOLUTION",
           },
         ],
@@ -1415,25 +1439,29 @@ export class RaydiumCandidateSubscriptionCoordinator {
     }
 
     // 7. Evaluate using decision timestamp at which evidence is actually available
-    const decisionTimestampMs = options.decisionTimestampMs ?? this.clock();
-    const observationEndMs = options.observationEndMs ?? decisionTimestampMs;
+    const explicitDecisionTime = optionsSnapshot.decisionTimestampMs;
+    const decisionTimestampMs = explicitDecisionTime ?? acquisitionCompletedAtMs;
+    const observationEndMs = optionsSnapshot.observationEndMs ?? decisionTimestampMs;
     const hasActiveBacklog =
-      options.hasActiveBacklog !== undefined
-        ? options.hasActiveBacklog
+      optionsSnapshot.hasActiveBacklog !== undefined
+        ? optionsSnapshot.hasActiveBacklog
         : this.adapter.getPendingQueueLength() > 0;
 
     const reconciliationResult = evaluateExactPoolWindowReconciliation({
       poolContext: this.poolContext,
       decisionTimestampMs,
-      observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+      observationStartMs: optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
       observationEndMs,
-      sourceCutoff,
+      sourceCutoff: sourceCutoffSnapshot,
       historyResult,
       resolutionResult,
+      historyRetrievedAtMs,
+      resolutionRetrievedAtMs,
+      acquisitionCompletedAtMs,
       tracker: this.tracker,
       hasActiveBacklog,
-      knownAnchorSignature: options.knownAnchorSignature,
-      budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+      knownAnchorSignature: optionsSnapshot.knownAnchorSignature,
+      budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
       clock: this.clock,
     });
 

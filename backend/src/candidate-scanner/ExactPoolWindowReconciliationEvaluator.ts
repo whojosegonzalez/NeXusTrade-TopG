@@ -227,6 +227,9 @@ export interface ExactPoolWindowReconciliationOptions {
   readonly minHostPacingMs?: number | undefined; // default: 2,500 ms
   readonly maxAllowedEvidenceAgeMs?: number | undefined; // default: 15,000 ms
   readonly simulatedLatenciesMs?: readonly number[] | undefined;
+  readonly historyRetrievedAtMs?: number | undefined;
+  readonly resolutionRetrievedAtMs?: number | undefined;
+  readonly acquisitionCompletedAtMs?: number | undefined;
   readonly clock?: (() => number) | undefined;
 }
 
@@ -254,7 +257,9 @@ function deepFreeze<T>(obj: T): Readonly<T> {
 /**
  * Clones a SourceCutoffEvidence object to ensure caller-owned references remain unfrozen.
  */
-function cloneSourceCutoff(cutoff: SourceCutoffEvidence | null): SourceCutoffEvidence | null {
+export function cloneSourceCutoff(
+  cutoff: SourceCutoffEvidence | null,
+): SourceCutoffEvidence | null {
   if (!cutoff) return null;
   let clonedPayload: unknown = undefined;
   if (cutoff.responsePayload !== undefined) {
@@ -883,6 +888,42 @@ export function evaluateExactPoolWindowReconciliation(
     );
   }
 
+  if (
+    typeof options.historyRetrievedAtMs === "number" &&
+    options.historyRetrievedAtMs > options.decisionTimestampMs
+  ) {
+    return buildResult(
+      "FUTURE_DATED_EVIDENCE",
+      "COLLECTION_GAP",
+      `CAUSALITY_VIOLATION: History enumeration evidence retrieval timestamp (${options.historyRetrievedAtMs} ms) is after decision time (${options.decisionTimestampMs} ms)`,
+      { windowStartMs, windowEndMs, evidenceAgeMs },
+    );
+  }
+
+  if (
+    typeof options.resolutionRetrievedAtMs === "number" &&
+    options.resolutionRetrievedAtMs > options.decisionTimestampMs
+  ) {
+    return buildResult(
+      "FUTURE_DATED_EVIDENCE",
+      "COLLECTION_GAP",
+      `CAUSALITY_VIOLATION: Transaction resolution evidence retrieval timestamp (${options.resolutionRetrievedAtMs} ms) is after decision time (${options.decisionTimestampMs} ms)`,
+      { windowStartMs, windowEndMs, evidenceAgeMs },
+    );
+  }
+
+  if (
+    typeof options.acquisitionCompletedAtMs === "number" &&
+    options.acquisitionCompletedAtMs > options.decisionTimestampMs
+  ) {
+    return buildResult(
+      "FUTURE_DATED_EVIDENCE",
+      "COLLECTION_GAP",
+      `CAUSALITY_VIOLATION: Acquisition completed timestamp (${options.acquisitionCompletedAtMs} ms) is after decision time (${options.decisionTimestampMs} ms)`,
+      { windowStartMs, windowEndMs, evidenceAgeMs },
+    );
+  }
+
   if (evidenceAgeMs > maxAllowedEvidenceAgeMs) {
     return buildResult(
       "STALE_DATA",
@@ -933,10 +974,6 @@ export function evaluateExactPoolWindowReconciliation(
   }
 
   for (const gap of gaps) {
-    // Transaction resolution failures (SOURCE_ADAPTER_LOSS) are evaluated downstream under resolution evidence (UNRESOLVED_TRANSACTIONS)
-    if (gap.reason?.startsWith("SOURCE_ADAPTER_LOSS:")) {
-      continue;
-    }
     if (gap.gapStartMs < windowEndMs && gap.gapEndMs > windowStartMs) {
       return buildResult(
         "STREAM_GAP",
