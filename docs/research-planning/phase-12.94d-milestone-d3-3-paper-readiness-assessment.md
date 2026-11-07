@@ -1033,11 +1033,15 @@ Candidate pools frequently experience periods of zero trading activity. However,
   An empty `getSignaturesForAddress` response indicates that zero signatures were returned for the target address; it does **not** advance the source watermark to local request or response time.
 - **Explicit Source Cutoff Evidence**:
   Advancing the source cutoff watermark requires verified on-chain evidence with explicit provenance:
-  1. _Source Method_: e.g. `getSlot`, `getBlockTime`, `getLatestBlockhash`, or the newest transaction in `getSignaturesForAddress`.
-  2. _Response Field_: Exact JSON-RPC field extracted (e.g. `result`, `result.context.slot`, or `result[0].blockTime`).
+  1. _Source Method_: Must provide verified on-chain timestamps for `ON_CHAIN_BLOCK_TIME` (e.g. `getBlockTime` for a verified slot, `getBlock`, or `getSignaturesForAddress` from `result[0].blockTime`). Methods returning slot numbers alone (e.g. `getSlot`) are rejected because slot height is not a timestamp. Synthetic checkpoints require `SYNTHETIC_CHECKPOINT` under `SYNTHETIC_FIXTURE` provenance.
+  2. _Response Field_: Exact JSON-RPC field extracted (e.g. `result` for `getBlockTime`, `result.blockTime` for `getBlock`, or `result[0].blockTime` for `getSignaturesForAddress`).
   3. _Commitment_: Explicitly `"confirmed"` or `"finalized"`.
   4. _Provenance_: Must be `"ON_CHAIN_BLOCK_TIME"` or `"SYNTHETIC_FIXTURE"`. Local host receipt time is never accepted as an on-chain ledger cutoff.
   5. _Telemetric Limitation_: A node's current slot or block time is provider-reported telemetry; it is **not** independent cryptographic proof that its address index is complete or unlagged. Missing cutoff evidence leaves the cutoff unavailable, failing closed with `MISSING_SOURCE_CUTOFF`.
+- **Strict Causal Time Ordering**:
+  Reconciliation evidence unavailable at decision time $T_{\text{decision}}$ is strictly rejected:
+  $$T_{\text{cutoff}} \le T_{\text{decision}}, \quad T_{\text{retrieval}} \le T_{\text{decision}}, \quad \text{and} \quad T_{\text{obsEnd}} \le T_{\text{decision}}.$$
+  Zero future look-ahead allowance is permitted. Clock uncertainty cannot be treated as verified future observation. Evidence retrieved or dated after $T_{\text{decision}}$ fails closed with `FUTURE_DATED_EVIDENCE`.
 - **Warm-Up / Full Observation Span Requirement**:
   A verified quiet window spans:
   $$W_{\text{verified}} = [T_{\text{cutoff}} - 60{,}000\text{ ms}, T_{\text{cutoff}}].$$
@@ -1161,12 +1165,18 @@ U = 6 unresolved                        7 requests                 17.5s (+ RTT)
   - Pacing $\ge 2{,}500\text{ ms}$ is strictly a client-side rate limiter to avoid HTTP 429 status codes; it is **not** an upstream SLA, contract entitlement, or physical limit.
   - Unauthenticated or free public RPC endpoints offer zero guaranteed capacity, variable round-trip latency ($RTT$), and may throttle or drop connections unpredictably.
 
-##### 4. Resource Exhaustion & Backlog Behavior
+##### 4. Non-Mutating Evaluation & Directional Accounting Rigor
 
-- If immediate demand $D$ exceeds remaining candidate enrichment quota, dispatches fail with `PROVIDER_QUOTA_EXCEEDED` or `RESERVED_QUOTA_EXCEEDED` (forward quote reservations remain strictly protected).
-- If $T_{\text{resolution}}$ exceeds operation deadline or causes $\Delta t_{\text{age}} > 15{,}000\text{ ms}$, the evaluation fails closed with `STALE_DATA`.
-- If an active queue backlog exists ($Q > 0$) at decision time, `RollingTradeFlowTracker` evaluates coverage as `PROCESSING_BACKLOG`.
-- In all exhaustion or backlog conditions, `flowCoverage` is non-`SUFFICIENT`, flow counts remain `null`, and candidate progression is blocked.
+- **Separation of Actual Receipts from Projected Demand**:
+  - The evaluator reports `actualRequestsDispatched` derived strictly from completed upstream acquisition receipts (e.g. history result `requestCount`, resolution bridge `totalProcessed`).
+  - Projected demand ($D = M + U$) and start-to-start pacing waits are calculated separately on an isolated budget snapshot without mutating caller budget state.
+  - Evaluation never invokes `recordRequestAttempt()` or mutates `GlobalResourceBudgetManager`.
+  - Unresolved transactions ($U > 0$) are never claimed as resolved by a capacity simulation; missing resolution evidence strictly fails closed with `UNRESOLVED_TRANSACTIONS`.
+- **Directional Event Counting Rigor**:
+  - Only candidate-bound (`poolId`, `candidateTokenMint`), signature-matched, and deduplicated trade events (via canonical swap key `${signature}:${outerInstructionIndex}:${swapIndex}`) are counted.
+  - Non-directional event totals (e.g. `ingestedEventsCount = 2`) are never approximated into BUYs. Directional evidence absence strictly leaves counts `null`.
+- **Input Snapshotting Invariant**:
+  - Caller-owned input objects (`sourceCutoff`, `poolContext`) are snapshotted prior to result creation, ensuring caller references remain unmutated and unfrozen.
 
 ---
 
@@ -1193,7 +1203,7 @@ Candidate pools frequently experience periods of zero trading activity. The eval
 
 - **Timeline**:
   - Continuous WebSocket observation active from $T_{\text{obsStart}} = 0\text{s}$ through $T_{\text{obsEnd}} = 65\text{s}$ with zero dropped frames or queue overflows.
-  - At $T = 65\text{s}$, on-chain source cutoff evidence is retrieved via `getSlot` (slot 280,000,200, blockTime 65s, commitment "confirmed", provenance "ON_CHAIN_BLOCK_TIME").
+  - At $T = 65\text{s}$, on-chain source cutoff evidence is retrieved via `getBlockTime` for confirmed slot 280,000,200 ($T_{\text{cutoff}} = 65\text{s}$, commitment "confirmed", provenance "ON_CHAIN_BLOCK_TIME").
   - The requested 60-second window is $W = [65\text{s} - 60\text{s}, 65\text{s}] = [5\text{s}, 65\text{s}]$.
   - Entire window $[5\text{s}, 65\text{s}]$ is fully spanned by continuous observation ($T_{\text{obsStart}} = 0\text{s} \le 5\text{s}$ and $T_{\text{obsEnd}} = 65\text{s} \ge 65\text{s}$).
   - RPC history query confirms zero transactions were indexed for the pool during $[5\text{s}, 65\text{s}]$.
