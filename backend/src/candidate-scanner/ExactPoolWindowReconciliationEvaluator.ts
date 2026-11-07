@@ -5,7 +5,7 @@
  * trade flow reconciliation across a single validated Raydium candidate pool and one
  * explicitly identified 60-second window.
  *
- * OPERATIONAL & SAFETY INVARIANTS (Audit-Hardened V3):
+ * OPERATIONAL & SAFETY INVARIANTS (Audit-Hardened V4):
  * 1. Scope: Offline reconciliation evaluation for one exact pool and one 60-second window only.
  *    Does NOT enable a production proof mode or modify coordinator.advanceCoverage(),
  *    CandidateFlowProvider production defaults, or strategy admission.
@@ -21,22 +21,23 @@
  *    - Explicit failure evidence (e.g. FETCH_ERROR, BUDGET_EXHAUSTED, PARTIAL_RESOLUTION)
  *      takes precedence over optimistic flags or empty record arrays.
  *    - Raw fixture arrays are not presented as completed acquisition receipts.
- * 4. Complete Valid Event Set Per Transaction:
- *    - Evidence is normalized into a validated per-signature map before aggregation.
- *    - Trade events must be candidate-bound (exact poolId and candidateTokenMint match),
- *      have valid finite integer timestamps, and satisfy causality (t <= decisionTimestampMs).
- *    - Rejects foreign-pool trades, NaN event times, and post-decision events.
- *    - Directional event counts per transaction must match resolution decodedEventsCount.
- *    - Distinguishes genuinely zero-swap transactions from missing directional evidence.
+ * 4. Mandatory Resolution Evidence & Conflicting Record Rejection:
+ *    - Explicit resolution evidence is MANDATORY for each in-window signature.
+ *      Event presence or alreadyResolvedSignatures membership alone cannot establish completeness.
+ *    - Conflicting resolution records (e.g. FAILED_DECODE overwritten by RESOLVED) are rejected fail-closed.
+ *      Failure records cannot be overwritten by later success records.
  * 5. Cutoff Content & Payload Validation:
- *    - Validates responseField against expected RPC schema (e.g. 'result' for getBlockTime,
- *      rejecting arbitrary strings such as 'banana').
- *    - Validates injected response payload contents, slot alignment, and timestamp correspondence.
- * 6. Non-Mutating Accounting & Read-Only Tracker:
+ *    - For ON_CHAIN_BLOCK_TIME provenance, supporting response content (responsePayload) and
+ *      relevant request binding (requestContext) are MANDATORY.
+ *    - Validates responseField against RPC schema (rejecting arbitrary strings such as 'banana').
+ *    - Validates extracted timestamp, slot alignment, and candidate poolId binding.
+ *    - Explicitly synthetic checkpoints (SYNTHETIC_FIXTURE) remain isolated.
+ * 6. Non-Mutating Accounting & Evidenced Dispatch Reporting:
  *    - Evaluation consumes read-only snapshots and never calls tracker.evaluateWindow().
- *    - Stream inactivity gaps at evaluation time are detected read-only without mutating tracker state.
- *    - Actual requests dispatched are drawn strictly from explicit acquisition receipts;
- *      unavailable accounting is reported as null, never invented from raw arrays.
+ *    - Stream inactivity at evaluation time is detected read-only against tracker.getLastObservationTimestampMs().
+ *    - Actual requests dispatched are reported ONLY when fully evidenced across all required operations;
+ *      pre-dispatch denials (e.g. PRE_DISPATCH_DEADLINE_EXCEEDED) are counted as 0 dispatches,
+ *      and ambiguous/unsupported statuses report null (unknown) rather than partial counts.
  *    - Projected demand preserves known unresolved demand separately from actual attempts.
  */
 
@@ -296,6 +297,46 @@ function validateAndExtractSourceCutoff(
         reason: `ON_CHAIN_BLOCK_TIME provenance requires a blockTime-providing method (getSignaturesForAddress, getBlockTime, getBlock), received: '${cutoff.sourceMethod}'`,
       };
     }
+
+    // MANDATORY Supporting evidence for ON_CHAIN_BLOCK_TIME
+    if (cutoff.responsePayload === undefined || cutoff.responsePayload === null) {
+      return {
+        valid: false,
+        reason: "ON_CHAIN_BLOCK_TIME cutoff requires supporting responsePayload",
+      };
+    }
+    if (cutoff.requestContext === undefined || cutoff.requestContext === null) {
+      return {
+        valid: false,
+        reason: "ON_CHAIN_BLOCK_TIME cutoff requires supporting requestContext",
+      };
+    }
+
+    // Validate requestContext binding
+    if (cutoff.sourceMethod === "getBlockTime" || cutoff.sourceMethod === "getBlock") {
+      if (
+        typeof cutoff.requestContext.slot !== "number" ||
+        cutoff.requestContext.slot !== cutoff.slot
+      ) {
+        return {
+          valid: false,
+          reason: `requestContext slot (${String(cutoff.requestContext.slot)}) must match cutoff slot (${cutoff.slot}) for ${cutoff.sourceMethod}`,
+        };
+      }
+    } else if (cutoff.sourceMethod === "getSignaturesForAddress") {
+      if (cutoff.requestContext.address !== poolContext.poolId) {
+        return {
+          valid: false,
+          reason: `requestContext address ('${String(cutoff.requestContext.address)}') must match candidate poolId ('${poolContext.poolId}')`,
+        };
+      }
+      if (cutoff.requestContext.slot !== undefined && cutoff.requestContext.slot !== cutoff.slot) {
+        return {
+          valid: false,
+          reason: `requestContext slot (${cutoff.requestContext.slot}) does not match cutoff slot (${cutoff.slot})`,
+        };
+      }
+    }
   } else if (cutoff.provenance === "SYNTHETIC_FIXTURE") {
     if (cutoff.sourceMethod !== "SYNTHETIC_CHECKPOINT") {
       return {
@@ -393,26 +434,7 @@ function validateAndExtractSourceCutoff(
     };
   }
 
-  // 4. Request context validation (if supplied)
-  if (cutoff.requestContext) {
-    if (cutoff.requestContext.slot !== undefined && cutoff.requestContext.slot !== cutoff.slot) {
-      return {
-        valid: false,
-        reason: `requestContext slot (${cutoff.requestContext.slot}) does not match cutoff slot (${cutoff.slot})`,
-      };
-    }
-    if (
-      cutoff.requestContext.address !== undefined &&
-      cutoff.requestContext.address !== poolContext.poolId
-    ) {
-      return {
-        valid: false,
-        reason: `requestContext address ('${cutoff.requestContext.address}') does not match candidate poolId ('${poolContext.poolId}')`,
-      };
-    }
-  }
-
-  // 5. Response payload validation (if supplied)
+  // 4. Response payload validation (if supplied)
   if (cutoff.responsePayload !== undefined) {
     const payload = cutoff.responsePayload;
     if (payload === null || (typeof payload !== "object" && typeof payload !== "number")) {
@@ -536,40 +558,6 @@ export function evaluateExactPoolWindowReconciliation(
     ? Math.max(0, budgetStats.maxEnrichmentAttempts - budgetStats.enrichmentRequests)
     : 0;
 
-  // Actual requests dispatched from explicit acquisition receipts
-  let actualRequestsDispatched: number | null = null;
-  const hasHistoryReceipt = typeof options.historyResult?.requestCount === "number";
-  const hasResolutionReceipt =
-    options.resolutionResult !== undefined &&
-    typeof options.resolutionResult.totalProcessed === "number";
-
-  if (hasHistoryReceipt || hasResolutionReceipt) {
-    let count = 0;
-    if (hasHistoryReceipt) {
-      count += options.historyResult!.requestCount;
-    }
-    if (hasResolutionReceipt) {
-      const res = options.resolutionResult!;
-      if (res.perSignatureResults && res.perSignatureResults.length > 0) {
-        let dispatched = 0;
-        for (const sigRes of res.perSignatureResults) {
-          if (
-            sigRes.status !== "DUPLICATE_RESOLVED" &&
-            sigRes.status !== "DUPLICATE_UNRESOLVED" &&
-            sigRes.status !== "BUDGET_DENIED"
-          ) {
-            dispatched++;
-          }
-        }
-        count += dispatched;
-      } else {
-        const dupes = (res.totalDuplicatesResolved ?? 0) + (res.totalDuplicatesUnresolved ?? 0);
-        count += Math.max(0, res.totalProcessed - dupes);
-      }
-    }
-    actualRequestsDispatched = count;
-  }
-
   // Projected demand calculation helper (non-mutating on isolated snapshot)
   const calculateProjectedDemand = (
     unresolvedCount: number,
@@ -606,6 +594,78 @@ export function evaluateExactPoolWindowReconciliation(
       projectedRetrievalDurationMs,
       isProjectedBudgetSufficient: isBudgetSufficient,
     };
+  };
+
+  // Actual requests dispatched calculation helper (from fully evidenced receipts only)
+  const computeActualRequestsDispatched = (): number | null => {
+    let historyDispatches: number | null = null;
+    if (options.historyResult && typeof options.historyResult.requestCount === "number") {
+      historyDispatches = options.historyResult.requestCount;
+    }
+
+    let resolutionDispatches: number | null = null;
+    if (options.resolutionResult && options.resolutionResult.perSignatureResults) {
+      let count = 0;
+      let isResolutionFullyEvidenced = true;
+
+      for (const sigRes of options.resolutionResult.perSignatureResults) {
+        const isPreDispatch =
+          sigRes.adapterOutcome === "PRE_DISPATCH_BUDGET_DENIED" ||
+          sigRes.adapterOutcome === "PRE_DISPATCH_DEADLINE_EXCEEDED" ||
+          sigRes.adapterOutcome === "DUPLICATE_NOTIFICATION" ||
+          sigRes.adapterOutcome === "INVALID_NOTIFICATION" ||
+          sigRes.adapterOutcome === "QUEUE_OVERFLOW" ||
+          sigRes.status === "DUPLICATE_RESOLVED" ||
+          sigRes.status === "DUPLICATE_UNRESOLVED" ||
+          sigRes.status === "BUDGET_DENIED";
+
+        if (isPreDispatch) {
+          continue;
+        }
+
+        const isPostDispatch =
+          sigRes.adapterOutcome === "SUCCESS" ||
+          sigRes.adapterOutcome === "REQUEST_TIMEOUT" ||
+          sigRes.adapterOutcome === "NETWORK_ERROR" ||
+          sigRes.adapterOutcome === "HTTP_ERROR" ||
+          sigRes.adapterOutcome === "MALFORMED_RESPONSE" ||
+          sigRes.adapterOutcome === "RPC_ERROR" ||
+          sigRes.adapterOutcome === "TRANSACTION_NOT_FOUND" ||
+          sigRes.adapterOutcome === "RESPONSE_SIGNATURE_MISMATCH" ||
+          sigRes.adapterOutcome === "CONTRADICTORY_METADATA" ||
+          sigRes.adapterOutcome === "DECODE_FAILED" ||
+          sigRes.adapterOutcome === "INGEST_FAILED" ||
+          sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
+          sigRes.status === "RESOLVED" ||
+          sigRes.status === "FAILED_DECODE" ||
+          sigRes.status === "FAILED_INGEST" ||
+          sigRes.status === "PARTIAL_INGEST" ||
+          sigRes.status === "TRANSACTION_UNAVAILABLE" ||
+          sigRes.status === "ADAPTER_ERROR";
+
+        if (isPostDispatch) {
+          count++;
+        } else {
+          isResolutionFullyEvidenced = false;
+          break;
+        }
+      }
+
+      if (isResolutionFullyEvidenced) {
+        resolutionDispatches = count;
+      }
+    } else if (
+      options.historyResult?.discoveredSignatures?.length === 0 ||
+      options.historyRecords?.length === 0
+    ) {
+      // Quiet window where 0 signatures were discovered: resolution dispatches = 0
+      resolutionDispatches = 0;
+    }
+
+    if (historyDispatches !== null && resolutionDispatches !== null) {
+      return historyDispatches + resolutionDispatches;
+    }
+    return null;
   };
 
   // Helper to construct a frozen result with cloned objects
@@ -697,7 +757,7 @@ export function evaluateExactPoolWindowReconciliation(
         actualRequestsDispatched:
           extra.actualRequestsDispatched !== undefined
             ? extra.actualRequestsDispatched
-            : actualRequestsDispatched,
+            : computeActualRequestsDispatched(),
         projectedDemand,
         budgetRemaining: extra.budgetRemaining ?? remainingBudget,
       },
@@ -1076,17 +1136,128 @@ export function evaluateExactPoolWindowReconciliation(
     }
   }
 
-  // 11. Normalize Evidence into Validated Per-Signature Map
+  // 11. Normalize Evidence into Validated Per-Signature Map (Rejecting Contradictions & Overwriting)
   const resolutionRecordsMap = new Map<string, ResolvedSignatureRecord>();
+  let hasContradictoryResolutionEvidence = false;
+  let contradictoryEvidenceReason = "";
+
+  const addResolutionRecord = (record: ResolvedSignatureRecord) => {
+    if (!record || typeof record !== "object" || !record.signature) return;
+    const sig = record.signature;
+    const existing = resolutionRecordsMap.get(sig);
+    if (existing) {
+      const isContradictory =
+        existing.status !== record.status ||
+        existing.slot !== record.slot ||
+        existing.blockTime !== record.blockTime ||
+        existing.decodedEventsCount !== record.decodedEventsCount ||
+        existing.ingestedEventsCount !== record.ingestedEventsCount;
+
+      if (isContradictory) {
+        hasContradictoryResolutionEvidence = true;
+        contradictoryEvidenceReason = `Conflicting resolution records supplied for signature '${sig}' (${existing.status} vs ${record.status})`;
+        // Failure must not disappear: preserve failure record
+        const isExistingFailure =
+          existing.status !== "RESOLVED" && existing.status !== "DUPLICATE_RESOLVED";
+        const isIncomingFailure =
+          record.status !== "RESOLVED" && record.status !== "DUPLICATE_RESOLVED";
+        if (isIncomingFailure && !isExistingFailure) {
+          resolutionRecordsMap.set(sig, record);
+        }
+        return;
+      }
+    }
+    resolutionRecordsMap.set(sig, record);
+  };
+
   if (options.resolutionResult) {
     for (const r of options.resolutionResult.perSignatureResults) {
-      resolutionRecordsMap.set(r.signature, r);
+      addResolutionRecord(r);
     }
   }
   if (options.resolvedSignatures) {
     for (const r of options.resolvedSignatures) {
-      resolutionRecordsMap.set(r.signature, r);
+      addResolutionRecord(r);
     }
+  }
+
+  if (hasContradictoryResolutionEvidence) {
+    return buildResult(
+      "UNRESOLVED_TRANSACTIONS",
+      "COLLECTION_GAP",
+      `CONTRADICTORY_EVIDENCE: ${contradictoryEvidenceReason}`,
+      { windowStartMs, windowEndMs, evidenceAgeMs, unresolvedCount: 1 },
+    );
+  }
+
+  // 12. Calculate Actual Requests Dispatched (from Fully Evidenced Receipts Only)
+  let historyDispatches: number | null = null;
+  if (options.historyResult && typeof options.historyResult.requestCount === "number") {
+    historyDispatches = options.historyResult.requestCount;
+  }
+
+  let resolutionDispatches: number | null = null;
+  if (signaturesInWindow.length === 0) {
+    // Verified quiet window: 0 resolution queries were needed or dispatched
+    resolutionDispatches = 0;
+  } else if (options.resolutionResult && options.resolutionResult.perSignatureResults) {
+    let count = 0;
+    let isResolutionFullyEvidenced = true;
+
+    for (const sigRes of options.resolutionResult.perSignatureResults) {
+      // Pre-dispatch denials & duplicate notifications did not dispatch an HTTP attempt:
+      const isPreDispatch =
+        sigRes.adapterOutcome === "PRE_DISPATCH_BUDGET_DENIED" ||
+        sigRes.adapterOutcome === "PRE_DISPATCH_DEADLINE_EXCEEDED" ||
+        sigRes.adapterOutcome === "DUPLICATE_NOTIFICATION" ||
+        sigRes.adapterOutcome === "INVALID_NOTIFICATION" ||
+        sigRes.adapterOutcome === "QUEUE_OVERFLOW" ||
+        sigRes.status === "DUPLICATE_RESOLVED" ||
+        sigRes.status === "DUPLICATE_UNRESOLVED" ||
+        sigRes.status === "BUDGET_DENIED";
+
+      if (isPreDispatch) {
+        continue;
+      }
+
+      // Explicit post-dispatch outcomes:
+      const isPostDispatch =
+        sigRes.adapterOutcome === "SUCCESS" ||
+        sigRes.adapterOutcome === "REQUEST_TIMEOUT" ||
+        sigRes.adapterOutcome === "NETWORK_ERROR" ||
+        sigRes.adapterOutcome === "HTTP_ERROR" ||
+        sigRes.adapterOutcome === "MALFORMED_RESPONSE" ||
+        sigRes.adapterOutcome === "RPC_ERROR" ||
+        sigRes.adapterOutcome === "TRANSACTION_NOT_FOUND" ||
+        sigRes.adapterOutcome === "RESPONSE_SIGNATURE_MISMATCH" ||
+        sigRes.adapterOutcome === "CONTRADICTORY_METADATA" ||
+        sigRes.adapterOutcome === "DECODE_FAILED" ||
+        sigRes.adapterOutcome === "INGEST_FAILED" ||
+        sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
+        sigRes.status === "RESOLVED" ||
+        sigRes.status === "FAILED_DECODE" ||
+        sigRes.status === "FAILED_INGEST" ||
+        sigRes.status === "PARTIAL_INGEST" ||
+        sigRes.status === "TRANSACTION_UNAVAILABLE" ||
+        sigRes.status === "ADAPTER_ERROR";
+
+      if (isPostDispatch) {
+        count++;
+      } else {
+        // Ambiguous status without explicit diagnostics (e.g. DEADLINE_EXCEEDED without adapterOutcome)
+        isResolutionFullyEvidenced = false;
+        break;
+      }
+    }
+
+    if (isResolutionFullyEvidenced) {
+      resolutionDispatches = count;
+    }
+  }
+
+  let actualRequestsDispatched: number | null = null;
+  if (historyDispatches !== null && resolutionDispatches !== null) {
+    actualRequestsDispatched = historyDispatches + resolutionDispatches;
   }
 
   // Gather trade events from options.trades or read-only from options.tracker
@@ -1111,44 +1282,50 @@ export function evaluateExactPoolWindowReconciliation(
   for (const sigRec of signaturesInWindow) {
     const sig = sigRec.signature;
     const resRecord = resolutionRecordsMap.get(sig);
-    const sigTrades = tradesBySignature.get(sig) ?? [];
+
+    // CRITICAL: Explicit resolution evidence is MANDATORY for each in-window signature!
+    // Event presence or alreadyResolvedSignatures membership alone cannot establish completeness.
+    if (!resRecord) {
+      unresolvedSignatures.push(sigRec);
+      continue;
+    }
 
     // 1. Explicit failure on resolution record takes precedence over optimistic flags or trade presence!
-    if (resRecord) {
-      if (resRecord.status !== "RESOLVED" && resRecord.status !== "DUPLICATE_RESOLVED") {
-        return buildResult(
-          "UNRESOLVED_TRANSACTIONS",
-          "COLLECTION_GAP",
-          `UNRESOLVED_TRANSACTIONS: Signature '${sig}' failed resolution with status '${resRecord.status}' (error: '${resRecord.error ?? "NONE"}')`,
-          {
-            windowStartMs,
-            windowEndMs,
-            evidenceAgeMs,
-            totalDiscovered: discoveredSignatures.length,
-            windowSignaturesCount: signaturesInWindow.length,
-            unresolvedCount: 1,
-          },
-        );
-      }
-      if (resRecord.slot !== sigRec.slot) {
-        return buildResult(
-          "IDENTITY_MISMATCH",
-          "COLLECTION_GAP",
-          `IDENTITY_MISMATCH: Resolution record slot (${resRecord.slot}) does not match history record slot (${sigRec.slot}) for signature '${sig}'`,
-          { windowStartMs, windowEndMs, evidenceAgeMs },
-        );
-      }
-      if (resRecord.blockTime !== null && resRecord.blockTime !== sigRec.blockTime) {
-        return buildResult(
-          "IDENTITY_MISMATCH",
-          "COLLECTION_GAP",
-          `IDENTITY_MISMATCH: Resolution record blockTime (${resRecord.blockTime}) does not match history record blockTime (${sigRec.blockTime}) for signature '${sig}'`,
-          { windowStartMs, windowEndMs, evidenceAgeMs },
-        );
-      }
+    if (resRecord.status !== "RESOLVED" && resRecord.status !== "DUPLICATE_RESOLVED") {
+      return buildResult(
+        "UNRESOLVED_TRANSACTIONS",
+        "COLLECTION_GAP",
+        `UNRESOLVED_TRANSACTIONS: Signature '${sig}' failed resolution with status '${resRecord.status}' (error: '${resRecord.error ?? "NONE"}')`,
+        {
+          windowStartMs,
+          windowEndMs,
+          evidenceAgeMs,
+          totalDiscovered: discoveredSignatures.length,
+          windowSignaturesCount: signaturesInWindow.length,
+          unresolvedCount: 1,
+          actualRequestsDispatched,
+        },
+      );
+    }
+    if (resRecord.slot !== sigRec.slot) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        `IDENTITY_MISMATCH: Resolution record slot (${resRecord.slot}) does not match history record slot (${sigRec.slot}) for signature '${sig}'`,
+        { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+      );
+    }
+    if (resRecord.blockTime !== null && resRecord.blockTime !== sigRec.blockTime) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        `IDENTITY_MISMATCH: Resolution record blockTime (${resRecord.blockTime}) does not match history record blockTime (${sigRec.blockTime}) for signature '${sig}'`,
+        { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+      );
     }
 
     // 2. Validate trade events for this signature
+    const sigTrades = tradesBySignature.get(sig) ?? [];
     const validSigEvents: TradeEvent[] = [];
     const seenSigCanonicalKeys = new Set<string>();
     let hasInvalidEvent = false;
@@ -1235,56 +1412,45 @@ export function evaluateExactPoolWindowReconciliation(
           evidenceAgeMs,
           totalDiscovered: discoveredSignatures.length,
           windowSignaturesCount: signaturesInWindow.length,
+          actualRequestsDispatched,
         },
       );
     }
 
     // 3. Completeness check between resolution record and directional trade events
-    if (resRecord) {
-      const expectedEventsCount = resRecord.decodedEventsCount;
-      if (expectedEventsCount > 0) {
-        if (validSigEvents.length !== expectedEventsCount) {
-          return buildResult(
-            "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
-            "COLLECTION_GAP",
-            `INSUFFICIENT_DIRECTIONAL_EVIDENCE: Signature '${sig}' expected ${expectedEventsCount} decoded event(s) from resolution, but found ${validSigEvents.length} valid candidate-bound event(s)`,
-            {
-              windowStartMs,
-              windowEndMs,
-              evidenceAgeMs,
-              totalDiscovered: discoveredSignatures.length,
-              windowSignaturesCount: signaturesInWindow.length,
-            },
-          );
-        }
-      } else {
-        // Genuinely zero relevant swaps for this pool
-        if (validSigEvents.length > 0) {
-          return buildResult(
-            "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
-            "COLLECTION_GAP",
-            `INSUFFICIENT_DIRECTIONAL_EVIDENCE: Signature '${sig}' reported 0 decoded events, but ${validSigEvents.length} trade event(s) were supplied`,
-            { windowStartMs, windowEndMs, evidenceAgeMs },
-          );
-        }
+    const expectedEventsCount = resRecord.decodedEventsCount;
+    if (expectedEventsCount > 0) {
+      if (validSigEvents.length !== expectedEventsCount) {
+        return buildResult(
+          "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
+          "COLLECTION_GAP",
+          `INSUFFICIENT_DIRECTIONAL_EVIDENCE: Signature '${sig}' expected ${expectedEventsCount} decoded event(s) from resolution, but found ${validSigEvents.length} valid candidate-bound event(s)`,
+          {
+            windowStartMs,
+            windowEndMs,
+            evidenceAgeMs,
+            totalDiscovered: discoveredSignatures.length,
+            windowSignaturesCount: signaturesInWindow.length,
+            actualRequestsDispatched,
+          },
+        );
       }
-
-      if (alreadyResolvedSet.has(sig)) {
-        incrementallyReusedCount++;
-      }
-      validatedEventsForWindow.push(...validSigEvents);
     } else {
-      // resRecord is NOT present
-      if (alreadyResolvedSet.has(sig) && validSigEvents.length > 0) {
-        incrementallyReusedCount++;
-        validatedEventsForWindow.push(...validSigEvents);
-      } else if (validSigEvents.length > 0) {
-        validatedEventsForWindow.push(...validSigEvents);
-      } else {
-        // Discovered signature in window has no resolution record and no valid candidate trades
-        unresolvedSignatures.push(sigRec);
+      // Genuinely zero relevant swaps for this pool
+      if (validSigEvents.length > 0) {
+        return buildResult(
+          "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
+          "COLLECTION_GAP",
+          `INSUFFICIENT_DIRECTIONAL_EVIDENCE: Signature '${sig}' reported 0 decoded events, but ${validSigEvents.length} trade event(s) were supplied`,
+          { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+        );
       }
     }
+
+    if (alreadyResolvedSet.has(sig)) {
+      incrementallyReusedCount++;
+    }
+    validatedEventsForWindow.push(...validSigEvents);
   }
 
   if (unresolvedSignatures.length > 0) {
@@ -1300,11 +1466,12 @@ export function evaluateExactPoolWindowReconciliation(
         windowSignaturesCount: signaturesInWindow.length,
         incrementallyReused: incrementallyReusedCount,
         unresolvedCount: unresolvedSignatures.length,
+        actualRequestsDispatched,
       },
     );
   }
 
-  // 12. Directional Aggregation from Normalized Evidence Map
+  // 13. Directional Aggregation from Normalized Evidence Map
   let buys: number | null = null;
   let sells: number | null = null;
   let flowRatio: number | null = null;
@@ -1365,6 +1532,7 @@ export function evaluateExactPoolWindowReconciliation(
     incrementallyReused: incrementallyReusedCount,
     windowSignaturesCount: signaturesInWindow.length,
     unresolvedCount: 0,
+    actualRequestsDispatched,
   });
 }
 
