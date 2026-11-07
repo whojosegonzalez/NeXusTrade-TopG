@@ -486,6 +486,8 @@ export function decodeInstructionData(data: unknown): Uint8Array | null {
 /**
  * Resolves static and lookup-table accounts from message and meta into a flat array of Base58 strings.
  * Rejects invalid static or loaded account entries without filtering or shifting index positions.
+ * In Solana Version 1 (SIMD-0385), all account keys are inline; Address Lookup Tables (ALTs)
+ * are not used and loadedAddresses cannot supply accounts. ALTs are strictly supported for Version 0.
  * Returns null if any entry is null or invalid Base58.
  */
 export function resolveTransactionAccounts(
@@ -503,6 +505,7 @@ export function resolveTransactionAccounts(
       }
     | null
     | undefined,
+  version?: number | "legacy" | null | undefined,
 ): string[] | null {
   if (!message || !Array.isArray(message.accountKeys)) {
     return null;
@@ -527,7 +530,9 @@ export function resolveTransactionAccounts(
     accounts.push(pubkeyStr);
   }
 
-  if (meta?.loadedAddresses) {
+  // Address Lookup Tables (loadedAddresses) are only valid for version 0 (and legacy fallbacks if present)
+  // In Solana Version 1 (SIMD-0385), all account keys are inline; ALTs cannot supply accounts.
+  if (version !== 1 && meta?.loadedAddresses) {
     if (meta.loadedAddresses.writable !== undefined) {
       if (!Array.isArray(meta.loadedAddresses.writable)) {
         return null;
@@ -1246,6 +1251,7 @@ export function decodeRaydiumTransactionSwaps(
   const resolvedAccounts = resolveTransactionAccounts(
     txPayload.transaction.message,
     txPayload.meta,
+    txVersion as number | "legacy" | null | undefined,
   );
   if (!resolvedAccounts) {
     return {

@@ -1304,14 +1304,124 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             !budgetCheck.allowed &&
             budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
             typeof budgetCheck.waitMs === "number" &&
-            budgetCheck.waitMs > 0 &&
-            budgetCheck.waitMs < remainingBudget
+            budgetCheck.waitMs > 0
           ) {
+            if (budgetCheck.waitMs >= remainingBudget) {
+              this.totalFailures++;
+              this.recordLossGap(notification, "PACING_WAIT_EXCEEDS_DEADLINE", tracker);
+              return {
+                ok: false,
+                signature,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                ingestedEventsCount: 0,
+                diagnostics: {
+                  signature,
+                  httpAttempts: 0,
+                  durationMs: this.clock() - startEpoch,
+                  outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                  decodedEventsCount: 0,
+                  ingestedCount: 0,
+                  endpointUrl: this.sanitizedRpcUrl,
+                  error: `Timer compensation wait of ${budgetCheck.waitMs}ms would exceed remaining deadline (${remainingBudget}ms)`,
+                },
+              };
+            }
+
             try {
               await sleepWithSignal(budgetCheck.waitMs, this.sleepFn, options?.signal);
-            } catch {
-              // Handled by subsequent checks
+            } catch (err) {
+              this.totalFailures++;
+              this.recordLossGap(notification, "PACING_WAIT_CANCELLED", tracker);
+              return {
+                ok: false,
+                signature,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                ingestedEventsCount: 0,
+                diagnostics: {
+                  signature,
+                  httpAttempts: 0,
+                  durationMs: this.clock() - startEpoch,
+                  outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                  decodedEventsCount: 0,
+                  ingestedCount: 0,
+                  endpointUrl: this.sanitizedRpcUrl,
+                  error: this.sanitizeErrorMessage(
+                    `Pacing wait cancelled: ${err instanceof Error ? err.message : String(err)}`,
+                  ),
+                },
+              };
             }
+
+            remainingBudget = getRemainingEffectiveBudgetMs();
+            if (remainingBudget <= 0) {
+              this.totalFailures++;
+              this.recordLossGap(notification, "PRE_DISPATCH_DEADLINE_EXCEEDED", tracker);
+              return {
+                ok: false,
+                signature,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                ingestedEventsCount: 0,
+                diagnostics: {
+                  signature,
+                  httpAttempts: 0,
+                  durationMs: this.clock() - startEpoch,
+                  outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                  decodedEventsCount: 0,
+                  ingestedCount: 0,
+                  endpointUrl: this.sanitizedRpcUrl,
+                  error: "Overall deadline exceeded during timer compensation wait",
+                },
+              };
+            }
+
+            if (options?.signal?.aborted) {
+              this.totalFailures++;
+              this.recordLossGap(notification, "CALLER_ABORTED_BEFORE_DISPATCH", tracker);
+              return {
+                ok: false,
+                signature,
+                outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                ingestedEventsCount: 0,
+                diagnostics: {
+                  signature,
+                  httpAttempts: 0,
+                  durationMs: this.clock() - startEpoch,
+                  outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+                  decodedEventsCount: 0,
+                  ingestedCount: 0,
+                  endpointUrl: this.sanitizedRpcUrl,
+                  error: "Request cancelled by caller before dispatch",
+                },
+              };
+            }
+
+            if (options?.validateState) {
+              try {
+                options.validateState();
+              } catch (validateErr) {
+                this.totalFailures++;
+                this.recordLossGap(notification, "VALIDATION_FAILED_BEFORE_DISPATCH", tracker);
+                return {
+                  ok: false,
+                  signature,
+                  outcome: "PRE_DISPATCH_BUDGET_DENIED",
+                  ingestedEventsCount: 0,
+                  diagnostics: {
+                    signature,
+                    httpAttempts: 0,
+                    durationMs: this.clock() - startEpoch,
+                    outcome: "PRE_DISPATCH_BUDGET_DENIED",
+                    decodedEventsCount: 0,
+                    ingestedCount: 0,
+                    endpointUrl: this.sanitizedRpcUrl,
+                    error: this.sanitizeErrorMessage(
+                      `Lifecycle validation failed before dispatch: ${validateErr instanceof Error ? validateErr.message : String(validateErr)}`,
+                    ),
+                  },
+                };
+              }
+            }
+
             budgetCheck = this.budgetManager.canMakeRequest(
               this.providerName,
               this.clock(),
@@ -1389,6 +1499,29 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               },
             };
           }
+        }
+
+        // Recompute remaining deadline immediately before budget recording or dispatch
+        remainingBudget = getRemainingEffectiveBudgetMs();
+        if (remainingBudget <= 0) {
+          this.totalFailures++;
+          this.recordLossGap(notification, "PRE_DISPATCH_DEADLINE_EXCEEDED", tracker);
+          return {
+            ok: false,
+            signature,
+            outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts: 0,
+              durationMs: this.clock() - startEpoch,
+              outcome: "PRE_DISPATCH_DEADLINE_EXCEEDED",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              error: "Overall deadline exceeded before dispatch",
+            },
+          };
         }
 
         // Record attempt in shared session budget

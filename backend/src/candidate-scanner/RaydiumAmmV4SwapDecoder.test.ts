@@ -2222,13 +2222,24 @@ describe("RaydiumAmmV4SwapDecoder — Offline Swap Decoding & Normalization", ()
       },
     };
 
-    const resolved = resolveTransactionAccounts(message, meta);
-    expect(resolved).not.toBeNull();
-    expect(resolved!.length).toBe(4);
-    expect(resolved![0]).toBe("StaticKey1111111111111111111111111111111111");
-    expect(resolved![1]).toBe("StaticKey2222222222222222222222222222222222");
-    expect(resolved![2]).toBe("WritableLookupKey11111111111111111111111111111");
-    expect(resolved![3]).toBe("ReadonlyLookupKey11111111111111111111111111111");
+    // Default / v0: appends loadedAddresses
+    const resolvedDefault = resolveTransactionAccounts(message, meta);
+    expect(resolvedDefault).not.toBeNull();
+    expect(resolvedDefault!.length).toBe(4);
+    expect(resolvedDefault![0]).toBe("StaticKey1111111111111111111111111111111111");
+    expect(resolvedDefault![1]).toBe("StaticKey2222222222222222222222222222222222");
+    expect(resolvedDefault![2]).toBe("WritableLookupKey11111111111111111111111111111");
+    expect(resolvedDefault![3]).toBe("ReadonlyLookupKey11111111111111111111111111111");
+
+    const resolvedV0 = resolveTransactionAccounts(message, meta, 0);
+    expect(resolvedV0).toEqual(resolvedDefault);
+
+    // Version 1 (SIMD-0385): all accounts must be inline; loadedAddresses cannot supply accounts
+    const resolvedV1 = resolveTransactionAccounts(message, meta, 1);
+    expect(resolvedV1).not.toBeNull();
+    expect(resolvedV1!.length).toBe(2);
+    expect(resolvedV1![0]).toBe("StaticKey1111111111111111111111111111111111");
+    expect(resolvedV1![1]).toBe("StaticKey2222222222222222222222222222222222");
   });
 
   it("verifies decodeInstructionData, parseRayLog, and parseInvocationFrames helpers", () => {

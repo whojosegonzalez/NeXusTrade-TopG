@@ -162,9 +162,109 @@ function createSyntheticBuyPayload(
 }
 
 /**
- * Creates a synthetic RPC transaction payload formatted as Solana version 1 with Address Lookup Tables.
+ * Creates a synthetic RPC transaction payload formatted as Solana version 1 with inline account keys,
+ * no Address Lookup Tables (ALTs), and documented transactionConfig object.
  */
 function createSyntheticV1BuyPayload(
+  signature: string,
+  amountInLamports = 50_000_000n,
+  amountOutTokens = 25_000_000_000n,
+  poolId = SYNTHETIC_POOL_ID,
+  slot = 280_000_100,
+  blockTime = 1_700_000_000,
+) {
+  const inlineAccounts = [
+    SPL_TOKEN_PROGRAM_ID, // 0
+    poolId, // 1
+    SYNTHETIC_AMM_AUTHORITY, // 2
+    SYNTHETIC_BASE_VAULT, // 3
+    SYNTHETIC_QUOTE_VAULT, // 4
+    SYNTHETIC_USER_SOURCE_ATA, // 5
+    SYNTHETIC_USER_DEST_ATA, // 6
+    SYNTHETIC_USER_WALLET, // 7
+    RAYDIUM_AMM_V4_PROGRAM_ID, // 8
+  ];
+
+  return {
+    version: 1,
+    slot,
+    blockTime,
+    transaction: {
+      signatures: [signature],
+      message: {
+        accountKeys: inlineAccounts,
+        instructions: [
+          {
+            programIdIndex: 8,
+            accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+            data: makeSwapBaseInV2Data(amountInLamports, amountOutTokens),
+          },
+        ],
+        transactionConfig: {
+          computeUnitLimit: 200_000,
+          priorityFee: 10_000,
+          loadedAccountsDataSizeLimit: 64_000,
+          heapSize: 32_768,
+        },
+      },
+    },
+    meta: {
+      err: null,
+      preTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: "1000000000", decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: "500000000000", decimals: 5 },
+        },
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: (1_000_000_000n + amountInLamports).toString(), decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: (500_000_000_000n - amountOutTokens).toString(), decimals: 5 },
+        },
+      ],
+      innerInstructions: [
+        {
+          index: 0,
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [5, 4, 7],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountInLamports]).buffer)),
+              ],
+            },
+            {
+              programIdIndex: 0,
+              accounts: [3, 6, 2],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountOutTokens]).buffer)),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Creates a synthetic RPC transaction payload formatted as Solana version 0 with Address Lookup Tables (ALTs).
+ */
+function createSyntheticV0BuyPayload(
   signature: string,
   amountInLamports = 50_000_000n,
   amountOutTokens = 25_000_000_000n,
@@ -190,7 +290,7 @@ function createSyntheticV1BuyPayload(
   ];
 
   return {
-    version: 1,
+    version: 0,
     slot,
     blockTime,
     transaction: {
@@ -1157,6 +1257,67 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
       expect(res.outcome).toBe("REQUEST_TIMEOUT");
       expect(res.diagnostics.httpAttempts).toBe(1);
       expect(abortSignalFired).toBe(true);
+    });
+
+    it("rechecks deadline after timer compensation await and rejects before dispatch (early-wake/late-wake regression)", async () => {
+      const signature =
+        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6G";
+      let fakeNow = 1_000_000;
+      const clock = () => fakeNow;
+
+      // Budget manager with 2,500ms pacing
+      const budgetManager = new GlobalResourceBudgetManager({
+        minProviderSpacingMs: 2500,
+        clock,
+      });
+
+      // Record an earlier request at fakeNow - 2400ms (100ms remaining for pacing)
+      budgetManager.recordRequestAttempt("SOLANA_RPC", "CANDIDATE_ENRICHMENT", fakeNow - 2400);
+
+      let sleepCallCount = 0;
+      const sleepFn = async (ms: number) => {
+        sleepCallCount++;
+        if (sleepCallCount === 1) {
+          // First sleep is requested for 100ms; wake up 1ms early at 99ms
+          fakeNow += ms - 1;
+        } else if (sleepCallCount === 2) {
+          // Second sleep is timer compensation for the remaining 1ms
+          // Simulate late wake (e.g. host timer lag of 150ms) exceeding 200ms overall deadline
+          fakeNow += 150;
+        }
+      };
+
+      let fetchDispatched = false;
+      const mockTransport: typeof fetch = async () => {
+        fetchDispatched = true;
+        return new Response("{}", { status: 200 });
+      };
+
+      const tracker = new RollingTradeFlowTracker({
+        poolId: SYNTHETIC_POOL_ID,
+        tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        clock,
+      });
+
+      const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+        poolContext: STANDARD_POOL_CONTEXT,
+        rpcUrl: MOCK_RPC_URL,
+        budgetManager,
+        transport: mockTransport,
+        pacingMs: 2500,
+        overallTimeoutMs: 200, // 200ms overall deadline
+        clock,
+        sleepFn,
+      });
+
+      const res = await adapter.processNotification(signature, tracker);
+
+      expect(res.ok).toBe(false);
+      expect(res.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
+      expect(res.diagnostics.httpAttempts).toBe(0);
+      expect(fetchDispatched).toBe(false); // Zero HTTP attempts
+      expect(budgetManager.getStats().totalRequests).toBe(1); // No new budget charged
+      expect(tracker.getEventsCount()).toBe(0);
     });
   });
 
@@ -2504,7 +2665,7 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         expect(gaps[0]?.reason).toBe("SOURCE_ADAPTER_LOSS:RPC_ERROR_RETURNED");
       });
 
-      it("fetches, decodes, and ingests a valid Solana version 1 transaction using Address Lookup Tables (ALTs)", async () => {
+      it("fetches, decodes, and ingests a valid Solana version 1 transaction with inline account keys and transactionConfig", async () => {
         const sig =
           "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6A";
         const v1Payload = createSyntheticV1BuyPayload(sig, 75_000_000n, 35_000_000_000n);
@@ -2604,7 +2765,7 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
 
         // Case 1: Non-string in loadedAddresses.writable
         {
-          const base = createSyntheticV1BuyPayload(sig);
+          const base = createSyntheticV0BuyPayload(sig);
           const payload = {
             ...base,
             meta: {
@@ -2685,69 +2846,106 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         }
       });
 
-      it("preserves positive control functionality for legacy and version 0 transactions", async () => {
+      it("positive control: decodes and ingests valid synthetic legacy transaction without version property", async () => {
         const sigLegacy =
           "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6D";
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+        const payload = createSyntheticBuyPayload(sigLegacy);
+        const mockTransport: typeof fetch = async () => {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const res = await adapter.processNotification(sigLegacy, tracker);
+        expect(res.ok).toBe(true);
+        expect(res.outcome).toBe("SUCCESS");
+        expect(tracker.getEventsCount()).toBe(1);
+      });
+
+      it("positive control: decodes and ingests valid synthetic version 0 (v0) transaction with Address Lookup Tables (ALTs)", async () => {
         const sigV0 =
           "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6E";
         const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
 
-        // Legacy payload (no version property)
-        {
-          const payload = createSyntheticBuyPayload(sigLegacy);
-          const mockTransport: typeof fetch = async () => {
-            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+        const payload = createSyntheticV0BuyPayload(sigV0);
+        const mockTransport: typeof fetch = async () => {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const res = await adapter.processNotification(sigV0, tracker);
+        expect(res.ok).toBe(true);
+        expect(res.outcome).toBe("SUCCESS");
+        expect(tracker.getEventsCount()).toBe(1);
+      });
+
+      it("negative control: inconsistent v1 lookup-table inputs cannot supply accounts used to admit a swap", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6F";
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+        // Construct inconsistent v1 transaction: claims version: 1, but places required swap
+        // accounts in meta.loadedAddresses and addressTableLookups instead of inline accountKeys.
+        // In Solana Version 1 (SIMD-0385), all account keys must be inline; lookup tables cannot supply accounts.
+        const v0Payload = createSyntheticV0BuyPayload(sig);
+        const inconsistentV1Payload = {
+          ...v0Payload,
+          version: 1, // Claims v1, but structured with v0 lookup tables
+        };
+
+        const mockTransport: typeof fetch = async () => {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: 1, result: inconsistentV1Payload }),
+            {
               status: 200,
-            });
-          };
+            },
+          );
+        };
 
-          const tracker = new RollingTradeFlowTracker({
-            poolId: SYNTHETIC_POOL_ID,
-            tokenMint: SYNTHETIC_CANDIDATE_MINT,
-          });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
 
-          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-            poolContext: STANDARD_POOL_CONTEXT,
-            rpcUrl: MOCK_RPC_URL,
-            budgetManager,
-            transport: mockTransport,
-          });
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
 
-          const res = await adapter.processNotification(sigLegacy, tracker);
-          expect(res.ok).toBe(true);
-          expect(res.outcome).toBe("SUCCESS");
-          expect(tracker.getEventsCount()).toBe(1);
-        }
-
-        // Version 0 payload (version: 0)
-        {
-          const payload = {
-            ...createSyntheticV1BuyPayload(sigV0),
-            version: 0,
-          };
-          const mockTransport: typeof fetch = async () => {
-            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
-              status: 200,
-            });
-          };
-
-          const tracker = new RollingTradeFlowTracker({
-            poolId: SYNTHETIC_POOL_ID,
-            tokenMint: SYNTHETIC_CANDIDATE_MINT,
-          });
-
-          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-            poolContext: STANDARD_POOL_CONTEXT,
-            rpcUrl: MOCK_RPC_URL,
-            budgetManager,
-            transport: mockTransport,
-          });
-
-          const res = await adapter.processNotification(sigV0, tracker);
-          expect(res.ok).toBe(true);
-          expect(res.outcome).toBe("SUCCESS");
-          expect(tracker.getEventsCount()).toBe(1);
-        }
+        const res = await adapter.processNotification(sig, tracker);
+        expect(res.ok).toBe(false);
+        expect(res.outcome).toBe("DECODE_FAILED");
+        expect(res.diagnostics.error).toMatch(/NO_MATCHING_SWAPS_FOUND|MALFORMED_INSTRUCTION_DATA/);
+        expect(tracker.getEventsCount()).toBe(0); // Zero swaps admitted!
       });
     });
   });
