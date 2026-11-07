@@ -249,37 +249,20 @@ export class CoordinatorCandidateFlowProvider implements CandidateFlowProvider {
       const buys = spotWithFlow.recentBuys60s;
       const sells = spotWithFlow.recentSells60s;
 
-      const validCounts =
-        buys !== null &&
-        sells !== null &&
-        Number.isInteger(buys) &&
-        buys >= 0 &&
-        Number.isInteger(sells) &&
-        sells >= 0;
-
-      if (isSufficient && validCounts) {
-        return {
-          poolAddress: target.poolAddress,
-          tokenMint: target.tokenMint,
-          recentBuys60s: buys,
-          recentSells60s: sells,
-          flowCoverage: "SUFFICIENT",
-          isCoverageSufficient: true,
-          diagnosticReason: diag?.limitationReason || "Coverage is sufficient",
-          evaluationTimestampMs,
-        };
-      }
-
-      return {
+      const rawResult = {
         poolAddress: target.poolAddress,
         tokenMint: target.tokenMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: (spotWithFlow.flowCoverage as FlowCoverageStatus) ?? "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason: diag?.limitationReason || "INSUFFICIENT_FLOW_COVERAGE",
+        recentBuys60s: buys,
+        recentSells60s: sells,
+        flowCoverage: spotWithFlow.flowCoverage,
+        isCoverageSufficient: isSufficient,
+        diagnosticReason:
+          diag?.limitationReason ||
+          (isSufficient ? "Coverage is sufficient" : "INSUFFICIENT_FLOW_COVERAGE"),
         evaluationTimestampMs,
       };
+
+      return validateAndSnapshotCandidateFlowResult(rawResult, target, evaluationTimestampMs);
     } catch (evalErr) {
       return {
         poolAddress: target.poolAddress,
@@ -293,6 +276,136 @@ export class CoordinatorCandidateFlowProvider implements CandidateFlowProvider {
       };
     }
   }
+}
+
+/**
+ * Validates and snapshots an arbitrary provider result against requested target coordinates and evaluation timestamp.
+ * Guarantees that downstream decision points always receive a sound, immutable CandidateFlowResult.
+ * Any mismatch, inconsistency, corruption, or exception is collapsed into explicit unavailable flow (null counts, non-SUFFICIENT coverage).
+ */
+export function validateAndSnapshotCandidateFlowResult(
+  rawResult: unknown,
+  target: CandidateFlowTarget,
+  evaluationTimestampMs: number,
+): CandidateFlowResult {
+  const fallback = (reason: string): CandidateFlowResult =>
+    Object.freeze({
+      poolAddress: target?.poolAddress ?? "",
+      tokenMint: target?.tokenMint ?? "",
+      recentBuys60s: null,
+      recentSells60s: null,
+      flowCoverage: "COLLECTION_GAP",
+      isCoverageSufficient: false,
+      diagnosticReason: reason,
+      evaluationTimestampMs,
+    });
+
+  // 1. Safe handling of null, undefined, or non-object results
+  if (!rawResult || typeof rawResult !== "object") {
+    return fallback(`MALFORMED_PROVIDER_RESULT: provider returned ${String(rawResult)}`);
+  }
+
+  const res = rawResult as Record<string, unknown>;
+
+  // 2. Exact, case-sensitive pool and mint match
+  if (typeof res.poolAddress !== "string" || res.poolAddress !== target.poolAddress) {
+    return fallback(
+      `IDENTITY_MISMATCH_POOL: expected exact pool '${target.poolAddress}', received '${String(res.poolAddress)}'`,
+    );
+  }
+  if (typeof res.tokenMint !== "string" || res.tokenMint !== target.tokenMint) {
+    return fallback(
+      `IDENTITY_MISMATCH_MINT: expected exact mint '${target.tokenMint}', received '${String(res.tokenMint)}'`,
+    );
+  }
+
+  // 3. Valid evaluation timestamp matching requested evaluation
+  if (
+    typeof res.evaluationTimestampMs !== "number" ||
+    !Number.isFinite(res.evaluationTimestampMs) ||
+    !Number.isInteger(res.evaluationTimestampMs)
+  ) {
+    return fallback(
+      `INVALID_EVALUATION_TIMESTAMP: expected finite integer, received ${String(res.evaluationTimestampMs)}`,
+    );
+  }
+  if (res.evaluationTimestampMs !== evaluationTimestampMs) {
+    return fallback(
+      `TIMESTAMP_MISMATCH: expected evaluation timestamp ${evaluationTimestampMs}, received ${res.evaluationTimestampMs}`,
+    );
+  }
+
+  // 4. Consistent sufficient-coverage fields
+  const isSufficient = res.isCoverageSufficient === true;
+  const flowCoverage = res.flowCoverage;
+
+  if (isSufficient && flowCoverage !== "SUFFICIENT") {
+    return fallback(
+      `INCONSISTENT_COVERAGE_FIELDS: isCoverageSufficient is true but flowCoverage is '${String(flowCoverage)}'`,
+    );
+  }
+  if (!isSufficient && flowCoverage === "SUFFICIENT") {
+    return fallback(
+      `INCONSISTENT_COVERAGE_FIELDS: flowCoverage is 'SUFFICIENT' but isCoverageSufficient is false`,
+    );
+  }
+
+  // 5. Valid, nonnegative safe-integer counts when coverage is sufficient
+  if (isSufficient) {
+    const buys = res.recentBuys60s;
+    const sells = res.recentSells60s;
+
+    if (
+      typeof buys !== "number" ||
+      !Number.isSafeInteger(buys) ||
+      buys < 0 ||
+      typeof sells !== "number" ||
+      !Number.isSafeInteger(sells) ||
+      sells < 0
+    ) {
+      return fallback(
+        `INVALID_FLOW_COUNTS: sufficient coverage requires nonnegative safe-integer counts, received buys=${String(buys)}, sells=${String(sells)}`,
+      );
+    }
+
+    const diagReason =
+      typeof res.diagnosticReason === "string" && res.diagnosticReason.trim().length > 0
+        ? res.diagnosticReason
+        : "Coverage is sufficient";
+
+    return Object.freeze({
+      poolAddress: target.poolAddress,
+      tokenMint: target.tokenMint,
+      recentBuys60s: buys,
+      recentSells60s: sells,
+      flowCoverage: "SUFFICIENT",
+      isCoverageSufficient: true,
+      diagnosticReason: diagReason,
+      evaluationTimestampMs,
+    });
+  }
+
+  // 6. When coverage is not sufficient, counts must be null (never substitute estimates or leave stale counts)
+  const coverageStatus: FlowCoverageStatus | "UNAVAILABLE" =
+    typeof flowCoverage === "string" && flowCoverage !== "SUFFICIENT"
+      ? (flowCoverage as FlowCoverageStatus | "UNAVAILABLE")
+      : "COLLECTION_GAP";
+
+  const diagReason =
+    typeof res.diagnosticReason === "string" && res.diagnosticReason.trim().length > 0
+      ? res.diagnosticReason
+      : "INSUFFICIENT_FLOW_COVERAGE";
+
+  return Object.freeze({
+    poolAddress: target.poolAddress,
+    tokenMint: target.tokenMint,
+    recentBuys60s: null,
+    recentSells60s: null,
+    flowCoverage: coverageStatus,
+    isCoverageSufficient: false,
+    diagnosticReason: diagReason,
+    evaluationTimestampMs,
+  });
 }
 
 /**
@@ -437,7 +550,7 @@ export function evaluateCandidateDecisionPoints(
 ): CandidateDecisionResult {
   const { candidate, baseSpotInfo, rugMetrics, existingArmedState, currentNowMs } = params;
 
-  // 1. Resolve candidate-bound flow
+  // 1. Resolve candidate-bound flow with boundary validation
   const target: CandidateFlowTarget = {
     poolAddress: candidate.poolId,
     tokenMint: candidate.mintAddress,
@@ -445,9 +558,10 @@ export function evaluateCandidateDecisionPoints(
   const provider = params.flowProvider ?? new UnavailableCandidateFlowProvider();
   let flowResult: CandidateFlowResult;
   try {
-    flowResult = provider.getCandidateFlow(target, currentNowMs);
+    const rawResult = provider.getCandidateFlow(target, currentNowMs);
+    flowResult = validateAndSnapshotCandidateFlowResult(rawResult, target, currentNowMs);
   } catch (providerErr) {
-    flowResult = {
+    flowResult = Object.freeze({
       poolAddress: candidate.poolId,
       tokenMint: candidate.mintAddress,
       recentBuys60s: null,
@@ -456,23 +570,21 @@ export function evaluateCandidateDecisionPoints(
       isCoverageSufficient: false,
       diagnosticReason: `PROVIDER_CALL_EXCEPTION: ${providerErr instanceof Error ? providerErr.message : String(providerErr)}`,
       evaluationTimestampMs: currentNowMs,
-    };
+    });
   }
 
   // 2. Construct RetestSpotInfo with candidate-bound flow overlay
   const retestSpotInfo = buildRetestSpotInfo(baseSpotInfo, flowResult);
 
-  // 3. Established Runner & Viral Runner classification
+  // 3. Established Runner & Viral Runner classification (pre-extraction ordering)
+  // Determine cohort eligibility strictly using candidate discovery metrics and verified holder count
   const isViral =
     candidate.liquidityUsd >= 30000 &&
     candidate.marketCapUsd >= 150000 &&
     candidate.assetAgeSeconds >= 900 &&
     candidate.assetAgeSeconds <= 7200;
   const isCandidateEstablished =
-    ((candidate.liquidityUsd >= 50000 &&
-      (baseSpotInfo.liquidityUsd ?? 0) >= 50000 &&
-      candidate.assetAgeSeconds >= 1800) ||
-      (isViral && (baseSpotInfo.liquidityUsd ?? 0) >= 30000)) &&
+    ((candidate.liquidityUsd >= 50000 && candidate.assetAgeSeconds >= 1800) || isViral) &&
     candidate.assetAgeSeconds <= 7200 &&
     rugMetrics?.holdersCount !== undefined &&
     rugMetrics.holdersCount >= (isViral ? 1000 : 250);

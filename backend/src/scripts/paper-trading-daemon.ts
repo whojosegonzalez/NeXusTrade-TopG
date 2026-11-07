@@ -9,17 +9,23 @@ import {
 import path from "node:path";
 import { parseArgs } from "node:util";
 
-// Automatically load .env file from workspace root or cwd if available
-try {
-  const rootEnv = path.resolve(process.cwd(), ".env");
-  const parentEnv = path.resolve(process.cwd(), "..", ".env");
-  if (existsSync(rootEnv)) {
-    process.loadEnvFile(rootEnv);
-  } else if (existsSync(parentEnv)) {
-    process.loadEnvFile(parentEnv);
+/**
+ * Loads environment variables from the root or parent .env file if available.
+ * Explicitly deferred to actual daemon startup (run() / CLI entrypoint) so
+ * importing daemon modules offline performs zero filesystem credential reads.
+ */
+export function loadDaemonEnvironment(): void {
+  try {
+    const rootEnv = path.resolve(process.cwd(), ".env");
+    const parentEnv = path.resolve(process.cwd(), "..", ".env");
+    if (existsSync(rootEnv)) {
+      process.loadEnvFile(rootEnv);
+    } else if (existsSync(parentEnv)) {
+      process.loadEnvFile(parentEnv);
+    }
+  } catch {
+    // Ignore if already loaded or unavailable
   }
-} catch {
-  // Ignore if already loaded or unavailable
 }
 import {
   PaperTradingDaemon,
@@ -499,6 +505,7 @@ export {
 } from "../paper/SettlementJournal.js";
 
 export async function run(): Promise<void> {
+  loadDaemonEnvironment();
   const args = parseCliArgs();
 
   // Section C: Genuinely read-only validation preflight when --dry-run is supplied

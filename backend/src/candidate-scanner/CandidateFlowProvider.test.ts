@@ -5,6 +5,7 @@ import {
   CoordinatorCandidateFlowProvider,
   buildRetestSpotInfo,
   evaluateCandidateDecisionPoints,
+  validateAndSnapshotCandidateFlowResult,
   type CandidateFlowTarget,
   type CandidateFlowProvider,
   type CandidateFlowResult,
@@ -12,6 +13,7 @@ import {
 import {
   setCandidateFlowProvider,
   getCandidateFlowProvider,
+  loadDaemonEnvironment,
 } from "../scripts/paper-trading-daemon.js";
 import { RaydiumCandidateSubscriptionCoordinator } from "./RaydiumCandidateSubscriptionCoordinator.js";
 import type { ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
@@ -781,6 +783,561 @@ describe("CandidateFlowProvider & Evaluation Seam", () => {
         expect(decision.retestResult.confirmReason).toBe("RETEST_PULLBACK_DISCOUNT");
       }
     });
+
+    describe("4.1 Shared Decision Boundary Validation Regressions", () => {
+      const armedPullbackState = {
+        mintAddress: CANONICAL_TOKEN_MINT,
+        armedAtMs: 1_000_000,
+        peakPriceSol: 0.0005,
+        peakPriceUsd: 0.07,
+        ticksObserved: 3,
+      };
+
+      const pullbackSpot = {
+        ...baseSpotInfo,
+        spotPriceSol: 0.00047, // 6% pullback
+      };
+
+      const establishedRugMetrics = {
+        ...validRugMetrics,
+        holdersCount: 1200,
+      };
+
+      it("rejects provider result with mismatched pool address and fails closed at decision boundary", () => {
+        const candidate = createSampleCandidate();
+        const badProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: "WrongPoolAddress11111111111111111111111111111111",
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Sufficient",
+            evaluationTimestampMs: 1_020_000,
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: badProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        // Must NOT confirm retest!
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.flowCoverage).toBe("COLLECTION_GAP");
+        expect(decision.flowResult.isCoverageSufficient).toBe(false);
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+        expect(decision.flowResult.recentSells60s).toBeNull();
+        expect(decision.flowResult.diagnosticReason).toContain("IDENTITY_MISMATCH_POOL");
+        expect(decision.retestSpotInfo.recentBuys60s).toBeNull();
+      });
+
+      it("rejects provider result with mismatched token mint and fails closed at decision boundary", () => {
+        const candidate = createSampleCandidate();
+        const badProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: "WrongTokenMint111111111111111111111111111111111",
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Sufficient",
+            evaluationTimestampMs: 1_020_000,
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: badProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.diagnosticReason).toContain("IDENTITY_MISMATCH_MINT");
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+      });
+
+      it("rejects stale evaluation timestamp (60s old) and never relabels stale data as current", () => {
+        const candidate = createSampleCandidate();
+        const staleProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Sufficient but stale",
+            evaluationTimestampMs: 1_020_000 - 60_000, // 60s in the past
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: staleProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.diagnosticReason).toContain("TIMESTAMP_MISMATCH");
+        expect(decision.flowResult.evaluationTimestampMs).toBe(1_020_000);
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+      });
+
+      it("rejects future evaluation timestamp (60s ahead)", () => {
+        const candidate = createSampleCandidate();
+        const futureProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Future timestamp",
+            evaluationTimestampMs: 1_020_000 + 60_000, // 60s in future
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: futureProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.diagnosticReason).toContain("TIMESTAMP_MISMATCH");
+      });
+
+      it("rejects inconsistent coverage fields (isCoverageSufficient=false alongside flowCoverage=SUFFICIENT)", () => {
+        const candidate = createSampleCandidate();
+        const inconsistentProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: false, // inconsistent!
+            diagnosticReason: "Inconsistent",
+            evaluationTimestampMs: 1_020_000,
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: inconsistentProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.diagnosticReason).toContain("INCONSISTENT_COVERAGE_FIELDS");
+        expect(decision.flowResult.flowCoverage).toBe("COLLECTION_GAP");
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+      });
+
+      it("rejects inconsistent coverage fields (isCoverageSufficient=true alongside flowCoverage=COLLECTION_GAP)", () => {
+        const candidate = createSampleCandidate();
+        const inconsistentProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: 25,
+            recentSells60s: 10,
+            flowCoverage: "COLLECTION_GAP",
+            isCoverageSufficient: true, // inconsistent!
+            diagnosticReason: "Inconsistent",
+            evaluationTimestampMs: 1_020_000,
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: inconsistentProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).not.toBe("RETEST_CONFIRMED");
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.flowResult.diagnosticReason).toContain("INCONSISTENT_COVERAGE_FIELDS");
+      });
+
+      it("safely handles null provider result without uncaught TypeError and fails closed", () => {
+        const candidate = createSampleCandidate();
+        const nullProvider: CandidateFlowProvider = {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          getCandidateFlow: () => null as any,
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: nullProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.rejectionReason).toBe("REJECTED_UNAVAILABLE_FLOW_COVERAGE");
+        expect(decision.flowResult.diagnosticReason).toContain("MALFORMED_PROVIDER_RESULT");
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+      });
+
+      it("safely handles invalid/non-integer/negative flow counts on sufficient coverage", () => {
+        const candidate = createSampleCandidate();
+        const invalidCountsProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: candidate.poolId,
+            tokenMint: candidate.mintAddress,
+            recentBuys60s: -5, // invalid negative count!
+            recentSells60s: 10,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Negative buys",
+            evaluationTimestampMs: 1_020_000,
+          }),
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate,
+          baseSpotInfo: pullbackSpot,
+          rugMetrics: establishedRugMetrics,
+          flowProvider: invalidCountsProvider,
+          existingArmedState: armedPullbackState,
+          currentNowMs: 1_020_000,
+          requireVerifiedHolders: true,
+        });
+
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+        expect(decision.flowResult.diagnosticReason).toContain("INVALID_FLOW_COUNTS");
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+      });
+    });
+
+    describe("4.2 validateAndSnapshotCandidateFlowResult Unit Tests", () => {
+      const target: CandidateFlowTarget = {
+        poolAddress: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+      };
+
+      it("returns frozen snapshot when raw result is valid and consistent", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid",
+          evaluationTimestampMs: 1_000_000,
+        };
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(Object.isFrozen(snap)).toBe(true);
+        expect(snap.isCoverageSufficient).toBe(true);
+        expect(snap.recentBuys60s).toBe(20);
+        expect(snap.recentSells60s).toBe(5);
+      });
+
+      it("normalizes counts to null when flowCoverage is not SUFFICIENT", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "WARM_UP",
+          isCoverageSufficient: false,
+          diagnosticReason: "Warming up",
+          evaluationTimestampMs: 1_000_000,
+        };
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.recentSells60s).toBeNull();
+        expect(snap.flowCoverage).toBe("WARM_UP");
+        expect(snap.isCoverageSufficient).toBe(false);
+      });
+    });
+
+    describe("4.3 Pre-Extraction Liquidity Floor Restoration & Cohort Preservation", () => {
+      // Reproduction 1: Candidate previously required $30,000; actual liquidity $25,000
+      it("rejects candidate when actual liquidity $25,000 falls below required $30,000 (Viral runner)", () => {
+        const viralCandidate = createSampleCandidate({
+          liquidityUsd: 35_000, // Discovery liq >= $30k
+          marketCapUsd: 160_000, // Discovery mcap >= $150k
+          assetAgeSeconds: 1200, // 900s - 7200s
+        });
+        const rugMetricsViral = {
+          rugScore: 100,
+          hasDangerRisk: false,
+          bundlerPct: 0.1,
+          top10HolderPct: 0.2,
+          holdersCount: 1200, // >= 1000 for Viral
+        };
+
+        // Live spot liquidity is $25,000 (< $30,000 requirement)
+        const spot = {
+          ...baseSpotInfo,
+          liquidityUsd: 25_000,
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate: viralCandidate,
+          baseSpotInfo: spot,
+          rugMetrics: rugMetricsViral,
+          currentNowMs: 1_000_000,
+        });
+
+        // Must reject INSUFFICIENT_LIVE_LIQUIDITY and NOT lower requirement to $20,000!
+        expect(decision.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(decision.rejectionReason).toBe("REJECTED_INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(decision.requiredLiveLiq).toBe(30_000);
+        expect(decision.liveLiqUsd).toBe(25_000);
+        expect(decision.isEstablished).toBe(true);
+        expect(decision.isViral).toBe(true);
+      });
+
+      // Reproduction 2: Candidate previously required $50,000; actual liquidity $40,000
+      it("rejects candidate when actual liquidity $40,000 falls below required $50,000 (Established runner)", () => {
+        const establishedCandidate = createSampleCandidate({
+          liquidityUsd: 65_000, // Discovery liq >= $50k
+          marketCapUsd: 100_000, // Discovery mcap < $150k (not viral)
+          assetAgeSeconds: 2400, // >= 1800s
+        });
+        const rugMetricsEstablished = {
+          rugScore: 100,
+          hasDangerRisk: false,
+          bundlerPct: 0.1,
+          top10HolderPct: 0.2,
+          holdersCount: 300, // >= 250 for non-viral Established
+        };
+
+        // Live spot liquidity is $40,000 (< $50,000 requirement)
+        const spot = {
+          ...baseSpotInfo,
+          liquidityUsd: 40_000,
+        };
+
+        const decision = evaluateCandidateDecisionPoints({
+          candidate: establishedCandidate,
+          baseSpotInfo: spot,
+          rugMetrics: rugMetricsEstablished,
+          currentNowMs: 1_000_000,
+        });
+
+        // Must reject INSUFFICIENT_LIVE_LIQUIDITY and NOT lower requirement to $20,000!
+        expect(decision.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(decision.rejectionReason).toBe("REJECTED_INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(decision.requiredLiveLiq).toBe(50_000);
+        expect(decision.liveLiqUsd).toBe(40_000);
+        expect(decision.isEstablished).toBe(true);
+        expect(decision.isViral).toBe(false);
+      });
+
+      // Exact boundaries: $20,000 (Micro-Cap), $30,000 (Viral), $50,000 (Established)
+      it("strictly enforces exact $20,000 boundary for Micro-Cap candidates", () => {
+        const microCandidate = createSampleCandidate({
+          liquidityUsd: 25_000,
+          marketCapUsd: 80_000,
+          assetAgeSeconds: 600,
+        });
+        const rugMetricsMicro = {
+          rugScore: 100,
+          hasDangerRisk: false,
+          bundlerPct: 0.1,
+          top10HolderPct: 0.2,
+          holdersCount: 150,
+        };
+
+        // $19,999 -> rejects
+        const rejDecision = evaluateCandidateDecisionPoints({
+          candidate: microCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 19_999 },
+          rugMetrics: rugMetricsMicro,
+          currentNowMs: 1_000_000,
+        });
+        expect(rejDecision.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(rejDecision.requiredLiveLiq).toBe(20_000);
+        expect(rejDecision.isEstablished).toBe(false);
+
+        // $20,000 -> passes floor check
+        const passDecision = evaluateCandidateDecisionPoints({
+          candidate: microCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 20_000 },
+          rugMetrics: rugMetricsMicro,
+          currentNowMs: 1_000_000,
+        });
+        expect(passDecision.outcome).not.toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(passDecision.requiredLiveLiq).toBe(20_000);
+        expect(passDecision.isEstablished).toBe(false);
+      });
+
+      it("strictly enforces exact $30,000 boundary for Viral candidates", () => {
+        const viralCandidate = createSampleCandidate({
+          liquidityUsd: 35_000,
+          marketCapUsd: 160_000,
+          assetAgeSeconds: 1200,
+        });
+        const rugMetricsViral = {
+          rugScore: 100,
+          hasDangerRisk: false,
+          bundlerPct: 0.1,
+          top10HolderPct: 0.2,
+          holdersCount: 1200,
+        };
+
+        // $29,999 -> rejects
+        const rejDecision = evaluateCandidateDecisionPoints({
+          candidate: viralCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 29_999 },
+          rugMetrics: rugMetricsViral,
+          currentNowMs: 1_000_000,
+        });
+        expect(rejDecision.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(rejDecision.requiredLiveLiq).toBe(30_000);
+
+        // $30,000 -> passes floor check
+        const passDecision = evaluateCandidateDecisionPoints({
+          candidate: viralCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 30_000 },
+          rugMetrics: rugMetricsViral,
+          currentNowMs: 1_000_000,
+        });
+        expect(passDecision.outcome).not.toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(passDecision.requiredLiveLiq).toBe(30_000);
+        expect(passDecision.isEstablished).toBe(true);
+        expect(passDecision.isViral).toBe(true);
+      });
+
+      it("strictly enforces exact $50,000 boundary for Established candidates", () => {
+        const establishedCandidate = createSampleCandidate({
+          liquidityUsd: 65_000,
+          marketCapUsd: 100_000,
+          assetAgeSeconds: 2400,
+        });
+        const rugMetricsEstablished = {
+          rugScore: 100,
+          hasDangerRisk: false,
+          bundlerPct: 0.1,
+          top10HolderPct: 0.2,
+          holdersCount: 300,
+        };
+
+        // $49,999 -> rejects
+        const rejDecision = evaluateCandidateDecisionPoints({
+          candidate: establishedCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 49_999 },
+          rugMetrics: rugMetricsEstablished,
+          currentNowMs: 1_000_000,
+        });
+        expect(rejDecision.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(rejDecision.requiredLiveLiq).toBe(50_000);
+
+        // $50,000 -> passes floor check
+        const passDecision = evaluateCandidateDecisionPoints({
+          candidate: establishedCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 50_000 },
+          rugMetrics: rugMetricsEstablished,
+          currentNowMs: 1_000_000,
+        });
+        expect(passDecision.outcome).not.toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+        expect(passDecision.requiredLiveLiq).toBe(50_000);
+        expect(passDecision.isEstablished).toBe(true);
+        expect(passDecision.isViral).toBe(false);
+      });
+
+      it("preserves subsequent retest classification cohort when liquidity floor check passes", () => {
+        const customProvider: CandidateFlowProvider = {
+          getCandidateFlow: () => ({
+            poolAddress: CANONICAL_POOL_ID,
+            tokenMint: CANONICAL_TOKEN_MINT,
+            recentBuys60s: 20,
+            recentSells60s: 8,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Sufficient",
+            evaluationTimestampMs: 1_000_000,
+          }),
+        };
+
+        // 1. Established passes floor: retest receives cohortLabel "ESTABLISHED"
+        const establishedCandidate = createSampleCandidate({
+          liquidityUsd: 65_000,
+          marketCapUsd: 100_000,
+          assetAgeSeconds: 2400,
+        });
+        const estDecision = evaluateCandidateDecisionPoints({
+          candidate: establishedCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 55_000 },
+          rugMetrics: { ...validRugMetrics, holdersCount: 300 },
+          flowProvider: customProvider,
+          currentNowMs: 1_000_000,
+          requireVerifiedHolders: true,
+        });
+        expect(estDecision.outcome).toBe("ARMED_FIRST_TICK");
+        expect(estDecision.isEstablished).toBe(true);
+        if (estDecision.outcome === "ARMED_FIRST_TICK") {
+          expect(estDecision.retestResult.cohortLabel).toBe("ESTABLISHED");
+        }
+
+        // 2. Micro-Cap passes floor: retest receives cohortLabel "MICRO_CAP"
+        const microCandidate = createSampleCandidate({
+          liquidityUsd: 25_000,
+          marketCapUsd: 80_000,
+          assetAgeSeconds: 600,
+        });
+        const microDecision = evaluateCandidateDecisionPoints({
+          candidate: microCandidate,
+          baseSpotInfo: { ...baseSpotInfo, liquidityUsd: 22_000 },
+          rugMetrics: { ...validRugMetrics, holdersCount: 150 },
+          flowProvider: customProvider,
+          currentNowMs: 1_000_000,
+          requireVerifiedHolders: true,
+        });
+        expect(microDecision.outcome).toBe("ARMED_FIRST_TICK");
+        expect(microDecision.isEstablished).toBe(false);
+        if (microDecision.outcome === "ARMED_FIRST_TICK") {
+          expect(microDecision.retestResult.cohortLabel).toBe("MICRO_CAP");
+        }
+      });
+    });
   });
 
   describe("5. Protective Retest Behavior Preservation", () => {
@@ -961,6 +1518,20 @@ describe("CandidateFlowProvider & Evaluation Seam", () => {
       // Reset
       setCandidateFlowProvider(new UnavailableCandidateFlowProvider());
       expect(getCandidateFlowProvider()).toBeInstanceOf(UnavailableCandidateFlowProvider);
+    });
+
+    it("defers environment-file loading to daemon startup and performs zero credential reads on import", () => {
+      const loadEnvSpy = vi.spyOn(process, "loadEnvFile").mockImplementation(() => {});
+
+      try {
+        // Module import has already happened: loadEnvSpy was not called during module evaluation!
+        expect(loadEnvSpy).not.toHaveBeenCalled();
+
+        // Calling loadDaemonEnvironment explicitly executes the loader without printing credentials
+        loadDaemonEnvironment();
+      } finally {
+        loadEnvSpy.mockRestore();
+      }
     });
   });
 });
