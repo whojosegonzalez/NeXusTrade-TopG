@@ -755,50 +755,127 @@ The bounded keepalive objective is recorded as **ACHIEVED** for this `ws`-client
 4. **Permanent Invariants**: `isProductionCompletenessEstablished` remains `false`, and Gate 11 bundler concentration remains fail-closed.
 5. **Task Status**: The keepalive implementation task is closed. This evidence directory is sealed and preserved unchanged.
 
-### 8.8 Offline Processing Capacity Assessment
+### 8.8 Offline Processing Capacity Assessment & Flow Provider Integration Proposal
 
-Using existing codebase contracts, configuration parameters, and captured notification timestamps, the operational boundaries affecting transaction processing are characterized:
+Using existing codebase contracts, configuration parameters, and captured notification timestamps, the operational boundaries affecting transaction processing and prospective PAPER flow inputs are characterized:
 
-#### 1. Exact Constraints Affecting Transaction Processing
+#### 8.8.1 Component Ownership of Processing Constraints
 
-- **Provider Spacing Constraint**: Pacing is pinned to $\ge 2,500\text{ ms}$ spacing via `GlobalResourceBudgetManager`. This limits serial HTTP RPC requests to a maximum sustained rate of **$0.40\text{ tx/s}$** from a single client instance.
-- **Active Workload Queue Limit**: Bounded at `MAX_QUEUE_DEPTH_LIMIT = 10` (queued + in-flight operations) inside `RaydiumAmmV4TransactionSourceAdapter`. An 11th concurrent pending transaction trips `QUEUE_OVERFLOW`.
-- **Diagnostic Sample Ceiling**: `MAX_TRANSACTION_RETRIEVALS_LIMIT = 5` in the observation probe. Transaction fetching halts once 5 sampled transactions have been dispatched.
-- **Request Budget & Forward Capacity Reservation**: `GlobalResourceBudgetManager` enforces `maxTotalRequests = 11`, `maxEnrichmentAttempts = 7`, and `minReservedForwardRequests = 4`. Historical enrichment and transaction retrievals cannot exhaust capacity reserved for forward monitoring.
-- **Session Duration & Deadlines**: Overall probe duration ceiling (default 90s, maximum 300s); individual HTTP transactions bounded by a 10-second timeout.
+The following source-backed matrix identifies which component owns each constraint, contrasting constructor/class defaults against diagnostic probe overrides and actual PAPER wiring status:
 
-#### 2. Burst Handling vs. Sustained Throughput
+| Constraint / Parameter                                                        | Component & Source File                                                                                                                                                                                                     | Constructor / Class Default                                    | Diagnostic Probe Override                       | Actual PAPER Wiring Status                                                                             |
+| :---------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------- | :---------------------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| **Active Workload Queue Ceiling (`maxPendingQueueSize`)**                     | `RaydiumAmmV4TransactionSourceAdapter`<br>([`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts#L424))                                | `100`<br>(queued + in-flight operations)                       | `10`<br>(`MAX_QUEUE_DEPTH_LIMIT = 10`)          | **Unwired / Open Integration Gap**<br>(daemon does not instantiate or wire adapter)                    |
+| **Diagnostic Transaction Sample Ceiling**                                     | `RaydiumTransportObservationProbe`<br>([`RaydiumTransportObservationProbe.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumTransportObservationProbe.ts#L95))                                             | N/A<br>(probe-specific diagnostic harness)                     | `5`<br>(`MAX_TRANSACTION_RETRIEVALS_LIMIT = 5`) | **N/A**<br>(not a component of continuous trading loop)                                                |
+| **Global Budget: Total Request Ceiling (`maxTotalRequests`)**                 | `GlobalResourceBudgetManager`<br>([`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts#L67))                                                         | `120`<br>(total provider request dispatches)                   | `11`<br>(probe session allocation ceiling)      | **Unwired / Open Integration Gap**<br>(daemon does not wire shared budget manager to RPC)              |
+| **Global Budget: Enrichment Attempts Ceiling (`maxEnrichmentAttempts`)**      | `GlobalResourceBudgetManager`<br>([`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts#L68))                                                         | `10`<br>(attempts allocated to enrichment)                     | `7`<br>(probe enrichment allocation ceiling)    | **Unwired / Open Integration Gap**<br>(daemon does not wire shared budget manager to RPC)              |
+| **Global Budget: Forward Request Reservation (`minReservedForwardRequests`)** | `GlobalResourceBudgetManager`<br>([`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts#L69))                                                         | `4`<br>(strictly reserved for forward quotes)                  | `4`<br>(retains 4 forward quote requests)       | **Unwired / Open Integration Gap**<br>(daemon does not wire shared budget manager to RPC)              |
+| **Provider Request Spacing (Pacing Constraint)**                              | `GlobalResourceBudgetManager` & `RaydiumAmmV4TransactionSourceAdapter`<br>([`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts#L50)) | $\ge 2,500\text{ ms}$ spacing<br>(`MIN_HOST_PACING_MS = 2500`) | $\ge 2,500\text{ ms}$ spacing<br>(unaltered)    | **Unwired for Transaction RPC**<br>(daemon paces DexScreener spot polling, but RPC adapter is unwired) |
 
-- **Sustained Ingestion Ceiling**: Under a $\ge 2,500\text{ ms}$ pacing constraint, any pool generating continuous transactions at an average rate $> 0.40\text{ tx/s}$ will monotonically exhaust any finite queue buffer and cause queue overflow.
-- **Transient Burst Capacity**: The 10-slot queue acts as a shock absorber for short bursts. For a cluster of $N$ notifications over duration $\Delta t$, the queue can accommodate at most $10 + \lfloor \frac{\Delta t}{2500\text{ ms}} \rfloor$ transactions.
-  - In Capture `03-37-10.713Z`, the 8-notification burst over 390 ms would be absorbed ($8 \le 10$), requiring $8 \times 2.5\text{ s} = 20.0\text{ s}$ of sequential HTTP processing to clear.
-  - In Captures `02-37-38.359Z` and `02-38-37.152Z`, 12 notifications arrived in ~3 seconds ($12 > 10 + \lfloor \frac{3}{2.5} \rfloor = 11$), triggering the `QUEUE_LIMIT_EXCEEDED` fail-closed abort.
-- **Delivery Disclaimers**: Captured notifications represent only the stream witnessed by this specific single public WebSocket subscription during that window; they do not represent proof of complete upstream pool activity or ledger-level completeness. Live on-chain traffic exhibits high burstiness.
+> [!IMPORTANT]
+> **Constraint Ownership & Limits Invariant**:
+>
+> 1. Diagnostic probe overrides (`maxQueueDepth: 10`, `maxTransactionRetrievals: 5`, `maxTotalRequests: 11`) and reusable component constructor defaults (`maxPendingQueueSize: 100`, `maxTotalRequests: 120`) are **NOT deployed PAPER configurations**. Live daemon supervisor wiring in [`backend/src/scripts/paper-trading-daemon.ts`](file:///u:/Projects/TopG/backend/src/scripts/paper-trading-daemon.ts) remains an open, documented integration gap.
+> 2. These architectural and source-level observations **do NOT authorize changing any limits** (such as increasing queue sizes, relaxing pacing, raising request budgets, or modifying trading thresholds).
 
-#### 3. Diagnostic Probe vs. Intended PAPER Execution Path
+#### 8.8.2 Corrected Processing Capacity & Burst Analysis
 
-- **Probe-Only Constraints**:
-  - Sample limit of 5 transaction retrievals and 2 history queries (designed to produce bounded diagnostic evidence packages).
-  - Fatal probe termination on `QUEUE_LIMIT_EXCEEDED` (designed to halt and seal evidence immediately upon queue saturation).
-  - Explicit `--transport-only` flag (diagnostic harness to isolate transport characterization).
-- **PAPER Execution Path Constraints**:
-  - Pacing constraint ($\ge 2,500\text{ ms}$) enforced by `GlobalResourceBudgetManager` to prevent 429 rate-limiting on public RPC.
-  - Active queue capacity (`maxPendingQueueSize = 10`): In PAPER mode, queue overflow drops unbuffered notifications (`totalQueueOverflows++`). Dropped events create gaps in `RollingTradeFlowTracker`, resulting in incomplete coverage (`flowCoverageStatus != FULL`) and preventing trade execution.
-  - Forward reservation (`minReservedForwardRequests = 4`): Prevents background enrichment from exhausting RPC capacity needed for forward quote observation and trade execution.
+1. **Configured Pacing-Imposed Upper Bound**:
+   - The rate **$0.40\text{ request starts/second}$** ($\frac{1}{2,500\text{ ms}}$) is strictly a software upper bound imposed by our client-side configured 2,500 ms spacing constraint inside `GlobalResourceBudgetManager` and `RaydiumAmmV4TransactionSourceAdapter`.
+   - This represents the theoretical maximum rate at which sequential HTTP requests can be initiated from a single client instance, _before_ accounting for upstream network round-trip latency ($RTT$), response-body streaming/read duration, or competing requests (e.g. metadata enrichment, pool discovery, forward quote requests) sharing the same host pacing interval.
+   - It is **not** a demonstrated API entitlement, provider SLA, or upstream throughput limit.
+2. **Transaction Retrievals (`getTransaction`) vs. Individual Swaps**:
+   - Each HTTP request dispatches a single `getTransaction` call for a specific transaction signature.
+   - A single transaction payload may contain zero, one, or multiple candidate swap instructions (e.g. multi-hop trades, aggregated swaps, or batch executions).
+   - Furthermore, a retrieved transaction may fail on-chain (`meta.err !== null`), which our decoder strictly rejects (`TRANSACTION_FAILED`), resulting in zero ingested swaps despite a successful HTTP 200 retrieval.
+   - Consequently, request processing capacity is measured strictly in terms of transaction retrieval request starts, not individual candidate swaps.
+3. **Candidate Pool Transaction Velocity**:
+   - We do not make the unsupported assumption that newly launched candidate tokens will naturally stay below $0.40\text{ tx/s}$. High-volatility launches, initial liquidity migrations, and bot activity frequently generate bursts exceeding $0.40\text{ tx/s}$.
+4. **Theoretical Burst-Capacity Modeling**:
+   - Burst absorption calculations must be explicitly treated as **theoretical models** that rely on idealized assumptions:
+     - Zero initial queue backlog ($Q_0 = 0$).
+     - Zero network latency for HTTP round-trip ($RTT = 0\text{ ms}$).
+     - Zero competing requests sharing host pacing.
+     - Strictly sequential notification arrivals.
+   - Under these idealized assumptions, a queue of capacity $Q$ can absorb at most $Q + \lfloor \frac{\Delta t}{2500\text{ ms}} \rfloor$ notifications arriving over duration $\Delta t$.
+5. **Sample Limit vs. Burst Ingestion in Capture `03-37-10.713Z`**:
+   - In Capture `03-37-10.713Z`, 8 notifications arrived in a 390 ms cluster.
+   - While these 8 notifications would fit into the probe's 10-slot queue ($8 \le 10$), they **cannot be fully processed** by the current 5-transaction diagnostic sample ceiling (`MAX_TRANSACTION_RETRIEVALS_LIMIT = 5`).
+   - Queue accommodation alone does not establish full processing or complete coverage: after dispatching 5 transaction retrievals, the probe sample ceiling halts processing, leaving the remaining 3 notifications unretrieved. Queue fit must never be conflated with complete coverage or trade flow validity.
 
-#### 4. Smallest Feasible Next Step & Acceptance Criteria
+#### 8.8.3 Offline Integration Proposal: Strategy-Facing Candidate Flow Provider Seam
 
-- **Recommended Next Step**: A separately reviewed proposal for **Candidate-Pool Profiling & Bounded Lossy Notification Sampling**:
-  1. _Candidate Token Profiling_: Distinguish high-frequency reference pools (RAY/WSOL, generating bursts of dozens of swaps per block) from target candidate tokens (newly launched pools, typically exhibiting sparse transaction volume $< 0.40\text{ tx/s}$). Target candidate volume fits naturally within the 10-item queue buffer.
-  2. _Bounded Diagnostic Sampling Mode_: For reference-pool characterization, specify an explicit non-fatal sampling policy where notifications exceeding queue capacity are recorded as unretrieved/skipped rather than triggering an immediate session-ending `QUEUE_LIMIT_EXCEEDED` abort.
-- **Concrete Acceptance Criteria**:
-  - Pacing constraint ($\ge 2,500\text{ ms}$) and $0.00 spending ceiling remain strictly preserved.
-  - Candidate stream coordinator gracefully absorbs transient bursts on candidate tokens without gap generation.
-  - Diagnostic probe handles high-frequency pool traffic by sampling without socket termination.
-- **Remaining Blockers**:
-  - Public RPC rate limits fundamentally constrain single-provider sustained processing to 0.40 tx/s.
-  - Production source completeness remains unproven without gapless block-range verification.
-  - Gate 11 bundler concentration remains fail-closed.
+Rather than proposing any non-standard "lossy sampling mode" (which is rejected; `--transport-only` mode is already the accepted connection-characterization path), this proposal defines a single, implementation-sized offline integration step advancing the prospective PAPER architecture.
+
+##### 1. Strategy-Facing Flow Integration Seam
+
+- **Affected Files**:
+  - [`backend/src/scripts/paper-trading-daemon.ts`](file:///u:/Projects/TopG/backend/src/scripts/paper-trading-daemon.ts)
+  - [`backend/src/candidate-scanner/BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts)
+  - [`backend/src/candidate-scanner/RetestGateEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RetestGateEvaluator.ts)
+  - [`backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts)
+- **Current Daemon Flow Inputs**:
+  - In `paper-trading-daemon.ts` (lines 345–346 and 1830–1886), flow counts are currently interpolated from 5-minute DexScreener aggregates:
+    $$\text{recentBuys60s} = \text{round}\left(\frac{\text{buys5m}}{5}\right), \quad \text{recentSells60s} = \text{round}\left(\frac{\text{sells5m}}{5}\right)$$
+  - These linear estimates are passed directly to `BuyGateTriggerService.evaluateCandidate()` and `evaluateRetestGate()`, while `flowCoverage` remains undefined.
+- **Architectural Seam**:
+  - Define an injectable abstraction in `paper-trading-daemon.ts`:
+    ```typescript
+    export interface CandidateFlowProvider {
+      getRetestSpotInfo(
+        poolAddress: string,
+        baseSpot: {
+          readonly spotPriceSol: number;
+          readonly spotPriceUsd?: number | null;
+          readonly liquidityUsd?: number | null;
+        },
+        evaluationTimestampMs?: number,
+      ): RetestSpotInfo;
+    }
+    ```
+  - This bridges [`RaydiumCandidateSubscriptionCoordinator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts) and [`RollingTradeFlowTracker`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts) via `coordinator.createRetestSpotInfo()` into the daemon's candidate evaluation loop.
+
+##### 2. Existing vs. Missing Connections
+
+- **Existing Connections**:
+  - `RaydiumCandidateSubscriptionCoordinator.createRetestSpotInfo()` already exists and constructs a typed `RetestSpotInfo` overlay.
+  - `RetestGateEvaluator.evaluateRetestGate()` already accepts `RetestSpotInfo` containing `recentBuys60s`, `recentSells60s`, and `flowCoverage`.
+  - `isFlowValidAndSufficient(spotInfo)` already strictly validates that `flowCoverage === "SUFFICIENT"` and both buy/sell counts are non-null, finite, non-negative integers.
+- **Missing Connections**:
+  - `paper-trading-daemon.ts` does not instantiate, supervise, or query `RaydiumCandidateSubscriptionCoordinator`.
+  - The daemon lacks an injectable flow provider seam, currently relying entirely on DexScreener 5-minute division.
+
+##### 3. Unavailable Flow Nulling & Fail-Closed Invariants
+
+- Under default production configuration, synthetic completeness proofs are strictly prohibited (`allowSyntheticCompletenessProofs: false`).
+- Without an explicit offline test opt-in (`allowSyntheticCompletenessProofs: true`), `coordinator.createRetestSpotInfo()` strictly delegates to `evaluateFlow()`, which produces:
+  - `recentBuys60s: null`
+  - `recentSells60s: null`
+  - `flowCoverage: "COLLECTION_GAP"` (or `"WARM_UP"` / `"UNINITIALIZED"`)
+- When these null counts are supplied to `RetestGateEvaluator`:
+  1. `isFlowValidAndSufficient(spotInfo)` returns `false`.
+  2. `isFlowAbsorbing` returns `false`.
+  3. The Retest Crater Drop ceiling for Established tokens strictly defaults to the unabsorbed 8% limit (`maxCraterDropPct = 0.08`), refusing the 12% absorption expansion.
+  4. In-flight seller surge bypass (Rule E) cannot be evaluated and is not triggered.
+  5. The evaluation strictly fails closed, preventing unverified or incomplete flow from admitting trades.
+
+##### 4. Offline Acceptance Checks
+
+1. **Unit Test: Injectable Seam Wiring**:
+   - Assert that `paper-trading-daemon.ts` consumes `CandidateFlowProvider` when injected.
+2. **Unit Test: Fail-Closed Default**:
+   - Assert that an unattached flow provider or a default coordinator (`allowSyntheticCompletenessProofs: false`) yields `recentBuys60s: null`, `recentSells60s: null`, and non-`SUFFICIENT` coverage in `spotInfo`.
+3. **Unit Test: Retest Gate Fail-Closed Guard**:
+   - Assert that `evaluateRetestGate()` enforces the 8% crater drop ceiling and rejects candidate progression when flow counts are `null`.
+4. **Unit Test: Synthetic Fixture Positive Control**:
+   - Assert that only an explicit test harness with `allowSyntheticCompletenessProofs: true` and continuous synthetic checkpoints can produce `SUFFICIENT` coverage and non-null flow counts.
+
+##### 5. Prerequisite Preventing Usable Production Flow
+
+- **Production Source Completeness Remains Unproven**:
+  - Live WebSocket feeds and single-stream subscriptions do not guarantee gapless block coverage or zero dropped notifications.
+  - The production source-completeness mechanism (e.g. verified gapless block-range confirmation) remains unimplemented.
+  - Therefore, completing this offline integration seam connects the architectural components and establishes fail-closed safety, but does **not** authorize live daemon activation or produce usable non-null production flow.
 
 ### 8.9 Invariant Preservation Reaffirmation
 
