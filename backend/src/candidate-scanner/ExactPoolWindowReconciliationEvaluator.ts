@@ -604,61 +604,82 @@ export function evaluateExactPoolWindowReconciliation(
     }
 
     let resolutionDispatches: number | null = null;
-    if (options.resolutionResult && options.resolutionResult.perSignatureResults) {
-      let count = 0;
-      let isResolutionFullyEvidenced = true;
+    if (options.resolutionResult) {
+      const res = options.resolutionResult;
+      const totalProcessed = typeof res.totalProcessed === "number" ? res.totalProcessed : 0;
+      const perSigResults = res.perSignatureResults;
+      const perSigLength = Array.isArray(perSigResults) ? perSigResults.length : 0;
 
-      for (const sigRes of options.resolutionResult.perSignatureResults) {
-        const isPreDispatch =
-          sigRes.adapterOutcome === "PRE_DISPATCH_BUDGET_DENIED" ||
-          sigRes.adapterOutcome === "PRE_DISPATCH_DEADLINE_EXCEEDED" ||
-          sigRes.adapterOutcome === "DUPLICATE_NOTIFICATION" ||
-          sigRes.adapterOutcome === "INVALID_NOTIFICATION" ||
-          sigRes.adapterOutcome === "QUEUE_OVERFLOW" ||
-          sigRes.status === "DUPLICATE_RESOLVED" ||
-          sigRes.status === "DUPLICATE_UNRESOLVED" ||
-          sigRes.status === "BUDGET_DENIED";
-
-        if (isPreDispatch) {
-          continue;
-        }
-
-        const isPostDispatch =
-          sigRes.adapterOutcome === "SUCCESS" ||
-          sigRes.adapterOutcome === "REQUEST_TIMEOUT" ||
-          sigRes.adapterOutcome === "NETWORK_ERROR" ||
-          sigRes.adapterOutcome === "HTTP_ERROR" ||
-          sigRes.adapterOutcome === "MALFORMED_RESPONSE" ||
-          sigRes.adapterOutcome === "RPC_ERROR" ||
-          sigRes.adapterOutcome === "TRANSACTION_NOT_FOUND" ||
-          sigRes.adapterOutcome === "RESPONSE_SIGNATURE_MISMATCH" ||
-          sigRes.adapterOutcome === "CONTRADICTORY_METADATA" ||
-          sigRes.adapterOutcome === "DECODE_FAILED" ||
-          sigRes.adapterOutcome === "INGEST_FAILED" ||
-          sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
-          sigRes.status === "RESOLVED" ||
-          sigRes.status === "FAILED_DECODE" ||
-          sigRes.status === "FAILED_INGEST" ||
-          sigRes.status === "PARTIAL_INGEST" ||
-          sigRes.status === "TRANSACTION_UNAVAILABLE" ||
-          sigRes.status === "ADAPTER_ERROR";
-
-        if (isPostDispatch) {
-          count++;
-        } else {
-          isResolutionFullyEvidenced = false;
-          break;
-        }
+      // Close unknown accounting: totalProcessed is nonzero but perSignatureResults is empty or partial.
+      // Missing records prevent establishing the total -> return null.
+      if (totalProcessed > 0 && perSigLength === 0) {
+        return null;
+      }
+      if (totalProcessed > perSigLength) {
+        return null;
       }
 
-      if (isResolutionFullyEvidenced) {
-        resolutionDispatches = count;
+      if (Array.isArray(perSigResults)) {
+        let count = 0;
+        let isResolutionFullyEvidenced = true;
+
+        for (const sigRes of perSigResults) {
+          // Pre-dispatch denials & duplicate notifications did not dispatch an HTTP attempt:
+          const isPreDispatch =
+            sigRes.adapterOutcome === "PRE_DISPATCH_BUDGET_DENIED" ||
+            sigRes.adapterOutcome === "PRE_DISPATCH_DEADLINE_EXCEEDED" ||
+            sigRes.adapterOutcome === "DUPLICATE_NOTIFICATION" ||
+            sigRes.adapterOutcome === "INVALID_NOTIFICATION" ||
+            sigRes.adapterOutcome === "QUEUE_OVERFLOW" ||
+            sigRes.status === "DUPLICATE_RESOLVED" ||
+            sigRes.status === "DUPLICATE_UNRESOLVED" ||
+            sigRes.status === "BUDGET_DENIED";
+
+          if (isPreDispatch) {
+            continue;
+          }
+
+          // Explicit post-dispatch outcomes:
+          // Note: ADAPTER_ERROR without explicit adapterOutcome or attempt evidence is NOT post-dispatch.
+          const isPostDispatch =
+            sigRes.adapterOutcome === "SUCCESS" ||
+            sigRes.adapterOutcome === "REQUEST_TIMEOUT" ||
+            sigRes.adapterOutcome === "NETWORK_ERROR" ||
+            sigRes.adapterOutcome === "HTTP_ERROR" ||
+            sigRes.adapterOutcome === "MALFORMED_RESPONSE" ||
+            sigRes.adapterOutcome === "RPC_ERROR" ||
+            sigRes.adapterOutcome === "TRANSACTION_NOT_FOUND" ||
+            sigRes.adapterOutcome === "RESPONSE_SIGNATURE_MISMATCH" ||
+            sigRes.adapterOutcome === "CONTRADICTORY_METADATA" ||
+            sigRes.adapterOutcome === "DECODE_FAILED" ||
+            sigRes.adapterOutcome === "INGEST_FAILED" ||
+            sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
+            sigRes.status === "RESOLVED" ||
+            sigRes.status === "FAILED_DECODE" ||
+            sigRes.status === "FAILED_INGEST" ||
+            sigRes.status === "PARTIAL_INGEST" ||
+            sigRes.status === "TRANSACTION_UNAVAILABLE";
+
+          if (isPostDispatch) {
+            count++;
+          } else {
+            // Ambiguous status without explicit diagnostics/attempt evidence (e.g. DEADLINE_EXCEEDED or ADAPTER_ERROR without adapterOutcome)
+            isResolutionFullyEvidenced = false;
+            break;
+          }
+        }
+
+        if (isResolutionFullyEvidenced) {
+          resolutionDispatches = count;
+        }
+      } else if (totalProcessed === 0) {
+        resolutionDispatches = 0;
       }
     } else if (
       options.historyResult?.discoveredSignatures?.length === 0 ||
       options.historyRecords?.length === 0
     ) {
-      // Quiet window where 0 signatures were discovered: resolution dispatches = 0
+      // Quiet window where 0 signatures were discovered in history: resolution dispatches = 0
       resolutionDispatches = 0;
     }
 
@@ -1190,77 +1211,7 @@ export function evaluateExactPoolWindowReconciliation(
     );
   }
 
-  // 12. Calculate Actual Requests Dispatched (from Fully Evidenced Receipts Only)
-  let historyDispatches: number | null = null;
-  if (options.historyResult && typeof options.historyResult.requestCount === "number") {
-    historyDispatches = options.historyResult.requestCount;
-  }
-
-  let resolutionDispatches: number | null = null;
-  if (signaturesInWindow.length === 0) {
-    // Verified quiet window: 0 resolution queries were needed or dispatched
-    resolutionDispatches = 0;
-  } else if (options.resolutionResult && options.resolutionResult.perSignatureResults) {
-    let count = 0;
-    let isResolutionFullyEvidenced = true;
-
-    for (const sigRes of options.resolutionResult.perSignatureResults) {
-      // Pre-dispatch denials & duplicate notifications did not dispatch an HTTP attempt:
-      const isPreDispatch =
-        sigRes.adapterOutcome === "PRE_DISPATCH_BUDGET_DENIED" ||
-        sigRes.adapterOutcome === "PRE_DISPATCH_DEADLINE_EXCEEDED" ||
-        sigRes.adapterOutcome === "DUPLICATE_NOTIFICATION" ||
-        sigRes.adapterOutcome === "INVALID_NOTIFICATION" ||
-        sigRes.adapterOutcome === "QUEUE_OVERFLOW" ||
-        sigRes.status === "DUPLICATE_RESOLVED" ||
-        sigRes.status === "DUPLICATE_UNRESOLVED" ||
-        sigRes.status === "BUDGET_DENIED";
-
-      if (isPreDispatch) {
-        continue;
-      }
-
-      // Explicit post-dispatch outcomes:
-      const isPostDispatch =
-        sigRes.adapterOutcome === "SUCCESS" ||
-        sigRes.adapterOutcome === "REQUEST_TIMEOUT" ||
-        sigRes.adapterOutcome === "NETWORK_ERROR" ||
-        sigRes.adapterOutcome === "HTTP_ERROR" ||
-        sigRes.adapterOutcome === "MALFORMED_RESPONSE" ||
-        sigRes.adapterOutcome === "RPC_ERROR" ||
-        sigRes.adapterOutcome === "TRANSACTION_NOT_FOUND" ||
-        sigRes.adapterOutcome === "RESPONSE_SIGNATURE_MISMATCH" ||
-        sigRes.adapterOutcome === "CONTRADICTORY_METADATA" ||
-        sigRes.adapterOutcome === "DECODE_FAILED" ||
-        sigRes.adapterOutcome === "INGEST_FAILED" ||
-        sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
-        sigRes.status === "RESOLVED" ||
-        sigRes.status === "FAILED_DECODE" ||
-        sigRes.status === "FAILED_INGEST" ||
-        sigRes.status === "PARTIAL_INGEST" ||
-        sigRes.status === "TRANSACTION_UNAVAILABLE" ||
-        sigRes.status === "ADAPTER_ERROR";
-
-      if (isPostDispatch) {
-        count++;
-      } else {
-        // Ambiguous status without explicit diagnostics (e.g. DEADLINE_EXCEEDED without adapterOutcome)
-        isResolutionFullyEvidenced = false;
-        break;
-      }
-    }
-
-    if (isResolutionFullyEvidenced) {
-      resolutionDispatches = count;
-    }
-  }
-
-  let actualRequestsDispatched: number | null = null;
-  if (historyDispatches !== null && resolutionDispatches !== null) {
-    actualRequestsDispatched = historyDispatches + resolutionDispatches;
-  }
-
-  // Gather trade events from options.trades or read-only from options.tracker
+  // 12. Gather trade events from options.trades or read-only from options.tracker
   const candidateTrades: readonly TradeEvent[] =
     options.trades ??
     (options.tracker as unknown as { readonly events?: readonly TradeEvent[] })?.events ??
@@ -1303,7 +1254,6 @@ export function evaluateExactPoolWindowReconciliation(
           totalDiscovered: discoveredSignatures.length,
           windowSignaturesCount: signaturesInWindow.length,
           unresolvedCount: 1,
-          actualRequestsDispatched,
         },
       );
     }
@@ -1312,7 +1262,7 @@ export function evaluateExactPoolWindowReconciliation(
         "IDENTITY_MISMATCH",
         "COLLECTION_GAP",
         `IDENTITY_MISMATCH: Resolution record slot (${resRecord.slot}) does not match history record slot (${sigRec.slot}) for signature '${sig}'`,
-        { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+        { windowStartMs, windowEndMs, evidenceAgeMs },
       );
     }
     if (resRecord.blockTime !== null && resRecord.blockTime !== sigRec.blockTime) {
@@ -1320,7 +1270,7 @@ export function evaluateExactPoolWindowReconciliation(
         "IDENTITY_MISMATCH",
         "COLLECTION_GAP",
         `IDENTITY_MISMATCH: Resolution record blockTime (${resRecord.blockTime}) does not match history record blockTime (${sigRec.blockTime}) for signature '${sig}'`,
-        { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+        { windowStartMs, windowEndMs, evidenceAgeMs },
       );
     }
 
@@ -1412,7 +1362,6 @@ export function evaluateExactPoolWindowReconciliation(
           evidenceAgeMs,
           totalDiscovered: discoveredSignatures.length,
           windowSignaturesCount: signaturesInWindow.length,
-          actualRequestsDispatched,
         },
       );
     }
@@ -1431,7 +1380,6 @@ export function evaluateExactPoolWindowReconciliation(
             evidenceAgeMs,
             totalDiscovered: discoveredSignatures.length,
             windowSignaturesCount: signaturesInWindow.length,
-            actualRequestsDispatched,
           },
         );
       }
@@ -1442,7 +1390,7 @@ export function evaluateExactPoolWindowReconciliation(
           "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
           "COLLECTION_GAP",
           `INSUFFICIENT_DIRECTIONAL_EVIDENCE: Signature '${sig}' reported 0 decoded events, but ${validSigEvents.length} trade event(s) were supplied`,
-          { windowStartMs, windowEndMs, evidenceAgeMs, actualRequestsDispatched },
+          { windowStartMs, windowEndMs, evidenceAgeMs },
         );
       }
     }
@@ -1466,7 +1414,6 @@ export function evaluateExactPoolWindowReconciliation(
         windowSignaturesCount: signaturesInWindow.length,
         incrementallyReused: incrementallyReusedCount,
         unresolvedCount: unresolvedSignatures.length,
-        actualRequestsDispatched,
       },
     );
   }
@@ -1532,7 +1479,6 @@ export function evaluateExactPoolWindowReconciliation(
     incrementallyReused: incrementallyReusedCount,
     windowSignaturesCount: signaturesInWindow.length,
     unresolvedCount: 0,
-    actualRequestsDispatched,
   });
 }
 

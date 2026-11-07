@@ -985,6 +985,247 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.resourceMetrics.actualRequestsDispatched).toBeNull();
     });
 
+    it("counts evidenced dispatches for older boundary transactions during quiet windows while keeping directional counts limited to window", () => {
+      // 1 recorded history query discovering 1 boundary transaction outside window (blockTime = 4s, window = [5s, 65s])
+      const boundarySig = "BoundaryAnchorTx";
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: boundarySig,
+        frozenTargetSignature: boundarySig,
+        discoveredSignatures: [
+          {
+            signature: boundarySig,
+            slot: 280_000_004,
+            blockTime: 4, // 4s < 5s (window start) -> outside evaluated window!
+            err: null,
+          },
+        ],
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      // 1 successful transaction-resolution receipt for that boundary transaction
+      const resolutionResult: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: boundarySig,
+        frozenTargetSignature: boundarySig,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 1,
+        totalFailed: 0,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 0,
+        perSignatureResults: [
+          {
+            signature: boundarySig,
+            slot: 280_000_004,
+            blockTime: 4,
+            status: "RESOLVED",
+            adapterOutcome: "SUCCESS",
+            decodedEventsCount: 0,
+            ingestedEventsCount: 0,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 50,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        resolutionResult,
+        knownAnchorSignature: boundarySig,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      // Directional counting limited to window: 0 BUY / 0 SELL
+      expect(result.flowCounts.recentBuys60s).toBe(0);
+      expect(result.flowCounts.recentSells60s).toBe(0);
+      expect(result.flowCounts.flowRatio).toBe(1.0);
+      // Actual dispatches: 1 history request + 1 resolution request = 2 (NOT 1!)
+      expect(result.resourceMetrics.actualRequestsDispatched).toBe(2);
+    });
+
+    it("reports actualRequestsDispatched as null (unknown) when totalProcessed is nonzero but perSignatureResults is empty", () => {
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        discoveredSignatures: historyRecords,
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const partialResolutionResult: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1, // Nonzero!
+        totalResolved: 1,
+        totalFailed: 0,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 1,
+        perSignatureResults: [], // Empty! Partial receipt missing individual records
+        isProductionCompletenessEstablished: false,
+        durationMs: 50,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        resolutionResult: partialResolutionResult,
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      // Missing records prevent establishing total dispatches -> reports null (unknown)
+      expect(result.resourceMetrics.actualRequestsDispatched).toBeNull();
+    });
+
+    it("reports actualRequestsDispatched as null (unknown) when ADAPTER_ERROR lacks adapter outcome or attempt evidence", () => {
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        discoveredSignatures: historyRecords,
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const adapterErrorResolutionResult: TransactionResolutionResult = {
+        outcome: "PARTIAL_RESOLUTION",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 0,
+        totalFailed: 1,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 0,
+        perSignatureResults: [
+          {
+            signature: sig1,
+            slot: 280_000_050,
+            blockTime: 50,
+            status: "ADAPTER_ERROR", // Broad status without adapterOutcome attempt evidence
+            decodedEventsCount: 0,
+            ingestedEventsCount: 0,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 50,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        resolutionResult: adapterErrorResolutionResult,
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      // Ambiguous ADAPTER_ERROR without attempt evidence reports null (unknown)
+      expect(result.resourceMetrics.actualRequestsDispatched).toBeNull();
+    });
+
+    it("counts ADAPTER_ERROR as an evidenced dispatch when explicit post-dispatch adapter outcome is present", () => {
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        discoveredSignatures: historyRecords,
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const evidencedAdapterErrorResult: TransactionResolutionResult = {
+        outcome: "PARTIAL_RESOLUTION",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: sig1,
+        totalDiscoveredSignatures: 1,
+        totalProcessed: 1,
+        totalResolved: 0,
+        totalFailed: 1,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 0,
+        totalIngestedSwaps: 0,
+        perSignatureResults: [
+          {
+            signature: sig1,
+            slot: 280_000_050,
+            blockTime: 50,
+            status: "ADAPTER_ERROR",
+            adapterOutcome: "HTTP_ERROR", // Explicit post-dispatch evidence!
+            decodedEventsCount: 0,
+            ingestedEventsCount: 0,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 50,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        resolutionResult: evidencedAdapterErrorResult,
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      // 1 history request + 1 failed HTTP resolution request = 2
+      expect(result.resourceMetrics.actualRequestsDispatched).toBe(2);
+    });
+
     it("consumes tracker read-only, detects evaluation-time inactivity gap without mutating tracker state", () => {
       const tracker = new RollingTradeFlowTracker({
         poolId: CANONICAL_POOL_ID,
