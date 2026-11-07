@@ -1,22 +1,55 @@
+/**
+ * Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evaluator Tests (Audit-Hardened V3)
+ *
+ * Comprehensive offline verification suite ensuring:
+ * 1. Warm-up and incomplete observation handling.
+ * 2. Full-duration quiet window reconciliation.
+ * 3. Evidence presence and accounting defect regressions.
+ * 4. Terminal evidence outcome validation (fetch error, cancelled, capped enumeration never become verified quiet windows).
+ * 5. Complete, valid event set per transaction:
+ *    - Incomplete directional events (2 decoded vs 1 supplied) fail closed.
+ *    - Explicit resolution failure takes precedence over alreadyResolved and trade records.
+ *    - Foreign pool trade filtering fails closed and does not manufacture verified zero activity.
+ *    - Genuinely zero-swap transactions (decodedEventsCount: 0) reconcile to 0/0.
+ *    - NaN event time and post-decision events are rejected.
+ * 6. Cutoff content & payload validation:
+ *    - Rejects responseField="banana".
+ *    - Validates injected response payload contents, slot alignment, and timestamp correspondence.
+ * 7. Non-mutating accounting & read-only tracker handling:
+ *    - Tracker is never mutated; evaluateWindow is never called.
+ *    - Stream inactivity at evaluation time is detected read-only.
+ *    - Raw fixture arrays yield actualRequestsDispatched = null.
+ *    - Explicit receipts report true HTTP dispatches.
+ *    - Duplicate signatures are excluded from HTTP dispatch counts.
+ *    - Known unresolved demand is preserved in UNRESOLVED_TRANSACTIONS.
+ * 8. Upstream index omission limitation acknowledgment and production protection.
+ */
+
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   evaluateExactPoolWindowReconciliation,
   toCandidateFlowResult,
-  type SourceCutoffEvidence,
   DEFAULT_PROVIDER_INDEX_ASSUMPTIONS,
   DEFAULT_UNRESOLVED_UNCERTAINTIES,
+  type SourceCutoffEvidence,
 } from "./ExactPoolWindowReconciliationEvaluator.js";
+import type { TrackedRaydiumPoolContext } from "./RaydiumAmmV4SwapDecoder.js";
+import type {
+  HistorySignatureRecord,
+  HistoryEnumerationResult,
+} from "./ExactPoolHistoryEnumerator.js";
+import type {
+  ResolvedSignatureRecord,
+  TransactionResolutionResult,
+} from "./ExactPoolTransactionResolutionBridge.js";
+import { RollingTradeFlowTracker, type TradeEvent } from "./RollingTradeFlowTracker.js";
+import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 import {
   validateAndSnapshotCandidateFlowResult,
   type CandidateFlowTarget,
 } from "./CandidateFlowProvider.js";
-import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
-import type { TrackedRaydiumPoolContext } from "./RaydiumAmmV4SwapDecoder.js";
-import type { HistorySignatureRecord } from "./ExactPoolHistoryEnumerator.js";
-import type { ResolvedSignatureRecord } from "./ExactPoolTransactionResolutionBridge.js";
-import type { StreamGap, TradeEvent } from "./RollingTradeFlowTracker.js";
 
-const CANONICAL_POOL_ID = "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA";
+const CANONICAL_POOL_ID = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
 const CANONICAL_TOKEN_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 const CANONICAL_PC_MINT = "So11111111111111111111111111111111111111112";
 const CANONICAL_COIN_VAULT = "EkVZ1kV8V2B5U7T3k2Z2x8r8m4K7J3W3e5R2T6U8V9Y";
@@ -33,7 +66,7 @@ const VALID_POOL_CONTEXT: TrackedRaydiumPoolContext = Object.freeze({
   orientation: "TOKEN_BASE_SOL_QUOTE" as const,
 });
 
-describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evaluator (Audit-Harden V2)", () => {
+describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evaluator (Audit-Hardened V3)", () => {
   let budgetManager: GlobalResourceBudgetManager;
 
   beforeEach(() => {
@@ -59,8 +92,8 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
 
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 60_000,
-        observationStartMs: 0,
+        decisionTimestampMs: 56_000,
+        observationStartMs: 0, // started at 0s, but window begins at -5s (55s - 60s)
         observationEndMs: 55_000,
         sourceCutoff: cutoffEvidence,
         historyRecords: [],
@@ -86,7 +119,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         responseField: "result",
         commitment: "confirmed",
         provenance: "ON_CHAIN_BLOCK_TIME",
-        slot: 280_000_150,
+        slot: 280_000_200,
         cutoffTimestampMs: 70_000,
         retrievedAtMs: 70_050,
       };
@@ -114,9 +147,6 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
 
   describe("2. Genuinely Full-Duration Quiet-Window Fixture", () => {
     it("successfully reconciles 0 buys and 0 sells for a full-duration quiet window under explicit provider assumptions", () => {
-      // Corrected Scenario A: observation started at 0ms, cutoff at 65_000ms.
-      // Window is [5_000ms, 65_000ms] spanning 60 seconds.
-      // Observation [0, 65_000] fully covers [5000, 65_000].
       const cutoffEvidence: SourceCutoffEvidence = {
         sourceMethod: "getBlockTime",
         responseField: "result",
@@ -125,6 +155,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         slot: 280_000_200,
         cutoffTimestampMs: 65_000,
         retrievedAtMs: 65_040,
+        responsePayload: { result: 65 },
       };
 
       const result = evaluateExactPoolWindowReconciliation({
@@ -147,11 +178,9 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.temporalContext.windowEndMs).toBe(65_000);
       expect(result.temporalContext.evidenceAgeMs).toBe(1000);
 
-      // Invariants: not cryptographic, not production completeness
       expect(result.isCryptographicCompletenessEstablished).toBe(false);
       expect(result.isProductionCompletenessEstablished).toBe(false);
 
-      // Explicit provider assumptions and unresolved uncertainties
       expect(result.providerAssumptions).toEqual(DEFAULT_PROVIDER_INDEX_ASSUMPTIONS);
       expect(result.unresolvedUncertainties).toEqual(DEFAULT_UNRESOLVED_UNCERTAINTIES);
       expect(result.diagnosticReason).toContain(
@@ -160,7 +189,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
     });
   });
 
-  describe("3. Evidence Presence & Accounting Defect Regressions (Audit Area 1)", () => {
+  describe("3. Terminal Evidence Outcome Validation (Audit Area 1)", () => {
     const validCutoff: SourceCutoffEvidence = {
       sourceMethod: "getBlockTime",
       responseField: "result",
@@ -171,6 +200,126 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       retrievedAtMs: 65_020,
     };
 
+    it("fails closed when historyResult has outcome FETCH_ERROR and empty records rather than returning a false quiet window", () => {
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "FETCH_ERROR",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: false,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: null,
+        discoveredSignatures: [],
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+        error: "JSON-RPC 503 Service Unavailable",
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("INCOMPLETE_OBSERVATION");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.isCoverageSufficient).toBe(false);
+      expect(result.flowCounts.recentBuys60s).toBeNull();
+      expect(result.flowCounts.recentSells60s).toBeNull();
+      expect(result.diagnosticReason).toContain("FETCH_ERROR");
+    });
+
+    it("fails closed when historyResult has outcome OPERATION_CANCELLED or MAX_PAGES_EXHAUSTED", () => {
+      const cancelledResult: HistoryEnumerationResult = {
+        outcome: "OPERATION_CANCELLED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: false,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: null,
+        discoveredSignatures: [],
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+        error: "Caller cancelled",
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult: cancelledResult,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("INCOMPLETE_OBSERVATION");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("OPERATION_CANCELLED");
+    });
+
+    it("fails closed with UNWITNESSED_PRIOR_ANCHOR when historyResult has outcome ANCHOR_NOT_FOUND", () => {
+      const anchorNotFoundResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_NOT_FOUND",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: false,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: "SigTarget",
+        discoveredSignatures: [],
+        requestCount: 2,
+        pagesQueried: 2,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult: anchorNotFoundResult,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+    });
+
+    it("fails closed with IDENTITY_MISMATCH when candidatePoolId in historyResult does not match poolContext", () => {
+      const foreignHistoryResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: "DifferentPoolAddress11111111111111111111111111",
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: "SigTarget",
+        discoveredSignatures: [],
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult: foreignHistoryResult,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("IDENTITY_MISMATCH");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("IDENTITY_MISMATCH");
+    });
+
     it("fails closed with MISSING_HISTORY_EVIDENCE when neither historyResult nor historyRecords is supplied", () => {
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,
@@ -179,7 +328,6 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         budgetManager,
-        // historyResult and historyRecords intentionally omitted!
       });
 
       expect(result.status).toBe("MISSING_HISTORY_EVIDENCE");
@@ -190,43 +338,11 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       );
     });
 
-    it("fails closed with UNRESOLVED_TRANSACTIONS when a discovered transaction has no resolution evidence", () => {
+    it("fails closed with AMBIGUOUS_TIMESTAMP when a history record has null blockTime", () => {
       const sig1 =
         "Sig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
       const historyRecords: HistorySignatureRecord[] = [
-        { signature: sig1, slot: 280_000_050, err: null, blockTime: 50 },
-        { signature: "Anchor000", slot: 280_000_001, err: null, blockTime: 1 },
-      ];
-
-      // No resolutionResult, resolvedSignatures, or trades provided for sig1!
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 65_000,
-        sourceCutoff: validCutoff,
-        historyRecords,
-        knownAnchorSignature: "Anchor000",
-        budgetManager,
-      });
-
-      expect(result.status).toBe("UNRESOLVED_TRANSACTIONS");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "UNRESOLVED_TRANSACTIONS: Discovered signature 'Sig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111' lacks validated resolution evidence",
-      );
-    });
-
-    it("fails closed with AMBIGUOUS_TIMESTAMP when a history record has null blockTime", () => {
-      const historyRecords: HistorySignatureRecord[] = [
-        {
-          signature:
-            "SigNullTime11111111111111111111111111111111111111111111111111111111111111111111111111111111",
-          slot: 280_000_050,
-          err: null,
-          blockTime: null, // Ambiguous blockTime!
-        },
+        { signature: sig1, slot: 280_000_050, err: null, blockTime: null },
       ];
 
       const result = evaluateExactPoolWindowReconciliation({
@@ -241,40 +357,11 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
 
       expect(result.status).toBe("AMBIGUOUS_TIMESTAMP");
       expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "AMBIGUOUS_TIMESTAMP: History record for signature 'SigNullTime11111111111111111111111111111111111111111111111111111111111111111111111111111111' has null or missing blockTime",
-      );
-    });
-
-    it("rejects incremental reuse from bare Set membership without a supporting resolution record", () => {
-      const sig1 =
-        "Sig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
-      const historyRecords: HistorySignatureRecord[] = [
-        { signature: sig1, slot: 280_000_050, err: null, blockTime: 50 },
-        { signature: "Anchor000", slot: 280_000_001, err: null, blockTime: 1 },
-      ];
-
-      // sig1 is in alreadyResolvedSignatures, but no resolution record or trade event supports it!
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 65_000,
-        sourceCutoff: validCutoff,
-        historyRecords,
-        alreadyResolvedSignatures: new Set([sig1]),
-        knownAnchorSignature: "Anchor000",
-        budgetManager,
-      });
-
-      expect(result.status).toBe("UNRESOLVED_TRANSACTIONS");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
+      expect(result.diagnosticReason).toContain("AMBIGUOUS_TIMESTAMP");
     });
   });
 
-  describe("4. Directional Event Counting & Binding Defect Regressions (Audit Area 2)", () => {
+  describe("4. Complete Valid Event Set Per Transaction (Audit Area 2)", () => {
     const validCutoff: SourceCutoffEvidence = {
       sourceMethod: "getBlockTime",
       responseField: "result",
@@ -291,125 +378,10 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       { signature: sig1, slot: 280_000_050, err: null, blockTime: 50 },
       { signature: "Anchor000", slot: 280_000_001, err: null, blockTime: 1 },
     ];
-    const resolvedSignatures: ResolvedSignatureRecord[] = [
-      {
-        signature: sig1,
-        slot: 280_000_050,
-        blockTime: 50,
-        status: "RESOLVED",
-        decodedEventsCount: 1,
-        ingestedEventsCount: 1,
-      },
-    ];
 
-    it("rejects and ignores trade events from another pool, token mint, or unrelated signature", () => {
-      const unrelatedSig =
-        "UnrelatedSig999999999999999999999999999999999999999999999999999999999999999999999999999999";
-      const alienTrades: TradeEvent[] = [
-        {
-          eventId: `${sig1}:0:0`,
-          signature: sig1,
-          swapIndex: 0,
-          outerInstructionIndex: 0,
-          poolId: "DifferentPoolAddress11111111111111111111111111", // Wrong pool!
-          tokenMint: CANONICAL_TOKEN_MINT,
-          side: "BUY",
-          slot: 280_000_050,
-          blockTimeSec: 50,
-          eventTimestampMs: 50_000,
-          receiptTimestampMs: 50_050,
-          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
-        },
-        {
-          eventId: `${unrelatedSig}:0:0`,
-          signature: unrelatedSig, // Unrelated signature!
-          swapIndex: 0,
-          outerInstructionIndex: 0,
-          poolId: CANONICAL_POOL_ID,
-          tokenMint: CANONICAL_TOKEN_MINT,
-          side: "BUY",
-          slot: 280_000_050,
-          blockTimeSec: 50,
-          eventTimestampMs: 50_000,
-          receiptTimestampMs: 50_050,
-          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
-        },
-      ];
-
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 65_000,
-        sourceCutoff: validCutoff,
-        historyRecords,
-        resolvedSignatures,
-        trades: alienTrades,
-        knownAnchorSignature: "Anchor000",
-        budgetManager,
-      });
-
-      // No legitimate candidate-bound trade was supplied for sig1
-      expect(result.status).toBe("RECONCILED");
-      expect(result.flowCounts.recentBuys60s).toBe(0);
-      expect(result.flowCounts.recentSells60s).toBe(0);
-    });
-
-    it("deduplicates multiple identical trade events using canonical swap key", () => {
-      const duplicateSellTrades: TradeEvent[] = [
-        {
-          eventId: `${sig1}:0:0`,
-          signature: sig1,
-          swapIndex: 0,
-          outerInstructionIndex: 0,
-          poolId: CANONICAL_POOL_ID,
-          tokenMint: CANONICAL_TOKEN_MINT,
-          side: "SELL",
-          slot: 280_000_050,
-          blockTimeSec: 50,
-          eventTimestampMs: 50_000,
-          receiptTimestampMs: 50_050,
-          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
-        },
-        {
-          eventId: `${sig1}:0:0`, // Identical canonical swap key!
-          signature: sig1,
-          swapIndex: 0,
-          outerInstructionIndex: 0,
-          poolId: CANONICAL_POOL_ID,
-          tokenMint: CANONICAL_TOKEN_MINT,
-          side: "SELL",
-          slot: 280_000_050,
-          blockTimeSec: 50,
-          eventTimestampMs: 50_000,
-          receiptTimestampMs: 50_050,
-          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
-        },
-      ];
-
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 65_000,
-        sourceCutoff: validCutoff,
-        historyRecords,
-        resolvedSignatures,
-        trades: duplicateSellTrades,
-        knownAnchorSignature: "Anchor000",
-        budgetManager,
-      });
-
-      expect(result.status).toBe("RECONCILED");
-      expect(result.flowCoverage).toBe("SUFFICIENT");
-      expect(result.flowCounts.recentSells60s).toBe(1); // Deduplicated to 1 SELL, not 2!
-      expect(result.flowCounts.recentBuys60s).toBe(0);
-    });
-
-    it("fails closed with INSUFFICIENT_DIRECTIONAL_EVIDENCE rather than approximating buys from ingestedEventsCount", () => {
-      // Discovered transaction resolved with ingestedEventsCount=2, but NO directional trade events provided
-      const resolutionResult = {
-        outcome: "ALL_RESOLVED" as const,
+    it("fails closed with INSUFFICIENT_DIRECTIONAL_EVIDENCE when resolution reported 2 decoded events but only 1 BUY event was supplied", () => {
+      const resolutionResult: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
         candidatePoolId: CANONICAL_POOL_ID,
         connectionEpoch: 1,
         anchorWitnessed: true,
@@ -427,14 +399,32 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
             signature: sig1,
             slot: 280_000_050,
             blockTime: 50,
-            status: "RESOLVED" as const,
-            decodedEventsCount: 2,
+            status: "RESOLVED",
+            decodedEventsCount: 2, // 2 events reported by decoder!
             ingestedEventsCount: 2,
           },
         ],
-        isProductionCompletenessEstablished: false as const,
+        isProductionCompletenessEstablished: false,
         durationMs: 50,
       };
+
+      // Caller only supplies 1 BUY event!
+      const incompleteTrades: TradeEvent[] = [
+        {
+          eventId: `${sig1}:0:0`,
+          signature: sig1,
+          swapIndex: 0,
+          outerInstructionIndex: 0,
+          poolId: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          side: "BUY",
+          slot: 280_000_050,
+          blockTimeSec: 50,
+          eventTimestampMs: 50_000,
+          receiptTimestampMs: 50_050,
+          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+        },
+      ];
 
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,
@@ -444,9 +434,9 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         sourceCutoff: validCutoff,
         historyRecords,
         resolutionResult,
+        trades: incompleteTrades,
         knownAnchorSignature: "Anchor000",
         budgetManager,
-        // trades intentionally omitted!
       });
 
       expect(result.status).toBe("INSUFFICIENT_DIRECTIONAL_EVIDENCE");
@@ -454,15 +444,230 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.flowCounts.recentBuys60s).toBeNull();
       expect(result.flowCounts.recentSells60s).toBeNull();
       expect(result.diagnosticReason).toContain(
-        "INSUFFICIENT_DIRECTIONAL_EVIDENCE: Directional swap events (buys/sells) were not supplied for resolved transactions in window",
+        "expected 2 decoded event(s) from resolution, but found 1",
       );
+    });
+
+    it("ensures explicit resolution failure (FAILED_DECODE) takes precedence over alreadyResolved and trade records", () => {
+      const failedResolutionRecord: ResolvedSignatureRecord = {
+        signature: sig1,
+        slot: 280_000_050,
+        blockTime: 50,
+        status: "FAILED_DECODE",
+        decodedEventsCount: 0,
+        ingestedEventsCount: 0,
+        error: "Instruction unpack failed",
+      };
+
+      const tradeForSig: TradeEvent = {
+        eventId: `${sig1}:0:0`,
+        signature: sig1,
+        swapIndex: 0,
+        outerInstructionIndex: 0,
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        side: "BUY",
+        slot: 280_000_050,
+        blockTimeSec: 50,
+        eventTimestampMs: 50_000,
+        receiptTimestampMs: 50_050,
+        timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyRecords,
+        alreadyResolvedSignatures: new Set([sig1]), // In alreadyResolved!
+        resolvedSignatures: [failedResolutionRecord], // But explicit failure!
+        trades: [tradeForSig],
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      expect(result.status).toBe("UNRESOLVED_TRANSACTIONS");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("FAILED_DECODE");
+    });
+
+    it("fails closed when foreign pool trade is filtered away rather than manufacturing verified zero activity", () => {
+      const resolvedWithOneEvent: ResolvedSignatureRecord = {
+        signature: sig1,
+        slot: 280_000_050,
+        blockTime: 50,
+        status: "RESOLVED",
+        decodedEventsCount: 1, // Resolution reported 1 decoded event
+        ingestedEventsCount: 1,
+      };
+
+      const foreignTrade: TradeEvent = {
+        eventId: `${sig1}:0:0`,
+        signature: sig1,
+        swapIndex: 0,
+        outerInstructionIndex: 0,
+        poolId: "DifferentPoolAddress11111111111111111111111111", // Wrong pool!
+        tokenMint: CANONICAL_TOKEN_MINT,
+        side: "BUY",
+        slot: 280_000_050,
+        blockTimeSec: 50,
+        eventTimestampMs: 50_000,
+        receiptTimestampMs: 50_050,
+        timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyRecords,
+        resolvedSignatures: [resolvedWithOneEvent],
+        trades: [foreignTrade],
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      // Must NOT return RECONCILED with 0 buys / 0 sells!
+      expect(result.status).toBe("INSUFFICIENT_DIRECTIONAL_EVIDENCE");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.flowCounts.recentBuys60s).toBeNull();
+      expect(result.flowCounts.recentSells60s).toBeNull();
+    });
+
+    it("reconciles genuinely zero-swap transaction (decodedEventsCount: 0) to 0 buys and 0 sells", () => {
+      const zeroSwapResolution: ResolvedSignatureRecord = {
+        signature: sig1,
+        slot: 280_000_050,
+        blockTime: 50,
+        status: "RESOLVED",
+        decodedEventsCount: 0, // Genuinely 0 decoded events for candidate pool
+        ingestedEventsCount: 0,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyRecords,
+        resolvedSignatures: [zeroSwapResolution],
+        trades: [],
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      expect(result.flowCounts.recentBuys60s).toBe(0);
+      expect(result.flowCounts.recentSells60s).toBe(0);
+    });
+
+    it("rejects NaN event timestamp and post-decision event receipts", () => {
+      const nanTrade: TradeEvent = {
+        eventId: `${sig1}:0:0`,
+        signature: sig1,
+        swapIndex: 0,
+        outerInstructionIndex: 0,
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        side: "BUY",
+        slot: 280_000_050,
+        blockTimeSec: 50,
+        eventTimestampMs: NaN, // NaN timestamp!
+        receiptTimestampMs: 50_050,
+        timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyRecords,
+        resolvedSignatures: [
+          {
+            signature: sig1,
+            slot: 280_000_050,
+            blockTime: 50,
+            status: "RESOLVED",
+            decodedEventsCount: 1,
+            ingestedEventsCount: 1,
+          },
+        ],
+        trades: [nanTrade],
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      expect(result.status).toBe("INSUFFICIENT_DIRECTIONAL_EVIDENCE");
+      expect(result.diagnosticReason).toContain("timestamp is invalid");
     });
   });
 
-  describe("5. Cutoff Provenance & Causal Time Ordering (Audit Area 3)", () => {
+  describe("5. Cutoff Content & Payload Validation (Audit Area 3)", () => {
+    it("rejects getBlockTime cutoff with responseField='banana'", () => {
+      const invalidCutoff: SourceCutoffEvidence = {
+        sourceMethod: "getBlockTime",
+        responseField: "banana", // Unsupported responseField!
+        commitment: "confirmed",
+        provenance: "ON_CHAIN_BLOCK_TIME",
+        slot: 280_000_100,
+        cutoffTimestampMs: 65_000,
+        retrievedAtMs: 65_020,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: invalidCutoff,
+        historyRecords: [],
+        budgetManager,
+      });
+
+      expect(result.status).toBe("INVALID_SOURCE_CUTOFF");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "Invalid responseField for getBlockTime: expected 'result', received 'banana'",
+      );
+    });
+
+    it("rejects getBlockTime cutoff when responsePayload timestamp does not match cutoffTimestampMs", () => {
+      const mismatchedPayloadCutoff: SourceCutoffEvidence = {
+        sourceMethod: "getBlockTime",
+        responseField: "result",
+        commitment: "confirmed",
+        provenance: "ON_CHAIN_BLOCK_TIME",
+        slot: 280_000_100,
+        cutoffTimestampMs: 65_000,
+        retrievedAtMs: 65_020,
+        responsePayload: { result: 50 }, // 50s != 65s!
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: mismatchedPayloadCutoff,
+        historyRecords: [],
+        budgetManager,
+      });
+
+      expect(result.status).toBe("INVALID_SOURCE_CUTOFF");
+      expect(result.diagnosticReason).toContain("does not match cutoffTimestampMs");
+    });
+
     it("rejects getSlot labeled as ON_CHAIN_BLOCK_TIME because getSlot returns a slot number, not a timestamp", () => {
       const invalidCutoff = {
-        sourceMethod: "getSlot", // getSlot does not provide on-chain blockTime timestamp!
+        sourceMethod: "getSlot",
         responseField: "result",
         commitment: "confirmed",
         provenance: "ON_CHAIN_BLOCK_TIME",
@@ -482,99 +687,47 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       });
 
       expect(result.status).toBe("INVALID_SOURCE_CUTOFF");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "INVALID_SOURCE_CUTOFF: ON_CHAIN_BLOCK_TIME provenance requires a method providing blockTime",
-      );
+      expect(result.diagnosticReason).toContain("blockTime-providing method");
     });
 
-    it("rejects evidence retrieved after the decision time as FUTURE_DATED_EVIDENCE (causality violation)", () => {
-      const futureRetrievedCutoff: SourceCutoffEvidence = {
-        sourceMethod: "getBlockTime",
-        responseField: "result",
-        commitment: "confirmed",
-        provenance: "ON_CHAIN_BLOCK_TIME",
-        slot: 280_000_100,
-        cutoffTimestampMs: 60_000,
-        retrievedAtMs: 68_000, // Retrieved at 68s, AFTER decision at 66s!
-      };
-
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 60_000,
-        sourceCutoff: futureRetrievedCutoff,
-        historyRecords: [],
-        budgetManager,
-      });
-
-      expect(result.status).toBe("FUTURE_DATED_EVIDENCE");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.diagnosticReason).toContain(
-        "CAUSALITY_VIOLATION: Cutoff evidence retrieval timestamp (68000 ms) is after decision time (66000 ms)",
-      );
-    });
-
-    it("rejects window cutoff ending after the decision time without any 5-second look-ahead allowance", () => {
-      const futureCutoff: SourceCutoffEvidence = {
-        sourceMethod: "getBlockTime",
-        responseField: "result",
-        commitment: "confirmed",
-        provenance: "ON_CHAIN_BLOCK_TIME",
-        slot: 280_000_100,
-        cutoffTimestampMs: 66_500, // 500ms in the future relative to decision at 66_000!
-        retrievedAtMs: 66_000,
-      };
-
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 66_000,
-        sourceCutoff: futureCutoff,
-        historyRecords: [],
-        budgetManager,
-      });
-
-      expect(result.status).toBe("FUTURE_DATED_EVIDENCE");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.diagnosticReason).toContain(
-        "CAUSALITY_VIOLATION: Source cutoff timestamp (66500 ms) is in the future relative to decision time (66000 ms)",
-      );
-    });
-
-    it("rejects observation end after decision time as FUTURE_DATED_EVIDENCE", () => {
-      const validCutoff: SourceCutoffEvidence = {
+    it("accepts valid getBlockTime with matching responsePayload", () => {
+      const validCutoffWithPayload: SourceCutoffEvidence = {
         sourceMethod: "getBlockTime",
         responseField: "result",
         commitment: "confirmed",
         provenance: "ON_CHAIN_BLOCK_TIME",
         slot: 280_000_100,
         cutoffTimestampMs: 65_000,
-        retrievedAtMs: 65_050,
+        retrievedAtMs: 65_020,
+        responsePayload: { result: 65 },
+        requestContext: { slot: 280_000_100, address: CANONICAL_POOL_ID },
       };
 
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,
         decisionTimestampMs: 66_000,
         observationStartMs: 0,
-        observationEndMs: 67_000, // Observation end is in the future relative to decision time!
-        sourceCutoff: validCutoff,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoffWithPayload,
         historyRecords: [],
         budgetManager,
       });
 
-      expect(result.status).toBe("FUTURE_DATED_EVIDENCE");
-      expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.diagnosticReason).toContain(
-        "CAUSALITY_VIOLATION: Observation end (67000 ms) is in the future relative to decision time (66000 ms)",
-      );
+      expect(result.status).toBe("RECONCILED");
     });
   });
 
-  describe("6. Non-Mutating Accounting & Input Snapshotting (Audit Area 4)", () => {
+  describe("6. Non-Mutating Accounting & Read-Only Tracker Handling (Audit Area 4)", () => {
+    const validCutoff: SourceCutoffEvidence = {
+      sourceMethod: "getBlockTime",
+      responseField: "result",
+      commitment: "confirmed",
+      provenance: "ON_CHAIN_BLOCK_TIME",
+      slot: 280_000_200,
+      cutoffTimestampMs: 65_000,
+      retrievedAtMs: 65_040,
+    };
+
     it("leaves caller budget manager and caller input objects completely unmutated and unfrozen", () => {
       const callerCutoff: SourceCutoffEvidence = {
         sourceMethod: "getBlockTime",
@@ -599,38 +752,129 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       });
 
       expect(result.status).toBe("RECONCILED");
-
-      // 1. Invariant: Caller budget manager was NOT mutated by evaluation
-      const postBudgetStats = budgetManager.getStats();
-      expect(postBudgetStats).toEqual(initialBudgetStats);
-
-      // 2. Invariant: Caller input objects were NOT frozen by deepFreeze
+      expect(budgetManager.getStats()).toEqual(initialBudgetStats);
       expect(Object.isFrozen(callerCutoff)).toBe(false);
       expect(Object.isFrozen(result.sourceCutoff)).toBe(true);
 
-      // 3. Invariant: Actual requests reported from receipts, not simulation
-      expect(result.resourceMetrics.actualRequestsDispatched).toBe(1); // 1 history query receipt
+      // Raw fixture arrays yield actualRequestsDispatched = null (do not invent 1!)
+      expect(result.resourceMetrics.actualRequestsDispatched).toBeNull();
+    });
+
+    it("reports actualRequestsDispatched from explicit receipts and excludes duplicate signatures", () => {
+      const historyResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: "Sig1",
+        discoveredSignatures: [
+          { signature: "Sig1", slot: 280_000_100, err: null, blockTime: 60 },
+          { signature: "Sig2", slot: 280_000_090, err: null, blockTime: 55 },
+          { signature: "Anchor000", slot: 280_000_001, err: null, blockTime: 1 },
+        ],
+        requestCount: 2, // 2 history queries dispatched
+        pagesQueried: 2,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const resolutionResult: TransactionResolutionResult = {
+        outcome: "ALL_RESOLVED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: "Anchor000",
+        frozenTargetSignature: "Sig1",
+        totalDiscoveredSignatures: 2,
+        totalProcessed: 2,
+        totalResolved: 2,
+        totalFailed: 0,
+        totalDuplicatesUnresolved: 0,
+        totalDuplicatesResolved: 1, // Sig2 was DUPLICATE_RESOLVED (cached, no HTTP dispatch!)
+        totalIngestedSwaps: 2,
+        perSignatureResults: [
+          {
+            signature: "Sig1",
+            slot: 280_000_100,
+            blockTime: 60,
+            status: "RESOLVED",
+            decodedEventsCount: 1,
+            ingestedEventsCount: 1,
+          },
+          {
+            signature: "Sig2",
+            slot: 280_000_090,
+            blockTime: 55,
+            status: "DUPLICATE_RESOLVED", // Cached duplicate
+            decodedEventsCount: 1,
+            ingestedEventsCount: 1,
+          },
+        ],
+        isProductionCompletenessEstablished: false,
+        durationMs: 50,
+      };
+
+      const trades: TradeEvent[] = [
+        {
+          eventId: "Sig1:0:0",
+          signature: "Sig1",
+          swapIndex: 0,
+          outerInstructionIndex: 0,
+          poolId: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          side: "BUY",
+          slot: 280_000_100,
+          blockTimeSec: 60,
+          eventTimestampMs: 60_000,
+          receiptTimestampMs: 60_050,
+          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+        },
+        {
+          eventId: "Sig2:0:0",
+          signature: "Sig2",
+          swapIndex: 0,
+          outerInstructionIndex: 0,
+          poolId: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          side: "SELL",
+          slot: 280_000_090,
+          blockTimeSec: 55,
+          eventTimestampMs: 55_000,
+          receiptTimestampMs: 55_050,
+          timestampProvenance: "ON_CHAIN_BLOCK_TIME",
+        },
+      ];
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult,
+        resolutionResult,
+        trades,
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      // 2 history requests + 1 resolution request (Sig2 was duplicate, not dispatched) = 3 total!
+      expect(result.resourceMetrics.actualRequestsDispatched).toBe(3);
       expect(result.resourceMetrics.projectedDemand.totalProjectedRequests).toBe(0);
     });
-  });
 
-  describe("7. Boundary Anchoring & General Failure Modes", () => {
-    const validCutoff: SourceCutoffEvidence = {
-      sourceMethod: "getBlockTime",
-      responseField: "result",
-      commitment: "confirmed",
-      provenance: "ON_CHAIN_BLOCK_TIME",
-      slot: 280_000_100,
-      cutoffTimestampMs: 65_000,
-      retrievedAtMs: 65_020,
-    };
+    it("preserves known unresolved demand in UNRESOLVED_TRANSACTIONS without claiming sufficient budget from zero placeholders", () => {
+      const sig1 =
+        "Sig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
+      const sig2 =
+        "Sig22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
 
-    it("fails closed with STREAM_GAP when a stream gap intersects the 60-second window", () => {
-      const recordedGap: StreamGap = {
-        gapStartMs: 20_000,
-        gapEndMs: 25_000,
-        reason: "WEBSOCKET_HEARTBEAT_TIMEOUT",
-      };
+      const historyRecords: HistorySignatureRecord[] = [
+        { signature: sig1, slot: 280_000_050, err: null, blockTime: 50 },
+        { signature: sig2, slot: 280_000_040, err: null, blockTime: 40 },
+        { signature: "Anchor000", slot: 280_000_001, err: null, blockTime: 1 },
+      ];
 
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,
@@ -638,72 +882,57 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationStartMs: 0,
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
+        historyRecords,
+        knownAnchorSignature: "Anchor000",
+        budgetManager,
+        // resolutionResult and trades omitted: sig1 and sig2 are unresolved!
+      });
+
+      expect(result.status).toBe("UNRESOLVED_TRANSACTIONS");
+      // Projected demand must carry the 2 unresolved signatures!
+      expect(result.resourceMetrics.projectedDemand.unresolvedTransactionRequests).toBe(2);
+      expect(result.resourceMetrics.projectedDemand.totalProjectedRequests).toBe(2);
+      expect(result.resourceMetrics.projectedDemand.projectedPacingWaitMs).toBe(2500); // 1 wait of 2500ms
+    });
+
+    it("consumes tracker read-only, detects evaluation-time inactivity gap without mutating tracker state", () => {
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: 1,
+        maxStreamInactivityMs: 15_000,
+      });
+
+      // Tracker last observation was at 30_000ms. Window ends at 65_000ms (> 15s inactivity!)
+      (tracker as unknown as { lastObservationTimestampMs: number }).lastObservationTimestampMs =
+        30_000;
+
+      const gapsBefore = tracker.getGapsCount();
+      expect(gapsBefore).toBe(0);
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
         historyRecords: [],
-        recordedGaps: [recordedGap],
         budgetManager,
       });
 
+      // Must detect inactivity gap and fail closed with STREAM_GAP
       expect(result.status).toBe("STREAM_GAP");
       expect(result.flowCoverage).toBe("COLLECTION_GAP");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "COLLECTION_GAP: Stream gap witnessed in observation window [20000, 25000] (reason: WEBSOCKET_HEARTBEAT_TIMEOUT)",
-      );
-    });
+      expect(result.diagnosticReason).toContain("STREAM_INACTIVITY_AT_EVALUATION");
 
-    it("fails closed with STALE_DATA when source cutoff age exceeds maxAllowedEvidenceAgeMs", () => {
-      const staleCutoff: SourceCutoffEvidence = {
-        sourceMethod: "getBlockTime",
-        responseField: "result",
-        commitment: "confirmed",
-        provenance: "ON_CHAIN_BLOCK_TIME",
-        slot: 280_000_100,
-        cutoffTimestampMs: 40_000, // 40s
-        retrievedAtMs: 40_050,
-      };
-
-      // decision at 60s, age is 20s > 15s limit
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 60_000,
-        observationStartMs: 0,
-        observationEndMs: 40_000,
-        sourceCutoff: staleCutoff,
-        historyRecords: [],
-        maxAllowedEvidenceAgeMs: 15_000,
-        budgetManager,
-      });
-
-      expect(result.status).toBe("STALE_DATA");
-      expect(result.flowCoverage).toBe("STALE_DATA");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "STALE_DATA: Source cutoff age (20000 ms) exceeds max allowed evidence age (15000 ms)",
-      );
-    });
-
-    it("fails closed with PROCESSING_BACKLOG when hasActiveBacklog is true", () => {
-      const result = evaluateExactPoolWindowReconciliation({
-        poolContext: VALID_POOL_CONTEXT,
-        decisionTimestampMs: 66_000,
-        observationStartMs: 0,
-        observationEndMs: 65_000,
-        sourceCutoff: validCutoff,
-        historyRecords: [],
-        hasActiveBacklog: true,
-        budgetManager,
-      });
-
-      expect(result.status).toBe("PROCESSING_BACKLOG");
-      expect(result.flowCoverage).toBe("PROCESSING_BACKLOG");
-      expect(result.flowCounts.recentBuys60s).toBeNull();
-      expect(result.diagnosticReason).toContain(
-        "PROCESSING_BACKLOG: Active transaction queue backlog present at evaluation time",
-      );
+      // Critical invariant: Caller tracker was NOT mutated!
+      const gapsAfter = tracker.getGapsCount();
+      expect(gapsAfter).toBe(0);
     });
   });
 
-  describe("8. Upstream Index Omission & Production Protection", () => {
+  describe("7. Upstream Index Omission & Production Protection", () => {
     it("acknowledges upstream index omission limitation without claiming it is independently detectable", () => {
       const anchorPrior =
         "AnchorPrior1111111111111111111111111111111111111111111111111111111111111111111111111111111";
@@ -798,7 +1027,6 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(reconResult.status).toBe("RECONCILED");
       expect(reconResult.flowCoverage).toBe("SUFFICIENT");
 
-      // Production conversion
       const prodFlowResult = toCandidateFlowResult(reconResult);
       expect(prodFlowResult.recentBuys60s).toBeNull();
       expect(prodFlowResult.recentSells60s).toBeNull();

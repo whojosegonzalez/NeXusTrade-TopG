@@ -1165,18 +1165,30 @@ U = 6 unresolved                        7 requests                 17.5s (+ RTT)
   - Pacing $\ge 2{,}500\text{ ms}$ is strictly a client-side rate limiter to avoid HTTP 429 status codes; it is **not** an upstream SLA, contract entitlement, or physical limit.
   - Unauthenticated or free public RPC endpoints offer zero guaranteed capacity, variable round-trip latency ($RTT$), and may throttle or drop connections unpredictably.
 
-##### 4. Non-Mutating Evaluation & Directional Accounting Rigor
+##### 4. Non-Mutating Evaluation & Evidence Consistency Rigor
 
-- **Separation of Actual Receipts from Projected Demand**:
-  - The evaluator reports `actualRequestsDispatched` derived strictly from completed upstream acquisition receipts (e.g. history result `requestCount`, resolution bridge `totalProcessed`).
-  - Projected demand ($D = M + U$) and start-to-start pacing waits are calculated separately on an isolated budget snapshot without mutating caller budget state.
-  - Evaluation never invokes `recordRequestAttempt()` or mutates `GlobalResourceBudgetManager`.
-  - Unresolved transactions ($U > 0$) are never claimed as resolved by a capacity simulation; missing resolution evidence strictly fails closed with `UNRESOLVED_TRANSACTIONS`.
-- **Directional Event Counting Rigor**:
-  - Only candidate-bound (`poolId`, `candidateTokenMint`), signature-matched, and deduplicated trade events (via canonical swap key `${signature}:${outerInstructionIndex}:${swapIndex}`) are counted.
-  - Non-directional event totals (e.g. `ingestedEventsCount = 2`) are never approximated into BUYs. Directional evidence absence strictly leaves counts `null`.
+- **Terminal Evidence Outcome Validation**:
+  - History enumeration and transaction resolution results must conclude with accepted terminal outcomes (`ANCHOR_WITNESSED` for history; `ALL_RESOLVED` for resolution).
+  - Explicit failure evidence (`FETCH_ERROR`, `OPERATION_CANCELLED`, `BUDGET_EXHAUSTED`, `MAX_PAGES_EXHAUSTED`, `PARTIAL_RESOLUTION`) strictly takes precedence over optimistic flags or empty record arrays; failures never become verified quiet windows.
+  - Cross-evidence consistency enforces matching candidate pool IDs, connection epochs, anchor signatures, and target signatures across supplied history and resolution results.
+- **Complete Valid Event Set Per Transaction**:
+  - Discovered transactions are normalized into a validated per-signature map before aggregation.
+  - Directional trade event counts per transaction must exactly match decoder totals (`decodedEventsCount`). Missing events fail closed with `INSUFFICIENT_DIRECTIONAL_EVIDENCE`.
+  - Explicit resolution failures (`FAILED_DECODE`, `PARTIAL_INGEST`) cannot be overridden by `alreadyResolvedSignatures` membership or trade event presence.
+  - Filtering away invalid or foreign-pool trades cannot manufacture verified zero activity; genuinely zero-swap transactions require explicit decoder evidence (`decodedEventsCount: 0`).
+  - Trade events must have valid finite integer timestamps within window bounds, satisfying strict causality ($T_{\text{event}} \le T_{\text{decision}}$, $T_{\text{receipt}} \le T_{\text{decision}}$); `NaN` timestamps and post-decision events fail closed.
+- **Cutoff Content & Response Payload Validation**:
+  - `responseField` is strictly validated against the specific method's RPC schema (`result` for `getBlockTime`; `result[0].blockTime` for `getSignaturesForAddress`; `result.blockTime` for `getBlock`; `syntheticTimestampMs` for `SYNTHETIC_CHECKPOINT`). Arbitrary field names such as `"banana"` fail closed with `INVALID_SOURCE_CUTOFF`.
+  - When injected response payloads are supplied, the evaluator deterministically validates payload contents, RPC error absence, slot alignment, and exact timestamp correspondence.
+- **Read-Only Tracker Consumption**:
+  - The evaluator never invokes `tracker.evaluateWindow()` and never mutates caller tracker state (`gaps` and `events` counts remain identical before and after evaluation).
+  - Stream inactivity at evaluation time is detected read-only against `tracker.getLastObservationTimestampMs()`, failing closed with `STREAM_GAP` without inserting gaps into caller state.
+- **Accurate Request Accounting & Demand Preservation**:
+  - The evaluator reports `actualRequestsDispatched` derived strictly from completed upstream acquisition receipts (e.g. history result `requestCount`, resolution receipts excluding cached duplicates and pre-dispatch denials).
+  - Raw fixture arrays without acquisition receipts report `actualRequestsDispatched: null` (unknown), never inventing dispatches because records exist.
+  - Projected demand ($D = M + U$) and start-to-start pacing waits are calculated on an isolated snapshot. Known unresolved demand ($U > 0$) is preserved in `UNRESOLVED_TRANSACTIONS` results, never claiming sufficient capacity from placeholder zero values.
 - **Input Snapshotting Invariant**:
-  - Caller-owned input objects (`sourceCutoff`, `poolContext`) are snapshotted prior to result creation, ensuring caller references remain unmutated and unfrozen.
+  - Caller-owned input objects (`sourceCutoff`, `poolContext`) are deep-cloned prior to result creation, ensuring caller references remain unmutated and unfrozen.
 
 ---
 
@@ -1255,7 +1267,7 @@ A candidate pool experiences moderate activity during the first 50 seconds, foll
    - Distinguishes warm-up from genuinely full-duration quiet windows; models accurate start-to-start pacing and credits incrementally resolved transactions.
    - Enforces production protection: `toCandidateFlowResult()` strictly defaults to unavailable counts (`recentBuys60s: null, recentSells60s: null, flowCoverage: "COLLECTION_GAP"`) under production configuration.
 2. [`backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.test.ts) (Comprehensive Acceptance Suite):
-   - 17 offline acceptance tests covering warm-up rejection, full quiet window, missing/invalid cutoffs, timestamp/identity validation, gaps, backlog, budget exhaustion, start-to-start pacing, index-omission limits, and production protection.
+   - 25 offline acceptance and regression tests covering warm-up rejection, full quiet window, terminal enumeration outcome validation (fetch error, cancelled, capped), complete directional event validation (multi-event completeness, foreign-pool rejection, genuinely zero-swap reconciliation, NaN/post-decision rejection), cutoff content and payload validation (rejection of 'banana', payload timestamp/slot verification), non-mutating accounting (read-only tracker preservation, actual receipt dispatch counting, duplicate exclusion, unresolved demand preservation), index-omission limits, and production protection.
 3. [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
    - Preserves accepted enumeration and anchor-witnessing contract (`anchorWitnessed: true`, `{ before: cursor }`).
 4. [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts):
