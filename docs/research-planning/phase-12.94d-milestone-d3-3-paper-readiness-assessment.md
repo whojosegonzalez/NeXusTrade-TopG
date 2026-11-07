@@ -1292,6 +1292,39 @@ A candidate pool experiences moderate activity during the first 50 seconds, foll
 - **Multi-Pool & Cluster-Wide Coverage**:
   - This proposal covers **one exact pool only**. It does not solve cluster-wide transaction ingestion or general market scanning.
 
+##### 3. Single-Pool Integration Architecture & Phased Verification Plan
+
+###### 1. Existing Component Seams & Missing Wiring
+
+- **Subscription Observation**: [`RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts) attaches WebSocket stream (`{ mentions: [poolId] }`), manages lifecycle/connection epochs, and ingests live trades into [`RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts) via [`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts).
+- **History Enumeration**: [`ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts) provides `{ before: cursor }` pagination until `knownAnchorSignature` is witnessed, yielding `HistoryEnumerationResult`.
+- **Transaction Resolution**: [`ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts) resolves discovered transactions chronological oldest-first via the adapter and ingests decoded swaps into the tracker, yielding `TransactionResolutionResult`.
+- **Window Reconciliation**: [`ExactPoolWindowReconciliationEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.ts) evaluates the 4-dimensional temporal contract, validates evidence completeness, verifies boundary anchors, detects collection gaps/backlog read-only, and reports accurate dispatch accounting (`WindowReconciliationResult`).
+- **Candidate Flow Seam**: [`CandidateFlowProvider.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateFlowProvider.ts) wraps coordinator flow via `CoordinatorCandidateFlowProvider` and validates decision boundary snapshots via `validateAndSnapshotCandidateFlowResult`.
+- **Wiring Still Required**: The coordinator does not yet invoke history enumeration, transaction resolution, or the window reconciliation evaluator during flow evaluation. A dedicated coordinator integration method (`reconcileObservedCandidateWindow`) is required to bind live observation with cutoff retrieval and history reconciliation while strictly separating research diagnostics (exposing reconciled counts) from production flow (retaining fail-closed `recentBuys60s: null`).
+
+###### 2. Four-Dimensional Coverage & Time Policy
+
+- **Decision Time ($T_{\text{decision}}$)**: Local host timestamp when evaluation is triggered.
+- **Event Time ($T_{\text{event}}$)**: On-chain timestamp of decoded trade (`blockTime * 1000`), bounded by $[T_{\text{cutoff}} - 60\text{s}, T_{\text{cutoff}}]$.
+- **Source Cutoff ($T_{\text{cutoff}}$)**: Authenticated on-chain ledger timestamp (via `getBlockTime` or `getSignaturesForAddress[0].blockTime`). The evaluated window is $[T_{\text{cutoff}} - 60\text{s}, T_{\text{cutoff}}]$.
+- **Retrieval Time ($T_{\text{receipt}}$)**: Host timestamp when cutoff evidence was received.
+- **Freshness Ceiling**: $\Delta t_{\text{age}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$.
+- **Collection Gap Permanence**: History backfill ingests missed trades but never clears recorded stream gaps; any gap overlapping the 60-second window fails closed with `STREAM_GAP` / `COLLECTION_GAP`.
+- **Honest Qualified Assurance**: Reconciliation is provider-relative under declared RPC indexer assumptions; it does not grant cryptographic completeness or production `SUFFICIENT` coverage.
+
+###### 3. Smallest Offline Implementation
+
+- Implement a non-mutating single-pool reconciliation bridge method in coordinator.
+- Expose provider-relative reconciled counts strictly in research diagnostics (`CandidateFlowCoverageDiagnostic`); production candidate-flow methods (`createRetestSpotInfo`, `toCandidateFlowResult`) strictly return `recentBuys60s: null` and `isCoverageSufficient: false`.
+- 8 focused integration scenarios: Complete activity, quiet windows, warm-up, processing backlog, stream disconnects, unresolved transactions, stale evidence, and budget quota exhaustion.
+
+###### 4. Bounded Operator-Run Live Validation Bounds
+
+- Single-pool, read-only diagnostic probe execution (90s duration).
+- 1 cutoff query, 1 history page ($\le 10$ signatures), $\le 5$ transaction retrievals, host pacing $\ge 2{,}500\text{ ms}$, queue ceiling 10, explicit RFC 6455 PING heartbeats.
+- Establishes pipeline feasibility on real RPC data; leaves cryptographic completeness, cluster-wide scalability, exit-path flow, and Gate 11 bundler concentration unproven.
+
 ---
 
 ### 8.11 Invariant Preservation Reaffirmation
