@@ -34,7 +34,11 @@ import {
   BuyGateTriggerService,
   type ArmedPullbackState,
 } from "../candidate-scanner/BuyGateTriggerService.js";
-import { evaluateRetestGate } from "../candidate-scanner/RetestGateEvaluator.js";
+import {
+  type CandidateFlowProvider,
+  UnavailableCandidateFlowProvider,
+  evaluateCandidateDecisionPoints,
+} from "../candidate-scanner/CandidateFlowProvider.js";
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
@@ -79,6 +83,16 @@ import {
   isVerifiedMatchingPool,
   type MetricProvenance,
 } from "../telemetry/index.js";
+
+let activeCandidateFlowProvider: CandidateFlowProvider = new UnavailableCandidateFlowProvider();
+
+export function setCandidateFlowProvider(provider: CandidateFlowProvider): void {
+  activeCandidateFlowProvider = provider;
+}
+
+export function getCandidateFlowProvider(): CandidateFlowProvider {
+  return activeCandidateFlowProvider;
+}
 
 export interface ParsedDaemonCliArgs {
   sessionId?: string | undefined;
@@ -1784,26 +1798,20 @@ export async function run(): Promise<void> {
                     candidate.mintAddress,
                   );
 
-                  // Deliverable 2: Live Spot Liquidity Hard Floor at Execution Time & Verified Holder Floor
-                  // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
-                  const isViral =
-                    candidate.liquidityUsd >= 30000 &&
-                    candidate.marketCapUsd >= 150000 &&
-                    candidate.assetAgeSeconds >= 900 &&
-                    candidate.assetAgeSeconds <= 7200;
-                  const isCandidateEstablished =
-                    ((candidate.liquidityUsd >= 50000 && candidate.assetAgeSeconds >= 1800) ||
-                      isViral) &&
-                    candidate.assetAgeSeconds <= 7200 &&
-                    rugMetrics?.holdersCount !== undefined &&
-                    rugMetrics.holdersCount >= (isViral ? 1000 : 250);
-                  const requiredLiveLiq = isCandidateEstablished
-                    ? isViral
-                      ? 30000
-                      : 50000
-                    : 20000;
-                  const liveLiqUsd = spotInfo.liquidityUsd ?? 0;
-                  if (liveLiqUsd < requiredLiveLiq) {
+                  // Candidate Decision Pipeline (Buy Gate & Retest Gate with candidate-bound flow)
+                  const existingArmed = armedPullbackCandidates.get(candidate.mintAddress);
+                  const decision = evaluateCandidateDecisionPoints({
+                    candidate,
+                    baseSpotInfo: spotInfo,
+                    rugMetrics,
+                    flowProvider: activeCandidateFlowProvider,
+                    existingArmedState: existingArmed,
+                    currentNowMs: currentNow,
+                    buyGateService,
+                    requireVerifiedHolders: true,
+                  });
+
+                  if (decision.outcome === "INSUFFICIENT_LIVE_LIQUIDITY") {
                     if (armedPullbackCandidates.has(candidate.mintAddress)) {
                       armedPullbackCandidates.delete(candidate.mintAddress);
                     }
@@ -1813,45 +1821,31 @@ export async function run(): Promise<void> {
                       "REJECTED_INSUFFICIENT_LIVE_LIQUIDITY",
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
-                      liveLiqUsd,
-                      spotInfo.recentBuys60s,
-                      spotInfo.recentSells60s,
+                      decision.liveLiqUsd,
+                      decision.flowResult.recentBuys60s,
+                      decision.flowResult.recentSells60s,
                       "LiveLiquidityFloor",
                       currentNow,
                       spotInfo,
                     );
                     console.log(
-                      `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${liveLiqUsd.toFixed(0)} < $${requiredLiveLiq} required (${isCandidateEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
+                      `[PaperDaemon] [LIVE_LIQ_REJECTED] ${candidate.symbol} live liquidity $${decision.liveLiqUsd.toFixed(0)} < $${decision.requiredLiveLiq} required (${decision.isEstablished ? "ESTABLISHED" : "MICRO_CAP"}). Dropping candidate.`,
                     );
                     continue;
                   }
 
-                  // Phase 12.89: Fail-Closed RugCheck on all cohorts (requireVerifiedHolders: true)
-                  const fullGateResult = buyGateService.evaluateCandidate(candidate, {
-                    recentBuysCount60s: spotInfo.recentBuys60s,
-                    recentSellsCount60s: spotInfo.recentSells60s,
-                    momentum1mBps: Math.round(spotInfo.momentum5mBps / 5),
-                    bundlerPct: rugMetrics?.bundlerPct,
-                    top10HolderPct: rugMetrics?.top10HolderPct,
-                    holdersCount: rugMetrics?.holdersCount,
-                    rugScore: rugMetrics?.rugScore,
-                    hasDangerRisk: rugMetrics?.hasDangerRisk,
-                    priceChange1hPct: spotInfo.priceChange1hPct,
-                    requireVerifiedHolders: true,
-                  });
-
-                  if (!fullGateResult.triggered) {
+                  if (decision.outcome === "BUY_GATE_REJECTED") {
                     if (armedPullbackCandidates.has(candidate.mintAddress)) {
                       armedPullbackCandidates.delete(candidate.mintAddress);
                     }
                     recordTriggerRejection(
                       candidate,
-                      fullGateResult.rejectionReason ?? "REJECTED_BUY_GATE_UNTRIGGERED",
+                      decision.rejectionReason ?? "REJECTED_BUY_GATE_UNTRIGGERED",
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
-                      liveLiqUsd,
-                      spotInfo.recentBuys60s,
-                      spotInfo.recentSells60s,
+                      decision.liveLiqUsd,
+                      decision.flowResult.recentBuys60s,
+                      decision.flowResult.recentSells60s,
                       "BuyGateService",
                       currentNow,
                       spotInfo,
@@ -1859,43 +1853,21 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  // Deliverable 4: Established Token Age Ceiling (Max 2 Hours / 7,200s, Min 30m / 1,800s, Min 250 Holders)
-                  // Phase 12.91: Include Graduated Viral Runner (CHROME Exception)
-                  const isCandidateViral =
-                    candidate.liquidityUsd >= 30000 &&
-                    candidate.marketCapUsd >= 150000 &&
-                    candidate.assetAgeSeconds >= 900 &&
-                    candidate.assetAgeSeconds <= 7200;
-                  const isEstablished =
-                    ((candidate.liquidityUsd >= 50000 &&
-                      liveLiqUsd >= 50000 &&
-                      candidate.assetAgeSeconds >= 1800) ||
-                      (isCandidateViral && liveLiqUsd >= 30000)) &&
-                    candidate.assetAgeSeconds <= 7200 &&
-                    rugMetrics?.holdersCount !== undefined &&
-                    rugMetrics.holdersCount >= (isCandidateViral ? 1000 : 250);
-
-                  // Deliverable 5: Route Established & Micro-Cap Tokens Through Retest Gate
-                  const existingArmed = armedPullbackCandidates.get(candidate.mintAddress);
-                  const retestResult = evaluateRetestGate({
-                    mintAddress: candidate.mintAddress,
-                    isEstablished,
-                    currentNowMs: currentNow,
-                    spotInfo,
-                    existingArmedState: existingArmed,
-                  });
-
-                  if (retestResult.status === "ARMED_FIRST_TICK") {
+                  if (decision.outcome === "ARMED_FIRST_TICK") {
                     armedPullbackCandidates.set(
                       candidate.mintAddress,
-                      retestResult.updatedArmedState,
+                      decision.retestResult!.updatedArmedState,
                     );
+                    const cohortLabel = decision.isEstablished ? "ESTABLISHED" : "MICRO_CAP";
+                    const targetWait = decision.isEstablished
+                      ? "4-8% pullback or consolidation"
+                      : "10-18% pullback or consolidation";
                     console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${(spotInfo.spotPriceUsd ?? 0).toFixed(6)}) [${retestResult.cohortLabel}]. Awaiting ${retestResult.targetWait}...`,
+                      `[PaperDaemon] [ARMED_PULLBACK] Armed ${candidate.symbol} (${candidate.mintAddress}) at peak ${spotInfo.spotPriceSol} SOL ($${(spotInfo.spotPriceUsd ?? 0).toFixed(6)}) [${cohortLabel}]. Awaiting ${targetWait}...`,
                     );
                     addActivityLog(
                       "INFO",
-                      `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${retestResult.cohortLabel}]. Awaiting retest/pullback...`,
+                      `🎯 Armed ${candidate.symbol} at peak ${spotInfo.spotPriceSol.toFixed(6)} SOL [${cohortLabel}]. Awaiting retest/pullback...`,
                       candidate.mintAddress,
                       candidate.symbol,
                     );
@@ -1905,10 +1877,11 @@ export async function run(): Promise<void> {
                   // Update armed candidate state in map
                   armedPullbackCandidates.set(
                     candidate.mintAddress,
-                    retestResult.updatedArmedState,
+                    decision.retestResult!.updatedArmedState,
                   );
 
-                  if (retestResult.status === "REJECTED") {
+                  if (decision.outcome === "RETEST_REJECTED") {
+                    const retestResult = decision.retestResult!;
                     armedPullbackCandidates.delete(candidate.mintAddress);
                     watchlistService.updateStatus(candidate.poolId, "DROPPED");
 
@@ -1918,8 +1891,8 @@ export async function run(): Promise<void> {
                       spotInfo.spotPriceSol,
                       spotInfo.spotPriceUsd,
                       spotInfo.liquidityUsd,
-                      spotInfo.recentBuys60s,
-                      spotInfo.recentSells60s,
+                      decision.flowResult.recentBuys60s,
+                      decision.flowResult.recentSells60s,
                       retestResult.rejectionGateName,
                       currentNow,
                       spotInfo,
@@ -1927,9 +1900,9 @@ export async function run(): Promise<void> {
 
                     if (retestResult.rejectionGateName === "RetestCraterDrop") {
                       const maxDropPct =
-                        retestResult.maxCraterDropPct ?? (isEstablished ? 0.08 : 0.15);
+                        retestResult.maxCraterDropPct ?? (decision.isEstablished ? 0.08 : 0.15);
                       console.log(
-                        `[PaperDaemon] [ARMED_PULLBACK_${isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(retestResult.updatedArmedState.peakPriceSol * (1 - maxDropPct)).toFixed(6)} SOL). Dropping candidate.`,
+                        `[PaperDaemon] [ARMED_PULLBACK_${decision.isEstablished ? "EXCESSIVE" : "CRATERED"}] ${candidate.symbol} plunged >${(maxDropPct * 100).toFixed(0)}% from peak (${spotInfo.spotPriceSol} < ${(retestResult.updatedArmedState.peakPriceSol * (1 - maxDropPct)).toFixed(6)} SOL). Dropping candidate.`,
                       );
                       addActivityLog(
                         "ALERT",
@@ -1939,17 +1912,18 @@ export async function run(): Promise<void> {
                       );
                     } else if (retestResult.rejectionGateName === "RetestSellerSurge") {
                       console.log(
-                        `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${spotInfo.recentSells60s}, Buys60s: ${spotInfo.recentBuys60s})`,
+                        `[Retest Gate] Disarmed ${candidate.symbol} due to seller surge while awaiting pullback (Sells60s: ${decision.flowResult.recentSells60s}, Buys60s: ${decision.flowResult.recentBuys60s})`,
                       );
                       addActivityLog(
                         "ALERT",
-                        `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${spotInfo.recentSells60s}S vs ${spotInfo.recentBuys60s}B)`,
+                        `⚠️ Disarmed ${candidate.symbol}: seller surge while awaiting pullback (${decision.flowResult.recentSells60s}S vs ${decision.flowResult.recentBuys60s}B)`,
                         candidate.mintAddress,
                         candidate.symbol,
                       );
                     } else if (retestResult.rejectionGateName === "RetestTimeout") {
                       const expirySec = (
-                        (retestResult.maxExpiryMs ?? (isEstablished ? 120_000 : 90_000)) / 1000
+                        (retestResult.maxExpiryMs ?? (decision.isEstablished ? 120_000 : 90_000)) /
+                        1000
                       ).toFixed(0);
                       console.log(
                         `[PaperDaemon] [ARMED_PULLBACK_EXPIRED] ${candidate.symbol} expired after ${expirySec}s without entry confirmation. Dropping candidate.`,
@@ -1958,14 +1932,25 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  if (retestResult.status === "WAITING") {
+                  if (decision.outcome === "RETEST_WAITING") {
+                    const retestResult = decision.retestResult!;
+                    const flowBuys =
+                      decision.flowResult.recentBuys60s !== null
+                        ? `${decision.flowResult.recentBuys60s}B`
+                        : "?B";
+                    const flowSells =
+                      decision.flowResult.recentSells60s !== null
+                        ? `${decision.flowResult.recentSells60s}S`
+                        : "?S";
                     console.log(
-                      `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${retestResult.updatedArmedState.peakPriceSol} SOL, Pullback: ${retestResult.pullbackPct.toFixed(1)}%) | Flow: ${spotInfo.recentBuys60s}B/${spotInfo.recentSells60s}S | Ticks: ${retestResult.updatedArmedState.ticksObserved}`,
+                      `[PaperDaemon] [ARMED_PULLBACK_WAIT] ${candidate.symbol} [${decision.isEstablished ? "ESTAB" : "MICRO"}] awaiting trigger | Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${retestResult.updatedArmedState.peakPriceSol} SOL, Pullback: ${retestResult.pullbackPct.toFixed(1)}%) | Flow: ${flowBuys}/${flowSells} (${decision.flowResult.flowCoverage}) | Ticks: ${retestResult.updatedArmedState.ticksObserved}`,
                     );
                     continue;
                   }
 
-                  // retestResult.status === "CONFIRMED"
+                  // decision.outcome === "RETEST_CONFIRMED"
+                  const isEstablished = decision.isEstablished;
+                  const retestResult = decision.retestResult!;
                   console.log(
                     `[PaperDaemon] [ARMED_PULLBACK_CONFIRMED] ${candidate.symbol} [${isEstablished ? "ESTABLISHED" : "MICRO_CAP"}] entry confirmed via ${retestResult.confirmReason}! Spot: ${spotInfo.spotPriceSol} SOL (Peak: ${retestResult.updatedArmedState.peakPriceSol} SOL)`,
                   );

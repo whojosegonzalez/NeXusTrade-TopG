@@ -1,5 +1,6 @@
 import type { WatchlistCandidateItem } from "@nexustrade/shared";
 import type { StrategyThresholds } from "@nexustrade/shared";
+import type { FlowCoverageStatus } from "./RetestGateEvaluator.js";
 
 export interface BuyGateConfig {
   readonly minMaturityAgeSec: number; // default: 300 (5m)
@@ -71,8 +72,10 @@ export interface ArmedPullbackState {
 
 export interface AdvancedMarketContext {
   readonly maxSingleDisposalUsd?: number | undefined;
-  readonly recentBuysCount60s?: number | undefined;
-  readonly recentSellsCount60s?: number | undefined;
+  readonly recentBuysCount60s?: number | null | undefined;
+  readonly recentSellsCount60s?: number | null | undefined;
+  readonly flowCoverage?: FlowCoverageStatus | string | undefined;
+  readonly requireValidFlowCoverage?: boolean | undefined;
   readonly momentum1mBps?: number | undefined;
   readonly bundlerPct?: number | undefined;
   readonly top10HolderPct?: number | undefined;
@@ -283,21 +286,61 @@ export class BuyGateTriggerService {
     });
 
     // 9. Short Horizon Flow Gate (1m flow & momentum check when available)
-    const hasShortHorizonData =
-      marketContext.recentBuysCount60s !== undefined ||
-      marketContext.recentSellsCount60s !== undefined ||
-      marketContext.momentum1mBps !== undefined;
-    if (hasShortHorizonData) {
-      const buys60s = marketContext.recentBuysCount60s ?? 0;
-      const sells60s = marketContext.recentSellsCount60s ?? 0;
-      const mom1m = marketContext.momentum1mBps ?? 0;
-      const shortFlowPassed = !(sells60s > buys60s || mom1m < -500);
-      gates.push({
-        name: "SHORT_HORIZON_FLOW_GATE",
-        passed: shortFlowPassed,
-        value: mom1m,
-        requirement: "Buys60s >= Sells60s & Mom1m >= -5.0%",
-      });
+    let shortFlowFailureReason: string | undefined;
+    if (marketContext.requireValidFlowCoverage) {
+      const isCoverageSufficient = marketContext.flowCoverage === "SUFFICIENT";
+      const buys60s = marketContext.recentBuysCount60s;
+      const sells60s = marketContext.recentSellsCount60s;
+      const hasValidCounts =
+        buys60s !== null &&
+        buys60s !== undefined &&
+        Number.isInteger(buys60s) &&
+        buys60s >= 0 &&
+        sells60s !== null &&
+        sells60s !== undefined &&
+        Number.isInteger(sells60s) &&
+        sells60s >= 0;
+
+      if (!isCoverageSufficient || !hasValidCounts) {
+        shortFlowFailureReason = "REJECTED_UNAVAILABLE_FLOW_COVERAGE";
+        gates.push({
+          name: "SHORT_HORIZON_FLOW_GATE",
+          passed: false,
+          value: 0,
+          requirement: "Verified 60s Flow Coverage (SUFFICIENT)",
+        });
+      } else {
+        const mom1m = marketContext.momentum1mBps ?? 0;
+        const shortFlowPassed = !(sells60s > buys60s || mom1m < -500);
+        if (!shortFlowPassed) {
+          shortFlowFailureReason = "SHORT_HORIZON_FLOW_GATE_FAILED";
+        }
+        gates.push({
+          name: "SHORT_HORIZON_FLOW_GATE",
+          passed: shortFlowPassed,
+          value: mom1m,
+          requirement: "Buys60s >= Sells60s & Mom1m >= -5.0%",
+        });
+      }
+    } else {
+      const hasShortHorizonData =
+        (marketContext.recentBuysCount60s !== undefined &&
+          marketContext.recentBuysCount60s !== null) ||
+        (marketContext.recentSellsCount60s !== undefined &&
+          marketContext.recentSellsCount60s !== null) ||
+        marketContext.momentum1mBps !== undefined;
+      if (hasShortHorizonData) {
+        const buys60s = marketContext.recentBuysCount60s ?? 0;
+        const sells60s = marketContext.recentSellsCount60s ?? 0;
+        const mom1m = marketContext.momentum1mBps ?? 0;
+        const shortFlowPassed = !(sells60s > buys60s || mom1m < -500);
+        gates.push({
+          name: "SHORT_HORIZON_FLOW_GATE",
+          passed: shortFlowPassed,
+          value: mom1m,
+          requirement: "Buys60s >= Sells60s & Mom1m >= -5.0%",
+        });
+      }
     }
 
     // 10. Dev Disposal Gate (No single disposal > 5% of liquidity)
@@ -413,6 +456,8 @@ export class BuyGateTriggerService {
     if (failedGate) {
       if (failedGate.name === "BUNDLER_CONCENTRATION_GATE" && rugCheckFailureReason) {
         rejectionReason = rugCheckFailureReason;
+      } else if (failedGate.name === "SHORT_HORIZON_FLOW_GATE" && shortFlowFailureReason) {
+        rejectionReason = shortFlowFailureReason;
       } else if (failedGate.name === "ESTABLISHED_MACRO_TREND_GATE") {
         rejectionReason = "REJECTED_ESTABLISHED_MACRO_DOWNTREND";
       } else if (failedGate.name === "WASH_TRADING_CEILING_GATE") {
