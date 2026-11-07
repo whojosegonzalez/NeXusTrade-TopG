@@ -726,7 +726,81 @@ To decouple connection liveness and keepalive characterization from transaction 
 3. **Full Observation Duration**: An empty retrieval queue does NOT cause early exit; the probe stream remains open for the full configured observation duration (`durationMs`), enabling all scheduled RFC 6455 PING/PONG cycles to execute.
 4. **Telemetric Transparency**: Metadata and summary explicitly record `executionMode: "TRANSPORT_ONLY"`, `transportOnly: true`, `zeroHttpDispatchesEnforced: true`, and `tradeFlowTelemetry.flowCoverageStatus = "NOT_EVALUATED_TRANSPORT_ONLY"`.
 
-### 8.7 Invariant Preservation Reaffirmation
+### 8.7 Bounded Keepalive Objective Achieved (Capture 2026-11-07T03-37-10.713Z)
+
+The bounded transport-only operator probe executed at commit `882d3d5` was independently verified with zero file alterations:
+
+- **Directory**: `data/research/captures/transport-probe/2026-11-07T03-37-10.713Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`
+- **Command**: `--live --transport ws --keepalive true --transport-only --ping-interval-ms 20000 --max-pings 4 --pong-timeout-ms 10000 --max-control-frames 50 --max-control-bytes 4096 --duration-ms 90000 --max-messages 500 --max-bytes 2097152`
+- **Duration**: 90,029 ms (clean `DURATION_EXPIRED` at the 90-second limit).
+- **Ingress Telemetry**: 9 application messages (1 subscription acknowledgement + 8 transaction log notifications), 36,163 application bytes, 8 witnessed signatures.
+- **Heartbeat Exchanges**: Exactly 4 RFC 6455 client PINGs dispatched and 4 matched PONGs acknowledged (`clientPingsSentCount: 4`, `matchedClientPongsCount: 4`, `missingPongDetected: false`).
+- **Observed Keepalive RTT**: Latency range 35–150 ms (last: 53 ms, min: 35 ms, max: 150 ms).
+- **Control Traffic Accounting**: 32 payload bytes sent / 32 received; 56 wire bytes sent / 40 received.
+- **RPC Telemetry**: Strictly 0 HTTP requests dispatched (`totalHttpRequests: 0`, `transactionRetrievalsAttempted: 0`, `historyQueriesAttempted: 0`).
+- **Queue Telemetry**: Zero backlog or overflow (`peakQueueDepth: 0`, `queueRejectionsCount: 0`).
+- **Integrity**: Manifest file sizes, SHA-256 hashes, and entries digest verified. Virtual wallet hash unchanged.
+
+#### Notification Timing & Idle Sustenance
+
+The connection experienced ~71.6 seconds of total application idle time following subscription acknowledgement. During this idle window, the `ws` transport dispatched three periodic PING frames at $t = 20\text{ s}, 40\text{ s}, 60\text{ s}$, receiving matched PONG frames on each occasion. The connection successfully crossed the 60-second threshold where earlier native-client probes suffered upstream disconnects (at 59.998s). At $t \approx 71.9\text{ s}$, a burst of 8 notifications arrived in a tight 390 ms cluster (slots 466363873–466363875), followed by the fourth PING/PONG at $t = 80\text{ s}$.
+
+#### Explicit Scope & Conclusion Boundaries
+
+The bounded keepalive objective is recorded as **ACHIEVED** for this `ws`-client configuration. However, the following constraints remain strictly in effect:
+
+1. **Single-Capture Limitation**: This single 90-second observation does not prove multi-hour reliability or definitively establish the root cause of previous native-client disconnections.
+2. **Intentional Processing Omission**: Transaction retrieval and trade-flow evaluation were intentionally disabled (`transportOnly: true`). The 8 unretrieved signatures represent intentionally unpolled notifications, not demonstrated notification loss.
+3. **Shutdown Boundaries**: Socket closure was initiated locally at the 90-second deadline; upstream peer close acknowledgement was not captured before process exit.
+4. **Permanent Invariants**: `isProductionCompletenessEstablished` remains `false`, and Gate 11 bundler concentration remains fail-closed.
+5. **Task Status**: The keepalive implementation task is closed. This evidence directory is sealed and preserved unchanged.
+
+### 8.8 Offline Processing Capacity Assessment
+
+Using existing codebase contracts, configuration parameters, and captured notification timestamps, the operational boundaries affecting transaction processing are characterized:
+
+#### 1. Exact Constraints Affecting Transaction Processing
+
+- **Provider Spacing Constraint**: Pacing is pinned to $\ge 2,500\text{ ms}$ spacing via `GlobalResourceBudgetManager`. This limits serial HTTP RPC requests to a maximum sustained rate of **$0.40\text{ tx/s}$** from a single client instance.
+- **Active Workload Queue Limit**: Bounded at `MAX_QUEUE_DEPTH_LIMIT = 10` (queued + in-flight operations) inside `RaydiumAmmV4TransactionSourceAdapter`. An 11th concurrent pending transaction trips `QUEUE_OVERFLOW`.
+- **Diagnostic Sample Ceiling**: `MAX_TRANSACTION_RETRIEVALS_LIMIT = 5` in the observation probe. Transaction fetching halts once 5 sampled transactions have been dispatched.
+- **Request Budget & Forward Capacity Reservation**: `GlobalResourceBudgetManager` enforces `maxTotalRequests = 11`, `maxEnrichmentAttempts = 7`, and `minReservedForwardRequests = 4`. Historical enrichment and transaction retrievals cannot exhaust capacity reserved for forward monitoring.
+- **Session Duration & Deadlines**: Overall probe duration ceiling (default 90s, maximum 300s); individual HTTP transactions bounded by a 10-second timeout.
+
+#### 2. Burst Handling vs. Sustained Throughput
+
+- **Sustained Ingestion Ceiling**: Under a $\ge 2,500\text{ ms}$ pacing constraint, any pool generating continuous transactions at an average rate $> 0.40\text{ tx/s}$ will monotonically exhaust any finite queue buffer and cause queue overflow.
+- **Transient Burst Capacity**: The 10-slot queue acts as a shock absorber for short bursts. For a cluster of $N$ notifications over duration $\Delta t$, the queue can accommodate at most $10 + \lfloor \frac{\Delta t}{2500\text{ ms}} \rfloor$ transactions.
+  - In Capture `03-37-10.713Z`, the 8-notification burst over 390 ms would be absorbed ($8 \le 10$), requiring $8 \times 2.5\text{ s} = 20.0\text{ s}$ of sequential HTTP processing to clear.
+  - In Captures `02-37-38.359Z` and `02-38-37.152Z`, 12 notifications arrived in ~3 seconds ($12 > 10 + \lfloor \frac{3}{2.5} \rfloor = 11$), triggering the `QUEUE_LIMIT_EXCEEDED` fail-closed abort.
+- **Delivery Disclaimers**: Captured notifications represent only the stream witnessed by this specific single public WebSocket subscription during that window; they do not represent proof of complete upstream pool activity or ledger-level completeness. Live on-chain traffic exhibits high burstiness.
+
+#### 3. Diagnostic Probe vs. Intended PAPER Execution Path
+
+- **Probe-Only Constraints**:
+  - Sample limit of 5 transaction retrievals and 2 history queries (designed to produce bounded diagnostic evidence packages).
+  - Fatal probe termination on `QUEUE_LIMIT_EXCEEDED` (designed to halt and seal evidence immediately upon queue saturation).
+  - Explicit `--transport-only` flag (diagnostic harness to isolate transport characterization).
+- **PAPER Execution Path Constraints**:
+  - Pacing constraint ($\ge 2,500\text{ ms}$) enforced by `GlobalResourceBudgetManager` to prevent 429 rate-limiting on public RPC.
+  - Active queue capacity (`maxPendingQueueSize = 10`): In PAPER mode, queue overflow drops unbuffered notifications (`totalQueueOverflows++`). Dropped events create gaps in `RollingTradeFlowTracker`, resulting in incomplete coverage (`flowCoverageStatus != FULL`) and preventing trade execution.
+  - Forward reservation (`minReservedForwardRequests = 4`): Prevents background enrichment from exhausting RPC capacity needed for forward quote observation and trade execution.
+
+#### 4. Smallest Feasible Next Step & Acceptance Criteria
+
+- **Recommended Next Step**: A separately reviewed proposal for **Candidate-Pool Profiling & Bounded Lossy Notification Sampling**:
+  1. _Candidate Token Profiling_: Distinguish high-frequency reference pools (RAY/WSOL, generating bursts of dozens of swaps per block) from target candidate tokens (newly launched pools, typically exhibiting sparse transaction volume $< 0.40\text{ tx/s}$). Target candidate volume fits naturally within the 10-item queue buffer.
+  2. _Bounded Diagnostic Sampling Mode_: For reference-pool characterization, specify an explicit non-fatal sampling policy where notifications exceeding queue capacity are recorded as unretrieved/skipped rather than triggering an immediate session-ending `QUEUE_LIMIT_EXCEEDED` abort.
+- **Concrete Acceptance Criteria**:
+  - Pacing constraint ($\ge 2,500\text{ ms}$) and $0.00 spending ceiling remain strictly preserved.
+  - Candidate stream coordinator gracefully absorbs transient bursts on candidate tokens without gap generation.
+  - Diagnostic probe handles high-frequency pool traffic by sampling without socket termination.
+- **Remaining Blockers**:
+  - Public RPC rate limits fundamentally constrain single-provider sustained processing to 0.40 tx/s.
+  - Production source completeness remains unproven without gapless block-range verification.
+  - Gate 11 bundler concentration remains fail-closed.
+
+### 8.9 Invariant Preservation Reaffirmation
 
 All Phase 12.94-D core safety boundaries remain unchanged and active:
 
