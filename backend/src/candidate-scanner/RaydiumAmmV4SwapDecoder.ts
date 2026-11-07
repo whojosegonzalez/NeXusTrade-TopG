@@ -356,6 +356,7 @@ export interface DecodableTokenBalance {
 export interface DecodableTransactionPayload {
   readonly slot: number;
   readonly blockTime?: number | null | undefined;
+  readonly version?: number | "legacy" | null | undefined;
   readonly transaction: {
     readonly signatures: readonly string[];
     readonly message: {
@@ -398,6 +399,7 @@ export type DecodeRaydiumSwapFailureReason =
   | "UNSUPPORTED_LAYOUT"
   | "UNSUPPORTED_CALL_TREE"
   | "MALFORMED_INSTRUCTION_DATA"
+  | "UNSUPPORTED_TRANSACTION_VERSION"
   | "AMBIGUOUS_DIRECTION"
   | "CONFLICTING_EVIDENCE";
 
@@ -1041,6 +1043,27 @@ export function decodeRaydiumTransactionSwaps(
       signature,
       events: [],
     };
+  }
+
+  // 4.5. Validate transaction version if present (fail-closed on unsupported versions)
+  const txVersion = (txPayload as { version?: unknown }).version;
+  if (txVersion !== undefined && txVersion !== null && txVersion !== "legacy") {
+    if (
+      typeof txVersion !== "number" ||
+      !Number.isFinite(txVersion) ||
+      !Number.isInteger(txVersion) ||
+      txVersion < 0 ||
+      txVersion > 1
+    ) {
+      return {
+        ok: false,
+        reason: "UNSUPPORTED_TRANSACTION_VERSION",
+        message: `Transaction ${signature} has unsupported transaction version: ${String(txVersion)} (supported: legacy, 0, 1)`,
+        signature,
+        slot,
+        events: [],
+      };
+    }
   }
 
   // 5. Require explicit transaction-success metadata

@@ -1374,6 +1374,7 @@ export async function executeTransportObservationProbe(
     pacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
     maxPendingQueueSize: maxQueueDepth,
     commitment: "confirmed",
+    maxSupportedTransactionVersion: 1,
     tracker,
     sleepFn: (ms) => sleepFn(ms),
     clock,

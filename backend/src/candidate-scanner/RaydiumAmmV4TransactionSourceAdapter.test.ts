@@ -162,6 +162,115 @@ function createSyntheticBuyPayload(
 }
 
 /**
+ * Creates a synthetic RPC transaction payload formatted as Solana version 1 with Address Lookup Tables.
+ */
+function createSyntheticV1BuyPayload(
+  signature: string,
+  amountInLamports = 50_000_000n,
+  amountOutTokens = 25_000_000_000n,
+  poolId = SYNTHETIC_POOL_ID,
+  slot = 280_000_100,
+  blockTime = 1_700_000_000,
+) {
+  const staticAccounts = [
+    SPL_TOKEN_PROGRAM_ID, // 0
+    poolId, // 1
+    SYNTHETIC_AMM_AUTHORITY, // 2
+    SYNTHETIC_BASE_VAULT, // 3
+    SYNTHETIC_QUOTE_VAULT, // 4
+  ];
+
+  const loadedWritable = [
+    SYNTHETIC_USER_SOURCE_ATA, // 5
+    SYNTHETIC_USER_DEST_ATA, // 6
+  ];
+  const loadedReadonly = [
+    SYNTHETIC_USER_WALLET, // 7
+    RAYDIUM_AMM_V4_PROGRAM_ID, // 8
+  ];
+
+  return {
+    version: 1,
+    slot,
+    blockTime,
+    transaction: {
+      signatures: [signature],
+      message: {
+        accountKeys: staticAccounts,
+        instructions: [
+          {
+            programIdIndex: 8,
+            accounts: [0, 1, 2, 3, 4, 5, 6, 7],
+            data: makeSwapBaseInV2Data(amountInLamports, amountOutTokens),
+          },
+        ],
+        addressTableLookups: [
+          {
+            accountKey: "LookupTable11111111111111111111111111111111",
+            writableIndexes: [0, 1],
+            readonlyIndexes: [0, 1],
+          },
+        ],
+      },
+    },
+    meta: {
+      err: null,
+      loadedAddresses: {
+        writable: loadedWritable,
+        readonly: loadedReadonly,
+      },
+      preTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: "1000000000", decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: "500000000000", decimals: 5 },
+        },
+      ],
+      postTokenBalances: [
+        {
+          accountIndex: 4,
+          mint: SYNTHETIC_WSOL_MINT,
+          uiTokenAmount: { amount: (1_000_000_000n + amountInLamports).toString(), decimals: 9 },
+        },
+        {
+          accountIndex: 3,
+          mint: SYNTHETIC_CANDIDATE_MINT,
+          uiTokenAmount: { amount: (500_000_000_000n - amountOutTokens).toString(), decimals: 5 },
+        },
+      ],
+      innerInstructions: [
+        {
+          index: 0,
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [5, 4, 7],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountInLamports]).buffer)),
+              ],
+            },
+            {
+              programIdIndex: 0,
+              accounts: [3, 6, 2],
+              data: [
+                3,
+                ...Array.from(new Uint8Array(new BigUint64Array([amountOutTokens]).buffer)),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/**
  * Creates a synthetic RPC transaction payload containing 2 Raydium swaps on the tracked pool.
  */
 function createSyntheticMultiSwapPayload(
@@ -372,6 +481,28 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
             pacingMs: -500,
           }),
       ).toThrow("pacingMs must be a non-negative integer");
+
+      // Invalid maxSupportedTransactionVersion
+      expect(
+        () =>
+          new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+            maxSupportedTransactionVersion: -1,
+          }),
+      ).toThrow("maxSupportedTransactionVersion must be a non-negative integer");
+      expect(
+        () =>
+          new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+            maxSupportedTransactionVersion: 1.5,
+          }),
+      ).toThrow("maxSupportedTransactionVersion must be a non-negative integer");
     });
   });
 
@@ -2272,6 +2403,351 @@ describe("RaydiumAmmV4TransactionSourceAdapter", () => {
         expect(batchRes.totalIngestedEvents).toBe(0);
         expect(batchRes.results[0]?.outcome).toBe("PRE_DISPATCH_DEADLINE_EXCEEDED");
         expect(batchRes.results[0]?.ingestedEventsCount).toBe(0);
+      });
+    });
+
+    describe("Finding 5: Solana Transaction Version 1 Compatibility, Error -32015 & Address Lookup Tables", () => {
+      it("explicitly specifies maxSupportedTransactionVersion: 1 as an integer in getTransaction queries by default", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6V1";
+        let capturedBodyText = "";
+
+        const mockTransport: typeof fetch = async (_url, init) => {
+          capturedBodyText = String(init?.body);
+          const payload = createSyntheticV1BuyPayload(sig);
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+            status: 200,
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const res = await adapter.processNotification(sig, tracker);
+
+        expect(res.ok).toBe(true);
+        expect(res.outcome).toBe("SUCCESS");
+
+        const parsedRpc = JSON.parse(capturedBodyText) as {
+          method: string;
+          params: [string, { maxSupportedTransactionVersion?: unknown }];
+        };
+        expect(parsedRpc.method).toBe("getTransaction");
+        expect(parsedRpc.params[0]).toBe(sig);
+        expect(parsedRpc.params[1].maxSupportedTransactionVersion).toBe(1);
+        expect(typeof parsedRpc.params[1].maxSupportedTransactionVersion).toBe("number");
+      });
+
+      it("accurately classifies and audits error -32015 when transaction version exceeds client supported version, retaining bounded responseBody", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6Err";
+        const rpcErrorResponse = JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32015,
+            message:
+              "Transaction version (1) is not supported by the requesting client. Please specify the 'maxSupportedTransactionVersion' parameter",
+          },
+          id: 1,
+        });
+
+        const mockTransport: typeof fetch = async () => {
+          return new Response(rpcErrorResponse, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const res = await adapter.processNotification(sig, tracker);
+
+        expect(res.ok).toBe(false);
+        expect(res.outcome).toBe("RPC_ERROR");
+        expect(res.ingestedEventsCount).toBe(0);
+        expect(res.diagnostics.httpAttempts).toBe(1);
+        expect(res.diagnostics.httpStatus).toBe(200);
+        expect(res.diagnostics.error).toContain("-32015");
+        expect(res.diagnostics.error).toContain("Transaction version (1) is not supported");
+        expect(res.diagnostics.responseBody).toBe(rpcErrorResponse);
+        expect(res.diagnostics.responseSnippet).toBe(rpcErrorResponse);
+        expect(res.diagnostics.isCompletePayload).toBe(true);
+
+        const expectedSha = createHash("sha256").update(rpcErrorResponse).digest("hex");
+        expect(res.diagnostics.responseSha256).toBe(expectedSha);
+
+        // Tracker records loss gap
+        expect(tracker.getEventsCount()).toBe(0);
+        const gaps = tracker.getRecordedGaps();
+        expect(gaps.length).toBeGreaterThanOrEqual(1);
+        expect(gaps[0]?.reason).toBe("SOURCE_ADAPTER_LOSS:RPC_ERROR_RETURNED");
+      });
+
+      it("fetches, decodes, and ingests a valid Solana version 1 transaction using Address Lookup Tables (ALTs)", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6A";
+        const v1Payload = createSyntheticV1BuyPayload(sig, 75_000_000n, 35_000_000_000n);
+        const rawJson = JSON.stringify({ jsonrpc: "2.0", id: 1, result: v1Payload });
+
+        const mockTransport: typeof fetch = async () => {
+          return new Response(rawJson, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        };
+
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+        const tracker = new RollingTradeFlowTracker({
+          poolId: SYNTHETIC_POOL_ID,
+          tokenMint: SYNTHETIC_CANDIDATE_MINT,
+        });
+
+        const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+          poolContext: STANDARD_POOL_CONTEXT,
+          rpcUrl: MOCK_RPC_URL,
+          budgetManager,
+          transport: mockTransport,
+        });
+
+        const res = await adapter.processNotification(sig, tracker);
+
+        expect(res.ok).toBe(true);
+        expect(res.outcome).toBe("SUCCESS");
+        expect(res.ingestedEventsCount).toBe(1);
+        expect(res.diagnostics.decodedEventsCount).toBe(1);
+        expect(res.diagnostics.ingestedCount).toBe(1);
+        expect(res.diagnostics.responseBody).toBe(rawJson);
+        expect(res.diagnostics.isCompletePayload).toBe(true);
+
+        // Verify tracker ingestion from v1 payload
+        expect(tracker.getEventsCount()).toBe(1);
+        const event = (
+          res.diagnostics.decodedEvents as Array<{
+            signature: string;
+            side: string;
+            solAmount?: bigint;
+            tokenAmount?: bigint;
+            timestampProvenance: string;
+          }>
+        )[0]!;
+        expect(event.signature).toBe(sig);
+        expect(event.side).toBe("BUY");
+        expect(event.solAmount).toBe(75_000_000n);
+        expect(event.tokenAmount).toBe(35_000_000_000n);
+        expect(event.timestampProvenance).toBe("ON_CHAIN_BLOCK_TIME");
+      });
+
+      it("fails closed on unsupported future transaction versions (e.g. version 2, negative, fractional)", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6B";
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+        for (const badVersion of [2, 3, -1, 1.5, "v2"]) {
+          const payload = {
+            ...createSyntheticV1BuyPayload(sig),
+            version: badVersion,
+          };
+
+          const mockTransport: typeof fetch = async () => {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+              status: 200,
+            });
+          };
+
+          const tracker = new RollingTradeFlowTracker({
+            poolId: SYNTHETIC_POOL_ID,
+            tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          });
+
+          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+          });
+
+          const res = await adapter.processNotification(sig, tracker);
+
+          expect(res.ok).toBe(false);
+          expect(res.outcome).toBe("DECODE_FAILED");
+          expect(res.diagnostics.error).toContain("UNSUPPORTED_TRANSACTION_VERSION");
+          expect(res.diagnostics.error).toContain(String(badVersion));
+          expect(tracker.getEventsCount()).toBe(0);
+        }
+      });
+
+      it("fails closed when loadedAddresses contains invalid non-string accounts or out-of-bounds indices", async () => {
+        const sig =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6C";
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+        // Case 1: Non-string in loadedAddresses.writable
+        {
+          const base = createSyntheticV1BuyPayload(sig);
+          const payload = {
+            ...base,
+            meta: {
+              ...base.meta,
+              loadedAddresses: {
+                writable: [12345 as unknown as string],
+                readonly: base.meta.loadedAddresses.readonly,
+              },
+            },
+          };
+
+          const mockTransport: typeof fetch = async () => {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+              status: 200,
+            });
+          };
+
+          const tracker = new RollingTradeFlowTracker({
+            poolId: SYNTHETIC_POOL_ID,
+            tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          });
+
+          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+          });
+
+          const res = await adapter.processNotification(sig, tracker);
+          expect(res.ok).toBe(false);
+          expect(res.outcome).toBe("DECODE_FAILED");
+          expect(res.diagnostics.error).toContain("MALFORMED_INSTRUCTION_DATA");
+        }
+
+        // Case 2: Out of bounds account index (e.g. index 99)
+        {
+          const base = createSyntheticV1BuyPayload(sig);
+          const payload = {
+            ...base,
+            transaction: {
+              ...base.transaction,
+              message: {
+                ...base.transaction.message,
+                instructions: [
+                  {
+                    programIdIndex: 8,
+                    accounts: [0, 1, 2, 3, 4, 5, 6, 99], // index 99 is out of bounds!
+                    data: makeSwapBaseInV2Data(50_000_000n, 25_000_000_000n),
+                  },
+                ],
+              },
+            },
+          };
+
+          const mockTransport: typeof fetch = async () => {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+              status: 200,
+            });
+          };
+
+          const tracker = new RollingTradeFlowTracker({
+            poolId: SYNTHETIC_POOL_ID,
+            tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          });
+
+          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+          });
+
+          const res = await adapter.processNotification(sig, tracker);
+          expect(res.ok).toBe(false);
+          expect(res.outcome).toBe("DECODE_FAILED");
+          expect(res.diagnostics.error).toContain("MALFORMED_INSTRUCTION_DATA");
+        }
+      });
+
+      it("preserves positive control functionality for legacy and version 0 transactions", async () => {
+        const sigLegacy =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6D";
+        const sigV0 =
+          "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6E";
+        const budgetManager = new GlobalResourceBudgetManager({ minProviderSpacingMs: 0 });
+
+        // Legacy payload (no version property)
+        {
+          const payload = createSyntheticBuyPayload(sigLegacy);
+          const mockTransport: typeof fetch = async () => {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+              status: 200,
+            });
+          };
+
+          const tracker = new RollingTradeFlowTracker({
+            poolId: SYNTHETIC_POOL_ID,
+            tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          });
+
+          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+          });
+
+          const res = await adapter.processNotification(sigLegacy, tracker);
+          expect(res.ok).toBe(true);
+          expect(res.outcome).toBe("SUCCESS");
+          expect(tracker.getEventsCount()).toBe(1);
+        }
+
+        // Version 0 payload (version: 0)
+        {
+          const payload = {
+            ...createSyntheticV1BuyPayload(sigV0),
+            version: 0,
+          };
+          const mockTransport: typeof fetch = async () => {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: payload }), {
+              status: 200,
+            });
+          };
+
+          const tracker = new RollingTradeFlowTracker({
+            poolId: SYNTHETIC_POOL_ID,
+            tokenMint: SYNTHETIC_CANDIDATE_MINT,
+          });
+
+          const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+            poolContext: STANDARD_POOL_CONTEXT,
+            rpcUrl: MOCK_RPC_URL,
+            budgetManager,
+            transport: mockTransport,
+          });
+
+          const res = await adapter.processNotification(sigV0, tracker);
+          expect(res.ok).toBe(true);
+          expect(res.outcome).toBe("SUCCESS");
+          expect(tracker.getEventsCount()).toBe(1);
+        }
       });
     });
   });

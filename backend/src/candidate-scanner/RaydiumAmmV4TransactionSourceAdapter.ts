@@ -177,7 +177,7 @@ export interface RaydiumAmmV4TransactionSourceAdapterOptions {
   /** RPC commitment level. Default: "confirmed". */
   readonly commitment?: "confirmed" | "finalized" | undefined;
 
-  /** Max supported transaction version for RPC. Default: 0. */
+  /** Max supported transaction version for RPC. Default: 1. */
   readonly maxSupportedTransactionVersion?: number | undefined;
 
   /** Optional associated RollingTradeFlowTracker for immediate backlog propagation and gap flushing. */
@@ -444,7 +444,16 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     this.maxDeduplicationKeys = maxDedup;
 
     this.commitment = options.commitment ?? "confirmed";
-    this.maxSupportedTransactionVersion = options.maxSupportedTransactionVersion ?? 0;
+    if (
+      options.maxSupportedTransactionVersion !== undefined &&
+      (typeof options.maxSupportedTransactionVersion !== "number" ||
+        !Number.isFinite(options.maxSupportedTransactionVersion) ||
+        !Number.isInteger(options.maxSupportedTransactionVersion) ||
+        options.maxSupportedTransactionVersion < 0)
+    ) {
+      throw new Error("maxSupportedTransactionVersion must be a non-negative integer");
+    }
+    this.maxSupportedTransactionVersion = options.maxSupportedTransactionVersion ?? 1;
     this.clock = options.clock ?? (() => Date.now());
     this.sleepFn =
       options.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -1290,6 +1299,25 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             this.clock(),
             this.requestPurpose,
           );
+
+          if (
+            !budgetCheck.allowed &&
+            budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+            typeof budgetCheck.waitMs === "number" &&
+            budgetCheck.waitMs > 0 &&
+            budgetCheck.waitMs < remainingBudget
+          ) {
+            try {
+              await sleepWithSignal(budgetCheck.waitMs, this.sleepFn, options?.signal);
+            } catch {
+              // Handled by subsequent checks
+            }
+            budgetCheck = this.budgetManager.canMakeRequest(
+              this.providerName,
+              this.clock(),
+              this.requestPurpose,
+            );
+          }
         }
 
         if (!budgetCheck.allowed) {
@@ -1747,6 +1775,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: this.sanitizeErrorMessage(`RPC returned error: ${JSON.stringify(rpcObj.error)}`),
           },
         };
@@ -1772,6 +1803,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: `Transaction ${signature} not found on-chain (result: null)`,
           },
         };
@@ -1802,6 +1836,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             requestSentAtMs,
             responseReceivedAtMs,
             responseSha256,
+            responseSnippet: bodyText.slice(0, 2048),
+            responseBody: bodyText,
+            isCompletePayload: true,
             error: this.sanitizeErrorMessage(
               `RPC returned signature mismatch: requested '${signature}', received '${String(primaryReturnedSig)}'`,
             ),
@@ -1832,6 +1869,9 @@ export class RaydiumAmmV4TransactionSourceAdapter {
               requestSentAtMs,
               responseReceivedAtMs,
               responseSha256,
+              responseSnippet: bodyText.slice(0, 2048),
+              responseBody: bodyText,
+              isCompletePayload: true,
               error: this.sanitizeErrorMessage(
                 `Slot contradiction: notification specified slot ${notification.slot}, but response contains slot ${payloadSlot}`,
               ),

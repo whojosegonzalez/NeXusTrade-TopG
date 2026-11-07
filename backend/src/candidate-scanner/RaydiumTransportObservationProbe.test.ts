@@ -940,15 +940,29 @@ describe("RaydiumTransportObservationProbe", () => {
     it("enforces transaction cap under concurrent phase transition", async () => {
       const mockTransport = new MockWebSocketTransport();
       let dispatchesCount = 0;
+      let fakeNow = 1_700_000_000_000;
+      const clock = () => fakeNow;
+      const sleepFn = async (ms: number) => {
+        if (ms >= 100) {
+          fakeNow += ms;
+        } else {
+          await new Promise((r) => setTimeout(r, ms));
+        }
+      };
 
-      const mockFetch: typeof fetch = async () => {
+      const mockFetch: typeof fetch = async (_input, init) => {
         dispatchesCount++;
+        const body = init?.body ? (JSON.parse(init.body as string) as { params?: unknown[] }) : {};
+        const reqSig =
+          Array.isArray(body?.params) && typeof body.params[0] === "string"
+            ? body.params[0]
+            : SIG_C;
         await new Promise((r) => setTimeout(r, 15));
         return new Response(
           JSON.stringify({
             jsonrpc: "2.0",
             id: 1,
-            result: createSyntheticBuyPayload(SIG_C),
+            result: createSyntheticBuyPayload(reqSig),
           }),
         );
       };
@@ -961,6 +975,8 @@ describe("RaydiumTransportObservationProbe", () => {
         maxTransactionRetrievals: 2,
         transport: mockTransport,
         fetchTransport: mockFetch,
+        clock,
+        sleepFn,
       });
 
       mockTransport.triggerOpen();
