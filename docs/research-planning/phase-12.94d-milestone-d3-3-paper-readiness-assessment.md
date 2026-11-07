@@ -1025,15 +1025,27 @@ T_watermark - 60s               T_watermark                     T_decision
 
 The requirement that an on-chain transaction $A_{\text{post}}$ must have $\text{blockTime} \ge T_{\text{decision}}$ is explicitly rejected. For an immediate decision, or for a quiet candidate pool, requiring a future transaction to validate the present is impossible.
 
-##### 3. Quiet & Zero-Transaction Windows
+##### 3. Quiet & Zero-Transaction Windows and Source Cutoff Evidence
 
-Candidate pools frequently experience periods of zero trading activity.
+Candidate pools frequently experience periods of zero trading activity. However, silence, client PING/PONG heartbeats, and an empty history page alone do **not** prove that a 60-second observation window is complete:
 
-- A quiet window $[T_{\text{watermark}} - 60\text{s}, T_{\text{watermark}}]$ is valid and verifiable if:
-  1. The WebSocket subscription maintained continuous observation with zero disconnects, dropped frames, or queue overflows.
-  2. The source watermark has advanced such that $\Delta t_{\text{age}} = T_{\text{decision}} - T_{\text{watermark}} \le 15{,}000\text{ ms}$.
-  3. RPC signature pagination confirms that zero transactions were indexed for the pool during that interval.
-- Under these conditions, the honest and valid result is **zero buys and zero sells** (`recentBuys60s: 0, recentSells60s: 0`), rather than treating silence as a failure.
+- **Empty History Does Not Advance Watermarks**:
+  An empty `getSignaturesForAddress` response indicates that zero signatures were returned for the target address; it does **not** advance the source watermark to local request or response time.
+- **Explicit Source Cutoff Evidence**:
+  Advancing the source cutoff watermark requires verified on-chain evidence with explicit provenance:
+  1. _Source Method_: e.g. `getSlot`, `getBlockTime`, `getLatestBlockhash`, or the newest transaction in `getSignaturesForAddress`.
+  2. _Response Field_: Exact JSON-RPC field extracted (e.g. `result`, `result.context.slot`, or `result[0].blockTime`).
+  3. _Commitment_: Explicitly `"confirmed"` or `"finalized"`.
+  4. _Provenance_: Must be `"ON_CHAIN_BLOCK_TIME"` or `"SYNTHETIC_FIXTURE"`. Local host receipt time is never accepted as an on-chain ledger cutoff.
+  5. _Telemetric Limitation_: A node's current slot or block time is provider-reported telemetry; it is **not** independent cryptographic proof that its address index is complete or unlagged. Missing cutoff evidence leaves the cutoff unavailable, failing closed with `MISSING_SOURCE_CUTOFF`.
+- **Warm-Up / Full Observation Span Requirement**:
+  A verified quiet window spans:
+  $$W_{\text{verified}} = [T_{\text{cutoff}} - 60{,}000\text{ ms}, T_{\text{cutoff}}].$$
+  To verify zero transactions across this entire window, stream observation must span the entire requested interval:
+  $$T_{\text{obsStart}} \le T_{\text{cutoff}} - 60{,}000\text{ ms} \quad \text{and} \quad T_{\text{obsEnd}} \ge T_{\text{cutoff}}.$$
+  If observation started at $T = 0$ and the watermark is established at $T = 55\text{s}$, the requested window is $[-5\text{s}, 55\text{s}]$, leaving $[-5\text{s}, 0\text{s}]$ unobserved. This is a warm-up condition that must strictly return `WARM_UP` / incomplete coverage (`flowCoverage: "WARM_UP"`, counts `null`).
+- **Genuinely Full Quiet Window**:
+  When continuous observation spans the full 60-second window (e.g. observation from $0\text{s}$ to $65\text{s}$ with cutoff at $65\text{s}$ yielding $[5\text{s}, 65\text{s}]$), zero stream gaps exist, evidence freshness $\Delta t_{\text{age}} \le 15{,}000\text{ ms}$ is satisfied, and the address index confirms zero transactions, the valid provider-relative result is **zero buys and zero sells** (`recentBuys60s: 0, recentSells60s: 0, flowRatio: 1.0`).
 
 ##### 4. Bounded-Lag Window Contract (for Operator Review)
 
@@ -1162,20 +1174,42 @@ U = 6 unresolved                        7 requests                 17.5s (+ RTT)
 
 To illustrate how the four-dimensional time contract, incremental resolution, and queue state operate in practice, the following synthetic scenarios trace candidate evaluation and document the exact conclusions and unresolved uncertainties at each decision point.
 
-##### Scenario A: Quiet Window (Zero-Transaction Pool)
+##### Scenario A: Quiet Window & Warm-Up Boundary Cases
 
-A newly discovered candidate pool experiences continuous WebSocket observation with zero witnessed transactions during the 60-second observation window.
+Candidate pools frequently experience periods of zero trading activity. The evaluator distinguishes incomplete warm-up from a genuinely full-duration quiet window:
 
-| Time ($T$)                         | Event / Subsystem Action                                                                                                   | Internal Queue State      | Evidence Freshness & Coverage State                                                                                         | Decision Point Conclusion & Uncertainty                                                                                                                                        |
-| :--------------------------------- | :------------------------------------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **$T = 0\text{s}$**                | Coordinator attaches WebSocket stream to target pool. Initial watermark established at $T_{\text{watermark}} = 0\text{s}$. | $Q = 0$, $K = 0$, $U = 0$ | Connection established; initial window open.                                                                                | Monitoring initiated.                                                                                                                                                          |
-| **$T = 0\text{s} \to 55\text{s}$** | Continuous WebSocket connection maintained. 2 client PING/PONG heartbeats exchanged successfully. 0 logs received.         | $Q = 0$, $K = 0$, $U = 0$ | Zero dropped frames; zero stream gaps.                                                                                      | Zero trades witnessed in stream.                                                                                                                                               |
-| **$T = 55\text{s}$**               | Bridge dispatches watermark query ($M = 1$ `getSignaturesForAddress` call). RPC returns zero new signatures for pool.      | $Q = 0$, $K = 0$, $U = 0$ | $T_{\text{watermark}}$ advanced to $55\text{s}$. Observation age $\Delta t_{\text{age}} = 5\text{s}$.                       | Watermark verified fresh ($\le 15\text{s}$).                                                                                                                                   |
-| **$T = 60\text{s}$**               | Strategy triggers candidate evaluation at $T_{\text{decision}} = 60\text{s}$.                                              | $Q = 0$, $K = 0$, $U = 0$ | Stream continuous; $\Delta t_{\text{age}} = 60\text{s} - 55\text{s} = 5\text{s} \le 15{,}000\text{ ms}$; no active backlog. | **Conclusion**: Valid quiet window. `recentBuys60s = 0`, `recentSells60s = 0`. Retest Gate evaluates micro-flow with 0 buys / 0 sells (unabsorbed crater drop limit enforced). |
+###### 1. Flawed / Incomplete Window: Insufficient [-5s, 55s] Observation (Warm-Up Failure)
 
-- **Unresolved Uncertainty at Decision Point ($T = 60\text{s}$)**:
+- **Timeline**:
+  - Observation attached at host time $T = 0\text{s}$.
+  - Cutoff query executed at $T = 55\text{s}$, returning cutoff evidence at $T_{\text{cutoff}} = 55\text{s}$.
+  - The requested 60-second window ending at the cutoff is $W = [55\text{s} - 60\text{s}, 55\text{s}] = [-5\text{s}, 55\text{s}]$.
+- **Evaluation**:
+  - Because observation began at $T_{\text{obsStart}} = 0\text{s}$, the interval $[-5\text{s}, 0\text{s}]$ was unobserved.
+  - An empty `getSignaturesForAddress` response does **not** advance the source watermark to local request or response time.
+  - **Conclusion**: Fails closed with `status: "WARM_UP"`, `flowCoverage: "WARM_UP"`, counts remain `null`. Retest Gate enforces unabsorbed crater drop limit.
+
+###### 2. Corrected Genuinely Full-Duration Quiet Window (Reconciled)
+
+- **Timeline**:
+  - Continuous WebSocket observation active from $T_{\text{obsStart}} = 0\text{s}$ through $T_{\text{obsEnd}} = 65\text{s}$ with zero dropped frames or queue overflows.
+  - At $T = 65\text{s}$, on-chain source cutoff evidence is retrieved via `getSlot` (slot 280,000,200, blockTime 65s, commitment "confirmed", provenance "ON_CHAIN_BLOCK_TIME").
+  - The requested 60-second window is $W = [65\text{s} - 60\text{s}, 65\text{s}] = [5\text{s}, 65\text{s}]$.
+  - Entire window $[5\text{s}, 65\text{s}]$ is fully spanned by continuous observation ($T_{\text{obsStart}} = 0\text{s} \le 5\text{s}$ and $T_{\text{obsEnd}} = 65\text{s} \ge 65\text{s}$).
+  - RPC history query confirms zero transactions were indexed for the pool during $[5\text{s}, 65\text{s}]$.
+  - Candidate evaluation triggered at $T_{\text{decision}} = 66\text{s}$ ($\Delta t_{\text{age}} = 66\text{s} - 65\text{s} = 1\text{s} \le 15{,}000\text{ ms}$).
+
+| Time ($T$)                         | Event / Subsystem Action                                                                                                            | Internal Queue State      | Evidence Freshness & Coverage State                                                                                         | Decision Point Conclusion & Uncertainty                                                                                                                                                                |
+| :--------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **$T = 0\text{s}$**                | Coordinator attaches WebSocket stream to target pool. Initial observation tracking begins.                                          | $Q = 0$, $K = 0$, $U = 0$ | Connection established; observation timeline open.                                                                          | Monitoring initiated.                                                                                                                                                                                  |
+| **$T = 0\text{s} \to 65\text{s}$** | Continuous WebSocket connection maintained. Client PING/PONG heartbeats exchanged successfully. 0 logs received.                    | $Q = 0$, $K = 0$, $U = 0$ | Zero dropped frames; zero stream gaps.                                                                                      | Zero trades witnessed in stream.                                                                                                                                                                       |
+| **$T = 65\text{s}$**               | Bridge receives verified source cutoff evidence (slot 280,000,200, $T_{\text{cutoff}} = 65\text{s}$). RPC confirms zero signatures. | $Q = 0$, $K = 0$, $U = 0$ | Window $[5\text{s}, 65\text{s}]$ verified. Age $\Delta t_{\text{age}} = 1\text{s}$.                                         | Verified on-chain cutoff fresh ($\le 15\text{s}$).                                                                                                                                                     |
+| **$T = 66\text{s}$**               | Strategy triggers candidate evaluation at $T_{\text{decision}} = 66\text{s}$.                                                       | $Q = 0$, $K = 0$, $U = 0$ | Stream continuous; $\Delta t_{\text{age}} = 66\text{s} - 65\text{s} = 1\text{s} \le 15{,}000\text{ ms}$; no active backlog. | **Conclusion**: Valid quiet window. `recentBuys60s = 0`, `recentSells60s = 0`, `flowRatio = 1.0`. Retest Gate evaluates micro-flow with 0 buys / 0 sells under declared provider-relative assumptions. |
+
+- **Unresolved Uncertainty at Decision Point ($T = 66\text{s}$)**:
   1. _Upstream Index Omission_: If the RPC node failed to index an on-chain transaction that actually occurred, neither the WebSocket stream nor `getSignaturesForAddress` witnessed it. The quiet-window conclusion is strictly provider-relative.
   2. _Intra-Second Timestamp Truncation_: Solana `blockTime` provides second-level resolution only; transactions occurring in the same second cannot be ordered with millisecond precision.
+  3. _Telemetry Limitation_: Node current slot/time is provider-reported telemetry, not an independent proof that the address index is complete.
 
 ##### Scenario B: Burst Window with Processing Delay & Active Backlog
 
@@ -1204,18 +1238,20 @@ A candidate pool experiences moderate activity during the first 50 seconds, foll
 
 #### 8.10.6 Implementation Blueprint & Preserved Readiness Gaps
 
-##### 1. Affected Files for Single-Pool Coverage Step
+##### 1. Implemented & Affected Files for Single-Pool Coverage Step
 
-1. [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
-   - Add window-bounding traversal helper `enumerateWindow(windowStartMs, windowEndMs)`.
-2. [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts):
-   - Add atomic window resolution method returning `ExactPoolWindowProof` upon complete resolution.
-3. [`backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts):
-   - Add support for consuming `ExactPoolWindowProof` in `advanceCoverage()` under a dedicated non-synthetic provider-relative mode, subject to operator acceptance policy.
-4. [`backend/src/candidate-scanner/RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts):
-   - Add immutable gap protection preventing retrospective trade ingestion from clearing active-window gaps.
-5. [`backend/src/candidate-scanner/ExactPoolWindowProof.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowProof.test.ts) (New Offline Test Suite):
-   - Comprehensive test suite covering synthetic fixtures, quiet windows, bursts with backlog, index omission detection limits, and boundary alignments.
+1. [`backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.ts) (Bounded Offline Evaluator Component):
+   - Implements bounded provider-relative window reconciliation evaluator returning immutable `WindowReconciliationResult`.
+   - Distinguishes warm-up from genuinely full-duration quiet windows; models accurate start-to-start pacing and credits incrementally resolved transactions.
+   - Enforces production protection: `toCandidateFlowResult()` strictly defaults to unavailable counts (`recentBuys60s: null, recentSells60s: null, flowCoverage: "COLLECTION_GAP"`) under production configuration.
+2. [`backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowReconciliationEvaluator.test.ts) (Comprehensive Acceptance Suite):
+   - 17 offline acceptance tests covering warm-up rejection, full quiet window, missing/invalid cutoffs, timestamp/identity validation, gaps, backlog, budget exhaustion, start-to-start pacing, index-omission limits, and production protection.
+3. [`backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts):
+   - Preserves accepted enumeration and anchor-witnessing contract (`anchorWitnessed: true`, `{ before: cursor }`).
+4. [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts):
+   - Provides transaction resolution and decoding bridge into tracker.
+5. [`backend/src/candidate-scanner/CandidateFlowProvider.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateFlowProvider.ts):
+   - Shared decision boundary validation seam protecting daemon candidate evaluation.
 
 ##### 2. Preserved Readiness Gaps (Explicitly Kept Visible)
 
