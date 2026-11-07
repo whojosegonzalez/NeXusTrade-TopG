@@ -17,6 +17,7 @@ import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import * as diagnostics_channel from "node:diagnostics_channel";
+import { WebSocketServer, type WebSocket } from "ws";
 import {
   executeTransportObservationProbe,
   parseTransportProbeArgs,
@@ -1997,6 +1998,285 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(td.serverPongsReceivedCount).toBe(1);
         expect(td.lastServerPongReceivedAtMs).toBe(fakeNow);
       }
+    });
+
+    describe("Optional RFC 6455 Keepalive Transport", () => {
+      async function createTestWebSocketServer(
+        onConnection?: (socket: WebSocket) => void,
+      ): Promise<{ server: WebSocketServer; port: number; close: () => Promise<void> }> {
+        return new Promise((resolve) => {
+          const server = new WebSocketServer({ port: 0, host: "127.0.0.1" }, () => {
+            const port = (server.address() as { port: number }).port;
+            if (onConnection) {
+              server.on("connection", onConnection);
+            }
+            resolve({
+              server,
+              port,
+              close: async () => {
+                for (const client of server.clients) {
+                  try {
+                    client.terminate();
+                  } catch {
+                    // ignore
+                  }
+                }
+                await new Promise<void>((r) => server.close(() => r()));
+              },
+            });
+          });
+        });
+      }
+
+      it("exchanges authentic RFC 6455 PING and PONG control frames on ws transport", async () => {
+        let pingsObservedAtServer = 0;
+        let lastServerPingPayload: Buffer | null = null;
+
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 12345 }));
+
+          socket.on("ping", (data: Buffer) => {
+            pingsObservedAtServer++;
+            lastServerPingPayload = data;
+          });
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 50,
+          maxPings: 2,
+          pongTimeoutMs: 1000,
+          durationMs: 350,
+          streamingDurationMs: 250,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        expect(result.dryRun).toBe(false);
+        expect("manifest" in result).toBe(true);
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          expect(succ.observationSuccess).toBe(true);
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(td.transportClient).toBe("ws");
+          expect(td.keepaliveEnabled).toBe(true);
+          expect(td.clientPingsSentCount).toBeGreaterThanOrEqual(1);
+          expect(td.clientPongsReceivedCount).toBeGreaterThanOrEqual(1);
+          expect(pingsObservedAtServer).toBeGreaterThanOrEqual(1);
+          expect(lastServerPingPayload).not.toBeNull();
+          expect(lastServerPingPayload!.length).toBe(8);
+          expect(td.controlFrameBytesSent).toBeGreaterThanOrEqual(8);
+          expect(td.controlFrameBytesReceived).toBeGreaterThanOrEqual(8);
+          expect(td.lastPongLatencyMs).not.toBeNull();
+          expect(td.minPongLatencyMs).not.toBeNull();
+          expect(td.maxPongLatencyMs).not.toBeNull();
+          expect(td.missingPongDetected).toBe(false);
+        }
+      });
+
+      it("terminates probe with TRANSPORT_ERROR when server fails to respond to PING within pongTimeoutMs", async () => {
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          // Suppress automatic pong replies so client detects missing pong
+          socket.pong = () => {};
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 30,
+          pongTimeoutMs: 60,
+          durationMs: 500,
+          streamingDurationMs: 400,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        expect("manifest" in result).toBe(true);
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          expect(succ.status).toBe("TRANSPORT_ERROR");
+          expect(succ.observationSuccess).toBe(false);
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(td.transportClient).toBe("ws");
+          expect(td.keepaliveEnabled).toBe(true);
+          expect(td.clientPingsSentCount).toBe(1);
+          expect(td.clientPongsReceivedCount).toBe(0);
+          expect(td.missingPongDetected).toBe(true);
+          expect(td.firstErrorMessage).toContain("Missing WebSocket keepalive PONG");
+        }
+      });
+
+      it("decouples client from heartbeat by allowing keepalive to be disabled on ws transport", async () => {
+        let pingsObservedAtServer = 0;
+
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          socket.on("ping", () => {
+            pingsObservedAtServer++;
+          });
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: false,
+          durationMs: 200,
+          streamingDurationMs: 100,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        await testWs.close();
+
+        if ("manifest" in result) {
+          const succ = result as TransportProbeSuccessResult;
+          const td = succ.metadata.transportDiagnostics;
+
+          expect(td.transportClient).toBe("ws");
+          expect(td.keepaliveEnabled).toBe(false);
+          expect(td.clientPingsSentCount).toBe(0);
+          expect(td.clientPongsReceivedCount).toBe(0);
+          expect(td.controlFrameBytesSent).toBe(0);
+          expect(pingsObservedAtServer).toBe(0);
+        }
+      });
+
+      it("ensures strict socket destruction, listener removal, and timer cleanup within 5-second deadline", async () => {
+        let serverSocketClosed = false;
+
+        const testWs = await createTestWebSocketServer((socket) => {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          socket.on("close", () => {
+            serverSocketClosed = true;
+          });
+        });
+
+        const mockFetch: typeof fetch = async () => new Response("ok");
+
+        const startTime = Date.now();
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          wsUrl: `ws://127.0.0.1:${testWs.port}`,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 25,
+          maxPings: 2,
+          pongTimeoutMs: 500,
+          durationMs: 150,
+          streamingDurationMs: 80,
+          fetchTransport: mockFetch,
+        });
+
+        const result = await probePromise;
+        const elapsedMs = Date.now() - startTime;
+
+        // Give loopback transport a brief tick to process closure frame
+        if (!serverSocketClosed) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
+        await testWs.close();
+
+        expect(elapsedMs).toBeLessThan(5000);
+        expect(result.dryRun).toBe(false);
+        expect(serverSocketClosed).toBe(true);
+      });
+
+      it("rejects --keepalive true on native transport as INVALID_INPUT", async () => {
+        const result = await executeTransportObservationProbe({
+          isLive: false,
+          transportType: "native",
+          keepalive: true,
+        });
+
+        expect(result.dryRun).toBe(true);
+        expect(result.status).toBe("INVALID_INPUT");
+        expect(result.success).toBe(false);
+        expect((result as { message: string }).message).toContain(
+          "keepalive is not supported on native WebSocket transport",
+        );
+      });
+
+      it("reports keepalive limits accurately in dry-run mode without network execution", async () => {
+        const result = await executeTransportObservationProbe({
+          isLive: false,
+          transportType: "ws",
+          keepalive: true,
+          pingIntervalMs: 20_000,
+          maxPings: 4,
+          pongTimeoutMs: 10_000,
+          durationMs: 90_000,
+        });
+
+        expect(result.dryRun).toBe(true);
+        expect(result.status).toBe("DRY_RUN");
+        expect(result.success).toBe(true);
+        if (result.dryRun && result.success) {
+          expect(result.limits.transportType).toBe("ws");
+          expect(result.limits.keepaliveEnabled).toBe(true);
+          expect(result.limits.pingIntervalMs).toBe(20_000);
+          expect(result.limits.maxPings).toBe(4);
+          expect(result.limits.pongTimeoutMs).toBe(10_000);
+        }
+      });
+
+      it("parses CLI flags for keepalive experiment correctly", () => {
+        const args1 = parseTransportProbeArgs([
+          "--transport",
+          "ws",
+          "--keepalive",
+          "true",
+          "--ping-interval-ms",
+          "15000",
+          "--max-pings",
+          "3",
+          "--pong-timeout-ms",
+          "8000",
+        ]);
+        expect(args1.transport).toBe("ws");
+        expect(args1.keepalive).toBe(true);
+        expect(args1.pingIntervalMs).toBe(15000);
+        expect(args1.maxPings).toBe(3);
+        expect(args1.pongTimeoutMs).toBe(8000);
+
+        const args2 = parseTransportProbeArgs(["--transport", "ws", "--disable-keepalive"]);
+        expect(args2.transport).toBe("ws");
+        expect(args2.keepalive).toBe(false);
+
+        const args3 = parseTransportProbeArgs(["--transport", "native"]);
+        expect(args3.transport).toBe("native");
+        expect(args3.keepalive).toBeUndefined();
+
+        expect(() => parseTransportProbeArgs(["--transport", "invalid"])).toThrow(
+          "--transport must be 'native' or 'ws'",
+        );
+        expect(() => parseTransportProbeArgs(["--keepalive", "notabool"])).toThrow(
+          "--keepalive must be 'true' or 'false'",
+        );
+      });
     });
   });
 });

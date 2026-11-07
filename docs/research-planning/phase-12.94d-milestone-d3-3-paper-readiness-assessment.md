@@ -622,3 +622,80 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
      - **Live Transaction Fetch Transport Wiring**: Live transaction fetch transport wiring (`getTransaction`) feeding `RaydiumAmmV4TransactionSourceAdapter.ts`.
      - **Authoritative Security & Concentration Provider Acquisition**: Standard RugCheck reports do not define a root bundler concentration field or establish risk label-to-ownership concentration mappings; all unsupported extraction paths have been removed. A pure offline parser module (`SolanaTrackerBundlerParser.ts`, 29 tests) and bounded one-shot operator capture tool (`SolanaTrackerBundlerCaptureTool.ts`, 14 tests) have been implemented and verified offline to validate documented top-level fields (`total`, `balance`, `percentage`, `initialBalance`, `initialPercentage`, `wallets`) from Solana Tracker's `/tokens/{token}/bundlers` response against synthetic fixtures, requiring the `wallets` array (bounded to 500 entries) and validating all 6 documented properties (`wallet`, `balance`, `percentage`, `initialBalance`, `initialPercentage`, `bundleTime`) on every wallet entry. Offline schema validation proves syntactic compliance, but does not establish operator account entitlement (2,500 req/mo Data API Free plan), network latency, rate limits, or observed accuracy against real on-chain launches. The strategy's historical initial-supply intent from Phase 12.86 (blocking deployers bundling >50% of initial supply via Jito) is preserved; evaluating current holdings requires an operator strategy decision. In the absence of an authorized live integration, bundler concentration remains quarantined (`bundlerPct: undefined`), and live evaluation strictly fails closed with `BUNDLER_CONCENTRATION_UNKNOWN` under verified holder requirements. Gate 11 logic is verified independently via synthetic evaluator controls. Live security qualification remains held.
      - **Real Network Latency & Provider Capacity Validation**: Real network latency profiling and provider capacity validation under live market conditions.
+
+## 8. Empirical Transport Observations, Live v1 Decoding Verification & Keepalive Hypothesis
+
+### 8.1 Verification of Sealed Operator Transport Captures
+
+Two bounded operator transport captures executed at commit `6616751` have been independently verified with zero file alterations:
+
+1. **Capture 1 (`2026-11-07T00-39-34.601Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
+   - **Duration**: 80,174 ms (completed cleanly through streaming and discovery phases).
+   - **Ingress Telemetry**: 18 application messages, 8,973 application bytes, peak queue depth 1.
+   - **HTTP RPC Calls**: 4 total HTTP attempts (2 history discovery queries, 2 sampled transaction retrievals).
+   - **Outcome**: Successfully decoded one Solana Version 0 swap.
+   - **Integrity**: Manifest file sizes, SHA-256 hashes, and entries digest verified. Offline decoder replay reproduced recorded results.
+
+2. **Capture 2 (`2026-11-07T00-41-02.221Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
+   - **Duration**: 62,820 ms.
+   - **Ingress Telemetry**: 13 application messages, 6,488 application bytes, peak queue depth 3.
+   - **HTTP RPC Calls**: 3 total HTTP attempts (3 sampled transaction retrievals, 0 history queries due to transport disconnect before discovery).
+   - **Outcome**: Successfully retrieved and decoded one Solana Version 1 swap; correctly rejected two failed on-chain transactions; encountered upstream transport disconnect at 62.8s.
+   - **Integrity**: Manifest file sizes, SHA-256 hashes, and entries digest verified. Offline decoder replay reproduced recorded results.
+
+### 8.2 Milestone: Demonstrated Live Solana Version 1 Retrieval and Swap Decoding
+
+Capture 2 successfully retrieved and decoded signature `gDZqEQSKcxE6a7oinmELh95Vk1dXMn2cauP1LP9vjuU8A3zR1HzyxUXzkoYWfKuKo1qwqvnAsFywnpZAWCQrqGk`:
+
+- **Protocol Structure**: HTTP 200 response with `"version": 1`, inline account keys, empty address table lookups, and valid `transactionConfig`.
+- **Decoding Outcome**: Successfully normalized and decoded as an authentic Raydium AMM v4 BUY transaction of 1,406,466 candidate tokens for 28,073,671 lamports.
+- **Milestone Accepted**: Live on-chain Solana Version 1 transaction retrieval and swap decoding is established and verified offline against retained production RPC responses.
+
+### 8.3 Critical Invariant: Successful HTTP Retrieval vs. Successful Swap Decoding
+
+In Capture 2, all 3 sampled transaction requests returned HTTP 200 from the Solana JSON-RPC provider. However, only 1 transaction was admitted as a decoded swap:
+
+- **Signatures `3xeGSTA...` and `5pUSEvo...`**: Returned HTTP 200 with `meta.err: {"InstructionError":[...]}`.
+- **Fail-Closed Handling**: The decoder verified `meta.err !== null` and correctly rejected both transactions with `DECODE_FAILED [TRANSACTION_FAILED]`. Zero failed events mutated trade flow state.
+- **Architectural Requirement**: Successful HTTP 200 transport retrieval must never be conflated with swap admission or trade ingestion. Transactions that failed on-chain are non-viable trades and must be fail-closed rejected to preserve tracker state integrity.
+
+### 8.4 Empirical Upstream Idle Disconnection Hypothesis
+
+Capture 2 failed at 62,820 ms with an upstream close code 1006 (`TypeError:`). Analysis of message timestamps reveals:
+
+- **Last Message Received**: `1,794,012,065,043` ms epoch.
+- **Transport Disconnect**: `1,794,012,125,041` ms epoch.
+- **Idle Duration**: Exactly **59.998 seconds** of socket inactivity between the last incoming message and socket teardown.
+
+In contrast, Capture 1 sustained intermittent traffic and remained connected for 80,174 ms without disconnection. This observation supports the **hypothesis** that upstream provider infrastructure or intermediate reverse proxies drop idle WebSocket connections near 60 seconds when no application traffic is exchanged. This remains an empirical hypothesis to be evaluated through controlled keepalive experiments, not a declared proven provider defect.
+
+### 8.5 Smallest Optional, Probe-Only RFC 6455 Keepalive Experiment
+
+To empirically test the 60-second idle disconnect hypothesis, a narrow, bounded keepalive experiment has been implemented and verified offline:
+
+1. **Protocol Control Frames Only**:
+   - Sends RFC 6455 PING control frames (opcode 0x9) eliciting standard PONG frames (opcode 0xA).
+   - Zero JSON-RPC `"ping"` strings, zero synthetic RPC requests, and zero undocumented Node.js runtime internals.
+2. **Native Default Preserved**:
+   - Standard `NativeWebSocketTransport` remains untouched and default (`--transport native`).
+   - The `ws` library client is strictly confined to the probe tool and opt-in via `--transport ws`.
+3. **Decoupled Client Evaluation**:
+   - Keepalive can be explicitly disabled on `ws` (`--keepalive false` or `--disable-keepalive`), allowing client library differences to be evaluated separately from heartbeat behavior.
+4. **Bounded Operational Ceilings**:
+   - Default spacing: 20 seconds after connection open (`--ping-interval-ms 20000`).
+   - Maximum pings: At most 4 client PINGs during a 90-second run (`--max-pings 4`).
+   - Payload: 8-byte big-endian epoch timestamp ($\le 125\text{ bytes}$).
+   - Missing-PONG timeout: 10 seconds (`--pong-timeout-ms 10000`). If unacknowledged, fails closed with `TRANSPORT_ERROR` and `missingPongDetected: true`.
+5. **Separated Control Telemetry**:
+   - `TransportDiagnostics` records `clientPingsSentCount`, `clientPongsReceivedCount`, ping/pong timestamps, latency RTT (last, min, max), and control frame byte counts separately from application payload metrics.
+6. **Strict Resource Disposal**:
+   - Client sockets, intervals, and missing-PONG timeouts are forcefully cleaned up and terminated on all normal, timeout, error, and cancellation paths. Verified offline with authentic loopback servers under a strict 5-second deadline.
+
+### 8.6 Invariant Preservation Reaffirmation
+
+All Phase 12.94-D core safety boundaries remain unchanged and active:
+
+- **Production Completeness**: `isProductionCompletenessEstablished = false`. Single-stream WebSocket observation does not prove gapless block coverage or zero dropped notifications.
+- **Virtual Wallet State**: Strictly frozen at 7.9259 SOL (hash `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`).
+- **Spending Ceiling**: Exactly $0.00. Zero live trades, zero signing, zero purchases.
+- **Gate 11 Concentration Safeguard**: Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).

@@ -80,6 +80,7 @@ import {
   deepRedactSensitiveObject,
 } from "./SolanaTrackerBundlerCaptureTool.js";
 import * as diagnostics_channel from "node:diagnostics_channel";
+import WsClient from "ws";
 
 // ============================================================================
 // Constants and Ceilings
@@ -96,6 +97,13 @@ export const MAX_TOTAL_HTTP_ATTEMPTS = 7;
 export const PROBE_MIN_PROVIDER_SPACING_MS = 2500;
 export const DEFAULT_PUBLIC_RPC_URL = "https://api.mainnet-beta.solana.com";
 export const FROZEN_VIRTUAL_WALLET_SOL = "7.9259 SOL";
+
+export type ProbeTransportType = "native" | "ws";
+export const DEFAULT_PROBE_TRANSPORT_TYPE: ProbeTransportType = "native";
+export const DEFAULT_KEEPALIVE_PING_INTERVAL_MS = 20_000;
+export const DEFAULT_KEEPALIVE_MAX_PINGS = 4;
+export const DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS = 10_000;
+export const MAX_KEEPALIVE_PAYLOAD_BYTES = 125;
 
 /**
  * Authentic reference Raydium AMM v4 RAY/WSOL pool context on Solana mainnet.
@@ -157,6 +165,13 @@ export interface TransportProbeConfig {
   readonly clock?: (() => number) | undefined;
   readonly sleepFn?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined;
   readonly streamingDurationMs?: number | undefined;
+
+  // Optional Keepalive Experiment Parameters
+  readonly transportType?: ProbeTransportType | undefined;
+  readonly keepalive?: boolean | undefined;
+  readonly pingIntervalMs?: number | undefined;
+  readonly maxPings?: number | undefined;
+  readonly pongTimeoutMs?: number | undefined;
 }
 
 export interface TransportProbeDryRunResult {
@@ -178,6 +193,11 @@ export interface TransportProbeDryRunResult {
     readonly maxTotalHttpAttempts: number;
     readonly minProviderSpacingMs: number;
     readonly spendingCeiling: string;
+    readonly transportType: ProbeTransportType;
+    readonly keepaliveEnabled: boolean;
+    readonly pingIntervalMs: number | null;
+    readonly maxPings: number | null;
+    readonly pongTimeoutMs: number | null;
   };
   readonly budgetStats: GlobalBudgetStats;
   readonly message: string;
@@ -295,6 +315,30 @@ export interface TransportDiagnostics {
   readonly lastServerPongReceivedAtMs: number | null;
   /** Classification of close origin: UPSTREAM, INTENTIONAL_SHUTDOWN, UNCERTAIN, or NOT_CLOSED */
   readonly observedCloseOrigin: "UPSTREAM" | "INTENTIONAL_SHUTDOWN" | "UNCERTAIN" | "NOT_CLOSED";
+  /** Transport client implementation used for this probe */
+  readonly transportClient: ProbeTransportType;
+  /** Whether client-initiated RFC 6455 keepalive PING frames were enabled */
+  readonly keepaliveEnabled: boolean;
+  /** Number of RFC 6455 client PING frames sent by probe */
+  readonly clientPingsSentCount: number;
+  /** Number of RFC 6455 client PONG frames received in response */
+  readonly clientPongsReceivedCount: number;
+  /** Timestamp when the most recent client PING was sent, or null */
+  readonly lastClientPingSentAtMs: number | null;
+  /** Timestamp when the most recent client PONG was received, or null */
+  readonly lastClientPongReceivedAtMs: number | null;
+  /** Latency / RTT in ms of the most recent PING/PONG exchange, or null */
+  readonly lastPongLatencyMs: number | null;
+  /** Minimum observed PING/PONG latency in ms, or null */
+  readonly minPongLatencyMs: number | null;
+  /** Maximum observed PING/PONG latency in ms, or null */
+  readonly maxPongLatencyMs: number | null;
+  /** True if a client PING timed out without receiving a PONG within pongTimeoutMs */
+  readonly missingPongDetected: boolean;
+  /** Total payload bytes sent in client RFC 6455 control frames */
+  readonly controlFrameBytesSent: number;
+  /** Total payload bytes received in RFC 6455 control frames */
+  readonly controlFrameBytesReceived: number;
 }
 
 export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze({
@@ -320,6 +364,18 @@ export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze
   serverPongsReceivedCount: 0,
   lastServerPongReceivedAtMs: null,
   observedCloseOrigin: "NOT_CLOSED",
+  transportClient: "native",
+  keepaliveEnabled: false,
+  clientPingsSentCount: 0,
+  clientPongsReceivedCount: 0,
+  lastClientPingSentAtMs: null,
+  lastClientPongReceivedAtMs: null,
+  lastPongLatencyMs: null,
+  minPongLatencyMs: null,
+  maxPongLatencyMs: null,
+  missingPongDetected: false,
+  controlFrameBytesSent: 0,
+  controlFrameBytesReceived: 0,
 });
 
 export interface HistoryQueryAuditRecord {
@@ -847,10 +903,146 @@ export function createBoundedFetchTransport(
 }
 
 // ============================================================================
+// Keepalive Transport Interfaces and Implementations
+// ============================================================================
+
+export interface ISolanaKeepaliveWebSocketTransport extends ISolanaWebSocketTransport {
+  ping?(data?: Buffer, cb?: (err?: Error) => void): void;
+  terminate?(): void;
+  destroy?(): void;
+  getUnderlyingSocket?(): unknown;
+  on(event: "open", listener: () => void): void;
+  on(event: "message", listener: (data: string | Buffer) => void): void;
+  on(event: "error", listener: (err: Error) => void): void;
+  on(event: "close", listener: (code: number, reason: string) => void): void;
+  on(event: "pong", listener: (data: Buffer) => void): void;
+  on(event: "ping", listener: (data: Buffer) => void): void;
+}
+
+export class WsWebSocketTransport implements ISolanaKeepaliveWebSocketTransport {
+  private ws: WsClient | null = null;
+  private readonly listeners: {
+    open: (() => void)[];
+    message: ((data: string | Buffer) => void)[];
+    error: ((err: Error) => void)[];
+    close: ((code: number, reason: string) => void)[];
+    pong: ((data: Buffer) => void)[];
+    ping: ((data: Buffer) => void)[];
+  } = {
+    open: [],
+    message: [],
+    error: [],
+    close: [],
+    pong: [],
+    ping: [],
+  };
+
+  constructor(url: string) {
+    this.ws = new WsClient(url);
+
+    this.ws.on("open", () => {
+      for (const listener of [...this.listeners.open]) listener();
+    });
+
+    this.ws.on("message", (data: WsClient.RawData) => {
+      const payload: string | Buffer =
+        typeof data === "string"
+          ? data
+          : Buffer.isBuffer(data)
+            ? data
+            : Array.isArray(data)
+              ? Buffer.concat(data)
+              : Buffer.from(data);
+      for (const listener of [...this.listeners.message]) listener(payload);
+    });
+
+    this.ws.on("error", (err: Error) => {
+      for (const listener of [...this.listeners.error]) listener(err);
+    });
+
+    this.ws.on("close", (code: number, reason: Buffer) => {
+      const reasonStr = reason ? reason.toString("utf8") : "";
+      for (const listener of [...this.listeners.close]) listener(code, reasonStr);
+    });
+
+    this.ws.on("pong", (data: Buffer) => {
+      for (const listener of [...this.listeners.pong]) listener(data);
+    });
+
+    this.ws.on("ping", (data: Buffer) => {
+      for (const listener of [...this.listeners.ping]) listener(data);
+    });
+  }
+
+  public getUnderlyingSocket(): unknown {
+    return this.ws;
+  }
+
+  public send(data: string): void {
+    if (!this.ws || this.ws.readyState !== WsClient.OPEN) {
+      throw new Error("[WEBSOCKET_NOT_OPEN] Cannot send message: socket is not in OPEN state");
+    }
+    this.ws.send(data);
+  }
+
+  public ping(data?: Buffer, cb?: (err?: Error) => void): void {
+    if (!this.ws || this.ws.readyState !== WsClient.OPEN) {
+      throw new Error("[WEBSOCKET_NOT_OPEN] Cannot send ping: socket is not in OPEN state");
+    }
+    this.ws.ping(data, undefined, cb);
+  }
+
+  public close(code?: number, reason?: string): void {
+    if (this.ws) {
+      try {
+        this.ws.close(code ?? 1000, reason ?? "Normal closure");
+      } catch {
+        // ignore if already closed
+      }
+    }
+  }
+
+  public terminate(): void {
+    if (this.ws) {
+      try {
+        this.ws.terminate();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  public destroy(): void {
+    this.terminate();
+    if (this.ws) {
+      try {
+        this.ws.removeAllListeners();
+      } catch {
+        // ignore
+      }
+      this.ws = null;
+    }
+  }
+
+  public on(event: "open", listener: () => void): void;
+  public on(event: "message", listener: (data: string | Buffer) => void): void;
+  public on(event: "error", listener: (err: Error) => void): void;
+  public on(event: "close", listener: (code: number, reason: string) => void): void;
+  public on(event: "pong", listener: (data: Buffer) => void): void;
+  public on(event: "ping", listener: (data: Buffer) => void): void;
+  public on(
+    event: "open" | "message" | "error" | "close" | "pong" | "ping",
+    listener: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+  ): void {
+    this.listeners[event]?.push(listener);
+  }
+}
+
+// ============================================================================
 // Metered WebSocket Transport Wrapper
 // ============================================================================
 
-export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
+export class MeteredWebSocketTransport implements ISolanaKeepaliveWebSocketTransport {
   private readonly inner: ISolanaWebSocketTransport;
   private messageCount = 0;
   private applicationPayloadBytes = 0;
@@ -870,11 +1062,15 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
     message: ((data: string | Buffer) => void)[];
     error: ((err: Error) => void)[];
     close: ((code: number, reason: string) => void)[];
+    pong: ((data: Buffer) => void)[];
+    ping: ((data: Buffer) => void)[];
   } = {
     open: [],
     message: [],
     error: [],
     close: [],
+    pong: [],
+    ping: [],
   };
 
   constructor(
@@ -935,6 +1131,25 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
         listener(code, reason);
       }
     });
+
+    // Forward pong and ping events if underlying transport emits them
+    const keepaliveInner = this.inner as Partial<ISolanaKeepaliveWebSocketTransport>;
+    if (typeof keepaliveInner.on === "function") {
+      try {
+        keepaliveInner.on("pong", (data: Buffer) => {
+          for (const listener of [...this.listeners.pong]) {
+            listener(data);
+          }
+        });
+        keepaliveInner.on("ping", (data: Buffer) => {
+          for (const listener of [...this.listeners.ping]) {
+            listener(data);
+          }
+        });
+      } catch {
+        // ignore if not supported by inner
+      }
+    }
   }
 
   public getMessageCount(): number {
@@ -953,15 +1168,48 @@ export class MeteredWebSocketTransport implements ISolanaWebSocketTransport {
     this.inner.close(code, reason);
   }
 
+  public ping(data?: Buffer, cb?: (err?: Error) => void): void {
+    const keepaliveInner = this.inner as Partial<ISolanaKeepaliveWebSocketTransport>;
+    if (typeof keepaliveInner.ping === "function") {
+      keepaliveInner.ping(data, cb);
+    }
+  }
+
+  public terminate(): void {
+    const keepaliveInner = this.inner as Partial<ISolanaKeepaliveWebSocketTransport>;
+    if (typeof keepaliveInner.terminate === "function") {
+      keepaliveInner.terminate();
+    }
+  }
+
+  public destroy(): void {
+    const keepaliveInner = this.inner as Partial<ISolanaKeepaliveWebSocketTransport>;
+    if (typeof keepaliveInner.destroy === "function") {
+      keepaliveInner.destroy();
+    }
+  }
+
+  public getUnderlyingSocket(): unknown {
+    const keepaliveInner = this.inner as Partial<ISolanaKeepaliveWebSocketTransport>;
+    if (typeof keepaliveInner.getUnderlyingSocket === "function") {
+      return keepaliveInner.getUnderlyingSocket();
+    }
+    return this.inner;
+  }
+
   public on(event: "open", listener: () => void): void;
   public on(event: "message", listener: (data: string | Buffer) => void): void;
   public on(event: "error", listener: (err: Error) => void): void;
   public on(event: "close", listener: (code: number, reason: string) => void): void;
+  public on(event: "pong", listener: (data: Buffer) => void): void;
+  public on(event: "ping", listener: (data: Buffer) => void): void;
   public on(
-    event: "open" | "message" | "error" | "close",
+    event: "open" | "message" | "error" | "close" | "pong" | "ping",
     listener: any, // eslint-disable-line @typescript-eslint/no-explicit-any
   ): void {
-    this.listeners[event].push(listener);
+    if (this.listeners[event]) {
+      this.listeners[event].push(listener);
+    }
   }
 }
 
@@ -1153,6 +1401,67 @@ export async function executeTransportObservationProbe(
     };
   }
 
+  // 2.5. Validate Optional Keepalive and Transport Parameters
+  const transportType: ProbeTransportType = config.transportType ?? DEFAULT_PROBE_TRANSPORT_TYPE;
+  if (transportType !== "native" && transportType !== "ws") {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid transportType: expected 'native' or 'ws', received '${String(transportType)}'`,
+    };
+  }
+
+  if (transportType === "native" && config.keepalive === true) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message:
+        "Invalid configuration: keepalive is not supported on native WebSocket transport. Use --transport ws to enable RFC 6455 keepalive.",
+    };
+  }
+
+  const keepaliveEnabled = transportType === "ws" ? config.keepalive !== false : false;
+
+  const pingIntervalMs = config.pingIntervalMs ?? DEFAULT_KEEPALIVE_PING_INTERVAL_MS;
+  if (
+    typeof pingIntervalMs !== "number" ||
+    !Number.isSafeInteger(pingIntervalMs) ||
+    pingIntervalMs <= 0
+  ) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid pingIntervalMs: expected integer > 0, received ${String(pingIntervalMs)}`,
+    };
+  }
+
+  const maxPings = config.maxPings ?? DEFAULT_KEEPALIVE_MAX_PINGS;
+  if (typeof maxPings !== "number" || !Number.isSafeInteger(maxPings) || maxPings < 0) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid maxPings: expected integer >= 0, received ${String(maxPings)}`,
+    };
+  }
+
+  const pongTimeoutMs = config.pongTimeoutMs ?? DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS;
+  if (
+    typeof pongTimeoutMs !== "number" ||
+    !Number.isSafeInteger(pongTimeoutMs) ||
+    pongTimeoutMs <= 0
+  ) {
+    return {
+      success: false,
+      dryRun: !isLive,
+      status: "INVALID_INPUT",
+      message: `Invalid pongTimeoutMs: expected integer > 0, received ${String(pongTimeoutMs)}`,
+    };
+  }
+
   // Output Directory Boundary Enforcement
   const projectRoot = resolveProjectRoot();
   const baseCapturesDir = path.resolve(
@@ -1221,6 +1530,11 @@ export async function executeTransportObservationProbe(
         maxTotalHttpAttempts: MAX_TOTAL_HTTP_ATTEMPTS,
         minProviderSpacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
         spendingCeiling: "$0.00",
+        transportType,
+        keepaliveEnabled,
+        pingIntervalMs: keepaliveEnabled ? pingIntervalMs : null,
+        maxPings: keepaliveEnabled ? maxPings : null,
+        pongTimeoutMs: keepaliveEnabled ? pongTimeoutMs : null,
       },
       budgetStats: budget.getStats(),
       message: "Dry-run plan validation succeeded. Zero network requests or sockets opened.",
@@ -1264,6 +1578,24 @@ export async function executeTransportObservationProbe(
   let removeCallerSignalListener: (() => void) | undefined;
   let cleanupDiagnosticsChannel: (() => void) | undefined;
 
+  let pingTimer: ReturnType<typeof setTimeout> | undefined;
+  let pongTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingPingTimestamp: number | null = null;
+  let keepaliveDisposed = false;
+
+  const cleanupKeepalive = () => {
+    if (keepaliveDisposed) return;
+    keepaliveDisposed = true;
+    if (pingTimer) {
+      clearTimeout(pingTimer);
+      pingTimer = undefined;
+    }
+    if (pongTimeoutTimer) {
+      clearTimeout(pongTimeoutTimer);
+      pongTimeoutTimer = undefined;
+    }
+  };
+
   const transportDiagnostics = {
     connectedAtMs: null as number | null,
     connectDurationMs: null as number | null,
@@ -1295,6 +1627,18 @@ export async function executeTransportObservationProbe(
       | "INTENTIONAL_SHUTDOWN"
       | "UNCERTAIN"
       | "NOT_CLOSED",
+    transportClient: transportType,
+    keepaliveEnabled,
+    clientPingsSentCount: 0,
+    clientPongsReceivedCount: 0,
+    lastClientPingSentAtMs: null as number | null,
+    lastClientPongReceivedAtMs: null as number | null,
+    lastPongLatencyMs: null as number | null,
+    minPongLatencyMs: null as number | null,
+    maxPongLatencyMs: null as number | null,
+    missingPongDetected: false,
+    controlFrameBytesSent: 0,
+    controlFrameBytesReceived: 0,
   };
 
   const probeState = {
@@ -1306,18 +1650,32 @@ export async function executeTransportObservationProbe(
     isProbeTerminated = true;
     probeActive = false;
     isIntentionalClosure = true;
+    cleanupKeepalive();
     if (reason !== "TRANSPORT_ERROR" && reason !== "TRANSPORT_DISCONNECT") {
       transportDiagnostics.intentionalShutdownInitiated = true;
     }
     const sanitizedCloseMsg = closeMsg ? redactSensitiveText(closeMsg) : undefined;
     transportDiagnostics.localCloseCode = 1000;
     transportDiagnostics.localCloseReason = sanitizedCloseMsg ?? reason;
+    if (reason === "TRANSPORT_ERROR" && transportDiagnostics.firstErrorMessage === null) {
+      transportDiagnostics.firstErrorMessage = sanitizedCloseMsg ?? reason;
+    }
     if (probeState.terminationReason === "UNKNOWN") {
       probeState.terminationReason = reason;
     }
     overallAbortController.abort(new Error(sanitizedCloseMsg ?? reason));
     try {
       meteredTransport?.close(1000, sanitizedCloseMsg ?? reason);
+    } catch {
+      // ignore
+    }
+    try {
+      meteredTransport?.terminate?.();
+    } catch {
+      // ignore
+    }
+    try {
+      (baseTransport as Partial<ISolanaKeepaliveWebSocketTransport> | undefined)?.terminate?.();
     } catch {
       // ignore
     }
@@ -1401,7 +1759,11 @@ export async function executeTransportObservationProbe(
   // Underlying WebSocket Transport
   let baseTransport: ISolanaWebSocketTransport | undefined;
   if (!isProbeTerminated && !overallAbortController.signal.aborted) {
-    baseTransport = config.transport ?? new NativeWebSocketTransport(wsUrl);
+    baseTransport =
+      config.transport ??
+      (transportType === "ws"
+        ? new WsWebSocketTransport(wsUrl)
+        : new NativeWebSocketTransport(wsUrl));
 
     let underlyingWs: unknown = undefined;
     if (
@@ -1484,6 +1846,115 @@ export async function executeTransportObservationProbe(
       maxNotificationsBudget: maxMessages,
       allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
     });
+
+    const sendPing = () => {
+      if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+      if (transportDiagnostics.clientPingsSentCount >= maxPings) return;
+
+      const now = clock();
+      pendingPingTimestamp = now;
+      transportDiagnostics.clientPingsSentCount++;
+      transportDiagnostics.lastClientPingSentAtMs = now;
+
+      // 8-byte epoch timestamp payload (<= 125 bytes)
+      const pingPayload = Buffer.alloc(8);
+      pingPayload.writeBigInt64BE(BigInt(now));
+      transportDiagnostics.controlFrameBytesSent += pingPayload.length;
+
+      try {
+        meteredTransport?.ping?.(pingPayload);
+      } catch (err: unknown) {
+        if (!isProbeTerminated && probeActive) {
+          terminateProbe(
+            "TRANSPORT_ERROR",
+            `Failed to send WebSocket keepalive PING: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        return;
+      }
+
+      // Enforce missing-PONG timeout
+      pongTimeoutTimer = setTimeout(() => {
+        if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+        transportDiagnostics.missingPongDetected = true;
+        terminateProbe(
+          "TRANSPORT_ERROR",
+          `Missing WebSocket keepalive PONG: no response received within ${pongTimeoutMs} ms`,
+        );
+      }, pongTimeoutMs);
+    };
+
+    if (keepaliveEnabled) {
+      meteredTransport.on("open", () => {
+        if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+        pingTimer = setTimeout(() => {
+          sendPing();
+        }, pingIntervalMs);
+      });
+
+      meteredTransport.on("pong", (payload: Buffer) => {
+        const now = clock();
+        const payloadBytes = payload ? payload.length : 0;
+        transportDiagnostics.controlFrameBytesReceived += payloadBytes;
+        transportDiagnostics.clientPongsReceivedCount++;
+        transportDiagnostics.lastClientPongReceivedAtMs = now;
+
+        if (pongTimeoutTimer) {
+          clearTimeout(pongTimeoutTimer);
+          pongTimeoutTimer = undefined;
+        }
+
+        let rtt: number | null = null;
+        if (payload && payload.length >= 8) {
+          try {
+            const sentEpoch = Number(payload.readBigInt64BE(0));
+            if (Number.isSafeInteger(sentEpoch) && sentEpoch > 0 && sentEpoch <= now) {
+              rtt = now - sentEpoch;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (rtt === null && pendingPingTimestamp !== null) {
+          rtt = Math.max(0, now - pendingPingTimestamp);
+        }
+
+        if (rtt !== null) {
+          transportDiagnostics.lastPongLatencyMs = rtt;
+          if (
+            transportDiagnostics.minPongLatencyMs === null ||
+            rtt < transportDiagnostics.minPongLatencyMs
+          ) {
+            transportDiagnostics.minPongLatencyMs = rtt;
+          }
+          if (
+            transportDiagnostics.maxPongLatencyMs === null ||
+            rtt > transportDiagnostics.maxPongLatencyMs
+          ) {
+            transportDiagnostics.maxPongLatencyMs = rtt;
+          }
+        }
+        pendingPingTimestamp = null;
+
+        if (
+          transportDiagnostics.clientPingsSentCount < maxPings &&
+          !keepaliveDisposed &&
+          !isProbeTerminated &&
+          probeActive
+        ) {
+          pingTimer = setTimeout(() => {
+            sendPing();
+          }, pingIntervalMs);
+        }
+      });
+    }
+
+    if (transportType === "ws") {
+      meteredTransport.on("ping", () => {
+        transportDiagnostics.serverPingsReceivedCount++;
+        transportDiagnostics.lastServerPingReceivedAtMs = clock();
+      });
+    }
 
     meteredTransport.on("open", () => {
       if (transportDiagnostics.connectedAtMs === null) {
@@ -2263,6 +2734,12 @@ export async function executeTransportObservationProbe(
 
   removeCallerSignalListener?.();
   cleanupDiagnosticsChannel?.();
+  cleanupKeepalive();
+  try {
+    (baseTransport as Partial<ISolanaKeepaliveWebSocketTransport> | undefined)?.destroy?.();
+  } catch {
+    // ignore
+  }
 
   return {
     success: isObservationSuccess,
@@ -2295,6 +2772,11 @@ export interface TransportProbeCliArgs {
   readonly maxHistoryQueries?: number | undefined;
   readonly maxTransactionRetrievals?: number | undefined;
   readonly help?: boolean | undefined;
+  readonly transport?: ProbeTransportType | undefined;
+  readonly keepalive?: boolean | undefined;
+  readonly pingIntervalMs?: number | undefined;
+  readonly maxPings?: number | undefined;
+  readonly pongTimeoutMs?: number | undefined;
 }
 
 export function parseTransportProbeArgs(argv: readonly string[]): TransportProbeCliArgs {
@@ -2309,6 +2791,11 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
   let maxHistoryQueries: number | undefined;
   let maxTransactionRetrievals: number | undefined;
   let help = false;
+  let transport: ProbeTransportType | undefined;
+  let keepalive: boolean | undefined;
+  let pingIntervalMs: number | undefined;
+  let maxPings: number | undefined;
+  let pongTimeoutMs: number | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -2412,6 +2899,61 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
         );
       }
       maxTransactionRetrievals = parsed;
+    } else if (arg === "--transport") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --transport");
+      }
+      const val = next.trim().toLowerCase();
+      if (val !== "native" && val !== "ws") {
+        throw new Error(`--transport must be 'native' or 'ws', received '${next}'`);
+      }
+      transport = val as ProbeTransportType;
+    } else if (arg === "--keepalive") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --keepalive");
+      }
+      const val = next.trim().toLowerCase();
+      if (val === "true" || val === "1") {
+        keepalive = true;
+      } else if (val === "false" || val === "0") {
+        keepalive = false;
+      } else {
+        throw new Error(`--keepalive must be 'true' or 'false', received '${next}'`);
+      }
+    } else if (arg === "--disable-keepalive" || arg === "--no-keepalive") {
+      keepalive = false;
+    } else if (arg === "--ping-interval-ms") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --ping-interval-ms");
+      }
+      const parsed = Number(next);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new Error(`--ping-interval-ms must be a positive integer, received '${next}'`);
+      }
+      pingIntervalMs = parsed;
+    } else if (arg === "--max-pings") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --max-pings");
+      }
+      const parsed = Number(next);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new Error(`--max-pings must be a non-negative integer, received '${next}'`);
+      }
+      maxPings = parsed;
+    } else if (arg === "--pong-timeout-ms") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing argument value for --pong-timeout-ms");
+      }
+      const parsed = Number(next);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new Error(`--pong-timeout-ms must be a positive integer, received '${next}'`);
+      }
+      pongTimeoutMs = parsed;
     } else {
       throw new Error(`Unrecognized argument: '${arg}'`);
     }
@@ -2429,5 +2971,10 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
     maxHistoryQueries,
     maxTransactionRetrievals,
     help,
+    transport,
+    keepalive,
+    pingIntervalMs,
+    maxPings,
+    pongTimeoutMs,
   };
 }

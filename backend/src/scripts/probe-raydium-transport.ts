@@ -52,6 +52,12 @@ OPTIONS:
   --max-queue-depth <count>    Maximum active queue depth (1..${MAX_QUEUE_DEPTH_LIMIT}, default: ${MAX_QUEUE_DEPTH_LIMIT})
   --max-history-queries <cnt>  Maximum bounded history RPC queries (1..${MAX_HISTORY_QUERIES_LIMIT}, default: ${MAX_HISTORY_QUERIES_LIMIT})
   --max-tx-retrievals <count>  Maximum sampled transaction retrievals (1..${MAX_TRANSACTION_RETRIEVALS_LIMIT}, default: ${MAX_TRANSACTION_RETRIEVALS_LIMIT})
+  --transport <native|ws>      WebSocket transport client implementation (native [default] or ws)
+  --keepalive <true|false>     Enable/disable RFC 6455 keepalive PING control frames on ws transport (default: true for ws, unsupported on native)
+  --disable-keepalive          Disable RFC 6455 keepalive on ws transport
+  --ping-interval-ms <ms>      Keepalive PING interval in milliseconds (default: 20000)
+  --max-pings <count>          Maximum keepalive PINGs to send (default: 4)
+  --pong-timeout-ms <ms>       Missing-PONG timeout in milliseconds (default: 10000)
   -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
@@ -101,6 +107,11 @@ async function main(): Promise<void> {
       maxQueueDepth: args.maxQueueDepth,
       maxHistoryQueries: args.maxHistoryQueries,
       maxTransactionRetrievals: args.maxTransactionRetrievals,
+      transportType: args.transport,
+      keepalive: args.keepalive,
+      pingIntervalMs: args.pingIntervalMs,
+      maxPings: args.maxPings,
+      pongTimeoutMs: args.pongTimeoutMs,
       signal: abortController.signal,
     });
   } finally {
@@ -193,7 +204,29 @@ async function main(): Promise<void> {
       if (td.lastServerPingReceivedAtMs !== null) {
         console.log(`Last Server Ping (ms):     ${td.lastServerPingReceivedAtMs}`);
       }
-      console.log(`Closure Origin:           ${td.observedCloseOrigin}`);
+      console.log(`Transport Client:          ${td.transportClient}`);
+      console.log(`Keepalive Enabled:         ${td.keepaliveEnabled}`);
+      if (td.keepaliveEnabled) {
+        console.log(`Client Pings Sent:         ${td.clientPingsSentCount}`);
+        console.log(`Client Pongs Received:     ${td.clientPongsReceivedCount}`);
+        if (td.lastClientPingSentAtMs !== null) {
+          console.log(`Last Ping Sent (ms):       ${td.lastClientPingSentAtMs}`);
+        }
+        if (td.lastClientPongReceivedAtMs !== null) {
+          console.log(`Last Pong Received (ms):   ${td.lastClientPongReceivedAtMs}`);
+        }
+        if (td.lastPongLatencyMs !== null) {
+          console.log(`Last Pong RTT:             ${td.lastPongLatencyMs} ms`);
+          console.log(
+            `Min/Max Pong RTT:          ${td.minPongLatencyMs} / ${td.maxPongLatencyMs} ms`,
+          );
+        }
+        console.log(`Missing Pong Detected:     ${td.missingPongDetected}`);
+        console.log(
+          `Control Frame Bytes:       Sent: ${td.controlFrameBytesSent}, Recv: ${td.controlFrameBytesReceived}`,
+        );
+      }
+      console.log(`Closure Origin:            ${td.observedCloseOrigin}`);
     }
 
     if (

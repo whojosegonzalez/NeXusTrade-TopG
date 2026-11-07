@@ -43,12 +43,18 @@ importers:
       "@solana/web3.js":
         specifier: ^3.1.1
         version: 3.1.1(typescript@5.9.3)
+      "@types/ws":
+        specifier: ^8.18.2
+        version: 8.18.2
       better-sqlite3:
         specifier: ^12.11.1
         version: 12.11.1
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(@types/better-sqlite3@7.6.13)(better-sqlite3@12.11.1)
+      ws:
+        specifier: ^8.22.1
+        version: 8.22.1
       zod:
         specifier: ^3.25.57
         version: 3.25.76
@@ -2298,6 +2304,12 @@ packages:
         integrity: sha512-AnzbBERsrLKtk2XSfTbYRLjQPdy116Sty4q+T+Bp3IC4l6jNBvreVPAHmpq9qhXQM7CXZPjLVmGMw9sy+hxQ3w==,
       }
 
+  "@types/ws@8.18.2":
+    resolution:
+      {
+        integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==,
+      }
+
   "@typescript-eslint/eslint-plugin@8.61.1":
     resolution:
       {
@@ -4445,6 +4457,21 @@ packages:
       utf-8-validate:
         optional: true
 
+  ws@8.22.1:
+    resolution:
+      {
+        integrity: sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==,
+      }
+    engines: { node: ">=10.0.0" }
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: ">=5.0.2"
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
   xml-name-validator@5.0.0:
     resolution:
       {
@@ -5429,7 +5456,7 @@ snapshots:
       "@solana/functional": 8.5.0(typescript@5.9.3)
       "@solana/rpc-subscriptions-spec": 8.5.0(typescript@5.9.3)
       "@solana/subscribable": 8.5.0(typescript@5.9.3)
-      ws: 8.21.3
+      ws: 8.22.1
     optionalDependencies:
       typescript: 5.9.3
     transitivePeerDependencies:
@@ -5723,6 +5750,10 @@ snapshots:
   "@types/react@19.2.18":
     dependencies:
       csstype: 3.2.3
+
+  "@types/ws@8.18.2":
+    dependencies:
+      "@types/node": 24.13.2
 
   "@typescript-eslint/eslint-plugin@8.61.1(@typescript-eslint/parser@8.61.1(eslint@9.39.4)(typescript@5.9.3))(eslint@9.39.4)(typescript@5.9.3)":
     dependencies:
@@ -6971,6 +7002,8 @@ snapshots:
   wrappy@1.0.2: {}
 
   ws@8.21.3: {}
+
+  ws@8.22.1: {}
 
   xml-name-validator@5.0.0: {}
 
