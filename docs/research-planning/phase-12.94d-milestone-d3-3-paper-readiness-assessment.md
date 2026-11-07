@@ -698,24 +698,24 @@ Two operator transport captures executed at commit `5eb023d` were independently 
 1. **Capture 1 (`2026-11-07T02-37-38.359Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
    - **Command**: `--live --transport ws --keepalive true --duration-ms 90000 --max-queue-depth 10`.
    - **Duration**: 3,089 ms.
-   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 45,958 application bytes, 12 witnessed signatures.
+   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 22,366 application bytes, 12 witnessed signatures.
    - **Queue Telemetry**: Peak queue depth reached 10; 1 queue rejection recorded; terminated with `QUEUE_LIMIT_EXCEEDED` (`status: "QUEUE_OVERFLOW"`).
-   - **HTTP RPC Calls**: 1 sampled transaction retrieval dispatched before queue limit trip; returned HTTP 200 with on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`). Correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`. Zero history queries attempted.
+   - **HTTP RPC Calls**: Two HTTP transaction requests—one completed HTTP-200 response containing an on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`), correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`, and one request cancelled during shutdown. Zero history queries attempted.
    - **Keepalive Telemetry**: 0 client PINGs sent (`clientPingsSentCount: 0`). The 20-second heartbeat timer did not fire before termination at 3.089 seconds.
    - **Keepalive Assessment**: **INCONCLUSIVE / NOT EXERCISED**.
 
 2. **Capture 2 (`2026-11-07T02-38-37.152Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
    - **Command**: `--live --transport ws --keepalive true --duration-ms 90000 --max-queue-depth 10`.
    - **Duration**: 2,920 ms.
-   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 45,960 application bytes, 12 witnessed signatures.
+   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 21,631 application bytes, 12 witnessed signatures.
    - **Queue Telemetry**: Peak queue depth reached 10; 1 queue rejection recorded; terminated with `QUEUE_LIMIT_EXCEEDED` (`status: "QUEUE_OVERFLOW"`).
-   - **HTTP RPC Calls**: 1 sampled transaction retrieval dispatched before queue limit trip; returned HTTP 200 with on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`). Correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`. Zero history queries attempted.
+   - **HTTP RPC Calls**: One HTTP transaction request; returned HTTP 200 with on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`), correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`. Zero history queries attempted.
    - **Keepalive Telemetry**: 0 client PINGs sent (`clientPingsSentCount: 0`). Terminated at 2.920 seconds before first heartbeat.
    - **Keepalive Assessment**: **INCONCLUSIVE / NOT EXERCISED**.
 
 #### Root Cause Analysis: Transaction Backlog Preemption
 
-The authentic reference Raydium AMM v4 pool (`AVs9TA4n...`) experiences bursty high-frequency trading activity, generating multiple transaction log notifications per second. Because transaction retrieval is paced at $\ge 2,500\text{ ms}$ spacing to respect public RPC rate limits, incoming notifications accumulate faster than worker retrieval capacity ($12\text{ notifications in } \approx 3\text{ seconds}$ vs. $1\text{ retrieval per } 2.5\text{ seconds}$). The `maxQueueDepth: 10` safeguard functioned as designed by halting execution to prevent unbounded memory growth, but this queue overflow prematurely halted the probe before the 20-second RFC 6455 keepalive cycle could be exercised.
+The authentic reference Raydium AMM v4 pool (`AVs9TA4n...`) experiences bursty high-frequency trading activity, generating multiple transaction log notifications per second. Because transaction retrieval is paced at $\ge 2,500\text{ ms}$ spacing under our configured pacing constraint (these captures did not demonstrate an API rate-limit response), incoming notifications accumulate faster than worker retrieval capacity ($12\text{ notifications in } \approx 3\text{ seconds}$ vs. $1\text{ retrieval per } 2.5\text{ seconds}$). The `maxQueueDepth: 10` safeguard functioned as designed by halting execution to prevent unbounded memory growth, but this queue overflow prematurely halted the probe before the 20-second RFC 6455 keepalive cycle could be exercised.
 
 #### Architectural Remedy: Opt-In Transport-Only Mode (`--transport-only`)
 
