@@ -61,6 +61,14 @@ import type { SubscriptionCommitment } from "../research/pilot/EventDiscoveryCon
 import { RAYDIUM_AMM_V4_PROGRAM_ID } from "../research/pilot/RaydiumAmmParser.js";
 import { RAYDIUM_CPMM_PROGRAM_ID } from "../research/pilot/RaydiumCpmmParser.js";
 import type { RetestSpotInfo } from "./RetestGateEvaluator.js";
+import type { ExactPoolHistoryEnumerator } from "./ExactPoolHistoryEnumerator.js";
+import type { ExactPoolTransactionResolutionBridge } from "./ExactPoolTransactionResolutionBridge.js";
+import {
+  evaluateExactPoolWindowReconciliation,
+  type SourceCutoffEvidence,
+  type WindowReconciliationResult,
+} from "./ExactPoolWindowReconciliationEvaluator.js";
+import type { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 
 export type SubscriptionCoordinatorStatus =
   | "DISCONNECTED"
@@ -132,6 +140,17 @@ export interface CoordinatorMetrics {
   readonly totalCoverageAdvancesRejected: number;
 }
 
+export interface CandidateWindowReconciliationOptions {
+  readonly knownAnchorSignature: string;
+  readonly historyEnumerator: ExactPoolHistoryEnumerator;
+  readonly resolutionBridge: ExactPoolTransactionResolutionBridge;
+  readonly decisionTimestampMs?: number | undefined;
+  readonly observationStartMs?: number | undefined;
+  readonly observationEndMs?: number | undefined;
+  readonly budgetManager?: GlobalResourceBudgetManager | undefined;
+  readonly hasActiveBacklog?: boolean | undefined;
+}
+
 export interface CoordinatorCoverageDiagnostic {
   readonly poolId: string;
   readonly tokenMint: string;
@@ -150,6 +169,7 @@ export interface CoordinatorCoverageDiagnostic {
   readonly adapterInFlightCount: number;
   readonly adapterActiveWorkload: number;
   readonly metrics: CoordinatorMetrics;
+  readonly lastReconciliationResult?: WindowReconciliationResult | undefined;
 }
 
 export class RaydiumCandidateSubscriptionCoordinator {
@@ -171,6 +191,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
   private pendingRequestEpoch: number | null = null;
   private disconnectedAtMs: number | null = null;
   private nextRequestId = 1;
+  private lastReconciliationResult?: WindowReconciliationResult | undefined;
 
   // Bounded metrics counters
   private totalNotificationsReceived = 0;
@@ -1267,7 +1288,157 @@ export class RaydiumCandidateSubscriptionCoordinator {
       adapterInFlightCount: this.adapter.getInFlightCount(),
       adapterActiveWorkload: this.adapter.getActiveWorkload(),
       metrics: this.getMetrics(),
+      lastReconciliationResult: this.lastReconciliationResult,
     });
+  }
+
+  /**
+   * Orchestrates provider-relative exact-pool window reconciliation for research and diagnostics.
+   *
+   * Asynchronous research orchestration:
+   * 1. Validates candidate pool binding and initial active subscription state.
+   * 2. Awaits ExactPoolHistoryEnumerator.enumerate(), verifying connection epoch and active status.
+   * 3. Awaits ExactPoolTransactionResolutionBridge.resolve(), which ingests discovered swaps into tracker.
+   * 4. Evaluates the cutoff-anchored research window [T_cutoff - 60s, T_cutoff] using evaluateExactPoolWindowReconciliation.
+   *
+   * Note: Production flow getters (createRetestSpotInfo, evaluateFlow) remain synchronous,
+   * perform zero network dispatch or reconciliation, and fail closed with unavailable counts.
+   */
+  public async reconcileCandidateWindow(
+    sourceCutoff: SourceCutoffEvidence,
+    options: CandidateWindowReconciliationOptions,
+  ): Promise<WindowReconciliationResult> {
+    const initialEpoch = this.connectionEpoch;
+    const initialStatus = this.status;
+    const now = this.clock();
+
+    // 1. Validate identity binding for candidate pool and mint
+    if (sourceCutoff.provenance === "ON_CHAIN_BLOCK_TIME") {
+      if (
+        sourceCutoff.sourceMethod === "getSignaturesForAddress" &&
+        sourceCutoff.requestContext?.address &&
+        sourceCutoff.requestContext.address !== this.poolContext.poolId
+      ) {
+        return evaluateExactPoolWindowReconciliation({
+          poolContext: this.poolContext,
+          decisionTimestampMs: options.decisionTimestampMs ?? now,
+          observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+          observationEndMs: options.observationEndMs ?? now,
+          sourceCutoff,
+          budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+          clock: this.clock,
+        });
+      }
+    }
+
+    // 2. Pre-await lifecycle validation: must be actively SUBSCRIBED
+    if (initialStatus !== "SUBSCRIBED" || this.activeSubscriptionId === null) {
+      return evaluateExactPoolWindowReconciliation({
+        poolContext: this.poolContext,
+        decisionTimestampMs: options.decisionTimestampMs ?? now,
+        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: options.observationEndMs ?? now,
+        sourceCutoff,
+        tracker: this.tracker,
+        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        clock: this.clock,
+        recordedGaps: [
+          {
+            gapStartMs: Math.min(now, sourceCutoff.cutoffTimestampMs - 1),
+            gapEndMs: Math.max(now + 1, sourceCutoff.cutoffTimestampMs),
+            reason: `COORDINATOR_NOT_SUBSCRIBED (${initialStatus})`,
+          },
+        ],
+      });
+    }
+
+    // 3. Await history enumeration
+    const historyResult = await options.historyEnumerator.enumerate();
+
+    // 4. Post-history await lifecycle check: detect disconnect or epoch change during await
+    if (this.connectionEpoch !== initialEpoch || this.status !== "SUBSCRIBED") {
+      const postEnumNow = this.clock();
+      return evaluateExactPoolWindowReconciliation({
+        poolContext: this.poolContext,
+        decisionTimestampMs: options.decisionTimestampMs ?? postEnumNow,
+        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: options.observationEndMs ?? postEnumNow,
+        sourceCutoff,
+        historyResult,
+        tracker: this.tracker,
+        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        clock: this.clock,
+        recordedGaps: [
+          {
+            gapStartMs: Math.min(
+              this.disconnectedAtMs ?? postEnumNow - 1,
+              sourceCutoff.cutoffTimestampMs - 1,
+            ),
+            gapEndMs: Math.max(postEnumNow + 1, sourceCutoff.cutoffTimestampMs),
+            reason: "LIFECYCLE_CANCELLED_DURING_ENUMERATION",
+          },
+        ],
+      });
+    }
+
+    // 5. Await transaction resolution (ingests discovered swaps into tracker)
+    const resolutionResult = await options.resolutionBridge.resolve(historyResult);
+
+    // 6. Post-resolution await lifecycle check: detect disconnect or epoch change during await
+    if (this.connectionEpoch !== initialEpoch || this.status !== "SUBSCRIBED") {
+      const postResNow = this.clock();
+      return evaluateExactPoolWindowReconciliation({
+        poolContext: this.poolContext,
+        decisionTimestampMs: options.decisionTimestampMs ?? postResNow,
+        observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+        observationEndMs: options.observationEndMs ?? postResNow,
+        sourceCutoff,
+        historyResult,
+        resolutionResult,
+        tracker: this.tracker,
+        hasActiveBacklog: options.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
+        budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+        clock: this.clock,
+        recordedGaps: [
+          {
+            gapStartMs: Math.min(
+              this.disconnectedAtMs ?? postResNow - 1,
+              sourceCutoff.cutoffTimestampMs - 1,
+            ),
+            gapEndMs: Math.max(postResNow + 1, sourceCutoff.cutoffTimestampMs),
+            reason: "LIFECYCLE_CANCELLED_DURING_RESOLUTION",
+          },
+        ],
+      });
+    }
+
+    // 7. Evaluate using decision timestamp at which evidence is actually available
+    const decisionTimestampMs = options.decisionTimestampMs ?? this.clock();
+    const observationEndMs = options.observationEndMs ?? decisionTimestampMs;
+    const hasActiveBacklog =
+      options.hasActiveBacklog !== undefined
+        ? options.hasActiveBacklog
+        : this.adapter.getPendingQueueLength() > 0;
+
+    const reconciliationResult = evaluateExactPoolWindowReconciliation({
+      poolContext: this.poolContext,
+      decisionTimestampMs,
+      observationStartMs: options.observationStartMs ?? this.tracker.getTrackingStartedMs(),
+      observationEndMs,
+      sourceCutoff,
+      historyResult,
+      resolutionResult,
+      tracker: this.tracker,
+      hasActiveBacklog,
+      knownAnchorSignature: options.knownAnchorSignature,
+      budgetManager: options.budgetManager ?? this.adapter.getBudgetManager(),
+      clock: this.clock,
+    });
+
+    this.lastReconciliationResult = reconciliationResult;
+    return reconciliationResult;
   }
 
   /**

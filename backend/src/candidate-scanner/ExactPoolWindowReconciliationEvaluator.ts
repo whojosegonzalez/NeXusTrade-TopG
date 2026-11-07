@@ -933,6 +933,10 @@ export function evaluateExactPoolWindowReconciliation(
   }
 
   for (const gap of gaps) {
+    // Transaction resolution failures (SOURCE_ADAPTER_LOSS) are evaluated downstream under resolution evidence (UNRESOLVED_TRANSACTIONS)
+    if (gap.reason?.startsWith("SOURCE_ADAPTER_LOSS:")) {
+      continue;
+    }
     if (gap.gapStartMs < windowEndMs && gap.gapEndMs > windowStartMs) {
       return buildResult(
         "STREAM_GAP",
