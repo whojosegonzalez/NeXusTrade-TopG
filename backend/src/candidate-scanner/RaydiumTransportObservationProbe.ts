@@ -169,7 +169,7 @@ export interface TransportProbeConfig {
   readonly sleepFn?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined;
   readonly streamingDurationMs?: number | undefined;
 
-  // Optional Keepalive Experiment Parameters
+  // Optional Keepalive and Transport-Only Experiment Parameters
   readonly transportType?: ProbeTransportType | undefined;
   readonly keepalive?: boolean | undefined;
   readonly pingIntervalMs?: number | undefined;
@@ -177,6 +177,7 @@ export interface TransportProbeConfig {
   readonly pongTimeoutMs?: number | undefined;
   readonly maxControlFrames?: number | undefined;
   readonly maxControlFrameBytes?: number | undefined;
+  readonly transportOnly?: boolean | undefined;
 }
 
 export interface TransportProbeDryRunResult {
@@ -205,6 +206,7 @@ export interface TransportProbeDryRunResult {
     readonly pongTimeoutMs: number | null;
     readonly maxControlFrames: number | null;
     readonly maxControlFrameBytes: number | null;
+    readonly transportOnly: boolean;
   };
   readonly budgetStats: GlobalBudgetStats;
   readonly message: string;
@@ -244,6 +246,9 @@ export type TransportProbeResult =
 
 export interface TransportProbeMetadata {
   readonly probeVersion: "1.0";
+  readonly executionMode: "FULL_PROBE" | "TRANSPORT_ONLY";
+  readonly transportOnly: boolean;
+  readonly zeroHttpDispatchesEnforced: boolean;
   readonly poolId: string;
   readonly candidateTokenMint: string;
   readonly quoteTokenMint: string;
@@ -433,6 +438,9 @@ export interface TransportProbeSummary {
   readonly status: TransportProbeStatus;
   readonly observationSuccess: boolean;
   readonly terminationReason: TransportProbeTerminationReason;
+  readonly executionMode: "FULL_PROBE" | "TRANSPORT_ONLY";
+  readonly transportOnly: boolean;
+  readonly zeroHttpDispatchesEnforced: boolean;
   readonly durationMs: number;
   readonly timing: {
     readonly startTimeIso: string;
@@ -1320,6 +1328,7 @@ export async function executeTransportObservationProbe(
 ): Promise<TransportProbeResult> {
   const clock = config.clock ?? (() => Date.now());
   const isLive = config.isLive === true;
+  const transportOnly = config.transportOnly === true;
 
   // 1. Validate Candidate Pool Context (Strictly bound to reference RAY/WSOL)
   const poolContext = config.poolContext ?? DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT;
@@ -1599,6 +1608,7 @@ export async function executeTransportObservationProbe(
         pongTimeoutMs: keepaliveEnabled ? pongTimeoutMs : null,
         maxControlFrames: keepaliveEnabled ? maxControlFrames : null,
         maxControlFrameBytes: keepaliveEnabled ? maxControlFrameBytes : null,
+        transportOnly,
       },
       budgetStats: budget.getStats(),
       message: "Dry-run plan validation succeeded. Zero network requests or sockets opened.",
@@ -2252,6 +2262,15 @@ export async function executeTransportObservationProbe(
       }
     }
 
+    if (transportOnly) {
+      // In transport-only mode, bypass adapter queueing and transaction retrieval
+      return {
+        ok: true,
+        signature: notif.signature,
+        queued: true,
+      };
+    }
+
     const enqueueRes = originalEnqueue(notif);
 
     if (!enqueueRes.ok && enqueueRes.reason === "QUEUE_OVERFLOW") {
@@ -2273,9 +2292,31 @@ export async function executeTransportObservationProbe(
     terminateProbe("DURATION_EXPIRED", "Probe duration expired");
   }, durationMs);
 
+  // Allocate streaming duration within overall maximum
+  const reconciliationReservationMs = transportOnly
+    ? 0
+    : Math.min(10_000, Math.floor(durationMs * 0.2));
+  const streamingDurationMs =
+    config.streamingDurationMs ?? Math.max(1, durationMs - reconciliationReservationMs);
+
+  let streamingTimer: ReturnType<typeof setTimeout> | undefined;
+  const streamingPhasePromise = new Promise<void>((resolve) => {
+    streamingTimer = setTimeout(() => {
+      resolve();
+    }, streamingDurationMs);
+    overallAbortController.signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+
   // Drain Queue Worker Loop
   let transactionRetrievalsReserved = 0;
   const drainWorker = async () => {
+    if (transportOnly) {
+      // In transport-only mode, zero transactions are retrieved.
+      // Await streaming phase completion without exiting early.
+      await streamingPhasePromise;
+      return;
+    }
+
     while (!overallAbortController.signal.aborted) {
       const remainingMs = overallDeadlineEpoch - clock();
       if (remainingMs <= 0) {
@@ -2359,19 +2400,6 @@ export async function executeTransportObservationProbe(
 
   const drainWorkerPromise = drainWorker();
 
-  // Allocate streaming duration within overall maximum
-  const reconciliationReservationMs = Math.min(10_000, Math.floor(durationMs * 0.2));
-  const streamingDurationMs =
-    config.streamingDurationMs ?? Math.max(1, durationMs - reconciliationReservationMs);
-
-  let streamingTimer: ReturnType<typeof setTimeout> | undefined;
-  const streamingPhasePromise = new Promise<void>((resolve) => {
-    streamingTimer = setTimeout(() => {
-      resolve();
-    }, streamingDurationMs);
-    overallAbortController.signal.addEventListener("abort", () => resolve(), { once: true });
-  });
-
   // Race streaming phase against drain worker
   await Promise.race([streamingPhasePromise, drainWorkerPromise]);
 
@@ -2388,9 +2416,16 @@ export async function executeTransportObservationProbe(
     isIntentionalClosure = true;
     transportDiagnostics.intentionalShutdownInitiated = true;
     transportDiagnostics.localCloseCode = 1000;
-    transportDiagnostics.localCloseReason = "Streaming phase complete; proceeding to discovery";
+    transportDiagnostics.localCloseReason = transportOnly
+      ? "Streaming phase complete (transport-only)"
+      : "Streaming phase complete; proceeding to discovery";
     coordinator?.close();
-    meteredTransport?.close(1000, "Streaming phase complete; proceeding to discovery");
+    meteredTransport?.close(
+      1000,
+      transportOnly
+        ? "Streaming phase complete (transport-only)"
+        : "Streaming phase complete; proceeding to discovery",
+    );
   }
 
   // Settle any remaining queued transaction retrieval work within deadline
@@ -2399,7 +2434,9 @@ export async function executeTransportObservationProbe(
   // 9. Bounded History Discovery Phase (Strictly within overall deadline)
   let historyQueriesAttempted = 0;
   let historyRecordsDiscovered = 0;
-  let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = "NOT_ATTEMPTED";
+  let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
+    ? "NOT_ATTEMPTED_TRANSPORT_ONLY"
+    : "NOT_ATTEMPTED";
   let historyDiscoveryDurationMs: number | null = null;
   let anchorWitnessed = false;
   let anchorSignature: string | null = null;
@@ -2411,6 +2448,7 @@ export async function executeTransportObservationProbe(
 
   const remainingForDiscovery = overallDeadlineEpoch - clock();
   const canRunDiscovery =
+    !transportOnly &&
     remainingForDiscovery > 10 &&
     !overallAbortController.signal.aborted &&
     probeState.terminationReason !== "TRANSPORT_ERROR" &&
@@ -2622,7 +2660,7 @@ export async function executeTransportObservationProbe(
       historyDiscoveryDurationMs = clock() - discoveryStartTime;
       historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
     }
-  } else {
+  } else if (!transportOnly) {
     if (clock() >= overallDeadlineEpoch) {
       historyDiscoveryOutcome = "OPERATION_DEADLINE_EXCEEDED";
     } else if (overallAbortController.signal.aborted) {
@@ -2714,8 +2752,9 @@ export async function executeTransportObservationProbe(
     wsWitnessedList.length - transactionRetrievalsAttempted,
   );
 
-  const comparisonNotice =
-    "Discrepancies represent differences between signatures actually witnessed through the single live WebSocket stream and up to 2 bounded history RPC pages. Signatures observed by WebSocket but not retrieved in the 5 sampled transactions are unretrieved sample signatures, not lost transactions. This does NOT represent a true total network notification-loss percentage.";
+  const comparisonNotice = transportOnly
+    ? "Transaction retrieval and history discovery skipped in transport-only mode. Witnessed signatures represent inbound WebSocket notifications recorded without HTTP RPC verification."
+    : "Discrepancies represent differences between signatures actually witnessed through the single live WebSocket stream and up to 2 bounded history RPC pages. Signatures observed by WebSocket but not retrieved in the 5 sampled transactions are unretrieved sample signatures, not lost transactions. This does NOT represent a true total network notification-loss percentage.";
 
   const endTime = clock();
   const endTimeIso = new Date(endTime).toISOString();
@@ -2736,6 +2775,9 @@ export async function executeTransportObservationProbe(
   // 11. Construct Metadata & Summary Evidence Artifacts
   const metadata: TransportProbeMetadata = Object.freeze({
     probeVersion: "1.0",
+    executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
+    transportOnly,
+    zeroHttpDispatchesEnforced: transportOnly,
     poolId: poolContext.poolId,
     candidateTokenMint: poolContext.candidateTokenMint,
     quoteTokenMint: poolContext.quoteTokenMint,
@@ -2753,20 +2795,21 @@ export async function executeTransportObservationProbe(
       overshootBytes,
       peakQueueDepth,
       queueRejectionsCount,
-      decodedSwapsCount,
-      transactionRetrievalsAttempted,
-      transactionRetrievalsSucceeded,
-      historyQueriesAttempted,
-      historySignaturesDiscovered: historyRecordsDiscovered,
-      nullBlockTimeCount,
+      decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
+      transactionRetrievalsAttempted: transportOnly ? 0 : transactionRetrievalsAttempted,
+      transactionRetrievalsSucceeded: transportOnly ? 0 : transactionRetrievalsSucceeded,
+      historyQueriesAttempted: transportOnly ? 0 : historyQueriesAttempted,
+      historySignaturesDiscovered: transportOnly ? 0 : historyRecordsDiscovered,
+      nullBlockTimeCount: transportOnly ? 0 : nullBlockTimeCount,
     },
     budgetStatus: budget.getStats(),
     isProductionCompletenessEstablished: false as const,
     gate11Status: "UNAFFECTED_FAIL_CLOSED" as const,
     virtualWalletBalanceSol: FROZEN_VIRTUAL_WALLET_SOL as "7.9259 SOL",
     spendingCeiling: "$0.00" as const,
-    disclaimer:
-      "Transport characterization evidence only. Production rolling-flow completeness remains unverified and unavailable.",
+    disclaimer: transportOnly
+      ? "Transport-only characterization evidence. Transaction retrieval, trade flow evaluation, and history discovery were disabled. Production rolling-flow completeness remains unverified and unavailable."
+      : "Transport characterization evidence only. Production rolling-flow completeness remains unverified and unavailable.",
     transportDiagnostics: frozenTransportDiagnostics,
   });
 
@@ -2778,6 +2821,9 @@ export async function executeTransportObservationProbe(
     status: finalStatus,
     observationSuccess: isObservationSuccess,
     terminationReason: finalTerminationReason,
+    executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
+    transportOnly,
+    zeroHttpDispatchesEnforced: transportOnly,
     durationMs: actualDurationMs,
     timing: {
       startTimeIso,
@@ -2812,10 +2858,10 @@ export async function executeTransportObservationProbe(
       },
     },
     tradeFlowTelemetry: {
-      decodedSwapsCount,
-      recentBuys: flowEval.recentBuys60s,
-      recentSells: flowEval.recentSells60s,
-      flowCoverageStatus: flowEval.coverage,
+      decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
+      recentBuys: transportOnly ? null : flowEval.recentBuys60s,
+      recentSells: transportOnly ? null : flowEval.recentSells60s,
+      flowCoverageStatus: transportOnly ? "NOT_EVALUATED_TRANSPORT_ONLY" : flowEval.coverage,
       isProductionCompletenessEstablished: false as const,
     },
     reconciliationTelemetry: {
@@ -2963,6 +3009,7 @@ export interface TransportProbeCliArgs {
   readonly pongTimeoutMs?: number | undefined;
   readonly maxControlFrames?: number | undefined;
   readonly maxControlFrameBytes?: number | undefined;
+  readonly transportOnly?: boolean | undefined;
 }
 
 export function parseTransportProbeArgs(argv: readonly string[]): TransportProbeCliArgs {
@@ -2984,6 +3031,7 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
   let pongTimeoutMs: number | undefined;
   let maxControlFrames: number | undefined;
   let maxControlFrameBytes: number | undefined;
+  let transportOnly: boolean | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -3162,6 +3210,10 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
         throw new Error(`--max-control-bytes must be a positive integer, received '${next}'`);
       }
       maxControlFrameBytes = parsed;
+    } else if (arg === "--transport-only") {
+      transportOnly = true;
+    } else if (arg === "--no-transport-only") {
+      transportOnly = false;
     } else {
       throw new Error(`Unrecognized argument: '${arg}'`);
     }
@@ -3186,5 +3238,6 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
     pongTimeoutMs,
     maxControlFrames,
     maxControlFrameBytes,
+    transportOnly,
   };
 }

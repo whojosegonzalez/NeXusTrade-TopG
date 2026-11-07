@@ -37,6 +37,7 @@ import {
   RAYDIUM_AMM_V4_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
 } from "../research/pilot/RaydiumAmmParser.js";
+import { encodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 
 // Canonical Base58 Ed25519 64-byte signatures
 const SIG_ANCHOR =
@@ -2534,6 +2535,275 @@ describe("RaydiumTransportObservationProbe", () => {
           expect(succ.status).toBe("CAP_LIMITED");
           expect(succ.observationSuccess).toBe(true);
         }
+      });
+
+      describe("Transport-Only Mode Isolation (--transport-only)", () => {
+        it("parses CLI flags and reports dry-run limits accurately for --transport-only", async () => {
+          const parsed1 = parseTransportProbeArgs(["--transport-only"]);
+          expect(parsed1.transportOnly).toBe(true);
+
+          const parsed2 = parseTransportProbeArgs(["--transport-only", "--no-transport-only"]);
+          expect(parsed2.transportOnly).toBe(false);
+
+          const parsed3 = parseTransportProbeArgs(["--transport", "ws"]);
+          expect(parsed3.transportOnly).toBeUndefined();
+
+          const dryRunRes = await executeTransportObservationProbe({
+            isLive: false,
+            transportOnly: true,
+          });
+          expect(dryRunRes.dryRun).toBe(true);
+          expect(dryRunRes.success).toBe(true);
+          if (dryRunRes.dryRun && dryRunRes.success) {
+            expect(dryRunRes.limits.transportOnly).toBe(true);
+          }
+        });
+
+        it("does NOT overflow or terminate transport-only observation on notification bursts exceeding queue capacity, and maintains strictly zero HTTP dispatches", async () => {
+          let httpDispatchAttempts = 0;
+          const mockFetch: typeof fetch = async () => {
+            httpDispatchAttempts++;
+            throw new Error("HTTP dispatches are strictly prohibited in transport-only mode");
+          };
+
+          let activeSocket: WebSocket | undefined;
+          const testWs = await createTestWebSocketServer((socket) => {
+            activeSocket = socket;
+            // Send subscription acknowledgement
+            socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          });
+
+          const probePromise = executeTransportObservationProbe({
+            isLive: true,
+            outDir: testOutputDir,
+            wsUrl: `ws://127.0.0.1:${testWs.port}`,
+            transportType: "ws",
+            transportOnly: true,
+            maxQueueDepth: 3, // Very low queue limit: 3
+            durationMs: 300,
+            streamingDurationMs: 150,
+            fetchTransport: mockFetch,
+          });
+
+          // Rapidly burst 12 notifications (far exceeding maxQueueDepth: 3)
+          setTimeout(() => {
+            for (let i = 0; i < 12; i++) {
+              const sig = encodeBase58(Buffer.alloc(64, i + 1));
+              activeSocket?.send(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "logsNotification",
+                  params: {
+                    subscription: 1,
+                    result: {
+                      context: { slot: 1000 + i },
+                      value: {
+                        signature: sig,
+                        logs: ["Program log: Instruction: Swap"],
+                        err: null,
+                      },
+                    },
+                  },
+                }),
+              );
+            }
+          }, 20);
+
+          const result = await probePromise;
+          await testWs.close();
+
+          expect(result.dryRun).toBe(false);
+          expect(httpDispatchAttempts).toBe(0);
+
+          if ("manifest" in result) {
+            const succ = result as TransportProbeSuccessResult;
+            expect(succ.status).toBe("SUCCESS");
+            expect(succ.observationSuccess).toBe(true);
+            expect(succ.metadata.executionMode).toBe("TRANSPORT_ONLY");
+            expect(succ.metadata.transportOnly).toBe(true);
+            expect(succ.metadata.zeroHttpDispatchesEnforced).toBe(true);
+            expect(succ.metadata.counts.peakQueueDepth).toBe(0);
+            expect(succ.metadata.counts.queueRejectionsCount).toBe(0);
+            expect(succ.metadata.counts.transactionRetrievalsAttempted).toBe(0);
+            expect(succ.metadata.counts.transactionRetrievalsSucceeded).toBe(0);
+            expect(succ.metadata.counts.historyQueriesAttempted).toBe(0);
+            expect(succ.metadata.counts.decodedSwapsCount).toBe(0);
+            expect(succ.summary.queueTelemetry.queueLimitExceeded).toBe(false);
+            expect(succ.summary.tradeFlowTelemetry.flowCoverageStatus).toBe(
+              "NOT_EVALUATED_TRANSPORT_ONLY",
+            );
+            expect(succ.summary.tradeFlowTelemetry.recentBuys).toBeNull();
+            expect(succ.summary.tradeFlowTelemetry.recentSells).toBeNull();
+            expect(succ.summary.historyDiscoveryTelemetry.discoveryOutcome).toBe(
+              "NOT_ATTEMPTED_TRANSPORT_ONLY",
+            );
+            expect(succ.summary.discrepancyAnalysis.totalWsWitnessedSignatures).toBe(12);
+            expect(succ.summary.discrepancyAnalysis.totalHistoryWitnessedSignatures).toBe(0);
+            expect(succ.summary.budgetAccounting.totalHttpRequests).toBe(0);
+          }
+        });
+
+        it("continues heartbeat exchanges for full configured observation duration without terminating early from empty retrieval queue", async () => {
+          let pingsReceivedAtServer = 0;
+          let activeSocket: WebSocket | undefined;
+
+          const testWs = await createTestWebSocketServer((socket) => {
+            activeSocket = socket;
+            socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+            socket.on("ping", () => {
+              pingsReceivedAtServer++;
+            });
+          });
+
+          let httpAttempts = 0;
+          const mockFetch: typeof fetch = async () => {
+            httpAttempts++;
+            return new Response("ok");
+          };
+
+          const startTime = Date.now();
+          const probePromise = executeTransportObservationProbe({
+            isLive: true,
+            outDir: testOutputDir,
+            wsUrl: `ws://127.0.0.1:${testWs.port}`,
+            transportType: "ws",
+            keepalive: true,
+            transportOnly: true,
+            pingIntervalMs: 35,
+            maxPings: 2,
+            pongTimeoutMs: 300,
+            durationMs: 200,
+            streamingDurationMs: 140,
+            fetchTransport: mockFetch,
+          });
+
+          // Send 1 notification during observation
+          setTimeout(() => {
+            activeSocket?.send(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 1,
+                  result: {
+                    context: { slot: 500 },
+                    value: {
+                      signature: SIG_B,
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+          }, 15);
+
+          const result = await probePromise;
+          const elapsedMs = Date.now() - startTime;
+          await testWs.close();
+
+          expect(elapsedMs).toBeGreaterThanOrEqual(120); // Ran for streaming duration, did NOT exit early at t=0
+          expect(httpAttempts).toBe(0);
+
+          if ("manifest" in result) {
+            const succ = result as TransportProbeSuccessResult;
+            expect(succ.observationSuccess).toBe(true);
+            expect(succ.status).toBe("SUCCESS");
+            const td = succ.metadata.transportDiagnostics;
+            expect(td.clientPingsSentCount).toBeGreaterThanOrEqual(2);
+            expect(td.matchedClientPongsCount).toBeGreaterThanOrEqual(2);
+            expect(td.missingPongDetected).toBe(false);
+            expect(pingsReceivedAtServer).toBeGreaterThanOrEqual(2);
+          }
+        });
+
+        it("enforces missing-PONG detection and control limits fail-closed in transport-only mode", async () => {
+          // Sub-test 1: Missing-PONG timeout still triggers TRANSPORT_ERROR in transport-only mode
+          const testWs1 = await createTestWebSocketServer((socket) => {
+            socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+            // Drop incoming pings: do not pong
+            socket.pong = () => {};
+          });
+
+          const mockFetch: typeof fetch = async () => new Response("ok");
+
+          const missingPongRes = await executeTransportObservationProbe({
+            isLive: true,
+            outDir: testOutputDir,
+            wsUrl: `ws://127.0.0.1:${testWs1.port}`,
+            transportType: "ws",
+            keepalive: true,
+            transportOnly: true,
+            pingIntervalMs: 25,
+            pongTimeoutMs: 50,
+            durationMs: 300,
+            streamingDurationMs: 200,
+            fetchTransport: mockFetch,
+          });
+          await testWs1.close();
+
+          if ("manifest" in missingPongRes) {
+            const succ = missingPongRes as TransportProbeSuccessResult;
+            expect(succ.status).toBe("TRANSPORT_ERROR");
+            expect(succ.observationSuccess).toBe(false);
+            expect(succ.metadata.terminationReason).toBe("TRANSPORT_ERROR");
+            expect(succ.metadata.transportDiagnostics.missingPongDetected).toBe(true);
+          }
+
+          // Clean testOutputDir for next sub-test
+          fsSync.rmSync(testOutputDir, { recursive: true, force: true });
+
+          // Sub-test 2: Inbound message limit still terminates probe in transport-only mode
+          let activeSocket2: WebSocket | undefined;
+          const testWs2 = await createTestWebSocketServer((socket) => {
+            activeSocket2 = socket;
+            socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+          });
+
+          const msgLimitPromise = executeTransportObservationProbe({
+            isLive: true,
+            outDir: testOutputDir,
+            wsUrl: `ws://127.0.0.1:${testWs2.port}`,
+            transportType: "ws",
+            transportOnly: true,
+            maxMessages: 3,
+            durationMs: 400,
+            streamingDurationMs: 300,
+            fetchTransport: mockFetch,
+          });
+
+          setTimeout(() => {
+            for (let i = 0; i < 4; i++) {
+              activeSocket2?.send(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "logsNotification",
+                  params: {
+                    subscription: 1,
+                    result: {
+                      context: { slot: 200 + i },
+                      value: {
+                        signature: SIG_B,
+                        logs: [],
+                        err: null,
+                      },
+                    },
+                  },
+                }),
+              );
+            }
+          }, 20);
+
+          const msgLimitRes = await msgLimitPromise;
+          await testWs2.close();
+
+          if ("manifest" in msgLimitRes) {
+            const succ = msgLimitRes as TransportProbeSuccessResult;
+            expect(succ.status).toBe("CAP_LIMITED");
+            expect(succ.metadata.terminationReason).toBe("MESSAGE_LIMIT_REACHED");
+            expect(succ.metadata.counts.inboundMessagesCount).toBeGreaterThanOrEqual(3);
+          }
+        });
       });
     });
   });

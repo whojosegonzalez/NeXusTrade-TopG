@@ -691,7 +691,42 @@ To empirically test the 60-second idle disconnect hypothesis, a narrow, bounded 
 6. **Strict Resource Disposal**:
    - Client sockets, intervals, and missing-PONG timeouts are forcefully cleaned up and terminated on all normal, timeout, error, and cancellation paths. Verified offline with authentic loopback servers under a strict 5-second deadline.
 
-### 8.6 Invariant Preservation Reaffirmation
+### 8.6 Verification of Keepalive Probe Captures & Queue Overflow Isolation
+
+Two operator transport captures executed at commit `5eb023d` were independently verified with zero file alterations:
+
+1. **Capture 1 (`2026-11-07T02-37-38.359Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
+   - **Command**: `--live --transport ws --keepalive true --duration-ms 90000 --max-queue-depth 10`.
+   - **Duration**: 3,089 ms.
+   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 45,958 application bytes, 12 witnessed signatures.
+   - **Queue Telemetry**: Peak queue depth reached 10; 1 queue rejection recorded; terminated with `QUEUE_LIMIT_EXCEEDED` (`status: "QUEUE_OVERFLOW"`).
+   - **HTTP RPC Calls**: 1 sampled transaction retrieval dispatched before queue limit trip; returned HTTP 200 with on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`). Correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`. Zero history queries attempted.
+   - **Keepalive Telemetry**: 0 client PINGs sent (`clientPingsSentCount: 0`). The 20-second heartbeat timer did not fire before termination at 3.089 seconds.
+   - **Keepalive Assessment**: **INCONCLUSIVE / NOT EXERCISED**.
+
+2. **Capture 2 (`2026-11-07T02-38-37.152Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`)**:
+   - **Command**: `--live --transport ws --keepalive true --duration-ms 90000 --max-queue-depth 10`.
+   - **Duration**: 2,920 ms.
+   - **Ingress Telemetry**: 13 inbound messages (1 subscription ack + 12 notification frames), 45,960 application bytes, 12 witnessed signatures.
+   - **Queue Telemetry**: Peak queue depth reached 10; 1 queue rejection recorded; terminated with `QUEUE_LIMIT_EXCEEDED` (`status: "QUEUE_OVERFLOW"`).
+   - **HTTP RPC Calls**: 1 sampled transaction retrieval dispatched before queue limit trip; returned HTTP 200 with on-chain failure (`meta.err: {"InstructionError":[1,{"Custom":2}]}`). Correctly rejected as `DECODE_FAILED [TRANSACTION_FAILED]`. Zero history queries attempted.
+   - **Keepalive Telemetry**: 0 client PINGs sent (`clientPingsSentCount: 0`). Terminated at 2.920 seconds before first heartbeat.
+   - **Keepalive Assessment**: **INCONCLUSIVE / NOT EXERCISED**.
+
+#### Root Cause Analysis: Transaction Backlog Preemption
+
+The authentic reference Raydium AMM v4 pool (`AVs9TA4n...`) experiences bursty high-frequency trading activity, generating multiple transaction log notifications per second. Because transaction retrieval is paced at $\ge 2,500\text{ ms}$ spacing to respect public RPC rate limits, incoming notifications accumulate faster than worker retrieval capacity ($12\text{ notifications in } \approx 3\text{ seconds}$ vs. $1\text{ retrieval per } 2.5\text{ seconds}$). The `maxQueueDepth: 10` safeguard functioned as designed by halting execution to prevent unbounded memory growth, but this queue overflow prematurely halted the probe before the 20-second RFC 6455 keepalive cycle could be exercised.
+
+#### Architectural Remedy: Opt-In Transport-Only Mode (`--transport-only`)
+
+To decouple connection liveness and keepalive characterization from transaction retrieval capacity without altering provider pacing or weakening queue safeguards:
+
+1. **Zero HTTP RPC Dispatches**: Bypasses adapter queueing and history RPC pagination entirely (`totalHttpRequests: 0`, `transactionRetrievalsAttempted: 0`, `historyQueriesAttempted: 0`).
+2. **Notification Recording Preserved**: Inbound WebSocket notifications are still received, parsed, and recorded in `wsWitnessedSignatures` and `wsWitnessedList` for discrepancy auditing.
+3. **Full Observation Duration**: An empty retrieval queue does NOT cause early exit; the probe stream remains open for the full configured observation duration (`durationMs`), enabling all scheduled RFC 6455 PING/PONG cycles to execute.
+4. **Telemetric Transparency**: Metadata and summary explicitly record `executionMode: "TRANSPORT_ONLY"`, `transportOnly: true`, `zeroHttpDispatchesEnforced: true`, and `tradeFlowTelemetry.flowCoverageStatus = "NOT_EVALUATED_TRANSPORT_ONLY"`.
+
+### 8.7 Invariant Preservation Reaffirmation
 
 All Phase 12.94-D core safety boundaries remain unchanged and active:
 

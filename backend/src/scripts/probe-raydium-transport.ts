@@ -60,6 +60,7 @@ OPTIONS:
   --pong-timeout-ms <ms>       Missing-PONG timeout in milliseconds (default: 10000)
   --max-control-frames <count> Maximum RFC 6455 control frames budget (default: 50)
   --max-control-bytes <bytes>  Maximum RFC 6455 control frame payload bytes budget (default: 4096)
+  --transport-only             Execute transport-only observation; disables HTTP transaction retrieval and history queries
   -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
       pongTimeoutMs: args.pongTimeoutMs,
       maxControlFrames: args.maxControlFrames,
       maxControlFrameBytes: args.maxControlFrameBytes,
+      transportOnly: args.transportOnly,
       signal: abortController.signal,
     });
   } finally {
@@ -141,6 +143,10 @@ async function main(): Promise<void> {
     console.log(`Target Directory:         ${result.targetDir}`);
     console.log(`Observation Success:      ${result.observationSuccess}`);
     console.log(`Status:                   ${result.status}`);
+    console.log(`Execution Mode:           ${result.metadata.executionMode}`);
+    if (result.metadata.transportOnly) {
+      console.log(`Transport-Only Mode:      true (zero HTTP RPC dispatches enforced)`);
+    }
     console.log(`Termination Reason:       ${result.metadata.terminationReason}`);
     console.log(`Duration (ms):            ${result.metadata.durationMs}`);
     console.log(`Messages Ingested:        ${result.metadata.counts.inboundMessagesCount}`);
