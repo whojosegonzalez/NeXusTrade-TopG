@@ -930,7 +930,7 @@ The three defects identified during independent audit of commit `995918a` were v
 
 1. **Shared Decision Boundary Validation & Snapshotting (`validateAndSnapshotCandidateFlowResult`)**:
    - [`CandidateFlowProvider.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateFlowProvider.ts#L45-L125) strictly intercepts every result returned by an injected provider before evaluation in `evaluateCandidateDecisionPoints()`.
-   - Validates identity matching (`poolAddress` and `tokenMint`), finite non-negative integer evaluation timestamps within $\pm 30{,}000\text{ ms}$ of host clock, and field consistency between `isCoverageSufficient` and `flowCoverage`.
+   - Validates identity matching (`poolAddress` and `tokenMint`), requires the returned `evaluationTimestampMs` to match the caller's requested `evaluationTimestampMs` **exactly** (`res.evaluationTimestampMs === evaluationTimestampMs`), and strictly enforces field consistency between `isCoverageSufficient` and `flowCoverage`. (The coordinator's internal provider performs an additional host-clock sanity check, but the shared decision boundary mandates exact equality, rejecting any timestamp skew).
    - Prevents inconsistent states (such as `isCoverageSufficient: false` paired with `flowCoverage: "SUFFICIENT"`), null results, and negative or non-integer buy/sell counts by immediately failing closed to safe defaults (`flowCoverage: "COLLECTION_GAP"`, `recentBuys60s: null`, `recentSells60s: null`).
 2. **Restored Pre-Extraction Liquidity Floors**:
    - Restored the original pre-extraction liquidity floor logic ($20{,}000 USD / $30{,}000 USD / $50{,}000 USD depending on candidate token profile and DEX source).
@@ -950,120 +950,99 @@ The three defects identified during independent audit of commit `995918a` were v
 
 ### 8.10 Smallest Production Source Coverage Implementation Proposal: Single Exact Pool 60-Second Window
 
-With the strategy-facing decision boundary safely wired and fail-closed defaults enforced, the primary blocker to usable trade flow is determining when **one real candidate pool’s 60-second flow window has sufficient source coverage to provide usable counts**.
+> [!IMPORTANT]
+> **Implementation Status: PROPOSAL UNDER REVIEW (NOT AUTHORIZED FOR CODE IMPLEMENTATION)**
+> The accepted candidate-flow integration remains closed at commit `b75d0e8`. This section defines a revised, source-backed implementation proposal for offline planning and operator review only. Zero production proof modes, daemon wiring, or code changes are authorized under this step.
 
-This proposal specifies the smallest, implementation-sized offline architecture step for single-pool, single-window source coverage. It deliberately eschews general multi-pool distributed infrastructure frameworks in favor of an exact, verifiable contract scoped strictly to **one validated candidate pool account and one 60-second observation window**.
+#### 8.10.1 Architecture Scope & Provider-Relative Assurance Model
 
-#### 8.10.1 Coverage Contract for One Exact Pool & One 60-Second Window
+##### 1. Provider-Relative Reconciliation vs. Independent Verification
 
-The coverage contract defines the precise preconditions under which trade flow counts across an authoritative 60-second window $[T_{\text{eval}} - 60{,}000\text{ ms}, T_{\text{eval}}]$ may transition from `null` to verified non-negative integers.
+Ordinary Solana JSON-RPC signature pagination (`getSignaturesForAddress`) does **not** provide cryptographic or ledger certainty. It queries an indexer maintained by an upstream RPC provider.
 
-```mermaid
-flowchart TD
-    subgraph Ingestion["1. Dual Ingestion & Anchoring"]
-        A["WebSocket Subscription<br/>logsSubscribe({ mentions: [poolId] })"] -->|"Forward Stream<br/>(Real-Time)"| B["Stream Receiver &<br/>Gap Recorder"]
-        C["RPC getSignaturesForAddress<br/>(Bounded Backward Traversal)"] -->|"Ledger Verification<br/>(Anchor A to Target C)"| D["Exact-Pool<br/>History Enumerator"]
-    end
+- **The Index Omission Counterexample**:
+  An independent synthetic test demonstrated this fundamental limitation: a synthetic history page containing both boundary anchors ($A_{\text{prior}}$ and $A_{\text{post}}$) was provided to [`ExactPoolHistoryEnumerator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts) with an intermediate transaction omitted. The enumerator returned `ANCHOR_WITNESSED`, correctly satisfying its enumeration contract (it verified the known anchor signature appeared in the page records), but it could not and did not detect that an intermediate transaction was missing from the upstream RPC index.
+- **Contract Boundary**:
+  The accepted enumerator will **not** be modified to disguise this limitation. Standard JSON-RPC pagination cannot independently verify ledger completeness without full block-level header verification and Merkle inclusion proofs, which are outside the capability of standard JSON-RPC endpoints.
+- **Explicit RPC Correctness & Completeness Assumptions**:
+  Reconciliation is therefore strictly **provider-relative**, operating under the explicit assumptions that:
+  1. _Indexer Completeness_: The upstream RPC node's transaction index has indexed and returns every transaction signature that mentioned the pool address without omission.
+  2. _Cursor Semantics_: The upstream RPC returns signatures in reverse chronological order respecting standard `before` pagination cursors.
+  3. _Payload Integrity_: The RPC's `getTransaction` method returns unmodified transaction instructions and account keys corresponding to confirmed ledger state.
+- **Policy Guard Against False Promotion**:
+  Because standard RPC evidence remains provider-relative, this evidence **must NOT be promoted into production `SUFFICIENT` coverage** until an explicit operator acceptance policy has been separately reviewed and authorized. Under default production configuration, flow counts strictly remain `null` and coverage remains `"COLLECTION_GAP"`.
 
-    subgraph Verification["2. Boundary & Freshness Verification"]
-        B --> E{"Stream Gaps<br/>or Disconnects in<br/>[T - 60s, T]?"}
-        D --> F{"Anchors Enclose<br/>[T - 60s, T]?<br/>(A_prior & A_post)"}
-        E -->|Yes: Collection Gap| G["Fail-Closed Coverage:<br/>flowCoverage = COLLECTION_GAP<br/>counts = null"]
-        E -->|No: Stream Clean| H["Evaluate Freshness &<br/>Ledger Continuity"]
-        F -->|No: Incomplete| G
-        F -->|Yes: Anchors Valid| H
-        H --> I{"Freshness & Capacity<br/>- Stream age <= 15s<br/>- Queue workload = 0<br/>- Budget within limits?"}
-        I -->|No: Violation| G
-        I -->|Yes: Verified| J["ExactPoolWindowProof Issued"]
-    end
-
-    subgraph Decision["3. Decision Boundary Guard"]
-        J --> K["Coordinator & Tracker<br/>advanceCoverage(SinglePoolProof)"]
-        K --> L["CandidateFlowProvider<br/>flowCoverage = SUFFICIENT<br/>recentBuys60s = Integer >= 0<br/>recentSells60s = Integer >= 0"]
-        G --> M["CandidateFlowProvider<br/>flowCoverage != SUFFICIENT<br/>recentBuys60s = null<br/>recentSells60s = null"]
-    end
-```
-
-##### 1. Acquisition Method & Hybrid Verification Architecture
-
-1. **Forward Live Observation**:
-   - Primary real-time stream via WebSocket `logsSubscribe` with filter `{ mentions: [poolAddress] }` on [`RaydiumCandidateSubscriptionCoordinator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts).
-   - Ingests incoming transaction signature notifications as they are confirmed on-chain.
-2. **Boundary Anchoring & Ledger Enumeration**:
-   - Secondary on-chain signature verification via JSON-RPC `getSignaturesForAddress(poolAddress, { until: anchorSig, limit: ... })` executed by [`ExactPoolHistoryEnumerator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts).
-   - Verifies that no transaction was dropped, throttled, or omitted by the WebSocket node between the witnessed on-chain anchors.
-3. **Full Transaction Resolution**:
-   - High-fidelity transaction retrieval via JSON-RPC `getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" })` executed by [`RaydiumAmmV4TransactionSourceAdapter`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts).
-   - Chronological decoding and ingestion into [`RollingTradeFlowTracker`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts) via [`ExactPoolTransactionResolutionBridge`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts).
-
-##### 2. Exact Candidate Identity Binding
-
-- **8-Field Identity Invariant**: All components (`Coordinator`, `Adapter`, `Enumerator`, `Bridge`, and `Tracker`) must be bound to the exact identical, immutable [`TrackedRaydiumPoolContext`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts#L42):
-  1. `poolId`: Exact candidate Raydium pool account address (Base58, 32–44 chars). Program-wide IDs (`675kPX9Mtx55nit5618tC98G364Nm1YsnP8G52109` or `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`) are strictly rejected.
-  2. `candidateTokenMint`: Exact SPL token mint of the candidate.
-  3. `quoteTokenMint`: Exact quote mint (e.g. WSOL `So11111111111111111111111111111111111111112`).
-  4. `baseVault`: Exact base token vault account address.
-  5. `quoteVault`: Exact quote token vault account address.
-  6. `baseMint`: Canonical base mint.
-  7. `quoteMint`: Canonical quote mint.
-  8. `orientation`: Vault and token orientation enum (`TOKEN_BASE_SOL_QUOTE` or `SOL_BASE_TOKEN_QUOTE`).
-- **Instruction-Level Filtering**:
-  - Decoded swap instructions must match the pool's base and quote vaults. Swaps touching unrelated tokens or external routing hops are strictly ignored or rejected.
-
-##### 3. Window Timestamps, Ordering & Freshness
-
-- **Authoritative Window Interval**:
-  $$W = [T_{\text{start}}, T_{\text{end}}] = [T_{\text{eval}} - 60{,}000\text{ ms}, T_{\text{eval}}]$$
-  where $T_{\text{eval}}$ is the integer millisecond timestamp when `CandidateFlowProvider.getRetestSpotInfo()` is queried.
-- **Authoritative Trade Timestamps**:
-  - Trade timestamps must be established strictly from on-chain `blockTime * 1000` (integer milliseconds).
-  - Trades with missing, null, or out-of-order `blockTime` are strictly quarantined.
-- **Strict Chronological Ordering**:
-  - Events must be ingested and evaluated strictly in ascending chronological order:
-    $$\text{Order Key} = (\text{slot}, \text{blockTime}, \text{transactionIndex}, \text{outerInstructionIndex}, \text{swapIndex})$$
-- **Freshness Ceiling**:
-  - The maximum allowable inactivity or age of the latest confirmed on-chain transaction or verified heartbeat is $\le 15{,}000\text{ ms}$ (`maxStreamInactivityMs = 15000`).
-  - If $T_{\text{eval}} - T_{\text{latestObservation}} > 15{,}000\text{ ms}$, coverage is classified as `STALE_DATA` / insufficient, regardless of previous stream stability.
-
-##### 4. Missing-Data Detection & Boundary Anchoring
-
-- **Dual-Boundary Anchor Requirement**:
-  - Coverage across $[T_{\text{eval}} - 60{,}000\text{ ms}, T_{\text{eval}}]$ requires positive evidence of continuous ledger bounds:
-    1. **Prior Anchor ($A_{\text{prior}}$)**: A witnessed, confirmed on-chain transaction signature for the pool with $\text{blockTime} \le T_{\text{eval}} - 60{,}000\text{ ms}$.
-    2. **Post Anchor ($A_{\text{post}}$)**: A witnessed, confirmed on-chain transaction signature for the pool with $\text{blockTime} \ge T_{\text{eval}}$.
-  - The signature chain between $A_{\text{post}}$ and $A_{\text{prior}}$ must be completely traversed via `ExactPoolHistoryEnumerator` without reaching pagination ceilings, hitting RPC errors, or discovering unresolvable gaps.
-- **Stream Gap Detection**:
-  - If the WebSocket disconnects, reconnects (advancing `connectionEpoch`), encounters a buffer overflow, or experiences an adapter queue drop during $[T_{\text{eval}} - 60\text{s}, T_{\text{eval}}]$, an immutable `StreamGap` is recorded in `RollingTradeFlowTracker`.
-
-##### 5. Ledger Assurance Provided vs. Not Provided
-
-- **What the Assurance DOES Provide**:
-  - Cryptographic and ledger certainty that every confirmed transaction mentioning the candidate pool address between the witnessed on-chain anchors was retrieved, decoded, and accounted for.
-- **What the Assurance DOES NOT Provide**:
-  - Global cluster consensus finality beyond the `confirmed` commitment level (a block reorganization could theoretically alter confirmed blocks, though highly improbable on Solana).
-  - Unconfirmed mempool or in-flight transactions that have not yet landed in a confirmed block.
-
-##### 6. Separation Invariant: Live Decision Support vs. Retrospective Recovery
+##### 2. Separation Invariant: Live Decision Support vs. Retrospective Recovery
 
 > [!CAUTION]
 > **Core Architectural Invariant: Retrospective Recovery Must Never Erase Live Collection Gaps**
 >
-> 1. In live candidate evaluation, trade admission requires **uninterrupted live stream observation** during $[T_{\text{eval}} - 60\text{s}, T_{\text{eval}}]$.
+> 1. In live candidate evaluation, trade admission requires **uninterrupted live stream observation** during the decision window.
 > 2. If a collection gap, socket interruption, queue overflow, or buffer drop occurred during the live 60-second observation window, retrospective discovery and backfill of those transactions via RPC history creates an **audit record and post-mortem dataset**, but **NEVER erases the recorded collection gap for live decision support**.
 > 3. For the affected candidate evaluation, `flowCoverage` must **permanently remain non-`SUFFICIENT`** (`"COLLECTION_GAP"`), and `recentBuys60s` / `recentSells60s` must **strictly remain `null`**.
 > 4. An algorithmic trading agent cannot travel back in time: discovering missing transactions seconds or minutes after the decision point does not make the live decision safe.
 
-##### 7. Explicit Rejection of False Coverage Proxies
+##### 3. Explicit Rejection of False Coverage Proxies
 
-To prevent fragile or misleading workarounds, the following conditions are explicitly rejected as sufficient coverage:
+The following conditions are explicitly rejected as sufficient coverage:
 
-| Proxy Metric / Event                 | Why It Does NOT Establish Sufficient Coverage                                                                                      |
-| :----------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------- |
-| **Socket Liveness (TCP/TLS Open)**   | Proves client network connectivity to the RPC node, but does not prove the node's pubsub daemon is forwarding pool notifications.  |
-| **Transport Heartbeats (PING/PONG)** | Proves transport connection hygiene, but carries zero application data or subscription delivery proof.                             |
-| **Empty Workload Queues ($Q = 0$)**  | Proves in-flight requests are drained, but does not prove that upstream notifications were not dropped before reaching the client. |
-| **Sampled History ($k$ of $N$ txs)** | Proves partial protocol compatibility, but fails the fundamental definition of gapless volume aggregation.                         |
-| **Single Successful Retrieval**      | Proves version-0/version-1 decoder execution, but provides zero guarantee of completeness across a 60-second time span.            |
+- **Socket Liveness (TCP/TLS Open)**: Proves client transport connectivity, not pubsub notification delivery.
+- **Transport Heartbeats (PING/PONG)**: Proves connection hygiene, carrying zero application subscription delivery proof.
+- **Empty Workload Queues ($Q = 0$)**: Proves local in-flight requests are drained, not that upstream notifications were delivered.
+- **Sampled History ($k$ of $N$ txs)**: Partial sampling fails the requirement of complete volume aggregation.
+- **Single Successful Retrieval**: Proves decoder compatibility, but provides zero guarantee of temporal completeness.
+
+---
+
+#### 8.10.2 Four-Dimensional Usable Time Contract & Watermarking
+
+To prevent logical contradictions (such as requiring a future transaction to validate an immediate decision), the time contract strictly separates four distinct temporal concepts:
+
+```
+[--- 60-Second Verified Window ---]       [-- Observation Lag --]
+T_watermark - 60s               T_watermark                     T_decision
+==================================|-----------------------------|
+(Verified Trade Events Occur Here) (No Unverified Lag Allowed > 15s)
+```
+
+##### 1. The Four Temporal Dimensions
+
+1. **Decision Time ($T_{\text{decision}}$)**:
+   - The local host wall-clock timestamp (integer milliseconds) at which the candidate retest gate is evaluated.
+2. **Trade Event Time ($T_{\text{event}}$)**:
+   - Derived from on-chain estimated `blockTime` in Unix epoch seconds.
+   - Scaled to integer milliseconds: $T_{\text{event}} = \text{blockTime} \times 1{,}000\text{ ms}$.
+   - _Precision Invariant_: Solana `blockTime` is an estimated timestamp in whole seconds; multiplying by 1,000 does **not** create millisecond precision. It retains 1-second resolution.
+   - _Null-Time Uncertainty_: Transactions with null or missing `blockTime` represent temporal uncertainty and are strictly rejected with `MISSING_UPSTREAM_TIMESTAMP`.
+3. **Verified Source Cutoff / Watermark ($T_{\text{watermark}}$)**:
+   - The latest confirmed on-chain timestamp or stream checkpoint up to which the feed has confirmed observation or index continuity.
+4. **Retrieval Time & Evidence Age ($\Delta t_{\text{age}}$)**:
+   - Retrieval time ($T_{\text{retrieval}}$) is the host timestamp when an HTTP response is received.
+   - Evidence age is the lag between the source watermark and the decision point:
+     $$\Delta t_{\text{age}} = T_{\text{decision}} - T_{\text{watermark}}.$$
+
+##### 2. Eliminating the Future-Transaction Requirement
+
+The requirement that an on-chain transaction $A_{\text{post}}$ must have $\text{blockTime} \ge T_{\text{decision}}$ is explicitly rejected. For an immediate decision, or for a quiet candidate pool, requiring a future transaction to validate the present is impossible.
+
+##### 3. Quiet & Zero-Transaction Windows
+
+Candidate pools frequently experience periods of zero trading activity.
+
+- A quiet window $[T_{\text{watermark}} - 60\text{s}, T_{\text{watermark}}]$ is valid and verifiable if:
+  1. The WebSocket subscription maintained continuous observation with zero disconnects, dropped frames, or queue overflows.
+  2. The source watermark has advanced such that $\Delta t_{\text{age}} = T_{\text{decision}} - T_{\text{watermark}} \le 15{,}000\text{ ms}$.
+  3. RPC signature pagination confirms that zero transactions were indexed for the pool during that interval.
+- Under these conditions, the honest and valid result is **zero buys and zero sells** (`recentBuys60s: 0, recentSells60s: 0`), rather than treating silence as a failure.
+
+##### 4. Bounded-Lag Window Contract (for Operator Review)
+
+When evaluating live candidate micro-flow, the verified observation window spans:
+$$W_{\text{verified}} = [T_{\text{watermark}} - 60{,}000\text{ ms}, T_{\text{watermark}}]$$
+subject to a maximum allowable observation lag:
+$$\Delta t_{\text{lag}} = T_{\text{decision}} - T_{\text{watermark}} \le \text{maxAllowedLagMs} \quad (\text{configured at } 15{,}000\text{ ms}).$$
+
+- **Lag Invariant**: The strategy's rolling window is **NOT silently shifted**, and older evidence is **NOT relabeled as current**. If $\Delta t_{\text{lag}} > 15{,}000\text{ ms}$, the window is explicitly classified as `STALE_DATA` / insufficient, forcing counts to `null`.
 
 ---
 
@@ -1073,7 +1052,7 @@ The implementation strictly reuses the accepted Phase 12.94-D modules, adding on
 
 | Component                                                                                                                                      | Role & Existing Validated Capability                                                                                                           | Required Architectural Changes for Single-Pool Coverage Step                                                                                                                                                           |
 | :--------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`RaydiumCandidateSubscriptionCoordinator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts) | Manages WebSocket subscription lifecycle, routes frames to adapter, and issues `RetestSpotInfo` overlays. Rejects synthetic proofs by default. | 1. Implement `ExactPoolWindowProof` validation under a dedicated `PROVEN_SINGLE_POOL_WINDOW` mode.<br>2. Consume single-pool proof to advance coverage without requiring synthetic test flags.                         |
+| [`RaydiumCandidateSubscriptionCoordinator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts) | Manages WebSocket subscription lifecycle, routes frames to adapter, and issues `RetestSpotInfo` overlays. Rejects synthetic proofs by default. | 1. Implement single-pool provider-relative proof evaluation under a dedicated non-synthetic mode.<br>2. Consume single-pool proof to advance coverage only if authorized under reviewed acceptance policy.             |
 | [`RollingTradeFlowTracker`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts)                                 | Maintains 60s sliding window of buys/sells, enforces chronological order, and tracks immutable collection gaps.                                | 1. Enforce gap immutability: backfilled transaction ingestion cannot clear an active-window `StreamGap`.<br>2. Expose `hasGapsInWindow(startMs, endMs)` query to verify absence of collection gaps.                    |
 | [`ExactPoolHistoryEnumerator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts)                           | Traverses backward from frozen target signature to known anchor signature with strict Ed25519 validation and budget accounting.                | 1. Add window bounding helper: paginate backward until reaching a transaction with $\text{blockTime} \le T_{\text{eval}} - 60{,}000\text{ ms}$, establishing $A_{\text{prior}}$.<br>2. Retain all existing invariants. |
 | [`ExactPoolTransactionResolutionBridge`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts)       | Resolves discovered signatures via adapter, decodes v0/v1 swaps, and ingests them into tracker. Enforces epoch and lifecycle isolation.        | 1. Wire resolution status into proof generator: if any transaction in the window fails resolution or decoding, resolution fails closed (`PARTIAL_RESOLVED`), blocking proof issuance.                                  |
@@ -1089,94 +1068,141 @@ The implementation strictly reuses the accepted Phase 12.94-D modules, adding on
   - Immutable retention of stream gaps (reconciliation does not erase gaps).
 - **What Remains Missing (Addressed by this Proposal)**:
   1. **Automated Window Anchoring**: Dynamically identifying $A_{\text{post}}$ and traversing to $A_{\text{prior}}$ at the candidate evaluation point.
-  2. **Proof Issuance & Consumption**: Generating an immutable `ExactPoolWindowProof` and consuming it in `coordinator.advanceCoverage()` to transition coverage to `SUFFICIENT` for that single pool.
-  3. **Velocity Feasibility Gate**: Detecting when a candidate pool's transaction velocity exceeds sequential client pacing capacity before exhausting budgets.
+  2. **Proof Issuance & Consumption**: Generating an immutable single-pool provider-relative proof and consuming it in `coordinator.advanceCoverage()` subject to operator acceptance policy.
+  3. **Queue & Incremental Resolution Handling**: Distinguishing incremental in-stream resolution from post-window bursts, ensuring active backlogs fail closed with `PROCESSING_BACKLOG`.
 
 ---
 
-#### 8.10.3 Resource Feasibility & Capacity Bounds
+#### 8.10.3 Source Contract Alignment & Ordering Invariants
 
-All resource constraints are evaluated strictly against existing code settings, without budget increases, provider changes, purchases, or pacing relaxations.
+##### 1. Versioned Transaction Compatibility
 
-##### 1. Configured Constraints & Throughput Ceiling
+- In [`RaydiumAmmV4TransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts#L456), the adapter explicitly defaults to:
+  $$\text{maxSupportedTransactionVersion} = 1.$$
+- This supports legacy, version-0, and version-1 Solana transactions without truncation or RPC rejection.
 
-- **Client Pacing Spacing**: $\ge 2{,}500\text{ ms}$ minimum spacing between HTTP request starts (`MIN_HOST_PACING_MS = 2500` in [`GlobalResourceBudgetManager.ts`](file:///u:/Projects/TopG/backend/src/research/prospective/GlobalResourceBudgetManager.ts#L50)).
-- **Maximum Request Rate**:
-  $$R_{\text{max}} = \frac{1}{2.5\text{ s}} = 0.40\text{ requests/second} = 24\text{ requests/minute}.$$
-- **Competing System Demands**:
-  - Candidate discovery & metadata enrichment: Periodic DexScreener spot polling.
-  - Forward quote reservations: Exactly 4 requests strictly reserved for trade execution (`minReservedForwardRequests = 4`).
-  - Available RPC budget over a 60-second evaluation interval: $\approx 15 \text{ to } 20\text{ requests}$.
+##### 2. Accepted Enumerator Cursor & Witnessing Semantics
 
-##### 2. Single 60-Second Window Request Demand
+- [`ExactPoolHistoryEnumerator`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolHistoryEnumerator.ts) operates strictly with:
+  1. Head signature of the first RPC history page frozen as `frozenTargetSignature`.
+  2. Backward traversal using standard `{ before: cursor }` pagination.
+  3. Requiring the explicit appearance of `knownAnchorSignature` within returned records to establish `anchorWitnessed: true` and `outcome: "ANCHOR_WITNESSED"`.
 
-To verify and resolve trade flow for one 60-second window:
+##### 3. Swap Event Identity & Intra-Slot Micro-Ordering
 
-1. **Signature Discovery**: 1 RPC call to `getSignaturesForAddress` (returns up to 1,000 signatures, covering the 60s span in a single page for low-to-medium velocity pools).
-2. **Transaction Resolution**: Exactly $N$ sequential RPC calls to `getTransaction`, where $N$ is the number of transaction signatures discovered in the window.
+- **Canonical Event Identity**:
+  $$\text{eventId} = \text{derivedSwapKey} = \texttt{\$\{signature\}:\$\{outerInstructionIndex\}:\$\{swapIndex\}}.$$
+- **Source of Instruction Indices**:
+  - `outerInstructionIndex` and `swapIndex` are extracted directly by [`RaydiumAmmV4SwapDecoder`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumAmmV4SwapDecoder.ts) from the transaction's instruction and inner instruction arrays.
+- **Transaction Index & Micro-Ordering Uncertainty**:
+  - Solana JSON-RPC `getTransaction` does **not** supply a `transactionIndex` (which is only exposed in block-level queries like `getBlock`).
+  - Within [`RollingTradeFlowTracker`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts), events are sorted chronologically by `eventTimestampMs` (`blockTimeSec * 1000`).
+  - Between distinct transactions that share the exact same slot and `blockTime`, ordering is established by arrival sequence or reverse-chronological order from `getSignaturesForAddress`. This represents an **unresolved intra-slot micro-ordering uncertainty**, which does not affect total buy/sell counts but precludes microsecond transaction sequencing.
 
-$$\text{Total Request Demand } D = 1 + N \text{ requests}.$$
-$$\text{Total Resolution Latency } L \ge (1 + N) \times 2{,}500\text{ ms} + \sum_{i=1}^{1+N} RTT_i.$$
+---
 
-##### 3. Feasible Pool Velocity vs. Freshness Deadline
+#### 8.10.4 Realistic Request Scheduling & Budget Feasibility
 
-The tracker enforces a strict freshness ceiling: data older than $15{,}000\text{ ms}$ is marked `STALE_DATA`.
-Therefore, transaction resolution must complete within $\le 15\text{ seconds}$ to remain fresh at evaluation time:
+##### 1. Correcting the Feasibility Model: Incremental Resolution
 
-$$\text{Maximum Sequential Retrievals in } 15\text{s} = \left\lfloor \frac{15{,}000\text{ ms}}{2{,}500\text{ ms}} \right\rfloor = 6\text{ transactions}.$$
+The previous readiness assessment asserted that all transactions must be retrieved after the 60-second window closes, concluding an arbitrary 6 tx/min limit and proposing a candidate pre-filter. That conclusion was flawed:
+
+- **Incremental Processing During Observation**:
+  - In a live WebSocket subscription, transaction notifications arrive continuously throughout the 60-second window.
+  - The adapter resolves transactions **incrementally as they arrive**.
+  - At configured 2,500 ms host pacing, up to 24 sequential transaction retrievals can be dispatched and completed across a 60-second interval _prior to_ the decision point.
+- **Deduplication & Zero Redundant Requests**:
+  - Already-resolved transactions are stored in `RollingTradeFlowTracker` and deduplicated in `RaydiumAmmV4TransactionSourceAdapter`.
+  - At decision time $T_{\text{decision}}$, already-resolved transactions require **zero additional duplicate HTTP requests**.
+- **15-Second Inactivity Invariant**:
+  - The tracker's 15-second inactivity threshold (`maxStreamInactivityMs = 15000`) is a **silence detection ceiling**, not a deadline requiring post-window batch resolution.
+
+##### 2. Explicit Request Schedule & Demand Calculation
+
+At the candidate evaluation point $T_{\text{decision}}$:
+
+- Let $N$ be the total number of transactions that occurred in the pool during $[T_{\text{watermark}} - 60\text{s}, T_{\text{watermark}}]$.
+- Let $K \le N$ be the number of transactions already incrementally resolved during observation.
+- Let $U = N - K$ be the number of unresolved transactions (e.g. from a recent burst or queue backlog).
+- Let $M$ be the number of watermark/boundary verification calls (typically $M = 1$ call to `getSignaturesForAddress`).
+
+$$\text{Immediate Request Demand at Decision Point: } D = M + U \text{ requests}.$$
+$$\text{Expected Resolution Duration: } T_{\text{resolution}} = D \times 2{,}500\text{ ms} + \sum_{i=1}^{D} RTT_i.$$
 
 ```
-Pool Velocity (N txs / 60s)    Sequential Resolution Time (2.5s pacing)    Freshness Status (<= 15s)    Feasibility Status
-----------------------------------------------------------------------------------------------------------------------------
-N = 1 to 4 transactions        2.5s to 10.0s                              FRESH (<= 15s)               FEASIBLE (Full Verification)
-N = 5 to 6 transactions        12.5s to 15.0s                             MARGINAL (<= 15s)            FEASIBLE (Near Deadline)
-N = 7 to 10 transactions       17.5s to 25.0s                             STALE (> 15s)                INFEASIBLE (Fails Freshness)
-N > 20 transactions            > 50.0s                                    STALE / BUDGET EXHAUSTED     INFEASIBLE (Hits Budget Ceiling)
+Burst Size (U unresolved txs)    Dispatch Demand (1 + U)    Minimum Resolution Duration (at 2.5s pacing)
+--------------------------------------------------------------------------------------------------------
+U = 0 unresolved (quiet / caught up)    1 request (page)           2.5s  (+ RTT)
+U = 1 unresolved                        2 requests                 5.0s  (+ RTT)
+U = 2 unresolved                        3 requests                 7.5s  (+ RTT)
+U = 4 unresolved                        5 requests                 12.5s (+ RTT)
+U = 6 unresolved                        7 requests                 17.5s (+ RTT) -> Exceeds 15s Freshness!
 ```
 
-##### 4. Specific Constraint & Required Operator Decision
+##### 3. Separation of Configured Client Limits from Provider Entitlements
 
-- **Specific Constraint**: Under our configured, zero-cost 2,500 ms sequential host pacing, **gapless source coverage can only be verified for low-velocity candidate pools ($\le 6\text{ transactions/minute}$)**.
-- **Required Operator Decision**:
-  - **Decision A (Candidate Pre-Filter)**: Configure the candidate scanner to inspect candidate transaction counts (from DexScreener discovery metadata or raw signature count) and **immediately skip pools with $> 6\text{ transactions/minute}$** as exceeding free-tier verification capacity. This focuses prospective PAPER execution strictly on quiet setups where full verification is provably achievable.
-  - **Decision B (Fail-Closed on High Velocity)**: Allow candidate pools with $> 6\text{ tx/min}$ to be evaluated, expecting the bridge to terminate with `"STALE_DATA"` or `"BUDGET_EXHAUSTED"`. In this case, `flowCoverage` remains non-`SUFFICIENT`, flow counts remain `null`, and the candidate fails closed without trading.
-  - **Zero-Budget Commitment**: Antigravity is not authorized to alter pacing below 2,500 ms, increase concurrency, or procure paid RPC endpoints. The above bounds represent the physical limits of the existing zero-cost environment.
+- **Configured Client Limits**:
+  - Client Pacing Throttle: $\ge 2{,}500\text{ ms}$ minimum spacing between HTTP request starts (`MIN_HOST_PACING_MS = 2500`).
+  - Active Workload Queue Ceiling: Constructor default 100 in `RaydiumAmmV4TransactionSourceAdapter` (diagnostic probe used 10).
+  - Shared Budget Ceiling: Constructor default 120 total requests, 10 enrichment attempts, 4 reserved forward requests in `GlobalResourceBudgetManager` (diagnostic probe used 11 total, 7 enrichment, 4 forward).
+- **Upstream Provider Entitlements**:
+  - Pacing $\ge 2{,}500\text{ ms}$ is strictly a client-side rate limiter to avoid HTTP 429 status codes; it is **not** an upstream SLA, contract entitlement, or physical limit.
+  - Unauthenticated or free public RPC endpoints offer zero guaranteed capacity, variable round-trip latency ($RTT$), and may throttle or drop connections unpredictably.
 
----
+##### 4. Resource Exhaustion & Backlog Behavior
 
-#### 8.10.4 Offline Acceptance Criteria
-
-Verification must be 100% offline, using deterministic synthetic fixtures, mock transports, and virtual clocks. Synthetic controls remain strictly test-only (`allowSyntheticCompletenessProofs = false` in production code).
-
-The single-pool coverage step must pass the following 7 explicit acceptance test scenarios:
-
-1. **Scenario 1: Known Complete Synthetic Window (Positive Control)**:
-   - Given: Valid candidate context, witnessed $A_{\text{prior}}$ at $T - 65\text{s}$ and $A_{\text{post}}$ at $T$.
-   - Activity: 4 transactions in $[T - 60\text{s}, T]$, all retrieved and decoded without error.
-   - Stream: Continuous WebSocket connection, zero dropped frames, zero queue overflow, freshness $\le 15\text{s}$.
-   - Assertion: `ExactPoolWindowProof` accepted; `flowCoverage === "SUFFICIENT"`; `recentBuys60s` and `recentSells60s` return exact non-null integers; Retest Gate evaluates micro-flow absorption normally.
-2. **Scenario 2: Incomplete Window (Missing Prior Anchor)**:
-   - Given: Enumeration halts (e.g. genesis reached or pagination capped) before reaching $T - 60\text{s}$.
-   - Assertion: Proof generation fails; `flowCoverage === "COLLECTION_GAP"`; flow counts remain `null`; Retest Gate enforces unabsorbed 8% crater drop limit.
-3. **Scenario 3: Missing / Failed Transaction**:
-   - Given: 4 signatures discovered, but 1 transaction retrieval returns HTTP 500, timeout, or decode failure.
-   - Assertion: Bridge returns `PARTIAL_RESOLVED`; proof issuance blocked; `flowCoverage === "COLLECTION_GAP"`; flow counts remain `null`.
-4. **Scenario 4: Source Interruption & Stream Gap Retention**:
-   - Given: WebSocket disconnects during $[T - 40\text{s}, T - 30\text{s}]$; bridge successfully backfills all transactions from history.
-   - Assertion: Recorded stream gap is **NOT erased**; `flowCoverage === "COLLECTION_GAP"`; flow counts remain `null`; retrospective recovery does not alter live decision support.
-5. **Scenario 5: Processing Backlog & Queue Overflow**:
-   - Given: Sudden burst causes adapter queue to exceed limit (`maxPendingQueueSize = 10`); active workload $> 0$ at evaluation point.
-   - Assertion: `hasActiveBacklog === true`; `flowCoverage === "PROCESSING_BACKLOG"`; flow counts remain `null`.
-6. **Scenario 6: Stale Data Invalidation**:
-   - Given: Newest transaction or stream observation timestamp is $T - 20\text{s}$ ($> 15{,}000\text{ ms}$ threshold).
-   - Assertion: `flowCoverage === "STALE_DATA"`; flow counts remain `null`.
-7. **Scenario 7: Budget Exhaustion Guard**:
-   - Given: Resolution of transaction 5 encounters `PROVIDER_QUOTA_EXCEEDED` from `GlobalResourceBudgetManager`.
-   - Assertion: Bridge halts; zero further requests dispatched; `flowCoverage === "COLLECTION_GAP"`; flow counts remain `null`.
+- If immediate demand $D$ exceeds remaining candidate enrichment quota, dispatches fail with `PROVIDER_QUOTA_EXCEEDED` or `RESERVED_QUOTA_EXCEEDED` (forward quote reservations remain strictly protected).
+- If $T_{\text{resolution}}$ exceeds operation deadline or causes $\Delta t_{\text{age}} > 15{,}000\text{ ms}$, the evaluation fails closed with `STALE_DATA`.
+- If an active queue backlog exists ($Q > 0$) at decision time, `RollingTradeFlowTracker` evaluates coverage as `PROCESSING_BACKLOG`.
+- In all exhaustion or backlog conditions, `flowCoverage` is non-`SUFFICIENT`, flow counts remain `null`, and candidate progression is blocked.
 
 ---
 
-#### 8.10.5 Implementation Blueprint & Preserved Readiness Gaps
+#### 8.10.5 Two Synthetic Scenarios and Timelines
+
+To illustrate how the four-dimensional time contract, incremental resolution, and queue state operate in practice, the following synthetic scenarios trace candidate evaluation and document the exact conclusions and unresolved uncertainties at each decision point.
+
+##### Scenario A: Quiet Window (Zero-Transaction Pool)
+
+A newly discovered candidate pool experiences continuous WebSocket observation with zero witnessed transactions during the 60-second observation window.
+
+| Time ($T$)                         | Event / Subsystem Action                                                                                                   | Internal Queue State      | Evidence Freshness & Coverage State                                                                                         | Decision Point Conclusion & Uncertainty                                                                                                                                        |
+| :--------------------------------- | :------------------------------------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **$T = 0\text{s}$**                | Coordinator attaches WebSocket stream to target pool. Initial watermark established at $T_{\text{watermark}} = 0\text{s}$. | $Q = 0$, $K = 0$, $U = 0$ | Connection established; initial window open.                                                                                | Monitoring initiated.                                                                                                                                                          |
+| **$T = 0\text{s} \to 55\text{s}$** | Continuous WebSocket connection maintained. 2 client PING/PONG heartbeats exchanged successfully. 0 logs received.         | $Q = 0$, $K = 0$, $U = 0$ | Zero dropped frames; zero stream gaps.                                                                                      | Zero trades witnessed in stream.                                                                                                                                               |
+| **$T = 55\text{s}$**               | Bridge dispatches watermark query ($M = 1$ `getSignaturesForAddress` call). RPC returns zero new signatures for pool.      | $Q = 0$, $K = 0$, $U = 0$ | $T_{\text{watermark}}$ advanced to $55\text{s}$. Observation age $\Delta t_{\text{age}} = 5\text{s}$.                       | Watermark verified fresh ($\le 15\text{s}$).                                                                                                                                   |
+| **$T = 60\text{s}$**               | Strategy triggers candidate evaluation at $T_{\text{decision}} = 60\text{s}$.                                              | $Q = 0$, $K = 0$, $U = 0$ | Stream continuous; $\Delta t_{\text{age}} = 60\text{s} - 55\text{s} = 5\text{s} \le 15{,}000\text{ ms}$; no active backlog. | **Conclusion**: Valid quiet window. `recentBuys60s = 0`, `recentSells60s = 0`. Retest Gate evaluates micro-flow with 0 buys / 0 sells (unabsorbed crater drop limit enforced). |
+
+- **Unresolved Uncertainty at Decision Point ($T = 60\text{s}$)**:
+  1. _Upstream Index Omission_: If the RPC node failed to index an on-chain transaction that actually occurred, neither the WebSocket stream nor `getSignaturesForAddress` witnessed it. The quiet-window conclusion is strictly provider-relative.
+  2. _Intra-Second Timestamp Truncation_: Solana `blockTime` provides second-level resolution only; transactions occurring in the same second cannot be ordered with millisecond precision.
+
+##### Scenario B: Burst Window with Processing Delay & Active Backlog
+
+A candidate pool experiences moderate activity during the first 50 seconds, followed by a rapid burst of 4 transactions at $T = 52\text{s}$. The adapter resolves transactions incrementally at configured 2,500 ms pacing, leaving an active backlog when the candidate reaches the 60-second evaluation mark.
+
+| Time ($T$)             | Event / Subsystem Action                                                                                         | Internal Queue State                               | Incremental Resolution State                                  | Decision Point Conclusion & Uncertainty                                                                                                                         |
+| :--------------------- | :--------------------------------------------------------------------------------------------------------------- | :------------------------------------------------- | :------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **$T = 0\text{s}$**    | Coordinator attaches WebSocket stream to target pool.                                                            | $Q = 0$, $N = 0$, $K = 0$                          | Monitoring started.                                           | Clean stream baseline.                                                                                                                                          |
+| **$T = 10\text{s}$**   | Tx 1 witnessed via WebSocket. Adapter begins retrieval.                                                          | $Q = 1 \to 0$ (active in-flight: 1)                | Retrieval dispatched for Tx 1.                                | Normal in-stream arrival.                                                                                                                                       |
+| **$T = 12.6\text{s}$** | Tx 1 retrieved and decoded (Buy). Ingested into tracker.                                                         | $Q = 0$, $N = 1$, $K = 1$                          | Tx 1 resolved (`recentBuys60s = 1`).                          | Incremental processing caught up.                                                                                                                               |
+| **$T = 25\text{s}$**   | Tx 2 witnessed via WebSocket. Adapter begins retrieval (paced $\ge 2.5\text{s}$ from Tx 1).                      | $Q = 1 \to 0$ (active in-flight: 1)                | Retrieval dispatched for Tx 2.                                | Normal in-stream arrival.                                                                                                                                       |
+| **$T = 27.7\text{s}$** | Tx 2 retrieved and decoded (Sell). Ingested into tracker.                                                        | $Q = 0$, $N = 2$, $K = 2$                          | Tx 2 resolved (`recentSells60s = 1`).                         | Incremental processing caught up.                                                                                                                               |
+| **$T = 52\text{s}$**   | Rapid burst: Tx 3, 4, 5, 6 arrive in quick succession ($N = 6$ total).                                           | $Q = 3$ pending, 1 in-flight                       | Tx 3 begins retrieval; Tx 4, 5, 6 queued.                     | Active backlog initiated ($Q > 0$).                                                                                                                             |
+| **$T = 54.6\text{s}$** | Tx 3 retrieved and decoded (Buy, $K = 3$). Tx 4 starts retrieval.                                                | $Q = 2$ pending, 1 in-flight                       | Pacing enforced ($\ge 2.5\text{s}$).                          | Queue draining ($Q = 2$).                                                                                                                                       |
+| **$T = 57.2\text{s}$** | Tx 4 retrieved and decoded (Buy, $K = 4$). Tx 5 starts retrieval.                                                | $Q = 1$ pending, 1 in-flight                       | Pacing enforced ($\ge 2.5\text{s}$).                          | Queue draining ($Q = 1$).                                                                                                                                       |
+| **$T = 59.8\text{s}$** | Tx 5 retrieved and decoded (Sell, $K = 5$). Tx 6 starts retrieval.                                               | $Q = 0$ pending, 1 in-flight                       | Pacing enforced ($\ge 2.5\text{s}$).                          | Active workload $> 0$ ($U = 1$).                                                                                                                                |
+| **$T = 60\text{s}$**   | **Candidate evaluation triggered at $T_{\text{decision}} = 60\text{s}$**. Tx 6 is currently in-flight ($U = 1$). | Active workload $= 1$ ($U = 1$ pending resolution) | Tracker detects active workload: `hasActiveBacklog === true`. | **Conclusion**: `flowCoverage = "PROCESSING_BACKLOG"`, `recentBuys60s = null`, `recentSells60s = null`. Evaluation fails closed; candidate progression blocked. |
+| **$T = 62.4\text{s}$** | Tx 6 retrieved and decoded (Buy, $K = 6$). Adapter queue completely drains.                                      | $Q = 0$, $K = 6$, $U = 0$                          | All 6 transactions now resolved (`buys = 4, sells = 2`).      | Post-decision drain complete. Live evaluation was not delayed.                                                                                                  |
+
+- **Unresolved Uncertainty at Decision Point ($T = 60\text{s}$)**:
+  1. _Unresolved Burst Contents_: At $T = 60\text{s}$, whether unresolved Tx 6 was a Buy, a Sell, or a reverted transaction is unknown. The system refuses to evaluate on incomplete counts.
+  2. _Intra-Slot Micro-Ordering_: Transactions 3 through 6 occurred in the exact same slot. Solana JSON-RPC `getTransaction` does not supply a `transactionIndex`; their relative execution sequence within the slot cannot be definitively ordered beyond arrival sequence.
+  3. _Provider-Relative Completeness_: Standard RPC indexer completeness assumption remains unverified by independent cryptographic proof.
+
+---
+
+#### 8.10.6 Implementation Blueprint & Preserved Readiness Gaps
 
 ##### 1. Affected Files for Single-Pool Coverage Step
 
@@ -1185,11 +1211,11 @@ The single-pool coverage step must pass the following 7 explicit acceptance test
 2. [`backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolTransactionResolutionBridge.ts):
    - Add atomic window resolution method returning `ExactPoolWindowProof` upon complete resolution.
 3. [`backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCandidateSubscriptionCoordinator.ts):
-   - Add support for consuming `ExactPoolWindowProof` in `advanceCoverage()` under `PROVEN_SINGLE_POOL_WINDOW` mode.
+   - Add support for consuming `ExactPoolWindowProof` in `advanceCoverage()` under a dedicated non-synthetic provider-relative mode, subject to operator acceptance policy.
 4. [`backend/src/candidate-scanner/RollingTradeFlowTracker.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RollingTradeFlowTracker.ts):
    - Add immutable gap protection preventing retrospective trade ingestion from clearing active-window gaps.
 5. [`backend/src/candidate-scanner/ExactPoolWindowProof.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ExactPoolWindowProof.test.ts) (New Offline Test Suite):
-   - Comprehensive test suite covering the 7 offline acceptance scenarios.
+   - Comprehensive test suite covering synthetic fixtures, quiet windows, bursts with backlog, index omission detection limits, and boundary alignments.
 
 ##### 2. Preserved Readiness Gaps (Explicitly Kept Visible)
 
@@ -1198,16 +1224,22 @@ The single-pool coverage step must pass the following 7 explicit acceptance test
 - **Exit-Path Volume & Liquidity Estimation**:
   - Exit sizing and slippage modeling in `PositionLifecycleManager` still rely on 5-minute DexScreener volume and liquidity estimates. Single-pool 60-second micro-flow covers entry retest gating only; exit-path volume estimation remains an unresolved dependency.
 - **Multi-Pool & Cluster-Wide Coverage**:
-  - This step covers **one exact pool only**. It does not solve cluster-wide transaction ingestion or general market scanning.
+  - This proposal covers **one exact pool only**. It does not solve cluster-wide transaction ingestion or general market scanning.
 
 ---
 
 ### 8.11 Invariant Preservation Reaffirmation
 
-All Phase 12.94-D core safety boundaries remain strictly enforced and unchanged:
+All Phase 12.94-D core safety boundaries and project invariants remain strictly enforced and unchanged:
 
-- **Production Completeness**: `isProductionCompletenessEstablished = false`. Single-stream WebSocket observation does not prove gapless block coverage or zero dropped notifications.
-- **Virtual Wallet State**: Strictly frozen at 7.9259 SOL (hash `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`).
-- **Spending Ceiling**: Exactly $0.00. Zero live trades, zero signing, zero purchases.
-- **Gate 11 Concentration Safeguard**: Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
-- **Offline Discipline**: All proposed verification is 100% offline using synthetic fixtures and unit test harnesses. No live network calls, no daemon activation, and no automated reruns.
+- **Provider-Relative Completeness & Policy Guard**:
+  - `isProductionCompletenessEstablished = false`. Single-stream WebSocket observation and RPC signature pagination do **not** establish cryptographic or independent ledger certainty. The synthetic counterexample demonstrating that intermediate omissions pass standard anchor pagination is acknowledged.
+  - Evidence remains provider-relative and is **not promoted into production `SUFFICIENT` coverage** without explicit operator review and authorization.
+- **Virtual Wallet State**:
+  - Strictly frozen at 7.9259 SOL (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`).
+- **Spending Ceiling**:
+  - Exactly \$0.00. Zero live trades, zero signing, zero purchases.
+- **Gate 11 Concentration Safeguard**:
+  - Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
+- **Offline Discipline**:
+  - All proposed verification is 100% offline using synthetic fixtures and unit test harnesses. No live network calls, no daemon activation, and no automated reruns.
