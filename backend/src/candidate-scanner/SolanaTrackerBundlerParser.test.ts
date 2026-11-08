@@ -1,6 +1,4 @@
 import { describe, expect, it } from "vitest";
-import fsSync from "node:fs";
-import path from "node:path";
 import type { WatchlistCandidateItem } from "@nexustrade/shared";
 import {
   MAX_SOLANA_TRACKER_WALLETS_SAMPLE_LIMIT,
@@ -10,6 +8,10 @@ import {
   type SolanaTrackerWalletSampleEntry,
 } from "./SolanaTrackerBundlerParser.js";
 import { BuyGateTriggerService } from "./BuyGateTriggerService.js";
+import {
+  CAPTURED_SOLANA_TRACKER_METADATA,
+  CAPTURED_SOLANA_TRACKER_SANITIZED_PAYLOAD,
+} from "./fixtures/CapturedSolanaTrackerBundlerFixture.js";
 
 // Canonical 32-byte Solana base58 public keys
 const CANONICAL_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
@@ -1070,30 +1072,11 @@ describe("SolanaTrackerBundlerParser", () => {
       expect(resultInvalid.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
     });
 
-    it("verifies captured initialPercentage normalization against sealed capture without treating favorable Gate 11 as full admission", () => {
-      const repoRootDir = path.resolve(import.meta.dirname, "../../..");
-      const captureFilePath = path.resolve(
-        repoRootDir,
-        "data/research/captures/solana-tracker-bundler/2026-11-06T04-30-37-645Z_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R/sanitized-response.json",
+    it("verifies captured initialPercentage normalization against portable capture fixture without treating favorable Gate 11 as full admission", () => {
+      const parseResult = parseSolanaTrackerBundlersResponse(
+        CAPTURED_SOLANA_TRACKER_SANITIZED_PAYLOAD,
+        CAPTURED_SOLANA_TRACKER_METADATA,
       );
-      const metadataFilePath = path.resolve(
-        repoRootDir,
-        "data/research/captures/solana-tracker-bundler/2026-11-06T04-30-37-645Z_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R/capture-metadata.json",
-      );
-
-      expect(fsSync.existsSync(captureFilePath)).toBe(true);
-      expect(fsSync.existsSync(metadataFilePath)).toBe(true);
-
-      const metadata = JSON.parse(fsSync.readFileSync(metadataFilePath, "utf8")) as {
-        requestedMint: string;
-        localRetrievedAtMs: number;
-      };
-      const responsePayload = JSON.parse(fsSync.readFileSync(captureFilePath, "utf8"));
-
-      const parseResult = parseSolanaTrackerBundlersResponse(responsePayload, {
-        requestedMint: metadata.requestedMint,
-        localRetrievedAtMs: metadata.localRetrievedAtMs,
-      });
       expect(parseResult.success).toBe(true);
       if (!parseResult.success) return;
 
