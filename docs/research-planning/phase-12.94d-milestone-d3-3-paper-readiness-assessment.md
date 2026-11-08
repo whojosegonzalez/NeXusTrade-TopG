@@ -1495,25 +1495,27 @@ Quiet-window qualification is governed by strict, fail-closed conditions:
 1. **Explicit Opt-In & Environment Context**:
    - Requires explicit opt-in via `paperQuietStreamPolicy: { enabled: true, executionContext: "PAPER_SIMULATION" | "BACKTEST" }`.
    - Missing, disabled (`enabled: false`), or non-PAPER execution contexts (e.g. `"PRODUCTION"`) strictly fail closed to `STREAM_GAP` / `COLLECTION_GAP` with unavailable counts (`recentBuys60s: null, recentSells60s: null`).
-2. **Identity Binding**:
+   - Snapshots nested policy options before any awaits or asynchronous operations so caller mutation cannot alter authorization.
+2. **Identity & Epoch Binding**:
    - Exact candidate pool and token mint identity binding (`VALID_POOL_CONTEXT`). Identity mismatches fail closed with `IDENTITY_MISMATCH`.
+   - Evidence receipts are strictly bound to expected operation epoch (`connectionEpoch === expectedConnectionEpoch`). Receipts with negative, non-integer, or mismatched epochs fail closed to `IDENTITY_MISMATCH`.
 3. **Temporal Invariants & Freshness**:
    - Observation duration must span the 60-second window ($T_{\text{obs\_end}} \ge T_{\text{cutoff}}$ and $T_{\text{obs\_start}} \le T_{\text{cutoff}} - 60\text{s}$).
    - Source cutoff age must not exceed 15,000 ms ($\Delta t_{\text{cutoffAge}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$). Older cutoffs fail closed with `STALE_DATA`.
 4. **Boundary Anchor Witnessing & Enumeration Completeness**:
-   - Final enumeration must complete with terminal outcome `ANCHOR_WITNESSED`.
+   - Final enumeration must complete with terminal outcome `ANCHOR_WITNESSED` and candidate-bound verified `anchorRecord`. Empty fixture arrays (`historyRecords: []`) cannot substitute for acquisition evidence.
    - The pre-observation anchor must precede or align with window start ($T_{\text{anchor}} \le T_{\text{cutoff}} - 60\text{s}$).
    - Zero signatures discovered newer than the anchor (`discoveredSignatures.length === 0`).
 5. **Zero In-Window Transactions**:
    - No transactions in window (`signaturesInWindow.length === 0`).
    - If any signatures were discovered on-chain, the stream was not quiet and missed transactions; evaluation immediately fails closed to `STREAM_GAP`.
-6. **Zero Processing Backlog & No Recorded Collection Loss**:
+6. **Zero Processing Backlog & Origin-Distinguished Gap Handling**:
    - Zero active adapter transaction queue backlog (`hasActiveBacklog === false`).
-   - Zero recorded collection losses in the tracker (disconnects, buffer loss, capacity loss, queue overflows).
-   - Only the derived heuristic `STREAM_INACTIVITY_AT_EVALUATION` is permitted for qualification; actual recorded collection loss is strictly non-waivable.
+   - All supplied or tracker-recorded overlapping collection gaps strictly fail closed immediately regardless of reason label (even if labeled `STREAM_INACTIVITY_AT_EVALUATION`).
+   - Only the stream inactivity objection generated locally by the evaluation's own check ($T_{\text{windowEnd}} - T_{\text{lastObs}} > 15{,}000\text{ ms}$) may be deferred under the PAPER quiet stream policy.
 7. **Qualification Result**:
    - Reconciles to `status = "RECONCILED"`, `flowCoverage = "SUFFICIENT"`, `recentBuys60s = 0`, `recentSells60s = 0`, and `flowRatio = 1.0`.
-   - Retains declared provider/indexer assumptions and records explicit qualification reason (`paperQuietStreamQualified: true`, `paperQualificationReason`).
+   - Retains declared provider/indexer assumptions and records explicit qualification reason (`paperQuietStreamQualified: true`, `paperQualificationReason`, `paperValidatedEpoch`).
 
 #### 3. Isolated PAPER Conversion Adapter Architecture (`PaperReconciledCandidateFlowAdapter`)
 
@@ -1524,10 +1526,17 @@ To consume qualified quiet windows in PAPER simulation without modifying product
   - `toCandidateFlowResult()` in `ExactPoolWindowReconciliationEvaluator.ts` remains untouched; in production mode it permanently returns `COLLECTION_GAP` and null counts.
   - `allowSyntheticCompletenessProofs` is strictly confined to unit test fixtures and is NOT used for PAPER operation.
   - Default `CandidateFlowProvider` and live daemon entrypoints remain completely isolated from PAPER qualification.
-- **Contract & Validation**:
-  - `convertCandidateFlow(reconciliationResult, options)` and `convertRetestSpotInfo(...)` enforce `PAPER_SIMULATION` or `BACKTEST` execution context.
-  - Validates pool/token binding, status `RECONCILED`, coverage `SUFFICIENT`, cutoff freshness ($\le 15{,}000\text{ ms}$), and causality ($T_{\text{receipt}} \le T_{\text{decision}}$).
-  - Returns `PaperReconciledCandidateFlow` with `isPaperQualified: true`.
+- **Conversion-Time Causality & Freshness Validation**:
+  - Enforces `PAPER_SIMULATION` or `BACKTEST` execution context.
+  - Validates positive finite integer conversion timestamps (`evaluationTimestampMs`).
+  - Freshness parameter `maxAllowedEvidenceAgeMs` must be a positive finite integer $\le 15{,}000\text{ ms}$; rejects `NaN`, `Infinity`, negative, non-integer, or expanded ($> 15{,}000\text{ ms}$) limits.
+  - Validates window structure ($T_{\text{windowEnd}} - T_{\text{windowStart}} = 60{,}000\text{ ms}$) and source cutoff consistency ($T_{\text{cutoff}} = T_{\text{windowEnd}}$ and $T_{\text{cutoff\_retrieved}} \le T_{\text{decision}}$) before date formatting.
+  - Enforces conversion-time causality: rejects conversion earlier than original evaluation availability ($T_{\text{eval}} < T_{\text{decision}}$), window cutoff ($T_{\text{eval}} < T_{\text{windowEnd}}$), or cutoff retrieval ($T_{\text{eval}} < T_{\text{cutoff\_retrieved}}$).
+- **Authorized Qualification & Provenance Retention**:
+  - Strictly requires `paperQuietStreamQualified === true`, non-empty `paperQualificationReason`, status `RECONCILED`, and coverage `SUFFICIENT`.
+  - Rejects contradictory flow counts (strictly requires `recentBuys60s === 0`, `recentSells60s === 0`, `flowRatio === 1.0`).
+  - Preserves complete structured qualification context (`paperQualificationContext`) in both `CandidateFlowResult` and `RetestSpotInfo` outputs:
+    `executionContext`, `validatedEpoch`, `originalEvaluationTimestampMs`, `researchWindowSpan`, `cutoffAgeMs`, `qualificationReason`, `providerAssumptions`, and `unresolvedUncertainties`.
 - **Honest Time-Basis Notice**:
   - Discloses that the evaluated window $[T_{\text{windowStart}}, T_{\text{windowEnd}}]$ is anchored to on-chain source cutoff time, lagging evaluation decision time by cutoff age $\Delta t$. It is distinct from a real-time sliding window $[T_{\text{decision}} - 60\text{s}, T_{\text{decision}}]$.
 

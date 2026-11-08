@@ -1322,7 +1322,12 @@ export class RaydiumCandidateSubscriptionCoordinator {
       observationEndMs: options?.observationEndMs,
       budgetManager: options?.budgetManager,
       hasActiveBacklog: options?.hasActiveBacklog,
-      paperQuietStreamPolicy: options?.paperQuietStreamPolicy,
+      paperQuietStreamPolicy: options?.paperQuietStreamPolicy
+        ? Object.freeze({
+            enabled: Boolean(options.paperQuietStreamPolicy.enabled),
+            executionContext: options.paperQuietStreamPolicy.executionContext,
+          })
+        : undefined,
     };
 
     const initialEpoch = this.connectionEpoch;
@@ -1344,6 +1349,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
             optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
           observationEndMs: optionsSnapshot.observationEndMs ?? now,
           sourceCutoff: sourceCutoffSnapshot,
+          expectedConnectionEpoch: initialEpoch,
           budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
           clock: this.clock,
           paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
@@ -1360,6 +1366,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
         observationEndMs: optionsSnapshot.observationEndMs ?? now,
         sourceCutoff: sourceCutoffSnapshot,
+        expectedConnectionEpoch: initialEpoch,
         tracker: this.tracker,
         hasActiveBacklog:
           optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
@@ -1390,6 +1397,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
         observationEndMs: optionsSnapshot.observationEndMs ?? postEnumNow,
         sourceCutoff: sourceCutoffSnapshot,
+        expectedConnectionEpoch: initialEpoch,
         historyResult,
         historyRetrievedAtMs,
         acquisitionCompletedAtMs: postEnumNow,
@@ -1426,6 +1434,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
         observationEndMs: optionsSnapshot.observationEndMs ?? postResNow,
         sourceCutoff: sourceCutoffSnapshot,
+        expectedConnectionEpoch: initialEpoch,
         historyResult,
         ...(resolutionResult ? { resolutionResult } : {}),
         historyRetrievedAtMs,
@@ -1462,6 +1471,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
       observationStartMs: optionsSnapshot.observationStartMs ?? this.tracker.getTrackingStartedMs(),
       observationEndMs,
       sourceCutoff: sourceCutoffSnapshot,
+      expectedConnectionEpoch: initialEpoch,
       historyResult,
       ...(resolutionResult ? { resolutionResult } : {}),
       historyRetrievedAtMs,

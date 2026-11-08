@@ -13,13 +13,23 @@
  *    - Validates exact case-sensitive pool address and candidate token mint.
  *    - Rejects coordinate mismatches fail-closed with IDENTITY_MISMATCH.
  * 3. Freshness & Causality Validation:
- *    - Rejects future-dated reconciliation evidence (evaluationTimestampMs < windowEndMs).
- *    - Rejects stale cutoff evidence exceeding maxAllowedEvidenceAgeMs (default: 15,000 ms).
- * 4. Production Protection Invariants:
+ *    - Validates finite integer conversion timestamps and freshness parameters.
+ *    - Rejects conversion timestamps earlier than the result's original evaluation/acquisition availability or cutoff.
+ *    - Rejects stale cutoff evidence exceeding maxAllowedEvidenceAgeMs (authorized limit: at most 15,000 ms).
+ *    - Rejects invalid (NaN, Infinity, negative, non-integer) or expanded (> 15,000 ms) freshness limits.
+ * 4. Qualification Verification & Provenance Preservation:
+ *    - Restricts conversion strictly to verified qualified quiet windows (paperQuietStreamQualified === true).
+ *    - Rejects missing, false, or unreasoned qualification markers.
+ *    - Rejects contradictory counts or coverage (strictly requires 0 buys, 0 sells, flowRatio = 1.0, SUFFICIENT).
+ *    - Preserves structured qualification context in both CandidateFlowResult and RetestSpotInfo outputs:
+ *      executionContext, validatedEpoch, originalEvaluationTimestampMs, researchWindowSpan, cutoffAgeMs,
+ *      qualificationReason, providerAssumptions, and unresolvedUncertainties.
+ * 5. Production Protection Invariants:
  *    - Zero modification to production flow getters (evaluateFlow, createRetestSpotInfo).
  *    - Does NOT use, modify, or depend on allowSyntheticCompletenessProofs.
  *    - Gate 11 bundler screening and dynamic exit safeguards remain independent and fail-closed.
- * 5. Transparent Time-Basis Disclosure:
+ * 6. Transparent Time-Basis Disclosure:
+ *    - Validates window structure and cutoff consistency before formatting ISO dates.
  *    - Explicitly reports the cutoff-anchored research window endpoints [windowStartMs .. windowEndMs]
  *      and its latency delta relative to strategy decision time.
  */
@@ -32,7 +42,27 @@ export type PaperExecutionContext = "PAPER_SIMULATION" | "BACKTEST";
 
 export interface PaperFlowConversionOptions {
   readonly executionContext: PaperExecutionContext;
-  readonly maxAllowedEvidenceAgeMs?: number | undefined; // default: 15,000 ms
+  readonly maxAllowedEvidenceAgeMs?: number | undefined; // default: 15,000 ms, authorized max: 15,000 ms
+}
+
+export interface PaperQualificationContext {
+  readonly executionContext: PaperExecutionContext;
+  readonly validatedEpoch: number;
+  readonly originalEvaluationTimestampMs: number;
+  readonly researchWindowSpan: {
+    readonly windowStartMs: number;
+    readonly windowEndMs: number;
+    readonly cutoffAgeMs: number;
+  };
+  readonly cutoffAgeMs: number;
+  readonly qualificationReason: string;
+  readonly providerAssumptions: readonly string[];
+  readonly unresolvedUncertainties: readonly string[];
+}
+
+export interface PaperCandidateFlowResult extends CandidateFlowResult {
+  readonly isPaperQualified: boolean;
+  readonly paperQualificationContext?: PaperQualificationContext | undefined;
 }
 
 export interface PaperRetestSpotInfoResult extends RetestSpotInfo {
@@ -43,6 +73,7 @@ export interface PaperRetestSpotInfoResult extends RetestSpotInfo {
     readonly cutoffAgeMs: number;
   };
   readonly timeBasisNotice: string;
+  readonly paperQualificationContext?: PaperQualificationContext | undefined;
 }
 
 /**
@@ -51,146 +82,237 @@ export interface PaperRetestSpotInfoResult extends RetestSpotInfo {
  */
 export class PaperReconciledCandidateFlowAdapter {
   private readonly defaultMaxAllowedEvidenceAgeMs: number = 15_000;
+  private readonly maxAuthorizedEvidenceAgeMs: number = 15_000;
 
   /**
-   * Converts a WindowReconciliationResult into a CandidateFlowResult for paper evaluation.
+   * Converts a WindowReconciliationResult into a PaperCandidateFlowResult for paper evaluation.
    */
   public convertCandidateFlow(
     result: WindowReconciliationResult | null | undefined,
     target: CandidateFlowTarget,
     evaluationTimestampMs: number,
     options: PaperFlowConversionOptions,
-  ): CandidateFlowResult {
+  ): PaperCandidateFlowResult {
     const targetPool = target?.poolAddress ?? "";
     const targetMint = target?.tokenMint ?? "";
+
+    const createFallback = (
+      reason: string,
+      coverage: FlowCoverageStatus | "UNAVAILABLE" = "COLLECTION_GAP",
+    ): PaperCandidateFlowResult =>
+      Object.freeze({
+        poolAddress: targetPool,
+        tokenMint: targetMint,
+        recentBuys60s: null,
+        recentSells60s: null,
+        flowCoverage: coverage,
+        isCoverageSufficient: false,
+        diagnosticReason: reason,
+        evaluationTimestampMs:
+          typeof evaluationTimestampMs === "number" && Number.isFinite(evaluationTimestampMs)
+            ? evaluationTimestampMs
+            : 0,
+        isPaperQualified: false,
+      });
 
     // 1. Strict Execution Context Validation
     if (
       !options ||
       (options.executionContext !== "PAPER_SIMULATION" && options.executionContext !== "BACKTEST")
     ) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason:
-          "NON_PAPER_EXECUTION_CONTEXT: PaperReconciledCandidateFlowAdapter is restricted to PAPER_SIMULATION or BACKTEST execution contexts",
-        evaluationTimestampMs,
-      };
+      return createFallback(
+        "NON_PAPER_EXECUTION_CONTEXT: PaperReconciledCandidateFlowAdapter is restricted to PAPER_SIMULATION or BACKTEST execution contexts",
+      );
     }
 
-    // 2. Validate Result Existence
-    if (!result) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason: "MISSING_RECONCILIATION_RESULT",
-        evaluationTimestampMs,
-      };
+    // 2. Validate Evaluation Timestamp (must be a positive finite integer)
+    if (
+      typeof evaluationTimestampMs !== "number" ||
+      !Number.isFinite(evaluationTimestampMs) ||
+      !Number.isInteger(evaluationTimestampMs) ||
+      evaluationTimestampMs <= 0
+    ) {
+      return createFallback(
+        `INVALID_EVALUATION_TIMESTAMP: expected positive finite integer millisecond timestamp, received ${String(evaluationTimestampMs)}`,
+      );
     }
 
-    // 3. Strict Coordinate Binding
+    // 3. Validate Freshness Limit Parameter (authorized limit: at most 15,000 ms)
+    const maxAllowedAgeMs = options.maxAllowedEvidenceAgeMs ?? this.defaultMaxAllowedEvidenceAgeMs;
+    if (
+      typeof maxAllowedAgeMs !== "number" ||
+      !Number.isFinite(maxAllowedAgeMs) ||
+      Number.isNaN(maxAllowedAgeMs) ||
+      !Number.isInteger(maxAllowedAgeMs) ||
+      maxAllowedAgeMs <= 0 ||
+      maxAllowedAgeMs > this.maxAuthorizedEvidenceAgeMs
+    ) {
+      return createFallback(
+        `INVALID_MAX_ALLOWED_AGE: maxAllowedEvidenceAgeMs must be a finite positive integer <= ${this.maxAuthorizedEvidenceAgeMs} ms, received ${String(options.maxAllowedEvidenceAgeMs)}`,
+      );
+    }
+
+    // 4. Validate Result Existence
+    if (!result || typeof result !== "object") {
+      return createFallback("MISSING_RECONCILIATION_RESULT");
+    }
+
+    // 5. Strict Coordinate Binding
     if (
       result.candidate.poolId !== targetPool ||
       result.candidate.candidateTokenMint !== targetMint
     ) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason: `IDENTITY_MISMATCH: Target pool=${targetPool}, mint=${targetMint} does not match reconciled candidate pool=${result.candidate.poolId}, mint=${result.candidate.candidateTokenMint}`,
-        evaluationTimestampMs,
-      };
+      return createFallback(
+        `IDENTITY_MISMATCH: Target pool=${targetPool}, mint=${targetMint} does not match reconciled candidate pool=${result.candidate.poolId}, mint=${result.candidate.candidateTokenMint}`,
+      );
     }
 
-    // 4. Validate Decision Timestamp
+    // 6. Validate Window Structure & Cutoff Consistency
+    const windowStartMs = result.temporalContext?.windowStartMs;
+    const windowEndMs = result.temporalContext?.windowEndMs;
+    const origDecisionMs = result.temporalContext?.decisionTimestampMs;
+
     if (
-      typeof evaluationTimestampMs !== "number" ||
-      !Number.isFinite(evaluationTimestampMs) ||
-      evaluationTimestampMs <= 0
+      typeof windowStartMs !== "number" ||
+      typeof windowEndMs !== "number" ||
+      typeof origDecisionMs !== "number" ||
+      !Number.isSafeInteger(windowStartMs) ||
+      !Number.isSafeInteger(windowEndMs) ||
+      !Number.isSafeInteger(origDecisionMs) ||
+      windowStartMs <= 0 ||
+      windowEndMs <= 0 ||
+      origDecisionMs <= 0 ||
+      windowEndMs - windowStartMs !== 60_000
     ) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason: "INVALID_EVALUATION_TIMESTAMP",
-        evaluationTimestampMs,
-      };
+      return createFallback(
+        "INVALID_WINDOW_STRUCTURE: Research window endpoints must be positive finite integers spanning exactly 60,000 ms",
+      );
     }
 
-    // 5. Validate Temporal Ordering (Causality) & Freshness
-    const windowEndMs = result.temporalContext.windowEndMs;
+    if (
+      !result.sourceCutoff ||
+      typeof result.sourceCutoff !== "object" ||
+      typeof result.sourceCutoff.cutoffTimestampMs !== "number" ||
+      !Number.isFinite(result.sourceCutoff.cutoffTimestampMs) ||
+      result.sourceCutoff.cutoffTimestampMs !== windowEndMs ||
+      typeof result.sourceCutoff.retrievedAtMs !== "number" ||
+      !Number.isFinite(result.sourceCutoff.retrievedAtMs) ||
+      result.sourceCutoff.retrievedAtMs > origDecisionMs
+    ) {
+      return createFallback(
+        "INVALID_SOURCE_CUTOFF_CONSISTENCY: Source cutoff is missing, inconsistent with windowEndMs, or retrieved after decision time",
+      );
+    }
+
+    // 7. Validate Temporal Ordering (Conversion-Time Causality)
+    if (evaluationTimestampMs < windowEndMs) {
+      return createFallback(
+        `FUTURE_DATED_RECONCILIATION: Conversion timestamp (${evaluationTimestampMs} ms) is earlier than research cutoff (${windowEndMs} ms)`,
+      );
+    }
+
+    if (evaluationTimestampMs < origDecisionMs) {
+      return createFallback(
+        `CAUSALITY_VIOLATION: Conversion timestamp (${evaluationTimestampMs} ms) is earlier than original evaluation availability (${origDecisionMs} ms)`,
+      );
+    }
+
+    if (evaluationTimestampMs < result.sourceCutoff.retrievedAtMs) {
+      return createFallback(
+        `CAUSALITY_VIOLATION: Conversion timestamp (${evaluationTimestampMs} ms) is earlier than cutoff retrieval (${result.sourceCutoff.retrievedAtMs} ms)`,
+      );
+    }
+
+    // 8. Validate Freshness
     const cutoffAgeMs = evaluationTimestampMs - windowEndMs;
-    const maxAllowedAgeMs = options.maxAllowedEvidenceAgeMs ?? this.defaultMaxAllowedEvidenceAgeMs;
-
-    if (cutoffAgeMs < 0) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "COLLECTION_GAP",
-        isCoverageSufficient: false,
-        diagnosticReason: `FUTURE_DATED_RECONCILIATION: Evaluation timestamp ${evaluationTimestampMs} ms is earlier than research cutoff ${windowEndMs} ms`,
-        evaluationTimestampMs,
-      };
-    }
-
     if (cutoffAgeMs > maxAllowedAgeMs) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: "STALE_DATA",
-        isCoverageSufficient: false,
-        diagnosticReason: `STALE_RECONCILIATION_EVIDENCE: Research cutoff age (${cutoffAgeMs} ms) exceeds max allowed evidence age (${maxAllowedAgeMs} ms)`,
-        evaluationTimestampMs,
-      };
+      return createFallback(
+        `STALE_RECONCILIATION_EVIDENCE: Research cutoff age (${cutoffAgeMs} ms) exceeds max allowed evidence age (${maxAllowedAgeMs} ms)`,
+        "STALE_DATA",
+      );
     }
 
-    // 6. Validate Reconciliation Terminal Status & Sufficiency
+    // 9. Require Authorized PAPER Qualification & Reject Contradictory Counts/Coverage
+    if (result.paperQuietStreamQualified !== true) {
+      return createFallback(
+        "UNQUALIFIED_PAPER_EVIDENCE: Reconciliation result lacks paperQuietStreamQualified === true",
+      );
+    }
+
+    if (
+      typeof result.paperQualificationReason !== "string" ||
+      result.paperQualificationReason.trim().length === 0
+    ) {
+      return createFallback(
+        "MISSING_PAPER_QUALIFICATION_REASON: Reconciliation result lacks non-empty paperQualificationReason",
+      );
+    }
+
     if (
       result.status !== "RECONCILED" ||
-      !result.isCoverageSufficient ||
-      result.flowCoverage !== "SUFFICIENT"
+      result.flowCoverage !== "SUFFICIENT" ||
+      result.isCoverageSufficient !== true
     ) {
-      return {
-        poolAddress: targetPool,
-        tokenMint: targetMint,
-        recentBuys60s: null,
-        recentSells60s: null,
-        flowCoverage: result.flowCoverage,
-        isCoverageSufficient: false,
-        diagnosticReason: `INSUFFICIENT_FLOW_COVERAGE: Reconciliation status=${result.status}, flowCoverage=${result.flowCoverage} (${result.diagnosticReason})`,
-        evaluationTimestampMs,
-      };
+      return createFallback(
+        `INSUFFICIENT_FLOW_COVERAGE: Reconciliation status=${result.status}, flowCoverage=${result.flowCoverage}, isCoverageSufficient=${result.isCoverageSufficient} (${result.diagnosticReason})`,
+        result.flowCoverage,
+      );
     }
 
-    // 7. Successful PAPER Conversion
-    return {
+    // Validate genuine 0/0 counts and flowRatio = 1.0 convention for quiet window qualification
+    if (
+      result.flowCounts.recentBuys60s !== 0 ||
+      result.flowCounts.recentSells60s !== 0 ||
+      result.flowCounts.flowRatio !== 1.0
+    ) {
+      return createFallback(
+        `CONTRADICTORY_FLOW_COUNTS: Qualified quiet window must have recentBuys60s=0, recentSells60s=0, flowRatio=1.0 (received buys=${result.flowCounts.recentBuys60s}, sells=${result.flowCounts.recentSells60s}, ratio=${result.flowCounts.flowRatio})`,
+      );
+    }
+
+    // 10. Assemble Validated Epoch & Structured Qualification Context
+    const validatedEpoch =
+      result.paperValidatedEpoch ??
+      (typeof (result as unknown as { historyResult?: { connectionEpoch?: number } }).historyResult
+        ?.connectionEpoch === "number"
+        ? (result as unknown as { historyResult?: { connectionEpoch?: number } }).historyResult!
+            .connectionEpoch!
+        : 0);
+
+    if (!Number.isSafeInteger(validatedEpoch) || validatedEpoch < 0) {
+      return createFallback(
+        "INVALID_VALIDATED_EPOCH: Validated epoch must be a non-negative integer",
+      );
+    }
+
+    const paperQualificationContext: PaperQualificationContext = Object.freeze({
+      executionContext: options.executionContext,
+      validatedEpoch,
+      originalEvaluationTimestampMs: origDecisionMs,
+      researchWindowSpan: Object.freeze({
+        windowStartMs,
+        windowEndMs,
+        cutoffAgeMs,
+      }),
+      cutoffAgeMs,
+      qualificationReason: result.paperQualificationReason,
+      providerAssumptions: Object.freeze([...(result.providerAssumptions ?? [])]),
+      unresolvedUncertainties: Object.freeze([...(result.unresolvedUncertainties ?? [])]),
+    });
+
+    // 11. Successful PAPER Conversion
+    return Object.freeze({
       poolAddress: targetPool,
       tokenMint: targetMint,
-      recentBuys60s: result.flowCounts.recentBuys60s,
-      recentSells60s: result.flowCounts.recentSells60s,
-      flowCoverage: "SUFFICIENT",
+      recentBuys60s: 0,
+      recentSells60s: 0,
+      flowCoverage: "SUFFICIENT" as const,
       isCoverageSufficient: true,
       diagnosticReason: result.diagnosticReason,
       evaluationTimestampMs,
-    };
+      isPaperQualified: true,
+      paperQualificationContext,
+    });
   }
 
   /**
@@ -209,29 +331,44 @@ export class PaperReconciledCandidateFlowAdapter {
   ): PaperRetestSpotInfoResult {
     const flowResult = this.convertCandidateFlow(result, target, evaluationTimestampMs, options);
 
-    const windowStartMs = result?.temporalContext.windowStartMs ?? 0;
-    const windowEndMs = result?.temporalContext.windowEndMs ?? 0;
+    const windowStartMs = result?.temporalContext?.windowStartMs ?? 0;
+    const windowEndMs = result?.temporalContext?.windowEndMs ?? 0;
     const cutoffAgeMs =
-      result && Number.isFinite(evaluationTimestampMs) ? evaluationTimestampMs - windowEndMs : -1;
+      result && Number.isFinite(evaluationTimestampMs) && typeof windowEndMs === "number"
+        ? evaluationTimestampMs - windowEndMs
+        : -1;
 
-    const timeBasisNotice = flowResult.isCoverageSufficient
-      ? `Research window is cutoff-anchored [${new Date(windowStartMs).toISOString()} .. ${new Date(windowEndMs).toISOString()}], lagging evaluation time by ${cutoffAgeMs} ms; not identical to real-time sliding window.`
-      : "Research window unavailable or flow coverage insufficient.";
+    let timeBasisNotice: string;
+    if (
+      flowResult.isCoverageSufficient &&
+      flowResult.isPaperQualified &&
+      Number.isSafeInteger(windowStartMs) &&
+      Number.isSafeInteger(windowEndMs) &&
+      windowStartMs > 0 &&
+      windowEndMs > 0
+    ) {
+      timeBasisNotice = `Research window is cutoff-anchored [${new Date(windowStartMs).toISOString()} .. ${new Date(windowEndMs).toISOString()}], lagging evaluation time by ${cutoffAgeMs} ms; not identical to real-time sliding window.`;
+    } else {
+      timeBasisNotice = "Research window unavailable or flow coverage insufficient.";
+    }
 
-    return {
+    return Object.freeze({
       spotPriceSol: baseSpot.spotPriceSol,
       spotPriceUsd: baseSpot.spotPriceUsd,
       liquidityUsd: baseSpot.liquidityUsd,
       recentBuys60s: flowResult.recentBuys60s,
       recentSells60s: flowResult.recentSells60s,
       flowCoverage: flowResult.flowCoverage as FlowCoverageStatus,
-      isPaperQualified: flowResult.isCoverageSufficient,
-      researchWindowSpan: {
+      isPaperQualified: flowResult.isPaperQualified,
+      researchWindowSpan: Object.freeze({
         windowStartMs,
         windowEndMs,
         cutoffAgeMs,
-      },
+      }),
       timeBasisNotice,
-    };
+      ...(flowResult.paperQualificationContext
+        ? { paperQualificationContext: flowResult.paperQualificationContext }
+        : {}),
+    });
   }
 }

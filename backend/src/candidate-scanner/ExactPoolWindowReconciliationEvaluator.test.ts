@@ -1794,6 +1794,234 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.paperQuietStreamQualified).toBe(false);
     });
 
+    it("fails closed to STREAM_GAP when historyResult is missing and only historyRecords: [] is supplied under paperQuietStreamPolicy", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyRecords: [], // empty fixture array without completed historyResult
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "PAPER quiet stream qualification requires completed historyResult enumeration receipt",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to IDENTITY_MISMATCH when historyResult.connectionEpoch does not match expectedConnectionEpoch", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: 2,
+        historyResult: createQuietHistoryResult(), // default epoch 0 !== 2
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("IDENTITY_MISMATCH");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("does not match expected operation epoch");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to IDENTITY_MISMATCH when historyResult.connectionEpoch is negative or non-integer", () => {
+      const tracker = createQuietTracker();
+      const invalidEpochResult = createQuietHistoryResult();
+      (invalidEpochResult as { connectionEpoch: number }).connectionEpoch = -1;
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: invalidEpochResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("IDENTITY_MISMATCH");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("valid non-negative connectionEpoch");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to UNWITNESSED_PRIOR_ANCHOR when historyResult.anchorRecord is missing under paperQuietStreamPolicy", () => {
+      const tracker = createQuietTracker();
+      const missingAnchorRecordResult = createQuietHistoryResult();
+      (missingAnchorRecordResult as { anchorRecord: unknown }).anchorRecord = null;
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: missingAnchorRecordResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "History enumeration did not witness prior boundary anchor at or before window start",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to UNWITNESSED_PRIOR_ANCHOR when historyResult.anchorRecord blockTime does not predate windowStartMs", () => {
+      const tracker = createQuietTracker();
+      // windowStartMs is 5,000 ms (windowEndMs 65_000 - 60_000). Set anchor blockTime = 10s = 10,000 ms > 5,000 ms
+      const postWindowAnchorResult = createQuietHistoryResult();
+      (postWindowAnchorResult as { anchorRecord: HistorySignatureRecord }).anchorRecord = {
+        signature: "AnchorPostWindow",
+        slot: 280_000_050,
+        err: null,
+        blockTime: 10,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: postWindowAnchorResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "History enumeration did not witness prior boundary anchor at or before window start",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when options.recordedGaps contains a gap with reason STREAM_INACTIVITY_AT_EVALUATION", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        recordedGaps: [
+          {
+            gapStartMs: 20_000,
+            gapEndMs: 25_000,
+            reason: "STREAM_INACTIVITY_AT_EVALUATION", // recorded gap with inactivity label is strictly non-waivable
+          },
+        ],
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "COLLECTION_GAP: Stream gap witnessed in observation window",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when tracker has a recorded gap with reason STREAM_INACTIVITY_AT_EVALUATION", () => {
+      const tracker = createQuietTracker();
+      tracker.recordCollectionGap({
+        gapStartMs: 20_000,
+        gapEndMs: 25_000,
+        reason: "STREAM_INACTIVITY_AT_EVALUATION",
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "COLLECTION_GAP: Stream gap witnessed in observation window",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("snapshots paperQuietStreamPolicy so caller mutation post-call does not alter authorization", () => {
+      const tracker = createQuietTracker();
+      const mutablePolicy = {
+        enabled: true,
+        executionContext: "PAPER_SIMULATION" as const,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: mutablePolicy,
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.paperQuietStreamQualified).toBe(true);
+
+      // Mutate policy after call
+      mutablePolicy.enabled = false;
+      // Result was frozen and unaffected
+      expect(result.paperQuietStreamQualified).toBe(true);
+    });
+
     it("preserves windowSignaturesCount as null on early exit before counting stage", () => {
       const result = evaluateExactPoolWindowReconciliation({
         poolContext: VALID_POOL_CONTEXT,

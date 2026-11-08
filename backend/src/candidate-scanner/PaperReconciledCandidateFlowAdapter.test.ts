@@ -28,12 +28,12 @@ describe("PaperReconciledCandidateFlowAdapter", () => {
     status: "RECONCILED",
     candidate: POOL_CONTEXT,
     temporalContext: {
-      decisionTimestampMs: BASE_TIME,
+      decisionTimestampMs: BASE_TIME + 1_000,
       windowStartMs: BASE_TIME - 60_000,
       windowEndMs: BASE_TIME,
       observationStartMs: BASE_TIME - 70_000,
       observationEndMs: BASE_TIME,
-      evidenceAgeMs: 2_500,
+      evidenceAgeMs: 1_000,
       maxAllowedEvidenceAgeMs: 15_000,
     },
     sourceCutoff: {
@@ -43,7 +43,7 @@ describe("PaperReconciledCandidateFlowAdapter", () => {
       sourceMethod: "getBlockTime",
       responseField: "result",
       commitment: "confirmed",
-      retrievedAtMs: BASE_TIME + 2_500,
+      retrievedAtMs: BASE_TIME + 500,
     },
     flowCounts: {
       recentBuys60s: 0,
@@ -253,5 +253,284 @@ describe("PaperReconciledCandidateFlowAdapter", () => {
     expect(flowResult.recentBuys60s).toBeNull();
     expect(flowResult.recentSells60s).toBeNull();
     expect(flowResult.diagnosticReason).toContain("INSUFFICIENT_FLOW_COVERAGE");
+  });
+
+  // Counterexample 3: Freshness & Causality Boundaries
+  it("fails closed with CAUSALITY_VIOLATION when conversion timestamp is earlier than original decision (e.g. 65.5s vs 66.0s)", () => {
+    // Window cutoff at BASE_TIME (65.0s), decision at BASE_TIME + 1_000 (66.0s)
+    const reconResult = createQualifiedQuietResult();
+    const midTime = BASE_TIME + 500; // 65.5s: between cutoff and decision
+
+    const flowResult = adapter.convertCandidateFlow(
+      reconResult,
+      validTarget,
+      midTime,
+      paperOptions,
+    );
+
+    expect(flowResult.isCoverageSufficient).toBe(false);
+    expect(flowResult.flowCoverage).toBe("COLLECTION_GAP");
+    expect(flowResult.recentBuys60s).toBeNull();
+    expect(flowResult.diagnosticReason).toContain("CAUSALITY_VIOLATION");
+    expect(flowResult.diagnosticReason).toContain("earlier than original evaluation availability");
+  });
+
+  it("fails closed with INVALID_EVALUATION_TIMESTAMP when conversion timestamp is non-integer or non-positive", () => {
+    const reconResult = createQualifiedQuietResult();
+
+    const nonIntegerResult = adapter.convertCandidateFlow(
+      reconResult,
+      validTarget,
+      BASE_TIME + 1000.5,
+      paperOptions,
+    );
+    expect(nonIntegerResult.isCoverageSufficient).toBe(false);
+    expect(nonIntegerResult.diagnosticReason).toContain("INVALID_EVALUATION_TIMESTAMP");
+
+    const zeroResult = adapter.convertCandidateFlow(reconResult, validTarget, 0, paperOptions);
+    expect(zeroResult.isCoverageSufficient).toBe(false);
+    expect(zeroResult.diagnosticReason).toContain("INVALID_EVALUATION_TIMESTAMP");
+
+    const nanResult = adapter.convertCandidateFlow(reconResult, validTarget, NaN, paperOptions);
+    expect(nanResult.isCoverageSufficient).toBe(false);
+    expect(nanResult.diagnosticReason).toContain("INVALID_EVALUATION_TIMESTAMP");
+  });
+
+  it("fails closed with INVALID_MAX_ALLOWED_AGE when maxAllowedEvidenceAgeMs is NaN, Infinity, negative, or > 15,000 ms", () => {
+    const reconResult = createQualifiedQuietResult();
+    const evalTime = BASE_TIME + 2_000;
+
+    // NaN
+    const nanRes = adapter.convertCandidateFlow(reconResult, validTarget, evalTime, {
+      executionContext: "PAPER_SIMULATION",
+      maxAllowedEvidenceAgeMs: NaN,
+    });
+    expect(nanRes.isCoverageSufficient).toBe(false);
+    expect(nanRes.diagnosticReason).toContain("INVALID_MAX_ALLOWED_AGE");
+
+    // Infinity
+    const infRes = adapter.convertCandidateFlow(reconResult, validTarget, evalTime, {
+      executionContext: "PAPER_SIMULATION",
+      maxAllowedEvidenceAgeMs: Infinity,
+    });
+    expect(infRes.isCoverageSufficient).toBe(false);
+    expect(infRes.diagnosticReason).toContain("INVALID_MAX_ALLOWED_AGE");
+
+    // Negative
+    const negRes = adapter.convertCandidateFlow(reconResult, validTarget, evalTime, {
+      executionContext: "PAPER_SIMULATION",
+      maxAllowedEvidenceAgeMs: -100,
+    });
+    expect(negRes.isCoverageSufficient).toBe(false);
+    expect(negRes.diagnosticReason).toContain("INVALID_MAX_ALLOWED_AGE");
+
+    // Expanded limit > 15,000 ms (e.g. 20,000 ms)
+    const expandedRes = adapter.convertCandidateFlow(reconResult, validTarget, evalTime, {
+      executionContext: "PAPER_SIMULATION",
+      maxAllowedEvidenceAgeMs: 20_000,
+    });
+    expect(expandedRes.isCoverageSufficient).toBe(false);
+    expect(expandedRes.diagnosticReason).toContain("INVALID_MAX_ALLOWED_AGE");
+    expect(expandedRes.diagnosticReason).toContain("<= 15000 ms");
+  });
+
+  it("fails closed with INVALID_WINDOW_STRUCTURE when window span is not exactly 60,000 ms", () => {
+    const reconResult = createQualifiedQuietResult({
+      temporalContext: {
+        decisionTimestampMs: BASE_TIME + 1_000,
+        windowStartMs: BASE_TIME - 30_000, // 30s instead of 60s
+        windowEndMs: BASE_TIME,
+        observationStartMs: BASE_TIME - 70_000,
+        observationEndMs: BASE_TIME,
+        evidenceAgeMs: 1_000,
+        maxAllowedEvidenceAgeMs: 15_000,
+      },
+    });
+
+    const flowResult = adapter.convertCandidateFlow(
+      reconResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(flowResult.isCoverageSufficient).toBe(false);
+    expect(flowResult.diagnosticReason).toContain("INVALID_WINDOW_STRUCTURE");
+  });
+
+  it("fails closed with INVALID_SOURCE_CUTOFF_CONSISTENCY when cutoff does not match windowEndMs or was retrieved after decision", () => {
+    // Cutoff mismatch with windowEndMs
+    const mismatchedCutoff = createQualifiedQuietResult({
+      sourceCutoff: {
+        slot: 280_000_100,
+        cutoffTimestampMs: BASE_TIME - 5_000, // does not match windowEndMs (BASE_TIME)
+        provenance: "ON_CHAIN_BLOCK_TIME",
+        sourceMethod: "getBlockTime",
+        responseField: "result",
+        commitment: "confirmed",
+        retrievedAtMs: BASE_TIME + 500,
+      },
+    });
+
+    const mismatchRes = adapter.convertCandidateFlow(
+      mismatchedCutoff,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(mismatchRes.isCoverageSufficient).toBe(false);
+    expect(mismatchRes.diagnosticReason).toContain("INVALID_SOURCE_CUTOFF_CONSISTENCY");
+
+    // Cutoff retrieved after decision
+    const retrievedAfterDecision = createQualifiedQuietResult({
+      sourceCutoff: {
+        slot: 280_000_100,
+        cutoffTimestampMs: BASE_TIME,
+        provenance: "ON_CHAIN_BLOCK_TIME",
+        sourceMethod: "getBlockTime",
+        responseField: "result",
+        commitment: "confirmed",
+        retrievedAtMs: BASE_TIME + 2_000, // > decisionTimestampMs (BASE_TIME + 1_000)
+      },
+    });
+
+    const retrievedAfterRes = adapter.convertCandidateFlow(
+      retrievedAfterDecision,
+      validTarget,
+      BASE_TIME + 2_500,
+      paperOptions,
+    );
+    expect(retrievedAfterRes.isCoverageSufficient).toBe(false);
+    expect(retrievedAfterRes.diagnosticReason).toContain("INVALID_SOURCE_CUTOFF_CONSISTENCY");
+  });
+
+  // Counterexample 4: Authorized Qualification & Provenance Retention
+  it("fails closed with UNQUALIFIED_PAPER_EVIDENCE when paperQuietStreamQualified is false or missing", () => {
+    const unqualResult = createQualifiedQuietResult({
+      paperQuietStreamQualified: false,
+    });
+
+    const flowResult = adapter.convertCandidateFlow(
+      unqualResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(flowResult.isCoverageSufficient).toBe(false);
+    expect(flowResult.diagnosticReason).toContain("UNQUALIFIED_PAPER_EVIDENCE");
+  });
+
+  it("fails closed with MISSING_PAPER_QUALIFICATION_REASON when paperQualificationReason is empty string or missing", () => {
+    const missingReasonResult = createQualifiedQuietResult({
+      paperQualificationReason: "   ",
+    });
+
+    const flowResult = adapter.convertCandidateFlow(
+      missingReasonResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(flowResult.isCoverageSufficient).toBe(false);
+    expect(flowResult.diagnosticReason).toContain("MISSING_PAPER_QUALIFICATION_REASON");
+  });
+
+  it("fails closed with CONTRADICTORY_FLOW_COUNTS when recentBuys60s, recentSells60s, or flowRatio are contradictory", () => {
+    // buys > 0
+    const nonZeroBuys = createQualifiedQuietResult({
+      flowCounts: { recentBuys60s: 1, recentSells60s: 0, flowRatio: 1.0 },
+    });
+    const buysRes = adapter.convertCandidateFlow(
+      nonZeroBuys,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(buysRes.isCoverageSufficient).toBe(false);
+    expect(buysRes.diagnosticReason).toContain("CONTRADICTORY_FLOW_COUNTS");
+
+    // sells > 0
+    const nonZeroSells = createQualifiedQuietResult({
+      flowCounts: { recentBuys60s: 0, recentSells60s: 2, flowRatio: 0.0 },
+    });
+    const sellsRes = adapter.convertCandidateFlow(
+      nonZeroSells,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(sellsRes.isCoverageSufficient).toBe(false);
+    expect(sellsRes.diagnosticReason).toContain("CONTRADICTORY_FLOW_COUNTS");
+
+    // flowRatio !== 1.0
+    const ratioMismatch = createQualifiedQuietResult({
+      flowCounts: { recentBuys60s: 0, recentSells60s: 0, flowRatio: 0.5 },
+    });
+    const ratioRes = adapter.convertCandidateFlow(
+      ratioMismatch,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(ratioRes.isCoverageSufficient).toBe(false);
+    expect(ratioRes.diagnosticReason).toContain("CONTRADICTORY_FLOW_COUNTS");
+  });
+
+  it("preserves complete structured qualification context in CandidateFlowResult and RetestSpotInfo", () => {
+    const reconResult = createQualifiedQuietResult({
+      paperValidatedEpoch: 3,
+      providerAssumptions: ["Assumption 1: standard RPC indexing"],
+      unresolvedUncertainties: ["Uncertainty 1: upstream latency"],
+      paperQualificationReason: "PAPER_QUIET_STREAM_QUALIFIED: verified 0/0 activity",
+    });
+    const evalTime = BASE_TIME + 3_000;
+
+    const flowResult = adapter.convertCandidateFlow(
+      reconResult,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+
+    expect(flowResult.isCoverageSufficient).toBe(true);
+    expect(flowResult.isPaperQualified).toBe(true);
+    expect(flowResult.paperQualificationContext).toBeDefined();
+    expect(flowResult.paperQualificationContext?.executionContext).toBe("PAPER_SIMULATION");
+    expect(flowResult.paperQualificationContext?.validatedEpoch).toBe(3);
+    expect(flowResult.paperQualificationContext?.originalEvaluationTimestampMs).toBe(
+      BASE_TIME + 1_000,
+    );
+    expect(flowResult.paperQualificationContext?.researchWindowSpan).toEqual({
+      windowStartMs: BASE_TIME - 60_000,
+      windowEndMs: BASE_TIME,
+      cutoffAgeMs: 3_000,
+    });
+    expect(flowResult.paperQualificationContext?.cutoffAgeMs).toBe(3_000);
+    expect(flowResult.paperQualificationContext?.qualificationReason).toBe(
+      "PAPER_QUIET_STREAM_QUALIFIED: verified 0/0 activity",
+    );
+    expect(flowResult.paperQualificationContext?.providerAssumptions).toEqual([
+      "Assumption 1: standard RPC indexing",
+    ]);
+    expect(flowResult.paperQualificationContext?.unresolvedUncertainties).toEqual([
+      "Uncertainty 1: upstream latency",
+    ]);
+
+    // RetestSpotInfo conversion
+    const baseSpot = { spotPriceSol: 0.005, spotPriceUsd: 1.25, liquidityUsd: 45_000 };
+    const spotInfo = adapter.convertRetestSpotInfo(
+      reconResult,
+      baseSpot,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+
+    expect(spotInfo.isPaperQualified).toBe(true);
+    expect(spotInfo.paperQualificationContext).toBeDefined();
+    expect(spotInfo.paperQualificationContext?.validatedEpoch).toBe(3);
+    expect(spotInfo.paperQualificationContext?.cutoffAgeMs).toBe(3_000);
+    expect(spotInfo.paperQualificationContext?.qualificationReason).toBe(
+      "PAPER_QUIET_STREAM_QUALIFIED: verified 0/0 activity",
+    );
   });
 });
