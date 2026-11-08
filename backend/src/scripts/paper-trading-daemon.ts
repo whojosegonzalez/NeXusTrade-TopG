@@ -584,7 +584,8 @@ export function buildPositionMarketContext(
   }
 
   // 3. Stagnation Evidence Accounting:
-  // Strictly require interval and epoch provenance. Do NOT substitute currentNow, currentNow - 60_000, or epoch 0.
+  // Strictly require complete, valid, fresh interval and epoch provenance.
+  // Do NOT substitute currentNow, currentNow - 60_000, or epoch 0.
   const windowStart =
     validatedFlow.windowStartMs ??
     validatedFlow.paperQualificationContext?.researchWindowSpan.windowStartMs;
@@ -594,6 +595,27 @@ export function buildPositionMarketContext(
   const connectionEpoch =
     validatedFlow.connectionEpoch ?? validatedFlow.paperQualificationContext?.validatedEpoch;
 
+  const hasIntervalMetadata =
+    windowStart !== undefined || windowEnd !== undefined || connectionEpoch !== undefined;
+
+  const isValidIntervalEvidence =
+    hasIntervalMetadata &&
+    windowStart !== undefined &&
+    windowEnd !== undefined &&
+    connectionEpoch !== undefined &&
+    typeof windowStart === "number" &&
+    typeof windowEnd === "number" &&
+    typeof connectionEpoch === "number" &&
+    Number.isSafeInteger(windowStart) &&
+    Number.isSafeInteger(windowEnd) &&
+    Number.isSafeInteger(connectionEpoch) &&
+    windowStart > 0 &&
+    windowEnd > 0 &&
+    connectionEpoch >= 0 &&
+    windowEnd - windowStart === 60_000 &&
+    windowEnd <= currentNow &&
+    currentNow - windowEnd <= 15_000;
+
   if (
     !validatedFlow.isCoverageSufficient ||
     validatedFlow.recentBuys60s === null ||
@@ -601,14 +623,13 @@ export function buildPositionMarketContext(
   ) {
     // Collection gaps, outages, or stale evidence break continuity
     quietTracker.reset("INSUFFICIENT_OR_UNAVAILABLE_FLOW");
-  } else if (
-    windowStart === undefined ||
-    windowEnd === undefined ||
-    connectionEpoch === undefined
-  ) {
+  } else if (!hasIntervalMetadata) {
     // Missing interval or epoch evidence must leave stagnation unavailable.
     // Counts alone cannot establish stagnation coverage.
     quietTracker.reset("MISSING_INTERVAL_OR_EPOCH_PROVENANCE");
+  } else if (!isValidIntervalEvidence) {
+    // Partial, malformed, stale, future, or oversized interval metadata fails closed
+    quietTracker.reset("INVALID_OR_STALE_INTERVAL_METADATA");
   } else {
     const isQuiet = validatedFlow.recentBuys60s === 0 && validatedFlow.recentSells60s === 0;
     quietTracker.recordQuietWindow({

@@ -538,31 +538,77 @@ export function validateAndSnapshotCandidateFlowResult(
         ? res.diagnosticReason
         : "Coverage is sufficient";
 
+    // Validate ordinary flow interval metadata if any interval field is supplied
+    const hasIntervalMetadata =
+      res.windowStartMs !== undefined ||
+      res.windowEndMs !== undefined ||
+      res.connectionEpoch !== undefined;
+
     const extraFields: {
       windowStartMs?: number;
       windowEndMs?: number;
       connectionEpoch?: number;
     } = {};
-    if (
-      typeof res.windowStartMs === "number" &&
-      Number.isSafeInteger(res.windowStartMs) &&
-      res.windowStartMs >= 0
-    ) {
-      extraFields.windowStartMs = res.windowStartMs;
-    }
-    if (
-      typeof res.windowEndMs === "number" &&
-      Number.isSafeInteger(res.windowEndMs) &&
-      res.windowEndMs >= 0
-    ) {
-      extraFields.windowEndMs = res.windowEndMs;
-    }
-    if (
-      typeof res.connectionEpoch === "number" &&
-      Number.isSafeInteger(res.connectionEpoch) &&
-      res.connectionEpoch >= 0
-    ) {
-      extraFields.connectionEpoch = res.connectionEpoch;
+
+    if (hasIntervalMetadata) {
+      // 1. All three fields must be supplied together (complete tuple)
+      if (
+        res.windowStartMs === undefined ||
+        res.windowEndMs === undefined ||
+        res.connectionEpoch === undefined
+      ) {
+        return fallback(
+          "PARTIAL_FLOW_INTERVAL_METADATA: windowStartMs, windowEndMs, and connectionEpoch must all be defined when interval metadata is supplied",
+        );
+      }
+
+      // 2. Types and safe-integer boundaries
+      const startMs = res.windowStartMs;
+      const endMs = res.windowEndMs;
+      const epoch = res.connectionEpoch;
+
+      if (
+        typeof startMs !== "number" ||
+        typeof endMs !== "number" ||
+        typeof epoch !== "number" ||
+        !Number.isSafeInteger(startMs) ||
+        !Number.isSafeInteger(endMs) ||
+        !Number.isSafeInteger(epoch) ||
+        startMs <= 0 ||
+        endMs <= 0 ||
+        epoch < 0
+      ) {
+        return fallback(
+          `MALFORMED_FLOW_INTERVAL_METADATA: timestamps must be positive safe integers and epoch must be non-negative safe integer, received windowStartMs=${String(startMs)}, windowEndMs=${String(endMs)}, connectionEpoch=${String(epoch)}`,
+        );
+      }
+
+      // 3. Exactly 60,000 ms duration for 60-second counts
+      if (endMs - startMs !== 60_000) {
+        return fallback(
+          `INVALID_FLOW_INTERVAL_DURATION: 60-second flow interval must span exactly 60000 ms, received ${endMs - startMs} ms`,
+        );
+      }
+
+      // 4. Causality check: windowEndMs <= evaluationTimestampMs
+      if (endMs > evaluationTimestampMs) {
+        return fallback(
+          `FUTURE_DATED_FLOW_INTERVAL: windowEndMs (${endMs} ms) exceeds consumption timestamp (${evaluationTimestampMs} ms)`,
+        );
+      }
+
+      // 5. Freshness check: cutoff age <= maxAllowedAgeMs (never exceeding 15,000 ms)
+      const cutoffAgeMs = evaluationTimestampMs - endMs;
+      if (cutoffAgeMs > maxAllowedAgeMs) {
+        return fallback(
+          `STALE_FLOW_INTERVAL_EVIDENCE: interval cutoff age (${cutoffAgeMs} ms) exceeds max allowed age (${maxAllowedAgeMs} ms)`,
+          "STALE_DATA",
+        );
+      }
+
+      extraFields.windowStartMs = startMs;
+      extraFields.windowEndMs = endMs;
+      extraFields.connectionEpoch = epoch;
     }
 
     return Object.freeze({

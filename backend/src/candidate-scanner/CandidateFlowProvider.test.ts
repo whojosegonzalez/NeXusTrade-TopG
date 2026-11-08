@@ -1359,6 +1359,119 @@ describe("CandidateFlowProvider & Evaluation Seam", () => {
         assumptions.push("injected-assumption");
         expect(snap.paperQualificationContext?.providerAssumptions).toEqual(["assumption-1"]);
       });
+
+      it("validates ordinary flow interval metadata tuple together and preserves fields on valid fresh 60s window", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid fresh window",
+          evaluationTimestampMs: 1_000_000,
+          windowStartMs: 940_000,
+          windowEndMs: 1_000_000,
+          connectionEpoch: 1,
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.isCoverageSufficient).toBe(true);
+        expect(snap.flowCoverage).toBe("SUFFICIENT");
+        expect(snap.recentBuys60s).toBe(20);
+        expect(snap.recentSells60s).toBe(5);
+        expect(snap.windowStartMs).toBe(940_000);
+        expect(snap.windowEndMs).toBe(1_000_000);
+        expect(snap.connectionEpoch).toBe(1);
+      });
+
+      it("rejects partial ordinary interval metadata fail-closed", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Partial metadata",
+          evaluationTimestampMs: 1_000_000,
+          windowStartMs: 940_000,
+          windowEndMs: 1_000_000,
+          // connectionEpoch omitted!
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("PARTIAL_FLOW_INTERVAL_METADATA");
+      });
+
+      it("rejects non-60s interval duration for 60-second flow counts fail-closed", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Oversized duration",
+          evaluationTimestampMs: 1_000_000,
+          windowStartMs: 820_000,
+          windowEndMs: 1_000_000, // 180,000ms duration!
+          connectionEpoch: 0,
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("INVALID_FLOW_INTERVAL_DURATION");
+      });
+
+      it("rejects stale ordinary interval cutoff age (> 15,000 ms) fail-closed with STALE_DATA", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Stale window",
+          evaluationTimestampMs: 2_000_000,
+          windowStartMs: 1_020_000,
+          windowEndMs: 1_080_000, // 920,000ms stale!
+          connectionEpoch: 0,
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 2_000_000);
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("STALE_DATA");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("STALE_FLOW_INTERVAL_EVIDENCE");
+      });
+
+      it("rejects future-dated ordinary interval endpoint fail-closed", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 20,
+          recentSells60s: 5,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Future window",
+          evaluationTimestampMs: 1_000_000,
+          windowStartMs: 940_001,
+          windowEndMs: 1_000_001, // 1ms into the future!
+          connectionEpoch: 0,
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("FUTURE_DATED_FLOW_INTERVAL");
+      });
     });
 
     describe("4.3 Pre-Extraction Liquidity Floor Restoration & Cohort Preservation", () => {

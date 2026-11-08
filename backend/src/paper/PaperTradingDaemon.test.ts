@@ -3573,5 +3573,228 @@ describe("PaperTradingDaemon", () => {
       expect(resZero.isFeedOutage).toBe(true);
       expect(resZero.marketContext).toBeNull();
     });
+
+    it("reproduction 1: rejects three old contiguous intervals consumed at 2,000,000 (final ending at 1,080,000) from producing volumeStalled3m=true", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-repro-1",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // Intervals end at 1,080,000 but are consumed at 2,000,000 (age 920,000 ms > 15,000 ms max cutoff age)
+      const intervals = [
+        { start: 960_000, end: 1_020_000 },
+        { start: 1_020_000, end: 1_080_000 },
+      ];
+
+      for (let i = 0; i < intervals.length; i++) {
+        const interval = intervals[i]!;
+        const flowProvider: CandidateFlowProvider = {
+          getCandidateFlow: (_target, evalMs) => ({
+            poolAddress: dummyPoolId,
+            tokenMint: dummyMint,
+            recentBuys60s: 0,
+            recentSells60s: 0,
+            flowCoverage: "SUFFICIENT",
+            isCoverageSufficient: true,
+            diagnosticReason: "Old interval",
+            evaluationTimestampMs: evalMs,
+            windowStartMs: interval.start,
+            windowEndMs: interval.end,
+            connectionEpoch: 0,
+          }),
+        };
+
+        const res = buildPositionMarketContext({
+          position: pos,
+          spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+          currentNow: 2_000_000,
+          flowProvider,
+          quietTracker,
+        });
+
+        // Stale interval metadata must fail closed without entering the quiet tracker
+        expect(res.validatedFlow.isCoverageSufficient).toBe(false);
+        expect(res.validatedFlow.flowCoverage).toBe("STALE_DATA");
+        expect(res.validatedFlow.recentBuys60s).toBeNull();
+        expect(res.marketContext?.volumeStalled3m).toBe(false);
+      }
+
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
+
+    it("reproduction 2: rejects single 180-second interval from producing volumeStalled3m=true for 60-second counts", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-repro-2",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // Interval spans 180,000 ms (820,000 to 1,000,000), but counts are 60-second counts
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: (_target, evalMs) => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Oversized interval",
+          evaluationTimestampMs: evalMs,
+          windowStartMs: 820_000,
+          windowEndMs: 1_000_000,
+          connectionEpoch: 0,
+        }),
+      };
+
+      const res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+
+      // Must fail closed with INVALID_FLOW_INTERVAL_DURATION and NOT establish stagnation
+      expect(res.validatedFlow.isCoverageSufficient).toBe(false);
+      expect(res.validatedFlow.flowCoverage).toBe("COLLECTION_GAP");
+      expect(res.validatedFlow.diagnosticReason).toContain("INVALID_FLOW_INTERVAL_DURATION");
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
+
+    it("fails closed on partial interval metadata without entering quiet tracker", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-partial-interval",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // windowStartMs and windowEndMs provided, connectionEpoch omitted
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: (_target, evalMs) => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Partial metadata",
+          evaluationTimestampMs: evalMs,
+          windowStartMs: 940_000,
+          windowEndMs: 1_000_000,
+          // connectionEpoch missing!
+        }),
+      };
+
+      const res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+
+      expect(res.validatedFlow.isCoverageSufficient).toBe(false);
+      expect(res.validatedFlow.flowCoverage).toBe("COLLECTION_GAP");
+      expect(res.validatedFlow.diagnosticReason).toContain("PARTIAL_FLOW_INTERVAL_METADATA");
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
+
+    it("fails closed on future interval endpoints without entering quiet tracker", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-future-endpoint",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // windowEndMs is 1_000_001 while currentNow is 1_000_000
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: (_target, evalMs) => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Future endpoint",
+          evaluationTimestampMs: evalMs,
+          windowStartMs: 940_001,
+          windowEndMs: 1_000_001,
+          connectionEpoch: 0,
+        }),
+      };
+
+      const res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+
+      expect(res.validatedFlow.isCoverageSufficient).toBe(false);
+      expect(res.validatedFlow.flowCoverage).toBe("COLLECTION_GAP");
+      expect(res.validatedFlow.diagnosticReason).toContain("FUTURE_DATED_FLOW_INTERVAL");
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
+
+    it("does not advance coverage on repeated snapshots of the same quiet window", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-repeated-snapshot",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: (_target, evalMs) => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Snapshot 1",
+          evaluationTimestampMs: evalMs,
+          windowStartMs: 940_000,
+          windowEndMs: 1_000_000,
+          connectionEpoch: 0,
+        }),
+      };
+
+      // Initial observation of [940_000, 1_000_000]
+      const res1 = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(res1.marketContext?.volumeStalled3m).toBe(false);
+
+      // Repeated observation of exact same window [940_000, 1_000_000] at 1_001_000
+      const res2 = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_001_000,
+        flowProvider,
+        quietTracker,
+      });
+      // Repeated snapshot must not advance coverage or double-count!
+      expect(res2.marketContext?.volumeStalled3m).toBe(false);
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
   });
 });
