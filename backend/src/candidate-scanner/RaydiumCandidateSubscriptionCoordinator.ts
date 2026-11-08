@@ -144,7 +144,7 @@ export interface CoordinatorMetrics {
 export interface CandidateWindowReconciliationOptions {
   readonly knownAnchorSignature: string;
   readonly historyEnumerator: ExactPoolHistoryEnumerator;
-  readonly resolutionBridge: ExactPoolTransactionResolutionBridge;
+  readonly resolutionBridge?: ExactPoolTransactionResolutionBridge | undefined;
   readonly decisionTimestampMs?: number | undefined;
   readonly observationStartMs?: number | undefined;
   readonly observationEndMs?: number | undefined;
@@ -1404,7 +1404,9 @@ export class RaydiumCandidateSubscriptionCoordinator {
     }
 
     // 5. Await transaction resolution (ingests discovered swaps into tracker) and record completion timestamp
-    const resolutionResult = await optionsSnapshot.resolutionBridge.resolve(historyResult);
+    const resolutionResult = optionsSnapshot.resolutionBridge
+      ? await optionsSnapshot.resolutionBridge.resolve(historyResult)
+      : null;
     const resolutionRetrievedAtMs = this.clock();
     const acquisitionCompletedAtMs = this.clock();
 
@@ -1419,7 +1421,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
         observationEndMs: optionsSnapshot.observationEndMs ?? postResNow,
         sourceCutoff: sourceCutoffSnapshot,
         historyResult,
-        resolutionResult,
+        ...(resolutionResult ? { resolutionResult } : {}),
         historyRetrievedAtMs,
         resolutionRetrievedAtMs,
         acquisitionCompletedAtMs,
@@ -1454,7 +1456,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
       observationEndMs,
       sourceCutoff: sourceCutoffSnapshot,
       historyResult,
-      resolutionResult,
+      ...(resolutionResult ? { resolutionResult } : {}),
       historyRetrievedAtMs,
       resolutionRetrievedAtMs,
       acquisitionCompletedAtMs,

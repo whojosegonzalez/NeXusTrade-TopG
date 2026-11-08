@@ -3340,11 +3340,22 @@ describe("RaydiumTransportObservationProbe", () => {
         const mockTransport = new MockWebSocketTransport();
 
         // fetchTransport fails for getBlockTime
-        const mockFetch: typeof fetch = async () => {
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = bodyStr ? JSON.parse(bodyStr) : {};
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id ?? 1, result: 280_000_100 }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
           return new Response(
             JSON.stringify({
               jsonrpc: "2.0",
-              id: 1,
+              id: parsed.id ?? 1,
               error: { code: -32000, message: "Slot not confirmed" },
             }),
             {
@@ -4319,6 +4330,200 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.reconciliationSuccess).toBe(false);
         expect(succ.reconciliationResult!.status).toBe("UNRESOLVED_TRANSACTIONS");
         expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+      });
+
+      it("preserves independent acquisition and binds bootstrap anchor when streaming exhausts transaction cap", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 0));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const BOOTSTRAP_SLOT = 466_788_444;
+        const STREAM_SLOT = 466_789_012;
+        const CONFIRMED_RPC_SLOT = 466_789_500;
+        const CUTOFF_SEC = baseEpochSec + 40;
+
+        let totalHttpRequests = 0;
+        let bootstrapQueriesCount = 0;
+        let getSlotCount = 0;
+        let getBlockTimeCount = 0;
+        let historyEnumCount = 0;
+        let txRetrievalCount = 0;
+
+        const SIG_S1 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ11";
+        const SIG_S2 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ12";
+        const SIG_S3 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ13";
+        const SIG_S4 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ14";
+        const SIG_S5 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ15";
+        const SIG_S6 =
+          "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQ16";
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          totalHttpRequests++;
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              bootstrapQueriesCount++;
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: BOOTSTRAP_SLOT,
+                      blockTime: baseEpochSec - 100,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Final bounded history enumeration query
+            historyEnumCount++;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_S1,
+                    slot: STREAM_SLOT,
+                    blockTime: baseEpochSec + 10,
+                    err: null,
+                  },
+                  {
+                    signature: SIG_ANCHOR,
+                    slot: BOOTSTRAP_SLOT,
+                    blockTime: baseEpochSec - 100,
+                    err: null,
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSlot") {
+            getSlotCount++;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: CONFIRMED_RPC_SLOT,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getBlockTime") {
+            getBlockTimeCount++;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: CUTOFF_SEC,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getTransaction") {
+            txRetrievalCount++;
+            const reqSig = parsed.params?.[0] ?? "unknown";
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(reqSig, baseEpochSec + 10, STREAM_SLOT),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          maxTransactionRetrievals: 3, // Global 3 transaction cap
+          durationMs: 90_000,
+          streamingDurationMs: 50_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        // Emit a burst of 6 stream notifications (identical to operator capture)
+        const burstSigs = [SIG_S1, SIG_S2, SIG_S3, SIG_S4, SIG_S5, SIG_S6];
+        for (const sig of burstSigs) {
+          mockTransport.triggerMessage(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                subscription: 1,
+                result: {
+                  context: { slot: STREAM_SLOT },
+                  value: { signature: sig, logs: [], err: null },
+                },
+              },
+            }),
+          );
+        }
+
+        const result = await probePromise;
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+
+        // 1. Evidence manifest must be sealed with all files
+        expect(succ.manifestSealed).toBe(true);
+
+        // 2. Transaction attempts must strictly equal 3 (no overshoot from 0 remaining allowance)
+        expect(txRetrievalCount).toBe(3);
+        expect(succ.metadata.counts.transactionRetrievalsAttempted).toBe(3);
+
+        // 3. Independent acquisition path must execute: 1 bootstrap, 1 getSlot, 1 getBlockTime, 1 history enum
+        expect(bootstrapQueriesCount).toBe(1);
+        expect(getSlotCount).toBe(1);
+        expect(getBlockTimeCount).toBe(1);
+        expect(historyEnumCount).toBe(1);
+        expect(totalHttpRequests).toBe(7); // <= 7 global ceiling
+
+        // 4. Anchor telemetry must bind strictly to the T0 bootstrap record, NOT first stream notification slot
+        expect(succ.summary.reconciliationTelemetry.anchorWitnessed).toBe(true);
+        expect(succ.summary.reconciliationTelemetry.anchorSignature).toBe(SIG_ANCHOR);
+        expect(succ.summary.reconciliationTelemetry.anchorSlot).toBe(BOOTSTRAP_SLOT);
+        expect(succ.summary.reconciliationTelemetry.anchorBlockTime).toBe(baseEpochSec - 100);
+
+        // 5. Status must be CAP_LIMITED due to transaction limit reached during streaming
+        expect(succ.status).toBe("CAP_LIMITED");
+        expect(succ.metadata.terminationReason).toBe("TRANSACTION_LIMIT_REACHED");
+        expect(succ.metadata.isCapTerminated).toBe(true);
+
+        // 6. Fail-closed: pending un-retrieved notifications keep coverage insufficient and counts null
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+        expect(succ.reconciliationResult!.flowCounts.recentBuys60s).toBeNull();
+        expect(succ.reconciliationResult!.flowCounts.recentSells60s).toBeNull();
       });
 
       it("aborts in-flight independent RPC work promptly on signal and cleanly seals partial evidence", async () => {

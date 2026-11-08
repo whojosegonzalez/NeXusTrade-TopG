@@ -2816,10 +2816,6 @@ export async function executeTransportObservationProbe(
     }
 
     // Intercept incoming notifications to record WS signatures and track queue depth
-    let firstObservedSignature: string | null = null;
-    let firstObservedSlot = 0;
-    let latestObservedSlot = 0;
-
     const originalEnqueue = adapter.enqueueNotification.bind(adapter);
     adapter.enqueueNotification = (notif: InjectedTransactionNotification) => {
       if (!probeActive || isProbeTerminated) {
@@ -2832,13 +2828,6 @@ export async function executeTransportObservationProbe(
       }
 
       if (isValidSolanaSignature(notif.signature)) {
-        if (firstObservedSignature === null) {
-          firstObservedSignature = notif.signature;
-          firstObservedSlot = notif.slot ?? 0;
-        }
-        if (typeof notif.slot === "number" && notif.slot > latestObservedSlot) {
-          latestObservedSlot = notif.slot;
-        }
         if (!wsWitnessedSignatures.has(notif.signature)) {
           wsWitnessedSignatures.add(notif.signature);
           wsWitnessedList.push({
@@ -2967,6 +2956,7 @@ export async function executeTransportObservationProbe(
 
     // Drain Queue Worker Loop
     let transactionRetrievalsReserved = 0;
+    let isTransactionCapReached = false;
     const drainWorker = async () => {
       if (transportOnly) {
         // In transport-only mode, zero transactions are retrieved.
@@ -2983,6 +2973,11 @@ export async function executeTransportObservationProbe(
         }
 
         if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+          isTransactionCapReached = true;
+          if (isReconcileMode) {
+            await streamingPhasePromise;
+            return;
+          }
           if (probeActive && !isProbeTerminated) {
             terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
           }
@@ -2991,6 +2986,11 @@ export async function executeTransportObservationProbe(
 
         if (adapter.getPendingQueueLength() > 0) {
           if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+            isTransactionCapReached = true;
+            if (isReconcileMode) {
+              await streamingPhasePromise;
+              return;
+            }
             if (probeActive && !isProbeTerminated) {
               terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
             }
@@ -3037,6 +3037,11 @@ export async function executeTransportObservationProbe(
           }
 
           if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+            isTransactionCapReached = true;
+            if (isReconcileMode) {
+              await streamingPhasePromise;
+              return;
+            }
             if (probeActive && !isProbeTerminated) {
               terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
             }
@@ -3115,26 +3120,20 @@ export async function executeTransportObservationProbe(
           probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
           probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED"
         ) {
-          if (latestObservedSlot > 0) {
-            confirmedSlot = latestObservedSlot;
-          } else if (firstObservedSlot > 0) {
-            confirmedSlot = firstObservedSlot;
-          } else {
-            try {
-              confirmedSlot = await acquireConfirmedSlot(
-                rpcUrl,
-                budget,
-                overallAbortController.signal,
-                boundedFetch,
-                clock,
-                sleepFn,
-                (rec) => {
-                  slotAuditRecord = rec;
-                },
-              );
-            } catch {
-              // Handled fail-closed: slot acquisition failed
-            }
+          try {
+            confirmedSlot = await acquireConfirmedSlot(
+              rpcUrl,
+              budget,
+              overallAbortController.signal,
+              boundedFetch,
+              clock,
+              sleepFn,
+              (rec) => {
+                slotAuditRecord = rec;
+              },
+            );
+          } catch {
+            // Handled fail-closed: slot acquisition failed
           }
 
           if (confirmedSlot !== null) {
@@ -3158,15 +3157,22 @@ export async function executeTransportObservationProbe(
         }
       }
 
-      anchorSignature =
-        bootstrapAnchorSignature ??
-        config.knownAnchorSignature ??
-        (wsWitnessedList.length > 0 ? wsWitnessedList[0]!.signature : null);
-      if (anchorSignature && wsWitnessedList.length > 0) {
-        anchorSlot = wsWitnessedList[0]!.slot;
-      } else if (anchorSignature && bootstrapAnchorRecord) {
+      if (bootstrapAnchorRecord) {
+        anchorSignature = bootstrapAnchorRecord.signature;
         anchorSlot = bootstrapAnchorRecord.slot;
         anchorBlockTime = bootstrapAnchorRecord.blockTime;
+      } else if (config.knownAnchorSignature) {
+        anchorSignature = config.knownAnchorSignature;
+        const knownRec = fetchedHistoryRecords.get(config.knownAnchorSignature);
+        if (knownRec) {
+          anchorSlot = knownRec.slot;
+          anchorBlockTime = knownRec.blockTime;
+        } else if (wsWitnessedList.length > 0) {
+          anchorSlot = wsWitnessedList[0]!.slot;
+        }
+      } else if (wsWitnessedList.length > 0) {
+        anchorSignature = wsWitnessedList[0]!.signature;
+        anchorSlot = wsWitnessedList[0]!.slot;
       }
 
       if (cutoffEvidence && anchorSignature) {
@@ -3176,6 +3182,8 @@ export async function executeTransportObservationProbe(
           if (anchorTimeMs > windowStartMs) {
             // Boundary anchor is not prior to window start!
             anchorSignature = null;
+            anchorSlot = null;
+            anchorBlockTime = null;
           }
         }
       }
@@ -3243,23 +3251,29 @@ export async function executeTransportObservationProbe(
             0,
             maxTransactionRetrievals - transactionRetrievalsReserved,
           );
-          const resolutionBridge = new ExactPoolTransactionResolutionBridge({
-            poolContext,
-            adapter,
-            tracker,
-            budgetManager: budget,
-            lifecycleTarget: coordinator,
-            signal: overallAbortController.signal,
-            clock,
-            maxTransactionsToProcess: Math.max(1, remainingTxAllowance),
-            operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
-          });
+          const resolutionBridge =
+            remainingTxAllowance > 0
+              ? new ExactPoolTransactionResolutionBridge({
+                  poolContext,
+                  adapter,
+                  tracker,
+                  budgetManager: budget,
+                  lifecycleTarget: coordinator,
+                  signal: overallAbortController.signal,
+                  clock,
+                  maxTransactionsToProcess: remainingTxAllowance,
+                  operationDeadlineMs: Math.max(
+                    1,
+                    Math.min(25_000, overallDeadlineEpoch - clock()),
+                  ),
+                })
+              : undefined;
 
           if (coordinator) {
             reconciliationResult = await coordinator.reconcileCandidateWindow(cutoffEvidence, {
               knownAnchorSignature: anchorSignature,
               historyEnumerator: enumerator,
-              resolutionBridge,
+              ...(resolutionBridge ? { resolutionBridge } : {}),
               observationStartMs: effectiveObservationStartMs,
               budgetManager: budget,
             });
@@ -3443,9 +3457,11 @@ export async function executeTransportObservationProbe(
     // Ensure Probe Termination and Settle Workers
     terminateProbe(
       probeState.terminationReason === "UNKNOWN"
-        ? clock() >= overallDeadlineEpoch
-          ? "DURATION_EXPIRED"
-          : "COMPLETED"
+        ? isTransactionCapReached
+          ? "TRANSACTION_LIMIT_REACHED"
+          : clock() >= overallDeadlineEpoch
+            ? "DURATION_EXPIRED"
+            : "COMPLETED"
         : probeState.terminationReason,
     );
     if (overallTimer) {
