@@ -13,8 +13,12 @@
  *    - No automatic environment-based enablement; default runtime remains quarantined.
  * 2. Launch-Allocation Metric Integrity:
  *    - Maps ONLY valid, normalized `initialPct` ($[0.0, 1.0]$) to `bundlerPct`.
+ *    - Requires both raw percentages ($[0, 100]$) and normalized fractions ($[0.0, 1.0]$) to be finite,
+ *      non-negative, and strictly in agreement (`Math.abs(normalized - raw / 100) < 1e-9`).
+ *    - Rejects contradictory, missing, or malformed values fail-closed (`CONTRADICTORY_METRIC_VALUES`,
+ *      `MALFORMED_REQUIRED_METRICS`). Does NOT reconstruct raw provider fields from normalized fractions.
  *    - Preserves `currentHoldingPct` separately; NEVER substitutes current holdings for initial allocation.
- *    - Missing or invalid initial allocation leaves `bundlerPct` strictly undefined.
+ *    - Never replaces missing or invalid current holdings with zero. Preserves genuine reported zero.
  * 3. Exact Identity Binding:
  *    - Binds token-level evidence strictly to the requested canonical base58 token mint.
  *    - Rejects mint mismatches fail-closed (`IDENTITY_MISMATCH`).
@@ -27,7 +31,9 @@
  *      Stale evidence fails closed (`STALE_RETRIEVAL_EVIDENCE`).
  *    - Note on Freshness: This measures client-side local retrieval freshness only; upstream provider
  *      measurement age remains null when unknown. Historical captures support dated replay only.
- * 5. Full Provenance Disclosure:
+ * 5. Full Provenance Disclosure & Contract Validation:
+ *    - Validates consumed provenance fields against the parsed-snapshot contract, including source
+ *      classification (`PROVIDER_REPORTED_UNVERIFIED`) and `totalBundlersCount`.
  *    - Preserves provider identity ("SOLANA_TRACKER"), mint, timestamps, raw percentages, and
  *      normalized fractions under policy classification `PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION`.
  *    - Explicitly flags detection accuracy, deployer attribution, Jito equivalence, and historical
@@ -50,11 +56,15 @@ export type PaperBundlerFailureStatus =
   | "FUTURE_DATED_EVIDENCE"
   | "STALE_RETRIEVAL_EVIDENCE"
   | "MISSING_OR_INVALID_SNAPSHOT"
-  | "INITIAL_ALLOCATION_UNAVAILABLE";
+  | "INVALID_PROVENANCE_CONTRACT"
+  | "CONTRADICTORY_METRIC_VALUES"
+  | "MALFORMED_REQUIRED_METRICS";
 
 export interface PaperBundlerProvenance {
   readonly provider: "SOLANA_TRACKER";
+  readonly dataSource: "PROVIDER_REPORTED_UNVERIFIED";
   readonly requestedMint: string;
+  readonly totalBundlersCount: number;
   readonly localRetrievedAtMs: number;
   readonly evaluationTimeMs: number;
   readonly retrievalAgeMs: number;
@@ -63,7 +73,6 @@ export interface PaperBundlerProvenance {
   readonly reportedRawCurrentPct: number;
   readonly initialPct: number;
   readonly currentHoldingPct: number;
-  readonly totalBundlersCount: number;
   readonly policyClassification: "PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION";
   readonly isProviderAccuracyVerified: false;
   readonly isDeployerAttributionVerified: false;
@@ -88,9 +97,9 @@ export interface PaperBundlerAdaptationFailure {
   readonly success: false;
   readonly status: PaperBundlerFailureStatus;
   readonly bundlerPct: undefined;
-  readonly currentHoldingPct?: number | undefined;
-  readonly initialPct?: number | undefined;
-  readonly provenance?: Partial<PaperBundlerProvenance> | undefined;
+  readonly currentHoldingPct?: undefined;
+  readonly initialPct?: undefined;
+  readonly provenance?: undefined;
   readonly marketContextPatch: {
     readonly bundlerPct: undefined;
   };
@@ -106,6 +115,18 @@ export interface AdaptPaperBundlerOptions {
   readonly evaluationTimeMs: number;
   readonly executionContext: PaperBundlerExecutionContext;
   readonly maxAllowedRetrievalAgeMs: number;
+}
+
+function isValidRawPercentage(val: unknown): val is number {
+  return typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 100;
+}
+
+function isValidNormalizedFraction(val: unknown): val is number {
+  return typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 1.0;
+}
+
+function fractionsAgree(normalized: number, rawPct: number): boolean {
+  return Math.abs(normalized - rawPct / 100) < 1e-9;
 }
 
 /**
@@ -166,7 +187,7 @@ export function adaptPaperBundlerSnapshot(
 
   // 5. Snapshot Presence and Type Validation
   const snapshot = options.snapshot;
-  if (!snapshot || typeof snapshot !== "object" || snapshot.provider !== "SOLANA_TRACKER") {
+  if (!snapshot || typeof snapshot !== "object") {
     return {
       success: false,
       status: "MISSING_OR_INVALID_SNAPSHOT",
@@ -220,50 +241,71 @@ export function adaptPaperBundlerSnapshot(
     };
   }
 
-  // 9. Metric Integrity: Separate initialPct and currentHoldingPct
-  const rawInitialPct = snapshot.reportedRawInitialPct;
-  const rawCurrentPct = snapshot.reportedRawCurrentPct;
-  const initialPct = snapshot.initialPct;
-  const currentHoldingPct = snapshot.currentHoldingPct;
-
-  const isCurrentHoldingValid =
-    typeof currentHoldingPct === "number" &&
-    Number.isFinite(currentHoldingPct) &&
-    currentHoldingPct >= 0 &&
-    currentHoldingPct <= 1.0;
-
-  const isInitialValid =
-    typeof initialPct === "number" &&
-    Number.isFinite(initialPct) &&
-    initialPct >= 0 &&
-    initialPct <= 1.0;
-
-  // Initial allocation is REQUIRED for Gate 11. Current holdings NEVER substitute.
-  if (!isInitialValid) {
+  // 9. Consumed Provenance Fields Contract Validation
+  if (
+    snapshot.provider !== "SOLANA_TRACKER" ||
+    snapshot.dataSource !== "PROVIDER_REPORTED_UNVERIFIED" ||
+    typeof snapshot.totalBundlersCount !== "number" ||
+    !Number.isSafeInteger(snapshot.totalBundlersCount) ||
+    snapshot.totalBundlersCount < 0 ||
+    snapshot.upstreamSnapshotTimeMs !== null ||
+    snapshot.isProviderAccuracyVerified !== false ||
+    snapshot.isLaunchHistoryComplete !== false ||
+    snapshot.isProductionCompletenessEstablished !== false
+  ) {
     return {
       success: false,
-      status: "INITIAL_ALLOCATION_UNAVAILABLE",
+      status: "INVALID_PROVENANCE_CONTRACT",
       bundlerPct: undefined,
-      initialPct: undefined,
-      currentHoldingPct: isCurrentHoldingValid ? currentHoldingPct : undefined,
       marketContextPatch: { bundlerPct: undefined },
     };
   }
 
-  // 10. Construct Verified Provenance
+  // 10. Metric Integrity: Validate Raw and Normalized Values
+  const rawInitial = snapshot.reportedRawInitialPct;
+  const initialPct = snapshot.initialPct;
+  const rawCurrent = snapshot.reportedRawCurrentPct;
+  const currentHoldingPct = snapshot.currentHoldingPct;
+
+  // Reject missing, non-finite, out-of-range, NaN, Infinity without manufacturing values
+  if (
+    !isValidRawPercentage(rawInitial) ||
+    !isValidNormalizedFraction(initialPct) ||
+    !isValidRawPercentage(rawCurrent) ||
+    !isValidNormalizedFraction(currentHoldingPct)
+  ) {
+    return {
+      success: false,
+      status: "MALFORMED_REQUIRED_METRICS",
+      bundlerPct: undefined,
+      marketContextPatch: { bundlerPct: undefined },
+    };
+  }
+
+  // Require normalized values to agree with raw percentages divided by 100
+  if (!fractionsAgree(initialPct, rawInitial) || !fractionsAgree(currentHoldingPct, rawCurrent)) {
+    return {
+      success: false,
+      status: "CONTRADICTORY_METRIC_VALUES",
+      bundlerPct: undefined,
+      marketContextPatch: { bundlerPct: undefined },
+    };
+  }
+
+  // 11. Construct Strictly Validated Provenance
   const provenance: PaperBundlerProvenance = Object.freeze({
     provider: "SOLANA_TRACKER",
+    dataSource: "PROVIDER_REPORTED_UNVERIFIED",
     requestedMint: snapshot.requestedMint,
+    totalBundlersCount: snapshot.totalBundlersCount,
     localRetrievedAtMs,
     evaluationTimeMs: options.evaluationTimeMs,
     retrievalAgeMs,
     upstreamSnapshotTimeMs: null,
-    reportedRawInitialPct: typeof rawInitialPct === "number" ? rawInitialPct : initialPct * 100,
-    reportedRawCurrentPct:
-      typeof rawCurrentPct === "number" ? rawCurrentPct : (currentHoldingPct ?? 0) * 100,
+    reportedRawInitialPct: rawInitial,
+    reportedRawCurrentPct: rawCurrent,
     initialPct,
-    currentHoldingPct: isCurrentHoldingValid ? currentHoldingPct : 0,
-    totalBundlersCount: snapshot.totalBundlersCount,
+    currentHoldingPct,
     policyClassification: "PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION",
     isProviderAccuracyVerified: false,
     isDeployerAttributionVerified: false,
@@ -276,7 +318,7 @@ export function adaptPaperBundlerSnapshot(
     success: true,
     status: "QUALIFIED_PAPER_PROXY",
     bundlerPct: initialPct,
-    currentHoldingPct: isCurrentHoldingValid ? currentHoldingPct : 0,
+    currentHoldingPct,
     initialPct,
     provenance,
     marketContextPatch: Object.freeze({

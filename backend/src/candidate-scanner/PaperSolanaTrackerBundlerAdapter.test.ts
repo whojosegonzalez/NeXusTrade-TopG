@@ -112,7 +112,7 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
   describe("Identity & Metric Integrity", () => {
     it("rejects token mint mismatch fail-closed without inventing pool provenance", () => {
       const result = adaptPaperBundlerSnapshot({
-        targetMint: DIFFERENT_CANONICAL_MINT, // Different mint
+        targetMint: DIFFERENT_CANONICAL_MINT,
         snapshot: capturedSnapshot,
         evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
         executionContext: "PAPER_SIMULATION",
@@ -126,8 +126,6 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
     });
 
     it("preserves initialPct and currentHoldingPct separately and never substitutes current holdings", () => {
-      // Synthetic scenario: cabal bought 60% of launch supply (violating 50% micro ceiling),
-      // then dumped 58% on retail, leaving current holdings at only 2%.
       const dumpedPayload = {
         total: 5,
         balance: 20_000,
@@ -154,10 +152,9 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
       expect(adapted.success).toBe(true);
       if (!adapted.success) return;
 
-      // Both metrics preserved separately
       expect(adapted.initialPct).toBeCloseTo(0.6, 4);
       expect(adapted.currentHoldingPct).toBeCloseTo(0.02, 4);
-      expect(adapted.bundlerPct).toBeCloseTo(0.6, 4); // Mapped exclusively from initialPct
+      expect(adapted.bundlerPct).toBeCloseTo(0.6, 4);
 
       // Evaluated in Gate 11: 0.60 > 0.50 (micro ceiling) -> fails closed
       const service = new BuyGateTriggerService();
@@ -180,35 +177,146 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
         hasDangerRisk: false,
         holdersCount: 300,
         top10HolderPct: 0.15,
-        bundlerPct: adapted.currentHoldingPct, // Invalid substitution
+        bundlerPct: adapted.currentHoldingPct,
         requireVerifiedHolders: true,
       });
       const gate11Check = counterfactualResult.gates.find(
         (g) => g.name === "BUNDLER_CONCENTRATION_GATE",
       );
-      expect(gate11Check?.passed).toBe(true); // Demonstrates why substitution is prohibited
+      expect(gate11Check?.passed).toBe(true);
     });
+  });
 
-    it("leaves bundlerPct unavailable if initialPct is missing or invalid; current holdings cannot substitute", () => {
-      const invalidInitialSnapshot = {
+  describe("Metric Agreement & Integrity Regressions", () => {
+    it("regression 1: rejects contradictory raw and normalized initial percentages (e.g. raw 95% with normalized 0.01)", () => {
+      const contradictoryInitialSnapshot = {
         ...capturedSnapshot,
-        initialPct: NaN as unknown as number,
-        currentHoldingPct: 0.05,
+        reportedRawInitialPct: 95, // 95%
+        initialPct: 0.01, // 1% (contradicts raw 95%!)
       };
 
       const result = adaptPaperBundlerSnapshot({
         targetMint: CANONICAL_MINT,
-        snapshot: invalidInitialSnapshot,
+        snapshot: contradictoryInitialSnapshot,
         evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
         executionContext: "PAPER_SIMULATION",
         maxAllowedRetrievalAgeMs: 15_000,
       });
 
       expect(result.success).toBe(false);
-      expect(result.status).toBe("INITIAL_ALLOCATION_UNAVAILABLE");
+      expect(result.status).toBe("CONTRADICTORY_METRIC_VALUES");
       expect(result.bundlerPct).toBeUndefined();
-      expect(result.currentHoldingPct).toBe(0.05);
+      expect(result.marketContextPatch.bundlerPct).toBeUndefined();
+    });
 
+    it("regression 1b: rejects contradictory raw and normalized current holding percentages", () => {
+      const contradictoryCurrentSnapshot = {
+        ...capturedSnapshot,
+        reportedRawCurrentPct: 50, // 50%
+        currentHoldingPct: 0.05, // 5% (contradicts raw 50%!)
+      };
+
+      const result = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: contradictoryCurrentSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("CONTRADICTORY_METRIC_VALUES");
+      expect(result.bundlerPct).toBeUndefined();
+    });
+
+    it("regression 2: rejects currentHoldingPct: NaN without replacing with zero or returning success", () => {
+      const nanCurrentSnapshot = {
+        ...capturedSnapshot,
+        currentHoldingPct: NaN,
+      };
+
+      const result = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: nanCurrentSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("MALFORMED_REQUIRED_METRICS");
+      expect(result.bundlerPct).toBeUndefined();
+      expect(result.currentHoldingPct).toBeUndefined(); // Never replaced with zero!
+    });
+
+    it("regression 3: rejects missing reportedRawInitialPct without reconstructing from initialPct", () => {
+      const missingRawInitialSnapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: undefined as unknown as number,
+      };
+
+      const result = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: missingRawInitialSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("MALFORMED_REQUIRED_METRICS");
+      expect(result.bundlerPct).toBeUndefined();
+      expect(result.provenance).toBeUndefined(); // No manufactured provenance!
+    });
+
+    it("regression 4: rejects reportedRawInitialPct: Infinity and does not accept into provenance", () => {
+      for (const nonFiniteVal of [Infinity, -Infinity, NaN]) {
+        const nonFiniteSnapshot = {
+          ...capturedSnapshot,
+          reportedRawInitialPct: nonFiniteVal,
+        };
+
+        const result = adaptPaperBundlerSnapshot({
+          targetMint: CANONICAL_MINT,
+          snapshot: nonFiniteSnapshot,
+          evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 5_000,
+          executionContext: "PAPER_SIMULATION",
+          maxAllowedRetrievalAgeMs: 15_000,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.status).toBe("MALFORMED_REQUIRED_METRICS");
+        expect(result.bundlerPct).toBeUndefined();
+        expect(result.provenance).toBeUndefined();
+      }
+    });
+
+    it("preserves genuine reported zero boundaries across raw and normalized values", () => {
+      const genuineZeroSnapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 0,
+        initialPct: 0,
+        reportedRawCurrentPct: 0,
+        currentHoldingPct: 0,
+      };
+
+      const result = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: genuineZeroSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 2_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.bundlerPct).toBe(0);
+      expect(result.initialPct).toBe(0);
+      expect(result.currentHoldingPct).toBe(0);
+      expect(result.provenance.reportedRawInitialPct).toBe(0);
+      expect(result.provenance.reportedRawCurrentPct).toBe(0);
+
+      // In Gate 11, genuine zero passes concentration check
       const service = new BuyGateTriggerService();
       const candidate = createSyntheticCandidate();
       const evalResult = service.evaluateCandidate(candidate, {
@@ -219,18 +327,164 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
         bundlerPct: result.bundlerPct,
         requireVerifiedHolders: true,
       });
-      expect(evalResult.triggered).toBe(false);
-      expect(evalResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+      const bundlerGate = evalResult.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(true);
+    });
+
+    it("verifies consistent 95% initial allocation is accepted by adapter and rejected by Gate 11 threshold", () => {
+      const consistent95Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 95.0,
+        initialPct: 0.95,
+        reportedRawCurrentPct: 5.0,
+        currentHoldingPct: 0.05,
+      };
+
+      const adapted = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: consistent95Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 2_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(adapted.success).toBe(true);
+      if (!adapted.success) return;
+      expect(adapted.bundlerPct).toBe(0.95);
+      expect(adapted.provenance.reportedRawInitialPct).toBe(95.0);
+      expect(adapted.provenance.initialPct).toBe(0.95);
+
+      const service = new BuyGateTriggerService();
+
+      // Case A: Micro-cap candidate (50% ceiling) -> 0.95 > 0.50 fails
+      const microCandidate = createSyntheticCandidate({
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        assetAgeSeconds: 450,
+      });
+      const microEval = service.evaluateCandidate(microCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: adapted.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+      expect(microEval.triggered).toBe(false);
+      expect(microEval.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+
+      // Case B: Established runner candidate (85% ceiling) -> 0.95 > 0.85 fails
+      const estCandidate = createSyntheticCandidate({
+        liquidityUsd: 60_000,
+        marketCapUsd: 250_000,
+        assetAgeSeconds: 900,
+      });
+      const estEval = service.evaluateCandidate(estCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: adapted.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+      expect(estEval.triggered).toBe(false);
+      expect(estEval.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+    });
+  });
+
+  describe("Provenance Contract Validation", () => {
+    it("rejects snapshots violating the parsed-snapshot contract", () => {
+      // Contaminated source classification
+      const invalidSourceSnapshot = {
+        ...capturedSnapshot,
+        dataSource: "SYNTHETIC_OVERRIDE" as unknown as "PROVIDER_REPORTED_UNVERIFIED",
+      };
+      const resSource = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: invalidSourceSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+      expect(resSource.success).toBe(false);
+      expect(resSource.status).toBe("INVALID_PROVENANCE_CONTRACT");
+
+      // Negative or non-safe-integer totalBundlersCount
+      for (const invalidCount of [-1, NaN, 1.5, "10"]) {
+        const invalidCountSnapshot = {
+          ...capturedSnapshot,
+          totalBundlersCount: invalidCount as unknown as number,
+        };
+        const resCount = adaptPaperBundlerSnapshot({
+          targetMint: CANONICAL_MINT,
+          snapshot: invalidCountSnapshot,
+          evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+          executionContext: "PAPER_SIMULATION",
+          maxAllowedRetrievalAgeMs: 15_000,
+        });
+        expect(resCount.success).toBe(false);
+        expect(resCount.status).toBe("INVALID_PROVENANCE_CONTRACT");
+      }
+
+      // Non-null upstream snapshot timestamp
+      const nonNullUpstreamSnapshot = {
+        ...capturedSnapshot,
+        upstreamSnapshotTimeMs: 1700000000000 as unknown as null,
+      };
+      const resUpstream = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: nonNullUpstreamSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+      expect(resUpstream.success).toBe(false);
+      expect(resUpstream.status).toBe("INVALID_PROVENANCE_CONTRACT");
+    });
+
+    it("preserves full verified provenance, unverified flags, and null upstream snapshot timestamp on valid adaptation", () => {
+      const evalTime = capturedSnapshot.localRetrievedAtMs + 4_500;
+      const result = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: capturedSnapshot,
+        evaluationTimeMs: evalTime,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const p = result.provenance;
+      expect(p.provider).toBe("SOLANA_TRACKER");
+      expect(p.dataSource).toBe("PROVIDER_REPORTED_UNVERIFIED");
+      expect(p.requestedMint).toBe(CANONICAL_MINT);
+      expect(p.totalBundlersCount).toBe(1349);
+      expect(p.localRetrievedAtMs).toBe(capturedSnapshot.localRetrievedAtMs);
+      expect(p.evaluationTimeMs).toBe(evalTime);
+      expect(p.retrievalAgeMs).toBe(4_500);
+      expect(p.upstreamSnapshotTimeMs).toBeNull();
+      expect(p.reportedRawInitialPct).toBe(0.00756);
+      expect(p.reportedRawCurrentPct).toBe(0.05904);
+      expect(p.initialPct).toBeCloseTo(0.0000756, 7);
+      expect(p.currentHoldingPct).toBeCloseTo(0.0005904, 7);
+      expect(p.policyClassification).toBe("PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION");
+
+      // Critical unverified assertions preserved
+      expect(p.isProviderAccuracyVerified).toBe(false);
+      expect(p.isDeployerAttributionVerified).toBe(false);
+      expect(p.isJitoEquivalenceVerified).toBe(false);
+      expect(p.isLaunchHistoryComplete).toBe(false);
+      expect(p.isProductionCompletenessEstablished).toBe(false);
     });
   });
 
   describe("Retrieval Freshness & Causality Validation", () => {
     it("rejects future-dated evidence fail-closed", () => {
-      // Evaluation timestamp is EARLIER than local retrieval time
       const result = adaptPaperBundlerSnapshot({
         targetMint: CANONICAL_MINT,
         snapshot: capturedSnapshot,
-        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs - 1_000, // 1s before retrieval
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs - 1_000,
         executionContext: "PAPER_SIMULATION",
         maxAllowedRetrievalAgeMs: 15_000,
       });
@@ -245,7 +499,7 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
       const result = adaptPaperBundlerSnapshot({
         targetMint: CANONICAL_MINT,
         snapshot: capturedSnapshot,
-        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + maxAgeMs + 1, // 1ms over limit
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + maxAgeMs + 1,
         executionContext: "PAPER_SIMULATION",
         maxAllowedRetrievalAgeMs: maxAgeMs,
       });
@@ -269,38 +523,6 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
         expect(result.status).toBe("INVALID_MAX_AGE_LIMIT");
         expect(result.bundlerPct).toBeUndefined();
       }
-    });
-  });
-
-  describe("Provenance Preservation", () => {
-    it("preserves full provenance, unverified flags, and null upstream snapshot timestamp", () => {
-      const evalTime = capturedSnapshot.localRetrievedAtMs + 4_500;
-      const result = adaptPaperBundlerSnapshot({
-        targetMint: CANONICAL_MINT,
-        snapshot: capturedSnapshot,
-        evaluationTimeMs: evalTime,
-        executionContext: "PAPER_SIMULATION",
-        maxAllowedRetrievalAgeMs: 15_000,
-      });
-
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-
-      const p = result.provenance;
-      expect(p.provider).toBe("SOLANA_TRACKER");
-      expect(p.requestedMint).toBe(CANONICAL_MINT);
-      expect(p.localRetrievedAtMs).toBe(capturedSnapshot.localRetrievedAtMs);
-      expect(p.evaluationTimeMs).toBe(evalTime);
-      expect(p.retrievalAgeMs).toBe(4_500);
-      expect(p.upstreamSnapshotTimeMs).toBeNull();
-      expect(p.policyClassification).toBe("PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION");
-
-      // Critical unverified assertions preserved
-      expect(p.isProviderAccuracyVerified).toBe(false);
-      expect(p.isDeployerAttributionVerified).toBe(false);
-      expect(p.isJitoEquivalenceVerified).toBe(false);
-      expect(p.isLaunchHistoryComplete).toBe(false);
-      expect(p.isProductionCompletenessEstablished).toBe(false);
     });
   });
 
@@ -329,14 +551,14 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
         requireVerifiedHolders: true,
       });
       const bundlerGate = evalVol.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
-      expect(bundlerGate?.passed).toBe(true); // Bundler gate passed
-      expect(evalVol.triggered).toBe(false); // Candidate was NOT admitted
+      expect(bundlerGate?.passed).toBe(true);
+      expect(evalVol.triggered).toBe(false);
       expect(evalVol.rejectionReason).toBe("VOLUME_SURGE_GATE_FAILED");
 
       // Case B: Failing RugCheck Score Gate (score 750 > 700)
       const passingCandidate = createSyntheticCandidate();
       const evalRugScore = service.evaluateCandidate(passingCandidate, {
-        rugScore: 750, // Failing score
+        rugScore: 750,
         hasDangerRisk: false,
         holdersCount: 300,
         top10HolderPct: 0.15,
