@@ -61,7 +61,7 @@ OPTIONS:
   --max-control-frames <count> Maximum RFC 6455 control frames budget (default: 50)
   --max-control-bytes <bytes>  Maximum RFC 6455 control frame payload bytes budget (default: 4096)
   --transport-only             Execute transport-only observation; disables HTTP transaction retrieval and history queries
-  --reconcile                  Execute bounded 60s window reconciliation evaluation (90s duration, 1 cutoff, 1 history, <=5 tx retrievals)
+  --reconcile                  Execute bounded 60s window reconciliation evaluation (90s duration, 1 anchor bootstrap, 1 slot, 1 block-time cutoff, 1 enumeration, <=3 shared tx retrievals)
   -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
@@ -188,9 +188,14 @@ async function main(): Promise<void> {
       console.log("=== WINDOW RECONCILIATION RESULT ===");
       console.log(`Reconciliation Status:    ${recon.status}`);
       console.log(`Coverage Status:          ${recon.flowCoverage}`);
-      console.log(
-        `Window Span:              [${new Date(recon.temporalContext.windowStartMs).toISOString()} .. ${new Date(recon.temporalContext.windowEndMs).toISOString()}]`,
-      );
+      const hasValidWindow =
+        recon.status !== "MISSING_SOURCE_CUTOFF" &&
+        recon.temporalContext.windowStartMs > 0 &&
+        recon.temporalContext.windowEndMs > 0;
+      const windowSpanStr = hasValidWindow
+        ? `[${new Date(recon.temporalContext.windowStartMs).toISOString()} .. ${new Date(recon.temporalContext.windowEndMs).toISOString()}]`
+        : "Unavailable (No valid source cutoff)";
+      console.log(`Window Span:              ${windowSpanStr}`);
       console.log(`Cutoff Age:               ${recon.temporalContext.evidenceAgeMs ?? "N/A"} ms`);
       console.log(`Reconciled Buys (60s):    ${recon.flowCounts.recentBuys60s ?? "Unavailable"}`);
       console.log(`Reconciled Sells (60s):   ${recon.flowCounts.recentSells60s ?? "Unavailable"}`);

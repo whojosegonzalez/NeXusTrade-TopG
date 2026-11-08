@@ -1437,3 +1437,41 @@ All Phase 12.94-D core safety boundaries and project invariants remain strictly 
   - Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
 - **Offline Discipline**:
   - All proposed verification is 100% offline using synthetic fixtures and unit test harnesses. No live network calls, no daemon activation, and no automated reruns.
+
+---
+
+### 8.12 Bounded Independent RPC Acquisition Offline Implementation (Silent-Stream Resolution)
+
+#### 1. Motivation & Context
+
+In operator diagnostic capture `2026-11-08T02-13-01.964Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`, the probe established successful WebSocket transport connection and exchanged RFC 6455 PING/PONG heartbeats for 90 seconds. However, zero transaction notifications were delivered by the stream. Under the prior implementation, source-cutoff acquisition strictly depended on stream-observed slots (`latestObservedSlot ?? firstObservedSlot`). In a genuinely quiet or notification-delayed market, this caused `MISSING_SOURCE_CUTOFF` without attempting independent cutoff or history resolution.
+
+#### 2. Five-Item Bounded Request Allocation ($\le 7$ Total HTTP Dispatches)
+
+To allow autonomous bounded evaluation even when the WebSocket stream delivers zero notifications, the probe implements bounded independent RPC acquisition under a strictly budgeted 5-item request allocation:
+
+1. **Bootstrap History Query ($T_0$)**: Exactly 1 `getSignaturesForAddress(address, { limit: 1 })` request dispatched immediately after subscription setup at $T_0$. This captures a pre-observation prior boundary anchor $S_{\text{anchor}}$ with slot and RPC-estimated `blockTime`. Pacing check ($\ge 2{,}500\text{ ms}$) and audit logging are strictly enforced.
+2. **Confirmed Slot Acquisition**: Exactly 1 `getSlot({ commitment: "confirmed" })` request dispatched when stream slots are absent (`latestObservedSlot === 0 && firstObservedSlot === 0`).
+3. **Block-Time Source Cutoff Acquisition**: Exactly 1 `getBlockTime(slot)` request fetching the RPC-reported estimated block production timestamp for the confirmed slot.
+4. **Final History Enumeration Query**: Exactly 1 bounded `getSignaturesForAddress(address, { limit: 20 })` request starting from the RPC head to discover all pool transactions between the head and the bootstrap anchor.
+5. **Shared Transaction Retrieval Allowance**: At most 3 `getTransaction` attempts shared across streaming and reconciliation ($3 - \text{transactionRetrievalsReserved}$).
+
+**Global Ceiling & Pacing Enforcement**:
+
+- Total HTTP dispatches across all phases are bounded by `maxTotalHttpAttempts = 7`.
+- Reconcile mode defaults: `maxHistoryQueries = 2` (1 bootstrap + 1 enumeration), `maxTransactionRetrievals = 3`.
+- Non-reconcile mode defaults: `maxHistoryQueries = 2`, `maxTransactionRetrievals = 5`.
+- All HTTP requests share a single `GlobalResourceBudgetManager` instance on provider `"SOLANA_RPC"` and purpose `"CANDIDATE_ENRICHMENT"` with host pacing strictly $\ge 2{,}500\text{ ms}$.
+
+#### 3. Anchor Witnessing & Fail-Closed Invariants
+
+- **No `until: S_anchor`**: Reuses the accepted history enumerator's RPC-head pagination contract. Standard `getSignaturesForAddress` pagination starts at head and requires explicit in-page witnessing of $S_{\text{anchor}}$.
+- **Boundary Anchor Timing**: If the bootstrap anchor timestamp is later than window start ($T_{\text{anchor}} > T_{\text{cutoff}} - 60\text{s}$), the boundary anchor is invalid and fails closed with `UNWITNESSED_PRIOR_ANCHOR`.
+- **Empty Stream Handling**: When the stream yields zero notifications, the probe relies on the $T_0$ bootstrap anchor and acquired confirmed slot. If bootstrap history is empty or fails, it fails closed to `UNWITNESSED_PRIOR_ANCHOR`. If blockTime returns null or slot acquisition fails, it fails closed to `MISSING_SOURCE_CUTOFF`.
+- **Evidence Sealing**: Partial or fail-closed reconciliation outputs are cryptographically sealed into `capture-manifest.json` with SHA-256 digests.
+
+#### 4. Safety Invariants Preserved
+
+- **Virtual Wallet**: Permanently frozen at 7.9259 SOL (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`). Spending ceiling permanently \$0.00.
+- **Production Isolation**: `isProductionCompletenessEstablished = false`. Gate 11 fail-closed.
+- **Zero Live Network Calls**: Verified offline via synthetic Vitest harnesses and mock transports.

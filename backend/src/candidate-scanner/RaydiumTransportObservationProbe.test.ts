@@ -2840,12 +2840,14 @@ describe("RaydiumTransportObservationProbe", () => {
         );
         expect(dryRunRes.limits.durationMs).toBe(DEFAULT_RECONCILIATION_PROBE_DURATION_MS);
         expect(dryRunRes.limits.durationMs).toBe(90_000);
-        expect(dryRunRes.limits.maxHistoryQueries).toBe(1);
+        expect(dryRunRes.limits.maxHistoryQueries).toBe(2);
         expect(dryRunRes.limits.reconcile).toBe(true);
         expect(dryRunRes.limits.plannedRequestAllocation).toEqual({
-          cutoffAcquisition: 1,
+          anchorBootstrap: 1,
+          slotAcquisition: 1,
+          blockTimeAcquisition: 1,
           historyPagination: 1,
-          transactionRetrievals: 5,
+          transactionRetrievals: 3,
           maxTotalHttpAttempts: MAX_TOTAL_HTTP_ATTEMPTS,
           minProviderSpacingMs: 2500,
         });
@@ -3221,12 +3223,24 @@ describe("RaydiumTransportObservationProbe", () => {
           await new Promise((r) => setTimeout(r, 1));
         };
 
+        const errorMockFetch: typeof fetch = async () => {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, message: "RPC unavailable" },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        };
+
         const mockTransport = new MockWebSocketTransport();
 
         const probePromise = executeTransportObservationProbe({
           isLive: true,
           outDir: testOutputDir,
           transport: mockTransport,
+          fetchTransport: errorMockFetch,
           reconcile: true,
           durationMs: 90_000,
           streamingDurationMs: 65_000,
@@ -3271,12 +3285,24 @@ describe("RaydiumTransportObservationProbe", () => {
           await new Promise((r) => setTimeout(r, 1));
         };
 
+        const errorMockFetch: typeof fetch = async () => {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, message: "RPC unavailable" },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        };
+
         const mockTransport = new MockWebSocketTransport();
 
         const probePromise = executeTransportObservationProbe({
           isLive: true,
           outDir: testOutputDir,
           transport: mockTransport,
+          fetchTransport: errorMockFetch,
           reconcile: true,
           durationMs: 90_000,
           streamingDurationMs: 50,
@@ -3418,8 +3444,7 @@ describe("RaydiumTransportObservationProbe", () => {
         const clock = () => fakeNow;
         const mockTransport = new MockWebSocketTransport();
         const sleepFn = async (ms: number) => {
-          await Promise.resolve();
-          const step = 10_000;
+          const step = 2_000;
           let remaining = ms;
           while (remaining > 0) {
             const chunk = Math.min(remaining, step);
@@ -3442,25 +3467,48 @@ describe("RaydiumTransportObservationProbe", () => {
                 },
               }),
             );
+            await new Promise((r) => setTimeout(r, 0));
           }
-          await new Promise((r) => setTimeout(r, 1));
         };
         const baseEpochSec = Math.floor(fakeNow / 1000);
         const fixedCutoffSec = baseEpochSec + 65;
-        const getCutoffBlockTimeSec = () => fixedCutoffSec;
 
         const mockFetch: typeof fetch = async (_input, init) => {
           const bodyStr = typeof init?.body === "string" ? init.body : "";
           const parsed = JSON.parse(bodyStr);
 
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
           if (parsed.method === "getBlockTime") {
             return new Response(
-              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: getCutoffBlockTimeSec() }),
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
               { status: 200, headers: { "Content-Type": "application/json" } },
             );
           }
 
           if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: 280_000_000,
+                      blockTime: baseEpochSec,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
             return new Response(
               JSON.stringify({
                 jsonrpc: "2.0",
@@ -3510,19 +3558,6 @@ describe("RaydiumTransportObservationProbe", () => {
 
         mockTransport.triggerOpen();
         mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
-        mockTransport.triggerMessage(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            method: "logsNotification",
-            params: {
-              subscription: 1,
-              result: {
-                context: { slot: 280_000_000 },
-                value: { signature: SIG_ANCHOR, logs: [], err: null },
-              },
-            },
-          }),
-        );
 
         const result = await probePromise;
 
@@ -3544,8 +3579,7 @@ describe("RaydiumTransportObservationProbe", () => {
         const clock = () => fakeNow;
         const mockTransport = new MockWebSocketTransport();
         const sleepFn = async (ms: number) => {
-          await Promise.resolve();
-          const step = 10_000;
+          const step = 2_000;
           let remaining = ms;
           while (remaining > 0) {
             const chunk = Math.min(remaining, step);
@@ -3568,23 +3602,38 @@ describe("RaydiumTransportObservationProbe", () => {
                 },
               }),
             );
+            await new Promise((r) => setTimeout(r, 0));
           }
-          await new Promise((r) => setTimeout(r, 1));
         };
-        const getCutoffBlockTimeSec = () => Math.floor(fakeNow / 1000);
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
 
         const mockFetch: typeof fetch = async (_input, init) => {
           const bodyStr = typeof init?.body === "string" ? init.body : "";
           const parsed = JSON.parse(bodyStr);
 
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
           if (parsed.method === "getBlockTime") {
             return new Response(
-              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: getCutoffBlockTimeSec() }),
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
               { status: 200, headers: { "Content-Type": "application/json" } },
             );
           }
 
           if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              // Bootstrap query at T_0: returns empty to force stream anchor fallback
+              return new Response(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: [] }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
             return new Response(
               JSON.stringify({
                 jsonrpc: "2.0",
@@ -3592,8 +3641,8 @@ describe("RaydiumTransportObservationProbe", () => {
                 result: [
                   {
                     signature: SIG_ANCHOR,
-                    slot: 280_000_000,
-                    blockTime: getCutoffBlockTimeSec() - 10,
+                    slot: 280_000_100,
+                    blockTime: fixedCutoffSec - 10,
                     err: null,
                   },
                 ],
@@ -3604,16 +3653,11 @@ describe("RaydiumTransportObservationProbe", () => {
 
           if (parsed.method === "getTransaction") {
             const reqSig = parsed.params?.[0] ?? SIG_ANCHOR;
-            const reqSlot = reqSig === SIG_ANCHOR ? 280_000_000 : 280_000_100;
-            const reqBlockTime =
-              reqSig === SIG_ANCHOR
-                ? Math.floor(1_700_000_000_000 / 1000)
-                : getCutoffBlockTimeSec() - 10;
             return new Response(
               JSON.stringify({
                 jsonrpc: "2.0",
                 id: parsed.id,
-                result: createSyntheticBuyPayload(reqSig, reqBlockTime, reqSlot),
+                result: createSyntheticBuyPayload(reqSig, fixedCutoffSec - 10, 280_000_100),
               }),
               { status: 200, headers: { "Content-Type": "application/json" } },
             );
@@ -3643,7 +3687,7 @@ describe("RaydiumTransportObservationProbe", () => {
             params: {
               subscription: 1,
               result: {
-                context: { slot: 280_000_000 },
+                context: { slot: 280_000_100 },
                 value: { signature: SIG_ANCHOR, logs: [], err: null },
               },
             },
@@ -3659,6 +3703,670 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.reconciliationResult!.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
         expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
         expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+      });
+
+      it("reconciles silent WebSocket stream with independently acquired RPC evidence", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          const step = 2_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        };
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              // Bootstrap query at T_0: returns prior anchor older than window
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: 280_000_000,
+                      blockTime: baseEpochSec,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Enumeration query post-streaming: returns window trade and witnesses anchor
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_B,
+                    slot: 280_000_100,
+                    blockTime: fixedCutoffSec - 10,
+                    err: null,
+                  },
+                  { signature: SIG_ANCHOR, slot: 280_000_000, blockTime: baseEpochSec, err: null },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getTransaction") {
+            const reqSig = parsed.params?.[0] ?? SIG_B;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(reqSig, fixedCutoffSec - 10, 280_000_100),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        // Acknowledged stream with ZERO transaction notifications
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(true);
+        expect(succ.reconciliationResult).toBeDefined();
+        const recon = succ.reconciliationResult!;
+        expect(recon.status).toBe("RECONCILED");
+        expect(recon.flowCoverage).toBe("SUFFICIENT");
+        expect(recon.flowCounts.recentBuys60s).toBe(1);
+        expect(recon.flowCounts.recentSells60s).toBe(0);
+        expect(succ.summary.slotAcquisitionAudit).toBeDefined();
+        expect(succ.summary.slotAcquisitionAudit?.acquiredSlot).toBe(280_000_100);
+        expect(succ.summary.cutoffAcquisitionAudit).toBeDefined();
+        expect(succ.summary.cutoffAcquisitionAudit?.httpStatus).toBe(200);
+        expect(succ.summary.reconciliationTelemetry.anchorWitnessed).toBe(true);
+        expect(succ.summary.reconciliationTelemetry.anchorSignature).toBe(SIG_ANCHOR);
+        // Shared 7-request ceiling: 1 bootstrap + 1 slot + 1 cutoff + 1 enum + 1 tx = 5
+        expect(succ.summary.budgetAccounting.totalHttpRequests).toBe(5);
+        expect(succ.summary.budgetAccounting.totalHttpRequests).toBeLessThanOrEqual(7);
+      });
+
+      it("fails closed to UNWITNESSED_PRIOR_ANCHOR when bootstrap evidence is empty", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          const step = 2_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        };
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+
+        // Bootstrap returns empty array
+        const mockFetchEmpty: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getSignaturesForAddress") {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: [] }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetchEmpty,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(succ.summary.reconciliationTelemetry.anchorWitnessed).toBe(false);
+        expect(succ.summary.reconciliationTelemetry.anchorSignature).toBeNull();
+      });
+
+      it("fails closed when final bounded history page does not witness bootstrap anchor", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          const step = 2_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        };
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: 280_000_000,
+                      blockTime: baseEpochSec,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Enumeration returns a page of transactions that DO NOT contain SIG_ANCHOR (maxPages: 1 exhausted)
+            const otherSignatures = Array.from({ length: 5 }, (_, i) => ({
+              signature: `3v2A2E1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8Fwz3v2A2E1bA6LqF2m8R8Fwz${String(i).padStart(2, "1")}B`,
+              slot: 280_000_100,
+              blockTime: fixedCutoffSec - 5,
+              err: null,
+            }));
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: otherSignatures }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(succ.summary.reconciliationTelemetry.anchorWitnessed).toBe(false);
+      });
+
+      it("fails closed to MISSING_SOURCE_CUTOFF when getBlockTime returns null", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 0));
+        };
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getBlockTime") {
+            // Null block time
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: null }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (parsed.method === "getSignaturesForAddress") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  { signature: SIG_ANCHOR, slot: 280_000_000, blockTime: baseEpochSec, err: null },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const result = await executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          clock,
+          sleepFn,
+        });
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult!.status).toBe("MISSING_SOURCE_CUTOFF");
+      });
+
+      it("enforces shared transaction allowance across streaming and reconciliation", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+
+        const SIG_STREAM_1 = encodeBase58(Buffer.alloc(64, 1));
+        const SIG_STREAM_2 = encodeBase58(Buffer.alloc(64, 2));
+        const SIG_HIST_1 = encodeBase58(Buffer.alloc(64, 3));
+        const SIG_HIST_2 = encodeBase58(Buffer.alloc(64, 4));
+
+        let stream1Sent = false;
+        let stream2Sent = false;
+
+        const sleepFn = async (ms: number) => {
+          const step = 2_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            if (fakeNow >= (baseEpochSec + 45) * 1000 && !stream1Sent) {
+              stream1Sent = true;
+              mockTransport.triggerMessage(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "logsNotification",
+                  params: {
+                    subscription: 1,
+                    result: {
+                      context: { slot: 280_000_050 },
+                      value: { signature: SIG_STREAM_1, logs: [], err: null },
+                    },
+                  },
+                }),
+              );
+            }
+            if (fakeNow >= (baseEpochSec + 50) * 1000 && !stream2Sent) {
+              stream2Sent = true;
+              mockTransport.triggerMessage(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "logsNotification",
+                  params: {
+                    subscription: 1,
+                    result: {
+                      context: { slot: 280_000_050 },
+                      value: { signature: SIG_STREAM_2, logs: [], err: null },
+                    },
+                  },
+                }),
+              );
+            }
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        };
+
+        let txRetrievalCount = 0;
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              },
+            );
+          }
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: 280_000_000,
+                      blockTime: baseEpochSec,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Discovers 2 new un-ingested window transactions + the 2 already ingested from stream + anchor
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_HIST_1,
+                    slot: 280_000_100,
+                    blockTime: baseEpochSec + 60,
+                    err: null,
+                  },
+                  {
+                    signature: SIG_HIST_2,
+                    slot: 280_000_100,
+                    blockTime: baseEpochSec + 57,
+                    err: null,
+                  },
+                  {
+                    signature: SIG_STREAM_1,
+                    slot: 280_000_050,
+                    blockTime: baseEpochSec + 45,
+                    err: null,
+                  },
+                  {
+                    signature: SIG_STREAM_2,
+                    slot: 280_000_050,
+                    blockTime: baseEpochSec + 50,
+                    err: null,
+                  },
+                  { signature: SIG_ANCHOR, slot: 280_000_000, blockTime: baseEpochSec, err: null },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (parsed.method === "getTransaction") {
+            txRetrievalCount++;
+            const reqSig = parsed.params?.[0] ?? "unknown";
+            let txTime = fixedCutoffSec - 10;
+            if (reqSig === SIG_HIST_1) txTime = baseEpochSec + 60;
+            else if (reqSig === SIG_HIST_2) txTime = baseEpochSec + 57;
+            else if (reqSig === SIG_STREAM_1) txTime = baseEpochSec + 45;
+            else if (reqSig === SIG_STREAM_2) txTime = baseEpochSec + 50;
+            const reqSlot =
+              reqSig === SIG_STREAM_1 || reqSig === SIG_STREAM_2 ? 280_000_050 : 280_000_100;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(reqSig, txTime, reqSlot),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          maxTransactionRetrievals: 3, // Total shared ceiling = 3
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        // Total getTransaction calls must NOT exceed 3
+        expect(txRetrievalCount).toBeLessThanOrEqual(3);
+        // Because 2 stream transactions consumed allowance, only 1 was left for bridge.
+        // HistSig2 could not be processed, so reconciliation fails closed to UNRESOLVED_TRANSACTIONS
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult!.status).toBe("UNRESOLVED_TRANSACTIONS");
+        expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+      });
+
+      it("aborts in-flight independent RPC work promptly on signal and cleanly seals partial evidence", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 0));
+        };
+
+        const abortCtrl = new AbortController();
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSignaturesForAddress") {
+            // Trigger abort while bootstrap query is in-flight
+            abortCtrl.abort(new Error("Caller cancellation during bootstrap"));
+            // Simulate aborted fetch
+            const abortErr = new Error("This operation was aborted");
+            abortErr.name = "AbortError";
+            throw abortErr;
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const result = await executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          signal: abortCtrl.signal,
+          reconcile: true,
+          durationMs: 90_000,
+          clock,
+          sleepFn,
+        });
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        expect(succ.metadata.terminationReason).toBe("MANUAL_CANCEL");
+        expect(mockTransport.isClosed).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
       });
     });
   });

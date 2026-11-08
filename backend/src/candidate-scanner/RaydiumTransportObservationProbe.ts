@@ -99,7 +99,9 @@ export const MAX_INBOUND_MESSAGES_BUDGET = 500;
 export const MAX_APPLICATION_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MiB
 export const MAX_QUEUE_DEPTH_LIMIT = 10;
 export const MAX_HISTORY_QUERIES_LIMIT = 2;
+export const DEFAULT_RECONCILIATION_HISTORY_QUERIES = 2;
 export const MAX_TRANSACTION_RETRIEVALS_LIMIT = 5;
+export const DEFAULT_RECONCILIATION_TRANSACTION_RETRIEVALS = 3;
 export const MAX_TOTAL_HTTP_ATTEMPTS = 7;
 export const PROBE_MIN_PROVIDER_SPACING_MS = 2500;
 export const DEFAULT_PUBLIC_RPC_URL = "https://api.mainnet-beta.solana.com";
@@ -224,7 +226,9 @@ export interface TransportProbeDryRunResult {
     readonly reconcile: boolean;
     readonly plannedRequestAllocation?:
       | {
-          readonly cutoffAcquisition: number;
+          readonly anchorBootstrap: number;
+          readonly slotAcquisition: number;
+          readonly blockTimeAcquisition: number;
           readonly historyPagination: number;
           readonly transactionRetrievals: number;
           readonly maxTotalHttpAttempts: number;
@@ -460,6 +464,19 @@ export interface HistoryQueryAuditRecord {
   readonly error?: string | undefined;
 }
 
+export interface SlotAcquisitionAuditRecord {
+  readonly endpointUrl: string;
+  readonly commitment: "confirmed";
+  readonly requestSentAtMs: number;
+  readonly headersReceivedAtMs?: number | undefined;
+  readonly responseReceivedAtMs: number | null;
+  readonly durationMs: number;
+  readonly httpStatus: number | null;
+  readonly responseSha256: string | null;
+  readonly acquiredSlot?: number | undefined;
+  readonly error?: string | undefined;
+}
+
 export interface SourceCutoffAuditRecord {
   readonly slot: number;
   readonly endpointUrl: string;
@@ -551,6 +568,7 @@ export interface TransportProbeSummary {
   };
   readonly sampledTransactionAudits: readonly TransactionSourceDiagnostics[];
   readonly historyQueryAudits: readonly HistoryQueryAuditRecord[];
+  readonly slotAcquisitionAudit?: SlotAcquisitionAuditRecord | null | undefined;
   readonly cutoffAcquisitionAudit?: SourceCutoffAuditRecord | null | undefined;
   readonly transportDiagnostics: TransportDiagnostics;
 }
@@ -1364,8 +1382,130 @@ function sealCaptureManifest(
 }
 
 // ============================================================================
-// Source Cutoff Acquisition Helper (Phase 12.94-D Milestone D.3.3)
+// Confirmed Slot and Cutoff Acquisition Helpers (Phase 12.94-D Milestone D.3.3)
 // ============================================================================
+
+/**
+ * Acquires latest confirmed slot via single getSlot query with "confirmed" commitment.
+ * Strictly respects shared budget manager accounting and configured host pacing.
+ */
+export async function acquireConfirmedSlot(
+  rpcUrl: string,
+  budget: GlobalResourceBudgetManager,
+  signal?: AbortSignal,
+  fetchFn: typeof fetch = fetch,
+  clock: () => number = () => Date.now(),
+  sleepFn: (ms: number, signal?: AbortSignal) => Promise<void> = async () => {},
+  onAuditRecord?: (record: SlotAcquisitionAuditRecord) => void,
+): Promise<number> {
+  const provider = "SOLANA_RPC";
+
+  let budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+  if (
+    !budgetCheck.allowed &&
+    budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+    typeof budgetCheck.waitMs === "number" &&
+    budgetCheck.waitMs > 0
+  ) {
+    await sleepFn(budgetCheck.waitMs, signal);
+    budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+  }
+  if (!budgetCheck.allowed) {
+    throw new Error(
+      `[BUDGET_DENIED] Cannot acquire confirmed slot: ${budgetCheck.reason ?? "Ceiling reached"}`,
+    );
+  }
+
+  budget.recordRequestAttempt(provider, "CANDIDATE_ENRICHMENT", clock());
+
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getSlot",
+    params: [{ commitment: "confirmed" }],
+  });
+
+  const sanitizedEndpoint = redactSensitiveText(rpcUrl);
+  const requestSentAtMs = clock();
+  let headersReceivedAtMs: number | undefined = undefined;
+  let responseReceivedAtMs: number | null = null;
+  let httpStatus: number | null = null;
+  let responseSha256: string | null = null;
+  let auditError: string | undefined = undefined;
+  let acquiredSlot: number | undefined = undefined;
+
+  try {
+    const resp = await fetchFn(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      ...(signal ? { signal } : {}),
+    });
+
+    headersReceivedAtMs = clock();
+    httpStatus = resp.status;
+
+    if (!resp.ok) {
+      throw new Error(`[SLOT_FETCH_FAILED] HTTP ${resp.status} ${resp.statusText}`);
+    }
+
+    const rawText = await resp.text();
+    responseReceivedAtMs = clock();
+    responseSha256 = computeSha256(rawText);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      throw new Error("[SLOT_MALFORMED_JSON] Response is not valid JSON");
+    }
+
+    const rpcObj = parsed as {
+      jsonrpc?: unknown;
+      error?: { code?: unknown; message?: unknown };
+      result?: unknown;
+    };
+
+    if (rpcObj.error) {
+      const msg =
+        typeof rpcObj.error === "object" && rpcObj.error !== null
+          ? (rpcObj.error as { message?: unknown }).message
+          : JSON.stringify(rpcObj.error);
+      throw new Error(`[SLOT_RPC_ERROR] ${String(msg || JSON.stringify(rpcObj.error))}`);
+    }
+
+    if (
+      typeof rpcObj.result !== "number" ||
+      !Number.isSafeInteger(rpcObj.result) ||
+      rpcObj.result <= 0
+    ) {
+      throw new Error(
+        `[SLOT_INVALID_RESULT] Expected positive integer slot in result, received: ${String(rpcObj.result)}`,
+      );
+    }
+
+    acquiredSlot = rpcObj.result;
+    return acquiredSlot;
+  } catch (err: unknown) {
+    auditError = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+    const auditRecord: SlotAcquisitionAuditRecord = {
+      endpointUrl: sanitizedEndpoint,
+      commitment: "confirmed",
+      requestSentAtMs,
+      ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+      responseReceivedAtMs,
+      durationMs: Math.max(0, durationEnd - requestSentAtMs),
+      httpStatus,
+      responseSha256,
+      ...(acquiredSlot !== undefined ? { acquiredSlot } : {}),
+      ...(auditError ? { error: auditError } : {}),
+    };
+    onAuditRecord?.(auditRecord);
+  }
+}
 
 /**
  * Acquires confirmed source cutoff evidence via single getBlockTime query.
@@ -1606,7 +1746,8 @@ export async function executeTransportObservationProbe(
   }
 
   const maxHistoryQueries =
-    config.maxHistoryQueries ?? (isReconcileMode ? 1 : MAX_HISTORY_QUERIES_LIMIT);
+    config.maxHistoryQueries ??
+    (isReconcileMode ? DEFAULT_RECONCILIATION_HISTORY_QUERIES : MAX_HISTORY_QUERIES_LIMIT);
   if (
     typeof maxHistoryQueries !== "number" ||
     !Number.isSafeInteger(maxHistoryQueries) ||
@@ -1622,7 +1763,10 @@ export async function executeTransportObservationProbe(
   }
 
   const maxTransactionRetrievals =
-    config.maxTransactionRetrievals ?? MAX_TRANSACTION_RETRIEVALS_LIMIT;
+    config.maxTransactionRetrievals ??
+    (isReconcileMode
+      ? DEFAULT_RECONCILIATION_TRANSACTION_RETRIEVALS
+      : MAX_TRANSACTION_RETRIEVALS_LIMIT);
   if (
     typeof maxTransactionRetrievals !== "number" ||
     !Number.isSafeInteger(maxTransactionRetrievals) ||
@@ -1806,9 +1950,14 @@ export async function executeTransportObservationProbe(
         ...(isReconcileMode
           ? {
               plannedRequestAllocation: {
-                cutoffAcquisition: 1,
-                historyPagination: Math.min(1, maxHistoryQueries),
-                transactionRetrievals: Math.min(5, maxTransactionRetrievals),
+                anchorBootstrap: 1,
+                slotAcquisition: 1,
+                blockTimeAcquisition: 1,
+                historyPagination: 1,
+                transactionRetrievals: Math.min(
+                  DEFAULT_RECONCILIATION_TRANSACTION_RETRIEVALS,
+                  maxTransactionRetrievals,
+                ),
                 maxTotalHttpAttempts: MAX_TOTAL_HTTP_ATTEMPTS,
                 minProviderSpacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
               },
@@ -2056,6 +2205,163 @@ export async function executeTransportObservationProbe(
   let nullBlockTimeCount = 0;
   const sampledTransactionAudits: TransactionSourceDiagnostics[] = [];
   const historyQueryAudits: HistoryQueryAuditRecord[] = [];
+  let historyQueriesAttempted = 0;
+  let historyRecordsDiscovered = 0;
+  let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
+    ? "NOT_ATTEMPTED_TRANSPORT_ONLY"
+    : "NOT_ATTEMPTED";
+  let historyDiscoveryDurationMs: number | null = null;
+  let anchorWitnessed = false;
+  let anchorSignature: string | null = null;
+  let anchorSlot: number | null = null;
+  let anchorBlockTime: number | null = null;
+  const historyWitnessedList: { signature: string; slot: number; blockTime: number | null }[] = [];
+  const historyWitnessedSignatures = new Set<string>();
+  const fetchedHistoryRecords = new Map<string, HistorySignatureRecord>();
+
+  const pageFetcher: HistoryPageFetcher = {
+    fetchPage: async (
+      params: HistoryPageQueryParams,
+    ): Promise<readonly HistorySignatureRecord[]> => {
+      if (historyQueriesAttempted >= maxHistoryQueries) {
+        throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
+      }
+      historyQueriesAttempted++;
+
+      if (config.historyPageFetcher) {
+        const reqSent = clock();
+        let recordsDiscovered = 0;
+        let auditError: string | undefined;
+        try {
+          const records = await config.historyPageFetcher.fetchPage(params);
+          recordsDiscovered = records.length;
+          for (const r of records) {
+            fetchedHistoryRecords.set(r.signature, r);
+          }
+          return records;
+        } catch (err: unknown) {
+          auditError = err instanceof Error ? err.message : String(err);
+          throw err;
+        } finally {
+          const reqEnd = clock();
+          historyQueryAudits.push({
+            pageIndex: historyQueriesAttempted,
+            address: params.address,
+            limit: params.limit,
+            ...(params.before ? { before: params.before } : {}),
+            requestSentAtMs: reqSent,
+            headersReceivedAtMs: reqEnd,
+            responseReceivedAtMs: reqEnd,
+            durationMs: reqEnd - reqSent,
+            httpStatus: auditError ? null : 200,
+            responseSha256: null,
+            recordsDiscovered,
+            ...(auditError ? { error: auditError } : {}),
+          });
+        }
+      }
+
+      const reqSent = clock();
+      let headersReceivedAtMs: number | undefined;
+      let responseReceivedAtMs: number | null = null;
+      let httpStatus: number | null = null;
+      let responseSha256: string | null = null;
+      let recordsDiscovered = 0;
+      let auditError: string | undefined;
+
+      try {
+        const body = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getSignaturesForAddress",
+          params: [
+            params.address,
+            {
+              limit: params.limit,
+              before: params.before,
+              commitment: "confirmed",
+            },
+          ],
+        });
+
+        const resp = await boundedFetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          ...(params.signal ? { signal: params.signal } : {}),
+        });
+
+        headersReceivedAtMs = clock();
+        httpStatus = resp.status;
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+        }
+
+        const rawText = await resp.text();
+        responseReceivedAtMs = clock();
+        responseSha256 = computeSha256(rawText);
+
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawText);
+        } catch {
+          throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
+        }
+
+        if (!parsedJson || typeof parsedJson !== "object") {
+          throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
+        }
+
+        const rpcObj = parsedJson as {
+          jsonrpc?: unknown;
+          error?: { code?: unknown; message?: unknown };
+          result?: unknown;
+        };
+
+        if (rpcObj.error) {
+          const msg =
+            typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
+          throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
+        }
+
+        if (!Array.isArray(rpcObj.result)) {
+          throw new Error("MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress");
+        }
+
+        const records = rpcObj.result as HistorySignatureRecord[];
+        recordsDiscovered = records.length;
+        for (const r of records) {
+          fetchedHistoryRecords.set(r.signature, r);
+        }
+
+        return records;
+      } catch (err: unknown) {
+        auditError = err instanceof Error ? err.message : String(err);
+        throw err;
+      } finally {
+        const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+        historyQueryAudits.push({
+          pageIndex: historyQueriesAttempted,
+          address: params.address,
+          limit: params.limit,
+          ...(params.before ? { before: params.before } : {}),
+          requestSentAtMs: reqSent,
+          ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+          responseReceivedAtMs,
+          durationMs: durationEnd - reqSent,
+          httpStatus,
+          responseSha256,
+          recordsDiscovered,
+          ...(auditError ? { error: auditError } : {}),
+        });
+      }
+    },
+  };
+
+  let actualSubscribedObservationStartMs: number | null = null;
+  let bootstrapAnchorRecord: HistorySignatureRecord | null = null;
+  let bootstrapAnchorSignature: string | null = config.knownAnchorSignature ?? null;
 
   // Underlying WebSocket Transport
   let baseTransport: ISolanaWebSocketTransport | undefined;
@@ -2385,6 +2691,10 @@ export async function executeTransportObservationProbe(
               transportDiagnostics.subscriptionAcknowledgedAtMs = clock();
               transportDiagnostics.subscriptionId = parsed.result;
               transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
+              if (actualSubscribedObservationStartMs === null) {
+                actualSubscribedObservationStartMs =
+                  transportDiagnostics.subscriptionAcknowledgedAtMs;
+              }
             } else if (parsed.error !== undefined && parsed.error !== null) {
               transportDiagnostics.subscriptionStatus = "REJECTED";
               const sanitizedErrorObj = deepRedactSensitiveObject(parsed.error);
@@ -2515,6 +2825,57 @@ export async function executeTransportObservationProbe(
     return enqueueRes;
   };
 
+  // Anchor Bootstrap at T_0 (Phase 12.94-D Milestone D.3.3)
+  if (
+    isReconcileMode &&
+    !bootstrapAnchorSignature &&
+    !transportOnly &&
+    !isProbeTerminated &&
+    !overallAbortController.signal.aborted
+  ) {
+    try {
+      const provider = "SOLANA_RPC";
+      let budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+      if (
+        !budgetCheck.allowed &&
+        budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+        typeof budgetCheck.waitMs === "number" &&
+        budgetCheck.waitMs > 0
+      ) {
+        await sleepFn(budgetCheck.waitMs, overallAbortController.signal);
+        budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+      }
+      if (budgetCheck.allowed) {
+        budget.recordRequestAttempt(provider, "CANDIDATE_ENRICHMENT", clock());
+        const bootstrapRecords = await pageFetcher.fetchPage({
+          address: poolContext.poolId,
+          limit: 1,
+          commitment: "confirmed",
+          signal: overallAbortController.signal,
+        });
+        if (bootstrapRecords.length > 0) {
+          const candidate = bootstrapRecords[0]!;
+          if (
+            isValidSolanaSignature(candidate.signature) &&
+            typeof candidate.slot === "number" &&
+            Number.isSafeInteger(candidate.slot) &&
+            candidate.slot >= 0 &&
+            typeof candidate.blockTime === "number" &&
+            Number.isSafeInteger(candidate.blockTime) &&
+            candidate.blockTime > 0
+          ) {
+            bootstrapAnchorRecord = candidate;
+            bootstrapAnchorSignature = candidate.signature;
+            anchorSlot = candidate.slot;
+            anchorBlockTime = candidate.blockTime;
+          }
+        }
+      }
+    } catch {
+      // Handled fail-closed: bootstrap query failed
+    }
+  }
+
   // Overall Duration Timer
   const overallTimer = setTimeout(() => {
     terminateProbe("DURATION_EXPIRED", "Probe duration expired");
@@ -2528,6 +2889,7 @@ export async function executeTransportObservationProbe(
       : Math.min(10_000, Math.floor(durationMs * 0.2));
   const streamingDurationMs =
     config.streamingDurationMs ?? Math.max(1, durationMs - reconciliationReservationMs);
+  const streamingStartEpochMs = clock();
 
   const streamingPhasePromise = new Promise<void>((resolve) => {
     let resolved = false;
@@ -2666,161 +3028,11 @@ export async function executeTransportObservationProbe(
   // 9. Bounded History Discovery / Window Reconciliation Phase
   let reconciliationResult: WindowReconciliationResult | undefined;
   let reconciliationSuccess = false;
+  let slotAuditRecord: SlotAcquisitionAuditRecord | null = null;
   let cutoffAuditRecord: SourceCutoffAuditRecord | null = null;
 
-  let historyQueriesAttempted = 0;
-  let historyRecordsDiscovered = 0;
-  let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
-    ? "NOT_ATTEMPTED_TRANSPORT_ONLY"
-    : "NOT_ATTEMPTED";
-  let historyDiscoveryDurationMs: number | null = null;
-  let anchorWitnessed = false;
-  let anchorSignature: string | null = null;
-  let anchorSlot: number | null = null;
-  let anchorBlockTime: number | null = null;
-  const historyWitnessedList: { signature: string; slot: number; blockTime: number | null }[] = [];
-  const historyWitnessedSignatures = new Set<string>();
-  const fetchedHistoryRecords = new Map<string, HistorySignatureRecord>();
-
-  const pageFetcher: HistoryPageFetcher = {
-    fetchPage: async (
-      params: HistoryPageQueryParams,
-    ): Promise<readonly HistorySignatureRecord[]> => {
-      if (historyQueriesAttempted >= maxHistoryQueries) {
-        throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
-      }
-      historyQueriesAttempted++;
-
-      if (config.historyPageFetcher) {
-        const reqSent = clock();
-        let recordsDiscovered = 0;
-        let auditError: string | undefined;
-        try {
-          const records = await config.historyPageFetcher.fetchPage(params);
-          recordsDiscovered = records.length;
-          for (const r of records) {
-            fetchedHistoryRecords.set(r.signature, r);
-          }
-          return records;
-        } catch (err: unknown) {
-          auditError = err instanceof Error ? err.message : String(err);
-          throw err;
-        } finally {
-          const reqEnd = clock();
-          historyQueryAudits.push({
-            pageIndex: historyQueriesAttempted,
-            address: params.address,
-            limit: params.limit,
-            ...(params.before ? { before: params.before } : {}),
-            requestSentAtMs: reqSent,
-            headersReceivedAtMs: reqEnd,
-            responseReceivedAtMs: reqEnd,
-            durationMs: reqEnd - reqSent,
-            httpStatus: auditError ? null : 200,
-            responseSha256: null,
-            recordsDiscovered,
-            ...(auditError ? { error: auditError } : {}),
-          });
-        }
-      }
-
-      const reqSent = clock();
-      let headersReceivedAtMs: number | undefined;
-      let responseReceivedAtMs: number | null = null;
-      let httpStatus: number | null = null;
-      let responseSha256: string | null = null;
-      let recordsDiscovered = 0;
-      let auditError: string | undefined;
-
-      try {
-        const body = JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignaturesForAddress",
-          params: [
-            params.address,
-            {
-              limit: params.limit,
-              before: params.before,
-              commitment: "confirmed",
-            },
-          ],
-        });
-
-        const resp = await boundedFetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          ...(params.signal ? { signal: params.signal } : {}),
-        });
-
-        headersReceivedAtMs = clock();
-        httpStatus = resp.status;
-
-        if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-        }
-
-        const rawText = await resp.text();
-        responseReceivedAtMs = clock();
-        responseSha256 = computeSha256(rawText);
-
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(rawText);
-        } catch {
-          throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
-        }
-
-        if (!parsedJson || typeof parsedJson !== "object") {
-          throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
-        }
-
-        const rpcObj = parsedJson as {
-          jsonrpc?: unknown;
-          error?: { code?: unknown; message?: unknown };
-          result?: unknown;
-        };
-
-        if (rpcObj.error) {
-          const msg =
-            typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
-          throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
-        }
-
-        if (!Array.isArray(rpcObj.result)) {
-          throw new Error("MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress");
-        }
-
-        const records = rpcObj.result as HistorySignatureRecord[];
-        recordsDiscovered = records.length;
-        for (const r of records) {
-          fetchedHistoryRecords.set(r.signature, r);
-        }
-
-        return records;
-      } catch (err: unknown) {
-        auditError = err instanceof Error ? err.message : String(err);
-        throw err;
-      } finally {
-        const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
-        historyQueryAudits.push({
-          pageIndex: historyQueriesAttempted,
-          address: params.address,
-          limit: params.limit,
-          ...(params.before ? { before: params.before } : {}),
-          requestSentAtMs: reqSent,
-          ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
-          responseReceivedAtMs,
-          durationMs: durationEnd - reqSent,
-          httpStatus,
-          responseSha256,
-          recordsDiscovered,
-          ...(auditError ? { error: auditError } : {}),
-        });
-      }
-    },
-  };
+  const effectiveObservationStartMs =
+    config.observationStartMs ?? actualSubscribedObservationStartMs ?? streamingStartEpochMs;
 
   if (isReconcileMode) {
     const reconcileStartTime = clock();
@@ -2834,38 +3046,76 @@ export async function executeTransportObservationProbe(
         // Handled fail-closed: cutoff fetcher failed
       }
     } else {
-      const targetSlot = latestObservedSlot ?? firstObservedSlot;
+      let confirmedSlot: number | null = null;
       if (
-        targetSlot !== null &&
         !overallAbortController.signal.aborted &&
         probeState.terminationReason !== "TRANSPORT_ERROR" &&
         probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
         probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED"
       ) {
-        try {
-          cutoffEvidence = await acquireSourceCutoff(
-            rpcUrl,
-            targetSlot,
-            budget,
-            overallAbortController.signal,
-            boundedFetch,
-            clock,
-            sleepFn,
-            (rec) => {
-              cutoffAuditRecord = rec;
-            },
-          );
-        } catch {
-          // Handled fail-closed: cutoff acquisition failed
+        if (latestObservedSlot > 0) {
+          confirmedSlot = latestObservedSlot;
+        } else if (firstObservedSlot > 0) {
+          confirmedSlot = firstObservedSlot;
+        } else {
+          try {
+            confirmedSlot = await acquireConfirmedSlot(
+              rpcUrl,
+              budget,
+              overallAbortController.signal,
+              boundedFetch,
+              clock,
+              sleepFn,
+              (rec) => {
+                slotAuditRecord = rec;
+              },
+            );
+          } catch {
+            // Handled fail-closed: slot acquisition failed
+          }
+        }
+
+        if (confirmedSlot !== null) {
+          try {
+            cutoffEvidence = await acquireSourceCutoff(
+              rpcUrl,
+              confirmedSlot,
+              budget,
+              overallAbortController.signal,
+              boundedFetch,
+              clock,
+              sleepFn,
+              (rec) => {
+                cutoffAuditRecord = rec;
+              },
+            );
+          } catch {
+            // Handled fail-closed: cutoff acquisition failed
+          }
         }
       }
     }
 
     anchorSignature =
+      bootstrapAnchorSignature ??
       config.knownAnchorSignature ??
       (wsWitnessedList.length > 0 ? wsWitnessedList[0]!.signature : null);
     if (anchorSignature && wsWitnessedList.length > 0) {
       anchorSlot = wsWitnessedList[0]!.slot;
+    } else if (anchorSignature && bootstrapAnchorRecord) {
+      anchorSlot = bootstrapAnchorRecord.slot;
+      anchorBlockTime = bootstrapAnchorRecord.blockTime;
+    }
+
+    if (cutoffEvidence && anchorSignature) {
+      const windowStartMs = cutoffEvidence.cutoffTimestampMs - 60_000;
+      if (bootstrapAnchorRecord && bootstrapAnchorRecord.blockTime !== null) {
+        const anchorTimeMs = bootstrapAnchorRecord.blockTime * 1000;
+        if (anchorTimeMs > windowStartMs) {
+          // Boundary anchor is not prior to window start!
+          anchorSignature = null;
+        }
+      }
     }
 
     try {
@@ -2873,7 +3123,7 @@ export async function executeTransportObservationProbe(
         reconciliationResult = evaluateExactPoolWindowReconciliation({
           poolContext,
           decisionTimestampMs: clock(),
-          observationStartMs: config.observationStartMs ?? startTime,
+          observationStartMs: effectiveObservationStartMs,
           observationEndMs: clock(),
           sourceCutoff: null,
           tracker,
@@ -2881,7 +3131,7 @@ export async function executeTransportObservationProbe(
           clock,
           recordedGaps: [
             {
-              gapStartMs: startTime,
+              gapStartMs: effectiveObservationStartMs,
               gapEndMs: clock(),
               reason: "MISSING_SOURCE_CUTOFF: Source cutoff evidence was not acquired",
             },
@@ -2892,20 +3142,24 @@ export async function executeTransportObservationProbe(
         reconciliationResult = evaluateExactPoolWindowReconciliation({
           poolContext,
           decisionTimestampMs: clock(),
-          observationStartMs: config.observationStartMs ?? startTime,
+          observationStartMs: effectiveObservationStartMs,
           observationEndMs: clock(),
           sourceCutoff: cutoffEvidence,
           tracker,
           budgetManager: budget,
           clock,
-          recordedGaps: [
-            {
-              gapStartMs: startTime,
-              gapEndMs: clock(),
-              reason:
-                "STREAM_GAP:UNWITNESSED_PRIOR_ANCHOR: No valid prior stream anchor signature witnessed",
-            },
-          ],
+          historyResult: {
+            candidatePoolId: poolContext.poolId,
+            connectionEpoch: coordinator?.getConnectionEpoch() ?? 0,
+            knownAnchorSignature: "",
+            anchorWitnessed: false,
+            outcome: "ANCHOR_NOT_FOUND",
+            frozenTargetSignature: null,
+            discoveredSignatures: [],
+            pagesQueried: 0,
+            requestCount: 0,
+            isProductionCompletenessEstablished: false,
+          },
         });
         historyDiscoveryOutcome = "MISSING_BOUNDARY_ANCHOR";
       } else {
@@ -2916,13 +3170,17 @@ export async function executeTransportObservationProbe(
           budgetManager: budget,
           lifecycleTarget: coordinator ?? undefined,
           pageSize: 20,
-          maxPages: maxHistoryQueries,
+          maxPages: 1,
           operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
           signal: overallAbortController.signal,
           sleepFn,
           clock,
         });
 
+        const remainingTxAllowance = Math.max(
+          0,
+          maxTransactionRetrievals - transactionRetrievalsReserved,
+        );
         const resolutionBridge = new ExactPoolTransactionResolutionBridge({
           poolContext,
           adapter,
@@ -2931,7 +3189,7 @@ export async function executeTransportObservationProbe(
           lifecycleTarget: coordinator,
           signal: overallAbortController.signal,
           clock,
-          maxTransactionsToProcess: maxTransactionRetrievals,
+          maxTransactionsToProcess: Math.max(1, remainingTxAllowance),
           operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
         });
 
@@ -2940,14 +3198,14 @@ export async function executeTransportObservationProbe(
             knownAnchorSignature: anchorSignature,
             historyEnumerator: enumerator,
             resolutionBridge,
-            observationStartMs: config.observationStartMs ?? startTime,
+            observationStartMs: effectiveObservationStartMs,
             budgetManager: budget,
           });
         } else {
           reconciliationResult = evaluateExactPoolWindowReconciliation({
             poolContext,
             decisionTimestampMs: clock(),
-            observationStartMs: config.observationStartMs ?? startTime,
+            observationStartMs: effectiveObservationStartMs,
             observationEndMs: clock(),
             sourceCutoff: cutoffEvidence,
             tracker,
@@ -2955,7 +3213,7 @@ export async function executeTransportObservationProbe(
             clock,
             recordedGaps: [
               {
-                gapStartMs: startTime,
+                gapStartMs: effectiveObservationStartMs,
                 gapEndMs: clock(),
                 reason: "COORDINATOR_UNAVAILABLE",
               },
@@ -3012,7 +3270,7 @@ export async function executeTransportObservationProbe(
         reconciliationResult = evaluateExactPoolWindowReconciliation({
           poolContext,
           decisionTimestampMs: clock(),
-          observationStartMs: config.observationStartMs ?? startTime,
+          observationStartMs: effectiveObservationStartMs,
           observationEndMs: clock(),
           sourceCutoff: cutoffEvidence ?? null,
           tracker,
@@ -3020,7 +3278,7 @@ export async function executeTransportObservationProbe(
           clock,
           recordedGaps: [
             {
-              gapStartMs: startTime,
+              gapStartMs: effectiveObservationStartMs,
               gapEndMs: clock(),
               reason: `RECONCILIATION_EXCEPTION: ${err instanceof Error ? err.message : String(err)}`,
             },
@@ -3360,6 +3618,7 @@ export async function executeTransportObservationProbe(
     },
     sampledTransactionAudits,
     historyQueryAudits,
+    slotAcquisitionAudit: slotAuditRecord,
     cutoffAcquisitionAudit: cutoffAuditRecord,
     transportDiagnostics: frozenTransportDiagnostics,
   });
