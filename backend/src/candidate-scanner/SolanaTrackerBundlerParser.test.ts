@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import fsSync from "node:fs";
+import path from "node:path";
 import type { WatchlistCandidateItem } from "@nexustrade/shared";
 import {
   MAX_SOLANA_TRACKER_WALLETS_SAMPLE_LIMIT,
   parseSolanaTrackerBundlersResponse,
   type SolanaTrackerBundlerParseRequestMetadata,
+  type SolanaTrackerBundlerSnapshot,
   type SolanaTrackerWalletSampleEntry,
 } from "./SolanaTrackerBundlerParser.js";
 import { BuyGateTriggerService } from "./BuyGateTriggerService.js";
@@ -831,6 +834,352 @@ describe("SolanaTrackerBundlerParser", () => {
 
       expect(evalResult.triggered).toBe(false);
       expect(evalResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+    });
+  });
+
+  describe("Isolated Bundler Mapping to Gate 11 (Offline Test Fixtures Only)", () => {
+    /**
+     * Isolated test fixture mapping: connects pure parsed Solana Tracker output to Gate 11 context.
+     *
+     * STRICT TEST-FIXTURE SCOPE GUARANTEES:
+     * 1. Test-only helper: NOT a production adapter; does not alter runtime evaluation or CandidateScanner.
+     * 2. Separate dimensions: Preserves initialPct and currentHoldingPct as distinct fields.
+     * 3. Strategy intent: Maps initialPct to bundlerPctForGate11 to enforce launch-allocation thresholds.
+     * 4. No fallback / substitution: If initialPct is missing, non-finite, negative, or > 1.0, bundlerPctForGate11
+     *    remains strictly undefined. currentHoldingPct MUST NEVER substitute for initialPct.
+     */
+    interface IsolatedBundlerGate11Mapping {
+      readonly initialPct?: number | undefined;
+      readonly currentHoldingPct?: number | undefined;
+      readonly bundlerPctForGate11?: number | undefined;
+    }
+
+    function mapBundlerSnapshotForGate11TestFixture(
+      snapshot: SolanaTrackerBundlerSnapshot | null | undefined,
+    ): IsolatedBundlerGate11Mapping {
+      if (!snapshot) {
+        return {
+          initialPct: undefined,
+          currentHoldingPct: undefined,
+          bundlerPctForGate11: undefined,
+        };
+      }
+
+      // Preserve initialPct and currentHoldingPct separately
+      const initialPct =
+        typeof snapshot.initialPct === "number" &&
+        Number.isFinite(snapshot.initialPct) &&
+        snapshot.initialPct >= 0 &&
+        snapshot.initialPct <= 1
+          ? snapshot.initialPct
+          : undefined;
+
+      const currentHoldingPct =
+        typeof snapshot.currentHoldingPct === "number" &&
+        Number.isFinite(snapshot.currentHoldingPct) &&
+        snapshot.currentHoldingPct >= 0 &&
+        snapshot.currentHoldingPct <= 1
+          ? snapshot.currentHoldingPct
+          : undefined;
+
+      // Strategy launch-allocation intent: Gate 11 maps exclusively to initialPct.
+      // Missing or invalid initial allocation must remain unavailable; current holdings cannot substitute!
+      const bundlerPctForGate11 = initialPct;
+
+      return {
+        initialPct,
+        currentHoldingPct,
+        bundlerPctForGate11,
+      };
+    }
+
+    function createSyntheticCandidate(
+      overrides?: Partial<WatchlistCandidateItem>,
+    ): WatchlistCandidateItem {
+      return {
+        poolId: "PoolAddress111111111111111111111111111111111",
+        mintAddress: CANONICAL_MINT,
+        symbol: "SYNTH",
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        lmcRatio: 0.25,
+        lpBurnPct: 99.0,
+        assetAgeSeconds: 450,
+        volume5mUsd: 6_000,
+        buys5m: 40,
+        sells5m: 15,
+        buyToSellRatio: 2.67,
+        status: "WATCHING",
+        discoveredAt: new Date().toISOString(),
+        lastEvaluatedAt: new Date().toISOString(),
+        ...overrides,
+      };
+    }
+
+    it("preserves initialPct and currentHoldingPct separately without conflating them", () => {
+      const payload = {
+        total: 3,
+        balance: 50_000,
+        percentage: 5.0, // 5% current holdings
+        initialBalance: 250_000,
+        initialPercentage: 25.0, // 25% initial launch allocation
+        wallets: [],
+      };
+
+      const parseResult = parseSolanaTrackerBundlersResponse(payload, validMetadata);
+      expect(parseResult.success).toBe(true);
+      if (!parseResult.success) return;
+
+      const mapped = mapBundlerSnapshotForGate11TestFixture(parseResult.data);
+      expect(mapped.initialPct).toBeCloseTo(0.25, 4);
+      expect(mapped.currentHoldingPct).toBeCloseTo(0.05, 4);
+      expect(mapped.bundlerPctForGate11).toBeCloseTo(0.25, 4);
+      expect(mapped.initialPct).not.toEqual(mapped.currentHoldingPct);
+    });
+
+    it("fails Gate 11 when synthetic initial allocation exceeds cohort threshold even if current holdings are low", () => {
+      const service = new BuyGateTriggerService();
+
+      // Case A: Micro-cap candidate (ceiling is 50% / 0.50)
+      // Initial allocation is 55% (violating 50% ceiling), but current holdings have dumped to 2%
+      const microPayload = {
+        total: 10,
+        balance: 20_000,
+        percentage: 2.0, // Low current holdings (2%)
+        initialBalance: 550_000,
+        initialPercentage: 55.0, // High launch allocation (55%)
+        wallets: [],
+      };
+      const microParse = parseSolanaTrackerBundlersResponse(microPayload, validMetadata);
+      expect(microParse.success).toBe(true);
+      if (!microParse.success) return;
+
+      const microMapped = mapBundlerSnapshotForGate11TestFixture(microParse.data);
+      expect(microMapped.initialPct).toBeCloseTo(0.55, 4);
+      expect(microMapped.currentHoldingPct).toBeCloseTo(0.02, 4);
+      expect(microMapped.bundlerPctForGate11).toBeCloseTo(0.55, 4);
+
+      const microCandidate = createSyntheticCandidate({
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        assetAgeSeconds: 450,
+      });
+
+      const microResult = service.evaluateCandidate(microCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: microMapped.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+
+      expect(microResult.triggered).toBe(false);
+      expect(microResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+
+      // Counterfactual check: if currentHoldingPct (0.02) had been substituted, Gate 11 would have erroneously passed
+      const counterfactualResult = service.evaluateCandidate(microCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: microMapped.currentHoldingPct, // Invalid substitution
+        requireVerifiedHolders: true,
+      });
+      const bundlerGateCheck = counterfactualResult.gates.find(
+        (g) => g.name === "BUNDLER_CONCENTRATION_GATE",
+      );
+      expect(bundlerGateCheck?.passed).toBe(true); // Demonstrates why substitution is prohibited!
+
+      // Case B: Established runner candidate (ceiling is 85% / 0.85)
+      // Initial allocation is 88% (violating 85% ceiling), current holdings dumped to 5%
+      const estPayload = {
+        total: 12,
+        balance: 50_000,
+        percentage: 5.0, // Low current holdings (5%)
+        initialBalance: 880_000,
+        initialPercentage: 88.0, // High launch allocation (88%)
+        wallets: [],
+      };
+      const estParse = parseSolanaTrackerBundlersResponse(estPayload, validMetadata);
+      expect(estParse.success).toBe(true);
+      if (!estParse.success) return;
+
+      const estMapped = mapBundlerSnapshotForGate11TestFixture(estParse.data);
+      expect(estMapped.initialPct).toBeCloseTo(0.88, 4);
+      expect(estMapped.bundlerPctForGate11).toBeCloseTo(0.88, 4);
+
+      const estCandidate = createSyntheticCandidate({
+        liquidityUsd: 60_000,
+        marketCapUsd: 250_000,
+        assetAgeSeconds: 900,
+      });
+
+      const estResult = service.evaluateCandidate(estCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: estMapped.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+
+      expect(estResult.triggered).toBe(false);
+      expect(estResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+    });
+
+    it("leaves bundler concentration unavailable when initial allocation is missing or invalid; current holdings cannot substitute", () => {
+      const service = new BuyGateTriggerService();
+      const candidate = createSyntheticCandidate();
+
+      // Case A: Missing / undefined snapshot
+      const mappedNull = mapBundlerSnapshotForGate11TestFixture(null);
+      expect(mappedNull.bundlerPctForGate11).toBeUndefined();
+
+      const resultNull = service.evaluateCandidate(candidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: mappedNull.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+      expect(resultNull.triggered).toBe(false);
+      expect(resultNull.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+
+      // Case B: Snapshot with invalid initialPct (e.g. NaN) but valid currentHoldingPct
+      const invalidInitialSnapshot = {
+        initialPct: NaN as unknown as number,
+        currentHoldingPct: 0.04,
+      } as unknown as SolanaTrackerBundlerSnapshot;
+
+      const mappedInvalid = mapBundlerSnapshotForGate11TestFixture(invalidInitialSnapshot);
+      expect(mappedInvalid.initialPct).toBeUndefined();
+      expect(mappedInvalid.currentHoldingPct).toBe(0.04);
+      expect(mappedInvalid.bundlerPctForGate11).toBeUndefined(); // Current holdings cannot substitute!
+
+      const resultInvalid = service.evaluateCandidate(candidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: mappedInvalid.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+      expect(resultInvalid.triggered).toBe(false);
+      expect(resultInvalid.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
+    });
+
+    it("verifies captured initialPercentage normalization against sealed capture without treating favorable Gate 11 as full admission", () => {
+      const repoRootDir = path.resolve(import.meta.dirname, "../../..");
+      const captureFilePath = path.resolve(
+        repoRootDir,
+        "data/research/captures/solana-tracker-bundler/2026-11-06T04-30-37-645Z_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R/sanitized-response.json",
+      );
+      const metadataFilePath = path.resolve(
+        repoRootDir,
+        "data/research/captures/solana-tracker-bundler/2026-11-06T04-30-37-645Z_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R/capture-metadata.json",
+      );
+
+      expect(fsSync.existsSync(captureFilePath)).toBe(true);
+      expect(fsSync.existsSync(metadataFilePath)).toBe(true);
+
+      const metadata = JSON.parse(fsSync.readFileSync(metadataFilePath, "utf8")) as {
+        requestedMint: string;
+        localRetrievedAtMs: number;
+      };
+      const responsePayload = JSON.parse(fsSync.readFileSync(captureFilePath, "utf8"));
+
+      const parseResult = parseSolanaTrackerBundlersResponse(responsePayload, {
+        requestedMint: metadata.requestedMint,
+        localRetrievedAtMs: metadata.localRetrievedAtMs,
+      });
+      expect(parseResult.success).toBe(true);
+      if (!parseResult.success) return;
+
+      // Verify exact raw values and normalization from sealed reference capture
+      expect(parseResult.data.totalBundlersCount).toBe(1349);
+      expect(parseResult.data.reportedRawInitialPct).toBe(0.00756); // 0.00756%
+      expect(parseResult.data.initialPct).toBeCloseTo(0.0000756, 7); // Normalized to [0.0, 1.0]
+      expect(parseResult.data.reportedRawCurrentPct).toBe(0.05904); // 0.05904%
+      expect(parseResult.data.currentHoldingPct).toBeCloseTo(0.0005904, 7);
+
+      const mapped = mapBundlerSnapshotForGate11TestFixture(parseResult.data);
+      expect(mapped.bundlerPctForGate11).toBeCloseTo(0.0000756, 7);
+
+      const service = new BuyGateTriggerService();
+
+      // Part A: Gate 11 alone passes because 0.0000756 <= 0.50 (micro-cap)
+      const syntheticPassingCandidate = createSyntheticCandidate();
+      const passingEval = service.evaluateCandidate(syntheticPassingCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: mapped.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+      const gate11Check = passingEval.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(gate11Check?.passed).toBe(true);
+
+      // Part B: Crucial requirement - Favorable Gate 11 does NOT admit candidate when another gate fails
+      const syntheticFailingCandidate = createSyntheticCandidate({
+        volume5mUsd: 1_000, // Failing: $1,000 < $2,500 min volume
+      });
+      const failingEval = service.evaluateCandidate(syntheticFailingCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: mapped.bundlerPctForGate11,
+        requireVerifiedHolders: true,
+      });
+      // Gate 11 passed, but candidate was NOT admitted due to Gate 7 (volume)
+      const gate11InFailing = failingEval.gates.find(
+        (g) => g.name === "BUNDLER_CONCENTRATION_GATE",
+      );
+      expect(gate11InFailing?.passed).toBe(true);
+      expect(failingEval.triggered).toBe(false);
+      expect(failingEval.rejectionReason).toBe("VOLUME_SURGE_GATE_FAILED");
+    });
+
+    it("confirms normal runtime path still leaves bundlerPct unavailable and Gate 11 fail-closed", async () => {
+      // Mock RugCheck response returning valid healthy security metrics
+      const mockRugCheckFetch: typeof fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            score: 50,
+            totalHolders: 350,
+            topHolders: [{ pct: 2.5 }, { pct: 1.5 }],
+            risks: [],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      };
+
+      const metrics = await BuyGateTriggerService.fetchRugCheckMetrics(
+        CANONICAL_MINT,
+        mockRugCheckFetch,
+      );
+      expect(metrics).not.toBeNull();
+      // Normal runtime path strictly leaves bundlerPct undefined
+      expect(metrics?.bundlerPct).toBeUndefined();
+
+      const service = new BuyGateTriggerService();
+      const candidate = createSyntheticCandidate();
+
+      const runtimeEval = service.evaluateCandidate(candidate, {
+        rugScore: metrics?.rugScore,
+        hasDangerRisk: metrics?.hasDangerRisk,
+        holdersCount: metrics?.holdersCount,
+        top10HolderPct: metrics?.top10HolderPct,
+        bundlerPct: metrics?.bundlerPct, // undefined in runtime
+        requireVerifiedHolders: true,
+      });
+
+      // Under requireVerifiedHolders: true, missing bundlerPct fails closed
+      expect(runtimeEval.triggered).toBe(false);
+      expect(runtimeEval.rejectionReason).toBe("BUNDLER_CONCENTRATION_UNKNOWN");
     });
   });
 });
