@@ -1,56 +1,44 @@
 /**
- * NeXusTrade — Offline Single-Target Acquisition & Decision Diagnostic
+ * NeXusTrade — Standalone Candidate Decision Diagnostic Runner
  *
- * Standalone diagnostic pipeline executing an exact-pool, no-trade acquisition and gate
- * evaluation workflow strictly bounded to at most 14 dispatched attempts.
- *
- * OPERATIONAL & ARCHITECTURAL INVARIANTS:
- * 1. Fixed Request Ceiling & Ledger:
- *    - Hard-capped at 14 total dispatched attempts across all providers.
- *    - Quiet path consumes at most 11 attempts.
- *    - Paced at >= 2,500 ms per provider; zero forward-quote reservation.
- *    - Immediate fail-closed abort on any HTTP 429 response.
- * 2. Observation Window Inequalities:
- *    - observationStartMs <= cutoffTimestampMs - 60,000 ms
- *    - observationEndMs >= cutoffTimestampMs
- *    - decisionTimestampMs - cutoffTimestampMs <= 15,000 ms
- * 3. Real Candidate-Token & Market Inputs:
- *    - Candidate-token mint account parsed via SolanaRpcMintAccountParser (decimals, authorities).
- *    - Strict actual marketCap check (FDV recorded separately, no FDV proxy).
- *    - Exact chain, DEX, pool, candidate mint, and WSOL orientation validation.
- *    - Provisional setup context validated against fresh LP evidence.
- * 4. Pre-Admission LP Precondition & Approved Decision Boundaries:
- *    - LP burn >= 90% and renounced authorities strictly enforced BEFORE Buy Gates.
- *    - Forward executionContext to evaluateCandidateDecisionPoints (PAPER_SIMULATION).
- *    - Quiet-window adapter qualification only; active/unverified flow remains UNAVAILABLE.
- *    - A single Retest evaluation arms first tick; never claims completed entry.
- * 5. Standalone Output Isolation:
- *    - Zero writes to canonical wallet, settlement journal, past sessions, or telemetry.
- *    - Writes diagnostic-report.json and evidence-manifest.json to dedicated output directory.
+ * Implements a strict, single-target offline acquisition and decision diagnostic:
+ * - One exact target pool/mint: reference RAY/WSOL pool.
+ * - Maximum 14 dispatched attempts enforced by GlobalResourceBudgetManager.
+ * - Single-page history enumeration (20 records max) via ExactPoolHistoryEnumerator.
+ * - Quiet-window verification with on-chain cutoff synchronization (getSlot + getBlockTime).
+ * - Bounded stream observation with strict message, byte, and queue limits.
+ * - Full pre-admission screening (LP burn >= 90%, explicitly observed renounced authorities).
+ * - Exact spot pricing, actual marketCap required (FDV non-substitutable).
+ * - Strict security evaluation reusing BuyGateTriggerService.fetchRugCheckMetrics.
+ * - Isolated diagnostic artifact writing with tamper-evident SHA-256 manifests.
+ * - Zero wallet operations, zero trading daemon execution, zero canonical state file writes.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import {
-  parseRaydiumAmmV4Account,
+  RAYDIUM_AMM_V4_LAYOUT_LENGTH,
   WSOL_MINT,
   isCanonicalSolanaBase58,
-  RAYDIUM_AMM_V4_LAYOUT_LENGTH,
-  RAYDIUM_AMM_V4_PROGRAM_ID,
+  parseRaydiumAmmV4Account,
 } from "../research/pilot/RaydiumAmmParser.js";
 import {
   type TrackedRaydiumPoolContext,
   validateTrackedPoolContext,
 } from "./RaydiumAmmV4SwapDecoder.js";
-import { type RaydiumPairOrientation } from "../research/pilot/PilotTypes.js";
 import { RaydiumCandidateSubscriptionCoordinator } from "./RaydiumCandidateSubscriptionCoordinator.js";
 import { type ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
+import {
+  MeteredWebSocketTransport,
+  WsWebSocketTransport,
+} from "./RaydiumTransportObservationProbe.js";
 import { RaydiumAmmV4TransactionSourceAdapter } from "./RaydiumAmmV4TransactionSourceAdapter.js";
 import { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
 import {
+  ExactPoolHistoryEnumerator,
   type HistorySignatureRecord,
-  type HistoryEnumerationResult,
+  type HistoryPageQueryParams,
 } from "./ExactPoolHistoryEnumerator.js";
 import {
   evaluateExactPoolWindowReconciliation,
@@ -63,7 +51,11 @@ import {
   evaluateCandidateDecisionPoints,
   type CandidateDecisionResult,
 } from "./CandidateFlowProvider.js";
-import { adaptPaperBundlerSnapshot } from "./PaperSolanaTrackerBundlerAdapter.js";
+import { BuyGateTriggerService } from "./BuyGateTriggerService.js";
+import {
+  adaptPaperBundlerSnapshot,
+  type PaperBundlerExecutionContext,
+} from "./PaperSolanaTrackerBundlerAdapter.js";
 import { parseSolanaTrackerBundlersResponse } from "./SolanaTrackerBundlerParser.js";
 import { parseSolanaRpcMintAccountResponse } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
@@ -75,20 +67,20 @@ import {
   deepRedactSensitiveObject,
   redactSensitiveText,
 } from "./SolanaTrackerBundlerCaptureTool.js";
+import { sanitizeSolanaRpcUrl } from "../research/pilot/SolanaRpcLiveObservationClient.js";
 import type { WatchlistCandidateItem, TokenMintAddress } from "@nexustrade/shared";
 
-const RENOUNCED_AUTHORITY_ADDRESSES = new Set([
-  "11111111111111111111111111111111",
-  "null",
-  "none",
-  "",
-]);
+const RENOUNCED_AUTHORITY_ADDRESSES = new Set(["11111111111111111111111111111111", "null", "none"]);
 
-export function isRenouncedAuthority(authority: string | null | undefined): boolean {
-  if (authority === null || authority === undefined) return true;
-  const trimmed = authority.trim();
-  if (!trimmed) return true;
-  return RENOUNCED_AUTHORITY_ADDRESSES.has(trimmed.toLowerCase());
+export function isRenouncedAuthority(authority: unknown, isExplicitlyObserved: boolean): boolean {
+  if (!isExplicitlyObserved) return false;
+  if (authority === null) return true;
+  if (typeof authority === "string") {
+    const trimmed = authority.trim();
+    if (!trimmed) return false;
+    return RENOUNCED_AUTHORITY_ADDRESSES.has(trimmed.toLowerCase());
+  }
+  return false;
 }
 
 export interface DiagnosticRequestRecord {
@@ -131,6 +123,7 @@ export interface CandidateDecisionDiagnosticOptions {
   readonly sleeper?: (ms: number) => Promise<void>;
   readonly executionContext?: "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST" | undefined;
   readonly overallTimeoutMs?: number | undefined; // default 90_000 ms
+  readonly requestTimeoutMs?: number | undefined; // default 10_000 ms
   readonly observationDurationMs?: number | undefined; // default 65_000 ms
   readonly isLive?: boolean | undefined;
   readonly solanaTrackerApiKey?: string | undefined;
@@ -162,6 +155,8 @@ export interface CandidateDecisionDiagnosticResult {
         readonly buys5m: number;
         readonly sells5m: number;
         readonly buyToSellRatio: number;
+        readonly priceChange1hPct?: number | undefined;
+        readonly momentum5mBps?: number | undefined;
       }
     | undefined;
   readonly candidateMintAccount?:
@@ -191,11 +186,14 @@ export interface CandidateDecisionDiagnosticResult {
         readonly recentSells60s: number | null;
         readonly isPaperQualified?: boolean | undefined;
         readonly diagnosticReason: string;
+        readonly windowStartMs?: number | undefined;
+        readonly windowEndMs?: number | undefined;
       }
     | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
   readonly outDir?: string | undefined;
   readonly manifestDigestSha256?: string | undefined;
+  writeError?: string | undefined;
 }
 
 export class CandidateDecisionDiagnostic {
@@ -204,11 +202,12 @@ export class CandidateDecisionDiagnostic {
   private readonly rpcUrl: string;
   private readonly outDir?: string | undefined;
   private readonly transport: typeof fetch;
-  private readonly wsTransport?: ISolanaWebSocketTransport | undefined;
+  private readonly wsTransport: ISolanaWebSocketTransport;
   private readonly clock: () => number;
   private readonly sleeper: (ms: number) => Promise<void>;
   private readonly executionContext: "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST";
   private readonly overallTimeoutMs: number;
+  private readonly requestTimeoutMs: number;
   private readonly observationDurationMs: number;
   private readonly isLive: boolean;
   private readonly solanaTrackerApiKey?: string | undefined;
@@ -252,21 +251,58 @@ export class CandidateDecisionDiagnostic {
     this.mintAddress = options.mintAddress;
     this.rpcUrl = options.rpcUrl;
     this.outDir = options.outDir;
-    this.transport = options.transport ?? globalThis.fetch;
-    this.wsTransport = options.wsTransport;
+    this.isLive = options.isLive ?? false;
+
+    if (this.outDir) {
+      const existingReport = path.join(this.outDir, "diagnostic-report.json");
+      const existingManifest = path.join(this.outDir, "evidence-manifest.json");
+      if (existsSync(existingReport) || existsSync(existingManifest)) {
+        throw new Error(
+          `[DIAGNOSTIC_OUTPUT_EXISTS] Target output directory already contains diagnostic artifacts: ${this.outDir}. Refusing to overwrite.`,
+        );
+      }
+    }
+
+    // Strict offline mode requirements: require explicitly injected transports
+    if (!this.isLive) {
+      if (!options.transport) {
+        throw new Error("[DIAGNOSTIC_INVALID_ARG] Offline mode requires injected transport");
+      }
+      if (!options.wsTransport) {
+        throw new Error("[DIAGNOSTIC_INVALID_ARG] Offline mode requires injected wsTransport");
+      }
+      this.transport = options.transport;
+      this.wsTransport = options.wsTransport;
+    } else {
+      this.transport = options.transport ?? globalThis.fetch;
+      if (options.wsTransport) {
+        this.wsTransport = options.wsTransport;
+      } else {
+        const wsUrl = this.rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
+        this.wsTransport = new WsWebSocketTransport(wsUrl);
+      }
+    }
+
     this.clock = options.clock ?? (() => Date.now());
     this.sleeper =
       options.sleeper ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.executionContext = options.executionContext ?? "PRODUCTION";
     this.overallTimeoutMs = options.overallTimeoutMs ?? 90_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.observationDurationMs = options.observationDurationMs ?? 65_000;
-    this.isLive = options.isLive ?? false;
     this.solanaTrackerApiKey = options.solanaTrackerApiKey;
     this.rugCheckApiUrl = options.rugCheckApiUrl ?? "https://api.rugcheck.xyz";
     this.solanaTrackerApiUrl = options.solanaTrackerApiUrl ?? "https://data.solanatracker.io";
     this.dexScreenerApiUrl = options.dexScreenerApiUrl ?? "https://api.dexscreener.com";
 
-    if (this.solanaTrackerApiKey) {
+    // Extract all credential tokens from RPC URL and API keys for comprehensive redaction
+    const rpcSanitized = sanitizeSolanaRpcUrl(this.rpcUrl);
+    for (const token of rpcSanitized.sensitiveTokens) {
+      if (token && token.length > 2 && !this.sensitiveTokens.includes(token)) {
+        this.sensitiveTokens.push(token);
+      }
+    }
+    if (this.solanaTrackerApiKey && !this.sensitiveTokens.includes(this.solanaTrackerApiKey)) {
       this.sensitiveTokens.push(this.solanaTrackerApiKey);
     }
 
@@ -284,9 +320,46 @@ export class CandidateDecisionDiagnostic {
     return this.ledger;
   }
 
+  public getBudgetManager(): GlobalResourceBudgetManager {
+    return this.budgetManager;
+  }
+
+  /**
+   * Cancellable sleeper racing wait against abort signal.
+   */
+  private async sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new Error(`[OPERATION_ABORTED] Sleep aborted: ${String(signal.reason ?? "Aborted")}`);
+    }
+    if (ms <= 0) return;
+
+    if (!signal) {
+      await this.sleeper(ms);
+      return;
+    }
+
+    let onAbort: (() => void) | undefined;
+    const abortPromise = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        reject(
+          new Error(`[OPERATION_ABORTED] Sleep aborted: ${String(signal.reason ?? "Aborted")}`),
+        );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+    try {
+      await Promise.race([this.sleeper(ms), abortPromise]);
+    } finally {
+      if (onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  }
+
   /**
    * Internal metered request dispatch wrapper enforcing shared budget, provider pacing,
-   * attempt counting, 429 fail-closed abort, and cryptographic wire recording.
+   * deadline racing, body read timeouts, and fail-closed HTTP 429 aborts.
    */
   private async dispatchMeteredRequest(params: {
     purpose:
@@ -308,6 +381,8 @@ export class CandidateDecisionDiagnostic {
     body?: string | undefined;
     signal?: AbortSignal | undefined;
     customTimeoutMs?: number | undefined;
+    skipBudgetRecording?: boolean | undefined;
+    overallDeadlineMs?: number | undefined;
   }): Promise<{
     ok: boolean;
     status: number;
@@ -323,33 +398,76 @@ export class CandidateDecisionDiagnostic {
       headers = {},
       body,
       signal,
-      customTimeoutMs = 10_000,
+      customTimeoutMs = this.requestTimeoutMs,
+      skipBudgetRecording = false,
+      overallDeadlineMs,
     } = params;
 
-    // 1. Budget manager admission check & pacing
-    let check = this.budgetManager.canMakeRequest(
-      providerName,
-      this.clock(),
-      "CANDIDATE_ENRICHMENT",
-    );
-    if (
-      !check.allowed &&
-      check.reason === "PROVIDER_PACING_NOT_MET" &&
-      typeof check.waitMs === "number"
-    ) {
-      await this.sleeper(check.waitMs);
-      check = this.budgetManager.canMakeRequest(providerName, this.clock(), "CANDIDATE_ENRICHMENT");
-    }
-
-    if (!check.allowed) {
+    // 0. Pre-flight abort and deadline checks
+    if (signal?.aborted) {
       throw new Error(
-        `[BUDGET_DENIED] ${purpose} denied by GlobalResourceBudgetManager: ${check.reason}`,
+        `[OPERATION_ABORTED] Signal already aborted before ${purpose}: ${String(signal.reason)}`,
+      );
+    }
+    if (overallDeadlineMs !== undefined && this.clock() >= overallDeadlineMs) {
+      throw new Error(
+        `[OVERALL_DIAGNOSTIC_TIMEOUT] Overall diagnostic deadline exceeded before ${purpose}`,
       );
     }
 
-    // 2. Count attempt in ledger and record in budget manager
+    // 1. Budget manager admission check & pacing (if not skipped by caller)
+    if (!skipBudgetRecording) {
+      let check = this.budgetManager.canMakeRequest(
+        providerName,
+        this.clock(),
+        "CANDIDATE_ENRICHMENT",
+      );
+      if (
+        !check.allowed &&
+        check.reason === "PROVIDER_PACING_NOT_MET" &&
+        typeof check.waitMs === "number"
+      ) {
+        if (signal?.aborted) {
+          throw new Error(
+            `[OPERATION_ABORTED] Signal aborted before pacing for ${purpose}: ${String(signal.reason)}`,
+          );
+        }
+        await this.sleepWithAbort(check.waitMs, signal);
+        if (signal?.aborted) {
+          throw new Error(
+            `[OPERATION_ABORTED] Signal aborted after pacing for ${purpose}: ${String(signal.reason)}`,
+          );
+        }
+        check = this.budgetManager.canMakeRequest(
+          providerName,
+          this.clock(),
+          "CANDIDATE_ENRICHMENT",
+        );
+      }
+
+      if (!check.allowed) {
+        throw new Error(
+          `[BUDGET_DENIED] ${purpose} denied by GlobalResourceBudgetManager: ${check.reason}`,
+        );
+      }
+
+      this.budgetManager.recordRequestAttempt(providerName, "CANDIDATE_ENRICHMENT", this.clock());
+    }
+
+    // Check cancellation immediately before dispatch
+    if (signal?.aborted) {
+      throw new Error(
+        `[OPERATION_ABORTED] Signal aborted immediately before dispatching ${purpose}: ${String(signal.reason)}`,
+      );
+    }
+    if (overallDeadlineMs !== undefined && this.clock() >= overallDeadlineMs) {
+      throw new Error(
+        `[OVERALL_DIAGNOSTIC_TIMEOUT] Overall deadline exceeded immediately before dispatching ${purpose}`,
+      );
+    }
+
+    // 2. Count attempt in ledger
     this.ledger.totalAttempts++;
-    this.budgetManager.recordRequestAttempt(providerName, "CANDIDATE_ENRICHMENT", this.clock());
     switch (purpose) {
       case "POOL_LAYOUT":
         this.ledger.poolLayoutAttempts++;
@@ -388,11 +506,45 @@ export class CandidateDecisionDiagnostic {
 
     const dispatchedAtMs = this.clock();
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort("REQUEST_TIMEOUT"), customTimeoutMs);
+    // Compute effective request timeout
+    const remainingOverallMs =
+      overallDeadlineMs !== undefined
+        ? Math.max(1, overallDeadlineMs - this.clock())
+        : customTimeoutMs;
+    const effectiveTimeoutMs = Math.min(customTimeoutMs, remainingOverallMs);
+
+    const reqController = new AbortController();
+    const reqTimeout = setTimeout(() => reqController.abort("REQUEST_TIMEOUT"), effectiveTimeoutMs);
+
+    const onCallerAbort = () => {
+      reqController.abort(signal?.reason ?? "CALLER_ABORTED");
+    };
     if (signal) {
-      signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+      if (signal.aborted) {
+        onCallerAbort();
+      } else {
+        signal.addEventListener("abort", onCallerAbort, { once: true });
+      }
     }
+
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (reqController.signal.aborted) {
+        reject(
+          new Error(`[REQUEST_ABORTED] ${purpose} aborted: ${String(reqController.signal.reason)}`),
+        );
+        return;
+      }
+      reqController.signal.addEventListener(
+        "abort",
+        () =>
+          reject(
+            new Error(
+              `[REQUEST_ABORTED] ${purpose} aborted: ${String(reqController.signal.reason)}`,
+            ),
+          ),
+        { once: true },
+      );
+    });
 
     let httpStatus = 0;
     let rawText = "";
@@ -401,21 +553,29 @@ export class CandidateDecisionDiagnostic {
     let errorMessage: string | undefined;
 
     try {
-      const res = await this.transport(url, {
+      const fetchPromise = this.transport(url, {
         method,
         headers: {
           Accept: "application/json",
           ...headers,
         },
         ...(body !== undefined ? { body } : {}),
-        signal: controller.signal,
+        signal: reqController.signal,
       });
 
+      // Race headers against abort/timeout
+      const res = await Promise.race([fetchPromise, abortPromise]);
       httpStatus = res.status;
-      rawText = await res.text();
+
+      // Race body text read against abort/timeout
+      const textPromise = res.text();
+      rawText = await Promise.race([textPromise, abortPromise]);
       wireDigestSha256 = createHash("sha256").update(Buffer.from(rawText, "utf8")).digest("hex");
 
-      this.budgetManager.recordResponseStatus(httpStatus);
+      if (!skipBudgetRecording) {
+        this.budgetManager.recordResponseStatus(httpStatus);
+      }
+
       if (httpStatus === 429) {
         errorMessage = `HTTP 429 Rate Limit encountered from ${providerName}`;
         ok = false;
@@ -429,28 +589,39 @@ export class CandidateDecisionDiagnostic {
       errorMessage = err instanceof Error ? err.message : String(err);
       ok = false;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(reqTimeout);
+      if (signal) signal.removeEventListener("abort", onCallerAbort);
     }
 
     const completedAtMs = this.clock();
 
+    const sanitizedEndpoint = sanitizeSolanaRpcUrl(url).sanitizedUrl;
     this.ledger.records.push({
       purpose,
       provider: providerName,
-      endpoint: redactSensitiveText(url, this.sensitiveTokens),
+      endpoint: redactSensitiveText(sanitizedEndpoint, this.sensitiveTokens),
       method,
       dispatchedAtMs,
       completedAtMs,
-      httpStatus: httpStatus > 0 ? httpStatus : undefined,
+      ...(httpStatus > 0 ? { httpStatus } : {}),
       ok,
-      error: errorMessage,
-      wireDigestSha256: wireDigestSha256.length > 0 ? wireDigestSha256 : undefined,
+      ...(errorMessage !== undefined ? { error: errorMessage } : {}),
+      ...(wireDigestSha256.length > 0 ? { wireDigestSha256 } : {}),
     });
 
     if (httpStatus === 429) {
       throw new Error(
         `[HTTP_429_RATE_LIMITED] ${purpose} received HTTP 429 from ${providerName}; aborting immediately.`,
       );
+    }
+
+    if (
+      !ok &&
+      errorMessage &&
+      (errorMessage.includes("REQUEST_TIMEOUT") ||
+        errorMessage.includes("OVERALL_DIAGNOSTIC_TIMEOUT"))
+    ) {
+      throw new Error(`[OPERATION_TIMEOUT] ${purpose} timed out: ${errorMessage}`);
     }
 
     let json: unknown | null = null;
@@ -462,7 +633,13 @@ export class CandidateDecisionDiagnostic {
       }
     }
 
-    return { ok, status: httpStatus, text: rawText, json, error: errorMessage };
+    return {
+      ok,
+      status: httpStatus,
+      text: rawText,
+      json,
+      ...(errorMessage !== undefined ? { error: errorMessage } : {}),
+    };
   }
 
   /**
@@ -481,6 +658,8 @@ export class CandidateDecisionDiagnostic {
     method: string,
     params: readonly unknown[],
     signal?: AbortSignal,
+    skipBudgetRecording = false,
+    overallDeadlineMs?: number,
   ): Promise<{
     ok: boolean;
     status: number;
@@ -502,10 +681,17 @@ export class CandidateDecisionDiagnostic {
       headers: { "Content-Type": "application/json" },
       body: rpcPayload,
       signal,
+      skipBudgetRecording,
+      overallDeadlineMs,
     });
 
     if (!res.ok) {
-      return { ok: false, status: res.status, json: null, error: res.error };
+      return {
+        ok: false,
+        status: res.status,
+        json: null,
+        ...(res.error !== undefined ? { error: res.error } : {}),
+      };
     }
 
     if (!res.json || typeof res.json !== "object" || Array.isArray(res.json)) {
@@ -523,7 +709,7 @@ export class CandidateDecisionDiagnostic {
         ok: false,
         status: res.status,
         json: jsonRecord,
-        error: `RPC error: ${JSON.stringify(jsonRecord.error)}`,
+        error: `Solana RPC error: ${JSON.stringify(jsonRecord.error)}`,
       };
     }
 
@@ -535,6 +721,7 @@ export class CandidateDecisionDiagnostic {
    */
   public async run(): Promise<CandidateDecisionDiagnosticResult> {
     const startedAtMs = this.clock();
+    const overallDeadlineMs = startedAtMs + this.overallTimeoutMs;
 
     const overallController = new AbortController();
     const overallTimer = setTimeout(
@@ -542,7 +729,17 @@ export class CandidateDecisionDiagnostic {
       this.overallTimeoutMs,
     );
 
+    let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
+
     try {
+      // Pre-check overall deadline
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before Phase 1",
+        );
+      }
+
       // =========================================================================
       // PHASE 1: Pre-Observation Setup (Pool Layout & Prior Anchor)
       // =========================================================================
@@ -552,6 +749,8 @@ export class CandidateDecisionDiagnostic {
         "getAccountInfo",
         [this.poolId, { encoding: "base64", commitment: "confirmed" }],
         overallController.signal,
+        false,
+        overallDeadlineMs,
       );
 
       if (!layoutRes.ok || !layoutRes.json) {
@@ -561,97 +760,85 @@ export class CandidateDecisionDiagnostic {
         );
       }
 
-      const layoutVal = (layoutRes.json.result as Record<string, unknown> | undefined)?.value as
-        | Record<string, unknown>
-        | null
-        | undefined;
-
-      if (!layoutVal) {
+      const layoutVal = (layoutRes.json.result as { value?: { data?: unknown } })?.value;
+      if (!layoutVal || !layoutVal.data) {
         return this.finishWithFailure(
           "POOL_ACCOUNT_NOT_FOUND",
-          `Pool account '${this.poolId}' not found on-chain.`,
+          `Pool account ${this.poolId} not found on RPC node`,
         );
       }
 
-      if (layoutVal.owner !== RAYDIUM_AMM_V4_PROGRAM_ID) {
+      const rawData = Array.isArray(layoutVal.data) ? layoutVal.data[0] : layoutVal.data;
+      if (typeof rawData !== "string") {
         return this.finishWithFailure(
-          "INVALID_POOL_OWNER",
-          `Pool account owner mismatch: expected ${RAYDIUM_AMM_V4_PROGRAM_ID}, got ${layoutVal.owner}`,
+          "POOL_DATA_INVALID",
+          "Pool account data is not base64 encoded string",
         );
       }
 
-      const layoutDataArr = layoutVal.data;
-      if (
-        !Array.isArray(layoutDataArr) ||
-        layoutDataArr.length < 2 ||
-        layoutDataArr[1] !== "base64"
-      ) {
-        return this.finishWithFailure("INVALID_POOL_DATA_FORMAT", "Pool data is not valid Base64");
-      }
-
-      const poolBuffer = Buffer.from(layoutDataArr[0] as string, "base64");
+      const poolBuffer = Buffer.from(rawData, "base64");
       if (poolBuffer.length !== RAYDIUM_AMM_V4_LAYOUT_LENGTH) {
         return this.finishWithFailure(
-          "INVALID_POOL_LAYOUT_LENGTH",
-          `Pool layout length mismatch: expected ${RAYDIUM_AMM_V4_LAYOUT_LENGTH}, received ${poolBuffer.length}`,
+          "POOL_LAYOUT_LENGTH_MISMATCH",
+          `Expected ${RAYDIUM_AMM_V4_LAYOUT_LENGTH} bytes, got ${poolBuffer.length}`,
         );
       }
 
-      const parsedPool = parseRaydiumAmmV4Account(
-        poolBuffer,
-        this.poolId,
-        RAYDIUM_AMM_V4_PROGRAM_ID,
-      );
+      const parsedPool = parseRaydiumAmmV4Account(poolBuffer, this.poolId);
       if (!parsedPool.ok) {
         return this.finishWithFailure(
-          "POOL_LAYOUT_PARSE_FAILED",
-          `Pool layout parse error: ${parsedPool.message}`,
+          "POOL_PARSE_FAILED",
+          `Failed to parse Raydium AMM v4 layout: ${parsedPool.message}`,
         );
       }
 
-      const poolState = parsedPool.state;
-      const isBaseSol = poolState.baseMint === WSOL_MINT;
-      const isQuoteSol = poolState.quoteMint === WSOL_MINT;
-
-      if (!isBaseSol && !isQuoteSol) {
-        return this.finishWithFailure(
-          "NOT_WSOL_PAIRED",
-          `Pool is not paired with WSOL (${WSOL_MINT}): base=${poolState.baseMint}, quote=${poolState.quoteMint}`,
-        );
+      if (parsedPool.orientation === "NON_SOL_PAIR") {
+        return this.finishWithFailure("NON_SOL_PAIR", "Pool is not paired against WSOL");
       }
 
-      const detectedTokenMint = isBaseSol ? poolState.quoteMint : poolState.baseMint;
-      if (detectedTokenMint !== this.mintAddress) {
+      const state = parsedPool.state;
+      const candidateMint =
+        parsedPool.orientation === "TOKEN_BASE_SOL_QUOTE" ? state.baseMint : state.quoteMint;
+      const quoteMint =
+        parsedPool.orientation === "TOKEN_BASE_SOL_QUOTE" ? state.quoteMint : state.baseMint;
+
+      if (candidateMint !== this.mintAddress) {
         return this.finishWithFailure(
           "TARGET_MINT_MISMATCH",
-          `Detected candidate token mint '${detectedTokenMint}' does not match expected mint '${this.mintAddress}'`,
+          `Pool token mint ${candidateMint} does not match expected target mint ${this.mintAddress}`,
         );
       }
-
-      const orientation: RaydiumPairOrientation = isBaseSol
-        ? "SOL_BASE_TOKEN_QUOTE"
-        : "TOKEN_BASE_SOL_QUOTE";
-      const candidateTokenMint = detectedTokenMint;
-      const quoteTokenMint = WSOL_MINT;
 
       const provisionalContext: TrackedRaydiumPoolContext = {
         poolId: this.poolId,
-        candidateTokenMint,
-        quoteTokenMint,
-        baseVault: poolState.baseVault,
-        quoteVault: poolState.quoteVault,
-        baseMint: poolState.baseMint,
-        quoteMint: poolState.quoteMint,
-        orientation,
+        candidateTokenMint: candidateMint,
+        quoteTokenMint: quoteMint,
+        baseVault: state.baseVault,
+        quoteVault: state.quoteVault,
+        baseMint: state.baseMint,
+        quoteMint: state.quoteMint,
+        orientation: parsedPool.orientation,
       };
+
       validateTrackedPoolContext(provisionalContext);
 
-      // 2. Prior Anchor Acquisition (Attempt 2)
+      // Check deadline before attempt 2
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before prior anchor",
+          { provisionalContext },
+        );
+      }
+
+      // 2. Prior-anchor acquisition (Attempt 2)
       const anchorRes = await this.dispatchSolanaRpc(
         "PRIOR_ANCHOR",
         "getSignaturesForAddress",
         [this.poolId, { limit: 1 }],
         overallController.signal,
+        false,
+        overallDeadlineMs,
       );
 
       if (!anchorRes.ok || !anchorRes.json) {
@@ -680,6 +867,14 @@ export class CandidateDecisionDiagnostic {
       // =========================================================================
       // PHASE 2: Observation Window & Quiet-Stream Verification
       // =========================================================================
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before Phase 2",
+          { provisionalContext },
+        );
+      }
+
       const flowTracker = new RollingTradeFlowTracker({
         poolId: this.poolId,
         tokenMint: this.mintAddress,
@@ -690,7 +885,6 @@ export class CandidateDecisionDiagnostic {
         poolContext: provisionalContext,
         rpcUrl: this.rpcUrl,
         transport: async (url, init) => {
-          // Transaction decodes routed through metered dispatch
           const bodyStr = typeof init?.body === "string" ? init.body : "";
           const parsed = JSON.parse(bodyStr) as { method?: string; params?: readonly unknown[] };
           const res = await this.dispatchSolanaRpc(
@@ -698,68 +892,105 @@ export class CandidateDecisionDiagnostic {
             parsed.method ?? "getTransaction",
             parsed.params ?? [],
             overallController.signal,
+            true, // skipBudgetRecording: true because adapter already records on budgetManager
+            overallDeadlineMs,
           );
           return new Response(JSON.stringify(res.json ?? {}), { status: res.status });
         },
         budgetManager: this.budgetManager,
         clock: this.clock,
-        sleepFn: this.sleeper,
+        sleepFn: (ms) => this.sleepWithAbort(ms, overallController.signal),
         requestPurpose: "CANDIDATE_ENRICHMENT",
       });
 
-      const coordinator = new RaydiumCandidateSubscriptionCoordinator({
+      coordinator = new RaydiumCandidateSubscriptionCoordinator({
         poolContext: provisionalContext,
         adapter,
         tracker: flowTracker,
         clock: this.clock,
+        maxNotificationsBudget: 50,
       });
 
       let observationStartMs = 0;
       let observationEndMs = 0;
-      let notificationsReceived = 0;
+      let isStreamLimitExceeded = false;
 
-      if (this.wsTransport) {
-        coordinator.attachTransport(this.wsTransport);
-        coordinator.sendSubscriptionRequest();
-
-        // Await subscription acknowledgement
-        const subDeadline = this.clock() + 5000;
-        while (coordinator.getStatus() !== "SUBSCRIBED" && this.clock() < subDeadline) {
-          await this.sleeper(50);
-        }
-        if (coordinator.getStatus() !== "SUBSCRIBED") {
-          return this.finishWithFailure(
-            "SUBSCRIPTION_ACK_TIMEOUT",
-            "WebSocket subscription request was not acknowledged within 5,000 ms",
-            { provisionalContext },
-          );
-        }
-        observationStartMs = this.clock();
-
-        // Process incoming messages up to 50 max / 1MB max / observation duration
-        const targetEnd = observationStartMs + this.observationDurationMs;
-        while (this.clock() < targetEnd && !overallController.signal.aborted) {
-          const step = Math.min(1000, Math.max(50, targetEnd - this.clock()));
-          await this.sleeper(step);
-          // Drain any pending transaction decodes (up to 3 max attempts total)
-          while (adapter.getPendingQueueLength() > 0 && this.ledger.transactionDecodeAttempts < 3) {
-            await coordinator.processNextPending({ signal: overallController.signal });
+      // Wrap transport with MeteredWebSocketTransport enforcing 1MB max payload bytes
+      const meteredWs = new MeteredWebSocketTransport(
+        this.wsTransport,
+        1024 * 1024,
+        (count, bytes, byteLen, data, isOversized) => {
+          if (count > 50 || isOversized) {
+            isStreamLimitExceeded = true;
           }
+        },
+      );
+
+      coordinator.attachTransport(meteredWs);
+      coordinator.sendSubscriptionRequest();
+
+      // Await subscription acknowledgement
+      const subDeadline = this.clock() + 5000;
+      while (
+        coordinator.getStatus() !== "SUBSCRIBED" &&
+        this.clock() < subDeadline &&
+        !overallController.signal.aborted
+      ) {
+        await this.sleepWithAbort(50, overallController.signal);
+      }
+      if (coordinator.getStatus() !== "SUBSCRIBED") {
+        return this.finishWithFailure(
+          "SUBSCRIPTION_ACK_TIMEOUT",
+          "WebSocket subscription request was not acknowledged within 5,000 ms",
+          { provisionalContext },
+        );
+      }
+      observationStartMs = this.clock();
+
+      // Process incoming stream messages up to observation duration or limits
+      const targetEnd = observationStartMs + this.observationDurationMs;
+      while (
+        this.clock() < targetEnd &&
+        !overallController.signal.aborted &&
+        this.clock() < overallDeadlineMs
+      ) {
+        if (isStreamLimitExceeded) {
+          coordinator.close();
+          break;
         }
-      } else {
-        // Without active socket transport, record synthetic observation span for testing
-        observationStartMs = this.clock();
-        await this.sleeper(this.observationDurationMs);
+        if (adapter.getPendingQueueLength() > 50) {
+          coordinator.close();
+          break;
+        }
+        const step = Math.min(1000, Math.max(50, targetEnd - this.clock()));
+        await this.sleepWithAbort(step, overallController.signal);
+
+        // Drain any pending transaction decodes (up to 3 max attempts total)
+        while (adapter.getPendingQueueLength() > 0 && this.ledger.transactionDecodeAttempts < 3) {
+          if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) break;
+          await coordinator.processNextPending({ signal: overallController.signal });
+        }
       }
 
-      notificationsReceived = coordinator.getMetrics().totalNotificationsReceived;
+      const notificationsReceived = coordinator.getMetrics().totalNotificationsReceived;
 
       // 3. Acquire on-chain cutoff (getSlot + getBlockTime) WHILE observation is STILL active
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        coordinator.close();
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before cutoff acquisition",
+          { provisionalContext },
+        );
+      }
+
       const slotRes = await this.dispatchSolanaRpc(
         "GET_SLOT",
         "getSlot",
         [{ commitment: "confirmed" }],
         overallController.signal,
+        false,
+        overallDeadlineMs,
       );
 
       if (!slotRes.ok || !slotRes.json || typeof slotRes.json.result !== "number") {
@@ -773,11 +1004,22 @@ export class CandidateDecisionDiagnostic {
 
       const cutoffSlot = slotRes.json.result;
 
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        coordinator.close();
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before getBlockTime",
+          { provisionalContext },
+        );
+      }
+
       const blockTimeRes = await this.dispatchSolanaRpc(
         "GET_BLOCK_TIME",
         "getBlockTime",
         [cutoffSlot],
         overallController.signal,
+        false,
+        overallDeadlineMs,
       );
 
       if (!blockTimeRes.ok || !blockTimeRes.json || typeof blockTimeRes.json.result !== "number") {
@@ -793,9 +1035,6 @@ export class CandidateDecisionDiagnostic {
       const cutoffTimestampMs = cutoffTimestampSec * 1000;
       const retrievedAtMs = this.clock();
       observationEndMs = this.clock();
-
-      // Now close WebSocket cleanly
-      coordinator.close();
 
       const sourceCutoff: SourceCutoffEvidence = {
         sourceMethod: "getBlockTime",
@@ -820,55 +1059,60 @@ export class CandidateDecisionDiagnostic {
 
       if (observationEndMs < cutoffTimestampMs) {
         return this.finishWithFailure(
-          "INCOMPLETE_OBSERVATION",
-          `Observation ended at ${observationEndMs} ms, before source cutoff ${cutoffTimestampMs} ms`,
+          "CUTOFF_OBSERVATION_GAP",
+          `Observation ended at ${observationEndMs} ms, before cutoff ${cutoffTimestampMs} ms`,
           { provisionalContext },
         );
       }
 
-      // 4. History Enumeration (Attempt: 1 page of 20 records)
-      let historyRecords: HistorySignatureRecord[] = [];
-      const historyRes = await this.dispatchSolanaRpc(
-        "HISTORY_ENUMERATION",
-        "getSignaturesForAddress",
-        [this.poolId, { limit: 20 }],
-        overallController.signal,
-      );
-
-      if (historyRes.ok && historyRes.json && Array.isArray(historyRes.json.result)) {
-        historyRecords = (
-          historyRes.json.result as Array<{
-            signature?: string;
-            slot?: number;
-            err?: unknown;
-            blockTime?: number;
-          }>
-        ).map((r) => ({
-          signature: r.signature ?? "",
-          slot: r.slot ?? 0,
-          err: r.err ?? null,
-          blockTime: typeof r.blockTime === "number" ? r.blockTime : null,
-        }));
+      // 4. Exact-pool history enumeration via accepted enumerator (1 page <= 20 records)
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before history enumeration",
+          { provisionalContext },
+        );
       }
 
-      const anchorIndex = historyRecords.findIndex((r) => r.signature === knownAnchorSignature);
-      const anchorRecord = anchorIndex !== -1 ? historyRecords[anchorIndex] : undefined;
-      const discoveredSinceAnchor =
-        anchorIndex !== -1 ? historyRecords.slice(0, anchorIndex) : historyRecords;
-
-      const historyResult: HistoryEnumerationResult = {
-        outcome: anchorIndex !== -1 ? "ANCHOR_WITNESSED" : "ANCHOR_NOT_FOUND",
-        candidatePoolId: this.poolId,
-        connectionEpoch: coordinator.getConnectionEpoch(),
-        anchorWitnessed: anchorIndex !== -1,
+      const enumerator = new ExactPoolHistoryEnumerator({
+        poolContext: provisionalContext,
         knownAnchorSignature,
-        anchorRecord,
-        frozenTargetSignature: historyRecords[0]?.signature ?? knownAnchorSignature,
-        discoveredSignatures: discoveredSinceAnchor,
-        pagesQueried: 1,
-        requestCount: 1,
-        isProductionCompletenessEstablished: false,
-      };
+        pageSize: 20,
+        maxPages: 1,
+        maxRetainedRecords: 20,
+        operationDeadlineMs: Math.max(1000, overallDeadlineMs - this.clock()),
+        budgetManager: this.budgetManager,
+        clock: this.clock,
+        sleepFn: (ms, sig) => this.sleepWithAbort(ms, sig ?? overallController.signal),
+        signal: overallController.signal,
+        lifecycleTarget: coordinator,
+        pageFetcher: async (params: HistoryPageQueryParams) => {
+          const rpcConfig: Record<string, unknown> = {
+            limit: params.limit,
+          };
+          if (params.before) {
+            rpcConfig.before = params.before;
+          }
+          if (params.commitment) {
+            rpcConfig.commitment = params.commitment;
+          }
+          const res = await this.dispatchSolanaRpc(
+            "HISTORY_ENUMERATION",
+            "getSignaturesForAddress",
+            [params.address, rpcConfig],
+            params.signal ?? overallController.signal,
+            true, // skipBudgetRecording: true because enumerator records on budgetManager
+            overallDeadlineMs,
+          );
+          if (!res.ok || !res.json || !Array.isArray(res.json.result)) {
+            throw new Error(res.error ?? "Failed to fetch signatures page");
+          }
+          return res.json.result as HistorySignatureRecord[];
+        },
+      });
+
+      const historyResult = await enumerator.enumerate();
+      coordinator.close();
 
       // 5. Evaluate Window Reconciliation
       const reconResult = evaluateExactPoolWindowReconciliation({
@@ -890,15 +1134,16 @@ export class CandidateDecisionDiagnostic {
       });
 
       const paperAdapter = new PaperReconciledCandidateFlowAdapter();
-
-      // Flow qualification outcome
-      let flowResult: CandidateFlowResult;
-      if (
+      const isQuietQualified =
         notificationsReceived === 0 &&
+        !isStreamLimitExceeded &&
+        adapter.getPendingQueueLength() === 0 &&
         reconResult.status === "RECONCILED" &&
         reconResult.paperQuietStreamQualified === true &&
-        (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST")
-      ) {
+        (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST");
+
+      let flowResult: CandidateFlowResult;
+      if (isQuietQualified) {
         flowResult = paperAdapter.convertCandidateFlow(
           reconResult,
           { poolAddress: this.poolId, tokenMint: this.mintAddress },
@@ -918,7 +1163,9 @@ export class CandidateDecisionDiagnostic {
               ? "PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION"
               : notificationsReceived > 0
                 ? "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS"
-                : `RECONCILIATION_UNQUALIFIED: ${reconResult.status}`,
+                : isStreamLimitExceeded
+                  ? "STREAM_LIMIT_EXCEEDED"
+                  : `RECONCILIATION_UNQUALIFIED: ${reconResult.status}`,
           evaluationTimestampMs: this.clock(),
         });
       }
@@ -926,7 +1173,14 @@ export class CandidateDecisionDiagnostic {
       // =========================================================================
       // PHASE 3: Fresh Candidate Evidence Acquisition (within 15s of Cutoff)
       // =========================================================================
-      // Enforce decision freshness boundary: decisionTime - cutoffTimestampMs <= 15,000 ms
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before Phase 3",
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
       if (this.clock() - cutoffTimestampMs > 15_000) {
         return this.finishWithFailure(
           "STALE_DATA",
@@ -936,12 +1190,15 @@ export class CandidateDecisionDiagnostic {
       }
 
       // 6. Exact-Pair Market Data (DexScreener)
+      const marketRetrievedAtMs = this.clock();
       const pairUrl = `${this.dexScreenerApiUrl}/latest/dex/pairs/solana/${this.poolId}`;
       const pairRes = await this.dispatchMeteredRequest({
         purpose: "EXACT_PAIR",
         providerName: "DEXSCREENER",
         url: pairUrl,
         signal: overallController.signal,
+        skipBudgetRecording: false,
+        overallDeadlineMs,
       });
 
       if (!pairRes.ok || !pairRes.json) {
@@ -967,7 +1224,7 @@ export class CandidateDecisionDiagnostic {
           volume?: { m5?: number };
           txns?: { m5?: { buys?: number; sells?: number } };
           pairCreatedAt?: number;
-          priceChange?: { h1?: number };
+          priceChange?: { m5?: number; h1?: number };
         }>;
       };
 
@@ -993,7 +1250,7 @@ export class CandidateDecisionDiagnostic {
       ) {
         return this.finishWithFailure(
           "PAIR_METADATA_MISMATCH",
-          `DexScreener pair metadata mismatch: chain=${pair.chainId}, dex=${pair.dexId}, address=${pair.pairAddress}`,
+          `DexScreener pair metadata mismatch: chain=${String(pair.chainId)}, dex=${String(pair.dexId)}, address=${String(pair.pairAddress)}`,
           { provisionalContext, flowEvaluation: flowResult },
         );
       }
@@ -1006,7 +1263,7 @@ export class CandidateDecisionDiagnostic {
       if (!isBaseCandidate && !isQuoteCandidate) {
         return this.finishWithFailure(
           "INVALID_WSOL_ORIENTATION",
-          `DexScreener pair is not WSOL-paired with candidate mint: base=${pair.baseToken?.address}, quote=${pair.quoteToken?.address}`,
+          `DexScreener pair is not WSOL-paired with candidate mint: base=${String(pair.baseToken?.address)}, quote=${String(pair.quoteToken?.address)}`,
           { provisionalContext, flowEvaluation: flowResult },
         );
       }
@@ -1015,7 +1272,7 @@ export class CandidateDecisionDiagnostic {
       if (!Number.isFinite(rawPriceNative) || rawPriceNative <= 0) {
         return this.finishWithFailure(
           "INVALID_SPOT_PRICE",
-          `Invalid priceNative: ${pair.priceNative}`,
+          `Invalid priceNative: ${String(pair.priceNative)}`,
           {
             provisionalContext,
             flowEvaluation: flowResult,
@@ -1024,7 +1281,25 @@ export class CandidateDecisionDiagnostic {
       }
 
       const spotPriceSol = isBaseCandidate ? rawPriceNative : 1 / rawPriceNative;
-      const spotPriceUsd = pair.priceUsd ? Number(pair.priceUsd) : null;
+      let spotPriceUsd: number | null = null;
+      if (isBaseCandidate) {
+        if (
+          typeof pair.priceUsd === "string" &&
+          Number.isFinite(Number(pair.priceUsd)) &&
+          Number(pair.priceUsd) > 0
+        ) {
+          spotPriceUsd = Number(pair.priceUsd);
+        }
+      } else if (isQuoteCandidate) {
+        if (
+          typeof pair.priceUsd === "string" &&
+          Number.isFinite(Number(pair.priceUsd)) &&
+          Number(pair.priceUsd) > 0 &&
+          rawPriceNative > 0
+        ) {
+          spotPriceUsd = Number(pair.priceUsd) / rawPriceNative;
+        }
+      }
 
       // Actual marketCap required; FDV recorded separately without substituting
       if (
@@ -1042,7 +1317,6 @@ export class CandidateDecisionDiagnostic {
       const marketCapUsd = pair.marketCap;
       const fdvUsd = typeof pair.fdv === "number" && Number.isFinite(pair.fdv) ? pair.fdv : null;
 
-      // Validate other non-nullable candidate fields
       if (
         typeof pair.liquidity?.usd !== "number" ||
         !Number.isFinite(pair.liquidity.usd) ||
@@ -1075,21 +1349,60 @@ export class CandidateDecisionDiagnostic {
       }
       const assetAgeSeconds = Math.max(0, Math.floor((this.clock() - pair.pairCreatedAt) / 1000));
 
-      const volume5mUsd =
-        typeof pair.volume?.m5 === "number" && Number.isFinite(pair.volume.m5) ? pair.volume.m5 : 0;
-      const buys5m =
-        typeof pair.txns?.m5?.buys === "number" && Number.isSafeInteger(pair.txns.m5.buys)
-          ? pair.txns.m5.buys
-          : 0;
-      const sells5m =
-        typeof pair.txns?.m5?.sells === "number" && Number.isSafeInteger(pair.txns.m5.sells)
-          ? pair.txns.m5.sells
-          : 0;
+      // Missing required volume/count fields must not become zero
+      if (
+        typeof pair.volume?.m5 !== "number" ||
+        !Number.isFinite(pair.volume.m5) ||
+        pair.volume.m5 < 0
+      ) {
+        return this.finishWithFailure(
+          "INCOMPLETE_MARKET_INPUTS",
+          `Missing or non-finite volume.m5: ${String(pair.volume?.m5)}`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+      const volume5mUsd = pair.volume.m5;
+
+      if (
+        typeof pair.txns?.m5?.buys !== "number" ||
+        !Number.isSafeInteger(pair.txns.m5.buys) ||
+        pair.txns.m5.buys < 0
+      ) {
+        return this.finishWithFailure(
+          "INCOMPLETE_MARKET_INPUTS",
+          `Missing or invalid txns.m5.buys: ${String(pair.txns?.m5?.buys)}`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+      const buys5m = pair.txns.m5.buys;
+
+      if (
+        typeof pair.txns?.m5?.sells !== "number" ||
+        !Number.isSafeInteger(pair.txns.m5.sells) ||
+        pair.txns.m5.sells < 0
+      ) {
+        return this.finishWithFailure(
+          "INCOMPLETE_MARKET_INPUTS",
+          `Missing or invalid txns.m5.sells: ${String(pair.txns?.m5?.sells)}`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+      const sells5m = pair.txns.m5.sells;
       const buyToSellRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
       const symbol =
         pair.baseToken?.address === this.mintAddress
           ? (pair.baseToken.symbol ?? "UNKNOWN")
           : (pair.quoteToken?.symbol ?? "UNKNOWN");
+
+      const priceChange1hPct =
+        typeof pair.priceChange?.h1 === "number" && Number.isFinite(pair.priceChange.h1)
+          ? pair.priceChange.h1
+          : undefined;
+
+      const momentum5mBps =
+        typeof pair.priceChange?.m5 === "number" && Number.isFinite(pair.priceChange.m5)
+          ? Math.round(pair.priceChange.m5 * 100)
+          : undefined;
 
       const candidateMarketData = {
         symbol,
@@ -1103,9 +1416,19 @@ export class CandidateDecisionDiagnostic {
         buys5m,
         sells5m,
         buyToSellRatio,
+        priceChange1hPct,
+        momentum5mBps,
       };
 
       // 7. Fresh Validated LP Acquisition (2 RPC Requests via acquireRaydiumAmmV4Snapshot)
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before LP refresh",
+          { provisionalContext, candidateMarketData, flowEvaluation: flowResult },
+        );
+      }
+
       const lpResult: SnapshotAcquisitionResult = await acquireRaydiumAmmV4Snapshot({
         poolId: this.poolId,
         expectedTokenMint: this.mintAddress,
@@ -1120,6 +1443,8 @@ export class CandidateDecisionDiagnostic {
             parsed.method ?? "getAccountInfo",
             parsed.params ?? [],
             overallController.signal,
+            false,
+            overallDeadlineMs,
           );
           return new Response(JSON.stringify(res.json ?? {}), { status: res.status });
         },
@@ -1165,7 +1490,7 @@ export class CandidateDecisionDiagnostic {
       if (!identitiesMatch) {
         return this.finishWithFailure(
           "PROVISIONAL_CONTEXT_MISMATCH",
-          `Provisional setup identities contradict fresh validated LP evidence.`,
+          "Provisional setup identities contradict fresh validated LP evidence.",
           {
             provisionalContext,
             validatedIdentitiesMatch: false,
@@ -1178,11 +1503,27 @@ export class CandidateDecisionDiagnostic {
       const lpBurnPct = validationResult.accounting.displayInaccessiblePct;
 
       // 8. Candidate Token Mint Account (Decimals & Authorities)
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before mint account query",
+          {
+            provisionalContext,
+            validatedIdentitiesMatch: true,
+            candidateMarketData,
+            flowEvaluation: flowResult,
+          },
+        );
+      }
+
+      const mintRetrievedAtMs = this.clock();
       const mintRes = await this.dispatchSolanaRpc(
         "CANDIDATE_MINT",
         "getAccountInfo",
         [this.mintAddress, { encoding: "jsonParsed", commitment: "confirmed" }],
         overallController.signal,
+        false,
+        overallDeadlineMs,
       );
 
       if (!mintRes.ok || !mintRes.json) {
@@ -1218,14 +1559,40 @@ export class CandidateDecisionDiagnostic {
         );
       }
 
-      const mintData = parsedMintRes.data;
-      const mintAuthorityRenounced = isRenouncedAuthority(mintData.mintAuthority);
-      const freezeAuthorityRenounced = isRenouncedAuthority(mintData.freezeAuthority);
+      // Explicit authority observation checks: missing/omitted fields remain unknown
+      const rawMintVal = (
+        mintRes.json.result as {
+          value?: { data?: { parsed?: { info?: Record<string, unknown> } } };
+        }
+      )?.value;
+      const rawInfo = rawMintVal?.data?.parsed?.info;
+
+      const mintAuthObserved =
+        rawInfo &&
+        typeof rawInfo === "object" &&
+        "mintAuthority" in rawInfo &&
+        rawInfo.mintAuthority !== undefined;
+      const freezeAuthObserved =
+        rawInfo &&
+        typeof rawInfo === "object" &&
+        "freezeAuthority" in rawInfo &&
+        rawInfo.freezeAuthority !== undefined;
+
+      const mintAuthorityRenounced = isRenouncedAuthority(
+        rawInfo?.mintAuthority,
+        Boolean(mintAuthObserved),
+      );
+      const freezeAuthorityRenounced = isRenouncedAuthority(
+        rawInfo?.freezeAuthority,
+        Boolean(freezeAuthObserved),
+      );
 
       const candidateMintAccount = {
-        decimals: mintData.decimals,
-        mintAuthority: mintData.mintAuthority,
-        freezeAuthority: mintData.freezeAuthority,
+        decimals: typeof rawInfo?.decimals === "number" ? rawInfo.decimals : undefined,
+        mintAuthority: mintAuthObserved ? (rawInfo.mintAuthority as string | null) : undefined,
+        freezeAuthority: freezeAuthObserved
+          ? (rawInfo.freezeAuthority as string | null)
+          : undefined,
         mintAuthorityRenounced,
         freezeAuthorityRenounced,
       };
@@ -1237,15 +1604,20 @@ export class CandidateDecisionDiagnostic {
         validationResult.accounting.meetsNinetyPercentThreshold &&
         typeof lpBurnPct === "number" &&
         lpBurnPct >= 90.0;
-      const mintAuthorityPassed = mintAuthorityRenounced;
-      const freezeAuthorityPassed = freezeAuthorityRenounced;
+      const mintAuthorityPassed = Boolean(mintAuthObserved && mintAuthorityRenounced);
+      const freezeAuthorityPassed = Boolean(freezeAuthObserved && freezeAuthorityRenounced);
       const preAdmissionPassed = lpSecurityPassed && mintAuthorityPassed && freezeAuthorityPassed;
 
       let preAdmissionRejectionReason: string | undefined;
       if (!lpSecurityPassed) preAdmissionRejectionReason = "REJECTED_UNLOCKED_LP_RISK";
       else if (!freezeAuthorityPassed)
-        preAdmissionRejectionReason = "REJECTED_ACTIVE_FREEZE_AUTHORITY";
-      else if (!mintAuthorityPassed) preAdmissionRejectionReason = "REJECTED_ACTIVE_MINT_AUTHORITY";
+        preAdmissionRejectionReason = !freezeAuthObserved
+          ? "REJECTED_UNKNOWN_FREEZE_AUTHORITY"
+          : "REJECTED_ACTIVE_FREEZE_AUTHORITY";
+      else if (!mintAuthorityPassed)
+        preAdmissionRejectionReason = !mintAuthObserved
+          ? "REJECTED_UNKNOWN_MINT_AUTHORITY"
+          : "REJECTED_ACTIVE_MINT_AUTHORITY";
 
       const preAdmissionScreening = {
         lpBurnPct,
@@ -1275,12 +1647,30 @@ export class CandidateDecisionDiagnostic {
       // PHASE 5: Security Reports (RugCheck & Solana Tracker Bundler Proxy)
       // =========================================================================
       // 9. RugCheck report
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before RugCheck query",
+          {
+            provisionalContext,
+            validatedIdentitiesMatch: true,
+            candidateMarketData,
+            candidateMintAccount,
+            preAdmissionScreening,
+            flowEvaluation: flowResult,
+          },
+        );
+      }
+
+      const rugCheckRetrievedAtMs = this.clock();
       const rcUrl = `${this.rugCheckApiUrl}/v1/tokens/${encodeURIComponent(this.mintAddress)}/report`;
       const rcRes = await this.dispatchMeteredRequest({
         purpose: "RUGCHECK_REPORT",
         providerName: "RUGCHECK",
         url: rcUrl,
         signal: overallController.signal,
+        skipBudgetRecording: false,
+        overallDeadlineMs,
       });
 
       let rugMetrics: {
@@ -1291,52 +1681,51 @@ export class CandidateDecisionDiagnostic {
         holdersCount?: number;
       } | null = null;
 
-      if (rcRes.ok && rcRes.json) {
-        const rcData = rcRes.json as {
-          score?: number;
-          risks?: Array<{ level?: string }>;
-          totalHolders?: number;
-          topHolders?: Array<{ pct?: number }>;
-        };
-        if (typeof rcData.score === "number" && Number.isFinite(rcData.score)) {
-          let hasDangerRisk = false;
-          if (Array.isArray(rcData.risks)) {
-            hasDangerRisk = rcData.risks.some(
-              (r) => r && typeof r.level === "string" && r.level.trim().toLowerCase() === "danger",
-            );
-          }
-          let top10HolderPct: number | undefined;
-          if (Array.isArray(rcData.topHolders)) {
-            let sumRaw = 0;
-            let valid = true;
-            for (const h of rcData.topHolders.slice(0, 10)) {
-              if (typeof h?.pct !== "number" || !Number.isFinite(h.pct) || h.pct < 0) {
-                valid = false;
-                break;
-              }
-              sumRaw += h.pct;
-            }
-            if (valid && sumRaw <= 100.0001) {
-              top10HolderPct = Math.min(1.0, Math.max(0.0, sumRaw / 100));
-            }
-          }
-          const holdersCount =
-            typeof rcData.totalHolders === "number" &&
-            Number.isSafeInteger(rcData.totalHolders) &&
-            rcData.totalHolders >= 0
-              ? rcData.totalHolders
-              : undefined;
-
+      if (rcRes.ok && rcRes.text) {
+        // Reuse accepted strict RugCheck validation without another provider request
+        const validatedRugCheck = await BuyGateTriggerService.fetchRugCheckMetrics(
+          this.mintAddress,
+          async () =>
+            new Response(rcRes.text, {
+              status: rcRes.status,
+              headers: { "Content-Type": "application/json" },
+            }),
+        );
+        if (validatedRugCheck) {
           rugMetrics = {
-            rugScore: rcData.score,
-            hasDangerRisk,
-            ...(top10HolderPct !== undefined ? { top10HolderPct } : {}),
-            ...(holdersCount !== undefined ? { holdersCount } : {}),
+            ...(validatedRugCheck.rugScore !== undefined
+              ? { rugScore: validatedRugCheck.rugScore }
+              : {}),
+            ...(validatedRugCheck.hasDangerRisk !== undefined
+              ? { hasDangerRisk: validatedRugCheck.hasDangerRisk }
+              : {}),
+            ...(validatedRugCheck.top10HolderPct !== undefined
+              ? { top10HolderPct: validatedRugCheck.top10HolderPct }
+              : {}),
+            ...(validatedRugCheck.holdersCount !== undefined
+              ? { holdersCount: validatedRugCheck.holdersCount }
+              : {}),
           };
         }
       }
 
       // 10. Solana Tracker Bundler Proxy
+      if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        return this.finishWithFailure(
+          "OVERALL_DIAGNOSTIC_TIMEOUT",
+          "Overall diagnostic deadline exceeded before bundler query",
+          {
+            provisionalContext,
+            validatedIdentitiesMatch: true,
+            candidateMarketData,
+            candidateMintAccount,
+            preAdmissionScreening,
+            flowEvaluation: flowResult,
+          },
+        );
+      }
+
+      const bundlerRetrievedAtMs = this.clock();
       const stUrl = `${this.solanaTrackerApiUrl}/tokens/${encodeURIComponent(this.mintAddress)}/bundlers`;
       const stHeaders: Record<string, string> = {};
       if (this.solanaTrackerApiKey) {
@@ -1349,20 +1738,22 @@ export class CandidateDecisionDiagnostic {
         url: stUrl,
         headers: stHeaders,
         signal: overallController.signal,
+        skipBudgetRecording: false,
+        overallDeadlineMs,
       });
 
       if (stRes.ok && stRes.json) {
         const parsedBundler = parseSolanaTrackerBundlersResponse(stRes.json, {
           requestedMint: this.mintAddress,
-          localRetrievedAtMs: this.clock(),
+          localRetrievedAtMs: bundlerRetrievedAtMs,
         });
         if (parsedBundler.success) {
+          // Do not coerce PRODUCTION into PAPER_SIMULATION
           const adapted = adaptPaperBundlerSnapshot({
             targetMint: this.mintAddress,
             snapshot: parsedBundler.data,
             evaluationTimeMs: this.clock(),
-            executionContext:
-              this.executionContext === "PRODUCTION" ? "PAPER_SIMULATION" : this.executionContext,
+            executionContext: this.executionContext as PaperBundlerExecutionContext,
             maxAllowedRetrievalAgeMs: 15_000,
           });
           if (adapted.success && adapted.bundlerPct !== undefined) {
@@ -1375,8 +1766,68 @@ export class CandidateDecisionDiagnostic {
       }
 
       // =========================================================================
-      // PHASE 6: Buy Gates (1-12) & Retest Gate Decision
+      // PHASE 6: Final Freshness Recheck & Decision Point Evaluation
       // =========================================================================
+      const decisionTimeMs = this.clock();
+      const maxAgeMs = 15_000;
+
+      // Recheck source cutoff age
+      if (decisionTimeMs - sourceCutoff.cutoffTimestampMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `Cutoff age (${decisionTimeMs - sourceCutoff.cutoffTimestampMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
+      // Recheck LP evidence retrieval age
+      const lpRetrievedMs = lpEvidence.retrievedAtIso
+        ? Date.parse(lpEvidence.retrievedAtIso)
+        : startedAtMs;
+      if (decisionTimeMs - lpRetrievedMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `LP evidence age (${decisionTimeMs - lpRetrievedMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
+      // Recheck market data retrieval age
+      if (decisionTimeMs - marketRetrievedAtMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `Market data age (${decisionTimeMs - marketRetrievedAtMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
+      // Recheck mint account retrieval age
+      if (decisionTimeMs - mintRetrievedAtMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `Mint account age (${decisionTimeMs - mintRetrievedAtMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
+      // Recheck RugCheck retrieval age
+      if (decisionTimeMs - rugCheckRetrievedAtMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `RugCheck evidence age (${decisionTimeMs - rugCheckRetrievedAtMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
+      // Recheck Solana Tracker retrieval age
+      if (decisionTimeMs - bundlerRetrievedAtMs > maxAgeMs) {
+        return this.finishWithFailure(
+          "STALE_DATA",
+          `Bundler evidence age (${decisionTimeMs - bundlerRetrievedAtMs} ms) exceeds ${maxAgeMs} ms at decision timestamp`,
+          { provisionalContext, flowEvaluation: flowResult },
+        );
+      }
+
       const watchlistCandidate: WatchlistCandidateItem = {
         poolId: this.poolId,
         mintAddress: this.mintAddress,
@@ -1392,15 +1843,13 @@ export class CandidateDecisionDiagnostic {
         buyToSellRatio: candidateMarketData.buyToSellRatio,
         status: "WATCHING",
         discoveredAt: new Date(startedAtMs).toISOString(),
-        lastEvaluatedAt: new Date(this.clock()).toISOString(),
+        lastEvaluatedAt: new Date(decisionTimeMs).toISOString(),
       };
 
       const immutableFlowProvider: CandidateFlowProvider = {
         getCandidateFlow: (target, evalMs) => {
           if (
-            notificationsReceived === 0 &&
-            reconResult.status === "RECONCILED" &&
-            reconResult.paperQuietStreamQualified === true &&
+            isQuietQualified &&
             (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST")
           ) {
             return paperAdapter.convertCandidateFlow(reconResult, target, evalMs, {
@@ -1421,12 +1870,12 @@ export class CandidateDecisionDiagnostic {
           spotPriceSol: candidateMarketData.spotPriceSol,
           spotPriceUsd: candidateMarketData.spotPriceUsd,
           liquidityUsd: candidateMarketData.liquidityUsd,
-          momentum5mBps: 0,
-          priceChange1hPct: 0,
+          momentum5mBps: candidateMarketData.momentum5mBps,
+          priceChange1hPct: candidateMarketData.priceChange1hPct,
         },
         rugMetrics,
         flowProvider: immutableFlowProvider,
-        currentNowMs: this.clock(),
+        currentNowMs: decisionTimeMs,
         requireVerifiedHolders: true,
         executionContext: this.executionContext,
       });
@@ -1437,16 +1886,36 @@ export class CandidateDecisionDiagnostic {
         candidateMarketData,
         candidateMintAccount,
         preAdmissionScreening,
-        flowEvaluation: flowResult,
+        flowEvaluation: decisionResult.flowResult,
         decisionResult,
       });
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTimeout =
+        overallController.signal.aborted ||
+        this.clock() >= overallDeadlineMs ||
+        msg.includes("OVERALL_DIAGNOSTIC_TIMEOUT") ||
+        msg.includes("REQUEST_TIMEOUT");
       return this.finishWithFailure(
-        "UNHANDLED_EXCEPTION",
-        err instanceof Error ? err.message : String(err),
+        isTimeout ? "OVERALL_DIAGNOSTIC_TIMEOUT" : "UNHANDLED_EXCEPTION",
+        msg,
       );
     } finally {
       clearTimeout(overallTimer);
+      if (coordinator) {
+        try {
+          coordinator.close();
+        } catch {
+          // ignore cleanup error
+        }
+      }
+      if (this.wsTransport) {
+        try {
+          this.wsTransport.close();
+        } catch {
+          // ignore cleanup error
+        }
+      }
     }
   }
 
@@ -1463,9 +1932,14 @@ export class CandidateDecisionDiagnostic {
       mintAddress: this.mintAddress,
       executionContext: this.executionContext,
       ledger: this.ledger,
+      ...(this.outDir !== undefined ? { outDir: this.outDir } : {}),
       ...partialData,
     };
-    this.writeDiagnosticArtifacts(result);
+    try {
+      this.writeDiagnosticArtifacts(result);
+    } catch (writeErr) {
+      result.writeError = writeErr instanceof Error ? writeErr.message : String(writeErr);
+    }
     return result;
   }
 
@@ -1484,10 +1958,25 @@ export class CandidateDecisionDiagnostic {
       mintAddress: this.mintAddress,
       executionContext: this.executionContext,
       ledger: this.ledger,
+      ...(this.outDir !== undefined ? { outDir: this.outDir } : {}),
       ...data,
     };
-    this.writeDiagnosticArtifacts(result);
-    return result;
+    try {
+      this.writeDiagnosticArtifacts(result);
+      return result;
+    } catch (writeErr) {
+      return {
+        ok: false,
+        status: "ARTIFACT_WRITE_FAILED",
+        message: writeErr instanceof Error ? writeErr.message : String(writeErr),
+        poolId: this.poolId,
+        mintAddress: this.mintAddress,
+        executionContext: this.executionContext,
+        ledger: this.ledger,
+        ...(this.outDir !== undefined ? { outDir: this.outDir } : {}),
+        ...data,
+      };
+    }
   }
 
   private writeDiagnosticArtifacts(result: CandidateDecisionDiagnosticResult): void {
@@ -1501,49 +1990,59 @@ export class CandidateDecisionDiagnostic {
         `diagnostic-${this.poolId.slice(0, 8)}-${this.clock()}`,
       );
 
-    try {
-      if (!existsSync(targetDir)) {
-        mkdirSync(targetDir, { recursive: true });
+    if (existsSync(targetDir)) {
+      // Refuse overwriting an existing diagnostic
+      const existingReport = path.join(targetDir, "diagnostic-report.json");
+      const existingManifest = path.join(targetDir, "evidence-manifest.json");
+      if (existsSync(existingReport) || existsSync(existingManifest)) {
+        throw new Error(
+          `[DIAGNOSTIC_OUTPUT_EXISTS] Target output directory already contains diagnostic artifacts: ${targetDir}. Refusing to overwrite.`,
+        );
       }
-
-      // Redact any credentials from report and manifest
-      const sanitizedReport = deepRedactSensitiveObject(result, this.sensitiveTokens);
-      const reportJson = JSON.stringify(sanitizedReport, null, 2);
-      writeFileSync(path.join(targetDir, "diagnostic-report.json"), reportJson, "utf8");
-
-      const manifestEntries = this.ledger.records.map((r) => ({
-        purpose: r.purpose,
-        provider: r.provider,
-        endpoint: r.endpoint,
-        method: r.method,
-        dispatchedAtMs: r.dispatchedAtMs,
-        completedAtMs: r.completedAtMs,
-        status: r.httpStatus,
-        ok: r.ok,
-        wireDigestSha256: r.wireDigestSha256 ?? null,
-      }));
-
-      const manifestObj = {
-        generatedAtIso: new Date(this.clock()).toISOString(),
-        poolId: this.poolId,
-        mintAddress: this.mintAddress,
-        totalRequestsDispatched: this.ledger.totalAttempts,
-        records: manifestEntries,
-      };
-
-      const sanitizedManifest = deepRedactSensitiveObject(manifestObj, this.sensitiveTokens);
-      const manifestJson = JSON.stringify(sanitizedManifest, null, 2);
-      writeFileSync(path.join(targetDir, "evidence-manifest.json"), manifestJson, "utf8");
-
-      (result as { outDir?: string }).outDir = targetDir;
-      (result as { manifestDigestSha256?: string }).manifestDigestSha256 = createHash("sha256")
-        .update(Buffer.from(manifestJson, "utf8"))
-        .digest("hex");
-    } catch (writeErr) {
-      console.warn(
-        "[CandidateDecisionDiagnostic] Failed to write diagnostic output artifacts:",
-        writeErr,
-      );
+    } else {
+      mkdirSync(targetDir, { recursive: true });
     }
+
+    // Redact sensitive tokens from report and manifest
+    const sanitizedReport = deepRedactSensitiveObject(result, this.sensitiveTokens);
+    const reportJson = JSON.stringify(sanitizedReport, null, 2);
+    const reportPath = path.join(targetDir, "diagnostic-report.json");
+    writeFileSync(reportPath, reportJson, "utf8");
+
+    const reportDigest = createHash("sha256").update(Buffer.from(reportJson, "utf8")).digest("hex");
+    const reportBytes = Buffer.byteLength(reportJson, "utf8");
+
+    const manifestEntries = this.ledger.records.map((r) => ({
+      purpose: r.purpose,
+      provider: r.provider,
+      endpoint: r.endpoint,
+      method: r.method,
+      dispatchedAtMs: r.dispatchedAtMs,
+      completedAtMs: r.completedAtMs,
+      durationMs: r.completedAtMs - r.dispatchedAtMs,
+      ...(r.httpStatus !== undefined ? { httpStatus: r.httpStatus } : {}),
+      ok: r.ok,
+      ...(r.error !== undefined
+        ? { error: redactSensitiveText(r.error, this.sensitiveTokens) }
+        : {}),
+      ...(r.wireDigestSha256 !== undefined ? { wireDigestSha256: r.wireDigestSha256 } : {}),
+    }));
+
+    const manifest = {
+      poolId: this.poolId,
+      mintAddress: this.mintAddress,
+      generatedAtIso: new Date(this.clock()).toISOString(),
+      reportFile: {
+        path: "diagnostic-report.json",
+        sha256: reportDigest,
+        bytes: reportBytes,
+      },
+      requests: manifestEntries,
+    };
+
+    const sanitizedManifest = deepRedactSensitiveObject(manifest, this.sensitiveTokens);
+    const manifestJson = JSON.stringify(sanitizedManifest, null, 2);
+    const manifestPath = path.join(targetDir, "evidence-manifest.json");
+    writeFileSync(manifestPath, manifestJson, "utf8");
   }
 }

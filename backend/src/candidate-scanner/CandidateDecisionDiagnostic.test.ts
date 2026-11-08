@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { CandidateDecisionDiagnostic } from "./CandidateDecisionDiagnostic.js";
 import {
@@ -14,6 +14,11 @@ import type { ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocke
 const TEST_POOL_ID = CAPTURED_RAY_WSOL_IDENTITIES.poolId;
 const TEST_MINT = CAPTURED_RAY_WSOL_IDENTITIES.expectedTokenMint!;
 const TEST_RPC_URL = "http://127.0.0.1:8899";
+
+const TEST_SIG_A =
+  "CeD7gRMFdZKnrBxCWczhvDmfAz4ke5NFKvqAi9jSwzCQReUhecVgBJb112WuuR9eVmzFDwMsQDWEa1WWhbF3aoB";
+const TEST_SIG_B =
+  "QHREMqhWG7eahNuQ2EzQqSYKLy8WH9jVerfLRJTttyPorHxQJDzMMcB1142poqJHzYyVSsijoS1U9222QBV6AbM";
 
 function createMockWebSocketTransport(options?: {
   immediateAck?: boolean;
@@ -85,14 +90,23 @@ interface MockFetchScenario {
   missingCreatedAt?: boolean;
   freezeAuthority?: string | null;
   mintAuthority?: string | null;
+  omitAuthorities?: boolean;
   active429OnProvider?: string;
   hangingRequest?: boolean;
+  hangingMethod?: string;
   rugScore?: number;
   hasDanger?: boolean;
+  missingRisks?: boolean;
+  emptyTopHolders?: boolean;
   delayMs?: number;
   getClock?: () => number;
   blockTimeSec?: number;
   unqualifiedLp?: boolean;
+  ageSeconds?: number;
+  h1PriceChange?: number;
+  missingVolume?: boolean;
+  missingBuysSells?: boolean;
+  quoteIsCandidate?: boolean;
 }
 
 function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
@@ -106,6 +120,15 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
 
     if (scenario.hangingRequest) {
       // Return a promise that never resolves within timeout
+      return new Promise(() => {});
+    }
+
+    if (
+      scenario.hangingMethod &&
+      init?.body &&
+      typeof init.body === "string" &&
+      init.body.includes(scenario.hangingMethod)
+    ) {
       return new Promise(() => {});
     }
 
@@ -125,6 +148,24 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
         : scenario.blockTimeSec
           ? scenario.blockTimeSec * 1000
           : 1791931000 * 1000;
+      const ageSec = scenario.ageSeconds !== undefined ? scenario.ageSeconds : 600;
+      const h1Val = scenario.h1PriceChange !== undefined ? scenario.h1PriceChange : 4.2;
+      const isQuoteCand = scenario.quoteIsCandidate === true;
+      const baseToken = isQuoteCand
+        ? {
+            address: "So11111111111111111111111111111111111111112",
+            name: "Wrapped SOL",
+            symbol: "SOL",
+          }
+        : { address: TEST_MINT, name: "Raydium", symbol: "RAY" };
+      const quoteToken = isQuoteCand
+        ? { address: TEST_MINT, name: "Raydium", symbol: "RAY" }
+        : {
+            address: "So11111111111111111111111111111111111111112",
+            name: "Wrapped SOL",
+            symbol: "SOL",
+          };
+
       const pairPayload = {
         schemaVersion: "1.0.0",
         pairs: [
@@ -133,21 +174,17 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
             dexId: "raydium",
             url: `https://dexscreener.com/solana/${TEST_POOL_ID}`,
             pairAddress: TEST_POOL_ID,
-            baseToken: { address: TEST_MINT, name: "Raydium", symbol: "RAY" },
-            quoteToken: {
-              address: "So11111111111111111111111111111111111111112",
-              name: "Wrapped SOL",
-              symbol: "SOL",
-            },
-            priceNative: "0.015",
-            priceUsd: "2.50",
+            baseToken,
+            quoteToken,
+            priceNative: isQuoteCand ? "66.66666666666667" : "0.015",
+            priceUsd: isQuoteCand ? "150.00" : "2.50",
             liquidity: scenario.missingLiquidity ? undefined : { usd: 65000 },
             marketCap: scenario.marketCap !== undefined ? scenario.marketCap : 250000,
             fdv: scenario.fdv !== undefined ? scenario.fdv : 300000,
-            volume: { m5: 15000 },
-            txns: { m5: { buys: 40, sells: 15 } },
-            pairCreatedAt: scenario.missingCreatedAt ? undefined : currentMs - 600 * 1000,
-            priceChange: { m5: 1.5, h1: 4.2 },
+            volume: scenario.missingVolume ? undefined : { m5: 15000 },
+            txns: scenario.missingBuysSells ? undefined : { m5: { buys: 40, sells: 15 } },
+            pairCreatedAt: scenario.missingCreatedAt ? undefined : currentMs - ageSec * 1000,
+            priceChange: { m5: 1.5, h1: h1Val },
           },
         ],
       };
@@ -156,18 +193,22 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
 
     // RugCheck Report Request
     if (urlStr.includes("api.rugcheck.xyz/v1/tokens/")) {
-      const rcPayload = {
+      const rcPayload: Record<string, unknown> = {
         score: scenario.rugScore !== undefined ? scenario.rugScore : 150,
-        risks: scenario.hasDanger
-          ? [{ name: "High Risk", level: "danger" }]
-          : [{ name: "Info", level: "info" }],
         tokenMeta: { mutable: false },
-        topHolders: [
-          { address: "Holder1", pct: 5.0 },
-          { address: "Holder2", pct: 4.0 },
-        ],
+        topHolders: scenario.emptyTopHolders
+          ? []
+          : [
+              { address: "Holder1", pct: 5.0 },
+              { address: "Holder2", pct: 4.0 },
+            ],
         totalHolders: 450,
       };
+      if (!scenario.missingRisks) {
+        rcPayload.risks = scenario.hasDanger
+          ? [{ name: "High Risk", level: "danger" }]
+          : [{ name: "Info", level: "info" }];
+      }
       return new Response(JSON.stringify(rcPayload), { status: 200 });
     }
 
@@ -193,9 +234,17 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
           });
         } else if (address === TEST_MINT) {
           // Return candidate token mint account
-          const freezeAuth =
-            scenario.freezeAuthority !== undefined ? scenario.freezeAuthority : null;
-          const mintAuth = scenario.mintAuthority !== undefined ? scenario.mintAuthority : null;
+          const infoObj: Record<string, unknown> = {
+            decimals: 6,
+            isInitialized: true,
+            supply: "555000000000000",
+          };
+          if (!scenario.omitAuthorities) {
+            infoObj.freezeAuthority =
+              scenario.freezeAuthority !== undefined ? scenario.freezeAuthority : null;
+            infoObj.mintAuthority =
+              scenario.mintAuthority !== undefined ? scenario.mintAuthority : null;
+          }
           const mintAccountRpc = {
             jsonrpc: "2.0",
             result: {
@@ -204,13 +253,7 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
                 data: {
                   program: "spl-token",
                   parsed: {
-                    info: {
-                      decimals: 6,
-                      freezeAuthority: freezeAuth,
-                      isInitialized: true,
-                      mintAuthority: mintAuth,
-                      supply: "555000000000000",
-                    },
+                    info: infoObj,
                     type: "mint",
                   },
                   space: 82,
@@ -249,8 +292,7 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
               jsonrpc: "2.0",
               result: [
                 {
-                  signature:
-                    "3bJ8AnchorSig1111111111111111111111111111111111111111111111111111111111111111",
+                  signature: TEST_SIG_A,
                   slot: 461970800,
                   err: null,
                   blockTime: anchorBlockTimeSec,
@@ -267,8 +309,7 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
               jsonrpc: "2.0",
               result: [
                 {
-                  signature:
-                    "3bJ8AnchorSig1111111111111111111111111111111111111111111111111111111111111111",
+                  signature: TEST_SIG_A,
                   slot: 461970800,
                   err: null,
                   blockTime: anchorBlockTimeSec,
@@ -409,8 +450,7 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
         result: {
           context: { slot: 461970850 },
           value: {
-            signature:
-              "5LiveTxSignature111111111111111111111111111111111111111111111111111111111111111111",
+            signature: TEST_SIG_B,
             err: null,
             logs: ["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"],
           },
@@ -606,7 +646,8 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
       await new Promise((resolve) => setImmediate(resolve));
     };
 
-    const transport = createDiagnosticMockFetch();
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
 
     const walletPath = path.resolve(process.cwd(), ".tmp", "virtual-wallet.json");
     const walletBefore = existsSync(walletPath) ? readFileSync(walletPath, "utf8") : null;
@@ -617,6 +658,7 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
       rpcUrl: TEST_RPC_URL,
       outDir: testOutDir,
       transport,
+      wsTransport,
       clock,
       sleeper,
       executionContext: "PAPER_SIMULATION",
@@ -639,5 +681,419 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     // Verify canonical state files under .tmp were NEVER modified
     const walletAfter = existsSync(walletPath) ? readFileSync(walletPath, "utf8") : null;
     expect(walletAfter).toBe(walletBefore);
+  });
+
+  it("8. Missing transport in offline mode throws [DIAGNOSTIC_INVALID_ARG]", () => {
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch();
+
+    expect(
+      () =>
+        new CandidateDecisionDiagnostic({
+          poolId: TEST_POOL_ID,
+          mintAddress: TEST_MINT,
+          rpcUrl: TEST_RPC_URL,
+          outDir: testOutDir,
+          wsTransport,
+        }),
+    ).toThrow(/Offline mode requires injected transport/);
+
+    expect(
+      () =>
+        new CandidateDecisionDiagnostic({
+          poolId: TEST_POOL_ID,
+          mintAddress: TEST_MINT,
+          rpcUrl: TEST_RPC_URL,
+          outDir: testOutDir,
+          transport,
+        }),
+    ).toThrow(/Offline mode requires injected wsTransport/);
+  });
+
+  it("9. Injected transport hanging request terminates within timeout without hanging process", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    // Hang on requests
+    const transport = createDiagnosticMockFetch({ hangingRequest: true, getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      requestTimeoutMs: 50,
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+    expect(result.message).toContain("OPERATION_TIMEOUT");
+  });
+
+  it("10. Overall deadline timeout terminates work and returns OVERALL_DIAGNOSTIC_TIMEOUT", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async () => {
+      // Simulate wall clock time advancing past 30s deadline
+      clockTime += 40_000;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      overallTimeoutMs: 30_000,
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+  });
+
+  it("11. Candidate mint account info with omitted authorities fails with PRE_ADMISSION_REJECTED", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ omitAuthorities: true, getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.message).toContain("REJECTED_UNKNOWN_FREEZE_AUTHORITY");
+  });
+
+  it("12. RugCheck report with missing risks or empty topHolders fails Gate 11", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Sub-case A: missing risks
+    {
+      const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+      const transport = createDiagnosticMockFetch({ missingRisks: true, getClock: clock });
+
+      const diagnostic = new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        outDir: path.join(testOutDir, "subcase-a"),
+        transport,
+        wsTransport,
+        clock,
+        sleeper,
+        executionContext: "PAPER_SIMULATION",
+        observationDurationMs: 65_000,
+      });
+
+      const result = await diagnostic.run();
+      expect(result.ok).toBe(true);
+      expect(result.status).toBe("BUY_GATE_REJECTED");
+      expect(result.decisionResult?.buyGateResult?.rejectionReason).toBe(
+        "REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN",
+      );
+    }
+
+    // Sub-case B: empty topHolders
+    {
+      const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+      const transport = createDiagnosticMockFetch({ emptyTopHolders: true, getClock: clock });
+
+      const diagnostic = new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        outDir: path.join(testOutDir, "subcase-b"),
+        transport,
+        wsTransport,
+        clock,
+        sleeper,
+        executionContext: "PAPER_SIMULATION",
+        observationDurationMs: 65_000,
+      });
+
+      const result = await diagnostic.run();
+      expect(result.ok).toBe(true);
+      expect(result.status).toBe("BUY_GATE_REJECTED");
+      expect(result.decisionResult?.buyGateResult?.rejectionReason).toBe(
+        "TOP_10_CONCENTRATION_UNKNOWN",
+      );
+    }
+  });
+
+  it("13. Established candidate with priceChange.h1 = -99 fails Gate 12", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    // ageSeconds: 2400 (between 1800 and 7200), liquidity >= 50000, h1PriceChange: -99
+    const transport = createDiagnosticMockFetch({
+      ageSeconds: 2400,
+      h1PriceChange: -99,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("BUY_GATE_REJECTED");
+    expect(result.decisionResult?.outcome).toBe("BUY_GATE_REJECTED");
+    expect(result.decisionResult?.buyGateResult?.rejectionReason).toBe(
+      "REJECTED_ESTABLISHED_MACRO_DOWNTREND",
+    );
+    const macroGate = result.decisionResult?.buyGateResult?.gates.find(
+      (g) => g.name === "ESTABLISHED_MACRO_TREND_GATE",
+    );
+    expect(macroGate?.passed).toBe(false);
+    expect(macroGate?.value).toBe(-99);
+  });
+
+  it("14. Reverse orientation USD price computation: quotes candidate token correctly", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    // quoteIsCandidate: true where priceUsd = 150.00 and priceNative = 66.66666666666667
+    const transport = createDiagnosticMockFetch({
+      quoteIsCandidate: true,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    // priceUsd / priceNative: 150.00 / 66.66666666666667 = 2.25
+    expect(result.candidateMarketData?.spotPriceUsd).toBeCloseTo(2.25, 2);
+    expect(result.candidateMarketData?.spotPriceSol).toBeCloseTo(1 / 66.66666666666667, 4);
+  });
+
+  it("15. Missing volume or transaction counts fails with INCOMPLETE_MARKET_INPUTS (does not default to 0)", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Sub-case A: missing volume
+    {
+      const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+      const transport = createDiagnosticMockFetch({ missingVolume: true, getClock: clock });
+
+      const diagnostic = new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        outDir: path.join(testOutDir, "subcase-vol"),
+        transport,
+        wsTransport,
+        clock,
+        sleeper,
+        executionContext: "PAPER_SIMULATION",
+        observationDurationMs: 65_000,
+      });
+
+      const result = await diagnostic.run();
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe("INCOMPLETE_MARKET_INPUTS");
+      expect(result.message).toContain("Missing or non-finite volume.m5");
+    }
+
+    // Sub-case B: missing buys/sells
+    {
+      const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+      const transport = createDiagnosticMockFetch({ missingBuysSells: true, getClock: clock });
+
+      const diagnostic = new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        outDir: path.join(testOutDir, "subcase-txns"),
+        transport,
+        wsTransport,
+        clock,
+        sleeper,
+        executionContext: "PAPER_SIMULATION",
+        observationDurationMs: 65_000,
+      });
+
+      const result = await diagnostic.run();
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe("INCOMPLETE_MARKET_INPUTS");
+      expect(result.message).toContain("Missing or invalid txns.m5");
+    }
+  });
+
+  it("16. Unwritable output destination fails closed with ARTIFACT_WRITE_FAILED", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    // Invalid non-existent drive on Windows
+    const unwritableDir = "Z:\\non-existent-drive-topg\\invalid-path";
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: unwritableDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("ARTIFACT_WRITE_FAILED");
+  });
+
+  it("17. Existing diagnostic destination refuses overwrite with DIAGNOSTIC_OUTPUT_EXISTS", () => {
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch();
+
+    // Create a mock report file in target directory
+    mkdirSync(testOutDir, { recursive: true });
+    writeFileSync(path.join(testOutDir, "diagnostic-report.json"), "{}", "utf8");
+
+    expect(
+      () =>
+        new CandidateDecisionDiagnostic({
+          poolId: TEST_POOL_ID,
+          mintAddress: TEST_MINT,
+          rpcUrl: TEST_RPC_URL,
+          outDir: testOutDir,
+          transport,
+          wsTransport,
+        }),
+    ).toThrow(/DIAGNOSTIC_OUTPUT_EXISTS/);
+  });
+
+  it("18. Redacts RPC URL path and query credentials in diagnostic report and manifest", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const credentialRpcUrl = "https://solana-mainnet.g.alchemy.com/v2/secret-api-key-alchemy-98765";
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: credentialRpcUrl,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+
+    const reportRaw = readFileSync(path.join(testOutDir, "diagnostic-report.json"), "utf8");
+    const manifestRaw = readFileSync(path.join(testOutDir, "evidence-manifest.json"), "utf8");
+
+    expect(reportRaw).not.toContain("secret-api-key-alchemy-98765");
+    expect(manifestRaw).not.toContain("secret-api-key-alchemy-98765");
+    expect(manifestRaw).toContain("[REDACTED]");
   });
 });
