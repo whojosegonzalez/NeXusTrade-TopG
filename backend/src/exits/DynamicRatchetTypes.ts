@@ -1,3 +1,5 @@
+import type { FlowCoverageStatus } from "../candidate-scanner/RetestGateEvaluator.js";
+
 export type RatchetTier =
   | "HARD_STOP"
   | "TIER_0_DRAWDOWN"
@@ -53,12 +55,14 @@ export interface PositionRatchetState {
 export interface MarketEvaluationContext {
   readonly spotPriceSol: number;
   readonly lpIntact: boolean;
-  readonly recentBuysCount60s: number;
-  readonly recentSellsCount60s: number;
+  readonly recentBuysCount60s: number | null;
+  readonly recentSellsCount60s: number | null;
   readonly momentum5mBps: number;
   readonly volumeStalled3m: boolean;
   readonly currentTimestampMs: number;
   readonly singleTickDropBps?: number | undefined;
+  readonly isFlowSufficient?: boolean | undefined;
+  readonly flowCoverage?: FlowCoverageStatus | string | undefined;
 }
 
 export interface RatchetEvaluationDiagnostics {
@@ -69,7 +73,7 @@ export interface RatchetEvaluationDiagnostics {
   readonly drawdownState: DrawdownState;
   readonly drawdownElapsedMs: number | null;
   readonly lpIntact: boolean;
-  readonly buySellRatio60s: number;
+  readonly buySellRatio60s: number | null;
   readonly momentum5mBps: number;
 }
 

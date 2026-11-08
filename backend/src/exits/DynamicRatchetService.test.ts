@@ -1110,4 +1110,162 @@ describe("DynamicRatchetService", () => {
       expect(cutResult.reasonCode).toBe("UNCONFIRMED_PRE_BREAKEVEN_CUT");
     });
   });
+
+  describe("Position-Flow Offline Policy: Unavailable Flow vs Genuine Observed Zero", () => {
+    it("reports buySellRatio60s as null when counts are null and skips flow-dependent cuts", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-unavail-1", "mint-1", 1.0, 1_000_000);
+
+      // Underwater at -4.5%, counts null (unavailable flow / collection gap)
+      const result = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.955, // -4.5%
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          flowCoverage: "COLLECTION_GAP",
+          currentTimestampMs: 1_000_010,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      // Should HOLD (skipping Rule A0 avalanche) and report buySellRatio60s = null
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).toBe("HOLD_NORMAL");
+      expect(result.diagnostics.buySellRatio60s).toBeNull();
+    });
+
+    it("skips whale/dev dump cliff cut when flow is unavailable, even with singleTickDropBps <= -10%", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-unavail-2", "mint-1", 1.0, 1_000_000);
+
+      // Underwater at -8.5%, cliff drop -10.5%, but flow is unavailable (null counts)
+      const result = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.915, // -8.5%
+          singleTickDropBps: -1050,
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          flowCoverage: "COLLECTION_GAP",
+          currentTimestampMs: 1_000_010,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      // Skips WHALE_DEV_DUMP_CLIFF_CUT; enters drawdown evaluation within base grace period
+      expect(result.action).toBe("HOLD");
+      expect(result.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+      expect(result.diagnostics.buySellRatio60s).toBeNull();
+    });
+
+    it("triggers whale/dev dump cliff cut when flow is genuinely observed zero with singleTickDropBps <= -10%", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-zero-1", "mint-1", 1.0, 1_000_000);
+
+      // Underwater at -8.5%, cliff drop -10.5%, verified observed 0 buys
+      const result = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.915, // -8.5%
+          singleTickDropBps: -1050,
+          recentBuysCount60s: 0,
+          recentSellsCount60s: 5,
+          isFlowSufficient: true,
+          flowCoverage: "SUFFICIENT",
+          currentTimestampMs: 1_000_010,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("WHALE_DEV_DUMP_CLIFF_CUT");
+      expect(result.diagnostics.buySellRatio60s).toBe(0);
+    });
+
+    it("cuts probe at -12% when flow is unavailable because unknown flow cannot authorize viral absorption", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-probe-unavail", "mint-1", 1.0, 1_000_000);
+
+      const result = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.88, // -12.0%
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          currentTimestampMs: 1_000_010,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      expect(result.action).toBe("SELL_ALL");
+      expect(result.reasonCode).toBe("PROBE_UNCONFIRMED_DUMP_CUT");
+    });
+
+    it("skips Health Check 2 on unavailable flow and holds for base grace timer, then expires on timeout", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-drawdown-unavail", "mint-1", 1.0, 1_000_000);
+
+      // 1. Enter drawdown at 1_000_000
+      const enterResult = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.92, // -8.0%
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          currentTimestampMs: 1_000_000,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG, // 120s base grace
+      );
+
+      expect(enterResult.action).toBe("HOLD");
+      expect(enterResult.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+
+      // 2. 100s later (within 120s base grace): still holds
+      const midResult = service.evaluate(
+        enterResult.updatedState,
+        {
+          ...baseContext,
+          spotPriceSol: 0.92,
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          currentTimestampMs: 1_100_000,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+      expect(midResult.action).toBe("HOLD");
+      expect(midResult.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+
+      // 3. 125s later (> 120s base grace): unknown flow cannot extend grace to 180s, expires!
+      const expireResult = service.evaluate(
+        midResult.updatedState,
+        {
+          ...baseContext,
+          spotPriceSol: 0.92,
+          recentBuysCount60s: null,
+          recentSellsCount60s: null,
+          isFlowSufficient: false,
+          currentTimestampMs: 1_125_000,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+      expect(expireResult.action).toBe("SELL_ALL");
+      expect(expireResult.reasonCode).toBe("DRAWDOWN_GRACE_EXPIRED");
+    });
+  });
 });

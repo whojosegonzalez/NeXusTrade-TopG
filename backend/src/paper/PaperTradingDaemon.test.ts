@@ -548,6 +548,47 @@ describe("PaperTradingDaemon", () => {
     expect(snapshot.closedTrades[0]?.exitReason).toBe("STAGNANCY_TIMEOUT_EXIT");
   });
 
+  it("persists poolId on position and does not force stagnancy exit when volumeStalled3m is false (unavailable flow)", () => {
+    let currentClockMs = nowMs;
+    const daemon = new PaperTradingDaemon({
+      config: baseConfig,
+      clock: () => currentClockMs,
+    });
+    daemon.start();
+
+    const bought = daemon.processScannedPool(
+      { ...validPool, poolId: "pool-originating-456" },
+      currentClockMs,
+      0.05,
+    );
+    expect(bought).toBe(true);
+
+    const pos = daemon.getSnapshot().openPositions[0]!;
+    expect(pos.poolId).toBe("pool-originating-456");
+
+    // 180 seconds elapse with flat price, but volumeStalled3m is false (flow unavailable / unestablished continuity)
+    currentClockMs += 180_000;
+    const tickResult = daemon.tickPosition(
+      pos.positionId,
+      {
+        ...baseMarketContext,
+        spotPriceSol: 0.05,
+        recentBuysCount60s: null,
+        recentSellsCount60s: null,
+        isFlowSufficient: false,
+        flowCoverage: "COLLECTION_GAP",
+        volumeStalled3m: false,
+        currentTimestampMs: currentClockMs,
+      },
+      currentClockMs,
+    );
+
+    // Stagnancy timeout exit must NOT fire because continuous 180s volume stagnation is not established!
+    expect(tickResult?.action).toBe("HOLD");
+    expect(tickResult?.reasonCode).toBe("HOLD_NORMAL");
+    expect(daemon.getSnapshot().openPositions.length).toBe(1);
+  });
+
   it("forces stagnancy exit via recordStagnantTick when valid spot price is flat for 3 minutes", () => {
     let currentClockMs = nowMs;
     const daemon = new PaperTradingDaemon({

@@ -238,13 +238,25 @@ export class DynamicRatchetService {
     }
 
     // 2. Evaluation Logic
+    // Validate verified flow availability for flow-dependent decisions
+    const isFlowAvailable =
+      context.isFlowSufficient !== false &&
+      context.recentBuysCount60s !== null &&
+      context.recentSellsCount60s !== null &&
+      Number.isSafeInteger(context.recentBuysCount60s) &&
+      Number.isSafeInteger(context.recentSellsCount60s) &&
+      context.recentBuysCount60s >= 0 &&
+      context.recentSellsCount60s >= 0 &&
+      (context.isFlowSufficient === true || context.isFlowSufficient === undefined);
+
     // Rule A0: Emergency Avalanche Sell-Pressure Cut
     // If position is underwater (currentPnlBps <= -400, i.e. <= -4.0%)
     // and live flow shows an extreme seller avalanche (sells >= 25 in 60s AND sells >= 3.0 * buys)
     if (
+      isFlowAvailable &&
       currentPnlBps <= -400 &&
-      context.recentSellsCount60s >= 25 &&
-      context.recentSellsCount60s >= 3.0 * Math.max(1, context.recentBuysCount60s)
+      context.recentSellsCount60s! >= 25 &&
+      context.recentSellsCount60s! >= 3.0 * Math.max(1, context.recentBuysCount60s!)
     ) {
       const updatedState: PositionRatchetState = {
         ...state,
@@ -284,6 +296,7 @@ export class DynamicRatchetService {
     // buyer flow has completely ceased (recentBuysCount60s === 0),
     // and price experienced a severe instantaneous cliff in a single tick (singleTickDropBps <= -1000, i.e. <= -10.0%)
     if (
+      isFlowAvailable &&
       currentPnlBps <= -800 &&
       context.recentBuysCount60s === 0 &&
       context.singleTickDropBps !== undefined &&
@@ -384,8 +397,9 @@ export class DynamicRatchetService {
     // If a position has never confirmed (+1.0% / 100 bps peak gain) and drops to <= -12.0%,
     // cut immediately unless extreme viral buyer absorption is active.
     const hasViralAbsorption =
-      context.recentBuysCount60s >= 50 &&
-      context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
+      isFlowAvailable &&
+      context.recentBuysCount60s! >= 50 &&
+      context.recentBuysCount60s! >= 1.25 * Math.max(1, context.recentSellsCount60s!);
 
     if (nextPeakGainBps < 100 && currentPnlBps <= -1200 && !hasViralAbsorption) {
       const updatedState: PositionRatchetState = {
@@ -459,8 +473,10 @@ export class DynamicRatchetService {
     // and buyer flow is unabsorbed (buys < sells or buys === 0), cut immediately!
     // But if buyer dominance is strong (buys >= 1.25 * sells), allow position to breathe down to catastrophic floor.
     if (
+      isFlowAvailable &&
       currentPnlBps <= -1200 &&
-      (context.recentBuysCount60s === 0 || context.recentBuysCount60s < context.recentSellsCount60s)
+      (context.recentBuysCount60s === 0 ||
+        context.recentBuysCount60s! < context.recentSellsCount60s!)
     ) {
       const updatedState: PositionRatchetState = {
         ...state,
@@ -622,10 +638,11 @@ export class DynamicRatchetService {
         };
       }
 
-      // Health Check 2: Buyer absorption
+      // Health Check 2: Buyer absorption (flow-dependent cut)
       if (
-        context.recentBuysCount60s === 0 ||
-        context.recentBuysCount60s < context.recentSellsCount60s
+        isFlowAvailable &&
+        (context.recentBuysCount60s === 0 ||
+          context.recentBuysCount60s! < context.recentSellsCount60s!)
       ) {
         const updatedState: PositionRatchetState = {
           ...state,
@@ -663,7 +680,8 @@ export class DynamicRatchetService {
       // Health Check 3: Grace period timeout
       // Dynamic Grace Extension: If buyer dominance is strong (buys >= 1.25 * sells), extend grace up to 180s (3m)
       const hasStrongBuyerDominance =
-        context.recentBuysCount60s >= 1.25 * Math.max(1, context.recentSellsCount60s);
+        isFlowAvailable &&
+        context.recentBuysCount60s! >= 1.25 * Math.max(1, context.recentSellsCount60s!);
       const effectiveGracePeriodMs = hasStrongBuyerDominance
         ? Math.max(activeConfig.drawdownGracePeriodMs, 180_000)
         : activeConfig.drawdownGracePeriodMs;
@@ -791,11 +809,13 @@ export class DynamicRatchetService {
     context: MarketEvaluationContext,
   ): RatchetEvaluationDiagnostics {
     const buySellRatio60s =
-      context.recentSellsCount60s === 0
-        ? context.recentBuysCount60s > 0
-          ? 999
-          : 0
-        : Number((context.recentBuysCount60s / context.recentSellsCount60s).toFixed(2));
+      context.recentBuysCount60s === null || context.recentSellsCount60s === null
+        ? null
+        : context.recentSellsCount60s === 0
+          ? context.recentBuysCount60s > 0
+            ? 999
+            : 0
+          : Number((context.recentBuysCount60s / context.recentSellsCount60s).toFixed(2));
 
     return {
       currentPnlBps,

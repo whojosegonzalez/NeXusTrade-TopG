@@ -37,6 +37,10 @@ import {
   type BuyGateEvaluationResult,
 } from "./BuyGateTriggerService.js";
 import type {
+  PaperExecutionContext,
+  PaperQualificationContext,
+} from "./PaperReconciledCandidateFlowAdapter.js";
+import type {
   RaydiumCandidateSubscriptionCoordinator,
   CoordinatorCoverageDiagnostic,
 } from "./RaydiumCandidateSubscriptionCoordinator.js";
@@ -62,6 +66,8 @@ export interface CandidateFlowResult {
   readonly isCoverageSufficient: boolean;
   readonly diagnosticReason: string;
   readonly evaluationTimestampMs: number;
+  readonly isPaperQualified?: boolean | undefined;
+  readonly paperQualificationContext?: PaperQualificationContext | undefined;
 }
 
 /**
@@ -278,6 +284,11 @@ export class CoordinatorCandidateFlowProvider implements CandidateFlowProvider {
   }
 }
 
+export interface SnapshotCandidateFlowOptions {
+  readonly executionContext?: PaperExecutionContext | "PRODUCTION" | undefined;
+  readonly maxAllowedEvidenceAgeMs?: number | undefined;
+}
+
 /**
  * Validates and snapshots an arbitrary provider result against requested target coordinates and evaluation timestamp.
  * Guarantees that downstream decision points always receive a sound, immutable CandidateFlowResult.
@@ -287,17 +298,25 @@ export function validateAndSnapshotCandidateFlowResult(
   rawResult: unknown,
   target: CandidateFlowTarget,
   evaluationTimestampMs: number,
+  options?: SnapshotCandidateFlowOptions,
 ): CandidateFlowResult {
-  const fallback = (reason: string): CandidateFlowResult =>
+  const isPaperMode =
+    options?.executionContext === "PAPER_SIMULATION" || options?.executionContext === "BACKTEST";
+
+  const fallback = (
+    reason: string,
+    coverage: FlowCoverageStatus | "UNAVAILABLE" = "COLLECTION_GAP",
+  ): CandidateFlowResult =>
     Object.freeze({
       poolAddress: target?.poolAddress ?? "",
       tokenMint: target?.tokenMint ?? "",
       recentBuys60s: null,
       recentSells60s: null,
-      flowCoverage: "COLLECTION_GAP",
+      flowCoverage: coverage,
       isCoverageSufficient: false,
       diagnosticReason: reason,
       evaluationTimestampMs,
+      ...(isPaperMode ? { isPaperQualified: false } : {}),
     });
 
   // 1. Safe handling of null, undefined, or non-object results
@@ -335,7 +354,95 @@ export function validateAndSnapshotCandidateFlowResult(
     );
   }
 
-  // 4. Consistent sufficient-coverage fields
+  // 4. PAPER Qualification Provenance Validation
+  if (res.isPaperQualified === true) {
+    if (!isPaperMode) {
+      // Reject PAPER-qualified evidence in default/production mode
+      return fallback("PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION");
+    }
+
+    const paperCtx = res.paperQualificationContext as PaperQualificationContext | undefined;
+    if (
+      !paperCtx ||
+      typeof paperCtx !== "object" ||
+      paperCtx.executionContext !== options?.executionContext ||
+      typeof paperCtx.validatedEpoch !== "number" ||
+      !Number.isSafeInteger(paperCtx.validatedEpoch) ||
+      paperCtx.validatedEpoch < 0 ||
+      !paperCtx.researchWindowSpan ||
+      typeof paperCtx.researchWindowSpan !== "object" ||
+      typeof paperCtx.researchWindowSpan.windowStartMs !== "number" ||
+      typeof paperCtx.researchWindowSpan.windowEndMs !== "number" ||
+      !Number.isSafeInteger(paperCtx.researchWindowSpan.windowStartMs) ||
+      !Number.isSafeInteger(paperCtx.researchWindowSpan.windowEndMs) ||
+      paperCtx.researchWindowSpan.windowStartMs <= 0 ||
+      paperCtx.researchWindowSpan.windowEndMs <= 0 ||
+      paperCtx.researchWindowSpan.windowEndMs - paperCtx.researchWindowSpan.windowStartMs !==
+        60_000 ||
+      typeof paperCtx.originalEvaluationTimestampMs !== "number" ||
+      !Number.isSafeInteger(paperCtx.originalEvaluationTimestampMs) ||
+      paperCtx.originalEvaluationTimestampMs <= 0
+    ) {
+      return fallback("INVALID_PAPER_QUALIFICATION_PROVENANCE");
+    }
+
+    // Causality checks
+    if (evaluationTimestampMs < paperCtx.researchWindowSpan.windowEndMs) {
+      return fallback(
+        `FUTURE_DATED_RECONCILIATION: Consumption timestamp (${evaluationTimestampMs} ms) is earlier than research cutoff (${paperCtx.researchWindowSpan.windowEndMs} ms)`,
+      );
+    }
+    if (evaluationTimestampMs < paperCtx.originalEvaluationTimestampMs) {
+      return fallback(
+        `CAUSALITY_VIOLATION: Consumption timestamp (${evaluationTimestampMs} ms) is earlier than original evaluation (${paperCtx.originalEvaluationTimestampMs} ms)`,
+      );
+    }
+
+    // Recalculate freshness from actual research cutoff at consumption time
+    const currentCutoffAgeMs = evaluationTimestampMs - paperCtx.researchWindowSpan.windowEndMs;
+    const maxAllowedAgeMs = Math.min(options?.maxAllowedEvidenceAgeMs ?? 15_000, 15_000);
+    if (currentCutoffAgeMs > maxAllowedAgeMs) {
+      return fallback(
+        `STALE_RECONCILIATION_EVIDENCE: Research cutoff age (${currentCutoffAgeMs} ms) exceeds max allowed age (${maxAllowedAgeMs} ms)`,
+        "STALE_DATA",
+      );
+    }
+
+    // Accepted quiet-window adapter restricted to qualified-zero scope
+    if (
+      res.recentBuys60s !== 0 ||
+      res.recentSells60s !== 0 ||
+      res.isCoverageSufficient !== true ||
+      res.flowCoverage !== "SUFFICIENT"
+    ) {
+      return fallback(
+        "INVALID_PAPER_QUIET_STREAM_COUNTS: PAPER quiet stream must have verified zero counts and sufficient coverage",
+      );
+    }
+
+    const diagReason =
+      typeof res.diagnosticReason === "string" && res.diagnosticReason.trim().length > 0
+        ? res.diagnosticReason
+        : "PAPER quiet window qualified";
+
+    return Object.freeze({
+      poolAddress: target.poolAddress,
+      tokenMint: target.tokenMint,
+      recentBuys60s: 0,
+      recentSells60s: 0,
+      flowCoverage: "SUFFICIENT",
+      isCoverageSufficient: true,
+      diagnosticReason: diagReason,
+      evaluationTimestampMs,
+      isPaperQualified: true,
+      paperQualificationContext: {
+        ...paperCtx,
+        cutoffAgeMs: currentCutoffAgeMs,
+      },
+    });
+  }
+
+  // 5. Consistent sufficient-coverage fields
   const isSufficient = res.isCoverageSufficient === true;
   const flowCoverage = res.flowCoverage;
 
@@ -350,7 +457,7 @@ export function validateAndSnapshotCandidateFlowResult(
     );
   }
 
-  // 5. Valid, nonnegative safe-integer counts when coverage is sufficient
+  // 6. Valid, nonnegative safe-integer counts when coverage is sufficient
   if (isSufficient) {
     const buys = res.recentBuys60s;
     const sells = res.recentSells60s;
@@ -385,7 +492,7 @@ export function validateAndSnapshotCandidateFlowResult(
     });
   }
 
-  // 6. When coverage is not sufficient, counts must be null (never substitute estimates or leave stale counts)
+  // 7. When coverage is not sufficient, counts must be null (never substitute estimates or leave stale counts)
   const coverageStatus: FlowCoverageStatus | "UNAVAILABLE" =
     typeof flowCoverage === "string" && flowCoverage !== "SUFFICIENT"
       ? (flowCoverage as FlowCoverageStatus | "UNAVAILABLE")

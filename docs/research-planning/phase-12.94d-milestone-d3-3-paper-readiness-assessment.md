@@ -652,9 +652,13 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
      - Importing daemon modules in offline test suites performs zero filesystem credential reads and executes zero runtime work.
    - **Offline Acceptance Verification**:
      - Verified across 43 focused offline unit tests (`CandidateFlowProvider.test.ts`), passing all candidate scanner (631 tests) and daemon (77 tests) suites with zero live network requests or wallet modifications.
-4. **Remaining Exit-Path Flow Estimation Gap (Quarantined)**:
-   - While the candidate evaluation path (Buy Gate and Retest Gate) now strictly consumes candidate flow via `CandidateFlowProvider` and fails closed on unavailable flow, **the active position exit-monitoring loop (`tickPosition` at line ~1360 in `paper-trading-daemon.ts`) continues to derive short-horizon trade flow estimates by interpolating DexScreener 5-minute metrics (`buys5m / 5`, `sells5m / 5`)**.
-   - This remaining estimation path is explicitly acknowledged and quarantined as an open integration gap. In keeping with bounded offline scoping, the position management and exit engine was NOT rewritten in this patch, avoiding unverified changes to live position state machines prior to authorized trade acquisition wiring.
+4. **Resolved Offline Position-Flow Integration & Selected Flow Policies**:
+   - The active position exit-monitoring loop (`tickPosition` in `paper-trading-daemon.ts`) has been corrected offline to consume candidate-bound validated flow via `activeCandidateFlowProvider.getCandidateFlow()` bound to the exact pool and token mint, completely excising interpolated 5-minute DexScreener counts (`buys5m / 5`, `sells5m / 5`) from exit and scale-in decisions.
+   - Originating pool identity (`poolId`) is persisted on each `PaperPosition`. Legacy positions without pool identity retain unavailable flow (`COLLECTION_GAP`, null counts) fail-closed without inferring replacement pools.
+   - Silent pool substitution in `fetchDexScreenerSpotInfo` is eliminated: supplying an `expectedPoolId` returns `null` if unmatched.
+   - Provider exceptions are safely contained so valid price ticks reach independent price-based protective exits.
+   - When flow is unavailable, flow-dependent loss cuts (Rule A0 avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop, Drawdown Health Check 2) are skipped; existing price protections (catastrophic hard floors, cohort pre-breakeven stops) and base drawdown grace timers remain active. Unknown flow cannot authorize scale-ins, viral-absorption exceptions, or extended grace. Ratio diagnostics report `null` without claiming observed sell pressure or buyer support.
+   - Stagnation exits require continuous quiet evidence over at least 180 seconds via `ContinuousQuietIntervalTracker`, merging overlapping intervals without double-counting and resetting on collection gaps, outages, trades, or epoch changes. Feedback dependency between `!volumeStalled3m` and `lastActivityMs` is eliminated. Full policy details documented in Section 8.13.6.
 5. **Reaffirmation: Production Source Completeness Remains Unproven**:
    - The coordinator defaults to fail-closed `isCoverageSufficient: false` and `recentBuys60s: null` / `recentSells60s: null` under default production configuration.
    - Synthetic completeness proofs are strictly restricted to isolated offline test fixtures via explicit `allowSyntheticCompletenessProofs: true`. Explanatory text strings, open socket liveness, empty queues, or environment variable flags (`process.env`) cannot establish or bypass completeness.
@@ -1556,7 +1560,51 @@ Reporting across probe metadata and summaries enforces strict unknown preservati
 3. **Dispatched HTTP Request Separation**:
    - Whole-probe HTTP requests (including bootstrap, slot, block time, enumeration, retrievals) are tracked separately from reconciliation-receipt requests.
 
-#### 5. Core Invariants Frozen
+#### 5. Offline Position-Flow Correction & Continuous Stagnation Architecture
+
+Following explicit operator review and policy selection (Policies 1 and 2), the position exit-monitoring flow architecture has been implemented and verified offline:
+
+1. **Position Identity & Provider Seam Binding**:
+   - Originating pool identity (`poolId`) is persisted on each `PaperPosition` upon acquisition.
+   - Position trade flow is obtained through the existing provider seam via `activeCandidateFlowProvider.getCandidateFlow()`, bound to the exact pool address and token mint.
+   - Legacy positions lacking pool identity retain unavailable flow (`COLLECTION_GAP`, null counts) fail-closed without inferring or guessing replacement pools.
+   - Provider exceptions are strictly contained within local `try/catch` handlers so valid price ticks reach independent price-based protective exits.
+   - Interpolated 5-minute DexScreener counts (`buys5m / 5`, `sells5m / 5`) are completely excised from position exit evaluations and scale-in momentum checks.
+   - Silent pool substitution in `fetchDexScreenerSpotInfo` is eliminated: when an `expectedPoolId` is supplied, absence of an exact match immediately returns `null` rather than falling back to `validSolPairs[0]`.
+
+2. **Selected Unavailable-Flow Exit Behavior (Operator Policy 1)**:
+   - Flow counts in `MarketEvaluationContext` are nullable (`number | null`). Unavailable flow is represented strictly as `null`, never substituted with `0`.
+   - Flow-dependent loss cuts (Rule A0 emergency avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop at -12.0%, Drawdown Health Check 2 unabsorbed sell pressure) require verified sufficient flow (`isFlowSufficient === true`, non-null safe-integer counts). When flow is unavailable, these flow-dependent conditions are skipped.
+   - Independent price protections evaluate without flow dependence:
+     - Catastrophic disaster floor (-18.0% Established / -20.0% Micro-Cap).
+     - Cohort-calibrated pre-breakeven stop (-10.0% Established / -12.0% Micro-Cap).
+     - Locked profit floors, moonbag protections, and armed breakeven floors.
+     - Probe quick-cut cuts unconfirmed positions at -12.0% because unknown flow cannot authorize viral-absorption exceptions.
+     - Drawdown Health Check 1 (LP integrity) cuts on broken LP independently of flow.
+   - When in drawdown at <= -8.0% with unavailable flow, Health Check 2 is skipped and the base drawdown grace period timer applies (120s Established / 90s Micro-Cap). Unknown flow cannot authorize grace extension. If price remains depressed past the base grace timer, position exits with `DRAWDOWN_GRACE_EXPIRED`.
+   - Ratio diagnostics (`buySellRatio60s`) report `null` when counts are unavailable, without claiming observed sell pressure or buyer support.
+
+3. **Continuous Stagnation Evidence (Operator Policy 2)**:
+   - Implemented `ContinuousQuietIntervalTracker.ts` to establish quiet coverage from actual interval endpoints covering at least 180 continuous seconds.
+   - Merges contiguous and overlapping quiet windows without double-counting; repeated snapshots or sub-intervals cannot advance coverage.
+   - Continuity is bound strictly to the same pool address, token mint, and connection epoch.
+   - Continuity breaks (resetting continuous quiet span to 0) on:
+     - Any observed trade activity (`recentBuys60s > 0 || recentSells60s > 0`).
+     - Collection gaps, feed outages, or non-sufficient coverage status (`flowCoverage !== "SUFFICIENT"`).
+     - Unobserved temporal gaps ($W_{\text{start}} > T_{\max}$).
+     - Identity or connection epoch changes.
+     - Price changes (`Math.abs(spotPriceSol - prevPrice) > 1e-9`).
+   - One quiet 60-second window yields 60s span and cannot establish 3-minute stagnation (`isStagnant3m() === false`).
+   - The feedback dependency between `!volumeStalled3m` and `lastActivityMs` is eliminated; `hasTradeActivity` only reflects observed trades.
+   - Both Rule C's volume condition and `STAGNANCY_TIMEOUT_EXIT` require `volumeStalled3m === true` (verified continuous 180s quiet evidence) and price inactivity, avoiding treating missing or unavailable data as market inactivity while ensuring missing continuity does not block independent price stops.
+
+4. **Snapshot Provenance & Production Boundary Defense**:
+   - `validateAndSnapshotCandidateFlowResult` preserves and validates `isPaperQualified` and `paperQualificationContext` when in `PAPER_SIMULATION` or `BACKTEST` mode.
+   - Recalculates research cutoff age at consumption time, enforcing authorized maximum evidence age ($\le 15{,}000\text{ ms}$) and causality checks ($T_{\text{eval}} \ge T_{\text{cutoff}}$, $T_{\text{eval}} \ge T_{\text{orig}}$).
+   - Rejects PAPER-qualified evidence in default/production mode with `PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION`.
+   - Scale-in momentum (`hasViralScaleInMomentum`) strictly requires verified sufficient flow (`isCoverageSufficient === true`, non-null counts $\ge 15$), preventing unknown or estimated flow from authorizing pyramiding.
+
+#### 6. Core Invariants Frozen
 
 - **Production Completeness Guard**: `isProductionCompletenessEstablished = false` permanently.
 - **Gate 11 Bundler Concentration**: Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).

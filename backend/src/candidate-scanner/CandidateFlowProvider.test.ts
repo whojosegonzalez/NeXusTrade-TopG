@@ -1094,6 +1094,121 @@ describe("CandidateFlowProvider & Evaluation Seam", () => {
         expect(snap.flowCoverage).toBe("WARM_UP");
         expect(snap.isCoverageSufficient).toBe(false);
       });
+
+      it("rejects PAPER-qualified evidence in default/production mode", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid quiet window",
+          evaluationTimestampMs: 1_000_000,
+          isPaperQualified: true,
+          paperQualificationContext: {
+            executionContext: "PAPER_SIMULATION",
+            validatedEpoch: 0,
+            originalEvaluationTimestampMs: 1_000_000,
+            researchWindowSpan: {
+              windowStartMs: 935_000,
+              windowEndMs: 995_000,
+              cutoffAgeMs: 5_000,
+            },
+            cutoffAgeMs: 5_000,
+            qualificationReason: "Quiet window control",
+            providerAssumptions: [],
+            unresolvedUncertainties: [],
+          },
+        };
+
+        // Called without options (defaults to production mode)
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000);
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.recentSells60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION");
+      });
+
+      it("preserves PAPER qualification and recalculates cutoff age at consumption time in PAPER_SIMULATION mode", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid quiet window",
+          evaluationTimestampMs: 1_002_000,
+          isPaperQualified: true,
+          paperQualificationContext: {
+            executionContext: "PAPER_SIMULATION",
+            validatedEpoch: 0,
+            originalEvaluationTimestampMs: 1_000_000,
+            researchWindowSpan: {
+              windowStartMs: 935_000,
+              windowEndMs: 995_000,
+              cutoffAgeMs: 5_000,
+            },
+            cutoffAgeMs: 5_000,
+            qualificationReason: "Quiet window control",
+            providerAssumptions: [],
+            unresolvedUncertainties: [],
+          },
+        };
+
+        // Consumption time is 1_002_000 (7,000ms after windowEndMs 995_000)
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_002_000, {
+          executionContext: "PAPER_SIMULATION",
+        });
+
+        expect(snap.isCoverageSufficient).toBe(true);
+        expect(snap.flowCoverage).toBe("SUFFICIENT");
+        expect(snap.recentBuys60s).toBe(0);
+        expect(snap.recentSells60s).toBe(0);
+        expect(snap.isPaperQualified).toBe(true);
+        expect(snap.paperQualificationContext?.cutoffAgeMs).toBe(7_000);
+      });
+
+      it("rejects stale PAPER evidence when consumption age exceeds 15,000ms", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid quiet window",
+          evaluationTimestampMs: 1_015_001,
+          isPaperQualified: true,
+          paperQualificationContext: {
+            executionContext: "PAPER_SIMULATION",
+            validatedEpoch: 0,
+            originalEvaluationTimestampMs: 1_000_000,
+            researchWindowSpan: {
+              windowStartMs: 935_000,
+              windowEndMs: 995_000,
+              cutoffAgeMs: 5_000,
+            },
+            cutoffAgeMs: 5_000,
+            qualificationReason: "Quiet window control",
+            providerAssumptions: [],
+            unresolvedUncertainties: [],
+          },
+        };
+
+        // Consumption time is 1_015_001 (20,001ms after windowEndMs 995_000 > 15,000ms max)
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_015_001, {
+          executionContext: "PAPER_SIMULATION",
+        });
+
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("STALE_DATA");
+        expect(snap.recentBuys60s).toBeNull();
+        expect(snap.recentSells60s).toBeNull();
+        expect(snap.diagnosticReason).toContain("STALE_RECONCILIATION_EVIDENCE");
+      });
     });
 
     describe("4.3 Pre-Extraction Liquidity Floor Restoration & Cohort Preservation", () => {

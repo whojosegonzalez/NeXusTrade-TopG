@@ -181,6 +181,7 @@ export interface PaperTradingDaemonConfig {
 
 export interface PaperPosition {
   readonly positionId: string;
+  readonly poolId?: string | undefined;
   readonly mintAddress: string;
   readonly symbol?: string | undefined;
   entryPriceSol: number;
@@ -891,6 +892,7 @@ export class PaperTradingDaemon {
 
     const position: PaperPosition = {
       positionId,
+      poolId: pool.poolId,
       mintAddress: pool.mintAddress,
       entryPriceSol,
       initialTokensHeld,
@@ -946,10 +948,9 @@ export class PaperTradingDaemon {
 
       // 2. Inactivity Tracking & 5-Minute Stagnancy Timeout
       const priceChanged = Math.abs(marketContext.spotPriceSol - position.spotPriceSol) > 1e-9;
-      const hasRecentActivity =
-        (marketContext.recentBuysCount60s ?? 0) > 0 ||
-        (marketContext.recentSellsCount60s ?? 0) > 0 ||
-        !marketContext.volumeStalled3m;
+      const hasTradeActivity =
+        (marketContext.recentBuysCount60s !== null && marketContext.recentBuysCount60s > 0) ||
+        (marketContext.recentSellsCount60s !== null && marketContext.recentSellsCount60s > 0);
 
       position.historicalPeakPriceSol = Math.max(
         position.historicalPeakPriceSol ?? position.entryPriceSol,
@@ -960,15 +961,15 @@ export class PaperTradingDaemon {
         position.lastValidPriceObservedAtMs = now;
       }
 
-      if (priceChanged || hasRecentActivity) {
+      if (priceChanged || hasTradeActivity) {
         position.lastActivityMs = now;
         position.stagnantTicksCount = 0;
       } else {
         position.stagnantTicksCount += 1;
       }
 
-      // If position has had no activity for >= 3 minutes (180,000ms), force stagnancy exit
-      if (now - position.lastActivityMs >= 180_000) {
+      // If position has had no activity for >= 3 minutes (180,000ms) AND continuous volume stagnation is established, force stagnancy exit
+      if (now - position.lastActivityMs >= 180_000 && marketContext.volumeStalled3m) {
         const exitPriceSol = marketContext.spotPriceSol;
         const finalProceedsSol = position.tokensHeld * exitPriceSol;
         this.currentCashSol += finalProceedsSol;
@@ -1022,7 +1023,18 @@ export class PaperTradingDaemon {
             drawdownElapsedMs: null,
             lpIntact: marketContext.lpIntact,
             buySellRatio60s:
-              marketContext.recentBuysCount60s / Math.max(1, marketContext.recentSellsCount60s),
+              marketContext.recentBuysCount60s === null ||
+              marketContext.recentSellsCount60s === null
+                ? null
+                : marketContext.recentSellsCount60s === 0
+                  ? marketContext.recentBuysCount60s > 0
+                    ? 999
+                    : 0
+                  : Number(
+                      (
+                        marketContext.recentBuysCount60s / marketContext.recentSellsCount60s
+                      ).toFixed(2),
+                    ),
             momentum5mBps: marketContext.momentum5mBps,
           },
           updatedState: position.ratchetState,

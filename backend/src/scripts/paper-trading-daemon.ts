@@ -42,9 +42,12 @@ import {
 } from "../candidate-scanner/BuyGateTriggerService.js";
 import {
   type CandidateFlowProvider,
+  type CandidateFlowResult,
   UnavailableCandidateFlowProvider,
   evaluateCandidateDecisionPoints,
+  validateAndSnapshotCandidateFlowResult,
 } from "../candidate-scanner/CandidateFlowProvider.js";
+import { ContinuousQuietIntervalTracker } from "../candidate-scanner/ContinuousQuietIntervalTracker.js";
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
@@ -303,15 +306,15 @@ async function fetchDexScreenerSpotInfo(
 
     if (validSolPairs.length === 0) return null;
 
-    // If expectedPoolId is provided, attempt to locate the exact tracked pool
-    let solPair = validSolPairs[0];
+    // If expectedPoolId is provided, attempt to locate the exact tracked pool without silent substitution
+    let solPair: (typeof validSolPairs)[number] | undefined;
     if (expectedPoolId) {
       const normExpected = expectedPoolId.replace(/^dexscreener-/, "");
-      const matched = validSolPairs.find(
+      solPair = validSolPairs.find(
         (p) => p.pairAddress === normExpected || p.pairAddress === expectedPoolId,
       );
-      if (matched) {
-        solPair = matched;
+      if (!solPair) {
+        return null;
       }
     } else {
       // Otherwise sort by highest USD liquidity
@@ -1202,7 +1205,7 @@ export async function run(): Promise<void> {
           try {
             let exitPrice = 0;
             try {
-              const freshSpot = await fetchDexScreenerSpotInfo(pos.mintAddress);
+              const freshSpot = await fetchDexScreenerSpotInfo(pos.mintAddress, pos.poolId);
               if (freshSpot && freshSpot.spotPriceSol > 0) {
                 exitPrice = freshSpot.spotPriceSol;
                 pos.lastValidPriceObservedAtMs = currentNow;
@@ -1258,11 +1261,13 @@ export async function run(): Promise<void> {
           }
         }),
       );
+      positionQuietTrackers.clear();
     };
 
     // Shared state between Position Ticker and Discovery Loop
     let isStandby = false;
     let minutesUntilNextWindow = 0;
+    const positionQuietTrackers = new Map<string, ContinuousQuietIntervalTracker>();
 
     // LOOP A: High-Frequency Position Monitor Ticker (every pollIntervalMs, default 1500ms)
     const runPositionMonitorTicker = async (): Promise<void> => {
@@ -1346,7 +1351,7 @@ export async function run(): Promise<void> {
           const openPosWithSpots = await Promise.all(
             snap.openPositions.map(async (pos) => {
               try {
-                const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress);
+                const spotInfo = await fetchDexScreenerSpotInfo(pos.mintAddress, pos.poolId);
                 return { pos, spotInfo };
               } catch {
                 return { pos, spotInfo: null };
@@ -1356,30 +1361,105 @@ export async function run(): Promise<void> {
 
           for (const { pos, spotInfo } of openPosWithSpots) {
             try {
+              let quietTracker = positionQuietTrackers.get(pos.positionId);
+              if (!quietTracker) {
+                quietTracker = new ContinuousQuietIntervalTracker();
+                positionQuietTrackers.set(pos.positionId, quietTracker);
+              }
+
               if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
                 // P0-B: Missing or failed price feed is an external data outage, NOT market stagnation
+                quietTracker.reset("FEED_OUTAGE");
                 daemon.recordFeedOutageTick(pos.positionId, currentNow);
                 continue;
+              }
+
+              // Obtain validated flow through existing provider seam bound to exact pool and mint
+              let validatedFlow: CandidateFlowResult;
+              if (!pos.poolId) {
+                // Legacy positions without pool identity retain unavailable flow; do not infer a replacement pool.
+                validatedFlow = validateAndSnapshotCandidateFlowResult(
+                  null,
+                  { poolAddress: "", tokenMint: pos.mintAddress },
+                  currentNow,
+                  { executionContext: "PAPER_SIMULATION" },
+                );
+              } else {
+                try {
+                  const rawFlow = activeCandidateFlowProvider.getCandidateFlow(
+                    { poolAddress: pos.poolId, tokenMint: pos.mintAddress },
+                    currentNow,
+                  );
+                  validatedFlow = validateAndSnapshotCandidateFlowResult(
+                    rawFlow,
+                    { poolAddress: pos.poolId, tokenMint: pos.mintAddress },
+                    currentNow,
+                    { executionContext: "PAPER_SIMULATION" },
+                  );
+                } catch {
+                  // Contain provider exceptions so valid price ticks still reach protective exits.
+                  validatedFlow = validateAndSnapshotCandidateFlowResult(
+                    null,
+                    { poolAddress: pos.poolId, tokenMint: pos.mintAddress },
+                    currentNow,
+                    { executionContext: "PAPER_SIMULATION" },
+                  );
+                }
               }
 
               tracker.samplePrice(pos.mintAddress, spotInfo.spotPriceSol, currentNow);
 
               const prevPrice = pos.spotPriceSol;
+              const priceChanged = Math.abs(spotInfo.spotPriceSol - prevPrice) > 1e-9;
               const singleTickDropBps =
                 prevPrice > 0
                   ? Math.round(((spotInfo.spotPriceSol - prevPrice) / prevPrice) * 10_000)
                   : 0;
 
-              const isVolumeStalled =
-                spotInfo.recentTransactionsCount === 0 ||
-                (spotInfo.recentBuys60s === 0 && spotInfo.recentSells60s === 0);
+              if (priceChanged) {
+                quietTracker.reset("PRICE_CHANGED");
+              }
+
+              if (
+                validatedFlow.isCoverageSufficient &&
+                validatedFlow.recentBuys60s !== null &&
+                validatedFlow.recentSells60s !== null
+              ) {
+                const isQuiet =
+                  validatedFlow.recentBuys60s === 0 && validatedFlow.recentSells60s === 0;
+                const windowEnd =
+                  validatedFlow.paperQualificationContext?.researchWindowSpan.windowEndMs ??
+                  currentNow;
+                const windowStart =
+                  validatedFlow.paperQualificationContext?.researchWindowSpan.windowStartMs ??
+                  currentNow - 60_000;
+                const epoch = validatedFlow.paperQualificationContext?.validatedEpoch ?? 0;
+
+                quietTracker.recordQuietWindow({
+                  poolAddress: pos.poolId ?? "",
+                  tokenMint: pos.mintAddress,
+                  connectionEpoch: epoch,
+                  windowStartMs: windowStart,
+                  windowEndMs: windowEnd,
+                  evaluationTimestampMs: currentNow,
+                  isQuiet,
+                  isCoverageSufficient: true,
+                });
+              } else {
+                // Collection gaps, outages, or stale evidence break continuity
+                quietTracker.reset("INSUFFICIENT_OR_UNAVAILABLE_FLOW");
+              }
+
+              const isVolumeStalled = quietTracker.isStagnant3m();
 
               const marketContext: MarketEvaluationContext = {
                 currentTimestampMs: currentNow,
                 spotPriceSol: spotInfo.spotPriceSol,
                 lpIntact: true,
-                recentBuysCount60s: spotInfo.recentBuys60s,
-                recentSellsCount60s: spotInfo.recentSells60s,
+                recentBuysCount60s: validatedFlow.recentBuys60s,
+                recentSellsCount60s: validatedFlow.recentSells60s,
+                isFlowSufficient: validatedFlow.isCoverageSufficient,
+                flowCoverage: validatedFlow.flowCoverage,
                 momentum5mBps: spotInfo.momentum5mBps,
                 volumeStalled3m: isVolumeStalled,
                 singleTickDropBps,
@@ -1387,6 +1467,7 @@ export async function run(): Promise<void> {
 
               const result = daemon.tickPosition(pos.positionId, marketContext, currentNow);
               if (result?.action === "SELL_ALL") {
+                positionQuietTrackers.delete(pos.positionId);
                 const timeStr = new Date(currentNow).toLocaleTimeString();
                 const usdPrice = (
                   spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
@@ -1445,8 +1526,11 @@ export async function run(): Promise<void> {
               // Phase 12.92 / Phase 12.93 Deliverable 1: Momentum-Only Scale-In Pyramiding
               // P0-06: Strict guard preventing scale-in after any partial profit milestone has triggered
               const hasViralScaleInMomentum =
-                spotInfo.recentBuys60s >= 15 &&
-                spotInfo.recentBuys60s >= 2.0 * Math.max(1, spotInfo.recentSells60s) &&
+                validatedFlow.isCoverageSufficient === true &&
+                validatedFlow.recentBuys60s !== null &&
+                validatedFlow.recentSells60s !== null &&
+                validatedFlow.recentBuys60s >= 15 &&
+                validatedFlow.recentBuys60s >= 2.0 * Math.max(1, validatedFlow.recentSells60s) &&
                 spotInfo.momentum5mBps >= 400;
 
               if (
