@@ -270,18 +270,17 @@ export class PaperReconciledCandidateFlowAdapter {
       );
     }
 
-    // 10. Assemble Validated Epoch & Structured Qualification Context
-    const validatedEpoch =
-      result.paperValidatedEpoch ??
-      (typeof (result as unknown as { historyResult?: { connectionEpoch?: number } }).historyResult
-        ?.connectionEpoch === "number"
-        ? (result as unknown as { historyResult?: { connectionEpoch?: number } }).historyResult!
-            .connectionEpoch!
-        : 0);
+    // 10. Require Evaluator's Explicit Validated Epoch
+    const validatedEpoch = result.paperValidatedEpoch;
 
-    if (!Number.isSafeInteger(validatedEpoch) || validatedEpoch < 0) {
+    if (
+      validatedEpoch === undefined ||
+      typeof validatedEpoch !== "number" ||
+      !Number.isSafeInteger(validatedEpoch) ||
+      validatedEpoch < 0
+    ) {
       return createFallback(
-        "INVALID_VALIDATED_EPOCH: Validated epoch must be a non-negative integer",
+        `INVALID_VALIDATED_EPOCH: Reconciliation result must contain a valid non-negative integer paperValidatedEpoch (received ${String(validatedEpoch)})`,
       );
     }
 

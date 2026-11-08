@@ -1498,7 +1498,7 @@ Quiet-window qualification is governed by strict, fail-closed conditions:
    - Snapshots nested policy options before any awaits or asynchronous operations so caller mutation cannot alter authorization.
 2. **Identity & Epoch Binding**:
    - Exact candidate pool and token mint identity binding (`VALID_POOL_CONTEXT`). Identity mismatches fail closed with `IDENTITY_MISMATCH`.
-   - Evidence receipts are strictly bound to expected operation epoch (`connectionEpoch === expectedConnectionEpoch`). Receipts with negative, non-integer, or mismatched epochs fail closed to `IDENTITY_MISMATCH`.
+   - Evidence receipts are strictly bound to expected operation epoch (`connectionEpoch === expectedConnectionEpoch`). A valid non-negative safe-integer `expectedConnectionEpoch` is mandatory for quiet qualification; missing, invalid, or mismatched epochs fail closed to `IDENTITY_MISMATCH` with counts unavailable.
 3. **Temporal Invariants & Freshness**:
    - Observation duration must span the 60-second window ($T_{\text{obs\_end}} \ge T_{\text{cutoff}}$ and $T_{\text{obs\_start}} \le T_{\text{cutoff}} - 60\text{s}$).
    - Source cutoff age must not exceed 15,000 ms ($\Delta t_{\text{cutoffAge}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$). Older cutoffs fail closed with `STALE_DATA`.
@@ -1535,6 +1535,7 @@ To consume qualified quiet windows in PAPER simulation without modifying product
 - **Authorized Qualification & Provenance Retention**:
   - Strictly requires `paperQuietStreamQualified === true`, non-empty `paperQualificationReason`, status `RECONCILED`, and coverage `SUFFICIENT`.
   - Rejects contradictory flow counts (strictly requires `recentBuys60s === 0`, `recentSells60s === 0`, `flowRatio === 1.0`).
+  - Strictly requires the evaluator's explicit `paperValidatedEpoch` (non-negative safe integer, preserving genuine epoch zero) without fallback to ad hoc history properties or default zeros.
   - Preserves complete structured qualification context (`paperQualificationContext`) in both `CandidateFlowResult` and `RetestSpotInfo` outputs:
     `executionContext`, `validatedEpoch`, `originalEvaluationTimestampMs`, `researchWindowSpan`, `cutoffAgeMs`, `qualificationReason`, `providerAssumptions`, and `unresolvedUncertainties`.
 - **Honest Time-Basis Notice**:

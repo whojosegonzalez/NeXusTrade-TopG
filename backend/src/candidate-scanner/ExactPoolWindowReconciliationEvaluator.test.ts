@@ -1498,10 +1498,11 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       anchorWitnessed?: boolean;
       discoveredSignatures?: readonly HistorySignatureRecord[];
       candidatePoolId?: string;
+      connectionEpoch?: number;
     }): HistoryEnumerationResult => ({
       outcome: options?.outcome ?? "ANCHOR_WITNESSED",
       candidatePoolId: options?.candidatePoolId ?? CANONICAL_POOL_ID,
-      connectionEpoch: 0,
+      connectionEpoch: options?.connectionEpoch ?? 0,
       anchorWitnessed: options?.anchorWitnessed ?? true,
       knownAnchorSignature: "Anchor000",
       anchorRecord: { signature: "Anchor000", slot: 280_000_000, err: null, blockTime: 1 },
@@ -1521,6 +1522,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: createQuietHistoryResult(),
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1535,6 +1537,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.flowCounts.recentSells60s).toBe(0);
       expect(result.flowCounts.flowRatio).toBe(1.0);
       expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(0);
       expect(result.paperQualificationReason).toContain("PAPER_QUIET_STREAM_QUALIFIED");
       expect(result.paperQualificationReason).toContain("0 buys, 0 sells in 60s window");
     });
@@ -1548,6 +1551,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: createQuietHistoryResult(),
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1559,6 +1563,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.status).toBe("RECONCILED");
       expect(result.flowCoverage).toBe("SUFFICIENT");
       expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(0);
     });
 
     it("fails closed to STREAM_GAP when paperQuietStreamPolicy is omitted (default behavior)", () => {
@@ -1724,6 +1729,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: nonQuietHistoryResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1755,6 +1761,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: unwitnessedHistoryResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1781,6 +1788,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: mismatchHistoryResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1855,6 +1863,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: invalidEpochResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1881,6 +1890,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: missingAnchorRecordResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1915,6 +1925,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: postWindowAnchorResult,
         budgetManager,
         paperQuietStreamPolicy: {
@@ -1940,6 +1951,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         recordedGaps: [
           {
             gapStartMs: 20_000,
@@ -1978,6 +1990,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: createQuietHistoryResult(),
         budgetManager,
         paperQuietStreamPolicy: {
@@ -2008,6 +2021,7 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
         observationEndMs: 65_000,
         sourceCutoff: validCutoff,
         tracker,
+        expectedConnectionEpoch: 0,
         historyResult: createQuietHistoryResult(),
         budgetManager,
         paperQuietStreamPolicy: mutablePolicy,
@@ -2015,11 +2029,158 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
 
       expect(result.status).toBe("RECONCILED");
       expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(0);
 
       // Mutate policy after call
       mutablePolicy.enabled = false;
       // Result was frozen and unaffected
       expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(0);
+    });
+
+    it("fails closed to IDENTITY_MISMATCH when expectedConnectionEpoch is missing under paperQuietStreamPolicy", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        // expectedConnectionEpoch intentionally omitted
+        historyResult: createQuietHistoryResult({ connectionEpoch: 0 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("IDENTITY_MISMATCH");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.flowCounts.recentBuys60s).toBeNull();
+      expect(result.flowCounts.recentSells60s).toBeNull();
+      expect(result.diagnosticReason).toContain(
+        "requires a valid non-negative integer expectedConnectionEpoch",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to IDENTITY_MISMATCH when expectedConnectionEpoch is negative or non-integer under paperQuietStreamPolicy", () => {
+      const tracker = createQuietTracker();
+      const negativeResult = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: -1,
+        historyResult: createQuietHistoryResult({ connectionEpoch: 0 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(negativeResult.status).toBe("IDENTITY_MISMATCH");
+      expect(negativeResult.flowCoverage).toBe("COLLECTION_GAP");
+      expect(negativeResult.paperQuietStreamQualified).toBe(false);
+
+      const nonIntegerResult = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: 1.5,
+        historyResult: createQuietHistoryResult({ connectionEpoch: 1 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(nonIntegerResult.status).toBe("IDENTITY_MISMATCH");
+      expect(nonIntegerResult.flowCoverage).toBe("COLLECTION_GAP");
+      expect(nonIntegerResult.paperQuietStreamQualified).toBe(false);
+
+      const nanResult = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: NaN,
+        historyResult: createQuietHistoryResult({ connectionEpoch: 0 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(nanResult.status).toBe("IDENTITY_MISMATCH");
+      expect(nanResult.flowCoverage).toBe("COLLECTION_GAP");
+      expect(nanResult.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("qualifies quiet stream with matching zero epoch (epoch 0 control)", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: 0,
+        historyResult: createQuietHistoryResult({ connectionEpoch: 0 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(0);
+      expect(result.flowCounts.recentBuys60s).toBe(0);
+      expect(result.flowCounts.recentSells60s).toBe(0);
+      expect(result.flowCounts.flowRatio).toBe(1.0);
+    });
+
+    it("qualifies quiet stream with matching nonzero epoch (epoch 3 control)", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        expectedConnectionEpoch: 3,
+        historyResult: createQuietHistoryResult({ connectionEpoch: 3 }),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperValidatedEpoch).toBe(3);
+      expect(result.flowCounts.recentBuys60s).toBe(0);
+      expect(result.flowCounts.recentSells60s).toBe(0);
+      expect(result.flowCounts.flowRatio).toBe(1.0);
     });
 
     it("preserves windowSignaturesCount as null on early exit before counting stage", () => {

@@ -85,6 +85,7 @@ describe("PaperReconciledCandidateFlowAdapter", () => {
     paperQuietStreamQualified: true,
     paperQualificationReason:
       "PAPER_QUIET_STREAM_QUALIFIED: zero stream notifications confirmed by complete RPC enumeration",
+    paperValidatedEpoch: 0,
     ...overrides,
   });
 
@@ -532,5 +533,134 @@ describe("PaperReconciledCandidateFlowAdapter", () => {
     expect(spotInfo.paperQualificationContext?.qualificationReason).toBe(
       "PAPER_QUIET_STREAM_QUALIFIED: verified 0/0 activity",
     );
+  });
+
+  // Validated Epoch Boundaries
+  it("fails closed with INVALID_VALIDATED_EPOCH when paperValidatedEpoch is missing", () => {
+    const missingEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: undefined,
+    });
+
+    const flowResult = adapter.convertCandidateFlow(
+      missingEpochResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+
+    expect(flowResult.isCoverageSufficient).toBe(false);
+    expect(flowResult.flowCoverage).toBe("COLLECTION_GAP");
+    expect(flowResult.recentBuys60s).toBeNull();
+    expect(flowResult.recentSells60s).toBeNull();
+    expect(flowResult.diagnosticReason).toContain("INVALID_VALIDATED_EPOCH");
+    expect(flowResult.paperQualificationContext).toBeUndefined();
+
+    const baseSpot = { spotPriceSol: 0.005, spotPriceUsd: 1.25, liquidityUsd: 45_000 };
+    const spotInfo = adapter.convertRetestSpotInfo(
+      missingEpochResult,
+      baseSpot,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(spotInfo.isPaperQualified).toBe(false);
+    expect(spotInfo.paperQualificationContext).toBeUndefined();
+  });
+
+  it("fails closed with INVALID_VALIDATED_EPOCH when paperValidatedEpoch is negative, non-integer, or NaN", () => {
+    // Negative
+    const negEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: -1,
+    });
+    const negRes = adapter.convertCandidateFlow(
+      negEpochResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(negRes.isCoverageSufficient).toBe(false);
+    expect(negRes.diagnosticReason).toContain("INVALID_VALIDATED_EPOCH");
+
+    // Non-integer
+    const floatEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: 2.5,
+    });
+    const floatRes = adapter.convertCandidateFlow(
+      floatEpochResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(floatRes.isCoverageSufficient).toBe(false);
+    expect(floatRes.diagnosticReason).toContain("INVALID_VALIDATED_EPOCH");
+
+    // NaN
+    const nanEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: NaN,
+    });
+    const nanRes = adapter.convertCandidateFlow(
+      nanEpochResult,
+      validTarget,
+      BASE_TIME + 2_000,
+      paperOptions,
+    );
+    expect(nanRes.isCoverageSufficient).toBe(false);
+    expect(nanRes.diagnosticReason).toContain("INVALID_VALIDATED_EPOCH");
+  });
+
+  it("successfully converts with genuine epoch zero control and retains validatedEpoch: 0 on both outputs", () => {
+    const zeroEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: 0,
+    });
+    const evalTime = BASE_TIME + 2_000;
+
+    const flowResult = adapter.convertCandidateFlow(
+      zeroEpochResult,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+    expect(flowResult.isCoverageSufficient).toBe(true);
+    expect(flowResult.isPaperQualified).toBe(true);
+    expect(flowResult.paperQualificationContext?.validatedEpoch).toBe(0);
+
+    const baseSpot = { spotPriceSol: 0.005, spotPriceUsd: 1.25, liquidityUsd: 45_000 };
+    const spotInfo = adapter.convertRetestSpotInfo(
+      zeroEpochResult,
+      baseSpot,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+    expect(spotInfo.isPaperQualified).toBe(true);
+    expect(spotInfo.paperQualificationContext?.validatedEpoch).toBe(0);
+  });
+
+  it("successfully converts with matching nonzero epoch control and retains validatedEpoch: 4 on both outputs", () => {
+    const nonzeroEpochResult = createQualifiedQuietResult({
+      paperValidatedEpoch: 4,
+    });
+    const evalTime = BASE_TIME + 2_000;
+
+    const flowResult = adapter.convertCandidateFlow(
+      nonzeroEpochResult,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+    expect(flowResult.isCoverageSufficient).toBe(true);
+    expect(flowResult.isPaperQualified).toBe(true);
+    expect(flowResult.paperQualificationContext?.validatedEpoch).toBe(4);
+
+    const baseSpot = { spotPriceSol: 0.005, spotPriceUsd: 1.25, liquidityUsd: 45_000 };
+    const spotInfo = adapter.convertRetestSpotInfo(
+      nonzeroEpochResult,
+      baseSpot,
+      validTarget,
+      evalTime,
+      paperOptions,
+    );
+    expect(spotInfo.isPaperQualified).toBe(true);
+    expect(spotInfo.paperQualificationContext?.validatedEpoch).toBe(4);
   });
 });

@@ -1212,6 +1212,60 @@ export function evaluateExactPoolWindowReconciliation(
     );
   }
 
+  if (pendingGeneratedInactivityGap !== null) {
+    if (
+      options.expectedConnectionEpoch === undefined ||
+      typeof options.expectedConnectionEpoch !== "number" ||
+      !Number.isSafeInteger(options.expectedConnectionEpoch) ||
+      options.expectedConnectionEpoch < 0
+    ) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        `IDENTITY_MISMATCH: PAPER quiet stream qualification requires a valid non-negative integer expectedConnectionEpoch (received ${String(options.expectedConnectionEpoch)})`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+
+    if (
+      options.historyResult?.connectionEpoch === undefined ||
+      typeof options.historyResult.connectionEpoch !== "number" ||
+      !Number.isSafeInteger(options.historyResult.connectionEpoch) ||
+      options.historyResult.connectionEpoch < 0
+    ) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        "IDENTITY_MISMATCH: PAPER quiet stream qualification requires historyResult with a valid non-negative connectionEpoch",
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+
+    if (options.historyResult.connectionEpoch !== options.expectedConnectionEpoch) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        `IDENTITY_MISMATCH: History connectionEpoch (${options.historyResult.connectionEpoch}) does not match expected operation epoch (${options.expectedConnectionEpoch})`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+
+    if (
+      options.resolutionResult &&
+      (options.resolutionResult.connectionEpoch === undefined ||
+        typeof options.resolutionResult.connectionEpoch !== "number" ||
+        !Number.isSafeInteger(options.resolutionResult.connectionEpoch) ||
+        options.resolutionResult.connectionEpoch < 0)
+    ) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        "IDENTITY_MISMATCH: PAPER quiet stream qualification requires resolutionResult with a valid non-negative connectionEpoch",
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+  }
+
   if (
     options.expectedConnectionEpoch !== undefined &&
     options.historyResult?.connectionEpoch !== undefined &&
@@ -1236,21 +1290,6 @@ export function evaluateExactPoolWindowReconciliation(
       `IDENTITY_MISMATCH: Resolution connectionEpoch (${options.resolutionResult.connectionEpoch}) does not match expected operation epoch (${options.expectedConnectionEpoch})`,
       { windowStartMs, windowEndMs, evidenceAgeMs },
     );
-  }
-
-  if (pendingGeneratedInactivityGap !== null) {
-    if (
-      options.historyResult?.connectionEpoch === undefined ||
-      !Number.isSafeInteger(options.historyResult.connectionEpoch) ||
-      options.historyResult.connectionEpoch < 0
-    ) {
-      return buildResult(
-        "IDENTITY_MISMATCH",
-        "COLLECTION_GAP",
-        "IDENTITY_MISMATCH: PAPER quiet stream qualification requires historyResult with a valid non-negative connectionEpoch",
-        { windowStartMs, windowEndMs, evidenceAgeMs },
-      );
-    }
   }
 
   if (
@@ -1628,8 +1667,7 @@ export function evaluateExactPoolWindowReconciliation(
       );
     }
 
-    const validatedEpoch =
-      options.historyResult?.connectionEpoch ?? options.expectedConnectionEpoch ?? 0;
+    const validatedEpoch = options.expectedConnectionEpoch;
 
     const paperQualificationReason =
       "PAPER_QUIET_STREAM_QUALIFIED: zero stream notifications confirmed by complete RPC enumeration witnessing prior anchor under declared provider-relative assumptions (0 buys, 0 sells in 60s window)";
