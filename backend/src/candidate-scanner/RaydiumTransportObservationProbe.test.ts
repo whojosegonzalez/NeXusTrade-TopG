@@ -4368,6 +4368,181 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(mockTransport.isClosed).toBe(true);
         expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
       });
+
+      it("cancels hanging bootstrap headers automatically at overall deadline without caller abort", async () => {
+        const mockTransport = new MockWebSocketTransport();
+        const fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+
+        // Bootstrap query hangs indefinitely on headers until aborted
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.method === "getSignaturesForAddress" && parsed.params?.[1]?.limit === 1) {
+            return new Promise<Response>((_, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => {
+                  const err = new Error("Operation aborted");
+                  err.name = "AbortError";
+                  reject(err);
+                },
+                { once: true },
+              );
+            });
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const testStartTime = Date.now();
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 80,
+          clock,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const elapsedRealMs = Date.now() - testStartTime;
+
+        expect(elapsedRealMs).toBeGreaterThanOrEqual(65);
+        expect(elapsedRealMs).toBeLessThan(350);
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.metadata.terminationReason).toBe("DURATION_EXPIRED");
+        expect(mockTransport.isClosed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult?.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
+          true,
+        );
+      });
+
+      it("cancels hanging bootstrap response body automatically at overall deadline without caller abort", async () => {
+        const mockTransport = new MockWebSocketTransport();
+        const fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+
+        // Headers return immediately, but response body ReadableStream stalls indefinitely
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.method === "getSignaturesForAddress" && parsed.params?.[1]?.limit === 1) {
+            const hangingStream = new ReadableStream<Uint8Array>({
+              start() {
+                // Never enqueues any chunks or closes
+              },
+            });
+            return new Response(hangingStream, {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const testStartTime = Date.now();
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 80,
+          clock,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const elapsedRealMs = Date.now() - testStartTime;
+
+        expect(elapsedRealMs).toBeGreaterThanOrEqual(65);
+        expect(elapsedRealMs).toBeLessThan(350);
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.metadata.terminationReason).toBe("DURATION_EXPIRED");
+        expect(mockTransport.isClosed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult?.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
+          true,
+        );
+      });
+
+      it("enforces absolute deadline when slow successful bootstrap consumes existing overall allowance", async () => {
+        const mockTransport = new MockWebSocketTransport();
+        const startEpoch = 1_700_000_000_000;
+        let fakeNow = startEpoch;
+        const clock = () => fakeNow;
+        const baseEpochSec = Math.floor(startEpoch / 1000);
+
+        // Bootstrap takes 50ms of a 70ms overall duration, then returns valid anchor
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.method === "getSignaturesForAddress" && parsed.params?.[1]?.limit === 1) {
+            await new Promise((r) => setTimeout(r, 50));
+            fakeNow += 50;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_ANCHOR,
+                    slot: 280_000_000,
+                    blockTime: baseEpochSec - 100,
+                    err: null,
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const testStartTime = Date.now();
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 70, // Total 70ms duration
+          clock,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const elapsedRealMs = Date.now() - testStartTime;
+
+        // Total elapsed time must be bounded by original duration (~70-130ms, NOT restarted to 140ms+)
+        expect(elapsedRealMs).toBeGreaterThanOrEqual(55);
+        expect(elapsedRealMs).toBeLessThan(250);
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.metadata.terminationReason).toBe("DURATION_EXPIRED");
+        expect(mockTransport.isClosed).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+      });
     });
   });
 });

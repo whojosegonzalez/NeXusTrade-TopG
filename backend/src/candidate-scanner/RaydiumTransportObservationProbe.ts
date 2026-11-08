@@ -2000,7 +2000,9 @@ export async function executeTransportObservationProbe(
   let isIntentionalClosure = false;
   let isStreamingActive = true;
   let probeActive = true;
+  let overallTimer: ReturnType<typeof setTimeout> | undefined;
 
+  let baseTransport: ISolanaWebSocketTransport | undefined;
   let meteredTransport: MeteredWebSocketTransport | undefined;
   let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
   let removeCallerSignalListener: (() => void) | undefined;
@@ -2090,6 +2092,10 @@ export async function executeTransportObservationProbe(
     isProbeTerminated = true;
     probeActive = false;
     isIntentionalClosure = true;
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = undefined;
+    }
     cleanupKeepalive();
     if (reason !== "TRANSPORT_ERROR" && reason !== "TRANSPORT_DISCONNECT") {
       transportDiagnostics.intentionalShutdownInitiated = true;
@@ -2145,1063 +2151,1056 @@ export async function executeTransportObservationProbe(
     }
   }
 
-  // 7. Bounded HTTP Transport Wrapper
-  const boundedFetch = createBoundedFetchTransport(
-    config.fetchTransport ?? globalThis.fetch,
-    maxPayloadBytes,
-  );
+  // Arm overall-duration enforcement before transport startup and the first bootstrap/network await
+  if (!isProbeTerminated && !overallAbortController.signal.aborted) {
+    overallTimer = setTimeout(
+      () => {
+        terminateProbe("DURATION_EXPIRED", "Probe duration expired");
+      },
+      Math.max(1, durationMs),
+    );
+  }
 
-  // 8. Components Setup
-  const sleepFn =
-    config.sleepFn ??
-    (async (ms: number, signal?: AbortSignal) => {
-      await sleepWithSignal(ms, signal);
+  try {
+    // 7. Bounded HTTP Transport Wrapper
+    const boundedFetch = createBoundedFetchTransport(
+      config.fetchTransport ?? globalThis.fetch,
+      maxPayloadBytes,
+    );
+
+    // 8. Components Setup
+    const sleepFn =
+      config.sleepFn ??
+      (async (ms: number, signal?: AbortSignal) => {
+        await sleepWithSignal(ms, signal);
+      });
+
+    const tracker = new RollingTradeFlowTracker({
+      poolId: poolContext.poolId,
+      tokenMint: poolContext.candidateTokenMint,
+      ...(config.observationStartMs !== undefined
+        ? { trackingStartedMs: config.observationStartMs }
+        : {}),
+      clock,
     });
 
-  const tracker = new RollingTradeFlowTracker({
-    poolId: poolContext.poolId,
-    tokenMint: poolContext.candidateTokenMint,
-    ...(config.observationStartMs !== undefined
-      ? { trackingStartedMs: config.observationStartMs }
-      : {}),
-    clock,
-  });
-
-  if (config.observationStartMs !== undefined && config.observationStartMs < startTime) {
-    for (let t = config.observationStartMs; t < startTime; t += 10_000) {
-      tracker.recordHeartbeat(t);
-    }
-    tracker.recordHeartbeat(startTime);
-  }
-
-  const adapter = new RaydiumAmmV4TransactionSourceAdapter({
-    poolContext,
-    rpcUrl,
-    budgetManager: budget,
-    transport: boundedFetch,
-    pacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
-    maxPendingQueueSize: maxQueueDepth,
-    commitment: "confirmed",
-    maxSupportedTransactionVersion: 1,
-    tracker,
-    sleepFn: (ms) => sleepFn(ms),
-    clock,
-  });
-
-  // Track witnessed signatures
-  interface WsSignatureRecord {
-    readonly signature: string;
-    readonly receivedEpochMs: number;
-    readonly slot: number;
-  }
-  const wsWitnessedList: WsSignatureRecord[] = [];
-  const wsWitnessedSignatures = new Set<string>();
-
-  let peakQueueDepth = 0;
-  let queueLimitExceeded = false;
-  let queueRejectionsCount = 0;
-  let transactionRetrievalsSucceeded = 0;
-  let decodedSwapsCount = 0;
-  let nullBlockTimeCount = 0;
-  const sampledTransactionAudits: TransactionSourceDiagnostics[] = [];
-  const historyQueryAudits: HistoryQueryAuditRecord[] = [];
-  let historyQueriesAttempted = 0;
-  let historyRecordsDiscovered = 0;
-  let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
-    ? "NOT_ATTEMPTED_TRANSPORT_ONLY"
-    : "NOT_ATTEMPTED";
-  let historyDiscoveryDurationMs: number | null = null;
-  let anchorWitnessed = false;
-  let anchorSignature: string | null = null;
-  let anchorSlot: number | null = null;
-  let anchorBlockTime: number | null = null;
-  const historyWitnessedList: { signature: string; slot: number; blockTime: number | null }[] = [];
-  const historyWitnessedSignatures = new Set<string>();
-  const fetchedHistoryRecords = new Map<string, HistorySignatureRecord>();
-
-  const pageFetcher: HistoryPageFetcher = {
-    fetchPage: async (
-      params: HistoryPageQueryParams,
-    ): Promise<readonly HistorySignatureRecord[]> => {
-      if (historyQueriesAttempted >= maxHistoryQueries) {
-        throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
+    if (config.observationStartMs !== undefined && config.observationStartMs < startTime) {
+      for (let t = config.observationStartMs; t < startTime; t += 10_000) {
+        tracker.recordHeartbeat(t);
       }
-      historyQueriesAttempted++;
+      tracker.recordHeartbeat(startTime);
+    }
 
-      if (config.historyPageFetcher) {
+    const adapter = new RaydiumAmmV4TransactionSourceAdapter({
+      poolContext,
+      rpcUrl,
+      budgetManager: budget,
+      transport: boundedFetch,
+      pacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
+      maxPendingQueueSize: maxQueueDepth,
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 1,
+      tracker,
+      sleepFn: (ms) => sleepFn(ms),
+      clock,
+    });
+
+    // Track witnessed signatures
+    interface WsSignatureRecord {
+      readonly signature: string;
+      readonly receivedEpochMs: number;
+      readonly slot: number;
+    }
+    const wsWitnessedList: WsSignatureRecord[] = [];
+    const wsWitnessedSignatures = new Set<string>();
+
+    let peakQueueDepth = 0;
+    let queueLimitExceeded = false;
+    let queueRejectionsCount = 0;
+    let transactionRetrievalsSucceeded = 0;
+    let decodedSwapsCount = 0;
+    let nullBlockTimeCount = 0;
+    const sampledTransactionAudits: TransactionSourceDiagnostics[] = [];
+    const historyQueryAudits: HistoryQueryAuditRecord[] = [];
+    let historyQueriesAttempted = 0;
+    let historyRecordsDiscovered = 0;
+    let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
+      ? "NOT_ATTEMPTED_TRANSPORT_ONLY"
+      : "NOT_ATTEMPTED";
+    let historyDiscoveryDurationMs: number | null = null;
+    let anchorWitnessed = false;
+    let anchorSignature: string | null = null;
+    let anchorSlot: number | null = null;
+    let anchorBlockTime: number | null = null;
+    const historyWitnessedList: { signature: string; slot: number; blockTime: number | null }[] =
+      [];
+    const historyWitnessedSignatures = new Set<string>();
+    const fetchedHistoryRecords = new Map<string, HistorySignatureRecord>();
+
+    const pageFetcher: HistoryPageFetcher = {
+      fetchPage: async (
+        params: HistoryPageQueryParams,
+      ): Promise<readonly HistorySignatureRecord[]> => {
+        if (
+          overallAbortController.signal.aborted ||
+          clock() >= overallDeadlineEpoch ||
+          params.signal?.aborted
+        ) {
+          throw new Error("OPERATION_CANCELLED: Probe duration expired or operation cancelled");
+        }
+        if (historyQueriesAttempted >= maxHistoryQueries) {
+          throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
+        }
+        historyQueriesAttempted++;
+
+        if (config.historyPageFetcher) {
+          const reqSent = clock();
+          let recordsDiscovered = 0;
+          let auditError: string | undefined;
+          try {
+            const records = await config.historyPageFetcher.fetchPage(params);
+            if (overallAbortController.signal.aborted || clock() >= overallDeadlineEpoch) {
+              throw new Error("OPERATION_CANCELLED: Late response arrived after deadline expiry");
+            }
+            recordsDiscovered = records.length;
+            for (const r of records) {
+              fetchedHistoryRecords.set(r.signature, r);
+            }
+            return records;
+          } catch (err: unknown) {
+            auditError = err instanceof Error ? err.message : String(err);
+            throw err;
+          } finally {
+            const reqEnd = clock();
+            historyQueryAudits.push({
+              pageIndex: historyQueriesAttempted,
+              address: params.address,
+              limit: params.limit,
+              ...(params.before ? { before: params.before } : {}),
+              requestSentAtMs: reqSent,
+              headersReceivedAtMs: reqEnd,
+              responseReceivedAtMs: reqEnd,
+              durationMs: reqEnd - reqSent,
+              httpStatus: auditError ? null : 200,
+              responseSha256: null,
+              recordsDiscovered,
+              ...(auditError ? { error: auditError } : {}),
+            });
+          }
+        }
+
         const reqSent = clock();
+        let headersReceivedAtMs: number | undefined;
+        let responseReceivedAtMs: number | null = null;
+        let httpStatus: number | null = null;
+        let responseSha256: string | null = null;
         let recordsDiscovered = 0;
         let auditError: string | undefined;
+
         try {
-          const records = await config.historyPageFetcher.fetchPage(params);
+          if (
+            overallAbortController.signal.aborted ||
+            clock() >= overallDeadlineEpoch ||
+            params.signal?.aborted
+          ) {
+            throw new Error("OPERATION_CANCELLED: Probe duration expired or operation cancelled");
+          }
+          const body = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getSignaturesForAddress",
+            params: [
+              params.address,
+              {
+                limit: params.limit,
+                before: params.before,
+                commitment: "confirmed",
+              },
+            ],
+          });
+
+          const resp = await boundedFetch(rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            ...(params.signal ? { signal: params.signal } : {}),
+          });
+
+          headersReceivedAtMs = clock();
+          httpStatus = resp.status;
+
+          if (overallAbortController.signal.aborted || clock() >= overallDeadlineEpoch) {
+            throw new Error(
+              "OPERATION_CANCELLED: Late response headers arrived after deadline expiry",
+            );
+          }
+
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+          }
+
+          const rawText = await resp.text();
+          responseReceivedAtMs = clock();
+          responseSha256 = computeSha256(rawText);
+
+          if (overallAbortController.signal.aborted || clock() >= overallDeadlineEpoch) {
+            throw new Error(
+              "OPERATION_CANCELLED: Late response body arrived after deadline expiry",
+            );
+          }
+
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(rawText);
+          } catch {
+            throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
+          }
+
+          if (!parsedJson || typeof parsedJson !== "object") {
+            throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
+          }
+
+          const rpcObj = parsedJson as {
+            jsonrpc?: unknown;
+            error?: { code?: unknown; message?: unknown };
+            result?: unknown;
+          };
+
+          if (rpcObj.error) {
+            const msg =
+              typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
+            throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
+          }
+
+          if (!Array.isArray(rpcObj.result)) {
+            throw new Error(
+              "MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress",
+            );
+          }
+
+          const records = rpcObj.result as HistorySignatureRecord[];
           recordsDiscovered = records.length;
           for (const r of records) {
             fetchedHistoryRecords.set(r.signature, r);
           }
+
           return records;
         } catch (err: unknown) {
           auditError = err instanceof Error ? err.message : String(err);
           throw err;
         } finally {
-          const reqEnd = clock();
+          const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
           historyQueryAudits.push({
             pageIndex: historyQueriesAttempted,
             address: params.address,
             limit: params.limit,
             ...(params.before ? { before: params.before } : {}),
             requestSentAtMs: reqSent,
-            headersReceivedAtMs: reqEnd,
-            responseReceivedAtMs: reqEnd,
-            durationMs: reqEnd - reqSent,
-            httpStatus: auditError ? null : 200,
-            responseSha256: null,
+            ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+            responseReceivedAtMs,
+            durationMs: durationEnd - reqSent,
+            httpStatus,
+            responseSha256,
             recordsDiscovered,
             ...(auditError ? { error: auditError } : {}),
           });
         }
-      }
-
-      const reqSent = clock();
-      let headersReceivedAtMs: number | undefined;
-      let responseReceivedAtMs: number | null = null;
-      let httpStatus: number | null = null;
-      let responseSha256: string | null = null;
-      let recordsDiscovered = 0;
-      let auditError: string | undefined;
-
-      try {
-        const body = JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignaturesForAddress",
-          params: [
-            params.address,
-            {
-              limit: params.limit,
-              before: params.before,
-              commitment: "confirmed",
-            },
-          ],
-        });
-
-        const resp = await boundedFetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          ...(params.signal ? { signal: params.signal } : {}),
-        });
-
-        headersReceivedAtMs = clock();
-        httpStatus = resp.status;
-
-        if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-        }
-
-        const rawText = await resp.text();
-        responseReceivedAtMs = clock();
-        responseSha256 = computeSha256(rawText);
-
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(rawText);
-        } catch {
-          throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
-        }
-
-        if (!parsedJson || typeof parsedJson !== "object") {
-          throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
-        }
-
-        const rpcObj = parsedJson as {
-          jsonrpc?: unknown;
-          error?: { code?: unknown; message?: unknown };
-          result?: unknown;
-        };
-
-        if (rpcObj.error) {
-          const msg =
-            typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
-          throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
-        }
-
-        if (!Array.isArray(rpcObj.result)) {
-          throw new Error("MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress");
-        }
-
-        const records = rpcObj.result as HistorySignatureRecord[];
-        recordsDiscovered = records.length;
-        for (const r of records) {
-          fetchedHistoryRecords.set(r.signature, r);
-        }
-
-        return records;
-      } catch (err: unknown) {
-        auditError = err instanceof Error ? err.message : String(err);
-        throw err;
-      } finally {
-        const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
-        historyQueryAudits.push({
-          pageIndex: historyQueriesAttempted,
-          address: params.address,
-          limit: params.limit,
-          ...(params.before ? { before: params.before } : {}),
-          requestSentAtMs: reqSent,
-          ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
-          responseReceivedAtMs,
-          durationMs: durationEnd - reqSent,
-          httpStatus,
-          responseSha256,
-          recordsDiscovered,
-          ...(auditError ? { error: auditError } : {}),
-        });
-      }
-    },
-  };
-
-  let actualSubscribedObservationStartMs: number | null = null;
-  let bootstrapAnchorRecord: HistorySignatureRecord | null = null;
-  let bootstrapAnchorSignature: string | null = config.knownAnchorSignature ?? null;
-
-  // Underlying WebSocket Transport
-  let baseTransport: ISolanaWebSocketTransport | undefined;
-  if (!isProbeTerminated && !overallAbortController.signal.aborted) {
-    baseTransport =
-      config.transport ??
-      (transportType === "ws"
-        ? new WsWebSocketTransport(wsUrl)
-        : new NativeWebSocketTransport(wsUrl));
-
-    let underlyingWs: unknown = undefined;
-    if (
-      baseTransport &&
-      "getUnderlyingSocket" in baseTransport &&
-      typeof (baseTransport as { getUnderlyingSocket?: unknown }).getUnderlyingSocket === "function"
-    ) {
-      underlyingWs = (
-        baseTransport as { getUnderlyingSocket: () => unknown }
-      ).getUnderlyingSocket();
-    }
-
-    if (underlyingWs && typeof diagnostics_channel !== "undefined") {
-      try {
-        const pingChannel = diagnostics_channel.channel("undici:websocket:ping");
-        const pongChannel = diagnostics_channel.channel("undici:websocket:pong");
-
-        const onPing = (msg: unknown) => {
-          if (
-            msg &&
-            typeof msg === "object" &&
-            (msg as { websocket?: unknown }).websocket === underlyingWs
-          ) {
-            transportDiagnostics.serverPingsReceivedCount++;
-            transportDiagnostics.lastServerPingReceivedAtMs = clock();
-          }
-        };
-
-        const onPong = (msg: unknown) => {
-          if (
-            msg &&
-            typeof msg === "object" &&
-            (msg as { websocket?: unknown }).websocket === underlyingWs
-          ) {
-            transportDiagnostics.serverPongsReceivedCount++;
-            transportDiagnostics.lastServerPongReceivedAtMs = clock();
-          }
-        };
-
-        pingChannel.subscribe(onPing);
-        pongChannel.subscribe(onPong);
-
-        cleanupDiagnosticsChannel = () => {
-          try {
-            pingChannel.unsubscribe(onPing);
-          } catch {
-            // ignore
-          }
-          try {
-            pongChannel.unsubscribe(onPong);
-          } catch {
-            // ignore
-          }
-        };
-      } catch {
-        // ignore diagnostics channel errors
-      }
-    }
-
-    meteredTransport = new MeteredWebSocketTransport(
-      baseTransport,
-      maxPayloadBytes,
-      (count, bytes, _byteLen, _data, isOversized) => {
-        if (isOversized && probeActive) {
-          terminateProbe("PAYLOAD_LIMIT_REACHED", "Application payload byte budget reached");
-        }
-        if (count >= maxMessages && probeActive) {
-          terminateProbe("MESSAGE_LIMIT_REACHED", "Inbound message budget reached");
-        }
       },
-    );
-
-    coordinator = new RaydiumCandidateSubscriptionCoordinator({
-      poolContext,
-      adapter,
-      tracker,
-      transport: meteredTransport,
-      commitment,
-      clock,
-      maxNotificationsBudget: maxMessages,
-      allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
-    });
-
-    const checkControlTrafficCeiling = () => {
-      const totalControlFrames =
-        transportDiagnostics.controlFramesSentCount +
-        transportDiagnostics.controlFramesReceivedCount;
-      const totalControlPayloadBytes =
-        transportDiagnostics.controlFramePayloadBytesSent +
-        transportDiagnostics.controlFramePayloadBytesReceived;
-
-      if (totalControlFrames >= maxControlFrames) {
-        if (!isProbeTerminated && probeActive) {
-          terminateProbe(
-            "CONTROL_LIMIT_REACHED",
-            `Control frame message budget reached: ${totalControlFrames} >= ${maxControlFrames}`,
-          );
-        }
-      } else if (totalControlPayloadBytes >= maxControlFrameBytes) {
-        if (!isProbeTerminated && probeActive) {
-          terminateProbe(
-            "CONTROL_LIMIT_REACHED",
-            `Control frame payload byte budget reached: ${totalControlPayloadBytes} >= ${maxControlFrameBytes}`,
-          );
-        }
-      }
     };
 
-    const sendPing = () => {
-      if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
-      if (transportDiagnostics.clientPingsSentCount >= maxPings) return;
-      // Enforce single pending PING: do not dispatch another if one is already outstanding
-      if (pendingPingPayload !== null) return;
+    let actualSubscribedObservationStartMs: number | null = null;
+    let bootstrapAnchorRecord: HistorySignatureRecord | null = null;
+    let bootstrapAnchorSignature: string | null = config.knownAnchorSignature ?? null;
 
-      // Clear any pending pingTimer to ensure strictly one scheduler
-      if (pingTimer) {
-        clearTimeout(pingTimer);
-        pingTimer = undefined;
+    // Underlying WebSocket Transport
+    if (!isProbeTerminated && !overallAbortController.signal.aborted) {
+      baseTransport =
+        config.transport ??
+        (transportType === "ws"
+          ? new WsWebSocketTransport(wsUrl)
+          : new NativeWebSocketTransport(wsUrl));
+
+      let underlyingWs: unknown = undefined;
+      if (
+        baseTransport &&
+        "getUnderlyingSocket" in baseTransport &&
+        typeof (baseTransport as { getUnderlyingSocket?: unknown }).getUnderlyingSocket ===
+          "function"
+      ) {
+        underlyingWs = (
+          baseTransport as { getUnderlyingSocket: () => unknown }
+        ).getUnderlyingSocket();
       }
 
-      const now = clock();
-      pendingPingTimestamp = now;
-      transportDiagnostics.clientPingsSentCount++;
-      transportDiagnostics.controlFramesSentCount++;
-      transportDiagnostics.lastClientPingSentAtMs = now;
+      if (underlyingWs && typeof diagnostics_channel !== "undefined") {
+        try {
+          const pingChannel = diagnostics_channel.channel("undici:websocket:ping");
+          const pongChannel = diagnostics_channel.channel("undici:websocket:pong");
 
-      // 8-byte epoch timestamp payload (<= 125 bytes)
-      const pingPayload = Buffer.alloc(8);
-      pingPayload.writeBigInt64BE(BigInt(now));
-      pendingPingPayload = pingPayload;
-
-      // Track payload bytes and wire bytes (masked client frame = 6 header bytes + payload)
-      transportDiagnostics.controlFramePayloadBytesSent += pingPayload.length;
-      transportDiagnostics.controlFrameWireBytesSent += 6 + pingPayload.length;
-      transportDiagnostics.controlFrameBytesSent =
-        transportDiagnostics.controlFramePayloadBytesSent;
-
-      checkControlTrafficCeiling();
-
-      try {
-        meteredTransport?.ping?.(pingPayload);
-      } catch (err: unknown) {
-        if (!isProbeTerminated && probeActive) {
-          terminateProbe(
-            "TRANSPORT_ERROR",
-            `Failed to send WebSocket keepalive PING: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        return;
-      }
-
-      // Enforce missing-PONG timeout
-      pongTimeoutTimer = setTimeout(() => {
-        if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
-        transportDiagnostics.missingPongDetected = true;
-        terminateProbe(
-          "TRANSPORT_ERROR",
-          `Missing WebSocket keepalive PONG: no response received within ${pongTimeoutMs} ms`,
-        );
-      }, pongTimeoutMs);
-    };
-
-    if (keepaliveEnabled) {
-      meteredTransport.on("open", () => {
-        if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
-        if (pingTimer) {
-          clearTimeout(pingTimer);
-          pingTimer = undefined;
-        }
-        pingTimer = setTimeout(() => {
-          sendPing();
-        }, pingIntervalMs);
-      });
-
-      meteredTransport.on("pong", (payload: Buffer) => {
-        if (keepaliveDisposed) return;
-        const now = clock();
-        const payloadBytes = payload ? payload.length : 0;
-
-        transportDiagnostics.clientPongsReceivedCount++;
-        transportDiagnostics.controlFramesReceivedCount++;
-        transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
-        // Server-to-client frame is unmasked: 2 bytes header + payload
-        transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
-        transportDiagnostics.controlFrameBytesReceived =
-          transportDiagnostics.controlFramePayloadBytesReceived;
-
-        checkControlTrafficCeiling();
-
-        // Correlate PONG with currently outstanding PING
-        const isExactMatch =
-          pendingPingPayload !== null &&
-          Buffer.isBuffer(payload) &&
-          payload.length === pendingPingPayload.length &&
-          payload.equals(pendingPingPayload);
-
-        if (!isExactMatch) {
-          // Record unsolicited, duplicate, stale, or mismatched PONG separately
-          transportDiagnostics.unmatchedClientPongsCount++;
-          // MUST NOT reset deadline or accelerate send interval
-          return;
-        }
-
-        // Exactly matched PONG acknowledged
-        transportDiagnostics.matchedClientPongsCount++;
-        transportDiagnostics.lastClientPongReceivedAtMs = now;
-
-        // Clear missing-PONG timeout
-        if (pongTimeoutTimer) {
-          clearTimeout(pongTimeoutTimer);
-          pongTimeoutTimer = undefined;
-        }
-
-        let rtt: number | null = null;
-        if (payload && payload.length >= 8) {
-          try {
-            const sentEpoch = Number(payload.readBigInt64BE(0));
-            if (Number.isSafeInteger(sentEpoch) && sentEpoch > 0 && sentEpoch <= now) {
-              rtt = now - sentEpoch;
+          const onPing = (msg: unknown) => {
+            if (
+              msg &&
+              typeof msg === "object" &&
+              (msg as { websocket?: unknown }).websocket === underlyingWs
+            ) {
+              transportDiagnostics.serverPingsReceivedCount++;
+              transportDiagnostics.lastServerPingReceivedAtMs = clock();
             }
-          } catch {
-            // ignore
+          };
+
+          const onPong = (msg: unknown) => {
+            if (
+              msg &&
+              typeof msg === "object" &&
+              (msg as { websocket?: unknown }).websocket === underlyingWs
+            ) {
+              transportDiagnostics.serverPongsReceivedCount++;
+              transportDiagnostics.lastServerPongReceivedAtMs = clock();
+            }
+          };
+
+          pingChannel.subscribe(onPing);
+          pongChannel.subscribe(onPong);
+
+          cleanupDiagnosticsChannel = () => {
+            try {
+              pingChannel.unsubscribe(onPing);
+            } catch {
+              // ignore
+            }
+            try {
+              pongChannel.unsubscribe(onPong);
+            } catch {
+              // ignore
+            }
+          };
+        } catch {
+          // ignore diagnostics channel errors
+        }
+      }
+
+      meteredTransport = new MeteredWebSocketTransport(
+        baseTransport,
+        maxPayloadBytes,
+        (count, bytes, _byteLen, _data, isOversized) => {
+          if (isOversized && probeActive) {
+            terminateProbe("PAYLOAD_LIMIT_REACHED", "Application payload byte budget reached");
+          }
+          if (count >= maxMessages && probeActive) {
+            terminateProbe("MESSAGE_LIMIT_REACHED", "Inbound message budget reached");
+          }
+        },
+      );
+
+      coordinator = new RaydiumCandidateSubscriptionCoordinator({
+        poolContext,
+        adapter,
+        tracker,
+        transport: meteredTransport,
+        commitment,
+        clock,
+        maxNotificationsBudget: maxMessages,
+        allowSyntheticCompletenessProofs: false, // Invariant: production completeness unproven
+      });
+
+      const checkControlTrafficCeiling = () => {
+        const totalControlFrames =
+          transportDiagnostics.controlFramesSentCount +
+          transportDiagnostics.controlFramesReceivedCount;
+        const totalControlPayloadBytes =
+          transportDiagnostics.controlFramePayloadBytesSent +
+          transportDiagnostics.controlFramePayloadBytesReceived;
+
+        if (totalControlFrames >= maxControlFrames) {
+          if (!isProbeTerminated && probeActive) {
+            terminateProbe(
+              "CONTROL_LIMIT_REACHED",
+              `Control frame message budget reached: ${totalControlFrames} >= ${maxControlFrames}`,
+            );
+          }
+        } else if (totalControlPayloadBytes >= maxControlFrameBytes) {
+          if (!isProbeTerminated && probeActive) {
+            terminateProbe(
+              "CONTROL_LIMIT_REACHED",
+              `Control frame payload byte budget reached: ${totalControlPayloadBytes} >= ${maxControlFrameBytes}`,
+            );
           }
         }
-        if (rtt === null && pendingPingTimestamp !== null) {
-          rtt = Math.max(0, now - pendingPingTimestamp);
-        }
+      };
 
-        if (rtt !== null) {
-          transportDiagnostics.lastPongLatencyMs = rtt;
-          if (
-            transportDiagnostics.minPongLatencyMs === null ||
-            rtt < transportDiagnostics.minPongLatencyMs
-          ) {
-            transportDiagnostics.minPongLatencyMs = rtt;
-          }
-          if (
-            transportDiagnostics.maxPongLatencyMs === null ||
-            rtt > transportDiagnostics.maxPongLatencyMs
-          ) {
-            transportDiagnostics.maxPongLatencyMs = rtt;
-          }
-        }
+      const sendPing = () => {
+        if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+        if (transportDiagnostics.clientPingsSentCount >= maxPings) return;
+        // Enforce single pending PING: do not dispatch another if one is already outstanding
+        if (pendingPingPayload !== null) return;
 
-        // Clear pending PING state
-        pendingPingPayload = null;
-        pendingPingTimestamp = null;
-
-        // Clear any existing pingTimer to ensure strictly one scheduler
+        // Clear any pending pingTimer to ensure strictly one scheduler
         if (pingTimer) {
           clearTimeout(pingTimer);
           pingTimer = undefined;
         }
 
-        // Schedule next heartbeat strictly after pingIntervalMs
-        if (
-          transportDiagnostics.clientPingsSentCount < maxPings &&
-          !keepaliveDisposed &&
-          !isProbeTerminated &&
-          probeActive
-        ) {
-          pingTimer = setTimeout(() => {
-            sendPing();
-          }, pingIntervalMs);
-        }
-      });
-    }
-
-    if (transportType === "ws") {
-      meteredTransport.on("ping", (data: Buffer) => {
-        if (keepaliveDisposed) return;
         const now = clock();
-        const payloadBytes = data ? data.length : 0;
-
-        transportDiagnostics.serverPingsReceivedCount++;
-        transportDiagnostics.controlFramesReceivedCount++;
-        transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
-        // Unmasked server-to-client frame: 2 header bytes + payload
-        transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
-        transportDiagnostics.controlFrameBytesReceived =
-          transportDiagnostics.controlFramePayloadBytesReceived;
-        transportDiagnostics.lastServerPingReceivedAtMs = now;
-
-        // In RFC 6455, ws client automatically responds with a masked PONG frame of the same payload
-        transportDiagnostics.automaticPongsSentCount++;
+        pendingPingTimestamp = now;
+        transportDiagnostics.clientPingsSentCount++;
         transportDiagnostics.controlFramesSentCount++;
-        transportDiagnostics.controlFramePayloadBytesSent += payloadBytes;
-        // Masked client-to-server frame: 6 header bytes + payload
-        transportDiagnostics.controlFrameWireBytesSent += 6 + payloadBytes;
+        transportDiagnostics.lastClientPingSentAtMs = now;
+
+        // 8-byte epoch timestamp payload (<= 125 bytes)
+        const pingPayload = Buffer.alloc(8);
+        pingPayload.writeBigInt64BE(BigInt(now));
+        pendingPingPayload = pingPayload;
+
+        // Track payload bytes and wire bytes (masked client frame = 6 header bytes + payload)
+        transportDiagnostics.controlFramePayloadBytesSent += pingPayload.length;
+        transportDiagnostics.controlFrameWireBytesSent += 6 + pingPayload.length;
         transportDiagnostics.controlFrameBytesSent =
           transportDiagnostics.controlFramePayloadBytesSent;
 
         checkControlTrafficCeiling();
+
+        try {
+          meteredTransport?.ping?.(pingPayload);
+        } catch (err: unknown) {
+          if (!isProbeTerminated && probeActive) {
+            terminateProbe(
+              "TRANSPORT_ERROR",
+              `Failed to send WebSocket keepalive PING: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          return;
+        }
+
+        // Enforce missing-PONG timeout
+        pongTimeoutTimer = setTimeout(() => {
+          if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+          transportDiagnostics.missingPongDetected = true;
+          terminateProbe(
+            "TRANSPORT_ERROR",
+            `Missing WebSocket keepalive PONG: no response received within ${pongTimeoutMs} ms`,
+          );
+        }, pongTimeoutMs);
+      };
+
+      if (keepaliveEnabled) {
+        meteredTransport.on("open", () => {
+          if (keepaliveDisposed || isProbeTerminated || !probeActive) return;
+          if (pingTimer) {
+            clearTimeout(pingTimer);
+            pingTimer = undefined;
+          }
+          pingTimer = setTimeout(() => {
+            sendPing();
+          }, pingIntervalMs);
+        });
+
+        meteredTransport.on("pong", (payload: Buffer) => {
+          if (keepaliveDisposed) return;
+          const now = clock();
+          const payloadBytes = payload ? payload.length : 0;
+
+          transportDiagnostics.clientPongsReceivedCount++;
+          transportDiagnostics.controlFramesReceivedCount++;
+          transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
+          // Server-to-client frame is unmasked: 2 bytes header + payload
+          transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
+          transportDiagnostics.controlFrameBytesReceived =
+            transportDiagnostics.controlFramePayloadBytesReceived;
+
+          checkControlTrafficCeiling();
+
+          // Correlate PONG with currently outstanding PING
+          const isExactMatch =
+            pendingPingPayload !== null &&
+            Buffer.isBuffer(payload) &&
+            payload.length === pendingPingPayload.length &&
+            payload.equals(pendingPingPayload);
+
+          if (!isExactMatch) {
+            // Record unsolicited, duplicate, stale, or mismatched PONG separately
+            transportDiagnostics.unmatchedClientPongsCount++;
+            // MUST NOT reset deadline or accelerate send interval
+            return;
+          }
+
+          // Exactly matched PONG acknowledged
+          transportDiagnostics.matchedClientPongsCount++;
+          transportDiagnostics.lastClientPongReceivedAtMs = now;
+
+          // Clear missing-PONG timeout
+          if (pongTimeoutTimer) {
+            clearTimeout(pongTimeoutTimer);
+            pongTimeoutTimer = undefined;
+          }
+
+          let rtt: number | null = null;
+          if (payload && payload.length >= 8) {
+            try {
+              const sentEpoch = Number(payload.readBigInt64BE(0));
+              if (Number.isSafeInteger(sentEpoch) && sentEpoch > 0 && sentEpoch <= now) {
+                rtt = now - sentEpoch;
+              }
+            } catch {
+              // ignore
+            }
+          }
+          if (rtt === null && pendingPingTimestamp !== null) {
+            rtt = Math.max(0, now - pendingPingTimestamp);
+          }
+
+          if (rtt !== null) {
+            transportDiagnostics.lastPongLatencyMs = rtt;
+            if (
+              transportDiagnostics.minPongLatencyMs === null ||
+              rtt < transportDiagnostics.minPongLatencyMs
+            ) {
+              transportDiagnostics.minPongLatencyMs = rtt;
+            }
+            if (
+              transportDiagnostics.maxPongLatencyMs === null ||
+              rtt > transportDiagnostics.maxPongLatencyMs
+            ) {
+              transportDiagnostics.maxPongLatencyMs = rtt;
+            }
+          }
+
+          // Clear pending PING state
+          pendingPingPayload = null;
+          pendingPingTimestamp = null;
+
+          // Clear any existing pingTimer to ensure strictly one scheduler
+          if (pingTimer) {
+            clearTimeout(pingTimer);
+            pingTimer = undefined;
+          }
+
+          // Schedule next heartbeat strictly after pingIntervalMs
+          if (
+            transportDiagnostics.clientPingsSentCount < maxPings &&
+            !keepaliveDisposed &&
+            !isProbeTerminated &&
+            probeActive
+          ) {
+            pingTimer = setTimeout(() => {
+              sendPing();
+            }, pingIntervalMs);
+          }
+        });
+      }
+
+      if (transportType === "ws") {
+        meteredTransport.on("ping", (data: Buffer) => {
+          if (keepaliveDisposed) return;
+          const now = clock();
+          const payloadBytes = data ? data.length : 0;
+
+          transportDiagnostics.serverPingsReceivedCount++;
+          transportDiagnostics.controlFramesReceivedCount++;
+          transportDiagnostics.controlFramePayloadBytesReceived += payloadBytes;
+          // Unmasked server-to-client frame: 2 header bytes + payload
+          transportDiagnostics.controlFrameWireBytesReceived += 2 + payloadBytes;
+          transportDiagnostics.controlFrameBytesReceived =
+            transportDiagnostics.controlFramePayloadBytesReceived;
+          transportDiagnostics.lastServerPingReceivedAtMs = now;
+
+          // In RFC 6455, ws client automatically responds with a masked PONG frame of the same payload
+          transportDiagnostics.automaticPongsSentCount++;
+          transportDiagnostics.controlFramesSentCount++;
+          transportDiagnostics.controlFramePayloadBytesSent += payloadBytes;
+          // Masked client-to-server frame: 6 header bytes + payload
+          transportDiagnostics.controlFrameWireBytesSent += 6 + payloadBytes;
+          transportDiagnostics.controlFrameBytesSent =
+            transportDiagnostics.controlFramePayloadBytesSent;
+
+          checkControlTrafficCeiling();
+        });
+      }
+
+      meteredTransport.on("open", () => {
+        if (transportDiagnostics.connectedAtMs === null) {
+          const now = clock();
+          transportDiagnostics.connectedAtMs = now;
+          transportDiagnostics.connectDurationMs = now - startTime;
+          transportDiagnostics.subscriptionStatus = "PENDING";
+          transportDiagnostics.subscriptionSentAtMs = now;
+        }
+      });
+
+      meteredTransport.on("message", (data: string | Buffer) => {
+        const msgNow = clock();
+        transportDiagnostics.lastMessageReceivedAtMs = msgNow;
+        tracker.recordHeartbeat(msgNow);
+        try {
+          const text = typeof data === "string" ? data : data.toString("utf8");
+          const parsed = JSON.parse(text) as { id?: unknown; result?: unknown; error?: unknown };
+          if (parsed && typeof parsed === "object") {
+            const reqId = coordinator?.getCoverageDiagnostic().activeSubscriptionId ?? 1;
+            if (parsed.id === 1 || parsed.id === reqId) {
+              if (typeof parsed.result === "number") {
+                transportDiagnostics.subscriptionAcknowledgedAtMs = clock();
+                transportDiagnostics.subscriptionId = parsed.result;
+                transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
+                if (actualSubscribedObservationStartMs === null) {
+                  actualSubscribedObservationStartMs =
+                    transportDiagnostics.subscriptionAcknowledgedAtMs;
+                }
+              } else if (parsed.error !== undefined && parsed.error !== null) {
+                transportDiagnostics.subscriptionStatus = "REJECTED";
+                const sanitizedErrorObj = deepRedactSensitiveObject(parsed.error);
+                const errStr =
+                  typeof sanitizedErrorObj === "object"
+                    ? JSON.stringify(sanitizedErrorObj)
+                    : String(sanitizedErrorObj);
+                transportDiagnostics.subscriptionError = redactSensitiveText(errStr);
+              }
+            }
+          }
+        } catch {
+          // ignore JSON parse error in message interceptor
+        }
+      });
+
+      meteredTransport.on("close", (code, reason) => {
+        // 1. Always record the observed close code and reason if not yet recorded
+        if (transportDiagnostics.closeCode === null) {
+          transportDiagnostics.closeCode = code;
+          transportDiagnostics.closeReason = reason ? redactSensitiveText(reason) : null;
+        }
+
+        // 2. Classify close origin
+        if (transportDiagnostics.firstErrorMessage !== null) {
+          // An upstream transport error preceded this close event (e.g. Undici TypeError followed by close 1006)
+          transportDiagnostics.isUpstreamClosure = true;
+          transportDiagnostics.observedCloseOrigin = "UPSTREAM";
+        } else if (transportDiagnostics.localCloseCode === null) {
+          // A genuine upstream close event occurred before any local shutdown request
+          transportDiagnostics.isUpstreamClosure = true;
+          transportDiagnostics.observedCloseOrigin = "UPSTREAM";
+          if (!isProbeTerminated && probeActive) {
+            terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
+          }
+        } else {
+          // Local shutdown was requested before this close event
+          if (code === 1000) {
+            transportDiagnostics.isUpstreamClosure = false;
+            transportDiagnostics.intentionalShutdownInitiated = true;
+            transportDiagnostics.observedCloseOrigin = "INTENTIONAL_SHUTDOWN";
+          } else {
+            // Local shutdown requested 1000, but transport observed an abnormal close code (e.g. 1006)
+            transportDiagnostics.observedCloseOrigin = "UNCERTAIN";
+          }
+        }
+      });
+
+      meteredTransport.on("error", (err) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const errCode = extractErrorCode(err);
+        const errCause =
+          err instanceof Error && "cause" in err && (err as { cause?: unknown }).cause
+            ? formatErrorCauseChain((err as { cause?: unknown }).cause)
+            : null;
+
+        if (transportDiagnostics.firstErrorMessage === null) {
+          transportDiagnostics.firstErrorMessage = redactSensitiveText(errMsg);
+          transportDiagnostics.firstErrorCode = errCode;
+          transportDiagnostics.firstErrorCause = errCause;
+        }
+        if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
+          transportDiagnostics.isUpstreamClosure = true;
+          terminateProbe(
+            "TRANSPORT_ERROR",
+            `WebSocket error: ${transportDiagnostics.firstErrorMessage}`,
+          );
+        }
       });
     }
 
-    meteredTransport.on("open", () => {
-      if (transportDiagnostics.connectedAtMs === null) {
-        const now = clock();
-        transportDiagnostics.connectedAtMs = now;
-        transportDiagnostics.connectDurationMs = now - startTime;
-        transportDiagnostics.subscriptionStatus = "PENDING";
-        transportDiagnostics.subscriptionSentAtMs = now;
-      }
-    });
+    // Intercept incoming notifications to record WS signatures and track queue depth
+    let firstObservedSignature: string | null = null;
+    let firstObservedSlot = 0;
+    let latestObservedSlot = 0;
 
-    meteredTransport.on("message", (data: string | Buffer) => {
-      const msgNow = clock();
-      transportDiagnostics.lastMessageReceivedAtMs = msgNow;
-      tracker.recordHeartbeat(msgNow);
+    const originalEnqueue = adapter.enqueueNotification.bind(adapter);
+    adapter.enqueueNotification = (notif: InjectedTransactionNotification) => {
+      if (!probeActive || isProbeTerminated) {
+        return {
+          ok: false,
+          signature: notif.signature,
+          queued: false,
+          reason: "QUEUE_OVERFLOW",
+        };
+      }
+
+      if (isValidSolanaSignature(notif.signature)) {
+        if (firstObservedSignature === null) {
+          firstObservedSignature = notif.signature;
+          firstObservedSlot = notif.slot ?? 0;
+        }
+        if (typeof notif.slot === "number" && notif.slot > latestObservedSlot) {
+          latestObservedSlot = notif.slot;
+        }
+        if (!wsWitnessedSignatures.has(notif.signature)) {
+          wsWitnessedSignatures.add(notif.signature);
+          wsWitnessedList.push({
+            signature: notif.signature,
+            receivedEpochMs: notif.receivedAtMs ?? clock(),
+            slot: notif.slot ?? 0,
+          });
+        }
+      }
+
+      if (transportOnly) {
+        // In transport-only mode, bypass adapter queueing and transaction retrieval
+        return {
+          ok: true,
+          signature: notif.signature,
+          queued: true,
+        };
+      }
+
+      const enqueueRes = originalEnqueue(notif);
+
+      if (!enqueueRes.ok && enqueueRes.reason === "QUEUE_OVERFLOW") {
+        queueLimitExceeded = true;
+        queueRejectionsCount++;
+        terminateProbe("QUEUE_LIMIT_EXCEEDED", "Queue overflow: max queue depth exceeded");
+      } else if (enqueueRes.ok && enqueueRes.queued) {
+        const activeWorkload = adapter.getActiveWorkload();
+        if (activeWorkload > peakQueueDepth) {
+          peakQueueDepth = activeWorkload;
+        }
+      }
+
+      return enqueueRes;
+    };
+
+    // Anchor Bootstrap at T_0 (Phase 12.94-D Milestone D.3.3)
+    if (
+      isReconcileMode &&
+      !bootstrapAnchorSignature &&
+      !transportOnly &&
+      !isProbeTerminated &&
+      !overallAbortController.signal.aborted &&
+      clock() < overallDeadlineEpoch
+    ) {
       try {
-        const text = typeof data === "string" ? data : data.toString("utf8");
-        const parsed = JSON.parse(text) as { id?: unknown; result?: unknown; error?: unknown };
-        if (parsed && typeof parsed === "object") {
-          const reqId = coordinator?.getCoverageDiagnostic().activeSubscriptionId ?? 1;
-          if (parsed.id === 1 || parsed.id === reqId) {
-            if (typeof parsed.result === "number") {
-              transportDiagnostics.subscriptionAcknowledgedAtMs = clock();
-              transportDiagnostics.subscriptionId = parsed.result;
-              transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
-              if (actualSubscribedObservationStartMs === null) {
-                actualSubscribedObservationStartMs =
-                  transportDiagnostics.subscriptionAcknowledgedAtMs;
-              }
-            } else if (parsed.error !== undefined && parsed.error !== null) {
-              transportDiagnostics.subscriptionStatus = "REJECTED";
-              const sanitizedErrorObj = deepRedactSensitiveObject(parsed.error);
-              const errStr =
-                typeof sanitizedErrorObj === "object"
-                  ? JSON.stringify(sanitizedErrorObj)
-                  : String(sanitizedErrorObj);
-              transportDiagnostics.subscriptionError = redactSensitiveText(errStr);
+        const provider = "SOLANA_RPC";
+        let budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+        if (
+          !budgetCheck.allowed &&
+          budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+          typeof budgetCheck.waitMs === "number" &&
+          budgetCheck.waitMs > 0
+        ) {
+          await sleepFn(budgetCheck.waitMs, overallAbortController.signal);
+          budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+        }
+        if (
+          budgetCheck.allowed &&
+          !isProbeTerminated &&
+          !overallAbortController.signal.aborted &&
+          clock() < overallDeadlineEpoch
+        ) {
+          budget.recordRequestAttempt(provider, "CANDIDATE_ENRICHMENT", clock());
+          const bootstrapRecords = await pageFetcher.fetchPage({
+            address: poolContext.poolId,
+            limit: 1,
+            commitment: "confirmed",
+            signal: overallAbortController.signal,
+          });
+          if (
+            bootstrapRecords.length > 0 &&
+            !isProbeTerminated &&
+            !overallAbortController.signal.aborted
+          ) {
+            const candidate = bootstrapRecords[0]!;
+            if (
+              isValidSolanaSignature(candidate.signature) &&
+              typeof candidate.slot === "number" &&
+              Number.isSafeInteger(candidate.slot) &&
+              candidate.slot >= 0 &&
+              typeof candidate.blockTime === "number" &&
+              Number.isSafeInteger(candidate.blockTime) &&
+              candidate.blockTime > 0
+            ) {
+              bootstrapAnchorRecord = candidate;
+              bootstrapAnchorSignature = candidate.signature;
+              anchorSlot = candidate.slot;
+              anchorBlockTime = candidate.blockTime;
             }
           }
         }
       } catch {
-        // ignore JSON parse error in message interceptor
+        // Handled fail-closed: bootstrap query failed
       }
+    }
+
+    // Allocate streaming duration within overall maximum
+    const remainingOverallMs = Math.max(0, overallDeadlineEpoch - clock());
+    const reconciliationReservationMs = transportOnly
+      ? 0
+      : isReconcileMode
+        ? Math.min(25_000, Math.floor(durationMs * 0.25))
+        : Math.min(10_000, Math.floor(durationMs * 0.2));
+    const defaultStreamingBudget = Math.max(0, remainingOverallMs - reconciliationReservationMs);
+    const streamingDurationMs =
+      config.streamingDurationMs !== undefined
+        ? Math.min(config.streamingDurationMs, remainingOverallMs)
+        : defaultStreamingBudget;
+    const streamingStartEpochMs = clock();
+
+    const streamingPhasePromise = new Promise<void>((resolve) => {
+      if (overallAbortController.signal.aborted || remainingOverallMs <= 0) {
+        resolve();
+        return;
+      }
+      let resolved = false;
+      const finish = () => {
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
+      };
+      sleepFn(streamingDurationMs, overallAbortController.signal).then(finish).catch(finish);
+      overallAbortController.signal.addEventListener("abort", finish, { once: true });
     });
 
-    meteredTransport.on("close", (code, reason) => {
-      // 1. Always record the observed close code and reason if not yet recorded
-      if (transportDiagnostics.closeCode === null) {
-        transportDiagnostics.closeCode = code;
-        transportDiagnostics.closeReason = reason ? redactSensitiveText(reason) : null;
+    // Drain Queue Worker Loop
+    let transactionRetrievalsReserved = 0;
+    const drainWorker = async () => {
+      if (transportOnly) {
+        // In transport-only mode, zero transactions are retrieved.
+        // Await streaming phase completion without exiting early.
+        await streamingPhasePromise;
+        return;
       }
 
-      // 2. Classify close origin
-      if (transportDiagnostics.firstErrorMessage !== null) {
-        // An upstream transport error preceded this close event (e.g. Undici TypeError followed by close 1006)
-        transportDiagnostics.isUpstreamClosure = true;
-        transportDiagnostics.observedCloseOrigin = "UPSTREAM";
-      } else if (transportDiagnostics.localCloseCode === null) {
-        // A genuine upstream close event occurred before any local shutdown request
-        transportDiagnostics.isUpstreamClosure = true;
-        transportDiagnostics.observedCloseOrigin = "UPSTREAM";
-        if (!isProbeTerminated && probeActive) {
-          terminateProbe("TRANSPORT_DISCONNECT", `WebSocket closed: ${reason || code}`);
+      while (!overallAbortController.signal.aborted) {
+        const remainingMs = overallDeadlineEpoch - clock();
+        if (remainingMs <= 0) {
+          terminateProbe("DURATION_EXPIRED", "Probe duration expired");
+          break;
         }
-      } else {
-        // Local shutdown was requested before this close event
-        if (code === 1000) {
-          transportDiagnostics.isUpstreamClosure = false;
-          transportDiagnostics.intentionalShutdownInitiated = true;
-          transportDiagnostics.observedCloseOrigin = "INTENTIONAL_SHUTDOWN";
+
+        if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+          if (probeActive && !isProbeTerminated) {
+            terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+          }
+          break;
+        }
+
+        if (adapter.getPendingQueueLength() > 0) {
+          if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+            if (probeActive && !isProbeTerminated) {
+              terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+            }
+            break;
+          }
+          transactionRetrievalsReserved++;
+
+          try {
+            const timeoutForReq = Math.min(10_000, remainingMs);
+            const processRes = await adapter.processNextPending(tracker, {
+              signal: overallAbortController.signal,
+              overallTimeoutMs: timeoutForReq,
+            });
+            if (processRes) {
+              const isCancelled =
+                !probeActive || isProbeTerminated || overallAbortController.signal.aborted;
+              if (isCancelled) {
+                // Discard late payload ingestion; retain cancellation audit record
+                sampledTransactionAudits.push({
+                  signature: processRes.diagnostics.signature,
+                  httpAttempts: processRes.diagnostics.httpAttempts,
+                  httpStatus: processRes.diagnostics.httpStatus ?? null,
+                  durationMs: processRes.diagnostics.durationMs,
+                  outcome: "REQUEST_TIMEOUT",
+                  decodedEventsCount: 0,
+                  ingestedCount: 0,
+                  endpointUrl: processRes.diagnostics.endpointUrl,
+                  requestSentAtMs: processRes.diagnostics.requestSentAtMs,
+                  responseReceivedAtMs: null,
+                  responseSha256: null,
+                  isCompletePayload: false,
+                  error: "Operation cancelled before attempt finalization",
+                });
+              } else {
+                sampledTransactionAudits.push(processRes.diagnostics);
+                if (processRes.ok && processRes.outcome === "SUCCESS") {
+                  transactionRetrievalsSucceeded++;
+                  decodedSwapsCount += processRes.diagnostics.ingestedCount ?? 1;
+                }
+              }
+            }
+          } catch {
+            // Handled fail-closed inside adapter
+          }
+
+          if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
+            if (probeActive && !isProbeTerminated) {
+              terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+            }
+            break;
+          }
         } else {
-          // Local shutdown requested 1000, but transport observed an abnormal close code (e.g. 1006)
-          transportDiagnostics.observedCloseOrigin = "UNCERTAIN";
-        }
-      }
-    });
-
-    meteredTransport.on("error", (err) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const errCode = extractErrorCode(err);
-      const errCause =
-        err instanceof Error && "cause" in err && (err as { cause?: unknown }).cause
-          ? formatErrorCauseChain((err as { cause?: unknown }).cause)
-          : null;
-
-      if (transportDiagnostics.firstErrorMessage === null) {
-        transportDiagnostics.firstErrorMessage = redactSensitiveText(errMsg);
-        transportDiagnostics.firstErrorCode = errCode;
-        transportDiagnostics.firstErrorCause = errCause;
-      }
-      if (!isIntentionalClosure && !isProbeTerminated && probeActive) {
-        transportDiagnostics.isUpstreamClosure = true;
-        terminateProbe(
-          "TRANSPORT_ERROR",
-          `WebSocket error: ${transportDiagnostics.firstErrorMessage}`,
-        );
-      }
-    });
-  }
-
-  // Intercept incoming notifications to record WS signatures and track queue depth
-  let firstObservedSignature: string | null = null;
-  let firstObservedSlot = 0;
-  let latestObservedSlot = 0;
-
-  const originalEnqueue = adapter.enqueueNotification.bind(adapter);
-  adapter.enqueueNotification = (notif: InjectedTransactionNotification) => {
-    if (!probeActive || isProbeTerminated) {
-      return {
-        ok: false,
-        signature: notif.signature,
-        queued: false,
-        reason: "QUEUE_OVERFLOW",
-      };
-    }
-
-    if (isValidSolanaSignature(notif.signature)) {
-      if (firstObservedSignature === null) {
-        firstObservedSignature = notif.signature;
-        firstObservedSlot = notif.slot ?? 0;
-      }
-      if (typeof notif.slot === "number" && notif.slot > latestObservedSlot) {
-        latestObservedSlot = notif.slot;
-      }
-      if (!wsWitnessedSignatures.has(notif.signature)) {
-        wsWitnessedSignatures.add(notif.signature);
-        wsWitnessedList.push({
-          signature: notif.signature,
-          receivedEpochMs: notif.receivedAtMs ?? clock(),
-          slot: notif.slot ?? 0,
-        });
-      }
-    }
-
-    if (transportOnly) {
-      // In transport-only mode, bypass adapter queueing and transaction retrieval
-      return {
-        ok: true,
-        signature: notif.signature,
-        queued: true,
-      };
-    }
-
-    const enqueueRes = originalEnqueue(notif);
-
-    if (!enqueueRes.ok && enqueueRes.reason === "QUEUE_OVERFLOW") {
-      queueLimitExceeded = true;
-      queueRejectionsCount++;
-      terminateProbe("QUEUE_LIMIT_EXCEEDED", "Queue overflow: max queue depth exceeded");
-    } else if (enqueueRes.ok && enqueueRes.queued) {
-      const activeWorkload = adapter.getActiveWorkload();
-      if (activeWorkload > peakQueueDepth) {
-        peakQueueDepth = activeWorkload;
-      }
-    }
-
-    return enqueueRes;
-  };
-
-  // Anchor Bootstrap at T_0 (Phase 12.94-D Milestone D.3.3)
-  if (
-    isReconcileMode &&
-    !bootstrapAnchorSignature &&
-    !transportOnly &&
-    !isProbeTerminated &&
-    !overallAbortController.signal.aborted
-  ) {
-    try {
-      const provider = "SOLANA_RPC";
-      let budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
-      if (
-        !budgetCheck.allowed &&
-        budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
-        typeof budgetCheck.waitMs === "number" &&
-        budgetCheck.waitMs > 0
-      ) {
-        await sleepFn(budgetCheck.waitMs, overallAbortController.signal);
-        budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
-      }
-      if (budgetCheck.allowed) {
-        budget.recordRequestAttempt(provider, "CANDIDATE_ENRICHMENT", clock());
-        const bootstrapRecords = await pageFetcher.fetchPage({
-          address: poolContext.poolId,
-          limit: 1,
-          commitment: "confirmed",
-          signal: overallAbortController.signal,
-        });
-        if (bootstrapRecords.length > 0) {
-          const candidate = bootstrapRecords[0]!;
-          if (
-            isValidSolanaSignature(candidate.signature) &&
-            typeof candidate.slot === "number" &&
-            Number.isSafeInteger(candidate.slot) &&
-            candidate.slot >= 0 &&
-            typeof candidate.blockTime === "number" &&
-            Number.isSafeInteger(candidate.blockTime) &&
-            candidate.blockTime > 0
-          ) {
-            bootstrapAnchorRecord = candidate;
-            bootstrapAnchorSignature = candidate.signature;
-            anchorSlot = candidate.slot;
-            anchorBlockTime = candidate.blockTime;
+          if (!isStreamingActive || !probeActive || isProbeTerminated) {
+            // Streaming has ended and queue is drained
+            break;
+          }
+          try {
+            await sleepFn(25, overallAbortController.signal);
+          } catch {
+            break;
           }
         }
-      }
-    } catch {
-      // Handled fail-closed: bootstrap query failed
-    }
-  }
-
-  // Overall Duration Timer
-  const overallTimer = setTimeout(() => {
-    terminateProbe("DURATION_EXPIRED", "Probe duration expired");
-  }, durationMs);
-
-  // Allocate streaming duration within overall maximum
-  const reconciliationReservationMs = transportOnly
-    ? 0
-    : isReconcileMode
-      ? Math.min(25_000, Math.floor(durationMs * 0.25))
-      : Math.min(10_000, Math.floor(durationMs * 0.2));
-  const streamingDurationMs =
-    config.streamingDurationMs ?? Math.max(1, durationMs - reconciliationReservationMs);
-  const streamingStartEpochMs = clock();
-
-  const streamingPhasePromise = new Promise<void>((resolve) => {
-    let resolved = false;
-    const finish = () => {
-      if (!resolved) {
-        resolved = true;
-        resolve();
       }
     };
-    sleepFn(streamingDurationMs, overallAbortController.signal).then(finish).catch(finish);
-    overallAbortController.signal.addEventListener("abort", finish, { once: true });
-  });
 
-  // Drain Queue Worker Loop
-  let transactionRetrievalsReserved = 0;
-  const drainWorker = async () => {
-    if (transportOnly) {
-      // In transport-only mode, zero transactions are retrieved.
-      // Await streaming phase completion without exiting early.
-      await streamingPhasePromise;
-      return;
+    const drainWorkerPromise = drainWorker();
+
+    // Race streaming phase against drain worker
+    await Promise.race([streamingPhasePromise, drainWorkerPromise]);
+
+    // End streaming observation phase
+    isStreamingActive = false;
+
+    // Stop keepalive timers and clear pending-response state before socket closure
+    cleanupKeepalive();
+
+    // Close streaming coordinator if probe not already terminated by limit (in non-reconciliation mode)
+    if (!isReconcileMode && !isProbeTerminated && probeActive) {
+      isIntentionalClosure = true;
+      transportDiagnostics.intentionalShutdownInitiated = true;
+      transportDiagnostics.localCloseCode = 1000;
+      transportDiagnostics.localCloseReason = transportOnly
+        ? "Streaming phase complete (transport-only)"
+        : "Streaming phase complete; proceeding to discovery";
+      coordinator?.close();
+      meteredTransport?.close(
+        1000,
+        transportOnly
+          ? "Streaming phase complete (transport-only)"
+          : "Streaming phase complete; proceeding to discovery",
+      );
     }
 
-    while (!overallAbortController.signal.aborted) {
-      const remainingMs = overallDeadlineEpoch - clock();
-      if (remainingMs <= 0) {
-        terminateProbe("DURATION_EXPIRED", "Probe duration expired");
-        break;
-      }
+    // Settle any remaining queued transaction retrieval work within deadline
+    await drainWorkerPromise;
 
-      if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
-        if (probeActive && !isProbeTerminated) {
-          terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
-        }
-        break;
-      }
+    // 9. Bounded History Discovery / Window Reconciliation Phase
+    let reconciliationResult: WindowReconciliationResult | undefined;
+    let reconciliationSuccess = false;
+    let slotAuditRecord: SlotAcquisitionAuditRecord | null = null;
+    let cutoffAuditRecord: SourceCutoffAuditRecord | null = null;
 
-      if (adapter.getPendingQueueLength() > 0) {
-        if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
-          if (probeActive && !isProbeTerminated) {
-            terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
-          }
-          break;
-        }
-        transactionRetrievalsReserved++;
+    const effectiveObservationStartMs =
+      config.observationStartMs ?? actualSubscribedObservationStartMs ?? streamingStartEpochMs;
 
+    if (isReconcileMode) {
+      const reconcileStartTime = clock();
+      let cutoffEvidence: SourceCutoffEvidence | null = null;
+      if (config.sourceCutoff) {
+        cutoffEvidence = config.sourceCutoff;
+      } else if (config.sourceCutoffFetcher) {
         try {
-          const timeoutForReq = Math.min(10_000, remainingMs);
-          const processRes = await adapter.processNextPending(tracker, {
-            signal: overallAbortController.signal,
-            overallTimeoutMs: timeoutForReq,
-          });
-          if (processRes) {
-            const isCancelled =
-              !probeActive || isProbeTerminated || overallAbortController.signal.aborted;
-            if (isCancelled) {
-              // Discard late payload ingestion; retain cancellation audit record
-              sampledTransactionAudits.push({
-                signature: processRes.diagnostics.signature,
-                httpAttempts: processRes.diagnostics.httpAttempts,
-                httpStatus: processRes.diagnostics.httpStatus ?? null,
-                durationMs: processRes.diagnostics.durationMs,
-                outcome: "REQUEST_TIMEOUT",
-                decodedEventsCount: 0,
-                ingestedCount: 0,
-                endpointUrl: processRes.diagnostics.endpointUrl,
-                requestSentAtMs: processRes.diagnostics.requestSentAtMs,
-                responseReceivedAtMs: null,
-                responseSha256: null,
-                isCompletePayload: false,
-                error: "Operation cancelled before attempt finalization",
-              });
-            } else {
-              sampledTransactionAudits.push(processRes.diagnostics);
-              if (processRes.ok && processRes.outcome === "SUCCESS") {
-                transactionRetrievalsSucceeded++;
-                decodedSwapsCount += processRes.diagnostics.ingestedCount ?? 1;
-              }
+          cutoffEvidence = (await config.sourceCutoffFetcher()) ?? null;
+        } catch {
+          // Handled fail-closed: cutoff fetcher failed
+        }
+      } else {
+        let confirmedSlot: number | null = null;
+        if (
+          !overallAbortController.signal.aborted &&
+          probeState.terminationReason !== "TRANSPORT_ERROR" &&
+          probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
+          probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED"
+        ) {
+          if (latestObservedSlot > 0) {
+            confirmedSlot = latestObservedSlot;
+          } else if (firstObservedSlot > 0) {
+            confirmedSlot = firstObservedSlot;
+          } else {
+            try {
+              confirmedSlot = await acquireConfirmedSlot(
+                rpcUrl,
+                budget,
+                overallAbortController.signal,
+                boundedFetch,
+                clock,
+                sleepFn,
+                (rec) => {
+                  slotAuditRecord = rec;
+                },
+              );
+            } catch {
+              // Handled fail-closed: slot acquisition failed
             }
           }
-        } catch {
-          // Handled fail-closed inside adapter
-        }
 
-        if (transactionRetrievalsReserved >= maxTransactionRetrievals) {
-          if (probeActive && !isProbeTerminated) {
-            terminateProbe("TRANSACTION_LIMIT_REACHED", "Transaction retrieval ceiling reached");
+          if (confirmedSlot !== null) {
+            try {
+              cutoffEvidence = await acquireSourceCutoff(
+                rpcUrl,
+                confirmedSlot,
+                budget,
+                overallAbortController.signal,
+                boundedFetch,
+                clock,
+                sleepFn,
+                (rec) => {
+                  cutoffAuditRecord = rec;
+                },
+              );
+            } catch {
+              // Handled fail-closed: cutoff acquisition failed
+            }
           }
-          break;
-        }
-      } else {
-        if (!isStreamingActive || !probeActive || isProbeTerminated) {
-          // Streaming has ended and queue is drained
-          break;
-        }
-        try {
-          await sleepFn(25, overallAbortController.signal);
-        } catch {
-          break;
         }
       }
-    }
-  };
 
-  const drainWorkerPromise = drainWorker();
+      anchorSignature =
+        bootstrapAnchorSignature ??
+        config.knownAnchorSignature ??
+        (wsWitnessedList.length > 0 ? wsWitnessedList[0]!.signature : null);
+      if (anchorSignature && wsWitnessedList.length > 0) {
+        anchorSlot = wsWitnessedList[0]!.slot;
+      } else if (anchorSignature && bootstrapAnchorRecord) {
+        anchorSlot = bootstrapAnchorRecord.slot;
+        anchorBlockTime = bootstrapAnchorRecord.blockTime;
+      }
 
-  // Race streaming phase against drain worker
-  await Promise.race([streamingPhasePromise, drainWorkerPromise]);
+      if (cutoffEvidence && anchorSignature) {
+        const windowStartMs = cutoffEvidence.cutoffTimestampMs - 60_000;
+        if (bootstrapAnchorRecord && bootstrapAnchorRecord.blockTime !== null) {
+          const anchorTimeMs = bootstrapAnchorRecord.blockTime * 1000;
+          if (anchorTimeMs > windowStartMs) {
+            // Boundary anchor is not prior to window start!
+            anchorSignature = null;
+          }
+        }
+      }
 
-  // End streaming observation phase
-  isStreamingActive = false;
-
-  // Stop keepalive timers and clear pending-response state before socket closure
-  cleanupKeepalive();
-
-  // Close streaming coordinator if probe not already terminated by limit (in non-reconciliation mode)
-  if (!isReconcileMode && !isProbeTerminated && probeActive) {
-    isIntentionalClosure = true;
-    transportDiagnostics.intentionalShutdownInitiated = true;
-    transportDiagnostics.localCloseCode = 1000;
-    transportDiagnostics.localCloseReason = transportOnly
-      ? "Streaming phase complete (transport-only)"
-      : "Streaming phase complete; proceeding to discovery";
-    coordinator?.close();
-    meteredTransport?.close(
-      1000,
-      transportOnly
-        ? "Streaming phase complete (transport-only)"
-        : "Streaming phase complete; proceeding to discovery",
-    );
-  }
-
-  // Settle any remaining queued transaction retrieval work within deadline
-  await drainWorkerPromise;
-
-  // 9. Bounded History Discovery / Window Reconciliation Phase
-  let reconciliationResult: WindowReconciliationResult | undefined;
-  let reconciliationSuccess = false;
-  let slotAuditRecord: SlotAcquisitionAuditRecord | null = null;
-  let cutoffAuditRecord: SourceCutoffAuditRecord | null = null;
-
-  const effectiveObservationStartMs =
-    config.observationStartMs ?? actualSubscribedObservationStartMs ?? streamingStartEpochMs;
-
-  if (isReconcileMode) {
-    const reconcileStartTime = clock();
-    let cutoffEvidence: SourceCutoffEvidence | null = null;
-    if (config.sourceCutoff) {
-      cutoffEvidence = config.sourceCutoff;
-    } else if (config.sourceCutoffFetcher) {
       try {
-        cutoffEvidence = (await config.sourceCutoffFetcher()) ?? null;
-      } catch {
-        // Handled fail-closed: cutoff fetcher failed
-      }
-    } else {
-      let confirmedSlot: number | null = null;
-      if (
-        !overallAbortController.signal.aborted &&
-        probeState.terminationReason !== "TRANSPORT_ERROR" &&
-        probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
-        probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED"
-      ) {
-        if (latestObservedSlot > 0) {
-          confirmedSlot = latestObservedSlot;
-        } else if (firstObservedSlot > 0) {
-          confirmedSlot = firstObservedSlot;
-        } else {
-          try {
-            confirmedSlot = await acquireConfirmedSlot(
-              rpcUrl,
-              budget,
-              overallAbortController.signal,
-              boundedFetch,
-              clock,
-              sleepFn,
-              (rec) => {
-                slotAuditRecord = rec;
-              },
-            );
-          } catch {
-            // Handled fail-closed: slot acquisition failed
-          }
-        }
-
-        if (confirmedSlot !== null) {
-          try {
-            cutoffEvidence = await acquireSourceCutoff(
-              rpcUrl,
-              confirmedSlot,
-              budget,
-              overallAbortController.signal,
-              boundedFetch,
-              clock,
-              sleepFn,
-              (rec) => {
-                cutoffAuditRecord = rec;
-              },
-            );
-          } catch {
-            // Handled fail-closed: cutoff acquisition failed
-          }
-        }
-      }
-    }
-
-    anchorSignature =
-      bootstrapAnchorSignature ??
-      config.knownAnchorSignature ??
-      (wsWitnessedList.length > 0 ? wsWitnessedList[0]!.signature : null);
-    if (anchorSignature && wsWitnessedList.length > 0) {
-      anchorSlot = wsWitnessedList[0]!.slot;
-    } else if (anchorSignature && bootstrapAnchorRecord) {
-      anchorSlot = bootstrapAnchorRecord.slot;
-      anchorBlockTime = bootstrapAnchorRecord.blockTime;
-    }
-
-    if (cutoffEvidence && anchorSignature) {
-      const windowStartMs = cutoffEvidence.cutoffTimestampMs - 60_000;
-      if (bootstrapAnchorRecord && bootstrapAnchorRecord.blockTime !== null) {
-        const anchorTimeMs = bootstrapAnchorRecord.blockTime * 1000;
-        if (anchorTimeMs > windowStartMs) {
-          // Boundary anchor is not prior to window start!
-          anchorSignature = null;
-        }
-      }
-    }
-
-    try {
-      if (!cutoffEvidence) {
-        reconciliationResult = evaluateExactPoolWindowReconciliation({
-          poolContext,
-          decisionTimestampMs: clock(),
-          observationStartMs: effectiveObservationStartMs,
-          observationEndMs: clock(),
-          sourceCutoff: null,
-          tracker,
-          budgetManager: budget,
-          clock,
-          recordedGaps: [
-            {
-              gapStartMs: effectiveObservationStartMs,
-              gapEndMs: clock(),
-              reason: "MISSING_SOURCE_CUTOFF: Source cutoff evidence was not acquired",
-            },
-          ],
-        });
-        historyDiscoveryOutcome = "MISSING_SOURCE_CUTOFF";
-      } else if (!anchorSignature || !isValidSolanaSignature(anchorSignature)) {
-        reconciliationResult = evaluateExactPoolWindowReconciliation({
-          poolContext,
-          decisionTimestampMs: clock(),
-          observationStartMs: effectiveObservationStartMs,
-          observationEndMs: clock(),
-          sourceCutoff: cutoffEvidence,
-          tracker,
-          budgetManager: budget,
-          clock,
-          historyResult: {
-            candidatePoolId: poolContext.poolId,
-            connectionEpoch: coordinator?.getConnectionEpoch() ?? 0,
-            knownAnchorSignature: "",
-            anchorWitnessed: false,
-            outcome: "ANCHOR_NOT_FOUND",
-            frozenTargetSignature: null,
-            discoveredSignatures: [],
-            pagesQueried: 0,
-            requestCount: 0,
-            isProductionCompletenessEstablished: false,
-          },
-        });
-        historyDiscoveryOutcome = "MISSING_BOUNDARY_ANCHOR";
-      } else {
-        const enumerator = new ExactPoolHistoryEnumerator({
-          poolContext,
-          knownAnchorSignature: anchorSignature,
-          pageFetcher,
-          budgetManager: budget,
-          lifecycleTarget: coordinator ?? undefined,
-          pageSize: 20,
-          maxPages: 1,
-          operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
-          signal: overallAbortController.signal,
-          sleepFn,
-          clock,
-        });
-
-        const remainingTxAllowance = Math.max(
-          0,
-          maxTransactionRetrievals - transactionRetrievalsReserved,
-        );
-        const resolutionBridge = new ExactPoolTransactionResolutionBridge({
-          poolContext,
-          adapter,
-          tracker,
-          budgetManager: budget,
-          lifecycleTarget: coordinator,
-          signal: overallAbortController.signal,
-          clock,
-          maxTransactionsToProcess: Math.max(1, remainingTxAllowance),
-          operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
-        });
-
-        if (coordinator) {
-          reconciliationResult = await coordinator.reconcileCandidateWindow(cutoffEvidence, {
-            knownAnchorSignature: anchorSignature,
-            historyEnumerator: enumerator,
-            resolutionBridge,
+        if (!cutoffEvidence) {
+          reconciliationResult = evaluateExactPoolWindowReconciliation({
+            poolContext,
+            decisionTimestampMs: clock(),
             observationStartMs: effectiveObservationStartMs,
+            observationEndMs: clock(),
+            sourceCutoff: null,
+            tracker,
             budgetManager: budget,
+            clock,
+            recordedGaps: [
+              {
+                gapStartMs: effectiveObservationStartMs,
+                gapEndMs: clock(),
+                reason: "MISSING_SOURCE_CUTOFF: Source cutoff evidence was not acquired",
+              },
+            ],
           });
-        } else {
+          historyDiscoveryOutcome = "MISSING_SOURCE_CUTOFF";
+        } else if (!anchorSignature || !isValidSolanaSignature(anchorSignature)) {
           reconciliationResult = evaluateExactPoolWindowReconciliation({
             poolContext,
             decisionTimestampMs: clock(),
@@ -3211,509 +3210,585 @@ export async function executeTransportObservationProbe(
             tracker,
             budgetManager: budget,
             clock,
+            historyResult: {
+              candidatePoolId: poolContext.poolId,
+              connectionEpoch: coordinator?.getConnectionEpoch() ?? 0,
+              knownAnchorSignature: "",
+              anchorWitnessed: false,
+              outcome: "ANCHOR_NOT_FOUND",
+              frozenTargetSignature: null,
+              discoveredSignatures: [],
+              pagesQueried: 0,
+              requestCount: 0,
+              isProductionCompletenessEstablished: false,
+            },
+          });
+          historyDiscoveryOutcome = "MISSING_BOUNDARY_ANCHOR";
+        } else {
+          const enumerator = new ExactPoolHistoryEnumerator({
+            poolContext,
+            knownAnchorSignature: anchorSignature,
+            pageFetcher,
+            budgetManager: budget,
+            lifecycleTarget: coordinator ?? undefined,
+            pageSize: 20,
+            maxPages: 1,
+            operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
+            signal: overallAbortController.signal,
+            sleepFn,
+            clock,
+          });
+
+          const remainingTxAllowance = Math.max(
+            0,
+            maxTransactionRetrievals - transactionRetrievalsReserved,
+          );
+          const resolutionBridge = new ExactPoolTransactionResolutionBridge({
+            poolContext,
+            adapter,
+            tracker,
+            budgetManager: budget,
+            lifecycleTarget: coordinator,
+            signal: overallAbortController.signal,
+            clock,
+            maxTransactionsToProcess: Math.max(1, remainingTxAllowance),
+            operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
+          });
+
+          if (coordinator) {
+            reconciliationResult = await coordinator.reconcileCandidateWindow(cutoffEvidence, {
+              knownAnchorSignature: anchorSignature,
+              historyEnumerator: enumerator,
+              resolutionBridge,
+              observationStartMs: effectiveObservationStartMs,
+              budgetManager: budget,
+            });
+          } else {
+            reconciliationResult = evaluateExactPoolWindowReconciliation({
+              poolContext,
+              decisionTimestampMs: clock(),
+              observationStartMs: effectiveObservationStartMs,
+              observationEndMs: clock(),
+              sourceCutoff: cutoffEvidence,
+              tracker,
+              budgetManager: budget,
+              clock,
+              recordedGaps: [
+                {
+                  gapStartMs: effectiveObservationStartMs,
+                  gapEndMs: clock(),
+                  reason: "COORDINATOR_UNAVAILABLE",
+                },
+              ],
+            });
+          }
+        }
+
+        if (reconciliationResult) {
+          historyDiscoveryDurationMs = clock() - reconcileStartTime;
+          if (historyDiscoveryOutcome === "UNKNOWN") {
+            historyDiscoveryOutcome =
+              reconciliationResult.underlyingOutcomes.enumerationOutcome ?? "UNKNOWN";
+          }
+          anchorWitnessed = reconciliationResult.underlyingOutcomes.anchorWitnessed;
+          historyRecordsDiscovered =
+            reconciliationResult.underlyingOutcomes.totalDiscoveredSignatures;
+          reconciliationSuccess = reconciliationResult.status === "RECONCILED";
+
+          for (const rec of fetchedHistoryRecords.values()) {
+            if (rec.blockTime === null) {
+              nullBlockTimeCount++;
+            }
+            if (!historyWitnessedSignatures.has(rec.signature)) {
+              historyWitnessedSignatures.add(rec.signature);
+              historyWitnessedList.push({
+                signature: rec.signature,
+                slot: rec.slot,
+                blockTime: rec.blockTime,
+              });
+            }
+          }
+
+          if (anchorWitnessed && anchorSignature) {
+            const anchorRec = fetchedHistoryRecords.get(anchorSignature);
+            if (anchorRec) {
+              anchorSlot = anchorRec.slot;
+              anchorBlockTime = anchorRec.blockTime;
+            }
+            if (!historyWitnessedSignatures.has(anchorSignature)) {
+              historyWitnessedSignatures.add(anchorSignature);
+              historyWitnessedList.push({
+                signature: anchorSignature,
+                slot: anchorSlot ?? wsWitnessedList[0]?.slot ?? 0,
+                blockTime: anchorBlockTime,
+              });
+            }
+          }
+        }
+      } catch (err: unknown) {
+        historyDiscoveryDurationMs = clock() - reconcileStartTime;
+        historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
+        if (!reconciliationResult) {
+          reconciliationResult = evaluateExactPoolWindowReconciliation({
+            poolContext,
+            decisionTimestampMs: clock(),
+            observationStartMs: effectiveObservationStartMs,
+            observationEndMs: clock(),
+            sourceCutoff: cutoffEvidence ?? null,
+            tracker,
+            budgetManager: budget,
+            clock,
             recordedGaps: [
               {
                 gapStartMs: effectiveObservationStartMs,
                 gapEndMs: clock(),
-                reason: "COORDINATOR_UNAVAILABLE",
+                reason: `RECONCILIATION_EXCEPTION: ${err instanceof Error ? err.message : String(err)}`,
               },
             ],
           });
         }
-      }
-
-      if (reconciliationResult) {
-        historyDiscoveryDurationMs = clock() - reconcileStartTime;
-        if (historyDiscoveryOutcome === "UNKNOWN") {
-          historyDiscoveryOutcome =
-            reconciliationResult.underlyingOutcomes.enumerationOutcome ?? "UNKNOWN";
-        }
-        anchorWitnessed = reconciliationResult.underlyingOutcomes.anchorWitnessed;
-        historyRecordsDiscovered =
-          reconciliationResult.underlyingOutcomes.totalDiscoveredSignatures;
-        reconciliationSuccess = reconciliationResult.status === "RECONCILED";
-
-        for (const rec of fetchedHistoryRecords.values()) {
-          if (rec.blockTime === null) {
-            nullBlockTimeCount++;
-          }
-          if (!historyWitnessedSignatures.has(rec.signature)) {
-            historyWitnessedSignatures.add(rec.signature);
-            historyWitnessedList.push({
-              signature: rec.signature,
-              slot: rec.slot,
-              blockTime: rec.blockTime,
-            });
-          }
-        }
-
-        if (anchorWitnessed && anchorSignature) {
-          const anchorRec = fetchedHistoryRecords.get(anchorSignature);
-          if (anchorRec) {
-            anchorSlot = anchorRec.slot;
-            anchorBlockTime = anchorRec.blockTime;
-          }
-          if (!historyWitnessedSignatures.has(anchorSignature)) {
-            historyWitnessedSignatures.add(anchorSignature);
-            historyWitnessedList.push({
-              signature: anchorSignature,
-              slot: anchorSlot ?? wsWitnessedList[0]?.slot ?? 0,
-              blockTime: anchorBlockTime,
-            });
-          }
+      } finally {
+        if (!isProbeTerminated && probeActive) {
+          isIntentionalClosure = true;
+          transportDiagnostics.intentionalShutdownInitiated = true;
+          transportDiagnostics.localCloseCode = 1000;
+          transportDiagnostics.localCloseReason = "Reconciliation evaluation complete";
+          coordinator?.close();
+          meteredTransport?.close(1000, "Reconciliation evaluation complete");
         }
       }
-    } catch (err: unknown) {
-      historyDiscoveryDurationMs = clock() - reconcileStartTime;
-      historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
-      if (!reconciliationResult) {
-        reconciliationResult = evaluateExactPoolWindowReconciliation({
+    } else {
+      // Non-reconcile discovery mode (existing behavior preserved)
+      const remainingForDiscovery = overallDeadlineEpoch - clock();
+      const canRunDiscovery =
+        !transportOnly &&
+        remainingForDiscovery > 10 &&
+        !overallAbortController.signal.aborted &&
+        probeState.terminationReason !== "TRANSPORT_ERROR" &&
+        probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
+        probeState.terminationReason !== "DURATION_EXPIRED" &&
+        probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
+        wsWitnessedList.length > 0;
+
+      if (canRunDiscovery) {
+        anchorSignature = wsWitnessedList[0]!.signature;
+        anchorSlot = wsWitnessedList[0]!.slot;
+        const discoveryStartTime = clock();
+
+        const enumerator = new ExactPoolHistoryEnumerator({
           poolContext,
-          decisionTimestampMs: clock(),
-          observationStartMs: effectiveObservationStartMs,
-          observationEndMs: clock(),
-          sourceCutoff: cutoffEvidence ?? null,
-          tracker,
+          knownAnchorSignature: anchorSignature,
+          pageFetcher,
           budgetManager: budget,
+          pageSize: 20,
+          maxPages: maxHistoryQueries,
+          operationDeadlineMs: Math.max(1, remainingForDiscovery),
+          signal: overallAbortController.signal,
+          sleepFn,
           clock,
-          recordedGaps: [
-            {
-              gapStartMs: effectiveObservationStartMs,
-              gapEndMs: clock(),
-              reason: `RECONCILIATION_EXCEPTION: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
         });
-      }
-    } finally {
-      if (!isProbeTerminated && probeActive) {
-        isIntentionalClosure = true;
-        transportDiagnostics.intentionalShutdownInitiated = true;
-        transportDiagnostics.localCloseCode = 1000;
-        transportDiagnostics.localCloseReason = "Reconciliation evaluation complete";
-        coordinator?.close();
-        meteredTransport?.close(1000, "Reconciliation evaluation complete");
+
+        try {
+          const enumRes = await enumerator.enumerate();
+          historyDiscoveryDurationMs = clock() - discoveryStartTime;
+          historyDiscoveryOutcome = enumRes.error
+            ? `${enumRes.outcome}: ${enumRes.error}`
+            : enumRes.outcome;
+          anchorWitnessed = enumRes.anchorWitnessed;
+          historyRecordsDiscovered = enumRes.discoveredSignatures.length;
+
+          for (const rec of enumRes.discoveredSignatures) {
+            if (rec.blockTime === null) {
+              nullBlockTimeCount++;
+            }
+            if (!historyWitnessedSignatures.has(rec.signature)) {
+              historyWitnessedSignatures.add(rec.signature);
+              historyWitnessedList.push({
+                signature: rec.signature,
+                slot: rec.slot,
+                blockTime: rec.blockTime,
+              });
+            }
+          }
+
+          // If anchor was witnessed, preserve its real observed slot and blockTime
+          if (enumRes.anchorWitnessed && anchorSignature) {
+            const anchorRec = fetchedHistoryRecords.get(anchorSignature);
+            if (anchorRec) {
+              anchorSlot = anchorRec.slot;
+              anchorBlockTime = anchorRec.blockTime;
+            }
+            if (!historyWitnessedSignatures.has(anchorSignature)) {
+              historyWitnessedSignatures.add(anchorSignature);
+              historyWitnessedList.push({
+                signature: anchorSignature,
+                slot: anchorSlot ?? wsWitnessedList[0]!.slot,
+                blockTime: anchorBlockTime,
+              });
+            }
+          }
+        } catch (err: unknown) {
+          historyDiscoveryDurationMs = clock() - discoveryStartTime;
+          historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      } else if (!transportOnly) {
+        if (clock() >= overallDeadlineEpoch) {
+          historyDiscoveryOutcome = "OPERATION_DEADLINE_EXCEEDED";
+        } else if (overallAbortController.signal.aborted) {
+          historyDiscoveryOutcome = "OPERATION_CANCELLED";
+        }
       }
     }
-  } else {
-    // Non-reconcile discovery mode (existing behavior preserved)
-    const remainingForDiscovery = overallDeadlineEpoch - clock();
-    const canRunDiscovery =
-      !transportOnly &&
-      remainingForDiscovery > 10 &&
-      !overallAbortController.signal.aborted &&
-      probeState.terminationReason !== "TRANSPORT_ERROR" &&
-      probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
-      probeState.terminationReason !== "DURATION_EXPIRED" &&
-      probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
-      wsWitnessedList.length > 0;
 
-    if (canRunDiscovery) {
-      anchorSignature = wsWitnessedList[0]!.signature;
-      anchorSlot = wsWitnessedList[0]!.slot;
-      const discoveryStartTime = clock();
+    // Ensure Probe Termination and Settle Workers
+    terminateProbe(
+      probeState.terminationReason === "UNKNOWN"
+        ? clock() >= overallDeadlineEpoch
+          ? "DURATION_EXPIRED"
+          : "COMPLETED"
+        : probeState.terminationReason,
+    );
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = undefined;
+    }
+    await drainWorkerPromise;
 
-      const enumerator = new ExactPoolHistoryEnumerator({
-        poolContext,
-        knownAnchorSignature: anchorSignature,
-        pageFetcher,
-        budgetManager: budget,
-        pageSize: 20,
-        maxPages: maxHistoryQueries,
-        operationDeadlineMs: Math.max(1, remainingForDiscovery),
-        signal: overallAbortController.signal,
-        sleepFn,
-        clock,
+    // 10. Accurate Accounting & Outcome Classification
+    const finalTerminationReason = probeState.terminationReason;
+    const isCapTerminated =
+      finalTerminationReason === "MESSAGE_LIMIT_REACHED" ||
+      finalTerminationReason === "PAYLOAD_LIMIT_REACHED" ||
+      finalTerminationReason === "CONTROL_LIMIT_REACHED" ||
+      finalTerminationReason === "HTTP_BUDGET_EXHAUSTED" ||
+      finalTerminationReason === "TRANSACTION_LIMIT_REACHED";
+
+    const isObservationSuccess =
+      finalTerminationReason !== "TRANSPORT_ERROR" &&
+      finalTerminationReason !== "TRANSPORT_DISCONNECT" &&
+      finalTerminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
+      finalTerminationReason !== "MANUAL_CANCEL";
+
+    let finalStatus: TransportProbeStatus;
+    if (
+      finalTerminationReason === "TRANSPORT_ERROR" ||
+      finalTerminationReason === "TRANSPORT_DISCONNECT" ||
+      finalTerminationReason === "MANUAL_CANCEL"
+    ) {
+      finalStatus = "TRANSPORT_ERROR";
+    } else if (finalTerminationReason === "QUEUE_LIMIT_EXCEEDED") {
+      finalStatus = "QUEUE_OVERFLOW";
+    } else if (isCapTerminated) {
+      finalStatus = "CAP_LIMITED";
+    } else {
+      finalStatus = "SUCCESS";
+    }
+
+    // Overshoot Bytes: calculated independently of winning termination reason
+    const totalPayloadBytes = meteredTransport?.getApplicationPayloadBytes() ?? 0;
+    const overshootBytes = Math.max(0, totalPayloadBytes - maxPayloadBytes);
+
+    // Transaction attempt counts derived from actual dispatched diagnostics
+    const transactionRetrievalsAttempted = adapter.getMetrics().totalDispatchedAttempts;
+
+    // Reconcile sampledTransactionAudits with totalDispatchedAttempts
+    while (sampledTransactionAudits.length < transactionRetrievalsAttempted) {
+      const missingIndex = sampledTransactionAudits.length;
+      sampledTransactionAudits.push({
+        signature: `dispatched-attempt-${missingIndex + 1}`,
+        httpAttempts: 1,
+        httpStatus: null,
+        durationMs: 0,
+        outcome: "REQUEST_TIMEOUT",
+        decodedEventsCount: 0,
+        ingestedCount: 0,
+        endpointUrl: rpcUrl,
+        requestSentAtMs: startTime,
+        responseReceivedAtMs: null,
+        responseSha256: null,
+        isCompletePayload: false,
+        error: "Dispatched attempt cancelled or timed out in flight",
       });
+    }
 
-      try {
-        const enumRes = await enumerator.enumerate();
-        historyDiscoveryDurationMs = clock() - discoveryStartTime;
-        historyDiscoveryOutcome = enumRes.error
-          ? `${enumRes.outcome}: ${enumRes.error}`
-          : enumRes.outcome;
-        anchorWitnessed = enumRes.anchorWitnessed;
-        historyRecordsDiscovered = enumRes.discoveredSignatures.length;
+    // Discrepancy Analysis (Explicitly bounded to witnessed data)
+    const commonSignatures = wsWitnessedList
+      .map((r) => r.signature)
+      .filter((sig) => historyWitnessedSignatures.has(sig));
+    const wsOnlySignatures = wsWitnessedList
+      .map((r) => r.signature)
+      .filter((sig) => !historyWitnessedSignatures.has(sig));
+    const historyOnlySignatures = historyWitnessedList
+      .map((r) => r.signature)
+      .filter((sig) => !wsWitnessedSignatures.has(sig));
 
-        for (const rec of enumRes.discoveredSignatures) {
-          if (rec.blockTime === null) {
-            nullBlockTimeCount++;
-          }
-          if (!historyWitnessedSignatures.has(rec.signature)) {
-            historyWitnessedSignatures.add(rec.signature);
-            historyWitnessedList.push({
-              signature: rec.signature,
-              slot: rec.slot,
-              blockTime: rec.blockTime,
-            });
-          }
-        }
+    const unretrievedSampleSignaturesCount = Math.max(
+      0,
+      wsWitnessedList.length - transactionRetrievalsAttempted,
+    );
 
-        // If anchor was witnessed, preserve its real observed slot and blockTime
-        if (enumRes.anchorWitnessed && anchorSignature) {
-          const anchorRec = fetchedHistoryRecords.get(anchorSignature);
-          if (anchorRec) {
-            anchorSlot = anchorRec.slot;
-            anchorBlockTime = anchorRec.blockTime;
-          }
-          if (!historyWitnessedSignatures.has(anchorSignature)) {
-            historyWitnessedSignatures.add(anchorSignature);
-            historyWitnessedList.push({
-              signature: anchorSignature,
-              slot: anchorSlot ?? wsWitnessedList[0]!.slot,
-              blockTime: anchorBlockTime,
-            });
-          }
-        }
-      } catch (err: unknown) {
-        historyDiscoveryDurationMs = clock() - discoveryStartTime;
-        historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    } else if (!transportOnly) {
-      if (clock() >= overallDeadlineEpoch) {
-        historyDiscoveryOutcome = "OPERATION_DEADLINE_EXCEEDED";
-      } else if (overallAbortController.signal.aborted) {
-        historyDiscoveryOutcome = "OPERATION_CANCELLED";
+    const comparisonNotice = transportOnly
+      ? "Transaction retrieval and history discovery skipped in transport-only mode. Witnessed signatures represent inbound WebSocket notifications recorded without HTTP RPC verification."
+      : "Discrepancies represent differences between signatures actually witnessed through the single live WebSocket stream and up to 2 bounded history RPC pages. Signatures observed by WebSocket but not retrieved in the 5 sampled transactions are unretrieved sample signatures, not lost transactions. This does NOT represent a true total network notification-loss percentage.";
+
+    const endTime = clock();
+    const endTimeIso = new Date(endTime).toISOString();
+    const actualDurationMs = endTime - startTime;
+
+    if (coordinator) {
+      const diag = coordinator.getCoverageDiagnostic();
+      if (diag.activeSubscriptionId !== null && transportDiagnostics.subscriptionId === null) {
+        transportDiagnostics.subscriptionId = diag.activeSubscriptionId;
+        transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
       }
     }
-  }
 
-  // Ensure Probe Termination and Settle Workers
-  terminateProbe(
-    probeState.terminationReason === "UNKNOWN"
-      ? clock() >= overallDeadlineEpoch
-        ? "DURATION_EXPIRED"
-        : "COMPLETED"
-      : probeState.terminationReason,
-  );
-  clearTimeout(overallTimer);
-  await drainWorkerPromise;
-
-  // 10. Accurate Accounting & Outcome Classification
-  const finalTerminationReason = probeState.terminationReason;
-  const isCapTerminated =
-    finalTerminationReason === "MESSAGE_LIMIT_REACHED" ||
-    finalTerminationReason === "PAYLOAD_LIMIT_REACHED" ||
-    finalTerminationReason === "CONTROL_LIMIT_REACHED" ||
-    finalTerminationReason === "HTTP_BUDGET_EXHAUSTED" ||
-    finalTerminationReason === "TRANSACTION_LIMIT_REACHED";
-
-  const isObservationSuccess =
-    finalTerminationReason !== "TRANSPORT_ERROR" &&
-    finalTerminationReason !== "TRANSPORT_DISCONNECT" &&
-    finalTerminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
-    finalTerminationReason !== "MANUAL_CANCEL";
-
-  let finalStatus: TransportProbeStatus;
-  if (
-    finalTerminationReason === "TRANSPORT_ERROR" ||
-    finalTerminationReason === "TRANSPORT_DISCONNECT" ||
-    finalTerminationReason === "MANUAL_CANCEL"
-  ) {
-    finalStatus = "TRANSPORT_ERROR";
-  } else if (finalTerminationReason === "QUEUE_LIMIT_EXCEEDED") {
-    finalStatus = "QUEUE_OVERFLOW";
-  } else if (isCapTerminated) {
-    finalStatus = "CAP_LIMITED";
-  } else {
-    finalStatus = "SUCCESS";
-  }
-
-  // Overshoot Bytes: calculated independently of winning termination reason
-  const totalPayloadBytes = meteredTransport?.getApplicationPayloadBytes() ?? 0;
-  const overshootBytes = Math.max(0, totalPayloadBytes - maxPayloadBytes);
-
-  // Transaction attempt counts derived from actual dispatched diagnostics
-  const transactionRetrievalsAttempted = adapter.getMetrics().totalDispatchedAttempts;
-
-  // Reconcile sampledTransactionAudits with totalDispatchedAttempts
-  while (sampledTransactionAudits.length < transactionRetrievalsAttempted) {
-    const missingIndex = sampledTransactionAudits.length;
-    sampledTransactionAudits.push({
-      signature: `dispatched-attempt-${missingIndex + 1}`,
-      httpAttempts: 1,
-      httpStatus: null,
-      durationMs: 0,
-      outcome: "REQUEST_TIMEOUT",
-      decodedEventsCount: 0,
-      ingestedCount: 0,
-      endpointUrl: rpcUrl,
-      requestSentAtMs: startTime,
-      responseReceivedAtMs: null,
-      responseSha256: null,
-      isCompletePayload: false,
-      error: "Dispatched attempt cancelled or timed out in flight",
+    const frozenTransportDiagnostics: TransportDiagnostics = Object.freeze({
+      ...transportDiagnostics,
     });
-  }
 
-  // Discrepancy Analysis (Explicitly bounded to witnessed data)
-  const commonSignatures = wsWitnessedList
-    .map((r) => r.signature)
-    .filter((sig) => historyWitnessedSignatures.has(sig));
-  const wsOnlySignatures = wsWitnessedList
-    .map((r) => r.signature)
-    .filter((sig) => !historyWitnessedSignatures.has(sig));
-  const historyOnlySignatures = historyWitnessedList
-    .map((r) => r.signature)
-    .filter((sig) => !wsWitnessedSignatures.has(sig));
-
-  const unretrievedSampleSignaturesCount = Math.max(
-    0,
-    wsWitnessedList.length - transactionRetrievalsAttempted,
-  );
-
-  const comparisonNotice = transportOnly
-    ? "Transaction retrieval and history discovery skipped in transport-only mode. Witnessed signatures represent inbound WebSocket notifications recorded without HTTP RPC verification."
-    : "Discrepancies represent differences between signatures actually witnessed through the single live WebSocket stream and up to 2 bounded history RPC pages. Signatures observed by WebSocket but not retrieved in the 5 sampled transactions are unretrieved sample signatures, not lost transactions. This does NOT represent a true total network notification-loss percentage.";
-
-  const endTime = clock();
-  const endTimeIso = new Date(endTime).toISOString();
-  const actualDurationMs = endTime - startTime;
-
-  if (coordinator) {
-    const diag = coordinator.getCoverageDiagnostic();
-    if (diag.activeSubscriptionId !== null && transportDiagnostics.subscriptionId === null) {
-      transportDiagnostics.subscriptionId = diag.activeSubscriptionId;
-      transportDiagnostics.subscriptionStatus = "ACKNOWLEDGED";
-    }
-  }
-
-  const frozenTransportDiagnostics: TransportDiagnostics = Object.freeze({
-    ...transportDiagnostics,
-  });
-
-  // 11. Construct Metadata & Summary Evidence Artifacts
-  const metadata: TransportProbeMetadata = Object.freeze({
-    probeVersion: "1.0",
-    executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
-    transportOnly,
-    zeroHttpDispatchesEnforced: transportOnly,
-    reconciliationMode: isReconcileMode,
-    reconciliationResult,
-    poolId: poolContext.poolId,
-    candidateTokenMint: poolContext.candidateTokenMint,
-    quoteTokenMint: poolContext.quoteTokenMint,
-    wsUrl,
-    rpcUrl,
-    commitment: "confirmed",
-    startTimeIso,
-    endTimeIso,
-    durationMs: actualDurationMs,
-    terminationReason: finalTerminationReason,
-    isCapTerminated,
-    counts: {
-      inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
-      applicationPayloadBytes: totalPayloadBytes,
-      overshootBytes,
-      peakQueueDepth,
-      queueRejectionsCount,
-      decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
-      transactionRetrievalsAttempted: transportOnly ? 0 : transactionRetrievalsAttempted,
-      transactionRetrievalsSucceeded: transportOnly ? 0 : transactionRetrievalsSucceeded,
-      historyQueriesAttempted: transportOnly ? 0 : historyQueriesAttempted,
-      historySignaturesDiscovered: transportOnly ? 0 : historyRecordsDiscovered,
-      nullBlockTimeCount: transportOnly ? 0 : nullBlockTimeCount,
-    },
-    budgetStatus: budget.getStats(),
-    isProductionCompletenessEstablished: false as const,
-    gate11Status: "UNAFFECTED_FAIL_CLOSED" as const,
-    virtualWalletBalanceSol: FROZEN_VIRTUAL_WALLET_SOL as "7.9259 SOL",
-    spendingCeiling: "$0.00" as const,
-    disclaimer: transportOnly
-      ? "Transport-only characterization evidence. Transaction retrieval, trade flow evaluation, and history discovery were disabled. Production rolling-flow completeness remains unverified and unavailable."
-      : "Transport characterization evidence only. Production rolling-flow completeness remains unverified and unavailable.",
-    transportDiagnostics: frozenTransportDiagnostics,
-  });
-
-  const flowEval = tracker.evaluateWindow(endTime);
-
-  const summary: TransportProbeSummary = Object.freeze({
-    poolId: poolContext.poolId,
-    candidateTokenMint: poolContext.candidateTokenMint,
-    status: finalStatus,
-    observationSuccess: isObservationSuccess,
-    terminationReason: finalTerminationReason,
-    executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
-    transportOnly,
-    zeroHttpDispatchesEnforced: transportOnly,
-    reconciliationMode: isReconcileMode,
-    reconciliationResult,
-    durationMs: actualDurationMs,
-    timing: {
+    // 11. Construct Metadata & Summary Evidence Artifacts
+    const metadata: TransportProbeMetadata = Object.freeze({
+      probeVersion: "1.0",
+      executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
+      transportOnly,
+      zeroHttpDispatchesEnforced: transportOnly,
+      reconciliationMode: isReconcileMode,
+      reconciliationResult,
+      poolId: poolContext.poolId,
+      candidateTokenMint: poolContext.candidateTokenMint,
+      quoteTokenMint: poolContext.quoteTokenMint,
+      wsUrl,
+      rpcUrl,
+      commitment: "confirmed",
       startTimeIso,
       endTimeIso,
-      localDurationMs: actualDurationMs,
-    },
-    queueTelemetry: {
-      peakQueueDepth,
-      queueLimit: maxQueueDepth,
-      queueLimitExceeded,
-      queueRejectionsCount,
-      pendingAtShutdown: adapter.getPendingQueueLength(),
-    },
-    streamingTelemetry: {
-      inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
-      maxMessagesCeiling: maxMessages,
-      applicationPayloadBytes: totalPayloadBytes,
-      maxPayloadBytesCeiling: maxPayloadBytes,
-      overshootBytes,
-      coordinatorMetrics: coordinator?.getMetrics() ?? {
-        totalNotificationsReceived: 0,
-        totalNotificationsRouted: 0,
-        totalDuplicatesSkipped: 0,
-        totalQueueOverflows: 0,
-        totalUnrelatedDropped: 0,
-        totalMalformedFramesDropped: 0,
-        totalStaleEpochMessagesDropped: 0,
-        totalDisconnectGapsRecorded: 0,
-        totalCoverageAdvancesAttempted: 0,
-        totalCoverageAdvancesSucceeded: 0,
-        totalCoverageAdvancesRejected: 0,
+      durationMs: actualDurationMs,
+      terminationReason: finalTerminationReason,
+      isCapTerminated,
+      counts: {
+        inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
+        applicationPayloadBytes: totalPayloadBytes,
+        overshootBytes,
+        peakQueueDepth,
+        queueRejectionsCount,
+        decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
+        transactionRetrievalsAttempted: transportOnly ? 0 : transactionRetrievalsAttempted,
+        transactionRetrievalsSucceeded: transportOnly ? 0 : transactionRetrievalsSucceeded,
+        historyQueriesAttempted: transportOnly ? 0 : historyQueriesAttempted,
+        historySignaturesDiscovered: transportOnly ? 0 : historyRecordsDiscovered,
+        nullBlockTimeCount: transportOnly ? 0 : nullBlockTimeCount,
       },
-    },
-    tradeFlowTelemetry: {
-      decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
-      recentBuys: transportOnly ? null : flowEval.recentBuys60s,
-      recentSells: transportOnly ? null : flowEval.recentSells60s,
-      flowCoverageStatus: transportOnly ? "NOT_EVALUATED_TRANSPORT_ONLY" : flowEval.coverage,
+      budgetStatus: budget.getStats(),
       isProductionCompletenessEstablished: false as const,
-    },
-    reconciliationTelemetry: {
-      anchorWitnessed,
-      anchorSignature,
-      anchorSlot,
-      anchorBlockTime,
-      historyQueriesAttempted,
-      historyQueriesLimit: maxHistoryQueries,
-      historyRecordsDiscovered,
-      enumeratorOutcome: historyDiscoveryOutcome,
-      discoveryDurationMs: historyDiscoveryDurationMs,
-    },
-    historyDiscoveryTelemetry: {
-      anchorWitnessed,
-      anchorSignature,
-      anchorSlot,
-      anchorBlockTime,
-      historyQueriesAttempted,
-      historyQueriesLimit: maxHistoryQueries,
-      historyRecordsDiscovered,
-      discoveryOutcome: historyDiscoveryOutcome,
-      discoveryDurationMs: historyDiscoveryDurationMs,
-    },
-    discrepancyAnalysis: {
-      totalWsWitnessedSignatures: wsWitnessedList.length,
-      totalHistoryWitnessedSignatures: historyWitnessedList.length,
-      commonSignaturesCount: commonSignatures.length,
-      wsOnlySignaturesCount: wsOnlySignatures.length,
-      historyOnlySignaturesCount: historyOnlySignatures.length,
-      unretrievedSampleSignaturesCount,
-      comparisonLimitsNotice: comparisonNotice,
-    },
-    budgetAccounting: {
-      totalHttpRequests: budget.getStats().totalRequests,
-      maxHttpAttemptsLimit: MAX_TOTAL_HTTP_ATTEMPTS,
-      enrichmentAttempts: budget.getStats().enrichmentRequests,
-      forwardReservationPreserved: true,
-      minProviderSpacingEnforcedMs: PROBE_MIN_PROVIDER_SPACING_MS,
-    },
-    sampledTransactionAudits,
-    historyQueryAudits,
-    slotAcquisitionAudit: slotAuditRecord,
-    cutoffAcquisitionAudit: cutoffAuditRecord,
-    transportDiagnostics: frozenTransportDiagnostics,
-  });
+      gate11Status: "UNAFFECTED_FAIL_CLOSED" as const,
+      virtualWalletBalanceSol: FROZEN_VIRTUAL_WALLET_SOL as "7.9259 SOL",
+      spendingCeiling: "$0.00" as const,
+      disclaimer: transportOnly
+        ? "Transport-only characterization evidence. Transaction retrieval, trade flow evaluation, and history discovery were disabled. Production rolling-flow completeness remains unverified and unavailable."
+        : "Transport characterization evidence only. Production rolling-flow completeness remains unverified and unavailable.",
+      transportDiagnostics: frozenTransportDiagnostics,
+    });
 
-  const witnessedEvidence: WitnessedSignaturesEvidence = Object.freeze({
-    poolId: poolContext.poolId,
-    timestampIso: endTimeIso,
-    wsWitnessed: wsWitnessedList,
-    historyWitnessed: historyWitnessedList,
-    discrepancies: {
-      commonSignatures,
-      wsOnlySignatures,
-      historyOnlySignatures,
-      unretrievedSampleSignaturesCount,
-      comparisonLimitsNotice: comparisonNotice,
-    },
-  });
+    const flowEval = tracker.evaluateWindow(endTime);
 
-  // Freeze telemetry and audit arrays to prevent any post-finalization mutations
-  Object.freeze(sampledTransactionAudits);
-  for (const item of sampledTransactionAudits) {
-    Object.freeze(item);
-  }
-  Object.freeze(historyQueryAudits);
-  for (const item of historyQueryAudits) {
-    Object.freeze(item);
-  }
-  Object.freeze(wsWitnessedList);
-  Object.freeze(historyWitnessedList);
+    const summary: TransportProbeSummary = Object.freeze({
+      poolId: poolContext.poolId,
+      candidateTokenMint: poolContext.candidateTokenMint,
+      status: finalStatus,
+      observationSuccess: isObservationSuccess,
+      terminationReason: finalTerminationReason,
+      executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
+      transportOnly,
+      zeroHttpDispatchesEnforced: transportOnly,
+      reconciliationMode: isReconcileMode,
+      reconciliationResult,
+      durationMs: actualDurationMs,
+      timing: {
+        startTimeIso,
+        endTimeIso,
+        localDurationMs: actualDurationMs,
+      },
+      queueTelemetry: {
+        peakQueueDepth,
+        queueLimit: maxQueueDepth,
+        queueLimitExceeded,
+        queueRejectionsCount,
+        pendingAtShutdown: adapter.getPendingQueueLength(),
+      },
+      streamingTelemetry: {
+        inboundMessagesCount: meteredTransport?.getMessageCount() ?? 0,
+        maxMessagesCeiling: maxMessages,
+        applicationPayloadBytes: totalPayloadBytes,
+        maxPayloadBytesCeiling: maxPayloadBytes,
+        overshootBytes,
+        coordinatorMetrics: coordinator?.getMetrics() ?? {
+          totalNotificationsReceived: 0,
+          totalNotificationsRouted: 0,
+          totalDuplicatesSkipped: 0,
+          totalQueueOverflows: 0,
+          totalUnrelatedDropped: 0,
+          totalMalformedFramesDropped: 0,
+          totalStaleEpochMessagesDropped: 0,
+          totalDisconnectGapsRecorded: 0,
+          totalCoverageAdvancesAttempted: 0,
+          totalCoverageAdvancesSucceeded: 0,
+          totalCoverageAdvancesRejected: 0,
+        },
+      },
+      tradeFlowTelemetry: {
+        decodedSwapsCount: transportOnly ? 0 : decodedSwapsCount,
+        recentBuys: transportOnly ? null : flowEval.recentBuys60s,
+        recentSells: transportOnly ? null : flowEval.recentSells60s,
+        flowCoverageStatus: transportOnly ? "NOT_EVALUATED_TRANSPORT_ONLY" : flowEval.coverage,
+        isProductionCompletenessEstablished: false as const,
+      },
+      reconciliationTelemetry: {
+        anchorWitnessed,
+        anchorSignature,
+        anchorSlot,
+        anchorBlockTime,
+        historyQueriesAttempted,
+        historyQueriesLimit: maxHistoryQueries,
+        historyRecordsDiscovered,
+        enumeratorOutcome: historyDiscoveryOutcome,
+        discoveryDurationMs: historyDiscoveryDurationMs,
+      },
+      historyDiscoveryTelemetry: {
+        anchorWitnessed,
+        anchorSignature,
+        anchorSlot,
+        anchorBlockTime,
+        historyQueriesAttempted,
+        historyQueriesLimit: maxHistoryQueries,
+        historyRecordsDiscovered,
+        discoveryOutcome: historyDiscoveryOutcome,
+        discoveryDurationMs: historyDiscoveryDurationMs,
+      },
+      discrepancyAnalysis: {
+        totalWsWitnessedSignatures: wsWitnessedList.length,
+        totalHistoryWitnessedSignatures: historyWitnessedList.length,
+        commonSignaturesCount: commonSignatures.length,
+        wsOnlySignaturesCount: wsOnlySignatures.length,
+        historyOnlySignaturesCount: historyOnlySignatures.length,
+        unretrievedSampleSignaturesCount,
+        comparisonLimitsNotice: comparisonNotice,
+      },
+      budgetAccounting: {
+        totalHttpRequests: budget.getStats().totalRequests,
+        maxHttpAttemptsLimit: MAX_TOTAL_HTTP_ATTEMPTS,
+        enrichmentAttempts: budget.getStats().enrichmentRequests,
+        forwardReservationPreserved: true,
+        minProviderSpacingEnforcedMs: PROBE_MIN_PROVIDER_SPACING_MS,
+      },
+      sampledTransactionAudits,
+      historyQueryAudits,
+      slotAcquisitionAudit: slotAuditRecord,
+      cutoffAcquisitionAudit: cutoffAuditRecord,
+      transportDiagnostics: frozenTransportDiagnostics,
+    });
 
-  // 12. Write and Seal Evidence Files
-  fsSync.writeFileSync(
-    path.join(targetDir, "capture-metadata.json"),
-    serializeJsonSafe(metadata, 2),
-    "utf8",
-  );
-  fsSync.writeFileSync(
-    path.join(targetDir, "probe-summary.json"),
-    serializeJsonSafe(summary, 2),
-    "utf8",
-  );
-  fsSync.writeFileSync(
-    path.join(targetDir, "witnessed-signatures.json"),
-    serializeJsonSafe(witnessedEvidence, 2),
-    "utf8",
-  );
-  fsSync.writeFileSync(
-    path.join(targetDir, "sampled-transactions.json"),
-    serializeJsonSafe(sampledTransactionAudits, 2),
-    "utf8",
-  );
+    const witnessedEvidence: WitnessedSignaturesEvidence = Object.freeze({
+      poolId: poolContext.poolId,
+      timestampIso: endTimeIso,
+      wsWitnessed: wsWitnessedList,
+      historyWitnessed: historyWitnessedList,
+      discrepancies: {
+        commonSignatures,
+        wsOnlySignatures,
+        historyOnlySignatures,
+        unretrievedSampleSignaturesCount,
+        comparisonLimitsNotice: comparisonNotice,
+      },
+    });
 
-  if (isReconcileMode && reconciliationResult) {
+    // Freeze telemetry and audit arrays to prevent any post-finalization mutations
+    Object.freeze(sampledTransactionAudits);
+    for (const item of sampledTransactionAudits) {
+      Object.freeze(item);
+    }
+    Object.freeze(historyQueryAudits);
+    for (const item of historyQueryAudits) {
+      Object.freeze(item);
+    }
+    Object.freeze(wsWitnessedList);
+    Object.freeze(historyWitnessedList);
+
+    // 12. Write and Seal Evidence Files
     fsSync.writeFileSync(
-      path.join(targetDir, "reconciliation-result.json"),
-      serializeJsonSafe(reconciliationResult, 2),
+      path.join(targetDir, "capture-metadata.json"),
+      serializeJsonSafe(metadata, 2),
       "utf8",
     );
+    fsSync.writeFileSync(
+      path.join(targetDir, "probe-summary.json"),
+      serializeJsonSafe(summary, 2),
+      "utf8",
+    );
+    fsSync.writeFileSync(
+      path.join(targetDir, "witnessed-signatures.json"),
+      serializeJsonSafe(witnessedEvidence, 2),
+      "utf8",
+    );
+    fsSync.writeFileSync(
+      path.join(targetDir, "sampled-transactions.json"),
+      serializeJsonSafe(sampledTransactionAudits, 2),
+      "utf8",
+    );
+
+    if (isReconcileMode && reconciliationResult) {
+      fsSync.writeFileSync(
+        path.join(targetDir, "reconciliation-result.json"),
+        serializeJsonSafe(reconciliationResult, 2),
+        "utf8",
+      );
+    }
+
+    const manifest = sealCaptureManifest(
+      targetDir,
+      poolContext.poolId,
+      poolContext.candidateTokenMint,
+      endTimeIso,
+    );
+
+    removeCallerSignalListener?.();
+    cleanupDiagnosticsChannel?.();
+    cleanupKeepalive();
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = undefined;
+    }
+    try {
+      (baseTransport as Partial<ISolanaKeepaliveWebSocketTransport> | undefined)?.destroy?.();
+    } catch {
+      // ignore
+    }
+
+    return {
+      success: isObservationSuccess,
+      observationSuccess: isObservationSuccess,
+      manifestSealed: true,
+      dryRun: false,
+      status: finalStatus,
+      targetDir,
+      poolId: poolContext.poolId,
+      candidateTokenMint: poolContext.candidateTokenMint,
+      metadata,
+      summary,
+      manifest,
+      ...(isReconcileMode
+        ? {
+            reconciliationResult,
+            reconciliationSuccess,
+          }
+        : {}),
+    };
+  } finally {
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = undefined;
+    }
   }
-
-  const manifest = sealCaptureManifest(
-    targetDir,
-    poolContext.poolId,
-    poolContext.candidateTokenMint,
-    endTimeIso,
-  );
-
-  removeCallerSignalListener?.();
-  cleanupDiagnosticsChannel?.();
-  cleanupKeepalive();
-  try {
-    (baseTransport as Partial<ISolanaKeepaliveWebSocketTransport> | undefined)?.destroy?.();
-  } catch {
-    // ignore
-  }
-
-  return {
-    success: isObservationSuccess,
-    observationSuccess: isObservationSuccess,
-    manifestSealed: true,
-    dryRun: false,
-    status: finalStatus,
-    targetDir,
-    poolId: poolContext.poolId,
-    candidateTokenMint: poolContext.candidateTokenMint,
-    metadata,
-    summary,
-    manifest,
-    ...(isReconcileMode
-      ? {
-          reconciliationResult,
-          reconciliationSuccess,
-        }
-      : {}),
-  };
 }
 
 // ============================================================================
