@@ -112,19 +112,29 @@ export class ContinuousQuietIntervalTracker {
       return;
     }
 
-    // Check for unobserved gap between existing span and new window
+    // Check for disjoint interval in the future (unobserved forward gap)
     if (observation.windowStartMs > this.continuousEndMs) {
-      // Unobserved gap breaks continuity
+      // Unobserved forward gap breaks continuity
       this.continuousStartMs = observation.windowStartMs;
       this.continuousEndMs = observation.windowEndMs;
       this.lastResetReason = "UNOBSERVED_GAP";
       return;
     }
 
-    // Contiguous or overlapping window: merge without double counting
-    if (observation.windowStartMs < this.continuousStartMs) {
-      this.continuousStartMs = observation.windowStartMs;
+    // Check for disjoint interval in the past (unobserved backward gap / out-of-order)
+    if (observation.windowEndMs < this.continuousStartMs) {
+      this.reset("OUT_OF_ORDER_OBSERVATION");
+      return;
     }
+
+    // Check for out-of-order backward expansion into unobserved past
+    if (observation.windowStartMs < this.continuousStartMs) {
+      this.reset("OUT_OF_ORDER_OBSERVATION");
+      return;
+    }
+
+    // Contiguous or overlapping window (continuousStartMs <= windowStartMs <= continuousEndMs):
+    // Advance continuousEndMs only if the new window extends beyond current end
     if (observation.windowEndMs > this.continuousEndMs) {
       this.continuousEndMs = observation.windowEndMs;
     }

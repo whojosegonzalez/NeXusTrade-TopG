@@ -68,6 +68,9 @@ export interface CandidateFlowResult {
   readonly evaluationTimestampMs: number;
   readonly isPaperQualified?: boolean | undefined;
   readonly paperQualificationContext?: PaperQualificationContext | undefined;
+  readonly windowStartMs?: number | undefined;
+  readonly windowEndMs?: number | undefined;
+  readonly connectionEpoch?: number | undefined;
 }
 
 /**
@@ -319,6 +322,25 @@ export function validateAndSnapshotCandidateFlowResult(
       ...(isPaperMode ? { isPaperQualified: false } : {}),
     });
 
+  // Validate options if provided
+  const rawMaxAge = options?.maxAllowedEvidenceAgeMs;
+  let maxAllowedAgeMs = 15_000;
+  if (rawMaxAge !== undefined) {
+    if (
+      typeof rawMaxAge !== "number" ||
+      !Number.isFinite(rawMaxAge) ||
+      Number.isNaN(rawMaxAge) ||
+      !Number.isInteger(rawMaxAge) ||
+      rawMaxAge <= 0 ||
+      rawMaxAge > 15_000
+    ) {
+      return fallback(
+        `INVALID_MAX_ALLOWED_AGE: maxAllowedEvidenceAgeMs must be a finite positive integer <= 15000 ms, received ${String(rawMaxAge)}`,
+      );
+    }
+    maxAllowedAgeMs = rawMaxAge;
+  }
+
   // 1. Safe handling of null, undefined, or non-object results
   if (!rawResult || typeof rawResult !== "object") {
     return fallback(`MALFORMED_PROVIDER_RESULT: provider returned ${String(rawResult)}`);
@@ -355,7 +377,22 @@ export function validateAndSnapshotCandidateFlowResult(
   }
 
   // 4. PAPER Qualification Provenance Validation
-  if (res.isPaperQualified === true) {
+  if (res.isPaperQualified !== undefined && typeof res.isPaperQualified !== "boolean") {
+    return fallback(
+      `INCONSISTENT_PAPER_QUALIFICATION: isPaperQualified must be a boolean when present`,
+    );
+  }
+
+  const hasPaperMarker = res.isPaperQualified === true;
+  const hasPaperCtx = res.paperQualificationContext !== undefined;
+
+  if (hasPaperMarker !== hasPaperCtx) {
+    return fallback(
+      "INCONSISTENT_PAPER_QUALIFICATION: isPaperQualified must be true and paperQualificationContext must be provided",
+    );
+  }
+
+  if (hasPaperMarker) {
     if (!isPaperMode) {
       // Reject PAPER-qualified evidence in default/production mode
       return fallback("PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION");
@@ -381,7 +418,11 @@ export function validateAndSnapshotCandidateFlowResult(
         60_000 ||
       typeof paperCtx.originalEvaluationTimestampMs !== "number" ||
       !Number.isSafeInteger(paperCtx.originalEvaluationTimestampMs) ||
-      paperCtx.originalEvaluationTimestampMs <= 0
+      paperCtx.originalEvaluationTimestampMs <= 0 ||
+      typeof paperCtx.qualificationReason !== "string" ||
+      paperCtx.qualificationReason.trim().length === 0 ||
+      !Array.isArray(paperCtx.providerAssumptions) ||
+      !Array.isArray(paperCtx.unresolvedUncertainties)
     ) {
       return fallback("INVALID_PAPER_QUALIFICATION_PROVENANCE");
     }
@@ -400,7 +441,6 @@ export function validateAndSnapshotCandidateFlowResult(
 
     // Recalculate freshness from actual research cutoff at consumption time
     const currentCutoffAgeMs = evaluationTimestampMs - paperCtx.researchWindowSpan.windowEndMs;
-    const maxAllowedAgeMs = Math.min(options?.maxAllowedEvidenceAgeMs ?? 15_000, 15_000);
     if (currentCutoffAgeMs > maxAllowedAgeMs) {
       return fallback(
         `STALE_RECONCILIATION_EVIDENCE: Research cutoff age (${currentCutoffAgeMs} ms) exceeds max allowed age (${maxAllowedAgeMs} ms)`,
@@ -425,6 +465,24 @@ export function validateAndSnapshotCandidateFlowResult(
         ? res.diagnosticReason
         : "PAPER quiet window qualified";
 
+    const frozenSpan = Object.freeze({
+      windowStartMs: paperCtx.researchWindowSpan.windowStartMs,
+      windowEndMs: paperCtx.researchWindowSpan.windowEndMs,
+      cutoffAgeMs: currentCutoffAgeMs,
+    });
+    const frozenAssumptions = Object.freeze(paperCtx.providerAssumptions.slice());
+    const frozenUncertainties = Object.freeze(paperCtx.unresolvedUncertainties.slice());
+    const frozenPaperCtx: PaperQualificationContext = Object.freeze({
+      executionContext: paperCtx.executionContext,
+      validatedEpoch: paperCtx.validatedEpoch,
+      originalEvaluationTimestampMs: paperCtx.originalEvaluationTimestampMs,
+      researchWindowSpan: frozenSpan,
+      cutoffAgeMs: currentCutoffAgeMs,
+      qualificationReason: paperCtx.qualificationReason,
+      providerAssumptions: frozenAssumptions,
+      unresolvedUncertainties: frozenUncertainties,
+    });
+
     return Object.freeze({
       poolAddress: target.poolAddress,
       tokenMint: target.tokenMint,
@@ -435,10 +493,10 @@ export function validateAndSnapshotCandidateFlowResult(
       diagnosticReason: diagReason,
       evaluationTimestampMs,
       isPaperQualified: true,
-      paperQualificationContext: {
-        ...paperCtx,
-        cutoffAgeMs: currentCutoffAgeMs,
-      },
+      paperQualificationContext: frozenPaperCtx,
+      windowStartMs: frozenSpan.windowStartMs,
+      windowEndMs: frozenSpan.windowEndMs,
+      connectionEpoch: frozenPaperCtx.validatedEpoch,
     });
   }
 
@@ -480,6 +538,33 @@ export function validateAndSnapshotCandidateFlowResult(
         ? res.diagnosticReason
         : "Coverage is sufficient";
 
+    const extraFields: {
+      windowStartMs?: number;
+      windowEndMs?: number;
+      connectionEpoch?: number;
+    } = {};
+    if (
+      typeof res.windowStartMs === "number" &&
+      Number.isSafeInteger(res.windowStartMs) &&
+      res.windowStartMs >= 0
+    ) {
+      extraFields.windowStartMs = res.windowStartMs;
+    }
+    if (
+      typeof res.windowEndMs === "number" &&
+      Number.isSafeInteger(res.windowEndMs) &&
+      res.windowEndMs >= 0
+    ) {
+      extraFields.windowEndMs = res.windowEndMs;
+    }
+    if (
+      typeof res.connectionEpoch === "number" &&
+      Number.isSafeInteger(res.connectionEpoch) &&
+      res.connectionEpoch >= 0
+    ) {
+      extraFields.connectionEpoch = res.connectionEpoch;
+    }
+
     return Object.freeze({
       poolAddress: target.poolAddress,
       tokenMint: target.tokenMint,
@@ -489,6 +574,7 @@ export function validateAndSnapshotCandidateFlowResult(
       isCoverageSufficient: true,
       diagnosticReason: diagReason,
       evaluationTimestampMs,
+      ...extraFields,
     });
   }
 

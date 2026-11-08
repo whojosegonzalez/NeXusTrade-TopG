@@ -1209,6 +1209,156 @@ describe("CandidateFlowProvider & Evaluation Seam", () => {
         expect(snap.recentSells60s).toBeNull();
         expect(snap.diagnosticReason).toContain("STALE_RECONCILIATION_EVIDENCE");
       });
+
+      it("rejects NaN maxAllowedEvidenceAgeMs fail-closed using finite-integer contract", () => {
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid quiet window",
+          evaluationTimestampMs: 1_000_000,
+          isPaperQualified: true,
+          paperQualificationContext: {
+            executionContext: "PAPER_SIMULATION",
+            validatedEpoch: 0,
+            originalEvaluationTimestampMs: 1_000_000,
+            researchWindowSpan: {
+              windowStartMs: 935_000,
+              windowEndMs: 995_000,
+              cutoffAgeMs: 5_000,
+            },
+            cutoffAgeMs: 5_000,
+            qualificationReason: "Quiet window control",
+            providerAssumptions: [],
+            unresolvedUncertainties: [],
+          },
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_000_000, {
+          executionContext: "PAPER_SIMULATION",
+          maxAllowedEvidenceAgeMs: NaN,
+        });
+
+        expect(snap.isCoverageSufficient).toBe(false);
+        expect(snap.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snap.diagnosticReason).toContain("INVALID_MAX_ALLOWED_AGE");
+      });
+
+      it("rejects inconsistent PAPER markers fail-closed and never falls through to ordinary sufficient flow", () => {
+        const paperCtx = {
+          executionContext: "PAPER_SIMULATION" as const,
+          validatedEpoch: 0,
+          originalEvaluationTimestampMs: 1_000_000,
+          researchWindowSpan: {
+            windowStartMs: 935_000,
+            windowEndMs: 995_000,
+            cutoffAgeMs: 5_000,
+          },
+          cutoffAgeMs: 5_000,
+          qualificationReason: "Quiet window control",
+          providerAssumptions: ["rpc-anchor-valid"],
+          unresolvedUncertainties: [],
+        };
+
+        // Case A: paperQualificationContext provided without isPaperQualified
+        const rawWithoutMarker = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Inconsistent marker",
+          evaluationTimestampMs: 1_000_000,
+          paperQualificationContext: paperCtx,
+        };
+
+        const snapA = validateAndSnapshotCandidateFlowResult(rawWithoutMarker, target, 1_000_000, {
+          executionContext: "PAPER_SIMULATION",
+        });
+        expect(snapA.isCoverageSufficient).toBe(false);
+        expect(snapA.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snapA.diagnosticReason).toContain("INCONSISTENT_PAPER_QUALIFICATION");
+
+        // Case B: isPaperQualified is true but paperQualificationContext is omitted
+        const rawWithoutCtx = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Missing context",
+          evaluationTimestampMs: 1_000_000,
+          isPaperQualified: true,
+        };
+
+        const snapB = validateAndSnapshotCandidateFlowResult(rawWithoutCtx, target, 1_000_000, {
+          executionContext: "PAPER_SIMULATION",
+        });
+        expect(snapB.isCoverageSufficient).toBe(false);
+        expect(snapB.flowCoverage).toBe("COLLECTION_GAP");
+        expect(snapB.diagnosticReason).toContain("INCONSISTENT_PAPER_QUALIFICATION");
+      });
+
+      it("deeply freezes nested provenance and ensures cutoffAgeMs agreement across top-level and researchWindowSpan", () => {
+        const assumptions = ["assumption-1"];
+        const uncertainties = ["uncertainty-1"];
+        const raw = {
+          poolAddress: CANONICAL_POOL_ID,
+          tokenMint: CANONICAL_TOKEN_MINT,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid quiet window",
+          evaluationTimestampMs: 1_003_000, // 8,000ms after windowEndMs 995_000
+          isPaperQualified: true,
+          paperQualificationContext: {
+            executionContext: "PAPER_SIMULATION" as const,
+            validatedEpoch: 2,
+            originalEvaluationTimestampMs: 1_000_000,
+            researchWindowSpan: {
+              windowStartMs: 935_000,
+              windowEndMs: 995_000,
+              cutoffAgeMs: 5_000, // old cutoff age from evaluation
+            },
+            cutoffAgeMs: 5_000,
+            qualificationReason: "Quiet window control",
+            providerAssumptions: assumptions,
+            unresolvedUncertainties: uncertainties,
+          },
+        };
+
+        const snap = validateAndSnapshotCandidateFlowResult(raw, target, 1_003_000, {
+          executionContext: "PAPER_SIMULATION",
+        });
+
+        expect(snap.isCoverageSufficient).toBe(true);
+        expect(snap.isPaperQualified).toBe(true);
+
+        // Provenance snapshot agreement: both top-level and nested span reflect current consumption cutoff age (8,000ms)
+        expect(snap.paperQualificationContext?.cutoffAgeMs).toBe(8_000);
+        expect(snap.paperQualificationContext?.researchWindowSpan.cutoffAgeMs).toBe(8_000);
+
+        // Snapshot exposure of interval and epoch
+        expect(snap.windowStartMs).toBe(935_000);
+        expect(snap.windowEndMs).toBe(995_000);
+        expect(snap.connectionEpoch).toBe(2);
+
+        // Deep immutability checks
+        expect(Object.isFrozen(snap.paperQualificationContext)).toBe(true);
+        expect(Object.isFrozen(snap.paperQualificationContext?.researchWindowSpan)).toBe(true);
+        expect(Object.isFrozen(snap.paperQualificationContext?.providerAssumptions)).toBe(true);
+        expect(Object.isFrozen(snap.paperQualificationContext?.unresolvedUncertainties)).toBe(true);
+
+        // Mutation of caller's source arrays does not affect snapshot
+        assumptions.push("injected-assumption");
+        expect(snap.paperQualificationContext?.providerAssumptions).toEqual(["assumption-1"]);
+      });
     });
 
     describe("4.3 Pre-Extraction Liquidity Floor Restoration & Cohort Preservation", () => {

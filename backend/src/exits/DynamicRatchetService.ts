@@ -238,16 +238,18 @@ export class DynamicRatchetService {
     }
 
     // 2. Evaluation Logic
-    // Validate verified flow availability for flow-dependent decisions
+    // Validate verified flow availability for flow-dependent decisions:
+    // Requires explicit isFlowSufficient === true AND flowCoverage === "SUFFICIENT"
+    // in addition to non-null valid safe integer counts.
     const isFlowAvailable =
-      context.isFlowSufficient !== false &&
+      context.isFlowSufficient === true &&
+      context.flowCoverage === "SUFFICIENT" &&
       context.recentBuysCount60s !== null &&
       context.recentSellsCount60s !== null &&
       Number.isSafeInteger(context.recentBuysCount60s) &&
       Number.isSafeInteger(context.recentSellsCount60s) &&
       context.recentBuysCount60s >= 0 &&
-      context.recentSellsCount60s >= 0 &&
-      (context.isFlowSufficient === true || context.isFlowSufficient === undefined);
+      context.recentSellsCount60s >= 0;
 
     // Rule A0: Emergency Avalanche Sell-Pressure Cut
     // If position is underwater (currentPnlBps <= -400, i.e. <= -4.0%)
@@ -808,14 +810,23 @@ export class DynamicRatchetService {
     drawdownElapsedMs: number | null,
     context: MarketEvaluationContext,
   ): RatchetEvaluationDiagnostics {
-    const buySellRatio60s =
-      context.recentBuysCount60s === null || context.recentSellsCount60s === null
-        ? null
-        : context.recentSellsCount60s === 0
-          ? context.recentBuysCount60s > 0
-            ? 999
-            : 0
-          : Number((context.recentBuysCount60s / context.recentSellsCount60s).toFixed(2));
+    const isFlowAvailable =
+      context.isFlowSufficient === true &&
+      context.flowCoverage === "SUFFICIENT" &&
+      context.recentBuysCount60s !== null &&
+      context.recentSellsCount60s !== null &&
+      Number.isSafeInteger(context.recentBuysCount60s) &&
+      Number.isSafeInteger(context.recentSellsCount60s) &&
+      context.recentBuysCount60s >= 0 &&
+      context.recentSellsCount60s >= 0;
+
+    const buySellRatio60s = !isFlowAvailable
+      ? null
+      : context.recentSellsCount60s === 0
+        ? context.recentBuysCount60s! > 0
+          ? 999
+          : 0
+        : Number((context.recentBuysCount60s! / context.recentSellsCount60s!).toFixed(2));
 
     return {
       currentPnlBps,

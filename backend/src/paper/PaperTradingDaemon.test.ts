@@ -36,7 +36,9 @@ import {
 import { recoverSettlementJournal, type SettlementJournalEntry } from "./SettlementJournal.js";
 import { checkLegacyConflict, findWorkspaceRoot } from "./CanonicalPaths.js";
 import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
-import { parseCliArgs } from "../scripts/paper-trading-daemon.js";
+import { parseCliArgs, buildPositionMarketContext } from "../scripts/paper-trading-daemon.js";
+import { ContinuousQuietIntervalTracker } from "../candidate-scanner/ContinuousQuietIntervalTracker.js";
+import type { CandidateFlowProvider } from "../candidate-scanner/CandidateFlowProvider.js";
 import {
   recoverInterruptedIntent,
   type ReconciliationIntent,
@@ -87,6 +89,8 @@ describe("PaperTradingDaemon", () => {
     momentum5mBps: 150,
     volumeStalled3m: false,
     currentTimestampMs: nowMs,
+    isFlowSufficient: true,
+    flowCoverage: "SUFFICIENT",
   };
 
   it("admits valid candidates and opens paper positions up to max capacity", () => {
@@ -1224,6 +1228,8 @@ describe("PaperTradingDaemon", () => {
           lpIntact: true,
           recentBuysCount60s: 50,
           recentSellsCount60s: 10,
+          isFlowSufficient: true,
+          flowCoverage: "SUFFICIENT",
           momentum5mBps: -400,
           volumeStalled3m: false,
         },
@@ -1253,6 +1259,8 @@ describe("PaperTradingDaemon", () => {
           lpIntact: true,
           recentBuysCount60s: 50,
           recentSellsCount60s: 10,
+          isFlowSufficient: true,
+          flowCoverage: "SUFFICIENT",
           momentum5mBps: -500,
           volumeStalled3m: false,
         },
@@ -3341,6 +3349,229 @@ describe("PaperTradingDaemon", () => {
       expect(telemetryObj.deployableSol).toBe(7.8759);
 
       rmSync(tempDir, { recursive: true, force: true });
+    });
+  });
+
+  describe("Phase 12.94-D: buildPositionMarketContext & Evidence Accounting Integration", () => {
+    const dummyPoolId = "Pool1111111111111111111111111111111111111111";
+    const dummyMint = "Mint1111111111111111111111111111111111111111";
+
+    it("resets tracker and leaves volumeStalled3m=false when interval/epoch provenance is missing (does not invent evidence)", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-no-provenance",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // Mock provider returns valid counts (0/0) and sufficient coverage, but NO windowStartMs/windowEndMs/connectionEpoch
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: () => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Sufficient counts without provenance",
+          evaluationTimestampMs: 1_000_000,
+        }),
+      };
+
+      // Simulate 4 consecutive ticks across 180 seconds (1_000_000 to 1_180_000)
+      for (let t = 0; t <= 180_000; t += 60_000) {
+        const result = buildPositionMarketContext({
+          position: pos,
+          spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+          currentNow: 1_000_000 + t,
+          flowProvider,
+          quietTracker,
+        });
+
+        expect(result.isFeedOutage).toBe(false);
+        expect(result.marketContext).toBeDefined();
+        // Stagnation must NOT be established because interval/epoch provenance was missing!
+        expect(result.marketContext?.volumeStalled3m).toBe(false);
+      }
+
+      // Tracker must never report stagnant 3m without proven intervals
+      expect(quietTracker.isStagnant3m()).toBe(false);
+    });
+
+    it("establishes stagnation (volumeStalled3m=true) when continuous quiet intervals with provenance span 180 seconds", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-valid-provenance",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      // Provider returns genuine continuous quiet window with interval provenance in epoch 0
+      let currentWindowStart = 940_000;
+      let currentWindowEnd = 1_000_000;
+
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: (_target, evalMs) => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Verified quiet window",
+          evaluationTimestampMs: evalMs,
+          windowStartMs: currentWindowStart,
+          windowEndMs: currentWindowEnd,
+          connectionEpoch: 0,
+        }),
+      };
+
+      // Tick 1: window [940_000, 1_000_000], span = 60s
+      let res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+
+      // Tick 2: window [1_000_000, 1_060_000], span = 120s
+      currentWindowStart = 1_000_000;
+      currentWindowEnd = 1_060_000;
+      res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_060_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+
+      // Tick 3: window [1_060_000, 1_120_000], span = 180s -> stagnation established!
+      currentWindowStart = 1_060_000;
+      currentWindowEnd = 1_120_000;
+      res = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 0 },
+        currentNow: 1_120_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(res.marketContext?.volumeStalled3m).toBe(true);
+      expect(quietTracker.isStagnant3m()).toBe(true);
+    });
+
+    it("returns unavailable flow for legacy positions missing poolId without inferring replacement pool", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const legacyPos = {
+        positionId: "pos-legacy-1",
+        poolId: undefined, // Legacy position missing pool identity
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: () => {
+          throw new Error("Should not be called for legacy positions");
+        },
+      };
+
+      const res = buildPositionMarketContext({
+        position: legacyPos,
+        spotInfo: { spotPriceSol: 1.0, momentum5mBps: 100 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+
+      expect(res.isFeedOutage).toBe(false);
+      expect(res.marketContext).toBeDefined();
+      expect(res.marketContext?.recentBuysCount60s).toBeNull();
+      expect(res.marketContext?.recentSellsCount60s).toBeNull();
+      expect(res.marketContext?.isFlowSufficient).toBe(false);
+      expect(res.marketContext?.flowCoverage).toBe("COLLECTION_GAP");
+      expect(res.marketContext?.volumeStalled3m).toBe(false);
+    });
+
+    it("safely contains provider exceptions and delivers valid spot price to protective exits", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-throwing-provider",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 0.95, // dropped from 1.0
+      };
+
+      const throwingProvider: CandidateFlowProvider = {
+        getCandidateFlow: () => {
+          throw new Error("RPC socket terminated");
+        },
+      };
+
+      const res = buildPositionMarketContext({
+        position: { ...pos, spotPriceSol: 1.0 },
+        spotInfo: { spotPriceSol: 0.95, momentum5mBps: -500 },
+        currentNow: 1_000_000,
+        flowProvider: throwingProvider,
+        quietTracker,
+      });
+
+      expect(res.isFeedOutage).toBe(false);
+      expect(res.singleTickDropBps).toBe(-500);
+      expect(res.marketContext).toBeDefined();
+      expect(res.marketContext?.spotPriceSol).toBe(0.95);
+      expect(res.marketContext?.recentBuysCount60s).toBeNull();
+      expect(res.marketContext?.recentSellsCount60s).toBeNull();
+      expect(res.marketContext?.isFlowSufficient).toBe(false);
+      expect(res.marketContext?.flowCoverage).toBe("COLLECTION_GAP");
+    });
+
+    it("handles missing spot feed as feed outage without marking stagnation", () => {
+      const quietTracker = new ContinuousQuietIntervalTracker();
+      const pos = {
+        positionId: "pos-outage",
+        poolId: dummyPoolId,
+        mintAddress: dummyMint,
+        spotPriceSol: 1.0,
+      };
+
+      const flowProvider: CandidateFlowProvider = {
+        getCandidateFlow: () => ({
+          poolAddress: dummyPoolId,
+          tokenMint: dummyMint,
+          recentBuys60s: 0,
+          recentSells60s: 0,
+          flowCoverage: "SUFFICIENT",
+          isCoverageSufficient: true,
+          diagnosticReason: "Valid",
+          evaluationTimestampMs: 1_000_000,
+        }),
+      };
+
+      // Spot info is null -> feed outage
+      const resNull = buildPositionMarketContext({
+        position: pos,
+        spotInfo: null,
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(resNull.isFeedOutage).toBe(true);
+      expect(resNull.marketContext).toBeNull();
+
+      // Spot price is 0 -> feed outage
+      const resZero = buildPositionMarketContext({
+        position: pos,
+        spotInfo: { spotPriceSol: 0, momentum5mBps: 0 },
+        currentNow: 1_000_000,
+        flowProvider,
+        quietTracker,
+      });
+      expect(resZero.isFeedOutage).toBe(true);
+      expect(resZero.marketContext).toBeNull();
     });
   });
 });

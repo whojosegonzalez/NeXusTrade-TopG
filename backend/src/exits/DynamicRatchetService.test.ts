@@ -16,6 +16,8 @@ describe("DynamicRatchetService", () => {
     momentum5mBps: 200,
     volumeStalled3m: false,
     currentTimestampMs: 1_000_000,
+    isFlowSufficient: true,
+    flowCoverage: "SUFFICIENT",
   };
 
   it("handles normal initial hold", () => {
@@ -1266,6 +1268,50 @@ describe("DynamicRatchetService", () => {
       );
       expect(expireResult.action).toBe("SELL_ALL");
       expect(expireResult.reasonCode).toBe("DRAWDOWN_GRACE_EXPIRED");
+    });
+
+    it("rejects flow with COLLECTION_GAP and omitted isFlowSufficient from extended grace and reports buySellRatio60s as null", () => {
+      const store = new RatchetStateStore();
+      const service = new DynamicRatchetService({}, store);
+      const state = store.initPositionState("pos-gap-repro", "mint-1", 1.0, 1_000_000);
+
+      // Enters drawdown at 1_000_000 with buyer dominance counts but COLLECTION_GAP and omitted isFlowSufficient
+      const enterResult = service.evaluate(
+        state,
+        {
+          ...baseContext,
+          spotPriceSol: 0.92, // -8.0%
+          flowCoverage: "COLLECTION_GAP",
+          recentBuysCount60s: 20,
+          recentSellsCount60s: 5,
+          isFlowSufficient: undefined,
+          currentTimestampMs: 1_000_000,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG, // 120s base grace
+      );
+
+      expect(enterResult.action).toBe("HOLD");
+      expect(enterResult.reasonCode).toBe("HOLD_DRAWDOWN_GRACE");
+      expect(enterResult.diagnostics.buySellRatio60s).toBeNull();
+
+      // At 125s elapsed (> 120s base grace): collection gap cannot extend grace to 180s, expires at base grace!
+      const expireResult = service.evaluate(
+        enterResult.updatedState,
+        {
+          ...baseContext,
+          spotPriceSol: 0.92,
+          flowCoverage: "COLLECTION_GAP",
+          recentBuysCount60s: 20,
+          recentSellsCount60s: 5,
+          isFlowSufficient: undefined,
+          currentTimestampMs: 1_125_000,
+        },
+        ESTABLISHED_DYNAMIC_RATCHET_CONFIG,
+      );
+
+      expect(expireResult.action).toBe("SELL_ALL");
+      expect(expireResult.reasonCode).toBe("DRAWDOWN_GRACE_EXPIRED");
+      expect(expireResult.diagnostics.buySellRatio60s).toBeNull();
     });
   });
 });

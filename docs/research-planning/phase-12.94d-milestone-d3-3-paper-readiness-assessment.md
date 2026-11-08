@@ -654,11 +654,14 @@ Before end-to-end PAPER execution can be scheduled or authorized, the following 
      - Verified across 43 focused offline unit tests (`CandidateFlowProvider.test.ts`), passing all candidate scanner (631 tests) and daemon (77 tests) suites with zero live network requests or wallet modifications.
 4. **Resolved Offline Position-Flow Integration & Selected Flow Policies**:
    - The active position exit-monitoring loop (`tickPosition` in `paper-trading-daemon.ts`) has been corrected offline to consume candidate-bound validated flow via `activeCandidateFlowProvider.getCandidateFlow()` bound to the exact pool and token mint, completely excising interpolated 5-minute DexScreener counts (`buys5m / 5`, `sells5m / 5`) from exit and scale-in decisions.
+   - Extracted and exported `buildPositionMarketContext` in `paper-trading-daemon.ts`, unifying spot price evaluation, price-change detection, flow provider querying, provider exception containment, and strict interval evidence accounting.
    - Originating pool identity (`poolId`) is persisted on each `PaperPosition`. Legacy positions without pool identity retain unavailable flow (`COLLECTION_GAP`, null counts) fail-closed without inferring replacement pools.
    - Silent pool substitution in `fetchDexScreenerSpotInfo` is eliminated: supplying an `expectedPoolId` returns `null` if unmatched.
    - Provider exceptions are safely contained so valid price ticks reach independent price-based protective exits.
-   - When flow is unavailable, flow-dependent loss cuts (Rule A0 avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop, Drawdown Health Check 2) are skipped; existing price protections (catastrophic hard floors, cohort pre-breakeven stops) and base drawdown grace timers remain active. Unknown flow cannot authorize scale-ins, viral-absorption exceptions, or extended grace. Ratio diagnostics report `null` without claiming observed sell pressure or buyer support.
-   - Stagnation exits require continuous quiet evidence over at least 180 seconds via `ContinuousQuietIntervalTracker`, merging overlapping intervals without double-counting and resetting on collection gaps, outages, trades, or epoch changes. Feedback dependency between `!volumeStalled3m` and `lastActivityMs` is eliminated. Full policy details documented in Section 8.13.6.
+   - When flow is unavailable or insufficient, flow-dependent loss cuts (Rule A0 avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop, Drawdown Health Check 2) are skipped; existing price protections (catastrophic hard floors, cohort pre-breakeven stops) and base drawdown grace timers remain active. Unknown flow cannot authorize scale-ins, viral-absorption exceptions, or extended grace. Ratio diagnostics report `null` without claiming observed sell pressure or buyer support.
+   - `DynamicRatchetService` strictly requires explicit `isFlowSufficient === true` AND `flowCoverage === "SUFFICIENT"` plus valid non-negative safe-integer counts for flow-dependent decisions; missing flags or collection gaps with numeric counts cannot authorize extended grace and report `buySellRatio60s: null`.
+   - Stagnation exits require continuous quiet evidence over at least 180 seconds via `ContinuousQuietIntervalTracker`, merging overlapping intervals without double-counting, rejecting out-of-order observations (`OUT_OF_ORDER_OBSERVATION`), and resetting on collection gaps, unobserved forward gaps (`UNOBSERVED_GAP`), outages, trades, or epoch changes.
+   - Invented stagnation evidence is eliminated: absence of interval or epoch provenance resets tracker with `MISSING_INTERVAL_OR_EPOCH_PROVENANCE`, leaving `volumeStalled3m = false` without blocking price stops. Feedback dependency between `!volumeStalled3m` and `lastActivityMs` is eliminated. Full policy details documented in Section 8.13.5.
 5. **Reaffirmation: Production Source Completeness Remains Unproven**:
    - The coordinator defaults to fail-closed `isCoverageSufficient: false` and `recentBuys60s: null` / `recentSells60s: null` under default production configuration.
    - Synthetic completeness proofs are strictly restricted to isolated offline test fixtures via explicit `allowSyntheticCompletenessProofs: true`. Explanatory text strings, open socket liveness, empty queues, or environment variable flags (`process.env`) cannot establish or bypass completeness.
@@ -1567,6 +1570,7 @@ Following explicit operator review and policy selection (Policies 1 and 2), the 
 1. **Position Identity & Provider Seam Binding**:
    - Originating pool identity (`poolId`) is persisted on each `PaperPosition` upon acquisition.
    - Position trade flow is obtained through the existing provider seam via `activeCandidateFlowProvider.getCandidateFlow()`, bound to the exact pool address and token mint.
+   - Extracted and exported `buildPositionMarketContext` in `paper-trading-daemon.ts`, unifying spot price evaluation, price-change detection, flow provider querying, provider exception containment, and strict interval evidence accounting.
    - Legacy positions lacking pool identity retain unavailable flow (`COLLECTION_GAP`, null counts) fail-closed without inferring or guessing replacement pools.
    - Provider exceptions are strictly contained within local `try/catch` handlers so valid price ticks reach independent price-based protective exits.
    - Interpolated 5-minute DexScreener counts (`buys5m / 5`, `sells5m / 5`) are completely excised from position exit evaluations and scale-in momentum checks.
@@ -1574,19 +1578,21 @@ Following explicit operator review and policy selection (Policies 1 and 2), the 
 
 2. **Selected Unavailable-Flow Exit Behavior (Operator Policy 1)**:
    - Flow counts in `MarketEvaluationContext` are nullable (`number | null`). Unavailable flow is represented strictly as `null`, never substituted with `0`.
-   - Flow-dependent loss cuts (Rule A0 emergency avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop at -12.0%, Drawdown Health Check 2 unabsorbed sell pressure) require verified sufficient flow (`isFlowSufficient === true`, non-null safe-integer counts). When flow is unavailable, these flow-dependent conditions are skipped.
+   - `DynamicRatchetService` strictly requires explicit `isFlowSufficient === true` AND `flowCoverage === "SUFFICIENT"` in addition to non-null valid safe-integer counts for flow-dependent decisions (Rule A0 emergency avalanche cut, Rule A0-cliff dump cut, Flow-Aware stop at -12.0%, Drawdown Health Check 2 unabsorbed sell pressure, Dynamic Grace Extension). When flow is unavailable or insufficient (e.g. `flowCoverage: "COLLECTION_GAP"` with numeric counts and omitted `isFlowSufficient`), these flow-dependent conditions are skipped.
    - Independent price protections evaluate without flow dependence:
      - Catastrophic disaster floor (-18.0% Established / -20.0% Micro-Cap).
      - Cohort-calibrated pre-breakeven stop (-10.0% Established / -12.0% Micro-Cap).
      - Locked profit floors, moonbag protections, and armed breakeven floors.
      - Probe quick-cut cuts unconfirmed positions at -12.0% because unknown flow cannot authorize viral-absorption exceptions.
      - Drawdown Health Check 1 (LP integrity) cuts on broken LP independently of flow.
-   - When in drawdown at <= -8.0% with unavailable flow, Health Check 2 is skipped and the base drawdown grace period timer applies (120s Established / 90s Micro-Cap). Unknown flow cannot authorize grace extension. If price remains depressed past the base grace timer, position exits with `DRAWDOWN_GRACE_EXPIRED`.
-   - Ratio diagnostics (`buySellRatio60s`) report `null` when counts are unavailable, without claiming observed sell pressure or buyer support.
+   - When in drawdown at <= -8.0% with unavailable or insufficient flow, Health Check 2 is skipped and the base drawdown grace period timer applies (120s Established / 90s Micro-Cap). Insufficient flow cannot authorize grace extension to 180s; positions expire strictly at base grace with `DRAWDOWN_GRACE_EXPIRED`.
+   - Ratio diagnostics (`buySellRatio60s`) report `null` whenever flow is not sufficient, even if numeric counts are supplied, without claiming observed sell pressure or buyer support.
 
-3. **Continuous Stagnation Evidence (Operator Policy 2)**:
+3. **Continuous Stagnation Evidence & Provenance Invariants (Operator Policy 2)**:
    - Implemented `ContinuousQuietIntervalTracker.ts` to establish quiet coverage from actual interval endpoints covering at least 180 continuous seconds.
    - Merges contiguous and overlapping quiet windows without double-counting; repeated snapshots or sub-intervals cannot advance coverage.
+   - Enforces strict monotonic progression: out-of-order or backward observations ($W_{\text{end}} < T_{\min}$ or $W_{\text{start}} < T_{\min}$) fail closed with `OUT_OF_ORDER_OBSERVATION`. Forward disjoint gaps ($W_{\text{start}} > T_{\max}$) reset the continuous span to $[W_{\text{start}}, W_{\text{end}}]$ with `UNOBSERVED_GAP`. Disjoint intervals can never bridge unobserved time or count uncovered periods.
+   - **No Invented Stagnation Evidence**: excises all default endpoint and epoch substitutions (`currentNow`, `currentNow - 60_000`, `connectionEpoch = 0`). Missing interval or epoch metadata resets the tracker fail-closed with `MISSING_INTERVAL_OR_EPOCH_PROVENANCE`, leaving `volumeStalled3m = false`. Counts alone can never establish continuous stagnation coverage.
    - Continuity is bound strictly to the same pool address, token mint, and connection epoch.
    - Continuity breaks (resetting continuous quiet span to 0) on:
      - Any observed trade activity (`recentBuys60s > 0 || recentSells60s > 0`).
@@ -1599,9 +1605,13 @@ Following explicit operator review and policy selection (Policies 1 and 2), the 
    - Both Rule C's volume condition and `STAGNANCY_TIMEOUT_EXIT` require `volumeStalled3m === true` (verified continuous 180s quiet evidence) and price inactivity, avoiding treating missing or unavailable data as market inactivity while ensuring missing continuity does not block independent price stops.
 
 4. **Snapshot Provenance & Production Boundary Defense**:
-   - `validateAndSnapshotCandidateFlowResult` preserves and validates `isPaperQualified` and `paperQualificationContext` when in `PAPER_SIMULATION` or `BACKTEST` mode.
-   - Recalculates research cutoff age at consumption time, enforcing authorized maximum evidence age ($\le 15{,}000\text{ ms}$) and causality checks ($T_{\text{eval}} \ge T_{\text{cutoff}}$, $T_{\text{eval}} \ge T_{\text{orig}}$).
+   - `validateAndSnapshotCandidateFlowResult` validates options using a finite positive integer contract: `maxAllowedEvidenceAgeMs` must be a finite integer $\le 15{,}000\text{ ms}$; invalid limits or `NaN` fail closed with `INVALID_MAX_ALLOWED_AGE`.
+   - Enforces consistent PAPER markers and qualification context: `paperQualificationContext` without `isPaperQualified: true` or vice versa fails closed with `INCONSISTENT_PAPER_QUALIFICATION`, never falling through to ordinary sufficient flow.
+   - Clones and deeply freezes nested provenance objects (`researchWindowSpan`, `providerAssumptions`, `unresolvedUncertainties`, `paperQualificationContext`).
+   - Recalculates research cutoff age at consumption time, ensuring mutual agreement between top-level `cutoffAgeMs` and nested `researchWindowSpan.cutoffAgeMs`.
+   - Rejects stale evidence exceeding `maxAllowedEvidenceAgeMs` with `STALE_RECONCILIATION_EVIDENCE` (`STALE_DATA`) and rejects future-dated evidence ($T_{\text{eval}} < T_{\text{cutoff}}$ or $T_{\text{eval}} < T_{\text{orig}}$).
    - Rejects PAPER-qualified evidence in default/production mode with `PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION`.
+   - Snapshots `windowStartMs`, `windowEndMs`, and `connectionEpoch` onto `CandidateFlowResult` for downstream consumption by position monitoring.
    - Scale-in momentum (`hasViralScaleInMomentum`) strictly requires verified sufficient flow (`isCoverageSufficient === true`, non-null counts $\ge 15$), preventing unknown or estimated flow from authorizing pyramiding.
 
 #### 6. Core Invariants Frozen

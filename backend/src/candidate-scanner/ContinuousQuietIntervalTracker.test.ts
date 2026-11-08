@@ -313,4 +313,72 @@ describe("ContinuousQuietIntervalTracker", () => {
     expect(tracker.getState().lastResetReason).toBe("PRICE_CHANGED");
     expect(tracker.isStagnant3m()).toBe(false);
   });
+
+  it("rejects an older disjoint interval across an unobserved gap and never counts uncovered time", () => {
+    const tracker = new ContinuousQuietIntervalTracker();
+
+    // Initial span: [100_000, 160_000] (60s)
+    tracker.recordQuietWindow({
+      poolAddress,
+      tokenMint,
+      connectionEpoch,
+      windowStartMs: 100_000,
+      windowEndMs: 160_000,
+      evaluationTimestampMs: 160_000,
+      isQuiet: true,
+      isCoverageSufficient: true,
+    });
+    expect(tracker.getContinuousSpanMs()).toBe(60_000);
+
+    // Older disjoint interval arrives: [10_000, 50_000]
+    // (ends at 50_000, which is < continuousStartMs 100_000; unobserved gap between 50k and 100k)
+    tracker.recordQuietWindow({
+      poolAddress,
+      tokenMint,
+      connectionEpoch,
+      windowStartMs: 10_000,
+      windowEndMs: 50_000,
+      evaluationTimestampMs: 160_000,
+      isQuiet: true,
+      isCoverageSufficient: true,
+    });
+
+    // Must NOT merge across the 50k-100k gap to claim [10k, 160k] (150s)!
+    expect(tracker.getContinuousSpanMs()).toBe(0);
+    expect(tracker.getState().lastResetReason).toBe("OUT_OF_ORDER_OBSERVATION");
+    expect(tracker.isStagnant3m()).toBe(false);
+  });
+
+  it("rejects out-of-order backward expansion into unobserved past", () => {
+    const tracker = new ContinuousQuietIntervalTracker();
+
+    // Initial span: [100_000, 160_000]
+    tracker.recordQuietWindow({
+      poolAddress,
+      tokenMint,
+      connectionEpoch,
+      windowStartMs: 100_000,
+      windowEndMs: 160_000,
+      evaluationTimestampMs: 160_000,
+      isQuiet: true,
+      isCoverageSufficient: true,
+    });
+    expect(tracker.getContinuousSpanMs()).toBe(60_000);
+
+    // Out-of-order window starting earlier than continuousStartMs: [90_000, 150_000]
+    tracker.recordQuietWindow({
+      poolAddress,
+      tokenMint,
+      connectionEpoch,
+      windowStartMs: 90_000,
+      windowEndMs: 150_000,
+      evaluationTimestampMs: 160_000,
+      isQuiet: true,
+      isCoverageSufficient: true,
+    });
+
+    expect(tracker.getContinuousSpanMs()).toBe(0);
+    expect(tracker.getState().lastResetReason).toBe("OUT_OF_ORDER_OBSERVATION");
+    expect(tracker.isStagnant3m()).toBe(false);
+  });
 });
