@@ -1475,3 +1475,80 @@ To allow autonomous bounded evaluation even when the WebSocket stream delivers z
 - **Virtual Wallet**: Permanently frozen at 7.9259 SOL (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`). Spending ceiling permanently \$0.00.
 - **Production Isolation**: `isProductionCompletenessEstablished = false`. Gate 11 fail-closed.
 - **Zero Live Network Calls**: Verified offline via synthetic Vitest harnesses and mock transports.
+
+---
+
+### 8.13 Isolated PAPER-Only Quiet-Window Qualification Policy & Conversion Adapter
+
+#### 1. Motivation & Policy Scope
+
+In operator capture `2026-11-08T05-21-24.315Z_AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA`, independent acquisition completed four HTTP requests (bootstrap history, confirmed slot, block time, final history enumeration). The final enumeration witnessed the pre-observation bootstrap anchor $S_{\text{anchor}}$ with zero transactions newer than the anchor in the 60-second window. All 20 returned signatures predated the window.
+
+Under prior default policy, zero stream transaction notifications generated `STREAM_GAP` via the derived heuristic `STREAM_INACTIVITY_AT_EVALUATION`, preventing qualification of genuinely quiet markets.
+
+Following explicit operator review and approval, an isolated PAPER-only quiet-window qualification policy and conversion adapter were designed and implemented offline to support PAPER simulation without compromising live production safety.
+
+#### 2. Isolated Qualification Criteria in `ExactPoolWindowReconciliationEvaluator`
+
+Quiet-window qualification is governed by strict, fail-closed conditions:
+
+1. **Explicit Opt-In & Environment Context**:
+   - Requires explicit opt-in via `paperQuietStreamPolicy: { enabled: true, executionContext: "PAPER_SIMULATION" | "BACKTEST" }`.
+   - Missing, disabled (`enabled: false`), or non-PAPER execution contexts (e.g. `"PRODUCTION"`) strictly fail closed to `STREAM_GAP` / `COLLECTION_GAP` with unavailable counts (`recentBuys60s: null, recentSells60s: null`).
+2. **Identity Binding**:
+   - Exact candidate pool and token mint identity binding (`VALID_POOL_CONTEXT`). Identity mismatches fail closed with `IDENTITY_MISMATCH`.
+3. **Temporal Invariants & Freshness**:
+   - Observation duration must span the 60-second window ($T_{\text{obs\_end}} \ge T_{\text{cutoff}}$ and $T_{\text{obs\_start}} \le T_{\text{cutoff}} - 60\text{s}$).
+   - Source cutoff age must not exceed 15,000 ms ($\Delta t_{\text{cutoffAge}} = T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$). Older cutoffs fail closed with `STALE_DATA`.
+4. **Boundary Anchor Witnessing & Enumeration Completeness**:
+   - Final enumeration must complete with terminal outcome `ANCHOR_WITNESSED`.
+   - The pre-observation anchor must precede or align with window start ($T_{\text{anchor}} \le T_{\text{cutoff}} - 60\text{s}$).
+   - Zero signatures discovered newer than the anchor (`discoveredSignatures.length === 0`).
+5. **Zero In-Window Transactions**:
+   - No transactions in window (`signaturesInWindow.length === 0`).
+   - If any signatures were discovered on-chain, the stream was not quiet and missed transactions; evaluation immediately fails closed to `STREAM_GAP`.
+6. **Zero Processing Backlog & No Recorded Collection Loss**:
+   - Zero active adapter transaction queue backlog (`hasActiveBacklog === false`).
+   - Zero recorded collection losses in the tracker (disconnects, buffer loss, capacity loss, queue overflows).
+   - Only the derived heuristic `STREAM_INACTIVITY_AT_EVALUATION` is permitted for qualification; actual recorded collection loss is strictly non-waivable.
+7. **Qualification Result**:
+   - Reconciles to `status = "RECONCILED"`, `flowCoverage = "SUFFICIENT"`, `recentBuys60s = 0`, `recentSells60s = 0`, and `flowRatio = 1.0`.
+   - Retains declared provider/indexer assumptions and records explicit qualification reason (`paperQuietStreamQualified: true`, `paperQualificationReason`).
+
+#### 3. Isolated PAPER Conversion Adapter Architecture (`PaperReconciledCandidateFlowAdapter`)
+
+To consume qualified quiet windows in PAPER simulation without modifying production safety boundaries:
+
+- **Isolated Adapter**: Created [`backend/src/candidate-scanner/PaperReconciledCandidateFlowAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/PaperReconciledCandidateFlowAdapter.ts).
+- **Separation from Production Paths**:
+  - `toCandidateFlowResult()` in `ExactPoolWindowReconciliationEvaluator.ts` remains untouched; in production mode it permanently returns `COLLECTION_GAP` and null counts.
+  - `allowSyntheticCompletenessProofs` is strictly confined to unit test fixtures and is NOT used for PAPER operation.
+  - Default `CandidateFlowProvider` and live daemon entrypoints remain completely isolated from PAPER qualification.
+- **Contract & Validation**:
+  - `convertCandidateFlow(reconciliationResult, options)` and `convertRetestSpotInfo(...)` enforce `PAPER_SIMULATION` or `BACKTEST` execution context.
+  - Validates pool/token binding, status `RECONCILED`, coverage `SUFFICIENT`, cutoff freshness ($\le 15{,}000\text{ ms}$), and causality ($T_{\text{receipt}} \le T_{\text{decision}}$).
+  - Returns `PaperReconciledCandidateFlow` with `isPaperQualified: true`.
+- **Honest Time-Basis Notice**:
+  - Discloses that the evaluated window $[T_{\text{windowStart}}, T_{\text{windowEnd}}]$ is anchored to on-chain source cutoff time, lagging evaluation decision time by cutoff age $\Delta t$. It is distinct from a real-time sliding window $[T_{\text{decision}} - 60\text{s}, T_{\text{decision}}]$.
+
+#### 4. Preserved Unknown Reporting & Dispatched Counting Integrity
+
+Reporting across probe metadata and summaries enforces strict unknown preservation:
+
+1. **Preserve Unknown Values**:
+   - Quantities not established by evidence (e.g. `signaturesSinceAnchor`, `signaturesInWindow`, `reconciliationReceiptHttpRequests`, `sourceCutoff`) report as `null` / `"Unavailable"`, never fabricated or defaulted to 0.
+   - Early returns before the counting stage preserve `windowSignaturesCount: null`.
+2. **Purpose-Distinguished RPC Query Scope**:
+   - `HistoryPageQueryParams` and audit records explicitly record `purpose: "BOOTSTRAP" | "ENUMERATION"`.
+   - `bootstrapHistoryRecordsReturned` counts only successful bootstrap queries (`limit: 1`).
+   - `finalPageHistoryRecordsReturned` counts only successful final enumeration queries.
+   - `signaturesSinceAnchor` is numeric only when enumeration queries were dispatched and established `ANCHOR_WITNESSED`; otherwise preserved as `null`.
+3. **Dispatched HTTP Request Separation**:
+   - Whole-probe HTTP requests (including bootstrap, slot, block time, enumeration, retrievals) are tracked separately from reconciliation-receipt requests.
+
+#### 5. Core Invariants Frozen
+
+- **Production Completeness Guard**: `isProductionCompletenessEstablished = false` permanently.
+- **Gate 11 Bundler Concentration**: Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
+- **Virtual Wallet**: Frozen at 7.9259 SOL (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling $0.00.
+- **Offline Implementation Only**: No daemon wiring, CLI enablement, live execution, or automated trading.

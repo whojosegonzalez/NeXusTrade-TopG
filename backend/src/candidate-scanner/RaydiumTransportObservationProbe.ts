@@ -457,6 +457,7 @@ export const DEFAULT_TRANSPORT_DIAGNOSTICS: TransportDiagnostics = Object.freeze
 
 export interface HistoryQueryAuditRecord {
   readonly pageIndex: number;
+  readonly purpose: "BOOTSTRAP" | "ENUMERATION";
   readonly address: string;
   readonly limit: number;
   readonly before?: string | undefined;
@@ -2277,6 +2278,8 @@ export async function executeTransportObservationProbe(
           const reqSent = clock();
           let recordsDiscovered = 0;
           let auditError: string | undefined;
+          const queryPurpose: "BOOTSTRAP" | "ENUMERATION" =
+            params.purpose ?? (params.limit === 1 && !params.before ? "BOOTSTRAP" : "ENUMERATION");
           try {
             const records = await config.historyPageFetcher.fetchPage(params);
             if (overallAbortController.signal.aborted || clock() >= overallDeadlineEpoch) {
@@ -2294,6 +2297,7 @@ export async function executeTransportObservationProbe(
             const reqEnd = clock();
             historyQueryAudits.push({
               pageIndex: historyQueriesAttempted,
+              purpose: queryPurpose,
               address: params.address,
               limit: params.limit,
               ...(params.before ? { before: params.before } : {}),
@@ -2316,6 +2320,8 @@ export async function executeTransportObservationProbe(
         let responseSha256: string | null = null;
         let recordsDiscovered = 0;
         let auditError: string | undefined;
+        const queryPurpose: "BOOTSTRAP" | "ENUMERATION" =
+          params.purpose ?? (params.limit === 1 && !params.before ? "BOOTSTRAP" : "ENUMERATION");
 
         try {
           if (
@@ -2412,6 +2418,7 @@ export async function executeTransportObservationProbe(
           const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
           historyQueryAudits.push({
             pageIndex: historyQueriesAttempted,
+            purpose: queryPurpose,
             address: params.address,
             limit: params.limit,
             ...(params.before ? { before: params.before } : {}),
@@ -2916,6 +2923,7 @@ export async function executeTransportObservationProbe(
             limit: 1,
             commitment: "confirmed",
             signal: overallAbortController.signal,
+            purpose: "BOOTSTRAP",
           });
           if (
             bootstrapRecords.length > 0 &&
@@ -3587,30 +3595,23 @@ export async function executeTransportObservationProbe(
     });
 
     // 11. Construct Metadata & Summary Evidence Artifacts
-    const bootstrapAudit = historyQueryAudits.find((a) => a.pageIndex === 1);
-    const finalPageAudit =
-      historyQueryAudits.length > 1 ? historyQueryAudits[historyQueryAudits.length - 1] : null;
-
     const isAuditSuccessful = (a: HistoryQueryAuditRecord | null | undefined): boolean =>
       Boolean(a && a.httpStatus === 200 && !a.error);
 
+    const bootstrapAudit = historyQueryAudits.find(
+      (a) => a.purpose === "BOOTSTRAP" && isAuditSuccessful(a),
+    );
+    const enumerationAudits = historyQueryAudits.filter(
+      (a) => a.purpose === "ENUMERATION" && isAuditSuccessful(a),
+    );
+    const finalPageAudit =
+      enumerationAudits.length > 0 ? enumerationAudits[enumerationAudits.length - 1] : null;
+
     const bootstrapHistoryRecordsReturned: number | null =
-      transportOnly || historyQueriesAttempted === 0
-        ? null
-        : isAuditSuccessful(bootstrapAudit)
-          ? bootstrapAudit!.recordsDiscovered
-          : null;
+      transportOnly || !bootstrapAudit ? null : bootstrapAudit.recordsDiscovered;
 
     const finalPageHistoryRecordsReturned: number | null =
-      transportOnly || historyQueriesAttempted === 0
-        ? null
-        : isAuditSuccessful(finalPageAudit)
-          ? finalPageAudit!.recordsDiscovered
-          : historyQueryAudits.length === 1 &&
-              bootstrapAudit?.limit !== 1 &&
-              isAuditSuccessful(bootstrapAudit)
-            ? bootstrapAudit!.recordsDiscovered
-            : null;
+      transportOnly || !finalPageAudit ? null : finalPageAudit.recordsDiscovered;
 
     const rawHistoryRecordsReturned: number | null =
       transportOnly || historyQueriesAttempted === 0
@@ -3626,22 +3627,17 @@ export async function executeTransportObservationProbe(
       ? 0
       : historyWitnessedList.length;
 
+    const hasEnumerationEvidence =
+      enumerationAudits.length > 0 &&
+      reconciliationResult?.underlyingOutcomes.enumerationOutcome === "ANCHOR_WITNESSED";
+
     const signaturesSinceAnchor: number | null =
-      transportOnly || historyQueriesAttempted === 0 || historyDiscoveryOutcome === "NOT_ATTEMPTED"
-        ? null
-        : historyRecordsDiscovered;
+      transportOnly || !hasEnumerationEvidence ? null : historyRecordsDiscovered;
 
-    const isWindowEvaluated =
-      !transportOnly &&
-      Boolean(reconciliationResult) &&
-      reconciliationResult!.sourceCutoff !== null &&
-      (reconciliationResult!.status === "RECONCILED" ||
-        reconciliationResult!.status === "UNRESOLVED_TRANSACTIONS" ||
-        reconciliationResult!.status === "INSUFFICIENT_DIRECTIONAL_EVIDENCE");
-
-    const signaturesInWindow: number | null = isWindowEvaluated
-      ? reconciliationResult!.underlyingOutcomes.windowSignaturesCount
-      : null;
+    const signaturesInWindow: number | null =
+      !transportOnly && reconciliationResult
+        ? reconciliationResult.underlyingOutcomes.windowSignaturesCount
+        : null;
 
     const reconciliationReceiptHttpRequests: number | null =
       reconciliationResult?.resourceMetrics.actualRequestsDispatched ?? null;

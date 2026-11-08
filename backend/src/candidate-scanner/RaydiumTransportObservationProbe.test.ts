@@ -4664,7 +4664,7 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.metadata.counts.signaturesInWindow).toBeNull();
         expect(succ.summary.reconciliationTelemetry.historyRecordsDiscovered).toBe(0);
         expect(succ.reconciliationResult!.underlyingOutcomes.totalDiscoveredSignatures).toBe(0);
-        expect(succ.reconciliationResult!.underlyingOutcomes.windowSignaturesCount).toBe(0);
+        expect(succ.reconciliationResult!.underlyingOutcomes.windowSignaturesCount).toBeNull();
 
         // 4. Counts preserved as unavailable rather than invented
         expect(succ.reconciliationResult!.flowCounts.recentBuys60s).toBeNull();
@@ -5047,6 +5047,98 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.metadata.terminationReason).toBe("DURATION_EXPIRED");
         expect(mockTransport.isClosed).toBe(true);
         expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+      });
+
+      it("preserves null telemetry counts when bootstrap succeeds but cutoff acquisition fails before enumeration", async () => {
+        const mockTransport = new MockWebSocketTransport();
+        const startEpoch = 1_700_000_000_000;
+        let fakeNow = startEpoch;
+        const clock = () => fakeNow;
+        const baseEpochSec = Math.floor(startEpoch / 1000);
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 0));
+        };
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          // 1. Bootstrap query succeeds with anchor
+          if (parsed.method === "getSignaturesForAddress" && parsed.params?.[1]?.limit === 1) {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_ANCHOR,
+                    slot: 280_000_000,
+                    blockTime: baseEpochSec - 100,
+                    err: null,
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          // 2. Cutoff slot query fails, preventing cutoff acquisition and final enumeration
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                error: { code: -32000, message: "RPC getSlot simulation failure" },
+              }),
+              { status: 500, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult).toBeDefined();
+
+        const recon = succ.reconciliationResult!;
+        expect(recon.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(recon.sourceCutoff).toBeNull();
+        expect(recon.underlyingOutcomes.windowSignaturesCount).toBeNull();
+
+        // Preserves unknown values (null) rather than false zeroes
+        expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBeNull();
+        expect(succ.metadata.counts.signaturesInWindow).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBeNull();
+
+        // Purpose-distinguished history counts
+        expect(succ.summary.reconciliationTelemetry.bootstrapHistoryRecordsReturned).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.finalPageHistoryRecordsReturned).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.uniqueHistorySignaturesWitnessed).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.enumeratorOutcome).toBe(
+          "MISSING_SOURCE_CUTOFF",
+        );
       });
     });
   });

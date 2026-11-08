@@ -44,6 +44,7 @@ import type { TrackedRaydiumPoolContext } from "./RaydiumAmmV4SwapDecoder.js";
 import type {
   HistorySignatureRecord,
   HistoryEnumerationResult,
+  HistoryEnumerationOutcome,
 } from "./ExactPoolHistoryEnumerator.js";
 import type {
   ResolvedSignatureRecord,
@@ -1469,6 +1470,343 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(snapshotted.flowCoverage).toBe("SUFFICIENT");
       expect(snapshotted.recentBuys60s).toBe(0);
       expect(snapshotted.recentSells60s).toBe(0);
+    });
+  });
+
+  describe("9. Isolated PAPER-Only Quiet-Window Qualification Policy", () => {
+    const validCutoff = createValidBlockTimeCutoff({
+      slot: 280_000_100,
+      cutoffTimestampMs: 65_000,
+      retrievedAtMs: 65_020,
+    });
+
+    const createQuietTracker = () => {
+      const tracker = new RollingTradeFlowTracker({
+        poolId: CANONICAL_POOL_ID,
+        tokenMint: CANONICAL_TOKEN_MINT,
+        trackingStartedMs: 1,
+        maxStreamInactivityMs: 15_000,
+      });
+      // Last observation at 30,000ms. Window ends at 65,000ms (> 15s inactivity)
+      (tracker as unknown as { lastObservationTimestampMs: number }).lastObservationTimestampMs =
+        30_000;
+      return tracker;
+    };
+
+    const createQuietHistoryResult = (options?: {
+      outcome?: HistoryEnumerationOutcome;
+      anchorWitnessed?: boolean;
+      discoveredSignatures?: readonly HistorySignatureRecord[];
+      candidatePoolId?: string;
+    }): HistoryEnumerationResult => ({
+      outcome: options?.outcome ?? "ANCHOR_WITNESSED",
+      candidatePoolId: options?.candidatePoolId ?? CANONICAL_POOL_ID,
+      connectionEpoch: 0,
+      anchorWitnessed: options?.anchorWitnessed ?? true,
+      knownAnchorSignature: "Anchor000",
+      anchorRecord: { signature: "Anchor000", slot: 280_000_000, err: null, blockTime: 1 },
+      frozenTargetSignature: "Anchor000",
+      discoveredSignatures: options?.discoveredSignatures ?? [],
+      pagesQueried: 1,
+      requestCount: 1,
+      isProductionCompletenessEstablished: false,
+    });
+
+    it("qualifies quiet stream with 0/0 and flowRatio = 1.0 when opted in under PAPER_SIMULATION", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      expect(result.flowCounts.recentBuys60s).toBe(0);
+      expect(result.flowCounts.recentSells60s).toBe(0);
+      expect(result.flowCounts.flowRatio).toBe(1.0);
+      expect(result.paperQuietStreamQualified).toBe(true);
+      expect(result.paperQualificationReason).toContain("PAPER_QUIET_STREAM_QUALIFIED");
+      expect(result.paperQualificationReason).toContain("0 buys, 0 sells in 60s window");
+    });
+
+    it("qualifies quiet stream when opted in under BACKTEST executionContext", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "BACKTEST",
+        },
+      });
+
+      expect(result.status).toBe("RECONCILED");
+      expect(result.flowCoverage).toBe("SUFFICIENT");
+      expect(result.paperQuietStreamQualified).toBe(true);
+    });
+
+    it("fails closed to STREAM_GAP when paperQuietStreamPolicy is omitted (default behavior)", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("STREAM_INACTIVITY_AT_EVALUATION");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when paperQuietStreamPolicy is disabled (enabled: false)", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: false,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when executionContext is PRODUCTION", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PRODUCTION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when recorded collection loss (e.g. disconnect) is present alongside inactivity", () => {
+      const tracker = createQuietTracker();
+      tracker.recordCollectionGap({
+        gapStartMs: 20_000,
+        gapEndMs: 25_000,
+        reason: "TRANSPORT_DISCONNECT",
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain("TRANSPORT_DISCONNECT");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to PROCESSING_BACKLOG when queue backlog exists", () => {
+      const tracker = createQuietTracker();
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        hasActiveBacklog: true,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("PROCESSING_BACKLOG");
+      expect(result.flowCoverage).toBe("PROCESSING_BACKLOG");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STALE_DATA when cutoff age exceeds 15,000 ms", () => {
+      const tracker = createQuietTracker();
+      const staleCutoff = createValidBlockTimeCutoff({
+        cutoffTimestampMs: 45_000,
+        retrievedAtMs: 45_020,
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000, // Age = 21,000 ms > 15s
+        observationStartMs: 0,
+        observationEndMs: 45_000,
+        sourceCutoff: staleCutoff,
+        tracker,
+        historyResult: createQuietHistoryResult(),
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("STALE_DATA");
+      expect(result.flowCoverage).toBe("STALE_DATA");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to STREAM_GAP when final enumeration discovers transactions newer than anchor", () => {
+      const tracker = createQuietTracker();
+      const nonQuietHistoryResult = createQuietHistoryResult({
+        discoveredSignatures: [
+          {
+            signature:
+              "SigNewerThanAnchor111111111111111111111111111111111111111111111111111111111111111111111",
+            slot: 280_000_005,
+            err: null,
+            blockTime: 2, // 2s < windowStartMs (5s), so not in window, but discovered since anchor
+          },
+        ],
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: nonQuietHistoryResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      // Because discoveredSignatures is > 0, it fails closed to STREAM_GAP
+      expect(result.status).toBe("STREAM_GAP");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.diagnosticReason).toContain(
+        "Stream inactivity accompanied by unobserved on-chain transactions",
+      );
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to UNWITNESSED_PRIOR_ANCHOR when enumeration does not witness anchor", () => {
+      const tracker = createQuietTracker();
+      const unwitnessedHistoryResult = createQuietHistoryResult({
+        outcome: "ANCHOR_NOT_FOUND",
+        anchorWitnessed: false,
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: unwitnessedHistoryResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("fails closed to IDENTITY_MISMATCH when historyResult poolId does not match context", () => {
+      const tracker = createQuietTracker();
+      const mismatchHistoryResult = createQuietHistoryResult({
+        candidatePoolId: "DifferentPool111111111111111111111111111111111",
+      });
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        tracker,
+        historyResult: mismatchHistoryResult,
+        budgetManager,
+        paperQuietStreamPolicy: {
+          enabled: true,
+          executionContext: "PAPER_SIMULATION",
+        },
+      });
+
+      expect(result.status).toBe("IDENTITY_MISMATCH");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.paperQuietStreamQualified).toBe(false);
+    });
+
+    it("preserves windowSignaturesCount as null on early exit before counting stage", () => {
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: null, // triggers MISSING_SOURCE_CUTOFF
+        historyRecords: [],
+        budgetManager,
+      });
+
+      expect(result.status).toBe("MISSING_SOURCE_CUTOFF");
+      expect(result.underlyingOutcomes.windowSignaturesCount).toBeNull();
     });
   });
 });

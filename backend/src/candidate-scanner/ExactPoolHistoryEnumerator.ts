@@ -86,6 +86,7 @@ export interface HistoryPageQueryParams {
   readonly before?: string | undefined;
   readonly commitment?: "confirmed" | "finalized" | undefined;
   readonly signal?: AbortSignal | undefined;
+  readonly purpose?: "BOOTSTRAP" | "ENUMERATION" | undefined;
 }
 
 /**
@@ -636,6 +637,7 @@ export class ExactPoolHistoryEnumerator {
             before: cursorBefore,
             commitment: this.commitment,
             signal: fetchAbortController.signal,
+            purpose: "ENUMERATION",
           });
 
           Promise.resolve(fetchPromise)

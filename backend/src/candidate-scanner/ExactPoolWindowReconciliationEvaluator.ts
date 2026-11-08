@@ -193,7 +193,7 @@ export interface WindowReconciliationResult {
     readonly totalDiscoveredSignatures: number;
     readonly totalResolvedTransactions: number;
     readonly incrementallyReusedCount: number;
-    readonly windowSignaturesCount: number;
+    readonly windowSignaturesCount: number | null;
   };
   readonly resourceMetrics: ResourceAccountingMetrics;
   readonly providerAssumptions: readonly string[];
@@ -201,6 +201,15 @@ export interface WindowReconciliationResult {
   readonly diagnosticReason: string;
   readonly isCryptographicCompletenessEstablished: false;
   readonly isProductionCompletenessEstablished: false;
+  readonly paperQuietStreamQualified?: boolean | undefined;
+  readonly paperQualificationReason?: string | undefined;
+}
+
+export type ExecutionEnvironment = "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST";
+
+export interface PaperQuietStreamPolicyOptions {
+  readonly enabled: boolean;
+  readonly executionContext: ExecutionEnvironment;
 }
 
 /**
@@ -231,6 +240,7 @@ export interface ExactPoolWindowReconciliationOptions {
   readonly resolutionRetrievedAtMs?: number | undefined;
   readonly acquisitionCompletedAtMs?: number | undefined;
   readonly clock?: (() => number) | undefined;
+  readonly paperQuietStreamPolicy?: PaperQuietStreamPolicyOptions | undefined;
 }
 
 /**
@@ -714,12 +724,14 @@ export function evaluateExactPoolWindowReconciliation(
       totalDiscovered?: number | undefined;
       totalResolved?: number | undefined;
       incrementallyReused?: number | undefined;
-      windowSignaturesCount?: number | undefined;
+      windowSignaturesCount?: number | null | undefined;
       actualRequestsDispatched?: number | null | undefined;
       projectedDemand?: ProjectedDemandMetrics | undefined;
       budgetRemaining?: number | undefined;
       unresolvedCount?: number | undefined;
       needsPagination?: boolean | undefined;
+      paperQuietStreamQualified?: boolean | undefined;
+      paperQualificationReason?: string | undefined;
     } = {},
   ): WindowReconciliationResult => {
     const isSufficient = flowCoverage === "SUFFICIENT";
@@ -777,7 +789,8 @@ export function evaluateExactPoolWindowReconciliation(
           options.resolvedSignatures?.length ??
           0,
         incrementallyReusedCount: extra.incrementallyReused ?? 0,
-        windowSignaturesCount: extra.windowSignaturesCount ?? 0,
+        windowSignaturesCount:
+          extra.windowSignaturesCount !== undefined ? extra.windowSignaturesCount : null,
       },
       resourceMetrics: {
         actualRequestsDispatched:
@@ -792,6 +805,10 @@ export function evaluateExactPoolWindowReconciliation(
       diagnosticReason,
       isCryptographicCompletenessEstablished: false,
       isProductionCompletenessEstablished: false,
+      paperQuietStreamQualified: extra.paperQuietStreamQualified ?? false,
+      ...(extra.paperQualificationReason
+        ? { paperQualificationReason: extra.paperQualificationReason }
+        : {}),
     };
     return deepFreeze(res);
   };
@@ -973,15 +990,46 @@ export function evaluateExactPoolWindowReconciliation(
     }
   }
 
-  for (const gap of gaps) {
-    if (gap.gapStartMs < windowEndMs && gap.gapEndMs > windowStartMs) {
+  const intersectingGaps = gaps.filter(
+    (gap) => gap.gapStartMs < windowEndMs && gap.gapEndMs > windowStartMs,
+  );
+
+  let pendingStreamInactivityGap: StreamGap | null = null;
+
+  if (intersectingGaps.length > 0) {
+    // 1. Any actual recorded collection loss (disconnect, buffer loss, capacity loss, overflow) is strictly non-waivable
+    const recordedLossGap = intersectingGaps.find(
+      (gap) => gap.reason !== "STREAM_INACTIVITY_AT_EVALUATION",
+    );
+    if (recordedLossGap) {
       return buildResult(
         "STREAM_GAP",
         "COLLECTION_GAP",
-        `COLLECTION_GAP: Stream gap witnessed in observation window [${gap.gapStartMs}, ${gap.gapEndMs}] (reason: ${gap.reason ?? "UNSPECIFIED"})`,
+        `COLLECTION_GAP: Stream gap witnessed in observation window [${recordedLossGap.gapStartMs}, ${recordedLossGap.gapEndMs}] (reason: ${recordedLossGap.reason ?? "UNSPECIFIED"})`,
         { windowStartMs, windowEndMs, evidenceAgeMs },
       );
     }
+
+    // 2. Validate explicit PAPER quiet-stream policy opt-in and execution context
+    const isPaperQuietOptedIn = Boolean(
+      options.paperQuietStreamPolicy?.enabled &&
+      (options.paperQuietStreamPolicy.executionContext === "PAPER_SIMULATION" ||
+        options.paperQuietStreamPolicy.executionContext === "BACKTEST"),
+    );
+
+    if (!isPaperQuietOptedIn) {
+      // Default / production / non-PAPER context: fails closed immediately
+      return buildResult(
+        "STREAM_GAP",
+        "COLLECTION_GAP",
+        `COLLECTION_GAP: Stream gap witnessed in observation window [${intersectingGaps[0]!.gapStartMs}, ${intersectingGaps[0]!.gapEndMs}] (reason: ${intersectingGaps[0]!.reason ?? "UNSPECIFIED"})`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+
+    // Sole objection is the derived STREAM_INACTIVITY_AT_EVALUATION heuristic under explicit PAPER opt-in.
+    // Defer objection until all subsequent validations (backlog, history, anchor, resolution completeness) succeed.
+    pendingStreamInactivityGap = intersectingGaps[0]!;
   }
 
   // 6. Check Backlog (Read-Only, Never Mutates Tracker)
@@ -1496,6 +1544,56 @@ export function evaluateExactPoolWindowReconciliation(
     buys = countedBuys;
     sells = countedSells;
     flowRatio = sells === 0 ? (buys > 0 ? buys : 1.0) : Number((buys / sells).toFixed(2));
+  }
+
+  if (pendingStreamInactivityGap) {
+    if (discoveredSignatures.length > 0 || signaturesInWindow.length > 0) {
+      // Non-quiet: transactions existed on-chain that the stream missed! Fails closed to STREAM_GAP
+      return buildResult(
+        "STREAM_GAP",
+        "COLLECTION_GAP",
+        `COLLECTION_GAP: Stream inactivity accompanied by unobserved on-chain transactions (${discoveredSignatures.length} discovered since anchor, ${signaturesInWindow.length} in window)`,
+        {
+          windowStartMs,
+          windowEndMs,
+          evidenceAgeMs,
+          totalDiscovered: discoveredSignatures.length,
+          windowSignaturesCount: signaturesInWindow.length,
+        },
+      );
+    }
+
+    const paperQualificationReason =
+      "PAPER_QUIET_STREAM_QUALIFIED: zero stream notifications confirmed by complete RPC enumeration witnessing prior anchor under declared provider-relative assumptions (0 buys, 0 sells in 60s window)";
+
+    return buildResult(
+      "RECONCILED",
+      "SUFFICIENT",
+      `RECONCILED: Verified quiet window under declared provider-relative assumptions (0 buys, 0 sells in 60s window; ${paperQualificationReason})`,
+      {
+        windowStartMs,
+        windowEndMs,
+        evidenceAgeMs,
+        buys: 0,
+        sells: 0,
+        flowRatio: 1.0,
+        enumerationOutcome,
+        resolutionOutcome: options.resolutionResult?.outcome,
+        anchorWitnessed: true,
+        knownAnchorSignature: effectiveAnchorSig,
+        frozenTargetSignature:
+          options.historyResult?.frozenTargetSignature ??
+          options.resolutionResult?.frozenTargetSignature ??
+          null,
+        totalDiscovered: 0,
+        totalResolved: 0,
+        incrementallyReused: incrementallyReusedCount,
+        windowSignaturesCount: 0,
+        unresolvedCount: 0,
+        paperQuietStreamQualified: true,
+        paperQualificationReason,
+      },
+    );
   }
 
   const diagReason =

@@ -68,6 +68,7 @@ import {
   evaluateExactPoolWindowReconciliation,
   type SourceCutoffEvidence,
   type WindowReconciliationResult,
+  type PaperQuietStreamPolicyOptions,
 } from "./ExactPoolWindowReconciliationEvaluator.js";
 import type { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 
@@ -150,6 +151,7 @@ export interface CandidateWindowReconciliationOptions {
   readonly observationEndMs?: number | undefined;
   readonly budgetManager?: GlobalResourceBudgetManager | undefined;
   readonly hasActiveBacklog?: boolean | undefined;
+  readonly paperQuietStreamPolicy?: PaperQuietStreamPolicyOptions | undefined;
 }
 
 export interface CoordinatorCoverageDiagnostic {
@@ -1320,6 +1322,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
       observationEndMs: options?.observationEndMs,
       budgetManager: options?.budgetManager,
       hasActiveBacklog: options?.hasActiveBacklog,
+      paperQuietStreamPolicy: options?.paperQuietStreamPolicy,
     };
 
     const initialEpoch = this.connectionEpoch;
@@ -1343,6 +1346,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           sourceCutoff: sourceCutoffSnapshot,
           budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
           clock: this.clock,
+          paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
         });
       }
     }
@@ -1361,6 +1365,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
         budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
+        paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
         recordedGaps: [
           {
             gapStartMs: Math.min(now, cutoffTimestampMs - 1),
@@ -1393,6 +1398,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
         budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
+        paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
         recordedGaps: [
           {
             gapStartMs: Math.min(this.disconnectedAtMs ?? postEnumNow - 1, cutoffTimestampMs - 1),
@@ -1430,6 +1436,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
           optionsSnapshot.hasActiveBacklog ?? this.adapter.getPendingQueueLength() > 0,
         budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
         clock: this.clock,
+        paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
         recordedGaps: [
           {
             gapStartMs: Math.min(this.disconnectedAtMs ?? postResNow - 1, cutoffTimestampMs - 1),
@@ -1465,6 +1472,7 @@ export class RaydiumCandidateSubscriptionCoordinator {
       knownAnchorSignature: optionsSnapshot.knownAnchorSignature,
       budgetManager: optionsSnapshot.budgetManager ?? this.adapter.getBudgetManager(),
       clock: this.clock,
+      paperQuietStreamPolicy: optionsSnapshot.paperQuietStreamPolicy,
     });
 
     this.lastReconciliationResult = reconciliationResult;
