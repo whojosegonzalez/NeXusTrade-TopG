@@ -157,6 +157,7 @@ async function main(): Promise<void> {
     console.log(`Peak Queue Depth:         ${result.metadata.counts.peakQueueDepth}`);
     console.log(`Queue Rejections:         ${result.metadata.counts.queueRejectionsCount}`);
     console.log(`Decoded Swaps:            ${result.metadata.counts.decodedSwapsCount}`);
+    console.log(`Whole-Probe HTTP Requests:${result.summary.budgetAccounting.totalHttpRequests}`);
     console.log(
       `Tx Retrievals Attempted:  ${result.metadata.counts.transactionRetrievalsAttempted}`,
     );
@@ -164,7 +165,12 @@ async function main(): Promise<void> {
       `Tx Retrievals Succeeded:  ${result.metadata.counts.transactionRetrievalsSucceeded}`,
     );
     console.log(`History Queries:          ${result.metadata.counts.historyQueriesAttempted}`);
-    console.log(`History Signatures Found: ${result.metadata.counts.historySignaturesDiscovered}`);
+    console.log(
+      `Raw RPC History Records:  ${result.summary.discrepancyAnalysis.rawHistoryRecordsReturned ?? result.summary.discrepancyAnalysis.totalHistoryWitnessedSignatures}`,
+    );
+    console.log(
+      `Signatures Since Anchor:  ${result.summary.reconciliationTelemetry.historyRecordsDiscovered}`,
+    );
     console.log(
       `Common Signatures:        ${result.summary.discrepancyAnalysis.commonSignaturesCount}`,
     );
@@ -200,11 +206,18 @@ async function main(): Promise<void> {
       console.log(`Reconciled Buys (60s):    ${recon.flowCounts.recentBuys60s ?? "Unavailable"}`);
       console.log(`Reconciled Sells (60s):   ${recon.flowCounts.recentSells60s ?? "Unavailable"}`);
       console.log(`Reconciled Flow Ratio:    ${recon.flowCounts.flowRatio ?? "Unavailable"}`);
-      console.log(`Requests Dispatched:      ${recon.resourceMetrics.actualRequestsDispatched}`);
+      console.log(`Whole-Probe HTTP Requests:${result.summary.budgetAccounting.totalHttpRequests}`);
       console.log(
-        `Discovered Signatures:    ${recon.underlyingOutcomes.totalDiscoveredSignatures}`,
+        `Reconciliation Step Requests: ${recon.resourceMetrics.actualRequestsDispatched}`,
       );
+      console.log(
+        `Signatures Since Anchor:  ${recon.underlyingOutcomes.totalDiscoveredSignatures}`,
+      );
+      console.log(`Signatures in Window:     ${recon.underlyingOutcomes.windowSignaturesCount}`);
       console.log(`Boundary Anchor Seen:     ${recon.underlyingOutcomes.anchorWitnessed}`);
+      console.log(
+        `Enumerator Outcome:       ${result.summary.reconciliationTelemetry.enumeratorOutcome}`,
+      );
       console.log(
         `Provider Assumptions:     ${recon.providerAssumptions.length} stated (${recon.providerAssumptions[0] ?? ""})`,
       );

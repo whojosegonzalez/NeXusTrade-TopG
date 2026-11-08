@@ -303,6 +303,9 @@ export interface TransportProbeMetadata {
     readonly transactionRetrievalsSucceeded: number;
     readonly historyQueriesAttempted: number;
     readonly historySignaturesDiscovered: number;
+    readonly rawHistoryRecordsReturned?: number;
+    readonly signaturesSinceAnchor?: number;
+    readonly signaturesInWindow?: number;
     readonly nullBlockTimeCount: number;
   };
   readonly budgetStatus: GlobalBudgetStats;
@@ -536,6 +539,11 @@ export interface TransportProbeSummary {
     readonly historyQueriesAttempted: number;
     readonly historyQueriesLimit: number;
     readonly historyRecordsDiscovered: number;
+    readonly rawHistoryRecordsReturned?: number;
+    readonly signaturesSinceAnchor?: number;
+    readonly signaturesInWindow?: number;
+    readonly wholeProbeHttpRequests?: number;
+    readonly reconciliationReceiptHttpRequests?: number;
     readonly enumeratorOutcome: HistoryEnumerationOutcome | string;
     readonly discoveryDurationMs: number | null;
   };
@@ -553,6 +561,9 @@ export interface TransportProbeSummary {
   readonly discrepancyAnalysis: {
     readonly totalWsWitnessedSignatures: number;
     readonly totalHistoryWitnessedSignatures: number;
+    readonly rawHistoryRecordsReturned?: number;
+    readonly signaturesSinceAnchor?: number;
+    readonly signaturesInWindow?: number;
     readonly commonSignaturesCount: number;
     readonly wsOnlySignaturesCount: number;
     readonly historyOnlySignaturesCount: number;
@@ -3300,7 +3311,10 @@ export async function executeTransportObservationProbe(
 
         if (reconciliationResult) {
           historyDiscoveryDurationMs = clock() - reconcileStartTime;
-          if (historyDiscoveryOutcome === "UNKNOWN") {
+          if (
+            historyDiscoveryOutcome === "UNKNOWN" ||
+            historyDiscoveryOutcome === "NOT_ATTEMPTED"
+          ) {
             historyDiscoveryOutcome =
               reconciliationResult.underlyingOutcomes.enumerationOutcome ?? "UNKNOWN";
           }
@@ -3593,6 +3607,11 @@ export async function executeTransportObservationProbe(
         transactionRetrievalsSucceeded: transportOnly ? 0 : transactionRetrievalsSucceeded,
         historyQueriesAttempted: transportOnly ? 0 : historyQueriesAttempted,
         historySignaturesDiscovered: transportOnly ? 0 : historyRecordsDiscovered,
+        rawHistoryRecordsReturned: transportOnly ? 0 : historyWitnessedList.length,
+        signaturesSinceAnchor: transportOnly ? 0 : historyRecordsDiscovered,
+        signaturesInWindow: transportOnly
+          ? 0
+          : (reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0),
         nullBlockTimeCount: transportOnly ? 0 : nullBlockTimeCount,
       },
       budgetStatus: budget.getStats(),
@@ -3667,6 +3686,12 @@ export async function executeTransportObservationProbe(
         historyQueriesAttempted,
         historyQueriesLimit: maxHistoryQueries,
         historyRecordsDiscovered,
+        rawHistoryRecordsReturned: historyWitnessedList.length,
+        signaturesSinceAnchor: historyRecordsDiscovered,
+        signaturesInWindow: reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0,
+        wholeProbeHttpRequests: budget.getStats().totalRequests,
+        reconciliationReceiptHttpRequests:
+          reconciliationResult?.resourceMetrics.actualRequestsDispatched ?? 0,
         enumeratorOutcome: historyDiscoveryOutcome,
         discoveryDurationMs: historyDiscoveryDurationMs,
       },
@@ -3684,6 +3709,9 @@ export async function executeTransportObservationProbe(
       discrepancyAnalysis: {
         totalWsWitnessedSignatures: wsWitnessedList.length,
         totalHistoryWitnessedSignatures: historyWitnessedList.length,
+        rawHistoryRecordsReturned: historyWitnessedList.length,
+        signaturesSinceAnchor: historyRecordsDiscovered,
+        signaturesInWindow: reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0,
         commonSignaturesCount: commonSignatures.length,
         wsOnlySignaturesCount: wsOnlySignatures.length,
         historyOnlySignaturesCount: historyOnlySignatures.length,

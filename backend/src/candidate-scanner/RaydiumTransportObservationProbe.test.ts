@@ -4524,6 +4524,149 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
         expect(succ.reconciliationResult!.flowCounts.recentBuys60s).toBeNull();
         expect(succ.reconciliationResult!.flowCounts.recentSells60s).toBeNull();
+
+        // 7. Reporting fields: outcome is ANCHOR_WITNESSED (not NOT_ATTEMPTED) and counts are distinguished
+        expect(succ.summary.reconciliationTelemetry.enumeratorOutcome).toBe("ANCHOR_WITNESSED");
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(2);
+        expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.wholeProbeHttpRequests).toBe(7);
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBe(0);
+      });
+
+      it("distinguishes raw RPC history, signatures since anchor, and signatures in window on quiet stream", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 0));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const BOOTSTRAP_SLOT = 466_792_838;
+        const CONFIRMED_RPC_SLOT = 466_795_911;
+        const CUTOFF_SEC = baseEpochSec + 60;
+        const ANCHOR_SEC = baseEpochSec - 500;
+
+        let totalHttpRequests = 0;
+        const mockFetch: typeof fetch = async (_input, init) => {
+          totalHttpRequests++;
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: BOOTSTRAP_SLOT,
+                      blockTime: ANCHOR_SEC,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Return 20 records starting with SIG_ANCHOR (anchor is record 0)
+            const records = [
+              { signature: SIG_ANCHOR, slot: BOOTSTRAP_SLOT, blockTime: ANCHOR_SEC, err: null },
+            ];
+            for (let i = 1; i < 20; i++) {
+              records.push({
+                signature: encodeBase58(Buffer.alloc(64, i + 10)),
+                slot: BOOTSTRAP_SLOT - i * 10,
+                blockTime: ANCHOR_SEC - i * 10,
+                err: null,
+              });
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: records,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: CONFIRMED_RPC_SLOT,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: CUTOFF_SEC,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+
+        // Verify correct reporting:
+        // 1. Enumerator outcome must be ANCHOR_WITNESSED (not NOT_ATTEMPTED)
+        expect(succ.summary.reconciliationTelemetry.enumeratorOutcome).toBe("ANCHOR_WITNESSED");
+        expect(succ.summary.historyDiscoveryTelemetry.discoveryOutcome).toBe("ANCHOR_WITNESSED");
+
+        // 2. Whole-probe vs reconciliation requests must be separated
+        expect(totalHttpRequests).toBe(4);
+        expect(succ.summary.budgetAccounting.totalHttpRequests).toBe(4);
+        expect(succ.summary.reconciliationTelemetry.wholeProbeHttpRequests).toBe(4);
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBe(1);
+        expect(succ.reconciliationResult!.resourceMetrics.actualRequestsDispatched).toBe(1);
+
+        // 3. Raw RPC history (20) vs records since anchor (0) vs records in window (0)
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(20);
+        expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.historyRecordsDiscovered).toBe(0);
+        expect(succ.reconciliationResult!.underlyingOutcomes.totalDiscoveredSignatures).toBe(0);
+        expect(succ.reconciliationResult!.underlyingOutcomes.windowSignaturesCount).toBe(0);
+
+        // 4. Counts preserved as unavailable rather than invented
+        expect(succ.reconciliationResult!.flowCounts.recentBuys60s).toBeNull();
+        expect(succ.reconciliationResult!.flowCounts.recentSells60s).toBeNull();
+        expect(succ.reconciliationResult!.flowCounts.flowRatio).toBeNull();
+        expect(succ.reconciliationResult!.status).toBe("STREAM_GAP");
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(succ.reconciliationResult!.diagnosticReason).toContain(
+          "STREAM_INACTIVITY_AT_EVALUATION",
+        );
       });
 
       it("aborts in-flight independent RPC work promptly on signal and cleanly seals partial evidence", async () => {
