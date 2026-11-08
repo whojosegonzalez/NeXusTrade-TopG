@@ -166,10 +166,19 @@ async function main(): Promise<void> {
     );
     console.log(`History Queries:          ${result.metadata.counts.historyQueriesAttempted}`);
     console.log(
-      `Raw RPC History Records:  ${result.summary.discrepancyAnalysis.rawHistoryRecordsReturned ?? result.summary.discrepancyAnalysis.totalHistoryWitnessedSignatures}`,
+      `Raw RPC History Records:  ${result.summary.reconciliationTelemetry.rawHistoryRecordsReturned ?? "Unavailable"}`,
     );
     console.log(
-      `Signatures Since Anchor:  ${result.summary.reconciliationTelemetry.historyRecordsDiscovered}`,
+      `Bootstrap History Records:${result.summary.reconciliationTelemetry.bootstrapHistoryRecordsReturned ?? "Unavailable"}`,
+    );
+    console.log(
+      `Final Page History Records:${result.summary.reconciliationTelemetry.finalPageHistoryRecordsReturned ?? "Unavailable"}`,
+    );
+    console.log(
+      `Unique Witnessed Records: ${result.summary.discrepancyAnalysis.uniqueHistorySignaturesWitnessed ?? result.summary.discrepancyAnalysis.totalHistoryWitnessedSignatures}`,
+    );
+    console.log(
+      `Signatures Since Anchor:  ${result.summary.reconciliationTelemetry.signaturesSinceAnchor ?? "Unavailable"}`,
     );
     console.log(
       `Common Signatures:        ${result.summary.discrepancyAnalysis.commonSignaturesCount}`,
@@ -208,12 +217,14 @@ async function main(): Promise<void> {
       console.log(`Reconciled Flow Ratio:    ${recon.flowCounts.flowRatio ?? "Unavailable"}`);
       console.log(`Whole-Probe HTTP Requests:${result.summary.budgetAccounting.totalHttpRequests}`);
       console.log(
-        `Reconciliation Step Requests: ${recon.resourceMetrics.actualRequestsDispatched}`,
+        `Reconciliation Step Requests: ${result.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests ?? "Unavailable"}`,
       );
       console.log(
-        `Signatures Since Anchor:  ${recon.underlyingOutcomes.totalDiscoveredSignatures}`,
+        `Signatures Since Anchor:  ${result.summary.reconciliationTelemetry.signaturesSinceAnchor ?? "Unavailable"}`,
       );
-      console.log(`Signatures in Window:     ${recon.underlyingOutcomes.windowSignaturesCount}`);
+      console.log(
+        `Signatures in Window:     ${result.summary.reconciliationTelemetry.signaturesInWindow ?? "Unavailable"}`,
+      );
       console.log(`Boundary Anchor Seen:     ${recon.underlyingOutcomes.anchorWitnessed}`);
       console.log(
         `Enumerator Outcome:       ${result.summary.reconciliationTelemetry.enumeratorOutcome}`,

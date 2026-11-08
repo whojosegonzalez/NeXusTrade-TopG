@@ -4527,11 +4527,15 @@ describe("RaydiumTransportObservationProbe", () => {
 
         // 7. Reporting fields: outcome is ANCHOR_WITNESSED (not NOT_ATTEMPTED) and counts are distinguished
         expect(succ.summary.reconciliationTelemetry.enumeratorOutcome).toBe("ANCHOR_WITNESSED");
-        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(2);
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(3);
+        expect(succ.summary.reconciliationTelemetry.bootstrapHistoryRecordsReturned).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.finalPageHistoryRecordsReturned).toBe(2);
+        expect(succ.summary.reconciliationTelemetry.uniqueHistorySignaturesWitnessed).toBe(2);
         expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBe(1);
-        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBeNull();
+        expect(succ.metadata.counts.signaturesInWindow).toBeNull();
         expect(succ.summary.reconciliationTelemetry.wholeProbeHttpRequests).toBe(7);
-        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBeNull();
       });
 
       it("distinguishes raw RPC history, signatures since anchor, and signatures in window on quiet stream", async () => {
@@ -4650,10 +4654,14 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBe(1);
         expect(succ.reconciliationResult!.resourceMetrics.actualRequestsDispatched).toBe(1);
 
-        // 3. Raw RPC history (20) vs records since anchor (0) vs records in window (0)
-        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(20);
+        // 3. Raw RPC history (21) vs bootstrap (1) vs final page (20) vs unique witnessed (20) vs records since anchor (0) vs unevaluated window (null)
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(21);
+        expect(succ.summary.reconciliationTelemetry.bootstrapHistoryRecordsReturned).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.finalPageHistoryRecordsReturned).toBe(20);
+        expect(succ.summary.reconciliationTelemetry.uniqueHistorySignaturesWitnessed).toBe(20);
         expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBe(0);
-        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBeNull();
+        expect(succ.metadata.counts.signaturesInWindow).toBeNull();
         expect(succ.summary.reconciliationTelemetry.historyRecordsDiscovered).toBe(0);
         expect(succ.reconciliationResult!.underlyingOutcomes.totalDiscoveredSignatures).toBe(0);
         expect(succ.reconciliationResult!.underlyingOutcomes.windowSignaturesCount).toBe(0);
@@ -4667,6 +4675,143 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.reconciliationResult!.diagnosticReason).toContain(
           "STREAM_INACTIVITY_AT_EVALUATION",
         );
+      });
+
+      it("reports established numeric zero counts and RECONCILED status on verified quiet window", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const VALID_UNRELATED_SIG = encodeBase58(Buffer.alloc(64, 77));
+        const sleepFn = async (ms: number) => {
+          const step = 2_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: VALID_UNRELATED_SIG,
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        };
+
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getSlot") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 280_000_100 }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: fixedCutoffSec }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSignaturesForAddress") {
+            if (parsed.params?.[1]?.limit === 1) {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: parsed.id,
+                  result: [
+                    {
+                      signature: SIG_ANCHOR,
+                      slot: 280_000_000,
+                      blockTime: baseEpochSec,
+                      err: null,
+                    },
+                  ],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            // Return 20 records where all records predate window start (baseEpochSec + 5s)
+            const records = [
+              { signature: SIG_ANCHOR, slot: 280_000_000, blockTime: baseEpochSec, err: null },
+            ];
+            for (let i = 1; i < 20; i++) {
+              records.push({
+                signature: encodeBase58(Buffer.alloc(64, i + 10)),
+                slot: 280_000_000 - i * 10,
+                blockTime: baseEpochSec - i * 10,
+                err: null,
+              });
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: records,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+        const succ = result as TransportProbeSuccessResult;
+
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(true);
+        expect(succ.reconciliationResult).toBeDefined();
+
+        const recon = succ.reconciliationResult!;
+        expect(recon.status).toBe("RECONCILED");
+        expect(recon.flowCoverage).toBe("SUFFICIENT");
+        expect(recon.flowCounts.recentBuys60s).toBe(0);
+        expect(recon.flowCounts.recentSells60s).toBe(0);
+        expect(recon.flowCounts.flowRatio).toBe(1.0);
+
+        // Established zeros verified across summary and metadata
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBe(21);
+        expect(succ.summary.reconciliationTelemetry.bootstrapHistoryRecordsReturned).toBe(1);
+        expect(succ.summary.reconciliationTelemetry.finalPageHistoryRecordsReturned).toBe(20);
+        expect(succ.summary.reconciliationTelemetry.uniqueHistorySignaturesWitnessed).toBe(20);
+        expect(succ.summary.reconciliationTelemetry.signaturesSinceAnchor).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBe(0);
+        expect(succ.metadata.counts.signaturesInWindow).toBe(0);
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBe(1);
       });
 
       it("aborts in-flight independent RPC work promptly on signal and cleanly seals partial evidence", async () => {
@@ -4769,6 +4914,12 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(mockTransport.isClosed).toBe(true);
         expect(succ.reconciliationSuccess).toBe(false);
         expect(succ.reconciliationResult?.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(succ.reconciliationResult?.sourceCutoff).toBeNull();
+        expect(succ.reconciliationResult?.resourceMetrics.actualRequestsDispatched).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBeNull();
+        expect(succ.metadata.counts.signaturesInWindow).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBeNull();
         expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
         expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
           true,
@@ -4825,6 +4976,12 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(mockTransport.isClosed).toBe(true);
         expect(succ.reconciliationSuccess).toBe(false);
         expect(succ.reconciliationResult?.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(succ.reconciliationResult?.sourceCutoff).toBeNull();
+        expect(succ.reconciliationResult?.resourceMetrics.actualRequestsDispatched).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.reconciliationReceiptHttpRequests).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.signaturesInWindow).toBeNull();
+        expect(succ.metadata.counts.signaturesInWindow).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.rawHistoryRecordsReturned).toBeNull();
         expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
         expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
           true,

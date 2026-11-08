@@ -303,9 +303,12 @@ export interface TransportProbeMetadata {
     readonly transactionRetrievalsSucceeded: number;
     readonly historyQueriesAttempted: number;
     readonly historySignaturesDiscovered: number;
-    readonly rawHistoryRecordsReturned?: number;
-    readonly signaturesSinceAnchor?: number;
-    readonly signaturesInWindow?: number;
+    readonly rawHistoryRecordsReturned?: number | null;
+    readonly bootstrapHistoryRecordsReturned?: number | null;
+    readonly finalPageHistoryRecordsReturned?: number | null;
+    readonly uniqueHistorySignaturesWitnessed?: number;
+    readonly signaturesSinceAnchor?: number | null;
+    readonly signaturesInWindow?: number | null;
     readonly nullBlockTimeCount: number;
   };
   readonly budgetStatus: GlobalBudgetStats;
@@ -539,11 +542,14 @@ export interface TransportProbeSummary {
     readonly historyQueriesAttempted: number;
     readonly historyQueriesLimit: number;
     readonly historyRecordsDiscovered: number;
-    readonly rawHistoryRecordsReturned?: number;
-    readonly signaturesSinceAnchor?: number;
-    readonly signaturesInWindow?: number;
+    readonly rawHistoryRecordsReturned?: number | null;
+    readonly bootstrapHistoryRecordsReturned?: number | null;
+    readonly finalPageHistoryRecordsReturned?: number | null;
+    readonly uniqueHistorySignaturesWitnessed?: number;
+    readonly signaturesSinceAnchor?: number | null;
+    readonly signaturesInWindow?: number | null;
     readonly wholeProbeHttpRequests?: number;
-    readonly reconciliationReceiptHttpRequests?: number;
+    readonly reconciliationReceiptHttpRequests?: number | null;
     readonly enumeratorOutcome: HistoryEnumerationOutcome | string;
     readonly discoveryDurationMs: number | null;
   };
@@ -561,9 +567,12 @@ export interface TransportProbeSummary {
   readonly discrepancyAnalysis: {
     readonly totalWsWitnessedSignatures: number;
     readonly totalHistoryWitnessedSignatures: number;
-    readonly rawHistoryRecordsReturned?: number;
-    readonly signaturesSinceAnchor?: number;
-    readonly signaturesInWindow?: number;
+    readonly rawHistoryRecordsReturned?: number | null;
+    readonly bootstrapHistoryRecordsReturned?: number | null;
+    readonly finalPageHistoryRecordsReturned?: number | null;
+    readonly uniqueHistorySignaturesWitnessed?: number;
+    readonly signaturesSinceAnchor?: number | null;
+    readonly signaturesInWindow?: number | null;
     readonly commonSignaturesCount: number;
     readonly wsOnlySignaturesCount: number;
     readonly historyOnlySignaturesCount: number;
@@ -3578,6 +3587,65 @@ export async function executeTransportObservationProbe(
     });
 
     // 11. Construct Metadata & Summary Evidence Artifacts
+    const bootstrapAudit = historyQueryAudits.find((a) => a.pageIndex === 1);
+    const finalPageAudit =
+      historyQueryAudits.length > 1 ? historyQueryAudits[historyQueryAudits.length - 1] : null;
+
+    const isAuditSuccessful = (a: HistoryQueryAuditRecord | null | undefined): boolean =>
+      Boolean(a && a.httpStatus === 200 && !a.error);
+
+    const bootstrapHistoryRecordsReturned: number | null =
+      transportOnly || historyQueriesAttempted === 0
+        ? null
+        : isAuditSuccessful(bootstrapAudit)
+          ? bootstrapAudit!.recordsDiscovered
+          : null;
+
+    const finalPageHistoryRecordsReturned: number | null =
+      transportOnly || historyQueriesAttempted === 0
+        ? null
+        : isAuditSuccessful(finalPageAudit)
+          ? finalPageAudit!.recordsDiscovered
+          : historyQueryAudits.length === 1 &&
+              bootstrapAudit?.limit !== 1 &&
+              isAuditSuccessful(bootstrapAudit)
+            ? bootstrapAudit!.recordsDiscovered
+            : null;
+
+    const rawHistoryRecordsReturned: number | null =
+      transportOnly || historyQueriesAttempted === 0
+        ? null
+        : historyQueryAudits.some(isAuditSuccessful)
+          ? historyQueryAudits.reduce(
+              (acc, a) => acc + (isAuditSuccessful(a) ? a.recordsDiscovered : 0),
+              0,
+            )
+          : null;
+
+    const uniqueHistorySignaturesWitnessed: number = transportOnly
+      ? 0
+      : historyWitnessedList.length;
+
+    const signaturesSinceAnchor: number | null =
+      transportOnly || historyQueriesAttempted === 0 || historyDiscoveryOutcome === "NOT_ATTEMPTED"
+        ? null
+        : historyRecordsDiscovered;
+
+    const isWindowEvaluated =
+      !transportOnly &&
+      Boolean(reconciliationResult) &&
+      reconciliationResult!.sourceCutoff !== null &&
+      (reconciliationResult!.status === "RECONCILED" ||
+        reconciliationResult!.status === "UNRESOLVED_TRANSACTIONS" ||
+        reconciliationResult!.status === "INSUFFICIENT_DIRECTIONAL_EVIDENCE");
+
+    const signaturesInWindow: number | null = isWindowEvaluated
+      ? reconciliationResult!.underlyingOutcomes.windowSignaturesCount
+      : null;
+
+    const reconciliationReceiptHttpRequests: number | null =
+      reconciliationResult?.resourceMetrics.actualRequestsDispatched ?? null;
+
     const metadata: TransportProbeMetadata = Object.freeze({
       probeVersion: "1.0",
       executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
@@ -3607,11 +3675,12 @@ export async function executeTransportObservationProbe(
         transactionRetrievalsSucceeded: transportOnly ? 0 : transactionRetrievalsSucceeded,
         historyQueriesAttempted: transportOnly ? 0 : historyQueriesAttempted,
         historySignaturesDiscovered: transportOnly ? 0 : historyRecordsDiscovered,
-        rawHistoryRecordsReturned: transportOnly ? 0 : historyWitnessedList.length,
-        signaturesSinceAnchor: transportOnly ? 0 : historyRecordsDiscovered,
-        signaturesInWindow: transportOnly
-          ? 0
-          : (reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0),
+        rawHistoryRecordsReturned,
+        bootstrapHistoryRecordsReturned,
+        finalPageHistoryRecordsReturned,
+        uniqueHistorySignaturesWitnessed,
+        signaturesSinceAnchor,
+        signaturesInWindow,
         nullBlockTimeCount: transportOnly ? 0 : nullBlockTimeCount,
       },
       budgetStatus: budget.getStats(),
@@ -3686,12 +3755,14 @@ export async function executeTransportObservationProbe(
         historyQueriesAttempted,
         historyQueriesLimit: maxHistoryQueries,
         historyRecordsDiscovered,
-        rawHistoryRecordsReturned: historyWitnessedList.length,
-        signaturesSinceAnchor: historyRecordsDiscovered,
-        signaturesInWindow: reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0,
+        rawHistoryRecordsReturned,
+        bootstrapHistoryRecordsReturned,
+        finalPageHistoryRecordsReturned,
+        uniqueHistorySignaturesWitnessed,
+        signaturesSinceAnchor,
+        signaturesInWindow,
         wholeProbeHttpRequests: budget.getStats().totalRequests,
-        reconciliationReceiptHttpRequests:
-          reconciliationResult?.resourceMetrics.actualRequestsDispatched ?? 0,
+        reconciliationReceiptHttpRequests,
         enumeratorOutcome: historyDiscoveryOutcome,
         discoveryDurationMs: historyDiscoveryDurationMs,
       },
@@ -3709,9 +3780,12 @@ export async function executeTransportObservationProbe(
       discrepancyAnalysis: {
         totalWsWitnessedSignatures: wsWitnessedList.length,
         totalHistoryWitnessedSignatures: historyWitnessedList.length,
-        rawHistoryRecordsReturned: historyWitnessedList.length,
-        signaturesSinceAnchor: historyRecordsDiscovered,
-        signaturesInWindow: reconciliationResult?.underlyingOutcomes.windowSignaturesCount ?? 0,
+        rawHistoryRecordsReturned,
+        bootstrapHistoryRecordsReturned,
+        finalPageHistoryRecordsReturned,
+        uniqueHistorySignaturesWitnessed,
+        signaturesSinceAnchor,
+        signaturesInWindow,
         commonSignaturesCount: commonSignatures.length,
         wsOnlySignaturesCount: wsOnlySignatures.length,
         historyOnlySignaturesCount: historyOnlySignatures.length,
