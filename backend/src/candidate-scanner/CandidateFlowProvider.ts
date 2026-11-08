@@ -695,6 +695,7 @@ export interface EvaluateCandidateDecisionParams {
   readonly currentNowMs: number;
   readonly buyGateService?: BuyGateTriggerService | undefined;
   readonly requireVerifiedHolders?: boolean | undefined;
+  readonly executionContext?: "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST" | undefined;
 }
 
 /**
@@ -798,7 +799,9 @@ export function evaluateCandidateDecisionPoints(
   let flowResult: CandidateFlowResult;
   try {
     const rawResult = provider.getCandidateFlow(target, currentNowMs);
-    flowResult = validateAndSnapshotCandidateFlowResult(rawResult, target, currentNowMs);
+    flowResult = validateAndSnapshotCandidateFlowResult(rawResult, target, currentNowMs, {
+      executionContext: params.executionContext,
+    });
   } catch (providerErr) {
     flowResult = Object.freeze({
       poolAddress: candidate.poolId,
