@@ -159,6 +159,7 @@ export interface HistoryEnumerationResult {
   readonly connectionEpoch: number;
   readonly anchorWitnessed: boolean;
   readonly knownAnchorSignature: string;
+  readonly anchorRecord?: HistorySignatureRecord | undefined;
   readonly frozenTargetSignature: string | null;
   readonly discoveredSignatures: readonly HistorySignatureRecord[];
   readonly pagesQueried: number;
@@ -993,6 +994,7 @@ export class ExactPoolHistoryEnumerator {
       const anchorIndex = rawRecords.findIndex((r) => r.signature === this.knownAnchorSignature);
 
       if (anchorIndex !== -1) {
+        const anchorRecord = cloneAndDeepFreezeRecord(rawRecords[anchorIndex]!);
         const newDiscovered = rawRecords.slice(0, anchorIndex);
         for (const raw of newDiscovered) {
           if (!seenSignatures.has(raw.signature)) {
@@ -1014,6 +1016,7 @@ export class ExactPoolHistoryEnumerator {
           connectionEpoch: expectedEpoch,
           anchorWitnessed: true,
           knownAnchorSignature: this.knownAnchorSignature,
+          anchorRecord,
           frozenTargetSignature,
           discoveredSignatures: deepFreeze([...accumulatedRecords]),
           pagesQueried,

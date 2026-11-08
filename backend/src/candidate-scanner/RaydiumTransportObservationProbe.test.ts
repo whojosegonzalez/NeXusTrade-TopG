@@ -26,10 +26,17 @@ import {
   boundedCancel,
   MeteredWebSocketTransport,
   DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT,
+  DEFAULT_RECONCILIATION_PROBE_DURATION_MS,
   MAX_TOTAL_HTTP_ATTEMPTS,
   resolveProjectRoot,
+  acquireSourceCutoff,
+  type SourceCutoffAuditRecord,
   type TransportProbeSuccessResult,
+  type TransportProbeDryRunResult,
 } from "./RaydiumTransportObservationProbe.js";
+import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
+import type { SourceCutoffEvidence } from "./ExactPoolWindowReconciliationEvaluator.js";
+import { UnavailableCandidateFlowProvider } from "./CandidateFlowProvider.js";
 import { decodeRaydiumTransactionSwaps } from "./RaydiumAmmV4SwapDecoder.js";
 import type { ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
 import type { HistoryPageFetcher, HistorySignatureRecord } from "./ExactPoolHistoryEnumerator.js";
@@ -112,7 +119,11 @@ function makeSwapBaseInV2Data(amountIn: bigint, minimumOut: bigint): number[] {
   return Array.from(buf);
 }
 
-function createSyntheticBuyPayload(signature: string, blockTime = Math.floor(Date.now() / 1000)) {
+function createSyntheticBuyPayload(
+  signature: string,
+  blockTime = Math.floor(Date.now() / 1000),
+  slot = 280_000_100,
+) {
   const ctx = DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT;
   const authority = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
   const userSource = "UserSourceTokenAccount1111111111111111111111";
@@ -135,7 +146,7 @@ function createSyntheticBuyPayload(signature: string, blockTime = Math.floor(Dat
   const amountOutTokens = 25_000_000_000n;
 
   return {
-    slot: 280_000_100,
+    slot,
     blockTime,
     transaction: {
       signatures: [signature],
@@ -2804,6 +2815,850 @@ describe("RaydiumTransportObservationProbe", () => {
             expect(succ.metadata.counts.inboundMessagesCount).toBeGreaterThanOrEqual(3);
           }
         });
+      });
+    });
+
+    describe("Bounded Window Reconciliation Diagnostic Mode (--reconcile)", () => {
+      it("parses CLI flags and produces valid dry-run plan with bounded request allocation", async () => {
+        const parsed = parseTransportProbeArgs(["--reconcile", "--dry-run"]);
+        expect(parsed.reconcile).toBe(true);
+        expect(parsed.dryRun).toBe(true);
+
+        const parsedWindow = parseTransportProbeArgs(["--reconcile-window"]);
+        expect(parsedWindow.reconcile).toBe(true);
+
+        const dryRunRes = (await executeTransportObservationProbe({
+          isLive: false,
+          reconcile: true,
+        })) as TransportProbeDryRunResult;
+
+        expect(dryRunRes.dryRun).toBe(true);
+        expect(dryRunRes.status).toBe("DRY_RUN");
+        expect(dryRunRes.targetPoolId).toBe(DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.poolId);
+        expect(dryRunRes.candidateTokenMint).toBe(
+          DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.candidateTokenMint,
+        );
+        expect(dryRunRes.limits.durationMs).toBe(DEFAULT_RECONCILIATION_PROBE_DURATION_MS);
+        expect(dryRunRes.limits.durationMs).toBe(90_000);
+        expect(dryRunRes.limits.maxHistoryQueries).toBe(1);
+        expect(dryRunRes.limits.reconcile).toBe(true);
+        expect(dryRunRes.limits.plannedRequestAllocation).toEqual({
+          cutoffAcquisition: 1,
+          historyPagination: 1,
+          transactionRetrievals: 5,
+          maxTotalHttpAttempts: MAX_TOTAL_HTTP_ATTEMPTS,
+          minProviderSpacingMs: 2500,
+        });
+        expect(dryRunRes.budgetStats.totalRequests).toBe(0);
+      });
+
+      it("reconciles cutoff-anchored window with positive trade flow and seals evidence manifest", async () => {
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        const cutoffBlockTimeSec = Math.floor((fakeNow - 5_000) / 1000);
+        const cutoffTimestampMs = cutoffBlockTimeSec * 1000;
+        const mockCutoff: SourceCutoffEvidence = {
+          sourceMethod: "getBlockTime",
+          responseField: "result",
+          commitment: "confirmed",
+          provenance: "ON_CHAIN_BLOCK_TIME",
+          slot: 280_000_100,
+          cutoffTimestampMs,
+          retrievedAtMs: fakeNow - 4_000,
+          responsePayload: { jsonrpc: "2.0", id: 1, result: cutoffBlockTimeSec },
+          requestContext: { slot: 280_000_100 },
+        };
+
+        const mockHistoryFetcher: HistoryPageFetcher = {
+          fetchPage: async () => [
+            {
+              signature: SIG_B,
+              slot: 280_000_100,
+              blockTime: cutoffBlockTimeSec - 10,
+              err: null,
+            },
+            {
+              signature: SIG_ANCHOR,
+              slot: 280_000_000,
+              blockTime: cutoffBlockTimeSec - 70,
+              err: null,
+            },
+          ],
+        };
+
+        const mockFetch: typeof fetch = async (input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.method === "getTransaction") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(SIG_B, cutoffBlockTimeSec - 10),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 40,
+          observationStartMs: 1_700_000_000_000,
+          sourceCutoff: mockCutoff,
+          historyPageFetcher: mockHistoryFetcher,
+          knownAnchorSignature: SIG_ANCHOR,
+          fetchTransport: mockFetch,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.observationSuccess).toBe(true);
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(true);
+        expect(succ.reconciliationResult).toBeDefined();
+        const recon = succ.reconciliationResult!;
+
+        expect(recon.status).toBe("RECONCILED");
+        expect(recon.flowCoverage).toBe("SUFFICIENT");
+        expect(recon.flowCounts.recentBuys60s).toBe(1);
+        expect(recon.flowCounts.recentSells60s).toBe(0);
+        expect(recon.flowCounts.flowRatio).toBe(1);
+        expect(recon.isCoverageSufficient).toBe(true);
+        expect(recon.underlyingOutcomes.anchorWitnessed).toBe(true);
+
+        // Verify evidence files on disk and inside manifest
+        const reconFilePath = path.join(testOutputDir, "reconciliation-result.json");
+        expect(fsSync.existsSync(reconFilePath)).toBe(true);
+        const reconContent = fsSync.readFileSync(reconFilePath, "utf8");
+        const reconParsed = JSON.parse(reconContent);
+        expect(reconParsed.status).toBe("RECONCILED");
+
+        const manifestEntry = succ.manifest.files.find(
+          (f) => f.filename === "reconciliation-result.json",
+        );
+        expect(manifestEntry).toBeDefined();
+        const diskSha256 = crypto.createHash("sha256").update(reconContent).digest("hex");
+        expect(manifestEntry!.sha256).toBe(diskSha256);
+      });
+
+      it("handles subscription notifications and duplicate resolution limitation fail-closed to UNRESOLVED_TRANSACTIONS", async () => {
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        const cutoffBlockTimeSec = Math.floor((fakeNow - 5_000) / 1000);
+        const cutoffTimestampMs = cutoffBlockTimeSec * 1000;
+        const mockCutoff: SourceCutoffEvidence = {
+          sourceMethod: "getBlockTime",
+          responseField: "result",
+          commitment: "confirmed",
+          provenance: "ON_CHAIN_BLOCK_TIME",
+          slot: 280_000_100,
+          cutoffTimestampMs,
+          retrievedAtMs: fakeNow - 4_000,
+          responsePayload: { jsonrpc: "2.0", id: 1, result: cutoffBlockTimeSec },
+          requestContext: { slot: 280_000_100 },
+        };
+
+        const mockHistoryFetcher: HistoryPageFetcher = {
+          fetchPage: async () => [
+            {
+              signature: SIG_B,
+              slot: 280_000_100,
+              blockTime: cutoffBlockTimeSec - 10,
+              err: null,
+            },
+            {
+              signature: SIG_ANCHOR,
+              slot: 280_000_000,
+              blockTime: cutoffBlockTimeSec - 70,
+              err: null,
+            },
+          ],
+        };
+
+        const mockFetch: typeof fetch = async (input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.method === "getTransaction") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(SIG_B, cutoffBlockTimeSec - 10),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 40,
+          observationStartMs: 1_700_000_000_000,
+          sourceCutoff: mockCutoff,
+          historyPageFetcher: mockHistoryFetcher,
+          knownAnchorSignature: SIG_ANCHOR,
+          fetchTransport: mockFetch,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+        // Trigger notification for SIG_B during streaming phase
+        mockTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              subscription: 1,
+              result: {
+                context: { slot: 280_000_100 },
+                value: {
+                  signature: SIG_B,
+                  logs: [],
+                  err: null,
+                },
+              },
+            },
+          }),
+        );
+
+        const result = await probePromise;
+
+        // Observation execution succeeded and manifest is sealed, but duplicate resolution limitation fails closed
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.observationSuccess).toBe(true);
+        expect(succ.manifestSealed).toBe(true);
+
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult).toBeDefined();
+        expect(succ.reconciliationResult!.status).toBe("UNRESOLVED_TRANSACTIONS");
+        expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+
+        // Evidence file was sealed into manifest despite incomplete reconciliation
+        expect(succ.manifest.files.some((f) => f.filename === "reconciliation-result.json")).toBe(
+          true,
+        );
+      });
+
+      it("rejects stale cutoff evidence with STALE_DATA and seals partial manifest", async () => {
+        const mockTransport = new MockWebSocketTransport();
+
+        const now = Date.now();
+        // 25 seconds in the past -> exceeds 15-second research freshness limit
+        const staleBlockTimeSec = Math.floor((now - 25_000) / 1000);
+        const staleCutoff: SourceCutoffEvidence = {
+          sourceMethod: "getBlockTime",
+          responseField: "result",
+          commitment: "confirmed",
+          provenance: "ON_CHAIN_BLOCK_TIME",
+          slot: 280_000_100,
+          cutoffTimestampMs: staleBlockTimeSec * 1000,
+          retrievedAtMs: now,
+          responsePayload: { jsonrpc: "2.0", id: 1, result: staleBlockTimeSec },
+          requestContext: { slot: 280_000_100 },
+        };
+
+        const mockHistoryFetcher: HistoryPageFetcher = {
+          fetchPage: async () => [],
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 300,
+          streamingDurationMs: 20,
+          observationStartMs: now - 70_000,
+          sourceCutoff: staleCutoff,
+          historyPageFetcher: mockHistoryFetcher,
+          knownAnchorSignature: SIG_ANCHOR,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult?.status).toBe("STALE_DATA");
+        expect(succ.reconciliationResult?.isCoverageSufficient).toBe(false);
+      });
+
+      it("strictly isolates production flow and preserves frozen virtual wallet invariant", async () => {
+        const dryRunRes = (await executeTransportObservationProbe({
+          isLive: false,
+          reconcile: true,
+        })) as TransportProbeDryRunResult;
+
+        expect(dryRunRes.targetPoolId).toBe(DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.poolId);
+        expect(dryRunRes.candidateTokenMint).toBe(
+          DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.candidateTokenMint,
+        );
+        expect(dryRunRes.limits.spendingCeiling).toBe("$0.00");
+
+        // Verify production candidate flow provider returns strictly unavailable
+        const prodFlowProvider = new UnavailableCandidateFlowProvider();
+        const prodFlow = prodFlowProvider.getCandidateFlow(
+          {
+            poolAddress: DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.poolId,
+            tokenMint: DEFAULT_REFERENCE_RAY_WSOL_POOL_CONTEXT.candidateTokenMint,
+          },
+          Date.now(),
+        );
+        expect(prodFlow.recentBuys60s).toBeNull();
+        expect(prodFlow.recentSells60s).toBeNull();
+        expect(prodFlow.flowCoverage).toBe("COLLECTION_GAP");
+        expect(prodFlow.isCoverageSufficient).toBe(false);
+
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        const cutoffBlockTimeSec = Math.floor((fakeNow - 5_000) / 1000);
+        const cutoffTimestampMs = cutoffBlockTimeSec * 1000;
+        const mockCutoff: SourceCutoffEvidence = {
+          sourceMethod: "getBlockTime",
+          responseField: "result",
+          commitment: "confirmed",
+          provenance: "ON_CHAIN_BLOCK_TIME",
+          slot: 280_000_100,
+          cutoffTimestampMs,
+          retrievedAtMs: fakeNow - 4_000,
+          responsePayload: { jsonrpc: "2.0", id: 1, result: cutoffBlockTimeSec },
+          requestContext: { slot: 280_000_100 },
+        };
+
+        const mockHistoryFetcher: HistoryPageFetcher = {
+          fetchPage: async () => [
+            {
+              signature: SIG_ANCHOR,
+              slot: 280_000_000,
+              blockTime: cutoffBlockTimeSec - 70,
+              err: null,
+            },
+          ],
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 40,
+          observationStartMs: 1_700_000_000_000,
+          sourceCutoff: mockCutoff,
+          historyPageFetcher: mockHistoryFetcher,
+          knownAnchorSignature: SIG_ANCHOR,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+
+        const succ = result as TransportProbeSuccessResult;
+        // Production completeness permanently false
+        expect(succ.summary.tradeFlowTelemetry.isProductionCompletenessEstablished).toBe(false);
+
+        // Virtual wallet invariants
+        expect(succ.metadata.isProductionCompletenessEstablished).toBe(false);
+        expect(succ.metadata.gate11Status).toBe("UNAFFECTED_FAIL_CLOSED");
+        expect(succ.metadata.virtualWalletBalanceSol).toBe("7.9259 SOL");
+        expect(succ.metadata.spendingCeiling).toBe("$0.00");
+      });
+
+      it("handles empty acknowledged stream without anchor fail-closed, closing transport and sealing manifest", async () => {
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        // Injected subscription ACK with 0 transaction notifications
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+        const result = await probePromise;
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(mockTransport.isClosed).toBe(true);
+
+        expect(succ.reconciliationResult).toBeDefined();
+        const recon = succ.reconciliationResult!;
+        expect(recon.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(recon.flowCoverage).toBe("COLLECTION_GAP");
+        expect(recon.isCoverageSufficient).toBe(false);
+        expect(recon.flowCounts.recentBuys60s).toBeNull();
+        expect(recon.flowCounts.recentSells60s).toBeNull();
+        expect(succ.summary.reconciliationTelemetry.anchorWitnessed).toBe(false);
+        expect(succ.summary.reconciliationTelemetry.anchorSignature).toBeNull();
+
+        // Verify sealed files
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
+          true,
+        );
+      });
+
+      it("handles transport failure before first signature, closing transport and sealing partial manifest", async () => {
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 50,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerError(new Error("ECONNRESET: Connection reset by peer"));
+
+        const result = await probePromise;
+
+        expect(result.dryRun).toBe(false);
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.status).toBe("TRANSPORT_ERROR");
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(mockTransport.isClosed).toBe(true);
+        expect(succ.reconciliationResult).toBeDefined();
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(fsSync.existsSync(path.join(testOutputDir, "capture-manifest.json"))).toBe(true);
+        expect(fsSync.existsSync(path.join(testOutputDir, "reconciliation-result.json"))).toBe(
+          true,
+        );
+      });
+
+      it("handles cutoff acquisition failure without replacing missing source time with wall-clock time", async () => {
+        let fakeNow = 1_700_000_070_000;
+        const clock = () => fakeNow;
+        const sleepFn = async (ms: number) => {
+          fakeNow += ms;
+          await new Promise((r) => setTimeout(r, 1));
+        };
+
+        const mockTransport = new MockWebSocketTransport();
+
+        // fetchTransport fails for getBlockTime
+        const mockFetch: typeof fetch = async () => {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, message: "Slot not confirmed" },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+        mockTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              subscription: 1,
+              result: {
+                context: { slot: 280_000_100 },
+                value: { signature: SIG_ANCHOR, logs: [], err: null },
+              },
+            },
+          }),
+        );
+
+        const result = await probePromise;
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult).toBeDefined();
+        expect(succ.reconciliationResult!.status).toBe("MISSING_SOURCE_CUTOFF");
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
+        expect(succ.summary.cutoffAcquisitionAudit).toBeDefined();
+        expect(succ.summary.cutoffAcquisitionAudit?.error).toContain("Slot not confirmed");
+      });
+
+      it("timing injection: acquireSourceCutoff records retrievedAtMs after completed body consumption", async () => {
+        let fakeNow = 10_000;
+        const clock = () => fakeNow;
+        const budget = new GlobalResourceBudgetManager();
+
+        const fakeFetch: typeof fetch = async () => {
+          const res = {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            text: async () => {
+              fakeNow = 15_000;
+              return JSON.stringify({ jsonrpc: "2.0", id: 1, result: 12345 });
+            },
+          } as unknown as Response;
+          return res;
+        };
+
+        let capturedAudit: SourceCutoffAuditRecord | null = null;
+        const evidence = await acquireSourceCutoff(
+          "https://api.mainnet-beta.solana.com",
+          100,
+          budget,
+          undefined,
+          fakeFetch,
+          clock,
+          async () => {},
+          (rec) => {
+            capturedAudit = rec;
+          },
+        );
+
+        expect(evidence.retrievedAtMs).toBe(15_000);
+        expect(evidence.cutoffTimestampMs).toBe(12345 * 1000);
+        expect(capturedAudit).toBeDefined();
+        expect(capturedAudit!.requestSentAtMs).toBe(10_000);
+        expect(capturedAudit!.headersReceivedAtMs).toBe(10_000);
+        expect(capturedAudit!.responseReceivedAtMs).toBe(15_000);
+        expect(capturedAudit!.durationMs).toBe(5_000);
+        expect(capturedAudit!.httpStatus).toBe(200);
+        expect(capturedAudit!.responseSha256).toBeDefined();
+        expect(capturedAudit!.error).toBeUndefined();
+      });
+
+      it("exercises genuine CLI acquisition path without prebuilt overrides", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          await Promise.resolve();
+          const step = 10_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+          }
+          await new Promise((r) => setTimeout(r, 1));
+        };
+        const baseEpochSec = Math.floor(fakeNow / 1000);
+        const fixedCutoffSec = baseEpochSec + 65;
+        const getCutoffBlockTimeSec = () => fixedCutoffSec;
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: getCutoffBlockTimeSec() }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSignaturesForAddress") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_B,
+                    slot: 280_000_100,
+                    blockTime: fixedCutoffSec - 10,
+                    err: null,
+                  },
+                  { signature: SIG_ANCHOR, slot: 280_000_000, blockTime: baseEpochSec, err: null },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getTransaction") {
+            const reqSig = parsed.params?.[0] ?? SIG_B;
+            const reqSlot = reqSig === SIG_ANCHOR ? 280_000_000 : 280_000_100;
+            const reqBlockTime = reqSig === SIG_ANCHOR ? baseEpochSec : fixedCutoffSec - 10;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(reqSig, reqBlockTime, reqSlot),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+        mockTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              subscription: 1,
+              result: {
+                context: { slot: 280_000_000 },
+                value: { signature: SIG_ANCHOR, logs: [], err: null },
+              },
+            },
+          }),
+        );
+
+        const result = await probePromise;
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(true);
+        expect(succ.reconciliationResult).toBeDefined();
+        const recon = succ.reconciliationResult!;
+        expect(recon.status).toBe("RECONCILED");
+        expect(recon.flowCoverage).toBe("SUFFICIENT");
+        expect(recon.flowCounts.recentBuys60s).toBe(1);
+        expect(recon.flowCounts.recentSells60s).toBe(0);
+        expect(succ.summary.cutoffAcquisitionAudit).toBeDefined();
+        expect(succ.summary.cutoffAcquisitionAudit?.httpStatus).toBe(200);
+      });
+
+      it("fails closed with UNWITNESSED_PRIOR_ANCHOR when earliest stream signature is inside window", async () => {
+        let fakeNow = 1_700_000_000_000;
+        const clock = () => fakeNow;
+        const mockTransport = new MockWebSocketTransport();
+        const sleepFn = async (ms: number) => {
+          await Promise.resolve();
+          const step = 10_000;
+          let remaining = ms;
+          while (remaining > 0) {
+            const chunk = Math.min(remaining, step);
+            fakeNow += chunk;
+            remaining -= chunk;
+            mockTransport.triggerMessage(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "logsNotification",
+                params: {
+                  subscription: 999999,
+                  result: {
+                    context: { slot: 280_000_100 },
+                    value: {
+                      signature: "UnrelatedSig1111111111111111111111111111111111",
+                      logs: [],
+                      err: null,
+                    },
+                  },
+                },
+              }),
+            );
+          }
+          await new Promise((r) => setTimeout(r, 1));
+        };
+        const getCutoffBlockTimeSec = () => Math.floor(fakeNow / 1000);
+
+        const mockFetch: typeof fetch = async (_input, init) => {
+          const bodyStr = typeof init?.body === "string" ? init.body : "";
+          const parsed = JSON.parse(bodyStr);
+
+          if (parsed.method === "getBlockTime") {
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: getCutoffBlockTimeSec() }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getSignaturesForAddress") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: [
+                  {
+                    signature: SIG_ANCHOR,
+                    slot: 280_000_000,
+                    blockTime: getCutoffBlockTimeSec() - 10,
+                    err: null,
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          if (parsed.method === "getTransaction") {
+            const reqSig = parsed.params?.[0] ?? SIG_ANCHOR;
+            const reqSlot = reqSig === SIG_ANCHOR ? 280_000_000 : 280_000_100;
+            const reqBlockTime =
+              reqSig === SIG_ANCHOR
+                ? Math.floor(1_700_000_000_000 / 1000)
+                : getCutoffBlockTimeSec() - 10;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                result: createSyntheticBuyPayload(reqSig, reqBlockTime, reqSlot),
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null }));
+        };
+
+        const probePromise = executeTransportObservationProbe({
+          isLive: true,
+          outDir: testOutputDir,
+          transport: mockTransport,
+          fetchTransport: mockFetch,
+          reconcile: true,
+          durationMs: 90_000,
+          streamingDurationMs: 65_000,
+          clock,
+          sleepFn,
+        });
+
+        mockTransport.triggerOpen();
+        mockTransport.triggerMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+        mockTransport.triggerMessage(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "logsNotification",
+            params: {
+              subscription: 1,
+              result: {
+                context: { slot: 280_000_000 },
+                value: { signature: SIG_ANCHOR, logs: [], err: null },
+              },
+            },
+          }),
+        );
+
+        const result = await probePromise;
+
+        const succ = result as TransportProbeSuccessResult;
+        expect(succ.manifestSealed).toBe(true);
+        expect(succ.reconciliationSuccess).toBe(false);
+        expect(succ.reconciliationResult).toBeDefined();
+        expect(succ.reconciliationResult!.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+        expect(succ.reconciliationResult!.flowCoverage).toBe("COLLECTION_GAP");
+        expect(succ.reconciliationResult!.isCoverageSufficient).toBe(false);
       });
     });
   });

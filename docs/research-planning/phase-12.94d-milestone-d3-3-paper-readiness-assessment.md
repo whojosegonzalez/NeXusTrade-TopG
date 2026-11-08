@@ -1354,15 +1354,71 @@ The offline single-pool integration suite ([`ExactPoolWindowReconciliationIntegr
 13. **Delayed History Acquisition Causality**: History enumeration completing after explicit decision timestamp strictly fails closed with `FUTURE_DATED_EVIDENCE`.
 14. **Delayed Resolution Acquisition Causality**: Transaction resolution completing after explicit decision timestamp strictly fails closed with `FUTURE_DATED_EVIDENCE`.
 
-###### 4. Bounded Operator-Run Live Validation Requirements (Next Step)
+###### 4. Bounded Operator Diagnostic Tooling & Live Execution Plan
 
-Before any bounded live execution on an operator machine, the following boundaries remain strictly defined:
+The isolated operator diagnostic path has been implemented by extending the existing transport observation probe (`RaydiumTransportObservationProbe.ts`) and CLI runner (`probe-raydium-transport.ts`) with the `--reconcile` flag. Default behavior (300s duration, 2 history queries, `reconcile: false`) is 100% preserved when `--reconcile` is omitted.
 
-- **Single-Pool Scope**: Evaluation bounded to exactly one confirmed Raydium AMM v4 pool address (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`), not CPMM.
-- **Read-Only Diagnostic Probe**: Executed strictly as a diagnostic probe script with dry-run verification first; zero purchases, zero signing, zero daemon startup.
-- **Acquisition Ceilings**: Maximum 1 source cutoff query, 1 history enumeration page ($\le 10$ signatures), $\le 3$ transaction resolutions.
-- **Pacing & Freshness**: Minimum host pacing $\ge 2{,}500\text{ ms}$; source cutoff timestamp $T_{\text{cutoff}}$ to evaluation duration strictly $\le 15{,}000\text{ ms}$ ($T_{\text{decision}} - T_{\text{cutoff}} \le 15{,}000\text{ ms}$).
-- **Unproven Production Gaps Preserved**: Cryptographic completeness, multi-pool scalability, exit-path volume estimation, and Gate 11 bundler concentration remain explicitly unproven.
+1. **Exact Operator Commands**:
+   - **Zero-Network Dry-Run Validation** (Verified & Working):
+     ```powershell
+     node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/probe-raydium-transport.ts --reconcile --transport ws --keepalive --ping-interval-ms 20000 --max-pings 4 --pong-timeout-ms 10000 --max-control-frames 50 --max-control-bytes 4096 --dry-run
+     ```
+     Validates the planned execution parameters, request budget allocations, and target identity with strictly zero network calls or socket operations.
+   - **Proposed Live Diagnostic Run** (_Pending Independent Operator Review & Explicit Authorization_):
+     ```powershell
+     node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/probe-raydium-transport.ts --reconcile --transport ws --keepalive --ping-interval-ms 20000 --max-pings 4 --pong-timeout-ms 10000 --max-control-frames 50 --max-control-bytes 4096 --live
+     ```
+
+2. **Fixed Pool & Token Scope**:
+   - Fixed Raydium AMM v4 reference pool: `AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA` (RAY/WSOL).
+   - Candidate token mint: `4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R` (RAY).
+   - Quote token mint: `So11111111111111111111111111111111111111112` (WSOL).
+   - Zero automatic pool substitution or alternate pool lookups.
+
+3. **Complete Request Allocation & Shared Pacing**:
+   - **Cutoff Acquisition**: Exactly 1 `getBlockTime` RPC query for latest confirmed slot via `SOLANA_RPC`.
+   - **History Pagination**: Exactly 1 `getSignaturesForAddress` query (limit 20) with pagination cursor.
+   - **Transaction Retrieval**: Up to 5 `getTransaction` queries for discovered in-window transactions.
+   - **Total HTTP Attempts**: Hard ceiling $\le 7$ total attempts across all phases.
+   - **Shared Budget Manager**: All requests share the single `GlobalResourceBudgetManager` instance on provider `"SOLANA_RPC"` with host pacing strictly $\ge 2{,}500\text{ ms}$. Ceilings are never silently increased.
+
+4. **Observation Duration & Stopping Conditions**:
+   - **Duration Ceiling**: 90 seconds (90,000 ms), with ~67.5s allocated to streaming observation and up to 22.5s reserved for post-acquisition cutoff, history pagination, and transaction resolution.
+   - **Message Ceiling**: 500 incoming WebSocket messages.
+   - **Payload Ceiling**: 2 MiB (2,097,152 bytes) application payload.
+   - **Queue Depth Ceiling**: 10 pending notifications.
+   - **HTTP Ceiling**: 7 total HTTP requests.
+   - Reaching any ceiling immediately triggers clean settled termination and manifest sealing.
+
+5. **Boundary Anchor & 60-Second Window Span**:
+   - Streaming observation runs for $\ge 60\text{s}$ before cutoff acquisition, ensuring the observation window $[T_{\text{obs\_start}}, T_{\text{obs\_end}}]$ spans the evaluated cutoff-anchored research window $[T_{\text{cutoff}} - 60\text{s}, T_{\text{cutoff}}]$.
+   - Earliest witnessed streaming notification establishes boundary anchor $S_{\text{anchor}}$.
+   - History enumeration starts at the RPC head and uses `before` cursors for subsequent pages until $S_{\text{anchor}}$ is witnessed (it does not initially query `before: S_anchor`), verifying that the boundary anchor and oldest discovered signature precede or span the 60-second window ($T_{\text{anchor}} \le T_{\text{cutoff}} - 60\text{s}$).
+
+6. **Subscription Notifications & Duplicate Resolution Limitation**:
+   - Live stream notifications are ingested into the transaction adapter and hashed.
+   - When history enumeration subsequently returns a signature already witnessed in the stream, the resolution bridge conservatively flags it as `DUPLICATE_UNRESOLVED` under conservative duplicate policy.
+   - Evaluator strictly fails closed to `UNRESOLVED_TRANSACTIONS` rather than claiming optimistic recovery.
+
+7. **Incomplete Capture & Stream Gap Preservation**:
+   - Stream gaps (`SOURCE_ADAPTER_LOSS:QUEUE_OVERFLOW`, `PACING_WAIT_EXCEEDS_DEADLINE`, transport disconnects) strictly invalidate overlapping windows with `STREAM_GAP`.
+   - Incomplete captures and diagnostic rejections (`UNRESOLVED_TRANSACTIONS`, `STREAM_GAP`, `STALE_DATA`) are preserved and sealed into the manifest; diagnostic failure is treated as authentic experimental evidence.
+
+8. **Evidence Artifacts & Sealing**:
+   - Output path: `data/research/captures/transport-probe/<timestamp>_<poolId>/`.
+   - Sealed artifacts written before manifest finalization:
+     1. `reconciliation-result.json`: Complete `WindowReconciliationResult` with provider assumptions, timestamps, flow counts, and diagnostic reason.
+     2. `capture-metadata.json`: Probe configuration, execution timings, limits, and invariant attestations.
+     3. `probe-summary.json`: Inbound message telemetry, queue metrics, and reconciliation outcome.
+     4. `witnessed-signatures.json`: Array of all stream-witnessed signatures with slots and timings.
+     5. `sampled-transactions.json`: Audit records for retrieved and decoded transactions.
+     6. `capture-manifest.json`: Cryptographic manifest containing SHA-256 digests of all 5 evidence files and an entries digest.
+
+9. **Strict Production Flow Separation & Frozen Virtual Wallet**:
+   - `CandidateFlowProvider` production defaults remain permanently unavailable (`recentBuys60s: null, flowCoverage: "COLLECTION_GAP"`).
+   - `isProductionCompletenessEstablished = false` permanently.
+   - Gate 11 bundler concentration remains quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
+   - Virtual wallet strictly frozen at 7.9259 SOL (`7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling $0.00. Zero purchases, zero signing.
 
 ---
 

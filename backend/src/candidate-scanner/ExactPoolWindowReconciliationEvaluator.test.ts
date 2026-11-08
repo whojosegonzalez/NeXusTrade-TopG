@@ -320,6 +320,46 @@ describe("Phase 12.94-D Milestone D.3.3: Exact-Pool Window Reconciliation Evalua
       expect(result.flowCoverage).toBe("COLLECTION_GAP");
     });
 
+    it("fails closed with UNWITNESSED_PRIOR_ANCHOR when witnessed anchor is inside window (blockTime > windowStartMs) and no prior boundary exists", () => {
+      const inWindowAnchor = "InWindowAnchorSig1111111111111111111111111111111";
+      const inWindowHistoryResult: HistoryEnumerationResult = {
+        outcome: "ANCHOR_WITNESSED",
+        candidatePoolId: CANONICAL_POOL_ID,
+        connectionEpoch: 1,
+        anchorWitnessed: true,
+        knownAnchorSignature: inWindowAnchor,
+        frozenTargetSignature: inWindowAnchor,
+        discoveredSignatures: [
+          {
+            signature: inWindowAnchor,
+            slot: 280_000_100,
+            err: null,
+            blockTime: 50, // 50s (50_000 ms) is inside [5s, 65s], not <= 5s!
+          },
+        ],
+        requestCount: 1,
+        pagesQueried: 1,
+        isProductionCompletenessEstablished: false,
+      };
+
+      const result = evaluateExactPoolWindowReconciliation({
+        poolContext: VALID_POOL_CONTEXT,
+        decisionTimestampMs: 66_000,
+        observationStartMs: 0,
+        observationEndMs: 65_000,
+        sourceCutoff: validCutoff,
+        historyResult: inWindowHistoryResult,
+        budgetManager,
+      });
+
+      expect(result.status).toBe("UNWITNESSED_PRIOR_ANCHOR");
+      expect(result.flowCoverage).toBe("COLLECTION_GAP");
+      expect(result.isCoverageSufficient).toBe(false);
+      expect(result.diagnosticReason).toContain(
+        "COLLECTION_GAP: History enumeration did not witness prior boundary anchor at or before window start (5000 ms)",
+      );
+    });
+
     it("fails closed with IDENTITY_MISMATCH when candidatePoolId in historyResult does not match poolContext", () => {
       const foreignHistoryResult: HistoryEnumerationResult = {
         outcome: "ANCHOR_WITNESSED",

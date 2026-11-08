@@ -1178,17 +1178,29 @@ export function evaluateExactPoolWindowReconciliation(
   }
 
   // Check Boundary Anchor Witnessing
-  if (discoveredSignatures.length > 0) {
+  if (discoveredSignatures.length > 0 || options.historyResult) {
     const anchorWitnessed =
       options.historyResult?.anchorWitnessed ??
       (effectiveAnchorSig
         ? discoveredSignatures.some((s) => s.signature === effectiveAnchorSig)
         : false);
 
-    const hasPriorBoundary =
-      oldestSignatureBlockTimeMs !== null && oldestSignatureBlockTimeMs <= windowStartMs;
+    const anchorRec =
+      options.historyResult?.anchorRecord ??
+      (effectiveAnchorSig
+        ? discoveredSignatures.find((s) => s.signature === effectiveAnchorSig)
+        : undefined);
 
-    if (!anchorWitnessed && !hasPriorBoundary) {
+    const anchorBlockTimeMs =
+      anchorRec && typeof anchorRec.blockTime === "number" && Number.isFinite(anchorRec.blockTime)
+        ? anchorRec.blockTime * 1000
+        : null;
+
+    const hasPriorBoundary =
+      (anchorBlockTimeMs !== null && anchorBlockTimeMs <= windowStartMs) ||
+      (oldestSignatureBlockTimeMs !== null && oldestSignatureBlockTimeMs <= windowStartMs);
+
+    if (!anchorWitnessed || !hasPriorBoundary) {
       return buildResult(
         "UNWITNESSED_PRIOR_ANCHOR",
         "COLLECTION_GAP",

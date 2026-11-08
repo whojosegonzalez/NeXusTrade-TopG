@@ -61,6 +61,7 @@ OPTIONS:
   --max-control-frames <count> Maximum RFC 6455 control frames budget (default: 50)
   --max-control-bytes <bytes>  Maximum RFC 6455 control frame payload bytes budget (default: 4096)
   --transport-only             Execute transport-only observation; disables HTTP transaction retrieval and history queries
+  --reconcile                  Execute bounded 60s window reconciliation evaluation (90s duration, 1 cutoff, 1 history, <=5 tx retrievals)
   -h, --help                   Display this help message
 
 SAFETY & CONSTRAINTS:
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
       maxControlFrames: args.maxControlFrames,
       maxControlFrameBytes: args.maxControlFrameBytes,
       transportOnly: args.transportOnly,
+      reconcile: args.reconcile,
       signal: abortController.signal,
     });
   } finally {
@@ -180,6 +182,28 @@ async function main(): Promise<void> {
     console.log(`Virtual Wallet:           ${result.metadata.virtualWalletBalanceSol}`);
     console.log(`Manifest File Hash:       ${result.manifest.manifestFileSha256}`);
     console.log(`Entries Digest:           ${result.manifest.entriesDigestSha256}`);
+
+    if (result.reconciliationResult) {
+      const recon = result.reconciliationResult;
+      console.log("=== WINDOW RECONCILIATION RESULT ===");
+      console.log(`Reconciliation Status:    ${recon.status}`);
+      console.log(`Coverage Status:          ${recon.flowCoverage}`);
+      console.log(
+        `Window Span:              [${new Date(recon.temporalContext.windowStartMs).toISOString()} .. ${new Date(recon.temporalContext.windowEndMs).toISOString()}]`,
+      );
+      console.log(`Cutoff Age:               ${recon.temporalContext.evidenceAgeMs ?? "N/A"} ms`);
+      console.log(`Reconciled Buys (60s):    ${recon.flowCounts.recentBuys60s ?? "Unavailable"}`);
+      console.log(`Reconciled Sells (60s):   ${recon.flowCounts.recentSells60s ?? "Unavailable"}`);
+      console.log(`Reconciled Flow Ratio:    ${recon.flowCounts.flowRatio ?? "Unavailable"}`);
+      console.log(`Requests Dispatched:      ${recon.resourceMetrics.actualRequestsDispatched}`);
+      console.log(
+        `Discovered Signatures:    ${recon.underlyingOutcomes.totalDiscoveredSignatures}`,
+      );
+      console.log(`Boundary Anchor Seen:     ${recon.underlyingOutcomes.anchorWitnessed}`);
+      console.log(
+        `Provider Assumptions:     ${recon.providerAssumptions.length} stated (${recon.providerAssumptions[0] ?? ""})`,
+      );
+    }
 
     if (result.metadata.transportDiagnostics) {
       const td = result.metadata.transportDiagnostics;

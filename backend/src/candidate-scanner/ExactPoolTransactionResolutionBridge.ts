@@ -639,7 +639,7 @@ export class ExactPoolTransactionResolutionBridge {
           }
         }
 
-        const remainingBudgetMs = Math.max(0, deadlineEpoch - this.clock());
+        const remainingBudgetMs = Math.max(0, Math.min(60_000, deadlineEpoch - this.clock()));
         const notification: InjectedTransactionNotification = {
           signature: record.signature,
           slot: record.slot,

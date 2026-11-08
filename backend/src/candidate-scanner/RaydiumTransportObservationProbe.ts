@@ -66,6 +66,12 @@ import {
   type HistoryEnumerationOutcome,
   isValidSolanaSignature,
 } from "./ExactPoolHistoryEnumerator.js";
+import { ExactPoolTransactionResolutionBridge } from "./ExactPoolTransactionResolutionBridge.js";
+import {
+  type SourceCutoffEvidence,
+  type WindowReconciliationResult,
+  evaluateExactPoolWindowReconciliation,
+} from "./ExactPoolWindowReconciliationEvaluator.js";
 import {
   GlobalResourceBudgetManager,
   type GlobalBudgetStats,
@@ -87,6 +93,7 @@ import WsClient from "ws";
 // ============================================================================
 
 export const DEFAULT_PROBE_DURATION_MS = 300_000; // 5 minutes
+export const DEFAULT_RECONCILIATION_PROBE_DURATION_MS = 90_000; // 90 seconds (1.5 minutes)
 export const MAX_ALLOWED_PROBE_DURATION_MS = 300_000; // Hard ceiling: 5 minutes
 export const MAX_INBOUND_MESSAGES_BUDGET = 500;
 export const MAX_APPLICATION_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MiB
@@ -178,6 +185,13 @@ export interface TransportProbeConfig {
   readonly maxControlFrames?: number | undefined;
   readonly maxControlFrameBytes?: number | undefined;
   readonly transportOnly?: boolean | undefined;
+
+  // Bounded Window Reconciliation Parameters (Phase 12.94-D Milestone D.3.3)
+  readonly reconcile?: boolean | undefined;
+  readonly sourceCutoff?: SourceCutoffEvidence | undefined;
+  readonly sourceCutoffFetcher?: (() => Promise<SourceCutoffEvidence>) | undefined;
+  readonly knownAnchorSignature?: string | undefined;
+  readonly observationStartMs?: number | undefined;
 }
 
 export interface TransportProbeDryRunResult {
@@ -207,6 +221,16 @@ export interface TransportProbeDryRunResult {
     readonly maxControlFrames: number | null;
     readonly maxControlFrameBytes: number | null;
     readonly transportOnly: boolean;
+    readonly reconcile: boolean;
+    readonly plannedRequestAllocation?:
+      | {
+          readonly cutoffAcquisition: number;
+          readonly historyPagination: number;
+          readonly transactionRetrievals: number;
+          readonly maxTotalHttpAttempts: number;
+          readonly minProviderSpacingMs: number;
+        }
+      | undefined;
   };
   readonly budgetStats: GlobalBudgetStats;
   readonly message: string;
@@ -237,6 +261,8 @@ export interface TransportProbeSuccessResult {
   readonly metadata: TransportProbeMetadata;
   readonly summary: TransportProbeSummary;
   readonly manifest: TransportProbeManifest;
+  readonly reconciliationResult?: WindowReconciliationResult | undefined;
+  readonly reconciliationSuccess?: boolean | undefined;
 }
 
 export type TransportProbeResult =
@@ -249,6 +275,8 @@ export interface TransportProbeMetadata {
   readonly executionMode: "FULL_PROBE" | "TRANSPORT_ONLY";
   readonly transportOnly: boolean;
   readonly zeroHttpDispatchesEnforced: boolean;
+  readonly reconciliationMode: boolean;
+  readonly reconciliationResult?: WindowReconciliationResult | undefined;
   readonly poolId: string;
   readonly candidateTokenMint: string;
   readonly quoteTokenMint: string;
@@ -432,6 +460,18 @@ export interface HistoryQueryAuditRecord {
   readonly error?: string | undefined;
 }
 
+export interface SourceCutoffAuditRecord {
+  readonly slot: number;
+  readonly endpointUrl: string;
+  readonly requestSentAtMs: number;
+  readonly headersReceivedAtMs?: number | undefined;
+  readonly responseReceivedAtMs: number | null;
+  readonly durationMs: number;
+  readonly httpStatus: number | null;
+  readonly responseSha256: string | null;
+  readonly error?: string | undefined;
+}
+
 export interface TransportProbeSummary {
   readonly poolId: string;
   readonly candidateTokenMint: string;
@@ -441,6 +481,8 @@ export interface TransportProbeSummary {
   readonly executionMode: "FULL_PROBE" | "TRANSPORT_ONLY";
   readonly transportOnly: boolean;
   readonly zeroHttpDispatchesEnforced: boolean;
+  readonly reconciliationMode: boolean;
+  readonly reconciliationResult?: WindowReconciliationResult | undefined;
   readonly durationMs: number;
   readonly timing: {
     readonly startTimeIso: string;
@@ -509,6 +551,7 @@ export interface TransportProbeSummary {
   };
   readonly sampledTransactionAudits: readonly TransactionSourceDiagnostics[];
   readonly historyQueryAudits: readonly HistoryQueryAuditRecord[];
+  readonly cutoffAcquisitionAudit?: SourceCutoffAuditRecord | null | undefined;
   readonly transportDiagnostics: TransportDiagnostics;
 }
 
@@ -1037,7 +1080,11 @@ export class WsWebSocketTransport implements ISolanaKeepaliveWebSocketTransport 
   public close(code?: number, reason?: string): void {
     if (this.ws) {
       try {
-        this.ws.close(code ?? 1000, reason ?? "Normal closure");
+        if (this.ws.readyState === 0 /* CONNECTING */) {
+          this.ws.terminate();
+        } else if (this.ws.readyState === 1 /* OPEN */) {
+          this.ws.close(code ?? 1000, reason ?? "Normal closure");
+        }
       } catch {
         // ignore if already closed
       }
@@ -1317,6 +1364,147 @@ function sealCaptureManifest(
 }
 
 // ============================================================================
+// Source Cutoff Acquisition Helper (Phase 12.94-D Milestone D.3.3)
+// ============================================================================
+
+/**
+ * Acquires confirmed source cutoff evidence via single getBlockTime query.
+ * Strictly respects shared budget manager accounting and configured host pacing.
+ */
+export async function acquireSourceCutoff(
+  rpcUrl: string,
+  slot: number,
+  budget: GlobalResourceBudgetManager,
+  signal?: AbortSignal,
+  fetchFn: typeof fetch = fetch,
+  clock: () => number = () => Date.now(),
+  sleepFn: (ms: number, signal?: AbortSignal) => Promise<void> = async () => {},
+  onAuditRecord?: (record: SourceCutoffAuditRecord) => void,
+): Promise<SourceCutoffEvidence> {
+  const provider = "SOLANA_RPC";
+  if (typeof slot !== "number" || !Number.isSafeInteger(slot) || slot <= 0) {
+    throw new Error(
+      `[CUTOFF_INVALID_SLOT] Slot must be a positive integer, received: ${String(slot)}`,
+    );
+  }
+
+  let budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+  if (
+    !budgetCheck.allowed &&
+    budgetCheck.reason === "PROVIDER_PACING_NOT_MET" &&
+    typeof budgetCheck.waitMs === "number" &&
+    budgetCheck.waitMs > 0
+  ) {
+    await sleepFn(budgetCheck.waitMs, signal);
+    budgetCheck = budget.canMakeRequest(provider, clock(), "CANDIDATE_ENRICHMENT");
+  }
+  if (!budgetCheck.allowed) {
+    throw new Error(
+      `[BUDGET_DENIED] Cannot acquire source cutoff: ${budgetCheck.reason ?? "Ceiling reached"}`,
+    );
+  }
+
+  budget.recordRequestAttempt(provider, "CANDIDATE_ENRICHMENT", clock());
+
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getBlockTime",
+    params: [slot],
+  });
+
+  const sanitizedEndpoint = redactSensitiveText(rpcUrl);
+  const requestSentAtMs = clock();
+  let headersReceivedAtMs: number | undefined = undefined;
+  let responseReceivedAtMs: number | null = null;
+  let httpStatus: number | null = null;
+  let responseSha256: string | null = null;
+  let auditError: string | undefined = undefined;
+
+  try {
+    const resp = await fetchFn(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      ...(signal ? { signal } : {}),
+    });
+
+    headersReceivedAtMs = clock();
+    httpStatus = resp.status;
+
+    if (!resp.ok) {
+      throw new Error(`[CUTOFF_FETCH_FAILED] HTTP ${resp.status} ${resp.statusText}`);
+    }
+
+    const rawText = await resp.text();
+    responseReceivedAtMs = clock();
+    responseSha256 = computeSha256(rawText);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      throw new Error("[CUTOFF_MALFORMED_JSON] Response is not valid JSON");
+    }
+
+    const rpcObj = parsed as {
+      jsonrpc?: unknown;
+      error?: { code?: unknown; message?: unknown };
+      result?: unknown;
+    };
+
+    if (rpcObj.error) {
+      const msg =
+        typeof rpcObj.error === "object" && rpcObj.error !== null
+          ? (rpcObj.error as { message?: unknown }).message
+          : JSON.stringify(rpcObj.error);
+      throw new Error(`[CUTOFF_RPC_ERROR] ${String(msg || JSON.stringify(rpcObj.error))}`);
+    }
+
+    if (
+      typeof rpcObj.result !== "number" ||
+      !Number.isSafeInteger(rpcObj.result) ||
+      rpcObj.result <= 0
+    ) {
+      throw new Error(
+        `[CUTOFF_INVALID_RESULT] Expected integer blockTime in result, received: ${String(rpcObj.result)}`,
+      );
+    }
+
+    const retrievedAtMs = responseReceivedAtMs;
+
+    return {
+      sourceMethod: "getBlockTime",
+      responseField: "result",
+      commitment: "confirmed",
+      provenance: "ON_CHAIN_BLOCK_TIME",
+      slot,
+      cutoffTimestampMs: rpcObj.result * 1000,
+      retrievedAtMs,
+      responsePayload: rpcObj,
+      requestContext: { slot },
+    };
+  } catch (err: unknown) {
+    auditError = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+    const auditRecord: SourceCutoffAuditRecord = {
+      slot,
+      endpointUrl: sanitizedEndpoint,
+      requestSentAtMs,
+      ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+      responseReceivedAtMs,
+      durationMs: Math.max(0, durationEnd - requestSentAtMs),
+      httpStatus,
+      responseSha256,
+      ...(auditError ? { error: auditError } : {}),
+    };
+    onAuditRecord?.(auditRecord);
+  }
+}
+
+// ============================================================================
 // Core Probe Runner Implementation
 // ============================================================================
 
@@ -1353,7 +1541,11 @@ export async function executeTransportObservationProbe(
   }
 
   // 2. Validate Operational Ceilings and Durations
-  const durationMs = config.durationMs ?? DEFAULT_PROBE_DURATION_MS;
+  const isReconcileMode = config.reconcile === true;
+  const defaultDuration = isReconcileMode
+    ? DEFAULT_RECONCILIATION_PROBE_DURATION_MS
+    : DEFAULT_PROBE_DURATION_MS;
+  const durationMs = config.durationMs ?? defaultDuration;
   if (
     typeof durationMs !== "number" ||
     !Number.isSafeInteger(durationMs) ||
@@ -1413,7 +1605,8 @@ export async function executeTransportObservationProbe(
     };
   }
 
-  const maxHistoryQueries = config.maxHistoryQueries ?? MAX_HISTORY_QUERIES_LIMIT;
+  const maxHistoryQueries =
+    config.maxHistoryQueries ?? (isReconcileMode ? 1 : MAX_HISTORY_QUERIES_LIMIT);
   if (
     typeof maxHistoryQueries !== "number" ||
     !Number.isSafeInteger(maxHistoryQueries) ||
@@ -1609,6 +1802,18 @@ export async function executeTransportObservationProbe(
         maxControlFrames: keepaliveEnabled ? maxControlFrames : null,
         maxControlFrameBytes: keepaliveEnabled ? maxControlFrameBytes : null,
         transportOnly,
+        reconcile: isReconcileMode,
+        ...(isReconcileMode
+          ? {
+              plannedRequestAllocation: {
+                cutoffAcquisition: 1,
+                historyPagination: Math.min(1, maxHistoryQueries),
+                transactionRetrievals: Math.min(5, maxTransactionRetrievals),
+                maxTotalHttpAttempts: MAX_TOTAL_HTTP_ATTEMPTS,
+                minProviderSpacingMs: PROBE_MIN_PROVIDER_SPACING_MS,
+              },
+            }
+          : {}),
       },
       budgetStats: budget.getStats(),
       message: "Dry-run plan validation succeeded. Zero network requests or sockets opened.",
@@ -1807,8 +2012,18 @@ export async function executeTransportObservationProbe(
   const tracker = new RollingTradeFlowTracker({
     poolId: poolContext.poolId,
     tokenMint: poolContext.candidateTokenMint,
+    ...(config.observationStartMs !== undefined
+      ? { trackingStartedMs: config.observationStartMs }
+      : {}),
     clock,
   });
+
+  if (config.observationStartMs !== undefined && config.observationStartMs < startTime) {
+    for (let t = config.observationStartMs; t < startTime; t += 10_000) {
+      tracker.recordHeartbeat(t);
+    }
+    tracker.recordHeartbeat(startTime);
+  }
 
   const adapter = new RaydiumAmmV4TransactionSourceAdapter({
     poolContext,
@@ -2157,7 +2372,9 @@ export async function executeTransportObservationProbe(
     });
 
     meteredTransport.on("message", (data: string | Buffer) => {
-      transportDiagnostics.lastMessageReceivedAtMs = clock();
+      const msgNow = clock();
+      transportDiagnostics.lastMessageReceivedAtMs = msgNow;
+      tracker.recordHeartbeat(msgNow);
       try {
         const text = typeof data === "string" ? data : data.toString("utf8");
         const parsed = JSON.parse(text) as { id?: unknown; result?: unknown; error?: unknown };
@@ -2240,6 +2457,10 @@ export async function executeTransportObservationProbe(
   }
 
   // Intercept incoming notifications to record WS signatures and track queue depth
+  let firstObservedSignature: string | null = null;
+  let firstObservedSlot = 0;
+  let latestObservedSlot = 0;
+
   const originalEnqueue = adapter.enqueueNotification.bind(adapter);
   adapter.enqueueNotification = (notif: InjectedTransactionNotification) => {
     if (!probeActive || isProbeTerminated) {
@@ -2252,6 +2473,13 @@ export async function executeTransportObservationProbe(
     }
 
     if (isValidSolanaSignature(notif.signature)) {
+      if (firstObservedSignature === null) {
+        firstObservedSignature = notif.signature;
+        firstObservedSlot = notif.slot ?? 0;
+      }
+      if (typeof notif.slot === "number" && notif.slot > latestObservedSlot) {
+        latestObservedSlot = notif.slot;
+      }
       if (!wsWitnessedSignatures.has(notif.signature)) {
         wsWitnessedSignatures.add(notif.signature);
         wsWitnessedList.push({
@@ -2295,16 +2523,22 @@ export async function executeTransportObservationProbe(
   // Allocate streaming duration within overall maximum
   const reconciliationReservationMs = transportOnly
     ? 0
-    : Math.min(10_000, Math.floor(durationMs * 0.2));
+    : isReconcileMode
+      ? Math.min(25_000, Math.floor(durationMs * 0.25))
+      : Math.min(10_000, Math.floor(durationMs * 0.2));
   const streamingDurationMs =
     config.streamingDurationMs ?? Math.max(1, durationMs - reconciliationReservationMs);
 
-  let streamingTimer: ReturnType<typeof setTimeout> | undefined;
   const streamingPhasePromise = new Promise<void>((resolve) => {
-    streamingTimer = setTimeout(() => {
-      resolve();
-    }, streamingDurationMs);
-    overallAbortController.signal.addEventListener("abort", () => resolve(), { once: true });
+    let resolved = false;
+    const finish = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
+    };
+    sleepFn(streamingDurationMs, overallAbortController.signal).then(finish).catch(finish);
+    overallAbortController.signal.addEventListener("abort", finish, { once: true });
   });
 
   // Drain Queue Worker Loop
@@ -2403,16 +2637,14 @@ export async function executeTransportObservationProbe(
   // Race streaming phase against drain worker
   await Promise.race([streamingPhasePromise, drainWorkerPromise]);
 
-  if (streamingTimer) clearTimeout(streamingTimer);
-
   // End streaming observation phase
   isStreamingActive = false;
 
   // Stop keepalive timers and clear pending-response state before socket closure
   cleanupKeepalive();
 
-  // Close streaming coordinator if probe not already terminated by limit
-  if (!isProbeTerminated && probeActive) {
+  // Close streaming coordinator if probe not already terminated by limit (in non-reconciliation mode)
+  if (!isReconcileMode && !isProbeTerminated && probeActive) {
     isIntentionalClosure = true;
     transportDiagnostics.intentionalShutdownInitiated = true;
     transportDiagnostics.localCloseCode = 1000;
@@ -2431,7 +2663,11 @@ export async function executeTransportObservationProbe(
   // Settle any remaining queued transaction retrieval work within deadline
   await drainWorkerPromise;
 
-  // 9. Bounded History Discovery Phase (Strictly within overall deadline)
+  // 9. Bounded History Discovery / Window Reconciliation Phase
+  let reconciliationResult: WindowReconciliationResult | undefined;
+  let reconciliationSuccess = false;
+  let cutoffAuditRecord: SourceCutoffAuditRecord | null = null;
+
   let historyQueriesAttempted = 0;
   let historyRecordsDiscovered = 0;
   let historyDiscoveryOutcome: HistoryEnumerationOutcome | string = transportOnly
@@ -2446,225 +2682,441 @@ export async function executeTransportObservationProbe(
   const historyWitnessedSignatures = new Set<string>();
   const fetchedHistoryRecords = new Map<string, HistorySignatureRecord>();
 
-  const remainingForDiscovery = overallDeadlineEpoch - clock();
-  const canRunDiscovery =
-    !transportOnly &&
-    remainingForDiscovery > 10 &&
-    !overallAbortController.signal.aborted &&
-    probeState.terminationReason !== "TRANSPORT_ERROR" &&
-    probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
-    probeState.terminationReason !== "DURATION_EXPIRED" &&
-    probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
-    wsWitnessedList.length > 0;
+  const pageFetcher: HistoryPageFetcher = {
+    fetchPage: async (
+      params: HistoryPageQueryParams,
+    ): Promise<readonly HistorySignatureRecord[]> => {
+      if (historyQueriesAttempted >= maxHistoryQueries) {
+        throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
+      }
+      historyQueriesAttempted++;
 
-  if (canRunDiscovery) {
-    anchorSignature = wsWitnessedList[0]!.signature;
-    anchorSlot = wsWitnessedList[0]!.slot;
-    const discoveryStartTime = clock();
-
-    const pageFetcher: HistoryPageFetcher = {
-      fetchPage: async (
-        params: HistoryPageQueryParams,
-      ): Promise<readonly HistorySignatureRecord[]> => {
-        if (historyQueriesAttempted >= maxHistoryQueries) {
-          throw new Error(`[PROBE_CEILING] Max history queries (${maxHistoryQueries}) reached`);
-        }
-        historyQueriesAttempted++;
-
-        if (config.historyPageFetcher) {
-          const reqSent = clock();
-          let recordsDiscovered = 0;
-          let auditError: string | undefined;
-          try {
-            const records = await config.historyPageFetcher.fetchPage(params);
-            recordsDiscovered = records.length;
-            for (const r of records) {
-              fetchedHistoryRecords.set(r.signature, r);
-            }
-            return records;
-          } catch (err: unknown) {
-            auditError = err instanceof Error ? err.message : String(err);
-            throw err;
-          } finally {
-            const reqEnd = clock();
-            historyQueryAudits.push({
-              pageIndex: historyQueriesAttempted,
-              address: params.address,
-              limit: params.limit,
-              ...(params.before ? { before: params.before } : {}),
-              requestSentAtMs: reqSent,
-              headersReceivedAtMs: reqEnd,
-              responseReceivedAtMs: reqEnd,
-              durationMs: reqEnd - reqSent,
-              httpStatus: auditError ? null : 200,
-              responseSha256: null,
-              recordsDiscovered,
-              ...(auditError ? { error: auditError } : {}),
-            });
-          }
-        }
-
+      if (config.historyPageFetcher) {
         const reqSent = clock();
-        let headersReceivedAtMs: number | undefined;
-        let responseReceivedAtMs: number | null = null;
-        let httpStatus: number | null = null;
-        let responseSha256: string | null = null;
         let recordsDiscovered = 0;
         let auditError: string | undefined;
-
         try {
-          const body = JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "getSignaturesForAddress",
-            params: [
-              params.address,
-              {
-                limit: params.limit,
-                before: params.before,
-                commitment: "confirmed",
-              },
-            ],
-          });
-
-          const resp = await boundedFetch(rpcUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body,
-            ...(params.signal ? { signal: params.signal } : {}),
-          });
-
-          headersReceivedAtMs = clock();
-          httpStatus = resp.status;
-
-          if (!resp.ok) {
-            throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-          }
-
-          const rawText = await resp.text();
-          responseReceivedAtMs = clock();
-          responseSha256 = computeSha256(rawText);
-
-          let parsedJson: unknown;
-          try {
-            parsedJson = JSON.parse(rawText);
-          } catch {
-            throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
-          }
-
-          if (!parsedJson || typeof parsedJson !== "object") {
-            throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
-          }
-
-          const rpcObj = parsedJson as {
-            jsonrpc?: unknown;
-            error?: { code?: unknown; message?: unknown };
-            result?: unknown;
-          };
-
-          if (rpcObj.error) {
-            const msg =
-              typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
-            throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
-          }
-
-          if (!Array.isArray(rpcObj.result)) {
-            throw new Error(
-              "MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress",
-            );
-          }
-
-          const records = rpcObj.result as HistorySignatureRecord[];
+          const records = await config.historyPageFetcher.fetchPage(params);
           recordsDiscovered = records.length;
           for (const r of records) {
             fetchedHistoryRecords.set(r.signature, r);
           }
-
           return records;
         } catch (err: unknown) {
           auditError = err instanceof Error ? err.message : String(err);
           throw err;
         } finally {
-          const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+          const reqEnd = clock();
           historyQueryAudits.push({
             pageIndex: historyQueriesAttempted,
             address: params.address,
             limit: params.limit,
             ...(params.before ? { before: params.before } : {}),
             requestSentAtMs: reqSent,
-            ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
-            responseReceivedAtMs,
-            durationMs: durationEnd - reqSent,
-            httpStatus,
-            responseSha256,
+            headersReceivedAtMs: reqEnd,
+            responseReceivedAtMs: reqEnd,
+            durationMs: reqEnd - reqSent,
+            httpStatus: auditError ? null : 200,
+            responseSha256: null,
             recordsDiscovered,
             ...(auditError ? { error: auditError } : {}),
           });
         }
-      },
-    };
+      }
 
-    const enumerator = new ExactPoolHistoryEnumerator({
-      poolContext,
-      knownAnchorSignature: anchorSignature,
-      pageFetcher,
-      budgetManager: budget,
-      pageSize: 20,
-      maxPages: maxHistoryQueries,
-      operationDeadlineMs: Math.max(1, remainingForDiscovery),
-      signal: overallAbortController.signal,
-      sleepFn,
-      clock,
-    });
+      const reqSent = clock();
+      let headersReceivedAtMs: number | undefined;
+      let responseReceivedAtMs: number | null = null;
+      let httpStatus: number | null = null;
+      let responseSha256: string | null = null;
+      let recordsDiscovered = 0;
+      let auditError: string | undefined;
+
+      try {
+        const body = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getSignaturesForAddress",
+          params: [
+            params.address,
+            {
+              limit: params.limit,
+              before: params.before,
+              commitment: "confirmed",
+            },
+          ],
+        });
+
+        const resp = await boundedFetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          ...(params.signal ? { signal: params.signal } : {}),
+        });
+
+        headersReceivedAtMs = clock();
+        httpStatus = resp.status;
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+        }
+
+        const rawText = await resp.text();
+        responseReceivedAtMs = clock();
+        responseSha256 = computeSha256(rawText);
+
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawText);
+        } catch {
+          throw new Error("MALFORMED_JSON_RPC: Response is not valid JSON");
+        }
+
+        if (!parsedJson || typeof parsedJson !== "object") {
+          throw new Error("MALFORMED_JSON_RPC: Response is not a JSON object");
+        }
+
+        const rpcObj = parsedJson as {
+          jsonrpc?: unknown;
+          error?: { code?: unknown; message?: unknown };
+          result?: unknown;
+        };
+
+        if (rpcObj.error) {
+          const msg =
+            typeof rpcObj.error === "object" ? rpcObj.error.message : String(rpcObj.error);
+          throw new Error(`JSON_RPC_ERROR: ${String(msg)}`);
+        }
+
+        if (!Array.isArray(rpcObj.result)) {
+          throw new Error("MALFORMED_JSON_RPC: Expected array result for getSignaturesForAddress");
+        }
+
+        const records = rpcObj.result as HistorySignatureRecord[];
+        recordsDiscovered = records.length;
+        for (const r of records) {
+          fetchedHistoryRecords.set(r.signature, r);
+        }
+
+        return records;
+      } catch (err: unknown) {
+        auditError = err instanceof Error ? err.message : String(err);
+        throw err;
+      } finally {
+        const durationEnd = responseReceivedAtMs ?? headersReceivedAtMs ?? clock();
+        historyQueryAudits.push({
+          pageIndex: historyQueriesAttempted,
+          address: params.address,
+          limit: params.limit,
+          ...(params.before ? { before: params.before } : {}),
+          requestSentAtMs: reqSent,
+          ...(headersReceivedAtMs !== undefined ? { headersReceivedAtMs } : {}),
+          responseReceivedAtMs,
+          durationMs: durationEnd - reqSent,
+          httpStatus,
+          responseSha256,
+          recordsDiscovered,
+          ...(auditError ? { error: auditError } : {}),
+        });
+      }
+    },
+  };
+
+  if (isReconcileMode) {
+    const reconcileStartTime = clock();
+    let cutoffEvidence: SourceCutoffEvidence | null = null;
+    if (config.sourceCutoff) {
+      cutoffEvidence = config.sourceCutoff;
+    } else if (config.sourceCutoffFetcher) {
+      try {
+        cutoffEvidence = (await config.sourceCutoffFetcher()) ?? null;
+      } catch {
+        // Handled fail-closed: cutoff fetcher failed
+      }
+    } else {
+      const targetSlot = latestObservedSlot ?? firstObservedSlot;
+      if (
+        targetSlot !== null &&
+        !overallAbortController.signal.aborted &&
+        probeState.terminationReason !== "TRANSPORT_ERROR" &&
+        probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
+        probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED"
+      ) {
+        try {
+          cutoffEvidence = await acquireSourceCutoff(
+            rpcUrl,
+            targetSlot,
+            budget,
+            overallAbortController.signal,
+            boundedFetch,
+            clock,
+            sleepFn,
+            (rec) => {
+              cutoffAuditRecord = rec;
+            },
+          );
+        } catch {
+          // Handled fail-closed: cutoff acquisition failed
+        }
+      }
+    }
+
+    anchorSignature =
+      config.knownAnchorSignature ??
+      (wsWitnessedList.length > 0 ? wsWitnessedList[0]!.signature : null);
+    if (anchorSignature && wsWitnessedList.length > 0) {
+      anchorSlot = wsWitnessedList[0]!.slot;
+    }
 
     try {
-      const enumRes = await enumerator.enumerate();
-      historyDiscoveryDurationMs = clock() - discoveryStartTime;
-      historyDiscoveryOutcome = enumRes.error
-        ? `${enumRes.outcome}: ${enumRes.error}`
-        : enumRes.outcome;
-      anchorWitnessed = enumRes.anchorWitnessed;
-      historyRecordsDiscovered = enumRes.discoveredSignatures.length;
+      if (!cutoffEvidence) {
+        reconciliationResult = evaluateExactPoolWindowReconciliation({
+          poolContext,
+          decisionTimestampMs: clock(),
+          observationStartMs: config.observationStartMs ?? startTime,
+          observationEndMs: clock(),
+          sourceCutoff: null,
+          tracker,
+          budgetManager: budget,
+          clock,
+          recordedGaps: [
+            {
+              gapStartMs: startTime,
+              gapEndMs: clock(),
+              reason: "MISSING_SOURCE_CUTOFF: Source cutoff evidence was not acquired",
+            },
+          ],
+        });
+        historyDiscoveryOutcome = "MISSING_SOURCE_CUTOFF";
+      } else if (!anchorSignature || !isValidSolanaSignature(anchorSignature)) {
+        reconciliationResult = evaluateExactPoolWindowReconciliation({
+          poolContext,
+          decisionTimestampMs: clock(),
+          observationStartMs: config.observationStartMs ?? startTime,
+          observationEndMs: clock(),
+          sourceCutoff: cutoffEvidence,
+          tracker,
+          budgetManager: budget,
+          clock,
+          recordedGaps: [
+            {
+              gapStartMs: startTime,
+              gapEndMs: clock(),
+              reason:
+                "STREAM_GAP:UNWITNESSED_PRIOR_ANCHOR: No valid prior stream anchor signature witnessed",
+            },
+          ],
+        });
+        historyDiscoveryOutcome = "MISSING_BOUNDARY_ANCHOR";
+      } else {
+        const enumerator = new ExactPoolHistoryEnumerator({
+          poolContext,
+          knownAnchorSignature: anchorSignature,
+          pageFetcher,
+          budgetManager: budget,
+          lifecycleTarget: coordinator ?? undefined,
+          pageSize: 20,
+          maxPages: maxHistoryQueries,
+          operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
+          signal: overallAbortController.signal,
+          sleepFn,
+          clock,
+        });
 
-      for (const rec of enumRes.discoveredSignatures) {
-        if (rec.blockTime === null) {
-          nullBlockTimeCount++;
-        }
-        if (!historyWitnessedSignatures.has(rec.signature)) {
-          historyWitnessedSignatures.add(rec.signature);
-          historyWitnessedList.push({
-            signature: rec.signature,
-            slot: rec.slot,
-            blockTime: rec.blockTime,
+        const resolutionBridge = new ExactPoolTransactionResolutionBridge({
+          poolContext,
+          adapter,
+          tracker,
+          budgetManager: budget,
+          lifecycleTarget: coordinator,
+          signal: overallAbortController.signal,
+          clock,
+          maxTransactionsToProcess: maxTransactionRetrievals,
+          operationDeadlineMs: Math.max(1, Math.min(25_000, overallDeadlineEpoch - clock())),
+        });
+
+        if (coordinator) {
+          reconciliationResult = await coordinator.reconcileCandidateWindow(cutoffEvidence, {
+            knownAnchorSignature: anchorSignature,
+            historyEnumerator: enumerator,
+            resolutionBridge,
+            observationStartMs: config.observationStartMs ?? startTime,
+            budgetManager: budget,
+          });
+        } else {
+          reconciliationResult = evaluateExactPoolWindowReconciliation({
+            poolContext,
+            decisionTimestampMs: clock(),
+            observationStartMs: config.observationStartMs ?? startTime,
+            observationEndMs: clock(),
+            sourceCutoff: cutoffEvidence,
+            tracker,
+            budgetManager: budget,
+            clock,
+            recordedGaps: [
+              {
+                gapStartMs: startTime,
+                gapEndMs: clock(),
+                reason: "COORDINATOR_UNAVAILABLE",
+              },
+            ],
           });
         }
       }
 
-      // If anchor was witnessed, preserve its real observed slot and blockTime
-      if (enumRes.anchorWitnessed && anchorSignature) {
-        const anchorRec = fetchedHistoryRecords.get(anchorSignature);
-        if (anchorRec) {
-          anchorSlot = anchorRec.slot;
-          anchorBlockTime = anchorRec.blockTime;
+      if (reconciliationResult) {
+        historyDiscoveryDurationMs = clock() - reconcileStartTime;
+        if (historyDiscoveryOutcome === "UNKNOWN") {
+          historyDiscoveryOutcome =
+            reconciliationResult.underlyingOutcomes.enumerationOutcome ?? "UNKNOWN";
         }
-        if (!historyWitnessedSignatures.has(anchorSignature)) {
-          historyWitnessedSignatures.add(anchorSignature);
-          historyWitnessedList.push({
-            signature: anchorSignature,
-            slot: anchorSlot ?? wsWitnessedList[0]!.slot,
-            blockTime: anchorBlockTime,
-          });
+        anchorWitnessed = reconciliationResult.underlyingOutcomes.anchorWitnessed;
+        historyRecordsDiscovered =
+          reconciliationResult.underlyingOutcomes.totalDiscoveredSignatures;
+        reconciliationSuccess = reconciliationResult.status === "RECONCILED";
+
+        for (const rec of fetchedHistoryRecords.values()) {
+          if (rec.blockTime === null) {
+            nullBlockTimeCount++;
+          }
+          if (!historyWitnessedSignatures.has(rec.signature)) {
+            historyWitnessedSignatures.add(rec.signature);
+            historyWitnessedList.push({
+              signature: rec.signature,
+              slot: rec.slot,
+              blockTime: rec.blockTime,
+            });
+          }
+        }
+
+        if (anchorWitnessed && anchorSignature) {
+          const anchorRec = fetchedHistoryRecords.get(anchorSignature);
+          if (anchorRec) {
+            anchorSlot = anchorRec.slot;
+            anchorBlockTime = anchorRec.blockTime;
+          }
+          if (!historyWitnessedSignatures.has(anchorSignature)) {
+            historyWitnessedSignatures.add(anchorSignature);
+            historyWitnessedList.push({
+              signature: anchorSignature,
+              slot: anchorSlot ?? wsWitnessedList[0]?.slot ?? 0,
+              blockTime: anchorBlockTime,
+            });
+          }
         }
       }
     } catch (err: unknown) {
-      historyDiscoveryDurationMs = clock() - discoveryStartTime;
+      historyDiscoveryDurationMs = clock() - reconcileStartTime;
       historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
+      if (!reconciliationResult) {
+        reconciliationResult = evaluateExactPoolWindowReconciliation({
+          poolContext,
+          decisionTimestampMs: clock(),
+          observationStartMs: config.observationStartMs ?? startTime,
+          observationEndMs: clock(),
+          sourceCutoff: cutoffEvidence ?? null,
+          tracker,
+          budgetManager: budget,
+          clock,
+          recordedGaps: [
+            {
+              gapStartMs: startTime,
+              gapEndMs: clock(),
+              reason: `RECONCILIATION_EXCEPTION: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        });
+      }
+    } finally {
+      if (!isProbeTerminated && probeActive) {
+        isIntentionalClosure = true;
+        transportDiagnostics.intentionalShutdownInitiated = true;
+        transportDiagnostics.localCloseCode = 1000;
+        transportDiagnostics.localCloseReason = "Reconciliation evaluation complete";
+        coordinator?.close();
+        meteredTransport?.close(1000, "Reconciliation evaluation complete");
+      }
     }
-  } else if (!transportOnly) {
-    if (clock() >= overallDeadlineEpoch) {
-      historyDiscoveryOutcome = "OPERATION_DEADLINE_EXCEEDED";
-    } else if (overallAbortController.signal.aborted) {
-      historyDiscoveryOutcome = "OPERATION_CANCELLED";
+  } else {
+    // Non-reconcile discovery mode (existing behavior preserved)
+    const remainingForDiscovery = overallDeadlineEpoch - clock();
+    const canRunDiscovery =
+      !transportOnly &&
+      remainingForDiscovery > 10 &&
+      !overallAbortController.signal.aborted &&
+      probeState.terminationReason !== "TRANSPORT_ERROR" &&
+      probeState.terminationReason !== "TRANSPORT_DISCONNECT" &&
+      probeState.terminationReason !== "DURATION_EXPIRED" &&
+      probeState.terminationReason !== "QUEUE_LIMIT_EXCEEDED" &&
+      wsWitnessedList.length > 0;
+
+    if (canRunDiscovery) {
+      anchorSignature = wsWitnessedList[0]!.signature;
+      anchorSlot = wsWitnessedList[0]!.slot;
+      const discoveryStartTime = clock();
+
+      const enumerator = new ExactPoolHistoryEnumerator({
+        poolContext,
+        knownAnchorSignature: anchorSignature,
+        pageFetcher,
+        budgetManager: budget,
+        pageSize: 20,
+        maxPages: maxHistoryQueries,
+        operationDeadlineMs: Math.max(1, remainingForDiscovery),
+        signal: overallAbortController.signal,
+        sleepFn,
+        clock,
+      });
+
+      try {
+        const enumRes = await enumerator.enumerate();
+        historyDiscoveryDurationMs = clock() - discoveryStartTime;
+        historyDiscoveryOutcome = enumRes.error
+          ? `${enumRes.outcome}: ${enumRes.error}`
+          : enumRes.outcome;
+        anchorWitnessed = enumRes.anchorWitnessed;
+        historyRecordsDiscovered = enumRes.discoveredSignatures.length;
+
+        for (const rec of enumRes.discoveredSignatures) {
+          if (rec.blockTime === null) {
+            nullBlockTimeCount++;
+          }
+          if (!historyWitnessedSignatures.has(rec.signature)) {
+            historyWitnessedSignatures.add(rec.signature);
+            historyWitnessedList.push({
+              signature: rec.signature,
+              slot: rec.slot,
+              blockTime: rec.blockTime,
+            });
+          }
+        }
+
+        // If anchor was witnessed, preserve its real observed slot and blockTime
+        if (enumRes.anchorWitnessed && anchorSignature) {
+          const anchorRec = fetchedHistoryRecords.get(anchorSignature);
+          if (anchorRec) {
+            anchorSlot = anchorRec.slot;
+            anchorBlockTime = anchorRec.blockTime;
+          }
+          if (!historyWitnessedSignatures.has(anchorSignature)) {
+            historyWitnessedSignatures.add(anchorSignature);
+            historyWitnessedList.push({
+              signature: anchorSignature,
+              slot: anchorSlot ?? wsWitnessedList[0]!.slot,
+              blockTime: anchorBlockTime,
+            });
+          }
+        }
+      } catch (err: unknown) {
+        historyDiscoveryDurationMs = clock() - discoveryStartTime;
+        historyDiscoveryOutcome = `FETCH_ERROR: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else if (!transportOnly) {
+      if (clock() >= overallDeadlineEpoch) {
+        historyDiscoveryOutcome = "OPERATION_DEADLINE_EXCEEDED";
+      } else if (overallAbortController.signal.aborted) {
+        historyDiscoveryOutcome = "OPERATION_CANCELLED";
+      }
     }
   }
 
@@ -2778,6 +3230,8 @@ export async function executeTransportObservationProbe(
     executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
     transportOnly,
     zeroHttpDispatchesEnforced: transportOnly,
+    reconciliationMode: isReconcileMode,
+    reconciliationResult,
     poolId: poolContext.poolId,
     candidateTokenMint: poolContext.candidateTokenMint,
     quoteTokenMint: poolContext.quoteTokenMint,
@@ -2824,6 +3278,8 @@ export async function executeTransportObservationProbe(
     executionMode: transportOnly ? "TRANSPORT_ONLY" : "FULL_PROBE",
     transportOnly,
     zeroHttpDispatchesEnforced: transportOnly,
+    reconciliationMode: isReconcileMode,
+    reconciliationResult,
     durationMs: actualDurationMs,
     timing: {
       startTimeIso,
@@ -2904,6 +3360,7 @@ export async function executeTransportObservationProbe(
     },
     sampledTransactionAudits,
     historyQueryAudits,
+    cutoffAcquisitionAudit: cutoffAuditRecord,
     transportDiagnostics: frozenTransportDiagnostics,
   });
 
@@ -2955,6 +3412,14 @@ export async function executeTransportObservationProbe(
     "utf8",
   );
 
+  if (isReconcileMode && reconciliationResult) {
+    fsSync.writeFileSync(
+      path.join(targetDir, "reconciliation-result.json"),
+      serializeJsonSafe(reconciliationResult, 2),
+      "utf8",
+    );
+  }
+
   const manifest = sealCaptureManifest(
     targetDir,
     poolContext.poolId,
@@ -2983,6 +3448,12 @@ export async function executeTransportObservationProbe(
     metadata,
     summary,
     manifest,
+    ...(isReconcileMode
+      ? {
+          reconciliationResult,
+          reconciliationSuccess,
+        }
+      : {}),
   };
 }
 
@@ -3010,6 +3481,7 @@ export interface TransportProbeCliArgs {
   readonly maxControlFrames?: number | undefined;
   readonly maxControlFrameBytes?: number | undefined;
   readonly transportOnly?: boolean | undefined;
+  readonly reconcile?: boolean | undefined;
 }
 
 export function parseTransportProbeArgs(argv: readonly string[]): TransportProbeCliArgs {
@@ -3032,6 +3504,7 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
   let maxControlFrames: number | undefined;
   let maxControlFrameBytes: number | undefined;
   let transportOnly: boolean | undefined;
+  let reconcile: boolean | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -3146,17 +3619,20 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
       }
       transport = val as ProbeTransportType;
     } else if (arg === "--keepalive") {
-      const next = argv[++i];
-      if (!next || next.startsWith("-")) {
-        throw new Error("Missing argument value for --keepalive");
-      }
-      const val = next.trim().toLowerCase();
-      if (val === "true" || val === "1") {
-        keepalive = true;
-      } else if (val === "false" || val === "0") {
-        keepalive = false;
+      const next = argv[i + 1];
+      if (next && !next.startsWith("-")) {
+        const val = next.trim().toLowerCase();
+        if (val === "true" || val === "1") {
+          keepalive = true;
+          i++;
+        } else if (val === "false" || val === "0") {
+          keepalive = false;
+          i++;
+        } else {
+          throw new Error(`--keepalive must be 'true' or 'false', received '${next}'`);
+        }
       } else {
-        throw new Error(`--keepalive must be 'true' or 'false', received '${next}'`);
+        keepalive = true;
       }
     } else if (arg === "--disable-keepalive" || arg === "--no-keepalive") {
       keepalive = false;
@@ -3214,6 +3690,10 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
       transportOnly = true;
     } else if (arg === "--no-transport-only") {
       transportOnly = false;
+    } else if (arg === "--reconcile" || arg === "--reconcile-window") {
+      reconcile = true;
+    } else if (arg === "--no-reconcile") {
+      reconcile = false;
     } else {
       throw new Error(`Unrecognized argument: '${arg}'`);
     }
@@ -3239,5 +3719,6 @@ export function parseTransportProbeArgs(argv: readonly string[]): TransportProbe
     maxControlFrames,
     maxControlFrameBytes,
     transportOnly,
+    reconcile,
   };
 }
