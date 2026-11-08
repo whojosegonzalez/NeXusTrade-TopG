@@ -1014,13 +1014,18 @@ describe("SolanaTrackerBundlerParser", () => {
       const estCandidate = createSyntheticCandidate({
         liquidityUsd: 60_000,
         marketCapUsd: 250_000,
-        assetAgeSeconds: 900,
+        lmcRatio: 60_000 / 250_000,
+        assetAgeSeconds: 2400, // Qualifying Established age (1800s <= Age <= 7200s)
+        volume5mUsd: 20_000,
+        buys5m: 50,
+        sells5m: 20,
+        buyToSellRatio: 2.5,
       });
 
       const estResult = service.evaluateCandidate(estCandidate, {
         rugScore: 50,
         hasDangerRisk: false,
-        holdersCount: 300,
+        holdersCount: 300, // >= 250 minEstablishedHolders
         top10HolderPct: 0.15,
         bundlerPct: estMapped.bundlerPctForGate11,
         requireVerifiedHolders: true,
@@ -1028,6 +1033,8 @@ describe("SolanaTrackerBundlerParser", () => {
 
       expect(estResult.triggered).toBe(false);
       expect(estResult.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+      const bundlerGate = estResult.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.requirement).toContain("Bundler <= 85%");
     });
 
     it("leaves bundler concentration unavailable when initial allocation is missing or invalid; current holdings cannot substitute", () => {

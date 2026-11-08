@@ -377,9 +377,59 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
       const estCandidate = createSyntheticCandidate({
         liquidityUsd: 60_000,
         marketCapUsd: 250_000,
-        assetAgeSeconds: 900,
+        lmcRatio: 60_000 / 250_000,
+        assetAgeSeconds: 2400, // Qualifying Established age (1800s <= Age <= 7200s)
+        volume5mUsd: 20_000,
+        buys5m: 50,
+        sells5m: 20,
+        buyToSellRatio: 2.5,
       });
       const estEval = service.evaluateCandidate(estCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300, // >= 250 minEstablishedHolders
+        top10HolderPct: 0.15,
+        bundlerPct: adapted.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+      expect(estEval.triggered).toBe(false);
+      expect(estEval.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+      const bundlerGate = estEval.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.requirement).toContain("Bundler <= 85%");
+    });
+  });
+
+  describe("Exact Boundary & Epsilon Rejection Controls", () => {
+    const service = new BuyGateTriggerService();
+
+    it("accepts exact 50% boundary for Micro-Cap and passes Gate 11 with 50% ceiling", () => {
+      const boundary50Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 50.0,
+        initialPct: 0.5,
+        reportedRawCurrentPct: 2.0,
+        currentHoldingPct: 0.02,
+      };
+
+      const adapted = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: boundary50Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(adapted.success).toBe(true);
+      if (!adapted.success) return;
+      expect(adapted.bundlerPct).toBe(0.5);
+
+      const microCandidate = createSyntheticCandidate({
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        assetAgeSeconds: 450,
+      });
+
+      const evalResult = service.evaluateCandidate(microCandidate, {
         rugScore: 50,
         hasDangerRisk: false,
         holdersCount: 300,
@@ -387,8 +437,249 @@ describe("PaperSolanaTrackerBundlerAdapter", () => {
         bundlerPct: adapted.bundlerPct,
         requireVerifiedHolders: true,
       });
-      expect(estEval.triggered).toBe(false);
-      expect(estEval.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+
+      const bundlerGate = evalResult.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(true);
+      expect(bundlerGate?.requirement).toContain("Bundler <= 50%");
+    });
+
+    it("accepts exact 85% boundary for Established and passes Gate 11 with 85% ceiling", () => {
+      const boundary85Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 85.0,
+        initialPct: 0.85,
+        reportedRawCurrentPct: 5.0,
+        currentHoldingPct: 0.05,
+      };
+
+      const adapted = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: boundary85Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(adapted.success).toBe(true);
+      if (!adapted.success) return;
+      expect(adapted.bundlerPct).toBe(0.85);
+
+      const estCandidate = createSyntheticCandidate({
+        liquidityUsd: 60_000,
+        marketCapUsd: 250_000,
+        lmcRatio: 60_000 / 250_000,
+        assetAgeSeconds: 2400, // Qualifying Established age
+        volume5mUsd: 20_000,
+        buys5m: 50,
+        sells5m: 20,
+        buyToSellRatio: 2.5,
+      });
+
+      const evalResult = service.evaluateCandidate(estCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: adapted.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+
+      const bundlerGate = evalResult.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate?.passed).toBe(true);
+      expect(bundlerGate?.requirement).toContain("Bundler <= 85%");
+    });
+
+    it("rejects values immediately above each boundary in Gate 11 (50.00000005% and 85.00000005%)", () => {
+      // Micro-Cap: immediately above 50%
+      const above50InitialPct = 50.00000005 / 100;
+      const above50Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 50.00000005,
+        initialPct: above50InitialPct,
+        reportedRawCurrentPct: 2.0,
+        currentHoldingPct: 0.02,
+      };
+
+      const adaptedAbove50 = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: above50Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(adaptedAbove50.success).toBe(true);
+      if (!adaptedAbove50.success) return;
+      expect(adaptedAbove50.bundlerPct).toBe(above50InitialPct);
+
+      const microCandidate = createSyntheticCandidate({
+        liquidityUsd: 25_000,
+        marketCapUsd: 100_000,
+        assetAgeSeconds: 450,
+      });
+
+      const evalAbove50 = service.evaluateCandidate(microCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: adaptedAbove50.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+
+      expect(evalAbove50.triggered).toBe(false);
+      expect(evalAbove50.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+      const bundlerGate50 = evalAbove50.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate50?.passed).toBe(false);
+      expect(bundlerGate50?.requirement).toContain("Bundler <= 50%");
+
+      // Established: immediately above 85%
+      const above85InitialPct = 85.00000005 / 100;
+      const above85Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 85.00000005,
+        initialPct: above85InitialPct,
+        reportedRawCurrentPct: 5.0,
+        currentHoldingPct: 0.05,
+      };
+
+      const adaptedAbove85 = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: above85Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(adaptedAbove85.success).toBe(true);
+      if (!adaptedAbove85.success) return;
+      expect(adaptedAbove85.bundlerPct).toBe(above85InitialPct);
+
+      const estCandidate = createSyntheticCandidate({
+        liquidityUsd: 60_000,
+        marketCapUsd: 250_000,
+        lmcRatio: 60_000 / 250_000,
+        assetAgeSeconds: 2400,
+        volume5mUsd: 20_000,
+        buys5m: 50,
+        sells5m: 20,
+        buyToSellRatio: 2.5,
+      });
+
+      const evalAbove85 = service.evaluateCandidate(estCandidate, {
+        rugScore: 50,
+        hasDangerRisk: false,
+        holdersCount: 300,
+        top10HolderPct: 0.15,
+        bundlerPct: adaptedAbove85.bundlerPct,
+        requireVerifiedHolders: true,
+      });
+
+      expect(evalAbove85.triggered).toBe(false);
+      expect(evalAbove85.rejectionReason).toBe("BUNDLER_CONCENTRATION_GATE_FAILED");
+      const bundlerGate85 = evalAbove85.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE");
+      expect(bundlerGate85?.passed).toBe(false);
+      expect(bundlerGate85?.requirement).toContain("Bundler <= 85%");
+    });
+
+    it("rejects contradictory normalized values rounded down to the boundary (zero-epsilon exact division check)", () => {
+      // Counterexample 1: Raw 50.00000005 rounded down to 0.5 (Micro-Cap boundary)
+      const roundedDown50Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 50.00000005,
+        initialPct: 0.5, // Fraudulently rounded down to 0.5 to pass 50% check!
+        reportedRawCurrentPct: 2.0,
+        currentHoldingPct: 0.02,
+      };
+
+      const result50 = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: roundedDown50Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result50.success).toBe(false);
+      expect(result50.status).toBe("CONTRADICTORY_METRIC_VALUES");
+      expect(result50.bundlerPct).toBeUndefined();
+
+      // Counterexample 2: Raw 85.00000005 rounded down to 0.85 (Established boundary)
+      const roundedDown85Snapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 85.00000005,
+        initialPct: 0.85, // Fraudulently rounded down to 0.85 to pass 85% check!
+        reportedRawCurrentPct: 5.0,
+        currentHoldingPct: 0.05,
+      };
+
+      const result85 = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: roundedDown85Snapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(result85.success).toBe(false);
+      expect(result85.status).toBe("CONTRADICTORY_METRIC_VALUES");
+      expect(result85.bundlerPct).toBeUndefined();
+
+      // Counterexample 3: Current holdings raw 10.00000005 rounded down to 0.1
+      const roundedDownCurrentSnapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 5.0,
+        initialPct: 0.05,
+        reportedRawCurrentPct: 10.00000005,
+        currentHoldingPct: 0.1, // Fraudulently rounded down
+      };
+
+      const resultCurrent = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: roundedDownCurrentSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+
+      expect(resultCurrent.success).toBe(false);
+      expect(resultCurrent.status).toBe("CONTRADICTORY_METRIC_VALUES");
+      expect(resultCurrent.bundlerPct).toBeUndefined();
+    });
+
+    it("accepts valid parser-produced fractions and genuine zeros via exact division equality", () => {
+      // 1. Genuine zeros
+      const zeroSnapshot = {
+        ...capturedSnapshot,
+        reportedRawInitialPct: 0,
+        initialPct: 0,
+        reportedRawCurrentPct: 0,
+        currentHoldingPct: 0,
+      };
+      const zeroResult = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: zeroSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+      expect(zeroResult.success).toBe(true);
+      if (!zeroResult.success) return;
+      expect(zeroResult.bundlerPct).toBe(0);
+      expect(zeroResult.currentHoldingPct).toBe(0);
+
+      // 2. Authentic parser-produced fixture fractions
+      const fixtureResult = adaptPaperBundlerSnapshot({
+        targetMint: CANONICAL_MINT,
+        snapshot: capturedSnapshot,
+        evaluationTimeMs: capturedSnapshot.localRetrievedAtMs + 1_000,
+        executionContext: "PAPER_SIMULATION",
+        maxAllowedRetrievalAgeMs: 15_000,
+      });
+      expect(fixtureResult.success).toBe(true);
+      if (!fixtureResult.success) return;
+      expect(fixtureResult.bundlerPct).toBe(0.00756 / 100);
+      expect(fixtureResult.currentHoldingPct).toBe(0.05904 / 100);
     });
   });
 

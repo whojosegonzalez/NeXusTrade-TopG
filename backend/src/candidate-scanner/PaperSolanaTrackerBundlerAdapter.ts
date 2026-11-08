@@ -14,7 +14,7 @@
  * 2. Launch-Allocation Metric Integrity:
  *    - Maps ONLY valid, normalized `initialPct` ($[0.0, 1.0]$) to `bundlerPct`.
  *    - Requires both raw percentages ($[0, 100]$) and normalized fractions ($[0.0, 1.0]$) to be finite,
- *      non-negative, and strictly in agreement (`Math.abs(normalized - raw / 100) < 1e-9`).
+ *      non-negative, and strictly in exact agreement (`normalized === raw / 100`) without epsilon or rounding.
  *    - Rejects contradictory, missing, or malformed values fail-closed (`CONTRADICTORY_METRIC_VALUES`,
  *      `MALFORMED_REQUIRED_METRICS`). Does NOT reconstruct raw provider fields from normalized fractions.
  *    - Preserves `currentHoldingPct` separately; NEVER substitutes current holdings for initial allocation.
@@ -126,7 +126,7 @@ function isValidNormalizedFraction(val: unknown): val is number {
 }
 
 function fractionsAgree(normalized: number, rawPct: number): boolean {
-  return Math.abs(normalized - rawPct / 100) < 1e-9;
+  return normalized === rawPct / 100;
 }
 
 /**
