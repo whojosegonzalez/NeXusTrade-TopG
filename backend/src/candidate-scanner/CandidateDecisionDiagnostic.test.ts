@@ -16,6 +16,7 @@ import {
 } from "./fixtures/CapturedRaydiumAmmV4SnapshotFixture.js";
 import { CAPTURED_SOLANA_TRACKER_SANITIZED_PAYLOAD } from "./fixtures/CapturedSolanaTrackerBundlerFixture.js";
 import type { ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocketSubscriptionClient.js";
+import type { ISolanaKeepaliveWebSocketTransport } from "./RaydiumTransportObservationProbe.js";
 
 const TEST_POOL_ID = CAPTURED_RAY_WSOL_IDENTITIES.poolId;
 const TEST_MINT = CAPTURED_RAY_WSOL_IDENTITIES.expectedTokenMint!;
@@ -28,6 +29,7 @@ const TEST_SIG_B =
 
 export interface MockWebSocketTransportOptions {
   immediateAck?: boolean;
+  onSend?: (data: string) => void;
   messagesToSend?: string[];
   readyState?: number; // 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
   autoPong?: boolean; // default true
@@ -107,6 +109,7 @@ function createMockWebSocketTransport(
       }
     },
     send: (data: string) => {
+      options?.onSend?.(data);
       const parsed = JSON.parse(data) as { id?: number; method?: string };
       if (parsed.method === "logsSubscribe" && options?.immediateAck !== false) {
         queueMicrotask(() => {
@@ -152,10 +155,93 @@ function createMockWebSocketTransport(
       } else if (event === "ping") {
         listeners.ping.push(listener as (data: Buffer) => void);
       }
-    }) as ISolanaWebSocketTransport["on"],
+    }) as ISolanaKeepaliveWebSocketTransport["on"],
   };
 
   return transport;
+}
+
+function createRealInterfaceMockWebSocketTransport(options?: {
+  immediateAck?: boolean;
+  onSend?: (data: string) => void;
+}): ISolanaKeepaliveWebSocketTransport & {
+  getUnderlyingSocket: () => { readyState: number };
+  getPingsReceived: () => Buffer[];
+  isClosed: () => boolean;
+  emitServerPing: (payload: Buffer) => void;
+} {
+  const listeners: {
+    open: (() => void)[];
+    message: ((data: string | Buffer) => void)[];
+    error: ((err: Error) => void)[];
+    close: ((code: number, reason: string) => void)[];
+    pong: ((data: Buffer) => void)[];
+    ping: ((data: Buffer) => void)[];
+  } = {
+    open: [],
+    message: [],
+    error: [],
+    close: [],
+    pong: [],
+    ping: [],
+  };
+  let closed = false;
+  const underlyingSocket = { readyState: 1 /* OPEN */ };
+  const pingsReceived: Buffer[] = [];
+
+  return {
+    // Strictly omit direct readyState property on the wrapper
+    getUnderlyingSocket: () => underlyingSocket,
+    getPingsReceived: () => pingsReceived,
+    isClosed: () => closed,
+    emitServerPing: (payload: Buffer) => {
+      for (const fn of listeners.ping) fn(payload);
+    },
+    on: ((event: string, listener: unknown) => {
+      if (event === "open") {
+        listeners.open.push(listener as () => void);
+        // Strictly does NOT replay earlier open event
+      } else if (event === "message") {
+        listeners.message.push(listener as (data: string | Buffer) => void);
+      } else if (event === "error") {
+        listeners.error.push(listener as (err: Error) => void);
+      } else if (event === "close") {
+        listeners.close.push(listener as (code: number, reason: string) => void);
+      } else if (event === "pong") {
+        listeners.pong.push(listener as (data: Buffer) => void);
+      } else if (event === "ping") {
+        listeners.ping.push(listener as (data: Buffer) => void);
+      }
+    }) as ISolanaKeepaliveWebSocketTransport["on"],
+    send: (data: string) => {
+      options?.onSend?.(data);
+      const parsed = JSON.parse(data) as { id?: number; method?: string };
+      if (options?.immediateAck && parsed.id !== undefined) {
+        queueMicrotask(() => {
+          for (const fn of listeners.message) {
+            fn(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: 1 }));
+          }
+        });
+      }
+    },
+    ping: (data?: Buffer) => {
+      if (data) pingsReceived.push(data);
+      if (data) {
+        queueMicrotask(() => {
+          for (const fn of listeners.pong) fn(data);
+        });
+      }
+    },
+    close: () => {
+      closed = true;
+      underlyingSocket.readyState = 3 /* CLOSED */;
+      for (const fn of listeners.close) fn(1000, "Normal Closure");
+    },
+    terminate: () => {
+      closed = true;
+      underlyingSocket.readyState = 3 /* CLOSED */;
+    },
+  };
 }
 
 interface MockFetchScenario {
@@ -1407,7 +1493,7 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     expect(result.candidateMintAccount?.mintAuthorityStatus).toBe("ACTIVE");
   });
 
-  it("25. Pre-admission screening: accepts canonical 32-byte zero address as valid disabled authority", async () => {
+  it("25. Pre-admission screening: rejects canonical 32-byte zero address as active authority", async () => {
     const now = 1791931000 * 1000;
     let clockTime = now - 70_000;
     const clock = () => clockTime;
@@ -1418,7 +1504,7 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
 
     const wsTransport = createMockWebSocketTransport({ immediateAck: true });
     const transport = createDiagnosticMockFetch({
-      mintAuthority: CANONICAL_ZERO_ADDRESS,
+      mintAuthority: null,
       freezeAuthority: CANONICAL_ZERO_ADDRESS,
       getClock: clock,
     });
@@ -1437,11 +1523,11 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     });
 
     const result = await diagnostic.run();
-    expect(result.ok).toBe(true);
-    expect(result.status).toBe("ARMED_FIRST_TICK");
-    expect(result.preAdmissionScreening?.passed).toBe(true);
-    expect(result.candidateMintAccount?.mintAuthorityStatus).toBe("DISABLED");
-    expect(result.candidateMintAccount?.freezeAuthorityStatus).toBe("DISABLED");
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.message).toContain("REJECTED_ACTIVE_FREEZE_AUTHORITY");
+    expect(result.candidateMintAccount?.freezeAuthorityStatus).toBe("ACTIVE");
+    expect(result.candidateMintAccount?.freezeAuthorityRenounced).toBe(false);
   });
 
   it("26. evaluateAuthorityEvidence helper correctly classifies all states", () => {
@@ -1452,20 +1538,21 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     );
     expect(evaluateAuthorityEvidence(null, "mintAuthority").status).toBe("OMITTED");
 
-    // 2. DISABLED: null or canonical zero address
+    // 2. DISABLED: only literal null
     const nullEval = evaluateAuthorityEvidence({ mintAuthority: null }, "mintAuthority");
     expect(nullEval.status).toBe("DISABLED");
     expect(nullEval.isRenounced).toBe(true);
     expect(nullEval.isExplicitlyObserved).toBe(true);
 
+    // 3. ACTIVE: valid Base58 public key (zero address is a present public key, not disabled)
     const zeroEval = evaluateAuthorityEvidence(
       { mintAuthority: CANONICAL_ZERO_ADDRESS },
       "mintAuthority",
     );
-    expect(zeroEval.status).toBe("DISABLED");
-    expect(zeroEval.isRenounced).toBe(true);
+    expect(zeroEval.status).toBe("ACTIVE");
+    expect(zeroEval.isRenounced).toBe(false);
+    expect(zeroEval.address).toBe(CANONICAL_ZERO_ADDRESS);
 
-    // 3. ACTIVE: valid non-zero Base58 public key
     const activeEval = evaluateAuthorityEvidence({ mintAuthority: TEST_MINT }, "mintAuthority");
     expect(activeEval.status).toBe("ACTIVE");
     expect(activeEval.isRenounced).toBe(false);
@@ -2077,5 +2164,304 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     expect(replay.ok).toBe(false);
     expect(replay.status).toBe("EVIDENCE_INTEGRITY_MISMATCH");
     expect(replay.message).toContain("evidence/lp-evidence.json");
+  });
+
+  it("40. WebSocket keepalive: initializes reliably with real WsWebSocketTransport wrapper contract (getUnderlyingSocket with readyState: 1 and no replayed open event)", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createRealInterfaceMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 25_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+    expect(diagResult.status).toBe("ARMED_FIRST_TICK");
+    expect(diagResult.keepaliveMetrics?.clientPingsSentCount).toBeGreaterThanOrEqual(1);
+    expect(diagResult.keepaliveMetrics?.matchedClientPongsCount).toBe(
+      diagResult.keepaliveMetrics?.clientPingsSentCount,
+    );
+    expect(wsTransport.isClosed()).toBe(true);
+  });
+
+  it("41. WebSocket keepalive: quiet qualification strictly requires keepalive scheduler started and matched pongs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Socket that drops pongs
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true, autoPong: false });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 25_000,
+      pongTimeoutMs: 5_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(false);
+    expect(diagResult.status).toBe("KEEPALIVE_PONG_TIMEOUT");
+    expect(diagResult.ledger.getSlotAttempts).toBe(0);
+    expect(diagResult.ledger.getBlockTimeAttempts).toBe(0);
+  });
+
+  it("42. Control frame ceiling: counts inbound server PING frames and automatic PONG responses, stopping promptly with CONTROL_FRAME_LIMIT_EXCEEDED", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createRealInterfaceMockWebSocketTransport({
+      immediateAck: true,
+      onSend: () => {
+        // Send 30 server PING frames (30 inbound pings + 30 auto pongs = 60 control frames > 50 limit)
+        for (let i = 0; i < 30; i++) {
+          wsTransport.emitServerPing(Buffer.alloc(100));
+        }
+      },
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 25_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(false);
+    expect(diagResult.status).toBe("CONTROL_FRAME_LIMIT_EXCEEDED");
+    expect(diagResult.ledger.getSlotAttempts).toBe(0);
+    expect(diagResult.ledger.getBlockTimeAttempts).toBe(0);
+  });
+
+  it("43. Timer lifecycle: unhandled exception in observation immediately disposes keepalive timers in finally and terminates transport", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createRealInterfaceMockWebSocketTransport({ immediateAck: true });
+    // Injected transport that fails during cutoff acquisition
+    const transport = createDiagnosticMockFetch({
+      getClock: clock,
+      hangingRequest: true,
+      hangingMethod: "getSlot",
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 25_000,
+      requestTimeoutMs: 1_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(false);
+    expect(wsTransport.isClosed()).toBe(true);
+  });
+
+  it("44. Manifest schema validation: rejects empty manifest.files, missing required files, or duplicate paths fail-closed", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+
+    const manifestPath = path.join(testOutDir, "evidence-manifest.json");
+    const originalManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+
+    // Case A: empty manifest.files
+    const emptyFilesManifest = { ...originalManifest, files: [] };
+    writeFileSync(manifestPath, JSON.stringify(emptyFilesManifest), "utf8");
+    const replayEmpty = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayEmpty.ok).toBe(false);
+    expect(replayEmpty.status).toBe("INVALID_MANIFEST_SCHEMA");
+
+    // Case B: duplicate path in manifest.files
+    const duplicateManifest = {
+      ...originalManifest,
+      files: [...originalManifest.files, originalManifest.files[0]],
+    };
+    writeFileSync(manifestPath, JSON.stringify(duplicateManifest), "utf8");
+    const replayDuplicate = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayDuplicate.ok).toBe(false);
+    expect(replayDuplicate.status).toBe("DUPLICATE_MANIFEST_ENTRY");
+
+    // Case C: missing required evidence file in manifest.files
+    const missingFileManifest = {
+      ...originalManifest,
+      files: originalManifest.files.filter(
+        (f: { path: string }) => f.path !== "evidence/mint-account.json",
+      ),
+    };
+    writeFileSync(manifestPath, JSON.stringify(missingFileManifest), "utf8");
+    const replayMissing = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayMissing.ok).toBe(false);
+    expect(replayMissing.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+  });
+
+  it("45. Offline replay pre-admission recomputation: recomputes LP claims and authority evaluations from raw evidence without relying on derived flags", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+
+    const manifestPath = path.join(testOutDir, "evidence-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+
+    const updateManifestFile = (relPath: string, newContent: string) => {
+      const fullPath = path.join(testOutDir, relPath);
+      writeFileSync(fullPath, newContent, "utf8");
+      const buf = Buffer.from(newContent, "utf8");
+      const sha256 = createHash("sha256").update(buf).digest("hex");
+      const entry = manifest.files.find((f: { path: string }) => f.path === relPath) as
+        | { sha256: string; bytes: number }
+        | undefined;
+      if (entry) {
+        entry.sha256 = sha256;
+        entry.bytes = buf.length;
+      }
+      writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+    };
+
+    // Sub-case A: Tamper with derived flag meetsNinetyPercentThreshold = false in lp-evidence.json
+    // Replay should STILL PASS because it recomputes from raw poolState and lpMintState using calculateAmmV4LpInaccessibleClaims
+    const lpEvidencePath = path.join(testOutDir, "evidence", "lp-evidence.json");
+    const lpEvidence = JSON.parse(readFileSync(lpEvidencePath, "utf8"));
+    lpEvidence.validationResult.accounting.meetsNinetyPercentThreshold = false;
+    lpEvidence.validationResult.accounting.displayInaccessiblePct = 0;
+    updateManifestFile("evidence/lp-evidence.json", JSON.stringify(lpEvidence));
+
+    const replayRecomputedPass = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayRecomputedPass.ok).toBe(true);
+    expect(replayRecomputedPass.status).toBe("ARMED_FIRST_TICK");
+    expect(replayRecomputedPass.auditMetadata).toBeDefined();
+    expect(replayRecomputedPass.auditMetadata?.requests?.length).toBeGreaterThan(0);
+
+    // Sub-case B: Tamper with raw lpMintState.supply to make it unlocked (< 90%), while keeping derived flag meetsNinetyPercentThreshold = true
+    lpEvidence.validationResult.diagnostics.lpMintState.supply = "500000000000";
+    lpEvidence.validationResult.accounting.meetsNinetyPercentThreshold = true;
+    lpEvidence.validationResult.accounting.displayInaccessiblePct = 99.9;
+    updateManifestFile("evidence/lp-evidence.json", JSON.stringify(lpEvidence));
+
+    const replayUnlockedLp = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayUnlockedLp.ok).toBe(false);
+    expect(replayUnlockedLp.status).toBe("REPLAY_PRE_ADMISSION_FAILED");
+    expect(replayUnlockedLp.message).toContain("REJECTED_UNLOCKED_LP_RISK");
+
+    // Restore lp-evidence
+    lpEvidence.validationResult.diagnostics.lpMintState.supply = "0";
+    updateManifestFile("evidence/lp-evidence.json", JSON.stringify(lpEvidence));
+
+    // Sub-case C: Tamper with rawMintResponse to have active freeze authority, while keeping derived freezeAuthorityRenounced = true
+    const mintAccountPath = path.join(testOutDir, "evidence", "mint-account.json");
+    const mintAccountEvidence = JSON.parse(readFileSync(mintAccountPath, "utf8"));
+    mintAccountEvidence.rawMintResponse.result.value.data.parsed.info.freezeAuthority =
+      "So11111111111111111111111111111111111111112";
+    mintAccountEvidence.candidateMintAccount.freezeAuthorityRenounced = true;
+    updateManifestFile("evidence/mint-account.json", JSON.stringify(mintAccountEvidence));
+
+    const replayActiveFreeze = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayActiveFreeze.ok).toBe(false);
+    expect(replayActiveFreeze.status).toBe("REPLAY_PRE_ADMISSION_FAILED");
+    expect(replayActiveFreeze.message).toContain("REJECTED_ACTIVE_FREEZE_AUTHORITY");
   });
 });

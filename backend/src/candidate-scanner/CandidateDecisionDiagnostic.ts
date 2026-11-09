@@ -33,6 +33,7 @@ import {
   MeteredWebSocketTransport,
   WsWebSocketTransport,
   createBoundedFetchTransport,
+  type ISolanaKeepaliveWebSocketTransport,
   DEFAULT_KEEPALIVE_PING_INTERVAL_MS,
   DEFAULT_KEEPALIVE_MAX_PINGS,
   DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS,
@@ -68,6 +69,7 @@ import {
   acquireRaydiumAmmV4Snapshot,
   type SnapshotAcquisitionResult,
 } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
+import { calculateAmmV4LpInaccessibleClaims } from "../research/pilot/RaydiumAmmLpAccounting.js";
 import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 import {
   deepRedactSensitiveObject,
@@ -91,8 +93,8 @@ export interface AuthorityEvaluation {
 /**
  * Validates authority fields against the Solana RPC schema:
  * - OMITTED: Field is undefined or missing from RPC object
- * - DISABLED: Literal null or canonical 32-byte zero address ("11111111111111111111111111111111")
- * - ACTIVE: Valid Solana Base58 public key (non-zero address)
+ * - DISABLED: Explicit literal null (authority disabled / COption::None)
+ * - ACTIVE: Present canonical Solana Base58 public key (including canonical 32-byte addresses)
  * - MALFORMED: Textual placeholders ("none", "null", "undefined", ""), wrong casing, or invalid Base58
  */
 export function evaluateAuthorityEvidence(info: unknown, fieldName: string): AuthorityEvaluation {
@@ -125,15 +127,6 @@ export function evaluateAuthorityEvidence(info: unknown, fieldName: string): Aut
     };
   }
   if (typeof val === "string") {
-    if (val === CANONICAL_ZERO_ADDRESS) {
-      return {
-        status: "DISABLED",
-        isRenounced: true,
-        isExplicitlyObserved: true,
-        rawValue: val,
-        address: val,
-      };
-    }
     if (isCanonicalSolanaBase58(val)) {
       return {
         status: "ACTIVE",
@@ -162,9 +155,29 @@ export function evaluateAuthorityEvidence(info: unknown, fieldName: string): Aut
 
 export function isRenouncedAuthority(authority: unknown, isExplicitlyObserved: boolean): boolean {
   if (!isExplicitlyObserved) return false;
-  if (authority === null) return true;
-  if (typeof authority === "string" && authority === CANONICAL_ZERO_ADDRESS) return true;
-  return false;
+  return authority === null;
+}
+
+/**
+ * Returns the readyState of a WebSocket transport, checking both the direct property
+ * and the underlying socket exposed via getUnderlyingSocket().
+ */
+export function getWebSocketTransportReadyState(transport: unknown): number | undefined {
+  if (!transport || typeof transport !== "object") return undefined;
+  const t = transport as {
+    readyState?: number;
+    getUnderlyingSocket?: () => unknown;
+  };
+  if (typeof t.readyState === "number") {
+    return t.readyState;
+  }
+  if (typeof t.getUnderlyingSocket === "function") {
+    const sock = t.getUnderlyingSocket() as { readyState?: number } | null | undefined;
+    if (sock && typeof sock.readyState === "number") {
+      return sock.readyState;
+    }
+  }
+  return undefined;
 }
 
 export interface DiagnosticRequestRecord {
@@ -172,6 +185,7 @@ export interface DiagnosticRequestRecord {
   readonly provider: string;
   readonly endpoint: string;
   readonly method: string;
+  readonly params?: unknown | undefined;
   readonly dispatchedAtMs: number;
   readonly completedAtMs: number;
   readonly httpStatus?: number | undefined;
@@ -284,6 +298,15 @@ export interface CandidateDecisionDiagnosticResult {
       }
     | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
+  readonly observationMetadata?:
+    | {
+        readonly observationStartMs: number;
+        readonly observationEndMs: number;
+        readonly observationDurationMs: number;
+        readonly cutoffTimestampMs: number;
+        readonly notificationsReceived: number;
+      }
+    | undefined;
   readonly keepaliveMetrics?:
     | {
         readonly clientPingsSentCount: number;
@@ -523,6 +546,7 @@ export class CandidateDecisionDiagnostic {
     method?: string | undefined;
     headers?: Record<string, string> | undefined;
     body?: string | undefined;
+    requestParams?: unknown | undefined;
     signal?: AbortSignal | undefined;
     customTimeoutMs?: number | undefined;
     skipBudgetRecording?: boolean | undefined;
@@ -541,6 +565,7 @@ export class CandidateDecisionDiagnostic {
       method = "GET",
       headers = {},
       body,
+      requestParams,
       signal,
       customTimeoutMs = this.requestTimeoutMs,
       skipBudgetRecording = false,
@@ -780,6 +805,9 @@ export class CandidateDecisionDiagnostic {
       provider: providerName,
       endpoint: redactSensitiveText(sanitizedEndpoint, this.sensitiveTokens),
       method,
+      ...(requestParams !== undefined
+        ? { params: deepRedactSensitiveObject(requestParams, this.sensitiveTokens) }
+        : {}),
       dispatchedAtMs,
       completedAtMs,
       ...(httpStatus > 0 ? { httpStatus } : {}),
@@ -851,6 +879,7 @@ export class CandidateDecisionDiagnostic {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: rpcPayload,
+      requestParams: params,
       signal,
       skipBudgetRecording,
       overallDeadlineMs,
@@ -904,6 +933,22 @@ export class CandidateDecisionDiagnostic {
     let liveWsTransport: ISolanaWebSocketTransport | undefined;
     let activeWsTransport: ISolanaWebSocketTransport | undefined;
 
+    let pingTimer: ReturnType<typeof setTimeout> | undefined;
+    let pongTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let keepaliveDisposed = false;
+
+    const cleanupKeepalive = () => {
+      keepaliveDisposed = true;
+      if (pingTimer) {
+        clearTimeout(pingTimer);
+        pingTimer = undefined;
+      }
+      if (pongTimeoutTimer) {
+        clearTimeout(pongTimeoutTimer);
+        pongTimeoutTimer = undefined;
+      }
+    };
+
     try {
       // Pre-check overall deadline
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
@@ -928,7 +973,7 @@ export class CandidateDecisionDiagnostic {
       }
 
       // Explicitly check readyState if supported
-      const readyState = (activeWsTransport as { readyState?: number }).readyState;
+      const readyState = getWebSocketTransportReadyState(activeWsTransport);
       if (readyState === 2 || readyState === 3) {
         return this.finishWithFailure(
           "WEBSOCKET_CONNECTION_CLOSED",
@@ -961,7 +1006,8 @@ export class CandidateDecisionDiagnostic {
             `WebSocket failed to connect: ${openError.message}`,
           );
         }
-        if (!openResolved && (activeWsTransport as { readyState?: number }).readyState !== 1) {
+        const currentReady = getWebSocketTransportReadyState(activeWsTransport);
+        if (!openResolved && currentReady !== 1) {
           return this.finishWithFailure(
             "WEBSOCKET_CONNECTION_TIMEOUT",
             "WebSocket failed to reach open state within 5,000 ms",
@@ -1158,21 +1204,7 @@ export class CandidateDecisionDiagnostic {
       let pendingPingPayload: Buffer | null = null;
       let pendingPingTimestamp: number | null = null;
       let nextPingScheduledTime = 0;
-      let pingTimer: ReturnType<typeof setTimeout> | undefined;
-      let pongTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
-      let keepaliveDisposed = false;
-
-      const cleanupKeepalive = () => {
-        keepaliveDisposed = true;
-        if (pingTimer) {
-          clearTimeout(pingTimer);
-          pingTimer = undefined;
-        }
-        if (pongTimeoutTimer) {
-          clearTimeout(pongTimeoutTimer);
-          pongTimeoutTimer = undefined;
-        }
-      };
+      let keepaliveSchedulerStarted = false;
 
       const stopWithLimit = (status: string, message: string) => {
         if (streamLimitReason) return;
@@ -1294,12 +1326,41 @@ export class CandidateDecisionDiagnostic {
         checkQueueLimit();
       });
 
+      const startKeepaliveScheduler = () => {
+        if (keepaliveDisposed || !this.keepalive || keepaliveSchedulerStarted) return;
+        keepaliveSchedulerStarted = true;
+        nextPingScheduledTime = this.clock() + this.pingIntervalMs;
+        if (clientPingsSentCount < this.maxPings && !pingTimer) {
+          pingTimer = setTimeout(sendPing, this.pingIntervalMs);
+        }
+      };
+
       if (this.keepalive) {
         meteredWs.on("open", () => {
+          startKeepaliveScheduler();
+        });
+
+        // Initialize keepalive reliably when the socket is already open
+        const initialReady = getWebSocketTransportReadyState(activeWsTransport);
+        if (initialReady === 1) {
+          startKeepaliveScheduler();
+        }
+
+        meteredWs.on("ping", (payload: Buffer) => {
           if (keepaliveDisposed) return;
-          nextPingScheduledTime = this.clock() + this.pingIntervalMs;
-          if (clientPingsSentCount < this.maxPings && !pingTimer) {
-            pingTimer = setTimeout(sendPing, this.pingIntervalMs);
+          const payloadBytes = payload ? payload.length : 0;
+          // Inbound server PING + automatic client PONG response = 2 control frames
+          controlFramesCount += 2;
+          controlFramePayloadBytes += payloadBytes * 2;
+
+          if (
+            controlFramesCount > this.maxControlFrames ||
+            controlFramePayloadBytes > this.maxControlFrameBytes
+          ) {
+            stopWithLimit(
+              "CONTROL_FRAME_LIMIT_EXCEEDED",
+              `Control frame limit exceeded: ${controlFramesCount} frames, ${controlFramePayloadBytes} bytes`,
+            );
           }
         });
 
@@ -1349,15 +1410,6 @@ export class CandidateDecisionDiagnostic {
 
       coordinator.attachTransport(meteredWs);
       coordinator.sendSubscriptionRequest();
-
-      if (this.keepalive && (activeWsTransport as { readyState?: number }).readyState === 1) {
-        if (nextPingScheduledTime === 0) {
-          nextPingScheduledTime = this.clock() + this.pingIntervalMs;
-        }
-        if (!pingTimer) {
-          pingTimer = setTimeout(sendPing, this.pingIntervalMs);
-        }
-      }
 
       // Await subscription acknowledgement
       const subDeadline = this.clock() + 5000;
@@ -1429,10 +1481,10 @@ export class CandidateDecisionDiagnostic {
       }
 
       if (this.keepalive) checkKeepalive(this.clock());
-      cleanupKeepalive();
 
       // Prompt stop on stream limit breach without proceeding to cutoff requests
       if (streamLimitReason) {
+        cleanupKeepalive();
         coordinator.close();
         return this.finishWithFailure(
           streamLimitReason,
@@ -1445,6 +1497,7 @@ export class CandidateDecisionDiagnostic {
 
       // 3. Acquire on-chain cutoff (getSlot + getBlockTime) WHILE observation is STILL active
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        cleanupKeepalive();
         coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
@@ -1462,7 +1515,20 @@ export class CandidateDecisionDiagnostic {
         overallDeadlineMs,
       );
 
+      if (this.keepalive) checkKeepalive(this.clock());
+      checkQueueLimit();
+      if (streamLimitReason) {
+        cleanupKeepalive();
+        coordinator.close();
+        return this.finishWithFailure(
+          streamLimitReason,
+          streamLimitMessage ?? `Observation stopped: ${streamLimitReason}`,
+          { provisionalContext },
+        );
+      }
+
       if (!slotRes.ok || !slotRes.json || typeof slotRes.json.result !== "number") {
+        cleanupKeepalive();
         coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_GET_SLOT_FAILED",
@@ -1474,6 +1540,7 @@ export class CandidateDecisionDiagnostic {
       const cutoffSlot = slotRes.json.result;
 
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        cleanupKeepalive();
         coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
@@ -1491,7 +1558,20 @@ export class CandidateDecisionDiagnostic {
         overallDeadlineMs,
       );
 
+      if (this.keepalive) checkKeepalive(this.clock());
+      checkQueueLimit();
+      if (streamLimitReason) {
+        cleanupKeepalive();
+        coordinator.close();
+        return this.finishWithFailure(
+          streamLimitReason,
+          streamLimitMessage ?? `Observation stopped: ${streamLimitReason}`,
+          { provisionalContext },
+        );
+      }
+
       if (!blockTimeRes.ok || !blockTimeRes.json || typeof blockTimeRes.json.result !== "number") {
+        cleanupKeepalive();
         coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_GET_BLOCK_TIME_FAILED",
@@ -1504,6 +1584,9 @@ export class CandidateDecisionDiagnostic {
       const cutoffTimestampMs = cutoffTimestampSec * 1000;
       const retrievedAtMs = this.clock();
       observationEndMs = this.clock();
+
+      if (this.keepalive) checkKeepalive(this.clock());
+      cleanupKeepalive();
 
       const sourceCutoff: SourceCutoffEvidence = {
         sourceMethod: "getBlockTime",
@@ -1608,12 +1691,19 @@ export class CandidateDecisionDiagnostic {
       });
 
       const paperAdapter = new PaperReconciledCandidateFlowAdapter();
+      const keepaliveSatisfied =
+        !this.keepalive ||
+        (keepaliveSchedulerStarted &&
+          !missingPongDetected &&
+          pendingPingPayload === null &&
+          (this.observationDurationMs < this.pingIntervalMs ||
+            (clientPingsSentCount >= 1 && matchedClientPongsCount === clientPingsSentCount)));
+
       const isQuietQualified =
         notificationsReceived === 0 &&
         !streamLimitReason &&
         adapter.getPendingQueueLength() === 0 &&
-        !missingPongDetected &&
-        pendingPingPayload === null &&
+        keepaliveSatisfied &&
         reconResult.status === "RECONCILED" &&
         reconResult.paperQuietStreamQualified === true &&
         (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST");
@@ -1641,7 +1731,7 @@ export class CandidateDecisionDiagnostic {
                 ? "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS"
                 : streamLimitReason
                   ? streamLimitReason
-                  : missingPongDetected || pendingPingPayload !== null
+                  : !keepaliveSatisfied
                     ? "MISSING_PONG_QUIET_WINDOW_UNQUALIFIED"
                     : `RECONCILIATION_UNQUALIFIED: ${reconResult.status}`,
           evaluationTimestampMs: this.clock(),
@@ -2369,6 +2459,19 @@ export class CandidateDecisionDiagnostic {
         preAdmissionScreening,
         flowEvaluation: decisionResult.flowResult,
         decisionResult,
+        observationMetadata:
+          observationStartMs > 0
+            ? {
+                observationStartMs,
+                observationEndMs,
+                observationDurationMs:
+                  observationEndMs > observationStartMs
+                    ? observationEndMs - observationStartMs
+                    : this.observationDurationMs,
+                cutoffTimestampMs,
+                notificationsReceived,
+              }
+            : undefined,
         keepaliveMetrics: {
           clientPingsSentCount,
           matchedClientPongsCount,
@@ -2389,6 +2492,7 @@ export class CandidateDecisionDiagnostic {
         msg,
       );
     } finally {
+      cleanupKeepalive();
       clearTimeout(overallTimer);
       if (coordinator) {
         try {
@@ -2397,7 +2501,19 @@ export class CandidateDecisionDiagnostic {
           // ignore cleanup error
         }
       }
-      if (liveWsTransport) {
+      if (activeWsTransport) {
+        try {
+          const keepalive = activeWsTransport as Partial<ISolanaKeepaliveWebSocketTransport>;
+          if (typeof keepalive.terminate === "function") {
+            keepalive.terminate();
+          } else if (typeof activeWsTransport.close === "function") {
+            activeWsTransport.close();
+          }
+        } catch {
+          // ignore cleanup error
+        }
+      }
+      if (liveWsTransport && liveWsTransport !== activeWsTransport) {
         try {
           liveWsTransport.close();
         } catch {
@@ -2593,6 +2709,7 @@ export class CandidateDecisionDiagnostic {
       provider: r.provider,
       endpoint: r.endpoint,
       method: r.method,
+      ...(r.params !== undefined ? { params: r.params } : {}),
       dispatchedAtMs: r.dispatchedAtMs,
       completedAtMs: r.completedAtMs,
       durationMs: r.completedAtMs - r.dispatchedAtMs,
@@ -2648,6 +2765,13 @@ export interface CandidateDecisionReplayResult {
   readonly verifiedFilesCount: number;
   readonly fileVerifications: ReplayVerificationItem[];
   readonly decisionResult?: CandidateDecisionResult | undefined;
+  readonly auditMetadata?:
+    | {
+        readonly requests?: readonly unknown[] | undefined;
+        readonly observation?: unknown | undefined;
+        readonly gapMetadata?: unknown | undefined;
+      }
+    | undefined;
 }
 
 /**
@@ -2671,15 +2795,110 @@ export function replayCandidateDecisionFromSealedEvidence(
   }
 
   const manifestContent = readFileSync(manifestPath, "utf8");
-  const manifest = JSON.parse(manifestContent);
-  const poolId = manifest.poolId;
-  const mintAddress = manifest.mintAddress;
+  let manifest: {
+    poolId?: string;
+    mintAddress?: string;
+    reportFile?: { path: string; bytes: number; sha256: string };
+    files?: Array<{ path: string; bytes: number; sha256: string }>;
+    requests?: unknown[];
+  } | null = null;
+  try {
+    manifest = JSON.parse(manifestContent);
+  } catch (parseErr) {
+    return {
+      ok: false,
+      status: "INVALID_MANIFEST_SCHEMA",
+      message: `Manifest JSON parsing failed: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      poolId: "",
+      mintAddress: "",
+      verifiedFilesCount: 0,
+      fileVerifications: [],
+    };
+  }
+
+  const poolId = typeof manifest?.poolId === "string" ? manifest.poolId : "";
+  const mintAddress = typeof manifest?.mintAddress === "string" ? manifest.mintAddress : "";
+
+  // Validate manifest schema: files array must be non-empty and well-formed
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    !Array.isArray(manifest.files) ||
+    manifest.files.length === 0
+  ) {
+    return {
+      ok: false,
+      status: "INVALID_MANIFEST_SCHEMA",
+      message: "Manifest schema invalid: files array must be non-empty",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: 0,
+      fileVerifications: [],
+    };
+  }
+
+  // Check duplicate paths and validate entry structures
+  const seenPaths = new Set<string>();
+  for (const entry of manifest.files) {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      typeof entry.path !== "string" ||
+      typeof entry.bytes !== "number" ||
+      typeof entry.sha256 !== "string"
+    ) {
+      return {
+        ok: false,
+        status: "INVALID_MANIFEST_SCHEMA",
+        message: `Manifest entry is malformed: ${JSON.stringify(entry)}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: 0,
+        fileVerifications: [],
+      };
+    }
+    const normPath = entry.path.replace(/\\/g, "/");
+    if (seenPaths.has(normPath)) {
+      return {
+        ok: false,
+        status: "DUPLICATE_MANIFEST_ENTRY",
+        message: `Duplicate file path in manifest: ${normPath}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: 0,
+        fileVerifications: [],
+      };
+    }
+    seenPaths.add(normPath);
+  }
+
+  // Ensure all required evidence files are present in manifest.files
+  const requiredFiles = [
+    "diagnostic-report.json",
+    "evidence/lp-evidence.json",
+    "evidence/cutoff-evidence.json",
+    "evidence/history-evidence.json",
+    "evidence/market-data.json",
+    "evidence/mint-account.json",
+  ];
+  for (const reqFile of requiredFiles) {
+    if (!seenPaths.has(reqFile)) {
+      return {
+        ok: false,
+        status: "INCOMPLETE_MANIFEST_COVERAGE",
+        message: `Required evidence file missing from manifest: ${reqFile}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: 0,
+        fileVerifications: [],
+      };
+    }
+  }
 
   const fileVerifications: ReplayVerificationItem[] = [];
 
   // Verify all files listed in manifest
-  const filesToVerify = manifest.files ?? [];
-  for (const entry of filesToVerify) {
+  for (const entry of manifest.files) {
     const fullPath = path.join(evidenceDir, entry.path);
     if (!existsSync(fullPath)) {
       return {
@@ -2716,6 +2935,38 @@ export function replayCandidateDecisionFromSealedEvidence(
     }
   }
 
+  // If manifest specifies reportFile separately, verify it as well
+  if (manifest.reportFile) {
+    const reportPath = path.join(evidenceDir, manifest.reportFile.path);
+    if (!existsSync(reportPath)) {
+      return {
+        ok: false,
+        status: "SEALED_FILE_MISSING",
+        message: `Report file missing: ${manifest.reportFile.path}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+      };
+    }
+    const reportBytes = readFileSync(reportPath);
+    const reportSha256 = createHash("sha256").update(reportBytes).digest("hex");
+    if (
+      reportSha256 !== manifest.reportFile.sha256 ||
+      reportBytes.length !== manifest.reportFile.bytes
+    ) {
+      return {
+        ok: false,
+        status: "EVIDENCE_INTEGRITY_MISMATCH",
+        message: `SHA-256 or byte length mismatch for report file: ${manifest.reportFile.path}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+      };
+    }
+  }
+
   // Load sealed evidence files
   const reportPath = path.join(evidenceDir, "diagnostic-report.json");
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
@@ -2728,27 +2979,9 @@ export function replayCandidateDecisionFromSealedEvidence(
   const bundlerPath = path.join(evidenceDir, "evidence", "bundler-provenance.json");
   const rugCheckPath = path.join(evidenceDir, "evidence", "rugcheck-report.json");
 
-  // Replay checks
-  if (
-    !existsSync(lpEvidencePath) ||
-    !existsSync(cutoffEvidencePath) ||
-    !existsSync(historyEvidencePath) ||
-    !existsSync(marketDataPath) ||
-    !existsSync(mintAccountPath)
-  ) {
-    return {
-      ok: false,
-      status: "INCOMPLETE_EVIDENCE_FOR_REPLAY",
-      message: "Required evidence files missing for complete decision replay",
-      poolId,
-      mintAddress,
-      verifiedFilesCount: fileVerifications.length,
-      fileVerifications,
-    };
-  }
-
   const lpEvidence = JSON.parse(readFileSync(lpEvidencePath, "utf8"));
   const sourceCutoff = JSON.parse(readFileSync(cutoffEvidencePath, "utf8"));
+  const historyEvidence = JSON.parse(readFileSync(historyEvidencePath, "utf8"));
   const marketDataEvidence = JSON.parse(readFileSync(marketDataPath, "utf8"));
   const mintAccountEvidence = JSON.parse(readFileSync(mintAccountPath, "utf8"));
 
@@ -2766,23 +2999,121 @@ export function replayCandidateDecisionFromSealedEvidence(
     };
   }
 
-  // Replay pre-admission screening
-  const lpBurnPct = lpEvidence.validationResult?.accounting?.displayInaccessiblePct;
-  const lpSecurityPassed =
-    Boolean(lpEvidence.validationResult?.accounting?.meetsNinetyPercentThreshold) &&
-    typeof lpBurnPct === "number" &&
-    lpBurnPct >= 90.0;
+  // Recompute pre-admission screening from raw evidence (NOT saved derived flags)
+  const poolState = lpEvidence.validationResult?.diagnostics?.poolState;
+  const lpMintState = lpEvidence.validationResult?.diagnostics?.lpMintState;
+  if (
+    !poolState ||
+    !lpMintState ||
+    poolState.lpReserve === undefined ||
+    lpMintState.supply === undefined
+  ) {
+    return {
+      ok: false,
+      status: "REPLAY_LP_EVIDENCE_INVALID",
+      message: "Missing raw poolState or lpMintState in LP evidence for replay recalculation",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
 
-  const mintAuthorityPassed =
-    mintAccountEvidence.candidateMintAccount?.mintAuthorityRenounced === true;
-  const freezeAuthorityPassed =
-    mintAccountEvidence.candidateMintAccount?.freezeAuthorityRenounced === true;
+  const recomputedLpAccounting = calculateAmmV4LpInaccessibleClaims(
+    BigInt(poolState.lpReserve),
+    BigInt(lpMintState.supply),
+  );
 
-  if (!lpSecurityPassed || !mintAuthorityPassed || !freezeAuthorityPassed) {
+  if (!recomputedLpAccounting.ok) {
     return {
       ok: false,
       status: "REPLAY_PRE_ADMISSION_FAILED",
-      message: "Pre-admission criteria not met during offline replay",
+      message: `LP claim calculation rejected [${recomputedLpAccounting.category}]: ${recomputedLpAccounting.message}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  const lpBurnPct = recomputedLpAccounting.displayInaccessiblePct;
+  const lpSecurityPassed =
+    recomputedLpAccounting.meetsNinetyPercentThreshold &&
+    typeof lpBurnPct === "number" &&
+    lpBurnPct >= 90.0;
+
+  // Recompute mint and freeze authorities using parseSolanaRpcMintAccountResponse and evaluateAuthorityEvidence
+  const rawMintResponse = mintAccountEvidence.rawMintResponse;
+  if (!rawMintResponse) {
+    return {
+      ok: false,
+      status: "REPLAY_MINT_EVIDENCE_INVALID",
+      message: "Missing rawMintResponse in mint account evidence for replay validation",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  const parsedMintRes = parseSolanaRpcMintAccountResponse(
+    rawMintResponse,
+    mintAddress as TokenMintAddress,
+    new Date(0),
+    "JSON_PARSED",
+  );
+
+  if (!parsedMintRes.ok) {
+    return {
+      ok: false,
+      status: "REPLAY_PRE_ADMISSION_FAILED",
+      message: `Candidate mint account parsing failed: ${parsedMintRes.message}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  const rawMintVal = (
+    rawMintResponse.result as {
+      value?: { data?: { parsed?: { info?: Record<string, unknown> } } };
+    }
+  )?.value;
+  const rawInfo = rawMintVal?.data?.parsed?.info;
+
+  const mintEval = evaluateAuthorityEvidence(rawInfo, "mintAuthority");
+  const freezeEval = evaluateAuthorityEvidence(rawInfo, "freezeAuthority");
+
+  const mintAuthorityPassed = mintEval.status === "DISABLED";
+  const freezeAuthorityPassed = freezeEval.status === "DISABLED";
+
+  if (!lpSecurityPassed || !mintAuthorityPassed || !freezeAuthorityPassed) {
+    let preAdmissionRejectionReason = "REJECTED_UNKNOWN";
+    if (!lpSecurityPassed) {
+      preAdmissionRejectionReason = "REJECTED_UNLOCKED_LP_RISK";
+    } else if (!freezeAuthorityPassed) {
+      if (freezeEval.status === "OMITTED") {
+        preAdmissionRejectionReason = "REJECTED_UNKNOWN_FREEZE_AUTHORITY";
+      } else if (freezeEval.status === "MALFORMED") {
+        preAdmissionRejectionReason = "REJECTED_MALFORMED_FREEZE_AUTHORITY";
+      } else {
+        preAdmissionRejectionReason = "REJECTED_ACTIVE_FREEZE_AUTHORITY";
+      }
+    } else if (!mintAuthorityPassed) {
+      if (mintEval.status === "OMITTED") {
+        preAdmissionRejectionReason = "REJECTED_UNKNOWN_MINT_AUTHORITY";
+      } else if (mintEval.status === "MALFORMED") {
+        preAdmissionRejectionReason = "REJECTED_MALFORMED_MINT_AUTHORITY";
+      } else {
+        preAdmissionRejectionReason = "REJECTED_ACTIVE_MINT_AUTHORITY";
+      }
+    }
+
+    return {
+      ok: false,
+      status: "REPLAY_PRE_ADMISSION_FAILED",
+      message: `Pre-admission criteria not met during offline replay: ${preAdmissionRejectionReason}`,
       poolId,
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
@@ -2864,6 +3195,26 @@ export function replayCandidateDecisionFromSealedEvidence(
     executionContext: report.executionContext,
   });
 
+  const auditMetadata = {
+    requests: manifest.requests ?? [],
+    observation: {
+      observationStartMs:
+        report.observationMetadata?.observationStartMs ?? sourceCutoff.cutoffTimestampMs - 60_000,
+      observationEndMs: report.observationMetadata?.observationEndMs ?? sourceCutoff.retrievedAtMs,
+      cutoffTimestampMs: sourceCutoff.cutoffTimestampMs,
+      notificationsReceived: report.observationMetadata?.notificationsReceived ?? 0,
+      keepaliveStats: report.keepaliveMetrics,
+    },
+    gapMetadata: {
+      flowCoverage: flowEvaluation?.flowCoverage,
+      isCoverageSufficient: flowEvaluation?.isCoverageSufficient,
+      diagnosticReason: flowEvaluation?.diagnosticReason,
+      historyRecordsCount: Array.isArray(historyEvidence?.records)
+        ? historyEvidence.records.length
+        : 0,
+    },
+  };
+
   return {
     ok: true,
     status: decisionResult.outcome,
@@ -2873,5 +3224,6 @@ export function replayCandidateDecisionFromSealedEvidence(
     verifiedFilesCount: fileVerifications.length,
     fileVerifications,
     decisionResult,
+    auditMetadata,
   };
 }

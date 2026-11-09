@@ -7,6 +7,8 @@ import {
   computeSha256,
   createStandaloneOneRequestBudget,
   createTransportResponseFromFetchResponse,
+  deepRedactSensitiveObject,
+  isSensitiveKeyName,
   parseBundlerCaptureArgs,
   SOLANA_TRACKER_DATA_API_BASE_URL,
   type HttpTransport,
@@ -1331,6 +1333,66 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
           }
           fsSync.rmSync(outDir, { recursive: true, force: true });
         }
+      });
+    });
+
+    describe("isSensitiveKeyName & deepRedactSensitiveObject narrow token exception tests", () => {
+      it("preserves exact public Solana SPL token field keys without redacting", () => {
+        const publicKeys = [
+          "tokenMint",
+          "candidateTokenMint",
+          "quoteTokenMint",
+          "baseMint",
+          "quoteMint",
+          "tokenAddress",
+          "baseToken",
+          "quoteToken",
+          "tokenMeta",
+          "tokenAmount",
+          "tokenAccount",
+          "tokenProgram",
+          "tokenDecimals",
+          "preTokenBalances",
+          "postTokenBalances",
+          "tokens",
+        ];
+
+        for (const k of publicKeys) {
+          expect(isSensitiveKeyName(k)).toBe(false);
+        }
+      });
+
+      it("strictly redacts secret-bearing suffixes and credential fields even with token prefixes", () => {
+        // Independent reproduction cases:
+        // - tokenMintApiKey retained a synthetic secret.
+        // - baseTokenPassword retained a synthetic password.
+        expect(isSensitiveKeyName("tokenMintApiKey")).toBe(true);
+        expect(isSensitiveKeyName("baseTokenPassword")).toBe(true);
+        expect(isSensitiveKeyName("tokenSecret")).toBe(true);
+        expect(isSensitiveKeyName("token")).toBe(true);
+        expect(isSensitiveKeyName("accessToken")).toBe(true);
+        expect(isSensitiveKeyName("authToken")).toBe(true);
+        expect(isSensitiveKeyName("apiKey")).toBe(true);
+        expect(isSensitiveKeyName("bearer")).toBe(true);
+      });
+
+      it("deepRedactSensitiveObject preserves public token fields while redacting secret-bearing fields", () => {
+        const payload = {
+          tokenMint: "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+          tokenMintApiKey: "synthetic-secret-key-12345",
+          baseToken: {
+            address: "So11111111111111111111111111111111111111112",
+            symbol: "SOL",
+          },
+          baseTokenPassword: "super-secret-password-xyz",
+        };
+
+        const sanitized = deepRedactSensitiveObject(payload);
+        expect(sanitized.tokenMint).toBe("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R");
+        expect(sanitized.tokenMintApiKey).toBe("[REDACTED]");
+        expect(sanitized.baseToken.address).toBe("So11111111111111111111111111111111111111112");
+        expect(sanitized.baseToken.symbol).toBe("SOL");
+        expect(sanitized.baseTokenPassword).toBe("[REDACTED]");
       });
     });
   });

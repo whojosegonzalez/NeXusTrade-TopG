@@ -428,29 +428,18 @@ export function buildEscapedSecretRegex(secret: string): RegExp {
  */
 export function isSensitiveKeyName(key: string): boolean {
   if (!key) return false;
-  const lower = key.toLowerCase();
-  if (
-    lower.includes("tokenmint") ||
-    lower.includes("tokendecimals") ||
-    lower.includes("tokenamount") ||
-    lower.includes("tokenaccount") ||
-    lower.includes("tokenaddress") ||
-    lower.includes("tokenmeta") ||
-    lower.includes("tokenbalance") ||
-    lower.includes("basetoken") ||
-    lower.includes("quotetoken")
-  ) {
-    return false;
-  }
   const tokens = key
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .toLowerCase()
-    .split(/[^a-z0-9]+/);
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 0);
 
+  if (tokens.length === 0) return false;
+
+  // 1. First, check if ANY credential/secret-bearing token exists anywhere in the key
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (
-      t === "token" ||
       t === "secret" ||
       t === "password" ||
       t === "passwd" ||
@@ -471,7 +460,51 @@ export function isSensitiveKeyName(key: string): boolean {
     if (t === "private" && i + 1 < tokens.length && tokens[i + 1] === "key") {
       return true;
     }
+    if (t === "access" && i + 1 < tokens.length && tokens[i + 1] === "key") {
+      return true;
+    }
+    if (
+      (t === "access" || t === "auth" || t === "session" || t === "jwt" || t === "refresh") &&
+      i + 1 < tokens.length &&
+      tokens[i + 1] === "token"
+    ) {
+      return true;
+    }
   }
+
+  // 2. Exact recognized public Solana / SPL token domain fields (without credential keywords)
+  const EXACT_PUBLIC_TOKEN_KEYS = new Set([
+    "tokenmint",
+    "candidatetokenmint",
+    "quotetokenmint",
+    "basemint",
+    "quotemint",
+    "tokenaddress",
+    "basetoken",
+    "quotetoken",
+    "tokenmeta",
+    "tokenamount",
+    "tokenaccount",
+    "tokenprogram",
+    "tokendecimals",
+    "pretokenbalances",
+    "posttokenbalances",
+    "tokens",
+  ]);
+
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (EXACT_PUBLIC_TOKEN_KEYS.has(normalized)) {
+    return false;
+  }
+
+  // 3. Any remaining standalone or auth-associated 'token' is sensitive
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "token") {
+      return true;
+    }
+  }
+
   return false;
 }
 

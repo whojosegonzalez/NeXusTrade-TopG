@@ -1031,6 +1031,7 @@ export function createBoundedFetchTransport(
 // ============================================================================
 
 export interface ISolanaKeepaliveWebSocketTransport extends ISolanaWebSocketTransport {
+  readyState?: number;
   ping?(data?: Buffer, cb?: (err?: Error) => void): void;
   terminate?(): void;
   destroy?(): void;
@@ -1096,6 +1097,10 @@ export class WsWebSocketTransport implements ISolanaKeepaliveWebSocketTransport 
     this.ws.on("ping", (data: Buffer) => {
       for (const listener of [...this.listeners.ping]) listener(data);
     });
+  }
+
+  public get readyState(): number {
+    return this.ws ? this.ws.readyState : 3 /* CLOSED */;
   }
 
   public getUnderlyingSocket(): unknown {
@@ -1315,6 +1320,16 @@ export class MeteredWebSocketTransport implements ISolanaKeepaliveWebSocketTrans
     if (typeof keepaliveInner.destroy === "function") {
       keepaliveInner.destroy();
     }
+  }
+
+  public get readyState(): number {
+    const raw = (this.inner as { readyState?: number }).readyState;
+    if (typeof raw === "number") return raw;
+    const sock = (
+      this.inner as { getUnderlyingSocket?: () => { readyState?: number } }
+    ).getUnderlyingSocket?.();
+    if (sock && typeof sock.readyState === "number") return sock.readyState;
+    return 3 /* CLOSED */;
   }
 
   public getUnderlyingSocket(): unknown {
