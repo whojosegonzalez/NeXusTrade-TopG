@@ -2899,3 +2899,24 @@ The operator ran the approved diagnostic on `85bded8018e8a2d4d86e57e3f1f2028e517
 **Interpretation**: a valid quiet-window result with the active option enabled. It is **not** live active-window qualification, and it does **not** validate the corrected stream-decode request-id path, because no transaction was retrieved. Production completeness remains unverified.
 
 **Next step (proposal only; requires separate operator approval)**: one diagnostic on a supported lead with higher historical turnover, using the reviewed command and unchanged limits. The provisional target is ACT (`B4PHSkL6CeZbxVqm1aUPQuVpc5ERFcaZj7u9dhtphmVX`), with at most one optional exact-pair activity check beforehand.
+
+#### ACT Precheck and Diagnostic (Second Quiet Capture)
+
+- **Precheck**: `data/research/prechecks/act-exact-pair-2026-11-09T17-19-13-796Z`, manifest `495a004a…10f1`.
+  - One GET, HTTP 200, 3,256 decoded bytes.
+  - Identity verified: Solana, Raydium, the exact pool, ACT (base) and WSOL (quote).
+  - Provider-reported five-minute activity: 1 buy, 9 sells, $1,019.18.
+  - `pairCreatedAt` is provider-reported only. The discovery capture's `openTime: "0"` does not establish the pool's age.
+- **Diagnostic**: `data/research/diagnostics/candidate-decision-act-active-2026-11-09T17-44-49-220Z`, manifest `07b56856de11cb314697de2cd3409c9bbf1953863f193472e9916f20546178d4`.
+  - All 24 listed files verify; there are no unlisted files.
+  - 11 HTTP attempts, all HTTP 200; minimum RPC spacing 2,503 ms.
+  - **0 notifications, 0 signatures since the witnessed anchor, 0 transaction retrievals → `QUIET_WINDOW`.**
+  - Keepalive: 3/3 pongs.
+  - Cutoff age at decision: 13,204 ms (margin 1,796 ms).
+  - Raw-account validation: 99.981423% inaccessible LP claims; mint and freeze authorities `DISABLED`.
+  - RugCheck: complete (208,746 decoded bytes); score 11,619, danger risk present, top-ten concentration 81.45115%.
+  - Decision: `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED`. Gate 11 also fails, on observed evidence. Replay matches.
+  - The wallet and earlier captures are unchanged.
+- **Timing caveat**: the precheck completed 1,536,517 ms (~25.6 min) before the diagnostic's first dispatch. Its five-minute counts did not describe activity immediately before the observation. No arrival probability is assigned without a validated model.
+
+**Status**: live active-window qualification and the corrected stream-decode request-id path remain **untested**. A precheck-to-diagnostic wrapper with a ≤ 30 s freshness gate has been prepared for review only (`.tmp/runbooks/act-precheck-and-diagnostic.ps1`). It allows at most 15 HTTP attempts in total: 1 precheck plus at most 14 diagnostic requests. The 1–15 five-minute range remains a heuristic only.
