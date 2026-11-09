@@ -11,6 +11,8 @@ import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import {
   CandidateDecisionDiagnostic,
+  DEFAULT_CAPACITY_PROFILE,
+  PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
   DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES,
   DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
   validateRugCheckDiagnosticOptions,
@@ -120,7 +122,10 @@ Options:
                     authority rejection; never admits a candidate. Default: serial after pre-admission.
   --paper-active-window
                     OPT-IN (requires --paper): qualify fully reconciled ACTIVE 60 s windows whose every in-window
-                    signature was resolved by the stream decode path within the unchanged 3-retrieval budget.
+                    signature was resolved by the stream decode path. Selects capacity profile
+                    PAPER_ACTIVE_WINDOW_20_9: 20 HTTP attempts, 9 transaction retrievals (at most 2 drain
+                    retrievals after the fixed 65 s nominal end), GET_SLOT within 5 s of that end, no retrieval
+                    after GET_SLOT. Default runs keep DEFAULT_14_3 (14 attempts, 3 retrievals).
                     PAPER research only; provider-relative assumptions; not production completeness.
   --help            Show this help text
 `);
@@ -183,9 +188,19 @@ Options:
   console.log(
     `Flow Policy:        ${
       paperActiveWindowFlow
-        ? "QUIET + ACTIVE-WINDOW PAPER qualification (OPT-IN; 3 shared transaction retrievals)"
+        ? "QUIET + ACTIVE-WINDOW PAPER qualification (OPT-IN)"
         : "QUIET-WINDOW PAPER qualification only (default)"
     }`,
+  );
+  const capacityProfile = paperActiveWindowFlow
+    ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE
+    : DEFAULT_CAPACITY_PROFILE;
+  console.log(
+    `Capacity Profile:   ${capacityProfile.id} (${capacityProfile.maxTotalRequests} HTTP attempts, ${capacityProfile.maxTransactionRetrievals} transaction retrievals, queue ceiling ${capacityProfile.queueCeiling}${
+      capacityProfile.cutoffDispatchWindowMs !== null
+        ? `, <= ${capacityProfile.maxDrainRetrievals} drain retrievals, GET_SLOT <= ${capacityProfile.cutoffDispatchWindowMs} ms after the fixed ${capacityProfile.nominalObservationMs} ms nominal observation end, no retrieval after GET_SLOT`
+        : ""
+    })`,
   );
   console.log("===============================================================================");
 
@@ -193,7 +208,7 @@ Options:
     console.log("[Dry-Run Preflight] Live execution flag (--live) omitted or --dry-run requested.");
     console.log("[Dry-Run Preflight] Validated canonical pool and token mint identities.");
     console.log(
-      "[Dry-Run Preflight] Maximum request ledger: 14 attempts max (Quiet path: <= 11 attempts).",
+      `[Dry-Run Preflight] Maximum request ledger: ${capacityProfile.maxTotalRequests} attempts max under ${capacityProfile.id} (Quiet path: <= 11 attempts).`,
     );
     console.log(
       "[Dry-Run Preflight] Unchanged limits: 2,500 ms RPC pacing, 10 s per request, 90 s overall, 15,000 ms evidence freshness, 1 request per purpose, no retries.",
@@ -237,7 +252,9 @@ Options:
   console.log(`Diagnostic Completed: ${result.ok ? "SUCCESS" : "REJECTED / FAILED"}`);
   console.log(`Status:               ${result.status}`);
   console.log(`Message:              ${result.message}`);
-  console.log(`Requests Dispatched:  ${result.ledger.totalAttempts} / 14 max`);
+  console.log(
+    `Requests Dispatched:  ${result.ledger.totalAttempts} / ${result.capacityProfile?.maxTotalRequests ?? capacityProfile.maxTotalRequests} max (${result.capacityProfile?.id ?? capacityProfile.id})`,
+  );
   if (result.outDir) {
     console.log(`Report Artifacts:     ${result.outDir}`);
   }

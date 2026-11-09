@@ -341,8 +341,9 @@ export interface CandidateDecisionDiagnosticOptions {
   readonly overlapRugCheckWithMintPacing?: boolean | undefined;
   /**
    * OPT-IN (PAPER_SIMULATION / BACKTEST only): qualify fully reconciled ACTIVE 60-second windows whose every
-   * in-window signature was resolved by the existing stream decode path (within the unchanged 3-retrieval
-   * budget). Omitted/false: quiet-window-only flow qualification (unchanged default).
+   * in-window signature was resolved by the existing stream decode path. Selects the PAPER_ACTIVE_WINDOW_20_9
+   * capacity profile (20 HTTP attempts, 9 retrievals, bounded pre-cutoff drain). Omitted/false: quiet-window-only
+   * flow qualification under the default 14/3 profile (unchanged default).
    */
   readonly paperActiveWindowFlow?: boolean | undefined;
 }
@@ -418,6 +419,119 @@ export function buildStreamResolutionRecords(
     });
   }
   return records;
+}
+
+/**
+ * Explicit diagnostic capacity profile. Replay accepts only the exact definitions below (never arbitrary numbers
+ * supplied by a capture). Default runs use DEFAULT_14_3; only the PAPER active-window opt-in selects 20/9.
+ */
+export interface DiagnosticCapacityProfile {
+  readonly id: "DEFAULT_14_3" | "PAPER_ACTIVE_WINDOW_20_9";
+  /** HTTP attempts across all providers. */
+  readonly maxTotalRequests: number;
+  /** TRANSACTION_DECODING retrievals, including drain retrievals. */
+  readonly maxTransactionRetrievals: number;
+  /** Retrievals dispatched at or after the fixed nominal observation end. */
+  readonly maxDrainRetrievals: number;
+  /** GET_SLOT must dispatch within this many ms of the nominal observation end (null: legacy, unbounded). */
+  readonly cutoffDispatchWindowMs: number | null;
+  /** Fixed nominal observation (null: configurable in default runs). */
+  readonly nominalObservationMs: number | null;
+  /** Fixed overall deadline (null: configurable in default runs). */
+  readonly overallDeadlineMs: number | null;
+  readonly queueCeiling: number;
+  readonly rpcPacingMs: number;
+  readonly cutoffFreshnessMs: number;
+}
+
+export const DEFAULT_CAPACITY_PROFILE: DiagnosticCapacityProfile = Object.freeze({
+  id: "DEFAULT_14_3",
+  maxTotalRequests: 14,
+  maxTransactionRetrievals: 3,
+  maxDrainRetrievals: 0,
+  cutoffDispatchWindowMs: null,
+  nominalObservationMs: null,
+  overallDeadlineMs: null,
+  queueCeiling: 10,
+  rpcPacingMs: 2500,
+  cutoffFreshnessMs: 15_000,
+});
+
+export const PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE: DiagnosticCapacityProfile = Object.freeze({
+  id: "PAPER_ACTIVE_WINDOW_20_9",
+  maxTotalRequests: 20,
+  maxTransactionRetrievals: 9,
+  maxDrainRetrievals: 2,
+  cutoffDispatchWindowMs: 5_000,
+  nominalObservationMs: 65_000,
+  overallDeadlineMs: 90_000,
+  queueCeiling: 10,
+  rpcPacingMs: 2500,
+  cutoffFreshnessMs: 15_000,
+});
+
+const SUPPORTED_CAPACITY_PROFILES: readonly DiagnosticCapacityProfile[] = Object.freeze([
+  DEFAULT_CAPACITY_PROFILE,
+  PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
+]);
+
+/**
+ * A projected retrieval dispatch within this guard of the nominal end is treated as a drain retrieval when
+ * reserving drain allowances, so pacing-sleep overshoot cannot turn it into an unreserved drain retrieval.
+ */
+const DRAIN_CLASSIFICATION_GUARD_MS = 250;
+
+/** RaydiumAmmV4TransactionSourceAdapter per-operation timeout ceiling (its default overallTimeoutMs). */
+const DEFAULT_ADAPTER_OPERATION_CEILING_MS = 60_000;
+
+/** Sealed timing evidence for the bounded (20/9) observation schedule. */
+export interface BoundedObservationSchedule {
+  readonly nominalObservationEndMs: number;
+  readonly getSlotDispatchDeadlineMs: number;
+  /** TRANSACTION_DECODING dispatched at or after the nominal end. */
+  readonly drainRetrievals: number;
+  /** Dispatched before the nominal end, completed at or after it (no extra allowance). */
+  readonly boundaryCrossingRetrievals: number;
+  readonly getSlotDispatchedAtMs: number | null;
+  /** TRANSACTION_DECODING dispatched at or after GET_SLOT dispatch (must be 0). */
+  readonly retrievalsAfterGetSlot: number;
+  readonly stopReason: string | null;
+}
+
+/** Derives schedule counts from ledger records (shared by sealing and replay). */
+export function deriveBoundedScheduleCounts(
+  records: readonly unknown[],
+  nominalObservationEndMs: number,
+): Pick<
+  BoundedObservationSchedule,
+  | "drainRetrievals"
+  | "boundaryCrossingRetrievals"
+  | "getSlotDispatchedAtMs"
+  | "retrievalsAfterGetSlot"
+> {
+  const recs = records.filter(
+    (r): r is { purpose: string; dispatchedAtMs: number; completedAtMs: number } =>
+      !!r &&
+      typeof r === "object" &&
+      typeof (r as { purpose?: unknown }).purpose === "string" &&
+      typeof (r as { dispatchedAtMs?: unknown }).dispatchedAtMs === "number" &&
+      typeof (r as { completedAtMs?: unknown }).completedAtMs === "number",
+  );
+  const tx = recs.filter((r) => r.purpose === "TRANSACTION_DECODING");
+  const getSlot = recs.find((r) => r.purpose === "GET_SLOT");
+  const getSlotDispatchedAtMs = getSlot ? getSlot.dispatchedAtMs : null;
+  return {
+    drainRetrievals: tx.filter((r) => r.dispatchedAtMs >= nominalObservationEndMs).length,
+    boundaryCrossingRetrievals: tx.filter(
+      (r) =>
+        r.dispatchedAtMs < nominalObservationEndMs && r.completedAtMs >= nominalObservationEndMs,
+    ).length,
+    getSlotDispatchedAtMs,
+    retrievalsAfterGetSlot:
+      getSlotDispatchedAtMs === null
+        ? 0
+        : tx.filter((r) => r.dispatchedAtMs >= getSlotDispatchedAtMs).length,
+  };
 }
 
 export interface CandidateDecisionDiagnosticResult {
@@ -503,6 +617,10 @@ export interface CandidateDecisionDiagnosticResult {
   readonly outDir?: string | undefined;
   readonly manifestDigestSha256?: string | undefined;
   writeError?: string | undefined;
+  /** Selected capacity profile (new captures; absent in historical captures = legacy 14/3 interpretation). */
+  readonly capacityProfile?: DiagnosticCapacityProfile | undefined;
+  /** Bounded observation timing evidence (PAPER_ACTIVE_WINDOW_20_9 runs that started observing). */
+  readonly observationSchedule?: BoundedObservationSchedule | undefined;
 }
 
 interface EarlyRugCheckHandle {
@@ -618,6 +736,13 @@ export class CandidateDecisionDiagnostic {
       })
     | null = null;
   private readonly paperActiveWindowFlow: boolean;
+  private readonly capacityProfile: DiagnosticCapacityProfile;
+  /** Bounded schedule base (set at observation start in 20/9 runs). */
+  private boundedScheduleBase: {
+    readonly nominalObservationEndMs: number;
+    readonly getSlotDispatchDeadlineMs: number;
+  } | null = null;
+  private boundedStopReason: string | null = null;
 
   constructor(options: CandidateDecisionDiagnosticOptions) {
     if (!options.poolId || !isCanonicalSolanaBase58(options.poolId)) {
@@ -722,10 +847,32 @@ export class CandidateDecisionDiagnostic {
       this.sensitiveTokens.push(this.solanaTrackerApiKey);
     }
 
-    // Configure diagnostic budget: max 14 attempts total, max 14 enrichment, 0 forward reservation, 2500ms pacing
+    // Capacity profile: the PAPER active-window opt-in selects 20/9 with a fixed 65 s observation and 90 s deadline;
+    // every other run keeps the default 14/3.
+    this.capacityProfile = this.paperActiveWindowFlow
+      ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE
+      : DEFAULT_CAPACITY_PROFILE;
+    if (
+      this.capacityProfile.nominalObservationMs !== null &&
+      this.observationDurationMs !== this.capacityProfile.nominalObservationMs
+    ) {
+      throw new Error(
+        `[DIAGNOSTIC_INVALID_ARG] ${this.capacityProfile.id} requires observationDurationMs ${this.capacityProfile.nominalObservationMs}; received ${this.observationDurationMs}`,
+      );
+    }
+    if (
+      this.capacityProfile.overallDeadlineMs !== null &&
+      this.overallTimeoutMs !== this.capacityProfile.overallDeadlineMs
+    ) {
+      throw new Error(
+        `[DIAGNOSTIC_INVALID_ARG] ${this.capacityProfile.id} requires overallTimeoutMs ${this.capacityProfile.overallDeadlineMs}; received ${this.overallTimeoutMs}`,
+      );
+    }
+
+    // Configure diagnostic budget from the selected profile (0 forward reservation, 2500 ms pacing)
     this.budgetManager = new GlobalResourceBudgetManager({
-      maxTotalRequests: 14,
-      maxEnrichmentAttempts: 14,
+      maxTotalRequests: this.capacityProfile.maxTotalRequests,
+      maxEnrichmentAttempts: this.capacityProfile.maxTotalRequests,
       minReservedForwardRequests: 0,
       minProviderSpacingMs: 2500,
       clock: this.clock,
@@ -738,6 +885,30 @@ export class CandidateDecisionDiagnostic {
 
   public getBudgetManager(): GlobalResourceBudgetManager {
     return this.budgetManager;
+  }
+
+  public getCapacityProfile(): DiagnosticCapacityProfile {
+    return this.capacityProfile;
+  }
+
+  /** Report fields for the selected profile and (bounded runs) the sealed observation schedule. */
+  private capacityReportFields(): Pick<
+    CandidateDecisionDiagnosticResult,
+    "capacityProfile" | "observationSchedule"
+  > {
+    const base = this.boundedScheduleBase;
+    return {
+      capacityProfile: this.capacityProfile,
+      ...(base
+        ? {
+            observationSchedule: {
+              ...base,
+              ...deriveBoundedScheduleCounts(this.ledger.records, base.nominalObservationEndMs),
+              stopReason: this.boundedStopReason,
+            },
+          }
+        : {}),
+    };
   }
 
   /**
@@ -811,6 +982,8 @@ export class CandidateDecisionDiagnostic {
     skipBudgetRecording?: boolean | undefined;
     overallDeadlineMs?: number | undefined;
     rpcRequestId?: string | number | undefined;
+    /** Latest permitted dispatch time, including any pacing wait (bounded cutoff dispatch). */
+    latestDispatchAtMs?: number | undefined;
   }): Promise<{
     ok: boolean;
     status: number;
@@ -831,6 +1004,7 @@ export class CandidateDecisionDiagnostic {
       skipBudgetRecording = false,
       overallDeadlineMs,
       rpcRequestId,
+      latestDispatchAtMs,
     } = params;
 
     // 0. Pre-flight fatal-stop, abort and deadline checks
@@ -853,6 +1027,20 @@ export class CandidateDecisionDiagnostic {
         this.clock(),
         "CANDIDATE_ENRICHMENT",
       );
+      if (
+        latestDispatchAtMs !== undefined &&
+        this.clock() +
+          (!check.allowed &&
+          check.reason === "PROVIDER_PACING_NOT_MET" &&
+          typeof check.waitMs === "number"
+            ? check.waitMs
+            : 0) >
+          latestDispatchAtMs
+      ) {
+        throw new Error(
+          `[CUTOFF_DISPATCH_WINDOW_EXCEEDED] ${purpose} cannot dispatch (including pacing) by ${latestDispatchAtMs}`,
+        );
+      }
       if (
         !check.allowed &&
         check.reason === "PROVIDER_PACING_NOT_MET" &&
@@ -879,6 +1067,11 @@ export class CandidateDecisionDiagnostic {
       if (!check.allowed) {
         throw new Error(
           `[BUDGET_DENIED] ${purpose} denied by GlobalResourceBudgetManager: ${check.reason}`,
+        );
+      }
+      if (latestDispatchAtMs !== undefined && this.clock() > latestDispatchAtMs) {
+        throw new Error(
+          `[CUTOFF_DISPATCH_WINDOW_EXCEEDED] ${purpose} pacing ended after the latest dispatch time ${latestDispatchAtMs}`,
         );
       }
 
@@ -1166,6 +1359,7 @@ export class CandidateDecisionDiagnostic {
     overallDeadlineMs?: number,
     /** Caller-owned JSON-RPC id forwarded on the wire (stream decode adapter verifies the echoed id). */
     requestId?: string | number,
+    latestDispatchAtMs?: number,
   ): Promise<{
     ok: boolean;
     status: number;
@@ -1192,6 +1386,7 @@ export class CandidateDecisionDiagnostic {
       signal,
       skipBudgetRecording,
       overallDeadlineMs,
+      ...(latestDispatchAtMs !== undefined ? { latestDispatchAtMs } : {}),
     });
 
     if (!res.ok) {
@@ -1730,7 +1925,8 @@ export class CandidateDecisionDiagnostic {
           ...(observationStartMs > 0 ? { keepaliveMetrics } : {}),
           telemetry: {
             schema: "STREAM_TELEMETRY_V1",
-            stopReason: streamLimitReason ?? null,
+            stopReason: streamLimitReason ?? this.boundedStopReason ?? null,
+            capacityProfile: this.capacityProfile.id,
             observation: {
               startMs: observationStartMs > 0 ? observationStartMs : null,
               endMs: observationEnd,
@@ -1747,7 +1943,7 @@ export class CandidateDecisionDiagnostic {
               schedulerStarted: keepaliveSchedulerStarted,
               missingPongDetected,
             },
-            transactionRetrievalCap: 3,
+            transactionRetrievalCap: this.capacityProfile.maxTransactionRetrievals,
             transactionDecodeAttempts: this.ledger.transactionDecodeAttempts,
             transactionRetrievals: retrievals,
             stagesNotReached,
@@ -1987,6 +2183,83 @@ export class CandidateDecisionDiagnostic {
 
       // Process incoming stream messages up to observation duration or limits
       const targetEnd = observationStartMs + this.observationDurationMs;
+
+      // Bounded schedule (PAPER_ACTIVE_WINDOW_20_9): fixed nominal end, GET_SLOT dispatch deadline, at most
+      // maxDrainRetrievals retrievals at/after the nominal end, and no retrieval after GET_SLOT.
+      const profile = this.capacityProfile;
+      const bounded = profile.cutoffDispatchWindowMs !== null;
+      const nominalObservationEndMs = targetEnd;
+      const getSlotDispatchDeadlineMs = targetEnd + (profile.cutoffDispatchWindowMs ?? 0);
+      if (bounded) {
+        this.boundedScheduleBase = { nominalObservationEndMs, getSlotDispatchDeadlineMs };
+      }
+      let boundedStop: { status: string; message: string } | null = null;
+      let drainRetrievalsReserved = 0;
+      // Conservative projected next Solana RPC dispatch: last recorded Solana dispatch + pacing.
+      const projectedSolanaDispatchMs = (now: number): number => {
+        let last = -Infinity;
+        for (const rec of this.ledger.records) {
+          if (rec.provider === "SOLANA_RPC" && rec.dispatchedAtMs > last) last = rec.dispatchedAtMs;
+        }
+        return Math.max(now, last + profile.rpcPacingMs);
+      };
+      const retrievalGate = ():
+        | { readonly allowed: true; readonly drain: boolean }
+        | { readonly allowed: false; readonly status: string; readonly reason: string } => {
+        const now = this.clock();
+        if (this.ledger.transactionDecodeAttempts >= profile.maxTransactionRetrievals) {
+          return {
+            allowed: false,
+            status: "TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED",
+            reason: `all ${profile.maxTransactionRetrievals} transaction retrievals used with notifications still pending`,
+          };
+        }
+        const projected = projectedSolanaDispatchMs(now);
+        // Reserve GET_SLOT pacing: the retrieval's own pacing wait plus one pacing interval must fit.
+        if (projected + profile.rpcPacingMs > getSlotDispatchDeadlineMs) {
+          return {
+            allowed: false,
+            status: "PRE_CUTOFF_BACKLOG_REMAINING",
+            reason: `a retrieval projected at ${projected} leaves no GET_SLOT pacing slot before ${getSlotDispatchDeadlineMs}`,
+          };
+        }
+        const drain = projected >= nominalObservationEndMs - DRAIN_CLASSIFICATION_GUARD_MS;
+        if (drain && drainRetrievalsReserved >= profile.maxDrainRetrievals) {
+          return {
+            allowed: false,
+            status: "PRE_CUTOFF_BACKLOG_REMAINING",
+            reason: `drain allowance of ${profile.maxDrainRetrievals} retrievals used`,
+          };
+        }
+        return { allowed: true, drain };
+      };
+      /** One bounded retrieval; returns a stop cause when timing or drain evidence is violated. */
+      const boundedRetrieve = async (
+        drain: boolean,
+      ): Promise<{ status: string; message: string } | null> => {
+        if (drain) drainRetrievalsReserved++;
+        const remaining = getSlotDispatchDeadlineMs - this.clock();
+        const streamResult = await coordinator!.processNextPending({
+          signal: overallController.signal,
+          // In-flight work (pacing wait, request, ingestion) is bounded by the GET_SLOT dispatch deadline.
+          overallTimeoutMs: Math.max(1, Math.min(DEFAULT_ADAPTER_OPERATION_CEILING_MS, remaining)),
+        });
+        if (streamResult) streamResults.push(streamResult);
+        const counts = deriveBoundedScheduleCounts(this.ledger.records, nominalObservationEndMs);
+        if (counts.drainRetrievals > profile.maxDrainRetrievals) {
+          return {
+            status: "PRE_CUTOFF_DRAIN_LIMIT_EXCEEDED",
+            message: `${counts.drainRetrievals} retrievals dispatched at or after the nominal observation end (limit ${profile.maxDrainRetrievals})`,
+          };
+        }
+        if (this.clock() > getSlotDispatchDeadlineMs) {
+          return {
+            status: "CUTOFF_DISPATCH_WINDOW_EXCEEDED",
+            message: `retrieval work ended at ${this.clock()}, after the GET_SLOT dispatch deadline ${getSlotDispatchDeadlineMs}`,
+          };
+        }
+        return null;
+      };
       while (
         this.clock() < targetEnd &&
         !overallController.signal.aborted &&
@@ -2016,8 +2289,29 @@ export class CandidateDecisionDiagnostic {
           break;
         }
 
-        // Drain any pending transaction decodes (up to 3 max attempts total)
-        while (adapter.getPendingQueueLength() > 0 && this.ledger.transactionDecodeAttempts < 3) {
+        if (bounded) {
+          // Bounded profile: observation-phase retrievals only; drain retrievals wait for the drain phase.
+          while (adapter.getPendingQueueLength() > 0 && !boundedStop) {
+            if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) break;
+            const gate = retrievalGate();
+            if (!gate.allowed) {
+              if (gate.status === "TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED") {
+                boundedStop = { status: gate.status, message: gate.reason };
+              }
+              break;
+            }
+            if (gate.drain) break;
+            boundedStop = await boundedRetrieve(false);
+          }
+          if (boundedStop) break;
+          continue;
+        }
+
+        // Drain any pending transaction decodes (up to the default 3 attempts total)
+        while (
+          adapter.getPendingQueueLength() > 0 &&
+          this.ledger.transactionDecodeAttempts < profile.maxTransactionRetrievals
+        ) {
           if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) break;
           const streamResult = await coordinator.processNextPending({
             signal: overallController.signal,
@@ -2025,8 +2319,49 @@ export class CandidateDecisionDiagnostic {
           if (streamResult) streamResults.push(streamResult);
         }
       }
-      if (!streamLimitReason && observationStartMs > 0) {
+      if (!streamLimitReason && !boundedStop && observationStartMs > 0) {
         observationLoopEndedAtMs = this.clock();
+      }
+
+      // Bounded pre-cutoff drain: resolve the remaining backlog within the drain allowance, then wait for the
+      // GET_SLOT pacing slot with an empty backlog. GET_SLOT must dispatch by its deadline; never with backlog.
+      while (bounded && !boundedStop && !streamLimitReason) {
+        if (this.keepalive) checkKeepalive(this.clock());
+        checkQueueLimit();
+        if (streamLimitReason) break;
+        if (overallController.signal.aborted || this.clock() >= overallDeadlineMs) break;
+        const now = this.clock();
+        const pacingWaitMs = projectedSolanaDispatchMs(now) - now;
+        if (now + pacingWaitMs > getSlotDispatchDeadlineMs) {
+          boundedStop = {
+            status: "CUTOFF_DISPATCH_WINDOW_EXCEEDED",
+            message: `GET_SLOT cannot dispatch (including pacing) by ${getSlotDispatchDeadlineMs}`,
+          };
+          break;
+        }
+        if (adapter.getPendingQueueLength() === 0 && adapter.getInFlightCount() === 0) {
+          if (pacingWaitMs <= 0) break; // backlog empty and pacing satisfied: dispatch GET_SLOT now
+          await this.sleepWithAbort(pacingWaitMs, overallController.signal);
+          continue; // re-check for notifications that arrived during the pacing wait
+        }
+        const gate = retrievalGate();
+        if (!gate.allowed) {
+          boundedStop = {
+            status: gate.status,
+            message: `${adapter.getPendingQueueLength()} notification(s) unresolved before cutoff: ${gate.reason}`,
+          };
+          break;
+        }
+        boundedStop = await boundedRetrieve(gate.drain);
+      }
+      if (boundedStop) {
+        this.boundedStopReason = boundedStop.status;
+        cleanupKeepalive();
+        captureBeforeCleanup(`BOUNDED_STOP:${boundedStop.status}`);
+        coordinator.close();
+        return this.finishWithFailureSettled(boundedStop.status, boundedStop.message, {
+          provisionalContext,
+        });
       }
 
       if (this.keepalive) checkKeepalive(this.clock());
@@ -2064,6 +2399,8 @@ export class CandidateDecisionDiagnostic {
         overallController.signal,
         false,
         overallDeadlineMs,
+        undefined,
+        bounded ? getSlotDispatchDeadlineMs : undefined,
       );
 
       if (this.keepalive) checkKeepalive(this.clock());
@@ -2268,6 +2605,7 @@ export class CandidateDecisionDiagnostic {
         // Each transaction response is sealed once under responses/; this evidence links signatures to it.
         this.retainedActiveWindowEvidence = {
           policy: "PAPER_ACTIVE_WINDOW",
+          capacityProfile: this.capacityProfile.id,
           failedTransactionPolicy: PAPER_FAILED_TRANSACTION_POLICY,
           executionContext: this.executionContext,
           expectedConnectionEpoch: coordinator.getConnectionEpoch(),
@@ -3153,8 +3491,14 @@ export class CandidateDecisionDiagnostic {
         this.clock() >= overallDeadlineMs ||
         msg.includes("OVERALL_DIAGNOSTIC_TIMEOUT") ||
         msg.includes("REQUEST_TIMEOUT");
+      const isCutoffWindow = msg.includes("[CUTOFF_DISPATCH_WINDOW_EXCEEDED]");
+      if (isCutoffWindow) this.boundedStopReason = "CUTOFF_DISPATCH_WINDOW_EXCEEDED";
       return await this.finishWithFailureSettled(
-        isTimeout ? "OVERALL_DIAGNOSTIC_TIMEOUT" : "UNHANDLED_EXCEPTION",
+        isCutoffWindow
+          ? "CUTOFF_DISPATCH_WINDOW_EXCEEDED"
+          : isTimeout
+            ? "OVERALL_DIAGNOSTIC_TIMEOUT"
+            : "UNHANDLED_EXCEPTION",
         msg,
       );
     } finally {
@@ -3318,6 +3662,7 @@ export class CandidateDecisionDiagnostic {
         ? { observationMetadata: finalized.observationMetadata }
         : {}),
       ...(finalized?.keepaliveMetrics ? { keepaliveMetrics: finalized.keepaliveMetrics } : {}),
+      ...this.capacityReportFields(),
       ...partialData,
     };
     try {
@@ -3344,6 +3689,7 @@ export class CandidateDecisionDiagnostic {
       executionContext: this.executionContext,
       ledger: this.ledger,
       ...(this.outDir !== undefined ? { outDir: this.outDir } : {}),
+      ...this.capacityReportFields(),
       ...data,
     };
     try {
@@ -3726,6 +4072,8 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
   conversionTimestampMs: number;
   poolId: string;
   mintAddress: string;
+  /** Validated capacity profile budget (legacy captures: 14). */
+  maxTotalRequests: number;
 }): { ok: true; value: CandidateDecisionReplayActiveWindow } | { ok: false; reason: string } {
   const executionContext = params.report.executionContext;
   if (executionContext !== "PAPER_SIMULATION" && executionContext !== "BACKTEST") {
@@ -4026,8 +4374,8 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
     resolvedSignatures: resolutions,
     trades,
     budgetManager: new GlobalResourceBudgetManager({
-      maxTotalRequests: 14,
-      maxEnrichmentAttempts: 14,
+      maxTotalRequests: params.maxTotalRequests,
+      maxEnrichmentAttempts: params.maxTotalRequests,
       minReservedForwardRequests: 0,
       minProviderSpacingMs: 2500,
       clock: () => params.originalEvaluationTimestampMs,
@@ -4197,6 +4545,126 @@ export interface CandidateDecisionReplayResult {
 }
 
 const REPLAY_MAX_CUTOFF_AGE_MS = 15_000;
+
+/**
+ * Validates the sealed capacity profile and (bounded profile) observation-schedule evidence. Captures without a
+ * profile keep their historical interpretation (legacy 14/3). Only exact supported profiles are accepted; ledger
+ * totals and retrieval counts must respect the selected ceilings; drain and cutoff timing is re-derived from the
+ * ledger and must match the sealed schedule.
+ */
+function validateSealedCapacityEvidence(
+  report: Record<string, unknown>,
+  activeEvidence: Record<string, unknown> | null,
+): { ok: true; profile: DiagnosticCapacityProfile | null } | { ok: false; reason: string } {
+  const fail = (reason: string) => ({ ok: false as const, reason });
+  const sealedProfile = report.capacityProfile;
+  if (sealedProfile === undefined) {
+    if (report.observationSchedule !== undefined) {
+      return fail("observation schedule sealed without a capacity profile");
+    }
+    if (activeEvidence && activeEvidence.capacityProfile !== undefined) {
+      return fail("active-window evidence names a capacity profile the report does not seal");
+    }
+    return { ok: true, profile: null };
+  }
+  const profile = SUPPORTED_CAPACITY_PROFILES.find(
+    (p) => canonicalJson(p) === canonicalJson(sealedProfile),
+  );
+  if (!profile) return fail("sealed capacity profile is unsupported or internally inconsistent");
+  const bounded = profile.cutoffDispatchWindowMs !== null;
+  if (
+    bounded &&
+    report.executionContext !== "PAPER_SIMULATION" &&
+    report.executionContext !== "BACKTEST"
+  ) {
+    return fail(`${profile.id} requires a PAPER_SIMULATION or BACKTEST capture`);
+  }
+  if (activeEvidence) {
+    if (activeEvidence.capacityProfile !== profile.id) {
+      return fail(
+        `active-window evidence profile (${String(activeEvidence.capacityProfile)}) contradicts the report (${profile.id})`,
+      );
+    }
+    if (!bounded)
+      return fail("active-window evidence requires the PAPER_ACTIVE_WINDOW_20_9 profile");
+  }
+
+  // Ledger totals and retrieval counts against the selected ceilings.
+  const ledger = report.ledger as
+    | { records?: unknown; totalAttempts?: unknown; transactionDecodeAttempts?: unknown }
+    | undefined;
+  const records = Array.isArray(ledger?.records) ? (ledger.records as unknown[]) : null;
+  if (!records) return fail("sealed ledger has no records array");
+  const purposeOf = (r: unknown) =>
+    r && typeof r === "object" ? (r as { purpose?: unknown }).purpose : undefined;
+  const txCount = records.filter((r) => purposeOf(r) === "TRANSACTION_DECODING").length;
+  if (
+    ledger?.totalAttempts !== records.length ||
+    records.length > profile.maxTotalRequests ||
+    ledger?.transactionDecodeAttempts !== txCount ||
+    txCount > profile.maxTransactionRetrievals
+  ) {
+    return fail(
+      `ledger totals (${String(ledger?.totalAttempts)} attempts, ${records.length} records, ${txCount} retrievals) contradict or exceed ${profile.id} (${profile.maxTotalRequests}/${profile.maxTransactionRetrievals})`,
+    );
+  }
+
+  const schedule = report.observationSchedule as Record<string, unknown> | undefined;
+  if (!bounded) {
+    return schedule === undefined
+      ? { ok: true, profile }
+      : fail("observation schedule sealed under an unbounded profile");
+  }
+  const hasObservationWork = records.some(
+    (r) => purposeOf(r) === "TRANSACTION_DECODING" || purposeOf(r) === "GET_SLOT",
+  );
+  if (schedule === undefined) {
+    return hasObservationWork
+      ? fail("bounded capture with retrievals or a cutoff lacks its observation schedule")
+      : { ok: true, profile };
+  }
+  const obsStart = (report.observationMetadata as { observationStartMs?: unknown } | undefined)
+    ?.observationStartMs;
+  const nominalEnd = schedule.nominalObservationEndMs;
+  if (
+    asPositiveSafeInteger(obsStart) === null ||
+    nominalEnd !== (obsStart as number) + (profile.nominalObservationMs as number) ||
+    schedule.getSlotDispatchDeadlineMs !==
+      (nominalEnd as number) + (profile.cutoffDispatchWindowMs as number)
+  ) {
+    return fail(
+      "observation schedule does not match the observation start and the profile windows",
+    );
+  }
+  const derived = deriveBoundedScheduleCounts(records, nominalEnd as number);
+  for (const key of Object.keys(derived) as Array<keyof typeof derived>) {
+    if (schedule[key] !== derived[key]) {
+      return fail(
+        `sealed ${key} (${String(schedule[key])}) contradicts the ledger (${String(derived[key])})`,
+      );
+    }
+  }
+  if (derived.drainRetrievals > profile.maxDrainRetrievals) {
+    return fail(`${derived.drainRetrievals} drain retrievals exceed ${profile.maxDrainRetrievals}`);
+  }
+  if (derived.retrievalsAfterGetSlot !== 0) {
+    return fail("a transaction retrieval was dispatched at or after GET_SLOT");
+  }
+  if (
+    derived.getSlotDispatchedAtMs !== null &&
+    derived.getSlotDispatchedAtMs > (schedule.getSlotDispatchDeadlineMs as number)
+  ) {
+    return fail("GET_SLOT dispatched after its deadline");
+  }
+  const stopReason = schedule.stopReason;
+  if (stopReason !== null && (typeof stopReason !== "string" || report.status !== stopReason)) {
+    return fail("sealed schedule stop reason contradicts the recorded status");
+  }
+  if (stopReason !== null && derived.getSlotDispatchedAtMs !== null) {
+    return fail("a bounded stop is recorded although GET_SLOT was dispatched");
+  }
+  return { ok: true, profile };
+}
 
 function asNonNegativeSafeInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -4512,6 +4980,31 @@ export function replayCandidateDecisionFromSealedEvidence(
   // Load sealed evidence files
   const reportPath = path.join(evidenceDir, "diagnostic-report.json");
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
+
+  const capacityActiveRel = "evidence/active-window-evidence.json";
+  const capacityCheck = validateSealedCapacityEvidence(
+    report as Record<string, unknown>,
+    verifiedFilesSet.has(capacityActiveRel)
+      ? (JSON.parse(readFileSync(path.join(evidenceDir, capacityActiveRel), "utf8")) as Record<
+          string,
+          unknown
+        >)
+      : null,
+  );
+  if (!capacityCheck.ok) {
+    return {
+      ok: false,
+      status: "REPLAY_CAPACITY_EVIDENCE_INVALID",
+      message: `Capacity profile evidence rejected: ${capacityCheck.reason}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+    };
+  }
+  const replayMaxTotalRequests =
+    capacityCheck.profile?.maxTotalRequests ?? DEFAULT_CAPACITY_PROFILE.maxTotalRequests;
 
   const lpEvidencePath = path.join(evidenceDir, "evidence", "lp-evidence.json");
   const cutoffEvidencePath = path.join(evidenceDir, "evidence", "cutoff-evidence.json");
@@ -4936,6 +5429,7 @@ export function replayCandidateDecisionFromSealedEvidence(
           conversionTimestampMs: recordedDecisionTimeMs,
           poolId,
           mintAddress,
+          maxTotalRequests: replayMaxTotalRequests,
         })
       : ({ ok: false, reason: `Verified ${activeRel} is required` } as const);
 

@@ -2972,7 +2972,7 @@ Four short samples from one pool on one day support no general rate, no arrival 
   - `2wFhQ99L…` (slot 467437817): one candidate-bound RAY **BUY**.
   - `4M6d5JsS…` (slot 467437834): one candidate-bound RAY **BUY**.
   - `4wfCxFpR…` (slot 467437834): `meta.err = InstructionError [1, Custom 30]`, rejected by the decoder as **failed on-chain** (`TRANSACTION_FAILED`).
-- **Termination**: `STREAM_QUEUE_LIMIT_EXCEEDED`, with the pending queue reaching 10 within about 10 s of observation. Cutoff, history and LP screening were never reached. The observation, keepalive and per-signature adapter outcomes were not recorded by that build.
+- **Termination**: `STREAM_QUEUE_LIMIT_EXCEEDED`, with the pending queue reaching 10 after the third retrieval (+10.0 s) and before sealing (+37.4 s); notification timestamps were not retained (corrected in §8.23). Cutoff, history and LP screening were never reached. The observation, keepalive and per-signature adapter outcomes were not recorded by that build.
 - **Replay**: full replay is **unavailable** and fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because the required later-stage evidence was never acquired. This is **not** a successful replay of the original termination; the recorded `STREAM_QUEUE_LIMIT_EXCEEDED` is preserved only in the sealed report. Nothing is synthesized. The wallet is unchanged.
 - **Historical evidence check** (independent review of `160fc12`): all manifest-listed files across **9 diagnostic captures (199 files in total)** verify, and the frozen wallet hash matches.
 
@@ -3002,7 +3002,7 @@ Every Solana RPC ledger record now carries `rpcRequestId` and the observed `rpcR
 - **Request budget**: with 11 base requests, the 14-request ceiling leaves exactly 3 retrievals.
 - **Freshness (measured margins)**: the five quiet runs reached decision at cutoff ages of 13,426, 13,321, 13,204, 12,651 and 12,095 ms, leaving margins of 1,574–2,905 ms under the 15,000 ms ceiling. One post-cutoff retrieval adds at least the 2,500 ms Solana RPC pacing plus its latency, delaying every later paced request. It would have exceeded the ceiling in four of these runs and fit only narrowly in the run with the largest margin (2,905 ms), and only if its latency stayed under about 400 ms. Post-cutoff retrieval capacity is therefore marginal and run-dependent, not universally impossible.
 - **What can qualify**: under these measured margins, a qualifying active window realistically needs at most 3 notifications across the whole ~65 s observation, decoded before the cutoff. A known failed transaction still consumes one HTTP attempt and one retrieval.
-- **Observed bursts exceed this**: RAY reached at least 13 notifications in about 10 s; ACT showed 15 signatures in 30 s.
+- **Observed bursts exceed this**: RAY reached at least 13 notifications before its stop (timing within the run not retained; corrected in §8.23); ACT showed 15 signatures in 30 s.
 - **Failed transactions also block qualification**: the existing adapter treats an on-chain-failed transaction as a decode failure, recording a loss gap and an unresolved signature. Any window containing one cannot qualify, even though a failed transaction executes no swap. Failed rows made up 1 of 3 RAY retrievals and 1–17 of 20 rows in the ACT history pages.
 
 Any higher ceiling, or a change in failed-transaction semantics, remains a separate proposal.
@@ -3156,9 +3156,9 @@ An independent review reproduced two gaps in `f5bb456`. §8.22 as first written 
 
 Limits, PAPER boundaries, budgets, pacing, freshness, thresholds and the wallet are unchanged. No live capture has exercised this path.
 
-### 8.23 Bounded Capacity Proposal for a Complete Active 60-Second Window (Offline Analysis, Not Implemented)
+### 8.23 Bounded Capacity Proposal for a Complete Active 60-Second Window (Offline Analysis; Implemented Offline in §8.23a)
 
-This is a proposal for review only. No limit has changed, the failed-transaction policy has not been run live, and no capture was made. All figures come from the 9 sealed diagnostic captures, the 3 ACT prechecks, their request ledgers, and source (`CandidateDecisionDiagnostic.ts`, `RaydiumAmmV4TransactionSourceAdapter.ts`, `ExactPoolWindowReconciliationEvaluator.ts`).
+This section was written as a proposal for review. The operator then approved an offline implementation, recorded in §8.23a, and the claims below were corrected after review (RAY rate, timing estimate, coverage wording). The failed-transaction policy and the 20/9 profile have not been run live, and no capture was made. All figures come from the 9 sealed diagnostic captures, the 3 ACT prechecks, their request ledgers, and source (`CandidateDecisionDiagnostic.ts`, `RaydiumAmmV4TransactionSourceAdapter.ts`, `ExactPoolWindowReconciliationEvaluator.ts`).
 
 #### 1. Recommended Configuration (PAPER active-window opt-in only)
 
@@ -3214,7 +3214,15 @@ The baseline timings below are **measured**, from the five current-build runs wi
 **Deadline**:
 
 - Measured last completion at 80.51–80.75 s, leaving 9.2 s of slack.
-- Proposed worst case: 72.9 s plus the slowest measured post-`GET_SLOT` chain of 14.05 s (an earlier non-overlapped build) gives **86.9 s < 90 s**.
+- **Illustrative estimate, not a worst-case guarantee**: `GET_SLOT` at its latest (about 72.9 s) plus the slowest measured post-`GET_SLOT` chain (14.05 s, an earlier non-overlapped build) gives about **86.9 s**, under 90 s.
+- **What the estimate excludes**:
+  - setup before `POOL_LAYOUT`;
+  - response parsing, decoding and reconciliation time;
+  - evidence finalization and sealing, which take place after the last request;
+  - provider latency beyond the measured samples.
+
+  None of these is bounded by measurement here. The enforced guarantees are the ones the implementation checks: the 90 s overall deadline (the run stops with `OVERALL_DIAGNOSTIC_TIMEOUT`), the `GET_SLOT` dispatch deadline, and the 15,000 ms cutoff freshness check.
+
 - A third drain slot would leave about 0.6 s, so it is excluded.
 
 #### 3. Measured Rates (Observations) vs Assumptions
@@ -3230,7 +3238,7 @@ The baseline timings below are **measured**, from the five current-build runs wi
   - **All 6 runs with a recorded notification count had 0 notifications** (ACT ×3, Fartcoin ×3).
   - The earlier-build Fartcoin 05:54 run retrieved 1 transaction (≥ 1 notification).
   - The earlier-build RAY 02:01 run did not record notifications.
-  - RAY/WSOL at 19:38 had **≥ 13 notifications in ≈ 10 s** (3 retrieved plus a pending queue of 10), i.e. ≥ 1.3/s.
+  - RAY/WSOL at 19:38: 3 retrievals were dispatched at about +5.0, +7.5 and +10.0 s, and the run stopped with `STREAM_QUEUE_LIMIT_EXCEEDED` (pending queue of 10). The manifest was sealed at about +37.4 s, and notification timestamps were not retained. The evidence therefore establishes only **at least 13 notifications before the stop (by about +37 s)**. It does **not** establish 13 notifications in 10 s, and it supports no sustained-rate conclusion.
 - **History pages** (each the 20 most recent signatures, provider-relative):
   - maximum 13–19 signatures in 10 s for busy pages (ACT 17:40, Fartcoin 05:5x and 10:39);
   - covered spans of 93–972 s;
@@ -3246,13 +3254,13 @@ The baseline timings below are **measured**, from the five current-build runs wi
   | 10–14                  | 6%                 |
   | 15+                    | 1%                 |
 
-  Among non-empty spans, the current 3-retrieval cap covers 58%, and 9 retrievals would cover **86%**.
+  Descriptively, among the non-empty sampled spans, 58% held ≤ 3 signatures and 86% held ≤ 9. These are statistics of biased historical samples, **not** forecasts or success probabilities for future windows.
 
 - **Five-minute summaries do not predict the next window**: ACT prechecks reported `txns5m` of 10, 4 and 13, yet the following windows had 0 notifications. DexScreener swap counts (≤ 13 per 5 min) also differ from on-chain pool signatures, which include failed and non-swap transactions.
 
 **Assumptions (not established)**:
 
-- **Sampling bias**: the overlapping spans are correlated, and pages end at their newest row, so they exclude the quiet tail before each cutoff and overstate activity. Live windows were quieter: only 1 of the 7 observations with known activity was non-empty. The 86% figure is an upper-bound guide, not a probability.
+- **Sampling bias**: the overlapping spans are correlated, and pages end at their newest row, so they exclude the quiet tail before each cutoff and overstate activity. Live windows were quieter: only 1 of the 7 observations with known activity was non-empty. The 58% and 86% figures describe the sample only and must not be read as expected pass rates.
 - **Arrival model for the tail estimate**: Poisson arrivals. Real activity is bursty.
 - **Tail exposure**: about 2 s (the `GET_SLOT` flight, confirmed block-time granularity and the 0.1–1.6 s notification lag). This is derived, not measured as a distribution.
 
@@ -3272,12 +3280,12 @@ The baseline timings below are **measured**, from the five current-build runs wi
 - **Must reject (fail closed, never zero counts)**:
   1. The 10th notification: retrieval budget exhausted, or the pending/workload ceiling reached. The window is unqualified.
   2. Notifications still pending after the 2 drain slots: `GET_SLOT` is not issued with an unresolved backlog, and the window is unqualified.
-  3. An in-window signature notified after `GET_SLOT` dispatch (the tail), or missing from the stream: `UNRESOLVED_TRANSACTIONS`. The estimated miss probability under the Poisson assumption is about 1 − e^(−2k/65): about 9% at k = 3 and about 24% at k = 9.
+  3. An in-window signature notified after `GET_SLOT` dispatch (the tail), or missing from the stream: `UNRESOLVED_TRANSACTIONS`. As an illustration only (assuming Poisson arrivals and about 2 s of exposure, neither measured), 1 − e^(−2k/65) gives about 9% at k = 3 and about 24% at k = 9.
   4. More than 19 signatures after the anchor before `HISTORY_ENUMERATION`: the anchor is not witnessed.
   5. A recorded gap, epoch change, missing pong, stale cutoff (> 15 s) or the 90 s deadline.
 - **Observed bursts are out of scope at 2,500 ms pacing**:
   - **ACT/Fartcoin bursts (19 in 10 s)**: these leave 15 pending after 10 s, which exceeds the queue. Clearing them would need a queue of ≥ 16, ≥ 19 retrievals (≥ 30 HTTP attempts in total) and 47.5 s of drain, and only if the burst began within about the first 20 s.
-  - **RAY at ≥ 1.3/s**: this exceeds the 0.4/s service rate, so the backlog grows by ≥ 0.9/s without bound for any budget or queue size.
+  - **Sustained rates above the service rate**: any sustained arrival rate above the 0.4/s pacing-limited service rate grows the backlog without bound, for any budget or queue size. The sealed evidence does not show that RAY/WSOL (or any sealed pool) sustains such a rate.
   - **Conclusion**: no existing component can complete such windows within unchanged pacing and freshness. Post-cutoff resolution through the existing bridge breaks the 15 s ceiling. These windows correctly stay unqualified, and the proposal does not target them. No paid provider is assumed.
 
 #### 5. Fixed Target and Pass/Fail Criteria
@@ -3287,7 +3295,7 @@ The baseline timings below are **measured**, from the five current-build runs wi
 - It has 3 verified quiet captures, sealed history with sparse activity, and a high failed-transaction share that exercises the accepted failed-transaction path.
 - Run it with the PAPER active-window opt-in and the accepted RugCheck options.
 - Make at most **5 separately authorized operator runs**, stopping at the first pass, with no automatic reruns. A quiet result is a valid non-result, not a defect.
-- RAY/WSOL is excluded (rate above service capacity).
+- RAY/WSOL is not the target. Its only active capture overflowed the unchanged queue during observation, and its notification rate is unknown.
 
 **PASS (complete active-window qualification)** requires all of:
 
@@ -3308,10 +3316,75 @@ The baseline timings below are **measured**, from the five current-build runs wi
 
 **Defects (block acceptance)**: any qualified flow despite an unresolved signature, gap or backlog; any post-cutoff retrieval; any limit or pacing violation; any replay mismatch or unverifiable file.
 
-**Implementation scope if approved** (separate review, offline tests first; nothing implemented now):
+**Implementation**: completed offline after operator approval; see §8.23a. The 86.9 s figure is not tested as a bound. The tests check the enforced deadlines instead.
 
-- the opt-in-only 20/9 limits;
-- the bounded pre-cutoff drain with an explicit stop reason;
-- sealing the limits;
-- replay reading the sealed budget;
-- short mocked tests for burst/drain/tail rejection and for the 86.9 s deadline bound.
+#### 8.23a Offline Implementation of the 20/9 Capacity Profile (Operator-Approved; Not Run Live)
+
+**Profile selection** (`CandidateDecisionDiagnostic.ts`):
+
+| Profile                    | Selected by                     | HTTP attempts | Retrievals         | Drain | GET_SLOT window                  | Observation / deadline   |
+| -------------------------- | ------------------------------- | ------------- | ------------------ | ----- | -------------------------------- | ------------------------ |
+| `DEFAULT_14_3`             | every run without the opt-in    | 14            | 3                  | —     | legacy (unbounded)               | configurable             |
+| `PAPER_ACTIVE_WINDOW_20_9` | PAPER active-window opt-in only | 20            | 9 (drain included) | ≤ 2   | ≤ 5,000 ms after the nominal end | fixed 65,000 / 90,000 ms |
+
+- Both profiles keep a queue ceiling of 10, 2,500 ms pacing and 15,000 ms freshness, and strategy thresholds are unchanged.
+- The 20/9 profile rejects any other observation duration or overall deadline at construction.
+- The selected profile is sealed in every new report (`capacityProfile`). An opted-in run that observes a quiet window reports 20/9, and stream telemetry reports the profile's retrieval cap. Nothing reverts to 14/3.
+- The default profile keeps the existing observation loop unchanged.
+
+**Bounded schedule (20/9 only)**:
+
+- **Nominal end**: fixed at observation start + 65,000 ms. The `GET_SLOT` dispatch deadline is the nominal end + 5,000 ms.
+- **Retrieval gate**: before each retrieval, the gate projects the paced dispatch time from the last recorded Solana RPC dispatch. It refuses the retrieval when:
+  - all 9 retrievals are used (the run stops with `TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED`);
+  - the projected dispatch plus one 2,500 ms pacing interval would pass the `GET_SLOT` deadline (the `GET_SLOT` pacing reserve);
+  - a drain retrieval (projected within 250 ms of the nominal end or later) would exceed the 2-retrieval drain allowance.
+- **Observation phase**: only observation-phase retrievals are dispatched. The inner loop can no longer extend observation.
+- **In-flight work**: each retrieval's pacing wait, request and ingestion are bounded by the `GET_SLOT` deadline through the adapter's existing per-operation deadline.
+- **Boundary crossing**: a retrieval dispatched before the nominal end that completes after it is recorded as a boundary-crossing retrieval. It counts once against the 9 and grants no drain allowance.
+- **Drain phase**: after the loop, remaining notifications are retrieved within the allowance. `GET_SLOT` is then dispatched only once the backlog is empty and its pacing slot has arrived, re-checking for notifications that arrived during the pacing wait.
+- **Explicit unavailable results**: a backlog that cannot be resolved stops with `PRE_CUTOFF_BACKLOG_REMAINING`. Work ending after the deadline stops with `CUTOFF_DISPATCH_WINDOW_EXCEEDED`, and so does a `GET_SLOT` dispatch, pacing wait included, that would pass the deadline. A defensive drain-count check stops with `PRE_CUTOFF_DRAIN_LIMIT_EXCEEDED`. Pacing is never bypassed, and no cutoff is acquired with a backlog.
+- **After `GET_SLOT`**: no retrieval is dispatched. A later in-window signature stays unresolved and blocks qualification.
+- **Unchanged**: first-cause reporting, exactly-once accounting, keepalive, epoch and gap checks, cancellation settlement, and the rule against sealing while work is pending. The transaction-source adapter was inspected and not changed.
+
+**Sealing and replay**:
+
+- **Sealed schedule**: the report seals `observationSchedule`:
+  - the nominal end and the `GET_SLOT` deadline;
+  - drain and boundary-crossing retrieval counts;
+  - the `GET_SLOT` dispatch time;
+  - the count of retrievals at or after `GET_SLOT`;
+  - the stop reason.
+
+  The active-window evidence also names the profile.
+
+- **Replay checks** (`REPLAY_CAPACITY_EVIDENCE_INVALID` on any failure):
+  - only the two exact profile definitions are accepted;
+  - the 20/9 profile requires a PAPER or BACKTEST capture, and the active-window evidence must name the same profile;
+  - ledger totals and retrieval counts must match their records and stay within the selected ceilings;
+  - every schedule count is re-derived from the ledger and must match;
+  - the nominal end must equal the observation start + 65,000 ms;
+  - drain retrievals ≤ 2, no retrieval at or after `GET_SLOT`, `GET_SLOT` by its deadline;
+  - a stop reason must match the recorded status.
+- **Active-window recomputation** uses the validated profile's budget.
+- **Historical captures** carry no profile and keep the legacy interpretation. All 9 replay identically to the pre-feature baseline.
+
+**CLI**: the dry-run prints the selected profile and its limits. The final summary reports attempts against the run's own profile.
+
+**Offline coverage** (synthetic clock, mocked transports, portable fixtures; `CandidateDecisionDiagnostic.test.ts`):
+
+- **C1, profile selection**: default 14/3 versus opt-in 20/9; construction guards; a quiet opted-in run reports 20/9 and replays.
+- **C2, capacity**: nine resolvable transactions use exactly 20 attempts and 9 retrievals, qualify, and replay re-decodes all nine.
+- **W2, over budget**: 10 notifications, including 3 validated failed transactions that each consume a retrieval, stop with `TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED` before the cutoff.
+- **C3, drain**: 2 drain retrievals, with `GET_SLOT` dispatched exactly at its deadline after the pacing wait.
+- **C4, backlog**: a third backlog notification stops with `PRE_CUTOFF_BACKLOG_REMAINING`.
+- **C5, boundary crossing**: a retrieval completing after the nominal end counts once and creates no extra drain allowance.
+- **C6, slow response**: a drain response past the deadline is bounded as `REQUEST_TIMEOUT` and stops with `CUTOFF_DISPATCH_WINDOW_EXCEEDED`.
+- **F9, late tail**: a late in-window signature after `GET_SLOT` stays unresolved with zero retrievals afterwards. The same test checks 11 profile, ledger and timing tampering cases, each rejected with its reason.
+- **C7, stale cutoff**: `STALE_DATA` under 20/9.
+- **C8, disconnect**: a `SUBSCRIPTION_DISCONNECT` gap keeps the window unqualified.
+- **Every bounded run**: Solana RPC dispatches stay ≥ 2,500 ms apart.
+
+Not covered by a dedicated test: the defensive `PRE_CUTOFF_DRAIN_LIMIT_EXCEEDED` branch, which needs real-time sleep overshoot to trigger, and an exhausted 90 s overall deadline under 20/9, because the profile fixes the deadline and the existing `OVERALL_DIAGNOSTIC_TIMEOUT` tests cover that mechanism.
+
+**Not done**: no provider call, socket, live capture, operator run, daemon activation, position, order, wallet change or push.
