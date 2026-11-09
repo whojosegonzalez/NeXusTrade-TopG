@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  mkdirSync,
+  statSync,
+  writeFileSync,
+  unlinkSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import {
@@ -1198,25 +1207,38 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     const wsTransport = createMockWebSocketTransport({ immediateAck: true });
     const transport = createDiagnosticMockFetch({ getClock: clock });
 
-    // Invalid non-existent drive on Windows
-    const unwritableDir = "Z:\\non-existent-drive-topg\\invalid-path";
+    // Portable obstruction inside the test-owned directory: the destination lies beneath a regular
+    // file, where a directory is required, so creating the capture directory fails on every platform.
+    mkdirSync(testOutDir, { recursive: true });
+    const blockingFile = path.join(testOutDir, "blocking-file");
+    const blockingContent = "SYNTHETIC blocking file; must remain intact";
+    writeFileSync(blockingFile, blockingContent, "utf8");
+    const unwritableDir = path.join(blockingFile, "capture");
 
-    const diagnostic = new CandidateDecisionDiagnostic({
-      poolId: TEST_POOL_ID,
-      mintAddress: TEST_MINT,
-      rpcUrl: TEST_RPC_URL,
-      outDir: unwritableDir,
-      transport,
-      wsTransport,
-      clock,
-      sleeper,
-      executionContext: "PAPER_SIMULATION",
-      observationDurationMs: 65_000,
-    });
+    try {
+      const diagnostic = new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        outDir: unwritableDir,
+        transport,
+        wsTransport,
+        clock,
+        sleeper,
+        executionContext: "PAPER_SIMULATION",
+        observationDurationMs: 65_000,
+      });
 
-    const result = await diagnostic.run();
-    expect(result.ok).toBe(false);
-    expect(result.status).toBe("ARTIFACT_WRITE_FAILED");
+      const result = await diagnostic.run();
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe("ARTIFACT_WRITE_FAILED");
+      expect(statSync(blockingFile).isFile()).toBe(true);
+      expect(readFileSync(blockingFile, "utf8")).toBe(blockingContent);
+      expect(existsSync(unwritableDir)).toBe(false);
+      expect(readdirSync(testOutDir)).toEqual(["blocking-file"]);
+    } finally {
+      rmSync(testOutDir, { recursive: true, force: true });
+    }
   });
 
   it("17. Existing diagnostic destination refuses overwrite with DIAGNOSTIC_OUTPUT_EXISTS", () => {
