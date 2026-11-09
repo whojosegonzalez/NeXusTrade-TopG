@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   RAYDIUM_AMM_V4_LAYOUT_LENGTH,
@@ -32,6 +32,12 @@ import { type ISolanaWebSocketTransport } from "../research/pilot/SolanaWebSocke
 import {
   MeteredWebSocketTransport,
   WsWebSocketTransport,
+  createBoundedFetchTransport,
+  DEFAULT_KEEPALIVE_PING_INTERVAL_MS,
+  DEFAULT_KEEPALIVE_MAX_PINGS,
+  DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS,
+  DEFAULT_MAX_CONTROL_FRAMES,
+  DEFAULT_MAX_CONTROL_FRAME_BYTES,
 } from "./RaydiumTransportObservationProbe.js";
 import { RaydiumAmmV4TransactionSourceAdapter } from "./RaydiumAmmV4TransactionSourceAdapter.js";
 import { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
@@ -70,16 +76,94 @@ import {
 import { sanitizeSolanaRpcUrl } from "../research/pilot/SolanaRpcLiveObservationClient.js";
 import type { WatchlistCandidateItem, TokenMintAddress } from "@nexustrade/shared";
 
-const RENOUNCED_AUTHORITY_ADDRESSES = new Set(["11111111111111111111111111111111", "null", "none"]);
+export const CANONICAL_ZERO_ADDRESS = "11111111111111111111111111111111";
+
+export type AuthorityStatus = "DISABLED" | "ACTIVE" | "MALFORMED" | "OMITTED";
+
+export interface AuthorityEvaluation {
+  readonly status: AuthorityStatus;
+  readonly isRenounced: boolean;
+  readonly isExplicitlyObserved: boolean;
+  readonly rawValue: unknown;
+  readonly address: string | null;
+}
+
+/**
+ * Validates authority fields against the Solana RPC schema:
+ * - OMITTED: Field is undefined or missing from RPC object
+ * - DISABLED: Literal null or canonical 32-byte zero address ("11111111111111111111111111111111")
+ * - ACTIVE: Valid Solana Base58 public key (non-zero address)
+ * - MALFORMED: Textual placeholders ("none", "null", "undefined", ""), wrong casing, or invalid Base58
+ */
+export function evaluateAuthorityEvidence(info: unknown, fieldName: string): AuthorityEvaluation {
+  if (info === null || typeof info !== "object" || !(fieldName in info)) {
+    return {
+      status: "OMITTED",
+      isRenounced: false,
+      isExplicitlyObserved: false,
+      rawValue: undefined,
+      address: null,
+    };
+  }
+  const val = (info as Record<string, unknown>)[fieldName];
+  if (val === undefined) {
+    return {
+      status: "OMITTED",
+      isRenounced: false,
+      isExplicitlyObserved: false,
+      rawValue: undefined,
+      address: null,
+    };
+  }
+  if (val === null) {
+    return {
+      status: "DISABLED",
+      isRenounced: true,
+      isExplicitlyObserved: true,
+      rawValue: null,
+      address: null,
+    };
+  }
+  if (typeof val === "string") {
+    if (val === CANONICAL_ZERO_ADDRESS) {
+      return {
+        status: "DISABLED",
+        isRenounced: true,
+        isExplicitlyObserved: true,
+        rawValue: val,
+        address: val,
+      };
+    }
+    if (isCanonicalSolanaBase58(val)) {
+      return {
+        status: "ACTIVE",
+        isRenounced: false,
+        isExplicitlyObserved: true,
+        rawValue: val,
+        address: val,
+      };
+    }
+    return {
+      status: "MALFORMED",
+      isRenounced: false,
+      isExplicitlyObserved: false,
+      rawValue: val,
+      address: null,
+    };
+  }
+  return {
+    status: "MALFORMED",
+    isRenounced: false,
+    isExplicitlyObserved: false,
+    rawValue: val,
+    address: null,
+  };
+}
 
 export function isRenouncedAuthority(authority: unknown, isExplicitlyObserved: boolean): boolean {
   if (!isExplicitlyObserved) return false;
   if (authority === null) return true;
-  if (typeof authority === "string") {
-    const trimmed = authority.trim();
-    if (!trimmed) return false;
-    return RENOUNCED_AUTHORITY_ADDRESSES.has(trimmed.toLowerCase());
-  }
+  if (typeof authority === "string" && authority === CANONICAL_ZERO_ADDRESS) return true;
   return false;
 }
 
@@ -94,6 +178,7 @@ export interface DiagnosticRequestRecord {
   readonly ok: boolean;
   readonly error?: string | undefined;
   readonly wireDigestSha256?: string | undefined;
+  readonly responseFile?: string | undefined;
 }
 
 export interface DiagnosticRequestLedger {
@@ -130,6 +215,12 @@ export interface CandidateDecisionDiagnosticOptions {
   readonly rugCheckApiUrl?: string | undefined;
   readonly solanaTrackerApiUrl?: string | undefined;
   readonly dexScreenerApiUrl?: string | undefined;
+  readonly keepalive?: boolean | undefined;
+  readonly pingIntervalMs?: number | undefined;
+  readonly maxPings?: number | undefined;
+  readonly pongTimeoutMs?: number | undefined;
+  readonly maxControlFrames?: number | undefined;
+  readonly maxControlFrameBytes?: number | undefined;
 }
 
 export interface CandidateDecisionDiagnosticResult {
@@ -164,6 +255,8 @@ export interface CandidateDecisionDiagnosticResult {
         readonly decimals?: number | undefined;
         readonly mintAuthority?: string | null | undefined;
         readonly freezeAuthority?: string | null | undefined;
+        readonly mintAuthorityStatus?: AuthorityStatus | undefined;
+        readonly freezeAuthorityStatus?: AuthorityStatus | undefined;
         readonly mintAuthorityRenounced: boolean;
         readonly freezeAuthorityRenounced: boolean;
       }
@@ -191,9 +284,38 @@ export interface CandidateDecisionDiagnosticResult {
       }
     | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
+  readonly keepaliveMetrics?:
+    | {
+        readonly clientPingsSentCount: number;
+        readonly matchedClientPongsCount: number;
+        readonly unmatchedClientPongsCount: number;
+        readonly controlFramesCount: number;
+        readonly controlFramePayloadBytes: number;
+      }
+    | undefined;
   readonly outDir?: string | undefined;
   readonly manifestDigestSha256?: string | undefined;
   writeError?: string | undefined;
+}
+
+interface RecordedResponse {
+  readonly index: number;
+  readonly purpose: string;
+  readonly rawWireBytes: Buffer;
+  readonly text: string;
+  readonly json: unknown | null;
+  readonly wireDigestSha256: string;
+  readonly ok: boolean;
+  readonly httpStatus: number;
+  readonly responseFile: string;
+}
+
+function safeJsonStringify(val: unknown): string {
+  return JSON.stringify(
+    val,
+    (_key, value) => (typeof value === "bigint" ? value.toString() : value),
+    2,
+  );
 }
 
 export class CandidateDecisionDiagnostic {
@@ -202,7 +324,7 @@ export class CandidateDecisionDiagnostic {
   private readonly rpcUrl: string;
   private readonly outDir?: string | undefined;
   private readonly transport: typeof fetch;
-  private readonly wsTransport: ISolanaWebSocketTransport;
+  private readonly wsTransportOption?: ISolanaWebSocketTransport | undefined;
   private readonly clock: () => number;
   private readonly sleeper: (ms: number) => Promise<void>;
   private readonly executionContext: "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST";
@@ -214,6 +336,12 @@ export class CandidateDecisionDiagnostic {
   private readonly rugCheckApiUrl: string;
   private readonly solanaTrackerApiUrl: string;
   private readonly dexScreenerApiUrl: string;
+  private readonly keepalive: boolean;
+  private readonly pingIntervalMs: number;
+  private readonly maxPings: number;
+  private readonly pongTimeoutMs: number;
+  private readonly maxControlFrames: number;
+  private readonly maxControlFrameBytes: number;
 
   private readonly ledger: DiagnosticRequestLedger = {
     poolLayoutAttempts: 0,
@@ -233,6 +361,17 @@ export class CandidateDecisionDiagnostic {
 
   private readonly budgetManager: GlobalResourceBudgetManager;
   private readonly sensitiveTokens: string[] = [];
+  private readonly recordedResponses: RecordedResponse[] = [];
+
+  private retainedLpEvidence?: unknown;
+  private retainedSourceCutoff?: SourceCutoffEvidence;
+  private retainedHistoryResult?: unknown;
+  private retainedCandidateMarketData?: unknown;
+  private retainedCandidateMintAccount?: unknown;
+  private retainedPreAdmissionScreening?: unknown;
+  private retainedBundlerEvidence?: unknown;
+  private retainedRugCheckEvidence?: unknown;
+  private retainedProvisionalContext?: TrackedRaydiumPoolContext;
 
   constructor(options: CandidateDecisionDiagnosticOptions) {
     if (!options.poolId || !isCanonicalSolanaBase58(options.poolId)) {
@@ -264,6 +403,7 @@ export class CandidateDecisionDiagnostic {
     }
 
     // Strict offline mode requirements: require explicitly injected transports
+    this.wsTransportOption = options.wsTransport;
     if (!this.isLive) {
       if (!options.transport) {
         throw new Error("[DIAGNOSTIC_INVALID_ARG] Offline mode requires injected transport");
@@ -271,16 +411,12 @@ export class CandidateDecisionDiagnostic {
       if (!options.wsTransport) {
         throw new Error("[DIAGNOSTIC_INVALID_ARG] Offline mode requires injected wsTransport");
       }
-      this.transport = options.transport;
-      this.wsTransport = options.wsTransport;
+      this.transport = createBoundedFetchTransport(options.transport, 1024 * 1024);
     } else {
-      this.transport = options.transport ?? globalThis.fetch;
-      if (options.wsTransport) {
-        this.wsTransport = options.wsTransport;
-      } else {
-        const wsUrl = this.rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
-        this.wsTransport = new WsWebSocketTransport(wsUrl);
-      }
+      this.transport = createBoundedFetchTransport(
+        options.transport ?? globalThis.fetch,
+        1024 * 1024,
+      );
     }
 
     this.clock = options.clock ?? (() => Date.now());
@@ -294,6 +430,14 @@ export class CandidateDecisionDiagnostic {
     this.rugCheckApiUrl = options.rugCheckApiUrl ?? "https://api.rugcheck.xyz";
     this.solanaTrackerApiUrl = options.solanaTrackerApiUrl ?? "https://data.solanatracker.io";
     this.dexScreenerApiUrl = options.dexScreenerApiUrl ?? "https://api.dexscreener.com";
+
+    // Keepalive and control frame settings
+    this.keepalive = options.keepalive ?? true;
+    this.pingIntervalMs = options.pingIntervalMs ?? DEFAULT_KEEPALIVE_PING_INTERVAL_MS;
+    this.maxPings = options.maxPings ?? DEFAULT_KEEPALIVE_MAX_PINGS;
+    this.pongTimeoutMs = options.pongTimeoutMs ?? DEFAULT_KEEPALIVE_PONG_TIMEOUT_MS;
+    this.maxControlFrames = options.maxControlFrames ?? DEFAULT_MAX_CONTROL_FRAMES;
+    this.maxControlFrameBytes = options.maxControlFrameBytes ?? DEFAULT_MAX_CONTROL_FRAME_BYTES;
 
     // Extract all credential tokens from RPC URL and API keys for comprehensive redaction
     const rpcSanitized = sanitizeSolanaRpcUrl(this.rpcUrl);
@@ -359,7 +503,7 @@ export class CandidateDecisionDiagnostic {
 
   /**
    * Internal metered request dispatch wrapper enforcing shared budget, provider pacing,
-   * deadline racing, body read timeouts, and fail-closed HTTP 429 aborts.
+   * deadline racing, body read timeouts, wire digest hashing before decode, and fail-closed HTTP 429 aborts.
    */
   private async dispatchMeteredRequest(params: {
     purpose:
@@ -549,6 +693,7 @@ export class CandidateDecisionDiagnostic {
     let httpStatus = 0;
     let rawText = "";
     let wireDigestSha256 = "";
+    let rawWireBytes = Buffer.alloc(0);
     let ok = false;
     let errorMessage: string | undefined;
 
@@ -567,10 +712,20 @@ export class CandidateDecisionDiagnostic {
       const res = await Promise.race([fetchPromise, abortPromise]);
       httpStatus = res.status;
 
-      // Race body text read against abort/timeout
-      const textPromise = res.text();
-      rawText = await Promise.race([textPromise, abortPromise]);
-      wireDigestSha256 = createHash("sha256").update(Buffer.from(rawText, "utf8")).digest("hex");
+      // Race body bytes read against abort/timeout using res.arrayBuffer()
+      const arrayBufferPromise = res.arrayBuffer();
+      const rawArrayBuffer = await Promise.race([arrayBufferPromise, abortPromise]);
+      rawWireBytes = Buffer.from(rawArrayBuffer);
+
+      // Wire digest: SHA-256 computed on raw wire bytes BEFORE text decoding
+      wireDigestSha256 = createHash("sha256").update(rawWireBytes).digest("hex");
+
+      // Strip UTF-8 BOM if present before text parsing
+      let decodedText = rawWireBytes.toString("utf8");
+      if (decodedText.charCodeAt(0) === 0xfeff) {
+        decodedText = decodedText.slice(1);
+      }
+      rawText = decodedText;
 
       if (!skipBudgetRecording) {
         this.budgetManager.recordResponseStatus(httpStatus);
@@ -595,6 +750,30 @@ export class CandidateDecisionDiagnostic {
 
     const completedAtMs = this.clock();
 
+    let json: unknown | null = null;
+    if (rawText.trim().length > 0) {
+      try {
+        json = JSON.parse(rawText);
+      } catch {
+        json = null;
+      }
+    }
+
+    const responseIndex = this.ledger.records.length + 1;
+    const responseFileName = `responses/${String(responseIndex).padStart(2, "0")}-${purpose.toLowerCase().replace(/_/g, "-")}.json`;
+
+    this.recordedResponses.push({
+      index: responseIndex,
+      purpose,
+      rawWireBytes,
+      text: rawText,
+      json,
+      wireDigestSha256,
+      ok,
+      httpStatus,
+      responseFile: responseFileName,
+    });
+
     const sanitizedEndpoint = sanitizeSolanaRpcUrl(url).sanitizedUrl;
     this.ledger.records.push({
       purpose,
@@ -607,6 +786,7 @@ export class CandidateDecisionDiagnostic {
       ok,
       ...(errorMessage !== undefined ? { error: errorMessage } : {}),
       ...(wireDigestSha256.length > 0 ? { wireDigestSha256 } : {}),
+      responseFile: responseFileName,
     });
 
     if (httpStatus === 429) {
@@ -622,15 +802,6 @@ export class CandidateDecisionDiagnostic {
         errorMessage.includes("OVERALL_DIAGNOSTIC_TIMEOUT"))
     ) {
       throw new Error(`[OPERATION_TIMEOUT] ${purpose} timed out: ${errorMessage}`);
-    }
-
-    let json: unknown | null = null;
-    if (rawText.trim().length > 0) {
-      try {
-        json = JSON.parse(rawText);
-      } catch {
-        json = null;
-      }
     }
 
     return {
@@ -730,6 +901,8 @@ export class CandidateDecisionDiagnostic {
     );
 
     let coordinator: RaydiumCandidateSubscriptionCoordinator | undefined;
+    let liveWsTransport: ISolanaWebSocketTransport | undefined;
+    let activeWsTransport: ISolanaWebSocketTransport | undefined;
 
     try {
       // Pre-check overall deadline
@@ -738,6 +911,62 @@ export class CandidateDecisionDiagnostic {
           "OVERALL_DIAGNOSTIC_TIMEOUT",
           "Overall diagnostic deadline exceeded before Phase 1",
         );
+      }
+
+      // Initialize WebSocket transport inside guarded run lifecycle
+      if (this.wsTransportOption) {
+        activeWsTransport = this.wsTransportOption;
+      } else if (this.isLive) {
+        const wsUrl = this.rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
+        liveWsTransport = new WsWebSocketTransport(wsUrl);
+        activeWsTransport = liveWsTransport;
+      } else {
+        return this.finishWithFailure(
+          "MISSING_TRANSPORT",
+          "Offline mode requires injected wsTransport",
+        );
+      }
+
+      // Explicitly check readyState if supported
+      const readyState = (activeWsTransport as { readyState?: number }).readyState;
+      if (readyState === 2 || readyState === 3) {
+        return this.finishWithFailure(
+          "WEBSOCKET_CONNECTION_CLOSED",
+          "WebSocket transport is already in closing or closed state",
+        );
+      }
+      if (readyState === 0) {
+        let openResolved = false;
+        let openError: Error | undefined;
+        const openDeadline = Math.min(this.clock() + 5000, overallDeadlineMs);
+        const onOpen = () => {
+          openResolved = true;
+        };
+        const onError = (e: Error) => {
+          openError = e;
+        };
+        activeWsTransport.on("open", onOpen);
+        activeWsTransport.on("error", onError);
+        while (
+          !openResolved &&
+          !openError &&
+          this.clock() < openDeadline &&
+          !overallController.signal.aborted
+        ) {
+          await this.sleepWithAbort(25, overallController.signal);
+        }
+        if (openError) {
+          return this.finishWithFailure(
+            "WEBSOCKET_CONNECTION_FAILED",
+            `WebSocket failed to connect: ${openError.message}`,
+          );
+        }
+        if (!openResolved && (activeWsTransport as { readyState?: number }).readyState !== 1) {
+          return this.finishWithFailure(
+            "WEBSOCKET_CONNECTION_TIMEOUT",
+            "WebSocket failed to reach open state within 5,000 ms",
+          );
+        }
       }
 
       // =========================================================================
@@ -821,6 +1050,7 @@ export class CandidateDecisionDiagnostic {
       };
 
       validateTrackedPoolContext(provisionalContext);
+      this.retainedProvisionalContext = provisionalContext;
 
       // Check deadline before attempt 2
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
@@ -884,6 +1114,7 @@ export class CandidateDecisionDiagnostic {
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: provisionalContext,
         rpcUrl: this.rpcUrl,
+        maxPendingQueueSize: 10, // Reviewed queue ceiling of 10 enforced at ingress
         transport: async (url, init) => {
           const bodyStr = typeof init?.body === "string" ? init.body : "";
           const parsed = JSON.parse(bodyStr) as { method?: string; params?: readonly unknown[] };
@@ -913,21 +1144,220 @@ export class CandidateDecisionDiagnostic {
 
       let observationStartMs = 0;
       let observationEndMs = 0;
-      let isStreamLimitExceeded = false;
+
+      let streamLimitReason: string | undefined;
+      let streamLimitMessage: string | undefined;
+
+      // Keepalive state
+      let clientPingsSentCount = 0;
+      let matchedClientPongsCount = 0;
+      let unmatchedClientPongsCount = 0;
+      let missingPongDetected = false;
+      let controlFramesCount = 0;
+      let controlFramePayloadBytes = 0;
+      let pendingPingPayload: Buffer | null = null;
+      let pendingPingTimestamp: number | null = null;
+      let nextPingScheduledTime = 0;
+      let pingTimer: ReturnType<typeof setTimeout> | undefined;
+      let pongTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      let keepaliveDisposed = false;
+
+      const cleanupKeepalive = () => {
+        keepaliveDisposed = true;
+        if (pingTimer) {
+          clearTimeout(pingTimer);
+          pingTimer = undefined;
+        }
+        if (pongTimeoutTimer) {
+          clearTimeout(pongTimeoutTimer);
+          pongTimeoutTimer = undefined;
+        }
+      };
+
+      const stopWithLimit = (status: string, message: string) => {
+        if (streamLimitReason) return;
+        streamLimitReason = status;
+        streamLimitMessage = message;
+        cleanupKeepalive();
+        coordinator?.close();
+      };
+
+      const sendPing = () => {
+        if (keepaliveDisposed || clientPingsSentCount >= this.maxPings) return;
+        if (pendingPingPayload !== null) return; // Single pending ping
+
+        if (pingTimer) {
+          clearTimeout(pingTimer);
+          pingTimer = undefined;
+        }
+
+        const now = this.clock();
+        clientPingsSentCount++;
+        controlFramesCount++;
+        nextPingScheduledTime = now + this.pingIntervalMs;
+
+        const pingPayload = Buffer.alloc(8);
+        pingPayload.writeBigInt64BE(BigInt(now));
+        pendingPingPayload = pingPayload;
+        pendingPingTimestamp = now;
+        controlFramePayloadBytes += pingPayload.length;
+
+        if (
+          controlFramesCount > this.maxControlFrames ||
+          controlFramePayloadBytes > this.maxControlFrameBytes
+        ) {
+          stopWithLimit(
+            "CONTROL_FRAME_LIMIT_EXCEEDED",
+            `Control frame limit exceeded: ${controlFramesCount} frames, ${controlFramePayloadBytes} bytes`,
+          );
+          return;
+        }
+
+        try {
+          meteredWs.ping(pingPayload);
+        } catch (err) {
+          stopWithLimit(
+            "TRANSPORT_ERROR",
+            `Failed to send ping: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return;
+        }
+
+        if (pongTimeoutTimer) {
+          clearTimeout(pongTimeoutTimer);
+        }
+        pongTimeoutTimer = setTimeout(() => {
+          if (keepaliveDisposed) return;
+          missingPongDetected = true;
+          stopWithLimit(
+            "KEEPALIVE_PONG_TIMEOUT",
+            `Missing WebSocket keepalive PONG: no response received within ${this.pongTimeoutMs} ms`,
+          );
+        }, this.pongTimeoutMs);
+      };
+
+      const checkKeepalive = (now: number) => {
+        if (keepaliveDisposed || !this.keepalive) return;
+        if (pendingPingPayload !== null && pendingPingTimestamp !== null) {
+          if (now - pendingPingTimestamp >= this.pongTimeoutMs) {
+            missingPongDetected = true;
+            stopWithLimit(
+              "KEEPALIVE_PONG_TIMEOUT",
+              `Missing WebSocket keepalive PONG: no response received within ${this.pongTimeoutMs} ms`,
+            );
+            return;
+          }
+        }
+        if (
+          pendingPingPayload === null &&
+          clientPingsSentCount < this.maxPings &&
+          nextPingScheduledTime > 0 &&
+          now >= nextPingScheduledTime
+        ) {
+          sendPing();
+        }
+      };
+
+      const checkQueueLimit = () => {
+        if (
+          adapter.getPendingQueueLength() >= 10 ||
+          adapter.getActiveWorkload() >= 10 ||
+          (coordinator?.getMetrics().totalQueueOverflows ?? 0) > 0
+        ) {
+          stopWithLimit(
+            "STREAM_QUEUE_LIMIT_EXCEEDED",
+            `WebSocket pending queue exceeded ceiling of 10 notifications (queue length: ${adapter.getPendingQueueLength()})`,
+          );
+        }
+      };
 
       // Wrap transport with MeteredWebSocketTransport enforcing 1MB max payload bytes
       const meteredWs = new MeteredWebSocketTransport(
-        this.wsTransport,
+        activeWsTransport,
         1024 * 1024,
         (count, bytes, byteLen, data, isOversized) => {
-          if (count > 50 || isOversized) {
-            isStreamLimitExceeded = true;
+          if (isOversized) {
+            stopWithLimit(
+              "STREAM_BYTE_LIMIT_EXCEEDED",
+              `WebSocket stream exceeded 1MB payload limit (${bytes} bytes received)`,
+            );
+          } else if (count > 50) {
+            stopWithLimit(
+              "STREAM_MESSAGE_LIMIT_EXCEEDED",
+              `WebSocket stream exceeded message limit of 50 (received ${count})`,
+            );
           }
         },
       );
 
+      meteredWs.on("message", () => {
+        checkQueueLimit();
+      });
+
+      if (this.keepalive) {
+        meteredWs.on("open", () => {
+          if (keepaliveDisposed) return;
+          nextPingScheduledTime = this.clock() + this.pingIntervalMs;
+          if (clientPingsSentCount < this.maxPings && !pingTimer) {
+            pingTimer = setTimeout(sendPing, this.pingIntervalMs);
+          }
+        });
+
+        meteredWs.on("pong", (payload: Buffer) => {
+          if (keepaliveDisposed) return;
+          controlFramesCount++;
+          const payloadBytes = payload ? payload.length : 0;
+          controlFramePayloadBytes += payloadBytes;
+
+          if (
+            controlFramesCount > this.maxControlFrames ||
+            controlFramePayloadBytes > this.maxControlFrameBytes
+          ) {
+            stopWithLimit(
+              "CONTROL_FRAME_LIMIT_EXCEEDED",
+              `Control frame limit exceeded: ${controlFramesCount} frames, ${controlFramePayloadBytes} bytes`,
+            );
+            return;
+          }
+
+          const isExactMatch =
+            pendingPingPayload !== null &&
+            Buffer.isBuffer(payload) &&
+            payload.length === pendingPingPayload.length &&
+            payload.equals(pendingPingPayload);
+
+          if (!isExactMatch) {
+            unmatchedClientPongsCount++;
+            return;
+          }
+
+          matchedClientPongsCount++;
+          if (pongTimeoutTimer) {
+            clearTimeout(pongTimeoutTimer);
+            pongTimeoutTimer = undefined;
+          }
+          pendingPingPayload = null;
+          pendingPingTimestamp = null;
+          nextPingScheduledTime = this.clock() + this.pingIntervalMs;
+
+          if (clientPingsSentCount < this.maxPings && !keepaliveDisposed) {
+            if (pingTimer) clearTimeout(pingTimer);
+            pingTimer = setTimeout(sendPing, this.pingIntervalMs);
+          }
+        });
+      }
+
       coordinator.attachTransport(meteredWs);
       coordinator.sendSubscriptionRequest();
+
+      if (this.keepalive && (activeWsTransport as { readyState?: number }).readyState === 1) {
+        if (nextPingScheduledTime === 0) {
+          nextPingScheduledTime = this.clock() + this.pingIntervalMs;
+        }
+        if (!pingTimer) {
+          pingTimer = setTimeout(sendPing, this.pingIntervalMs);
+        }
+      }
 
       // Await subscription acknowledgement
       const subDeadline = this.clock() + 5000;
@@ -936,9 +1366,22 @@ export class CandidateDecisionDiagnostic {
         this.clock() < subDeadline &&
         !overallController.signal.aborted
       ) {
+        if (streamLimitReason) break;
+        checkQueueLimit();
+        if (streamLimitReason) break;
         await this.sleepWithAbort(50, overallController.signal);
       }
+      if (streamLimitReason) {
+        cleanupKeepalive();
+        coordinator.close();
+        return this.finishWithFailure(
+          streamLimitReason,
+          streamLimitMessage ?? `Observation stopped: ${streamLimitReason}`,
+          { provisionalContext },
+        );
+      }
       if (coordinator.getStatus() !== "SUBSCRIBED") {
+        cleanupKeepalive();
         return this.finishWithFailure(
           "SUBSCRIPTION_ACK_TIMEOUT",
           "WebSocket subscription request was not acknowledged within 5,000 ms",
@@ -954,22 +1397,48 @@ export class CandidateDecisionDiagnostic {
         !overallController.signal.aborted &&
         this.clock() < overallDeadlineMs
       ) {
-        if (isStreamLimitExceeded) {
-          coordinator.close();
+        if (streamLimitReason) {
           break;
         }
-        if (adapter.getPendingQueueLength() > 50) {
-          coordinator.close();
+        if (this.keepalive) checkKeepalive(this.clock());
+        if (streamLimitReason) {
           break;
         }
+        checkQueueLimit();
+        if (streamLimitReason) {
+          break;
+        }
+
         const step = Math.min(1000, Math.max(50, targetEnd - this.clock()));
         await this.sleepWithAbort(step, overallController.signal);
+
+        if (this.keepalive) checkKeepalive(this.clock());
+        if (streamLimitReason) {
+          break;
+        }
+        checkQueueLimit();
+        if (streamLimitReason) {
+          break;
+        }
 
         // Drain any pending transaction decodes (up to 3 max attempts total)
         while (adapter.getPendingQueueLength() > 0 && this.ledger.transactionDecodeAttempts < 3) {
           if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) break;
           await coordinator.processNextPending({ signal: overallController.signal });
         }
+      }
+
+      if (this.keepalive) checkKeepalive(this.clock());
+      cleanupKeepalive();
+
+      // Prompt stop on stream limit breach without proceeding to cutoff requests
+      if (streamLimitReason) {
+        coordinator.close();
+        return this.finishWithFailure(
+          streamLimitReason,
+          streamLimitMessage ?? `Observation stopped: ${streamLimitReason}`,
+          { provisionalContext },
+        );
       }
 
       const notificationsReceived = coordinator.getMetrics().totalNotificationsReceived;
@@ -1047,9 +1516,11 @@ export class CandidateDecisionDiagnostic {
         responsePayload: blockTimeRes.json,
         requestContext: { slot: cutoffSlot },
       };
+      this.retainedSourceCutoff = sourceCutoff;
 
       // Validate observation window inequalities
       if (observationStartMs > cutoffTimestampMs - 60_000) {
+        coordinator.close();
         return this.finishWithFailure(
           "WARM_UP_INSUFFICIENT",
           `Observation started at ${observationStartMs} ms, after window start ${cutoffTimestampMs - 60_000} ms`,
@@ -1058,6 +1529,7 @@ export class CandidateDecisionDiagnostic {
       }
 
       if (observationEndMs < cutoffTimestampMs) {
+        coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_OBSERVATION_GAP",
           `Observation ended at ${observationEndMs} ms, before cutoff ${cutoffTimestampMs} ms`,
@@ -1067,6 +1539,7 @@ export class CandidateDecisionDiagnostic {
 
       // 4. Exact-pool history enumeration via accepted enumerator (1 page <= 20 records)
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
           "Overall diagnostic deadline exceeded before history enumeration",
@@ -1112,6 +1585,7 @@ export class CandidateDecisionDiagnostic {
       });
 
       const historyResult = await enumerator.enumerate();
+      this.retainedHistoryResult = historyResult;
       coordinator.close();
 
       // 5. Evaluate Window Reconciliation
@@ -1136,8 +1610,10 @@ export class CandidateDecisionDiagnostic {
       const paperAdapter = new PaperReconciledCandidateFlowAdapter();
       const isQuietQualified =
         notificationsReceived === 0 &&
-        !isStreamLimitExceeded &&
+        !streamLimitReason &&
         adapter.getPendingQueueLength() === 0 &&
+        !missingPongDetected &&
+        pendingPingPayload === null &&
         reconResult.status === "RECONCILED" &&
         reconResult.paperQuietStreamQualified === true &&
         (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST");
@@ -1163,9 +1639,11 @@ export class CandidateDecisionDiagnostic {
               ? "PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION"
               : notificationsReceived > 0
                 ? "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS"
-                : isStreamLimitExceeded
-                  ? "STREAM_LIMIT_EXCEEDED"
-                  : `RECONCILIATION_UNQUALIFIED: ${reconResult.status}`,
+                : streamLimitReason
+                  ? streamLimitReason
+                  : missingPongDetected || pendingPingPayload !== null
+                    ? "MISSING_PONG_QUIET_WINDOW_UNQUALIFIED"
+                    : `RECONCILIATION_UNQUALIFIED: ${reconResult.status}`,
           evaluationTimestampMs: this.clock(),
         });
       }
@@ -1419,6 +1897,7 @@ export class CandidateDecisionDiagnostic {
         priceChange1hPct,
         momentum5mBps,
       };
+      this.retainedCandidateMarketData = { candidateMarketData, rawPair: pair };
 
       // 7. Fresh Validated LP Acquisition (2 RPC Requests via acquireRaydiumAmmV4Snapshot)
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
@@ -1500,6 +1979,7 @@ export class CandidateDecisionDiagnostic {
         );
       }
 
+      this.retainedLpEvidence = lpEvidence;
       const lpBurnPct = validationResult.accounting.displayInaccessiblePct;
 
       // 8. Candidate Token Mint Account (Decimals & Authorities)
@@ -1559,7 +2039,7 @@ export class CandidateDecisionDiagnostic {
         );
       }
 
-      // Explicit authority observation checks: missing/omitted fields remain unknown
+      // Explicit authority observation checks: validate against Solana RPC schema
       const rawMintVal = (
         mintRes.json.result as {
           value?: { data?: { parsed?: { info?: Record<string, unknown> } } };
@@ -1567,35 +2047,19 @@ export class CandidateDecisionDiagnostic {
       )?.value;
       const rawInfo = rawMintVal?.data?.parsed?.info;
 
-      const mintAuthObserved =
-        rawInfo &&
-        typeof rawInfo === "object" &&
-        "mintAuthority" in rawInfo &&
-        rawInfo.mintAuthority !== undefined;
-      const freezeAuthObserved =
-        rawInfo &&
-        typeof rawInfo === "object" &&
-        "freezeAuthority" in rawInfo &&
-        rawInfo.freezeAuthority !== undefined;
-
-      const mintAuthorityRenounced = isRenouncedAuthority(
-        rawInfo?.mintAuthority,
-        Boolean(mintAuthObserved),
-      );
-      const freezeAuthorityRenounced = isRenouncedAuthority(
-        rawInfo?.freezeAuthority,
-        Boolean(freezeAuthObserved),
-      );
+      const mintEval = evaluateAuthorityEvidence(rawInfo, "mintAuthority");
+      const freezeEval = evaluateAuthorityEvidence(rawInfo, "freezeAuthority");
 
       const candidateMintAccount = {
         decimals: typeof rawInfo?.decimals === "number" ? rawInfo.decimals : undefined,
-        mintAuthority: mintAuthObserved ? (rawInfo.mintAuthority as string | null) : undefined,
-        freezeAuthority: freezeAuthObserved
-          ? (rawInfo.freezeAuthority as string | null)
-          : undefined,
-        mintAuthorityRenounced,
-        freezeAuthorityRenounced,
+        mintAuthority: mintEval.address,
+        freezeAuthority: freezeEval.address,
+        mintAuthorityStatus: mintEval.status,
+        freezeAuthorityStatus: freezeEval.status,
+        mintAuthorityRenounced: mintEval.isRenounced,
+        freezeAuthorityRenounced: freezeEval.isRenounced,
       };
+      this.retainedCandidateMintAccount = { candidateMintAccount, rawMintResponse: mintRes.json };
 
       // =========================================================================
       // PHASE 4: Pre-Admission Screening (LP & Authorities Preconditions)
@@ -1604,20 +2068,30 @@ export class CandidateDecisionDiagnostic {
         validationResult.accounting.meetsNinetyPercentThreshold &&
         typeof lpBurnPct === "number" &&
         lpBurnPct >= 90.0;
-      const mintAuthorityPassed = Boolean(mintAuthObserved && mintAuthorityRenounced);
-      const freezeAuthorityPassed = Boolean(freezeAuthObserved && freezeAuthorityRenounced);
+      const mintAuthorityPassed = mintEval.status === "DISABLED";
+      const freezeAuthorityPassed = freezeEval.status === "DISABLED";
       const preAdmissionPassed = lpSecurityPassed && mintAuthorityPassed && freezeAuthorityPassed;
 
       let preAdmissionRejectionReason: string | undefined;
-      if (!lpSecurityPassed) preAdmissionRejectionReason = "REJECTED_UNLOCKED_LP_RISK";
-      else if (!freezeAuthorityPassed)
-        preAdmissionRejectionReason = !freezeAuthObserved
-          ? "REJECTED_UNKNOWN_FREEZE_AUTHORITY"
-          : "REJECTED_ACTIVE_FREEZE_AUTHORITY";
-      else if (!mintAuthorityPassed)
-        preAdmissionRejectionReason = !mintAuthObserved
-          ? "REJECTED_UNKNOWN_MINT_AUTHORITY"
-          : "REJECTED_ACTIVE_MINT_AUTHORITY";
+      if (!lpSecurityPassed) {
+        preAdmissionRejectionReason = "REJECTED_UNLOCKED_LP_RISK";
+      } else if (!freezeAuthorityPassed) {
+        if (freezeEval.status === "OMITTED") {
+          preAdmissionRejectionReason = "REJECTED_UNKNOWN_FREEZE_AUTHORITY";
+        } else if (freezeEval.status === "MALFORMED") {
+          preAdmissionRejectionReason = "REJECTED_MALFORMED_FREEZE_AUTHORITY";
+        } else {
+          preAdmissionRejectionReason = "REJECTED_ACTIVE_FREEZE_AUTHORITY";
+        }
+      } else if (!mintAuthorityPassed) {
+        if (mintEval.status === "OMITTED") {
+          preAdmissionRejectionReason = "REJECTED_UNKNOWN_MINT_AUTHORITY";
+        } else if (mintEval.status === "MALFORMED") {
+          preAdmissionRejectionReason = "REJECTED_MALFORMED_MINT_AUTHORITY";
+        } else {
+          preAdmissionRejectionReason = "REJECTED_ACTIVE_MINT_AUTHORITY";
+        }
+      }
 
       const preAdmissionScreening = {
         lpBurnPct,
@@ -1627,6 +2101,7 @@ export class CandidateDecisionDiagnostic {
         passed: preAdmissionPassed,
         rejectionReason: preAdmissionRejectionReason,
       };
+      this.retainedPreAdmissionScreening = preAdmissionScreening;
 
       if (!preAdmissionPassed) {
         return this.finishWithFailure(
@@ -1708,6 +2183,7 @@ export class CandidateDecisionDiagnostic {
           };
         }
       }
+      this.retainedRugCheckEvidence = { rugMetrics, rawRugCheck: rcRes.json };
 
       // 10. Solana Tracker Bundler Proxy
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
@@ -1762,6 +2238,11 @@ export class CandidateDecisionDiagnostic {
               bundlerPct: adapted.bundlerPct,
             };
           }
+          this.retainedBundlerEvidence = {
+            bundlerSnapshot: parsedBundler.data,
+            adaptedBundler: adapted,
+            rawBundler: stRes.json,
+          };
         }
       }
 
@@ -1888,6 +2369,13 @@ export class CandidateDecisionDiagnostic {
         preAdmissionScreening,
         flowEvaluation: decisionResult.flowResult,
         decisionResult,
+        keepaliveMetrics: {
+          clientPingsSentCount,
+          matchedClientPongsCount,
+          unmatchedClientPongsCount,
+          controlFramesCount,
+          controlFramePayloadBytes,
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1909,9 +2397,9 @@ export class CandidateDecisionDiagnostic {
           // ignore cleanup error
         }
       }
-      if (this.wsTransport) {
+      if (liveWsTransport) {
         try {
-          this.wsTransport.close();
+          liveWsTransport.close();
         } catch {
           // ignore cleanup error
         }
@@ -2003,15 +2491,103 @@ export class CandidateDecisionDiagnostic {
       mkdirSync(targetDir, { recursive: true });
     }
 
-    // Redact sensitive tokens from report and manifest
-    const sanitizedReport = deepRedactSensitiveObject(result, this.sensitiveTokens);
-    const reportJson = JSON.stringify(sanitizedReport, null, 2);
-    const reportPath = path.join(targetDir, "diagnostic-report.json");
-    writeFileSync(reportPath, reportJson, "utf8");
+    const evidenceDir = path.join(targetDir, "evidence");
+    const responsesDir = path.join(targetDir, "responses");
+    mkdirSync(evidenceDir, { recursive: true });
+    mkdirSync(responsesDir, { recursive: true });
 
-    const reportDigest = createHash("sha256").update(Buffer.from(reportJson, "utf8")).digest("hex");
-    const reportBytes = Buffer.byteLength(reportJson, "utf8");
+    const manifestFiles: Array<{
+      path: string;
+      category: "REPORT" | "EVIDENCE" | "RESPONSE";
+      sha256: string;
+      bytes: number;
+    }> = [];
 
+    const writeSanitizedFile = (
+      relPath: string,
+      category: "REPORT" | "EVIDENCE" | "RESPONSE",
+      data: unknown,
+    ): { sha256: string; bytes: number } => {
+      const sanitized = deepRedactSensitiveObject(data, this.sensitiveTokens);
+      const content = typeof sanitized === "string" ? sanitized : safeJsonStringify(sanitized);
+      const fullPath = path.join(targetDir, relPath);
+      mkdirSync(path.dirname(fullPath), { recursive: true });
+      writeFileSync(fullPath, content, "utf8");
+      const buf = Buffer.from(content, "utf8");
+      const sha256 = createHash("sha256").update(buf).digest("hex");
+      manifestFiles.push({
+        path: relPath.replace(/\\/g, "/"),
+        category,
+        sha256,
+        bytes: buf.length,
+      });
+      return { sha256, bytes: buf.length };
+    };
+
+    // 1. Write sealed response files
+    for (const resp of this.recordedResponses) {
+      writeSanitizedFile(resp.responseFile, "RESPONSE", resp.json ?? resp.text);
+    }
+
+    // 2. Write sealed evidence files
+    if (this.retainedProvisionalContext) {
+      writeSanitizedFile(
+        "evidence/provisional-context.json",
+        "EVIDENCE",
+        this.retainedProvisionalContext,
+      );
+    }
+    if (this.retainedSourceCutoff) {
+      writeSanitizedFile("evidence/cutoff-evidence.json", "EVIDENCE", this.retainedSourceCutoff);
+    }
+    if (this.retainedHistoryResult) {
+      writeSanitizedFile("evidence/history-evidence.json", "EVIDENCE", this.retainedHistoryResult);
+    }
+    if (this.retainedLpEvidence) {
+      writeSanitizedFile("evidence/lp-evidence.json", "EVIDENCE", this.retainedLpEvidence);
+    }
+    if (this.retainedCandidateMarketData) {
+      writeSanitizedFile("evidence/market-data.json", "EVIDENCE", this.retainedCandidateMarketData);
+    }
+    if (this.retainedCandidateMintAccount) {
+      writeSanitizedFile(
+        "evidence/mint-account.json",
+        "EVIDENCE",
+        this.retainedCandidateMintAccount,
+      );
+    }
+    if (this.retainedPreAdmissionScreening) {
+      writeSanitizedFile(
+        "evidence/pre-admission.json",
+        "EVIDENCE",
+        this.retainedPreAdmissionScreening,
+      );
+    }
+    if (this.retainedRugCheckEvidence) {
+      writeSanitizedFile(
+        "evidence/rugcheck-report.json",
+        "EVIDENCE",
+        this.retainedRugCheckEvidence,
+      );
+    }
+    if (this.retainedBundlerEvidence) {
+      writeSanitizedFile(
+        "evidence/bundler-provenance.json",
+        "EVIDENCE",
+        this.retainedBundlerEvidence,
+      );
+    }
+    if (result.flowEvaluation) {
+      writeSanitizedFile("evidence/flow-evaluation.json", "EVIDENCE", result.flowEvaluation);
+    }
+    if (result.decisionResult) {
+      writeSanitizedFile("evidence/decision-result.json", "EVIDENCE", result.decisionResult);
+    }
+
+    // 3. Write diagnostic-report.json
+    const reportFileMeta = writeSanitizedFile("diagnostic-report.json", "REPORT", result);
+
+    // 4. Write evidence-manifest.json
     const manifestEntries = this.ledger.records.map((r) => ({
       purpose: r.purpose,
       provider: r.provider,
@@ -2026,6 +2602,7 @@ export class CandidateDecisionDiagnostic {
         ? { error: redactSensitiveText(r.error, this.sensitiveTokens) }
         : {}),
       ...(r.wireDigestSha256 !== undefined ? { wireDigestSha256: r.wireDigestSha256 } : {}),
+      ...(r.responseFile !== undefined ? { responseFile: r.responseFile.replace(/\\/g, "/") } : {}),
     }));
 
     const manifest = {
@@ -2034,15 +2611,267 @@ export class CandidateDecisionDiagnostic {
       generatedAtIso: new Date(this.clock()).toISOString(),
       reportFile: {
         path: "diagnostic-report.json",
-        sha256: reportDigest,
-        bytes: reportBytes,
+        sha256: reportFileMeta.sha256,
+        bytes: reportFileMeta.bytes,
       },
+      files: manifestFiles,
       requests: manifestEntries,
     };
 
     const sanitizedManifest = deepRedactSensitiveObject(manifest, this.sensitiveTokens);
-    const manifestJson = JSON.stringify(sanitizedManifest, null, 2);
+    const manifestJson = safeJsonStringify(sanitizedManifest);
     const manifestPath = path.join(targetDir, "evidence-manifest.json");
     writeFileSync(manifestPath, manifestJson, "utf8");
+
+    const manifestDigest = createHash("sha256")
+      .update(Buffer.from(manifestJson, "utf8"))
+      .digest("hex");
+    (result as { manifestDigestSha256?: string }).manifestDigestSha256 = manifestDigest;
   }
+}
+
+export interface ReplayVerificationItem {
+  readonly path: string;
+  readonly expectedBytes: number;
+  readonly actualBytes: number;
+  readonly expectedSha256: string;
+  readonly actualSha256: string;
+  readonly valid: boolean;
+}
+
+export interface CandidateDecisionReplayResult {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly message: string;
+  readonly poolId: string;
+  readonly mintAddress: string;
+  readonly verifiedFilesCount: number;
+  readonly fileVerifications: ReplayVerificationItem[];
+  readonly decisionResult?: CandidateDecisionResult | undefined;
+}
+
+/**
+ * Replays and reconstructs a CandidateDecision solely from sealed evidence files offline.
+ * Verifies all file integrity hashes against evidence-manifest.json before evaluation.
+ */
+export function replayCandidateDecisionFromSealedEvidence(
+  evidenceDir: string,
+): CandidateDecisionReplayResult {
+  const manifestPath = path.join(evidenceDir, "evidence-manifest.json");
+  if (!existsSync(manifestPath)) {
+    return {
+      ok: false,
+      status: "MANIFEST_NOT_FOUND",
+      message: `Manifest file not found: ${manifestPath}`,
+      poolId: "",
+      mintAddress: "",
+      verifiedFilesCount: 0,
+      fileVerifications: [],
+    };
+  }
+
+  const manifestContent = readFileSync(manifestPath, "utf8");
+  const manifest = JSON.parse(manifestContent);
+  const poolId = manifest.poolId;
+  const mintAddress = manifest.mintAddress;
+
+  const fileVerifications: ReplayVerificationItem[] = [];
+
+  // Verify all files listed in manifest
+  const filesToVerify = manifest.files ?? [];
+  for (const entry of filesToVerify) {
+    const fullPath = path.join(evidenceDir, entry.path);
+    if (!existsSync(fullPath)) {
+      return {
+        ok: false,
+        status: "SEALED_FILE_MISSING",
+        message: `Sealed evidence file missing: ${entry.path}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+      };
+    }
+    const fileBytes = readFileSync(fullPath);
+    const actualSha256 = createHash("sha256").update(fileBytes).digest("hex");
+    const valid = actualSha256 === entry.sha256 && fileBytes.length === entry.bytes;
+    fileVerifications.push({
+      path: entry.path,
+      expectedBytes: entry.bytes,
+      actualBytes: fileBytes.length,
+      expectedSha256: entry.sha256,
+      actualSha256,
+      valid,
+    });
+    if (!valid) {
+      return {
+        ok: false,
+        status: "EVIDENCE_INTEGRITY_MISMATCH",
+        message: `SHA-256 or byte length mismatch for sealed file ${entry.path}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+      };
+    }
+  }
+
+  // Load sealed evidence files
+  const reportPath = path.join(evidenceDir, "diagnostic-report.json");
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+
+  const lpEvidencePath = path.join(evidenceDir, "evidence", "lp-evidence.json");
+  const cutoffEvidencePath = path.join(evidenceDir, "evidence", "cutoff-evidence.json");
+  const historyEvidencePath = path.join(evidenceDir, "evidence", "history-evidence.json");
+  const marketDataPath = path.join(evidenceDir, "evidence", "market-data.json");
+  const mintAccountPath = path.join(evidenceDir, "evidence", "mint-account.json");
+  const bundlerPath = path.join(evidenceDir, "evidence", "bundler-provenance.json");
+  const rugCheckPath = path.join(evidenceDir, "evidence", "rugcheck-report.json");
+
+  // Replay checks
+  if (
+    !existsSync(lpEvidencePath) ||
+    !existsSync(cutoffEvidencePath) ||
+    !existsSync(historyEvidencePath) ||
+    !existsSync(marketDataPath) ||
+    !existsSync(mintAccountPath)
+  ) {
+    return {
+      ok: false,
+      status: "INCOMPLETE_EVIDENCE_FOR_REPLAY",
+      message: "Required evidence files missing for complete decision replay",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  const lpEvidence = JSON.parse(readFileSync(lpEvidencePath, "utf8"));
+  const sourceCutoff = JSON.parse(readFileSync(cutoffEvidencePath, "utf8"));
+  const marketDataEvidence = JSON.parse(readFileSync(marketDataPath, "utf8"));
+  const mintAccountEvidence = JSON.parse(readFileSync(mintAccountPath, "utf8"));
+
+  // Verify identities match between provisional context and LP evidence
+  const validatedIdentities = lpEvidence.discoveredIdentities;
+  if (!validatedIdentities || validatedIdentities.poolId !== poolId) {
+    return {
+      ok: false,
+      status: "REPLAY_IDENTITY_MISMATCH",
+      message: "LP evidence identity does not match candidate poolId",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  // Replay pre-admission screening
+  const lpBurnPct = lpEvidence.validationResult?.accounting?.displayInaccessiblePct;
+  const lpSecurityPassed =
+    Boolean(lpEvidence.validationResult?.accounting?.meetsNinetyPercentThreshold) &&
+    typeof lpBurnPct === "number" &&
+    lpBurnPct >= 90.0;
+
+  const mintAuthorityPassed =
+    mintAccountEvidence.candidateMintAccount?.mintAuthorityRenounced === true;
+  const freezeAuthorityPassed =
+    mintAccountEvidence.candidateMintAccount?.freezeAuthorityRenounced === true;
+
+  if (!lpSecurityPassed || !mintAuthorityPassed || !freezeAuthorityPassed) {
+    return {
+      ok: false,
+      status: "REPLAY_PRE_ADMISSION_FAILED",
+      message: "Pre-admission criteria not met during offline replay",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+    };
+  }
+
+  // Replay candidate decision points
+  const candidateMarketData = marketDataEvidence.candidateMarketData;
+
+  const flowPath = path.join(evidenceDir, "evidence", "flow-evaluation.json");
+  const flowEvaluation = existsSync(flowPath)
+    ? JSON.parse(readFileSync(flowPath, "utf8"))
+    : report.flowEvaluation;
+
+  const decisionNowMs =
+    flowEvaluation?.evaluationTimestampMs ??
+    (report.decisionResult?.lastEvaluatedAt
+      ? Date.parse(report.decisionResult.lastEvaluatedAt)
+      : sourceCutoff.cutoffTimestampMs);
+
+  const watchlistCandidate: WatchlistCandidateItem = {
+    poolId,
+    mintAddress,
+    symbol: candidateMarketData.symbol,
+    liquidityUsd: candidateMarketData.liquidityUsd,
+    marketCapUsd: candidateMarketData.marketCapUsd,
+    lmcRatio: candidateMarketData.liquidityUsd / candidateMarketData.marketCapUsd,
+    lpBurnPct,
+    assetAgeSeconds: candidateMarketData.assetAgeSeconds,
+    volume5mUsd: candidateMarketData.volume5mUsd,
+    buys5m: candidateMarketData.buys5m,
+    sells5m: candidateMarketData.sells5m,
+    buyToSellRatio: candidateMarketData.buyToSellRatio,
+    status: "WATCHING",
+    discoveredAt: report.discoveredAt ?? new Date(decisionNowMs).toISOString(),
+    lastEvaluatedAt: new Date(decisionNowMs).toISOString(),
+  };
+
+  let rugMetrics: {
+    rugScore?: number;
+    hasDangerRisk?: boolean;
+    bundlerPct?: number;
+    top10HolderPct?: number;
+    holdersCount?: number;
+  } | null = null;
+
+  if (existsSync(rugCheckPath)) {
+    const rcData = JSON.parse(readFileSync(rugCheckPath, "utf8"));
+    rugMetrics = rcData.rugMetrics ?? null;
+  }
+  if (existsSync(bundlerPath)) {
+    const bundlerData = JSON.parse(readFileSync(bundlerPath, "utf8"));
+    if (bundlerData.adaptedBundler?.bundlerPct !== undefined) {
+      rugMetrics = {
+        ...rugMetrics,
+        bundlerPct: bundlerData.adaptedBundler.bundlerPct,
+      };
+    }
+  }
+
+  const flowProvider: CandidateFlowProvider = {
+    getCandidateFlow: () => flowEvaluation,
+  };
+
+  const decisionResult = evaluateCandidateDecisionPoints({
+    candidate: watchlistCandidate,
+    baseSpotInfo: {
+      spotPriceSol: candidateMarketData.spotPriceSol,
+      spotPriceUsd: candidateMarketData.spotPriceUsd,
+      liquidityUsd: candidateMarketData.liquidityUsd,
+      momentum5mBps: candidateMarketData.momentum5mBps,
+      priceChange1hPct: candidateMarketData.priceChange1hPct,
+    },
+    rugMetrics,
+    flowProvider,
+    currentNowMs: decisionNowMs,
+    requireVerifiedHolders: true,
+    executionContext: report.executionContext,
+  });
+
+  return {
+    ok: true,
+    status: decisionResult.outcome,
+    message: `Replay completed successfully with outcome: ${decisionResult.outcome}`,
+    poolId,
+    mintAddress,
+    verifiedFilesCount: fileVerifications.length,
+    fileVerifications,
+    decisionResult,
+  };
 }

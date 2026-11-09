@@ -428,6 +428,20 @@ export function buildEscapedSecretRegex(secret: string): RegExp {
  */
 export function isSensitiveKeyName(key: string): boolean {
   if (!key) return false;
+  const lower = key.toLowerCase();
+  if (
+    lower.includes("tokenmint") ||
+    lower.includes("tokendecimals") ||
+    lower.includes("tokenamount") ||
+    lower.includes("tokenaccount") ||
+    lower.includes("tokenaddress") ||
+    lower.includes("tokenmeta") ||
+    lower.includes("tokenbalance") ||
+    lower.includes("basetoken") ||
+    lower.includes("quotetoken")
+  ) {
+    return false;
+  }
   const tokens = key
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .toLowerCase()

@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { CandidateDecisionDiagnostic } from "./CandidateDecisionDiagnostic.js";
+import {
+  CandidateDecisionDiagnostic,
+  replayCandidateDecisionFromSealedEvidence,
+  evaluateAuthorityEvidence,
+  CANONICAL_ZERO_ADDRESS,
+} from "./CandidateDecisionDiagnostic.js";
 import {
   CAPTURED_RAY_WSOL_IDENTITIES,
   RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
@@ -20,24 +26,86 @@ const TEST_SIG_A =
 const TEST_SIG_B =
   "QHREMqhWG7eahNuQ2EzQqSYKLy8WH9jVerfLRJTttyPorHxQJDzMMcB1142poqJHzYyVSsijoS1U9222QBV6AbM";
 
-function createMockWebSocketTransport(options?: {
+export interface MockWebSocketTransportOptions {
   immediateAck?: boolean;
   messagesToSend?: string[];
-}): ISolanaWebSocketTransport {
+  readyState?: number; // 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+  autoPong?: boolean; // default true
+  pongPayload?: Buffer;
+  pongDelayMs?: number;
+  onPing?: (data?: Buffer) => void;
+}
+
+export type MockSolanaWebSocketTransport = ISolanaWebSocketTransport & {
+  ping: (data?: Buffer) => void;
+  getPingsReceived: () => Buffer[];
+  emitPong: (data: Buffer) => void;
+  emitOpen: () => void;
+  emitError: (err: Error) => void;
+  emitMessage: (data: string | Buffer) => void;
+  readyState: number;
+};
+
+function createMockWebSocketTransport(
+  options?: MockWebSocketTransportOptions,
+): MockSolanaWebSocketTransport {
   const listeners: {
     open: (() => void)[];
     message: ((data: string | Buffer) => void)[];
     error: ((err: Error) => void)[];
     close: ((code: number, reason: string) => void)[];
+    pong: ((data: Buffer) => void)[];
+    ping: ((data: Buffer) => void)[];
   } = {
     open: [],
     message: [],
     error: [],
     close: [],
+    pong: [],
+    ping: [],
   };
   let isClosed = false;
+  let readyState = options?.readyState ?? 1; // default OPEN
+  const pingsReceived: Buffer[] = [];
 
-  const transport: ISolanaWebSocketTransport = {
+  const transport: MockSolanaWebSocketTransport = {
+    get readyState() {
+      return readyState;
+    },
+    set readyState(val: number) {
+      readyState = val;
+    },
+    getPingsReceived: () => pingsReceived,
+    emitOpen: () => {
+      readyState = 1;
+      for (const fn of listeners.open) fn();
+    },
+    emitError: (err: Error) => {
+      for (const fn of listeners.error) fn(err);
+    },
+    emitMessage: (data: string | Buffer) => {
+      for (const fn of listeners.message) fn(data);
+    },
+    emitPong: (data: Buffer) => {
+      for (const fn of listeners.pong) fn(data);
+    },
+    ping: (data?: Buffer) => {
+      if (data) pingsReceived.push(data);
+      options?.onPing?.(data);
+      if (options?.autoPong !== false && data) {
+        const replyPayload = options?.pongPayload ?? data;
+        const delay = options?.pongDelayMs ?? 0;
+        if (delay > 0) {
+          setTimeout(() => {
+            for (const fn of listeners.pong) fn(replyPayload);
+          }, delay);
+        } else {
+          queueMicrotask(() => {
+            for (const fn of listeners.pong) fn(replyPayload);
+          });
+        }
+      }
+    },
     send: (data: string) => {
       const parsed = JSON.parse(data) as { id?: number; method?: string };
       if (parsed.method === "logsSubscribe" && options?.immediateAck !== false) {
@@ -60,6 +128,7 @@ function createMockWebSocketTransport(options?: {
     },
     close: (code?: number, reason?: string) => {
       isClosed = true;
+      readyState = 3;
       for (const fn of listeners.close) {
         fn(code ?? 1000, reason ?? "");
       }
@@ -67,15 +136,21 @@ function createMockWebSocketTransport(options?: {
     on: ((event: string, listener: (...args: never[]) => void) => {
       if (event === "open") {
         listeners.open.push(listener as () => void);
-        queueMicrotask(() => {
-          if (!isClosed) (listener as () => void)();
-        });
+        if (readyState === 1) {
+          queueMicrotask(() => {
+            if (!isClosed) (listener as () => void)();
+          });
+        }
       } else if (event === "message") {
         listeners.message.push(listener as (data: string | Buffer) => void);
       } else if (event === "error") {
         listeners.error.push(listener as (err: Error) => void);
       } else if (event === "close") {
         listeners.close.push(listener as (code: number, reason: string) => void);
+      } else if (event === "pong") {
+        listeners.pong.push(listener as (data: Buffer) => void);
+      } else if (event === "ping") {
+        listeners.ping.push(listener as (data: Buffer) => void);
       }
     }) as ISolanaWebSocketTransport["on"],
   };
@@ -107,6 +182,7 @@ interface MockFetchScenario {
   missingVolume?: boolean;
   missingBuysSells?: boolean;
   quoteIsCandidate?: boolean;
+  includeBomInGetSlot?: boolean;
 }
 
 function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
@@ -323,7 +399,19 @@ function createDiagnosticMockFetch(scenario: MockFetchScenario = {}) {
       }
 
       if (method === "getSlot") {
-        return new Response(JSON.stringify({ jsonrpc: "2.0", result: 461970880, id }), {
+        const slot = 461970880;
+        const resObj = { jsonrpc: "2.0", result: slot, id };
+        if (scenario.includeBomInGetSlot) {
+          const bomBuffer = Buffer.concat([
+            Buffer.from([0xef, 0xbb, 0xbf]),
+            Buffer.from(JSON.stringify(resObj), "utf8"),
+          ]);
+          return new Response(bomBuffer, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(resObj), {
           status: 200,
         });
       }
@@ -573,7 +661,7 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     const wsTransport = createMockWebSocketTransport({ immediateAck: true });
     // Candidate token has active unrenounced freeze authority
     const transport = createDiagnosticMockFetch({
-      freezeAuthority: "ActiveMaliciousFreezeAuthority11111111111111111",
+      freezeAuthority: TEST_MINT,
       getClock: clock,
     });
 
@@ -1095,5 +1183,899 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     expect(reportRaw).not.toContain("secret-api-key-alchemy-98765");
     expect(manifestRaw).not.toContain("secret-api-key-alchemy-98765");
     expect(manifestRaw).toContain("[REDACTED]");
+  });
+
+  it("19. Pre-admission screening: rejects textual placeholder mintAuthority 'none' with REJECTED_MALFORMED_MINT_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: "none",
+      freezeAuthority: null,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "mint-auth-none"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.mintAuthorityPassed).toBe(false);
+    expect(result.preAdmissionScreening?.rejectionReason).toBe("REJECTED_MALFORMED_MINT_AUTHORITY");
+    expect(result.candidateMintAccount?.mintAuthorityStatus).toBe("MALFORMED");
+  });
+
+  it("20. Pre-admission screening: rejects textual placeholder freezeAuthority 'none' with REJECTED_MALFORMED_FREEZE_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: null,
+      freezeAuthority: "none",
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "freeze-auth-none"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.freezeAuthorityPassed).toBe(false);
+    expect(result.preAdmissionScreening?.rejectionReason).toBe(
+      "REJECTED_MALFORMED_FREEZE_AUTHORITY",
+    );
+    expect(result.candidateMintAccount?.freezeAuthorityStatus).toBe("MALFORMED");
+  });
+
+  it("21. Pre-admission screening: rejects literal string mintAuthority 'null' with REJECTED_MALFORMED_MINT_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: "null",
+      freezeAuthority: null,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "mint-auth-str-null"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.mintAuthorityPassed).toBe(false);
+    expect(result.preAdmissionScreening?.rejectionReason).toBe("REJECTED_MALFORMED_MINT_AUTHORITY");
+  });
+
+  it("22. Pre-admission screening: rejects literal string freezeAuthority 'null' with REJECTED_MALFORMED_FREEZE_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: null,
+      freezeAuthority: "null",
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "freeze-auth-str-null"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.freezeAuthorityPassed).toBe(false);
+    expect(result.preAdmissionScreening?.rejectionReason).toBe(
+      "REJECTED_MALFORMED_FREEZE_AUTHORITY",
+    );
+  });
+
+  it("23. Pre-admission screening: rejects invalid non-Base58 mintAuthority with REJECTED_MALFORMED_MINT_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: "invalid_address_with_0_and_O_and_I",
+      freezeAuthority: null,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "mint-auth-invalid-base58"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.rejectionReason).toBe("REJECTED_MALFORMED_MINT_AUTHORITY");
+  });
+
+  it("24. Pre-admission screening: rejects active valid Base58 mintAuthority with REJECTED_ACTIVE_MINT_AUTHORITY", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: TEST_MINT,
+      freezeAuthority: null,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "mint-auth-active"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(result.preAdmissionScreening?.mintAuthorityPassed).toBe(false);
+    expect(result.preAdmissionScreening?.rejectionReason).toBe("REJECTED_ACTIVE_MINT_AUTHORITY");
+    expect(result.candidateMintAccount?.mintAuthorityStatus).toBe("ACTIVE");
+  });
+
+  it("25. Pre-admission screening: accepts canonical 32-byte zero address as valid disabled authority", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({
+      mintAuthority: CANONICAL_ZERO_ADDRESS,
+      freezeAuthority: CANONICAL_ZERO_ADDRESS,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "zero-addr-auth"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+    expect(result.preAdmissionScreening?.passed).toBe(true);
+    expect(result.candidateMintAccount?.mintAuthorityStatus).toBe("DISABLED");
+    expect(result.candidateMintAccount?.freezeAuthorityStatus).toBe("DISABLED");
+  });
+
+  it("26. evaluateAuthorityEvidence helper correctly classifies all states", () => {
+    // 1. OMITTED: undefined or missing key
+    expect(evaluateAuthorityEvidence({}, "mintAuthority").status).toBe("OMITTED");
+    expect(evaluateAuthorityEvidence({ mintAuthority: undefined }, "mintAuthority").status).toBe(
+      "OMITTED",
+    );
+    expect(evaluateAuthorityEvidence(null, "mintAuthority").status).toBe("OMITTED");
+
+    // 2. DISABLED: null or canonical zero address
+    const nullEval = evaluateAuthorityEvidence({ mintAuthority: null }, "mintAuthority");
+    expect(nullEval.status).toBe("DISABLED");
+    expect(nullEval.isRenounced).toBe(true);
+    expect(nullEval.isExplicitlyObserved).toBe(true);
+
+    const zeroEval = evaluateAuthorityEvidence(
+      { mintAuthority: CANONICAL_ZERO_ADDRESS },
+      "mintAuthority",
+    );
+    expect(zeroEval.status).toBe("DISABLED");
+    expect(zeroEval.isRenounced).toBe(true);
+
+    // 3. ACTIVE: valid non-zero Base58 public key
+    const activeEval = evaluateAuthorityEvidence({ mintAuthority: TEST_MINT }, "mintAuthority");
+    expect(activeEval.status).toBe("ACTIVE");
+    expect(activeEval.isRenounced).toBe(false);
+    expect(activeEval.isExplicitlyObserved).toBe(true);
+    expect(activeEval.address).toBe(TEST_MINT);
+
+    // 4. MALFORMED: placeholders, empty strings, invalid characters
+    expect(evaluateAuthorityEvidence({ mintAuthority: "none" }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+    expect(evaluateAuthorityEvidence({ mintAuthority: "null" }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+    expect(evaluateAuthorityEvidence({ mintAuthority: "undefined" }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+    expect(evaluateAuthorityEvidence({ mintAuthority: "" }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+    expect(evaluateAuthorityEvidence({ mintAuthority: 12345 }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+    expect(evaluateAuthorityEvidence({ mintAuthority: true }, "mintAuthority").status).toBe(
+      "MALFORMED",
+    );
+  });
+
+  it("27. WebSocket lifecycle: waits for transport to reach OPEN from initial CONNECTING state", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Transport begins in readyState 0 (CONNECTING)
+    const wsTransport = createMockWebSocketTransport({
+      readyState: 0,
+      immediateAck: true,
+    });
+
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    // Simulate transition to readyState 1 (OPEN)
+    setImmediate(() => {
+      wsTransport.emitOpen();
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "ws-connecting"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+  });
+
+  it("28. WebSocket lifecycle: fails closed if transport starts in CLOSED readyState", async () => {
+    const now = 1791931000 * 1000;
+    const clock = () => now;
+
+    // Transport already in CLOSED readyState (3)
+    const wsTransport = createMockWebSocketTransport({ readyState: 3 });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "ws-closed"),
+      transport,
+      wsTransport,
+      clock,
+      executionContext: "PAPER_SIMULATION",
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("WEBSOCKET_CONNECTION_CLOSED");
+  });
+
+  it("29. WebSocket lifecycle: fails closed if transport emits error before OPEN", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ readyState: 0 });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    setImmediate(() => {
+      wsTransport.emitError(new Error("ECONNREFUSED"));
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "ws-error-before-open"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("WEBSOCKET_CONNECTION_FAILED");
+    expect(result.message).toContain("ECONNREFUSED");
+  });
+
+  it("30. Keepalive: dispatches pings with 8-byte epoch payload and records matched pongs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      autoPong: true,
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "keepalive-matched"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 20_000,
+      maxPings: 4,
+      pongTimeoutMs: 10_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+
+    const pings = wsTransport.getPingsReceived();
+    expect(pings.length).toBeGreaterThanOrEqual(1);
+    expect(pings[0]?.length).toBe(8); // 8-byte BigInt timestamp payload
+  });
+
+  it("31. Keepalive: missing pong terminates promptly with KEEPALIVE_PONG_TIMEOUT and halts before cutoff RPCs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // autoPong: false simulates server not returning PONG
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      autoPong: false,
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "keepalive-timeout"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 20,
+      pongTimeoutMs: 30,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("KEEPALIVE_PONG_TIMEOUT");
+    expect(result.message).toContain("Missing WebSocket keepalive PONG");
+
+    // Must NOT proceed to cutoff requests (getSlot/getBlockTime attempts must be 0)
+    expect(result.ledger.getSlotAttempts).toBe(0);
+    expect(result.ledger.getBlockTimeAttempts).toBe(0);
+    expect(result.ledger.totalAttempts).toBe(2); // Only pool layout and prior anchor
+  });
+
+  it("32. Keepalive: control frame traffic ceiling aborts promptly with CONTROL_FRAME_LIMIT_EXCEEDED", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      autoPong: true,
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    // maxControlFrames set to 1 so the very first ping reaches the ceiling
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "control-limit"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      pingIntervalMs: 10,
+      maxControlFrames: 1,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("CONTROL_FRAME_LIMIT_EXCEEDED");
+    expect(result.ledger.getSlotAttempts).toBe(0);
+  });
+
+  it("33. Stream limits: queue ceiling of 10 enforced at ingress stops promptly with STREAM_QUEUE_LIMIT_EXCEEDED without calling cutoff RPCs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Inject 15 notifications exceeding queue limit of 10
+    const burstNotifications = Array.from({ length: 15 }, (_, i) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 101,
+          result: {
+            context: { slot: 461970850 },
+            value: {
+              signature: `BurstSig${i}111111111111111111111111111111111111111111`,
+              err: null,
+              logs: ["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"],
+            },
+          },
+        },
+      }),
+    );
+
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      messagesToSend: burstNotifications,
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "queue-limit"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(result.message).toContain("ceiling of 10 notifications");
+
+    // Prompt stop: zero cutoff attempts dispatched
+    expect(result.ledger.getSlotAttempts).toBe(0);
+    expect(result.ledger.getBlockTimeAttempts).toBe(0);
+  });
+
+  it("34. Stream limits: payload byte ceiling of 1MB stops promptly with STREAM_BYTE_LIMIT_EXCEEDED without calling cutoff RPCs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // Create oversized notification payload (> 1MB)
+    const largeLogs = ["x".repeat(1024 * 1024 + 100)];
+    const oversizedMsg = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "logsNotification",
+      params: {
+        result: {
+          value: {
+            signature: TEST_SIG_A,
+            err: null,
+            logs: largeLogs,
+          },
+        },
+        subscription: 101,
+      },
+    });
+
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      messagesToSend: [oversizedMsg],
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "byte-limit"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("STREAM_BYTE_LIMIT_EXCEEDED");
+    expect(result.ledger.getSlotAttempts).toBe(0);
+  });
+
+  it("35. Stream limits: message ceiling of 50 stops promptly with STREAM_MESSAGE_LIMIT_EXCEEDED without calling cutoff RPCs", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const messages = Array.from({ length: 55 }, (_, i) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          result: {
+            value: {
+              signature: `MsgCeilingSig${i}1111111111111111111111111111111111111`,
+              err: null,
+              logs: ["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"],
+            },
+          },
+          subscription: 101,
+        },
+      }),
+    );
+
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      messagesToSend: messages,
+    });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: path.join(testOutDir, "msg-limit"),
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(false);
+    expect(
+      result.status === "STREAM_MESSAGE_LIMIT_EXCEEDED" ||
+        result.status === "STREAM_QUEUE_LIMIT_EXCEEDED",
+    ).toBe(true);
+    expect(result.ledger.getSlotAttempts).toBe(0);
+  });
+
+  it("36. Evidence sealing: saves responses, evidence files, and manifest with verified hashes and byte sizes", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+
+    // Verify manifest exists and is parseable
+    const manifestPath = path.join(testOutDir, "evidence-manifest.json");
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+
+    expect(manifest.poolId).toBe(TEST_POOL_ID);
+    expect(manifest.files.length).toBeGreaterThanOrEqual(15);
+    expect(manifest.requests.length).toBe(11);
+
+    // Verify every file listed in manifest matches its recorded bytes and SHA-256
+    for (const f of manifest.files) {
+      const fullPath = path.join(testOutDir, f.path);
+      expect(existsSync(fullPath)).toBe(true);
+      const bytes = readFileSync(fullPath);
+      expect(bytes.length).toBe(f.bytes);
+      const computedSha256 = createHash("sha256").update(bytes).digest("hex");
+      expect(computedSha256).toBe(f.sha256);
+    }
+
+    // Verify evidence directory contains all required derivation artifacts
+    expect(existsSync(path.join(testOutDir, "evidence", "lp-evidence.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "cutoff-evidence.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "history-evidence.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "market-data.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "mint-account.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "pre-admission.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "bundler-provenance.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "rugcheck-report.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "flow-evaluation.json"))).toBe(true);
+    expect(existsSync(path.join(testOutDir, "evidence", "decision-result.json"))).toBe(true);
+
+    // Verify response directory contains 11 sealed response files
+    for (let i = 1; i <= 11; i++) {
+      const prefix = String(i).padStart(2, "0");
+      const matched = manifest.files.find((f: { path: string }) =>
+        f.path.startsWith(`responses/${prefix}`),
+      );
+      expect(matched).toBeDefined();
+    }
+  });
+
+  it("37. Wire digest: hashes raw wire bytes before decoding, preserving distinct wireDigestSha256 on UTF-8 BOM", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    // Injects UTF-8 BOM (0xEF, 0xBB, 0xBF) into getSlot response
+    const transport = createDiagnosticMockFetch({
+      includeBomInGetSlot: true,
+      getClock: clock,
+    });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const result = await diagnostic.run();
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+
+    const manifest = JSON.parse(
+      readFileSync(path.join(testOutDir, "evidence-manifest.json"), "utf8"),
+    );
+    const slotReq = manifest.requests.find((r: { purpose: string }) => r.purpose === "GET_SLOT");
+    expect(slotReq).toBeDefined();
+    expect(slotReq.wireDigestSha256).toBeDefined();
+
+    // The wire digest was computed on raw bytes with BOM
+    const expectedBomBuffer = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from(JSON.stringify({ jsonrpc: "2.0", result: 461970880, id: "diag-3" }), "utf8"),
+    ]);
+    const expectedWireHash = createHash("sha256").update(expectedBomBuffer).digest("hex");
+    expect(slotReq.wireDigestSha256).toBe(expectedWireHash);
+
+    // The saved response file was sanitized and written without BOM
+    const slotFileEntry = manifest.files.find(
+      (f: { path: string }) => f.path === slotReq.responseFile,
+    );
+    expect(slotFileEntry).toBeDefined();
+    // Saved artifact hash is distinct from wire digest
+    expect(slotFileEntry.sha256).not.toBe(slotReq.wireDigestSha256);
+  });
+
+  it("38. Offline replay: replayCandidateDecisionFromSealedEvidence verifies manifest and reconstructs candidate decision without network or RPC calls", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+    expect(diagResult.status).toBe("ARMED_FIRST_TICK");
+
+    // Replay solely from testOutDir without network, mocks, or daemons
+    const replay = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.status).toBe("ARMED_FIRST_TICK");
+    expect(replay.decisionResult?.outcome).toBe("ARMED_FIRST_TICK");
+    expect(replay.poolId).toBe(TEST_POOL_ID);
+    expect(replay.mintAddress).toBe(TEST_MINT);
+    expect(replay.verifiedFilesCount).toBeGreaterThanOrEqual(15);
+    expect(replay.fileVerifications.every((v) => v.valid)).toBe(true);
+  });
+
+  it("39. Offline replay: detects tampering in sealed files fail-closed", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+
+    // Tamper with one sealed evidence file
+    const lpEvidencePath = path.join(testOutDir, "evidence", "lp-evidence.json");
+    const lpContent = JSON.parse(readFileSync(lpEvidencePath, "utf8"));
+    lpContent.tampered = true;
+    writeFileSync(lpEvidencePath, JSON.stringify(lpContent), "utf8");
+
+    // Replay must fail with EVIDENCE_INTEGRITY_MISMATCH
+    const replay = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("EVIDENCE_INTEGRITY_MISMATCH");
+    expect(replay.message).toContain("evidence/lp-evidence.json");
   });
 });
