@@ -3358,16 +3358,18 @@ The baseline timings below are **measured**, from the five current-build runs wi
 
   The active-window evidence also names the profile.
 
-- **Replay checks** (`REPLAY_CAPACITY_EVIDENCE_INVALID` on any failure):
+- **Replay checks** (`REPLAY_CAPACITY_EVIDENCE_INVALID` on any failure; as corrected in §8.23b, since at `af1e3ba` several of these checks were incomplete):
   - only the two exact profile definitions are accepted;
   - the 20/9 profile requires a PAPER or BACKTEST capture, and the active-window evidence must name the same profile;
-  - ledger totals and retrieval counts must match their records and stay within the selected ceilings;
-  - every schedule count is re-derived from the ledger and must match;
+  - ledger totals and retrieval counts must match their records and stay within the selected ceilings, or within 14/3 when no profile is sealed;
+  - every ledger record needs valid integer timestamps; Solana RPC requests must be sequential and ≥ 2,500 ms apart in dispatch order;
+  - a completed bounded capture must carry exactly one `GET_SLOT` record, dispatched no earlier than the nominal end;
+  - every schedule count is re-derived from the ledger (malformed records are rejected, not skipped) and must match;
   - the nominal end must equal the observation start + 65,000 ms;
   - drain retrievals ≤ 2, no retrieval at or after `GET_SLOT`, `GET_SLOT` by its deadline;
   - a stop reason must match the recorded status.
 - **Active-window recomputation** uses the validated profile's budget.
-- **Historical captures** carry no profile and keep the legacy interpretation. All 9 replay identically to the pre-feature baseline.
+- **Historical captures** carry no profile and keep the legacy interpretation, which still enforces 14/3 and the timing rules. All 9 replay identically to the pre-feature baseline.
 
 **CLI**: the dry-run prints the selected profile and its limits. The final summary reports attempts against the run's own profile.
 
@@ -3384,7 +3386,37 @@ The baseline timings below are **measured**, from the five current-build runs wi
 - **C7, stale cutoff**: `STALE_DATA` under 20/9.
 - **C8, disconnect**: a `SUBSCRIPTION_DISCONNECT` gap keeps the window unqualified.
 - **Every bounded run**: Solana RPC dispatches stay ≥ 2,500 ms apart.
+- **C2 (stripped profile), C9 (timing tampering), C10 (90 s deadline)**: see §8.23b.
 
-Not covered by a dedicated test: the defensive `PRE_CUTOFF_DRAIN_LIMIT_EXCEEDED` branch, which needs real-time sleep overshoot to trigger, and an exhausted 90 s overall deadline under 20/9, because the profile fixes the deadline and the existing `OVERALL_DIAGNOSTIC_TIMEOUT` tests cover that mechanism.
+Not covered by a dedicated test: the defensive `PRE_CUTOFF_DRAIN_LIMIT_EXCEEDED` branch, which needs real-time sleep overshoot to trigger. (At `af1e3ba`, this note also excused the missing 90 s deadline test by pointing at the existing timeout tests; that test now exists as C10, §8.23b.)
 
 **Not done**: no provider call, socket, live capture, operator run, daemon activation, position, order, wallet change or push.
+
+#### 8.23b Replay Validation Corrections (Review of `af1e3ba`)
+
+An independent review reproduced two replay gaps at `af1e3ba`. §8.23a overstated replay strictness in both areas and has been corrected above.
+
+1. **Removing the profile bypassed the ceilings.** A valid 20/9 capture (20 attempts, 9 retrievals) with `capacityProfile`, `observationSchedule` and the active-window `capacityProfile` removed still replayed as `ok` with a matching decision. The profile-absent branch returned before any ledger check.
+   - **Fix**: when no profile is sealed, the legacy interpretation now enforces the default 14/3 ceilings, plus the timing rules below. The stripped capture fails with an explicit "exceed DEFAULT_14_3 (legacy interpretation)" reason (C2).
+   - **History**: genuine historical captures are within 14/3 and satisfy the timing rules, so all 9 still replay identically.
+2. **Missing or contradictory timing evidence was accepted.** On a quiet 20/9 capture, each of these still replayed successfully:
+   - a deleted `GET_SLOT` dispatch time;
+   - a deleted `GET_SLOT` completion time (each with the schedule set to `null`);
+   - `GET_BLOCK_TIME` dispatched 1 ms after `GET_SLOT`.
+
+   Schedule derivation had silently filtered out malformed records.
+   - **Fix**: every ledger record must have safe-integer, positive dispatch and completion times, with completion ≥ dispatch. Malformed records are rejected, and the derivation no longer filters.
+   - **Solana ordering**: Solana RPC requests, sorted by dispatch time, must be sequential (each dispatched at or after the previous completion) and ≥ 2,500 ms apart.
+   - **Bounded captures**: a completed bounded capture must have exactly one `GET_SLOT` record, dispatched no earlier than the nominal end, and no retrieval may predate observation.
+   - **Unchanged**: the drain allowance, cutoff window and no-retrieval-after-`GET_SLOT` checks remain.
+   - **Regressions (C9)**: the three reviewer cases plus a removed `GET_SLOT`, completion before dispatch, a fractional timestamp, overlapping Solana requests, `GET_SLOT` before the nominal end, and a legacy capture violating spacing. Each fails with its asserted reason after manifest recalculation.
+
+3. **Source-side spacing guarantee.** The budget manager paces from its own recording point, which for stream retrievals lies inside the adapter and can precede the ledger dispatch time by a few ms. Live captures could therefore have failed the replay spacing check by about 1 ms. Solana RPC dispatches now also wait for ledger-level spacing (≥ 2,500 ms after the previous recorded Solana dispatch) before dispatching. This never shortens pacing, and it never waits under synthetic clocks.
+4. **90 s overall deadline (C10).** With a synthetic clock (no real waiting), a 20 s post-cutoff history response pushes the run past its fixed 90,000 ms deadline. The test checks that:
+   - the run stops with `OVERALL_DIAGNOSTIC_TIMEOUT`;
+   - nothing is dispatched at or after the deadline, and no later stage is attempted;
+   - there is no qualified flow or decision;
+   - the `GET_SLOT` evidence is within its window and no bounded stop is claimed;
+   - artifacts are sealed without error, and replay of the partial capture fails closed (`INCOMPLETE_MANIFEST_COVERAGE`).
+
+Limits, pacing, thresholds, the wallet and historical evidence are unchanged. Nothing has run live.

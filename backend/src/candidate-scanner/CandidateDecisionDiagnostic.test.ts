@@ -4911,6 +4911,15 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       mutate(j);
       writeFileSync(reportPath, JSON.stringify(j), "utf8");
     };
+    /** Shifts every ledger record dispatched at/after `fromMs` by `delta` (keeps spacing and order). */
+    const shiftFrom = (j: Rep, fromMs: number, delta: number) => {
+      for (const r of j.ledger.records) {
+        if ((r.dispatchedAtMs as number) >= fromMs) {
+          r.dispatchedAtMs = (r.dispatchedAtMs as number) + delta;
+          r.completedAtMs = (r.completedAtMs as number) + delta;
+        }
+      }
+    };
     const rederive = (j: Rep) => {
       Object.assign(
         j.observationSchedule,
@@ -4980,23 +4989,29 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
         "stop reason contradicts the recorded status",
       ],
       [
-        "GET_SLOT moved after its deadline (schedule re-derived)",
+        "GET_SLOT moved after its deadline (later records shifted, pacing kept, schedule re-derived)",
         () =>
           editReport((j) => {
             const rec = j.ledger.records.find((r) => r.purpose === "GET_SLOT")!;
-            rec.dispatchedAtMs = (j.observationSchedule.getSlotDispatchDeadlineMs as number) + 1;
+            const delta =
+              (j.observationSchedule.getSlotDispatchDeadlineMs as number) +
+              1 -
+              (rec.dispatchedAtMs as number);
+            shiftFrom(j, rec.dispatchedAtMs as number, delta);
             rederive(j);
           }),
         "GET_SLOT dispatched after its deadline",
       ],
       [
-        "retrieval moved to GET_SLOT dispatch (schedule re-derived)",
+        "retrieval moved after GET_SLOT (later records shifted, pacing kept, schedule re-derived)",
         () =>
           editReport((j) => {
             const getSlotRec = j.ledger.records.find((r) => r.purpose === "GET_SLOT")!;
             const txRec = j.ledger.records.find((r) => r.purpose === "TRANSACTION_DECODING")!;
-            txRec.dispatchedAtMs = getSlotRec.dispatchedAtMs;
-            txRec.completedAtMs = getSlotRec.dispatchedAtMs;
+            const getSlotAt = getSlotRec.dispatchedAtMs as number;
+            shiftFrom(j, getSlotAt + 1, 2_500);
+            txRec.dispatchedAtMs = getSlotAt + 2_500;
+            txRec.completedAtMs = getSlotAt + 2_500;
             rederive(j);
           }),
         "dispatched at or after GET_SLOT",
@@ -5112,6 +5127,36 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(schedule.drainRetrievals, label).toBeLessThanOrEqual(2);
   };
 
+  /** Edits sealed JSON files of the current capture, reseals, and returns the replay (restores afterwards). */
+  const tamperAndReplay = (edits: () => void) => {
+    const files = [
+      path.join(activeOutDir, "diagnostic-report.json"),
+      path.join(activeOutDir, "evidence-manifest.json"),
+      ...(existsSync(activeEvidencePath()) ? [activeEvidencePath()] : []),
+    ];
+    const originals = new Map(files.map((p) => [p, readFileSync(p, "utf8")]));
+    try {
+      edits();
+      resealSyntheticCapture(activeOutDir);
+      return replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    } finally {
+      for (const [p, content] of originals) writeFileSync(p, content, "utf8");
+    }
+  };
+  type SealedReport = Record<string, unknown> & {
+    capacityProfile?: unknown;
+    observationSchedule?: Record<string, unknown>;
+    ledger: { totalAttempts: number; records: Array<Record<string, unknown>> };
+  };
+  const editSealedReport = (mutate: (j: SealedReport) => void) => {
+    const p = path.join(activeOutDir, "diagnostic-report.json");
+    const j = JSON.parse(readFileSync(p, "utf8")) as SealedReport;
+    mutate(j);
+    writeFileSync(p, JSON.stringify(j), "utf8");
+  };
+  const recordOf = (j: SealedReport, purpose: string, nth = 0) =>
+    j.ledger.records.filter((r) => r.purpose === purpose)[nth]!;
+
   it("C1. Profile selection: default runs keep 14/3; the opt-in selects 20/9 and a quiet opted-in run reports it", async () => {
     const transport = vi.fn(async () => new Response("{}", { status: 200 }));
     const base = {
@@ -5190,6 +5235,25 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(replay.matchesRecordedDecision).toBe(true);
     expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(9);
     expect(replay.recomputedActiveWindowFlow?.recentBuys60s).toBe(5);
+
+    // Reviewer reproduction: removing every profile field cannot relax the limits. The legacy interpretation
+    // enforces 14 attempts / 3 retrievals (manifest recalculated).
+    const stripped = tamperAndReplay(() => {
+      editSealedReport((j) => {
+        delete j.capacityProfile;
+        delete j.observationSchedule;
+      });
+      const ae = JSON.parse(readFileSync(activeEvidencePath(), "utf8")) as Record<string, unknown>;
+      delete ae.capacityProfile;
+      writeFileSync(activeEvidencePath(), JSON.stringify(ae), "utf8");
+    });
+    expect(stripped.ok).toBe(false);
+    expect(stripped.status).toBe("REPLAY_CAPACITY_EVIDENCE_INVALID");
+    expect(stripped.message).toContain(
+      "(20 attempts, 20 records, 9 retrievals) contradict or exceed DEFAULT_14_3 (legacy interpretation) (14/3)",
+    );
+    expect(stripped.matchesRecordedDecision).toBeUndefined();
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
   });
 
   it("C3. Bounded drain: two retrievals at/after the nominal end, GET_SLOT dispatched exactly at its deadline", async () => {
@@ -5311,5 +5375,165 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(result.flowEvaluation?.diagnosticReason).toContain("SUBSCRIPTION_DISCONNECT");
     expectBoundedRunInvariants(result);
     expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+  });
+
+  it("C9. Replay rejects malformed or contradictory timing evidence (quiet 20/9 capture, manifests recalculated)", async () => {
+    const quiet = await runActive({ swaps: [], paperActiveWindowFlow: true });
+    expectBoundedRunInvariants(quiet);
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+
+    const cases: Array<[string, (j: SealedReport) => void, string]> = [
+      // Reviewer reproductions.
+      [
+        "GET_SLOT dispatch time deleted; schedule set to null",
+        (j) => {
+          delete recordOf(j, "GET_SLOT").dispatchedAtMs;
+          j.observationSchedule!.getSlotDispatchedAtMs = null;
+        },
+        "(GET_SLOT) has a missing or non-integer dispatch/completion time",
+      ],
+      [
+        "GET_SLOT completion time deleted; schedule set to null",
+        (j) => {
+          delete recordOf(j, "GET_SLOT").completedAtMs;
+          j.observationSchedule!.getSlotDispatchedAtMs = null;
+        },
+        "(GET_SLOT) has a missing or non-integer dispatch/completion time",
+      ],
+      [
+        "GET_BLOCK_TIME dispatched 1 ms after GET_SLOT",
+        (j) =>
+          (recordOf(j, "GET_BLOCK_TIME").dispatchedAtMs =
+            (recordOf(j, "GET_SLOT").dispatchedAtMs as number) + 1),
+        "Solana RPC GET_BLOCK_TIME dispatched 1 ms after GET_SLOT (minimum 2500 ms)",
+      ],
+      // Adjacent cases.
+      [
+        "GET_SLOT record removed (totals adjusted, schedule null)",
+        (j) => {
+          j.ledger.records = j.ledger.records.filter((r) => r.purpose !== "GET_SLOT");
+          j.ledger.totalAttempts -= 1;
+          j.observationSchedule!.getSlotDispatchedAtMs = null;
+        },
+        "requires exactly one GET_SLOT record (found 0)",
+      ],
+      [
+        "completion before dispatch",
+        (j) => {
+          const lp = recordOf(j, "LP_REFRESH");
+          lp.completedAtMs = (lp.dispatchedAtMs as number) - 1;
+        },
+        "(LP_REFRESH) completed before it was dispatched",
+      ],
+      [
+        "fractional timestamp",
+        (j) => {
+          const h = recordOf(j, "HISTORY_ENUMERATION");
+          h.dispatchedAtMs = (h.dispatchedAtMs as number) + 0.5;
+        },
+        "(HISTORY_ENUMERATION) has a missing or non-integer dispatch/completion time",
+      ],
+      [
+        "overlapping Solana RPC requests",
+        (j) => {
+          recordOf(j, "LP_REFRESH", 0).completedAtMs =
+            (recordOf(j, "LP_REFRESH", 1).dispatchedAtMs as number) + 1;
+        },
+        "Solana RPC LP_REFRESH dispatched before LP_REFRESH completed",
+      ],
+      [
+        "GET_SLOT before the nominal end (later records shifted, schedule re-derived)",
+        (j) => {
+          for (const r of j.ledger.records) {
+            if (
+              (r.dispatchedAtMs as number) >= (recordOf(j, "GET_SLOT").dispatchedAtMs as number)
+            ) {
+              r.dispatchedAtMs = (r.dispatchedAtMs as number) - 1;
+              r.completedAtMs = (r.completedAtMs as number) - 1;
+            }
+          }
+          Object.assign(
+            j.observationSchedule!,
+            deriveBoundedScheduleCounts(
+              j.ledger.records,
+              j.observationSchedule!.nominalObservationEndMs as number,
+            ),
+          );
+        },
+        "GET_SLOT dispatched before the nominal observation end",
+      ],
+      [
+        "legacy interpretation keeps the timing rules (profile fields removed)",
+        (j) => {
+          delete j.capacityProfile;
+          delete j.observationSchedule;
+          recordOf(j, "GET_BLOCK_TIME").dispatchedAtMs =
+            (recordOf(j, "GET_SLOT").dispatchedAtMs as number) + 1;
+        },
+        "Solana RPC GET_BLOCK_TIME dispatched 1 ms after GET_SLOT (minimum 2500 ms)",
+      ],
+    ];
+    for (const [label, mutate, reason] of cases) {
+      const r = tamperAndReplay(() => {
+        editSealedReport(mutate);
+        if (label.startsWith("legacy") && existsSync(activeEvidencePath())) {
+          const ae = JSON.parse(readFileSync(activeEvidencePath(), "utf8")) as Record<
+            string,
+            unknown
+          >;
+          delete ae.capacityProfile;
+          writeFileSync(activeEvidencePath(), JSON.stringify(ae), "utf8");
+        }
+      });
+      expect(r.ok, label).toBe(false);
+      expect(r.status, label).toBe("REPLAY_CAPACITY_EVIDENCE_INVALID");
+      expect(r.message, label).toContain(reason);
+      expect(r.decisionResult, label).toBeUndefined();
+    }
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+  });
+
+  it("C10. The 90 s overall deadline under 20/9: no later dispatch, no qualified flow, settled work, honest evidence", async () => {
+    // SYNTHETIC: the post-cutoff history page takes 20 s of synthetic time (clock advances; no real waiting),
+    // so the run passes its fixed 90,000 ms deadline (run start + 90,000 ms) before Phase 3.
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      historyAdvanceMs: 20_000,
+      swaps: [{ signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY" }],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+    expectBoundedRunInvariants(result);
+    const deadline = RUN_START + 90_000;
+    // Nothing dispatched at or after the deadline; the run stopped after the history page.
+    expect(result.ledger.records.every((r) => r.dispatchedAtMs < deadline)).toBe(true);
+    expect(result.ledger.records.at(-1)?.purpose).toBe("HISTORY_ENUMERATION");
+    for (const purpose of [
+      "EXACT_PAIR",
+      "LP_REFRESH",
+      "CANDIDATE_MINT",
+      "RUGCHECK_REPORT",
+      "SOLANA_TRACKER_BUNDLERS",
+    ]) {
+      expect(
+        result.ledger.records.some((r) => r.purpose === purpose),
+        purpose,
+      ).toBe(false);
+    }
+    // No qualified flow; the cutoff was acquired in time and is reported honestly; no bounded stop is claimed.
+    expect(result.flowEvaluation?.isPaperQualified).not.toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s ?? null).toBeNull();
+    expect(result.decisionResult).toBeUndefined();
+    expect(result.observationSchedule!.stopReason).toBeNull();
+    expect(result.observationSchedule!.getSlotDispatchedAtMs!).toBeLessThanOrEqual(
+      result.observationSchedule!.getSlotDispatchDeadlineMs,
+    );
+    // Settled and sealed: artifacts written without a write error; replay of the partial capture fails closed
+    // rather than reporting success.
+    expect(result.writeError).toBeUndefined();
+    expect(existsSync(path.join(activeOutDir, "evidence-manifest.json"))).toBe(true);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
   });
 });

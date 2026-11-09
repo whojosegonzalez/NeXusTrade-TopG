@@ -498,7 +498,67 @@ export interface BoundedObservationSchedule {
   readonly stopReason: string | null;
 }
 
-/** Derives schedule counts from ledger records (shared by sealing and replay). */
+/** Ledger record shape required for timing validation and schedule derivation. */
+interface TimedLedgerRecord {
+  readonly purpose: string;
+  readonly provider: string;
+  readonly dispatchedAtMs: number;
+  readonly completedAtMs: number;
+}
+
+/**
+ * Validates every ledger record's timing: purpose/provider strings, finite safe-integer positive dispatch and
+ * completion times, and completion at or after dispatch. Malformed records are rejected, never filtered out.
+ */
+export function validateLedgerRecordTiming(
+  records: readonly unknown[],
+): { ok: true; records: readonly TimedLedgerRecord[] } | { ok: false; reason: string } {
+  const out: TimedLedgerRecord[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i] as Record<string, unknown> | null;
+    if (
+      !r ||
+      typeof r !== "object" ||
+      typeof r.purpose !== "string" ||
+      typeof r.provider !== "string"
+    ) {
+      return { ok: false, reason: `ledger record ${i} lacks a purpose or provider` };
+    }
+    const dispatched = r.dispatchedAtMs;
+    const completed = r.completedAtMs;
+    if (
+      typeof dispatched !== "number" ||
+      !Number.isSafeInteger(dispatched) ||
+      dispatched <= 0 ||
+      typeof completed !== "number" ||
+      !Number.isSafeInteger(completed) ||
+      completed <= 0
+    ) {
+      return {
+        ok: false,
+        reason: `ledger record ${i} (${r.purpose}) has a missing or non-integer dispatch/completion time`,
+      };
+    }
+    if (completed < dispatched) {
+      return {
+        ok: false,
+        reason: `ledger record ${i} (${r.purpose}) completed before it was dispatched`,
+      };
+    }
+    out.push({
+      purpose: r.purpose,
+      provider: r.provider,
+      dispatchedAtMs: dispatched,
+      completedAtMs: completed,
+    });
+  }
+  return { ok: true, records: out };
+}
+
+/**
+ * Derives schedule counts from ledger records (shared by sealing and replay). Throws on a malformed record or on
+ * more than one GET_SLOT record; nothing is filtered out silently.
+ */
 export function deriveBoundedScheduleCounts(
   records: readonly unknown[],
   nominalObservationEndMs: number,
@@ -509,17 +569,13 @@ export function deriveBoundedScheduleCounts(
   | "getSlotDispatchedAtMs"
   | "retrievalsAfterGetSlot"
 > {
-  const recs = records.filter(
-    (r): r is { purpose: string; dispatchedAtMs: number; completedAtMs: number } =>
-      !!r &&
-      typeof r === "object" &&
-      typeof (r as { purpose?: unknown }).purpose === "string" &&
-      typeof (r as { dispatchedAtMs?: unknown }).dispatchedAtMs === "number" &&
-      typeof (r as { completedAtMs?: unknown }).completedAtMs === "number",
-  );
+  const timing = validateLedgerRecordTiming(records);
+  if (!timing.ok) throw new Error(`[MALFORMED_LEDGER] ${timing.reason}`);
+  const recs = timing.records;
   const tx = recs.filter((r) => r.purpose === "TRANSACTION_DECODING");
-  const getSlot = recs.find((r) => r.purpose === "GET_SLOT");
-  const getSlotDispatchedAtMs = getSlot ? getSlot.dispatchedAtMs : null;
+  const getSlots = recs.filter((r) => r.purpose === "GET_SLOT");
+  if (getSlots.length > 1) throw new Error("[MALFORMED_LEDGER] more than one GET_SLOT record");
+  const getSlotDispatchedAtMs = getSlots[0]?.dispatchedAtMs ?? null;
   return {
     drainRetrievals: tx.filter((r) => r.dispatchedAtMs >= nominalObservationEndMs).length,
     boundaryCrossingRetrievals: tx.filter(
@@ -897,16 +953,18 @@ export class CandidateDecisionDiagnostic {
     "capacityProfile" | "observationSchedule"
   > {
     const base = this.boundedScheduleBase;
+    let counts: ReturnType<typeof deriveBoundedScheduleCounts> | null = null;
+    if (base) {
+      try {
+        counts = deriveBoundedScheduleCounts(this.ledger.records, base.nominalObservationEndMs);
+      } catch {
+        counts = null; // never synthesized: replay rejects a bounded capture without its schedule
+      }
+    }
     return {
       capacityProfile: this.capacityProfile,
-      ...(base
-        ? {
-            observationSchedule: {
-              ...base,
-              ...deriveBoundedScheduleCounts(this.ledger.records, base.nominalObservationEndMs),
-              stopReason: this.boundedStopReason,
-            },
-          }
+      ...(base && counts
+        ? { observationSchedule: { ...base, ...counts, stopReason: this.boundedStopReason } }
         : {}),
     };
   }
@@ -1018,6 +1076,27 @@ export class CandidateDecisionDiagnostic {
       throw new Error(
         `[OVERALL_DIAGNOSTIC_TIMEOUT] Overall diagnostic deadline exceeded before ${purpose}`,
       );
+    }
+
+    // 0b. Ledger-level Solana RPC pacing: sealed dispatch times stay >= the profile pacing apart. The budget manager
+    //     paces from its own recording point (for stream retrievals, inside the adapter), which can precede the
+    //     ledger dispatch time by a few ms; this wait closes that gap. It never shortens pacing.
+    if (providerName === "SOLANA_RPC") {
+      let lastSolanaDispatch = -Infinity;
+      for (const rec of this.ledger.records) {
+        if (rec.provider === "SOLANA_RPC" && rec.dispatchedAtMs > lastSolanaDispatch) {
+          lastSolanaDispatch = rec.dispatchedAtMs;
+        }
+      }
+      const ledgerWaitMs = lastSolanaDispatch + this.capacityProfile.rpcPacingMs - this.clock();
+      if (ledgerWaitMs > 0) {
+        if (latestDispatchAtMs !== undefined && this.clock() + ledgerWaitMs > latestDispatchAtMs) {
+          throw new Error(
+            `[CUTOFF_DISPATCH_WINDOW_EXCEEDED] ${purpose} cannot dispatch (including pacing) by ${latestDispatchAtMs}`,
+          );
+        }
+        await this.sleepWithAbort(ledgerWaitMs, signal);
+      }
     }
 
     // 1. Budget manager admission check & pacing (if not skipped by caller)
@@ -4547,10 +4626,15 @@ export interface CandidateDecisionReplayResult {
 const REPLAY_MAX_CUTOFF_AGE_MS = 15_000;
 
 /**
- * Validates the sealed capacity profile and (bounded profile) observation-schedule evidence. Captures without a
- * profile keep their historical interpretation (legacy 14/3). Only exact supported profiles are accepted; ledger
- * totals and retrieval counts must respect the selected ceilings; drain and cutoff timing is re-derived from the
- * ledger and must match the sealed schedule.
+ * Validates the sealed capacity profile and its ledger/timing evidence.
+ * - Profile absent (historical captures): the legacy DEFAULT_14_3 ceilings and the same timing rules still apply;
+ *   removing profile fields can never relax a limit.
+ * - Profile present: only the exact supported definitions are accepted.
+ * - Every ledger record needs valid integer timestamps (completion >= dispatch); Solana RPC requests must be
+ *   sequential (each dispatched at/after the previous completion) and >= the profile pacing apart, judged in
+ *   dispatch order (overlapping providers mean ledger order is completion order).
+ * - Bounded profile: the sealed schedule is re-derived from the ledger; a completed capture must carry its
+ *   actual GET_SLOT dispatch evidence; no retrieval at/after GET_SLOT; drain and cutoff windows enforced.
  */
 function validateSealedCapacityEvidence(
   report: Record<string, unknown>,
@@ -4558,6 +4642,7 @@ function validateSealedCapacityEvidence(
 ): { ok: true; profile: DiagnosticCapacityProfile | null } | { ok: false; reason: string } {
   const fail = (reason: string) => ({ ok: false as const, reason });
   const sealedProfile = report.capacityProfile;
+  let profile: DiagnosticCapacityProfile | null = null;
   if (sealedProfile === undefined) {
     if (report.observationSchedule !== undefined) {
       return fail("observation schedule sealed without a capacity profile");
@@ -4565,21 +4650,23 @@ function validateSealedCapacityEvidence(
     if (activeEvidence && activeEvidence.capacityProfile !== undefined) {
       return fail("active-window evidence names a capacity profile the report does not seal");
     }
-    return { ok: true, profile: null };
+  } else {
+    profile =
+      SUPPORTED_CAPACITY_PROFILES.find((p) => canonicalJson(p) === canonicalJson(sealedProfile)) ??
+      null;
+    if (!profile) return fail("sealed capacity profile is unsupported or internally inconsistent");
   }
-  const profile = SUPPORTED_CAPACITY_PROFILES.find(
-    (p) => canonicalJson(p) === canonicalJson(sealedProfile),
-  );
-  if (!profile) return fail("sealed capacity profile is unsupported or internally inconsistent");
-  const bounded = profile.cutoffDispatchWindowMs !== null;
+  // Legacy interpretation enforces the default ceilings; it never skips them.
+  const limits = profile ?? DEFAULT_CAPACITY_PROFILE;
+  const bounded = limits.cutoffDispatchWindowMs !== null;
   if (
     bounded &&
     report.executionContext !== "PAPER_SIMULATION" &&
     report.executionContext !== "BACKTEST"
   ) {
-    return fail(`${profile.id} requires a PAPER_SIMULATION or BACKTEST capture`);
+    return fail(`${limits.id} requires a PAPER_SIMULATION or BACKTEST capture`);
   }
-  if (activeEvidence) {
+  if (activeEvidence && profile) {
     if (activeEvidence.capacityProfile !== profile.id) {
       return fail(
         `active-window evidence profile (${String(activeEvidence.capacityProfile)}) contradicts the report (${profile.id})`,
@@ -4589,24 +4676,43 @@ function validateSealedCapacityEvidence(
       return fail("active-window evidence requires the PAPER_ACTIVE_WINDOW_20_9 profile");
   }
 
-  // Ledger totals and retrieval counts against the selected ceilings.
+  // Ledger totals and retrieval counts against the selected (or legacy) ceilings.
   const ledger = report.ledger as
     | { records?: unknown; totalAttempts?: unknown; transactionDecodeAttempts?: unknown }
     | undefined;
-  const records = Array.isArray(ledger?.records) ? (ledger.records as unknown[]) : null;
-  if (!records) return fail("sealed ledger has no records array");
-  const purposeOf = (r: unknown) =>
-    r && typeof r === "object" ? (r as { purpose?: unknown }).purpose : undefined;
-  const txCount = records.filter((r) => purposeOf(r) === "TRANSACTION_DECODING").length;
+  const rawRecords = Array.isArray(ledger?.records) ? (ledger.records as unknown[]) : null;
+  if (!rawRecords) return fail("sealed ledger has no records array");
+  const timing = validateLedgerRecordTiming(rawRecords);
+  if (!timing.ok) return fail(timing.reason);
+  const records = timing.records;
+  const txCount = records.filter((r) => r.purpose === "TRANSACTION_DECODING").length;
   if (
     ledger?.totalAttempts !== records.length ||
-    records.length > profile.maxTotalRequests ||
+    records.length > limits.maxTotalRequests ||
     ledger?.transactionDecodeAttempts !== txCount ||
-    txCount > profile.maxTransactionRetrievals
+    txCount > limits.maxTransactionRetrievals
   ) {
     return fail(
-      `ledger totals (${String(ledger?.totalAttempts)} attempts, ${records.length} records, ${txCount} retrievals) contradict or exceed ${profile.id} (${profile.maxTotalRequests}/${profile.maxTransactionRetrievals})`,
+      `ledger totals (${String(ledger?.totalAttempts)} attempts, ${records.length} records, ${txCount} retrievals) contradict or exceed ${limits.id}${profile ? "" : " (legacy interpretation)"} (${limits.maxTotalRequests}/${limits.maxTransactionRetrievals})`,
     );
+  }
+
+  // Solana RPC: sequential and paced, judged in dispatch order.
+  const solana = records
+    .filter((r) => r.provider === "SOLANA_RPC")
+    .slice()
+    .sort((a, b) => a.dispatchedAtMs - b.dispatchedAtMs);
+  for (let i = 1; i < solana.length; i++) {
+    const prev = solana[i - 1]!;
+    const cur = solana[i]!;
+    if (cur.dispatchedAtMs - prev.dispatchedAtMs < limits.rpcPacingMs) {
+      return fail(
+        `Solana RPC ${cur.purpose} dispatched ${cur.dispatchedAtMs - prev.dispatchedAtMs} ms after ${prev.purpose} (minimum ${limits.rpcPacingMs} ms)`,
+      );
+    }
+    if (cur.dispatchedAtMs < prev.completedAtMs) {
+      return fail(`Solana RPC ${cur.purpose} dispatched before ${prev.purpose} completed`);
+    }
   }
 
   const schedule = report.observationSchedule as Record<string, unknown> | undefined;
@@ -4615,22 +4721,23 @@ function validateSealedCapacityEvidence(
       ? { ok: true, profile }
       : fail("observation schedule sealed under an unbounded profile");
   }
-  const hasObservationWork = records.some(
-    (r) => purposeOf(r) === "TRANSACTION_DECODING" || purposeOf(r) === "GET_SLOT",
-  );
-  if (schedule === undefined) {
-    return hasObservationWork
-      ? fail("bounded capture with retrievals or a cutoff lacks its observation schedule")
-      : { ok: true, profile };
+  // Bounded profile (replay runs this only on the full path, where cutoff evidence is required): the actual
+  // GET_SLOT dispatch evidence and the sealed schedule are mandatory.
+  const getSlots = records.filter((r) => r.purpose === "GET_SLOT");
+  if (getSlots.length !== 1) {
+    return fail(
+      `a completed bounded capture requires exactly one GET_SLOT record (found ${getSlots.length})`,
+    );
   }
+  if (schedule === undefined) return fail("bounded capture lacks its observation schedule");
   const obsStart = (report.observationMetadata as { observationStartMs?: unknown } | undefined)
     ?.observationStartMs;
   const nominalEnd = schedule.nominalObservationEndMs;
   if (
     asPositiveSafeInteger(obsStart) === null ||
-    nominalEnd !== (obsStart as number) + (profile.nominalObservationMs as number) ||
+    nominalEnd !== (obsStart as number) + (limits.nominalObservationMs as number) ||
     schedule.getSlotDispatchDeadlineMs !==
-      (nominalEnd as number) + (profile.cutoffDispatchWindowMs as number)
+      (nominalEnd as number) + (limits.cutoffDispatchWindowMs as number)
   ) {
     return fail(
       "observation schedule does not match the observation start and the profile windows",
@@ -4644,23 +4751,31 @@ function validateSealedCapacityEvidence(
       );
     }
   }
-  if (derived.drainRetrievals > profile.maxDrainRetrievals) {
-    return fail(`${derived.drainRetrievals} drain retrievals exceed ${profile.maxDrainRetrievals}`);
+  const getSlotAt = derived.getSlotDispatchedAtMs as number;
+  if (
+    records.some(
+      (r) => r.purpose === "TRANSACTION_DECODING" && r.dispatchedAtMs < (obsStart as number),
+    )
+  ) {
+    return fail("a transaction retrieval was dispatched before observation started");
+  }
+  if (getSlotAt < (nominalEnd as number)) {
+    return fail("GET_SLOT dispatched before the nominal observation end");
+  }
+  if (derived.drainRetrievals > limits.maxDrainRetrievals) {
+    return fail(`${derived.drainRetrievals} drain retrievals exceed ${limits.maxDrainRetrievals}`);
   }
   if (derived.retrievalsAfterGetSlot !== 0) {
     return fail("a transaction retrieval was dispatched at or after GET_SLOT");
   }
-  if (
-    derived.getSlotDispatchedAtMs !== null &&
-    derived.getSlotDispatchedAtMs > (schedule.getSlotDispatchDeadlineMs as number)
-  ) {
+  if (getSlotAt > (schedule.getSlotDispatchDeadlineMs as number)) {
     return fail("GET_SLOT dispatched after its deadline");
   }
   const stopReason = schedule.stopReason;
   if (stopReason !== null && (typeof stopReason !== "string" || report.status !== stopReason)) {
     return fail("sealed schedule stop reason contradicts the recorded status");
   }
-  if (stopReason !== null && derived.getSlotDispatchedAtMs !== null) {
+  if (stopReason !== null) {
     return fail("a bounded stop is recorded although GET_SLOT was dispatched");
   }
   return { ok: true, profile };
