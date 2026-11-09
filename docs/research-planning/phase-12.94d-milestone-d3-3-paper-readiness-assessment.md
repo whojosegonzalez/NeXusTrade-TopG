@@ -2697,3 +2697,51 @@ node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decisio
 ```
 
 **Boundaries unchanged**: the virtual wallet `U:\Projects\TopG\.tmp\virtual-wallet.json` remains 7.9259 SOL (SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`) with a $0.00 spending ceiling. No provider requests, RPC, sockets, captures, reruns, daemons, trades or threshold changes were performed for this work.
+
+---
+
+### 8.18 Accepted RugCheck Opt-In Capture (Retrieval and Timing Objective Closed) & Next Blocker
+
+The operator ran the approved diagnostic on `0356bb62f42dfe55df838a519b39e291c3311adf` with `--paper --rugcheck-max-bytes 4194304 --overlap-rugcheck`, after a zero-network dry run. Independent review and a read-only verification here agree. **No further Fartcoin captures are needed for this objective.**
+
+- **Capture**: `data/research/diagnostics/candidate-decision-fartcoin-rugcheck-optin-2026-11-09T08-36-08-553Z`
+- **Manifest SHA-256**: `6b932ed27d8b09302dc9ec1d14104a299cccfe261a4f9489039cd20372bcbf4d`. All 23 entries and the report file verify; there are no unlisted files.
+
+#### 1. Requests and Timing
+
+- **Requests**: 11 HTTP attempts, all HTTP 200, each recorded once with its own sealed response file. There were 0 transaction retrievals, 1 RugCheck request and 1 Solana Tracker request.
+- **Pacing and duration**: the minimum Solana RPC dispatch spacing was 2,507 ms. First dispatch to last completion took 80,630 ms, inside the 90 s limit.
+- **Overlap**: `RUGCHECK_REPORT` was dispatched 3 ms after the LP batch completed and took 1,030 ms. It finished **1,432 ms before** `CANDIDATE_MINT` was dispatched, so the download fell entirely inside the pacing wait.
+- **Freshness**: the cutoff age at decision was **13,426 ms**, a margin of **1,574 ms** under the unchanged 15,000 ms ceiling. The serial Run 2 (§8.16) had 14,618 ms and a 382 ms margin.
+- **Observation**: 67,561 ms, 0 notifications, 3 client pings and 3 matched pongs, `ANCHOR_WITNESSED` with 0 signatures newer than the anchor.
+
+#### 2. Security Evidence (Complete Retrieval vs Provider-Reported Values)
+
+- **RugCheck retrieval was complete.** `bodyStatus: COMPLETE`, with **2,007,984 decoded bytes** retained under the 4 MiB ceiling. The retained digest equals the wire digest `c22bfd3a…4f78`.
+  - The provider declared `Content-Encoding: gzip` and sent no `Content-Length`. That is metadata only and does not establish size.
+  - The sealed `responses/09-rugcheck-report.json` is **2,774,061 bytes**. It is the redacted, re-serialized (indented) JSON, not the wire bytes, which is why it is larger than the decoded body.
+  - The derived `evidence/rugcheck-report.json` is 834 bytes and references the sealed response instead of duplicating it.
+- **RugCheck metrics** (provider-reported; validated with the shared strict validator and reproduced by replay): score 1; no `danger` risks; `totalHolders` 587,075; top-ten concentration 33.670597%, the sum of the provider-reported `topHolders[0..9].pct`.
+- **Raw-account revalidation**: 99.786359% inaccessible LP claims; mint and freeze authorities `DISABLED`.
+- **Solana Tracker**: `QUALIFIED_PAPER_PROXY` / `PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION`. Initial allocation 0.05072% (proxy), current holdings ≈ 1.1607%. Provider accuracy and attribution remain unverified.
+- **Flow**: PAPER quiet-window qualification (0 buys, 0 sells) under the declared provider-relative assumptions. **This does not establish active-pool coverage or production completeness** (`isProductionCompletenessEstablished = false`).
+
+#### 3. Decision and Replay
+
+- **Decision**: `BUY_GATE_REJECTED`, primary reason **`MATURITY_WINDOW_GATE_FAILED`**. The age is 64,981,655 s, past the 7,200 s established ceiling, so the candidate was evaluated as non-established.
+- **Gate 11**: it now rejects on observed evidence, not on missing data. Top-ten concentration is 33.67%, above the unchanged 30% ceiling; score, danger, holders and the bundler proxy pass.
+- **Other failed gates**: depth balance, flow absorption, volume surge and minimum sells. The DexScreener 5-minute volume and transaction counts were all 0.
+- **Replay**: `DECISION_REEVALUATED` at `1794213450426`, `matchesRecordedDecision: true`, recomputed RugCheck `AVAILABLE` with identical metrics, 23/23 files verified.
+- **Unchanged**: the earlier 67 diagnostic files and the standing wallet.
+
+#### 4. Next Blocker for a Bounded PAPER Run (Source Assessment)
+
+1. **Quiet coverage cannot produce an entry.** Both retest confirmation rules require verified `recentBuys60s > 0` with `SUFFICIENT` coverage (`RetestGateEvaluator.ts`: Rule A pullback absorption and Rule B consolidation). A quiet 0/0 window can at most reach `ARMED_FIRST_TICK`. Confirmation, sizing, fills, positions and ratchet exits therefore all depend on **active-window** flow coverage.
+2. **Active-window reconciliation exists but is discarded.** `ExactPoolWindowReconciliationEvaluator` already returns `RECONCILED` with buy/sell counts when every in-window enumerated signature has an explicit resolution record. Three places drop it:
+   - `toCandidateFlowResult` returns `COLLECTION_GAP` outside synthetic proofs;
+   - `PaperReconciledCandidateFlowAdapter` accepts only 0/0 counts;
+   - the diagnostic maps any notification to `NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS`.
+3. **Retrieval budget is the binding live constraint.** An armable micro-cap requires `Sells5m ≥ 15` and `Buys/Sells ≥ 1.5`, which implies ≥ 37.5 transactions per 5 min (≈ 7.5 per min). Each needs a `getTransaction` resolution. At 2,500 ms pacing that is ≈ 19 s of RPC time per minute for one candidate, against the diagnostic's 14-request / 3-retrieval ceilings. The provider roadmap already lists transaction retrieval volume as an immediate blocker. Live active coverage therefore needs a separate operator budget or provider decision.
+4. **The daemon path is wired but unreachable.** It already has retest via `evaluateCandidateDecisionPoints` with armed state, inline cohort sizing, and `PaperTradingDaemon` with `DynamicRatchetService` exits. But its flow provider is `UnavailableCandidateFlowProvider` (nothing calls `setCandidateFlowProvider`), so the Buy Gate rejects with `REJECTED_UNAVAILABLE_FLOW_COVERAGE`. Its Gate 11 remains quarantined (`BUNDLER_CONCENTRATION_UNKNOWN`), and its RugCheck fetch is unbounded. Daemon integration should follow, not precede, active-window qualification.
+
+**Recommended next task**: offline, opt-in, PAPER-only **active-window flow qualification**. A fully reconciled 60 s window with non-zero verified counts should reach PAPER decisions through the existing isolated adapter and diagnostic, under an explicit transaction-resolution budget. Defaults and the production and daemon paths stay unchanged. Live verification is deferred to a separate budget decision.
