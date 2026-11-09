@@ -23,6 +23,7 @@ import {
 } from "./CandidateDecisionDiagnostic.js";
 import { runCandidateDecisionDiagnosticCli } from "../scripts/candidate-decision-diagnostic.js";
 import { buildSyntheticSwapTransactionResult } from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
+import { encodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
   CAPTURED_RAY_WSOL_IDENTITIES,
   RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
@@ -2836,9 +2837,17 @@ describe("CandidateDecisionDiagnostic replay: recorded outcomes and unknown meta
   it("R2. Missing observation/keepalive metadata stays unknown (null), never synthesized from cutoff or defaults", async () => {
     const diagResult = await runSyntheticStaleCapture();
     expect(diagResult.status).toBe("STALE_DATA");
-    const report = readJson<SealedReportJson>(path.join(replayOutDir, "diagnostic-report.json"));
-    expect(report.observationMetadata).toBeUndefined();
-    expect(report.keepaliveMetrics).toBeUndefined();
+    // New failure reports record the actual observation and keepalive state.
+    expect(diagResult.observationMetadata?.notificationsReceived).toBe(1);
+    expect(diagResult.keepaliveMetrics).toBeDefined();
+
+    // SYNTHETIC edit + reseal emulating a historical failure report that never recorded them.
+    const staleReportPath = path.join(replayOutDir, "diagnostic-report.json");
+    const historicalLike = readJson<SealedReportJson>(staleReportPath);
+    delete historicalLike.observationMetadata;
+    delete historicalLike.keepaliveMetrics;
+    writeFileSync(staleReportPath, JSON.stringify(historicalLike), "utf8");
+    resealSyntheticCapture(replayOutDir);
 
     const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
     const obs = replay.auditMetadata?.observation;
@@ -3725,19 +3734,27 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     readonly offsetMs: number; // emitted at run start + offset (synthetic clock)
     readonly slot: number;
     readonly side: "BUY" | "SELL";
+    /** SYNTHETIC: transaction failed on-chain (meta.err set). */
+    readonly failed?: boolean;
+    /** SYNTHETIC: getTransaction never answers until aborted (interrupted retrieval). */
+    readonly hang?: boolean;
   }
 
   /** Runs the diagnostic with SYNTHETIC stream notifications and decodable SYNTHETIC swap transactions. */
   async function runActive(params: {
     swaps: readonly ScheduledSwap[];
     paperActiveWindowFlow?: boolean;
+    requestTimeoutMs?: number;
   }) {
     const now = 1791931000 * 1000;
     const startMs = now - 70_000;
     let clockTime = startMs;
     const clock = () => clockTime;
     const wsTransport = createMockWebSocketTransport({ immediateAck: true });
-    const emitted = new Map<string, { slot: number; blockTime: number; side: "BUY" | "SELL" }>();
+    const emitted = new Map<
+      string,
+      { slot: number; blockTime: number; side: "BUY" | "SELL"; failed?: boolean; hang?: boolean }
+    >();
     const emitDue = () => {
       for (const swap of params.swaps) {
         if (!emitted.has(swap.signature) && clockTime >= startMs + swap.offsetMs) {
@@ -3745,6 +3762,8 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
             slot: swap.slot,
             blockTime: Math.floor(clockTime / 1000),
             side: swap.side,
+            failed: swap.failed === true,
+            hang: swap.hang === true,
           });
           wsTransport.emitMessage(
             JSON.stringify({
@@ -3780,18 +3799,31 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       if (body?.method === "getTransaction") {
         const sig = String(body.params?.[0]);
         const tx = emitted.get(sig);
+        if (tx?.hang) {
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+              once: true,
+            });
+          });
+        }
         if (tx) {
+          const txResult = buildSyntheticSwapTransactionResult({
+            poolContext: POOL_CONTEXT,
+            signature: sig,
+            slot: tx.slot,
+            blockTime: tx.blockTime,
+            side: tx.side,
+          });
+          if (tx.failed) {
+            (txResult.meta as Record<string, unknown>).err = {
+              InstructionError: [1, { Custom: 30 }],
+            };
+          }
           return new Response(
             JSON.stringify({
               jsonrpc: "2.0",
               id: body.id,
-              result: buildSyntheticSwapTransactionResult({
-                poolContext: POOL_CONTEXT,
-                signature: sig,
-                slot: tx.slot,
-                blockTime: tx.blockTime,
-                side: tx.side,
-              }),
+              result: txResult,
             }),
             { status: 200 },
           );
@@ -3840,6 +3872,9 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       observationDurationMs: 65_000,
       ...(params.paperActiveWindowFlow !== undefined
         ? { paperActiveWindowFlow: params.paperActiveWindowFlow }
+        : {}),
+      ...(params.requestTimeoutMs !== undefined
+        ? { requestTimeoutMs: params.requestTimeoutMs }
         : {}),
     });
     return diagnostic.run();
@@ -4056,6 +4091,175 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       transactionDecodeRecords: 0,
     });
     expect(replay.recomputedActiveWindowFlow).toBeUndefined();
+  });
+
+  /** SYNTHETIC distinct 64-byte Base58 signatures. */
+  const syntheticSig = (k: number) =>
+    encodeBase58(Uint8Array.from({ length: 64 }, (_, i) => (i * 31 + k * 17 + 1) % 256));
+  const overflowBurst = (offsetMs: number): ScheduledSwap[] =>
+    Array.from({ length: 10 }, (_, i) => ({
+      signature: syntheticSig(100 + i),
+      offsetMs,
+      slot: 461970870 + i,
+      side: "BUY" as const,
+    }));
+  interface StreamTelemetry {
+    stopReason: string | null;
+    observation: { startMs: number | null; endMs: number | null; endBasis: string | null };
+    stateBeforeCleanup: {
+      reason: string;
+      coordinatorStatus: string | null;
+      pendingQueueLength: number;
+      activeWorkload: number;
+      connectionEpoch: number | null;
+      recordedGaps: Array<{ reason?: string }>;
+      coordinatorMetrics: { totalNotificationsReceived: number } | null;
+    };
+    keepalive: { clientPingsSentCount: number; matchedClientPongsCount: number };
+    transactionDecodeAttempts: number;
+    transactionRetrievals: Array<{
+      signature: string | null;
+      responseFile: string | null;
+      rpcRequestId: unknown;
+      rpcResponseId: unknown;
+      requestOk: boolean;
+      adapterOutcome: string | null;
+      decodedEventsCount: number | null;
+      ingestedEventsCount: number | null;
+      onChainErrorStatus: string;
+      classification: string;
+    }>;
+    stagesNotReached: string[];
+  }
+  const sealedHashes = (dir: string) => {
+    const manifest = readJson<{ files: Array<{ path: string }> }>(
+      path.join(dir, "evidence-manifest.json"),
+    );
+    return [...manifest.files.map((f) => f.path), "evidence-manifest.json"].map((p) => [
+      p,
+      createHash("sha256")
+        .update(readFileSync(path.join(dir, p)))
+        .digest("hex"),
+    ]);
+  };
+
+  it("T1. Early queue termination preserves observation, keepalive, workload, epoch, gaps and per-signature outcomes", async () => {
+    const decoded: ScheduledSwap[] = [
+      { signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY" },
+      { signature: SIG_C, offsetMs: 20_000, slot: 461970851, side: "BUY" },
+      { signature: SIG_D, offsetMs: 20_000, slot: 461970852, side: "SELL", failed: true },
+    ];
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [...decoded, ...overflowBurst(40_000)],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+
+    // Report: actual observation and keepalive state; cutoff never synthesized.
+    const obs = result.observationMetadata!;
+    expect(obs.observationStartMs).toBeGreaterThan(0);
+    expect(obs.observationEndMs).toBeGreaterThanOrEqual(obs.observationStartMs);
+    expect(obs.cutoffTimestampMs).toBeNull();
+    expect(obs.notificationsReceived).toBe(13);
+    expect(result.keepaliveMetrics).toBeDefined();
+
+    // Sealed telemetry, captured before coordinator cleanup.
+    const telemetry = readJson<StreamTelemetry>(
+      path.join(activeOutDir, "evidence", "stream-telemetry.json"),
+    );
+    const manifest = readJson<{ files: Array<{ path: string }> }>(
+      path.join(activeOutDir, "evidence-manifest.json"),
+    );
+    const listed = new Set(manifest.files.map((f) => f.path));
+    expect(listed.has("evidence/stream-telemetry.json")).toBe(true);
+    expect(telemetry.stopReason).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(telemetry.observation.endBasis).toBe("EARLY_STOP");
+    expect(telemetry.stateBeforeCleanup.reason).toBe("STREAM_LIMIT:STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(telemetry.stateBeforeCleanup.coordinatorStatus).toBe("SUBSCRIBED");
+    expect(telemetry.stateBeforeCleanup.pendingQueueLength).toBeGreaterThanOrEqual(10);
+    expect(telemetry.stateBeforeCleanup.connectionEpoch).toEqual(expect.any(Number));
+    expect(
+      telemetry.stateBeforeCleanup.recordedGaps.some((g) => g.reason === "COORDINATOR_CLOSED"),
+    ).toBe(false);
+    expect(telemetry.stateBeforeCleanup.coordinatorMetrics?.totalNotificationsReceived).toBe(13);
+    expect(telemetry.transactionDecodeAttempts).toBe(3);
+
+    // Success vs on-chain failure, each linked to its sealed response and RPC ids.
+    const retrievals = telemetry.transactionRetrievals;
+    expect(retrievals.map((r) => r.classification)).toEqual([
+      "CANDIDATE_BOUND_SWAPS",
+      "CANDIDATE_BOUND_SWAPS",
+      "ONCHAIN_FAILED",
+    ]);
+    expect(retrievals.map((r) => r.onChainErrorStatus)).toEqual(["NONE", "NONE", "PRESENT"]);
+    expect(retrievals.map((r) => r.decodedEventsCount)).toEqual([1, 1, 0]);
+    expect(retrievals.map((r) => r.adapterOutcome)).toEqual([
+      "SUCCESS",
+      "SUCCESS",
+      "DECODE_FAILED",
+    ]);
+    for (const r of retrievals) {
+      expect(listed.has(r.responseFile!)).toBe(true);
+      expect(r.rpcRequestId).toBe(1);
+      expect(r.rpcResponseId).toBe(1);
+    }
+
+    // Stages not reached stay unavailable; nothing synthesized.
+    expect(telemetry.stagesNotReached).toEqual(
+      expect.arrayContaining(["SOURCE_CUTOFF", "HISTORY_ENUMERATION", "LP_SCREENING"]),
+    );
+    for (const missing of ["cutoff-evidence.json", "history-evidence.json", "lp-evidence.json"]) {
+      expect(existsSync(path.join(activeOutDir, "evidence", missing))).toBe(false);
+    }
+
+    // Exactly-once accounting with actual outgoing ids for every Solana RPC request.
+    expect(result.ledger.records).toHaveLength(result.ledger.totalAttempts);
+    expect(result.ledger.totalAttempts).toBe(5);
+    for (const rec of result.ledger.records.filter((r) => r.provider === "SOLANA_RPC")) {
+      // Actual outgoing id is recorded; the response id is recorded as observed (the captured
+      // bootstrap fixture always answers id 1, which is reported as-is rather than assumed).
+      if (rec.purpose === "TRANSACTION_DECODING") {
+        expect(rec.rpcRequestId).toBe(1);
+      } else {
+        expect(rec.rpcRequestId).toMatch(/^diag-\d+$/);
+      }
+      expect(rec).toHaveProperty("rpcResponseId");
+    }
+
+    // Replay fails closed and leaves sealed evidence byte-identical.
+    const before = sealedHashes(activeOutDir);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(sealedHashes(activeOutDir)).toEqual(before);
+  });
+
+  it("T2. An interrupted (timed-out) retrieval is recorded once and reported as unavailable, never as decoded", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      requestTimeoutMs: 300,
+      swaps: [
+        { signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY", hang: true },
+        ...overflowBurst(40_000),
+      ],
+    });
+    expect(result.ok).toBe(false);
+    const telemetry = readJson<StreamTelemetry>(
+      path.join(activeOutDir, "evidence", "stream-telemetry.json"),
+    );
+    const decodeRecords = result.ledger.records.filter((r) => r.purpose === "TRANSACTION_DECODING");
+    expect(decodeRecords).toHaveLength(1);
+    expect(decodeRecords[0]!.ok).toBe(false);
+    expect(result.ledger.records).toHaveLength(result.ledger.totalAttempts);
+    const interrupted = telemetry.transactionRetrievals.find((r) => r.signature === TEST_SIG_B)!;
+    expect(interrupted.requestOk).toBe(false);
+    expect(result.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(interrupted.onChainErrorStatus).toBe("UNKNOWN");
+    expect(interrupted.adapterOutcome).toBe("REQUEST_TIMEOUT");
+    expect(interrupted.classification).toBe("RETRIEVAL_OR_DECODE_FAILED");
+    expect(interrupted.decodedEventsCount ?? 0).toBe(0);
+    expect(interrupted.ingestedEventsCount ?? 0).toBe(0);
   });
 
   it("W2. Budget exhaustion (4 notifications, 3 shared retrievals) leaves a backlog and stays unavailable", async () => {

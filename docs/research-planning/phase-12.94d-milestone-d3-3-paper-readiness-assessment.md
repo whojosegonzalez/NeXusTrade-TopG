@@ -2962,3 +2962,46 @@ Each diagnostic's `HISTORY_ENUMERATION` page holds the 20 most recent pool signa
 Four short samples from one pool on one day support no general rate, no arrival probability, and no inference of a provider or stream defect.
 
 **Implication**: a backward-looking five-minute aggregate does not target activity during the following 65 s observation. A cluster like 19:17:10–40 (15 signatures, including failed ones that also require resolution) would exceed 3 retrievals. Live active-window qualification and the corrected decode-id path remain **untested**.
+
+#### RAY/WSOL Decode Diagnostic (Live Acquisition and Independent Re-Decoding Evidence)
+
+- **Capture**: `data/research/diagnostics/candidate-decision-ray-active-2026-11-09T19-38-42-111Z`, manifest `29d29145ba39b846f228ae188cf58099a1952b725b10f56c4a5ca4a8d8129647`. All 7 listed files verify; there are no unlisted files.
+- **Requests**: 5 HTTP attempts, all HTTP 200 (`POOL_LAYOUT`, `PRIOR_ANCHOR`, three `TRANSACTION_DECODING` at +5.0 s, +7.5 s and +10.0 s); minimum RPC spacing 2,500 ms. The 3 transaction retrievals exhausted the shared retrieval cap.
+- **Echoed ids**: all three sealed transaction responses echo JSON-RPC id `1`, the adapter's expected id. This is evidence that the corrected id forwarding was active. The outgoing request id itself was not sealed by that build.
+- **Independent offline re-decoding** of the sealed responses:
+  - `2wFhQ99L…` (slot 467437817): one candidate-bound RAY **BUY**.
+  - `4M6d5JsS…` (slot 467437834): one candidate-bound RAY **BUY**.
+  - `4wfCxFpR…` (slot 467437834): `meta.err = InstructionError [1, Custom 30]`, rejected by the decoder as **failed on-chain** (`TRANSACTION_FAILED`).
+- **Termination**: `STREAM_QUEUE_LIMIT_EXCEEDED`, with the pending queue reaching 10 within about 10 s of observation. Cutoff, history and LP screening were never reached. The observation, keepalive and per-signature adapter outcomes were not recorded by that build.
+- **Replay**: fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because the required later-stage evidence was never acquired. Nothing is synthesized. The wallet is unchanged.
+
+**Classification**: verified live acquisition plus independent re-decoding. It is **not** complete-window qualification, and it does **not** prove the original runtime's ingestion outcome.
+
+**Telemetry correction (offline)**: `run()` now captures the stream state **before coordinator cleanup**. A failure report now carries:
+
+- the actual observation start and stop times (`cutoffTimestampMs: null` when the cutoff was not acquired);
+- notifications;
+- keepalive metrics.
+
+`evidence/stream-telemetry.json` (failure paths only) records:
+
+- queue, in-flight and workload counts;
+- connection epoch;
+- recorded gaps captured before the cleanup-generated `COORDINATOR_CLOSED` gap;
+- per-signature adapter outcome, decoded and ingested counts;
+- each signature's linked sealed response and outgoing and echoed JSON-RPC ids;
+- on-chain error status;
+- a classification: `CANDIDATE_BOUND_SWAPS`, `NO_CANDIDATE_SWAPS`, `ONCHAIN_FAILED`, `RETRIEVAL_OR_DECODE_FAILED`, `NO_ADAPTER_RESULT` or `NOT_DISPATCHED`;
+- the stages not reached.
+
+Every Solana RPC ledger record now carries `rpcRequestId` and the observed `rpcResponseId`. Budgets, queue ceiling and thresholds are unchanged. Historical captures are not rewritten.
+
+**Capacity finding**:
+
+- **Request budget**: with 11 base requests, the 14-request ceiling leaves exactly 3 retrievals.
+- **Freshness**: quiet runs reach decision at a cutoff age of 12.1–13.4 s, so no post-cutoff retrieval fits the 15,000 ms freshness ceiling at 2,500 ms pacing.
+- **What can qualify**: a qualifying active window therefore needs at most 3 notifications across the whole ~65 s observation, all decoded before the cutoff.
+- **Observed bursts exceed this**: RAY reached at least 13 notifications in about 10 s; ACT showed 15 signatures in 30 s.
+- **Failed transactions also block qualification**: the existing adapter treats an on-chain-failed transaction as a decode failure, recording a loss gap and an unresolved signature. Any window containing one cannot qualify, even though a failed transaction executes no swap. Failed rows made up 1 of 3 RAY retrievals and 1–17 of 20 rows in the ACT history pages.
+
+Any higher ceiling, or a change in failed-transaction semantics, remains a separate proposal.

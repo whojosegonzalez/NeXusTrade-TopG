@@ -210,6 +210,10 @@ export interface DiagnosticRequestRecord {
   readonly responseFile?: string | undefined;
   /** Body-size evidence; recorded for RUGCHECK_REPORT only. */
   readonly responseBodyMetadata?: ResponseBodyMetadata | undefined;
+  /** Actual outgoing JSON-RPC id (Solana RPC requests only). */
+  readonly rpcRequestId?: string | number | undefined;
+  /** JSON-RPC id echoed in the parsed response, when present (Solana RPC requests only). */
+  readonly rpcResponseId?: unknown;
 }
 
 /**
@@ -451,7 +455,8 @@ export interface CandidateDecisionDiagnosticResult {
         readonly observationStartMs: number;
         readonly observationEndMs: number;
         readonly observationDurationMs: number;
-        readonly cutoffTimestampMs: number;
+        /** null when the run stopped before the on-chain cutoff was acquired (never synthesized). */
+        readonly cutoffTimestampMs: number | null;
         readonly notificationsReceived: number;
       }
     | undefined;
@@ -569,6 +574,16 @@ export class CandidateDecisionDiagnostic {
   private retainedRugCheckEvidence?: unknown;
   private retainedProvisionalContext?: TrackedRaydiumPoolContext;
   private retainedActiveWindowEvidence?: unknown;
+  /** Early-stop stream telemetry (failure paths only), sealed as evidence/stream-telemetry.json. */
+  private retainedStreamTelemetry?: unknown;
+  /** Builds observation/keepalive report fields and stream telemetry from the live observation state. */
+  private streamTelemetryFinalizer:
+    | (() => {
+        observationMetadata?: CandidateDecisionDiagnosticResult["observationMetadata"];
+        keepaliveMetrics?: CandidateDecisionDiagnosticResult["keepaliveMetrics"];
+        telemetry: unknown;
+      })
+    | null = null;
   private readonly paperActiveWindowFlow: boolean;
 
   constructor(options: CandidateDecisionDiagnosticOptions) {
@@ -762,6 +777,7 @@ export class CandidateDecisionDiagnostic {
     customTimeoutMs?: number | undefined;
     skipBudgetRecording?: boolean | undefined;
     overallDeadlineMs?: number | undefined;
+    rpcRequestId?: string | number | undefined;
   }): Promise<{
     ok: boolean;
     status: number;
@@ -781,6 +797,7 @@ export class CandidateDecisionDiagnostic {
       customTimeoutMs = this.requestTimeoutMs,
       skipBudgetRecording = false,
       overallDeadlineMs,
+      rpcRequestId,
     } = params;
 
     // 0. Pre-flight fatal-stop, abort and deadline checks
@@ -1043,6 +1060,10 @@ export class CandidateDecisionDiagnostic {
       ...(errorMessage !== undefined ? { error: errorMessage } : {}),
       ...(wireDigestSha256.length > 0 ? { wireDigestSha256 } : {}),
       responseFile: responseFileName,
+      ...(rpcRequestId !== undefined ? { rpcRequestId } : {}),
+      ...(rpcRequestId !== undefined && json !== null && typeof json === "object" && "id" in json
+        ? { rpcResponseId: (json as { id?: unknown }).id }
+        : {}),
       ...(isRugCheck
         ? {
             responseBodyMetadata: {
@@ -1118,9 +1139,10 @@ export class CandidateDecisionDiagnostic {
     json: Record<string, unknown> | null;
     error?: string | undefined;
   }> {
+    const rpcRequestId = requestId ?? `diag-${this.ledger.totalAttempts + 1}`;
     const rpcPayload = JSON.stringify({
       jsonrpc: "2.0",
-      id: requestId ?? `diag-${this.ledger.totalAttempts + 1}`,
+      id: rpcRequestId,
       method,
       params,
     });
@@ -1133,6 +1155,7 @@ export class CandidateDecisionDiagnostic {
       headers: { "Content-Type": "application/json" },
       body: rpcPayload,
       requestParams: params,
+      rpcRequestId,
       signal,
       skipBudgetRecording,
       overallDeadlineMs,
@@ -1477,6 +1500,29 @@ export class CandidateDecisionDiagnostic {
       let streamLimitReason: string | undefined;
       let streamLimitMessage: string | undefined;
 
+      // Early-stop telemetry: captured BEFORE coordinator cleanup so termination cannot erase it.
+      let observationStoppedAtMs: number | null = null;
+      let streamStateBeforeCleanup: Record<string, unknown> | null = null;
+      const snapshotStreamState = (reason: string): Record<string, unknown> => ({
+        capturedAtMs: this.clock(),
+        reason,
+        coordinatorStatus: coordinator?.getStatus() ?? null,
+        coordinatorMetrics: coordinator ? { ...coordinator.getMetrics() } : null,
+        pendingQueueLength: adapter.getPendingQueueLength(),
+        inFlightCount: adapter.getInFlightCount(),
+        activeWorkload: adapter.getActiveWorkload(),
+        connectionEpoch: coordinator?.getConnectionEpoch() ?? null,
+        recordedGaps: [...flowTracker.getRecordedGaps()],
+      });
+      const captureBeforeCleanup = (reason: string) => {
+        if (observationStartMs > 0 && observationEndMs === 0 && observationStoppedAtMs === null) {
+          observationStoppedAtMs = this.clock();
+        }
+        if (streamStateBeforeCleanup === null) {
+          streamStateBeforeCleanup = snapshotStreamState(reason);
+        }
+      };
+
       // Keepalive state
       let clientPingsSentCount = 0;
       let matchedClientPongsCount = 0;
@@ -1493,8 +1539,126 @@ export class CandidateDecisionDiagnostic {
         if (streamLimitReason) return;
         streamLimitReason = status;
         streamLimitMessage = message;
+        captureBeforeCleanup(`STREAM_LIMIT:${status}`);
         cleanupKeepalive();
         coordinator?.close();
+      };
+
+      this.streamTelemetryFinalizer = () => {
+        const records = this.ledger.records.filter((r) => r.purpose === "TRANSACTION_DECODING");
+        const linkedSignatures = new Set<string>();
+        const retrievals: Array<Record<string, unknown>> = records.map((rec) => {
+          const sig =
+            Array.isArray(rec.params) && typeof rec.params[0] === "string" ? rec.params[0] : null;
+          if (sig !== null) linkedSignatures.add(sig);
+          const streamResult =
+            sig === null ? undefined : streamResults.find((r) => r.signature === sig);
+          const sealed = this.recordedResponses.find((rr) => rr.responseFile === rec.responseFile);
+          const tx = (sealed?.json as { result?: { meta?: { err?: unknown } } } | null)?.result;
+          const txKnown = !!tx && typeof tx === "object";
+          const onChainErr = txKnown ? (tx.meta?.err ?? null) : null;
+          const decoded = streamResult?.diagnostics?.decodedEventsCount ?? null;
+          const classification = !streamResult
+            ? "NO_ADAPTER_RESULT"
+            : streamResult.ok && streamResult.outcome === "SUCCESS"
+              ? (decoded ?? 0) > 0
+                ? "CANDIDATE_BOUND_SWAPS"
+                : "NO_CANDIDATE_SWAPS"
+              : txKnown && onChainErr !== null
+                ? "ONCHAIN_FAILED"
+                : "RETRIEVAL_OR_DECODE_FAILED";
+          return {
+            signature: sig,
+            responseFile: rec.responseFile ?? null,
+            rpcRequestId: rec.rpcRequestId ?? null,
+            rpcResponseId: rec.rpcResponseId ?? null,
+            httpStatus: rec.httpStatus ?? null,
+            requestOk: rec.ok,
+            adapterOutcome: streamResult?.outcome ?? null,
+            adapterOk: streamResult?.ok ?? null,
+            decodedEventsCount: decoded,
+            ingestedEventsCount: streamResult?.ingestedEventsCount ?? null,
+            slot: sig === null ? null : (txIdentityBySignature.get(sig)?.slot ?? null),
+            blockTime: sig === null ? null : (txIdentityBySignature.get(sig)?.blockTime ?? null),
+            onChainErrorStatus: !txKnown ? "UNKNOWN" : onChainErr === null ? "NONE" : "PRESENT",
+            onChainError: onChainErr,
+            classification,
+            error: streamResult?.diagnostics?.error ?? rec.error ?? null,
+          };
+        });
+        for (const r of streamResults) {
+          if (linkedSignatures.has(r.signature)) continue;
+          retrievals.push({
+            signature: r.signature,
+            responseFile: null,
+            adapterOutcome: r.outcome,
+            adapterOk: r.ok,
+            decodedEventsCount: r.diagnostics?.decodedEventsCount ?? null,
+            ingestedEventsCount: r.ingestedEventsCount,
+            classification: "NOT_DISPATCHED",
+            error: r.diagnostics?.error ?? null,
+          });
+        }
+        const observationEnd = observationEndMs > 0 ? observationEndMs : observationStoppedAtMs;
+        const stagesNotReached = [
+          ["SOURCE_CUTOFF", this.retainedSourceCutoff],
+          ["HISTORY_ENUMERATION", this.retainedHistoryResult],
+          ["EXACT_PAIR_MARKET_DATA", this.retainedCandidateMarketData],
+          ["LP_SCREENING", this.retainedLpEvidence],
+          ["CANDIDATE_MINT", this.retainedCandidateMintAccount],
+          ["RUGCHECK", this.retainedRugCheckEvidence],
+          ["SOLANA_TRACKER", this.retainedBundlerEvidence],
+        ]
+          .filter(([, evidence]) => evidence === undefined)
+          .map(([stage]) => stage as string);
+        const keepaliveMetrics = {
+          clientPingsSentCount,
+          matchedClientPongsCount,
+          unmatchedClientPongsCount,
+          controlFramesCount,
+          controlFramePayloadBytes,
+        };
+        const notifications = coordinator?.getMetrics().totalNotificationsReceived ?? null;
+        return {
+          ...(observationStartMs > 0 && observationEnd !== null && notifications !== null
+            ? {
+                observationMetadata: {
+                  observationStartMs,
+                  observationEndMs: observationEnd,
+                  observationDurationMs: Math.max(0, observationEnd - observationStartMs),
+                  cutoffTimestampMs: this.retainedSourceCutoff?.cutoffTimestampMs ?? null,
+                  notificationsReceived: notifications,
+                },
+              }
+            : {}),
+          ...(observationStartMs > 0 ? { keepaliveMetrics } : {}),
+          telemetry: {
+            schema: "STREAM_TELEMETRY_V1",
+            stopReason: streamLimitReason ?? null,
+            observation: {
+              startMs: observationStartMs > 0 ? observationStartMs : null,
+              endMs: observationEnd,
+              endBasis:
+                observationEndMs > 0
+                  ? "CUTOFF_ACQUISITION"
+                  : observationStoppedAtMs !== null
+                    ? "EARLY_STOP"
+                    : null,
+            },
+            stateBeforeCleanup:
+              streamStateBeforeCleanup ?? snapshotStreamState("AT_SEAL_NO_PRIOR_CLEANUP"),
+            keepalive: {
+              ...keepaliveMetrics,
+              schedulerStarted: keepaliveSchedulerStarted,
+              missingPongDetected,
+            },
+            transactionRetrievalCap: 3,
+            transactionDecodeAttempts: this.ledger.transactionDecodeAttempts,
+            transactionRetrievals: retrievals,
+            stagesNotReached,
+            note: "Recorded at termination from live state; stages not reached are unavailable and never synthesized.",
+          },
+        };
       };
 
       const sendPing = () => {
@@ -1708,6 +1872,7 @@ export class CandidateDecisionDiagnostic {
       }
       if (streamLimitReason) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           streamLimitReason,
@@ -1771,6 +1936,7 @@ export class CandidateDecisionDiagnostic {
       // Prompt stop on stream limit breach without proceeding to cutoff requests
       if (streamLimitReason) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           streamLimitReason,
@@ -1784,6 +1950,7 @@ export class CandidateDecisionDiagnostic {
       // 3. Acquire on-chain cutoff (getSlot + getBlockTime) WHILE observation is STILL active
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
@@ -1805,6 +1972,7 @@ export class CandidateDecisionDiagnostic {
       checkQueueLimit();
       if (streamLimitReason) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           streamLimitReason,
@@ -1815,6 +1983,7 @@ export class CandidateDecisionDiagnostic {
 
       if (!slotRes.ok || !slotRes.json || typeof slotRes.json.result !== "number") {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_GET_SLOT_FAILED",
@@ -1827,6 +1996,7 @@ export class CandidateDecisionDiagnostic {
 
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
@@ -1848,6 +2018,7 @@ export class CandidateDecisionDiagnostic {
       checkQueueLimit();
       if (streamLimitReason) {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           streamLimitReason,
@@ -1858,6 +2029,7 @@ export class CandidateDecisionDiagnostic {
 
       if (!blockTimeRes.ok || !blockTimeRes.json || typeof blockTimeRes.json.result !== "number") {
         cleanupKeepalive();
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_GET_BLOCK_TIME_FAILED",
@@ -1889,6 +2061,7 @@ export class CandidateDecisionDiagnostic {
 
       // Validate observation window inequalities
       if (observationStartMs > cutoffTimestampMs - 60_000) {
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "WARM_UP_INSUFFICIENT",
@@ -1898,6 +2071,7 @@ export class CandidateDecisionDiagnostic {
       }
 
       if (observationEndMs < cutoffTimestampMs) {
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "CUTOFF_OBSERVATION_GAP",
@@ -1908,6 +2082,7 @@ export class CandidateDecisionDiagnostic {
 
       // 4. Exact-pool history enumeration via accepted enumerator (1 page <= 20 records)
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
+        captureBeforeCleanup("EARLY_TERMINATION");
         coordinator.close();
         return this.finishWithFailure(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
@@ -1955,6 +2130,7 @@ export class CandidateDecisionDiagnostic {
 
       const historyResult = await enumerator.enumerate();
       this.retainedHistoryResult = historyResult;
+      captureBeforeCleanup("OBSERVATION_COMPLETE");
       coordinator.close();
 
       // 5. Evaluate Window Reconciliation
@@ -3017,6 +3193,13 @@ export class CandidateDecisionDiagnostic {
     message: string,
     partialData?: Partial<CandidateDecisionDiagnosticResult>,
   ): CandidateDecisionDiagnosticResult {
+    let finalized: ReturnType<NonNullable<typeof this.streamTelemetryFinalizer>> | null = null;
+    try {
+      finalized = this.streamTelemetryFinalizer?.() ?? null;
+    } catch {
+      finalized = null;
+    }
+    if (finalized) this.retainedStreamTelemetry = finalized.telemetry;
     const result: CandidateDecisionDiagnosticResult = {
       ok: false,
       status,
@@ -3026,6 +3209,10 @@ export class CandidateDecisionDiagnostic {
       executionContext: this.executionContext,
       ledger: this.ledger,
       ...(this.outDir !== undefined ? { outDir: this.outDir } : {}),
+      ...(finalized?.observationMetadata
+        ? { observationMetadata: finalized.observationMetadata }
+        : {}),
+      ...(finalized?.keepaliveMetrics ? { keepaliveMetrics: finalized.keepaliveMetrics } : {}),
       ...partialData,
     };
     try {
@@ -3178,6 +3365,13 @@ export class CandidateDecisionDiagnostic {
         "evidence/rugcheck-report.json",
         "EVIDENCE",
         this.retainedRugCheckEvidence,
+      );
+    }
+    if (this.retainedStreamTelemetry) {
+      writeSanitizedFile(
+        "evidence/stream-telemetry.json",
+        "EVIDENCE",
+        this.retainedStreamTelemetry,
       );
     }
     if (this.retainedActiveWindowEvidence) {
