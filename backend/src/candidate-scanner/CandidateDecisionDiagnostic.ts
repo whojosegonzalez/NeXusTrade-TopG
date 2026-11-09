@@ -438,6 +438,10 @@ export class CandidateDecisionDiagnostic {
   private readonly rugCheckMaxResponseBytes: number;
   private readonly overlapRugCheckWithMintPacing: boolean;
   private pendingEarlyRugCheck: EarlyRugCheckHandle | null = null;
+  /** First HTTP 429 observed on any request. Once set, no further request is dispatched. */
+  private fatalDispatchStop: Error | null = null;
+  /** Fatal failure of the overlapped RugCheck request; preserved as the run's original stop cause. */
+  private earlyRugCheckFatalCause: Error | null = null;
   private readonly wsTransportOption?: ISolanaWebSocketTransport | undefined;
   private readonly clock: () => number;
   private readonly sleeper: (ms: number) => Promise<void>;
@@ -623,6 +627,16 @@ export class CandidateDecisionDiagnostic {
     }
   }
 
+  /** Refuses any dispatch once a fatal provider stop (HTTP 429) has been observed. */
+  private throwIfDispatchStopped(purpose: string): void {
+    const stop = this.fatalDispatchStop;
+    if (stop) {
+      throw new Error(
+        `[DISPATCH_STOPPED] ${purpose} not dispatched after fatal stop: ${stop.message}`,
+      );
+    }
+  }
+
   /**
    * Internal metered request dispatch wrapper enforcing shared budget, provider pacing,
    * deadline racing, body read timeouts, wire digest hashing before decode, and fail-closed HTTP 429 aborts.
@@ -671,7 +685,8 @@ export class CandidateDecisionDiagnostic {
       overallDeadlineMs,
     } = params;
 
-    // 0. Pre-flight abort and deadline checks
+    // 0. Pre-flight fatal-stop, abort and deadline checks
+    this.throwIfDispatchStopped(purpose);
     if (signal?.aborted) {
       throw new Error(
         `[OPERATION_ABORTED] Signal already aborted before ${purpose}: ${String(signal.reason)}`,
@@ -722,7 +737,8 @@ export class CandidateDecisionDiagnostic {
       this.budgetManager.recordRequestAttempt(providerName, "CANDIDATE_ENRICHMENT", this.clock());
     }
 
-    // Check cancellation immediately before dispatch
+    // Check fatal stop and cancellation immediately before dispatch (after any pacing wait)
+    this.throwIfDispatchStopped(purpose);
     if (signal?.aborted) {
       throw new Error(
         `[OPERATION_ABORTED] Signal aborted immediately before dispatching ${purpose}: ${String(signal.reason)}`,
@@ -953,9 +969,11 @@ export class CandidateDecisionDiagnostic {
     });
 
     if (httpStatus === 429) {
-      throw new Error(
+      const rateLimitError = new Error(
         `[HTTP_429_RATE_LIMITED] ${purpose} received HTTP 429 from ${providerName}; aborting immediately.`,
       );
+      this.fatalDispatchStop ??= rateLimitError;
+      throw rateLimitError;
     }
 
     if (
@@ -2218,6 +2236,12 @@ export class CandidateDecisionDiagnostic {
         this.pendingEarlyRugCheck = this.startEarlyRugCheck(
           overallController.signal,
           overallDeadlineMs,
+          (cause) => {
+            // A fatal overlapped failure (HTTP 429, request timeout, deadline) stops the supervising run
+            // promptly, including a CANDIDATE_MINT request still waiting for pacing.
+            this.earlyRugCheckFatalCause ??= cause;
+            overallController.abort(cause);
+          },
         );
       }
 
@@ -2695,6 +2719,7 @@ export class CandidateDecisionDiagnostic {
   private startEarlyRugCheck(
     overallSignal: AbortSignal,
     overallDeadlineMs: number,
+    stopRun: (cause: Error) => void,
   ): EarlyRugCheckHandle {
     const controller = new AbortController();
     const onOverallAbort = () => controller.abort(overallSignal.reason ?? "OVERALL_ABORTED");
@@ -2707,7 +2732,14 @@ export class CandidateDecisionDiagnostic {
     const settled = this.dispatchRugCheckReport(controller.signal, overallDeadlineMs)
       .then(
         (res) => ({ kind: "fulfilled" as const, res }),
-        (err: unknown) => ({ kind: "rejected" as const, err }),
+        (err: unknown) => {
+          // Cancellation initiated by the run, or a run already stopped, is not a new cause.
+          // Ordinary unavailable data (HTTP errors, over-limit, invalid bodies) fulfils, not rejects.
+          if (!controller.signal.aborted && !overallSignal.aborted) {
+            stopRun(err instanceof Error ? err : new Error(String(err)));
+          }
+          return { kind: "rejected" as const, err };
+        },
       )
       .finally(() => overallSignal.removeEventListener("abort", onOverallAbort));
     return { controller, retrievedAtMs, settled };
@@ -2763,6 +2795,21 @@ export class CandidateDecisionDiagnostic {
       return this.finishWithFailure(
         "EARLY_RUGCHECK_UNSETTLED",
         `${message}; overlapped RugCheck request did not settle within ${EARLY_RUGCHECK_SETTLE_BOUND_MS} ms after cancellation`,
+        partialData,
+      );
+    }
+    const cause = this.earlyRugCheckFatalCause;
+    if (cause) {
+      // Same status mapping as a serial RugCheck failure (HTTP 429 -> UNHANDLED_EXCEPTION; timeouts ->
+      // OVERALL_DIAGNOSTIC_TIMEOUT), with the original cause message first.
+      const causeIsTimeout =
+        cause.message.includes("OVERALL_DIAGNOSTIC_TIMEOUT") ||
+        cause.message.includes("REQUEST_TIMEOUT");
+      return this.finishWithFailure(
+        causeIsTimeout ? "OVERALL_DIAGNOSTIC_TIMEOUT" : "UNHANDLED_EXCEPTION",
+        message === cause.message
+          ? cause.message
+          : `${cause.message} [overlapped RUGCHECK_REPORT stopped the run; superseded ${status}: ${message}]`,
         partialData,
       );
     }

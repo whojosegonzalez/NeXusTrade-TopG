@@ -3098,29 +3098,64 @@ describe("CandidateDecisionDiagnostic RugCheck opt-ins (synthetic, offline)", ()
     overlapRugCheckWithMintPacing?: boolean;
     requestTimeoutMs?: number;
     overallTimeoutMs?: number;
+    /** SYNTHETIC: once RugCheck is requested, each pacing sleep also takes this much real time. */
+    realPacingDelayAfterRugCheckMs?: number;
+    hangCandidateMint?: boolean;
   }) {
     const now = 1791931000 * 1000;
     let clockTime = now - 70_000;
     const clock = () => clockTime;
+    let rugCheckRequested = false;
     const sleeper = async (ms: number) => {
       clockTime += ms;
-      await new Promise((resolve) => setImmediate(resolve));
+      if (rugCheckRequested && params.realPacingDelayAfterRugCheckMs) {
+        await new Promise((resolve) => setTimeout(resolve, params.realPacingDelayAfterRugCheckMs));
+      } else {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
     };
+    // Transport call log: every request that reached the (mock) network, in order.
+    const transportCalls: string[] = [];
+    let callsAfterRateLimit = 0;
+    let rateLimitServed = false;
     const baseFetch = createDiagnosticMockFetch({ getClock: clock, ...(params.scenario ?? {}) });
     const rugCheckSignals: AbortSignal[] = [];
+    const candidateMintSignals: AbortSignal[] = [];
     const transport = async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const rpcMethod =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as { method?: string }).method
+          : undefined;
+      transportCalls.push(rpcMethod ?? urlStr);
+      if (rateLimitServed) callsAfterRateLimit++;
       if (urlStr.includes("api.rugcheck.xyz/v1/tokens/")) {
+        rugCheckRequested = true;
         if (init?.signal) rugCheckSignals.push(init.signal);
         if (params.rugCheck) {
-          return params.rugCheck({
+          const res = await params.rugCheck({
             init,
             advanceClock: (ms) => {
               clockTime += ms;
             },
           });
+          if (res.status === 429) rateLimitServed = true;
+          return res;
         }
+      }
+      if (
+        params.hangCandidateMint &&
+        typeof init?.body === "string" &&
+        init.body.includes('"jsonParsed"')
+      ) {
+        // SYNTHETIC: CANDIDATE_MINT in flight until aborted.
+        candidateMintSignals.push(init.signal!);
+        return new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
       }
       if (params.pairOverride && urlStr.includes("api.dexscreener.com/latest/dex/pairs")) {
         return params.pairOverride();
@@ -3152,7 +3187,13 @@ describe("CandidateDecisionDiagnostic RugCheck opt-ins (synthetic, offline)", ()
         : {}),
     });
     const result = await diagnostic.run();
-    return { result, rugCheckSignals };
+    return {
+      result,
+      rugCheckSignals,
+      candidateMintSignals,
+      transportCalls,
+      callsAfterRateLimit: () => callsAfterRateLimit,
+    };
   }
 
   const recordOf = (result: CandidateDecisionDiagnosticResult, purpose: string) =>
@@ -3472,6 +3513,94 @@ describe("CandidateDecisionDiagnostic RugCheck opt-ins (synthetic, offline)", ()
     const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
     expect(replay.status).toBe("STALE_DATA");
     expect(replay.replayMode).toBe("RECORDED_TERMINATION_PRESERVED");
+  });
+
+  it("O10. Overlap + RugCheck HTTP 429 during CANDIDATE_MINT pacing: run stops; no request dispatched after the 429", async () => {
+    const run = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      // SYNTHETIC: the mint pacing wait takes real time, so without propagation the mint would dispatch.
+      realPacingDelayAfterRugCheckMs: 300,
+      rugCheck: () => new Response("Too Many Requests", { status: 429 }),
+    });
+    const { result } = run;
+    expect(result.ok).toBe(false);
+    // Same status mapping as a serial RugCheck 429 (test 3); original cause preserved first.
+    expect(result.status).toBe("UNHANDLED_EXCEPTION");
+    expect(result.message.startsWith("[HTTP_429_RATE_LIMITED] RUGCHECK_REPORT")).toBe(true);
+
+    expect(run.callsAfterRateLimit()).toBe(0);
+    expect(run.transportCalls[run.transportCalls.length - 1]).toContain("api.rugcheck.xyz");
+    expect(result.ledger.candidateMintAttempts).toBe(0);
+    expect(recordOf(result, "CANDIDATE_MINT")).toHaveLength(0);
+    expect(result.ledger.solanaTrackerAttempts).toBe(0);
+
+    const rc = rugCheckRecord(result);
+    expect(rc.ok).toBe(false);
+    expect(rc.httpStatus).toBe(429);
+    for (const r of result.ledger.records) {
+      expect(r.dispatchedAtMs).toBeLessThanOrEqual(rc.completedAtMs);
+    }
+    expect(existsSync(path.join(optOutDir, "evidence", "rugcheck-report.json"))).toBe(false);
+    expectLedgerConsistent(result);
+
+    // Stopped before mint-account evidence existed: replay fails closed on the unchanged
+    // required-evidence rule rather than inventing the missing evidence or a decision.
+    const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(replay.message).toContain("evidence/mint-account.json");
+    expect(replay.decisionResult).toBeUndefined();
+  });
+
+  it("O11. Overlap + RugCheck HTTP 429 while CANDIDATE_MINT is in flight: mint is cancelled, settled, and recorded once", async () => {
+    const run = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      hangCandidateMint: true,
+      rugCheck: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100)); // SYNTHETIC: 429 after mint dispatch
+        return new Response("Too Many Requests", { status: 429 });
+      },
+    });
+    const { result } = run;
+    expect(result.status).toBe("UNHANDLED_EXCEPTION");
+    expect(result.message.startsWith("[HTTP_429_RATE_LIMITED] RUGCHECK_REPORT")).toBe(true);
+    expect(result.message).toContain("superseded");
+
+    expect(run.callsAfterRateLimit()).toBe(0);
+    expect(result.ledger.candidateMintAttempts).toBe(1);
+    const mint = recordOf(result, "CANDIDATE_MINT");
+    expect(mint).toHaveLength(1);
+    expect(mint[0]!.ok).toBe(false);
+    expect(mint[0]!.error).toContain("HTTP_429_RATE_LIMITED");
+    expect(run.candidateMintSignals).toHaveLength(1);
+    expect(run.candidateMintSignals[0]!.aborted).toBe(true);
+    expect(rugCheckRecord(result).httpStatus).toBe(429);
+    expect(result.ledger.solanaTrackerAttempts).toBe(0);
+    expectLedgerConsistent(result);
+  });
+
+  it("O12. Overlap + RugCheck request timeout during CANDIDATE_MINT pacing: run stops with the timeout cause; no mint dispatch", async () => {
+    const run = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      requestTimeoutMs: 200,
+      realPacingDelayAfterRugCheckMs: 800,
+      rugCheck: ({ init }) =>
+        new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+    });
+    const { result } = run;
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+    expect(result.message.startsWith("[OPERATION_TIMEOUT] RUGCHECK_REPORT")).toBe(true);
+    expect(result.ledger.candidateMintAttempts).toBe(0);
+    expect(run.rugCheckSignals[0]!.aborted).toBe(true);
+    const rc = rugCheckRecord(result);
+    expect(rc.ok).toBe(false);
+    expect(rc.responseBodyMetadata?.bodyStatus).toBe("INCOMPLETE");
+    expectLedgerConsistent(result);
   });
 
   it("O8. Invalid opt-in options fail at construction before any network activity", () => {

@@ -2654,6 +2654,26 @@ Recorded responses are held until sealing. A realistic peak is tens of MiB (orde
 5. **The candidate cannot arm.** Fartcoin still fails `MATURITY_WINDOW_GATE` (age ≫ 7,200 s), so a Fartcoin run can verify RugCheck retrieval, sizing and the overlap timeline only. Retest, sizing, fills, positions and exits remain untested.
 6. **The daemon path is unchanged.** It still calls `fetchRugCheckMetrics` with an unbounded `res.json()` and a 3.5 s timeout. That is outside this scope and noted for review.
 
+#### 6a. Overlapped RugCheck Fatal-Stop Correction (Review of `b6138b0`)
+
+**Defect**: with overlap enabled, an immediate RugCheck HTTP 429 was recorded, but nothing stopped the run until Phase 5 awaited the RugCheck result. `CANDIDATE_MINT` still dispatched after its pacing wait, spending an extra request.
+
+**Correction** (`CandidateDecisionDiagnostic.ts`; serial defaults, limits, pacing, freshness and thresholds unchanged):
+
+- **Dispatch-wide stop on HTTP 429**: the first 429 on any request is kept as a fatal stop. Every later dispatch attempt is refused before counting and again after any pacing wait (`[DISPATCH_STOPPED] …`), so nothing is counted, sent or recorded.
+- **Supervisor propagation**: if the overlapped RugCheck request rejects (HTTP 429, request timeout, or a deadline/budget refusal), the run's overall abort signal fires immediately. That wakes a `CANDIDATE_MINT` waiting for pacing and aborts one already in flight, which is then recorded exactly once with an aborted error. No sealing happens while work is pending (unchanged guard).
+  - Rejections caused by the run's own cancellation, or by an already-aborted overall signal (overall deadline), are not treated as new causes.
+  - Ordinary unavailable RugCheck data (HTTP errors, over-limit, truncated, malformed) does not reject and keeps its existing fail-closed behaviour.
+- **Cause preserved through finalization**: the overlapped failure is kept as the run's original stop cause and reported first, with the same status mapping as serial mode: HTTP 429 → `UNHANDLED_EXCEPTION` with `[HTTP_429_RATE_LIMITED] RUGCHECK_REPORT …`; request timeout → `OVERALL_DIAGNOSTIC_TIMEOUT` with `[OPERATION_TIMEOUT] RUGCHECK_REPORT …`. If another terminal path was already concluding, it is appended as `superseded …`.
+- **Overall deadline**: the overall timer aborts the overall signal, which aborts the linked overlapped request. Classification stays `OVERALL_DIAGNOSTIC_TIMEOUT`, as in serial mode.
+
+**Regressions** (synthetic; external process timeouts):
+
+- **O10 – 429 during the mint pacing wait** (the wait takes real synthetic time): there are zero mock-network calls after the 429, no `CANDIDATE_MINT` or Solana Tracker attempt, every record was dispatched before the 429 completed, and the ledger is consistent. Replay fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because mint-account evidence was never acquired; the required-evidence rule is unchanged.
+- **O11 – 429 while `CANDIDATE_MINT` is in flight**: the mint is aborted, settled and recorded once, and the original 429 cause is preserved.
+- **O12 – RugCheck request timeout during pacing**: the run stops with the timeout cause, and no mint is dispatched.
+- **Unchanged coverage still passes**: successful overlap (O5), authority rejection (O6) and serial 429 (test 3).
+
 #### 7. Proposed Operator Command (Pending Separate Review — Not Executed)
 
 > [!IMPORTANT]
