@@ -3155,3 +3155,163 @@ An independent review reproduced two gaps in `f5bb456`. §8.22 as first written 
    - **Legacy captures**: captures without the policy keep their original interpretation. Replay results for all 9 historical captures are again identical before and after.
 
 Limits, PAPER boundaries, budgets, pacing, freshness, thresholds and the wallet are unchanged. No live capture has exercised this path.
+
+### 8.23 Bounded Capacity Proposal for a Complete Active 60-Second Window (Offline Analysis, Not Implemented)
+
+This is a proposal for review only. No limit has changed, the failed-transaction policy has not been run live, and no capture was made. All figures come from the 9 sealed diagnostic captures, the 3 ACT prechecks, their request ledgers, and source (`CandidateDecisionDiagnostic.ts`, `RaydiumAmmV4TransactionSourceAdapter.ts`, `ExactPoolWindowReconciliationEvaluator.ts`).
+
+#### 1. Recommended Configuration (PAPER active-window opt-in only)
+
+| Limit                                                                              | Current     | Proposed                                                                          | Changes? |
+| ---------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------------- | -------- |
+| Total HTTP attempts per run (all providers)                                        | 14          | **20**                                                                            | yes      |
+| Transaction retrievals (`TRANSACTION_DECODING`)                                    | 3           | **9**                                                                             | yes      |
+| Base requests (8 Solana RPC + DexScreener + RugCheck + Solana Tracker)             | 11          | 11                                                                                | no       |
+| Pending queue / active workload ceiling (stop at ≥ 10)                             | 10          | 10                                                                                | no       |
+| Stream notification budget                                                         | 50          | 50                                                                                | no       |
+| Observation loop                                                                   | 65 s        | 65 s                                                                              | no       |
+| Pre-cutoff drain after the loop (new, bounded)                                     | none        | **≤ 2 retrieval slots; `GET_SLOT` dispatched ≤ 5.0 s after the nominal loop end** | yes      |
+| Retrievals after `GET_SLOT` (post-cutoff)                                          | 0           | 0                                                                                 | no       |
+| Solana RPC pacing                                                                  | 2,500 ms    | 2,500 ms                                                                          | no       |
+| Per-request timeout / overall deadline                                             | 10 s / 90 s | 10 s / 90 s                                                                       | no       |
+| Cutoff-to-decision freshness                                                       | 15,000 ms   | 15,000 ms                                                                         | no       |
+| History page (`limit 20`, 1 page)                                                  | 20          | 20                                                                                | no       |
+| Strategy thresholds, production guard, daemon isolation, failed-transaction policy | —           | —                                                                                 | no       |
+
+- **Why 9**: 9 is the largest retrieval budget at which the unchanged queue ceiling can never be what rejects a run. Any run with ≥ 10 notifications already exceeds the retrieval budget, so the queue limit and the budget reject the same runs. Raising the queue would add no processable windows at this budget.
+- **Scope**: default runs, quiet runs and historical replays keep 14/3.
+- **Sealing**: the new limits are sealed in `active-window-evidence.json`, and replay must take its budget from that sealed value instead of the current hard-coded 14.
+- **Retrievals**: a failed transaction still consumes one retrieval and one HTTP attempt.
+
+#### 2. Request Allocation and Timing Schedule
+
+The baseline timings below are **measured**, from the five current-build runs with overlapped RugCheck (ACT ×3, Fartcoin active, Fartcoin RugCheck opt-in). The schedule assumes the same accepted RugCheck options (4 MiB ceiling, overlap).
+
+| Step                                                                      | Provider                    | Offset from run start                   |
+| ------------------------------------------------------------------------- | --------------------------- | --------------------------------------- |
+| `POOL_LAYOUT`                                                             | Solana RPC                  | 0.0 s                                   |
+| `PRIOR_ANCHOR`                                                            | Solana RPC                  | 2.5 s                                   |
+| Observation start (subscription acknowledged)                             | WebSocket                   | ≈ 2.7 s                                 |
+| ≤ 9 `TRANSACTION_DECODING`, only on notification, FIFO, ≥ 2.5 s apart     | Solana RPC                  | ≈ 5.0–70.2 s                            |
+| Nominal loop end                                                          | —                           | ≈ 67.7 s                                |
+| Drain (≤ 2 slots) only while notifications are pending and budget remains | Solana RPC                  | ≤ 70.2 s                                |
+| `GET_SLOT` = t_G (cutoff ≈ t_G ± 1 s)                                     | Solana RPC                  | 67.6–67.8 s measured; ≤ 72.9 s proposed |
+| `GET_BLOCK_TIME`                                                          | Solana RPC                  | t_G + 2.5 s                             |
+| `HISTORY_ENUMERATION` ‖ `EXACT_PAIR`                                      | Solana RPC ‖ DexScreener    | t_G + 5.0 s                             |
+| `LP_REFRESH`                                                              | Solana RPC                  | t_G + 7.5 s                             |
+| `LP_REFRESH` ‖ `RUGCHECK_REPORT` (≤ 1.03 s measured)                      | Solana RPC ‖ RugCheck       | t_G + 10.1 s                            |
+| `CANDIDATE_MINT` → `SOLANA_TRACKER_BUNDLERS` (≤ 0.41 s measured)          | Solana RPC → Solana Tracker | t_G + 12.6 s                            |
+| Last request complete / decision                                          | —                           | t_G + 12.82–12.99 s measured            |
+
+**Request totals**: at most 17 paced Solana RPC requests (8 base + 9 retrievals) plus 3 other providers, for **≤ 20 in total**.
+
+**Freshness**: unchanged.
+
+- The post-cutoff chain is identical, so the measured cutoff age at the last request is 12.09–13.40 s (margin 1.60–2.91 s).
+- The drain happens before `GET_SLOT`, and no retrieval occurs after it, so the drain cannot consume freshness margin.
+- One post-cutoff retrieval (≥ 2.5 s) would exceed the ceiling in four of the five runs. The non-overlapped Fartcoin run at 05:54 reached 15.11 s and failed `STALE_DATA`, which shows the ceiling is real.
+
+**Deadline**:
+
+- Measured last completion at 80.51–80.75 s, leaving 9.2 s of slack.
+- Proposed worst case: 72.9 s plus the slowest measured post-`GET_SLOT` chain of 14.05 s (an earlier non-overlapped build) gives **86.9 s < 90 s**.
+- A third drain slot would leave about 0.6 s, so it is excluded.
+
+#### 3. Measured Rates (Observations) vs Assumptions
+
+**Observations (sealed evidence)**:
+
+- **Retrieval service**:
+  - Solana RPC dispatches are strictly serialized at 2,500–2,590 ms.
+  - Retrieval latency is 54–113 ms (4 samples) and all Solana RPC latency is 36–300 ms.
+  - The service rate is therefore set by pacing: ≤ 0.4 retrievals/s, or ≤ 25 retrieval slots in 65 s.
+- **Notification lag** (block time to retrieval dispatch, unqueued): 0.1, 1.4 and 1.6 s.
+- **Live observation windows** (about 65 s each):
+  - **All 6 runs with a recorded notification count had 0 notifications** (ACT ×3, Fartcoin ×3).
+  - The earlier-build Fartcoin 05:54 run retrieved 1 transaction (≥ 1 notification).
+  - The earlier-build RAY 02:01 run did not record notifications.
+  - RAY/WSOL at 19:38 had **≥ 13 notifications in ≈ 10 s** (3 retrieved plus a pending queue of 10), i.e. ≥ 1.3/s.
+- **History pages** (each the 20 most recent signatures, provider-relative):
+  - maximum 13–19 signatures in 10 s for busy pages (ACT 17:40, Fartcoin 05:5x and 10:39);
+  - covered spans of 93–972 s;
+  - failed share 25–44% (ACT 35/80 unique rows, Fartcoin 11/41, RAY 5/20).
+- **65-second span counts**: these are sliding spans fully inside each page's covered span (2,132 overlapping spans):
+
+  | Signatures in the span | Share of all spans |
+  | ---------------------- | ------------------ |
+  | 0                      | 49%                |
+  | 1–3                    | 29%                |
+  | 4–6                    | 12%                |
+  | 7–9                    | 2%                 |
+  | 10–14                  | 6%                 |
+  | 15+                    | 1%                 |
+
+  Among non-empty spans, the current 3-retrieval cap covers 58%, and 9 retrievals would cover **86%**.
+
+- **Five-minute summaries do not predict the next window**: ACT prechecks reported `txns5m` of 10, 4 and 13, yet the following windows had 0 notifications. DexScreener swap counts (≤ 13 per 5 min) also differ from on-chain pool signatures, which include failed and non-swap transactions.
+
+**Assumptions (not established)**:
+
+- **Sampling bias**: the overlapping spans are correlated, and pages end at their newest row, so they exclude the quiet tail before each cutoff and overstate activity. Live windows were quieter: only 1 of the 7 observations with known activity was non-empty. The 86% figure is an upper-bound guide, not a probability.
+- **Arrival model for the tail estimate**: Poisson arrivals. Real activity is bursty.
+- **Tail exposure**: about 2 s (the `GET_SLOT` flight, confirmed block-time granularity and the 0.1–1.6 s notification lag). This is derived, not measured as a distribution.
+
+#### 4. Burst and Backlog Capacity (Proposed Configuration)
+
+- **Processing rule**: `GET_SLOT` must follow the last retrieval by 2,500 ms and come ≤ 5.0 s after the loop end (observation +65.0 s), so the last retrieval is dispatched by observation +67.5 s. A burst of B ≤ 9 notifications starting at observation offset τ is therefore fully retrieved if τ + 2.5·B ≤ 67.5 s. This is conservative: it allows up to 2.5 s of slot alignment. The latest onsets are:
+
+  | Burst size B | Latest onset τ |
+  | ------------ | -------------- |
+  | 1            | 65.0 s         |
+  | 3            | 60.0 s         |
+  | 5            | 55.0 s         |
+  | 9            | 45.0 s         |
+
+  Peak workload is ≤ 9, below the unchanged ceiling. Retrieval utilization stays ≤ 22.5 s of 65 s (35%).
+
+- **Must reject (fail closed, never zero counts)**:
+  1. The 10th notification: retrieval budget exhausted, or the pending/workload ceiling reached. The window is unqualified.
+  2. Notifications still pending after the 2 drain slots: `GET_SLOT` is not issued with an unresolved backlog, and the window is unqualified.
+  3. An in-window signature notified after `GET_SLOT` dispatch (the tail), or missing from the stream: `UNRESOLVED_TRANSACTIONS`. The estimated miss probability under the Poisson assumption is about 1 − e^(−2k/65): about 9% at k = 3 and about 24% at k = 9.
+  4. More than 19 signatures after the anchor before `HISTORY_ENUMERATION`: the anchor is not witnessed.
+  5. A recorded gap, epoch change, missing pong, stale cutoff (> 15 s) or the 90 s deadline.
+- **Observed bursts are out of scope at 2,500 ms pacing**:
+  - **ACT/Fartcoin bursts (19 in 10 s)**: these leave 15 pending after 10 s, which exceeds the queue. Clearing them would need a queue of ≥ 16, ≥ 19 retrievals (≥ 30 HTTP attempts in total) and 47.5 s of drain, and only if the burst began within about the first 20 s.
+  - **RAY at ≥ 1.3/s**: this exceeds the 0.4/s service rate, so the backlog grows by ≥ 0.9/s without bound for any budget or queue size.
+  - **Conclusion**: no existing component can complete such windows within unchanged pacing and freshness. Post-cutoff resolution through the existing bridge breaks the 15 s ceiling. These windows correctly stay unqualified, and the proposal does not target them. No paid provider is assumed.
+
+#### 5. Fixed Target and Pass/Fail Criteria
+
+**Target**: ACT/WSOL Raydium AMM v4 pool `B4PHSkL6CeZbxVqm1aUPQuVpc5ERFcaZj7u9dhtphmVX` (mint `GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump`).
+
+- It has 3 verified quiet captures, sealed history with sparse activity, and a high failed-transaction share that exercises the accepted failed-transaction path.
+- Run it with the PAPER active-window opt-in and the accepted RugCheck options.
+- Make at most **5 separately authorized operator runs**, stopping at the first pass, with no automatic reruns. A quiet result is a valid non-result, not a defect.
+- RAY/WSOL is excluded (rate above service capacity).
+
+**PASS (complete active-window qualification)** requires all of:
+
+1. **Limits held**:
+   - totalAttempts ≤ 20 and transactionDecodeAttempts ≤ 9;
+   - every Solana RPC dispatch ≥ 2,500 ms after the previous one;
+   - no `TRANSACTION_DECODING` after `GET_SLOT`;
+   - `GET_SLOT` ≤ 5.0 s after the nominal loop end;
+   - run completion ≤ 90 s.
+2. **Window resolved**:
+   - ≥ 1 notification and ≥ 1 in-window history signature;
+   - every in-window signature resolved as `RESOLVED` or validated `RESOLVED_FAILED_TRANSACTION`;
+   - no pending workload, no recorded stream gap other than the post-evaluation `COORDINATOR_CLOSED` gap, consistent epoch, satisfied keepalive, anchor witnessed.
+3. **Qualified flow**: `isPaperQualified: true`, `qualificationKind: ACTIVE_WINDOW`, non-null buy/sell counts, and cutoff age at decision ≤ 15,000 ms.
+4. **Independent replay**: `integrityVerified`, full manifest coverage, `DECISION_REEVALUATED`, `ok`, `matchesRecordedDecision`. The re-decoded flow reproduces the recorded buys and sells; `redecodedTransactions` equals the sealed retrieval count; and every sealed resolution field agrees with its re-derivation (§8.22a).
+
+**Valid non-results (fail closed; not defects)**: a quiet window; budget, queue or drain exhaustion; an unresolved tail; a stale cutoff; an unwitnessed anchor.
+
+**Defects (block acceptance)**: any qualified flow despite an unresolved signature, gap or backlog; any post-cutoff retrieval; any limit or pacing violation; any replay mismatch or unverifiable file.
+
+**Implementation scope if approved** (separate review, offline tests first; nothing implemented now):
+
+- the opt-in-only 20/9 limits;
+- the bounded pre-cutoff drain with an explicit stop reason;
+- sealing the limits;
+- replay reading the sealed budget;
+- short mocked tests for burst/drain/tail rejection and for the 86.9 s deadline bound.
