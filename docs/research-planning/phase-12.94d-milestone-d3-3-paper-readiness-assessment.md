@@ -1,6 +1,6 @@
 # NeXusTrade — Phase 12.94-D Milestone D.3.3: Source-Accurate PAPER Implementation Handoff
 
-**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V6`  
+**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V7`  
 **Location**: `docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`  
 **Related Closure Report**: [`audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md`](file:///u:/Projects/TopG/audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md)  
 **Status**: **READ-ONLY ARCHITECTURAL SPECIFICATION & OFFLINE IMPLEMENTATION HANDOFF**  
@@ -1741,121 +1741,363 @@ The proposal replaces this entirely with an isolated, single-request capture and
 - **Retry Allowance**: Exactly zero retries (fails closed on network or HTTP error).
 - **Pagination Allowance**: Exactly zero pagination requests (single page only).
 - **Follow-up Enrichment Allowance**: Exactly zero follow-up requests (no RPC, DexScreener, or RugCheck calls during discovery).
-- **Timeout Ceiling**: Explicit `10,000 ms` abort signal (`AbortSignal.timeout(10_000)`).
-- **Response Byte Ceiling**: Explicit `1,048,576 bytes` (1 MB); aborts/fails if response length exceeds 1 MB.
+- **Active Network & Body Timeout**: Explicit `10,000 ms` deadline maintained through headers and full streaming body reading (`AbortSignal.timeout(10_000)` / active `AbortController`). Header arrival ($T_{\text{headers}}$) and body completion ($T_{\text{bodyCompleted}}$) are recorded separately.
+- **Streaming Byte Ceiling**: Explicit `1,048,576 bytes` (1 MiB) retained-byte limit enforced while streaming. The stream cancels immediately upon observing $> 1\text{ MiB}$ without buffering the entire oversized response.
 - **Provider Pacing**: Single standalone dispatch (0 ms queue pacing needed for a single request).
 
 ##### C. Source-Supported Units & Compatibility Rules
 
-1. **`burnPercent` Units**:
+1. **`burnPercent` Units & Range**:
    - Official Raydium SDK V2 (`@raydium-io/raydium-sdk-v2`) and Raydium API v3 return `burnPercent` as a numeric value expressed in **percentage points** in the range $[0, 100]$ (e.g. `burnPercent: 100` indicates 100%, per [Raydium SDK Issue #83](https://github.com/raydium-io/raydium-sdk-V2/issues/83)).
-   - The candidate-selection comparison is therefore `reportedBurnPercent >= 90`, **not** `>= 0.90`.
+   - The filter strictly requires a finite number in $[0, 100]$ before comparing against the 90% threshold (`reportedBurnPercent >= 90 && reportedBurnPercent <= 100`).
+   - Out-of-range values ($> 100$ or $< 0$, such as `101`) fail closed with `BURN_PERCENT_OUT_OF_RANGE`. Values $< 90$ fail closed with `BURN_PERCENT_BELOW_90`.
    - Raw values and explicit units (`percentage_points_0_to_100`) are preserved in selection records.
-   - If `burnPercent` is missing, `null`, `undefined`, NaN, or non-numeric, it remains unknown (`undefined`) and fails closed (rejected).
+   - If `burnPercent` is missing, `null`, `undefined`, NaN, or non-numeric, it remains unknown (`undefined`) and fails closed (`BURN_PERCENT_UNKNOWN`).
    - **Authoritative Boundary**: This indexer field is strictly a provisional discovery selection hint. The accepted on-chain account validator in `CandidateDecisionDiagnostic` and exact integer cross-multiplication ($100n \times (L - S) \ge 90n \times L$) remain solely authoritative.
 2. **Raydium AMM v4 Program ID Identification**:
    - `poolType: "standard"` in Raydium API v3 covers both legacy AMM v4 and CPMM pools.
    - The accepted 752-byte account decoder (`LIQUIDITY_STATE_LAYOUT_V4`) requires legacy Raydium AMM v4. CPMM pools use a 637-byte layout and are incompatible.
    - The filter strictly requires reported `programId === "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"`.
-3. **Canonical Pair Leg Resolution**:
-   - Pool ID and token mints must be valid base58 public keys matching canonical format.
+3. **Canonical 32-Byte Public Key Validator**:
+   - Validates pool ID and token mints against the project's accepted canonical 32-byte public-key validator (`isCanonicalSolanaBase58` using `@solana/web3.js` `PublicKey`).
+   - Malformed base58 strings and invalid length keys (such as 32 "2" characters, which decode to 23 bytes) fail closed (`INVALID_POOL_ID` / `INVALID_MINTS`).
    - Exactly one leg (`mintA.address` or `mintB.address`) must equal canonical WSOL (`So11111111111111111111111111111111111111112`), allowing either mintA or mintB orientation.
-   - The opposite leg is the candidate token mint (must not be WSOL).
+   - The opposite leg is the candidate token mint (must be a valid 32-byte public key different from WSOL).
    - Final ownership, layout, and executable state verification remains the on-chain diagnostic's responsibility.
 4. **Pool Age (`openTime`) Handling**:
-   - `openTime` must be parsed as an integer representing unix epoch seconds.
-   - It must be strictly positive, an integer, not in the future relative to the retrieval timestamp ($T_{\text{open}} \le T_{\text{retrieval}}$), and must satisfy $T_{\text{retrieval}} - T_{\text{open}} \ge 300\text{ seconds}$ (5-minute maturity window).
+   - `openTime` is parsed consistently from numeric or decimal-string representations (e.g. `1714000000`, `"1714000000"`, `"1714000000.0"`).
+   - Requires a positive safe integer (`Number.isSafeInteger(openTime) && openTime > 0`) before checking age ($T_{\text{retrieval}} - T_{\text{open}} \ge 300\text{s}$) and future timestamps ($T_{\text{open}} \le T_{\text{retrieval}}$).
    - Missing, zero, `null`, malformed, non-integer, negative, or future `openTime` values are rejected fail-closed and are not treated as observed pool age.
 5. **Provisional Lead vs. Qualified Candidate Distinction**:
    - Passing this filter identifies an unverified **provisional discovery lead**, not a strategy-qualified candidate. Full qualification only occurs after on-chain LP, authority, quiet flow, and Buy Gate verification.
 
-##### D. Output Directory & Sealed Manifest Contract
+##### D. Output Directory, Failure Evidence & Sealed Manifest Contract
 
-All discovery artifacts are written to a timestamped, project-local directory:
-`data/research/discovery/raydium-standard-pools-<timestamp>/`
+All discovery artifacts are written to a timestamped, project-local directory anchored to `U:\Projects\TopG`:
+`U:\Projects\TopG\data\research\discovery\raydium-standard-pools-<timestamp>\`
 
-The directory preserves five explicit, auditable files:
-
-1. `raw-response.json`: Exact byte-for-byte unprojected JSON response body returned by the Raydium API.
-2. `capture-metadata.json`: Dispatched URL, HTTP status, start/end timestamps ($T_{\text{dispatch}}$, $T_{\text{response}}$, $\Delta T$), byte length, and SHA-256 digest of `raw-response.json`.
-3. `selection-ledger.json`: Structured array of every pool in the response evaluated against the filter with pass/fail status and specific rejection reasons.
-4. `provisional-target.json`: Deterministic selection of at most one provisional target (highest TVL among qualifying pools), or `{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`. Zero matches is a valid, terminating outcome without automatic threshold relaxation or query expansion.
-5. `manifest.json`: List of all generated files with exact byte sizes and SHA-256 digests.
+1. **Local Isolation & Overwrite Refusal**:
+   - Path resolution is anchored to `U:\Projects\TopG\data\research\discovery`.
+   - Before writing, the command verifies `!fs.existsSync(outDir)`. If the directory already exists, it refuses overwrite and aborts with `DESTINATION_EXISTS`.
+2. **Deterministic Target Selection & Tie-Breaker**:
+   - Qualifying pools are sorted by TVL descending (`b.tvl - a.tvl`).
+   - For identical TVL values, a deterministic pool-ID lexical tie-breaker is applied (`a.poolId.localeCompare(b.poolId)`).
+   - Selects at most one provisional target. Zero qualifying pools is a normal terminating result (`{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`).
+3. **Distinct Failure Classification & Evidence Sealing**:
+   - Validates `json.success === true` and `Array.isArray(json.data?.data)`.
+   - Distinctly records failure categories: `HTTP_ERROR`, `TIMEOUT`, `OVERFLOW`, `JSON_PARSE_ERROR`, `PROVIDER_ERROR` (when `success !== true`), and `SCHEMA_ERROR` (when missing `data.data` array).
+   - On failure, writes `failure-report.json`, records failure status in `capture-metadata.json`, preserves retained wire bytes in `raw-response.json` (including the 1 MiB prefix on overflow), and seals all generated files in `manifest.json`.
+4. **Preserved Artifact Catalog (Success Path)**:
+   - `raw-response.json`: Exact byte-for-byte unprojected JSON response body returned by the Raydium API.
+   - `capture-metadata.json`: Dispatched URL, HTTP status, start/headers/body timestamps, retained byte length, total observed bytes, and SHA-256 digest of `raw-response.json`.
+   - `selection-ledger.json`: Structured array of every pool in the response evaluated against the filter with pass/fail status and specific rejection reasons.
+   - `provisional-target.json`: Deterministic selection of at most one provisional target, or `{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`.
+   - `manifest.json`: Sealed list of all generated files with exact byte sizes and SHA-256 digests.
 
 ##### E. Copyable Operator Discovery Command (Pending Separate Approval)
 
 > [!IMPORTANT]
-> **READ-ONLY PROPOSAL — DO NOT EXECUTE**: The command below is provided for operator review and separate authorization. It does not run automatically.
+> **READ-ONLY PROPOSAL — DO NOT EXECUTE**: The command below uses literal, non-expanding PowerShell syntax (`@' ... '@ | node`) to guarantee cross-platform portability without shell interpolation defects. It is provided for operator review and separate authorization. It does not run automatically.
 
 ```powershell
-node -e @"
+@'
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { createRequire } = require('module');
 
 (async () => {
+  const PROJECT_ROOT = process.env.PROJECT_ROOT || 'U:/Projects/TopG';
   const WSOL = 'So11111111111111111111111111111111111111112';
   const AMM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-  const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-  const MAX_BYTES = 1048576; // 1 MB ceiling
-  const TIMEOUT_MS = 10000;
+  const MAX_BYTES = 1048576; // 1 MiB retained-byte limit
+  const TIMEOUT_MS = 10000;  // 10s total network deadline
   const URL = 'https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=20&page=1';
 
-  const timestampIso = new Date().toISOString();
+  // Load canonical 32-byte Solana public-key validator from project dependency
+  let PublicKey;
+  try {
+    const req = createRequire(path.resolve(PROJECT_ROOT, 'backend/package.json'));
+    PublicKey = req('@solana/web3.js').PublicKey;
+  } catch {
+    PublicKey = require('@solana/web3.js').PublicKey;
+  }
+
+  function isCanonicalSolanaBase58(val) {
+    if (typeof val !== 'string') return false;
+    const trimmed = val.trim();
+    if (trimmed !== val || trimmed.length < 32 || trimmed.length > 44) return false;
+    try {
+      const pk = new PublicKey(val);
+      return pk.toBytes().length === 32 && pk.toBase58() === val;
+    } catch {
+      return false;
+    }
+  }
+
+  function parseOpenTime(raw) {
+    if (typeof raw === 'number') {
+      if (Number.isFinite(raw) && Number.isSafeInteger(raw) && raw > 0) {
+        return raw;
+      }
+      return null;
+    }
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (/^\d+(\.\d+)?$/.test(trimmed)) {
+        const num = Number(trimmed);
+        if (Number.isFinite(num) && Number.isSafeInteger(num) && num > 0) {
+          return num;
+        }
+      }
+      return null;
+    }
+    return null;
+  }
+
+  // Streaming reader enforcing timeout and byte ceiling
+  async function readBodyWithLimit(bodyStream, maxBytes, signal) {
+    const reader = bodyStream.getReader();
+    const retainedChunks = [];
+    let retainedBytes = 0;
+    let totalObservedBytes = 0;
+    const hasher = crypto.createHash('sha256');
+
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          await reader.cancel(signal.reason);
+          const err = new Error('Operation aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
+
+        const readPromise = reader.read();
+        const abortPromise = signal
+          ? new Promise((_, reject) => {
+              if (signal.aborted) {
+                const err = new Error('Operation aborted');
+                err.name = 'AbortError';
+                reject(err);
+                return;
+              }
+              signal.addEventListener(
+                'abort',
+                () => {
+                  const err = new Error('Operation aborted');
+                  err.name = 'AbortError';
+                  reject(err);
+                },
+                { once: true }
+              );
+            })
+          : null;
+
+        const { done, value } = abortPromise
+          ? await Promise.race([readPromise, abortPromise])
+          : await readPromise;
+
+        if (done) break;
+
+        if (value && value.byteLength > 0) {
+          totalObservedBytes += value.byteLength;
+          hasher.update(value);
+
+          const remainingCapacity = maxBytes - retainedBytes;
+          if (remainingCapacity > 0) {
+            const toCopy = Math.min(value.byteLength, remainingCapacity);
+            const chunkCopy = Buffer.alloc(toCopy);
+            chunkCopy.set(value.subarray(0, toCopy));
+            retainedChunks.push(chunkCopy);
+            retainedBytes += toCopy;
+          }
+
+          if (totalObservedBytes > maxBytes) {
+            await reader.cancel(new Error(`Response body size exceeded maximum limit of ${maxBytes} bytes.`));
+            const overflowErr = new Error(`RESPONSE_OVERFLOW: Observed ${totalObservedBytes} bytes, exceeding ceiling of ${maxBytes} bytes`);
+            overflowErr.name = 'ResponseTooLargeError';
+            overflowErr.retainedBuffer = Buffer.concat(retainedChunks);
+            overflowErr.totalObservedBytes = totalObservedBytes;
+            overflowErr.sha256 = hasher.digest('hex');
+            throw overflowErr;
+          }
+        }
+      }
+    } finally {
+      // reader cleanup
+    }
+
+    return {
+      retainedBuffer: Buffer.concat(retainedChunks),
+      totalObservedBytes,
+      sha256: hasher.digest('hex'),
+    };
+  }
+
+  // Setup timestamp and anchored output directory with overwrite prevention
+  const tDispatch = Date.now();
+  const timestampIso = new Date(tDispatch).toISOString();
   const dirTimestamp = timestampIso.replace(/[:.]/g, '-');
-  const outDir = path.resolve('data/research/discovery', \`raydium-standard-pools-\${dirTimestamp}\`);
+  const baseDir = path.resolve(PROJECT_ROOT, 'data/research/discovery');
+  const outDir = process.env.DISCOVERY_OUT_DIR
+    ? path.resolve(process.env.DISCOVERY_OUT_DIR)
+    : path.join(baseDir, `raydium-standard-pools-${dirTimestamp}`);
+
+  if (fs.existsSync(outDir)) {
+    throw new Error(`DESTINATION_EXISTS: Refusing to overwrite existing directory: ${outDir}`);
+  }
   fs.mkdirSync(outDir, { recursive: true });
 
-  const t0 = Date.now();
-  console.log(\`[DISCOVERY] Dispatching single GET request to: \${URL}\`);
-
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`NETWORK_TIMEOUT: Exceeded ${TIMEOUT_MS}ms deadline`));
+  }, TIMEOUT_MS);
 
-  let response;
+  let tHeaders = null;
+  let tBodyCompleted = null;
+  let response = null;
+  let bodyResult = null;
+  let failureCategory = null;
+  let failureMessage = null;
+  let failureDetails = {};
+
   try {
-    response = await fetch(URL, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      redirect: 'error',
-      signal: controller.signal
-    });
+    try {
+      response = await fetch(URL, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      tHeaders = Date.now();
+    } catch (err) {
+      tHeaders = Date.now();
+      tBodyCompleted = tHeaders;
+      if (err.name === 'AbortError' || controller.signal.aborted) {
+        failureCategory = 'TIMEOUT';
+        failureMessage = `Request timed out after ${TIMEOUT_MS}ms`;
+      } else {
+        failureCategory = 'NETWORK_ERROR';
+        failureMessage = err.message || String(err);
+      }
+      throw err;
+    }
+
+    if (!response.ok) {
+      tBodyCompleted = Date.now();
+      failureCategory = 'HTTP_ERROR';
+      failureMessage = `HTTP ${response.status} ${response.statusText}`;
+      failureDetails.httpStatus = response.status;
+      try {
+        bodyResult = await readBodyWithLimit(response.body, MAX_BYTES, controller.signal);
+      } catch {
+        // ignore body read error on non-ok
+      }
+      throw new Error(failureMessage);
+    }
+
+    // Stream and retain response body with byte ceiling and active timeout
+    try {
+      bodyResult = await readBodyWithLimit(response.body, MAX_BYTES, controller.signal);
+      tBodyCompleted = Date.now();
+    } catch (err) {
+      tBodyCompleted = Date.now();
+      if (err.name === 'ResponseTooLargeError') {
+        failureCategory = 'OVERFLOW';
+        failureMessage = err.message;
+        failureDetails.observedBytes = err.totalObservedBytes;
+        failureDetails.retainedBytes = err.retainedBuffer.length;
+        bodyResult = {
+          retainedBuffer: err.retainedBuffer,
+          totalObservedBytes: err.totalObservedBytes,
+          sha256: err.sha256,
+        };
+      } else if (err.name === 'AbortError' || controller.signal.aborted) {
+        failureCategory = 'TIMEOUT';
+        failureMessage = `Body streaming timed out after ${TIMEOUT_MS}ms`;
+      } else {
+        failureCategory = 'STREAM_READ_ERROR';
+        failureMessage = err.message || String(err);
+      }
+      throw err;
+    }
+  } catch (err) {
+    // failureCategory is already set above
   } finally {
     clearTimeout(timer);
   }
 
-  const t1 = Date.now();
-  if (!response.ok) {
-    throw new Error(\`HTTP \${response.status} \${response.statusText}\`);
+  // 1. Write raw response if any body bytes were received/retained
+  if (bodyResult && bodyResult.retainedBuffer && bodyResult.retainedBuffer.length > 0) {
+    fs.writeFileSync(path.join(outDir, 'raw-response.json'), bodyResult.retainedBuffer);
   }
 
-  const rawBytes = Buffer.from(await response.arrayBuffer());
-  if (rawBytes.length > MAX_BYTES) {
-    throw new Error(\`Response length \${rawBytes.length} exceeds ceiling of \${MAX_BYTES} bytes\`);
+  // 2. Parse and evaluate JSON if body was successfully read
+  let json = null;
+  if (!failureCategory && bodyResult) {
+    try {
+      json = JSON.parse(bodyResult.retainedBuffer.toString('utf8'));
+    } catch (parseErr) {
+      failureCategory = 'JSON_PARSE_ERROR';
+      failureMessage = `Failed to parse response as JSON: ${parseErr.message}`;
+    }
   }
 
-  const sha256 = crypto.createHash('sha256').update(rawBytes).digest('hex');
-  const rawText = rawBytes.toString('utf8');
-  const json = JSON.parse(rawText);
+  // 3. Validate provider success flag and data array schema
+  if (!failureCategory && json) {
+    if (json.success !== true) {
+      failureCategory = 'PROVIDER_ERROR';
+      failureMessage = `Provider returned success: false (code: ${json.code ?? 'NONE'}, msg: ${json.msg ?? json.message ?? 'UNKNOWN'})`;
+      failureDetails.providerPayload = { success: json.success, code: json.code, msg: json.msg };
+    } else if (!json.data || !Array.isArray(json.data.data)) {
+      failureCategory = 'SCHEMA_ERROR';
+      failureMessage = 'Provider response missing data.data array';
+    }
+  }
 
-  // 1. Save raw unprojected response byte-for-byte
-  fs.writeFileSync(path.join(outDir, 'raw-response.json'), rawBytes);
-
-  // 2. Save capture metadata
+  // 4. Save capture metadata
   const metadata = {
     url: URL,
-    httpStatus: response.status,
-    dispatchedAtIso: new Date(t0).toISOString(),
-    respondedAtIso: new Date(t1).toISOString(),
-    elapsedMs: t1 - t0,
-    byteLength: rawBytes.length,
-    sha256
+    httpStatus: response ? response.status : null,
+    dispatchedAtIso: new Date(tDispatch).toISOString(),
+    headersReceivedAtIso: tHeaders ? new Date(tHeaders).toISOString() : null,
+    bodyCompletedAtIso: tBodyCompleted ? new Date(tBodyCompleted).toISOString() : null,
+    elapsedMs: (tBodyCompleted || Date.now()) - tDispatch,
+    retainedByteLength: bodyResult ? bodyResult.retainedBuffer.length : 0,
+    totalObservedBytes: bodyResult ? bodyResult.totalObservedBytes : 0,
+    sha256: bodyResult ? bodyResult.sha256 : null,
+    status: failureCategory ? failureCategory : 'SUCCESS',
+    ...(failureMessage ? { errorMessage: failureMessage } : {}),
   };
   fs.writeFileSync(path.join(outDir, 'capture-metadata.json'), JSON.stringify(metadata, null, 2));
 
-  // 3. In-memory filter directly on unprojected pools
-  const pools = json?.data?.data || [];
-  const retrievalSec = Math.floor(t1 / 1000);
+  // 5. If failure, write failure report and seal manifest
+  if (failureCategory) {
+    const failureReport = {
+      failureCategory,
+      message: failureMessage,
+      details: failureDetails,
+      capturedAtIso: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(outDir, 'failure-report.json'), JSON.stringify(failureReport, null, 2));
+
+    const manifestFiles = fs.readdirSync(outDir).filter(f => f !== 'manifest.json').map(f => {
+      const content = fs.readFileSync(path.join(outDir, f));
+      return {
+        path: f,
+        byteLength: content.length,
+        sha256: crypto.createHash('sha256').update(content).digest('hex'),
+      };
+    });
+    fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify({ generatedAtIso: new Date().toISOString(), outDir, status: failureCategory, files: manifestFiles }, null, 2));
+
+    console.error(`[DISCOVERY_FAILED] Category: ${failureCategory}, Message: ${failureMessage}. Sealed evidence in: ${outDir}`);
+    return;
+  }
+
+  // 6. Evaluate qualifying pools on successful response
+  const pools = json.data.data;
+  const retrievalSec = Math.floor((tBodyCompleted || Date.now()) / 1000);
   const ledger = [];
   const qualifying = [];
 
@@ -1869,11 +2111,15 @@ const crypto = require('crypto');
     const tvl = p?.tvl;
     const rawOpenTime = p?.openTime;
 
-    if (!poolId || !BASE58_RE.test(poolId)) reasons.push('INVALID_POOL_ID');
-    if (programId !== AMM_V4_PROGRAM) reasons.push(\`PROGRAM_MISMATCH_\${programId || 'NONE'}\`);
+    if (!poolId || !isCanonicalSolanaBase58(poolId)) {
+      reasons.push('INVALID_POOL_ID');
+    }
+    if (programId !== AMM_V4_PROGRAM) {
+      reasons.push(`PROGRAM_MISMATCH_${programId || 'NONE'}`);
+    }
 
-    const hasMintA = mintA && BASE58_RE.test(mintA);
-    const hasMintB = mintB && BASE58_RE.test(mintB);
+    const hasMintA = mintA && isCanonicalSolanaBase58(mintA);
+    const hasMintB = mintB && isCanonicalSolanaBase58(mintB);
     if (!hasMintA || !hasMintB) {
       reasons.push('INVALID_MINTS');
     } else {
@@ -1886,27 +2132,23 @@ const crypto = require('crypto');
 
     if (burnPercent === null || burnPercent === undefined || typeof burnPercent !== 'number' || !Number.isFinite(burnPercent)) {
       reasons.push('BURN_PERCENT_UNKNOWN');
+    } else if (burnPercent < 0 || burnPercent > 100) {
+      reasons.push(`BURN_PERCENT_OUT_OF_RANGE_${burnPercent}`);
     } else if (burnPercent < 90) {
-      reasons.push(\`BURN_PERCENT_BELOW_90_\${burnPercent}\`);
+      reasons.push(`BURN_PERCENT_BELOW_90_${burnPercent}`);
     }
 
     if (typeof tvl !== 'number' || !Number.isFinite(tvl) || tvl < 30000) {
-      reasons.push(\`INSUFFICIENT_LIQUIDITY_TVL_\${tvl}\`);
+      reasons.push(`INSUFFICIENT_LIQUIDITY_TVL_${tvl}`);
     }
 
-    let openTimeNum = null;
-    if (typeof rawOpenTime === 'number' && Number.isInteger(rawOpenTime) && rawOpenTime > 0) {
-      openTimeNum = rawOpenTime;
-    } else if (typeof rawOpenTime === 'string' && /^\\d+$/.test(rawOpenTime.trim())) {
-      openTimeNum = parseInt(rawOpenTime.trim(), 10);
-    }
-
-    if (openTimeNum === null) {
+    const parsedOpenTime = parseOpenTime(rawOpenTime);
+    if (parsedOpenTime === null) {
       reasons.push('OPEN_TIME_INVALID_OR_MISSING');
-    } else if (openTimeNum > retrievalSec) {
+    } else if (parsedOpenTime > retrievalSec) {
       reasons.push('OPEN_TIME_IN_FUTURE');
-    } else if (retrievalSec - openTimeNum < 300) {
-      reasons.push(\`POOL_AGE_UNDER_300S_\${retrievalSec - openTimeNum}\`);
+    } else if (retrievalSec - parsedOpenTime < 300) {
+      reasons.push(`POOL_AGE_UNDER_300S_${retrievalSec - parsedOpenTime}`);
     }
 
     const passed = reasons.length === 0;
@@ -1919,10 +2161,10 @@ const crypto = require('crypto');
       reportedBurnPercent: burnPercent,
       burnPercentUnits: 'percentage_points_0_to_100',
       tvl: typeof tvl === 'number' ? tvl : null,
-      openTime: openTimeNum,
-      ageSecondsAtRetrieval: openTimeNum ? retrievalSec - openTimeNum : null,
+      openTime: parsedOpenTime,
+      ageSecondsAtRetrieval: parsedOpenTime ? retrievalSec - parsedOpenTime : null,
       passed,
-      rejectionReasons: reasons
+      rejectionReasons: reasons,
     };
     ledger.push(entry);
     if (passed) qualifying.push(entry);
@@ -1930,14 +2172,19 @@ const crypto = require('crypto');
 
   fs.writeFileSync(path.join(outDir, 'selection-ledger.json'), JSON.stringify(ledger, null, 2));
 
-  // 4. Deterministic single target selection (highest TVL)
-  qualifying.sort((a, b) => (b.tvl || 0) - (a.tvl || 0));
+  // 7. Deterministic selection: highest TVL with poolId tie-breaker
+  qualifying.sort((a, b) => {
+    if (b.tvl !== a.tvl) {
+      return (b.tvl || 0) - (a.tvl || 0);
+    }
+    return a.poolId.localeCompare(b.poolId);
+  });
   const chosen = qualifying[0] || null;
 
   const targetPayload = chosen
     ? {
         hasTarget: true,
-        selectionCriterion: 'HIGHEST_TVL_AMONG_QUALIFYING',
+        selectionCriterion: 'HIGHEST_TVL_WITH_POOL_ID_TIEBREAKER',
         poolId: chosen.poolId,
         candidateMint: chosen.candidateMint,
         symbol: chosen.symbol,
@@ -1945,36 +2192,36 @@ const crypto = require('crypto');
         burnPercentUnits: chosen.burnPercentUnits,
         tvl: chosen.tvl,
         ageSecondsAtRetrieval: chosen.ageSecondsAtRetrieval,
-        provisionalStatus: 'PROVISIONAL_DISCOVERY_LEAD_PENDING_ONCHAIN_VALIDATION'
+        provisionalStatus: 'PROVISIONAL_DISCOVERY_LEAD_PENDING_ONCHAIN_VALIDATION',
       }
     : {
         hasTarget: false,
-        reason: 'NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION'
+        reason: 'NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION',
       };
 
   fs.writeFileSync(path.join(outDir, 'provisional-target.json'), JSON.stringify(targetPayload, null, 2));
 
-  // 5. Generate manifest
-  const fileNames = ['raw-response.json', 'capture-metadata.json', 'selection-ledger.json', 'provisional-target.json'];
-  const manifestFiles = fileNames.map(f => {
+  // 8. Seal manifest
+  const manifestFiles = fs.readdirSync(outDir).filter(f => f !== 'manifest.json').map(f => {
     const content = fs.readFileSync(path.join(outDir, f));
     return {
       path: f,
       byteLength: content.length,
-      sha256: crypto.createHash('sha256').update(content).digest('hex')
+      sha256: crypto.createHash('sha256').update(content).digest('hex'),
     };
   });
 
   const manifest = {
     generatedAtIso: new Date().toISOString(),
     outDir,
-    files: manifestFiles
+    status: 'SUCCESS',
+    files: manifestFiles,
   };
   fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
-  console.log(\`[DISCOVERY] Completed. Scanned \${pools.length} pools. Qualifying: \${qualifying.length}. Target selected: \${chosen ? chosen.poolId : 'NONE'}. Artifacts in: \${outDir}\`);
+  console.log(`[DISCOVERY] Completed. Scanned ${pools.length} pools. Qualifying: ${qualifying.length}. Target selected: ${chosen ? chosen.poolId : 'NONE'}. Artifacts in: ${outDir}`);
 })();
-"@
+'@ | node
 ```
 
 #### 3. Bounded Standalone Diagnostic Execution on Approved Target
