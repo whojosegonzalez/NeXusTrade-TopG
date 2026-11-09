@@ -1,6 +1,6 @@
 # NeXusTrade — Phase 12.94-D Milestone D.3.3: Source-Accurate PAPER Implementation Handoff
 
-**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V8`  
+**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V9`  
 **Location**: `docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`  
 **Related Closure Report**: [`audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md`](file:///u:/Projects/TopG/audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md)  
 **Status**: **READ-ONLY ARCHITECTURAL SPECIFICATION & OFFLINE IMPLEMENTATION HANDOFF**  
@@ -2295,37 +2295,132 @@ const { createRequire } = require('module');
 '@ | node
 ```
 
-#### 3. Bounded Standalone Diagnostic Execution on Approved Target
+#### 3. Accepted Operator Discovery Capture Review (`raydium-standard-pools-2026-11-09T05-40-28-324Z`)
 
-Once a candidate target is approved by the operator, the diagnostic is executed via the accepted runner:
+Independent offline verification confirms acceptance of the completed single-request discovery capture executed by the operator at `2026-11-09T05:40:28.324Z`:
+
+- **Capture Directory**: `U:\Projects\TopG\data\research\discovery\raydium-standard-pools-2026-11-09T05-40-28-324Z`
+- **Dispatched Request**: Exactly one `GET` request to `https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=20&page=1` with 0 redirects, 0 retries, and 0 follow-up enrichment calls.
+- **Network Performance**: HTTP 200 returned; 315 ms recorded elapsed time from dispatch to body completion.
+- **Wire Volume & Digest Parity**: Exactly 45,914 response bytes observed and retained. Observed and retained SHA-256 digests match identically: `e1329277776f9b4ace969deb2f0c9ad3e794e56270aeffcf4504ce4d8c587728`.
+- **Manifest Integrity**: Sealed manifest at `manifest.json` with SHA-256 digest `7ffa7744ef789f110ea5c1e2bdcf790b421f8a68b7dc2ed1342ce9eb94496a37`. All four listed files match recorded sizes and SHA-256 hashes:
+  - `capture-metadata.json` (630 bytes, SHA-256: `4f352b03306e83ff877ae468e84d4302d9a57f69c3a5c5d4c6554f6ab02497ea`)
+  - `provisional-target.json` (83 bytes, SHA-256: `f9f5cc55029691aa0fb06aa02ed0ba48b90ed176ce34801b14a5be49480f3360`)
+  - `raw-response.json` (45,914 bytes, SHA-256: `e1329277776f9b4ace969deb2f0c9ad3e794e56270aeffcf4504ce4d8c587728`)
+  - `selection-ledger.json` (10,725 bytes, SHA-256: `f8def3351ecb1c5550700013c5f5daf0bc831dbfc0ca1631d2c58a40b85d4775`)
+- **Standing Wallet Boundary**: Virtual wallet balance remains frozen at 7.9259 SOL with SHA-256 hash unchanged ($0.00 spend).
+- **Returned Pool Population & Filter Breakdown (20 Total Records)**:
+  - **15 CPMM Pools**: Rejected fail-closed for program mismatch (`PROGRAM_MISMATCH_CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`).
+  - **2 Non-Qualifying AMM v4 Pools**:
+    - `58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2` (USDC/WSOL, TVL $17,407,520.60): rejected for `BURN_PERCENT_BELOW_90_0` (0% burn).
+    - `6UmmUiYoBjSrhakAobJw8BvkmJtDVxaeBtbt7rxWo1mg` (RAY/USDC, TVL $6,290,960.08): rejected for `NOT_EXACTLY_ONE_WSOL_LEG` and `BURN_PERCENT_BELOW_90_0.03` (0.03% burn).
+  - **3 AMM v4 Unverified Leads with Unknown Age**:
+    The following three pools satisfied AMM v4 program ID, single WSOL pairing, liquidity floor ($\ge \$30{,}000$), and reported indexer burn ($\ge 90\%$), but returned indexer `openTime: "0"`:
+    1. **Fartcoin (`Fartcoin `)**: Pool `Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw`, Mint `9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump`, TVL $6,061,855.21, Reported Burn 99.78%.
+    2. **ACT (`ACT`)**: Pool `B4PHSkL6CeZbxVqm1aUPQuVpc5ERFcaZj7u9dhtphmVX`, Mint `GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump`, TVL $1,265,167.28, Reported Burn 99.98%.
+    3. **swarms (`swarms`)**: Pool `HL4KFTfhZZMm7NGefszQxzJ3M6CaDWE7TesyuRuQYmMJ`, Mint `74SBV4zDXxTRgv1pEMoECskKBkZHc2yGPnc7GYVepump`, TVL $1,211,206.14, Reported Burn 99.73%.
+- **Authoritative Preservation of Zero-Target Outcome**:
+  - In accordance with the contract, `openTime: "0"` is rejected as non-positive (`OPEN_TIME_INVALID_OR_MISSING`).
+  - Zero pools passed every discovery filter.
+  - `provisional-target.json` correctly records `{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`.
+  - The capture and its zero-target outcome are preserved unchanged.
+  - The three leads are recorded strictly as **unverified leads with unknown age**. No age is substituted, and none are treated as strategy-qualified.
+
+#### 4. Bounded Follow-Up Proposal on Highest-TVL Lead (Fartcoin)
+
+To exercise the downstream verification pipeline and untested strategy stages without dispatching additional discovery requests or introducing a new capture framework, a bounded follow-up execution using the accepted standalone diagnostic runner is proposed on the highest-TVL provisional lead from this capture:
+
+- **Target Candidate**: Fartcoin (`Fartcoin `)
+- **Pool Address**: `Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw`
+- **Candidate Mint**: `9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump`
+- **Discovery TVL**: $6,061,855.21
+- **Reported Burn Hint**: 99.78% (percentage points in $[0, 100]$)
+
+##### A. Exact Copyable Operator Command (Pending Separate Approval)
+
+> [!IMPORTANT]
+> **READ-ONLY SPECIFICATION — DO NOT EXECUTE**: The follow-up command below uses the accepted runner (`backend/src/scripts/candidate-decision-diagnostic.ts`) targeting Fartcoin. It is provided for operator review and requires separate operator authorization before execution. Zero network calls or runs occur automatically.
 
 ```powershell
 node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decision-diagnostic.ts `
-    --pool <APPROVED_POOL_ID> `
-    --mint <APPROVED_MINT_ADDRESS> `
+    --pool Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw `
+    --mint 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump `
     --rpc-url https://api.mainnet-beta.solana.com `
-    --out-dir <TARGET_OUT_DIR> `
+    --out-dir data/research/diagnostics/candidate-decision-fartcoin `
     --paper `
     --live
 ```
 
-**Bounded Request Allocation on Passing Quiet Path (11 Total Dispatches)**:
+##### B. Authoritative Resolution of Pair Age via Existing EXACT_PAIR Acquisition
 
-| Phase                         | Purpose                         | Provider          | Method | Dispatched |
-| :---------------------------- | :------------------------------ | :---------------- | :----: | :--------: |
-| **Phase 1: Bootstrap**        | `POOL_LAYOUT`                   | Solana RPC        |  POST  |     1      |
-|                               | `PRIOR_ANCHOR`                  | Solana RPC        |  POST  |     1      |
-| **Phase 2: Observation**      | 65-second observation span      | WebSocket / Quiet |   —    |     0      |
-| **Phase 3: Cutoff & History** | `GET_SLOT`                      | Solana RPC        |  POST  |     1      |
-|                               | `GET_BLOCK_TIME`                | Solana RPC        |  POST  |     1      |
-|                               | `HISTORY_ENUMERATION`           | Solana RPC        |  POST  |     1      |
-| **Phase 4: Market Data**      | `EXACT_PAIR`                    | DexScreener       |  GET   |     1      |
-| **Phase 5: Pre-Admission**    | `LP_REFRESH` (single account)   | Solana RPC        |  POST  |     1      |
-|                               | `LP_REFRESH` (batch accounts)   | Solana RPC        |  POST  |     1      |
-|                               | `CANDIDATE_MINT` (`jsonParsed`) | Solana RPC        |  POST  |     1      |
-| **Phase 6: Security**         | `RUGCHECK_REPORT`               | RugCheck          |  GET   |     1      |
-|                               | `SOLANA_TRACKER_BUNDLERS`       | Solana Tracker    |  GET   |     1      |
-| **Total Dispatched Requests** |                                 |                   |        |   **11**   |
+In the discovery indexer response, `openTime` was `"0"`, correctly failing the discovery age filter. In the follow-up diagnostic:
 
-- **Ceiling Compliance**: 11 total dispatched attempts on the passing quiet path complies strictly with the maximum 14-attempt ceiling.
-- **Unlocks Untested Stages**: If on-chain LP burn $\ge 90.0\%$ and authorities are renounced, the diagnostic proceeds directly to Phase 6, executing the live RugCheck query, Solana Tracker bundler query, Gate 11 (`BUNDLER_CONCENTRATION_GATE`), Gate 12 (`ESTABLISHED_MACRO_TREND_GATE`), and decision point evaluation (`ARMED_FIRST_TICK` or gate rejection), sealing a complete 23-file manifest.
+1. **Existing Market Data Endpoint**: In Phase 4, the runner dispatches exactly one metered `GET` request to DexScreener:
+   `https://api.dexscreener.com/latest/dex/pairs/solana/Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw`
+2. **Provider-Reported `pairCreatedAt`**: The runner reads `pair.pairCreatedAt` directly from the pair payload.
+3. **Strict Validation (No Favorable Defaults)**:
+   - Requires `typeof pair.pairCreatedAt === "number" && Number.isFinite(pair.pairCreatedAt) && pair.pairCreatedAt > 0`.
+   - Missing, non-numeric, or non-positive timestamps fail closed immediately with `INCOMPLETE_MARKET_INPUTS` ("Missing or non-finite pairCreatedAt timestamp").
+   - The unknown discovery age is never defaulted to 0, assumed mature, or substituted with a favorable placeholder.
+4. **Authoritative Age Calculation**:
+   `assetAgeSeconds = Math.max(0, Math.floor((clock - pair.pairCreatedAt) / 1000))`
+   This value is passed directly to the strategy evaluator and Gate 1 (`MATURITY_GATE`).
+
+##### C. Stages Exercised & Non-Arming Gate Rejection Expectations
+
+This single-target execution exercises the entire multi-stage decision pipeline:
+
+1. **Phase 1: Bootstrap & Prior Anchor (2 Solana RPC dispatches)**:
+   - `POOL_LAYOUT` (1 dispatch): Acquires raw 752-byte pool account for `Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw`. Confirms AMM v4 program ownership and extracts base/quote vaults and LP mint.
+   - `PRIOR_ANCHOR` (1 dispatch): Fetches initial transaction signature via `getSignaturesForAddress`.
+2. **Phase 2: Live Observation Window (0 HTTP, 1 WebSocket transport, 65-second span)**:
+   - Subscribes to live pool account notifications with keepalive pings/pongs and strict resource limits (10-frame queue ceiling, max 100 messages, 256 KiB buffer).
+   - **Active Flow Reality on High-Volume Memecoin**: Fartcoin is a high-volume, multi-million dollar token with frequent live swaps. Any swap occurring during the 65-second observation window is detected by `RollingTradeFlowTracker`, resulting in `ACTIVE_FLOW` and causing quiet qualification to fail. This is an authentic strategy gate evaluation, not an execution flaw.
+3. **Phase 3: Independent Cutoff & History Enumeration (3 Solana RPC dispatches)**:
+   - Captures independent on-chain cutoff via `getSlot` (1 dispatch) and `getBlockTime` (1 dispatch).
+   - Dispatches `HISTORY_ENUMERATION` (1 dispatch) for one bounded page of up to 20 records and reconciles against the prior anchor.
+4. **Phase 4: Market Data & Age Resolution (1 DexScreener HTTP dispatch)**:
+   - Resolves true `assetAgeSeconds` from `pairCreatedAt`.
+   - Validates spot price native, actual market cap (FDV non-substitutable), and 5m volume.
+5. **Phase 5: Pre-Admission Screening (3 Solana RPC dispatches)**:
+   - Refreshes pool account (`LP_REFRESH`, 1 dispatch).
+   - Batches LP mint supply and known lock/burn accounts (`LP_REFRESH`, 1 dispatch). Derives protocol inaccessible claims via exact integer cross-multiplication: $100n \times (L - S) \ge 90n \times L$.
+   - Revalidates candidate mint account (`CANDIDATE_MINT`, 1 dispatch via `jsonParsed`), verifying `mintAuthority === null` and `freezeAuthority === null`.
+6. **Phase 6: Downstream Security & Strategy Decision Gates (2 HTTP dispatches)**:
+   - _Only entered if Phase 5 passes_ (LP burn $\ge 90.0\%$ and authorities renounced):
+     - Dispatches live `RUGCHECK_REPORT` (1 dispatch) and `SOLANA_TRACKER_BUNDLERS` (1 dispatch).
+     - Evaluates Gate 11 (`BUNDLER_CONCENTRATION_GATE`), Gate 12 (`ESTABLISHED_MACRO_TREND_GATE`), and all pre-buy conditions.
+   - **Expected Non-Arming Rejection Modes (No First-Tick Arming Promised)**:
+     - **Mature Pool Rejection**: Fartcoin was launched weeks prior to this assessment. If `assetAgeSeconds > 7,200s` (2 hours), Gate 1 rejects with `REJECTED_OUTSIDE_MATURITY_WINDOW`.
+     - **Observation Active Flow**: Live trades during the 65s window disqualify the quiet path.
+     - **On-Chain LP Deficit**: If on-chain accounts derive $< 90\%$ burn, Phase 5 rejects with `REJECTED_UNLOCKED_LP_RISK`.
+     - **Security / Holder Concentration**: RugCheck danger risks or bundler concentration $> 20\%$ reject at downstream gates.
+     - _Conclusion_: A rejection at any gate represents a successful, informative execution of the diagnostic machinery.
+
+##### D. Bounded Request Allocation on Passing Quiet Path (11 Total Dispatches)
+
+| Phase                         | Purpose                          | Provider          | Method | Dispatched |
+| :---------------------------- | :------------------------------- | :---------------- | :----: | :--------: |
+| **Phase 1: Bootstrap**        | `POOL_LAYOUT`                    | Solana RPC        |  POST  |     1      |
+|                               | `PRIOR_ANCHOR`                   | Solana RPC        |  POST  |     1      |
+| **Phase 2: Observation**      | 65-second observation span       | WebSocket / Quiet |   —    |     0      |
+| **Phase 3: Cutoff & History** | `GET_SLOT`                       | Solana RPC        |  POST  |     1      |
+|                               | `GET_BLOCK_TIME`                 | Solana RPC        |  POST  |     1      |
+|                               | `HISTORY_ENUMERATION`            | Solana RPC        |  POST  |     1      |
+| **Phase 4: Market Data**      | `EXACT_PAIR` (Resolves Pair Age) | DexScreener       |  GET   |     1      |
+| **Phase 5: Pre-Admission**    | `LP_REFRESH` (single account)    | Solana RPC        |  POST  |     1      |
+|                               | `LP_REFRESH` (batch accounts)    | Solana RPC        |  POST  |     1      |
+|                               | `CANDIDATE_MINT` (`jsonParsed`)  | Solana RPC        |  POST  |     1      |
+| **Phase 6: Security**         | `RUGCHECK_REPORT`                | RugCheck          |  GET   |     1      |
+|                               | `SOLANA_TRACKER_BUNDLERS`        | Solana Tracker    |  GET   |     1      |
+| **Total Dispatched Requests** |                                  |                   |        |   **11**   |
+
+##### E. Preserved Ceilings & Safety Invariants
+
+- **HTTP Request Ceiling**: Maximum 14 dispatched attempts strictly enforced by `GlobalResourceBudgetManager` (quiet path requires at most 11).
+- **Network Timeout**: 90-second overall diagnostic deadline (`AbortSignal.timeout(90_000)`).
+- **RPC Host Pacing**: Minimum 2,500 ms spacing between sequential Solana RPC calls strictly enforced.
+- **WebSocket Limits**: Single connection with keepalive scheduler (15s pings, 5s pong timeout, max 4 pings), 10-frame pending queue ceiling, and 256 KiB buffer limit.
+- **Spending Ceiling**: Exactly **$0.00**; standing wallet balance remains frozen at 7.9259 SOL.
+- **Standalone Isolation**: Single exact pool/mint; zero background trading daemons, zero position tracking, zero order routing, and zero automated retries or follow-ups.
+- **Authorization Boundary**: The command is presented for review only; execution is held pending explicit operator approval.
