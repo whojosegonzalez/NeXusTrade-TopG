@@ -2741,7 +2741,89 @@ The operator ran the approved diagnostic on `0356bb62f42dfe55df838a519b39e291c33
    - `toCandidateFlowResult` returns `COLLECTION_GAP` outside synthetic proofs;
    - `PaperReconciledCandidateFlowAdapter` accepts only 0/0 counts;
    - the diagnostic maps any notification to `NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS`.
-3. **Retrieval budget is the binding live constraint.** An armable micro-cap requires `Sells5m ≥ 15` and `Buys/Sells ≥ 1.5`, which implies ≥ 37.5 transactions per 5 min (≈ 7.5 per min). Each needs a `getTransaction` resolution. At 2,500 ms pacing that is ≈ 19 s of RPC time per minute for one candidate, against the diagnostic's 14-request / 3-retrieval ceilings. The provider roadmap already lists transaction retrieval volume as an immediate blocker. Live active coverage therefore needs a separate operator budget or provider decision.
+3. **Retrieval budget is a live constraint (corrected in §8.19).** An armable micro-cap's five-minute DexScreener totals (`Sells5m ≥ 15`, `Buys/Sells ≥ 1.5`) imply at least 37.5 swaps over five minutes. ~~That implies ≈ 7.5 per minute and ≈ 19 s of RPC time per minute.~~ **Correction**: five-minute totals do not establish a minimum transaction rate in any particular 60-second window, nor an equivalent number of unique RPC retrievals. Swaps can cluster, and one transaction can contain several swaps. What does hold: each in-window signature needs its own resolution, and the diagnostic allows 3 shared retrievals within 14 HTTP attempts.
 4. **The daemon path is wired but unreachable.** It already has retest via `evaluateCandidateDecisionPoints` with armed state, inline cohort sizing, and `PaperTradingDaemon` with `DynamicRatchetService` exits. But its flow provider is `UnavailableCandidateFlowProvider` (nothing calls `setCandidateFlowProvider`), so the Buy Gate rejects with `REJECTED_UNAVAILABLE_FLOW_COVERAGE`. Its Gate 11 remains quarantined (`BUNDLER_CONCENTRATION_UNKNOWN`), and its RugCheck fetch is unbounded. Daemon integration should follow, not precede, active-window qualification.
 
 **Recommended next task**: offline, opt-in, PAPER-only **active-window flow qualification**. A fully reconciled 60 s window with non-zero verified counts should reach PAPER decisions through the existing isolated adapter and diagnostic, under an explicit transaction-resolution budget. Defaults and the production and daemon paths stay unchanged. Live verification is deferred to a separate budget decision.
+
+---
+
+### 8.19 Opt-In PAPER Active-Window Flow Qualification (Offline Implementation)
+
+**Scope**: operator-approved offline development. The policy accepts provider-relative RPC-index completeness assumptions for isolated PAPER research only. It does **not** establish cryptographic completeness or production readiness, and it does not authorize live execution. No retrieval budget was added; the RugCheck opt-ins and their defaults are unchanged.
+
+#### 1. Boundary and Provenance
+
+- **Explicit opt-in at every layer**, PAPER_SIMULATION or BACKTEST only; there is no environment variable.
+  - **Evaluator**: `paperActiveWindowPolicy`.
+  - **Adapter**: `allowActiveWindowQualification`.
+  - **Diagnostic**: `paperActiveWindowFlow`.
+  - **CLI**: `--paper-active-window`, which requires `--paper`. A non-PAPER request is rejected before any network activity.
+- **Defaults stay quiet-only.** The active opt-in does not grant quiet-window qualification.
+- **Unchanged**: the production conversion guard (`toCandidateFlowResult`), synthetic-proof restrictions, `isProductionCompletenessEstablished = false`, and daemon wiring.
+- **Distinct provenance**:
+  - The evaluator reports `paperActiveWindowQualified` and `paperQualificationKind: "ACTIVE_WINDOW"`, versus `"QUIET_WINDOW"` for quiet windows.
+  - The adapter and consumption-side snapshot carry `qualificationKind`. Quiet (or legacy) contexts still require 0/0 counts; active contexts require verified non-negative integer counts.
+  - Provider assumptions and unresolved uncertainties are preserved.
+
+#### 2. Qualification
+
+The existing checks are unchanged:
+
+- identity and causality;
+- the 15,000 ms freshness ceiling at evaluation, conversion and consumption;
+- full observation span;
+- non-waivable recorded gaps;
+- no backlog;
+- `ANCHOR_WITNESSED` with a prior boundary;
+- explicit `RESOLVED` evidence for every in-window signature, with matching slot and blockTime;
+- candidate-bound, de-duplicated decoded events whose count matches each resolution.
+
+The active policy additionally requires:
+
+- a real `historyResult` receipt;
+- a valid `expectedConnectionEpoch` equal to the history (and resolution) epoch;
+- a transaction slot on every counted event.
+
+Under the active policy, only the _locally generated_ evaluation-time inactivity heuristic is deferred, and only when every in-window signature has explicit resolution evidence. Recorded stream gaps still fail closed, so backfill cannot erase them. Missing, failed, unsupported, budget-denied, stale, future-dated or over-budget evidence stays unavailable with null counts. A failed decode is never turned into a zero.
+
+#### 3. Diagnostic Path, Evidence and Replay
+
+- **Resolution records**: each stream decode result becomes a resolution record. It is `RESOLVED` only when the decode succeeded and the slot and blockTime were read from that transaction's own `getTransaction` response. All decodes use the unchanged 3 shared retrievals and 14 HTTP attempts; pacing, timeouts and stream limits are unchanged.
+- **Sealing**: each transaction response is sealed once under `responses/`. `evidence/active-window-evidence.json` links each signature to its response file, resolution, recorded gaps, workload and epoch.
+- **Replay** of an `ACTIVE_WINDOW` capture uses only raw evidence:
+  - it re-decodes every verified sealed transaction with the existing decoder;
+  - rebuilds the resolutions and events;
+  - re-runs the evaluator and adapter at the recorded times;
+  - and requires the recorded counts to be reproduced before replaying the decision.
+- **Replay failure statuses**:
+  - `REPLAY_ACTIVE_WINDOW_MISMATCH` when re-decoding does not reproduce the recorded counts;
+  - `REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID` when evidence is missing or incomplete.
+- **Pre-existing redaction**: sealing redaction replaces `uiTokenAmount` objects with `[REDACTED]`. The decoder does not read them; re-decoding the real sealed Fartcoin Run 1 transaction offline reproduced its one SELL.
+- **Defect fixed (decode request id)**: the diagnostic re-issued each stream `getTransaction` with its own `diag-N` JSON-RPC id. The transaction adapter requires its own id, so **every stream decode failed with `RPC_ID_MISMATCH`**. Fartcoin Run 1's live response carried `diag-3`. The adapter's id is now forwarded on the wire, so the provider's genuine echo satisfies the existing check. Default outcomes are unchanged, because non-quiet windows without the opt-in remain `COLLECTION_GAP`.
+
+#### 4. Offline Verification (Synthetic Clocks and Labelled Synthetic Inputs)
+
+`PaperActiveWindowQualification.test.ts` (A1–A7) and `CandidateDecisionDiagnostic.test.ts` (W1–W4) use a new version-controlled fixture, `fixtures/SyntheticRaydiumSwapTransactionFixture.ts`.
+
+- **A1 – Qualification**: a fully resolved 2-buy / 1-sell window qualifies with `ACTIVE_WINDOW` provenance; the production guard still returns `COLLECTION_GAP`.
+- **A2 – Retest**: through the existing decision path, the first tick arms and an armed 12% pullback reaches **`RETEST_CONFIRMED`** (`RETEST_PULLBACK_DISCOUNT`). A quiet 0/0 window stays `RETEST_WAITING`.
+- **A3 – Other gates still bind**: a failed RugCheck score gate still produces `BUY_GATE_REJECTED` despite qualified flow.
+- **A4–A6 – Fail-safe cases**: missing, failed, budget-denied or incomplete resolutions; foreign identity, slot or epoch mismatch; recorded gaps; backlog; stale or future evidence; exhausted enumeration; and stale conversion all fail closed. Duplicate events count once.
+- **A7 – Protection**: production, default and quiet-only boundaries hold, including a forged quiet-kind context with non-zero counts.
+- **W1 – End to end**: the diagnostic qualifies two stream-decoded BUYs (2/3 retrievals, 13/14 HTTP attempts), arms, and seals linked evidence. Replay re-decodes and reproduces the result. A re-sealed BUY→SELL tamper gives `REPLAY_ACTIVE_WINDOW_MISMATCH`; removed evidence gives `REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID`.
+- **W2 – Budget exhaustion**: four notifications against three retrievals leave a backlog and stay unavailable.
+- **W3 – Default unchanged**: without the opt-in, the existing `NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS` behaviour is kept.
+- **W4 – Rejection before network**: non-PAPER and CLI misuse are rejected before any network activity.
+
+All four sealed historical captures replay with unchanged results, and all 91 diagnostic files are byte-identical.
+
+#### 5. Remaining Live-Verification Prerequisites
+
+1. **Operator authorization** for any live run with `--paper-active-window`. Nothing enables it automatically.
+2. **The 3-retrieval budget bounds what can qualify.** A live window qualifies only when every notification during the ~65 s observation is decoded within the 3 shared retrievals and every in-window signature was among them. Busier windows end as backlog or unresolved (fail-closed). Any larger budget is a separate operator decision.
+3. **Live provider behaviour is unverified**: the corrected decode-id path, enumeration completeness against the 20-record single page, and stream delivery of every in-window signature.
+4. **Freshness margin**: decodes add paced RPC calls before the cutoff, while post-cutoff evidence must still fit the unchanged 15,000 ms ceiling.
+5. **Downstream remains unexercised live**: confirmation still needs a second evaluation tick, which the single-evaluation diagnostic does not perform. Sizing, fills, positions, exits and daemon wiring remain untested against live evidence.
+
+**Boundaries**: the virtual wallet remains 7.9259 SOL (SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), $0.00 spend. No provider calls, RPC, sockets, captures or daemon execution were performed.

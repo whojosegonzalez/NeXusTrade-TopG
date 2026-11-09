@@ -202,13 +202,29 @@ export interface WindowReconciliationResult {
   readonly isCryptographicCompletenessEstablished: false;
   readonly isProductionCompletenessEstablished: false;
   readonly paperQuietStreamQualified?: boolean | undefined;
+  /** Present only under the explicit PAPER active-window policy. */
+  readonly paperActiveWindowQualified?: boolean | undefined;
+  /** Distinguishes quiet-window from active-window PAPER qualification provenance. */
+  readonly paperQualificationKind?: PaperQualificationKind | undefined;
   readonly paperQualificationReason?: string | undefined;
   readonly paperValidatedEpoch?: number | undefined;
 }
 
+export type PaperQualificationKind = "QUIET_WINDOW" | "ACTIVE_WINDOW";
+
 export type ExecutionEnvironment = "PRODUCTION" | "PAPER_SIMULATION" | "BACKTEST";
 
 export interface PaperQuietStreamPolicyOptions {
+  readonly enabled: boolean;
+  readonly executionContext: ExecutionEnvironment;
+}
+
+/**
+ * Explicit opt-in PAPER policy for fully reconciled ACTIVE 60-second windows (non-zero in-window signatures).
+ * Accepts provider-relative RPC-index completeness assumptions for isolated PAPER research only; it never
+ * establishes cryptographic or production completeness.
+ */
+export interface PaperActiveWindowPolicyOptions {
   readonly enabled: boolean;
   readonly executionContext: ExecutionEnvironment;
 }
@@ -243,6 +259,7 @@ export interface ExactPoolWindowReconciliationOptions {
   readonly acquisitionCompletedAtMs?: number | undefined;
   readonly clock?: (() => number) | undefined;
   readonly paperQuietStreamPolicy?: PaperQuietStreamPolicyOptions | undefined;
+  readonly paperActiveWindowPolicy?: PaperActiveWindowPolicyOptions | undefined;
 }
 
 /**
@@ -733,6 +750,8 @@ export function evaluateExactPoolWindowReconciliation(
       unresolvedCount?: number | undefined;
       needsPagination?: boolean | undefined;
       paperQuietStreamQualified?: boolean | undefined;
+      paperActiveWindowQualified?: boolean | undefined;
+      paperQualificationKind?: PaperQualificationKind | undefined;
       paperQualificationReason?: string | undefined;
       paperValidatedEpoch?: number | undefined;
     } = {},
@@ -809,6 +828,12 @@ export function evaluateExactPoolWindowReconciliation(
       isCryptographicCompletenessEstablished: false,
       isProductionCompletenessEstablished: false,
       paperQuietStreamQualified: extra.paperQuietStreamQualified ?? false,
+      ...(extra.paperActiveWindowQualified !== undefined
+        ? { paperActiveWindowQualified: extra.paperActiveWindowQualified }
+        : {}),
+      ...(extra.paperQualificationKind !== undefined
+        ? { paperQualificationKind: extra.paperQualificationKind }
+        : {}),
       ...(extra.paperQualificationReason
         ? { paperQualificationReason: extra.paperQualificationReason }
         : {}),
@@ -827,6 +852,17 @@ export function evaluateExactPoolWindowReconciliation(
           executionContext: options.paperQuietStreamPolicy.executionContext,
         })
       : undefined;
+
+  const isPaperQuietOptedIn = Boolean(
+    paperPolicySnapshot?.enabled &&
+    (paperPolicySnapshot.executionContext === "PAPER_SIMULATION" ||
+      paperPolicySnapshot.executionContext === "BACKTEST"),
+  );
+  const isPaperActiveWindowOptedIn = Boolean(
+    options.paperActiveWindowPolicy?.enabled === true &&
+    (options.paperActiveWindowPolicy.executionContext === "PAPER_SIMULATION" ||
+      options.paperActiveWindowPolicy.executionContext === "BACKTEST"),
+  );
 
   // 1. Validate Candidate Pool Context
   try {
@@ -1019,13 +1055,7 @@ export function evaluateExactPoolWindowReconciliation(
     const lastObsMs = options.tracker.getLastObservationTimestampMs();
     const inactivityThresholdMs = 15_000;
     if (windowEndMs - lastObsMs > inactivityThresholdMs) {
-      const isPaperQuietOptedIn = Boolean(
-        paperPolicySnapshot?.enabled &&
-        (paperPolicySnapshot.executionContext === "PAPER_SIMULATION" ||
-          paperPolicySnapshot.executionContext === "BACKTEST"),
-      );
-
-      if (!isPaperQuietOptedIn) {
+      if (!isPaperQuietOptedIn && !isPaperActiveWindowOptedIn) {
         // Default / production / non-PAPER context: fails closed immediately
         return buildResult(
           "STREAM_GAP",
@@ -1650,7 +1680,10 @@ export function evaluateExactPoolWindowReconciliation(
     flowRatio = sells === 0 ? (buys > 0 ? buys : 1.0) : Number((buys / sells).toFixed(2));
   }
 
-  if (pendingGeneratedInactivityGap) {
+  // Under the explicit active-window policy, the locally generated inactivity heuristic is answered by explicit
+  // resolution evidence for every in-window signature (verified above). Recorded gaps remain non-waivable.
+  const activeWindowAnswersInactivity = isPaperActiveWindowOptedIn && signaturesInWindow.length > 0;
+  if (pendingGeneratedInactivityGap && !activeWindowAnswersInactivity) {
     if (discoveredSignatures.length > 0 || signaturesInWindow.length > 0) {
       // Non-quiet: transactions existed on-chain that the stream missed! Fails closed to STREAM_GAP
       return buildResult(
@@ -1664,6 +1697,16 @@ export function evaluateExactPoolWindowReconciliation(
           totalDiscovered: discoveredSignatures.length,
           windowSignaturesCount: signaturesInWindow.length,
         },
+      );
+    }
+
+    if (!isPaperQuietOptedIn) {
+      // Quiet qualification requires its own explicit opt-in (active-window opt-in does not grant it)
+      return buildResult(
+        "STREAM_GAP",
+        "COLLECTION_GAP",
+        `COLLECTION_GAP: Stream gap witnessed in observation window [${pendingGeneratedInactivityGap.gapStartMs}, ${pendingGeneratedInactivityGap.gapEndMs}] (reason: STREAM_INACTIVITY_AT_EVALUATION)`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
       );
     }
 
@@ -1697,8 +1740,84 @@ export function evaluateExactPoolWindowReconciliation(
         windowSignaturesCount: 0,
         unresolvedCount: 0,
         paperQuietStreamQualified: true,
+        paperQualificationKind: "QUIET_WINDOW",
         paperQualificationReason,
         paperValidatedEpoch: validatedEpoch,
+      },
+    );
+  }
+
+  // 14. Explicit PAPER active-window qualification (opt-in; PAPER_SIMULATION / BACKTEST only).
+  // All checks above already passed: identity, causality, freshness, observation span, no recorded gap,
+  // no backlog, witnessed prior anchor, explicit RESOLVED evidence for every in-window signature, and
+  // candidate-bound de-duplicated decoded events matching each resolution's decoded event count.
+  if (isPaperActiveWindowOptedIn && signaturesInWindow.length > 0) {
+    if (!options.historyResult) {
+      return buildResult(
+        "MISSING_HISTORY_EVIDENCE",
+        "COLLECTION_GAP",
+        "MISSING_HISTORY_EVIDENCE: PAPER active-window qualification requires a completed historyResult enumeration receipt (historyRecords fixtures cannot substitute)",
+        { windowStartMs, windowEndMs, evidenceAgeMs, needsPagination: true },
+      );
+    }
+    const expectedEpoch = options.expectedConnectionEpoch;
+    if (
+      typeof expectedEpoch !== "number" ||
+      !Number.isSafeInteger(expectedEpoch) ||
+      expectedEpoch < 0 ||
+      options.historyResult.connectionEpoch !== expectedEpoch ||
+      (options.resolutionResult !== undefined &&
+        options.resolutionResult.connectionEpoch !== expectedEpoch)
+    ) {
+      return buildResult(
+        "IDENTITY_MISMATCH",
+        "COLLECTION_GAP",
+        `IDENTITY_MISMATCH: PAPER active-window qualification requires a valid expectedConnectionEpoch matching history${options.resolutionResult ? " and resolution" : ""} epochs (expected ${String(expectedEpoch)}, history ${String(options.historyResult.connectionEpoch)})`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+    const inWindowSlots = new Map(signaturesInWindow.map((r) => [r.signature, r.slot] as const));
+    const eventWithoutSlot = validatedEventsForWindow.find(
+      (t) => typeof t.slot !== "number" || t.slot !== inWindowSlots.get(t.signature),
+    );
+    if (eventWithoutSlot) {
+      return buildResult(
+        "INSUFFICIENT_DIRECTIONAL_EVIDENCE",
+        "COLLECTION_GAP",
+        `INSUFFICIENT_DIRECTIONAL_EVIDENCE: PAPER active-window qualification requires every counted event to carry its transaction slot (signature '${eventWithoutSlot.signature}')`,
+        { windowStartMs, windowEndMs, evidenceAgeMs },
+      );
+    }
+
+    const paperQualificationReason = `PAPER_ACTIVE_WINDOW_QUALIFIED: all ${signaturesInWindow.length} in-window signatures resolved with explicit evidence; ${buys} buys, ${sells} sells from candidate-bound decoded swaps under declared provider-relative assumptions`;
+    return buildResult(
+      "RECONCILED",
+      "SUFFICIENT",
+      `RECONCILED: All ${signaturesInWindow.length} transactions in window reconciled (${buys} buys, ${sells} sells; ${incrementallyReusedCount} incrementally reused; ${paperQualificationReason})`,
+      {
+        windowStartMs,
+        windowEndMs,
+        evidenceAgeMs,
+        buys,
+        sells,
+        flowRatio,
+        enumerationOutcome,
+        resolutionOutcome: options.resolutionResult?.outcome,
+        anchorWitnessed: true,
+        knownAnchorSignature: effectiveAnchorSig,
+        frozenTargetSignature:
+          options.historyResult.frozenTargetSignature ??
+          options.resolutionResult?.frozenTargetSignature ??
+          null,
+        totalDiscovered: discoveredSignatures.length,
+        totalResolved: signaturesInWindow.length,
+        incrementallyReused: incrementallyReusedCount,
+        windowSignaturesCount: signaturesInWindow.length,
+        unresolvedCount: 0,
+        paperActiveWindowQualified: true,
+        paperQualificationKind: "ACTIVE_WINDOW",
+        paperQualificationReason,
+        paperValidatedEpoch: expectedEpoch,
       },
     );
   }

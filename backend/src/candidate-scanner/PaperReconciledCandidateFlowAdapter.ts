@@ -34,7 +34,10 @@
  *      and its latency delta relative to strategy decision time.
  */
 
-import type { WindowReconciliationResult } from "./ExactPoolWindowReconciliationEvaluator.js";
+import type {
+  PaperQualificationKind,
+  WindowReconciliationResult,
+} from "./ExactPoolWindowReconciliationEvaluator.js";
 import type { CandidateFlowTarget, CandidateFlowResult } from "./CandidateFlowProvider.js";
 import type { FlowCoverageStatus, RetestSpotInfo } from "./RetestGateEvaluator.js";
 
@@ -43,10 +46,22 @@ export type PaperExecutionContext = "PAPER_SIMULATION" | "BACKTEST";
 export interface PaperFlowConversionOptions {
   readonly executionContext: PaperExecutionContext;
   readonly maxAllowedEvidenceAgeMs?: number | undefined; // default: 15,000 ms, authorized max: 15,000 ms
+  /**
+   * OPT-IN: also accept evaluator results qualified under the explicit PAPER active-window policy.
+   * Omitted/false: quiet-window-only conversion (unchanged default).
+   */
+  readonly allowActiveWindowQualification?: boolean | undefined;
+}
+
+/** Evaluator flowRatio convention for reconciled counts (must match exactly). */
+function expectedFlowRatio(buys: number, sells: number): number {
+  return sells === 0 ? (buys > 0 ? buys : 1.0) : Number((buys / sells).toFixed(2));
 }
 
 export interface PaperQualificationContext {
   readonly executionContext: PaperExecutionContext;
+  /** QUIET_WINDOW (0/0) or ACTIVE_WINDOW (fully reconciled non-zero in-window signatures). Absent = legacy quiet. */
+  readonly qualificationKind?: PaperQualificationKind | undefined;
   readonly validatedEpoch: number;
   readonly originalEvaluationTimestampMs: number;
   readonly researchWindowSpan: {
@@ -233,9 +248,37 @@ export class PaperReconciledCandidateFlowAdapter {
     }
 
     // 9. Require Authorized PAPER Qualification & Reject Contradictory Counts/Coverage
-    if (result.paperQuietStreamQualified !== true) {
+    const isQuietQualified = result.paperQuietStreamQualified === true;
+    const isActiveQualified = result.paperActiveWindowQualified === true;
+    if (isQuietQualified && isActiveQualified) {
+      return createFallback(
+        "CONTRADICTORY_PAPER_QUALIFICATION: Result claims both quiet-window and active-window qualification",
+      );
+    }
+    if (!isQuietQualified && !isActiveQualified) {
       return createFallback(
         "UNQUALIFIED_PAPER_EVIDENCE: Reconciliation result lacks paperQuietStreamQualified === true",
+      );
+    }
+    if (isActiveQualified && options.allowActiveWindowQualification !== true) {
+      return createFallback(
+        "ACTIVE_WINDOW_NOT_OPTED_IN: Active-window PAPER qualification requires explicit allowActiveWindowQualification",
+      );
+    }
+    const qualificationKind: PaperQualificationKind = isActiveQualified
+      ? "ACTIVE_WINDOW"
+      : "QUIET_WINDOW";
+    if (
+      result.paperQualificationKind !== undefined &&
+      result.paperQualificationKind !== qualificationKind
+    ) {
+      return createFallback(
+        `CONTRADICTORY_PAPER_QUALIFICATION: paperQualificationKind '${String(result.paperQualificationKind)}' does not match qualification flags`,
+      );
+    }
+    if (isActiveQualified && result.paperQualificationKind !== "ACTIVE_WINDOW") {
+      return createFallback(
+        "CONTRADICTORY_PAPER_QUALIFICATION: Active-window qualification requires paperQualificationKind ACTIVE_WINDOW",
       );
     }
 
@@ -259,15 +302,35 @@ export class PaperReconciledCandidateFlowAdapter {
       );
     }
 
-    // Validate genuine 0/0 counts and flowRatio = 1.0 convention for quiet window qualification
-    if (
-      result.flowCounts.recentBuys60s !== 0 ||
-      result.flowCounts.recentSells60s !== 0 ||
-      result.flowCounts.flowRatio !== 1.0
-    ) {
-      return createFallback(
-        `CONTRADICTORY_FLOW_COUNTS: Qualified quiet window must have recentBuys60s=0, recentSells60s=0, flowRatio=1.0 (received buys=${result.flowCounts.recentBuys60s}, sells=${result.flowCounts.recentSells60s}, ratio=${result.flowCounts.flowRatio})`,
-      );
+    const buys = result.flowCounts.recentBuys60s;
+    const sells = result.flowCounts.recentSells60s;
+    if (qualificationKind === "QUIET_WINDOW") {
+      // Validate genuine 0/0 counts and flowRatio = 1.0 convention for quiet window qualification
+      if (buys !== 0 || sells !== 0 || result.flowCounts.flowRatio !== 1.0) {
+        return createFallback(
+          `CONTRADICTORY_FLOW_COUNTS: Qualified quiet window must have recentBuys60s=0, recentSells60s=0, flowRatio=1.0 (received buys=${buys}, sells=${sells}, ratio=${result.flowCounts.flowRatio})`,
+        );
+      }
+    } else {
+      // Active window: verified non-negative integer counts from decoded events and >= 1 in-window signature
+      const windowSigs = result.underlyingOutcomes?.windowSignaturesCount;
+      if (
+        typeof buys !== "number" ||
+        typeof sells !== "number" ||
+        !Number.isSafeInteger(buys) ||
+        !Number.isSafeInteger(sells) ||
+        buys < 0 ||
+        sells < 0 ||
+        result.flowCounts.flowRatio !== expectedFlowRatio(buys, sells) ||
+        typeof windowSigs !== "number" ||
+        !Number.isSafeInteger(windowSigs) ||
+        windowSigs < 1 ||
+        result.underlyingOutcomes.anchorWitnessed !== true
+      ) {
+        return createFallback(
+          `CONTRADICTORY_FLOW_COUNTS: Qualified active window requires non-negative integer counts, consistent flowRatio, >= 1 in-window signature and a witnessed anchor (received buys=${String(buys)}, sells=${String(sells)}, ratio=${String(result.flowCounts.flowRatio)}, windowSignatures=${String(windowSigs)})`,
+        );
+      }
     }
 
     // 10. Require Evaluator's Explicit Validated Epoch
@@ -286,6 +349,7 @@ export class PaperReconciledCandidateFlowAdapter {
 
     const paperQualificationContext: PaperQualificationContext = Object.freeze({
       executionContext: options.executionContext,
+      qualificationKind,
       validatedEpoch,
       originalEvaluationTimestampMs: origDecisionMs,
       researchWindowSpan: Object.freeze({
@@ -303,8 +367,8 @@ export class PaperReconciledCandidateFlowAdapter {
     return Object.freeze({
       poolAddress: targetPool,
       tokenMint: targetMint,
-      recentBuys60s: 0,
-      recentSells60s: 0,
+      recentBuys60s: buys as number,
+      recentSells60s: sells as number,
       flowCoverage: "SUFFICIENT" as const,
       isCoverageSufficient: true,
       diagnosticReason: result.diagnosticReason,

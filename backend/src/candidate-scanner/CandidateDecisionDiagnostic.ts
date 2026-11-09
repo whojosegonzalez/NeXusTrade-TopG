@@ -25,6 +25,7 @@ import {
 } from "../research/pilot/RaydiumAmmParser.js";
 import {
   type TrackedRaydiumPoolContext,
+  decodeRaydiumTransactionSwaps,
   validateTrackedPoolContext,
 } from "./RaydiumAmmV4SwapDecoder.js";
 import { RaydiumCandidateSubscriptionCoordinator } from "./RaydiumCandidateSubscriptionCoordinator.js";
@@ -41,12 +42,25 @@ import {
   DEFAULT_MAX_CONTROL_FRAMES,
   DEFAULT_MAX_CONTROL_FRAME_BYTES,
 } from "./RaydiumTransportObservationProbe.js";
-import { RaydiumAmmV4TransactionSourceAdapter } from "./RaydiumAmmV4TransactionSourceAdapter.js";
-import { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
+import {
+  RaydiumAmmV4TransactionSourceAdapter,
+  type ProcessNotificationResult,
+  type TransactionProcessingOutcome,
+} from "./RaydiumAmmV4TransactionSourceAdapter.js";
+import type {
+  ResolvedSignatureRecord,
+  SignatureResolutionStatus,
+} from "./ExactPoolTransactionResolutionBridge.js";
+import {
+  RollingTradeFlowTracker,
+  type StreamGap,
+  type TradeEvent,
+} from "./RollingTradeFlowTracker.js";
 import {
   ExactPoolHistoryEnumerator,
   type HistorySignatureRecord,
   type HistoryPageQueryParams,
+  type HistoryEnumerationResult,
 } from "./ExactPoolHistoryEnumerator.js";
 import {
   evaluateExactPoolWindowReconciliation,
@@ -305,6 +319,70 @@ export interface CandidateDecisionDiagnosticOptions {
    * rejection; it never admits a candidate. Omitted/false: serial retrieval after pre-admission passes.
    */
   readonly overlapRugCheckWithMintPacing?: boolean | undefined;
+  /**
+   * OPT-IN (PAPER_SIMULATION / BACKTEST only): qualify fully reconciled ACTIVE 60-second windows whose every
+   * in-window signature was resolved by the existing stream decode path (within the unchanged 3-retrieval
+   * budget). Omitted/false: quiet-window-only flow qualification (unchanged default).
+   */
+  readonly paperActiveWindowFlow?: boolean | undefined;
+}
+
+/** Maps a stream decode outcome to the resolution status the reconciliation evaluator consumes. */
+function toResolutionStatus(outcome: TransactionProcessingOutcome): SignatureResolutionStatus {
+  switch (outcome) {
+    case "SUCCESS":
+      return "RESOLVED";
+    case "TRANSACTION_NOT_FOUND":
+      return "TRANSACTION_UNAVAILABLE";
+    case "PRE_DISPATCH_BUDGET_DENIED":
+      return "BUDGET_DENIED";
+    case "PRE_DISPATCH_DEADLINE_EXCEEDED":
+    case "REQUEST_TIMEOUT":
+      return "DEADLINE_EXCEEDED";
+    case "INGEST_FAILED":
+      return "FAILED_INGEST";
+    case "PARTIAL_INGEST_FAILED":
+      return "PARTIAL_INGEST";
+    case "DUPLICATE_NOTIFICATION":
+      return "DUPLICATE_UNRESOLVED";
+    default:
+      return "FAILED_DECODE";
+  }
+}
+
+/**
+ * Builds explicit per-signature resolution records from stream decode results. A record is RESOLVED only when
+ * the decode succeeded AND the transaction's slot/blockTime were read from its own getTransaction response.
+ * Duplicate notifications add no record (the first result for the signature stands).
+ */
+export function buildStreamResolutionRecords(
+  streamResults: readonly ProcessNotificationResult[],
+  txIdentityBySignature: ReadonlyMap<
+    string,
+    { readonly slot: number; readonly blockTime: number | null }
+  >,
+): ResolvedSignatureRecord[] {
+  const records: ResolvedSignatureRecord[] = [];
+  const seen = new Set<string>();
+  for (const r of streamResults) {
+    if (r.outcome === "DUPLICATE_NOTIFICATION" || seen.has(r.signature)) continue;
+    seen.add(r.signature);
+    const identity = txIdentityBySignature.get(r.signature);
+    const succeeded = r.ok && r.outcome === "SUCCESS" && identity !== undefined;
+    records.push({
+      signature: r.signature,
+      slot: identity?.slot ?? -1,
+      blockTime: identity?.blockTime ?? null,
+      status: succeeded
+        ? "RESOLVED"
+        : toResolutionStatus(r.outcome === "SUCCESS" ? "MALFORMED_RESPONSE" : r.outcome),
+      adapterOutcome: r.outcome,
+      decodedEventsCount: r.diagnostics?.decodedEventsCount ?? 0,
+      ingestedEventsCount: r.ingestedEventsCount,
+      ...(succeeded ? {} : { error: r.diagnostics?.error ?? `Stream decode outcome ${r.outcome}` }),
+    });
+  }
+  return records;
 }
 
 export interface CandidateDecisionDiagnosticResult {
@@ -490,6 +568,8 @@ export class CandidateDecisionDiagnostic {
   private retainedBundlerEvidence?: unknown;
   private retainedRugCheckEvidence?: unknown;
   private retainedProvisionalContext?: TrackedRaydiumPoolContext;
+  private retainedActiveWindowEvidence?: unknown;
+  private readonly paperActiveWindowFlow: boolean;
 
   constructor(options: CandidateDecisionDiagnosticOptions) {
     if (!options.poolId || !isCanonicalSolanaBase58(options.poolId)) {
@@ -505,6 +585,24 @@ export class CandidateDecisionDiagnostic {
     }
 
     validateRugCheckDiagnosticOptions(options);
+    if (
+      options.paperActiveWindowFlow !== undefined &&
+      typeof options.paperActiveWindowFlow !== "boolean"
+    ) {
+      throw new Error(
+        `[DIAGNOSTIC_INVALID_ARG] paperActiveWindowFlow must be a boolean; received ${String(options.paperActiveWindowFlow)}`,
+      );
+    }
+    if (
+      options.paperActiveWindowFlow === true &&
+      options.executionContext !== "PAPER_SIMULATION" &&
+      options.executionContext !== "BACKTEST"
+    ) {
+      throw new Error(
+        "[DIAGNOSTIC_INVALID_ARG] paperActiveWindowFlow requires executionContext PAPER_SIMULATION or BACKTEST",
+      );
+    }
+    this.paperActiveWindowFlow = options.paperActiveWindowFlow === true;
     this.rugCheckMaxResponseBytes =
       options.rugCheckMaxResponseBytes ?? DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES;
     this.overlapRugCheckWithMintPacing = options.overlapRugCheckWithMintPacing === true;
@@ -1012,6 +1110,8 @@ export class CandidateDecisionDiagnostic {
     signal?: AbortSignal,
     skipBudgetRecording = false,
     overallDeadlineMs?: number,
+    /** Caller-owned JSON-RPC id forwarded on the wire (stream decode adapter verifies the echoed id). */
+    requestId?: string | number,
   ): Promise<{
     ok: boolean;
     status: number;
@@ -1020,7 +1120,7 @@ export class CandidateDecisionDiagnostic {
   }> {
     const rpcPayload = JSON.stringify({
       jsonrpc: "2.0",
-      id: `diag-${this.ledger.totalAttempts + 1}`,
+      id: requestId ?? `diag-${this.ledger.totalAttempts + 1}`,
       method,
       params,
     });
@@ -1310,13 +1410,24 @@ export class CandidateDecisionDiagnostic {
         clock: this.clock,
       });
 
+      // Transaction identity (slot, blockTime) read from each getTransaction response itself.
+      const txIdentityBySignature = new Map<
+        string,
+        { readonly slot: number; readonly blockTime: number | null }
+      >();
+      const streamResults: ProcessNotificationResult[] = [];
+
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: provisionalContext,
         rpcUrl: this.rpcUrl,
         maxPendingQueueSize: 10, // Reviewed queue ceiling of 10 enforced at ingress
         transport: async (url, init) => {
           const bodyStr = typeof init?.body === "string" ? init.body : "";
-          const parsed = JSON.parse(bodyStr) as { method?: string; params?: readonly unknown[] };
+          const parsed = JSON.parse(bodyStr) as {
+            method?: string;
+            params?: readonly unknown[];
+            id?: string | number;
+          };
           const res = await this.dispatchSolanaRpc(
             "TRANSACTION_DECODING",
             parsed.method ?? "getTransaction",
@@ -1324,7 +1435,26 @@ export class CandidateDecisionDiagnostic {
             overallController.signal,
             true, // skipBudgetRecording: true because adapter already records on budgetManager
             overallDeadlineMs,
+            // Forward the adapter request id so the provider echo satisfies its RPC id check
+            // (previously a diag-N id was substituted and every stream decode failed RPC_ID_MISMATCH).
+            typeof parsed.id === "string" || typeof parsed.id === "number" ? parsed.id : undefined,
           );
+          const requestedSig = parsed.params?.[0];
+          const txResult = (res.json as { result?: { slot?: unknown; blockTime?: unknown } } | null)
+            ?.result;
+          if (
+            typeof requestedSig === "string" &&
+            txResult &&
+            typeof txResult.slot === "number" &&
+            Number.isSafeInteger(txResult.slot) &&
+            (txResult.blockTime === null ||
+              (typeof txResult.blockTime === "number" && Number.isSafeInteger(txResult.blockTime)))
+          ) {
+            txIdentityBySignature.set(requestedSig, {
+              slot: txResult.slot,
+              blockTime: txResult.blockTime as number | null,
+            });
+          }
           return new Response(JSON.stringify(res.json ?? {}), { status: res.status });
         },
         budgetManager: this.budgetManager,
@@ -1629,7 +1759,10 @@ export class CandidateDecisionDiagnostic {
         // Drain any pending transaction decodes (up to 3 max attempts total)
         while (adapter.getPendingQueueLength() > 0 && this.ledger.transactionDecodeAttempts < 3) {
           if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) break;
-          await coordinator.processNextPending({ signal: overallController.signal });
+          const streamResult = await coordinator.processNextPending({
+            signal: overallController.signal,
+          });
+          if (streamResult) streamResults.push(streamResult);
         }
       }
 
@@ -1825,6 +1958,10 @@ export class CandidateDecisionDiagnostic {
       coordinator.close();
 
       // 5. Evaluate Window Reconciliation
+      // OPT-IN active-window inputs: explicit per-signature stream resolutions, backlog, and policy.
+      const streamResolutionRecords = this.paperActiveWindowFlow
+        ? buildStreamResolutionRecords(streamResults, txIdentityBySignature)
+        : [];
       const reconResult = evaluateExactPoolWindowReconciliation({
         poolContext: provisionalContext,
         sourceCutoff,
@@ -1841,7 +1978,49 @@ export class CandidateDecisionDiagnostic {
           enabled: true,
           executionContext: this.executionContext,
         },
+        ...(this.paperActiveWindowFlow
+          ? {
+              resolvedSignatures: streamResolutionRecords,
+              hasActiveBacklog: adapter.getActiveWorkload() > 0,
+              paperActiveWindowPolicy: {
+                enabled: true,
+                executionContext: this.executionContext,
+              },
+            }
+          : {}),
       });
+
+      if (this.paperActiveWindowFlow) {
+        // Each transaction response is sealed once under responses/; this evidence links signatures to it.
+        this.retainedActiveWindowEvidence = {
+          policy: "PAPER_ACTIVE_WINDOW",
+          executionContext: this.executionContext,
+          expectedConnectionEpoch: coordinator.getConnectionEpoch(),
+          recordedGaps: flowTracker.getRecordedGaps(),
+          pendingWorkloadAtEvaluation: adapter.getActiveWorkload(),
+          transactionDecodeAttempts: this.ledger.transactionDecodeAttempts,
+          resolutions: streamResolutionRecords.map((r) => ({
+            ...r,
+            responseFile:
+              this.ledger.records.find(
+                (rec) =>
+                  rec.purpose === "TRANSACTION_DECODING" &&
+                  Array.isArray(rec.params) &&
+                  rec.params[0] === r.signature,
+              )?.responseFile ?? null,
+          })),
+          reconciliation: {
+            status: reconResult.status,
+            diagnosticReason: reconResult.diagnosticReason,
+            paperActiveWindowQualified: reconResult.paperActiveWindowQualified === true,
+            windowSignaturesCount: reconResult.underlyingOutcomes.windowSignaturesCount,
+            providerAssumptions: reconResult.providerAssumptions,
+            unresolvedUncertainties: reconResult.unresolvedUncertainties,
+            isProductionCompletenessEstablished: false,
+          },
+          note: "Derived records only; replay re-decodes the sealed getTransaction responses and does not trust these counts or flags.",
+        };
+      }
 
       const paperAdapter = new PaperReconciledCandidateFlowAdapter();
       const keepaliveSatisfied =
@@ -1851,6 +2030,16 @@ export class CandidateDecisionDiagnostic {
           pendingPingPayload === null &&
           (this.observationDurationMs < this.pingIntervalMs ||
             (clientPingsSentCount >= 1 && matchedClientPongsCount === clientPingsSentCount)));
+
+      const isActiveQualified =
+        this.paperActiveWindowFlow &&
+        notificationsReceived > 0 &&
+        !streamLimitReason &&
+        adapter.getActiveWorkload() === 0 &&
+        keepaliveSatisfied &&
+        reconResult.status === "RECONCILED" &&
+        reconResult.paperActiveWindowQualified === true &&
+        (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST");
 
       const isQuietQualified =
         notificationsReceived === 0 &&
@@ -1862,12 +2051,16 @@ export class CandidateDecisionDiagnostic {
         (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST");
 
       let flowResult: CandidateFlowResult;
-      if (isQuietQualified) {
+      if (isQuietQualified || isActiveQualified) {
         flowResult = paperAdapter.convertCandidateFlow(
           reconResult,
           { poolAddress: this.poolId, tokenMint: this.mintAddress },
           this.clock(),
-          { executionContext: this.executionContext, maxAllowedEvidenceAgeMs: 15_000 },
+          {
+            executionContext: this.executionContext as "PAPER_SIMULATION" | "BACKTEST",
+            maxAllowedEvidenceAgeMs: 15_000,
+            ...(isActiveQualified ? { allowActiveWindowQualification: true } : {}),
+          },
         );
       } else {
         flowResult = Object.freeze({
@@ -1881,7 +2074,9 @@ export class CandidateDecisionDiagnostic {
             this.executionContext === "PRODUCTION"
               ? "PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION"
               : notificationsReceived > 0
-                ? "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS"
+                ? this.paperActiveWindowFlow
+                  ? `ACTIVE_WINDOW_UNQUALIFIED: ${reconResult.status}: ${reconResult.diagnosticReason}`
+                  : "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS"
                 : streamLimitReason
                   ? streamLimitReason
                   : !keepaliveSatisfied
@@ -2609,12 +2804,13 @@ export class CandidateDecisionDiagnostic {
       const immutableFlowProvider: CandidateFlowProvider = {
         getCandidateFlow: (target, evalMs) => {
           if (
-            isQuietQualified &&
+            (isQuietQualified || isActiveQualified) &&
             (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST")
           ) {
             return paperAdapter.convertCandidateFlow(reconResult, target, evalMs, {
               executionContext: this.executionContext,
               maxAllowedEvidenceAgeMs: 15_000,
+              ...(isActiveQualified ? { allowActiveWindowQualification: true } : {}),
             });
           }
           return {
@@ -2984,6 +3180,13 @@ export class CandidateDecisionDiagnostic {
         this.retainedRugCheckEvidence,
       );
     }
+    if (this.retainedActiveWindowEvidence) {
+      writeSanitizedFile(
+        "evidence/active-window-evidence.json",
+        "EVIDENCE",
+        this.retainedActiveWindowEvidence,
+      );
+    }
     if (this.retainedBundlerEvidence) {
       writeSanitizedFile(
         "evidence/bundler-provenance.json",
@@ -3183,6 +3386,207 @@ function rugMetricsEqual(a: RugCheckMetrics | null, b: RugCheckMetrics | null): 
   return keys.every((k) => a[k] === b[k]);
 }
 
+export interface CandidateDecisionReplayActiveWindow {
+  readonly reconciliationStatus: string;
+  readonly diagnosticReason: string;
+  readonly recentBuys60s: number | null;
+  readonly recentSells60s: number | null;
+  readonly windowSignaturesCount: number | null;
+  readonly redecodedTransactions: number;
+  readonly flow: CandidateFlowResult;
+}
+
+/**
+ * Recomputes PAPER active-window flow from raw sealed evidence only: re-decodes every verified sealed
+ * TRANSACTION_DECODING response with the existing decoder, rebuilds explicit resolution records and
+ * candidate-bound events, re-runs the reconciliation evaluator under the PAPER active-window policy, and
+ * converts through the PAPER adapter at the recorded decision time. Saved counts and flags are not used.
+ */
+function recomputeActiveWindowFlowFromSealedEvidence(params: {
+  evidenceDir: string;
+  report: Record<string, unknown> & {
+    ledger?: { records?: unknown };
+    observationMetadata?: { observationStartMs?: unknown; observationEndMs?: unknown } | null;
+    executionContext?: unknown;
+  };
+  verifiedFilesSet: ReadonlySet<string>;
+  sourceCutoff: SourceCutoffEvidence;
+  historyEvidence: unknown;
+  activeEvidence: {
+    expectedConnectionEpoch?: unknown;
+    recordedGaps?: unknown;
+    pendingWorkloadAtEvaluation?: unknown;
+  };
+  originalEvaluationTimestampMs: number;
+  conversionTimestampMs: number;
+  poolId: string;
+  mintAddress: string;
+}): { ok: true; value: CandidateDecisionReplayActiveWindow } | { ok: false; reason: string } {
+  const executionContext = params.report.executionContext;
+  if (executionContext !== "PAPER_SIMULATION" && executionContext !== "BACKTEST") {
+    return {
+      ok: false,
+      reason: "Active-window replay requires a PAPER_SIMULATION or BACKTEST capture",
+    };
+  }
+  const contextRel = "evidence/provisional-context.json";
+  if (!params.verifiedFilesSet.has(contextRel)) {
+    return { ok: false, reason: `Verified ${contextRel} is required for active-window replay` };
+  }
+  const poolContext = JSON.parse(
+    readFileSync(path.join(params.evidenceDir, contextRel), "utf8"),
+  ) as TrackedRaydiumPoolContext;
+  if (
+    poolContext.poolId !== params.poolId ||
+    poolContext.candidateTokenMint !== params.mintAddress
+  ) {
+    return { ok: false, reason: "Provisional context identity does not match the capture" };
+  }
+  const obsStart = params.report.observationMetadata?.observationStartMs;
+  const obsEnd = params.report.observationMetadata?.observationEndMs;
+  if (asPositiveSafeInteger(obsStart) === null || asPositiveSafeInteger(obsEnd) === null) {
+    return {
+      ok: false,
+      reason: "Recorded observation metadata is required for active-window replay",
+    };
+  }
+  const expectedEpoch = asNonNegativeSafeInteger(params.activeEvidence.expectedConnectionEpoch);
+  const pendingWorkload = asNonNegativeSafeInteger(
+    params.activeEvidence.pendingWorkloadAtEvaluation,
+  );
+  if (
+    expectedEpoch === null ||
+    pendingWorkload === null ||
+    !Array.isArray(params.activeEvidence.recordedGaps)
+  ) {
+    return {
+      ok: false,
+      reason: "Sealed active-window metadata (epoch, workload, recorded gaps) is incomplete",
+    };
+  }
+
+  const records = Array.isArray(params.report.ledger?.records) ? params.report.ledger.records : [];
+  const decodeRecords = records.filter(
+    (r): r is { ok?: unknown; responseFile?: unknown; params?: unknown; completedAtMs?: unknown } =>
+      !!r &&
+      typeof r === "object" &&
+      (r as { purpose?: unknown }).purpose === "TRANSACTION_DECODING",
+  );
+  const resolutions: ResolvedSignatureRecord[] = [];
+  const trades: TradeEvent[] = [];
+  let redecoded = 0;
+  for (const rec of decodeRecords) {
+    const sig =
+      Array.isArray(rec.params) && typeof rec.params[0] === "string" ? rec.params[0] : null;
+    if (sig === null) {
+      return {
+        ok: false,
+        reason: "Sealed TRANSACTION_DECODING record lacks its requested signature",
+      };
+    }
+    if (resolutions.some((r) => r.signature === sig)) continue; // first record for a signature stands
+    const responseFile =
+      typeof rec.responseFile === "string" ? rec.responseFile.replace(/\\/g, "/") : null;
+    const unavailable = (status: SignatureResolutionStatus, error: string) =>
+      resolutions.push({
+        signature: sig,
+        slot: -1,
+        blockTime: null,
+        status,
+        decodedEventsCount: 0,
+        ingestedEventsCount: 0,
+        error,
+      });
+    if (rec.ok !== true || responseFile === null || !params.verifiedFilesSet.has(responseFile)) {
+      unavailable(
+        "TRANSACTION_UNAVAILABLE",
+        "Sealed transaction response unavailable or unverified",
+      );
+      continue;
+    }
+    let payload: { result?: { slot?: unknown; blockTime?: unknown } } | null;
+    try {
+      payload = JSON.parse(readFileSync(path.join(params.evidenceDir, responseFile), "utf8"));
+    } catch {
+      unavailable("FAILED_DECODE", "Sealed transaction response is not valid JSON");
+      continue;
+    }
+    const tx = payload?.result;
+    const slot = asNonNegativeSafeInteger(tx?.slot);
+    const blockTime = tx?.blockTime === null ? null : asNonNegativeSafeInteger(tx?.blockTime);
+    const receiptMs = asPositiveSafeInteger(rec.completedAtMs);
+    if (
+      !tx ||
+      slot === null ||
+      (tx.blockTime !== null && blockTime === null) ||
+      receiptMs === null
+    ) {
+      unavailable("FAILED_DECODE", "Sealed transaction response lacks a valid slot/blockTime");
+      continue;
+    }
+    const decoded = decodeRaydiumTransactionSwaps(tx, poolContext, {
+      clock: () => receiptMs,
+      receiptTimestampMs: receiptMs,
+    });
+    redecoded++;
+    if (!decoded.ok || decoded.signature !== sig) {
+      unavailable("FAILED_DECODE", decoded.ok ? "Decoded signature mismatch" : decoded.message);
+      continue;
+    }
+    resolutions.push({
+      signature: sig,
+      slot,
+      blockTime,
+      status: "RESOLVED",
+      adapterOutcome: "SUCCESS",
+      decodedEventsCount: decoded.events.length,
+      ingestedEventsCount: decoded.events.length,
+    });
+    trades.push(...decoded.events);
+  }
+
+  const recon = evaluateExactPoolWindowReconciliation({
+    poolContext,
+    sourceCutoff: params.sourceCutoff,
+    historyResult: params.historyEvidence as HistoryEnumerationResult,
+    expectedConnectionEpoch: expectedEpoch,
+    observationStartMs: obsStart as number,
+    observationEndMs: obsEnd as number,
+    decisionTimestampMs: params.originalEvaluationTimestampMs,
+    maxAllowedEvidenceAgeMs: 15_000,
+    recordedGaps: params.activeEvidence.recordedGaps as StreamGap[],
+    hasActiveBacklog: pendingWorkload > 0,
+    resolvedSignatures: resolutions,
+    trades,
+    budgetManager: new GlobalResourceBudgetManager({
+      maxTotalRequests: 14,
+      maxEnrichmentAttempts: 14,
+      minReservedForwardRequests: 0,
+      minProviderSpacingMs: 2500,
+      clock: () => params.originalEvaluationTimestampMs,
+    }),
+    paperActiveWindowPolicy: { enabled: true, executionContext },
+  });
+  const flow = new PaperReconciledCandidateFlowAdapter().convertCandidateFlow(
+    recon,
+    { poolAddress: params.poolId, tokenMint: params.mintAddress },
+    params.conversionTimestampMs,
+    { executionContext, maxAllowedEvidenceAgeMs: 15_000, allowActiveWindowQualification: true },
+  );
+  return {
+    ok: true,
+    value: {
+      reconciliationStatus: recon.status,
+      diagnosticReason: recon.diagnosticReason,
+      recentBuys60s: flow.recentBuys60s,
+      recentSells60s: flow.recentSells60s,
+      windowSignaturesCount: recon.underlyingOutcomes.windowSignaturesCount,
+      redecodedTransactions: redecoded,
+      flow,
+    },
+  };
+}
+
 export interface CandidateDecisionReplayResult {
   readonly ok: boolean;
   readonly status: string;
@@ -3212,6 +3616,8 @@ export interface CandidateDecisionReplayResult {
   readonly recomputedPreAdmission?: CandidateDecisionReplayPreAdmission | undefined;
   /** RugCheck metrics recomputed from the verified sealed response with the shared strict validator. */
   readonly recomputedRugCheck?: CandidateDecisionReplayRugCheck | undefined;
+  /** Active-window flow recomputed by re-decoding sealed getTransaction responses (ACTIVE_WINDOW captures only). */
+  readonly recomputedActiveWindowFlow?: CandidateDecisionReplayActiveWindow | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
   readonly auditMetadata?:
     | {
@@ -3911,6 +4317,69 @@ export function replayCandidateDecisionFromSealedEvidence(
     };
   }
 
+  // PAPER active-window captures: recompute flow from raw sealed transactions instead of trusting saved counts.
+  let replayFlow: unknown = flowEvaluation;
+  let recomputedActiveWindowFlow: CandidateDecisionReplayActiveWindow | undefined;
+  if (flowEvaluation?.paperQualificationContext?.qualificationKind === "ACTIVE_WINDOW") {
+    const activeRel = "evidence/active-window-evidence.json";
+    const originalEvalMs = asPositiveSafeInteger(
+      flowEvaluation?.paperQualificationContext?.originalEvaluationTimestampMs,
+    );
+    const recomputed =
+      verifiedFilesSet.has(activeRel) && originalEvalMs !== null
+        ? recomputeActiveWindowFlowFromSealedEvidence({
+            evidenceDir,
+            report,
+            verifiedFilesSet,
+            sourceCutoff,
+            historyEvidence,
+            activeEvidence: JSON.parse(readFileSync(path.join(evidenceDir, activeRel), "utf8")),
+            originalEvaluationTimestampMs: originalEvalMs,
+            conversionTimestampMs: recordedDecisionTimeMs,
+            poolId,
+            mintAddress,
+          })
+        : ({
+            ok: false,
+            reason: `Verified ${activeRel} and original evaluation timestamp are required`,
+          } as const);
+    if (!recomputed.ok) {
+      return {
+        ok: false,
+        status: "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        message: `Active-window flow could not be recomputed from sealed evidence: ${recomputed.reason}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+        integrityVerified: true,
+        recomputedPreAdmission,
+        auditMetadata,
+      };
+    }
+    recomputedActiveWindowFlow = recomputed.value;
+    if (
+      recomputed.value.flow.isCoverageSufficient !== true ||
+      recomputed.value.recentBuys60s !== flowEvaluation.recentBuys60s ||
+      recomputed.value.recentSells60s !== flowEvaluation.recentSells60s
+    ) {
+      return {
+        ok: false,
+        status: "REPLAY_ACTIVE_WINDOW_MISMATCH",
+        message: `Re-decoded active-window flow (${recomputed.value.reconciliationStatus}, buys=${String(recomputed.value.recentBuys60s)}, sells=${String(recomputed.value.recentSells60s)}) does not reproduce the recorded flow (buys=${String(flowEvaluation.recentBuys60s)}, sells=${String(flowEvaluation.recentSells60s)})`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+        integrityVerified: true,
+        recomputedPreAdmission,
+        recomputedActiveWindowFlow,
+        auditMetadata,
+      };
+    }
+    replayFlow = recomputed.value.flow;
+  }
+
   // Replay candidate decision points
   const candidateMarketData = marketDataEvidence.candidateMarketData;
   const decisionNowMs = recordedDecisionTimeMs;
@@ -3980,7 +4449,7 @@ export function replayCandidateDecisionFromSealedEvidence(
   }
 
   const flowProvider: CandidateFlowProvider = {
-    getCandidateFlow: () => flowEvaluation,
+    getCandidateFlow: () => replayFlow as CandidateFlowResult,
   };
 
   const decisionResult = evaluateCandidateDecisionPoints({
@@ -4024,6 +4493,7 @@ export function replayCandidateDecisionFromSealedEvidence(
       replayedRejectionReason === recordedRejectionReason,
     recomputedPreAdmission,
     recomputedRugCheck,
+    ...(recomputedActiveWindowFlow ? { recomputedActiveWindowFlow } : {}),
     decisionResult,
     auditMetadata: {
       ...auditMetadata,

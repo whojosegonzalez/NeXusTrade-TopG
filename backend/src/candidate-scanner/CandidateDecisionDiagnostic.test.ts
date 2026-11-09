@@ -13,6 +13,7 @@ import {
   type DiagnosticRequestRecord,
 } from "./CandidateDecisionDiagnostic.js";
 import { runCandidateDecisionDiagnosticCli } from "../scripts/candidate-decision-diagnostic.js";
+import { buildSyntheticSwapTransactionResult } from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
 import {
   CAPTURED_RAY_WSOL_IDENTITIES,
   RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
@@ -3658,6 +3659,322 @@ describe("CandidateDecisionDiagnostic RugCheck opt-ins (synthetic, offline)", ()
       expect(output).toContain("OVERLAPPED with CANDIDATE_MINT pacing");
       expect(output).toContain("Overlap trade-off");
       expect(output).toContain("without dispatching network calls");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+});
+
+describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, offline)", () => {
+  const activeOutDir = path.resolve(
+    process.cwd(),
+    ".tmp",
+    "test-diagnostics",
+    `active-window-${Date.now()}`,
+  );
+  beforeEach(() => {
+    if (existsSync(activeOutDir)) {
+      rmSync(activeOutDir, { recursive: true, force: true });
+    }
+  });
+
+  // SYNTHETIC identifiers: public Base58 signature strings reused as opaque test identifiers.
+  const SIG_C =
+    "3aFt8NNc96JF5yMrpTToPy22vaANB9pc41ih3jc93jGonfarwpokoEu9BnF6nWKytqgDWCyBB92fqBMsGWSyvDmu";
+  const SIG_D =
+    "5qYjujutG9cP6zeCAJ4yELWCmzAyxPQQUuthYgyuhBWhHFPad7PivMqZw5NFV6kJtWWN5AukcVbkLLFLFMND8BMT";
+  const SIG_E =
+    "MNSAJVBNSy9HuwnmMFjG3xpVnBc47Hm4UuVUdLnvmm4P8BZ1yFaDqcekkoaAYMFMXjHsaGqRareXmjhKiLYEtMy";
+  const POOL_CONTEXT = {
+    poolId: TEST_POOL_ID,
+    candidateTokenMint: TEST_MINT,
+    quoteTokenMint: "So11111111111111111111111111111111111111112",
+    baseVault: CAPTURED_RAY_WSOL_IDENTITIES.baseVault,
+    quoteVault: CAPTURED_RAY_WSOL_IDENTITIES.quoteVault,
+    baseMint: TEST_MINT,
+    quoteMint: "So11111111111111111111111111111111111111112",
+    orientation: "TOKEN_BASE_SOL_QUOTE" as const,
+  };
+
+  interface ScheduledSwap {
+    readonly signature: string;
+    readonly offsetMs: number; // emitted at run start + offset (synthetic clock)
+    readonly slot: number;
+    readonly side: "BUY" | "SELL";
+  }
+
+  /** Runs the diagnostic with SYNTHETIC stream notifications and decodable SYNTHETIC swap transactions. */
+  async function runActive(params: {
+    swaps: readonly ScheduledSwap[];
+    paperActiveWindowFlow?: boolean;
+  }) {
+    const now = 1791931000 * 1000;
+    const startMs = now - 70_000;
+    let clockTime = startMs;
+    const clock = () => clockTime;
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const emitted = new Map<string, { slot: number; blockTime: number; side: "BUY" | "SELL" }>();
+    const emitDue = () => {
+      for (const swap of params.swaps) {
+        if (!emitted.has(swap.signature) && clockTime >= startMs + swap.offsetMs) {
+          emitted.set(swap.signature, {
+            slot: swap.slot,
+            blockTime: Math.floor(clockTime / 1000),
+            side: swap.side,
+          });
+          wsTransport.emitMessage(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              method: "logsNotification",
+              params: {
+                subscription: 101,
+                result: {
+                  context: { slot: swap.slot },
+                  value: {
+                    signature: swap.signature,
+                    err: null,
+                    logs: ["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"],
+                  },
+                },
+              },
+            }),
+          );
+        }
+      }
+    };
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      emitDue();
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const baseFetch = createDiagnosticMockFetch({ getClock: clock });
+    const transport = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as { method?: string; params?: unknown[]; id?: unknown })
+          : null;
+      if (body?.method === "getTransaction") {
+        const sig = String(body.params?.[0]);
+        const tx = emitted.get(sig);
+        if (tx) {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: buildSyntheticSwapTransactionResult({
+                poolContext: POOL_CONTEXT,
+                signature: sig,
+                slot: tx.slot,
+                blockTime: tx.blockTime,
+                side: tx.side,
+              }),
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      if (
+        body?.method === "getSignaturesForAddress" &&
+        (body.params?.[1] as { limit?: number } | undefined)?.limit !== 1
+      ) {
+        // SYNTHETIC history page: emitted signatures (newest first) followed by the prior anchor.
+        const newest = [...emitted.entries()].sort((a, b) => b[1].slot - a[1].slot);
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: [
+              ...newest.map(([signature, t]) => ({
+                signature,
+                slot: t.slot,
+                err: null,
+                blockTime: t.blockTime,
+              })),
+              {
+                signature: TEST_SIG_A,
+                slot: 461970800,
+                err: null,
+                blockTime: Math.floor((clockTime - 75_000) / 1000),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return baseFetch(input, init);
+    };
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: activeOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      ...(params.paperActiveWindowFlow !== undefined
+        ? { paperActiveWindowFlow: params.paperActiveWindowFlow }
+        : {}),
+    });
+    return diagnostic.run();
+  }
+
+  const TWO_BUYS: readonly ScheduledSwap[] = [
+    { signature: TEST_SIG_B, offsetMs: 25_000, slot: 461970850, side: "BUY" },
+    { signature: SIG_C, offsetMs: 45_000, slot: 461970860, side: "BUY" },
+  ];
+
+  it("W1. Opt-in active window: stream-resolved swaps qualify, arm the candidate, seal linked evidence, and replay by re-decoding", async () => {
+    const result = await runActive({ swaps: TWO_BUYS, paperActiveWindowFlow: true });
+    expect(result.flowEvaluation?.diagnosticReason).toContain("PAPER_ACTIVE_WINDOW_QUALIFIED");
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(2);
+    expect(result.flowEvaluation?.recentSells60s).toBe(0);
+    const ctx = (
+      result.flowEvaluation as { paperQualificationContext?: { qualificationKind?: string } }
+    ).paperQualificationContext;
+    expect(ctx?.qualificationKind).toBe("ACTIVE_WINDOW");
+    // Unchanged ceilings: 2 of 3 shared retrievals, 13 of 14 HTTP attempts.
+    expect(result.ledger.transactionDecodeAttempts).toBe(2);
+    expect(result.ledger.totalAttempts).toBe(13);
+    expect(result.ledger.records).toHaveLength(13);
+
+    const evidence = readJson<{
+      resolutions: Array<{ signature: string; status: string; responseFile: string | null }>;
+    }>(path.join(activeOutDir, "evidence", "active-window-evidence.json"));
+    const manifest = readJson<{ files: Array<{ path: string }> }>(
+      path.join(activeOutDir, "evidence-manifest.json"),
+    );
+    const listed = new Set(manifest.files.map((f) => f.path));
+    expect(evidence.resolutions.map((r) => r.status)).toEqual(["RESOLVED", "RESOLVED"]);
+    for (const r of evidence.resolutions) {
+      expect(r.responseFile).not.toBeNull();
+      expect(listed.has(r.responseFile!)).toBe(true);
+    }
+
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.status).toBe("ARMED_FIRST_TICK");
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(2);
+    expect(replay.recomputedActiveWindowFlow?.recentBuys60s).toBe(2);
+    expect(replay.recomputedActiveWindowFlow?.recentSells60s).toBe(0);
+    expect(replay.recomputedActiveWindowFlow?.reconciliationStatus).toBe("RECONCILED");
+
+    // SYNTHETIC tamper + reseal: a sealed transaction now decodes as a SELL; replay re-decodes and fails closed.
+    const tamperedFile = evidence.resolutions[1]!.responseFile!;
+    const sealed = readJson<{ result: { slot: number; blockTime: number } }>(
+      path.join(activeOutDir, tamperedFile),
+    );
+    writeFileSync(
+      path.join(activeOutDir, tamperedFile),
+      JSON.stringify({
+        ...sealed,
+        result: buildSyntheticSwapTransactionResult({
+          poolContext: POOL_CONTEXT,
+          signature: evidence.resolutions[1]!.signature,
+          slot: sealed.result.slot,
+          blockTime: sealed.result.blockTime,
+          side: "SELL",
+        }),
+      }),
+      "utf8",
+    );
+    resealSyntheticCapture(activeOutDir);
+    const mismatch = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(mismatch.ok).toBe(false);
+    expect(mismatch.status).toBe("REPLAY_ACTIVE_WINDOW_MISMATCH");
+    expect(mismatch.recomputedActiveWindowFlow?.recentSells60s).toBe(1);
+    expect(mismatch.decisionResult).toBeUndefined();
+
+    // Derived active-window evidence removed (resealed): replay cannot recompute and fails closed.
+    unlinkSync(path.join(activeOutDir, "evidence", "active-window-evidence.json"));
+    resealSyntheticCapture(activeOutDir);
+    const missing = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(missing.status).toBe("REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID");
+    expect(missing.decisionResult).toBeUndefined();
+  });
+
+  it("W2. Budget exhaustion (4 notifications, 3 shared retrievals) leaves a backlog and stays unavailable", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        { signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY" },
+        { signature: SIG_C, offsetMs: 30_000, slot: 461970855, side: "BUY" },
+        { signature: SIG_D, offsetMs: 40_000, slot: 461970860, side: "BUY" },
+        { signature: SIG_E, offsetMs: 50_000, slot: 461970865, side: "SELL" },
+      ],
+    });
+    expect(result.ledger.transactionDecodeAttempts).toBe(3);
+    expect(result.ledger.totalAttempts).toBeLessThanOrEqual(14);
+    expect(result.flowEvaluation?.flowCoverage).toBe("COLLECTION_GAP");
+    expect(result.flowEvaluation?.recentBuys60s).toBeNull();
+    expect(result.flowEvaluation?.diagnosticReason).toContain("ACTIVE_WINDOW_UNQUALIFIED");
+    expect(result.decisionResult?.outcome).not.toBe("ARMED_FIRST_TICK");
+  });
+
+  it("W3. Without the opt-in, the same active stream keeps the existing non-quiet COLLECTION_GAP behavior", async () => {
+    const result = await runActive({ swaps: TWO_BUYS });
+    expect(result.flowEvaluation?.flowCoverage).toBe("COLLECTION_GAP");
+    expect(result.flowEvaluation?.recentBuys60s).toBeNull();
+    expect(result.flowEvaluation?.diagnosticReason).toBe(
+      "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS",
+    );
+    expect(existsSync(path.join(activeOutDir, "evidence", "active-window-evidence.json"))).toBe(
+      false,
+    );
+  });
+
+  it("W4. The opt-in is rejected outside PAPER before any network activity (constructor and CLI)", async () => {
+    const transport = vi.fn(async () => new Response("{}", { status: 200 }));
+    const construct = (extra: Record<string, unknown>) =>
+      new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        transport,
+        wsTransport: createMockWebSocketTransport({ immediateAck: true }),
+        ...extra,
+      });
+    expect(() => construct({ paperActiveWindowFlow: true })).toThrow("[DIAGNOSTIC_INVALID_ARG]");
+    expect(() =>
+      construct({ paperActiveWindowFlow: true, executionContext: "PRODUCTION" }),
+    ).toThrow("[DIAGNOSTIC_INVALID_ARG]");
+    expect(() =>
+      construct({ paperActiveWindowFlow: "yes", executionContext: "PAPER_SIMULATION" }),
+    ).toThrow("[DIAGNOSTIC_INVALID_ARG]");
+    expect(transport).not.toHaveBeenCalled();
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await expect(
+        runCandidateDecisionDiagnosticCli([
+          "--pool",
+          TEST_POOL_ID,
+          "--mint",
+          TEST_MINT,
+          "--live",
+          "--paper-active-window",
+        ]),
+      ).rejects.toThrow("[CLI_INVALID_ARG]");
+      await runCandidateDecisionDiagnosticCli([
+        "--pool",
+        TEST_POOL_ID,
+        "--mint",
+        TEST_MINT,
+        "--paper",
+        "--dry-run",
+        "--paper-active-window",
+      ]);
+      const output = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(output).toContain("ACTIVE-WINDOW PAPER qualification (OPT-IN");
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();

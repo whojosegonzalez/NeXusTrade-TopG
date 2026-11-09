@@ -86,6 +86,7 @@ export async function runCandidateDecisionDiagnosticCli(
         help: { type: "boolean" },
         "rugcheck-max-bytes": { type: "string" },
         "overlap-rugcheck": { type: "boolean" },
+        "paper-active-window": { type: "boolean" },
       },
       // Strict parsing: a misspelled opt-in must fail rather than silently fall back to defaults.
       strict: true,
@@ -117,6 +118,10 @@ Options:
                     OPT-IN: dispatch RUGCHECK_REPORT once validated LP evidence passes the unchanged 90% rule,
                     overlapping the pacing wait before CANDIDATE_MINT. May spend one RugCheck request before an
                     authority rejection; never admits a candidate. Default: serial after pre-admission.
+  --paper-active-window
+                    OPT-IN (requires --paper): qualify fully reconciled ACTIVE 60 s windows whose every in-window
+                    signature was resolved by the stream decode path within the unchanged 3-retrieval budget.
+                    PAPER research only; provider-relative assumptions; not production completeness.
   --help            Show this help text
 `);
     return;
@@ -138,6 +143,10 @@ Options:
 
   // Opt-ins are validated before the dry-run exit, environment loading, or any network activity.
   const rugCheckOptIns = parseRugCheckCliOptIns(values);
+  const paperActiveWindowFlow = values["paper-active-window"] === true;
+  if (paperActiveWindowFlow && values.paper !== true) {
+    throw new Error("[CLI_INVALID_ARG] --paper-active-window requires --paper (PAPER_SIMULATION)");
+  }
 
   const isPaper = values.paper === true;
   const isLive = values.live === true;
@@ -170,6 +179,13 @@ Options:
   );
   console.log(
     `Other HTTP Ceiling: ${DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES} decoded bytes per response`,
+  );
+  console.log(
+    `Flow Policy:        ${
+      paperActiveWindowFlow
+        ? "QUIET + ACTIVE-WINDOW PAPER qualification (OPT-IN; 3 shared transaction retrievals)"
+        : "QUIET-WINDOW PAPER qualification only (default)"
+    }`,
   );
   console.log("===============================================================================");
 
@@ -212,6 +228,7 @@ Options:
     solanaTrackerApiKey,
     rugCheckMaxResponseBytes: rugCheckOptIns.rugCheckMaxResponseBytes,
     overlapRugCheckWithMintPacing: rugCheckOptIns.overlapRugCheckWithMintPacing,
+    paperActiveWindowFlow,
   });
 
   const result = await diagnostic.run();

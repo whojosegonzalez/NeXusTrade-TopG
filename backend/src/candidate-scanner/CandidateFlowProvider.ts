@@ -448,17 +448,42 @@ export function validateAndSnapshotCandidateFlowResult(
       );
     }
 
-    // Accepted quiet-window adapter restricted to qualified-zero scope
+    // Quiet-window (or legacy, kind absent) PAPER flow is restricted to verified zero counts.
+    // Active-window PAPER flow (explicit kind) requires verified non-negative integer counts.
+    const qualificationKind = paperCtx.qualificationKind;
     if (
-      res.recentBuys60s !== 0 ||
-      res.recentSells60s !== 0 ||
-      res.isCoverageSufficient !== true ||
-      res.flowCoverage !== "SUFFICIENT"
+      qualificationKind !== undefined &&
+      qualificationKind !== "QUIET_WINDOW" &&
+      qualificationKind !== "ACTIVE_WINDOW"
     ) {
+      return fallback("INVALID_PAPER_QUALIFICATION_PROVENANCE");
+    }
+    const isActiveWindow = qualificationKind === "ACTIVE_WINDOW";
+    if (res.isCoverageSufficient !== true || res.flowCoverage !== "SUFFICIENT") {
+      return fallback(
+        "INVALID_PAPER_QUIET_STREAM_COUNTS: PAPER qualified flow must have sufficient coverage",
+      );
+    }
+    if (!isActiveWindow && (res.recentBuys60s !== 0 || res.recentSells60s !== 0)) {
       return fallback(
         "INVALID_PAPER_QUIET_STREAM_COUNTS: PAPER quiet stream must have verified zero counts and sufficient coverage",
       );
     }
+    if (
+      isActiveWindow &&
+      (typeof res.recentBuys60s !== "number" ||
+        typeof res.recentSells60s !== "number" ||
+        !Number.isSafeInteger(res.recentBuys60s) ||
+        !Number.isSafeInteger(res.recentSells60s) ||
+        res.recentBuys60s < 0 ||
+        res.recentSells60s < 0)
+    ) {
+      return fallback(
+        "INVALID_PAPER_ACTIVE_WINDOW_COUNTS: PAPER active-window flow must have verified non-negative integer counts",
+      );
+    }
+    const verifiedBuys = res.recentBuys60s as number;
+    const verifiedSells = res.recentSells60s as number;
 
     const diagReason =
       typeof res.diagnosticReason === "string" && res.diagnosticReason.trim().length > 0
@@ -474,6 +499,7 @@ export function validateAndSnapshotCandidateFlowResult(
     const frozenUncertainties = Object.freeze(paperCtx.unresolvedUncertainties.slice());
     const frozenPaperCtx: PaperQualificationContext = Object.freeze({
       executionContext: paperCtx.executionContext,
+      ...(qualificationKind !== undefined ? { qualificationKind } : {}),
       validatedEpoch: paperCtx.validatedEpoch,
       originalEvaluationTimestampMs: paperCtx.originalEvaluationTimestampMs,
       researchWindowSpan: frozenSpan,
@@ -486,8 +512,8 @@ export function validateAndSnapshotCandidateFlowResult(
     return Object.freeze({
       poolAddress: target.poolAddress,
       tokenMint: target.tokenMint,
-      recentBuys60s: 0,
-      recentSells60s: 0,
+      recentBuys60s: verifiedBuys,
+      recentSells60s: verifiedSells,
       flowCoverage: "SUFFICIENT",
       isCoverageSufficient: true,
       diagnosticReason: diagReason,
