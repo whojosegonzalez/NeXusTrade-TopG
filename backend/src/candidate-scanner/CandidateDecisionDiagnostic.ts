@@ -2756,6 +2756,50 @@ export interface ReplayVerificationItem {
   readonly valid: boolean;
 }
 
+/**
+ * How the replay treated the sealed capture after integrity verification.
+ * - DECISION_REEVALUATED: the sealed report recorded a completed decision; the decision was
+ *   re-evaluated offline at the recorded decision timestamp.
+ * - RECORDED_TERMINATION_PRESERVED: the sealed report recorded a terminal failure (e.g. STALE_DATA)
+ *   before any decision; that termination is returned unchanged and no Buy Gate decision is evaluated.
+ */
+export type CandidateDecisionReplayMode = "DECISION_REEVALUATED" | "RECORDED_TERMINATION_PRESERVED";
+
+export interface CandidateDecisionReplayObservationAudit {
+  /** RECORDED when the sealed report carries observationMetadata; otherwise every observation field is null. */
+  readonly observationMetadataStatus: "RECORDED" | "NOT_RECORDED_IN_SEALED_REPORT";
+  readonly observationStartMs: number | null;
+  readonly observationEndMs: number | null;
+  readonly observationDurationMs: number | null;
+  readonly notificationsReceived: number | null;
+  /** Source cutoff from the verified cutoff evidence file, or null when unusable. */
+  readonly cutoffTimestampMs: number | null;
+  /** Connection epoch recorded in the verified history evidence, or null when not recorded. */
+  readonly historyConnectionEpoch: number | null;
+  /** Connection epoch recorded on the flow evaluation, or null when not recorded. */
+  readonly flowConnectionEpoch: number | null;
+  readonly keepaliveMetricsStatus: "RECORDED" | "NOT_RECORDED_IN_SEALED_REPORT";
+  readonly keepaliveStats: CandidateDecisionDiagnosticResult["keepaliveMetrics"] | null;
+}
+
+export interface CandidateDecisionReplayGapAudit {
+  readonly flowCoverage: string | null;
+  readonly isCoverageSufficient: boolean | null;
+  readonly diagnosticReason: string | null;
+  readonly historyOutcome: string | null;
+  /**
+   * Rows returned by the HISTORY_ENUMERATION RPC page(s), counted from verified sealed response
+   * files. Includes rows at or older than the anchor. Null when not derivable from verified evidence.
+   */
+  readonly historyEnumerationRowsReturned: number | null;
+  readonly historyEnumerationRowsBasis: string;
+  /**
+   * Signatures newer than the witnessed prior anchor (history evidence `discoveredSignatures`).
+   * Null unless the history outcome is ANCHOR_WITNESSED with a well-formed list.
+   */
+  readonly newSignaturesSinceAnchor: number | null;
+}
+
 export interface CandidateDecisionReplayResult {
   readonly ok: boolean;
   readonly status: string;
@@ -2764,14 +2808,93 @@ export interface CandidateDecisionReplayResult {
   readonly mintAddress: string;
   readonly verifiedFilesCount: number;
   readonly fileVerifications: ReplayVerificationItem[];
+  /** True only once manifest coverage, file hashes/sizes, and required evidence have all verified. */
+  readonly integrityVerified?: boolean | undefined;
+  readonly replayMode?: CandidateDecisionReplayMode | undefined;
+  /** Terminal status/message exactly as recorded in the sealed report (RECORDED_TERMINATION_PRESERVED only). */
+  readonly recordedTermination?:
+    | { readonly status: string; readonly message: string | null }
+    | undefined;
+  /** Decision outcome recorded in the sealed report (DECISION_REEVALUATED only). */
+  readonly recordedDecision?:
+    | {
+        readonly outcome: string;
+        readonly rejectionReason: string | null;
+        readonly decisionTimestampMs: number;
+      }
+    | undefined;
+  /** Whether the offline re-evaluation reproduced the recorded outcome and rejection reason. */
+  readonly matchesRecordedDecision?: boolean | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
   readonly auditMetadata?:
     | {
         readonly requests?: readonly unknown[] | undefined;
-        readonly observation?: unknown | undefined;
-        readonly gapMetadata?: unknown | undefined;
+        readonly observation?: CandidateDecisionReplayObservationAudit | undefined;
+        readonly gapMetadata?: CandidateDecisionReplayGapAudit | undefined;
+        /** Inputs the replay had to supply that were not sealed; never consumed as observed evidence. */
+        readonly syntheticReplayContext?:
+          | Readonly<Record<string, { readonly value: string; readonly reason: string }>>
+          | undefined;
       }
     | undefined;
+}
+
+const REPLAY_MAX_CUTOFF_AGE_MS = 15_000;
+
+function asNonNegativeSafeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function asPositiveSafeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Counts rows returned by HISTORY_ENUMERATION requests using only the verified sealed report
+ * ledger and verified response files. Returns null with a basis label when not derivable.
+ */
+function countHistoryEnumerationRows(
+  evidenceDir: string,
+  report: { ledger?: { records?: unknown } } | null | undefined,
+  verifiedFilesSet: ReadonlySet<string>,
+): { rows: number | null; basis: string } {
+  const records = report?.ledger?.records;
+  if (!Array.isArray(records)) {
+    return { rows: null, basis: "UNAVAILABLE: sealed report ledger has no records array" };
+  }
+  const enumerationRecords = records.filter(
+    (r): r is { ok?: unknown; responseFile?: unknown } =>
+      !!r &&
+      typeof r === "object" &&
+      (r as { purpose?: unknown }).purpose === "HISTORY_ENUMERATION",
+  );
+  if (enumerationRecords.length === 0) {
+    return { rows: null, basis: "UNAVAILABLE: no HISTORY_ENUMERATION request recorded" };
+  }
+  let total = 0;
+  const files: string[] = [];
+  for (const rec of enumerationRecords) {
+    if (rec.ok !== true || typeof rec.responseFile !== "string") {
+      return { rows: null, basis: "UNAVAILABLE: HISTORY_ENUMERATION request did not succeed" };
+    }
+    const relPath = rec.responseFile.replace(/\\/g, "/");
+    if (!verifiedFilesSet.has(relPath)) {
+      return { rows: null, basis: `UNAVAILABLE: response file not verified: ${relPath}` };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(path.join(evidenceDir, relPath), "utf8"));
+    } catch {
+      return { rows: null, basis: `UNAVAILABLE: response file is not valid JSON: ${relPath}` };
+    }
+    const result = (parsed as { result?: unknown } | null)?.result;
+    if (!Array.isArray(result)) {
+      return { rows: null, basis: `UNAVAILABLE: response has no result array: ${relPath}` };
+    }
+    total += result.length;
+    files.push(relPath);
+  }
+  return { rows: total, basis: `VERIFIED_RESPONSE_FILES: ${files.join(", ")}` };
 }
 
 /**
@@ -3183,20 +3306,173 @@ export function replayCandidateDecisionFromSealedEvidence(
     };
   }
 
-  // Replay candidate decision points
-  const candidateMarketData = marketDataEvidence.candidateMarketData;
-
   const flowRelPath = "evidence/flow-evaluation.json";
   const flowPath = path.join(evidenceDir, flowRelPath);
   const flowEvaluation = verifiedFilesSet.has(flowRelPath)
     ? JSON.parse(readFileSync(flowPath, "utf8"))
     : report.flowEvaluation;
 
-  const decisionNowMs =
-    flowEvaluation?.evaluationTimestampMs ??
-    (report.decisionResult?.lastEvaluatedAt
-      ? Date.parse(report.decisionResult.lastEvaluatedAt)
-      : sourceCutoff.cutoffTimestampMs);
+  // Audit metadata is derived only from verified sealed evidence. Anything not recorded stays null.
+  const observationMetadata = report.observationMetadata as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  const hasObservationMetadata = !!observationMetadata && typeof observationMetadata === "object";
+  const keepaliveMetrics = report.keepaliveMetrics as
+    | CandidateDecisionDiagnosticResult["keepaliveMetrics"]
+    | null
+    | undefined;
+  const hasKeepaliveMetrics = !!keepaliveMetrics && typeof keepaliveMetrics === "object";
+  const historyRows = countHistoryEnumerationRows(evidenceDir, report, verifiedFilesSet);
+  const historyDiscovered = historyEvidence?.discoveredSignatures;
+
+  const auditMetadata: NonNullable<CandidateDecisionReplayResult["auditMetadata"]> = {
+    requests: manifest.requests ?? [],
+    observation: {
+      observationMetadataStatus: hasObservationMetadata
+        ? "RECORDED"
+        : "NOT_RECORDED_IN_SEALED_REPORT",
+      observationStartMs: asPositiveSafeInteger(observationMetadata?.observationStartMs),
+      observationEndMs: asPositiveSafeInteger(observationMetadata?.observationEndMs),
+      observationDurationMs: asNonNegativeSafeInteger(observationMetadata?.observationDurationMs),
+      notificationsReceived: asNonNegativeSafeInteger(observationMetadata?.notificationsReceived),
+      cutoffTimestampMs: asPositiveSafeInteger(sourceCutoff?.cutoffTimestampMs),
+      historyConnectionEpoch: asNonNegativeSafeInteger(historyEvidence?.connectionEpoch),
+      flowConnectionEpoch: asNonNegativeSafeInteger(flowEvaluation?.connectionEpoch),
+      keepaliveMetricsStatus: hasKeepaliveMetrics ? "RECORDED" : "NOT_RECORDED_IN_SEALED_REPORT",
+      keepaliveStats: hasKeepaliveMetrics ? keepaliveMetrics : null,
+    },
+    gapMetadata: {
+      flowCoverage:
+        typeof flowEvaluation?.flowCoverage === "string" ? flowEvaluation.flowCoverage : null,
+      isCoverageSufficient:
+        typeof flowEvaluation?.isCoverageSufficient === "boolean"
+          ? flowEvaluation.isCoverageSufficient
+          : null,
+      diagnosticReason:
+        typeof flowEvaluation?.diagnosticReason === "string"
+          ? flowEvaluation.diagnosticReason
+          : null,
+      historyOutcome: typeof historyEvidence?.outcome === "string" ? historyEvidence.outcome : null,
+      historyEnumerationRowsReturned: historyRows.rows,
+      historyEnumerationRowsBasis: historyRows.basis,
+      newSignaturesSinceAnchor:
+        historyEvidence?.outcome === "ANCHOR_WITNESSED" && Array.isArray(historyDiscovered)
+          ? historyDiscovered.length
+          : null,
+    },
+  };
+
+  // =========================================================================
+  // Historical outcome: integrity verification above is separate from decision replay.
+  // =========================================================================
+  if (typeof report.ok !== "boolean" || typeof report.status !== "string" || !report.status) {
+    return {
+      ok: false,
+      status: "REPLAY_RECORDED_OUTCOME_UNKNOWN",
+      message:
+        "Sealed report does not record a boolean ok and non-empty status; no decision replayed",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      auditMetadata,
+    };
+  }
+
+  if (report.ok === false) {
+    // A capture that terminated before a recorded decision keeps its termination outcome.
+    // No Buy Gate decision is evaluated, and earlier snapshot timestamps are not reused.
+    const recordedMessage = typeof report.message === "string" ? report.message : null;
+    return {
+      ok: false,
+      status: report.status,
+      message: `Sealed capture terminated with ${report.status}; recorded termination preserved and no decision re-evaluated${recordedMessage ? ` (recorded: ${recordedMessage})` : ""}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      replayMode: "RECORDED_TERMINATION_PRESERVED",
+      recordedTermination: { status: report.status, message: recordedMessage },
+      auditMetadata,
+    };
+  }
+
+  const recordedDecision = report.decisionResult as
+    | {
+        outcome?: unknown;
+        rejectionReason?: unknown;
+        flowResult?: { evaluationTimestampMs?: unknown };
+      }
+    | null
+    | undefined;
+  const recordedDecisionTimeMs = asPositiveSafeInteger(
+    recordedDecision?.flowResult?.evaluationTimestampMs,
+  );
+  if (
+    !recordedDecision ||
+    typeof recordedDecision.outcome !== "string" ||
+    recordedDecision.outcome !== report.status ||
+    recordedDecisionTimeMs === null
+  ) {
+    return {
+      ok: false,
+      status: "REPLAY_RECORDED_DECISION_INCOMPLETE",
+      message:
+        "Sealed report records success but lacks a consistent decision outcome and decision timestamp; no decision replayed",
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      auditMetadata,
+    };
+  }
+
+  // The flow snapshot consumed by replay must be the one evaluated at the recorded decision time.
+  if (flowEvaluation?.evaluationTimestampMs !== recordedDecisionTimeMs) {
+    return {
+      ok: false,
+      status: "REPLAY_DECISION_TIME_MISMATCH",
+      message: `Flow evaluation timestamp (${String(flowEvaluation?.evaluationTimestampMs)}) does not match recorded decision timestamp (${recordedDecisionTimeMs})`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      auditMetadata,
+    };
+  }
+
+  // Freshness recheck at the recorded decision time against the unchanged 15,000 ms ceiling.
+  const replayCutoffMs = auditMetadata.observation?.cutoffTimestampMs ?? null;
+  if (
+    replayCutoffMs === null ||
+    recordedDecisionTimeMs < replayCutoffMs ||
+    recordedDecisionTimeMs - replayCutoffMs > REPLAY_MAX_CUTOFF_AGE_MS
+  ) {
+    return {
+      ok: false,
+      status: "REPLAY_STALE_DATA",
+      message:
+        replayCutoffMs === null
+          ? "Verified cutoff evidence lacks a usable cutoff timestamp; decision not replayed"
+          : `Cutoff age (${recordedDecisionTimeMs - replayCutoffMs} ms) at recorded decision time is outside 0..${REPLAY_MAX_CUTOFF_AGE_MS} ms; decision not replayed`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      auditMetadata,
+    };
+  }
+
+  // Replay candidate decision points
+  const candidateMarketData = marketDataEvidence.candidateMarketData;
+  const decisionNowMs = recordedDecisionTimeMs;
+  const decisionNowIso = new Date(decisionNowMs).toISOString();
 
   const watchlistCandidate: WatchlistCandidateItem = {
     poolId,
@@ -3212,8 +3488,9 @@ export function replayCandidateDecisionFromSealedEvidence(
     sells5m: candidateMarketData.sells5m,
     buyToSellRatio: candidateMarketData.buyToSellRatio,
     status: "WATCHING",
-    discoveredAt: report.discoveredAt ?? new Date(decisionNowMs).toISOString(),
-    lastEvaluatedAt: new Date(decisionNowMs).toISOString(),
+    // Non-semantic synthetic value; labeled in auditMetadata.syntheticReplayContext.
+    discoveredAt: decisionNowIso,
+    lastEvaluatedAt: decisionNowIso,
   };
 
   let rugMetrics: {
@@ -3260,25 +3537,10 @@ export function replayCandidateDecisionFromSealedEvidence(
     executionContext: report.executionContext,
   });
 
-  const auditMetadata = {
-    requests: manifest.requests ?? [],
-    observation: {
-      observationStartMs:
-        report.observationMetadata?.observationStartMs ?? sourceCutoff.cutoffTimestampMs - 60_000,
-      observationEndMs: report.observationMetadata?.observationEndMs ?? sourceCutoff.retrievedAtMs,
-      cutoffTimestampMs: sourceCutoff.cutoffTimestampMs,
-      notificationsReceived: report.observationMetadata?.notificationsReceived ?? 0,
-      keepaliveStats: report.keepaliveMetrics,
-    },
-    gapMetadata: {
-      flowCoverage: flowEvaluation?.flowCoverage,
-      isCoverageSufficient: flowEvaluation?.isCoverageSufficient,
-      diagnosticReason: flowEvaluation?.diagnosticReason,
-      historyRecordsCount: Array.isArray(historyEvidence?.records)
-        ? historyEvidence.records.length
-        : 0,
-    },
-  };
+  const recordedRejectionReason =
+    typeof recordedDecision.rejectionReason === "string" ? recordedDecision.rejectionReason : null;
+  const replayedRejectionReason =
+    typeof decisionResult.rejectionReason === "string" ? decisionResult.rejectionReason : null;
 
   return {
     ok: true,
@@ -3288,7 +3550,26 @@ export function replayCandidateDecisionFromSealedEvidence(
     mintAddress,
     verifiedFilesCount: fileVerifications.length,
     fileVerifications,
+    integrityVerified: true,
+    replayMode: "DECISION_REEVALUATED",
+    recordedDecision: {
+      outcome: recordedDecision.outcome,
+      rejectionReason: recordedRejectionReason,
+      decisionTimestampMs: recordedDecisionTimeMs,
+    },
+    matchesRecordedDecision:
+      decisionResult.outcome === recordedDecision.outcome &&
+      replayedRejectionReason === recordedRejectionReason,
     decisionResult,
-    auditMetadata,
+    auditMetadata: {
+      ...auditMetadata,
+      syntheticReplayContext: {
+        discoveredAt: {
+          value: decisionNowIso,
+          reason:
+            "NON_SEMANTIC_SYNTHETIC: WatchlistCandidateItem requires discoveredAt; the original run start was not sealed, so the recorded decision time is supplied. Decision evaluation does not consume discoveredAt; this is not an observed discovery time.",
+        },
+      },
+    },
   };
 }

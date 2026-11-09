@@ -2430,3 +2430,128 @@ Execution through subsequent phases is strictly **conditional**: resource limits
 - **Spending Ceiling**: Exactly **$0.00**; standing wallet balance remains frozen at 7.9259 SOL.
 - **Standalone Isolation**: Single exact pool/mint; zero background trading daemons, zero position tracking, zero order routing, and zero automated retries or follow-ups.
 - **Authorization Boundary**: The command is presented for review only; execution is held pending explicit operator authorization.
+
+---
+
+### 8.16 Fartcoin Follow-Up Diagnostic Runs (Two Captures), Failed-Capture Replay Correction & RugCheck Size Proposal
+
+The operator ran the §8.15.4 follow-up command twice against the same exact pool and mint on runtime `b36b352eea7df3877e1fdad1bddfbb5fff0c495d`. **Both runs are recorded here; the first run's failure is not superseded by the second.** Both capture directories are preserved unchanged (all 48 files, including both manifests, re-hashed identically before and after the offline replay check below).
+
+- **Pool**: `Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw` (Raydium AMM v4, orientation `SOL_BASE_TOKEN_QUOTE`)
+- **Mint**: `9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump` (Fartcoin)
+- **Execution context**: `PAPER_SIMULATION`
+
+#### 1. Run Record
+
+| Item                             | Run 1 — `candidate-decision-fartcoin-2026-11-09T05-54-10-245Z`              | Run 2 — `candidate-decision-fartcoin-2026-11-09T05-59-59-714Z`                |
+| :------------------------------- | :-------------------------------------------------------------------------- | :---------------------------------------------------------------------------- |
+| Manifest file SHA-256            | `51829a258a77e6839d27c0e806a2180a622031d518d8834230721df5b16ac2bb`          | `69861fdce92d04217e52b8a1aa8d3beb84f2cbef17475efd72187fc45889f920`            |
+| Manifest-listed files verified   | 23 / 23 (sizes and SHA-256)                                                 | 23 / 23 (sizes and SHA-256)                                                   |
+| Recorded HTTP attempts           | **12** (includes 1 `TRANSACTION_DECODING`)                                  | **11**                                                                        |
+| Observation stream               | Non-quiet: 1 signature newer than the witnessed anchor (`3aFt8NNc…`)        | Quiet: 0 notifications; 0 signatures newer than the anchor                    |
+| Flow evaluation                  | `COLLECTION_GAP`, counts `null`, `NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS` | `RECONCILED` / `SUFFICIENT`, PAPER quiet-qualified, 0 buys / 0 sells, epoch 1 |
+| History enumeration              | 20 rows returned; 1 new signature since anchor                              | 20 rows returned; 0 new signatures since anchor                               |
+| Keepalive / observation metadata | **Not recorded** in the failure report (unknown)                            | 3 client pings, 3 matched pongs, 0 unmatched; 67,581 ms observation           |
+| Terminal outcome                 | **`STALE_DATA`** — cutoff age 15,142 ms > 15,000 ms at decision recheck     | **`BUY_GATE_REJECTED`**, primary reason **`MATURITY_WINDOW_GATE_FAILED`**     |
+| Buy Gate decision                | **Not evaluated** (terminated before decision)                              | Evaluated at recorded decision time `1794204082618` (cutoff age 14,618 ms)    |
+
+Combined recorded HTTP attempts across both runs: **23** (12 + 11). Every attempt returned HTTP 200; both `RUGCHECK_REPORT` attempts were then rejected locally (§8.16.3).
+
+#### 2. Acquisition Completed in Both Runs
+
+- **LP (raw account revalidation)**: both runs derive $100n \times (L - S) \ge 90n \times L$ from the raw pool/LP-mint accounts with **99.786359%** inaccessible LP claims — passes the unchanged ≥ 90% rule.
+- **Authorities**: `mintAuthority` and `freezeAuthority` explicitly `null` (`DISABLED`) in both runs.
+- **Solana Tracker bundler proxy**: retrieval, strict parsing and the approved PAPER proxy mapping succeeded in both runs (`QUALIFIED_PAPER_PROXY`, `PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION`): `initialPercentage` 0.05072% → `bundlerPct = 0.0005072` (fraction), held separately from current holdings (≈ 1.178%). Provider accuracy, deployer attribution, Jito equivalence and launch-history completeness remain **unverified**.
+- **RugCheck**: **not validated in either run** (§8.16.3). Score, danger risks, top-10 concentration and holder count are unavailable, so Gate 11 (`BUNDLER_CONCENTRATION_GATE`) could not pass even though the bundler proxy itself is within the micro-cap 50% ceiling.
+
+#### 3. RugCheck Outcome (Both Runs)
+
+Both runs received HTTP 200 and then locally rejected the body:
+
+`RESPONSE_TOO_LARGE: Response body (1064960 bytes) exceeded maximum allowed limit of 1048576 bytes`
+
+- **1,064,960 bytes is the count observed when reading stopped**, not the complete response size. `readBoundedStream` cancels the stream on the first chunk that crosses the ceiling, and the count is post-decoding (after any transparent content decoding), so the true size is unknown and only a lower bound is established.
+- The partial body was discarded: each sealed `responses/*-rugcheck-report.json` is 0 bytes, and `evidence/rugcheck-report.json` records `{ "rugMetrics": null, "rawRugCheck": null }`. No partial parse occurred and no favorable value was substituted.
+
+#### 4. Run 2 Decision Interpretation
+
+- **Maturity**: provider-reported `pairCreatedAt` gives `assetAgeSeconds = 64,972,286`. This already exceeds the **established-cohort age ceiling (7,200 s)**, so Fartcoin cannot classify as an established runner regardless of holders. It was evaluated under the non-established window `300s <= Age <= 900s` and failed. **Missing holder data (RugCheck unavailable) is an additional, independent limitation**, not the cause of the maturity failure.
+- **Other recorded gate results** (informational; maturity is the primary reason): `DEPTH_BALANCE_GATE` failed (L/MC 0.0538 vs `15% <= L/MC <= 55%`), `FLOW_ABSORPTION_GATE`, `VOLUME_SURGE_GATE` (vol5m $0.08), `MIN_SELLS_GATE` and `BUNDLER_CONCENTRATION_GATE` failed; liquidity, wash-trading, sell-congestion, short-horizon and dev-disposal gates passed. Gate 12 was not applicable (non-established).
+- **Freshness margin**: the decision passed with a cutoff age of 14,618 ms — a 382 ms margin. Run 1 failed by 142 ms. The **15,000 ms ceiling is preserved and was not adjusted** to make either run pass.
+
+Cutoff age at each request's completion (ms after the on-chain source cutoff):
+
+| Request (Phase 3 →)                         |              Run 1 |      Run 2 |
+| :------------------------------------------ | -----------------: | ---------: |
+| `GET_SLOT`                                  |              1,214 |        885 |
+| `GET_BLOCK_TIME`                            |              3,637 |      3,301 |
+| `HISTORY_ENUMERATION`                       |              6,155 |      5,821 |
+| `EXACT_PAIR`                                |              6,321 |      5,931 |
+| `LP_REFRESH` (pool)                         |              8,649 |      8,327 |
+| `LP_REFRESH` (batch)                        |             11,222 |     10,930 |
+| `CANDIDATE_MINT`                            |             13,707 |     13,402 |
+| `RUGCHECK_REPORT` (998 / 928 ms, truncated) |             14,706 |     14,331 |
+| `SOLANA_TRACKER_BUNDLERS`                   |             15,114 |     14,596 |
+| Decision recheck                            | **15,142** (stale) | **14,618** |
+
+The 2,500 ms RPC pacing chain consumes ~13.4–13.7 s of the 15 s budget before any security query, so the freshness ceiling is near-binding for this runner sequence.
+
+#### 5. Failed-Capture Replay Correction (Offline Implementation)
+
+**Defect**: `replayCandidateDecisionFromSealedEvidence` ignored the sealed report's terminal status. For Run 1 it re-evaluated a new Buy Gate decision using the _earlier_ Phase 2 flow snapshot timestamp (`1794203724159`, cutoff age ≈ 6.2 s), bypassing the `STALE_DATA` failure recorded at the later decision recheck. It also fabricated observation metadata (`cutoff − 60 s` start, cutoff-retrieval end, `notificationsReceived: 0`), substituted `discoveredAt`, and reported `historyRecordsCount` from a `records` field that the sealed history summary does not have (always 0).
+
+**Correction** in [`CandidateDecisionDiagnostic.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateDecisionDiagnostic.ts):
+
+1. **Integrity verification is unchanged and runs first**: manifest schema, duplicate paths, required-file coverage, unlisted-file rejection, size/SHA-256 verification, LP identity binding, and raw LP/authority pre-admission recomputation. Results now carry `integrityVerified: true` only after all of these pass.
+2. **Recorded terminations are preserved**: when the sealed report records `ok: false`, replay returns that exact `status` and message with `replayMode: "RECORDED_TERMINATION_PRESERVED"`, `recordedTermination`, and **no `decisionResult`**. A report without a boolean `ok` and non-empty `status` fails closed (`REPLAY_RECORDED_OUTCOME_UNKNOWN`).
+3. **Completed decisions replay at the recorded decision time**: the decision timestamp is taken from the recorded `decisionResult.flowResult.evaluationTimestampMs`. The replayed flow snapshot must carry the same timestamp (`REPLAY_DECISION_TIME_MISMATCH` otherwise), and the cutoff age at that time is rechecked against the same 15,000 ms ceiling (`REPLAY_STALE_DATA` otherwise). The previous fallback to the cutoff timestamp is removed. Results carry `replayMode: "DECISION_REEVALUATED"`, `recordedDecision`, and `matchesRecordedDecision`.
+4. **No fabricated metadata**: observation start/end/duration, notification count and keepalive stats are passed through only when recorded; otherwise they are `null` with `NOT_RECORDED_IN_SEALED_REPORT`. Epochs are reported only as recorded (`historyConnectionEpoch`, `flowConnectionEpoch`), never defaulted.
+5. **History counts**: `historyRecordsCount` is replaced by `historyEnumerationRowsReturned` (counted from verified `HISTORY_ENUMERATION` response files; `null` with an `UNAVAILABLE` basis otherwise) and `newSignaturesSinceAnchor` (from `discoveredSignatures`, only for `ANCHOR_WITNESSED`).
+6. **`discoveredAt`** is non-semantic for decision evaluation and was never sealed. Replay supplies the recorded decision time and labels it in `auditMetadata.syntheticReplayContext.discoveredAt` as `NON_SEMANTIC_SYNTHETIC`.
+
+**Offline replay of the two sealed captures** (read-only, no network):
+
+| Capture | Replay result                                                                                                                                                                                                                                 |
+| :------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run 1   | `ok: false`, `status: STALE_DATA`, `RECORDED_TERMINATION_PRESERVED`, 23 files verified, no decision; observation/keepalive `null` (not recorded); `COLLECTION_GAP`; 20 rows returned, 1 new signature since anchor                            |
+| Run 2   | `ok: true`, `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED` at recorded time `1794204082618`, `matchesRecordedDecision: true`, 23 files verified; observation and 3/3 keepalive recorded; 20 rows returned, 0 new signatures since anchor |
+
+**Offline regressions** (`CandidateDecisionDiagnostic.test.ts`, R1–R5) generate synthetic captures with mock transports and a synthetic clock under the ignored `.tmp/test-diagnostics/` directory. They need no operator captures, credentials or network:
+
+- R1: a non-quiet capture made stale by a synthetic 15.5 s RugCheck delay keeps `STALE_DATA` without a decision, even though its earlier flow snapshot was within 15 s of the cutoff.
+- R2: missing observation/keepalive metadata stays `null` for both a failed report and a re-sealed completed report.
+- R3: returned enumeration rows come from the verified response and differ from new signatures since the anchor; when that response is absent, the row count is `null`.
+- R4: a completed `MATURITY_WINDOW_GATE_FAILED` rejection replays at the recorded decision time with recorded metadata passed through and a labeled synthetic `discoveredAt`.
+- R5: an earlier flow timestamp, or a decision time more than 15 s after the cutoff, fails closed without a decision.
+
+#### 6. RugCheck Handling — Bounded Proposal (Not Implemented)
+
+**Required fields** (existing strict validator `BuyGateTriggerService.fetchRugCheckMetrics`): `score` (finite, ≥ 0), `risks[]` with `level ∈ {danger, warn, info}`, `topHolders[0..9].pct`, `totalHolders`. No other endpoint is proposed, and no favorable default is introduced.
+
+**Current constraints**:
+
+- A single 1 MiB ceiling applies to every HTTP purpose (`createBoundedFetchTransport(…, 1024 * 1024)` in the diagnostic constructor).
+- The per-request timeout is 10 s within the 90 s overall deadline.
+- `RUGCHECK_REPORT` is dispatched only after LP and authority pre-admission pass, after the paced RPC chain.
+
+**Freshness is the binding constraint, not only bytes.** Even truncated at ~1 MiB, RugCheck completed at a cutoff age of 14.3–14.7 s. A larger ceiling alone would most likely turn "RugCheck unavailable" into `STALE_DATA` for this token under the unchanged 15,000 ms ceiling.
+
+**Smallest bounded proposal** (for operator decision):
+
+1. **RugCheck-only byte ceiling**: give `RUGCHECK_REPORT` its own bounded transport at **4 MiB** of decoded bytes. All other purposes stay at 1 MiB, and overflow remains fail-closed `RESPONSE_TOO_LARGE`. Peak retained memory is bounded by the 4 MiB buffer plus one JSON parse of at most 4 MiB.
+2. **No timeout increase**: keep the 10 s per-request limit and the 90 s deadline. The effective limit is the freshness budget anyway.
+3. **Sequencing within existing budgets**: dispatch `RUGCHECK_REPORT` as soon as the LP batch establishes ≥ 90% inaccessible LP, overlapping the ~2.5 s pacing wait before `CANDIDATE_MINT`. Today it waits until after the authority check. This removes the RugCheck download from the cutoff-age chain. The trade-off is that RugCheck becomes conditional on LP passing only, so an authority rejection would still spend one request (still within the 14-attempt ceiling). Its own retrieval age remains checked at decision time against 15,000 ms.
+4. **Honest overflow evidence**: on overflow, record `observedBytesAtStop` as a labeled lower bound, plus `Content-Length` / `Content-Encoding` response headers when present. This establishes the declared size without another request. Never parse a truncated prefix: partial evidence remains unavailable and Gate 11 still fails closed.
+5. **Sealing and replay**: keep the raw body only in the sealed response file, with the validated metrics plus a digest reference in `evidence/rugcheck-report.json`, to avoid duplicating up to 4 MiB. Replay should recompute RugCheck metrics from the verified raw response with the same validator, as it already does for LP and authorities. Today it trusts the stored derived `rugMetrics`.
+6. **Acceptance (offline)**: synthetic bodies of 1.5 MiB and 3.9 MiB parse; 4 MiB + 1 byte rejects; a truncated stream never yields metrics; a slow body that pushes cutoff age past 15,000 ms still ends `STALE_DATA`; non-RugCheck purposes still reject above 1 MiB.
+
+If the body exceeds 4 MiB, the run stays fail-closed and the recorded headers or lower bound inform a separate operator decision. No automatic escalation is proposed. Separately, the production daemon path calls `fetchRugCheckMetrics` with an unbounded `res.json()` and a 3.5 s timeout. That is outside this task and noted for review only.
+
+#### 7. Boundaries Carried Forward
+
+- **PAPER proxy isolation**: Solana Tracker proxy consumption (`adaptPaperBundlerSnapshot`) occurs only in the explicitly approved `PAPER_SIMULATION` / `BACKTEST` diagnostic path. Default production and daemon Gate 11 handling remain quarantined: RugCheck-derived `bundlerPct` is always `undefined`, so `BUNDLER_CONCENTRATION_UNKNOWN` applies. §8.13.6's frozen invariant remains true for those paths; the diagnostic's proxy use is the approved research exception.
+- **Freshness**: the 15,000 ms ceiling is unchanged in the runner, the PAPER adapter and replay.
+- **Untested stages**: retest confirmation (`RetestGateEvaluator`), sizing (`PositionSizer`), fills (`simulateFill`), positions and exits (`DynamicRatchetService`) remain **untested** against live evidence. Neither run armed a first tick.
+- **Documentation discrepancies (recorded, not changed in code)**: §8.15.4.C anticipated `MATURITY_GATE_FAILED`, but the runtime gate is `MATURITY_WINDOW_GATE` / `MATURITY_WINDOW_GATE_FAILED`. The §8.15.1 threshold summary (liquidity ≥ $30,000 micro, L/MC ≥ 0.08 / 0.04, holders ≥ 100 / 250) differs from the requirements recorded by the runtime in Run 2 (liquidity ≥ $20,000, `15% <= L/MC <= 55%`, `Holders >= 350`). The sealed runtime values are authoritative for these captures. No strategy threshold was changed.
+- **Virtual wallet**: `U:\Projects\TopG\.tmp\virtual-wallet.json` remains 7.9259 SOL with SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`, re-verified unchanged. Spending ceiling $0.00.
+- **No network activity** was performed for this correction: no provider requests, RPC, sockets, captures, reruns, daemons or trades.

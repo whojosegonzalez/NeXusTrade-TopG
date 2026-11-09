@@ -2627,3 +2627,351 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     unlinkSync(extraResponsePath);
   });
 });
+
+/**
+ * SYNTHETIC TEST HELPER — re-seals a capture that this test suite generated locally (mock transports,
+ * synthetic clock) after deliberate edits, so replay *semantics* are exercised rather than integrity
+ * rejection. Never applied to operator captures under data/research.
+ */
+function resealSyntheticCapture(dir: string): void {
+  const sha = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+  const manifestPath = path.join(dir, "evidence-manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    files: Array<{ path: string; bytes: number; sha256: string }>;
+    reportFile: { path: string; bytes: number; sha256: string };
+  };
+  manifest.files = manifest.files
+    .filter((f) => existsSync(path.join(dir, f.path)))
+    .map((f) => {
+      const buf = readFileSync(path.join(dir, f.path));
+      return { ...f, bytes: buf.length, sha256: sha(buf) };
+    });
+  const reportBuf = readFileSync(path.join(dir, manifest.reportFile.path));
+  manifest.reportFile = { ...manifest.reportFile, bytes: reportBuf.length, sha256: sha(reportBuf) };
+  writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+}
+
+interface SealedCutoffJson {
+  cutoffTimestampMs: number;
+}
+interface SealedFlowJson {
+  evaluationTimestampMs: number;
+}
+interface SealedHistoryJson {
+  outcome: string;
+  connectionEpoch: number;
+  records?: unknown;
+  discoveredSignatures: unknown[];
+}
+interface SealedReportJson {
+  observationMetadata?: unknown;
+  keepaliveMetrics?: unknown;
+}
+interface SealedRpcPageJson {
+  result: unknown[];
+}
+
+function readJson<T>(filePath: string): T {
+  return JSON.parse(readFileSync(filePath, "utf8")) as T;
+}
+
+describe("CandidateDecisionDiagnostic replay: recorded outcomes and unknown metadata (synthetic captures)", () => {
+  const replayOutDir = path.resolve(
+    process.cwd(),
+    ".tmp",
+    "test-diagnostics",
+    `replay-semantics-${Date.now()}`,
+  );
+
+  beforeEach(() => {
+    if (existsSync(replayOutDir)) {
+      rmSync(replayOutDir, { recursive: true, force: true });
+    }
+  });
+
+  /** Synthetic non-quiet capture that terminates with STALE_DATA at the final decision freshness recheck. */
+  async function runSyntheticStaleCapture() {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const notificationMsg = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "logsNotification",
+      params: {
+        subscription: 101,
+        result: {
+          context: { slot: 461970850 },
+          value: {
+            signature: TEST_SIG_B,
+            err: null,
+            logs: ["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]"],
+          },
+        },
+      },
+    });
+    const wsTransport = createMockWebSocketTransport({
+      immediateAck: true,
+      messagesToSend: [notificationMsg],
+    });
+    const baseFetch = createDiagnosticMockFetch({ getClock: clock });
+    // Synthetic delay: the RugCheck response consumes 15.5 s of synthetic time, so the source cutoff
+    // is older than 15,000 ms by the Phase 6 decision recheck (mirrors a late-stage STALE_DATA failure).
+    const transport = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlStr.includes("api.rugcheck.xyz/v1/tokens/")) {
+        clockTime += 15_500;
+      }
+      return baseFetch(input, init);
+    };
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: replayOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      overallTimeoutMs: 180_000,
+    });
+    return diagnostic.run();
+  }
+
+  /** Synthetic quiet capture that completes with a Buy Gate rejection on the maturity window. */
+  async function runSyntheticMatureRejectionCapture() {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock, ageSeconds: 64_972_286 });
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: replayOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+    return diagnostic.run();
+  }
+
+  it("R1. STALE_DATA capture: replay preserves recorded termination and evaluates no Buy Gate decision", async () => {
+    const diagResult = await runSyntheticStaleCapture();
+    expect(diagResult.ok).toBe(false);
+    expect(diagResult.status).toBe("STALE_DATA");
+    expect(diagResult.message).toContain("at decision timestamp");
+    expect(diagResult.decisionResult).toBeUndefined();
+    expect(diagResult.flowEvaluation?.flowCoverage).toBe("COLLECTION_GAP");
+
+    // The earlier flow snapshot was still within 15 s of the cutoff; using its timestamp would
+    // bypass the later recorded freshness failure.
+    const flowSnapshot = readJson<SealedFlowJson>(
+      path.join(replayOutDir, "evidence", "flow-evaluation.json"),
+    );
+    const cutoff = readJson<SealedCutoffJson>(
+      path.join(replayOutDir, "evidence", "cutoff-evidence.json"),
+    );
+    expect(flowSnapshot.evaluationTimestampMs - cutoff.cutoffTimestampMs).toBeLessThanOrEqual(
+      15_000,
+    );
+
+    const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(replay.integrityVerified).toBe(true);
+    expect(replay.fileVerifications.every((v) => v.valid)).toBe(true);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("STALE_DATA");
+    expect(replay.replayMode).toBe("RECORDED_TERMINATION_PRESERVED");
+    expect(replay.recordedTermination?.status).toBe("STALE_DATA");
+    expect(replay.recordedTermination?.message).toBe(diagResult.message);
+    expect(replay.decisionResult).toBeUndefined();
+    expect(replay.recordedDecision).toBeUndefined();
+    expect(replay.matchesRecordedDecision).toBeUndefined();
+    expect(replay.auditMetadata?.gapMetadata?.flowCoverage).toBe("COLLECTION_GAP");
+    expect(replay.auditMetadata?.gapMetadata?.isCoverageSufficient).toBe(false);
+  });
+
+  it("R2. Missing observation/keepalive metadata stays unknown (null), never synthesized from cutoff or defaults", async () => {
+    const diagResult = await runSyntheticStaleCapture();
+    expect(diagResult.status).toBe("STALE_DATA");
+    const report = readJson<SealedReportJson>(path.join(replayOutDir, "diagnostic-report.json"));
+    expect(report.observationMetadata).toBeUndefined();
+    expect(report.keepaliveMetrics).toBeUndefined();
+
+    const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    const obs = replay.auditMetadata?.observation;
+    expect(obs?.observationMetadataStatus).toBe("NOT_RECORDED_IN_SEALED_REPORT");
+    expect(obs?.observationStartMs).toBeNull();
+    expect(obs?.observationEndMs).toBeNull();
+    expect(obs?.observationDurationMs).toBeNull();
+    expect(obs?.notificationsReceived).toBeNull();
+    expect(obs?.keepaliveMetricsStatus).toBe("NOT_RECORDED_IN_SEALED_REPORT");
+    expect(obs?.keepaliveStats).toBeNull();
+    // The flow snapshot carries no epoch; it is not defaulted to 0.
+    expect(obs?.flowConnectionEpoch).toBeNull();
+    // Recorded values are still reported from verified evidence.
+    const cutoff = readJson<SealedCutoffJson>(
+      path.join(replayOutDir, "evidence", "cutoff-evidence.json"),
+    );
+    const history = readJson<SealedHistoryJson>(
+      path.join(replayOutDir, "evidence", "history-evidence.json"),
+    );
+    expect(obs?.cutoffTimestampMs).toBe(cutoff.cutoffTimestampMs);
+    expect(obs?.historyConnectionEpoch).toBe(history.connectionEpoch);
+
+    // Synthetic edit + reseal: a completed report without observation/keepalive metadata also stays unknown.
+    rmSync(replayOutDir, { recursive: true, force: true });
+    const completed = await runSyntheticMatureRejectionCapture();
+    expect(completed.ok).toBe(true);
+    const reportPath = path.join(replayOutDir, "diagnostic-report.json");
+    const completedReport = readJson<SealedReportJson>(reportPath);
+    delete completedReport.observationMetadata;
+    delete completedReport.keepaliveMetrics;
+    writeFileSync(reportPath, JSON.stringify(completedReport), "utf8");
+    resealSyntheticCapture(replayOutDir);
+
+    const completedReplay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(completedReplay.ok).toBe(true);
+    expect(completedReplay.auditMetadata?.observation?.observationMetadataStatus).toBe(
+      "NOT_RECORDED_IN_SEALED_REPORT",
+    );
+    expect(completedReplay.auditMetadata?.observation?.observationStartMs).toBeNull();
+    expect(completedReplay.auditMetadata?.observation?.observationEndMs).toBeNull();
+    expect(completedReplay.auditMetadata?.observation?.notificationsReceived).toBeNull();
+    expect(completedReplay.auditMetadata?.observation?.keepaliveStats).toBeNull();
+  });
+
+  it("R3. History counts: returned enumeration rows come from verified responses and are distinct from new signatures since anchor", async () => {
+    const diagResult = await runSyntheticStaleCapture();
+    expect(diagResult.status).toBe("STALE_DATA");
+    const history = readJson<SealedHistoryJson>(
+      path.join(replayOutDir, "evidence", "history-evidence.json"),
+    );
+    expect(history.records).toBeUndefined(); // sealed summary has no records field
+    expect(history.outcome).toBe("ANCHOR_WITNESSED");
+
+    const enumRecord = diagResult.ledger.records.find((r) => r.purpose === "HISTORY_ENUMERATION");
+    expect(enumRecord?.responseFile).toBeDefined();
+    const enumResponse = readJson<SealedRpcPageJson>(
+      path.join(replayOutDir, enumRecord!.responseFile!),
+    );
+    const returnedRows = enumResponse.result.length;
+
+    const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    const gap = replay.auditMetadata?.gapMetadata;
+    expect(gap?.historyOutcome).toBe("ANCHOR_WITNESSED");
+    expect(gap?.historyEnumerationRowsReturned).toBe(returnedRows);
+    expect(gap?.historyEnumerationRowsBasis).toContain("VERIFIED_RESPONSE_FILES");
+    expect(gap?.newSignaturesSinceAnchor).toBe(history.discoveredSignatures.length);
+    expect(returnedRows).toBeGreaterThan(0);
+    // Returned rows include the anchor and older rows, so they exceed newly discovered signatures.
+    expect(returnedRows).toBeGreaterThan(gap!.newSignaturesSinceAnchor!);
+    expect(gap).not.toHaveProperty("historyRecordsCount");
+
+    // Synthetic removal + reseal: without a verified enumeration response, returned rows are unknown.
+    unlinkSync(path.join(replayOutDir, enumRecord!.responseFile!));
+    resealSyntheticCapture(replayOutDir);
+    const replayNoResponse = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(replayNoResponse.integrityVerified).toBe(true);
+    expect(replayNoResponse.auditMetadata?.gapMetadata?.historyEnumerationRowsReturned).toBeNull();
+    expect(replayNoResponse.auditMetadata?.gapMetadata?.historyEnumerationRowsBasis).toContain(
+      "UNAVAILABLE",
+    );
+    expect(replayNoResponse.auditMetadata?.gapMetadata?.newSignaturesSinceAnchor).toBe(
+      history.discoveredSignatures.length,
+    );
+  });
+
+  it("R4. Completed rejection: replay re-evaluates at the recorded decision time and reproduces MATURITY_WINDOW_GATE_FAILED", async () => {
+    const diagResult = await runSyntheticMatureRejectionCapture();
+    expect(diagResult.ok).toBe(true);
+    expect(diagResult.status).toBe("BUY_GATE_REJECTED");
+    expect(diagResult.decisionResult?.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
+    const recordedDecisionTimeMs = diagResult.decisionResult!.flowResult.evaluationTimestampMs;
+
+    const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.integrityVerified).toBe(true);
+    expect(replay.replayMode).toBe("DECISION_REEVALUATED");
+    expect(replay.status).toBe("BUY_GATE_REJECTED");
+    expect(replay.decisionResult?.rejectionReason).toBe("MATURITY_WINDOW_GATE_FAILED");
+    expect(replay.recordedDecision).toEqual({
+      outcome: "BUY_GATE_REJECTED",
+      rejectionReason: "MATURITY_WINDOW_GATE_FAILED",
+      decisionTimestampMs: recordedDecisionTimeMs,
+    });
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.decisionResult?.flowResult.evaluationTimestampMs).toBe(recordedDecisionTimeMs);
+
+    // Recorded observation metadata is passed through unchanged.
+    const obs = replay.auditMetadata?.observation;
+    expect(obs?.observationMetadataStatus).toBe("RECORDED");
+    expect(obs?.observationStartMs).toBe(diagResult.observationMetadata?.observationStartMs);
+    expect(obs?.observationEndMs).toBe(diagResult.observationMetadata?.observationEndMs);
+    expect(obs?.notificationsReceived).toBe(diagResult.observationMetadata?.notificationsReceived);
+    expect(obs?.keepaliveMetricsStatus).toBe("RECORDED");
+    expect(obs?.keepaliveStats).toEqual(diagResult.keepaliveMetrics);
+
+    // The substituted discoveredAt is explicitly labeled synthetic and non-semantic.
+    const synthetic = replay.auditMetadata?.syntheticReplayContext?.discoveredAt;
+    expect(synthetic?.value).toBe(new Date(recordedDecisionTimeMs).toISOString());
+    expect(synthetic?.reason).toContain("NON_SEMANTIC_SYNTHETIC");
+  });
+
+  it("R5. Completed capture: an earlier flow timestamp or stale recorded decision time fails closed without a decision", async () => {
+    const diagResult = await runSyntheticMatureRejectionCapture();
+    expect(diagResult.ok).toBe(true);
+    const flowPath = path.join(replayOutDir, "evidence", "flow-evaluation.json");
+    const reportPath = path.join(replayOutDir, "diagnostic-report.json");
+    const originalFlow = readFileSync(flowPath, "utf8");
+    const originalReport = readFileSync(reportPath, "utf8");
+    const originalManifest = readFileSync(
+      path.join(replayOutDir, "evidence-manifest.json"),
+      "utf8",
+    );
+
+    // Synthetic edit: the flow snapshot claims an earlier evaluation time than the recorded decision.
+    const flow = JSON.parse(originalFlow);
+    flow.evaluationTimestampMs -= 5_000;
+    writeFileSync(flowPath, JSON.stringify(flow), "utf8");
+    resealSyntheticCapture(replayOutDir);
+    const mismatch = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(mismatch.ok).toBe(false);
+    expect(mismatch.status).toBe("REPLAY_DECISION_TIME_MISMATCH");
+    expect(mismatch.decisionResult).toBeUndefined();
+
+    // Synthetic edit: recorded decision time 20 s after cutoff exceeds the unchanged 15,000 ms ceiling.
+    writeFileSync(flowPath, originalFlow, "utf8");
+    writeFileSync(reportPath, originalReport, "utf8");
+    writeFileSync(path.join(replayOutDir, "evidence-manifest.json"), originalManifest, "utf8");
+    const cutoff = readJson<SealedCutoffJson>(
+      path.join(replayOutDir, "evidence", "cutoff-evidence.json"),
+    );
+    const staleDecisionMs = cutoff.cutoffTimestampMs + 20_000;
+    const staleFlow = JSON.parse(originalFlow);
+    staleFlow.evaluationTimestampMs = staleDecisionMs;
+    writeFileSync(flowPath, JSON.stringify(staleFlow), "utf8");
+    const staleReport = JSON.parse(originalReport);
+    staleReport.decisionResult.flowResult.evaluationTimestampMs = staleDecisionMs;
+    writeFileSync(reportPath, JSON.stringify(staleReport), "utf8");
+    resealSyntheticCapture(replayOutDir);
+    const stale = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(stale.ok).toBe(false);
+    expect(stale.status).toBe("REPLAY_STALE_DATA");
+    expect(stale.decisionResult).toBeUndefined();
+  });
+});
