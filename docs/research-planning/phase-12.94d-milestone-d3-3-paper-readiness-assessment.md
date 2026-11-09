@@ -1,6 +1,6 @@
 # NeXusTrade — Phase 12.94-D Milestone D.3.3: Source-Accurate PAPER Implementation Handoff
 
-**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V4`  
+**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V5`  
 **Location**: `docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`  
 **Related Closure Report**: [`audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md`](file:///u:/Projects/TopG/audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md)  
 **Status**: **READ-ONLY ARCHITECTURAL SPECIFICATION & OFFLINE IMPLEMENTATION HANDOFF**  
@@ -1622,3 +1622,143 @@ Following explicit operator review and policy selection (Policies 1 and 2), the 
 - **Gate 11 Bundler Concentration**: Quarantined (`bundlerPct: undefined`) and fail-closed (`BUNDLER_CONCENTRATION_UNKNOWN`).
 - **Virtual Wallet**: Frozen at 7.9259 SOL (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling $0.00.
 - **Offline Implementation Only**: No daemon wiring, CLI enablement, live execution, or automated trading.
+
+---
+
+### 8.14 Live Operator Candidate Diagnostic Run (Capture 2026-11-09T02-01-06-791Z) & Pre-Admission LP Rejection
+
+#### 1. Verification of Sealed Operator Diagnostic Capture
+
+On commit `b36b352eea7df3877e1fdad1bddfbb5fff0c495d`, the operator executed the standalone live candidate decision diagnostic (`candidate-decision-diagnostic.ts`) against the reference pair:
+
+- **Capture Directory**: `data/research/diagnostics/candidate-decision-2026-11-09T02-01-06-791Z`
+- **Target Pool Address**: `AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA` (Raydium AMM v4 RAY/WSOL)
+- **Candidate Token Mint**: `4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R` (RAY)
+- **Execution Mode**: `PAPER_SIMULATION`
+- **Manifest SHA-256 Digest**: `c35bbe76b8c5c297d8553035758ca7e7dc597271e6eda12c109ded2dffc13d0e`
+- **Manifest Integrity**: All 18 manifest-listed files match their recorded byte sizes and SHA-256 digests.
+- **Dispatched Request Ledger**: Exactly 9 recorded HTTP attempts (7 Solana RPC, 1 DexScreener, 1 Solana RPC mint account), all returning HTTP 200.
+- **Provider Pacing Compliance**: Minimum recorded RPC dispatch spacing: **2,501 ms**, adhering to the $\ge 2{,}500\text{ ms}$ host pacing policy.
+- **Total Execution Elapsed Time**: From first dispatch ($T_0 = 1794189669283\text{ ms}$) to evidence sealing ($T_{\text{seal}} = 1794189749676\text{ ms}$), total elapsed time was approximately **80.4 seconds**.
+- **Virtual Wallet Invariant**: Virtual wallet balance remains frozen at **7.9259 SOL** (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling $0.00.
+
+#### 2. On-Chain Protocol LP Accounting & Correct Pre-Admission Rejection
+
+1. **Protocol Accounting Revalidation**:
+   - Raw account-batch revalidation passes structural and identity checks.
+   - Decoded Raydium AMM v4 pool account byte offset 720..728 (`lpReserve`):
+     $$L_{\text{protocol}} = 362{,}689{,}347{,}209$$
+   - Decoded SPL LP mint supply (`supply`):
+     $$S_{\text{current}} = 362{,}196{,}893{,}883$$
+   - Inaccessible LP claims ($L_{\text{protocol}} - S_{\text{current}}$):
+     $$\Delta L_{\text{inaccessible}} = 492{,}453{,}326$$
+   - Derived inaccessible percentage:
+     $$\text{lpBurnPct} = \frac{492{,}453{,}326}{362{,}689{,}347{,}209} \times 100\% = 0.135778\%$$
+   - Existing 90% threshold check: **`false`** ($0.135778\% < 90.0\%$).
+2. **Authority Evidence**:
+   - `mintAuthority`: `null` (status `DISABLED`, `mintAuthorityRenounced: true`).
+   - `freezeAuthority`: `null` (status `DISABLED`, `freezeAuthorityRenounced: true`).
+3. **Diagnostic Outcome**:
+   - Status: `PRE_ADMISSION_REJECTED`.
+   - Message: `Pre-admission screening failed: REJECTED_UNLOCKED_LP_RISK`.
+   - Downstream stages: Because pre-admission screening failed at Stage 1, the diagnostic terminated early as designed. RugCheck (request 10), Solana Tracker (request 11), and Buy Gate decision evaluations were not reached.
+4. **Deterministic Offline Replay**:
+   - `replayCandidateDecisionFromSealedEvidence` verified all 18 files from disk against `evidence-manifest.json` and reproduced `REJECTED_UNLOCKED_LP_RISK` without network dispatches.
+
+#### 3. Observation & Production Completeness Boundaries
+
+- **PAPER Quiet-Window Qualification**: The 60-second observation window and reconciliation completed with `paperQuietStreamQualified: true`, status `RECONCILED`, and `SUFFICIENT` flow under declared provider-relative assumptions (0 buys, 0 sells in 60s window).
+- **Production Completeness Unproven**: In accordance with project policy, provider-relative RPC pagination does not establish production cryptographic certainty (`isProductionCompletenessEstablished = false`).
+- **Keepalive & Observation Metadata**: In this early-return report, keepalive metrics and observation metadata are omitted from `diagnostic-report.json`; independently verified ping/pong counts are **not** claimed.
+
+#### 4. Catalog of Remaining Untested Stages
+
+The early fail-closed termination on unlocked LP leaves the following downstream strategy stages untested in live acquisition:
+
+| Stage / Component                       | Status in Capture 2026-11-09 | Functionality & Gates Unreached                                                                                                                                                                                                                       |
+| :-------------------------------------- | :--------------------------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **RugCheck Security Enrichment**        | **NOT REACHED** (0 attempts) | Live retrieval of `/tokens/{mint}/report`; validation of Gate 8 (score $\le 700$), Gate 9 (no danger risks), and Gate 10 (top-10 concentration $\le 30\%$).                                                                                           |
+| **Solana Tracker Bundler Proxy**        | **NOT REACHED** (0 attempts) | Live retrieval of `/tokens/{mint}/bundlers`; parser extraction and PAPER adapter evaluation of Gate 11 (bundler concentration $\le 85\% / 50\%$) and holder floor ($\ge 250 / 100$).                                                                  |
+| **Gate 12 Macro Trend Gate**            |       **NOT REACHED**        | Anti-dead-cat bounce check for Established candidates (`priceChange1hPct > -80%` or flow absorption $\ge 1.5\times$).                                                                                                                                 |
+| **Candidate Decision Point Evaluation** |       **NOT REACHED**        | Full `evaluateCandidateDecisionPoints` synthesis and first-tick arming (`ARMED_FIRST_TICK`).                                                                                                                                                          |
+| **Retest Gate Evaluation**              |       **NOT REACHED**        | Pure `evaluateRetestGate` evaluation: Rule A (pullback discount $10\%\text{--}15\%$ micro, $4\%\text{--}10\%$ estab with flow absorption) vs Rule B (consolidation breakout) vs Rule C (crater drop) / Rule E (seller surge) / Rule D (timeout).      |
+| **Confirmed-Entry Sizing**              |       **NOT REACHED**        | Probe sizing via `walletScale` ($1.0\text{--}1.25\times$), cohort base ($0.50$ estab, $0.35$ micro), risk downsizing ($0.35$ if bundler $> 60\%$ or top10 $> 30\%$), and dynamic portfolio gas reservation.                                           |
+| **Execution Realism Simulation**        |       **NOT REACHED**        | `QuoteExecutionEngine.createDeterministicAmmQuote(BUY)` and `simulateFill(isNewAta: true)` with mandatory $2{,}039{,}280\text{ lamports}$ ATA rent debit.                                                                                             |
+| **Position Monitoring & Ratchet Exits** |       **NOT REACHED**        | Position monitor ticker ($1{,}500\text{ ms}$), Dynamic Ratchet milestones (breakeven floor at $+10.0\%$, Tier 1 50% sell at $+20.0\%$, Tier 2 25% sell at $+48.5\%$, trailing moonbag floor at $+35.0\%$, catastrophic floor at $-18.0\% / -20.0\%$). |
+
+---
+
+### 8.15 Bounded Proposal for Untested Stages via Existing Discovery and Diagnostic Paths
+
+#### 1. Candidate Evidence Review & Target Selection Policy
+
+1. **RAY/WSOL Reference Pair Role**:
+   - `AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA` has definitively proven that the diagnostic runner accurately acquires live on-chain accounts, respects pacing ($\ge 2{,}501\text{ ms}$), derives protocol-exact LP claims ($0.135778\%$), rejects unlocked LP fail-closed without false-passing, and seals tamper-evident replay manifests.
+   - However, because its LP is not locked or burned, it cannot progress past Stage 1 pre-admission screening.
+2. **Review of Existing Captured Data**:
+   - An exhaustive review of all preserved captures in the repository (`data/research/snapshots/`, `data/research/captures/`, `data/research/prospective/`, `data/research/diagnostics/`) confirms that **all existing captures target RAY/WSOL**.
+   - No suitable candidate with verified $\ge 90\%$ burned LP exists in current preserved project evidence.
+   - In accordance with operator instructions, **no eligible candidate is invented**.
+3. **Threshold Preservation Invariant**:
+   - Selecting a new candidate must preserve all established threshold rules without relaxation:
+     - LP Burn: $\ge 90.0\%$ protocol-derived inaccessible claims.
+     - Authorities: explicitly disabled (`mintAuthority: null`, `freezeAuthority: null`).
+     - Liquidity: $\ge \$30{,}000$ (Micro-Cap) or $\ge \$50{,}000$ (Established).
+     - L/MC Ratio: $\ge 0.08$ (Micro-Cap) or $\ge 0.04$ (Established).
+     - Token Age: $\ge 300\text{s}$ (maturity window passed).
+     - RugScore: $\le 700$, `hasDangerRisk: false`.
+     - Top 10 Concentration: $\le 30.0\%$.
+     - Bundler Concentration: $\le 50.0\%$ (Micro-Cap) or $\le 85.0\%$ (Established).
+     - Verified Holders: $\ge 100$ (Micro-Cap) or $\ge 250$ (Established).
+
+#### 2. Minimum Candidate-Selection Request for Separate Operator Approval
+
+To establish an authentic on-chain candidate likely to pass pre-admission LP screening, the minimum proposed selection request uses the existing discovery path in `CandidateStreamEngine.ts`:
+
+- **Single Discovery Request**:
+  - **Endpoint**: `GET https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=10&page=1`
+  - **Provider Identity**: `"RAYDIUM_API"`.
+  - **Purpose**: `"DISCOVERY_POLL"`.
+  - **Request Budget**: **Exactly 1 outbound HTTP request**.
+- **Deterministic Selection Filter** (applied in memory to returned response):
+  1. Standard Raydium AMM v4 pool (`poolType: "standard"`).
+  2. Quote mint is canonical WSOL (`So11111111111111111111111111111111111111112`).
+  3. Pre-calculated burn percentage: `burnPercent >= 0.90` (reported $90\%$ burn by Raydium indexer).
+  4. Liquidity: $\text{tvl} \ge \$30{,}000$.
+  5. Age: `openTime` indicates $\ge 300\text{ seconds}$ elapsed.
+- **Operator Approval Gate**: The single candidate identified (`poolId`, `mintAddress`, `symbol`, reported `burnPercent`) is submitted to the operator for separate approval prior to any diagnostic execution.
+
+#### 3. Bounded Standalone Diagnostic Execution on Approved Target
+
+Once a candidate target is approved by the operator, the diagnostic is executed via the accepted runner:
+
+```powershell
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decision-diagnostic.ts `
+    --pool <APPROVED_POOL_ID> `
+    --mint <APPROVED_MINT_ADDRESS> `
+    --rpc-url https://api.mainnet-beta.solana.com `
+    --out-dir <TARGET_OUT_DIR> `
+    --paper `
+    --live
+```
+
+**Bounded Request Allocation on Passing Quiet Path (11 Total Dispatches)**:
+
+| Phase                         | Purpose                         | Provider          | Method | Dispatched |
+| :---------------------------- | :------------------------------ | :---------------- | :----: | :--------: |
+| **Phase 1: Bootstrap**        | `POOL_LAYOUT`                   | Solana RPC        |  POST  |     1      |
+|                               | `PRIOR_ANCHOR`                  | Solana RPC        |  POST  |     1      |
+| **Phase 2: Observation**      | 65-second observation span      | WebSocket / Quiet |   —    |     0      |
+| **Phase 3: Cutoff & History** | `GET_SLOT`                      | Solana RPC        |  POST  |     1      |
+|                               | `GET_BLOCK_TIME`                | Solana RPC        |  POST  |     1      |
+|                               | `HISTORY_ENUMERATION`           | Solana RPC        |  POST  |     1      |
+| **Phase 4: Market Data**      | `EXACT_PAIR`                    | DexScreener       |  GET   |     1      |
+| **Phase 5: Pre-Admission**    | `LP_REFRESH` (single account)   | Solana RPC        |  POST  |     1      |
+|                               | `LP_REFRESH` (batch accounts)   | Solana RPC        |  POST  |     1      |
+|                               | `CANDIDATE_MINT` (`jsonParsed`) | Solana RPC        |  POST  |     1      |
+| **Phase 6: Security**         | `RUGCHECK_REPORT`               | RugCheck          |  GET   |     1      |
+|                               | `SOLANA_TRACKER_BUNDLERS`       | Solana Tracker    |  GET   |     1      |
+| **Total Dispatched Requests** |                                 |                   |        |   **11**   |
+
+- **Ceiling Compliance**: 11 total dispatched attempts on the passing quiet path complies strictly with the maximum 14-attempt ceiling.
+- **Unlocks Untested Stages**: If on-chain LP burn $\ge 90.0\%$ and authorities are renounced, the diagnostic proceeds directly to Phase 6, executing the live RugCheck query, Solana Tracker bundler query, Gate 8--12 evaluations, and decision point evaluation (`ARMED_FIRST_TICK` or gate rejection), sealing a complete 23-file manifest.
