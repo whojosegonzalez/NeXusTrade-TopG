@@ -3901,6 +3901,141 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(missing.decisionResult).toBeUndefined();
   });
 
+  it("W5. Relabelled, de-marked, downgraded, or conflicting flow claims on an active capture fail closed before decision replay", async () => {
+    const result = await runActive({ swaps: TWO_BUYS, paperActiveWindowFlow: true });
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+    const flowPath = path.join(activeOutDir, "evidence", "flow-evaluation.json");
+    const reportPath = path.join(activeOutDir, "diagnostic-report.json");
+    const activePath = path.join(activeOutDir, "evidence", "active-window-evidence.json");
+    const manifestPath = path.join(activeOutDir, "evidence-manifest.json");
+    const originals = new Map(
+      [flowPath, reportPath, activePath, manifestPath].map((p) => [p, readFileSync(p, "utf8")]),
+    );
+    const restore = () => {
+      for (const [p, content] of originals) writeFileSync(p, content, "utf8");
+    };
+    type FlowRecord = Record<string, unknown> & {
+      paperQualificationContext?: Record<string, unknown>;
+    };
+    /** SYNTHETIC edit of the selected sealed flow records, then reseal. */
+    const editFlows = (
+      edit: (rec: FlowRecord) => FlowRecord,
+      targets: { file?: boolean; reportFlow?: boolean; decisionFlow?: boolean },
+    ) => {
+      if (targets.file) {
+        writeFileSync(flowPath, JSON.stringify(edit(readJson<FlowRecord>(flowPath))), "utf8");
+      }
+      const report = readJson<{
+        flowEvaluation: FlowRecord;
+        decisionResult: { flowResult: FlowRecord };
+      }>(reportPath);
+      if (targets.reportFlow) report.flowEvaluation = edit(report.flowEvaluation);
+      if (targets.decisionFlow)
+        report.decisionResult.flowResult = edit(report.decisionResult.flowResult);
+      writeFileSync(reportPath, JSON.stringify(report), "utf8");
+      resealSyntheticCapture(activeOutDir);
+      return replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    };
+    const toQuiet = (rec: FlowRecord): FlowRecord => ({
+      ...rec,
+      recentBuys60s: 0,
+      recentSells60s: 0,
+      paperQualificationContext: {
+        ...rec.paperQualificationContext,
+        qualificationKind: "QUIET_WINDOW",
+      },
+    });
+    const removeMarker = (rec: FlowRecord): FlowRecord => {
+      const ctx = { ...rec.paperQualificationContext };
+      delete ctx.qualificationKind;
+      return { ...rec, paperQualificationContext: ctx };
+    };
+    const toUnqualified = (rec: FlowRecord): FlowRecord => {
+      const copy: FlowRecord = {
+        ...rec,
+        recentBuys60s: null,
+        recentSells60s: null,
+        flowCoverage: "COLLECTION_GAP",
+        isCoverageSufficient: false,
+      };
+      delete copy.isPaperQualified;
+      delete copy.paperQualificationContext;
+      return copy;
+    };
+    const all = { file: true, reportFlow: true, decisionFlow: true };
+
+    // 1. Reviewer reproduction: only flow-evaluation.json relabelled QUIET with zero counts.
+    const relabelled = editFlows(toQuiet, { file: true });
+    expect(relabelled.ok).toBe(false);
+    expect(relabelled.status).toBe("REPLAY_FLOW_RECORDS_INCONSISTENT");
+    expect(relabelled.decisionResult).toBeUndefined();
+
+    // 2. All sealed flow records consistently relabelled QUIET 0/0: contradicted by raw evidence.
+    restore();
+    const consistentQuiet = editFlows(toQuiet, all);
+    expect(consistentQuiet.status).toBe("REPLAY_FLOW_QUALIFICATION_CONTRADICTED");
+    expect(consistentQuiet.flowQualificationCheck?.rawActivity.inWindowSignatures).toBe(2);
+    expect(consistentQuiet.flowQualificationCheck?.rawActivity.transactionDecodeRecords).toBe(2);
+    expect(consistentQuiet.decisionResult).toBeUndefined();
+
+    // 3. Active qualification marker removed everywhere (legacy-quiet form with 2/0 counts).
+    restore();
+    const unmarked = editFlows(removeMarker, all);
+    expect(unmarked.status).toBe("REPLAY_FLOW_QUALIFICATION_CONTRADICTED");
+    expect(unmarked.decisionResult).toBeUndefined();
+
+    // 4. Downgraded to an unqualified COLLECTION_GAP everywhere: raw evidence re-decodes to a qualifying window.
+    restore();
+    const downgraded = editFlows(toUnqualified, all);
+    expect(downgraded.status).toBe("REPLAY_FLOW_QUALIFICATION_CONTRADICTED");
+    expect(downgraded.recomputedActiveWindowFlow?.recentBuys60s).toBe(2);
+    expect(downgraded.decisionResult).toBeUndefined();
+
+    // 5. Conflicting counts across sealed flow records.
+    restore();
+    const conflicting = editFlows((rec) => ({ ...rec, recentBuys60s: 3 }), { decisionFlow: true });
+    expect(conflicting.status).toBe("REPLAY_FLOW_RECORDS_INCONSISTENT");
+
+    // 6. Optional active evidence removed AND records relabelled quiet: still contradicted (no file reliance).
+    restore();
+    unlinkSync(activePath);
+    const noEvidenceQuiet = editFlows(toQuiet, all);
+    expect(noEvidenceQuiet.status).toBe("REPLAY_FLOW_QUALIFICATION_CONTRADICTED");
+
+    // Restored capture still replays by re-decoding.
+    restore();
+    resealSyntheticCapture(activeOutDir);
+    const valid = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(valid.ok).toBe(true);
+    expect(valid.matchesRecordedDecision).toBe(true);
+    expect(valid.flowQualificationCheck?.claimed?.qualificationKind).toBe("ACTIVE_WINDOW");
+    expect(valid.recomputedActiveWindowFlow?.redecodedTransactions).toBe(2);
+  });
+
+  it("W6. A genuine quiet capture made with the active option enabled replays on the quiet path", async () => {
+    const result = await runActive({ swaps: [], paperActiveWindowFlow: true });
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+    const ctx = (
+      result.flowEvaluation as { paperQualificationContext?: { qualificationKind?: string } }
+    ).paperQualificationContext;
+    expect(ctx?.qualificationKind).toBe("QUIET_WINDOW");
+    // The optional evidence file exists but does not make the capture "active".
+    expect(existsSync(path.join(activeOutDir, "evidence", "active-window-evidence.json"))).toBe(
+      true,
+    );
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.flowQualificationCheck?.claimed?.qualificationKind).toBe("QUIET_WINDOW");
+    expect(replay.flowQualificationCheck?.rawActivity).toEqual({
+      inWindowSignatures: 0,
+      discoveredSinceAnchor: 0,
+      notificationsReceived: 0,
+      transactionDecodeRecords: 0,
+    });
+    expect(replay.recomputedActiveWindowFlow).toBeUndefined();
+  });
+
   it("W2. Budget exhaustion (4 notifications, 3 shared retrievals) leaves a backlog and stays unavailable", async () => {
     const result = await runActive({
       paperActiveWindowFlow: true,
@@ -3917,6 +4052,13 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(result.flowEvaluation?.recentBuys60s).toBeNull();
     expect(result.flowEvaluation?.diagnosticReason).toContain("ACTIVE_WINDOW_UNQUALIFIED");
     expect(result.decisionResult?.outcome).not.toBe("ARMED_FIRST_TICK");
+
+    // A legitimately unqualified active capture is not misreported as a downgrade on replay.
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.flowQualificationCheck?.claimed?.qualificationKind).toBe("UNQUALIFIED");
+    expect(replay.recomputedActiveWindowFlow?.flow.isCoverageSufficient).toBe(false);
   });
 
   it("W3. Without the opt-in, the same active stream keeps the existing non-quiet COLLECTION_GAP behavior", async () => {

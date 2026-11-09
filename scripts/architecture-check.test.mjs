@@ -212,3 +212,32 @@ test("rejects redirected source before reading its target", () => {
   );
   assert.throws(() => checkArchitecture(f.dir, f.policy), /SOURCE_REDIRECTED/);
 });
+
+test("a typeFiles-only module accepts type-only imports but rejects runtime imports", () => {
+  const typeOnly = fixture('import type { T } from "./types.js";', {
+    "types.ts": 'import "./entry.js";\nexport type T = string;',
+  });
+  assert.deepEqual(checkArchitecture(typeOnly.dir, typeOnly.policy).failures, []);
+  const runtime = fixture('import { value } from "./types.js";', {
+    "types.ts": "export const value = 1;\nexport type T = string;",
+  });
+  assert.match(
+    checkArchitecture(runtime.dir, runtime.policy).failures.join(),
+    /FORBIDDEN_MODULE backend\/src\/types\.ts/,
+  );
+});
+
+test("repository policy permits only the BuyGateTriggerService type edge to RetestGateEvaluator", () => {
+  const policy = JSON.parse(
+    fs.readFileSync(path.join(root, "scripts/architecture-policy.json"), "utf8"),
+  );
+  const group = policy.groups.find((g) => g.name === "candidate-scanner");
+  const target = "backend/src/candidate-scanner/RetestGateEvaluator.ts";
+  assert.ok(group.typeFiles.includes(target));
+  assert.equal(group.files.includes(target), false); // runtime traversal remains forbidden
+  assert.equal(Object.hasOwn(group.capabilities, target), false);
+  assert.deepEqual(
+    checkArchitecture(root, policy).failures.filter((f) => f.startsWith("candidate-scanner:")),
+    [],
+  );
+});

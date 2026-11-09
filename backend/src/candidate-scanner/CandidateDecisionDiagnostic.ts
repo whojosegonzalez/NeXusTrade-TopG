@@ -3587,6 +3587,97 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
   };
 }
 
+/** Normalized qualification/count summary of one sealed flow record (timestamps excluded). */
+export interface SealedFlowRecordSummary {
+  readonly qualificationKind: "QUIET_WINDOW" | "ACTIVE_WINDOW" | "UNQUALIFIED" | "INVALID";
+  readonly flowCoverage: string | null;
+  readonly isCoverageSufficient: boolean;
+  readonly recentBuys60s: number | null;
+  readonly recentSells60s: number | null;
+}
+
+function summarizeSealedFlowRecord(rec: unknown): SealedFlowRecordSummary {
+  const r = (rec && typeof rec === "object" ? rec : {}) as {
+    isPaperQualified?: unknown;
+    paperQualificationContext?: { qualificationKind?: unknown } | null;
+    flowCoverage?: unknown;
+    isCoverageSufficient?: unknown;
+    recentBuys60s?: unknown;
+    recentSells60s?: unknown;
+  };
+  const kindLabel = r.paperQualificationContext?.qualificationKind;
+  let qualificationKind: SealedFlowRecordSummary["qualificationKind"];
+  if (r.isPaperQualified === true) {
+    qualificationKind =
+      kindLabel === undefined || kindLabel === "QUIET_WINDOW" // legacy quiet contexts carry no kind
+        ? "QUIET_WINDOW"
+        : kindLabel === "ACTIVE_WINDOW"
+          ? "ACTIVE_WINDOW"
+          : "INVALID";
+  } else {
+    qualificationKind =
+      r.paperQualificationContext === undefined || r.paperQualificationContext === null
+        ? "UNQUALIFIED"
+        : "INVALID";
+  }
+  const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) ? v : null);
+  return {
+    qualificationKind,
+    flowCoverage: typeof r.flowCoverage === "string" ? r.flowCoverage : null,
+    isCoverageSufficient: r.isCoverageSufficient === true,
+    recentBuys60s: count(r.recentBuys60s),
+    recentSells60s: count(r.recentSells60s),
+  };
+}
+
+/** Raw window activity derived only from sealed history, cutoff, observation, and transaction records. */
+export interface RawWindowActivity {
+  readonly inWindowSignatures: number | null;
+  readonly discoveredSinceAnchor: number | null;
+  readonly notificationsReceived: number | null;
+  readonly transactionDecodeRecords: number;
+}
+
+function deriveRawWindowActivity(
+  report: {
+    ledger?: { records?: unknown };
+    observationMetadata?: { notificationsReceived?: unknown } | null;
+  },
+  historyEvidence: unknown,
+  sourceCutoff: unknown,
+): RawWindowActivity {
+  const discovered = (historyEvidence as { discoveredSignatures?: unknown } | null)
+    ?.discoveredSignatures;
+  const cutoffMs = (sourceCutoff as { cutoffTimestampMs?: unknown } | null)?.cutoffTimestampMs;
+  let inWindowSignatures: number | null = null;
+  if (Array.isArray(discovered) && typeof cutoffMs === "number" && Number.isFinite(cutoffMs)) {
+    inWindowSignatures = 0;
+    for (const rec of discovered) {
+      const blockTime = (rec as { blockTime?: unknown } | null)?.blockTime;
+      if (typeof blockTime !== "number" || !Number.isFinite(blockTime)) {
+        inWindowSignatures = null; // ambiguous timestamp: unknown, never zero
+        break;
+      }
+      const ms = blockTime * 1000;
+      if (ms >= cutoffMs - 60_000 && ms <= cutoffMs) inWindowSignatures++;
+    }
+  }
+  const records = Array.isArray(report.ledger?.records) ? report.ledger.records : [];
+  return {
+    inWindowSignatures,
+    discoveredSinceAnchor: Array.isArray(discovered) ? discovered.length : null,
+    notificationsReceived: asNonNegativeSafeInteger(
+      report.observationMetadata?.notificationsReceived,
+    ),
+    transactionDecodeRecords: records.filter(
+      (r) =>
+        !!r &&
+        typeof r === "object" &&
+        (r as { purpose?: unknown }).purpose === "TRANSACTION_DECODING",
+    ).length,
+  };
+}
+
 export interface CandidateDecisionReplayResult {
   readonly ok: boolean;
   readonly status: string;
@@ -3618,6 +3709,10 @@ export interface CandidateDecisionReplayResult {
   readonly recomputedRugCheck?: CandidateDecisionReplayRugCheck | undefined;
   /** Active-window flow recomputed by re-decoding sealed getTransaction responses (ACTIVE_WINDOW captures only). */
   readonly recomputedActiveWindowFlow?: CandidateDecisionReplayActiveWindow | undefined;
+  /** Claimed flow qualification vs raw sealed window activity (completed-decision replays). */
+  readonly flowQualificationCheck?:
+    | { readonly claimed: SealedFlowRecordSummary | null; readonly rawActivity: RawWindowActivity }
+    | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
   readonly auditMetadata?:
     | {
@@ -4317,67 +4412,166 @@ export function replayCandidateDecisionFromSealedEvidence(
     };
   }
 
-  // PAPER active-window captures: recompute flow from raw sealed transactions instead of trusting saved counts.
+  // =========================================================================
+  // Flow qualification consistency. The verification path is selected from RAW sealed evidence
+  // (history, cutoff, observation, transaction records), never from a saved qualification label.
+  // =========================================================================
+  const flowRecordSummaries = [
+    verifiedFilesSet.has(flowRelPath) ? flowEvaluation : undefined,
+    report.flowEvaluation,
+    report.decisionResult?.flowResult,
+  ]
+    .filter((rec) => rec !== undefined)
+    .map((rec) => summarizeSealedFlowRecord(rec));
+  const flowRecordKeys = new Set(flowRecordSummaries.map((sum) => JSON.stringify(sum)));
+  const claimed = flowRecordSummaries[0] ?? null;
+  const rawActivity = deriveRawWindowActivity(report, historyEvidence, sourceCutoff);
+  const failFlow = (
+    status: string,
+    message: string,
+    extra: Partial<CandidateDecisionReplayResult> = {},
+  ) =>
+    ({
+      ok: false,
+      status,
+      message,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      recomputedPreAdmission,
+      flowQualificationCheck: { claimed, rawActivity },
+      auditMetadata,
+      ...extra,
+    }) satisfies CandidateDecisionReplayResult;
+
+  if (claimed === null || flowRecordKeys.size !== 1) {
+    return failFlow(
+      "REPLAY_FLOW_RECORDS_INCONSISTENT",
+      `Sealed flow records (flow-evaluation, report flow, decision flow) disagree on qualification or counts: ${[...flowRecordKeys].join(" | ")}`,
+    );
+  }
+
+  const activeRel = "evidence/active-window-evidence.json";
+  const recomputeActive = (originalEvaluationTimestampMs: number) =>
+    verifiedFilesSet.has(activeRel)
+      ? recomputeActiveWindowFlowFromSealedEvidence({
+          evidenceDir,
+          report,
+          verifiedFilesSet,
+          sourceCutoff,
+          historyEvidence,
+          activeEvidence: JSON.parse(readFileSync(path.join(evidenceDir, activeRel), "utf8")),
+          originalEvaluationTimestampMs,
+          conversionTimestampMs: recordedDecisionTimeMs,
+          poolId,
+          mintAddress,
+        })
+      : ({ ok: false, reason: `Verified ${activeRel} is required` } as const);
+
   let replayFlow: unknown = flowEvaluation;
   let recomputedActiveWindowFlow: CandidateDecisionReplayActiveWindow | undefined;
-  if (flowEvaluation?.paperQualificationContext?.qualificationKind === "ACTIVE_WINDOW") {
-    const activeRel = "evidence/active-window-evidence.json";
+  const rawShowsActivity =
+    (rawActivity.inWindowSignatures ?? 0) > 0 ||
+    (rawActivity.discoveredSinceAnchor ?? 0) > 0 ||
+    (rawActivity.notificationsReceived ?? 0) > 0 ||
+    rawActivity.transactionDecodeRecords > 0;
+
+  if (claimed.qualificationKind === "QUIET_WINDOW") {
+    // Quiet claims (including legacy contexts without a kind) must be verified 0/0 and contradicted by
+    // no raw activity: no in-window or post-anchor signatures, no notifications, no transaction retrievals.
+    const quietConsistent =
+      claimed.recentBuys60s === 0 &&
+      claimed.recentSells60s === 0 &&
+      claimed.isCoverageSufficient &&
+      rawActivity.inWindowSignatures === 0 &&
+      rawActivity.discoveredSinceAnchor === 0 &&
+      rawActivity.transactionDecodeRecords === 0 &&
+      (rawActivity.notificationsReceived === null || rawActivity.notificationsReceived === 0);
+    if (!quietConsistent) {
+      return failFlow(
+        "REPLAY_FLOW_QUALIFICATION_CONTRADICTED",
+        `Quiet-window claim (buys=${String(claimed.recentBuys60s)}, sells=${String(claimed.recentSells60s)}) is contradicted or unverifiable from raw evidence (in-window=${String(rawActivity.inWindowSignatures)}, since-anchor=${String(rawActivity.discoveredSinceAnchor)}, notifications=${String(rawActivity.notificationsReceived)}, decodes=${rawActivity.transactionDecodeRecords})`,
+      );
+    }
+  } else if (claimed.qualificationKind === "ACTIVE_WINDOW") {
     const originalEvalMs = asPositiveSafeInteger(
       flowEvaluation?.paperQualificationContext?.originalEvaluationTimestampMs,
     );
-    const recomputed =
-      verifiedFilesSet.has(activeRel) && originalEvalMs !== null
-        ? recomputeActiveWindowFlowFromSealedEvidence({
-            evidenceDir,
-            report,
-            verifiedFilesSet,
-            sourceCutoff,
-            historyEvidence,
-            activeEvidence: JSON.parse(readFileSync(path.join(evidenceDir, activeRel), "utf8")),
-            originalEvaluationTimestampMs: originalEvalMs,
-            conversionTimestampMs: recordedDecisionTimeMs,
-            poolId,
-            mintAddress,
-          })
-        : ({
-            ok: false,
-            reason: `Verified ${activeRel} and original evaluation timestamp are required`,
-          } as const);
+    if ((rawActivity.inWindowSignatures ?? 0) < 1 || originalEvalMs === null) {
+      return failFlow(
+        "REPLAY_FLOW_QUALIFICATION_CONTRADICTED",
+        `Active-window claim requires >= 1 in-window signature in sealed history and an original evaluation time (in-window=${String(rawActivity.inWindowSignatures)})`,
+      );
+    }
+    const recomputed = recomputeActive(originalEvalMs);
     if (!recomputed.ok) {
-      return {
-        ok: false,
-        status: "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
-        message: `Active-window flow could not be recomputed from sealed evidence: ${recomputed.reason}`,
-        poolId,
-        mintAddress,
-        verifiedFilesCount: fileVerifications.length,
-        fileVerifications,
-        integrityVerified: true,
-        recomputedPreAdmission,
-        auditMetadata,
-      };
+      return failFlow(
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        `Active-window flow could not be recomputed from sealed evidence: ${recomputed.reason}`,
+      );
     }
     recomputedActiveWindowFlow = recomputed.value;
     if (
       recomputed.value.flow.isCoverageSufficient !== true ||
-      recomputed.value.recentBuys60s !== flowEvaluation.recentBuys60s ||
-      recomputed.value.recentSells60s !== flowEvaluation.recentSells60s
+      recomputed.value.recentBuys60s !== claimed.recentBuys60s ||
+      recomputed.value.recentSells60s !== claimed.recentSells60s
     ) {
-      return {
-        ok: false,
-        status: "REPLAY_ACTIVE_WINDOW_MISMATCH",
-        message: `Re-decoded active-window flow (${recomputed.value.reconciliationStatus}, buys=${String(recomputed.value.recentBuys60s)}, sells=${String(recomputed.value.recentSells60s)}) does not reproduce the recorded flow (buys=${String(flowEvaluation.recentBuys60s)}, sells=${String(flowEvaluation.recentSells60s)})`,
-        poolId,
-        mintAddress,
-        verifiedFilesCount: fileVerifications.length,
-        fileVerifications,
-        integrityVerified: true,
-        recomputedPreAdmission,
-        recomputedActiveWindowFlow,
-        auditMetadata,
-      };
+      return failFlow(
+        "REPLAY_ACTIVE_WINDOW_MISMATCH",
+        `Re-decoded active-window flow (${recomputed.value.reconciliationStatus}, buys=${String(recomputed.value.recentBuys60s)}, sells=${String(recomputed.value.recentSells60s)}) does not reproduce the recorded flow (buys=${String(claimed.recentBuys60s)}, sells=${String(claimed.recentSells60s)})`,
+        { recomputedActiveWindowFlow },
+      );
     }
     replayFlow = recomputed.value.flow;
+  } else {
+    // Unqualified claim: must carry no sufficient coverage or counts. If raw evidence shows in-window activity
+    // and the active-window option sealed its evidence, re-decode: an active window that would qualify cannot
+    // be presented as unavailable (unless the recorded keepalive shows the live run could not qualify).
+    if (
+      claimed.qualificationKind !== "UNQUALIFIED" ||
+      claimed.isCoverageSufficient ||
+      claimed.recentBuys60s !== null ||
+      claimed.recentSells60s !== null
+    ) {
+      return failFlow(
+        "REPLAY_FLOW_QUALIFICATION_CONTRADICTED",
+        `Flow claims coverage or counts without a PAPER qualification (${JSON.stringify(claimed)})`,
+      );
+    }
+    if (
+      rawShowsActivity &&
+      (rawActivity.inWindowSignatures ?? 0) > 0 &&
+      verifiedFilesSet.has(activeRel)
+    ) {
+      const recomputed = recomputeActive(recordedDecisionTimeMs);
+      if (!recomputed.ok) {
+        return failFlow(
+          "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+          `Active-window evidence present but not recomputable: ${recomputed.reason}`,
+        );
+      }
+      recomputedActiveWindowFlow = recomputed.value;
+      const keepalive = report.keepaliveMetrics as
+        | {
+            clientPingsSentCount?: unknown;
+            matchedClientPongsCount?: unknown;
+            unmatchedClientPongsCount?: unknown;
+          }
+        | undefined;
+      const keepaliveSatisfiedAsRecorded =
+        !!keepalive &&
+        keepalive.clientPingsSentCount === keepalive.matchedClientPongsCount &&
+        keepalive.unmatchedClientPongsCount === 0;
+      if (recomputed.value.flow.isCoverageSufficient === true && keepaliveSatisfiedAsRecorded) {
+        return failFlow(
+          "REPLAY_FLOW_QUALIFICATION_CONTRADICTED",
+          `Raw evidence re-decodes to a qualifying active window (buys=${String(recomputed.value.recentBuys60s)}, sells=${String(recomputed.value.recentSells60s)}) but the sealed flow claims it unavailable`,
+          { recomputedActiveWindowFlow },
+        );
+      }
+    }
   }
 
   // Replay candidate decision points
@@ -4494,6 +4688,7 @@ export function replayCandidateDecisionFromSealedEvidence(
     recomputedPreAdmission,
     recomputedRugCheck,
     ...(recomputedActiveWindowFlow ? { recomputedActiveWindowFlow } : {}),
+    flowQualificationCheck: { claimed, rawActivity },
     decisionResult,
     auditMetadata: {
       ...auditMetadata,

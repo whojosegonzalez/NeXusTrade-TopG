@@ -2827,3 +2827,51 @@ All four sealed historical captures replay with unchanged results, and all 91 di
 5. **Downstream remains unexercised live**: confirmation still needs a second evaluation tick, which the single-evaluation diagnostic does not perform. Sizing, fills, positions, exits and daemon wiring remain untested against live evidence.
 
 **Boundaries**: the virtual wallet remains 7.9259 SOL (SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), $0.00 spend. No provider calls, RPC, sockets, captures or daemon execution were performed.
+
+---
+
+### 8.20 Architecture-Check Correction & Replay Qualification Consistency (Review of `b1293fa`)
+
+#### 1. Architecture Check
+
+- **Failure**: CI reported `candidate-scanner: FORBIDDEN_TYPE_EDGE backend/src/candidate-scanner/BuyGateTriggerService.ts ./RetestGateEvaluator.js`, and it reproduced locally. The `import type { FlowCoverageStatus }` edge predates this milestone's work; it was introduced in `995918a`.
+- **Correction**: the dependency is intended, so `backend/src/candidate-scanner/RetestGateEvaluator.ts` was added **only** to the candidate-scanner group's `typeFiles`. It is not added to `files` (no runtime traversal), `capabilities` or `external`.
+  - The checker does not traverse type-only edges.
+  - A runtime import of the module would traverse into it and fail with `FORBIDDEN_MODULE`.
+- **Regressions** in `scripts/architecture-check.test.mjs`:
+  - a fixture showing that a typeFiles-only module accepts type imports but rejects runtime imports;
+  - a repository-policy test pinning this exact permission.
+- **Out of scope**: the Node action-runtime deprecation notices (warnings) and workflow or dependency upgrades.
+
+#### 2. Replay Qualification Consistency
+
+**Defect**: replay chose its verification path from the saved `qualificationKind`. A synthetically re-sealed W1 capture whose `flow-evaluation.json` was relabelled `QUIET_WINDOW` with 0/0 counts replayed as `ok: true` / `ARMED_FIRST_TICK` / `matchesRecordedDecision: true`, without re-decoding anything.
+
+**Correction** (completed-decision replays, before the decision is re-evaluated):
+
+1. **All sealed flow records must agree.** The flow-evaluation file, the report's flow and the decision's flow must match on qualification kind, coverage and counts (timestamps excluded); otherwise `REPLAY_FLOW_RECORDS_INCONSISTENT`.
+2. **The path is selected from raw sealed evidence.** Replay derives in-window signatures (history and cutoff), signatures since the anchor, recorded notifications and transaction-retrieval records. A label never selects the path.
+   - **Quiet claims** (including legacy contexts without a kind) require 0/0 counts and no raw activity; unknown notification metadata is allowed only as unknown. Otherwise `REPLAY_FLOW_QUALIFICATION_CONTRADICTED`.
+   - **Active claims** require ≥ 1 in-window signature. Sealed transactions are always re-decoded, and the counts must reproduce.
+   - **Unqualified claims** may carry no coverage or counts. If raw evidence shows in-window activity and the active-window evidence was sealed, the transactions are re-decoded. A window that would qualify, with keepalive satisfied as recorded, cannot be presented as unavailable.
+3. **The optional evidence file never implies active qualification.** A genuine quiet capture made with the active option enabled replays on the quiet path.
+
+**Regressions** (W2, W5, W6; synthetic). The following all fail closed, with no decision replayed:
+
+- active-to-quiet relabelling of the flow file alone;
+- a consistent relabel of all records;
+- removing the active marker;
+- a downgrade to unqualified;
+- conflicting counts;
+- relabelling after deleting the optional evidence.
+
+These still replay successfully:
+
+- a valid active capture (re-decoded);
+- a legitimately unqualified active capture (budget exhausted);
+- a quiet capture made with the option enabled;
+- all four historical captures, including their quiet results and recorded `STALE_DATA` / `PRE_ADMISSION_REJECTED` terminations.
+
+**Residual limit**: a capture whose raw evidence (history, ledger and transaction responses) was itself consistently forged and re-sealed remains undetectable offline. File integrity proves only that sealed files are unchanged since sealing.
+
+**CI status**: the checks above were verified locally only. GitHub CI results remain pending an operator push or run. Budgets, thresholds, production guards, daemon isolation, historical captures and the standing wallet are unchanged.
