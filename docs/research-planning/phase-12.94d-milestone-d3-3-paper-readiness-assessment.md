@@ -1,6 +1,6 @@
 # NeXusTrade — Phase 12.94-D Milestone D.3.3: Source-Accurate PAPER Implementation Handoff
 
-**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V7`  
+**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V8`  
 **Location**: `docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`  
 **Related Closure Report**: [`audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md`](file:///u:/Projects/TopG/audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md)  
 **Status**: **READ-ONLY ARCHITECTURAL SPECIFICATION & OFFLINE IMPLEMENTATION HANDOFF**  
@@ -1773,23 +1773,26 @@ The proposal replaces this entirely with an isolated, single-request capture and
 
 ##### D. Output Directory, Failure Evidence & Sealed Manifest Contract
 
-All discovery artifacts are written to a timestamped, project-local directory anchored to `U:\Projects\TopG`:
+All discovery artifacts are written to a timestamped, project-local directory anchored strictly to `U:\Projects\TopG`:
 `U:\Projects\TopG\data\research\discovery\raydium-standard-pools-<timestamp>\`
 
 1. **Local Isolation & Overwrite Refusal**:
-   - Path resolution is anchored to `U:\Projects\TopG\data\research\discovery`.
-   - Before writing, the command verifies `!fs.existsSync(outDir)`. If the directory already exists, it refuses overwrite and aborts with `DESTINATION_EXISTS`.
+   - Path resolution is anchored strictly to `U:\Projects\TopG\data\research\discovery` without arbitrary environment-variable overrides in the operator command.
+   - Before writing, the command verifies `!fs.existsSync(outDir)` and enforces that `outDir` resides strictly within `baseDir`. If the directory already exists, it refuses overwrite and aborts with `DESTINATION_EXISTS`.
 2. **Deterministic Target Selection & Tie-Breaker**:
    - Qualifying pools are sorted by TVL descending (`b.tvl - a.tvl`).
    - For identical TVL values, a deterministic pool-ID lexical tie-breaker is applied (`a.poolId.localeCompare(b.poolId)`).
    - Selects at most one provisional target. Zero qualifying pools is a normal terminating result (`{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`).
 3. **Distinct Failure Classification & Evidence Sealing**:
-   - Validates `json.success === true` and `Array.isArray(json.data?.data)`.
-   - Distinctly records failure categories: `HTTP_ERROR`, `TIMEOUT`, `OVERFLOW`, `JSON_PARSE_ERROR`, `PROVIDER_ERROR` (when `success !== true`), and `SCHEMA_ERROR` (when missing `data.data` array).
-   - On failure, writes `failure-report.json`, records failure status in `capture-metadata.json`, preserves retained wire bytes in `raw-response.json` (including the 1 MiB prefix on overflow), and seals all generated files in `manifest.json`.
+   - Validates that the response parses to a genuine non-null JSON object, `json.success === true`, and `Array.isArray(json.data?.data)`. Primitives, `null`, `false`, arrays, or invalid shapes fail closed.
+   - Distinctly records failure categories: `HTTP_ERROR`, `TIMEOUT`, `OVERFLOW`, `JSON_PARSE_ERROR`, `PROVIDER_ERROR` (when `success !== true`), and `SCHEMA_ERROR` (when not a valid JSON object or missing `data.data` array).
+   - Partial evidence is preserved across aborts, timeouts, or stream interruptions: accumulated bytes, observed/retained counts, and distinct digests (`retainedSha256` matching `raw-response.json` and `observedSha256` matching all streamed wire bytes).
+   - Timestamps record header arrival as null if headers never arrived, distinguish completed-body time (`bodyCompletedAtIso`) from failure/end time (`endedAtIso`), and record HTTP-error body completion after reading.
+   - Reader cancellation is bounded by a safe timeout race (`cancelReaderSafely`), and per-read abort event listeners are removed upon promise settlement.
+   - On failure, writes `failure-report.json`, records failure status in `capture-metadata.json`, preserves retained wire bytes in `raw-response.json` (including partial bytes on timeout/stream error and the 1 MiB prefix on overflow), and seals all generated files in `manifest.json`.
 4. **Preserved Artifact Catalog (Success Path)**:
-   - `raw-response.json`: Exact byte-for-byte unprojected JSON response body returned by the Raydium API.
-   - `capture-metadata.json`: Dispatched URL, HTTP status, start/headers/body timestamps, retained byte length, total observed bytes, and SHA-256 digest of `raw-response.json`.
+   - `raw-response.json`: Exact byte-for-byte unprojected JSON response body returned by the Raydium API (or retained prefix).
+   - `capture-metadata.json`: Dispatched URL, HTTP status, start/headers/body/ended timestamps, retained byte length, total observed bytes, retained SHA-256 digest (matching `raw-response.json`), and observed SHA-256 digest across all streamed wire bytes.
    - `selection-ledger.json`: Structured array of every pool in the response evaluated against the filter with pass/fail status and specific rejection reasons.
    - `provisional-target.json`: Deterministic selection of at most one provisional target, or `{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`.
    - `manifest.json`: Sealed list of all generated files with exact byte sizes and SHA-256 digests.
@@ -1807,7 +1810,7 @@ const crypto = require('crypto');
 const { createRequire } = require('module');
 
 (async () => {
-  const PROJECT_ROOT = process.env.PROJECT_ROOT || 'U:/Projects/TopG';
+  const PROJECT_ROOT = 'U:/Projects/TopG';
   const WSOL = 'So11111111111111111111111111111111111111112';
   const AMM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
   const MAX_BYTES = 1048576; // 1 MiB retained-byte limit
@@ -1855,23 +1858,57 @@ const { createRequire } = require('module');
     return null;
   }
 
-  // Streaming reader enforcing timeout and byte ceiling
+  async function cancelReaderSafely(reader, reason, timeoutMs = 250) {
+    if (!reader || typeof reader.cancel !== 'function') return;
+    try {
+      await Promise.race([
+        reader.cancel(reason).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    } catch {
+      // ignore cancellation errors
+    }
+  }
+
+  // Streaming reader enforcing timeout, byte ceiling, bounded cancellation, and partial evidence
   async function readBodyWithLimit(bodyStream, maxBytes, signal) {
     const reader = bodyStream.getReader();
     const retainedChunks = [];
     let retainedBytes = 0;
     let totalObservedBytes = 0;
-    const hasher = crypto.createHash('sha256');
+    const observedHasher = crypto.createHash('sha256');
+    let observedDigest = null;
+
+    function getObservedDigest() {
+      if (observedDigest === null) {
+        try {
+          observedDigest = observedHasher.digest('hex');
+        } catch {
+          observedDigest = null;
+        }
+      }
+      return observedDigest;
+    }
+
+    function attachPartialEvidence(err) {
+      const retainedBuffer = Buffer.concat(retainedChunks);
+      err.retainedBuffer = retainedBuffer;
+      err.totalObservedBytes = totalObservedBytes;
+      err.retainedSha256 = crypto.createHash('sha256').update(retainedBuffer).digest('hex');
+      err.observedSha256 = getObservedDigest();
+      return err;
+    }
 
     try {
       while (true) {
         if (signal?.aborted) {
-          await reader.cancel(signal.reason);
+          await cancelReaderSafely(reader, signal.reason);
           const err = new Error('Operation aborted');
           err.name = 'AbortError';
-          throw err;
+          throw attachPartialEvidence(err);
         }
 
+        let abortListener = null;
         const readPromise = reader.read();
         const abortPromise = signal
           ? new Promise((_, reject) => {
@@ -1881,27 +1918,32 @@ const { createRequire } = require('module');
                 reject(err);
                 return;
               }
-              signal.addEventListener(
-                'abort',
-                () => {
-                  const err = new Error('Operation aborted');
-                  err.name = 'AbortError';
-                  reject(err);
-                },
-                { once: true }
-              );
+              abortListener = () => {
+                const err = new Error('Operation aborted');
+                err.name = 'AbortError';
+                reject(err);
+              };
+              signal.addEventListener('abort', abortListener, { once: true });
             })
           : null;
 
-        const { done, value } = abortPromise
-          ? await Promise.race([readPromise, abortPromise])
-          : await readPromise;
+        let readResult;
+        try {
+          readResult = abortPromise
+            ? await Promise.race([readPromise, abortPromise])
+            : await readPromise;
+        } finally {
+          if (signal && abortListener) {
+            signal.removeEventListener('abort', abortListener);
+          }
+        }
 
+        const { done, value } = readResult;
         if (done) break;
 
         if (value && value.byteLength > 0) {
           totalObservedBytes += value.byteLength;
-          hasher.update(value);
+          observedHasher.update(value);
 
           const remainingCapacity = maxBytes - retainedBytes;
           if (remainingCapacity > 0) {
@@ -1913,24 +1955,33 @@ const { createRequire } = require('module');
           }
 
           if (totalObservedBytes > maxBytes) {
-            await reader.cancel(new Error(`Response body size exceeded maximum limit of ${maxBytes} bytes.`));
+            await cancelReaderSafely(reader, new Error(`Response body size exceeded maximum limit of ${maxBytes} bytes.`));
             const overflowErr = new Error(`RESPONSE_OVERFLOW: Observed ${totalObservedBytes} bytes, exceeding ceiling of ${maxBytes} bytes`);
             overflowErr.name = 'ResponseTooLargeError';
-            overflowErr.retainedBuffer = Buffer.concat(retainedChunks);
-            overflowErr.totalObservedBytes = totalObservedBytes;
-            overflowErr.sha256 = hasher.digest('hex');
-            throw overflowErr;
+            throw attachPartialEvidence(overflowErr);
           }
         }
       }
+    } catch (err) {
+      await cancelReaderSafely(reader, err);
+      if (!err.retainedBuffer && err.totalObservedBytes === undefined) {
+        attachPartialEvidence(err);
+      }
+      throw err;
     } finally {
-      // reader cleanup
+      try {
+        reader.releaseLock();
+      } catch {
+        // ignore if lock already released or stream closed
+      }
     }
 
+    const retainedBuffer = Buffer.concat(retainedChunks);
     return {
-      retainedBuffer: Buffer.concat(retainedChunks),
+      retainedBuffer,
       totalObservedBytes,
-      sha256: hasher.digest('hex'),
+      retainedSha256: crypto.createHash('sha256').update(retainedBuffer).digest('hex'),
+      observedSha256: getObservedDigest(),
     };
   }
 
@@ -1939,10 +1990,12 @@ const { createRequire } = require('module');
   const timestampIso = new Date(tDispatch).toISOString();
   const dirTimestamp = timestampIso.replace(/[:.]/g, '-');
   const baseDir = path.resolve(PROJECT_ROOT, 'data/research/discovery');
-  const outDir = process.env.DISCOVERY_OUT_DIR
-    ? path.resolve(process.env.DISCOVERY_OUT_DIR)
-    : path.join(baseDir, `raydium-standard-pools-${dirTimestamp}`);
+  const outDir = path.resolve(baseDir, `raydium-standard-pools-${dirTimestamp}`);
 
+  // Enforce boundary strictly within approved research directory
+  if (!outDir.startsWith(baseDir + path.sep)) {
+    throw new Error(`SECURITY_VIOLATION: Destination outside approved directory: ${outDir}`);
+  }
   if (fs.existsSync(outDir)) {
     throw new Error(`DESTINATION_EXISTS: Refusing to overwrite existing directory: ${outDir}`);
   }
@@ -1971,8 +2024,7 @@ const { createRequire } = require('module');
       });
       tHeaders = Date.now();
     } catch (err) {
-      tHeaders = Date.now();
-      tBodyCompleted = tHeaders;
+      // Headers were never received: keep tHeaders = null and tBodyCompleted = null
       if (err.name === 'AbortError' || controller.signal.aborted) {
         failureCategory = 'TIMEOUT';
         failureMessage = `Request timed out after ${TIMEOUT_MS}ms`;
@@ -1984,14 +2036,21 @@ const { createRequire } = require('module');
     }
 
     if (!response.ok) {
-      tBodyCompleted = Date.now();
       failureCategory = 'HTTP_ERROR';
       failureMessage = `HTTP ${response.status} ${response.statusText}`;
       failureDetails.httpStatus = response.status;
       try {
         bodyResult = await readBodyWithLimit(response.body, MAX_BYTES, controller.signal);
-      } catch {
-        // ignore body read error on non-ok
+        tBodyCompleted = Date.now();
+      } catch (err) {
+        if (err.retainedBuffer || err.totalObservedBytes !== undefined) {
+          bodyResult = {
+            retainedBuffer: err.retainedBuffer || Buffer.alloc(0),
+            totalObservedBytes: err.totalObservedBytes || 0,
+            retainedSha256: err.retainedSha256 || null,
+            observedSha256: err.observedSha256 || null,
+          };
+        }
       }
       throw new Error(failureMessage);
     }
@@ -2001,23 +2060,29 @@ const { createRequire } = require('module');
       bodyResult = await readBodyWithLimit(response.body, MAX_BYTES, controller.signal);
       tBodyCompleted = Date.now();
     } catch (err) {
-      tBodyCompleted = Date.now();
+      if (err.retainedBuffer || err.totalObservedBytes !== undefined) {
+        bodyResult = {
+          retainedBuffer: err.retainedBuffer || Buffer.alloc(0),
+          totalObservedBytes: err.totalObservedBytes || 0,
+          retainedSha256: err.retainedSha256 || null,
+          observedSha256: err.observedSha256 || null,
+        };
+      }
       if (err.name === 'ResponseTooLargeError') {
         failureCategory = 'OVERFLOW';
         failureMessage = err.message;
         failureDetails.observedBytes = err.totalObservedBytes;
-        failureDetails.retainedBytes = err.retainedBuffer.length;
-        bodyResult = {
-          retainedBuffer: err.retainedBuffer,
-          totalObservedBytes: err.totalObservedBytes,
-          sha256: err.sha256,
-        };
+        failureDetails.retainedBytes = err.retainedBuffer ? err.retainedBuffer.length : 0;
       } else if (err.name === 'AbortError' || controller.signal.aborted) {
         failureCategory = 'TIMEOUT';
         failureMessage = `Body streaming timed out after ${TIMEOUT_MS}ms`;
+        failureDetails.observedBytes = bodyResult ? bodyResult.totalObservedBytes : 0;
+        failureDetails.retainedBytes = bodyResult ? bodyResult.retainedBuffer.length : 0;
       } else {
         failureCategory = 'STREAM_READ_ERROR';
         failureMessage = err.message || String(err);
+        failureDetails.observedBytes = bodyResult ? bodyResult.totalObservedBytes : 0;
+        failureDetails.retainedBytes = bodyResult ? bodyResult.retainedBuffer.length : 0;
       }
       throw err;
     }
@@ -2032,7 +2097,7 @@ const { createRequire } = require('module');
     fs.writeFileSync(path.join(outDir, 'raw-response.json'), bodyResult.retainedBuffer);
   }
 
-  // 2. Parse and evaluate JSON if body was successfully read
+  // 2. Parse JSON if body was successfully read
   let json = null;
   if (!failureCategory && bodyResult) {
     try {
@@ -2043,29 +2108,35 @@ const { createRequire } = require('module');
     }
   }
 
-  // 3. Validate provider success flag and data array schema
-  if (!failureCategory && json) {
-    if (json.success !== true) {
+  // 3. Validate provider response object, success flag, and data array schema
+  if (!failureCategory) {
+    if (!json || typeof json !== 'object' || Array.isArray(json)) {
+      failureCategory = 'SCHEMA_ERROR';
+      failureMessage = 'Response body is not a valid JSON object';
+    } else if (json.success !== true) {
       failureCategory = 'PROVIDER_ERROR';
       failureMessage = `Provider returned success: false (code: ${json.code ?? 'NONE'}, msg: ${json.msg ?? json.message ?? 'UNKNOWN'})`;
       failureDetails.providerPayload = { success: json.success, code: json.code, msg: json.msg };
-    } else if (!json.data || !Array.isArray(json.data.data)) {
+    } else if (!json.data || typeof json.data !== 'object' || Array.isArray(json.data) || !Array.isArray(json.data.data)) {
       failureCategory = 'SCHEMA_ERROR';
       failureMessage = 'Provider response missing data.data array';
     }
   }
 
   // 4. Save capture metadata
+  const tEnded = Date.now();
   const metadata = {
     url: URL,
     httpStatus: response ? response.status : null,
     dispatchedAtIso: new Date(tDispatch).toISOString(),
     headersReceivedAtIso: tHeaders ? new Date(tHeaders).toISOString() : null,
     bodyCompletedAtIso: tBodyCompleted ? new Date(tBodyCompleted).toISOString() : null,
-    elapsedMs: (tBodyCompleted || Date.now()) - tDispatch,
-    retainedByteLength: bodyResult ? bodyResult.retainedBuffer.length : 0,
+    endedAtIso: new Date(tEnded).toISOString(),
+    elapsedMs: tEnded - tDispatch,
+    retainedByteLength: bodyResult && bodyResult.retainedBuffer ? bodyResult.retainedBuffer.length : 0,
     totalObservedBytes: bodyResult ? bodyResult.totalObservedBytes : 0,
-    sha256: bodyResult ? bodyResult.sha256 : null,
+    retainedSha256: bodyResult && bodyResult.retainedBuffer && bodyResult.retainedBuffer.length > 0 ? bodyResult.retainedSha256 : null,
+    observedSha256: bodyResult && bodyResult.totalObservedBytes > 0 ? bodyResult.observedSha256 : null,
     status: failureCategory ? failureCategory : 'SUCCESS',
     ...(failureMessage ? { errorMessage: failureMessage } : {}),
   };
