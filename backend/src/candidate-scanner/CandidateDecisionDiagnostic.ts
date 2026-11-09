@@ -576,6 +576,8 @@ export class CandidateDecisionDiagnostic {
   private retainedActiveWindowEvidence?: unknown;
   /** Early-stop stream telemetry (failure paths only), sealed as evidence/stream-telemetry.json. */
   private retainedStreamTelemetry?: unknown;
+  /** Captures stream state at an exception, before finally-block cleanup (set once observation is wired). */
+  private streamExceptionCapture: ((reason: string) => void) | null = null;
   /** Builds observation/keepalive report fields and stream telemetry from the live observation state. */
   private streamTelemetryFinalizer:
     | (() => {
@@ -1501,7 +1503,10 @@ export class CandidateDecisionDiagnostic {
       let streamLimitMessage: string | undefined;
 
       // Early-stop telemetry: captured BEFORE coordinator cleanup so termination cannot erase it.
+      // Distinct timestamps: observation loop end, explicit stream stop/close, exception capture, sealing.
       let observationStoppedAtMs: number | null = null;
+      let observationLoopEndedAtMs: number | null = null;
+      let terminationCapturedAtMs: number | null = null;
       let streamStateBeforeCleanup: Record<string, unknown> | null = null;
       const snapshotStreamState = (reason: string): Record<string, unknown> => ({
         capturedAtMs: this.clock(),
@@ -1515,9 +1520,17 @@ export class CandidateDecisionDiagnostic {
         recordedGaps: [...flowTracker.getRecordedGaps()],
       });
       const captureBeforeCleanup = (reason: string) => {
-        if (observationStartMs > 0 && observationEndMs === 0 && observationStoppedAtMs === null) {
+        if (observationStartMs > 0 && observationStoppedAtMs === null) {
           observationStoppedAtMs = this.clock();
         }
+        if (streamStateBeforeCleanup === null) {
+          streamStateBeforeCleanup = snapshotStreamState(reason);
+        }
+      };
+      // Exception path (outer catch): records when termination was captured (after the failing request
+      // settled) without treating it as an explicit stream stop; state is snapshotted before cleanup.
+      this.streamExceptionCapture = (reason: string) => {
+        if (terminationCapturedAtMs === null) terminationCapturedAtMs = this.clock();
         if (streamStateBeforeCleanup === null) {
           streamStateBeforeCleanup = snapshotStreamState(reason);
         }
@@ -1554,9 +1567,25 @@ export class CandidateDecisionDiagnostic {
           const streamResult =
             sig === null ? undefined : streamResults.find((r) => r.signature === sig);
           const sealed = this.recordedResponses.find((rr) => rr.responseFile === rec.responseFile);
-          const tx = (sealed?.json as { result?: { meta?: { err?: unknown } } } | null)?.result;
-          const txKnown = !!tx && typeof tx === "object";
-          const onChainErr = txKnown ? (tx.meta?.err ?? null) : null;
+          const tx = (sealed?.json as { result?: unknown } | null)?.result;
+          const meta =
+            tx !== null && typeof tx === "object" ? (tx as { meta?: unknown }).meta : undefined;
+          const metaObj =
+            meta !== null && typeof meta === "object" && !Array.isArray(meta)
+              ? (meta as Record<string, unknown>)
+              : null;
+          // NONE requires an explicit err: null; PRESENT requires a well-formed reported error.
+          // Missing/null/malformed metadata stays UNKNOWN.
+          const hasErr = metaObj !== null && Object.prototype.hasOwnProperty.call(metaObj, "err");
+          const errValue = hasErr ? metaObj.err : undefined;
+          const onChainErrorStatus: "NONE" | "PRESENT" | "UNKNOWN" = !hasErr
+            ? "UNKNOWN"
+            : errValue === null
+              ? "NONE"
+              : (typeof errValue === "string" && errValue.length > 0) ||
+                  (typeof errValue === "object" && !Array.isArray(errValue))
+                ? "PRESENT"
+                : "UNKNOWN";
           const decoded = streamResult?.diagnostics?.decodedEventsCount ?? null;
           const classification = !streamResult
             ? "NO_ADAPTER_RESULT"
@@ -1564,7 +1593,7 @@ export class CandidateDecisionDiagnostic {
               ? (decoded ?? 0) > 0
                 ? "CANDIDATE_BOUND_SWAPS"
                 : "NO_CANDIDATE_SWAPS"
-              : txKnown && onChainErr !== null
+              : onChainErrorStatus === "PRESENT"
                 ? "ONCHAIN_FAILED"
                 : "RETRIEVAL_OR_DECODE_FAILED";
           return {
@@ -1580,8 +1609,8 @@ export class CandidateDecisionDiagnostic {
             ingestedEventsCount: streamResult?.ingestedEventsCount ?? null,
             slot: sig === null ? null : (txIdentityBySignature.get(sig)?.slot ?? null),
             blockTime: sig === null ? null : (txIdentityBySignature.get(sig)?.blockTime ?? null),
-            onChainErrorStatus: !txKnown ? "UNKNOWN" : onChainErr === null ? "NONE" : "PRESENT",
-            onChainError: onChainErr,
+            onChainErrorStatus,
+            onChainError: onChainErrorStatus === "PRESENT" ? errValue : null,
             classification,
             error: streamResult?.diagnostics?.error ?? rec.error ?? null,
           };
@@ -1599,7 +1628,30 @@ export class CandidateDecisionDiagnostic {
             error: r.diagnostics?.error ?? null,
           });
         }
-        const observationEnd = observationEndMs > 0 ? observationEndMs : observationStoppedAtMs;
+        // Observation end: cutoff acquisition, else the completed observation loop, else an explicit
+        // early stream stop, else (observation interrupted by an exception) the exception capture time.
+        const endBasis =
+          observationStartMs <= 0
+            ? null
+            : observationEndMs > 0
+              ? "CUTOFF_ACQUISITION"
+              : observationLoopEndedAtMs !== null
+                ? "OBSERVATION_LOOP_END"
+                : observationStoppedAtMs !== null
+                  ? "EARLY_STOP"
+                  : terminationCapturedAtMs !== null
+                    ? "INTERRUPTED_BY_EXCEPTION"
+                    : null;
+        const observationEnd =
+          endBasis === "CUTOFF_ACQUISITION"
+            ? observationEndMs
+            : endBasis === "OBSERVATION_LOOP_END"
+              ? observationLoopEndedAtMs
+              : endBasis === "EARLY_STOP"
+                ? observationStoppedAtMs
+                : endBasis === "INTERRUPTED_BY_EXCEPTION"
+                  ? terminationCapturedAtMs
+                  : null;
         const stagesNotReached = [
           ["SOURCE_CUTOFF", this.retainedSourceCutoff],
           ["HISTORY_ENUMERATION", this.retainedHistoryResult],
@@ -1638,12 +1690,11 @@ export class CandidateDecisionDiagnostic {
             observation: {
               startMs: observationStartMs > 0 ? observationStartMs : null,
               endMs: observationEnd,
-              endBasis:
-                observationEndMs > 0
-                  ? "CUTOFF_ACQUISITION"
-                  : observationStoppedAtMs !== null
-                    ? "EARLY_STOP"
-                    : null,
+              endBasis,
+              loopEndedAtMs: observationLoopEndedAtMs,
+              streamStoppedAtMs: observationStoppedAtMs,
+              terminationCapturedAtMs,
+              sealedAtMs: this.clock(),
             },
             stateBeforeCleanup:
               streamStateBeforeCleanup ?? snapshotStreamState("AT_SEAL_NO_PRIOR_CLEANUP"),
@@ -1929,6 +1980,9 @@ export class CandidateDecisionDiagnostic {
           });
           if (streamResult) streamResults.push(streamResult);
         }
+      }
+      if (!streamLimitReason && observationStartMs > 0) {
+        observationLoopEndedAtMs = this.clock();
       }
 
       if (this.keepalive) checkKeepalive(this.clock());
@@ -3043,6 +3097,11 @@ export class CandidateDecisionDiagnostic {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      try {
+        this.streamExceptionCapture?.(`EXCEPTION:${msg.slice(0, 120)}`);
+      } catch {
+        // telemetry capture must never mask the original failure
+      }
       const isTimeout =
         overallController.signal.aborted ||
         this.clock() >= overallDeadlineMs ||

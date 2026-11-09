@@ -3738,6 +3738,8 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     readonly failed?: boolean;
     /** SYNTHETIC: getTransaction never answers until aborted (interrupted retrieval). */
     readonly hang?: boolean;
+    /** SYNTHETIC transaction-metadata variants for error-status classification. */
+    readonly meta?: "STRIP_ERR" | "META_NULL" | "MALFORMED_ERR";
   }
 
   /** Runs the diagnostic with SYNTHETIC stream notifications and decodable SYNTHETIC swap transactions. */
@@ -3745,6 +3747,10 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     swaps: readonly ScheduledSwap[];
     paperActiveWindowFlow?: boolean;
     requestTimeoutMs?: number;
+    /** SYNTHETIC: JSON-RPC methods whose responses never arrive until aborted. */
+    hangMethods?: readonly string[];
+    /** SYNTHETIC: synthetic clock time consumed while a hung method waits (models request settlement). */
+    hangAdvanceMs?: number;
   }) {
     const now = 1791931000 * 1000;
     const startMs = now - 70_000;
@@ -3753,7 +3759,14 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     const wsTransport = createMockWebSocketTransport({ immediateAck: true });
     const emitted = new Map<
       string,
-      { slot: number; blockTime: number; side: "BUY" | "SELL"; failed?: boolean; hang?: boolean }
+      {
+        slot: number;
+        blockTime: number;
+        side: "BUY" | "SELL";
+        failed?: boolean;
+        hang?: boolean;
+        meta?: ScheduledSwap["meta"];
+      }
     >();
     const emitDue = () => {
       for (const swap of params.swaps) {
@@ -3764,6 +3777,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
             side: swap.side,
             failed: swap.failed === true,
             hang: swap.hang === true,
+            meta: swap.meta,
           });
           wsTransport.emitMessage(
             JSON.stringify({
@@ -3796,6 +3810,14 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
         typeof init?.body === "string"
           ? (JSON.parse(init.body) as { method?: string; params?: unknown[]; id?: unknown })
           : null;
+      if (body?.method && params.hangMethods?.includes(body.method)) {
+        clockTime += params.hangAdvanceMs ?? 0;
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
+      }
       if (body?.method === "getTransaction") {
         const sig = String(body.params?.[0]);
         const tx = emitted.get(sig);
@@ -3819,6 +3841,9 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
               InstructionError: [1, { Custom: 30 }],
             };
           }
+          if (tx.meta === "STRIP_ERR") delete (txResult.meta as Record<string, unknown>).err;
+          if (tx.meta === "MALFORMED_ERR") (txResult.meta as Record<string, unknown>).err = 5;
+          if (tx.meta === "META_NULL") (txResult as Record<string, unknown>).meta = null;
           return new Response(
             JSON.stringify({
               jsonrpc: "2.0",
@@ -4260,6 +4285,118 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(interrupted.classification).toBe("RETRIEVAL_OR_DECODE_FAILED");
     expect(interrupted.decodedEventsCount ?? 0).toBe(0);
     expect(interrupted.ingestedEventsCount ?? 0).toBe(0);
+  });
+
+  it("X1. getSlot stalls until its timeout after observation: observation timing and pre-cleanup state are preserved on the exception path", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      requestTimeoutMs: 300,
+      hangMethods: ["getSlot"],
+      hangAdvanceMs: 10_000,
+      swaps: [{ signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY" }],
+    });
+    // Original timeout cause preserved.
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+    expect(result.message).toContain("GET_SLOT");
+
+    const telemetry = readJson<
+      StreamTelemetry & {
+        observation: {
+          loopEndedAtMs: number | null;
+          streamStoppedAtMs: number | null;
+          terminationCapturedAtMs: number | null;
+          sealedAtMs: number;
+        };
+      }
+    >(path.join(activeOutDir, "evidence", "stream-telemetry.json"));
+    const o = telemetry.observation;
+    expect(o.endBasis).toBe("OBSERVATION_LOOP_END");
+    expect(o.startMs).toEqual(expect.any(Number));
+    expect(o.endMs).toBe(o.loopEndedAtMs);
+    expect(o.endMs! - o.startMs!).toBeGreaterThanOrEqual(65_000);
+    // Observation end is distinct from the later request settlement / exception capture and sealing.
+    expect(o.streamStoppedAtMs).toBeNull();
+    expect(o.terminationCapturedAtMs!).toBeGreaterThan(o.endMs!);
+    expect(o.sealedAtMs).toBeGreaterThanOrEqual(o.terminationCapturedAtMs!);
+    expect(telemetry.stateBeforeCleanup.reason).toMatch(/^EXCEPTION:/);
+    expect(telemetry.stateBeforeCleanup.coordinatorStatus).toBe("SUBSCRIBED");
+    expect(telemetry.transactionRetrievals.map((r) => r.classification)).toEqual([
+      "CANDIDATE_BOUND_SWAPS",
+    ]);
+    expect(telemetry.stagesNotReached).toEqual(
+      expect.arrayContaining(["SOURCE_CUTOFF", "HISTORY_ENUMERATION", "LP_SCREENING"]),
+    );
+
+    // Report carries the same observation timing; the cutoff never started, so it stays null.
+    const obs = result.observationMetadata!;
+    expect(obs.observationStartMs).toBe(o.startMs);
+    expect(obs.observationEndMs).toBe(o.endMs);
+    expect(obs.cutoffTimestampMs).toBeNull();
+    expect(obs.notificationsReceived).toBe(1);
+    expect(result.keepaliveMetrics).toBeDefined();
+
+    // Exactly-once accounting: the stalled getSlot is recorded once; nothing after it was dispatched.
+    expect(result.ledger.records).toHaveLength(result.ledger.totalAttempts);
+    const slotRecords = result.ledger.records.filter((r) => r.purpose === "GET_SLOT");
+    expect(slotRecords).toHaveLength(1);
+    expect(slotRecords[0]!.ok).toBe(false);
+    expect(result.ledger.records.some((r) => r.purpose === "GET_BLOCK_TIME")).toBe(false);
+    expect(existsSync(path.join(activeOutDir, "evidence", "cutoff-evidence.json"))).toBe(false);
+  });
+
+  it("X2. Transaction error status: explicit err null is NONE; missing, null or malformed metadata stays UNKNOWN", async () => {
+    const first = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        { signature: TEST_SIG_B, offsetMs: 20_000, slot: 461970850, side: "BUY" },
+        { signature: SIG_C, offsetMs: 20_000, slot: 461970851, side: "BUY", meta: "STRIP_ERR" },
+        { signature: SIG_D, offsetMs: 20_000, slot: 461970852, side: "BUY", meta: "MALFORMED_ERR" },
+        ...overflowBurst(40_000),
+      ],
+    });
+    expect(first.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    const t1 = readJson<StreamTelemetry>(
+      path.join(activeOutDir, "evidence", "stream-telemetry.json"),
+    );
+    const bySig = new Map(t1.transactionRetrievals.map((r) => [r.signature, r]));
+    expect(bySig.get(TEST_SIG_B)!.onChainErrorStatus).toBe("NONE");
+    expect(bySig.get(TEST_SIG_B)!.classification).toBe("CANDIDATE_BOUND_SWAPS");
+    for (const sig of [SIG_C, SIG_D]) {
+      const r = bySig.get(sig)!;
+      expect(r.onChainErrorStatus).toBe("UNKNOWN");
+      // Decoder rejection preserved; never classified as a verified on-chain failure or a swap.
+      expect(r.adapterOutcome).not.toBe("SUCCESS");
+      expect(r.decodedEventsCount ?? 0).toBe(0);
+      expect(r.classification).toBe("RETRIEVAL_OR_DECODE_FAILED");
+    }
+
+    rmSync(activeOutDir, { recursive: true, force: true });
+    const second = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        {
+          signature: TEST_SIG_B,
+          offsetMs: 20_000,
+          slot: 461970850,
+          side: "BUY",
+          meta: "META_NULL",
+        },
+        { signature: SIG_C, offsetMs: 20_000, slot: 461970851, side: "SELL", failed: true },
+        ...overflowBurst(40_000),
+      ],
+    });
+    expect(second.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    const t2 = readJson<StreamTelemetry>(
+      path.join(activeOutDir, "evidence", "stream-telemetry.json"),
+    );
+    const bySig2 = new Map(t2.transactionRetrievals.map((r) => [r.signature, r]));
+    expect(bySig2.get(TEST_SIG_B)!.onChainErrorStatus).toBe("UNKNOWN");
+    expect(bySig2.get(TEST_SIG_B)!.classification).toBe("RETRIEVAL_OR_DECODE_FAILED");
+    expect(bySig2.get(SIG_C)!.onChainErrorStatus).toBe("PRESENT");
+    expect(bySig2.get(SIG_C)!.classification).toBe("ONCHAIN_FAILED");
+    // Unavailable-flow behaviour unchanged: no qualified flow from these windows.
+    expect(second.flowEvaluation?.isCoverageSufficient ?? false).toBe(false);
   });
 
   it("W2. Budget exhaustion (4 notifications, 3 shared retrievals) leaves a backlog and stays unavailable", async () => {

@@ -2973,7 +2973,8 @@ Four short samples from one pool on one day support no general rate, no arrival 
   - `4M6d5JsS…` (slot 467437834): one candidate-bound RAY **BUY**.
   - `4wfCxFpR…` (slot 467437834): `meta.err = InstructionError [1, Custom 30]`, rejected by the decoder as **failed on-chain** (`TRANSACTION_FAILED`).
 - **Termination**: `STREAM_QUEUE_LIMIT_EXCEEDED`, with the pending queue reaching 10 within about 10 s of observation. Cutoff, history and LP screening were never reached. The observation, keepalive and per-signature adapter outcomes were not recorded by that build.
-- **Replay**: fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because the required later-stage evidence was never acquired. Nothing is synthesized. The wallet is unchanged.
+- **Replay**: full replay is **unavailable** and fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because the required later-stage evidence was never acquired. This is **not** a successful replay of the original termination; the recorded `STREAM_QUEUE_LIMIT_EXCEEDED` is preserved only in the sealed report. Nothing is synthesized. The wallet is unchanged.
+- **Historical evidence check** (independent review of `160fc12`): all manifest-listed files across **9 diagnostic captures (199 files in total)** verify, and the frozen wallet hash matches.
 
 **Classification**: verified live acquisition plus independent re-decoding. It is **not** complete-window qualification, and it does **not** prove the original runtime's ingestion outcome.
 
@@ -2999,9 +3000,14 @@ Every Solana RPC ledger record now carries `rpcRequestId` and the observed `rpcR
 **Capacity finding**:
 
 - **Request budget**: with 11 base requests, the 14-request ceiling leaves exactly 3 retrievals.
-- **Freshness**: quiet runs reach decision at a cutoff age of 12.1–13.4 s, so no post-cutoff retrieval fits the 15,000 ms freshness ceiling at 2,500 ms pacing.
-- **What can qualify**: a qualifying active window therefore needs at most 3 notifications across the whole ~65 s observation, all decoded before the cutoff.
+- **Freshness (measured margins)**: the five quiet runs reached decision at cutoff ages of 13,426, 13,321, 13,204, 12,651 and 12,095 ms, leaving margins of 1,574–2,905 ms under the 15,000 ms ceiling. One post-cutoff retrieval adds at least the 2,500 ms Solana RPC pacing plus its latency, delaying every later paced request. It would have exceeded the ceiling in four of these runs and fit only narrowly in the run with the largest margin (2,905 ms), and only if its latency stayed under about 400 ms. Post-cutoff retrieval capacity is therefore marginal and run-dependent, not universally impossible.
+- **What can qualify**: under these measured margins, a qualifying active window realistically needs at most 3 notifications across the whole ~65 s observation, decoded before the cutoff. A known failed transaction still consumes one HTTP attempt and one retrieval.
 - **Observed bursts exceed this**: RAY reached at least 13 notifications in about 10 s; ACT showed 15 signatures in 30 s.
 - **Failed transactions also block qualification**: the existing adapter treats an on-chain-failed transaction as a decode failure, recording a loss gap and an unresolved signature. Any window containing one cannot qualify, even though a failed transaction executes no swap. Failed rows made up 1 of 3 RAY retrievals and 1–17 of 20 rows in the ACT history pages.
 
 Any higher ceiling, or a change in failed-transaction semantics, remains a separate proposal.
+
+**Telemetry corrections (offline, review of `160fc12`)**:
+
+- **Exception-path timing**: when an exception bypasses explicit cleanup (for example, `getSlot` stalling until its request timeout after observation), the outer catch now snapshots the stream state before the `finally` cleanup. Telemetry separates the observation-loop end (`OBSERVATION_LOOP_END`), any explicit stream stop, the exception capture after the failing request settled, and sealing. The report keeps the observation start and end; the cutoff stays `null`, because that stage never completed. The original timeout cause and exactly-once accounting are unchanged.
+- **Strict error status**: `onChainErrorStatus` is `NONE` only for an explicit `meta.err: null`, and `PRESENT` only for a well-formed reported error (non-empty string or object). Missing `err`, `meta: null` or malformed values stay `UNKNOWN`. Decoder rejection and unavailable-flow behaviour are unchanged.
