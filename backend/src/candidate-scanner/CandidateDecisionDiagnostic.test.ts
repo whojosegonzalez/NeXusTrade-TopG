@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import {
@@ -2463,5 +2463,167 @@ describe("CandidateDecisionDiagnostic Offline Test Suite", () => {
     expect(replayActiveFreeze.ok).toBe(false);
     expect(replayActiveFreeze.status).toBe("REPLAY_PRE_ADMISSION_FAILED");
     expect(replayActiveFreeze.message).toContain("REJECTED_ACTIVE_FREEZE_AUTHORITY");
+  });
+
+  it("46. Replay manifest coverage: unverified files present on disk cause replay to fail before decision evaluation, and optional absent evidence is handled safely", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const wsTransport = createMockWebSocketTransport({ immediateAck: true });
+    const transport = createDiagnosticMockFetch({ getClock: clock });
+
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: testOutDir,
+      transport,
+      wsTransport,
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(true);
+
+    const manifestPath = path.join(testOutDir, "evidence-manifest.json");
+    const baselineManifestRaw = readFileSync(manifestPath, "utf8");
+    const baselineManifest = JSON.parse(baselineManifestRaw);
+    expect(baselineManifest.files.length).toBe(23);
+
+    // Verify baseline replay succeeds with 23 verified files and outcome ARMED_FIRST_TICK
+    const baselineReplay = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(baselineReplay.ok).toBe(true);
+    expect(baselineReplay.status).toBe("ARMED_FIRST_TICK");
+    expect(baselineReplay.verifiedFilesCount).toBe(23);
+
+    // Sub-case A: Remove bundler-provenance entry from manifest.files and modify that file on disk to 0.9 bundlerPct
+    const bundlerFilePath = path.join(testOutDir, "evidence", "bundler-provenance.json");
+    const bundlerOriginalContent = readFileSync(bundlerFilePath, "utf8");
+    const bundlerData = JSON.parse(bundlerOriginalContent);
+    bundlerData.adaptedBundler.bundlerPct = 0.9;
+    writeFileSync(bundlerFilePath, JSON.stringify(bundlerData), "utf8");
+
+    const manifestNoBundler = {
+      ...baselineManifest,
+      files: baselineManifest.files.filter(
+        (f: { path: string }) => f.path !== "evidence/bundler-provenance.json",
+      ),
+    };
+    writeFileSync(manifestPath, JSON.stringify(manifestNoBundler), "utf8");
+
+    // Replay must fail before decision evaluation (NOT return BUY_GATE_REJECTED or ok: true)
+    const replayBundlerUnverified = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayBundlerUnverified.ok).toBe(false);
+    expect(replayBundlerUnverified.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(replayBundlerUnverified.message).toContain("evidence/bundler-provenance.json");
+    expect(replayBundlerUnverified.decisionResult).toBeUndefined();
+
+    // Restore bundler file and manifest
+    writeFileSync(bundlerFilePath, bundlerOriginalContent, "utf8");
+    writeFileSync(manifestPath, baselineManifestRaw, "utf8");
+
+    // Sub-case B: Remove flow-evaluation entry from manifest.files and modify that file on disk
+    const flowFilePath = path.join(testOutDir, "evidence", "flow-evaluation.json");
+    const flowOriginalContent = readFileSync(flowFilePath, "utf8");
+    const flowData = JSON.parse(flowOriginalContent);
+    flowData.isCoverageSufficient = false;
+    writeFileSync(flowFilePath, JSON.stringify(flowData), "utf8");
+
+    const manifestNoFlow = {
+      ...baselineManifest,
+      files: baselineManifest.files.filter(
+        (f: { path: string }) => f.path !== "evidence/flow-evaluation.json",
+      ),
+    };
+    writeFileSync(manifestPath, JSON.stringify(manifestNoFlow), "utf8");
+
+    const replayFlowUnverified = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayFlowUnverified.ok).toBe(false);
+    expect(replayFlowUnverified.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(replayFlowUnverified.message).toContain("evidence/flow-evaluation.json");
+    expect(replayFlowUnverified.decisionResult).toBeUndefined();
+
+    // Restore flow file and manifest
+    writeFileSync(flowFilePath, flowOriginalContent, "utf8");
+    writeFileSync(manifestPath, baselineManifestRaw, "utf8");
+
+    // Sub-case C: Remove rugcheck-report entry from manifest.files and modify that file on disk
+    const rugCheckFilePath = path.join(testOutDir, "evidence", "rugcheck-report.json");
+    const rugCheckOriginalContent = readFileSync(rugCheckFilePath, "utf8");
+    const rugCheckData = JSON.parse(rugCheckOriginalContent);
+    rugCheckData.rugMetrics = {
+      ...(rugCheckData.rugMetrics ?? {}),
+      hasDangerRisk: true,
+      rugScore: 900,
+    };
+    writeFileSync(rugCheckFilePath, JSON.stringify(rugCheckData), "utf8");
+
+    const manifestNoRugCheck = {
+      ...baselineManifest,
+      files: baselineManifest.files.filter(
+        (f: { path: string }) => f.path !== "evidence/rugcheck-report.json",
+      ),
+    };
+    writeFileSync(manifestPath, JSON.stringify(manifestNoRugCheck), "utf8");
+
+    const replayRugCheckUnverified = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayRugCheckUnverified.ok).toBe(false);
+    expect(replayRugCheckUnverified.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(replayRugCheckUnverified.message).toContain("evidence/rugcheck-report.json");
+    expect(replayRugCheckUnverified.decisionResult).toBeUndefined();
+
+    // Restore rugcheck file and manifest
+    writeFileSync(rugCheckFilePath, rugCheckOriginalContent, "utf8");
+    writeFileSync(manifestPath, baselineManifestRaw, "utf8");
+
+    // Sub-case D: Optional evidence absent and unavailable: deleted from disk AND excluded from manifest
+    // Replay must succeed verification with 22 verified files and evaluate with bundler unavailable (BUY_GATE_REJECTED)
+    unlinkSync(bundlerFilePath);
+    writeFileSync(manifestPath, JSON.stringify(manifestNoBundler), "utf8");
+
+    const replayAbsentOptional = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayAbsentOptional.ok).toBe(true);
+    expect(replayAbsentOptional.status).toBe("BUY_GATE_REJECTED");
+    expect(replayAbsentOptional.verifiedFilesCount).toBe(22);
+    expect(replayAbsentOptional.decisionResult?.outcome).toBe("BUY_GATE_REJECTED");
+    expect(replayAbsentOptional.decisionResult?.rejectionReason).toBe(
+      "BUNDLER_CONCENTRATION_UNKNOWN",
+    );
+
+    // Sub-case D2: Optional flow-evaluation absent on disk and excluded from manifest:
+    // Replay succeeds with 22 verified files and falls back to report.flowEvaluation, outcome ARMED_FIRST_TICK
+    writeFileSync(bundlerFilePath, bundlerOriginalContent, "utf8");
+    unlinkSync(flowFilePath);
+    writeFileSync(manifestPath, JSON.stringify(manifestNoFlow), "utf8");
+
+    const replayAbsentFlow = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayAbsentFlow.ok).toBe(true);
+    expect(replayAbsentFlow.status).toBe("ARMED_FIRST_TICK");
+    expect(replayAbsentFlow.verifiedFilesCount).toBe(22);
+    expect(replayAbsentFlow.decisionResult?.outcome).toBe("ARMED_FIRST_TICK");
+
+    writeFileSync(flowFilePath, flowOriginalContent, "utf8");
+
+    // Sub-case E: Unlisted extra file in responses/ directory fails before decision evaluation
+    writeFileSync(bundlerFilePath, bundlerOriginalContent, "utf8");
+    writeFileSync(manifestPath, baselineManifestRaw, "utf8");
+    const extraResponsePath = path.join(testOutDir, "responses", "99-unlisted-response.json");
+    writeFileSync(extraResponsePath, "{}", "utf8");
+
+    const replayUnlistedResponse = replayCandidateDecisionFromSealedEvidence(testOutDir);
+    expect(replayUnlistedResponse.ok).toBe(false);
+    expect(replayUnlistedResponse.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+    expect(replayUnlistedResponse.message).toContain("responses/99-unlisted-response.json");
+    expect(replayUnlistedResponse.decisionResult).toBeUndefined();
+
+    unlinkSync(extraResponsePath);
   });
 });

@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   RAYDIUM_AMM_V4_LAYOUT_LENGTH,
@@ -2895,6 +2895,50 @@ export function replayCandidateDecisionFromSealedEvidence(
     }
   }
 
+  // Ensure all files present on disk are covered by manifest.files (fail-closed if unlisted file exists)
+  const scanDirForUnlistedFiles = (dir: string, baseRel: string): string | null => {
+    if (!existsSync(dir)) return null;
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (
+        entry.name === ".DS_Store" ||
+        entry.name === "Thumbs.db" ||
+        entry.name === "desktop.ini"
+      ) {
+        continue;
+      }
+      const relPath = baseRel
+        ? `${baseRel}/${entry.name}`.replace(/\\/g, "/")
+        : entry.name.replace(/\\/g, "/");
+
+      if (entry.isDirectory()) {
+        const unlisted = scanDirForUnlistedFiles(path.join(dir, entry.name), relPath);
+        if (unlisted) return unlisted;
+      } else if (entry.isFile()) {
+        if (relPath === "evidence-manifest.json") {
+          continue; // Manifest itself indexes the directory
+        }
+        if (!seenPaths.has(relPath)) {
+          return relPath;
+        }
+      }
+    }
+    return null;
+  };
+
+  const unlistedFile = scanDirForUnlistedFiles(evidenceDir, "");
+  if (unlistedFile) {
+    return {
+      ok: false,
+      status: "INCOMPLETE_MANIFEST_COVERAGE",
+      message: `Evidence file present on disk but missing from manifest: ${unlistedFile}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: 0,
+      fileVerifications: [],
+    };
+  }
+
   const fileVerifications: ReplayVerificationItem[] = [];
 
   // Verify all files listed in manifest
@@ -2959,6 +3003,24 @@ export function replayCandidateDecisionFromSealedEvidence(
         ok: false,
         status: "EVIDENCE_INTEGRITY_MISMATCH",
         message: `SHA-256 or byte length mismatch for report file: ${manifest.reportFile.path}`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+      };
+    }
+  }
+
+  const verifiedFilesSet = new Set(
+    fileVerifications.filter((v) => v.valid).map((v) => v.path.replace(/\\/g, "/")),
+  );
+
+  for (const reqFile of requiredFiles) {
+    if (!verifiedFilesSet.has(reqFile)) {
+      return {
+        ok: false,
+        status: "EVIDENCE_INTEGRITY_MISMATCH",
+        message: `Required evidence file failed verification: ${reqFile}`,
         poolId,
         mintAddress,
         verifiedFilesCount: fileVerifications.length,
@@ -3124,8 +3186,9 @@ export function replayCandidateDecisionFromSealedEvidence(
   // Replay candidate decision points
   const candidateMarketData = marketDataEvidence.candidateMarketData;
 
-  const flowPath = path.join(evidenceDir, "evidence", "flow-evaluation.json");
-  const flowEvaluation = existsSync(flowPath)
+  const flowRelPath = "evidence/flow-evaluation.json";
+  const flowPath = path.join(evidenceDir, flowRelPath);
+  const flowEvaluation = verifiedFilesSet.has(flowRelPath)
     ? JSON.parse(readFileSync(flowPath, "utf8"))
     : report.flowEvaluation;
 
@@ -3161,11 +3224,13 @@ export function replayCandidateDecisionFromSealedEvidence(
     holdersCount?: number;
   } | null = null;
 
-  if (existsSync(rugCheckPath)) {
+  const rugCheckRelPath = "evidence/rugcheck-report.json";
+  if (verifiedFilesSet.has(rugCheckRelPath)) {
     const rcData = JSON.parse(readFileSync(rugCheckPath, "utf8"));
     rugMetrics = rcData.rugMetrics ?? null;
   }
-  if (existsSync(bundlerPath)) {
+  const bundlerRelPath = "evidence/bundler-provenance.json";
+  if (verifiedFilesSet.has(bundlerRelPath)) {
     const bundlerData = JSON.parse(readFileSync(bundlerPath, "utf8"));
     if (bundlerData.adaptedBundler?.bundlerPct !== undefined) {
       rugMetrics = {
