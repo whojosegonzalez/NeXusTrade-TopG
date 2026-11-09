@@ -2875,3 +2875,27 @@ These still replay successfully:
 **Residual limit**: a capture whose raw evidence (history, ledger and transaction responses) was itself consistently forged and re-sealed remains undetectable offline. File integrity proves only that sealed files are unchanged since sealing.
 
 **CI status**: the checks above were verified locally only. GitHub CI results remain pending an operator push or run. Budgets, thresholds, production guards, daemon isolation, historical captures and the standing wallet are unchanged.
+
+---
+
+### 8.21 Active-Option Fartcoin Capture: Valid Quiet Window (Active-Window Objective Still Open)
+
+The operator ran the approved diagnostic on `85bded8018e8a2d4d86e57e3f1f2028e5177ee09` with `--paper --paper-active-window --rugcheck-max-bytes 4194304 --overlap-rugcheck`, after a zero-network dry run. A read-only verification here agrees with the independent review.
+
+- **Capture**: `data/research/diagnostics/candidate-decision-fartcoin-active-2026-11-09T10-40-54-516Z`
+- **Manifest SHA-256**: `781c52f77dad11d538d0e4e4859ad6c6ab01d6201c3a4ca2ff5c92ce1c096c5e`. All 24 listed files verify; there are no unlisted files.
+- **Requests**: 11 HTTP attempts, all HTTP 200, each recorded once. Minimum Solana RPC spacing was 2,504 ms. First dispatch to last completion took 80,535 ms.
+- **Window: quiet.**
+  - 0 notifications, 0 signatures since the witnessed anchor, 0 transaction retrievals.
+  - The sealed active-window evidence holds 0 resolutions and 0 pending workload. Its single recorded gap (`COORDINATOR_CLOSED`) falls about 5.5 s _after_ the cutoff, outside the window.
+  - Qualification is **`QUIET_WINDOW`**, not `ACTIVE_WINDOW`.
+  - Keepalive: 3 client pings, 3 matched pongs.
+- **Timing**: decision cutoff age 13,321 ms, a margin of 1,679 ms under the unchanged 15,000 ms ceiling. The overlapped RugCheck request took 1,023 ms and finished 1,437 ms before `CANDIDATE_MINT` was dispatched.
+- **Security evidence**:
+  - RugCheck: complete, 2,008,582 decoded bytes; metrics recomputed as `AVAILABLE` on replay.
+  - Raw-account validation: 99.786359% inaccessible LP claims; mint and freeze authorities `DISABLED`.
+- **Decision**: `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED` (age 64,989,141 s). DexScreener's five-minute snapshot reported 0 buys, 2 sells and $5.59 volume. Replay (`DECISION_REEVALUATED`) matches. The earlier captures (91 files) and the standing wallet are unchanged.
+
+**Interpretation**: a valid quiet-window result with the active option enabled. It is **not** live active-window qualification, and it does **not** validate the corrected stream-decode request-id path, because no transaction was retrieved. Production completeness remains unverified.
+
+**Next step (proposal only; requires separate operator approval)**: one diagnostic on a supported lead with higher historical turnover, using the reviewed command and unchanged limits. The provisional target is ACT (`B4PHSkL6CeZbxVqm1aUPQuVpc5ERFcaZj7u9dhtphmVX`), with at most one optional exact-pair activity check beforehand.
