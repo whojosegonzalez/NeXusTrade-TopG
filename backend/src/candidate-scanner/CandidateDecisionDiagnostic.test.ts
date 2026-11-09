@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -7,7 +7,12 @@ import {
   replayCandidateDecisionFromSealedEvidence,
   evaluateAuthorityEvidence,
   CANONICAL_ZERO_ADDRESS,
+  DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES,
+  DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
+  type CandidateDecisionDiagnosticResult,
+  type DiagnosticRequestRecord,
 } from "./CandidateDecisionDiagnostic.js";
+import { runCandidateDecisionDiagnosticCli } from "../scripts/candidate-decision-diagnostic.js";
 import {
   CAPTURED_RAY_WSOL_IDENTITIES,
   RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE,
@@ -2973,5 +2978,561 @@ describe("CandidateDecisionDiagnostic replay: recorded outcomes and unknown meta
     expect(stale.ok).toBe(false);
     expect(stale.status).toBe("REPLAY_STALE_DATA");
     expect(stale.decisionResult).toBeUndefined();
+  });
+
+  it("R6. Correctly sealed below-threshold pre-admission rejection: replay preserves PRE_ADMISSION_REJECTED after raw revalidation", async () => {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: replayOutDir,
+      // SYNTHETIC: captured RAY/WSOL accounts whose protocol-derived LP inaccessibility is far below 90%.
+      transport: createDiagnosticMockFetch({ getClock: clock, unqualifiedLp: true }),
+      wsTransport: createMockWebSocketTransport({ immediateAck: true }),
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+    });
+    const diagResult = await diagnostic.run();
+    expect(diagResult.ok).toBe(false);
+    expect(diagResult.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(diagResult.preAdmissionScreening?.rejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+    expect(diagResult.ledger.rugCheckAttempts).toBe(0);
+
+    const replay = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(replay.integrityVerified).toBe(true);
+    expect(replay.fileVerifications.every((v) => v.valid)).toBe(true);
+    expect(replay.ok).toBe(false);
+    expect(replay.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(replay.replayMode).toBe("RECORDED_TERMINATION_PRESERVED");
+    expect(replay.recordedTermination?.message).toBe(diagResult.message);
+    expect(replay.recomputedPreAdmission?.passed).toBe(false);
+    expect(replay.recomputedPreAdmission?.lpSecurityPassed).toBe(false);
+    expect(replay.recomputedPreAdmission?.rejectionReason).toBe("REJECTED_UNLOCKED_LP_RISK");
+    expect(replay.decisionResult).toBeUndefined();
+
+    // Tamper safeguard retained: raw LP edited to pass, without resealing, fails integrity.
+    const lpPath = path.join(replayOutDir, "evidence", "lp-evidence.json");
+    const originalLp = readFileSync(lpPath, "utf8");
+    const lp = JSON.parse(originalLp);
+    lp.validationResult.diagnostics.lpMintState.supply = "0";
+    writeFileSync(lpPath, JSON.stringify(lp), "utf8");
+    const tampered = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(tampered.status).toBe("EVIDENCE_INTEGRITY_MISMATCH");
+    expect(tampered.integrityVerified).toBeUndefined();
+
+    // Synthetic edit + reseal: raw evidence that now passes contradicts the recorded rejection.
+    resealSyntheticCapture(replayOutDir);
+    const contradicted = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(contradicted.ok).toBe(false);
+    expect(contradicted.status).toBe("REPLAY_PRE_ADMISSION_MISMATCH");
+    expect(contradicted.replayMode).toBeUndefined();
+    expect(contradicted.decisionResult).toBeUndefined();
+
+    // Structural corruption (missing raw LP state) remains distinct from qualification failure.
+    delete lp.validationResult.diagnostics.lpMintState;
+    writeFileSync(lpPath, JSON.stringify(lp), "utf8");
+    resealSyntheticCapture(replayOutDir);
+    const structural = replayCandidateDecisionFromSealedEvidence(replayOutDir);
+    expect(structural.status).toBe("REPLAY_LP_EVIDENCE_INVALID");
+    expect(structural.replayMode).toBeUndefined();
+  });
+});
+
+describe("CandidateDecisionDiagnostic RugCheck opt-ins (synthetic, offline)", () => {
+  const optOutDir = path.resolve(
+    process.cwd(),
+    ".tmp",
+    "test-diagnostics",
+    `rugcheck-optins-${Date.now()}`,
+  );
+  const MIB = 1024 * 1024;
+  const sha256Hex = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+
+  const resetOutDir = () => {
+    if (existsSync(optOutDir)) {
+      rmSync(optOutDir, { recursive: true, force: true });
+    }
+  };
+  beforeEach(resetOutDir);
+
+  /** SYNTHETIC RugCheck report that passes strict validation, padded to approximately targetBytes. */
+  function syntheticRugCheckBody(targetBytes: number, overrides: Record<string, unknown> = {}) {
+    const base: Record<string, unknown> = {
+      score: 150,
+      tokenMeta: { mutable: false },
+      topHolders: [
+        { address: "Holder1", pct: 5.0 },
+        { address: "Holder2", pct: 4.0 },
+      ],
+      totalHolders: 450,
+      risks: [{ name: "Info", level: "info" }],
+      syntheticPadding: "",
+      ...overrides,
+    };
+    const baseLen = Buffer.byteLength(JSON.stringify(base));
+    return JSON.stringify({
+      ...base,
+      syntheticPadding: "x".repeat(Math.max(0, targetBytes - baseLen)),
+    });
+  }
+
+  interface RugCheckCtx {
+    readonly init?: RequestInit | undefined;
+    readonly advanceClock: (ms: number) => void;
+  }
+
+  async function runOptIn(params: {
+    rugCheck?: (ctx: RugCheckCtx) => Promise<Response> | Response;
+    pairOverride?: () => Response;
+    scenario?: MockFetchScenario;
+    rugCheckMaxResponseBytes?: number;
+    overlapRugCheckWithMintPacing?: boolean;
+    requestTimeoutMs?: number;
+    overallTimeoutMs?: number;
+  }) {
+    const now = 1791931000 * 1000;
+    let clockTime = now - 70_000;
+    const clock = () => clockTime;
+    const sleeper = async (ms: number) => {
+      clockTime += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    const baseFetch = createDiagnosticMockFetch({ getClock: clock, ...(params.scenario ?? {}) });
+    const rugCheckSignals: AbortSignal[] = [];
+    const transport = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlStr.includes("api.rugcheck.xyz/v1/tokens/")) {
+        if (init?.signal) rugCheckSignals.push(init.signal);
+        if (params.rugCheck) {
+          return params.rugCheck({
+            init,
+            advanceClock: (ms) => {
+              clockTime += ms;
+            },
+          });
+        }
+      }
+      if (params.pairOverride && urlStr.includes("api.dexscreener.com/latest/dex/pairs")) {
+        return params.pairOverride();
+      }
+      return baseFetch(input, init);
+    };
+    const diagnostic = new CandidateDecisionDiagnostic({
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      outDir: optOutDir,
+      transport,
+      wsTransport: createMockWebSocketTransport({ immediateAck: true }),
+      clock,
+      sleeper,
+      executionContext: "PAPER_SIMULATION",
+      observationDurationMs: 65_000,
+      ...(params.requestTimeoutMs !== undefined
+        ? { requestTimeoutMs: params.requestTimeoutMs }
+        : {}),
+      ...(params.overallTimeoutMs !== undefined
+        ? { overallTimeoutMs: params.overallTimeoutMs }
+        : {}),
+      ...(params.rugCheckMaxResponseBytes !== undefined
+        ? { rugCheckMaxResponseBytes: params.rugCheckMaxResponseBytes }
+        : {}),
+      ...(params.overlapRugCheckWithMintPacing !== undefined
+        ? { overlapRugCheckWithMintPacing: params.overlapRugCheckWithMintPacing }
+        : {}),
+    });
+    const result = await diagnostic.run();
+    return { result, rugCheckSignals };
+  }
+
+  const recordOf = (result: CandidateDecisionDiagnosticResult, purpose: string) =>
+    result.ledger.records.filter((r) => r.purpose === purpose);
+  const rugCheckRecord = (result: CandidateDecisionDiagnosticResult): DiagnosticRequestRecord => {
+    const recs = recordOf(result, "RUGCHECK_REPORT");
+    expect(recs).toHaveLength(1);
+    return recs[0]!;
+  };
+
+  /** Every dispatched attempt recorded once, linked to a unique sealed response, within budgets and pacing. */
+  function expectLedgerConsistent(result: CandidateDecisionDiagnosticResult) {
+    const { ledger } = result;
+    expect(ledger.records).toHaveLength(ledger.totalAttempts);
+    expect(ledger.totalAttempts).toBeLessThanOrEqual(14);
+    expect(ledger.transactionDecodeAttempts).toBeLessThanOrEqual(3);
+    expect(ledger.rugCheckAttempts).toBeLessThanOrEqual(1);
+    expect(recordOf(result, "RUGCHECK_REPORT")).toHaveLength(ledger.rugCheckAttempts);
+    const files = ledger.records.map((r) => r.responseFile);
+    expect(new Set(files).size).toBe(files.length);
+    const manifest = readJson<{ files: Array<{ path: string }> }>(
+      path.join(optOutDir, "evidence-manifest.json"),
+    );
+    const listed = new Set(manifest.files.map((f) => f.path));
+    for (const file of files) {
+      expect(listed.has(file!)).toBe(true);
+    }
+    const rpcDispatches = ledger.records
+      .filter((r) => r.provider === "SOLANA_RPC")
+      .map((r) => r.dispatchedAtMs)
+      .sort((a, b) => a - b);
+    for (let i = 1; i < rpcDispatches.length; i++) {
+      expect(rpcDispatches[i]! - rpcDispatches[i - 1]!).toBeGreaterThanOrEqual(2_500);
+    }
+  }
+
+  const rugCheckEvidence = () =>
+    readJson<Record<string, unknown>>(path.join(optOutDir, "evidence", "rugcheck-report.json"));
+
+  it("O1. Default: shared 1 MiB ceiling and serial retrieval; a complete >1 MiB report stays unavailable", async () => {
+    const body = syntheticRugCheckBody(1.5 * MIB);
+    const { result } = await runOptIn({ rugCheck: () => new Response(body, { status: 200 }) });
+    expect(result.ok).toBe(true);
+    expect(result.decisionResult?.outcome).toBe("BUY_GATE_REJECTED");
+
+    const rc = rugCheckRecord(result);
+    expect(rc.ok).toBe(false);
+    expect(rc.error).toContain(`maximum allowed limit of ${DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES}`);
+    expect(rc.responseBodyMetadata?.bodyStatus).toBe("OVER_LIMIT");
+    expect(rc.responseBodyMetadata?.ceilingBytes).toBe(MIB);
+    expect(rc.responseBodyMetadata?.retainedBytes).toBe(MIB);
+    expect(rc.responseBodyMetadata?.retainedSha256).toBe(
+      sha256Hex(Buffer.from(body, "utf8").subarray(0, MIB)),
+    );
+    expect(rc.responseBodyMetadata?.observedBytesAtStopLowerBound).toBeGreaterThan(MIB);
+    // No truncated prefix is sealed.
+    expect(readFileSync(path.join(optOutDir, rc.responseFile!)).length).toBe(0);
+
+    // Serial default: RugCheck dispatched only after CANDIDATE_MINT completed.
+    const mint = recordOf(result, "CANDIDATE_MINT")[0]!;
+    expect(rc.dispatchedAtMs).toBeGreaterThanOrEqual(mint.completedAtMs);
+
+    const evidence = rugCheckEvidence();
+    expect(evidence.rugMetrics).toBeNull();
+    expect(evidence.validationStatus).toBe("REQUEST_NOT_OK");
+    expect(evidence.retrievalMode).toBe("SERIAL_AFTER_PRE_ADMISSION");
+    expect(evidence).not.toHaveProperty("rawRugCheck");
+    expectLedgerConsistent(result);
+
+    const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedRugCheck?.status).toBe("REQUEST_NOT_OK");
+    expect(replay.recomputedRugCheck?.metrics).toBeNull();
+  });
+
+  it("O2. Explicit 4 MiB RugCheck ceiling: complete valid reports above 1 MiB and below 4 MiB succeed and replay", async () => {
+    for (const size of [1.5 * MIB, 3.9 * MIB]) {
+      resetOutDir();
+      const body = syntheticRugCheckBody(size);
+      expect(Buffer.byteLength(body)).toBeGreaterThan(MIB);
+      expect(Buffer.byteLength(body)).toBeLessThan(4 * MIB);
+      const { result } = await runOptIn({
+        rugCheck: () => new Response(body, { status: 200 }),
+        rugCheckMaxResponseBytes: DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
+      });
+      expect(result.status).toBe("ARMED_FIRST_TICK");
+
+      const rc = rugCheckRecord(result);
+      expect(rc.ok).toBe(true);
+      expect(rc.responseBodyMetadata?.bodyStatus).toBe("COMPLETE");
+      expect(rc.responseBodyMetadata?.ceilingBytes).toBe(4 * MIB);
+      expect(rc.responseBodyMetadata?.retainedBytes).toBe(Buffer.byteLength(body));
+      expect(rc.responseBodyMetadata?.retainedSha256).toBe(sha256Hex(Buffer.from(body, "utf8")));
+      expect(rc.responseBodyMetadata?.retainedSha256).toBe(rc.wireDigestSha256);
+      expect(rc.responseBodyMetadata?.observedBytesAtStopLowerBound).toBeNull();
+
+      // Full sanitized response sealed once; derived evidence references it without duplicating it.
+      const sealed = JSON.parse(readFileSync(path.join(optOutDir, rc.responseFile!), "utf8"));
+      expect(sealed).toEqual(JSON.parse(body));
+      const evidencePath = path.join(optOutDir, "evidence", "rugcheck-report.json");
+      expect(readFileSync(evidencePath).length).toBeLessThan(8_192);
+      const evidence = rugCheckEvidence();
+      expect(evidence.validationStatus).toBe("AVAILABLE");
+      expect(evidence.responseFile).toBe(rc.responseFile);
+      expect(evidence.rugMetrics).toEqual({
+        rugScore: 150,
+        hasDangerRisk: false,
+        top10HolderPct: 0.09,
+        holdersCount: 450,
+      });
+      expectLedgerConsistent(result);
+
+      const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+      expect(replay.ok).toBe(true);
+      expect(replay.status).toBe("ARMED_FIRST_TICK");
+      expect(replay.matchesRecordedDecision).toBe(true);
+      expect(replay.recomputedRugCheck?.status).toBe("AVAILABLE");
+      expect(replay.recomputedRugCheck?.metrics?.holdersCount).toBe(450);
+    }
+  });
+
+  it("O3. Over-limit, truncated, malformed, and stalled RugCheck responses remain unavailable under the opt-in", async () => {
+    const opt = { rugCheckMaxResponseBytes: DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES };
+
+    // Over-limit: never parsed; retained prefix and lower bound recorded separately.
+    resetOutDir();
+    const overBody = syntheticRugCheckBody(4 * MIB + 1);
+    expect(Buffer.byteLength(overBody)).toBeGreaterThan(4 * MIB);
+    const over = await runOptIn({
+      ...opt,
+      rugCheck: () => new Response(overBody, { status: 200 }),
+    });
+    expect(over.result.status).not.toBe("ARMED_FIRST_TICK");
+    const overRc = rugCheckRecord(over.result);
+    expect(overRc.ok).toBe(false);
+    expect(overRc.responseBodyMetadata?.bodyStatus).toBe("OVER_LIMIT");
+    expect(overRc.responseBodyMetadata?.retainedBytes).toBe(4 * MIB);
+    expect(overRc.responseBodyMetadata?.observedBytesAtStopLowerBound).toBeGreaterThan(4 * MIB);
+    expect(rugCheckEvidence().rugMetrics).toBeNull();
+
+    // Truncated document (complete transfer of an incomplete JSON body): unavailable.
+    resetOutDir();
+    const truncatedBody = syntheticRugCheckBody(2 * MIB).slice(0, 1.5 * MIB);
+    const truncated = await runOptIn({
+      ...opt,
+      rugCheck: () => new Response(truncatedBody, { status: 200 }),
+    });
+    expect(truncated.result.status).not.toBe("ARMED_FIRST_TICK");
+    expect(rugCheckEvidence().validationStatus).toBe("RESPONSE_NOT_JSON");
+    expect(rugCheckEvidence().rugMetrics).toBeNull();
+    const truncatedReplay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(truncatedReplay.recomputedRugCheck?.metrics).toBeNull();
+    expect(truncatedReplay.matchesRecordedDecision).toBe(true);
+
+    // Malformed (valid JSON, missing risk list): strict validator rejects.
+    resetOutDir();
+    const malformedBody = syntheticRugCheckBody(1.2 * MIB, { risks: undefined });
+    const malformed = await runOptIn({
+      ...opt,
+      rugCheck: () => new Response(malformedBody, { status: 200 }),
+    });
+    expect(malformed.result.status).not.toBe("ARMED_FIRST_TICK");
+    expect(rugCheckEvidence().validationStatus).toBe("VALIDATION_REJECTED");
+    expect(replayCandidateDecisionFromSealedEvidence(optOutDir).recomputedRugCheck?.status).toBe(
+      "VALIDATION_REJECTED",
+    );
+
+    // Stalled body: per-request timeout aborts and cancels the stream; nothing is derived.
+    for (const overlap of [false, true]) {
+      resetOutDir();
+      let streamCancelled = false;
+      const stalled = await runOptIn({
+        ...opt,
+        overlapRugCheckWithMintPacing: overlap,
+        requestTimeoutMs: 300,
+        rugCheck: () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"score":150,'));
+              },
+              cancel() {
+                streamCancelled = true;
+              },
+            }),
+            { status: 200 },
+          ),
+      });
+      expect(stalled.result.ok).toBe(false);
+      expect(stalled.result.status).toBe("OVERALL_DIAGNOSTIC_TIMEOUT");
+      const stalledRc = rugCheckRecord(stalled.result);
+      expect(stalledRc.ok).toBe(false);
+      expect(stalledRc.responseBodyMetadata?.bodyStatus).toBe("INCOMPLETE");
+      expect(stalledRc.responseBodyMetadata?.retainedBytes).toBeNull();
+      expect(streamCancelled).toBe(true);
+      expect(stalled.rugCheckSignals[0]?.aborted).toBe(true);
+      expect(existsSync(path.join(optOutDir, "evidence", "rugcheck-report.json"))).toBe(false);
+      expectLedgerConsistent(stalled.result);
+    }
+  });
+
+  it("O4. Non-RugCheck purposes keep the 1 MiB ceiling under the RugCheck opt-in", async () => {
+    const pad = "y".repeat(1.5 * MIB);
+    const { result } = await runOptIn({
+      rugCheckMaxResponseBytes: DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
+      overlapRugCheckWithMintPacing: true,
+      pairOverride: () =>
+        new Response(JSON.stringify({ schemaVersion: "1.0.0", pairs: [], pad }), { status: 200 }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("EXACT_PAIR_FETCH_FAILED");
+    const pair = recordOf(result, "EXACT_PAIR")[0]!;
+    expect(pair.error).toContain(
+      `maximum allowed limit of ${DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES}`,
+    );
+    expect(pair.responseBodyMetadata).toBeUndefined();
+    expect(result.ledger.rugCheckAttempts).toBe(0);
+    expectLedgerConsistent(result);
+  });
+
+  it("O5. Overlap: RugCheck dispatched during CANDIDATE_MINT pacing with unchanged accounting, pacing, and replay", async () => {
+    const { result, rugCheckSignals } = await runOptIn({ overlapRugCheckWithMintPacing: true });
+    expect(result.status).toBe("ARMED_FIRST_TICK");
+    expect(result.ledger.totalAttempts).toBe(11);
+    expect(result.ledger.rugCheckAttempts).toBe(1);
+
+    const rc = rugCheckRecord(result);
+    const lpRefreshes = recordOf(result, "LP_REFRESH");
+    const mint = recordOf(result, "CANDIDATE_MINT")[0]!;
+    expect(rc.dispatchedAtMs).toBeGreaterThanOrEqual(lpRefreshes[1]!.completedAtMs);
+    expect(rc.dispatchedAtMs).toBeLessThan(mint.dispatchedAtMs);
+    expect(mint.dispatchedAtMs - lpRefreshes[1]!.dispatchedAtMs).toBeGreaterThanOrEqual(2_500);
+    expect(rugCheckSignals[0]?.aborted).toBe(false);
+    expect(rugCheckEvidence().retrievalMode).toBe("OVERLAPPED_WITH_CANDIDATE_MINT_PACING");
+    expectLedgerConsistent(result);
+
+    const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.status).toBe("ARMED_FIRST_TICK");
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedRugCheck?.status).toBe("AVAILABLE");
+  });
+
+  it("O6. Overlap + authority rejection: started RugCheck is cancelled, settled, and recorded exactly once before sealing", async () => {
+    const activeFreeze = { freezeAuthority: TEST_MINT };
+
+    // RugCheck still in flight at the authority rejection: aborted and settled before sealing.
+    const pending = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      scenario: activeFreeze,
+      rugCheck: ({ init }) =>
+        new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+    });
+    expect(pending.result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(pending.result.preAdmissionScreening?.rejectionReason).toBe(
+      "REJECTED_ACTIVE_FREEZE_AUTHORITY",
+    );
+    expect(pending.rugCheckSignals).toHaveLength(1);
+    expect(pending.rugCheckSignals[0]!.aborted).toBe(true);
+    const abortedRc = rugCheckRecord(pending.result);
+    expect(abortedRc.ok).toBe(false);
+    expect(abortedRc.error).toContain("TERMINATED_PRE_ADMISSION_REJECTED");
+    expect(abortedRc.responseBodyMetadata?.bodyStatus).toBe("INCOMPLETE");
+    expect(existsSync(path.join(optOutDir, "evidence", "rugcheck-report.json"))).toBe(false);
+    expectLedgerConsistent(pending.result);
+    const pendingReplay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(pendingReplay.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(pendingReplay.replayMode).toBe("RECORDED_TERMINATION_PRESERVED");
+
+    // RugCheck already completed before the rejection: one spent request, recorded, never consumed.
+    resetOutDir();
+    const completed = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      scenario: activeFreeze,
+    });
+    expect(completed.result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(rugCheckRecord(completed.result).ok).toBe(true);
+    expect(completed.result.decisionResult).toBeUndefined();
+    expect(existsSync(path.join(optOutDir, "evidence", "rugcheck-report.json"))).toBe(false);
+    expectLedgerConsistent(completed.result);
+
+    // Default serial mode spends no RugCheck request on the same rejection.
+    resetOutDir();
+    const serial = await runOptIn({ scenario: activeFreeze });
+    expect(serial.result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(serial.result.ledger.rugCheckAttempts).toBe(0);
+
+    // LP below 90%: overlap never starts RugCheck.
+    resetOutDir();
+    const lowLp = await runOptIn({
+      overlapRugCheckWithMintPacing: true,
+      scenario: { unqualifiedLp: true },
+    });
+    expect(lowLp.result.status).toBe("PRE_ADMISSION_REJECTED");
+    expect(lowLp.result.ledger.rugCheckAttempts).toBe(0);
+  });
+
+  it("O7. Stale evidence still fails at the unchanged 15,000 ms ceiling with both opt-ins", async () => {
+    const { result } = await runOptIn({
+      rugCheckMaxResponseBytes: DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
+      overlapRugCheckWithMintPacing: true,
+      overallTimeoutMs: 180_000,
+      rugCheck: ({ advanceClock }) => {
+        advanceClock(15_500); // SYNTHETIC slow response consuming the freshness budget
+        return new Response(syntheticRugCheckBody(1.5 * MIB), { status: 200 });
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("STALE_DATA");
+    expect(result.decisionResult).toBeUndefined();
+    expectLedgerConsistent(result);
+    const replay = replayCandidateDecisionFromSealedEvidence(optOutDir);
+    expect(replay.status).toBe("STALE_DATA");
+    expect(replay.replayMode).toBe("RECORDED_TERMINATION_PRESERVED");
+  });
+
+  it("O8. Invalid opt-in options fail at construction before any network activity", () => {
+    const transport = vi.fn(async () => new Response("{}", { status: 200 }));
+    const construct = (extra: Record<string, unknown>) =>
+      new CandidateDecisionDiagnostic({
+        poolId: TEST_POOL_ID,
+        mintAddress: TEST_MINT,
+        rpcUrl: TEST_RPC_URL,
+        transport,
+        wsTransport: createMockWebSocketTransport({ immediateAck: true }),
+        executionContext: "PAPER_SIMULATION",
+        ...extra,
+      });
+    for (const bad of [0, -1, 1.5, Number.NaN, 4 * MIB + 1, "1048576"]) {
+      expect(() => construct({ rugCheckMaxResponseBytes: bad })).toThrow(
+        "[DIAGNOSTIC_INVALID_ARG]",
+      );
+    }
+    expect(() => construct({ overlapRugCheckWithMintPacing: "yes" })).toThrow(
+      "[DIAGNOSTIC_INVALID_ARG]",
+    );
+    expect(() =>
+      construct({ rugCheckMaxResponseBytes: 4 * MIB, overlapRugCheckWithMintPacing: true }),
+    ).not.toThrow();
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it("O9. CLI: invalid opt-ins fail before any network activity; dry-run with opt-ins stays zero-network", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const base = ["--pool", TEST_POOL_ID, "--mint", TEST_MINT, "--paper"];
+      const invalid = [
+        [...base, "--live", "--rugcheck-max-bytes", String(4 * MIB + 1)],
+        [...base, "--live", "--rugcheck-max-bytes", "abc"],
+        [...base, "--rugcheck-max-bytes", "0"],
+        [...base, "--rugcheck-max-bytes", "1.5"],
+        [...base, "--live", "--overlap-rugcheck=yes"],
+        [...base, "--live", "--rugcheck-max-byte", "2097152"],
+      ];
+      for (const args of invalid) {
+        await expect(runCandidateDecisionDiagnosticCli(args)).rejects.toThrow("[CLI_INVALID_ARG]");
+      }
+
+      await runCandidateDecisionDiagnosticCli([
+        ...base,
+        "--dry-run",
+        "--rugcheck-max-bytes",
+        String(DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES),
+        "--overlap-rugcheck",
+      ]);
+      const output = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(output).toContain("4194304 decoded bytes (OPT-IN, RUGCHECK_REPORT only)");
+      expect(output).toContain("OVERLAPPED with CANDIDATE_MINT pacing");
+      expect(output).toContain("Overlap trade-off");
+      expect(output).toContain("without dispatching network calls");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+    }
   });
 });

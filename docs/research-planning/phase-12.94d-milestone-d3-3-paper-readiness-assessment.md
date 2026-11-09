@@ -2555,3 +2555,125 @@ If the body exceeds 4 MiB, the run stays fail-closed and the recorded headers or
 - **Documentation discrepancies (recorded, not changed in code)**: §8.15.4.C anticipated `MATURITY_GATE_FAILED`, but the runtime gate is `MATURITY_WINDOW_GATE` / `MATURITY_WINDOW_GATE_FAILED`. The §8.15.1 threshold summary (liquidity ≥ $30,000 micro, L/MC ≥ 0.08 / 0.04, holders ≥ 100 / 250) differs from the requirements recorded by the runtime in Run 2 (liquidity ≥ $20,000, `15% <= L/MC <= 55%`, `Holders >= 350`). The sealed runtime values are authoritative for these captures. No strategy threshold was changed.
 - **Virtual wallet**: `U:\Projects\TopG\.tmp\virtual-wallet.json` remains 7.9259 SOL with SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`, re-verified unchanged. Spending ceiling $0.00.
 - **No network activity** was performed for this correction: no provider requests, RPC, sockets, captures, reruns, daemons or trades.
+
+---
+
+### 8.17 Pre-Admission Replay Preservation & Opt-In RugCheck Diagnostic Handling (Offline Implementation)
+
+Independent review of `b8d2819` accepted the §8.16 replay correction. This section records two further offline changes. **Neither is enabled by default, wired into production or daemon paths, or exercised live.**
+
+#### 1. Valid Pre-Admission Rejections Are Preserved in Replay
+
+**Defect**: the RAY/WSOL capture `candidate-decision-2026-11-09T02-01-06-791Z` (§8.14) recorded `PRE_ADMISSION_REJECTED`, but replay returned `REPLAY_PRE_ADMISSION_FAILED` without `integrityVerified` or `replayMode`. The LP qualification check (≥ 90%) ran before recorded-termination preservation, so valid below-threshold evidence was treated as a replay failure.
+
+**Correction** (`replayCandidateDecisionFromSealedEvidence`):
+
+1. **Integrity and binding first (unchanged)**: manifest schema and coverage, hashes and sizes, and LP identity binding. Every result after file verification now carries `integrityVerified: true`.
+2. **Structural validation of raw evidence (fail-closed, distinct statuses)**: missing raw pool/LP-mint state, LP accounting that cannot be computed (`REPLAY_LP_EVIDENCE_INVALID`), and a missing or unparseable mint account (`REPLAY_MINT_EVIDENCE_INVALID`). These were previously reported as `REPLAY_PRE_ADMISSION_FAILED`.
+3. **Strategy qualification recomputed from raw evidence**: LP ≥ 90% via exact integer accounting, and both authorities `DISABLED`. The result is reported as `recomputedPreAdmission` and is **applied only after the recorded outcome is read**:
+   - **Recorded termination** (`ok: false`): the recorded pre-admission result must agree with the recomputation. A recorded `PRE_ADMISSION_REJECTED` requires a recorded failed screening with the same rejection reason. On agreement the termination is preserved (`RECORDED_TERMINATION_PRESERVED`) and no decision is evaluated. A contradiction fails closed with `REPLAY_PRE_ADMISSION_MISMATCH`.
+   - **Recorded decision** (`ok: true`): pre-admission must pass on recomputation; otherwise `REPLAY_PRE_ADMISSION_FAILED`, as before.
+
+**Sealed captures replayed offline** (read-only; all 67 files under `data/research/diagnostics/` re-hashed identically):
+
+| Capture                         | Replay                                                                                                                                                              |
+| :------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| RAY/WSOL `…02-01-06-791Z`       | `PRE_ADMISSION_REJECTED`, `RECORDED_TERMINATION_PRESERVED`, `integrityVerified: true`, 18/18 files; recomputed LP 0.135778%, `REJECTED_UNLOCKED_LP_RISK`            |
+| Fartcoin Run 1 `…05-54-10-245Z` | `STALE_DATA` preserved (unchanged from §8.16)                                                                                                                       |
+| Fartcoin Run 2 `…05-59-59-714Z` | `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED` at `1794204082618`, `matchesRecordedDecision: true`; recomputed RugCheck `REQUEST_NOT_OK` (metrics unavailable) |
+
+**Regression R6** (synthetic, portable): a correctly sealed below-threshold rejection preserves `PRE_ADMISSION_REJECTED`. Unsealed tampering still fails integrity. A re-sealed raw edit that contradicts the recorded rejection fails with `REPLAY_PRE_ADMISSION_MISMATCH`. Missing raw LP state fails structurally with `REPLAY_LP_EVIDENCE_INVALID`.
+
+#### 2. Explicit RugCheck Diagnostic Opt-Ins
+
+Both opt-ins exist only on the standalone diagnostic (`CandidateDecisionDiagnostic` options and the isolated CLI). There is **no environment-based enablement**, and the production and daemon paths are not wired.
+
+| Opt-in                                 | Option / CLI flag                                       | Accepted values               | Default (unchanged)                         |
+| :------------------------------------- | :------------------------------------------------------ | :---------------------------- | :------------------------------------------ |
+| RugCheck-only decoded-response ceiling | `rugCheckMaxResponseBytes` / `--rugcheck-max-bytes <n>` | integer 1 … 4,194,304 (4 MiB) | shared 1,048,576-byte (1 MiB) ceiling       |
+| Overlapped RugCheck retrieval          | `overlapRugCheckWithMintPacing` / `--overlap-rugcheck`  | flag / boolean                | serial retrieval after pre-admission passes |
+
+- **Validation before any network activity**: invalid values (0, negative, non-integer, `NaN`, > 4 MiB, non-numeric strings, a non-boolean overlap) throw `[DIAGNOSTIC_INVALID_ARG]` at construction or `[CLI_INVALID_ARG]` in the CLI.
+- **Strict CLI parsing**: the CLI now parses strictly, so a misspelled opt-in fails instead of silently falling back to defaults.
+- **Dry-run is zero-network**: the dry-run prints the effective RugCheck ceiling, retrieval mode, unchanged limits and the overlap trade-off, and makes no network calls. `.env` (RPC URL, API keys) is now loaded only after the dry-run exit.
+- **Non-RugCheck purposes always keep the 1 MiB ceiling.** The RugCheck ceiling is a decoded **response-byte ceiling**, not a process memory limit (§8.17.4).
+
+**Overlap behaviour.** When opted in and validated LP evidence passes the unchanged 90% rule, `RUGCHECK_REPORT` is dispatched immediately, before `CANDIDATE_MINT`. The candidate-mint request then waits its normal 2,500 ms Solana RPC pacing while RugCheck runs. The RugCheck result is consumed only after authority validation passes; its own retrieval time is still rechecked against 15,000 ms at the decision.
+
+- **Trade-off**: early retrieval can spend one RugCheck request before an authority rejection. That request is recorded and sealed but never consumed, and **overlap never admits a candidate**. Default serial mode spends no RugCheck request on such a rejection. If LP is below 90%, overlap never starts.
+- **Cancellation and settlement**: authority rejection, mint failure, deadline, timeout, HTTP 429 and any exception now go through `finishWithFailureSettled`. It aborts the overlapped request through its own controller (linked to the overall abort signal) and waits up to 2,000 ms for it to settle. Settlement is effectively immediate because the dispatch races its abort signal. If the bound ever elapsed, the run would end with the explicit status `EARLY_RUGCHECK_UNSETTLED`.
+- **Sealing guard**: sealing refuses to proceed while an overlapped request is pending (`[EARLY_RUGCHECK_PENDING]`). Every dispatched attempt is recorded exactly once, with its own response file; a request aborted before dispatch is never counted.
+- **Preserved**: ≤ 14 HTTP attempts, ≤ 3 shared transaction retrievals, provider pacing (2,500 ms Solana RPC spacing enforced by the unchanged budget manager), 10 s per request, 90 s overall, 15,000 ms freshness checks, one request per purpose (guarded by `[RUGCHECK_SINGLE_REQUEST_VIOLATION]`), no retries or escalation, and all strategy thresholds and authority requirements.
+
+#### 3. RugCheck Evidence and Replay
+
+- **Body-size evidence** (`responseBodyMetadata`, recorded on the `RUGCHECK_REPORT` ledger record in all modes):
+  - `ceilingBytes`
+  - `bodyStatus`: `COMPLETE` / `OVER_LIMIT` / `INCOMPLETE`
+  - `retainedBytes` and `retainedSha256`: the complete body, or only the truncated prefix when over the limit
+  - `observedBytesAtStopLowerBound`: over-limit only; a **lower bound**, not the body size
+  - `declaredContentLength` and `declaredContentEncoding`: provider-declared headers, verbatim. They are **metadata, not proof** of the complete decoded size: Content-Length describes the encoded transfer and may be absent.
+  - The shared bounded transport now throws a typed `BoundedResponseTooLargeError` with these fields; its message is unchanged.
+- **No metrics from truncated or invalid bodies**: over-limit, transport-incomplete (abort, timeout, stall), non-JSON (including complete transfers of a truncated document) and validator-rejected bodies stay unavailable. A truncated prefix is never sealed or parsed.
+- **Single sealed payload**: the complete sanitized response is sealed once, in its `responses/NN-rugcheck-report.json`. `evidence/rugcheck-report.json` now holds only the derived metrics, `validationStatus`, `responseFile`, `wireDigestSha256`, `responseBodyMetadata`, `retrievalMode` and `retrievedAtMs`. It no longer duplicates the raw report (the previous `rawRugCheck` field).
+- **Shared strict validation**: the validation inside `BuyGateTriggerService.fetchRugCheckMetrics` was extracted unchanged into the synchronous `BuyGateTriggerService.validateRugCheckReportPayload`. Live retrieval, the diagnostic and replay all call it, and the public `fetchRugCheckMetrics` API and behaviour are unchanged.
+- **Replay recomputation**: replay recomputes RugCheck metrics from the verified sealed response (`recomputedRugCheck`) instead of trusting stored derived metrics. Sealed derived metrics that disagree fail closed with `REPLAY_RUGCHECK_EVIDENCE_MISMATCH`.
+
+#### 4. Memory Accounting at the 4 MiB Ceiling (Estimate, Not Measured)
+
+The ceiling bounds decoded response bytes only. For one RugCheck response at the cap, transient memory includes:
+
+- the bounded reader's chunks and their concatenation, plus the array-buffer copy (≈ 3 × 4 MiB);
+- the decoded text (4–8 MiB, depending on string representation);
+- the parsed object graph (typically several times the text size);
+- the redacted deep copy made at sealing, the indented JSON serialization, and the buffer used for hashing.
+
+Recorded responses are held until sealing. A realistic peak is tens of MiB (order 50–100 MiB worst case) for this request alone — within default Node heap limits, but **not** 4 MiB.
+
+**Redaction fix found during this work**: the shared redaction pattern `/([a-zA-Z0-9]+:\/\/)…@/g` (`SolanaTrackerBundlerCaptureTool.redactSensitiveText`, applied to every sealed response) backtracked quadratically on long alphanumeric runs. A synthetic 3.9 MiB report stalled sealing; extrapolated from measurements, about 3 hours at 4 MiB. It is now anchored with a lookbehind `(?<![a-zA-Z0-9])`, which produces identical matches (verified on representative inputs) and redacts 4 MiB adversarial strings in about 40 ms. No previously sealed capture was affected: neither Fartcoin run sealed a RugCheck body.
+
+#### 5. Offline Coverage (Synthetic Mocks, No Network)
+
+`CandidateDecisionDiagnostic.test.ts` O1–O9:
+
+- **O1 – Default unchanged**: a complete 1.5 MiB report stays unavailable under the shared 1 MiB ceiling with serial retrieval; the prefix and lower bound are recorded, no prefix is sealed, and replay matches.
+- **O2 – Opt-in success**: 1.5 MiB and 3.9 MiB valid reports succeed only with the 4 MiB opt-in. The sealed payload is complete, derived evidence stays under 8 KiB, and replay recomputes `AVAILABLE`.
+- **O3 – Still unavailable under the opt-in**: over 4 MiB, truncated JSON, a missing risk list, and a stalled body (serial and overlapped) are all unavailable. The stalled stream is cancelled and its signal aborted.
+- **O4 – Other purposes**: a 1.5 MiB DexScreener response still fails at 1 MiB under the opt-in.
+- **O5 – Overlap accounting**: RugCheck is dispatched after the LP batch and before `CANDIDATE_MINT`, with the mint still paced ≥ 2,500 ms. There are 11 attempts, the ledger is consistent, and replay matches.
+- **O6 – Overlap with authority rejection**: an in-flight RugCheck is aborted, settled and recorded once before sealing; a completed one is recorded but not consumed; serial mode spends none; LP below 90% never starts it.
+- **O7 – Freshness**: stale evidence still fails at 15,000 ms with both opt-ins.
+- **O8 / O9 – Option validation**: invalid options fail before any network activity, and a CLI dry-run with both opt-ins makes zero network calls.
+
+#### 6. Remaining Live-Verification Prerequisites
+
+1. **Operator authorization** for any live run using the opt-ins. Nothing activates them automatically.
+2. **Actual RugCheck body size is still unknown.** The only evidence is a lower bound of 1,064,960 decoded bytes (§8.16.3). A live run may still exceed 4 MiB and end unavailable; no automatic escalation exists.
+3. **The live freshness budget is unproven.** Overlap removes the RugCheck download from the cutoff-age chain, but decision cutoff age still depends on live RPC and Solana Tracker latency against the unchanged 15,000 ms ceiling.
+4. **Live cancellation is unproven.** Cancellation behaviour against the real provider (aborted request accounting) is verified offline only.
+5. **The candidate cannot arm.** Fartcoin still fails `MATURITY_WINDOW_GATE` (age ≫ 7,200 s), so a Fartcoin run can verify RugCheck retrieval, sizing and the overlap timeline only. Retest, sizing, fills, positions and exits remain untested.
+6. **The daemon path is unchanged.** It still calls `fetchRugCheckMetrics` with an unbounded `res.json()` and a 3.5 s timeout. That is outside this scope and noted for review.
+
+#### 7. Proposed Operator Command (Pending Separate Review — Not Executed)
+
+> [!IMPORTANT]
+> **READ-ONLY SPECIFICATION — DO NOT EXECUTE WITHOUT SEPARATE OPERATOR AUTHORIZATION.** The dry-run makes no network calls and loads no credentials. The live command uses both opt-ins on the accepted Fartcoin pool to verify complete RugCheck retrieval and the overlapped timeline. It is expected to end in a rejection, not a buy.
+
+```powershell
+$TIMESTAMP = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ss-fffZ")
+$OUT = "data/research/diagnostics/candidate-decision-fartcoin-rugcheck-optin-$TIMESTAMP"
+# 1. Zero-network preflight (prints effective ceiling, retrieval mode, limits, trade-off)
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decision-diagnostic.ts `
+    --pool Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw `
+    --mint 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump `
+    --paper --dry-run --rugcheck-max-bytes 4194304 --overlap-rugcheck
+# 2. Live run (only after separate authorization)
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decision-diagnostic.ts `
+    --pool Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw `
+    --mint 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump `
+    --rpc-url https://api.mainnet-beta.solana.com `
+    --out-dir $OUT `
+    --paper --live --rugcheck-max-bytes 4194304 --overlap-rugcheck
+```
+
+**Boundaries unchanged**: the virtual wallet `U:\Projects\TopG\.tmp\virtual-wallet.json` remains 7.9259 SOL (SHA-256 `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`) with a $0.00 spending ceiling. No provider requests, RPC, sockets, captures, reruns, daemons, trades or threshold changes were performed for this work.

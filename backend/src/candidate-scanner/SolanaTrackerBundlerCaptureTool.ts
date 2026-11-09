@@ -547,7 +547,12 @@ export function redactSensitiveText(text: string, secrets: readonly string[] = [
     /(api[-_]?key|token|secret|password|auth|x-api-key):\s*['"]?([^&\s'"]+)['"]?/gi,
     "$1:[REDACTED]",
   );
-  out = out.replace(/([a-zA-Z0-9]+:\/\/)([^:]+):([^@]+)@/g, "$1[REDACTED]:[REDACTED]@");
+  // Lookbehind anchors match attempts at the start of an alphanumeric run. Matches are identical to the
+  // unanchored form, but long alphanumeric runs no longer cause quadratic backtracking on large bodies.
+  out = out.replace(
+    /(?<![a-zA-Z0-9])([a-zA-Z0-9]+:\/\/)([^:]+):([^@]+)@/g,
+    "$1[REDACTED]:[REDACTED]@",
+  );
   return out;
 }
 

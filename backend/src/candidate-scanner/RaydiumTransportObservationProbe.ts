@@ -910,6 +910,27 @@ export async function readBoundedStream(
 }
 
 /**
+ * Thrown when a bounded response body crosses its ceiling. The message is unchanged from the
+ * original RESPONSE_TOO_LARGE error; structured fields distinguish what was actually observed:
+ * - observedBytesAtStop: decoded bytes counted when reading stopped — a LOWER BOUND, not the body size.
+ * - retainedBytes / retainedSha256: the retained prefix (at most maxBytes) and its digest. A prefix is
+ *   never a complete body and must never be parsed for metrics.
+ */
+export class BoundedResponseTooLargeError extends Error {
+  constructor(
+    readonly observedBytesAtStop: number,
+    readonly maxBytes: number,
+    readonly retainedBytes: number,
+    readonly retainedSha256: string,
+  ) {
+    super(
+      `RESPONSE_TOO_LARGE: Response body (${observedBytesAtStop} bytes) exceeded maximum allowed limit of ${maxBytes} bytes`,
+    );
+    this.name = "BoundedResponseTooLargeError";
+  }
+}
+
+/**
  * Wraps an underlying fetch function with redirect rejection and body-size limits.
  */
 export function createBoundedFetchTransport(
@@ -979,8 +1000,11 @@ export function createBoundedFetchTransport(
 
       const streamRes = await readBoundedStream(resp.body, maxBytes, init?.signal ?? undefined);
       if (streamRes.overflow) {
-        throw new Error(
-          `RESPONSE_TOO_LARGE: Response body (${streamRes.totalObservedBytes} bytes) exceeded maximum allowed limit of ${maxBytes} bytes`,
+        throw new BoundedResponseTooLargeError(
+          streamRes.totalObservedBytes,
+          maxBytes,
+          streamRes.bytes.length,
+          crypto.createHash("sha256").update(streamRes.bytes).digest("hex"),
         );
       }
       cachedBuffer = streamRes.bytes;

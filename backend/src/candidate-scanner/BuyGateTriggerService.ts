@@ -498,7 +498,28 @@ export class BuyGateTriggerService {
         headers: { Accept: "application/json" },
       });
       if (!res.ok) return null;
-      const data = (await res.json()) as {
+      const data: unknown = await res.json();
+      return BuyGateTriggerService.validateRugCheckReportPayload(data);
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Strict, synchronous RugCheck report validation shared by live retrieval and sealed-evidence replay.
+   * Returns null (unavailable) for any missing, malformed, or unsupported field; never substitutes favorable values.
+   */
+  public static validateRugCheckReportPayload(payload: unknown): {
+    rugScore?: number;
+    hasDangerRisk?: boolean;
+    bundlerPct?: number;
+    top10HolderPct?: number;
+    holdersCount?: number;
+  } | null {
+    try {
+      const data = payload as {
         score?: unknown;
         score_normalised?: unknown;
         risks?: unknown;
@@ -596,8 +617,6 @@ export class BuyGateTriggerService {
       return result;
     } catch {
       return null;
-    } finally {
-      clearTimeout(timeout);
     }
   }
 }

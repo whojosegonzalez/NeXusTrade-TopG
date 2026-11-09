@@ -33,6 +33,7 @@ import {
   MeteredWebSocketTransport,
   WsWebSocketTransport,
   createBoundedFetchTransport,
+  BoundedResponseTooLargeError,
   type ISolanaKeepaliveWebSocketTransport,
   DEFAULT_KEEPALIVE_PING_INTERVAL_MS,
   DEFAULT_KEEPALIVE_MAX_PINGS,
@@ -193,6 +194,64 @@ export interface DiagnosticRequestRecord {
   readonly error?: string | undefined;
   readonly wireDigestSha256?: string | undefined;
   readonly responseFile?: string | undefined;
+  /** Body-size evidence; recorded for RUGCHECK_REPORT only. */
+  readonly responseBodyMetadata?: ResponseBodyMetadata | undefined;
+}
+
+/**
+ * Response body size evidence. Provider-declared headers are metadata, not proof of the complete
+ * decoded size (Content-Length describes the encoded transfer and may be absent or wrong).
+ */
+export interface ResponseBodyMetadata {
+  /** Decoded-byte ceiling applied to this request. */
+  readonly ceilingBytes: number;
+  /** COMPLETE: entire decoded body retained. OVER_LIMIT: reading stopped at the ceiling.
+   *  INCOMPLETE: body not fully read (abort, timeout, transport error). */
+  readonly bodyStatus: "COMPLETE" | "OVER_LIMIT" | "INCOMPLETE";
+  /** Provider-declared Content-Length header, verbatim, or null when absent. */
+  readonly declaredContentLength: string | null;
+  /** Provider-declared Content-Encoding header, verbatim, or null when absent. */
+  readonly declaredContentEncoding: string | null;
+  /** Decoded bytes retained in memory (complete body, or truncated prefix for OVER_LIMIT); null if unknown. */
+  readonly retainedBytes: number | null;
+  /** SHA-256 of the retained bytes (complete body or truncated prefix); null if unknown. */
+  readonly retainedSha256: string | null;
+  /** OVER_LIMIT only: decoded bytes counted when reading stopped — a lower bound on body size. */
+  readonly observedBytesAtStopLowerBound: number | null;
+}
+
+/** Shared default decoded-response ceiling for every diagnostic HTTP purpose. */
+export const DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
+/** Hard cap for the opt-in RugCheck-only decoded-response ceiling (a response-byte ceiling, not process memory). */
+export const DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES = 4 * 1024 * 1024;
+/** Bound for cancelling and settling an overlapped RugCheck request before sealing. */
+export const EARLY_RUGCHECK_SETTLE_BOUND_MS = 2_000;
+
+/**
+ * Validates the opt-in RugCheck diagnostic options. Throws [DIAGNOSTIC_INVALID_ARG] before any network use.
+ */
+export function validateRugCheckDiagnosticOptions(options: {
+  readonly rugCheckMaxResponseBytes?: unknown;
+  readonly overlapRugCheckWithMintPacing?: unknown;
+}): void {
+  const max = options.rugCheckMaxResponseBytes;
+  if (
+    max !== undefined &&
+    (typeof max !== "number" ||
+      !Number.isSafeInteger(max) ||
+      max < 1 ||
+      max > DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES)
+  ) {
+    throw new Error(
+      `[DIAGNOSTIC_INVALID_ARG] rugCheckMaxResponseBytes must be an integer between 1 and ${DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES} (4 MiB); received ${String(max)}`,
+    );
+  }
+  const overlap = options.overlapRugCheckWithMintPacing;
+  if (overlap !== undefined && typeof overlap !== "boolean") {
+    throw new Error(
+      `[DIAGNOSTIC_INVALID_ARG] overlapRugCheckWithMintPacing must be a boolean; received ${String(overlap)}`,
+    );
+  }
 }
 
 export interface DiagnosticRequestLedger {
@@ -235,6 +294,17 @@ export interface CandidateDecisionDiagnosticOptions {
   readonly pongTimeoutMs?: number | undefined;
   readonly maxControlFrames?: number | undefined;
   readonly maxControlFrameBytes?: number | undefined;
+  /**
+   * OPT-IN: decoded-response ceiling for RUGCHECK_REPORT only (1..4 MiB). Omitted: the shared 1 MiB ceiling.
+   * Every other purpose always keeps the shared 1 MiB ceiling.
+   */
+  readonly rugCheckMaxResponseBytes?: number | undefined;
+  /**
+   * OPT-IN: dispatch RUGCHECK_REPORT once validated LP evidence passes the unchanged 90% rule, overlapping
+   * the provider pacing wait before CANDIDATE_MINT. May spend one RugCheck request before an authority
+   * rejection; it never admits a candidate. Omitted/false: serial retrieval after pre-admission passes.
+   */
+  readonly overlapRugCheckWithMintPacing?: boolean | undefined;
 }
 
 export interface CandidateDecisionDiagnosticResult {
@@ -321,6 +391,23 @@ export interface CandidateDecisionDiagnosticResult {
   writeError?: string | undefined;
 }
 
+interface EarlyRugCheckHandle {
+  readonly controller: AbortController;
+  readonly retrievedAtMs: number;
+  readonly settled: Promise<
+    | { readonly kind: "fulfilled"; readonly res: MeteredResponse }
+    | { readonly kind: "rejected"; readonly err: unknown }
+  >;
+}
+
+interface MeteredResponse {
+  ok: boolean;
+  status: number;
+  text: string;
+  json: unknown | null;
+  error?: string | undefined;
+}
+
 interface RecordedResponse {
   readonly index: number;
   readonly purpose: string;
@@ -347,6 +434,10 @@ export class CandidateDecisionDiagnostic {
   private readonly rpcUrl: string;
   private readonly outDir?: string | undefined;
   private readonly transport: typeof fetch;
+  private readonly rugCheckTransport: typeof fetch;
+  private readonly rugCheckMaxResponseBytes: number;
+  private readonly overlapRugCheckWithMintPacing: boolean;
+  private pendingEarlyRugCheck: EarlyRugCheckHandle | null = null;
   private readonly wsTransportOption?: ISolanaWebSocketTransport | undefined;
   private readonly clock: () => number;
   private readonly sleeper: (ms: number) => Promise<void>;
@@ -409,6 +500,11 @@ export class CandidateDecisionDiagnostic {
       throw new Error("[DIAGNOSTIC_INVALID_ARG] rpcUrl is required");
     }
 
+    validateRugCheckDiagnosticOptions(options);
+    this.rugCheckMaxResponseBytes =
+      options.rugCheckMaxResponseBytes ?? DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES;
+    this.overlapRugCheckWithMintPacing = options.overlapRugCheckWithMintPacing === true;
+
     this.poolId = options.poolId;
     this.mintAddress = options.mintAddress;
     this.rpcUrl = options.rpcUrl;
@@ -434,13 +530,16 @@ export class CandidateDecisionDiagnostic {
       if (!options.wsTransport) {
         throw new Error("[DIAGNOSTIC_INVALID_ARG] Offline mode requires injected wsTransport");
       }
-      this.transport = createBoundedFetchTransport(options.transport, 1024 * 1024);
-    } else {
-      this.transport = createBoundedFetchTransport(
-        options.transport ?? globalThis.fetch,
-        1024 * 1024,
-      );
     }
+    const baseTransport = options.transport ?? globalThis.fetch;
+    this.transport = createBoundedFetchTransport(
+      baseTransport,
+      DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES,
+    );
+    this.rugCheckTransport =
+      this.rugCheckMaxResponseBytes === DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES
+        ? this.transport
+        : createBoundedFetchTransport(baseTransport, this.rugCheckMaxResponseBytes);
 
     this.clock = options.clock ?? (() => Date.now());
     this.sleeper =
@@ -721,9 +820,18 @@ export class CandidateDecisionDiagnostic {
     let rawWireBytes = Buffer.alloc(0);
     let ok = false;
     let errorMessage: string | undefined;
+    let declaredContentLength: string | null = null;
+    let declaredContentEncoding: string | null = null;
+    let bodyComplete = false;
+    let overflow: BoundedResponseTooLargeError | null = null;
+    const isRugCheck = purpose === "RUGCHECK_REPORT";
+    const ceilingBytes = isRugCheck
+      ? this.rugCheckMaxResponseBytes
+      : DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES;
 
     try {
-      const fetchPromise = this.transport(url, {
+      const purposeTransport = isRugCheck ? this.rugCheckTransport : this.transport;
+      const fetchPromise = purposeTransport(url, {
         method,
         headers: {
           Accept: "application/json",
@@ -736,11 +844,14 @@ export class CandidateDecisionDiagnostic {
       // Race headers against abort/timeout
       const res = await Promise.race([fetchPromise, abortPromise]);
       httpStatus = res.status;
+      declaredContentLength = res.headers?.get?.("content-length") ?? null;
+      declaredContentEncoding = res.headers?.get?.("content-encoding") ?? null;
 
       // Race body bytes read against abort/timeout using res.arrayBuffer()
       const arrayBufferPromise = res.arrayBuffer();
       const rawArrayBuffer = await Promise.race([arrayBufferPromise, abortPromise]);
       rawWireBytes = Buffer.from(rawArrayBuffer);
+      bodyComplete = true;
 
       // Wire digest: SHA-256 computed on raw wire bytes BEFORE text decoding
       wireDigestSha256 = createHash("sha256").update(rawWireBytes).digest("hex");
@@ -767,6 +878,9 @@ export class CandidateDecisionDiagnostic {
       }
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
+      if (err instanceof BoundedResponseTooLargeError) {
+        overflow = err;
+      }
       ok = false;
     } finally {
       clearTimeout(reqTimeout);
@@ -815,6 +929,27 @@ export class CandidateDecisionDiagnostic {
       ...(errorMessage !== undefined ? { error: errorMessage } : {}),
       ...(wireDigestSha256.length > 0 ? { wireDigestSha256 } : {}),
       responseFile: responseFileName,
+      ...(isRugCheck
+        ? {
+            responseBodyMetadata: {
+              ceilingBytes,
+              bodyStatus: overflow ? "OVER_LIMIT" : bodyComplete ? "COMPLETE" : "INCOMPLETE",
+              declaredContentLength,
+              declaredContentEncoding,
+              retainedBytes: overflow
+                ? overflow.retainedBytes
+                : bodyComplete
+                  ? rawWireBytes.length
+                  : null,
+              retainedSha256: overflow
+                ? overflow.retainedSha256
+                : bodyComplete
+                  ? wireDigestSha256
+                  : null,
+              observedBytesAtStopLowerBound: overflow ? overflow.observedBytesAtStop : null,
+            } satisfies ResponseBodyMetadata,
+          }
+        : {}),
     });
 
     if (httpStatus === 429) {
@@ -2071,10 +2206,24 @@ export class CandidateDecisionDiagnostic {
 
       this.retainedLpEvidence = lpEvidence;
       const lpBurnPct = validationResult.accounting.displayInaccessiblePct;
+      // Unchanged 90% rule on validated LP evidence (single source for overlap gating and pre-admission).
+      const lpEvidencePassesNinetyPercentRule =
+        validationResult.accounting.meetsNinetyPercentThreshold &&
+        typeof lpBurnPct === "number" &&
+        lpBurnPct >= 90.0;
+
+      // OPT-IN: overlap RugCheck retrieval with the provider pacing wait before CANDIDATE_MINT.
+      // Never admits a candidate; may spend one RugCheck request before an authority rejection.
+      if (this.overlapRugCheckWithMintPacing && lpEvidencePassesNinetyPercentRule) {
+        this.pendingEarlyRugCheck = this.startEarlyRugCheck(
+          overallController.signal,
+          overallDeadlineMs,
+        );
+      }
 
       // 8. Candidate Token Mint Account (Decimals & Authorities)
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
-        return this.finishWithFailure(
+        return await this.finishWithFailureSettled(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
           "Overall diagnostic deadline exceeded before mint account query",
           {
@@ -2097,7 +2246,7 @@ export class CandidateDecisionDiagnostic {
       );
 
       if (!mintRes.ok || !mintRes.json) {
-        return this.finishWithFailure(
+        return await this.finishWithFailureSettled(
           "CANDIDATE_MINT_FETCH_FAILED",
           `Failed to acquire candidate token mint account: ${mintRes.error ?? "Empty response"}`,
           {
@@ -2117,7 +2266,7 @@ export class CandidateDecisionDiagnostic {
       );
 
       if (!parsedMintRes.ok) {
-        return this.finishWithFailure(
+        return await this.finishWithFailureSettled(
           "CANDIDATE_MINT_PARSE_FAILED",
           `Candidate mint account parsing failed: ${parsedMintRes.message}`,
           {
@@ -2154,10 +2303,7 @@ export class CandidateDecisionDiagnostic {
       // =========================================================================
       // PHASE 4: Pre-Admission Screening (LP & Authorities Preconditions)
       // =========================================================================
-      const lpSecurityPassed =
-        validationResult.accounting.meetsNinetyPercentThreshold &&
-        typeof lpBurnPct === "number" &&
-        lpBurnPct >= 90.0;
+      const lpSecurityPassed = lpEvidencePassesNinetyPercentRule;
       const mintAuthorityPassed = mintEval.status === "DISABLED";
       const freezeAuthorityPassed = freezeEval.status === "DISABLED";
       const preAdmissionPassed = lpSecurityPassed && mintAuthorityPassed && freezeAuthorityPassed;
@@ -2194,7 +2340,7 @@ export class CandidateDecisionDiagnostic {
       this.retainedPreAdmissionScreening = preAdmissionScreening;
 
       if (!preAdmissionPassed) {
-        return this.finishWithFailure(
+        return await this.finishWithFailureSettled(
           "PRE_ADMISSION_REJECTED",
           `Pre-admission screening failed: ${preAdmissionRejectionReason}`,
           {
@@ -2211,9 +2357,9 @@ export class CandidateDecisionDiagnostic {
       // =========================================================================
       // PHASE 5: Security Reports (RugCheck & Solana Tracker Bundler Proxy)
       // =========================================================================
-      // 9. RugCheck report
+      // 9. RugCheck report (serial by default; consumed from the overlapped request when opted in)
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
-        return this.finishWithFailure(
+        return await this.finishWithFailureSettled(
           "OVERALL_DIAGNOSTIC_TIMEOUT",
           "Overall diagnostic deadline exceeded before RugCheck query",
           {
@@ -2227,17 +2373,29 @@ export class CandidateDecisionDiagnostic {
         );
       }
 
-      const rugCheckRetrievedAtMs = this.clock();
-      const rcUrl = `${this.rugCheckApiUrl}/v1/tokens/${encodeURIComponent(this.mintAddress)}/report`;
-      const rcRes = await this.dispatchMeteredRequest({
-        purpose: "RUGCHECK_REPORT",
-        providerName: "RUGCHECK",
-        url: rcUrl,
-        signal: overallController.signal,
-        skipBudgetRecording: false,
-        overallDeadlineMs,
-      });
+      let rugCheckRetrievedAtMs: number;
+      let rcRes: MeteredResponse;
+      const earlyRugCheck = this.pendingEarlyRugCheck;
+      if (earlyRugCheck) {
+        // Bounded by the per-request timeout and overall deadline enforced inside the dispatch.
+        const outcome = await earlyRugCheck.settled;
+        this.pendingEarlyRugCheck = null;
+        if (outcome.kind === "rejected") {
+          throw outcome.err;
+        }
+        rugCheckRetrievedAtMs = earlyRugCheck.retrievedAtMs;
+        rcRes = outcome.res;
+      } else {
+        rugCheckRetrievedAtMs = this.clock();
+        rcRes = await this.dispatchRugCheckReport(overallController.signal, overallDeadlineMs);
+      }
 
+      // Metrics only from a complete, successfully parsed body via the shared strict validator.
+      // Over-limit, truncated, malformed, or failed responses remain unavailable (null).
+      const validatedRugCheck =
+        rcRes.ok && rcRes.json !== null
+          ? BuyGateTriggerService.validateRugCheckReportPayload(rcRes.json)
+          : null;
       let rugMetrics: {
         rugScore?: number;
         hasDangerRisk?: boolean;
@@ -2245,35 +2403,42 @@ export class CandidateDecisionDiagnostic {
         top10HolderPct?: number;
         holdersCount?: number;
       } | null = null;
-
-      if (rcRes.ok && rcRes.text) {
-        // Reuse accepted strict RugCheck validation without another provider request
-        const validatedRugCheck = await BuyGateTriggerService.fetchRugCheckMetrics(
-          this.mintAddress,
-          async () =>
-            new Response(rcRes.text, {
-              status: rcRes.status,
-              headers: { "Content-Type": "application/json" },
-            }),
-        );
-        if (validatedRugCheck) {
-          rugMetrics = {
-            ...(validatedRugCheck.rugScore !== undefined
-              ? { rugScore: validatedRugCheck.rugScore }
-              : {}),
-            ...(validatedRugCheck.hasDangerRisk !== undefined
-              ? { hasDangerRisk: validatedRugCheck.hasDangerRisk }
-              : {}),
-            ...(validatedRugCheck.top10HolderPct !== undefined
-              ? { top10HolderPct: validatedRugCheck.top10HolderPct }
-              : {}),
-            ...(validatedRugCheck.holdersCount !== undefined
-              ? { holdersCount: validatedRugCheck.holdersCount }
-              : {}),
-          };
-        }
+      if (validatedRugCheck) {
+        rugMetrics = {
+          ...(validatedRugCheck.rugScore !== undefined
+            ? { rugScore: validatedRugCheck.rugScore }
+            : {}),
+          ...(validatedRugCheck.hasDangerRisk !== undefined
+            ? { hasDangerRisk: validatedRugCheck.hasDangerRisk }
+            : {}),
+          ...(validatedRugCheck.top10HolderPct !== undefined
+            ? { top10HolderPct: validatedRugCheck.top10HolderPct }
+            : {}),
+          ...(validatedRugCheck.holdersCount !== undefined
+            ? { holdersCount: validatedRugCheck.holdersCount }
+            : {}),
+        };
       }
-      this.retainedRugCheckEvidence = { rugMetrics, rawRugCheck: rcRes.json };
+      const rcRecord = this.ledger.records.find((r) => r.purpose === "RUGCHECK_REPORT");
+      // The complete sanitized response is sealed once (responseFile); derived evidence references it.
+      this.retainedRugCheckEvidence = {
+        rugMetrics,
+        validationStatus: !rcRes.ok
+          ? "REQUEST_NOT_OK"
+          : rcRes.json === null
+            ? "RESPONSE_NOT_JSON"
+            : rugMetrics
+              ? "AVAILABLE"
+              : "VALIDATION_REJECTED",
+        responseFile: rcRecord?.responseFile ?? null,
+        wireDigestSha256: rcRecord?.wireDigestSha256 ?? null,
+        responseBodyMetadata: rcRecord?.responseBodyMetadata ?? null,
+        retrievalMode: earlyRugCheck
+          ? "OVERLAPPED_WITH_CANDIDATE_MINT_PACING"
+          : "SERIAL_AFTER_PRE_ADMISSION",
+        retrievedAtMs: rugCheckRetrievedAtMs,
+        payload: "NOT_DUPLICATED: complete sanitized response is sealed only in responseFile",
+      };
 
       // 10. Solana Tracker Bundler Proxy
       if (this.clock() >= overallDeadlineMs || overallController.signal.aborted) {
@@ -2487,7 +2652,7 @@ export class CandidateDecisionDiagnostic {
         this.clock() >= overallDeadlineMs ||
         msg.includes("OVERALL_DIAGNOSTIC_TIMEOUT") ||
         msg.includes("REQUEST_TIMEOUT");
-      return this.finishWithFailure(
+      return await this.finishWithFailureSettled(
         isTimeout ? "OVERALL_DIAGNOSTIC_TIMEOUT" : "UNHANDLED_EXCEPTION",
         msg,
       );
@@ -2521,6 +2686,87 @@ export class CandidateDecisionDiagnostic {
         }
       }
     }
+  }
+
+  /**
+   * Starts the opt-in overlapped RugCheck request with its own abort controller linked to the overall signal.
+   * Rejections are captured immediately so no unhandled rejection can escape.
+   */
+  private startEarlyRugCheck(
+    overallSignal: AbortSignal,
+    overallDeadlineMs: number,
+  ): EarlyRugCheckHandle {
+    const controller = new AbortController();
+    const onOverallAbort = () => controller.abort(overallSignal.reason ?? "OVERALL_ABORTED");
+    if (overallSignal.aborted) {
+      onOverallAbort();
+    } else {
+      overallSignal.addEventListener("abort", onOverallAbort, { once: true });
+    }
+    const retrievedAtMs = this.clock();
+    const settled = this.dispatchRugCheckReport(controller.signal, overallDeadlineMs)
+      .then(
+        (res) => ({ kind: "fulfilled" as const, res }),
+        (err: unknown) => ({ kind: "rejected" as const, err }),
+      )
+      .finally(() => overallSignal.removeEventListener("abort", onOverallAbort));
+    return { controller, retrievedAtMs, settled };
+  }
+
+  /** Single RUGCHECK_REPORT dispatch (one request per provider purpose; no retries). */
+  private async dispatchRugCheckReport(
+    signal: AbortSignal,
+    overallDeadlineMs: number,
+  ): Promise<MeteredResponse> {
+    if (this.ledger.rugCheckAttempts > 0) {
+      throw new Error("[RUGCHECK_SINGLE_REQUEST_VIOLATION] RUGCHECK_REPORT already dispatched");
+    }
+    const rcUrl = `${this.rugCheckApiUrl}/v1/tokens/${encodeURIComponent(this.mintAddress)}/report`;
+    return this.dispatchMeteredRequest({
+      purpose: "RUGCHECK_REPORT",
+      providerName: "RUGCHECK",
+      url: rcUrl,
+      signal,
+      skipBudgetRecording: false,
+      overallDeadlineMs,
+    });
+  }
+
+  /**
+   * Cancels any overlapped RugCheck request and waits (bounded) for it to settle, so that its attempt is
+   * recorded exactly once and no work remains pending when evidence is sealed. Returns false if the bound elapsed.
+   */
+  private async cancelAndSettleEarlyRugCheck(reason: string): Promise<boolean> {
+    const handle = this.pendingEarlyRugCheck;
+    if (!handle) return true;
+    handle.controller.abort(reason);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settledInBound = await Promise.race([
+      handle.settled.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), EARLY_RUGCHECK_SETTLE_BOUND_MS);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    this.pendingEarlyRugCheck = null;
+    return settledInBound;
+  }
+
+  /** Terminal failure that first cancels and settles any overlapped RugCheck request. */
+  private async finishWithFailureSettled(
+    status: string,
+    message: string,
+    partialData?: Partial<CandidateDecisionDiagnosticResult>,
+  ): Promise<CandidateDecisionDiagnosticResult> {
+    const settled = await this.cancelAndSettleEarlyRugCheck(`TERMINATED_${status}`);
+    if (!settled) {
+      return this.finishWithFailure(
+        "EARLY_RUGCHECK_UNSETTLED",
+        `${message}; overlapped RugCheck request did not settle within ${EARLY_RUGCHECK_SETTLE_BOUND_MS} ms after cancellation`,
+        partialData,
+      );
+    }
+    return this.finishWithFailure(status, message, partialData);
   }
 
   private finishWithFailure(
@@ -2584,6 +2830,11 @@ export class CandidateDecisionDiagnostic {
   }
 
   private writeDiagnosticArtifacts(result: CandidateDecisionDiagnosticResult): void {
+    if (this.pendingEarlyRugCheck !== null) {
+      throw new Error(
+        "[EARLY_RUGCHECK_PENDING] Refusing to seal evidence while an overlapped RugCheck request is unsettled",
+      );
+    }
     const targetDir =
       this.outDir ??
       path.resolve(
@@ -2800,6 +3051,91 @@ export interface CandidateDecisionReplayGapAudit {
   readonly newSignaturesSinceAnchor: number | null;
 }
 
+export interface CandidateDecisionReplayPreAdmission {
+  readonly lpBurnPct: number | null;
+  readonly lpSecurityPassed: boolean;
+  readonly mintAuthorityStatus: AuthorityStatus;
+  readonly freezeAuthorityStatus: AuthorityStatus;
+  readonly passed: boolean;
+  readonly rejectionReason: string | null;
+}
+
+export interface CandidateDecisionReplayRugCheck {
+  /**
+   * AVAILABLE: metrics recomputed from a verified, complete sealed response.
+   * NOT_DISPATCHED / REQUEST_NOT_OK / RESPONSE_NOT_VERIFIED / RESPONSE_NOT_JSON / VALIDATION_REJECTED:
+   * metrics unavailable (never derived from truncated or unverified bodies).
+   */
+  readonly status:
+    | "AVAILABLE"
+    | "NOT_DISPATCHED"
+    | "REQUEST_NOT_OK"
+    | "RESPONSE_NOT_VERIFIED"
+    | "RESPONSE_NOT_JSON"
+    | "VALIDATION_REJECTED";
+  readonly responseFile: string | null;
+  readonly metrics: RugCheckMetrics | null;
+}
+
+type RugCheckMetrics = {
+  rugScore?: number;
+  hasDangerRisk?: boolean;
+  bundlerPct?: number;
+  top10HolderPct?: number;
+  holdersCount?: number;
+};
+
+/**
+ * Recomputes RugCheck metrics from the verified sealed RUGCHECK_REPORT response using the same strict
+ * validator as live retrieval. Uses only the verified report ledger and verified response files.
+ */
+function recomputeRugCheckFromSealedResponse(
+  evidenceDir: string,
+  report: { ledger?: { records?: unknown } } | null | undefined,
+  verifiedFilesSet: ReadonlySet<string>,
+): CandidateDecisionReplayRugCheck {
+  const records = Array.isArray(report?.ledger?.records) ? report.ledger.records : [];
+  const rcRecords = records.filter(
+    (r): r is { ok?: unknown; responseFile?: unknown } =>
+      !!r && typeof r === "object" && (r as { purpose?: unknown }).purpose === "RUGCHECK_REPORT",
+  );
+  if (rcRecords.length === 0) {
+    return { status: "NOT_DISPATCHED", responseFile: null, metrics: null };
+  }
+  // One request per provider purpose: more than one record is not a valid capture shape.
+  const rec = rcRecords.length === 1 ? rcRecords[0] : undefined;
+  const responseFile =
+    typeof rec?.responseFile === "string" ? rec.responseFile.replace(/\\/g, "/") : null;
+  if (!rec || rec.ok !== true) {
+    return { status: "REQUEST_NOT_OK", responseFile, metrics: null };
+  }
+  if (responseFile === null || !verifiedFilesSet.has(responseFile)) {
+    return { status: "RESPONSE_NOT_VERIFIED", responseFile, metrics: null };
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(readFileSync(path.join(evidenceDir, responseFile), "utf8"));
+  } catch {
+    return { status: "RESPONSE_NOT_JSON", responseFile, metrics: null };
+  }
+  const metrics = BuyGateTriggerService.validateRugCheckReportPayload(payload);
+  return metrics
+    ? { status: "AVAILABLE", responseFile, metrics }
+    : { status: "VALIDATION_REJECTED", responseFile, metrics: null };
+}
+
+function rugMetricsEqual(a: RugCheckMetrics | null, b: RugCheckMetrics | null): boolean {
+  if (a === null || b === null) return a === b;
+  const keys: Array<keyof RugCheckMetrics> = [
+    "rugScore",
+    "hasDangerRisk",
+    "bundlerPct",
+    "top10HolderPct",
+    "holdersCount",
+  ];
+  return keys.every((k) => a[k] === b[k]);
+}
+
 export interface CandidateDecisionReplayResult {
   readonly ok: boolean;
   readonly status: string;
@@ -2825,6 +3161,10 @@ export interface CandidateDecisionReplayResult {
     | undefined;
   /** Whether the offline re-evaluation reproduced the recorded outcome and rejection reason. */
   readonly matchesRecordedDecision?: boolean | undefined;
+  /** Pre-admission screening recomputed from raw LP and mint evidence (strategy qualification, not integrity). */
+  readonly recomputedPreAdmission?: CandidateDecisionReplayPreAdmission | undefined;
+  /** RugCheck metrics recomputed from the verified sealed response with the shared strict validator. */
+  readonly recomputedRugCheck?: CandidateDecisionReplayRugCheck | undefined;
   readonly decisionResult?: CandidateDecisionResult | undefined;
   readonly auditMetadata?:
     | {
@@ -3181,6 +3521,7 @@ export function replayCandidateDecisionFromSealedEvidence(
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
       fileVerifications,
+      integrityVerified: true,
     };
   }
 
@@ -3201,6 +3542,7 @@ export function replayCandidateDecisionFromSealedEvidence(
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
       fileVerifications,
+      integrityVerified: true,
     };
   }
 
@@ -3212,12 +3554,13 @@ export function replayCandidateDecisionFromSealedEvidence(
   if (!recomputedLpAccounting.ok) {
     return {
       ok: false,
-      status: "REPLAY_PRE_ADMISSION_FAILED",
+      status: "REPLAY_LP_EVIDENCE_INVALID",
       message: `LP claim calculation rejected [${recomputedLpAccounting.category}]: ${recomputedLpAccounting.message}`,
       poolId,
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
       fileVerifications,
+      integrityVerified: true,
     };
   }
 
@@ -3238,6 +3581,7 @@ export function replayCandidateDecisionFromSealedEvidence(
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
       fileVerifications,
+      integrityVerified: true,
     };
   }
 
@@ -3251,12 +3595,13 @@ export function replayCandidateDecisionFromSealedEvidence(
   if (!parsedMintRes.ok) {
     return {
       ok: false,
-      status: "REPLAY_PRE_ADMISSION_FAILED",
+      status: "REPLAY_MINT_EVIDENCE_INVALID",
       message: `Candidate mint account parsing failed: ${parsedMintRes.message}`,
       poolId,
       mintAddress,
       verifiedFilesCount: fileVerifications.length,
       fileVerifications,
+      integrityVerified: true,
     };
   }
 
@@ -3273,8 +3618,11 @@ export function replayCandidateDecisionFromSealedEvidence(
   const mintAuthorityPassed = mintEval.status === "DISABLED";
   const freezeAuthorityPassed = freezeEval.status === "DISABLED";
 
+  // Strategy qualification is recomputed here but applied only after the recorded outcome is known:
+  // valid below-threshold evidence is a legitimate recorded rejection, not corrupted evidence.
+  let preAdmissionRejectionReason: string | null = null;
   if (!lpSecurityPassed || !mintAuthorityPassed || !freezeAuthorityPassed) {
-    let preAdmissionRejectionReason = "REJECTED_UNKNOWN";
+    preAdmissionRejectionReason = "REJECTED_UNKNOWN";
     if (!lpSecurityPassed) {
       preAdmissionRejectionReason = "REJECTED_UNLOCKED_LP_RISK";
     } else if (!freezeAuthorityPassed) {
@@ -3294,17 +3642,15 @@ export function replayCandidateDecisionFromSealedEvidence(
         preAdmissionRejectionReason = "REJECTED_ACTIVE_MINT_AUTHORITY";
       }
     }
-
-    return {
-      ok: false,
-      status: "REPLAY_PRE_ADMISSION_FAILED",
-      message: `Pre-admission criteria not met during offline replay: ${preAdmissionRejectionReason}`,
-      poolId,
-      mintAddress,
-      verifiedFilesCount: fileVerifications.length,
-      fileVerifications,
-    };
   }
+  const recomputedPreAdmission: CandidateDecisionReplayPreAdmission = {
+    lpBurnPct: typeof lpBurnPct === "number" ? lpBurnPct : null,
+    lpSecurityPassed,
+    mintAuthorityStatus: mintEval.status,
+    freezeAuthorityStatus: freezeEval.status,
+    passed: preAdmissionRejectionReason === null,
+    rejectionReason: preAdmissionRejectionReason,
+  };
 
   const flowRelPath = "evidence/flow-evaluation.json";
   const flowPath = path.join(evidenceDir, flowRelPath);
@@ -3384,8 +3730,41 @@ export function replayCandidateDecisionFromSealedEvidence(
   if (report.ok === false) {
     // A capture that terminated before a recorded decision keeps its termination outcome.
     // No Buy Gate decision is evaluated, and earlier snapshot timestamps are not reused.
+    // The recorded pre-admission result (when present) must agree with the raw recomputation.
+    const recordedScreening = report.preAdmissionScreening as
+      | { passed?: unknown; rejectionReason?: unknown }
+      | null
+      | undefined;
+    const recordedPassed =
+      typeof recordedScreening?.passed === "boolean" ? recordedScreening.passed : null;
+    const recordedReason =
+      typeof recordedScreening?.rejectionReason === "string"
+        ? recordedScreening.rejectionReason
+        : null;
+    const requiresRecordedScreening = report.status === "PRE_ADMISSION_REJECTED";
+    const screeningContradicted =
+      (requiresRecordedScreening && (recordedPassed !== false || recordedReason === null)) ||
+      (recordedPassed !== null &&
+        (recordedPassed !== recomputedPreAdmission.passed ||
+          (!recordedPassed && recordedReason !== recomputedPreAdmission.rejectionReason)));
+    if (screeningContradicted) {
+      return {
+        ok: false,
+        status: "REPLAY_PRE_ADMISSION_MISMATCH",
+        message: `Recorded pre-admission result (passed=${String(recordedPassed)}, reason=${String(recordedReason)}) contradicts raw recomputation (passed=${String(recomputedPreAdmission.passed)}, reason=${String(recomputedPreAdmission.rejectionReason)}); recorded termination not accepted`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+        integrityVerified: true,
+        recomputedPreAdmission,
+        auditMetadata,
+      };
+    }
+
     const recordedMessage = typeof report.message === "string" ? report.message : null;
     return {
+      recomputedPreAdmission,
       ok: false,
       status: report.status,
       message: `Sealed capture terminated with ${report.status}; recorded termination preserved and no decision re-evaluated${recordedMessage ? ` (recorded: ${recordedMessage})` : ""}`,
@@ -3396,6 +3775,22 @@ export function replayCandidateDecisionFromSealedEvidence(
       integrityVerified: true,
       replayMode: "RECORDED_TERMINATION_PRESERVED",
       recordedTermination: { status: report.status, message: recordedMessage },
+      auditMetadata,
+    };
+  }
+
+  // A completed decision requires pre-admission to pass on raw recomputation.
+  if (!recomputedPreAdmission.passed) {
+    return {
+      ok: false,
+      status: "REPLAY_PRE_ADMISSION_FAILED",
+      message: `Pre-admission criteria not met during offline replay: ${String(recomputedPreAdmission.rejectionReason)}`,
+      poolId,
+      mintAddress,
+      verifiedFilesCount: fileVerifications.length,
+      fileVerifications,
+      integrityVerified: true,
+      recomputedPreAdmission,
       auditMetadata,
     };
   }
@@ -3493,19 +3888,39 @@ export function replayCandidateDecisionFromSealedEvidence(
     lastEvaluatedAt: decisionNowIso,
   };
 
-  let rugMetrics: {
-    rugScore?: number;
-    hasDangerRisk?: boolean;
-    bundlerPct?: number;
-    top10HolderPct?: number;
-    holdersCount?: number;
-  } | null = null;
-
+  // RugCheck metrics are recomputed from the verified sealed response with the shared strict validator.
+  // Derived evidence, when sealed, must agree with the recomputation.
+  const recomputedRugCheck = recomputeRugCheckFromSealedResponse(
+    evidenceDir,
+    report,
+    verifiedFilesSet,
+  );
   const rugCheckRelPath = "evidence/rugcheck-report.json";
   if (verifiedFilesSet.has(rugCheckRelPath)) {
-    const rcData = JSON.parse(readFileSync(rugCheckPath, "utf8"));
-    rugMetrics = rcData.rugMetrics ?? null;
+    const rcData = JSON.parse(readFileSync(rugCheckPath, "utf8")) as {
+      rugMetrics?: RugCheckMetrics | null;
+    };
+    const storedMetrics = rcData.rugMetrics ?? null;
+    if (!rugMetricsEqual(storedMetrics, recomputedRugCheck.metrics)) {
+      return {
+        ok: false,
+        status: "REPLAY_RUGCHECK_EVIDENCE_MISMATCH",
+        message: `Sealed derived RugCheck metrics disagree with recomputation from ${recomputedRugCheck.responseFile ?? "no response"} (${recomputedRugCheck.status}); decision not replayed`,
+        poolId,
+        mintAddress,
+        verifiedFilesCount: fileVerifications.length,
+        fileVerifications,
+        integrityVerified: true,
+        recomputedPreAdmission,
+        recomputedRugCheck,
+        auditMetadata,
+      };
+    }
   }
+
+  let rugMetrics: RugCheckMetrics | null = recomputedRugCheck.metrics
+    ? { ...recomputedRugCheck.metrics }
+    : null;
   const bundlerRelPath = "evidence/bundler-provenance.json";
   if (verifiedFilesSet.has(bundlerRelPath)) {
     const bundlerData = JSON.parse(readFileSync(bundlerPath, "utf8"));
@@ -3560,6 +3975,8 @@ export function replayCandidateDecisionFromSealedEvidence(
     matchesRecordedDecision:
       decisionResult.outcome === recordedDecision.outcome &&
       replayedRejectionReason === recordedRejectionReason,
+    recomputedPreAdmission,
+    recomputedRugCheck,
     decisionResult,
     auditMetadata: {
       ...auditMetadata,
