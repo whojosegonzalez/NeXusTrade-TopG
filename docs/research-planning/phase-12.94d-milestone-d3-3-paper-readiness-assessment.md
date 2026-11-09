@@ -1,6 +1,6 @@
 # NeXusTrade — Phase 12.94-D Milestone D.3.3: Source-Accurate PAPER Implementation Handoff
 
-**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V5`  
+**Document ID**: `NXT-D3.3-PAPER-READINESS-ASSESSMENT-V6`  
 **Location**: `docs/research-planning/phase-12.94d-milestone-d3-3-paper-readiness-assessment.md`  
 **Related Closure Report**: [`audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md`](file:///u:/Projects/TopG/audit/PHASE_12_94D_MILESTONE_D3_3_QUOTE_PILOT_003_CLOSURE_REPORT.md)  
 **Status**: **READ-ONLY ARCHITECTURAL SPECIFICATION & OFFLINE IMPLEMENTATION HANDOFF**  
@@ -1637,10 +1637,10 @@ On commit `b36b352eea7df3877e1fdad1bddfbb5fff0c495d`, the operator executed the 
 - **Execution Mode**: `PAPER_SIMULATION`
 - **Manifest SHA-256 Digest**: `c35bbe76b8c5c297d8553035758ca7e7dc597271e6eda12c109ded2dffc13d0e`
 - **Manifest Integrity**: All 18 manifest-listed files match their recorded byte sizes and SHA-256 digests.
-- **Dispatched Request Ledger**: Exactly 9 recorded HTTP attempts (7 Solana RPC, 1 DexScreener, 1 Solana RPC mint account), all returning HTTP 200.
+- **Dispatched Request Ledger**: Exactly 9 recorded HTTP attempts (eight Solana RPC requests plus one DexScreener request), all returning HTTP 200.
 - **Provider Pacing Compliance**: Minimum recorded RPC dispatch spacing: **2,501 ms**, adhering to the $\ge 2{,}500\text{ ms}$ host pacing policy.
-- **Total Execution Elapsed Time**: From first dispatch ($T_0 = 1794189669283\text{ ms}$) to evidence sealing ($T_{\text{seal}} = 1794189749676\text{ ms}$), total elapsed time was approximately **80.4 seconds**.
-- **Virtual Wallet Invariant**: Virtual wallet balance remains frozen at **7.9259 SOL** (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling $0.00.
+- **Elapsed Time**: From first dispatch ($T_0 = 1794189669283\text{ ms}$) through final HTTP response ($T_{\text{response}} = 1794189749676\text{ ms}$) to manifest generation ($T_{\text{manifest}} = 1794189749705\text{ ms}$), approximately **80.4 seconds** elapsed.
+- **Virtual Wallet Invariant**: Virtual wallet balance remains frozen at **7.9259 SOL** (SHA-256: `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`), spending ceiling \$0.00.
 
 #### 2. On-Chain Protocol LP Accounting & Correct Pre-Admission Rejection
 
@@ -1671,37 +1671,45 @@ On commit `b36b352eea7df3877e1fdad1bddfbb5fff0c495d`, the operator executed the 
 - **Production Completeness Unproven**: In accordance with project policy, provider-relative RPC pagination does not establish production cryptographic certainty (`isProductionCompletenessEstablished = false`).
 - **Keepalive & Observation Metadata**: In this early-return report, keepalive metrics and observation metadata are omitted from `diagnostic-report.json`; independently verified ping/pong counts are **not** claimed.
 
-#### 4. Catalog of Remaining Untested Stages
+#### 4. Scope Delineation: Untested Diagnostic Stages vs. Subsequent Pipeline Stages
 
-The early fail-closed termination on unlocked LP leaves the following downstream strategy stages untested in live acquisition:
+Because pre-admission screening rejected unlocked LP early at Stage 1, downstream evaluation stages were not exercised in live acquisition. The table below delineates what the standalone single-evaluation diagnostic exercises upon passing pre-admission screening versus subsequent runtime pipeline stages that require multi-tick observation, execution, or position management:
 
-| Stage / Component                       | Status in Capture 2026-11-09 | Functionality & Gates Unreached                                                                                                                                                                                                                       |
-| :-------------------------------------- | :--------------------------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **RugCheck Security Enrichment**        | **NOT REACHED** (0 attempts) | Live retrieval of `/tokens/{mint}/report`; validation of Gate 8 (score $\le 700$), Gate 9 (no danger risks), and Gate 10 (top-10 concentration $\le 30\%$).                                                                                           |
-| **Solana Tracker Bundler Proxy**        | **NOT REACHED** (0 attempts) | Live retrieval of `/tokens/{mint}/bundlers`; parser extraction and PAPER adapter evaluation of Gate 11 (bundler concentration $\le 85\% / 50\%$) and holder floor ($\ge 250 / 100$).                                                                  |
-| **Gate 12 Macro Trend Gate**            |       **NOT REACHED**        | Anti-dead-cat bounce check for Established candidates (`priceChange1hPct > -80%` or flow absorption $\ge 1.5\times$).                                                                                                                                 |
-| **Candidate Decision Point Evaluation** |       **NOT REACHED**        | Full `evaluateCandidateDecisionPoints` synthesis and first-tick arming (`ARMED_FIRST_TICK`).                                                                                                                                                          |
-| **Retest Gate Evaluation**              |       **NOT REACHED**        | Pure `evaluateRetestGate` evaluation: Rule A (pullback discount $10\%\text{--}15\%$ micro, $4\%\text{--}10\%$ estab with flow absorption) vs Rule B (consolidation breakout) vs Rule C (crater drop) / Rule E (seller surge) / Rule D (timeout).      |
-| **Confirmed-Entry Sizing**              |       **NOT REACHED**        | Probe sizing via `walletScale` ($1.0\text{--}1.25\times$), cohort base ($0.50$ estab, $0.35$ micro), risk downsizing ($0.35$ if bundler $> 60\%$ or top10 $> 30\%$), and dynamic portfolio gas reservation.                                           |
-| **Execution Realism Simulation**        |       **NOT REACHED**        | `QuoteExecutionEngine.createDeterministicAmmQuote(BUY)` and `simulateFill(isNewAta: true)` with mandatory $2{,}039{,}280\text{ lamports}$ ATA rent debit.                                                                                             |
-| **Position Monitoring & Ratchet Exits** |       **NOT REACHED**        | Position monitor ticker ($1{,}500\text{ ms}$), Dynamic Ratchet milestones (breakeven floor at $+10.0\%$, Tier 1 50% sell at $+20.0\%$, Tier 2 25% sell at $+48.5\%$, trailing moonbag floor at $+35.0\%$, catastrophic floor at $-18.0\% / -20.0\%$). |
+##### A. Standalone Diagnostic Scope (Single-Evaluation Path)
+
+| Stage / Operation                               | Status in Capture 2026-11-09 | Source-Backed Functionality & Gates                                                                                                                                                                                                                                                                                                                                                        |
+| :---------------------------------------------- | :--------------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 6 Security Queries**                    | **NOT REACHED** (0 attempts) | Live `GET /tokens/{mint}/report` (RugCheck) and `GET /tokens/{mint}/bundlers` (Solana Tracker) via isolated HTTP requests.                                                                                                                                                                                                                                                                 |
+| **Buy Gate 11: `BUNDLER_CONCENTRATION_GATE`**   |       **NOT REACHED**        | Evaluates composite security criteria in [`BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts#L357-L437): RugCheck score ($\le 700$), danger flag (`false`), top-10 concentration ($\le 30\%$), bundler concentration ($\le 50\%$ micro / $\le 85\%$ established), and verified holders ($\ge 100$ micro / $\ge 250$ established). |
+| **Buy Gate 12: `ESTABLISHED_MACRO_TREND_GATE`** |       **NOT REACHED**        | Evaluated for established candidates only in [`BuyGateTriggerService.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/BuyGateTriggerService.ts#L440-L450); checks 1h price change $\ge -15.0\%$ (`maxEstablishedMacroDrawdownPct: -15.0`).                                                                                                                                      |
+| **Decision Point Evaluation**                   |       **NOT REACHED**        | Full `evaluateCandidateDecisionPoints` synthesis yielding `ARMED_FIRST_TICK` (or gate rejection).                                                                                                                                                                                                                                                                                          |
+| **Complete Replay Evidence Sealing**            |       **NOT REACHED**        | Capturing and sealing all 23 replay manifest files (including bundler provenance, rugcheck report, and flow evaluation).                                                                                                                                                                                                                                                                   |
+
+##### B. Subsequent Pipeline Stages (Outside Standalone Diagnostic Scope)
+
+| Stage / Component                                                 | Scope Boundary & Runtime Responsibility                                                                                                                                          |
+| :---------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Retest Gate Evaluation (`RetestGateEvaluator`)**                | Multi-tick price monitoring requiring subsequent candle/tick feeds to evaluate pullback absorption (Rule A) or consolidation breakout (Rule B) vs invalidations (Rules C, D, E). |
+| **Confirmed-Entry Sizing (`PositionSizer`)**                      | Determining trade size in SOL/tokens upon confirmed entry based on cohort base size, risk downsizing multipliers, and dynamic gas reservation.                                   |
+| **Execution Realism Simulation (`simulateFill`)**                 | Simulating AMM quote generation and fill execution with ATA rent debit ($2{,}039{,}280\text{ lamports}$).                                                                        |
+| **Position Monitoring & Ratchet Exits (`DynamicRatchetService`)** | Post-entry ticker monitoring, multi-tier partial take-profits, trailing moonbag protection, and catastrophic stop-loss enforcement.                                              |
 
 ---
 
-### 8.15 Bounded Proposal for Untested Stages via Existing Discovery and Diagnostic Paths
+### 8.15 Bounded Proposal for Untested Stages via Clean Single-Request Discovery and Accepted Diagnostic
 
 #### 1. Candidate Evidence Review & Target Selection Policy
 
 1. **RAY/WSOL Reference Pair Role**:
    - `AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA` has definitively proven that the diagnostic runner accurately acquires live on-chain accounts, respects pacing ($\ge 2{,}501\text{ ms}$), derives protocol-exact LP claims ($0.135778\%$), rejects unlocked LP fail-closed without false-passing, and seals tamper-evident replay manifests.
    - However, because its LP is not locked or burned, it cannot progress past Stage 1 pre-admission screening.
-2. **Review of Existing Captured Data**:
-   - An exhaustive review of all preserved captures in the repository (`data/research/snapshots/`, `data/research/captures/`, `data/research/prospective/`, `data/research/diagnostics/`) confirms that **all existing captures target RAY/WSOL**.
-   - No suitable candidate with verified $\ge 90\%$ burned LP exists in current preserved project evidence.
+2. **Review of Preserved Capture Evidence**:
+   - Review of preserved capture evidence confirms that **no suitable verified candidate was identified in the reviewed evidence**.
+   - No candidate with verified $\ge 90\%$ burned LP exists in current preserved project evidence.
    - In accordance with operator instructions, **no eligible candidate is invented**.
 3. **Threshold Preservation Invariant**:
    - Selecting a new candidate must preserve all established threshold rules without relaxation:
-     - LP Burn: $\ge 90.0\%$ protocol-derived inaccessible claims.
+     - LP Burn: $\ge 90.0\%$ protocol-derived inaccessible claims ($100n \times (L - S) \ge 90n \times L$).
      - Authorities: explicitly disabled (`mintAuthority: null`, `freezeAuthority: null`).
      - Liquidity: $\ge \$30{,}000$ (Micro-Cap) or $\ge \$50{,}000$ (Established).
      - L/MC Ratio: $\ge 0.08$ (Micro-Cap) or $\ge 0.04$ (Established).
@@ -1711,22 +1719,263 @@ The early fail-closed termination on unlocked LP leaves the following downstream
      - Bundler Concentration: $\le 50.0\%$ (Micro-Cap) or $\le 85.0\%$ (Established).
      - Verified Holders: $\ge 100$ (Micro-Cap) or $\ge 250$ (Established).
 
-#### 2. Minimum Candidate-Selection Request for Separate Operator Approval
+#### 2. Clean Single-Request Discovery Capture Specification
 
-To establish an authentic on-chain candidate likely to pass pre-admission LP screening, the minimum proposed selection request uses the existing discovery path in `CandidateStreamEngine.ts`:
+To identify an authentic candidate likely to pass on-chain pre-admission LP screening without legacy distortions:
 
-- **Single Discovery Request**:
-  - **Endpoint**: `GET https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=10&page=1`
-  - **Provider Identity**: `"RAYDIUM_API"`.
-  - **Purpose**: `"DISCOVERY_POLL"`.
-  - **Request Budget**: **Exactly 1 outbound HTTP request**.
-- **Deterministic Selection Filter** (applied in memory to returned response):
-  1. Standard Raydium AMM v4 pool (`poolType: "standard"`).
-  2. Quote mint is canonical WSOL (`So11111111111111111111111111111111111111112`).
-  3. Pre-calculated burn percentage: `burnPercent >= 0.90` (reported $90\%$ burn by Raydium indexer).
-  4. Liquidity: $\text{tvl} \ge \$30{,}000$.
-  5. Age: `openTime` indicates $\ge 300\text{ seconds}$ elapsed.
-- **Operator Approval Gate**: The single candidate identified (`poolId`, `mintAddress`, `symbol`, reported `burnPercent`) is submitted to the operator for separate approval prior to any diagnostic execution.
+##### A. Avoiding Legacy Discovery Projections and Request Fan-Out
+
+The existing `fetchRawPools` implementation in [`CandidateStreamEngine.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CandidateStreamEngine.ts#L261-L360) exhibits significant architectural defects:
+
+- It manufactures placeholder fields: assumed market cap ($\text{liquidityUsd} \times 4.5$), hardcoded 5-minute transaction counts (`txCount5m: 30`, `buys5m: 18`, `sells5m: 12`), and fabricated null authorities (`mintAuthority: null`, `freezeAuthority: null`).
+- It applies favorable defaults to missing data: missing or non-numeric `burnPercent` defaults to `100` (100% burned), and if present, multiplies an already-percentage value by 100.
+- It fans out across multiple external discovery endpoints (`fetchRaydiumPools`, `fetchRaydiumTopTradedPools`, `fetchDexScreenerPools`, `fetchDexScreenerRecentUpdates`, `fetchDexScreenerBoostedPools`).
+
+The proposal replaces this entirely with an isolated, single-request capture and direct in-memory filter on the raw response without projections or starting candidate engine components.
+
+##### B. Discovery Request Contract & Ceilings
+
+- **HTTP Method**: Exactly one `GET` attempt.
+- **Endpoint**: `https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=20&page=1`
+- **Redirect Policy**: `redirect: "error"` (no redirects permitted).
+- **Retry Allowance**: Exactly zero retries (fails closed on network or HTTP error).
+- **Pagination Allowance**: Exactly zero pagination requests (single page only).
+- **Follow-up Enrichment Allowance**: Exactly zero follow-up requests (no RPC, DexScreener, or RugCheck calls during discovery).
+- **Timeout Ceiling**: Explicit `10,000 ms` abort signal (`AbortSignal.timeout(10_000)`).
+- **Response Byte Ceiling**: Explicit `1,048,576 bytes` (1 MB); aborts/fails if response length exceeds 1 MB.
+- **Provider Pacing**: Single standalone dispatch (0 ms queue pacing needed for a single request).
+
+##### C. Source-Supported Units & Compatibility Rules
+
+1. **`burnPercent` Units**:
+   - Official Raydium SDK V2 (`@raydium-io/raydium-sdk-v2`) and Raydium API v3 return `burnPercent` as a numeric value expressed in **percentage points** in the range $[0, 100]$ (e.g. `burnPercent: 100` indicates 100%, per [Raydium SDK Issue #83](https://github.com/raydium-io/raydium-sdk-V2/issues/83)).
+   - The candidate-selection comparison is therefore `reportedBurnPercent >= 90`, **not** `>= 0.90`.
+   - Raw values and explicit units (`percentage_points_0_to_100`) are preserved in selection records.
+   - If `burnPercent` is missing, `null`, `undefined`, NaN, or non-numeric, it remains unknown (`undefined`) and fails closed (rejected).
+   - **Authoritative Boundary**: This indexer field is strictly a provisional discovery selection hint. The accepted on-chain account validator in `CandidateDecisionDiagnostic` and exact integer cross-multiplication ($100n \times (L - S) \ge 90n \times L$) remain solely authoritative.
+2. **Raydium AMM v4 Program ID Identification**:
+   - `poolType: "standard"` in Raydium API v3 covers both legacy AMM v4 and CPMM pools.
+   - The accepted 752-byte account decoder (`LIQUIDITY_STATE_LAYOUT_V4`) requires legacy Raydium AMM v4. CPMM pools use a 637-byte layout and are incompatible.
+   - The filter strictly requires reported `programId === "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"`.
+3. **Canonical Pair Leg Resolution**:
+   - Pool ID and token mints must be valid base58 public keys matching canonical format.
+   - Exactly one leg (`mintA.address` or `mintB.address`) must equal canonical WSOL (`So11111111111111111111111111111111111111112`), allowing either mintA or mintB orientation.
+   - The opposite leg is the candidate token mint (must not be WSOL).
+   - Final ownership, layout, and executable state verification remains the on-chain diagnostic's responsibility.
+4. **Pool Age (`openTime`) Handling**:
+   - `openTime` must be parsed as an integer representing unix epoch seconds.
+   - It must be strictly positive, an integer, not in the future relative to the retrieval timestamp ($T_{\text{open}} \le T_{\text{retrieval}}$), and must satisfy $T_{\text{retrieval}} - T_{\text{open}} \ge 300\text{ seconds}$ (5-minute maturity window).
+   - Missing, zero, `null`, malformed, non-integer, negative, or future `openTime` values are rejected fail-closed and are not treated as observed pool age.
+5. **Provisional Lead vs. Qualified Candidate Distinction**:
+   - Passing this filter identifies an unverified **provisional discovery lead**, not a strategy-qualified candidate. Full qualification only occurs after on-chain LP, authority, quiet flow, and Buy Gate verification.
+
+##### D. Output Directory & Sealed Manifest Contract
+
+All discovery artifacts are written to a timestamped, project-local directory:
+`data/research/discovery/raydium-standard-pools-<timestamp>/`
+
+The directory preserves five explicit, auditable files:
+
+1. `raw-response.json`: Exact byte-for-byte unprojected JSON response body returned by the Raydium API.
+2. `capture-metadata.json`: Dispatched URL, HTTP status, start/end timestamps ($T_{\text{dispatch}}$, $T_{\text{response}}$, $\Delta T$), byte length, and SHA-256 digest of `raw-response.json`.
+3. `selection-ledger.json`: Structured array of every pool in the response evaluated against the filter with pass/fail status and specific rejection reasons.
+4. `provisional-target.json`: Deterministic selection of at most one provisional target (highest TVL among qualifying pools), or `{ "hasTarget": false, "reason": "NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION" }`. Zero matches is a valid, terminating outcome without automatic threshold relaxation or query expansion.
+5. `manifest.json`: List of all generated files with exact byte sizes and SHA-256 digests.
+
+##### E. Copyable Operator Discovery Command (Pending Separate Approval)
+
+> [!IMPORTANT]
+> **READ-ONLY PROPOSAL — DO NOT EXECUTE**: The command below is provided for operator review and separate authorization. It does not run automatically.
+
+```powershell
+node -e @"
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+(async () => {
+  const WSOL = 'So11111111111111111111111111111111111111112';
+  const AMM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+  const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  const MAX_BYTES = 1048576; // 1 MB ceiling
+  const TIMEOUT_MS = 10000;
+  const URL = 'https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=default&sortType=desc&pageSize=20&page=1';
+
+  const timestampIso = new Date().toISOString();
+  const dirTimestamp = timestampIso.replace(/[:.]/g, '-');
+  const outDir = path.resolve('data/research/discovery', \`raydium-standard-pools-\${dirTimestamp}\`);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const t0 = Date.now();
+  console.log(\`[DISCOVERY] Dispatching single GET request to: \${URL}\`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(URL, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      redirect: 'error',
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const t1 = Date.now();
+  if (!response.ok) {
+    throw new Error(\`HTTP \${response.status} \${response.statusText}\`);
+  }
+
+  const rawBytes = Buffer.from(await response.arrayBuffer());
+  if (rawBytes.length > MAX_BYTES) {
+    throw new Error(\`Response length \${rawBytes.length} exceeds ceiling of \${MAX_BYTES} bytes\`);
+  }
+
+  const sha256 = crypto.createHash('sha256').update(rawBytes).digest('hex');
+  const rawText = rawBytes.toString('utf8');
+  const json = JSON.parse(rawText);
+
+  // 1. Save raw unprojected response byte-for-byte
+  fs.writeFileSync(path.join(outDir, 'raw-response.json'), rawBytes);
+
+  // 2. Save capture metadata
+  const metadata = {
+    url: URL,
+    httpStatus: response.status,
+    dispatchedAtIso: new Date(t0).toISOString(),
+    respondedAtIso: new Date(t1).toISOString(),
+    elapsedMs: t1 - t0,
+    byteLength: rawBytes.length,
+    sha256
+  };
+  fs.writeFileSync(path.join(outDir, 'capture-metadata.json'), JSON.stringify(metadata, null, 2));
+
+  // 3. In-memory filter directly on unprojected pools
+  const pools = json?.data?.data || [];
+  const retrievalSec = Math.floor(t1 / 1000);
+  const ledger = [];
+  const qualifying = [];
+
+  for (const p of pools) {
+    const reasons = [];
+    const poolId = p?.id;
+    const programId = p?.programId;
+    const mintA = p?.mintA?.address;
+    const mintB = p?.mintB?.address;
+    const burnPercent = p?.burnPercent;
+    const tvl = p?.tvl;
+    const rawOpenTime = p?.openTime;
+
+    if (!poolId || !BASE58_RE.test(poolId)) reasons.push('INVALID_POOL_ID');
+    if (programId !== AMM_V4_PROGRAM) reasons.push(\`PROGRAM_MISMATCH_\${programId || 'NONE'}\`);
+
+    const hasMintA = mintA && BASE58_RE.test(mintA);
+    const hasMintB = mintB && BASE58_RE.test(mintB);
+    if (!hasMintA || !hasMintB) {
+      reasons.push('INVALID_MINTS');
+    } else {
+      const isWSOL_A = mintA === WSOL;
+      const isWSOL_B = mintB === WSOL;
+      if ((isWSOL_A && isWSOL_B) || (!isWSOL_A && !isWSOL_B)) {
+        reasons.push('NOT_EXACTLY_ONE_WSOL_LEG');
+      }
+    }
+
+    if (burnPercent === null || burnPercent === undefined || typeof burnPercent !== 'number' || !Number.isFinite(burnPercent)) {
+      reasons.push('BURN_PERCENT_UNKNOWN');
+    } else if (burnPercent < 90) {
+      reasons.push(\`BURN_PERCENT_BELOW_90_\${burnPercent}\`);
+    }
+
+    if (typeof tvl !== 'number' || !Number.isFinite(tvl) || tvl < 30000) {
+      reasons.push(\`INSUFFICIENT_LIQUIDITY_TVL_\${tvl}\`);
+    }
+
+    let openTimeNum = null;
+    if (typeof rawOpenTime === 'number' && Number.isInteger(rawOpenTime) && rawOpenTime > 0) {
+      openTimeNum = rawOpenTime;
+    } else if (typeof rawOpenTime === 'string' && /^\\d+$/.test(rawOpenTime.trim())) {
+      openTimeNum = parseInt(rawOpenTime.trim(), 10);
+    }
+
+    if (openTimeNum === null) {
+      reasons.push('OPEN_TIME_INVALID_OR_MISSING');
+    } else if (openTimeNum > retrievalSec) {
+      reasons.push('OPEN_TIME_IN_FUTURE');
+    } else if (retrievalSec - openTimeNum < 300) {
+      reasons.push(\`POOL_AGE_UNDER_300S_\${retrievalSec - openTimeNum}\`);
+    }
+
+    const passed = reasons.length === 0;
+    const candidateMint = mintA === WSOL ? mintB : mintA;
+    const entry = {
+      poolId: poolId || 'UNKNOWN',
+      candidateMint: candidateMint || 'UNKNOWN',
+      symbol: (mintA === WSOL ? p?.mintB?.symbol : p?.mintA?.symbol) || 'UNKNOWN',
+      programId: programId || 'UNKNOWN',
+      reportedBurnPercent: burnPercent,
+      burnPercentUnits: 'percentage_points_0_to_100',
+      tvl: typeof tvl === 'number' ? tvl : null,
+      openTime: openTimeNum,
+      ageSecondsAtRetrieval: openTimeNum ? retrievalSec - openTimeNum : null,
+      passed,
+      rejectionReasons: reasons
+    };
+    ledger.push(entry);
+    if (passed) qualifying.push(entry);
+  }
+
+  fs.writeFileSync(path.join(outDir, 'selection-ledger.json'), JSON.stringify(ledger, null, 2));
+
+  // 4. Deterministic single target selection (highest TVL)
+  qualifying.sort((a, b) => (b.tvl || 0) - (a.tvl || 0));
+  const chosen = qualifying[0] || null;
+
+  const targetPayload = chosen
+    ? {
+        hasTarget: true,
+        selectionCriterion: 'HIGHEST_TVL_AMONG_QUALIFYING',
+        poolId: chosen.poolId,
+        candidateMint: chosen.candidateMint,
+        symbol: chosen.symbol,
+        reportedBurnPercent: chosen.reportedBurnPercent,
+        burnPercentUnits: chosen.burnPercentUnits,
+        tvl: chosen.tvl,
+        ageSecondsAtRetrieval: chosen.ageSecondsAtRetrieval,
+        provisionalStatus: 'PROVISIONAL_DISCOVERY_LEAD_PENDING_ONCHAIN_VALIDATION'
+      }
+    : {
+        hasTarget: false,
+        reason: 'NO_QUALIFYING_POOLS_FOUND_WITHOUT_EXPANSION'
+      };
+
+  fs.writeFileSync(path.join(outDir, 'provisional-target.json'), JSON.stringify(targetPayload, null, 2));
+
+  // 5. Generate manifest
+  const fileNames = ['raw-response.json', 'capture-metadata.json', 'selection-ledger.json', 'provisional-target.json'];
+  const manifestFiles = fileNames.map(f => {
+    const content = fs.readFileSync(path.join(outDir, f));
+    return {
+      path: f,
+      byteLength: content.length,
+      sha256: crypto.createHash('sha256').update(content).digest('hex')
+    };
+  });
+
+  const manifest = {
+    generatedAtIso: new Date().toISOString(),
+    outDir,
+    files: manifestFiles
+  };
+  fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+
+  console.log(\`[DISCOVERY] Completed. Scanned \${pools.length} pools. Qualifying: \${qualifying.length}. Target selected: \${chosen ? chosen.poolId : 'NONE'}. Artifacts in: \${outDir}\`);
+})();
+"@
+```
 
 #### 3. Bounded Standalone Diagnostic Execution on Approved Target
 
@@ -1761,4 +2010,4 @@ node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/candidate-decisio
 | **Total Dispatched Requests** |                                 |                   |        |   **11**   |
 
 - **Ceiling Compliance**: 11 total dispatched attempts on the passing quiet path complies strictly with the maximum 14-attempt ceiling.
-- **Unlocks Untested Stages**: If on-chain LP burn $\ge 90.0\%$ and authorities are renounced, the diagnostic proceeds directly to Phase 6, executing the live RugCheck query, Solana Tracker bundler query, Gate 8--12 evaluations, and decision point evaluation (`ARMED_FIRST_TICK` or gate rejection), sealing a complete 23-file manifest.
+- **Unlocks Untested Stages**: If on-chain LP burn $\ge 90.0\%$ and authorities are renounced, the diagnostic proceeds directly to Phase 6, executing the live RugCheck query, Solana Tracker bundler query, Gate 11 (`BUNDLER_CONCENTRATION_GATE`), Gate 12 (`ESTABLISHED_MACRO_TREND_GATE`), and decision point evaluation (`ARMED_FIRST_TICK` or gate rejection), sealing a complete 23-file manifest.
