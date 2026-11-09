@@ -53,8 +53,20 @@ import type {
 } from "./ExactPoolTransactionResolutionBridge.js";
 import {
   PAPER_FAILED_TRANSACTION_POLICY,
+  canonicalJson,
   validateFailedTransactionEvidence,
 } from "./ValidatedFailedTransactionEvidence.js";
+
+/** Sealed active-window classification derived from a resolution status (one definition for sealing and replay). */
+export function activeWindowResolutionClassification(
+  status: unknown,
+): "KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS" | "EXECUTED_DECODED" | "UNRESOLVED" {
+  return status === "RESOLVED_FAILED_TRANSACTION"
+    ? "KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS"
+    : status === "RESOLVED"
+      ? "EXECUTED_DECODED"
+      : "UNRESOLVED";
+}
 import {
   RollingTradeFlowTracker,
   type StreamGap,
@@ -2264,12 +2276,7 @@ export class CandidateDecisionDiagnostic {
           transactionDecodeAttempts: this.ledger.transactionDecodeAttempts,
           resolutions: streamResolutionRecords.map((r) => ({
             ...r,
-            classification:
-              r.status === "RESOLVED_FAILED_TRANSACTION"
-                ? "KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS"
-                : r.status === "RESOLVED"
-                  ? "EXECUTED_DECODED"
-                  : "UNRESOLVED",
+            classification: activeWindowResolutionClassification(r.status),
             responseFile:
               this.ledger.records.find(
                 (rec) =>
@@ -3906,8 +3913,9 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
   }
 
   if (failedTxPolicyEnabled) {
-    // The sealed resolution classification (and its response link) must agree with the re-derivation for every
-    // signature either side claims as resolved; altered or inconsistent evidence fails closed.
+    // Every substantive sealed resolution field (status, classification, response link, adapter outcome,
+    // identity, event counts, policy and error evidence) must agree with its raw-response re-derivation for each
+    // signature either side claims as resolved. Contradictions are rejected, never ignored.
     const sealedResolutions = params.activeEvidence.resolutions;
     if (!Array.isArray(sealedResolutions)) {
       return {
@@ -3917,52 +3925,77 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       };
     }
     const resolvedClasses = new Set<string>(["RESOLVED", "RESOLVED_FAILED_TRANSACTION"]);
-    const sealedBySig = new Map<
-      string,
-      {
-        readonly status?: unknown;
-        readonly responseFile?: unknown;
-        readonly knownFailedTransaction?: { readonly onChainErrorCanonical?: unknown } | null;
-      }
-    >();
+    const sealedBySig = new Map<string, Record<string, unknown>>();
     for (const entry of sealedResolutions as unknown[]) {
-      const e = entry as { signature?: unknown } | null;
+      const e = entry as Record<string, unknown> | null;
       if (
         !e ||
         typeof e !== "object" ||
+        Array.isArray(e) ||
         typeof e.signature !== "string" ||
         sealedBySig.has(e.signature)
       ) {
         return { ok: false, reason: "Sealed resolution records are malformed or duplicated" };
       }
-      sealedBySig.set(e.signature, e as Record<string, unknown>);
+      // Each sealed classification must match its own status, and failure evidence appears only on a known
+      // failed transaction (checked for every record, resolved or not).
+      if (e.classification !== activeWindowResolutionClassification(e.status)) {
+        return {
+          ok: false,
+          reason: `Sealed classification for '${e.signature}' (${String(e.classification)}) contradicts its status (${String(e.status)})`,
+        };
+      }
+      if (
+        (e.status === "RESOLVED_FAILED_TRANSACTION") !==
+        (e.knownFailedTransaction !== undefined && e.knownFailedTransaction !== null)
+      ) {
+        return {
+          ok: false,
+          reason: `Sealed failure evidence for '${e.signature}' is inconsistent with its status (${String(e.status)})`,
+        };
+      }
+      sealedBySig.set(e.signature, e);
     }
     for (const r of resolutions) {
       const sealed = sealedBySig.get(r.signature);
       const sealedStatus = sealed?.status;
       if (!resolvedClasses.has(r.status) && !resolvedClasses.has(String(sealedStatus))) continue;
-      if (sealedStatus !== r.status) {
+      if (!sealed || sealedStatus !== r.status) {
         return {
           ok: false,
           reason: `Sealed resolution classification for '${r.signature}' (${String(sealedStatus)}) contradicts re-derivation from the raw response (${r.status})`,
         };
       }
       const sealedFile =
-        typeof sealed?.responseFile === "string" ? sealed.responseFile.replace(/\\/g, "/") : null;
+        typeof sealed.responseFile === "string" ? sealed.responseFile.replace(/\\/g, "/") : null;
       if (sealedFile !== (responseFileBySignature.get(r.signature) ?? null)) {
         return {
           ok: false,
           reason: `Sealed resolution for '${r.signature}' is not linked to its sealed transaction response`,
         };
       }
+      const fieldChecks: ReadonlyArray<readonly [string, unknown, unknown]> = [
+        ["adapterOutcome", sealed.adapterOutcome, r.adapterOutcome],
+        ["slot", sealed.slot, r.slot],
+        ["blockTime", sealed.blockTime, r.blockTime],
+        ["decodedEventsCount", sealed.decodedEventsCount, r.decodedEventsCount],
+        ["ingestedEventsCount", sealed.ingestedEventsCount, r.ingestedEventsCount],
+      ];
+      for (const [field, sealedValue, derivedValue] of fieldChecks) {
+        if (sealedValue !== derivedValue) {
+          return {
+            ok: false,
+            reason: `Sealed ${field} for '${r.signature}' (${String(sealedValue)}) contradicts re-derivation from the raw response (${String(derivedValue)})`,
+          };
+        }
+      }
       if (
         r.status === "RESOLVED_FAILED_TRANSACTION" &&
-        sealed?.knownFailedTransaction?.onChainErrorCanonical !==
-          r.knownFailedTransaction?.onChainErrorCanonical
+        canonicalJson(sealed.knownFailedTransaction) !== canonicalJson(r.knownFailedTransaction)
       ) {
         return {
           ok: false,
-          reason: `Sealed on-chain error for '${r.signature}' does not match the raw transaction response`,
+          reason: `Sealed failure evidence for '${r.signature}' (policy, identity, or on-chain error) does not match the raw transaction response`,
         };
       }
     }

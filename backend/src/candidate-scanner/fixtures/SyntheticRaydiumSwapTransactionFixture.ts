@@ -5,6 +5,7 @@
  * the same legacy 17-account SwapBaseIn layout exercised by RaydiumAmmV4SwapDecoder.test.ts. These are not
  * captured market data; amounts, users, slots, and times are synthetic and chosen by each test.
  */
+import { createHash } from "node:crypto";
 import { encodeBase58 } from "../../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
   RAYDIUM_AMM_V4_PROGRAM_ID,
@@ -138,32 +139,76 @@ export const SYNTHETIC_FAILED_TRANSACTION_ERROR = Object.freeze({
 });
 
 /**
- * SYNTHETIC: a complete getTransaction `result` for a candidate-pool swap attempt that FAILED on-chain.
- * Same account layout as the swap fixture plus a message header, a recognized `meta.err` with a matching
- * deprecated `meta.status`, failure logs, and no committed inner transfers. Pass `err` to vary the error.
+ * SYNTHETIC deterministic 32-byte address: canonical Base58 of SHA-256 over a fixed label. Structurally valid
+ * (unlike the placeholder strings used by the swap fixture); it names no real account.
+ */
+export function syntheticCanonicalAddress(label: string): string {
+  return encodeBase58(createHash("sha256").update(`NEXUSTRADE-SYNTHETIC:${label}`).digest());
+}
+
+/**
+ * SYNTHETIC: a structurally complete getTransaction `result` (json encoding, legacy message) for a candidate-
+ * pool SwapBaseIn attempt that FAILED on-chain. Every field the failed-transaction validator checks is valid:
+ *  - header consistent with one writable fee-payer signer and the readonly static keys;
+ *  - canonical 32-byte Base58 account keys and recent blockhash (deterministic synthetic addresses, plus the
+ *    pool, vaults, and real program ids);
+ *  - Raydium AMM v4 program as a static, non-fee-payer program index; Base58 instruction data;
+ *  - empty loaded addresses (legacy), a recognized `meta.err`, and a matching deprecated `meta.status`.
+ * No inner transfers are committed. Pass `err` to vary the error.
  */
 export function buildSyntheticFailedTransactionResult(params: {
   readonly poolContext: TrackedRaydiumPoolContext;
   readonly signature: string;
   readonly slot: number;
   readonly blockTime: number;
-  readonly side?: "BUY" | "SELL";
   readonly err?: unknown;
 }): Record<string, unknown> {
-  const base = buildSyntheticSwapTransactionResult({ ...params, side: params.side ?? "BUY" });
+  const { poolContext, signature, slot, blockTime } = params;
   const err = params.err === undefined ? SYNTHETIC_FAILED_TRANSACTION_ERROR : params.err;
-  const transaction = base.transaction as { message: Record<string, unknown> };
+  const a = (label: string) => syntheticCanonicalAddress(`${label}:${poolContext.poolId}`);
+  // Writable signer, writable non-signers, then readonly non-signers (Solana static key ordering).
+  const accountKeys = [
+    a("user-wallet"), // 0 fee payer / user owner (writable signer)
+    a("user-source-ata"), // 1
+    a("user-dest-ata"), // 2
+    poolContext.poolId, // 3 amm
+    a("amm-open-orders"), // 4
+    poolContext.baseVault, // 5 pool coin vault
+    poolContext.quoteVault, // 6 pool pc vault
+    a("serum-market"), // 7
+    a("serum-bids"), // 8
+    a("serum-asks"), // 9
+    a("serum-event-queue"), // 10
+    a("serum-coin-vault"), // 11
+    a("serum-pc-vault"), // 12
+    a("amm-authority"), // 13 readonly
+    a("serum-vault-signer"), // 14 readonly
+    a("serum-program"), // 15 readonly
+    SPL_TOKEN_PROGRAM_ID, // 16 readonly
+    RAYDIUM_AMM_V4_PROGRAM_ID, // 17 readonly
+  ];
   return {
-    ...base,
+    slot,
+    blockTime,
+    version: "legacy",
     transaction: {
-      ...transaction,
+      signatures: [signature],
       message: {
         header: {
           numRequiredSignatures: 1,
           numReadonlySignedAccounts: 0,
-          numReadonlyUnsignedAccounts: 2,
+          numReadonlyUnsignedAccounts: 5,
         },
-        ...transaction.message,
+        accountKeys,
+        recentBlockhash: a("recent-blockhash"),
+        instructions: [
+          {
+            programIdIndex: 17,
+            accounts: [16, 3, 13, 4, 5, 6, 15, 7, 8, 9, 10, 11, 12, 14, 1, 2, 0],
+            data: encodeBase58(u64Data(9, 100_000_000n, 50_000_000_000n)),
+            stackHeight: null,
+          },
+        ],
       },
     },
     meta: {
@@ -171,6 +216,7 @@ export function buildSyntheticFailedTransactionResult(params: {
       status: { Err: JSON.parse(JSON.stringify(err)) as unknown },
       fee: 5000,
       innerInstructions: [],
+      loadedAddresses: { writable: [], readonly: [] },
       logMessages: [
         `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
         "Program log: Error: exceeds desired slippage limit",

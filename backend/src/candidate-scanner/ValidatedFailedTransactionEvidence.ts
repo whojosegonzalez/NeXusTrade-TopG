@@ -14,11 +14,15 @@
  *    behavior are unchanged.
  */
 import {
+  decodeInstructionData,
   decodeRaydiumTransactionSwaps,
   type TrackedRaydiumPoolContext,
 } from "./RaydiumAmmV4SwapDecoder.js";
 import { isValidSolanaSignature } from "./ExactPoolHistoryEnumerator.js";
-import { RAYDIUM_AMM_V4_PROGRAM_ID } from "../research/pilot/RaydiumAmmParser.js";
+import {
+  RAYDIUM_AMM_V4_PROGRAM_ID,
+  isCanonicalSolanaBase58,
+} from "../research/pilot/RaydiumAmmParser.js";
 
 /** Sealed policy identifier. Replay honours only this exact value; any other sealed value fails closed. */
 export const PAPER_FAILED_TRANSACTION_POLICY =
@@ -341,53 +345,167 @@ export function validateFailedTransactionEvidence(
     );
   }
 
-  // 4. Supported message structure.
+  // 4. Supported message structure for the json-encoded getTransaction format. Bounded to this acceptance
+  //    path: it is not a general transaction framework and performs no cryptographic signature verification.
+  const version = payload.version;
+  const versionKind: "legacy" | 0 | 1 | null =
+    version === undefined || version === "legacy"
+      ? "legacy"
+      : version === 0
+        ? 0
+        : version === 1
+          ? 1
+          : null;
+  if (versionKind === null) return fail(`unsupported transaction version ${String(version)}`);
+
+  const unexpectedTxField = Object.keys(transaction).find(
+    (k) => k !== "signatures" && k !== "message",
+  );
+  if (unexpectedTxField !== undefined) {
+    return fail(`unsupported transaction field '${unexpectedTxField}'`);
+  }
   const message = transaction.message;
   if (!isPlainObject(message)) return fail("message missing");
+  const allowedMessageFields = new Set([
+    "accountKeys",
+    "header",
+    "instructions",
+    "recentBlockhash",
+    ...(versionKind === 0 ? ["addressTableLookups"] : []),
+    ...(versionKind === 1 ? ["transactionConfig"] : []),
+  ]);
+  const unexpectedMessageField = Object.keys(message).find((k) => !allowedMessageFields.has(k));
+  if (unexpectedMessageField !== undefined) {
+    return fail(
+      `unsupported message field '${unexpectedMessageField}' for version ${String(versionKind)}`,
+    );
+  }
+
+  // Header: signer count matches the signatures, the fee payer stays a writable signer, and the readonly
+  // counts fit inside the static account keys.
   const header = message.header;
   if (
     !isPlainObject(header) ||
+    Object.keys(header).length !== 3 ||
     !isIntInRange(header.numRequiredSignatures, 1, U8_MAX) ||
     !isIntInRange(header.numReadonlySignedAccounts, 0, U8_MAX) ||
     !isIntInRange(header.numReadonlyUnsignedAccounts, 0, U8_MAX)
   ) {
     return fail("message header missing or malformed");
   }
-  if (header.numRequiredSignatures !== signatures.length) {
+  const numSigners = header.numRequiredSignatures;
+  if (numSigners !== signatures.length) {
     return fail("signature count does not match header.numRequiredSignatures");
   }
-  const staticKeys = message.accountKeys;
-  if (
-    !Array.isArray(staticKeys) ||
-    staticKeys.length === 0 ||
-    !staticKeys.every((k) => typeof k === "string" && k.trim().length > 0)
-  ) {
-    return fail("accountKeys must be a nonempty array of account strings");
+  if (header.numReadonlySignedAccounts >= numSigners) {
+    return fail("header.numReadonlySignedAccounts leaves no writable fee payer");
   }
-  if (staticKeys.length < header.numRequiredSignatures)
-    return fail("accountKeys shorter than signers");
 
+  // Static account keys: canonical 32-byte Base58 addresses.
+  const staticKeys = message.accountKeys;
+  if (!Array.isArray(staticKeys) || staticKeys.length === 0 || staticKeys.length > U8_MAX + 1) {
+    return fail("accountKeys must be a nonempty array of at most 256 keys");
+  }
+  const badStaticKey = staticKeys.findIndex((k) => !isCanonicalSolanaBase58(k));
+  if (badStaticKey !== -1) {
+    return fail(`accountKeys[${badStaticKey}] is not a canonical 32-byte Base58 address`);
+  }
+  if (numSigners + header.numReadonlyUnsignedAccounts > staticKeys.length) {
+    return fail("header signer and readonly-unsigned counts exceed the static account keys");
+  }
+
+  // Recent blockhash: canonical 32-byte Base58.
+  if (!isCanonicalSolanaBase58(message.recentBlockhash)) {
+    return fail("recentBlockhash missing or not a canonical 32-byte Base58 value");
+  }
+
+  // Version / lookup-table relationships.
   const meta = payload.meta;
   if (!isPlainObject(meta)) return fail("meta object missing");
-  const loadedKeys: string[] = [];
-  if (meta.loadedAddresses !== undefined && meta.loadedAddresses !== null) {
-    const loaded = meta.loadedAddresses;
-    if (!isPlainObject(loaded)) return fail("loadedAddresses malformed");
+  const loaded = meta.loadedAddresses;
+  let loadedWritable: string[] = [];
+  let loadedReadonly: string[] = [];
+  if (loaded !== undefined && loaded !== null) {
+    if (
+      !isPlainObject(loaded) ||
+      Object.keys(loaded).some((k) => k !== "writable" && k !== "readonly")
+    ) {
+      return fail("loadedAddresses malformed");
+    }
     for (const field of ["writable", "readonly"] as const) {
       const list = loaded[field];
       if (list === undefined) continue;
-      if (
-        !Array.isArray(list) ||
-        !list.every((k) => typeof k === "string" && k.trim().length > 0)
-      ) {
-        return fail(`loadedAddresses.${field} malformed`);
+      if (!Array.isArray(list)) return fail(`loadedAddresses.${field} malformed`);
+      const bad = list.findIndex((k) => !isCanonicalSolanaBase58(k));
+      if (bad !== -1) {
+        return fail(`loadedAddresses.${field}[${bad}] is not a canonical 32-byte Base58 address`);
       }
-      loadedKeys.push(...(list as string[]));
+      if (field === "writable") loadedWritable = list as string[];
+      else loadedReadonly = list as string[];
     }
   }
-  const allKeys = [...(staticKeys as string[]), ...loadedKeys];
+  if (versionKind === 0) {
+    // Version 0: loaded addresses must correspond exactly to the message's address-table lookups.
+    if (loaded === undefined || loaded === null) {
+      return fail("version 0 transaction lacks meta.loadedAddresses");
+    }
+    const lookups = message.addressTableLookups;
+    if (!Array.isArray(lookups)) return fail("version 0 transaction lacks addressTableLookups");
+    let writableCount = 0;
+    let readonlyCount = 0;
+    const tables = new Set<string>();
+    for (let i = 0; i < lookups.length; i++) {
+      const lookup = lookups[i] as unknown;
+      if (
+        !isPlainObject(lookup) ||
+        Object.keys(lookup).length !== 3 ||
+        !isCanonicalSolanaBase58(lookup.accountKey) ||
+        !Array.isArray(lookup.writableIndexes) ||
+        !Array.isArray(lookup.readonlyIndexes) ||
+        ![...lookup.writableIndexes, ...lookup.readonlyIndexes].every((x) =>
+          isIntInRange(x, 0, U8_MAX),
+        )
+      ) {
+        return fail(`addressTableLookups[${i}] malformed`);
+      }
+      if (tables.has(lookup.accountKey as string)) {
+        return fail("duplicate address-table lookup");
+      }
+      tables.add(lookup.accountKey as string);
+      writableCount += lookup.writableIndexes.length;
+      readonlyCount += lookup.readonlyIndexes.length;
+    }
+    if (writableCount !== loadedWritable.length || readonlyCount !== loadedReadonly.length) {
+      return fail("loadedAddresses do not correspond to the address-table lookups");
+    }
+  } else if (loadedWritable.length > 0 || loadedReadonly.length > 0) {
+    // Legacy and version 1 (SIMD-0385, inline keys only) cannot load accounts from lookup tables.
+    return fail(`version ${String(versionKind)} transaction cannot carry loaded addresses`);
+  }
+  if (versionKind === 1 && message.transactionConfig !== undefined) {
+    const config = message.transactionConfig;
+    const knownConfigFields = new Set([
+      "computeUnitLimit",
+      "computeUnitPrice",
+      "heapSize",
+      "loadedAccountsDataSizeLimit",
+      "priorityFee",
+    ]);
+    if (
+      !isPlainObject(config) ||
+      !Object.entries(config).every(
+        ([k, v]) => knownConfigFields.has(k) && isIntInRange(v, 0, Number.MAX_SAFE_INTEGER),
+      )
+    ) {
+      return fail("transactionConfig malformed or unsupported");
+    }
+  }
+  const allKeys = [...(staticKeys as string[]), ...loadedWritable, ...loadedReadonly];
+  if (allKeys.length > U8_MAX + 1) return fail("more than 256 account keys");
   if (new Set(allKeys).size !== allKeys.length) return fail("duplicate account keys");
 
+  // Compiled instructions: programs are static, non-fee-payer keys; account indices in range; data is
+  // canonically Base58-encoded (empty data allowed); outer stackHeight, when present, is 1 or null.
   const instructions = message.instructions;
   if (!Array.isArray(instructions) || instructions.length === 0)
     return fail("instructions missing");
@@ -395,12 +513,22 @@ export function validateFailedTransactionEvidence(
     const ix = instructions[i] as unknown;
     if (
       !isPlainObject(ix) ||
-      !isIntInRange(ix.programIdIndex, 0, allKeys.length - 1) ||
+      Object.keys(ix).some(
+        (k) => k !== "programIdIndex" && k !== "accounts" && k !== "data" && k !== "stackHeight",
+      ) ||
+      !isIntInRange(ix.programIdIndex, 1, staticKeys.length - 1) ||
       !Array.isArray(ix.accounts) ||
       !ix.accounts.every((a) => isIntInRange(a, 0, allKeys.length - 1)) ||
-      typeof ix.data !== "string"
+      (ix.stackHeight !== undefined && ix.stackHeight !== null && ix.stackHeight !== 1)
     ) {
       return fail(`instruction ${i} malformed`);
+    }
+    if (
+      typeof ix.data !== "string" ||
+      ix.data.trim() !== ix.data ||
+      decodeInstructionData(ix.data) === null
+    ) {
+      return fail(`instruction ${i} data is not valid Base58`);
     }
   }
 

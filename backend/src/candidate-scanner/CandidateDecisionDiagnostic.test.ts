@@ -3747,6 +3747,20 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     readonly meta?: "STRIP_ERR" | "META_NULL" | "MALFORMED_ERR";
     /** SYNTHETIC: complete, explicitly failed transaction (recognized error; history reports the same err). */
     readonly validFailure?: boolean;
+    /** SYNTHETIC: structural mutation applied to the failed transaction result before it is served. */
+    readonly failureMutation?: (result: FailedTxResult) => void;
+  }
+  interface FailedTxResult {
+    transaction: {
+      signatures: string[];
+      message: {
+        header: Record<string, number>;
+        accountKeys: string[];
+        instructions: Array<Record<string, unknown>>;
+        [field: string]: unknown;
+      };
+    };
+    [field: string]: unknown;
   }
 
   /** Runs the diagnostic with SYNTHETIC stream notifications and decodable SYNTHETIC swap transactions. */
@@ -3774,6 +3788,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
         hang?: boolean;
         meta?: ScheduledSwap["meta"];
         validFailure?: boolean;
+        failureMutation?: ScheduledSwap["failureMutation"];
       }
     >();
     const emitDue = () => {
@@ -3787,6 +3802,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
             hang: swap.hang === true,
             meta: swap.meta,
             validFailure: swap.validFailure === true,
+            failureMutation: swap.failureMutation,
           });
           wsTransport.emitMessage(
             JSON.stringify({
@@ -3838,17 +3854,15 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
           });
         }
         if (tx?.validFailure) {
+          const failedResult = buildSyntheticFailedTransactionResult({
+            poolContext: POOL_CONTEXT,
+            signature: sig,
+            slot: tx.slot,
+            blockTime: tx.blockTime,
+          }) as unknown as FailedTxResult;
+          tx.failureMutation?.(failedResult);
           return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: body.id,
-              result: buildSyntheticFailedTransactionResult({
-                poolContext: POOL_CONTEXT,
-                signature: sig,
-                slot: tx.slot,
-                blockTime: tx.blockTime,
-              }),
-            }),
+            JSON.stringify({ jsonrpc: "2.0", id: body.id, result: failedResult }),
             { status: 200 },
           );
         }
@@ -4570,6 +4584,19 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(2);
     expect(replay.recomputedActiveWindowFlow?.recentBuys60s).toBe(1);
     expect(replay.recomputedActiveWindowFlow?.recentSells60s).toBe(0);
+
+    // The executed record's sealed fields are cross-checked as well (manifest recalculated).
+    const executed = JSON.parse(readFileSync(activeEvidencePath(), "utf8")) as {
+      resolutions: Array<Record<string, unknown>>;
+    };
+    executed.resolutions.find((r) => r.signature === TEST_SIG_B)!.ingestedEventsCount = 99;
+    writeFileSync(activeEvidencePath(), JSON.stringify(executed), "utf8");
+    resealSyntheticCapture(activeOutDir);
+    const tampered = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(tampered.ok).toBe(false);
+    expect(tampered.status).toBe("REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID");
+    expect(tampered.message).toContain("Sealed ingestedEventsCount");
+    expect(tampered.decisionResult).toBeUndefined();
   });
 
   it("F7. Failed-only window replays as 0/0 active flow; altered raw responses or sealed labels fail closed", async () => {
@@ -4609,6 +4636,13 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       mutate(j);
       writeFileSync(p, JSON.stringify(j), "utf8");
     };
+    /** Edits the (only) sealed resolution record of the failed-only capture. */
+    const editSealed = (mutate: (r: Record<string, unknown>) => void) =>
+      editJson(activeEvidencePath(), (j) =>
+        mutate((j.resolutions as Array<Record<string, unknown>>)[0]!),
+      );
+    const failure = (r: Record<string, unknown>) =>
+      r.knownFailedTransaction as Record<string, unknown>;
     const setErr = (err: unknown) => (j: Record<string, unknown>) => {
       const meta = (j.result as { meta: Record<string, unknown> }).meta;
       meta.err = err;
@@ -4652,13 +4686,81 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
         "Unsupported sealed failed-transaction policy",
       ],
       [
-        "sealed label relabelled as an executed transaction",
+        "sealed status relabelled as an executed transaction",
+        () => editSealed((r) => (r.status = "RESOLVED")),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "contradicts its status (RESOLVED)",
+      ],
+      [
+        "sealed record consistently relabelled as an executed transaction",
         () =>
-          editJson(activeEvidencePath(), (j) => {
-            (j.resolutions as Array<Record<string, unknown>>)[0]!.status = "RESOLVED";
+          editSealed((r) => {
+            r.status = "RESOLVED";
+            r.classification = "EXECUTED_DECODED";
+            r.adapterOutcome = "SUCCESS";
+            delete r.knownFailedTransaction;
           }),
         "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
         "(RESOLVED) contradicts re-derivation from the raw response (RESOLVED_FAILED_TRANSACTION)",
+      ],
+      // Reviewer reproductions (sealed resolution fields altered, manifest recalculated).
+      [
+        "classification changed to EXECUTED_DECODED",
+        () => editSealed((r) => (r.classification = "EXECUTED_DECODED")),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "(EXECUTED_DECODED) contradicts its status (RESOLVED_FAILED_TRANSACTION)",
+      ],
+      [
+        "knownFailedTransaction.slot changed to 1",
+        () => editSealed((r) => (failure(r).slot = 1)),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Sealed failure evidence for",
+      ],
+      [
+        "decoded and ingested event counts changed to 99",
+        () =>
+          editSealed((r) => {
+            r.decodedEventsCount = 99;
+            r.ingestedEventsCount = 99;
+          }),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Sealed decodedEventsCount",
+      ],
+      [
+        "knownFailedTransaction.onChainError changed to {}",
+        () => editSealed((r) => (failure(r).onChainError = {})),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "does not match the raw transaction response",
+      ],
+      [
+        "knownFailedTransaction.policy changed",
+        () => editSealed((r) => (failure(r).policy = "OTHER_POLICY")),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "does not match the raw transaction response",
+      ],
+      [
+        "sealed slot changed",
+        () => editSealed((r) => (r.slot = 1)),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Sealed slot",
+      ],
+      [
+        "sealed blockTime changed",
+        () => editSealed((r) => (r.blockTime = 1)),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Sealed blockTime",
+      ],
+      [
+        "sealed adapter outcome changed",
+        () => editSealed((r) => (r.adapterOutcome = "SUCCESS")),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Sealed adapterOutcome",
+      ],
+      [
+        "failure evidence removed",
+        () => editSealed((r) => delete r.knownFailedTransaction),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "inconsistent with its status (RESOLVED_FAILED_TRANSACTION)",
       ],
       [
         "sealed response link changed",
@@ -4738,5 +4840,101 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     expect(replay.ok).toBe(true);
     expect(replay.matchesRecordedDecision).toBe(true);
     expect(replay.recomputedActiveWindowFlow?.flow.isCoverageSufficient).toBe(false);
+
+    // Sealed labels on an unqualified capture are cross-checked too (manifest recalculated after each edit).
+    const original = readFileSync(activeEvidencePath(), "utf8");
+    const originalManifest = readFileSync(
+      path.join(activeOutDir, "evidence-manifest.json"),
+      "utf8",
+    );
+    const tamperCases: Array<[string, (rs: Array<Record<string, unknown>>) => void, string]> = [
+      [
+        "failed record event counts changed",
+        (rs) =>
+          (rs.find((r) => r.status === "RESOLVED_FAILED_TRANSACTION")!.decodedEventsCount = 99),
+        "Sealed decodedEventsCount",
+      ],
+    ];
+    try {
+      for (const [label, mutate, reason] of tamperCases) {
+        const j = JSON.parse(original) as { resolutions: Array<Record<string, unknown>> };
+        mutate(j.resolutions);
+        writeFileSync(activeEvidencePath(), JSON.stringify(j), "utf8");
+        resealSyntheticCapture(activeOutDir);
+        const r = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+        expect(r.ok, label).toBe(false);
+        expect(r.status, label).toBe("REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID");
+        expect(r.message, label).toContain(reason);
+        expect(r.decisionResult, label).toBeUndefined();
+      }
+    } finally {
+      writeFileSync(activeEvidencePath(), original, "utf8");
+      writeFileSync(path.join(activeOutDir, "evidence-manifest.json"), originalManifest, "utf8");
+    }
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+  });
+
+  it("F10. Structurally malformed failed transactions stay unavailable in the diagnostic (no zero-swap acceptance)", async () => {
+    const mutations: Array<[string, (r: FailedTxResult) => void]> = [
+      [
+        "impossible readonly-signed header",
+        (r) => (r.transaction.message.header.numReadonlySignedAccounts = 255),
+      ],
+      [
+        "impossible readonly-unsigned header",
+        (r) => (r.transaction.message.header.numReadonlyUnsignedAccounts = 255),
+      ],
+      ["invalid static address", (r) => (r.transaction.message.accountKeys[0] = "invalid_key!")],
+      ["invalid instruction data", (r) => (r.transaction.message.instructions[0]!.data = "%%%")],
+      ["missing recent blockhash", (r) => delete r.transaction.message.recentBlockhash],
+    ];
+    for (const [label, failureMutation] of mutations) {
+      rmSync(activeOutDir, { recursive: true, force: true });
+      const result = await runActive({
+        paperActiveWindowFlow: true,
+        swaps: [
+          { signature: TEST_SIG_B, offsetMs: 25_000, slot: 461970850, side: "BUY" },
+          {
+            signature: SIG_C,
+            offsetMs: 45_000,
+            slot: 461970860,
+            side: "BUY",
+            validFailure: true,
+            failureMutation,
+          },
+        ],
+      });
+      expect(result.status, label).not.toBe("ARMED_FIRST_TICK");
+      expect(result.flowEvaluation?.isPaperQualified, label).not.toBe(true);
+      expect(result.flowEvaluation?.recentBuys60s, label).toBeNull();
+      expect(result.flowEvaluation?.diagnosticReason, label).toContain("ACTIVE_WINDOW_UNQUALIFIED");
+      // The retrieval still consumed its allowance.
+      expect(result.ledger.transactionDecodeAttempts, label).toBe(2);
+      const evidence = readJson<SealedActiveEvidence>(activeEvidencePath());
+      const failed = evidence.resolutions.find((r) => r.signature === SIG_C)!;
+      expect(failed.status, label).toBe("FAILED_DECODE");
+      expect(failed.classification, label).toBe("UNRESOLVED");
+      expect(failed.knownFailedTransaction, label).toBeUndefined();
+      // Replay re-derives the same rejection and reproduces the unavailable decision.
+      const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+      expect(replay.ok, label).toBe(true);
+      expect(replay.matchesRecordedDecision, label).toBe(true);
+      expect(replay.recomputedActiveWindowFlow?.knownFailedTransactions, label).toBe(0);
+      expect(replay.recomputedActiveWindowFlow?.flow.isCoverageSufficient, label).toBe(false);
+    }
+
+    // An unresolved sealed record relabelled as executed is rejected (manifest recalculated).
+    const sealed = JSON.parse(readFileSync(activeEvidencePath(), "utf8")) as {
+      resolutions: Array<Record<string, unknown>>;
+    };
+    sealed.resolutions.find((r) => r.signature === SIG_C)!.classification = "EXECUTED_DECODED";
+    writeFileSync(activeEvidencePath(), JSON.stringify(sealed), "utf8");
+    resealSyntheticCapture(activeOutDir);
+    const relabelled = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(relabelled.ok).toBe(false);
+    expect(relabelled.status).toBe("REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID");
+    expect(relabelled.message).toContain(
+      "(EXECUTED_DECODED) contradicts its status (FAILED_DECODE)",
+    );
   });
 });

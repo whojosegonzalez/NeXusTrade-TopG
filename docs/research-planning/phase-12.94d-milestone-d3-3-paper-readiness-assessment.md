@@ -3022,11 +3022,20 @@ A decoder `TRANSACTION_FAILED` result, or a telemetry `PRESENT` label, is **not*
 
 - **Response**: the adapter's existing JSON-RPC checks pass (version `2.0`, expected id, no `error`, non-null `result`, exact requested signature). Notification slot and blockTime contradictions are still rejected first.
 - **Decoder classification**: the shared decoder classifies the exact payload as `TRANSACTION_FAILED` for the candidate pool context, which also validates the pool context, slot and supported version (legacy, 0 or 1).
-- **Structure**:
+- **Structure** (json-encoded `getTransaction` format; completed in §8.22a after review of `f5bb456`):
   - a valid signature list whose first entry is the requested signature, with no duplicates;
-  - a message header whose signer count matches the signatures;
-  - non-empty, unique account keys (static plus loaded);
-  - well-formed outer instructions, with program and account indices in range.
+  - a three-field header whose signer count matches the signatures, which leaves the fee payer a writable signer (`numReadonlySignedAccounts < numRequiredSignatures`), and whose signer plus readonly-unsigned counts fit inside the static keys;
+  - static and loaded account addresses that are canonical 32-byte Base58, unique, and at most 256 in total;
+  - a canonical 32-byte Base58 `recentBlockhash`;
+  - outer instructions whose program is a static, non-fee-payer key, whose account indices are in range, whose data is canonically Base58-encoded, and whose `stackHeight` (if present) is 1 or `null`;
+  - version and lookup relationships:
+    - legacy messages carry no lookups, `transactionConfig` or loaded addresses;
+    - version 0 requires `addressTableLookups` whose writable and readonly index counts equal `meta.loadedAddresses`;
+    - version 1 (SIMD-0385) carries inline keys only, with no loaded addresses and only a known integer `transactionConfig`;
+    - unknown transaction, message, header or instruction fields are rejected.
+
+  This is not cryptographic signature verification and not a general transaction framework.
+
 - **Timestamps**: a safe-integer slot and a positive integer `blockTime`. Neither is ever manufactured.
 - **Candidate binding**: the transaction references the candidate pool and the Raydium AMM v4 program.
 - **Recognized error**: `meta.err` is a recognized Solana `TransactionError` representation:
@@ -3069,9 +3078,9 @@ The genuine sealed RAY failure (`InstructionError [1, Custom 30]`, version 1, ma
 - **Replay re-derivation**: replay re-derives eligibility from the raw sealed response:
   - a verified JSON-RPC envelope (version `2.0`, no error, `id` equal to the sealed ledger `rpcRequestId` and `rpcResponseId`);
   - the same full validation;
-  - a cross-check of every sealed resolved classification, response link and on-chain error against the re-derivation.
+  - a cross-check of the sealed resolution records against the re-derivation (completed in §8.22a; at `f5bb456` only status, response link and canonical error were compared, and other contradictions were ignored).
 
-  Saved counts, labels and statuses are never trusted. Each of the following fails closed: altered errors, a removed error, an altered response id, a relabelled status, a changed response link, or an unsupported policy value. Removing the policy reverts to the legacy interpretation, which cannot reproduce the recorded flow.
+  Removing the policy reverts to the legacy interpretation, which cannot reproduce the recorded flow.
 
 - **Historical captures** carry no policy and keep their original interpretation. Replay results for all 9 captures are identical before and after this change.
 
@@ -3103,8 +3112,46 @@ All coverage uses `buildSyntheticFailedTransactionResult` (version-controlled), 
   - missing opt-in, production context and incomplete or forged evidence;
   - history, slot, time and epoch mismatches;
   - gaps, backlog, staleness and exhausted enumeration.
-- **Diagnostic (F6–F9)**:
+- **Diagnostic (F6–F10)**:
   - mixed and failed-only sealing and replay;
-  - eight tamper variants, each with its asserted failure reason;
+  - raw-response, sealed-label and sealed-field tamper variants, each with its asserted failure reason (§8.22a);
   - no opt-in;
-  - failed transactions exhausting the 3 retrievals.
+  - failed transactions exhausting the 3 retrievals;
+  - structurally malformed failed transactions staying unavailable (F10).
+
+#### 8.22a Review Corrections (Review of `f5bb456`)
+
+An independent review reproduced two gaps in `f5bb456`. §8.22 as first written overstated the verified behaviour in both areas, and has been corrected above.
+
+1. **Structural validation was incomplete.** Starting from the genuine sealed RAY failure, each of these mutations was still accepted:
+   - `numReadonlySignedAccounts = 255`;
+   - `numReadonlyUnsignedAccounts = 255`;
+   - `accountKeys[0] = "invalid_key!"`;
+   - instruction data `"%%%"`;
+   - a removed `recentBlockhash`.
+
+   A synthetic diagnostic with the impossible signed-account header even reached `ARMED_FIRST_TICK` with `isPaperQualified: true`.
+
+   - **Fix**: the structural checks listed in §8.22.1 now run, reusing `isCanonicalSolanaBase58` and the decoder's `decodeInstructionData`. Each of the five mutations is rejected with an explicit reason, as are several adjacent cases (a short blockhash, the fee payer used as a program, version/lookup mismatches, unknown fields).
+   - **Real data**: the genuine sealed RAY failure (version 1, `transactionConfig`, `stackHeight: 1`) still validates (read-only check).
+   - **Fixture**: the synthetic failed-transaction fixture was rebuilt with deterministic canonical 32-byte addresses, a recent blockhash, a consistent header, and Raydium as a static, non-fee-payer program. Validation was not weakened to accommodate placeholders.
+   - **Diagnostic (F10)**: with each mutation, the window stays `ACTIVE_WINDOW_UNQUALIFIED` (no counts). The transaction is sealed as `FAILED_DECODE` / `UNRESOLVED`, the retrieval still counts, and replay reproduces the unavailable decision.
+
+2. **Replay ignored contradictory sealed fields.** On a synthetic failed-only capture with recalculated manifest hashes, each of these still replayed as `ok` with a matching decision:
+   - a classification changed to `EXECUTED_DECODED`;
+   - `knownFailedTransaction.slot = 1`;
+   - event counts set to 99;
+   - `onChainError = {}`.
+
+   The earlier statement that saved labels "are never trusted" was true only in the sense that replay did not _use_ them; it did not _reject_ contradictions.
+
+   - **Fix**: under the policy, every sealed record's classification must equal the classification of its own status, and failure evidence must appear exactly on `RESOLVED_FAILED_TRANSACTION` records.
+   - **Resolved signatures**: for every signature either side claims as resolved, the following must equal the raw-response re-derivation, otherwise replay fails with `REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID` and an explicit reason:
+     - status and response link;
+     - adapter outcome, slot and `blockTime`;
+     - decoded and ingested event counts;
+     - the complete failure evidence (policy, classification, identity, error, variant, decoder reason and message).
+   - **Regressions**: the four reviewer cases, plus tampering with the policy, slot, `blockTime` and adapter outcome, removed failure evidence, an executed record's count (F6), a failed record's count on an unqualified capture (F9), and an unresolved record relabelled as executed (F10).
+   - **Legacy captures**: captures without the policy keep their original interpretation. Replay results for all 9 historical captures are again identical before and after.
+
+Limits, PAPER boundaries, budgets, pacing, freshness, thresholds and the wallet are unchanged. No live capture has exercised this path.

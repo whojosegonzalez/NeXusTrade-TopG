@@ -19,6 +19,7 @@ import {
   buildSyntheticFailedTransactionResult,
   buildSyntheticSwapTransactionResult,
   SYNTHETIC_FAILED_TRANSACTION_ERROR,
+  syntheticCanonicalAddress,
 } from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
 
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -192,51 +193,256 @@ describe("validateFailedTransactionEvidence (decoder TRANSACTION_FAILED alone is
     }
   });
 
-  it("rejects identity, timestamp, version, structure, and pool-binding defects", () => {
-    const cases: Array<[string, (p: Payload) => void, Record<string, unknown>?]> = [
-      ["signature mismatch", (p) => (p.transaction.signatures = [OTHER_SIG])],
-      ["invalid signature encoding", (p) => (p.transaction.signatures = ["not-a-signature"])],
-      ["header signer count mismatch", (p) => (p.transaction.signatures = [SIG, OTHER_SIG])],
-      ["missing header", (p) => delete p.transaction.message.header],
-      ["missing blockTime", (p) => (p.blockTime = null)],
-      ["zero blockTime", (p) => (p.blockTime = 0)],
-      ["fractional blockTime", (p) => (p.blockTime = BLOCK_TIME + 0.5)],
-      ["invalid slot", (p) => (p.slot = -1)],
-      ["unsupported version", (p) => (p.version = 2)],
-      ["malformed instruction", (p) => (p.transaction.message.instructions = [{ data: "x" }])],
+  interface Msg {
+    header: Record<string, unknown>;
+    accountKeys: string[];
+    instructions: Array<Record<string, unknown>>;
+    [field: string]: unknown;
+  }
+  const msg = (p: Payload) => p.transaction.message as unknown as Msg;
+  const meta = (p: Payload) => p.meta as Record<string, unknown>;
+  const FOREIGN = syntheticCanonicalAddress("foreign-account");
+  const LOOKUP_TABLE = syntheticCanonicalAddress("lookup-table");
+  const LOADED = syntheticCanonicalAddress("loaded-writable");
+
+  it("accepts supported legacy, version 0 lookup, and version 1 inline representations", () => {
+    const v0 = failedPayload();
+    v0.version = 0;
+    msg(v0).addressTableLookups = [
+      { accountKey: LOOKUP_TABLE, writableIndexes: [4], readonlyIndexes: [] },
+    ];
+    meta(v0).loadedAddresses = { writable: [LOADED], readonly: [] };
+    const v1 = failedPayload();
+    v1.version = 1;
+    msg(v1).transactionConfig = { computeUnitLimit: 28_030, heapSize: 32_768, priorityFee: 2_121 };
+    msg(v1).instructions[0]!.stackHeight = 1;
+    const emptyData = failedPayload();
+    msg(emptyData).instructions[0]!.data = "";
+    for (const [label, p] of [
+      ["legacy", failedPayload()],
+      ["version 0 with a matching lookup", v0],
+      ["version 1 with transactionConfig", v1],
+      ["empty instruction data", emptyData],
+    ] as const) {
+      const r = validate(p);
+      expect(r.ok, `${label}: ${r.ok ? "" : r.reason}`).toBe(true);
+    }
+  });
+
+  it("rejects identity, timestamp, version, structure, and pool-binding defects with explicit reasons", () => {
+    const cases: Array<[string, (p: Payload) => void, string, Record<string, unknown>?]> = [
+      [
+        "signature mismatch",
+        (p) => (p.transaction.signatures = [OTHER_SIG]),
+        "decoded signature mismatch",
+      ],
+      [
+        "invalid signature encoding",
+        (p) => (p.transaction.signatures = [SIG, "not-a-signature"]),
+        "invalid signature encoding",
+      ],
+      [
+        "header signer count mismatch",
+        (p) => (p.transaction.signatures = [SIG, OTHER_SIG]),
+        "signature count does not match",
+      ],
+      [
+        "missing header",
+        (p) => delete (p.transaction.message as Record<string, unknown>).header,
+        "message header missing or malformed",
+      ],
+      [
+        "extra header field",
+        (p) => (msg(p).header.extra = 0),
+        "message header missing or malformed",
+      ],
+      // Reviewer reproduction: impossible readonly-signed count.
+      [
+        "numReadonlySignedAccounts = 255",
+        (p) => (msg(p).header.numReadonlySignedAccounts = 255),
+        "leaves no writable fee payer",
+      ],
+      [
+        "readonly fee payer",
+        (p) => (msg(p).header.numReadonlySignedAccounts = 1),
+        "leaves no writable fee payer",
+      ],
+      // Reviewer reproduction: impossible readonly-unsigned count.
+      [
+        "numReadonlyUnsignedAccounts = 255",
+        (p) => (msg(p).header.numReadonlyUnsignedAccounts = 255),
+        "exceed the static account keys",
+      ],
+      [
+        "readonly-unsigned overlaps the signer",
+        (p) => (msg(p).header.numReadonlyUnsignedAccounts = 18),
+        "exceed the static account keys",
+      ],
+      // Reviewer reproduction: non-canonical static address.
+      [
+        'accountKeys[0] = "invalid_key!"',
+        (p) => (msg(p).accountKeys[0] = "invalid_key!"),
+        "accountKeys[0] is not a canonical 32-byte Base58 address",
+      ],
+      [
+        "short static address",
+        (p) => (msg(p).accountKeys[7] = "1111"),
+        "accountKeys[7] is not a canonical 32-byte Base58 address",
+      ],
+      // Reviewer reproduction: invalid instruction data encoding.
+      [
+        'instructions[0].data = "%%%"',
+        (p) => (msg(p).instructions[0]!.data = "%%%"),
+        "instruction 0 data is not valid Base58",
+      ],
+      [
+        "padded instruction data",
+        (p) => (msg(p).instructions[0]!.data = ` ${String(msg(p).instructions[0]!.data)}`),
+        "instruction 0 data is not valid Base58",
+      ],
+      [
+        "byte-array instruction data (not the json encoding)",
+        (p) => (msg(p).instructions[0]!.data = [9, 1, 2]),
+        "instruction 0 data is not valid Base58",
+      ],
+      // Reviewer reproduction: missing recent blockhash.
+      [
+        "recentBlockhash removed",
+        (p) => delete msg(p).recentBlockhash,
+        "recentBlockhash missing or not a canonical 32-byte Base58 value",
+      ],
+      [
+        "recentBlockhash malformed",
+        (p) => (msg(p).recentBlockhash = "invalid!"),
+        "recentBlockhash missing or not a canonical 32-byte Base58 value",
+      ],
+      [
+        "fee payer used as program",
+        (p) => (msg(p).instructions[0]!.programIdIndex = 0),
+        "instruction 0 malformed",
+      ],
+      [
+        "unknown instruction field",
+        (p) => (msg(p).instructions[0]!.extra = 1),
+        "instruction 0 malformed",
+      ],
+      [
+        "outer stackHeight other than 1",
+        (p) => (msg(p).instructions[0]!.stackHeight = 2),
+        "instruction 0 malformed",
+      ],
       [
         "instruction account index out of range",
-        (p) =>
-          (p.transaction.message.instructions = [
-            { programIdIndex: 17, accounts: [99], data: "x" },
-          ]),
+        (p) => (msg(p).instructions[0]!.accounts = [99]),
+        "instruction 0 malformed",
       ],
-      ["no instructions", (p) => (p.transaction.message.instructions = [])],
+      ["no instructions", (p) => (msg(p).instructions = []), "instructions missing"],
+      ["unsupported version", (p) => (p.version = 2), "UNSUPPORTED_TRANSACTION_VERSION"],
+      [
+        "version 0 without lookups",
+        (p) => (p.version = 0),
+        "version 0 transaction lacks addressTableLookups",
+      ],
+      [
+        "version 0 lookups not matching loaded addresses",
+        (p) => {
+          p.version = 0;
+          msg(p).addressTableLookups = [
+            { accountKey: LOOKUP_TABLE, writableIndexes: [1, 2], readonlyIndexes: [] },
+          ];
+        },
+        "loadedAddresses do not correspond to the address-table lookups",
+      ],
+      [
+        "legacy carrying loaded addresses",
+        (p) => (meta(p).loadedAddresses = { writable: [LOADED], readonly: [] }),
+        "cannot carry loaded addresses",
+      ],
+      [
+        "version 1 carrying loaded addresses",
+        (p) => {
+          p.version = 1;
+          meta(p).loadedAddresses = { writable: [], readonly: [LOADED] };
+        },
+        "cannot carry loaded addresses",
+      ],
+      [
+        "legacy with address-table lookups",
+        (p) => (msg(p).addressTableLookups = []),
+        "unsupported message field 'addressTableLookups'",
+      ],
+      [
+        "legacy with transactionConfig",
+        (p) => (msg(p).transactionConfig = {}),
+        "unsupported message field 'transactionConfig'",
+      ],
+      [
+        "version 1 unsupported transactionConfig",
+        (p) => {
+          p.version = 1;
+          msg(p).transactionConfig = { unknownSetting: 1 };
+        },
+        "transactionConfig malformed or unsupported",
+      ],
+      [
+        "non-canonical loaded address",
+        (p) => {
+          p.version = 0;
+          msg(p).addressTableLookups = [
+            { accountKey: LOOKUP_TABLE, writableIndexes: [0], readonlyIndexes: [] },
+          ];
+          meta(p).loadedAddresses = { writable: ["bad_address"], readonly: [] };
+        },
+        "loadedAddresses.writable[0] is not a canonical 32-byte Base58 address",
+      ],
+      ["unknown message field", (p) => (msg(p).extra = 1), "unsupported message field 'extra'"],
+      [
+        "unknown transaction field",
+        (p) => ((p.transaction as Record<string, unknown>).extra = 1),
+        "unsupported transaction field 'extra'",
+      ],
+      ["missing blockTime", (p) => (p.blockTime = null), "missing or invalid blockTime"],
+      ["zero blockTime", (p) => (p.blockTime = 0), "missing or invalid blockTime"],
+      [
+        "fractional blockTime",
+        (p) => (p.blockTime = BLOCK_TIME + 0.5),
+        "missing or invalid blockTime",
+      ],
+      ["invalid slot", (p) => (p.slot = -1), "INVALID_SLOT"],
       [
         "pool not referenced",
-        (p) => {
-          const keys = p.transaction.message.accountKeys as string[];
-          keys[1] = "ForeignPoo1111111111111111111111111111111111";
-        },
+        (p) => (msg(p).accountKeys[3] = FOREIGN),
+        "does not reference candidate pool",
+      ],
+      [
+        "Raydium program not referenced",
+        (p) => (msg(p).accountKeys[17] = FOREIGN),
+        "does not reference the Raydium AMM v4 program",
       ],
       [
         "duplicate account keys",
-        (p) => {
-          const keys = p.transaction.message.accountKeys as string[];
-          keys[3] = keys[2]!;
-        },
+        (p) => (msg(p).accountKeys[2] = msg(p).accountKeys[1]!),
+        "duplicate account keys",
       ],
-      ["slot contradicts notification", () => undefined, { expectedSlot: SLOT + 1 }],
+      [
+        "slot contradicts notification",
+        () => undefined,
+        "contradicts expected slot",
+        { expectedSlot: SLOT + 1 },
+      ],
       [
         "blockTime contradicts notification",
         () => undefined,
+        "contradicts expected blockTime",
         { expectedBlockTime: BLOCK_TIME + 1 },
       ],
     ];
-    for (const [label, mutate, extra] of cases) {
+    for (const [label, mutate, reason, extra] of cases) {
       const p = failedPayload();
       mutate(p);
-      expect(validate(p, extra).ok, label).toBe(false);
+      const r = validate(p, extra);
+      expect(r.ok, label).toBe(false);
+      expect(r.ok ? "" : r.reason, label).toContain(reason);
     }
   });
 
