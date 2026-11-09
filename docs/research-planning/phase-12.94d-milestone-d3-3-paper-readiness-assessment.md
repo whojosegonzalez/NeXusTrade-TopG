@@ -3011,3 +3011,100 @@ Any higher ceiling, or a change in failed-transaction semantics, remains a separ
 
 - **Exception-path timing**: when an exception bypasses explicit cleanup (for example, `getSlot` stalling until its request timeout after observation), the outer catch now snapshots the stream state before the `finally` cleanup. Telemetry separates the observation-loop end (`OBSERVATION_LOOP_END`), any explicit stream stop, the exception capture after the failing request settled, and sealing. The report keeps the observation start and end; the cutoff stays `null`, because that stage never completed. The original timeout cause and exactly-once accounting are unchanged.
 - **Strict error status**: `onChainErrorStatus` is `NONE` only for an explicit `meta.err: null`, and `PRESENT` only for a well-formed reported error (non-empty string or object). Missing `err`, `meta: null` or malformed values stay `UNKNOWN`. Decoder rejection and unavailable-flow behaviour are unchanged.
+
+### 8.22 PAPER Failed-Transaction Handling (Offline Implementation, Operator-Approved)
+
+This section supersedes the "failed transactions also block qualification" finding in §8.21, **only under the explicit PAPER active-window opt-in**. Default, production and daemon behaviour are unchanged, and no live capture has exercised this path yet.
+
+#### 1. Validated Evidence Required
+
+A decoder `TRANSACTION_FAILED` result, or a telemetry `PRESENT` label, is **not** sufficient on its own, because the decoder returns that failure before its later checks. `ValidatedFailedTransactionEvidence.ts` accepts a failed transaction as zero committed swaps only when **all** of the following hold:
+
+- **Response**: the adapter's existing JSON-RPC checks pass (version `2.0`, expected id, no `error`, non-null `result`, exact requested signature). Notification slot and blockTime contradictions are still rejected first.
+- **Decoder classification**: the shared decoder classifies the exact payload as `TRANSACTION_FAILED` for the candidate pool context, which also validates the pool context, slot and supported version (legacy, 0 or 1).
+- **Structure**:
+  - a valid signature list whose first entry is the requested signature, with no duplicates;
+  - a message header whose signer count matches the signatures;
+  - non-empty, unique account keys (static plus loaded);
+  - well-formed outer instructions, with program and account indices in range.
+- **Timestamps**: a safe-integer slot and a positive integer `blockTime`. Neither is ever manufactured.
+- **Candidate binding**: the transaction references the candidate pool and the Raydium AMM v4 program.
+- **Recognized error**: `meta.err` is a recognized Solana `TransactionError` representation:
+  - a known unit-variant string; or
+  - a single-key `InstructionError` `[index, error]` pair, where the index is a valid outer instruction and the error is a known unit variant, `{Custom: u32}` or legacy `{BorshIoError: string}`; or
+  - `DuplicateInstruction`, `InsufficientFundsForRent` or `ProgramExecutionTemporarilyRestricted`, with in-range indices.
+
+  The deprecated `meta.status`, when present, must be exactly `{Err: <same error>}`.
+
+- **Rejected**: empty objects, arbitrary strings or objects, malformed or unsupported `InstructionError` values, missing or `null` metadata, and contradictory identities, timestamps or status. All stay unavailable.
+
+The genuine sealed RAY failure (`InstructionError [1, Custom 30]`, version 1, matching `status.Err`) validates offline (read-only check).
+
+#### 2. Distinct Classification
+
+- **Adapter**: under `paperFailedTransactionPolicy: { enabled: true, executionContext: PAPER_SIMULATION | BACKTEST }` (any other value throws at construction), a validated failure returns the new outcome `KNOWN_FAILED_TRANSACTION`.
+  - It carries zero decoded and ingested events and **no decode-loss gap**.
+  - It keeps the raw response body and hash, plus the decoder's reason and message and the validated error.
+  - No trade event is manufactured.
+  - Every other decode failure, and any failure that does not validate, keeps `DECODE_FAILED`, its loss gap and the rejection reason.
+  - Existing disconnect, overflow, epoch and other gaps are untouched.
+- **Resolution record**: `RESOLVED_FAILED_TRANSACTION`. This is distinct from `RESOLVED`, which means executed and decoded.
+- **Evaluator**: accepts that status **only** under the PAPER active-window opt-in, with complete evidence:
+  - outcome `KNOWN_FAILED_TRANSACTION` and 0/0 counts;
+  - the supported policy, with signature, slot and blockTime matching the record;
+  - a recognized, self-consistent error;
+  - **frozen history** `err` equal to the validated error, otherwise `IDENTITY_MISMATCH`.
+
+  The existing slot, blockTime and epoch identity checks and all gap, backlog, freshness and budget checks still apply. A trade event attributed to a failed signature fails closed.
+
+- **Failed-only windows**:
+  - remain **non-quiet** `ACTIVE_WINDOW` activity with 0 buys and 0 sells;
+  - keep the existing 0/0 `flowRatio` convention (1.0), so no favourable ratio is invented;
+  - **cannot confirm a retest**, because the existing retest rules require verified buys > 0.
+- **Mixed windows**: count only decoded swaps.
+
+#### 3. Sealing and Replay
+
+- **Sealed evidence**: `active-window-evidence.json` seals `failedTransactionPolicy: PAPER_VALIDATED_FAILED_TRANSACTION_ZERO_SWAPS_V1`. Each resolution carries its status, a classification (`KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS`, `EXECUTED_DECODED` or `UNRESOLVED`), the validated failure evidence and its `responseFile` link.
+- **Replay re-derivation**: replay re-derives eligibility from the raw sealed response:
+  - a verified JSON-RPC envelope (version `2.0`, no error, `id` equal to the sealed ledger `rpcRequestId` and `rpcResponseId`);
+  - the same full validation;
+  - a cross-check of every sealed resolved classification, response link and on-chain error against the re-derivation.
+
+  Saved counts, labels and statuses are never trusted. Each of the following fails closed: altered errors, a removed error, an altered response id, a relabelled status, a changed response link, or an unsupported policy value. Removing the policy reverts to the legacy interpretation, which cannot reproduce the recorded flow.
+
+- **Historical captures** carry no policy and keep their original interpretation. Replay results for all 9 captures are identical before and after this change.
+
+#### 4. Unchanged Limits
+
+- **Request ceilings**: 14 HTTP attempts and 3 shared transaction retrievals. Each failed transaction still consumes one HTTP attempt and one retrieval.
+- **Stream and timing limits**:
+  - queue limit 10;
+  - 2,500 ms RPC pacing;
+  - 90 s deadline;
+  - 15,000 ms freshness.
+- **Other limits**: strategy thresholds, the production guard and daemon isolation.
+- **Capacity**: the §8.21 finding stands. Bursts larger than 3 retrievals still exhaust the budget, and such windows stay unavailable.
+
+#### 5. Offline Coverage (Synthetic, Portable Fixtures)
+
+All coverage uses `buildSyntheticFailedTransactionResult` (version-controlled), synthetic clocks and in-memory transports:
+
+- **Validator**: recognized and rejected error representations; metadata, identity, timestamp, version, structure and pool-binding defects.
+- **Adapter**:
+  - the opt-in versus default paths;
+  - unvalidated failures;
+  - id, signature, slot and blockTime contradictions;
+  - exhausted budget with no dispatch;
+  - policy construction guards.
+- **Evaluator (F1–F5)**:
+  - failed-only and mixed windows;
+  - retest non-confirmation;
+  - missing opt-in, production context and incomplete or forged evidence;
+  - history, slot, time and epoch mismatches;
+  - gaps, backlog, staleness and exhausted enumeration.
+- **Diagnostic (F6–F9)**:
+  - mixed and failed-only sealing and replay;
+  - eight tamper variants, each with its asserted failure reason;
+  - no opt-in;
+  - failed transactions exhausting the 3 retrievals.

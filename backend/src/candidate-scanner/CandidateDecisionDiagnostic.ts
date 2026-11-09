@@ -52,6 +52,10 @@ import type {
   SignatureResolutionStatus,
 } from "./ExactPoolTransactionResolutionBridge.js";
 import {
+  PAPER_FAILED_TRANSACTION_POLICY,
+  validateFailedTransactionEvidence,
+} from "./ValidatedFailedTransactionEvidence.js";
+import {
   RollingTradeFlowTracker,
   type StreamGap,
   type TradeEvent,
@@ -373,17 +377,32 @@ export function buildStreamResolutionRecords(
     seen.add(r.signature);
     const identity = txIdentityBySignature.get(r.signature);
     const succeeded = r.ok && r.outcome === "SUCCESS" && identity !== undefined;
+    // PAPER opt-in only (the adapter emits KNOWN_FAILED_TRANSACTION solely under its explicit policy).
+    const knownFailed =
+      r.ok &&
+      r.outcome === "KNOWN_FAILED_TRANSACTION" &&
+      identity !== undefined &&
+      r.diagnostics?.knownFailedTransaction !== undefined;
     records.push({
       signature: r.signature,
       slot: identity?.slot ?? -1,
       blockTime: identity?.blockTime ?? null,
       status: succeeded
         ? "RESOLVED"
-        : toResolutionStatus(r.outcome === "SUCCESS" ? "MALFORMED_RESPONSE" : r.outcome),
+        : knownFailed
+          ? "RESOLVED_FAILED_TRANSACTION"
+          : toResolutionStatus(
+              r.outcome === "SUCCESS" || r.outcome === "KNOWN_FAILED_TRANSACTION"
+                ? "MALFORMED_RESPONSE"
+                : r.outcome,
+            ),
       adapterOutcome: r.outcome,
       decodedEventsCount: r.diagnostics?.decodedEventsCount ?? 0,
       ingestedEventsCount: r.ingestedEventsCount,
-      ...(succeeded ? {} : { error: r.diagnostics?.error ?? `Stream decode outcome ${r.outcome}` }),
+      ...(knownFailed ? { knownFailedTransaction: r.diagnostics.knownFailedTransaction } : {}),
+      ...(succeeded || knownFailed
+        ? {}
+        : { error: r.diagnostics?.error ?? `Stream decode outcome ${r.outcome}` }),
     });
   }
   return records;
@@ -1486,6 +1505,17 @@ export class CandidateDecisionDiagnostic {
         clock: this.clock,
         sleepFn: (ms) => this.sleepWithAbort(ms, overallController.signal),
         requestPurpose: "CANDIDATE_ENRICHMENT",
+        // Failed-transaction policy is applied only through the explicit PAPER active-window opt-in
+        // (paperActiveWindowFlow already requires PAPER_SIMULATION or BACKTEST).
+        ...(this.paperActiveWindowFlow &&
+        (this.executionContext === "PAPER_SIMULATION" || this.executionContext === "BACKTEST")
+          ? {
+              paperFailedTransactionPolicy: {
+                enabled: true as const,
+                executionContext: this.executionContext,
+              },
+            }
+          : {}),
       });
 
       coordinator = new RaydiumCandidateSubscriptionCoordinator({
@@ -1593,9 +1623,11 @@ export class CandidateDecisionDiagnostic {
               ? (decoded ?? 0) > 0
                 ? "CANDIDATE_BOUND_SWAPS"
                 : "NO_CANDIDATE_SWAPS"
-              : onChainErrorStatus === "PRESENT"
-                ? "ONCHAIN_FAILED"
-                : "RETRIEVAL_OR_DECODE_FAILED";
+              : streamResult.ok && streamResult.outcome === "KNOWN_FAILED_TRANSACTION"
+                ? "KNOWN_FAILED_TRANSACTION_ZERO_SWAPS"
+                : onChainErrorStatus === "PRESENT"
+                  ? "ONCHAIN_FAILED"
+                  : "RETRIEVAL_OR_DECODE_FAILED";
           return {
             signature: sig,
             responseFile: rec.responseFile ?? null,
@@ -2224,6 +2256,7 @@ export class CandidateDecisionDiagnostic {
         // Each transaction response is sealed once under responses/; this evidence links signatures to it.
         this.retainedActiveWindowEvidence = {
           policy: "PAPER_ACTIVE_WINDOW",
+          failedTransactionPolicy: PAPER_FAILED_TRANSACTION_POLICY,
           executionContext: this.executionContext,
           expectedConnectionEpoch: coordinator.getConnectionEpoch(),
           recordedGaps: flowTracker.getRecordedGaps(),
@@ -2231,6 +2264,12 @@ export class CandidateDecisionDiagnostic {
           transactionDecodeAttempts: this.ledger.transactionDecodeAttempts,
           resolutions: streamResolutionRecords.map((r) => ({
             ...r,
+            classification:
+              r.status === "RESOLVED_FAILED_TRANSACTION"
+                ? "KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS"
+                : r.status === "RESOLVED"
+                  ? "EXECUTED_DECODED"
+                  : "UNRESOLVED",
             responseFile:
               this.ledger.records.find(
                 (rec) =>
@@ -2248,7 +2287,7 @@ export class CandidateDecisionDiagnostic {
             unresolvedUncertainties: reconResult.unresolvedUncertainties,
             isProductionCompletenessEstablished: false,
           },
-          note: "Derived records only; replay re-decodes the sealed getTransaction responses and does not trust these counts or flags.",
+          note: "Derived records only; replay re-decodes the sealed getTransaction responses, re-derives failed-transaction eligibility from the raw response under the sealed policy, and does not trust these counts, labels, or flags.",
         };
       }
 
@@ -3646,6 +3685,10 @@ export interface CandidateDecisionReplayActiveWindow {
   readonly recentSells60s: number | null;
   readonly windowSignaturesCount: number | null;
   readonly redecodedTransactions: number;
+  /** Sealed failed-transaction policy honoured by this replay (null: legacy capture, original interpretation). */
+  readonly failedTransactionPolicy: string | null;
+  /** Failed transactions re-validated from raw responses as zero committed swaps under the sealed policy. */
+  readonly knownFailedTransactions: number;
   readonly flow: CandidateFlowResult;
 }
 
@@ -3669,6 +3712,8 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
     expectedConnectionEpoch?: unknown;
     recordedGaps?: unknown;
     pendingWorkloadAtEvaluation?: unknown;
+    failedTransactionPolicy?: unknown;
+    resolutions?: unknown;
   };
   originalEvaluationTimestampMs: number;
   conversionTimestampMs: number;
@@ -3703,6 +3748,19 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       reason: "Recorded observation metadata is required for active-window replay",
     };
   }
+  // Failed-transaction policy: absent = legacy capture (original interpretation preserved); only the exact
+  // supported identifier is honoured; anything else fails closed.
+  const sealedFailedTxPolicy = params.activeEvidence.failedTransactionPolicy;
+  if (
+    sealedFailedTxPolicy !== undefined &&
+    sealedFailedTxPolicy !== PAPER_FAILED_TRANSACTION_POLICY
+  ) {
+    return {
+      ok: false,
+      reason: `Unsupported sealed failed-transaction policy '${String(sealedFailedTxPolicy)}'`,
+    };
+  }
+  const failedTxPolicyEnabled = sealedFailedTxPolicy === PAPER_FAILED_TRANSACTION_POLICY;
   const expectedEpoch = asNonNegativeSafeInteger(params.activeEvidence.expectedConnectionEpoch);
   const pendingWorkload = asNonNegativeSafeInteger(
     params.activeEvidence.pendingWorkloadAtEvaluation,
@@ -3720,14 +3778,25 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
 
   const records = Array.isArray(params.report.ledger?.records) ? params.report.ledger.records : [];
   const decodeRecords = records.filter(
-    (r): r is { ok?: unknown; responseFile?: unknown; params?: unknown; completedAtMs?: unknown } =>
+    (
+      r,
+    ): r is {
+      ok?: unknown;
+      responseFile?: unknown;
+      params?: unknown;
+      completedAtMs?: unknown;
+      rpcRequestId?: unknown;
+      rpcResponseId?: unknown;
+    } =>
       !!r &&
       typeof r === "object" &&
       (r as { purpose?: unknown }).purpose === "TRANSACTION_DECODING",
   );
   const resolutions: ResolvedSignatureRecord[] = [];
   const trades: TradeEvent[] = [];
+  const responseFileBySignature = new Map<string, string | null>();
   let redecoded = 0;
+  let knownFailedTransactions = 0;
   for (const rec of decodeRecords) {
     const sig =
       Array.isArray(rec.params) && typeof rec.params[0] === "string" ? rec.params[0] : null;
@@ -3740,6 +3809,7 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
     if (resolutions.some((r) => r.signature === sig)) continue; // first record for a signature stands
     const responseFile =
       typeof rec.responseFile === "string" ? rec.responseFile.replace(/\\/g, "/") : null;
+    responseFileBySignature.set(sig, responseFile);
     const unavailable = (status: SignatureResolutionStatus, error: string) =>
       resolutions.push({
         signature: sig,
@@ -3757,7 +3827,12 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       );
       continue;
     }
-    let payload: { result?: { slot?: unknown; blockTime?: unknown } } | null;
+    let payload: {
+      jsonrpc?: unknown;
+      id?: unknown;
+      error?: unknown;
+      result?: { slot?: unknown; blockTime?: unknown };
+    } | null;
     try {
       payload = JSON.parse(readFileSync(path.join(params.evidenceDir, responseFile), "utf8"));
     } catch {
@@ -3782,6 +3857,38 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       receiptTimestampMs: receiptMs,
     });
     redecoded++;
+    if (!decoded.ok && decoded.reason === "TRANSACTION_FAILED" && failedTxPolicyEnabled) {
+      // Re-derive eligibility from the raw response: verified JSON-RPC envelope (version, echoed request id,
+      // no error) plus full failed-transaction validation. Saved counts and labels are not trusted.
+      const envelopeVerified =
+        payload?.jsonrpc === "2.0" &&
+        (payload.error === undefined || payload.error === null) &&
+        (typeof rec.rpcRequestId === "number" || typeof rec.rpcRequestId === "string") &&
+        payload.id === rec.rpcRequestId &&
+        rec.rpcResponseId === payload.id;
+      const validated = envelopeVerified
+        ? validateFailedTransactionEvidence({ payload: tx, expectedSignature: sig, poolContext })
+        : ({
+            ok: false,
+            reason: "JSON-RPC envelope (version, echoed request id, error) not verified",
+          } as const);
+      if (validated.ok) {
+        resolutions.push({
+          signature: sig,
+          slot,
+          blockTime,
+          status: "RESOLVED_FAILED_TRANSACTION",
+          adapterOutcome: "KNOWN_FAILED_TRANSACTION",
+          decodedEventsCount: 0,
+          ingestedEventsCount: 0,
+          knownFailedTransaction: validated.value,
+        });
+        knownFailedTransactions++;
+      } else {
+        unavailable("FAILED_DECODE", `Failed transaction not accepted: ${validated.reason}`);
+      }
+      continue;
+    }
     if (!decoded.ok || decoded.signature !== sig) {
       unavailable("FAILED_DECODE", decoded.ok ? "Decoded signature mismatch" : decoded.message);
       continue;
@@ -3796,6 +3903,80 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       ingestedEventsCount: decoded.events.length,
     });
     trades.push(...decoded.events);
+  }
+
+  if (failedTxPolicyEnabled) {
+    // The sealed resolution classification (and its response link) must agree with the re-derivation for every
+    // signature either side claims as resolved; altered or inconsistent evidence fails closed.
+    const sealedResolutions = params.activeEvidence.resolutions;
+    if (!Array.isArray(sealedResolutions)) {
+      return {
+        ok: false,
+        reason:
+          "Sealed resolution classifications are required under the failed-transaction policy",
+      };
+    }
+    const resolvedClasses = new Set<string>(["RESOLVED", "RESOLVED_FAILED_TRANSACTION"]);
+    const sealedBySig = new Map<
+      string,
+      {
+        readonly status?: unknown;
+        readonly responseFile?: unknown;
+        readonly knownFailedTransaction?: { readonly onChainErrorCanonical?: unknown } | null;
+      }
+    >();
+    for (const entry of sealedResolutions as unknown[]) {
+      const e = entry as { signature?: unknown } | null;
+      if (
+        !e ||
+        typeof e !== "object" ||
+        typeof e.signature !== "string" ||
+        sealedBySig.has(e.signature)
+      ) {
+        return { ok: false, reason: "Sealed resolution records are malformed or duplicated" };
+      }
+      sealedBySig.set(e.signature, e as Record<string, unknown>);
+    }
+    for (const r of resolutions) {
+      const sealed = sealedBySig.get(r.signature);
+      const sealedStatus = sealed?.status;
+      if (!resolvedClasses.has(r.status) && !resolvedClasses.has(String(sealedStatus))) continue;
+      if (sealedStatus !== r.status) {
+        return {
+          ok: false,
+          reason: `Sealed resolution classification for '${r.signature}' (${String(sealedStatus)}) contradicts re-derivation from the raw response (${r.status})`,
+        };
+      }
+      const sealedFile =
+        typeof sealed?.responseFile === "string" ? sealed.responseFile.replace(/\\/g, "/") : null;
+      if (sealedFile !== (responseFileBySignature.get(r.signature) ?? null)) {
+        return {
+          ok: false,
+          reason: `Sealed resolution for '${r.signature}' is not linked to its sealed transaction response`,
+        };
+      }
+      if (
+        r.status === "RESOLVED_FAILED_TRANSACTION" &&
+        sealed?.knownFailedTransaction?.onChainErrorCanonical !==
+          r.knownFailedTransaction?.onChainErrorCanonical
+      ) {
+        return {
+          ok: false,
+          reason: `Sealed on-chain error for '${r.signature}' does not match the raw transaction response`,
+        };
+      }
+    }
+    for (const [sig, sealed] of sealedBySig) {
+      if (
+        resolvedClasses.has(String(sealed.status)) &&
+        !resolutions.some((r) => r.signature === sig)
+      ) {
+        return {
+          ok: false,
+          reason: `Sealed resolved record '${sig}' has no sealed transaction retrieval`,
+        };
+      }
+    }
   }
 
   const recon = evaluateExactPoolWindowReconciliation({
@@ -3835,6 +4016,8 @@ function recomputeActiveWindowFlowFromSealedEvidence(params: {
       recentSells60s: flow.recentSells60s,
       windowSignaturesCount: recon.underlyingOutcomes.windowSignaturesCount,
       redecodedTransactions: redecoded,
+      failedTransactionPolicy: failedTxPolicyEnabled ? PAPER_FAILED_TRANSACTION_POLICY : null,
+      knownFailedTransactions,
       flow,
     },
   };

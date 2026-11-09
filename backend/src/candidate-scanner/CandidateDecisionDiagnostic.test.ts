@@ -22,7 +22,12 @@ import {
   type DiagnosticRequestRecord,
 } from "./CandidateDecisionDiagnostic.js";
 import { runCandidateDecisionDiagnosticCli } from "../scripts/candidate-decision-diagnostic.js";
-import { buildSyntheticSwapTransactionResult } from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
+import {
+  buildSyntheticFailedTransactionResult,
+  buildSyntheticSwapTransactionResult,
+  SYNTHETIC_FAILED_TRANSACTION_ERROR,
+} from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
+import { PAPER_FAILED_TRANSACTION_POLICY } from "./ValidatedFailedTransactionEvidence.js";
 import { encodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
   CAPTURED_RAY_WSOL_IDENTITIES,
@@ -3740,6 +3745,8 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     readonly hang?: boolean;
     /** SYNTHETIC transaction-metadata variants for error-status classification. */
     readonly meta?: "STRIP_ERR" | "META_NULL" | "MALFORMED_ERR";
+    /** SYNTHETIC: complete, explicitly failed transaction (recognized error; history reports the same err). */
+    readonly validFailure?: boolean;
   }
 
   /** Runs the diagnostic with SYNTHETIC stream notifications and decodable SYNTHETIC swap transactions. */
@@ -3766,6 +3773,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
         failed?: boolean;
         hang?: boolean;
         meta?: ScheduledSwap["meta"];
+        validFailure?: boolean;
       }
     >();
     const emitDue = () => {
@@ -3778,6 +3786,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
             failed: swap.failed === true,
             hang: swap.hang === true,
             meta: swap.meta,
+            validFailure: swap.validFailure === true,
           });
           wsTransport.emitMessage(
             JSON.stringify({
@@ -3828,6 +3837,21 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
             });
           });
         }
+        if (tx?.validFailure) {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: buildSyntheticFailedTransactionResult({
+                poolContext: POOL_CONTEXT,
+                signature: sig,
+                slot: tx.slot,
+                blockTime: tx.blockTime,
+              }),
+            }),
+            { status: 200 },
+          );
+        }
         if (tx) {
           const txResult = buildSyntheticSwapTransactionResult({
             poolContext: POOL_CONTEXT,
@@ -3868,7 +3892,7 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
               ...newest.map(([signature, t]) => ({
                 signature,
                 slot: t.slot,
-                err: null,
+                err: t.validFailure ? SYNTHETIC_FAILED_TRANSACTION_ERROR : null,
                 blockTime: t.blockTime,
               })),
               {
@@ -4485,5 +4509,234 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       fetchSpy.mockRestore();
       logSpy.mockRestore();
     }
+  });
+
+  interface SealedActiveEvidence {
+    failedTransactionPolicy?: string;
+    recordedGaps: unknown[];
+    resolutions: Array<{
+      signature: string;
+      status: string;
+      classification: string;
+      responseFile: string | null;
+      knownFailedTransaction?: { onChainErrorCanonical: string; decoderReason: string };
+    }>;
+  }
+  const activeEvidencePath = () =>
+    path.join(activeOutDir, "evidence", "active-window-evidence.json");
+
+  it("F6. Mixed window: a validated failed transaction counts zero swaps, consumes a retrieval, seals its policy, and replays", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        { signature: TEST_SIG_B, offsetMs: 25_000, slot: 461970850, side: "BUY" },
+        { signature: SIG_C, offsetMs: 45_000, slot: 461970860, side: "BUY", validFailure: true },
+      ],
+    });
+    expect(result.flowEvaluation?.diagnosticReason).toContain("PAPER_ACTIVE_WINDOW_QUALIFIED");
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(1);
+    expect(result.flowEvaluation?.recentSells60s).toBe(0);
+    // Unchanged ceilings: the failed transaction still used one HTTP attempt and one of 3 retrievals.
+    expect(result.ledger.transactionDecodeAttempts).toBe(2);
+    expect(result.ledger.totalAttempts).toBe(13);
+
+    const evidence = readJson<SealedActiveEvidence>(activeEvidencePath());
+    expect(evidence.failedTransactionPolicy).toBe(PAPER_FAILED_TRANSACTION_POLICY);
+    // No decode-loss gap for the validated failure (the existing post-evaluation close gap is unaffected).
+    const gapReasons = (evidence.recordedGaps as Array<{ reason?: string }>).map((g) => g.reason);
+    expect(gapReasons.some((r) => String(r).includes("DECODE_FAILED"))).toBe(false);
+    const bySig = new Map(evidence.resolutions.map((r) => [r.signature, r]));
+    expect(bySig.get(TEST_SIG_B)?.status).toBe("RESOLVED");
+    expect(bySig.get(TEST_SIG_B)?.classification).toBe("EXECUTED_DECODED");
+    const failed = bySig.get(SIG_C)!;
+    expect(failed.status).toBe("RESOLVED_FAILED_TRANSACTION");
+    expect(failed.classification).toBe("KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS");
+    expect(failed.knownFailedTransaction?.decoderReason).toBe("TRANSACTION_FAILED");
+    expect(failed.responseFile).not.toBeNull();
+    const rawFailed = readJson<{ result: { meta: { err: unknown } } }>(
+      path.join(activeOutDir, failed.responseFile!),
+    );
+    expect(rawFailed.result.meta.err).toEqual(SYNTHETIC_FAILED_TRANSACTION_ERROR);
+
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.status).toBe(result.status);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.failedTransactionPolicy).toBe(
+      PAPER_FAILED_TRANSACTION_POLICY,
+    );
+    expect(replay.recomputedActiveWindowFlow?.knownFailedTransactions).toBe(1);
+    expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(2);
+    expect(replay.recomputedActiveWindowFlow?.recentBuys60s).toBe(1);
+    expect(replay.recomputedActiveWindowFlow?.recentSells60s).toBe(0);
+  });
+
+  it("F7. Failed-only window replays as 0/0 active flow; altered raw responses or sealed labels fail closed", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        { signature: SIG_C, offsetMs: 45_000, slot: 461970860, side: "BUY", validFailure: true },
+      ],
+    });
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(0);
+    expect(result.flowEvaluation?.recentSells60s).toBe(0);
+    const ctx = (
+      result.flowEvaluation as { paperQualificationContext?: { qualificationKind?: string } }
+    ).paperQualificationContext;
+    expect(ctx?.qualificationKind).toBe("ACTIVE_WINDOW");
+    expect(result.status).not.toBe("RETEST_CONFIRMED");
+    expect(result.ledger.transactionDecodeAttempts).toBe(1);
+
+    const baseline = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(baseline.ok).toBe(true);
+    expect(baseline.matchesRecordedDecision).toBe(true);
+    expect(baseline.recomputedActiveWindowFlow?.knownFailedTransactions).toBe(1);
+    expect(baseline.recomputedActiveWindowFlow?.recentBuys60s).toBe(0);
+
+    const evidence = readJson<SealedActiveEvidence>(activeEvidencePath());
+    const responsePath = path.join(activeOutDir, evidence.resolutions[0]!.responseFile!);
+    const manifestPath = path.join(activeOutDir, "evidence-manifest.json");
+    const originals = new Map(
+      [responsePath, activeEvidencePath(), manifestPath].map((p) => [p, readFileSync(p, "utf8")]),
+    );
+    const restore = () => {
+      for (const [p, content] of originals) writeFileSync(p, content, "utf8");
+    };
+    const editJson = (p: string, mutate: (j: Record<string, unknown>) => void) => {
+      const j = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+      mutate(j);
+      writeFileSync(p, JSON.stringify(j), "utf8");
+    };
+    const setErr = (err: unknown) => (j: Record<string, unknown>) => {
+      const meta = (j.result as { meta: Record<string, unknown> }).meta;
+      meta.err = err;
+      meta.status = { Err: err };
+    };
+    const cases: Array<[string, () => void, string, string]> = [
+      [
+        "raw error replaced by an empty object",
+        () => editJson(responsePath, setErr({})),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "contradicts re-derivation from the raw response (FAILED_DECODE)",
+      ],
+      [
+        "raw error replaced by a different recognized error",
+        () => editJson(responsePath, setErr({ InstructionError: [0, { Custom: 31 }] })),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "does not match the raw transaction response",
+      ],
+      [
+        "raw error removed",
+        () =>
+          editJson(responsePath, (j) => {
+            const meta = (j.result as { meta: Record<string, unknown> }).meta;
+            delete meta.err;
+            delete meta.status;
+          }),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "contradicts re-derivation from the raw response (FAILED_DECODE)",
+      ],
+      [
+        "JSON-RPC response id altered",
+        () => editJson(responsePath, (j) => (j.id = 7)),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "contradicts re-derivation from the raw response (FAILED_DECODE)",
+      ],
+      [
+        "sealed policy replaced",
+        () =>
+          editJson(activeEvidencePath(), (j) => (j.failedTransactionPolicy = "SOME_OTHER_POLICY")),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "Unsupported sealed failed-transaction policy",
+      ],
+      [
+        "sealed label relabelled as an executed transaction",
+        () =>
+          editJson(activeEvidencePath(), (j) => {
+            (j.resolutions as Array<Record<string, unknown>>)[0]!.status = "RESOLVED";
+          }),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "(RESOLVED) contradicts re-derivation from the raw response (RESOLVED_FAILED_TRANSACTION)",
+      ],
+      [
+        "sealed response link changed",
+        () =>
+          editJson(activeEvidencePath(), (j) => {
+            (j.resolutions as Array<Record<string, unknown>>)[0]!.responseFile =
+              "responses/01-pool-layout.json";
+          }),
+        "REPLAY_ACTIVE_WINDOW_EVIDENCE_INVALID",
+        "is not linked to its sealed transaction response",
+      ],
+      [
+        "policy removed (legacy interpretation cannot reproduce the recorded flow)",
+        () => editJson(activeEvidencePath(), (j) => delete j.failedTransactionPolicy),
+        "REPLAY_ACTIVE_WINDOW_MISMATCH",
+        "does not reproduce the recorded flow (buys=0, sells=0)",
+      ],
+    ];
+    try {
+      for (const [label, tamper, status, reason] of cases) {
+        restore();
+        tamper();
+        resealSyntheticCapture(activeOutDir);
+        const r = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+        expect(r.ok, label).toBe(false);
+        expect(r.status, label).toBe(status);
+        expect(r.message, label).toContain(reason);
+        expect(r.decisionResult, label).toBeUndefined();
+      }
+    } finally {
+      restore();
+    }
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+  });
+
+  it("F8. Without the opt-in, a validated failed transaction keeps the existing unavailable behavior", async () => {
+    const result = await runActive({
+      swaps: [
+        { signature: SIG_C, offsetMs: 45_000, slot: 461970860, side: "BUY", validFailure: true },
+      ],
+    });
+    expect(result.flowEvaluation?.flowCoverage).toBe("COLLECTION_GAP");
+    expect(result.flowEvaluation?.recentBuys60s).toBeNull();
+    expect(result.flowEvaluation?.recentSells60s).toBeNull();
+    expect(result.flowEvaluation?.diagnosticReason).toBe(
+      "NON_QUIET_STREAM_UNVERIFIED_COMPLETENESS",
+    );
+    expect(existsSync(activeEvidencePath())).toBe(false);
+  });
+
+  it("F9. Failed transactions still exhaust the 3 shared retrievals; the window stays unavailable", async () => {
+    const result = await runActive({
+      paperActiveWindowFlow: true,
+      swaps: [
+        {
+          signature: TEST_SIG_B,
+          offsetMs: 20_000,
+          slot: 461970850,
+          side: "BUY",
+          validFailure: true,
+        },
+        { signature: SIG_C, offsetMs: 30_000, slot: 461970855, side: "BUY", validFailure: true },
+        { signature: SIG_D, offsetMs: 40_000, slot: 461970860, side: "BUY", validFailure: true },
+        { signature: SIG_E, offsetMs: 50_000, slot: 461970865, side: "SELL" },
+      ],
+    });
+    expect(result.ledger.transactionDecodeAttempts).toBe(3);
+    expect(result.ledger.totalAttempts).toBeLessThanOrEqual(14);
+    expect(result.flowEvaluation?.flowCoverage).toBe("COLLECTION_GAP");
+    expect(result.flowEvaluation?.recentBuys60s).toBeNull();
+    expect(result.flowEvaluation?.diagnosticReason).toContain("ACTIVE_WINDOW_UNQUALIFIED");
+    const evidence = readJson<SealedActiveEvidence>(activeEvidencePath());
+    expect(
+      evidence.resolutions.filter((r) => r.status === "RESOLVED_FAILED_TRANSACTION"),
+    ).toHaveLength(3);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.flow.isCoverageSufficient).toBe(false);
   });
 });

@@ -32,6 +32,12 @@
  *    - Cleans up abort listeners in all execution paths.
  * 7. Sanitized Diagnostics:
  *    - Endpoint credentials, API keys, and sensitive tokens are redacted to [REDACTED] in all error messages.
+ * 8. PAPER Failed-Transaction Policy (explicit opt-in only; absent by default, in production and daemon wiring):
+ *    - A decoder TRANSACTION_FAILED result is re-validated (exact signature, structure/version, slot/blockTime,
+ *      candidate pool binding, recognized Solana TransactionError, consistent meta.status) before it may be
+ *      reported as KNOWN_FAILED_TRANSACTION with zero committed swaps and no decode-loss gap.
+ *    - Every other decode failure, and any failed transaction that does not validate, keeps the existing
+ *      DECODE_FAILED outcome and loss gap. The retrieval still consumes its HTTP attempt and budget.
  */
 
 import { createHash } from "node:crypto";
@@ -46,6 +52,10 @@ import {
   type TradeTimestampProvenance,
   type StreamGap,
 } from "./RollingTradeFlowTracker.js";
+import {
+  validateFailedTransactionEvidence,
+  type ValidatedFailedTransaction,
+} from "./ValidatedFailedTransactionEvidence.js";
 import {
   MIN_HOST_PACING_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
@@ -86,7 +96,9 @@ export type TransactionProcessingOutcome =
   | "CONTRADICTORY_METADATA"
   | "DECODE_FAILED"
   | "INGEST_FAILED"
-  | "PARTIAL_INGEST_FAILED";
+  | "PARTIAL_INGEST_FAILED"
+  /** PAPER opt-in only: validated explicitly failed on-chain transaction, zero committed swaps. */
+  | "KNOWN_FAILED_TRANSACTION";
 
 export interface TransactionSourceDiagnostics {
   readonly signature: string;
@@ -105,6 +117,8 @@ export interface TransactionSourceDiagnostics {
   readonly responseSnippet?: string | undefined;
   readonly responseBody?: string | undefined;
   readonly isCompletePayload?: boolean | undefined;
+  /** Present only for KNOWN_FAILED_TRANSACTION: decoder failure info plus the validated on-chain error. */
+  readonly knownFailedTransaction?: ValidatedFailedTransaction | undefined;
 }
 
 export interface ProcessNotificationResult {
@@ -188,6 +202,17 @@ export interface RaydiumAmmV4TransactionSourceAdapterOptions {
 
   /** Sleep function for pacing waits. Default: setTimeout promise. */
   readonly sleepFn?: ((ms: number) => Promise<void>) | undefined;
+
+  /**
+   * Explicit PAPER-only opt-in: a fully validated, explicitly failed on-chain transaction is reported as
+   * KNOWN_FAILED_TRANSACTION (zero committed swaps, no decode-loss gap). Absent by default.
+   */
+  readonly paperFailedTransactionPolicy?: PaperFailedTransactionPolicyOptions | undefined;
+}
+
+export interface PaperFailedTransactionPolicyOptions {
+  readonly enabled: true;
+  readonly executionContext: "PAPER_SIMULATION" | "BACKTEST";
 }
 
 /**
@@ -322,6 +347,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
   private readonly maxSupportedTransactionVersion: number;
   private readonly clock: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly paperFailedTransactionPolicyEnabled: boolean;
 
   // Workload and active deduplication tracking
   private readonly pendingQueue: InjectedTransactionNotification[] = [];
@@ -368,6 +394,22 @@ export class RaydiumAmmV4TransactionSourceAdapter {
     ) {
       throw new Error("rpcUrl is required for RaydiumAmmV4TransactionSourceAdapter");
     }
+
+    const ftPolicy = options.paperFailedTransactionPolicy as unknown;
+    if (ftPolicy !== undefined) {
+      const p = ftPolicy as { enabled?: unknown; executionContext?: unknown } | null;
+      if (
+        p === null ||
+        typeof p !== "object" ||
+        p.enabled !== true ||
+        (p.executionContext !== "PAPER_SIMULATION" && p.executionContext !== "BACKTEST")
+      ) {
+        throw new Error(
+          "paperFailedTransactionPolicy requires { enabled: true, executionContext: PAPER_SIMULATION | BACKTEST }",
+        );
+      }
+    }
+    this.paperFailedTransactionPolicyEnabled = ftPolicy !== undefined;
 
     validateTrackedPoolContext(options.poolContext);
     this.poolContext = Object.freeze({ ...options.poolContext });
@@ -2114,6 +2156,49 @@ export class RaydiumAmmV4TransactionSourceAdapter {
         decodeOptions,
       );
 
+      let failedTransactionRejection: string | null = null;
+      if (
+        !ingestResult.decodeResult.ok &&
+        ingestResult.decodeResult.reason === "TRANSACTION_FAILED" &&
+        this.paperFailedTransactionPolicyEnabled
+      ) {
+        const validated = validateFailedTransactionEvidence({
+          payload: rpcObj.result,
+          expectedSignature: signature,
+          poolContext: this.poolContext,
+          expectedSlot: notification.slot,
+          expectedBlockTime: notification.blockTime,
+        });
+        if (validated.ok) {
+          // Known failed transaction: zero committed swaps, no decode-loss gap, no trade events manufactured.
+          this.totalSuccesses++;
+          return {
+            ok: true,
+            signature,
+            outcome: "KNOWN_FAILED_TRANSACTION",
+            ingestedEventsCount: 0,
+            diagnostics: {
+              signature,
+              httpAttempts,
+              httpStatus,
+              durationMs: this.clock() - startEpoch,
+              outcome: "KNOWN_FAILED_TRANSACTION",
+              decodedEventsCount: 0,
+              ingestedCount: 0,
+              endpointUrl: this.sanitizedRpcUrl,
+              requestSentAtMs,
+              responseReceivedAtMs,
+              responseSha256,
+              responseSnippet: bodyText.slice(0, 2048),
+              responseBody: bodyText,
+              isCompletePayload: true,
+              knownFailedTransaction: validated.value,
+            },
+          };
+        }
+        failedTransactionRejection = validated.reason;
+      }
+
       if (!ingestResult.decodeResult.ok) {
         this.totalFailures++;
         this.recordLossGap(
@@ -2142,7 +2227,7 @@ export class RaydiumAmmV4TransactionSourceAdapter {
             responseBody: bodyText,
             isCompletePayload: true,
             error: this.sanitizeErrorMessage(
-              `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}`,
+              `Decode failed [${ingestResult.decodeResult.reason}]: ${ingestResult.decodeResult.message}${failedTransactionRejection !== null ? ` (failed-transaction evidence rejected: ${failedTransactionRejection})` : ""}`,
             ),
           },
         };

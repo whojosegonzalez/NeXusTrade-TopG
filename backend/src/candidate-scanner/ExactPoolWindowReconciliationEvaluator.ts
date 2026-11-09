@@ -64,6 +64,59 @@ import {
 } from "./RollingTradeFlowTracker.js";
 import type { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 import type { CandidateFlowResult } from "./CandidateFlowProvider.js";
+import {
+  PAPER_FAILED_TRANSACTION_POLICY,
+  canonicalJson,
+  validateSolanaTransactionError,
+} from "./ValidatedFailedTransactionEvidence.js";
+
+/**
+ * Validates a RESOLVED_FAILED_TRANSACTION record (PAPER active-window opt-in only). Returns null when the record
+ * carries complete validated failure evidence consistent with the frozen history record, else a rejection reason
+ * (prefixed IDENTITY_MISMATCH for contradictions with frozen history). Saved counts and labels alone never suffice.
+ */
+function checkKnownFailedTransactionRecord(
+  record: ResolvedSignatureRecord,
+  historyRecord: HistorySignatureRecord,
+): string | null {
+  const kft = record.knownFailedTransaction;
+  if (record.adapterOutcome !== "KNOWN_FAILED_TRANSACTION") {
+    return `adapter outcome '${String(record.adapterOutcome)}' is not KNOWN_FAILED_TRANSACTION`;
+  }
+  if (record.decodedEventsCount !== 0 || record.ingestedEventsCount !== 0) {
+    return "a known failed transaction must report zero decoded and ingested events";
+  }
+  if (
+    !kft ||
+    kft.policy !== PAPER_FAILED_TRANSACTION_POLICY ||
+    kft.classification !== "KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS" ||
+    kft.decoderReason !== "TRANSACTION_FAILED" ||
+    kft.committedSwapCount !== 0
+  ) {
+    return "validated failed-transaction evidence is missing or not under the supported policy";
+  }
+  if (
+    kft.signature !== record.signature ||
+    kft.slot !== record.slot ||
+    record.blockTime === null ||
+    kft.blockTime !== record.blockTime
+  ) {
+    return "failed-transaction evidence identity (signature/slot/blockTime) does not match the resolution record";
+  }
+  const errCheck = validateSolanaTransactionError(kft.onChainError);
+  if (!errCheck.ok || errCheck.canonical !== kft.onChainErrorCanonical) {
+    return `recorded on-chain error is not a recognized, self-consistent Solana TransactionError${errCheck.ok ? "" : ` (${errCheck.reason})`}`;
+  }
+  // Frozen history consistency: getSignaturesForAddress reports the same transaction error for the signature.
+  if (
+    historyRecord.err === null ||
+    historyRecord.err === undefined ||
+    canonicalJson(historyRecord.err) !== errCheck.canonical
+  ) {
+    return `IDENTITY_MISMATCH: Frozen history err (${canonicalJson(historyRecord.err ?? null)}) contradicts the validated on-chain error (${errCheck.canonical})`;
+  }
+  return null;
+}
 
 /**
  * Optional request context passed with cutoff evidence to verify slot and poolId binding.
@@ -688,7 +741,9 @@ export function evaluateExactPoolWindowReconciliation(
             sigRes.adapterOutcome === "DECODE_FAILED" ||
             sigRes.adapterOutcome === "INGEST_FAILED" ||
             sigRes.adapterOutcome === "PARTIAL_INGEST_FAILED" ||
+            sigRes.adapterOutcome === "KNOWN_FAILED_TRANSACTION" ||
             sigRes.status === "RESOLVED" ||
+            sigRes.status === "RESOLVED_FAILED_TRANSACTION" ||
             sigRes.status === "FAILED_DECODE" ||
             sigRes.status === "FAILED_INGEST" ||
             sigRes.status === "PARTIAL_INGEST" ||
@@ -1462,6 +1517,7 @@ export function evaluateExactPoolWindowReconciliation(
 
   const alreadyResolvedSet = options.alreadyResolvedSignatures ?? new Set<string>();
   let incrementallyReusedCount = 0;
+  let knownFailedTransactionsCount = 0;
   const unresolvedSignatures: HistorySignatureRecord[] = [];
   const validatedEventsForWindow: TradeEvent[] = [];
 
@@ -1476,8 +1532,34 @@ export function evaluateExactPoolWindowReconciliation(
       continue;
     }
 
-    // 1. Explicit failure on resolution record takes precedence over optimistic flags or trade presence!
-    if (resRecord.status !== "RESOLVED" && resRecord.status !== "DUPLICATE_RESOLVED") {
+    // 0. Known failed on-chain transaction (zero committed swaps): accepted ONLY under the explicit PAPER
+    //    active-window opt-in, and only with complete validated evidence consistent with frozen history.
+    if (resRecord.status === "RESOLVED_FAILED_TRANSACTION") {
+      const rejection = !isPaperActiveWindowOptedIn
+        ? "known failed-transaction evidence requires the explicit PAPER active-window opt-in"
+        : checkKnownFailedTransactionRecord(resRecord, sigRec);
+      if (rejection !== null) {
+        return buildResult(
+          rejection.startsWith("IDENTITY_MISMATCH")
+            ? "IDENTITY_MISMATCH"
+            : "UNRESOLVED_TRANSACTIONS",
+          "COLLECTION_GAP",
+          rejection.startsWith("IDENTITY_MISMATCH")
+            ? `${rejection} for signature '${sig}'`
+            : `UNRESOLVED_TRANSACTIONS: Signature '${sig}' known failed-transaction record rejected (${rejection})`,
+          {
+            windowStartMs,
+            windowEndMs,
+            evidenceAgeMs,
+            totalDiscovered: discoveredSignatures.length,
+            windowSignaturesCount: signaturesInWindow.length,
+            unresolvedCount: 1,
+          },
+        );
+      }
+      knownFailedTransactionsCount++;
+    } else if (resRecord.status !== "RESOLVED" && resRecord.status !== "DUPLICATE_RESOLVED") {
+      // 1. Explicit failure on resolution record takes precedence over optimistic flags or trade presence!
       return buildResult(
         "UNRESOLVED_TRANSACTIONS",
         "COLLECTION_GAP",
@@ -1789,7 +1871,11 @@ export function evaluateExactPoolWindowReconciliation(
       );
     }
 
-    const paperQualificationReason = `PAPER_ACTIVE_WINDOW_QUALIFIED: all ${signaturesInWindow.length} in-window signatures resolved with explicit evidence; ${buys} buys, ${sells} sells from candidate-bound decoded swaps under declared provider-relative assumptions`;
+    const failedNote =
+      knownFailedTransactionsCount > 0
+        ? `; ${knownFailedTransactionsCount} validated failed on-chain transaction(s) contributed zero committed swaps`
+        : "";
+    const paperQualificationReason = `PAPER_ACTIVE_WINDOW_QUALIFIED: all ${signaturesInWindow.length} in-window signatures resolved with explicit evidence; ${buys} buys, ${sells} sells from candidate-bound decoded swaps${failedNote} under declared provider-relative assumptions`;
     return buildResult(
       "RECONCILED",
       "SUFFICIENT",

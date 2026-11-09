@@ -58,6 +58,7 @@ import type {
   InjectedTransactionNotification,
 } from "./RaydiumAmmV4TransactionSourceAdapter.js";
 import type { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
+import type { ValidatedFailedTransaction } from "./ValidatedFailedTransactionEvidence.js";
 import type { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 import type {
   HistoryEnumerationResult,
@@ -91,6 +92,11 @@ function deepFreeze<T>(obj: T): Readonly<T> {
  */
 export type SignatureResolutionStatus =
   | "RESOLVED"
+  /**
+   * PAPER active-window opt-in only: a validated, explicitly failed on-chain transaction with zero committed
+   * swaps. Distinct from RESOLVED (executed). Rejected as unresolved without the explicit opt-in.
+   */
+  | "RESOLVED_FAILED_TRANSACTION"
   | "DUPLICATE_RESOLVED"
   | "DUPLICATE_UNRESOLVED"
   | "FAILED_DECODE"
@@ -115,6 +121,8 @@ export interface ResolvedSignatureRecord {
   readonly decodedEventsCount: number;
   readonly ingestedEventsCount: number;
   readonly error?: string | undefined;
+  /** Required for RESOLVED_FAILED_TRANSACTION: validated failure evidence and decoder failure information. */
+  readonly knownFailedTransaction?: ValidatedFailedTransaction | undefined;
 }
 
 /**

@@ -131,3 +131,51 @@ export function buildSyntheticSwapTransactionResult(params: {
     },
   };
 }
+
+/** SYNTHETIC on-chain error shaped like a Raydium slippage failure (`InstructionError` with a custom code). */
+export const SYNTHETIC_FAILED_TRANSACTION_ERROR = Object.freeze({
+  InstructionError: Object.freeze([0, Object.freeze({ Custom: 30 })]),
+});
+
+/**
+ * SYNTHETIC: a complete getTransaction `result` for a candidate-pool swap attempt that FAILED on-chain.
+ * Same account layout as the swap fixture plus a message header, a recognized `meta.err` with a matching
+ * deprecated `meta.status`, failure logs, and no committed inner transfers. Pass `err` to vary the error.
+ */
+export function buildSyntheticFailedTransactionResult(params: {
+  readonly poolContext: TrackedRaydiumPoolContext;
+  readonly signature: string;
+  readonly slot: number;
+  readonly blockTime: number;
+  readonly side?: "BUY" | "SELL";
+  readonly err?: unknown;
+}): Record<string, unknown> {
+  const base = buildSyntheticSwapTransactionResult({ ...params, side: params.side ?? "BUY" });
+  const err = params.err === undefined ? SYNTHETIC_FAILED_TRANSACTION_ERROR : params.err;
+  const transaction = base.transaction as { message: Record<string, unknown> };
+  return {
+    ...base,
+    transaction: {
+      ...transaction,
+      message: {
+        header: {
+          numRequiredSignatures: 1,
+          numReadonlySignedAccounts: 0,
+          numReadonlyUnsignedAccounts: 2,
+        },
+        ...transaction.message,
+      },
+    },
+    meta: {
+      err: JSON.parse(JSON.stringify(err)) as unknown,
+      status: { Err: JSON.parse(JSON.stringify(err)) as unknown },
+      fee: 5000,
+      innerInstructions: [],
+      logMessages: [
+        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]`,
+        "Program log: Error: exceeds desired slippage limit",
+        `Program ${RAYDIUM_AMM_V4_PROGRAM_ID} failed: custom program error: 0x1e`,
+      ],
+    },
+  };
+}
