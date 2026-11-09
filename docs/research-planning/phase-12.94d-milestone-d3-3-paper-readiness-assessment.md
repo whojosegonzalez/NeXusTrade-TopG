@@ -2920,3 +2920,45 @@ The operator ran the approved diagnostic on `85bded8018e8a2d4d86e57e3f1f2028e517
 - **Timing caveat**: the precheck completed 1,536,517 ms (~25.6 min) before the diagnostic's first dispatch. Its five-minute counts did not describe activity immediately before the observation. No arrival probability is assigned without a validated model.
 
 **Status**: live active-window qualification and the corrected stream-decode request-id path remain **untested**. A precheck-to-diagnostic wrapper with a ≤ 30 s freshness gate has been prepared for review only (`.tmp/runbooks/act-precheck-and-diagnostic.ps1`). It allows at most 15 HTTP attempts in total: 1 precheck plus at most 14 diagnostic requests. The 1–15 five-minute range remains a heuristic only.
+
+#### ACT Precheck-to-Diagnostic Sequences (Executed Twice; the Second Was an Unplanned Repeat)
+
+Both sequences used the reviewed wrapper and are preserved. Each made 1 precheck and 11 diagnostic requests, 24 HTTP requests in total, all HTTP 200. All four manifests and their listed files verify, with no unlisted files.
+
+| Item                                                 | Sequence 1 (planned)                                                            | Sequence 2 (unplanned repeat)                                                   |
+| :--------------------------------------------------- | :------------------------------------------------------------------------------ | :------------------------------------------------------------------------------ |
+| Precheck                                             | `act-exact-pair-2026-11-09T18-48-15-832Z` (manifest `62cf9b8a…`)                | `act-exact-pair-2026-11-09T19-20-02-553Z` (manifest `df2c861a…`)                |
+| Provider-reported 5 min                              | 4 buys, 0 sells, $135.62                                                        | 0 buys, 13 sells, $619.56                                                       |
+| Diagnostic                                           | `candidate-decision-act-active-2026-11-09T18-48-14-799Z` (manifest `cf7248ba…`) | `candidate-decision-act-active-2026-11-09T19-20-01-484Z` (manifest `281166c0…`) |
+| Precheck completion → first dispatch                 | 909 ms                                                                          | 841 ms                                                                          |
+| Notifications / since-anchor signatures / retrievals | 0 / 0 / 0                                                                       | 0 / 0 / 0                                                                       |
+| Qualification                                        | `QUIET_WINDOW`                                                                  | `QUIET_WINDOW`                                                                  |
+| Keepalive; minimum RPC spacing                       | 3/3 pongs; 2,506 ms                                                             | 3/3 pongs; 2,501 ms                                                             |
+| Cutoff age at decision                               | 12,651 ms                                                                       | 12,095 ms                                                                       |
+| Decision / replay                                    | `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED`; replay matches             | same; replay matches                                                            |
+
+The wallet is unchanged.
+
+#### Timing Assessment from Retained Evidence (Read-Only)
+
+Each diagnostic's `HISTORY_ENUMERATION` page holds the 20 most recent pool signatures at query time. The anchor is row 0, since no newer signature existed. Times below are on-chain blockTimes.
+
+- **Sequence 1**: rows at 18:45:09, 18:45:18, 18:45:26 and 18:45:55 (anchor). Before them is a 333 s gap, then 16 rows within 55 s around 18:38:41–18:39:36. 8 of the 20 rows are failed transactions. The observation ran 18:48:19–18:49:27 and the window 18:48:25–18:49:25: no pool signature between 18:45:55 and the history query at 18:49:29, at least 214 s.
+- **Sequence 2**: 15 rows within 30 s (19:17:10–19:17:40, anchor last), preceded by gaps of 146 s and more; 1 failed row. The observation ran 19:20:06–19:21:13 and the window 19:20:12–19:21:12: no signature from 19:17:40 to the history query at 19:21:16, at least 216 s.
+- **Earlier 17:44 ACT capture**: anchor at 17:42:49, preceded by 19 rows within the same second (17:40:50), 17 of them failed.
+
+**What this establishes**:
+
+- In each case the pool's most recent signature preceded the observation by about 2.3–2.5 minutes. Nothing was indexed through the window or the history query. Each precheck's five-minute count was explained by clusters that had already ended before the observation began.
+- The same-second groups, ≤ 30 s clusters, multi-minute gaps, and the high share of failed transactions in two pages are consistent with **bursty, clustered activity** in these samples.
+
+**What remains unknown**:
+
+- activity older than each 20-row page, which spans only about 4–9 minutes;
+- whether any row is a candidate-bound swap (rows were not decoded; `err` shows only failure);
+- intra-second ordering;
+- the provider-relative completeness of the address index.
+
+Four short samples from one pool on one day support no general rate, no arrival probability, and no inference of a provider or stream defect.
+
+**Implication**: a backward-looking five-minute aggregate does not target activity during the following 65 s observation. A cluster like 19:17:10–40 (15 signatures, including failed ones that also require resolution) would exceed 3 retrievals. Live active-window qualification and the corrected decode-id path remain **untested**.
