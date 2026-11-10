@@ -12,7 +12,8 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { WatchlistCandidateItem } from "@nexustrade/shared";
 import {
   PaperTradingDaemon,
   type PaperTradingDaemonConfig,
@@ -36,9 +37,23 @@ import {
 import { recoverSettlementJournal, type SettlementJournalEntry } from "./SettlementJournal.js";
 import { checkLegacyConflict, findWorkspaceRoot } from "./CanonicalPaths.js";
 import { acquireProcessLock, releaseProcessLock, isProcessAlive } from "./ProcessLock.js";
-import { parseCliArgs, buildPositionMarketContext } from "../scripts/paper-trading-daemon.js";
+import {
+  parseCliArgs,
+  buildPositionMarketContext,
+  evaluatePaperDaemonEntryDecision,
+  getCandidateFlowProvider,
+  setCandidateFlowProvider,
+} from "../scripts/paper-trading-daemon.js";
 import { ContinuousQuietIntervalTracker } from "../candidate-scanner/ContinuousQuietIntervalTracker.js";
-import type { CandidateFlowProvider } from "../candidate-scanner/CandidateFlowProvider.js";
+import {
+  UnavailableCandidateFlowProvider,
+  evaluateCandidateDecisionPoints,
+  validateAndSnapshotCandidateFlowResult,
+  type CandidateFlowProvider,
+  type CandidateFlowResult,
+  type CandidateFlowTarget,
+} from "../candidate-scanner/CandidateFlowProvider.js";
+import type { ArmedPullbackState } from "../candidate-scanner/BuyGateTriggerService.js";
 import {
   recoverInterruptedIntent,
   type ReconciliationIntent,
@@ -3796,5 +3811,269 @@ describe("PaperTradingDaemon", () => {
       expect(res2.marketContext?.volumeStalled3m).toBe(false);
       expect(quietTracker.isStagnant3m()).toBe(false);
     });
+  });
+});
+
+/**
+ * PAPER daemon entry decision context (offline, synthetic).
+ *
+ * Every candidate, price, security and flow input below is SYNTHETIC. No run(), daemon loop,
+ * provider call, socket, wallet operation or session is started. The module-level flow provider
+ * is restored after each test.
+ */
+describe("PAPER daemon entry decision context (synthetic, offline)", () => {
+  const T = 1_791_931_000_000; // SYNTHETIC research cutoff
+  const NOW = T + 4_000; // SYNTHETIC entry evaluation time (cutoff age 4 s)
+  const SYNTH_POOL = "SYNTHETIC_ENTRY_CONTEXT_POOL";
+  const SYNTH_MINT = "SYNTHETIC_ENTRY_CONTEXT_MINT";
+
+  // SYNTHETIC micro-cap candidate and security context that passes every buy gate with verified flow.
+  const SYNTH_CANDIDATE: WatchlistCandidateItem = {
+    poolId: SYNTH_POOL,
+    mintAddress: SYNTH_MINT,
+    symbol: "SYNTH",
+    liquidityUsd: 65_000,
+    marketCapUsd: 250_000,
+    lmcRatio: 0.26,
+    lpBurnPct: 99.9,
+    assetAgeSeconds: 600,
+    volume5mUsd: 15_000,
+    buys5m: 40,
+    sells5m: 15,
+    buyToSellRatio: 40 / 15,
+    status: "WATCHING",
+    discoveredAt: new Date(T - 120_000).toISOString(),
+    lastEvaluatedAt: new Date(T).toISOString(),
+  } as WatchlistCandidateItem;
+  const SYNTH_RUG = {
+    rugScore: 150,
+    hasDangerRisk: false,
+    top10HolderPct: 0.09,
+    holdersCount: 450 as number | undefined,
+    bundlerPct: 0.05,
+  };
+  const PEAK_SOL = 0.0001;
+  // SYNTHETIC: armed 30 s earlier at the peak; the current price is a 12% pullback.
+  const SYNTH_ARMED: ArmedPullbackState = {
+    mintAddress: SYNTH_MINT,
+    armedAtMs: T - 26_000,
+    peakPriceSol: PEAK_SOL,
+    peakPriceUsd: 0.015,
+    ticksObserved: 1,
+  };
+  const SYNTH_SPOT = {
+    spotPriceSol: PEAK_SOL * 0.88,
+    spotPriceUsd: 0.0132,
+    liquidityUsd: 65_000,
+    momentum5mBps: 0,
+    priceChange1hPct: 4.2,
+  };
+
+  interface SyntheticFlowOverrides {
+    readonly windowEndMs?: number;
+    readonly poolAddress?: string;
+    readonly tokenMint?: string;
+    readonly evaluationTimestampMs?: number;
+    readonly paperExecutionContext?: string;
+  }
+
+  /** SYNTHETIC PAPER-qualified active-window flow, bound to the requested target and time. */
+  function syntheticPaperFlow(
+    target: CandidateFlowTarget,
+    evalMs: number,
+    overrides: SyntheticFlowOverrides = {},
+  ): CandidateFlowResult {
+    const windowEndMs = overrides.windowEndMs ?? T;
+    const cutoffAgeMs = evalMs - windowEndMs;
+    return {
+      poolAddress: overrides.poolAddress ?? target.poolAddress,
+      tokenMint: overrides.tokenMint ?? target.tokenMint,
+      recentBuys60s: 2,
+      recentSells60s: 1,
+      flowCoverage: "SUFFICIENT",
+      isCoverageSufficient: true,
+      diagnosticReason: "SYNTHETIC PAPER active window",
+      evaluationTimestampMs: overrides.evaluationTimestampMs ?? evalMs,
+      isPaperQualified: true,
+      paperQualificationContext: {
+        executionContext: overrides.paperExecutionContext ?? "PAPER_SIMULATION",
+        qualificationKind: "ACTIVE_WINDOW",
+        validatedEpoch: 1,
+        originalEvaluationTimestampMs: Math.min(windowEndMs + 1_000, evalMs),
+        researchWindowSpan: { windowStartMs: windowEndMs - 60_000, windowEndMs, cutoffAgeMs },
+        cutoffAgeMs,
+        qualificationReason: "SYNTHETIC fully reconciled active window",
+        providerAssumptions: ["SYNTHETIC"],
+        unresolvedUncertainties: ["SYNTHETIC"],
+      },
+    } as CandidateFlowResult;
+  }
+
+  type CountingProvider = CandidateFlowProvider & { calls: number };
+  const paperProvider = (overrides?: SyntheticFlowOverrides): CountingProvider => {
+    const p: CountingProvider = {
+      calls: 0,
+      getCandidateFlow(target: CandidateFlowTarget, evalMs: number) {
+        p.calls++;
+        return syntheticPaperFlow(target, evalMs, overrides);
+      },
+    };
+    return p;
+  };
+
+  const entry = (
+    flowProvider: CandidateFlowProvider | undefined,
+    opts: {
+      armed?: ArmedPullbackState | undefined;
+      rug?: typeof SYNTH_RUG;
+      liquidityUsd?: number;
+    } = {},
+  ) =>
+    evaluatePaperDaemonEntryDecision({
+      candidate: SYNTH_CANDIDATE,
+      baseSpotInfo: { ...SYNTH_SPOT, liquidityUsd: opts.liquidityUsd ?? SYNTH_SPOT.liquidityUsd },
+      rugMetrics: opts.rug ?? SYNTH_RUG,
+      flowProvider,
+      existingArmedState: opts.armed,
+      currentNowMs: NOW,
+      requireVerifiedHolders: true,
+    });
+
+  let originalProvider: CandidateFlowProvider;
+  beforeEach(() => {
+    originalProvider = getCandidateFlowProvider();
+  });
+  afterEach(() => {
+    setCandidateFlowProvider(originalProvider);
+  });
+
+  it("EC-01: fresh, candidate-bound PAPER flow reaches the existing buy and retest gates", () => {
+    const provider = paperProvider();
+    const armed = entry(provider);
+    expect(armed.flowResult.isCoverageSufficient).toBe(true);
+    expect(armed.flowResult.isPaperQualified).toBe(true);
+    expect(armed.flowResult.paperQualificationContext?.executionContext).toBe("PAPER_SIMULATION");
+    expect(armed.flowResult.recentBuys60s).toBe(2);
+    expect(armed.flowResult.recentSells60s).toBe(1);
+    expect(armed.buyGateResult.triggered).toBe(true);
+    expect(armed.outcome).toBe("ARMED_FIRST_TICK");
+
+    const confirmed = entry(provider, { armed: SYNTH_ARMED });
+    expect(confirmed.outcome).toBe("RETEST_CONFIRMED");
+    if (confirmed.outcome === "RETEST_CONFIRMED") {
+      expect(confirmed.retestResult.confirmReason).toBe("RETEST_PULLBACK_DISCOUNT");
+    }
+    expect(provider.calls).toBe(2);
+  });
+
+  it("EC-02: without the daemon's context the same flow is rejected (the corrected defect)", () => {
+    for (const executionContext of [undefined, "PRODUCTION"] as const) {
+      const generic = evaluateCandidateDecisionPoints({
+        candidate: SYNTH_CANDIDATE,
+        baseSpotInfo: SYNTH_SPOT,
+        rugMetrics: SYNTH_RUG,
+        flowProvider: paperProvider(),
+        existingArmedState: SYNTH_ARMED,
+        currentNowMs: NOW,
+        requireVerifiedHolders: true,
+        executionContext,
+      });
+      expect(generic.flowResult.isCoverageSufficient).toBe(false);
+      expect(generic.flowResult.recentBuys60s).toBeNull();
+      expect(generic.flowResult.diagnosticReason).toBe(
+        "PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION",
+      );
+      expect(generic.outcome).toBe("BUY_GATE_REJECTED");
+    }
+  });
+
+  it("EC-03: valid PAPER flow alone does not admit a candidate", () => {
+    const failedSecurity = entry(paperProvider(), {
+      armed: SYNTH_ARMED,
+      rug: { ...SYNTH_RUG, rugScore: 900 },
+    });
+    expect(failedSecurity.flowResult.isCoverageSufficient).toBe(true);
+    expect(failedSecurity.outcome).toBe("BUY_GATE_REJECTED");
+
+    const unverifiedHolders = entry(paperProvider(), {
+      armed: SYNTH_ARMED,
+      rug: { ...SYNTH_RUG, holdersCount: undefined },
+    });
+    expect(unverifiedHolders.flowResult.isCoverageSufficient).toBe(true);
+    expect(unverifiedHolders.outcome).toBe("BUY_GATE_REJECTED");
+
+    const thinLiquidity = entry(paperProvider(), { armed: SYNTH_ARMED, liquidityUsd: 19_999 });
+    expect(thinLiquidity.outcome).toBe("INSUFFICIENT_LIVE_LIQUIDITY");
+  });
+
+  it("EC-04: the default UnavailableCandidateFlowProvider cannot arm or confirm an entry", () => {
+    const defaultProvider = getCandidateFlowProvider();
+    expect(defaultProvider).toBeInstanceOf(UnavailableCandidateFlowProvider);
+    for (const provider of [defaultProvider, undefined]) {
+      for (const armedState of [undefined, SYNTH_ARMED]) {
+        const decision = entry(provider, { armed: armedState });
+        expect(decision.flowResult.isCoverageSufficient).toBe(false);
+        expect(decision.flowResult.recentBuys60s).toBeNull();
+        expect(decision.outcome).toBe("BUY_GATE_REJECTED");
+      }
+    }
+  });
+
+  it("EC-05: stale or mismatched PAPER evidence stays unavailable", () => {
+    const cases: readonly (readonly [string, SyntheticFlowOverrides, string])[] = [
+      ["stale by 1 ms", { windowEndMs: NOW - 15_001 }, "STALE_RECONCILIATION_EVIDENCE"],
+      ["future-dated cutoff", { windowEndMs: NOW + 1 }, "FUTURE_DATED_RECONCILIATION"],
+      ["other pool", { poolAddress: "SYNTHETIC_OTHER_POOL" }, "IDENTITY_MISMATCH_POOL"],
+      ["other mint", { tokenMint: "SYNTHETIC_OTHER_MINT" }, "IDENTITY_MISMATCH_MINT"],
+      ["other evaluation time", { evaluationTimestampMs: NOW - 1 }, "TIMESTAMP_MISMATCH"],
+      [
+        "BACKTEST provenance",
+        { paperExecutionContext: "BACKTEST" },
+        "INVALID_PAPER_QUALIFICATION_PROVENANCE",
+      ],
+    ];
+    for (const [label, overrides, reason] of cases) {
+      for (const armedState of [undefined, SYNTH_ARMED]) {
+        const decision = entry(paperProvider(overrides), { armed: armedState });
+        expect(decision.flowResult.isCoverageSufficient, label).toBe(false);
+        expect(decision.flowResult.recentBuys60s, label).toBeNull();
+        expect(decision.flowResult.diagnosticReason, label).toContain(reason);
+        expect(decision.outcome, label).toBe("BUY_GATE_REJECTED");
+      }
+    }
+  });
+
+  it("EC-06: the generic production path still rejects PAPER-qualified evidence", () => {
+    const target = { poolAddress: SYNTH_POOL, tokenMint: SYNTH_MINT };
+    const raw = syntheticPaperFlow(target, NOW);
+    for (const options of [undefined, {}, { executionContext: "PRODUCTION" as const }]) {
+      const snapshot = validateAndSnapshotCandidateFlowResult(raw, target, NOW, options);
+      expect(snapshot.isCoverageSufficient).toBe(false);
+      expect(snapshot.diagnosticReason).toBe("PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION");
+    }
+    const paper = validateAndSnapshotCandidateFlowResult(raw, target, NOW, {
+      executionContext: "PAPER_SIMULATION",
+    });
+    expect(paper.isCoverageSufficient).toBe(true);
+  });
+
+  it("EC-07: the daemon boundary fixes its context and reads the injected module provider", () => {
+    // A caller cannot override the daemon's context, even with a cast.
+    const forced = evaluatePaperDaemonEntryDecision({
+      candidate: SYNTH_CANDIDATE,
+      baseSpotInfo: SYNTH_SPOT,
+      rugMetrics: SYNTH_RUG,
+      flowProvider: paperProvider(),
+      currentNowMs: NOW,
+      requireVerifiedHolders: true,
+      executionContext: "PRODUCTION",
+    } as Parameters<typeof evaluatePaperDaemonEntryDecision>[0]);
+    expect(forced.flowResult.isCoverageSufficient).toBe(true);
+
+    // The injected module-level provider is read through the daemon's accessor; afterEach restores it.
+    const injected = paperProvider();
+    setCandidateFlowProvider(injected);
+    expect(entry(getCandidateFlowProvider()).outcome).toBe("ARMED_FIRST_TICK");
+    expect(injected.calls).toBe(1);
   });
 });

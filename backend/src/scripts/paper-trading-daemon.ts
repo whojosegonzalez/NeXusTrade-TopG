@@ -41,8 +41,10 @@ import {
   type ArmedPullbackState,
 } from "../candidate-scanner/BuyGateTriggerService.js";
 import {
+  type CandidateDecisionResult,
   type CandidateFlowProvider,
   type CandidateFlowResult,
+  type EvaluateCandidateDecisionParams,
   UnavailableCandidateFlowProvider,
   evaluateCandidateDecisionPoints,
   validateAndSnapshotCandidateFlowResult,
@@ -665,6 +667,22 @@ export function buildPositionMarketContext(
     validatedFlow,
     marketContext,
   };
+}
+
+/**
+ * Entry-side decision boundary for the PAPER trading daemon.
+ *
+ * The daemon is a PAPER simulation, so its entry decision validates candidate-bound flow under
+ * the same `PAPER_SIMULATION` context that the exit path (`buildPositionMarketContext`) already
+ * uses. The context is fixed here and cannot be supplied by the caller. The generic
+ * `evaluateCandidateDecisionPoints` keeps its fail-closed default: without a context, PAPER-qualified
+ * evidence is still rejected as production evidence. Every admission gate and threshold is unchanged;
+ * valid flow only supplies verified counts to the existing buy and retest gates.
+ */
+export function evaluatePaperDaemonEntryDecision(
+  params: Omit<EvaluateCandidateDecisionParams, "executionContext">,
+): CandidateDecisionResult {
+  return evaluateCandidateDecisionPoints({ ...params, executionContext: "PAPER_SIMULATION" });
 }
 
 export {
@@ -1986,7 +2004,7 @@ export async function run(): Promise<void> {
 
                   // Candidate Decision Pipeline (Buy Gate & Retest Gate with candidate-bound flow)
                   const existingArmed = armedPullbackCandidates.get(candidate.mintAddress);
-                  const decision = evaluateCandidateDecisionPoints({
+                  const decision = evaluatePaperDaemonEntryDecision({
                     candidate,
                     baseSpotInfo: spotInfo,
                     rugMetrics,

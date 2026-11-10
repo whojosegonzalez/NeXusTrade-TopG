@@ -3541,7 +3541,7 @@ It is **not** live validation of burst capacity, drain handling, queue ceiling 1
 - **Profile**: the sealed `PAPER_ACTIVE_WINDOW_23_12` matches the exact definition (23 / 12 / queue 13, timing limits unchanged), in a PAPER_SIMULATION capture. The active-window evidence names the same profile, and the failed-transaction policy is sealed.
 - **Requests**: 11 of 23, all HTTP 200, with echoed Solana RPC ids. 0 of 12 retrievals.
   - **Pacing**: Solana RPC requests are sequential, with a minimum spacing of 2,501 ms.
-  - **RugCheck**: overlapped with `LP_REFRESH` (855 ms).
+  - **RugCheck** (corrected in §8.27): the 855 ms request was dispatched 2 ms after the second `LP_REFRESH` response had completed. It overlapped the Solana pacing wait before `CANDIDATE_MINT`, not any Solana RPC request.
 - **Observation and cutoff timing**:
   - Observation started at run +2.642 s.
   - 0 notifications, 0 backlog, 0 drain and 0 boundary-crossing retrievals.
@@ -3598,3 +3598,45 @@ Make the daemon's entry decision PAPER-context-aware:
 - **Unchanged**: thresholds, providers and network behaviour.
 
 This removes a concrete, verified blocker but is **not sufficient on its own**: until a PAPER flow provider is installed (item 2), a short operator-run PAPER session still cannot arm or enter any candidate. No identical ACT run is proposed.
+
+### 8.27 PAPER Daemon Entry Decision Context Corrected (Offline; Provider Integration Still Missing)
+
+An independent source review confirmed the §8.26 entry-context defect. Using the sealed ACT flow at its recorded evaluation time, validation rejects it without an execution context, accepts it with `PAPER_SIMULATION`, and still rejects it in `PRODUCTION`. The operator approved the narrow correction, which is implemented offline.
+
+**Change** (`backend/src/scripts/paper-trading-daemon.ts`):
+
+- **New boundary**: an import-safe, exported `evaluatePaperDaemonEntryDecision(params)`. It calls `evaluateCandidateDecisionPoints` with `executionContext: "PAPER_SIMULATION"`, matching the exit path (`buildPositionMarketContext`).
+  - The parameter type omits `executionContext`.
+  - At runtime the PAPER context is applied last, so a caller cannot replace it.
+- **Call site**: the daemon's entry decision now goes through this function, with the same candidate, spot, RugCheck metrics, active provider, armed state, time, buy-gate service and `requireVerifiedHolders: true`.
+- **Unchanged**:
+  - The generic `evaluateCandidateDecisionPoints` and `validateAndSnapshotCandidateFlowResult` keep their fail-closed default. Without a context, or in `PRODUCTION`, PAPER-qualified evidence is still replaced by `PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION`.
+  - No missing context is globally defaulted to PAPER.
+  - Every admission gate, threshold, freshness limit (15 s), retest rule and exit rule is unchanged.
+  - No runtime provider is installed, and nothing is activated by environment.
+  - The standalone diagnostic is not wired into the daemon, and no historical capture is used as current data.
+
+**Offline regressions** (`backend/src/paper/PaperTradingDaemon.test.ts`, "PAPER daemon entry decision context"; SYNTHETIC candidate, price, security and flow inputs, synthetic clock):
+
+| Test  | Shows                                                                                                                                                                                                                                           |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EC-01 | Fresh, candidate-bound PAPER active-window flow (cutoff age 4 s) passes the daemon boundary. It triggers the existing buy gate (`ARMED_FIRST_TICK`) and, from an armed pullback state, reaches `RETEST_CONFIRMED` (`RETEST_PULLBACK_DISCOUNT`). |
+| EC-02 | The same inputs through the generic evaluator without a context, or with `PRODUCTION`, yield `PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION` and `BUY_GATE_REJECTED`. This is the corrected defect.                                           |
+| EC-03 | Valid PAPER flow alone does not admit: a failing security gate or unverified holders give `BUY_GATE_REJECTED`, and live liquidity below the floor gives `INSUFFICIENT_LIVE_LIQUIDITY`.                                                          |
+| EC-04 | The default `UnavailableCandidateFlowProvider`, or an omitted provider, cannot arm or confirm, with or without an armed state.                                                                                                                  |
+| EC-05 | Stale (15,001 ms), future-dated, wrong-pool, wrong-mint, wrong-timestamp and `BACKTEST`-provenance PAPER evidence all stay unavailable, with their specific reasons, and cannot arm or confirm.                                                 |
+| EC-06 | The generic validator still rejects PAPER-qualified evidence with no options, empty options and `PRODUCTION`, and accepts it only with `PAPER_SIMULATION`.                                                                                      |
+| EC-07 | A cast `PRODUCTION` context cannot override the daemon boundary. A provider injected with `setCandidateFlowProvider` is read through the daemon's accessor. The original module provider is restored after every test.                          |
+
+- **Mutation check**: removing the context from the helper makes EC-01, EC-03, EC-05 and EC-07 fail.
+- **Test safety**: no test starts `run()`, a daemon loop, a provider call, a socket, a wallet operation or a session.
+
+**Remaining blocker (not addressed here)**: the daemon still has no PAPER flow provider.
+
+- `activeCandidateFlowProvider` defaults to `UnavailableCandidateFlowProvider`, and only tests call `setCandidateFlowProvider`.
+- The diagnostic's qualification is a one-shot sealed run of about 80 s per window. The daemon needs per-candidate flow no older than 15 s at each tick, and a retest confirmation needs a second fresh window within the 90 s / 120 s expiry.
+- Until a provider design reconciles these, a PAPER session still cannot arm or enter any candidate. That is a separate design task. It must not be solved by relaxing freshness or thresholds, or by treating sealed captures as current flow.
+
+**Correction to §8.26**: the RugCheck request did not overlap `LP_REFRESH`. It was dispatched 2 ms after the second `LP_REFRESH` response had completed, and its 855 ms ran during the Solana pacing wait before `CANDIDATE_MINT`. §8.26 has been amended accordingly.
+
+**Verification**: the affected suites pass: PaperTradingDaemon 95/95, CandidateFlowProvider 54/54, MarketTelemetry 33/33 and PaperActiveWindowQualification 12/12. The backend typecheck, ESLint and Prettier checks on the changed files pass. Each ran under an external 60 s limit. Sealed captures and the wallet hash are unchanged.
