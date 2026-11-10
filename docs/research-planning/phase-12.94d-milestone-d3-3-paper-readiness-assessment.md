@@ -3640,3 +3640,192 @@ An independent source review confirmed the §8.26 entry-context defect. Using th
 **Correction to §8.26**: the RugCheck request did not overlap `LP_REFRESH`. It was dispatched 2 ms after the second `LP_REFRESH` response had completed, and its 855 ms ran during the Solana pacing wait before `CANDIDATE_MINT`. §8.26 has been amended accordingly.
 
 **Verification**: the affected suites pass: PaperTradingDaemon 95/95, CandidateFlowProvider 54/54, MarketTelemetry 33/33 and PaperActiveWindowQualification 12/12. The backend typecheck, ESLint and Prettier checks on the changed files pass. Each ran under an external 60 s limit. Sealed captures and the wallet hash are unchanged.
+
+### 8.28 Design: Minimal Fresh PAPER Flow for the Daemon (Offline Proposal; Not Implemented)
+
+Independent review accepted `4edf171` (§8.27). This section proposes how the existing daemon could receive fresh PAPER flow for **one** operator-named candidate pool and mint. It is documentation only:
+
+- no provider is installed or activated;
+- no source, threshold, freshness policy, strategy rule or production default changes;
+- every limit below is a proposal for review.
+
+#### Why the Standalone Diagnostic Cannot Run per Tick (Traced)
+
+- **Duration and cost**: one diagnostic run takes about 80 s and 11–23 requests, including security checks the daemon already performs separately.
+- **Teardown and warm-up**: each run closes its subscription (`coordinator.close()`) after history enumeration. A new subscription therefore needs a fresh 60 s warm-up, so the diagnostic produces at most one window per run.
+- **Quiet rule**: the diagnostic's quiet rule requires zero notifications over the whole run, which a long-lived subscription cannot meet.
+- **Private internals**: its paced dispatcher (`dispatchMeteredRequest`), ledger guard and keepalive checks are private to `CandidateDecisionDiagnostic`. Sealing also writes files.
+
+The design therefore reuses the **components**, not the diagnostic.
+
+#### Components Reused and How They Fit
+
+| Component                                                           | Use                                                                                                | Compatibility facts traced from source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CandidateFlowProvider.getCandidateFlow(target, T)`                 | The synchronous read. No `getFlowSnapshot()` exists; the existing method is kept.                  | Must return `evaluationTimestampMs === T`, or the validator returns `TIMESTAMP_MISMATCH`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `PaperReconciledCandidateFlowAdapter.convertCandidateFlow`          | Called **at read time** on a stored reconciliation result. It is pure: no I/O and no mutation.     | Recomputes `cutoffAgeMs = T − windowEndMs` from the original cutoff. Rejects `T` earlier than the cutoff, the original evaluation or the cutoff retrieval, and an age over 15,000 ms. Active windows need `allowActiveWindowQualification: true`.                                                                                                                                                                                                                                                                                                                                                            |
+| `RaydiumCandidateSubscriptionCoordinator`                           | One long-lived `logsSubscribe` for the pool.                                                       | `attachTransport` increments the epoch. A resubscribe after a disconnect records a `SUBSCRIPTION_DISCONNECT` gap. `maxNotificationsBudget` closes the coordinator when exceeded. Retrievals run only when the caller invokes `processNextPending`.                                                                                                                                                                                                                                                                                                                                                           |
+| `RaydiumAmmV4TransactionSourceAdapter`                              | Retrievals, with `paperFailedTransactionPolicy` (PAPER_SIMULATION).                                | Queue overflow is recorded as capacity loss. `getActiveWorkload()` supplies the backlog input.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `RollingTradeFlowTracker`                                           | Decoded events and gaps.                                                                           | Retains 180 s of events and gaps by default, which covers a 60 s window.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ExactPoolHistoryEnumerator`                                        | One page (`pageSize 20`, `maxPages 1`), as in the diagnostic.                                      | Only `ANCHOR_WITNESSED` is accepted. More than 19 newer signatures means the anchor is not witnessed, so the window is unavailable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `ExactPoolWindowReconciliationEvaluator`                            | Unchanged, with both PAPER policies enabled.                                                       | <ul><li>**Rejects**: observation starting after window start (`WARM_UP`); any recorded gap that intersects the window; backlog at evaluation (`PROCESSING_BACKLOG`); an anchor not witnessed at or before window start; any in-window signature without explicit resolution; mismatched slot or block time.</li><li>**Quiet qualification** needs zero signatures since the anchor.</li><li>**Active qualification** needs every in-window signature resolved. Validated failed transactions (`RESOLVED_FAILED_TRANSACTION`) count as zero swaps; any other failure leaves the window unavailable.</li></ul> |
+| `buildStreamResolutionRecords` (exported from the diagnostic)       | Builds per-signature resolution records from the stream results of the current epoch.              | Each resolution is reused across overlapping windows, so a signature is retrieved once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `GlobalResourceBudgetManager`                                       | One instance per provider session: `maxTotalRequests` = session cap, `minProviderSpacingMs: 2500`. | Already shared by the adapter and enumerator in the diagnostic. It is never recreated, so counters cannot be reset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `MeteredWebSocketTransport` (`RaydiumTransportObservationProbe.ts`) | Transport, with ping/pong.                                                                         | The diagnostic's keepalive check is inline. The provider needs the same rule: a missing matching pong is treated as a disconnect.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+
+#### 1. Asynchronous Collection Separate from Synchronous Reads
+
+- **New module**: `backend/src/candidate-scanner/PaperRollingCandidateFlowProvider.ts`, with class `PaperRollingCandidateFlowProvider implements CandidateFlowProvider`. It is import-inert, and the constructor performs no I/O.
+- **Constructor inputs**: one `target` (pool and mint), `executionContext: "PAPER_SIMULATION"`, injected Solana RPC and WebSocket transport factories, `clock`, `sleep`, and the limits below.
+- **`start(signal): Promise<StopReport>`**: the only path that dispatches requests. It runs the collection loop until it is stopped, cancelled or out of budget.
+- **`stop(reason)`**: aborts the loop, closes the coordinator and withdraws all snapshots.
+- **`getCandidateFlow(target, T)`**: synchronous. It performs no requests, timers, promises or mutation of collection state.
+  - **Identity**: the pool and mint must match exactly.
+  - **Snapshot selection**: from the at most two retained snapshots, it selects the newest whose publication time ≤ `T`. A snapshot published after `T` is never used.
+  - **Conversion**: it returns `adapter.convertCandidateFlow(snapshot.result, target, T, { executionContext: "PAPER_SIMULATION", maxAllowedEvidenceAgeMs: 15_000, allowActiveWindowQualification: true })`.
+  - **No usable snapshot**: it returns an explicit unavailable result (`PROVIDER_NOT_STARTED`, `WARMING_UP`, `NO_PUBLISHED_SNAPSHOT`, `EPOCH_INVALIDATED` or `PROVIDER_STOPPED:<reason>`).
+- **Unchanged downstream**: the daemon's `validateAndSnapshotCandidateFlowResult` then validates the result again under the PAPER context fixed in §8.27.
+
+#### 2. Warm-Up, Refresh Cadence and Publication (Paced Schedule)
+
+Measured inputs, from the 9 sealed captures that reached a cutoff:
+
+- **Cutoff skew**: the cutoff (`getBlockTime` of the `GET_SLOT` slot) fell between −1,067 and +733 ms of `GET_SLOT` dispatch.
+- **Cutoff age at history completion**: 4,340–6,155 ms.
+- **Latency**: Solana RPC latency was at most 300 ms (median about 70 ms).
+
+All Solana RPC requests share one 2,500 ms dispatch-to-dispatch pacing (the daemon itself makes no Solana RPC calls). **S** is the time the subscription is confirmed.
+
+**Setup and first window (quiet or active)**:
+
+| Step                     | Dispatch      | Notes                                                                                                                       |
+| ------------------------ | ------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `POOL_LAYOUT`            | run +0        | Once per session; derives the `TrackedRaydiumPoolContext` with `parseRaydiumAmmV4Account` and `validateTrackedPoolContext`. |
+| `PRIOR_ANCHOR`           | run +2.5 s    | One signature, before observation.                                                                                          |
+| Subscribe, ack → S       | ≈ run +2.6 s  | Observation starts at S (measured 2.642 s).                                                                                 |
+| Retrievals (active only) | ≥ 2.5 s apart | Drained before `GET_SLOT`; at most 4 per cycle.                                                                             |
+| `GET_SLOT`               | S + 65.0 s    | The unchanged nominal end. Sent only with an empty backlog.                                                                 |
+| `GET_BLOCK_TIME`         | + 2.5 s       | Gives cutoff C₁ ∈ S + [63.9, 65.7] s, so window start ≥ S + 3.9 s, after S.                                                 |
+| `HISTORY_ENUMERATION`    | + 5.0 s       | Anchor witnessed within one page of 20.                                                                                     |
+| Evaluate, then publish   | ≈ + 5.1–5.3 s | Cutoff age at publication 4.3–6.2 s. Valid until C₁ + 15.0 s, i.e. about 8.8–10.7 s of use.                                 |
+
+**Steady state**:
+
+- **Refresh**: each refresh repeats `GET_SLOT` → `GET_BLOCK_TIME` → `HISTORY` (3 requests).
+- **Anchor advance**: the anchor advances to the newest signature in the previous page with block time ≤ the new window start (otherwise the prior anchor is kept). This keeps the anchor within one page without extra pages.
+- **Cycle length**: with N new signatures to retrieve, the cycle is 7.5 + 2.5·N s.
+- **Coverage**: the next publication falls at `GET_SLOT_k + 12.6 + 2.5·N` s, and snapshot k expires at `GET_SLOT_k + 13.9…15.7` s.
+
+| New signatures per cycle (N)                          | Cycle  | Coverage between snapshots                                   |
+| ----------------------------------------------------- | ------ | ------------------------------------------------------------ |
+| 0 (quiet, or active with already-resolved signatures) | 7.5 s  | Continuous (overlap ≥ 1.1 s at 300 ms latency)               |
+| 1                                                     | 10.0 s | Continuous or a gap of up to 1.2 s, depending on cutoff skew |
+| 2                                                     | 12.5 s | Gap 1.9–3.7 s each cycle                                     |
+| 3                                                     | 15.0 s | Gap 4.4–6.2 s each cycle                                     |
+| 4 (cap)                                               | 17.5 s | Gap 6.9–8.7 s each cycle                                     |
+
+- **During a gap**: the previous snapshot expires naturally (`STALE_RECONCILIATION_EVIDENCE`), and nothing replaces its timestamps.
+- **Late notifications**: a notification received between `GET_SLOT` and evaluation leaves backlog. That refresh then publishes nothing (`PROCESSING_BACKLOG`, unchanged). In pools with arrivals every few seconds, many refreshes will not publish.
+- **Sustained throughput**: limited to fewer than one new signature per 2.5 s minus refresh overhead (`cycle = 7.5 / (1 − 2.5·λ)` for λ < 0.4 per s).
+
+These figures assume latencies stay within the measured range. They are estimates, not guarantees.
+
+#### 3. Immutable, Candidate-Bound Snapshots
+
+- **What is published**: only a `RECONCILED` result that qualifies under the PAPER quiet or active policy, deep-frozen with its original `sourceCutoff`, window, epoch, anchor, provider assumptions, unresolved uncertainties and `decisionTimestampMs` (its publication time).
+- **Freshness**: it is never re-stamped. Freshness is re-derived at each read from the original cutoff by the existing adapter and validator.
+- **Unavailable outcomes**: missing, stale (> 15,000 ms), future-dated, wrong-pool, wrong-mint, wrong-context and unqualified evidence all stay unavailable with their existing reasons.
+- **Failed refreshes**: a failed refresh publishes nothing. The previous snapshot keeps serving only until its own cutoff is 15 s old.
+- **Retention**: at most the two newest snapshots, so a read whose `T` precedes the newest publication can still use the previous one causally.
+
+#### 4. Lifecycle, Cancellation, Reconnects, Backlog and Gaps
+
+- **Start and stop**: `start` is called explicitly, never by import or by a read. Stopping or aborting cancels the pacing wait and any in-flight request (per-request timeout 5,000 ms, proposed), closes the coordinator and keepalive, and withdraws every snapshot. The `start` promise settles with a stop report. No timers remain.
+- **Disconnect, missing pong or epoch change**:
+  - **Immediately**: all snapshots are withdrawn (`EPOCH_INVALIDATED`), resolutions from the previous epoch are discarded, and observation start resets to the new subscription confirmation.
+  - **Before the next snapshot**: a full 60 s warm-up, plus one new `PRIOR_ANCHOR`.
+  - **Recorded gaps stay**: the coordinator's recorded gap remains in the tracker, so any window that intersects it fails.
+  - **Proposed limit**: at most one reconnect per session; a second disconnect stops the provider.
+- **Backlog**:
+  - **`GET_SLOT` gating**: `GET_SLOT` is sent only when the queue and in-flight work are empty. If the per-cycle retrieval cap is reached with work still pending, that cycle skips its refresh and keeps draining. The backlog is never discarded.
+  - **Queue ceiling**: 13, the approved 23/12 ceiling. Overflow is recorded as capacity loss and fails the affected windows.
+  - **Evaluation**: `hasActiveBacklog = adapter.getActiveWorkload() > 0`.
+- **Failed transactions**:
+  - **Validated**: known failed transactions (`KNOWN_FAILED_TRANSACTION` → `RESOLVED_FAILED_TRANSACTION`) consume a retrieval and count zero swaps, only under the PAPER active-window opt-in with `checkKnownFailedTransactionRecord`.
+  - **Everything else**: retrieval, decode and malformed-error failures leave the window unavailable.
+
+#### 5. Retest Feasibility with the Current Caller (Unchanged Strategy)
+
+- **Cadence**: the daemon evaluates a candidate at most every ~5 s (Loop B `scanIntervalMs`, plus its network calls).
+- **Disarm on unavailable flow**: on every tick, the buy gate requires sufficient 60 s flow. If flow is unavailable on any tick, the result is `BUY_GATE_REJECTED`, and the caller **deletes the armed state**. The next tick with fresh flow re-arms from scratch, with a new `armedAtMs` and peak. An armed candidate therefore survives only if **every** tick from arming to confirmation reads a valid snapshot.
+- **Quiet windows**: they can pass the short-horizon gate (0/0) but can **never confirm**, because both retest rules require buys > 0. Confirmation needs an active window.
+- **What is feasible unchanged**:
+  - **Rule A (pullback)**: can confirm on the second tick, about 5 s after arming. Both ticks may read the same snapshot, whose 8.8–10.7 s validity can span them.
+  - **Rule B (consolidation, ≥ 3 ticks or 30 s)** and waits approaching 90 s / 120 s: need overlapping snapshots on every tick. That holds only while each cycle brings at most one new signature (table above). With two or more new swaps per cycle, gaps recur and a tick landing in one disarms the candidate.
+- **No change proposed here**: treating unavailable flow while armed as "wait" instead of "disarm" would be a strategy and caller change. It requires a separate, explicit decision.
+
+#### 6. Request Budgets (Proposed; Subject to Review)
+
+| Scope       | Proposed limit                                                                                                                                |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pacing      | 2,500 ms between all Solana RPC dispatches (unchanged)                                                                                        |
+| Per refresh | Exactly 1 `GET_SLOT` + 1 `GET_BLOCK_TIME` + 1 history page (20 records); no retrieval between `GET_SLOT` and evaluation                       |
+| Per cycle   | ≤ 4 retrievals before `GET_SLOT`                                                                                                              |
+| Per epoch   | 1 `PRIOR_ANCHOR`; `POOL_LAYOUT` once per session                                                                                              |
+| Session     | One candidate; subscription lifetime ≤ 600 s; ≤ 60 notifications/retrievals (`maxNotificationsBudget`); ≤ 1 reconnect; `maxTotalRequests` 300 |
+
+- **Arithmetic**: a fully quiet 600 s session uses 2 + 3 × 72 = 218 requests. Retrievals add at most 60, and a reconnect adds 1 anchor, for at most 279, under the cap of 300.
+- **Exhaustion**: reaching any limit stops refreshing and closes the subscription. All later reads are unavailable with an explicit reason (for example `PROVIDER_BUDGET_EXHAUSTED`). Nothing is reset or renewed automatically.
+
+#### Smallest Necessary Patch (For Later Approval)
+
+1. **`PaperRollingCandidateFlowProvider.ts` (new)**: the class above.
+   - **Request path**: an internal paced RPC wrapper over the injected fetch, recording on the session `GlobalResourceBudgetManager`.
+   - **Keepalive**: the same rule as the diagnostic.
+   - **Anchor advance and snapshot store**: as described above.
+   - **Reuse**: no existing module changes, apart from optionally moving `buildStreamResolutionRecords` unchanged into a small shared module, so the provider need not import the diagnostic.
+2. **Daemon wiring (separate approval)**:
+   - an explicit CLI selection of one pool and mint (no environment variable);
+   - `setCandidateFlowProvider(provider)`;
+   - `provider.start(signal)` tied to daemon termination, and `provider.stop()` in shutdown.
+3. **Decision time basis (review item)**:
+   - **Problem**: Loop B captures `currentNow` once, before its network calls, so a candidate's flow freshness is judged at a time earlier than its price fetch.
+   - **Change**: pass a timestamp taken immediately before `evaluatePaperDaemonEntryDecision`.
+   - **Effect**: freshness is measured at the actual decision moment. That is stricter, not looser.
+
+#### Focused Offline Tests (Synthetic Clock, Injected Transport and RPC)
+
+1. **Reads are inert**:
+   - thousands of `getCandidateFlow` calls make zero RPC calls, socket sends or timers;
+   - reads before `start` are unavailable;
+   - import is inert.
+2. **Warm-up schedule**:
+   - the exact dispatch order and times from the table;
+   - the minimum Solana spacing is ≥ 2,500 ms;
+   - unavailable before first publication;
+   - available up to cutoff + 15,000 ms and stale at + 15,001 ms.
+3. **Quiet continuity**: reads every 500 ms for 120 s stay available, with cutoff skews spanning the measured −1,067 to +733 ms and 300 ms latency.
+4. **Active windows**:
+   - retrievals happen before `GET_SLOT`;
+   - a resolution is reused across overlapping windows, with one retrieval per signature;
+   - counts are exact;
+   - validated failed transactions count zero swaps, and invalid ones leave the window unavailable.
+5. **Gaps**: with two new signatures per cycle, reads inside the computed gaps are stale. Every available read keeps its original `windowEndMs`, with `cutoffAgeMs = T − cutoff`.
+6. **Backlog**:
+   - a notification after `GET_SLOT` means no publication for that refresh;
+   - when the per-cycle cap is reached, the refresh is skipped but the backlog is kept.
+7. **Reconnect and missing pong**: snapshots are withdrawn at once, the gap is recorded, previous-epoch resolutions are not reused, and the 60 s warm-up is required again.
+8. **Budgets**: the session cap, the notification budget and the reconnect limit each stop the provider with an explicit reason and no counter reset.
+9. **Cancellation**: `stop` during a pacing wait or an in-flight request makes no further dispatch, closes everything and settles `start`.
+10. **Anchor advance**: the anchor is chosen at or before the new window start, and more than 19 newer signatures make the window unavailable.
+11. **Identity and context**: another pool or mint is unavailable, and the generic production path still rejects the evidence.
+12. **Daemon boundary**: the provider injected through `setCandidateFlowProvider` arms through `evaluatePaperDaemonEntryDecision`. A read inside a gap yields `BUY_GATE_REJECTED`, which documents the current disarm behaviour.
+
+#### Not Proposed
+
+- Any change to thresholds, the 15 s freshness limit, pacing, the 90 s / 120 s expiries, buy or retest rules, production defaults or evaluator rules.
+- Extra history pages.
+- Post-cutoff retrievals.
+- Environment-based activation.
+- Using sealed captures as current flow.
+- An identical ACT run.
