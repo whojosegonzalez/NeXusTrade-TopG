@@ -3420,3 +3420,70 @@ An independent review reproduced two replay gaps at `af1e3ba`. §8.23a overstate
    - artifacts are sealed without error, and replay of the partial capture fails closed (`INCOMPLETE_MANIFEST_COVERAGE`).
 
 Limits, pacing, thresholds, the wallet and historical evidence are unchanged. Nothing has run live.
+
+### 8.24 ACT/WSOL 20/9 Capture: Incomplete Active Observation Stopped by the Local Queue Ceiling
+
+**Classification**: an **incomplete active observation**. Two transactions were decoded successfully, but the run stopped at the local queue ceiling before any cutoff, so no 60-second window was evaluated.
+
+- It is **not** a completed active-window test.
+- It is **not** a quiet result.
+- It is **not** a strategy rejection, because no strategy decision was made.
+- It is **not** a provider rate limit: all 4 requests returned HTTP 200, and there was no 429.
+
+**Capture**: `data/research/diagnostics/candidate-decision-act-capacity-24949a4`, manifest `dd276d32c712f66669c335224dbed7ba3a5c69885127be9b3807c7aa54229dd5`, made at commit `24949a4`. One operator run; the authorization is consumed and the run was not repeated.
+
+#### Verified (read-only, offline)
+
+- **Integrity**: all 7 listed files verify, plus the manifest (8 files); there are no unlisted files. All 10 diagnostic captures (207 files) verify, the 9 earlier captures replay identically, and the wallet hash is unchanged.
+- **Profile**: `PAPER_ACTIVE_WINDOW_20_9` (exact definition), `PAPER_SIMULATION`.
+- **Requests**: 4 of 20 attempts, all HTTP 200 and all Solana RPC: `POOL_LAYOUT`, `PRIOR_ANCHOR`, and 2 `TRANSACTION_DECODING` (2 of 9 retrievals).
+  - **Gaps between dispatches**: 2,514, 15,310 and 24,363 ms.
+  - **Ids**: each retrieval echoed its request id (1).
+  - **Not reached**: no `GET_SLOT`, drain, history enumeration, security enrichment or decision.
+- **Observation**: started at run +2.687 s and stopped at observation +41.169 s with `STREAM_QUEUE_LIMIT_EXCEEDED`.
+  - 12 notifications, all routed: no duplicates, unrelated messages, overflows, stale-epoch messages or disconnect gaps.
+  - Pending queue 10, in-flight 0, workload 10, epoch 1, no recorded gaps before cleanup.
+  - Keepalive: 2 pings, 2 matched pongs.
+  - Telemetry was sealed at observation +41.606 s.
+- **Sealed schedule**: nominal end and `GET_SLOT` deadline recorded; 0 drain retrievals; `GET_SLOT` not dispatched. The stop reason in the schedule is `null`, because this was a stream-limit stop rather than a bounded-drain stop; the queue stop is recorded as the run status and in telemetry.
+- **Transactions**: both retrievals (slots 467511401 and 467511522, legacy, `meta.err: null`) independently re-decode as one candidate-bound **ACT SELL** each. Telemetry records 1 decoded and 1 ingested event for each.
+- **Replay**: full replay fails closed with `INCOMPLETE_MANIFEST_COVERAGE`, because the later-stage evidence was never acquired. This is not a successful replay.
+
+#### Evidenced Arrival Bounds
+
+The adapter queue is FIFO (`push`/`shift`), and a notification cannot precede its block's time. Times below are from observation start; block times are whole seconds, so they are lower bounds.
+
+| Notification        | Evidence                                             | Arrival bound          |
+| ------------------- | ---------------------------------------------------- | ---------------------- |
+| #1 (`3m71…`)        | block time +13.249 s; retrieval dispatched +15.137 s | +13.249 to +15.137 s   |
+| #2 (`49a4…`)        | block time +39.249 s; retrieval dispatched +39.500 s | +39.249 to +39.500 s   |
+| #3–#12 (10 pending) | queued after #2 (FIFO); pending at the stop          | after #2, by +41.169 s |
+
+- **Between #1 and #2**: no notification arrived; otherwise it would have preceded #2.
+- **The burst**: at least **11 notifications (#2–#12) arrived within at most 1.92 s**.
+- **Unknown**: individual arrival times within these bounds, any arrivals after +41.169 s, and the eventual complete window.
+
+#### Why the Queue Stopped Before the Retrieval Allowance Was Used
+
+- **Pacing**: after the retrieval at +39.500 s, the next Solana dispatch could not occur before +42.000 s. During the burst (+39.249 to +41.169 s), no more than that one retrieval was possible, so the backlog reached 10 and the unchanged ceiling (stop at ≥ 10 pending or active workload) ended the run. 7 of the 9 retrievals were unused.
+- **The budget would also have rejected it**: by design the queue ceiling is the retrieval cap + 1 (§8.23). 12 notifications already exceed 9 retrievals, so continuing would have ended in `TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED` rather than a complete window.
+- **A larger queue alone cannot help**: it cannot resolve more than 9 relevant transactions, and it does not raise retrieval throughput.
+
+#### Queue and Retrieval Capacity Together (Evidence-Bound)
+
+- **Pacing ceiling for this run**: after +39.5 s, paced retrieval slots fall at +42.0, +44.5, …, +67.0 s (the last retrieval must leave the 2,500 ms `GET_SLOT` pacing slot inside the unchanged 5 s cutoff window). That is 11 slots, so this run could have resolved **at most 13 transactions in total**, whatever the budget or queue size.
+- **What clearing the observed backlog needed**: the 10 pending would have needed slots +42.0 to +64.5 s, which needs **≥ 12 retrievals** and a queue that does not stop at 10 pending.
+- **What remains unknown**: whether any further notification arrived after +41.169 s. With 12 retrievals, even one more arrival would make the window unavailable.
+
+#### Recommendation for the Next Bounded Step (Not Implemented)
+
+- **Smallest justified combination**: if the operator wants a profile that would not have stopped on this observed set, raise both limits together, under the opt-in only:
+  - **12 retrievals** (the observed count);
+  - **a queue ceiling of 13** (retrieval cap + 1, so the queue never rejects a run the budget would accept);
+  - **23 HTTP attempts** (11 base + 12).
+- **Unchanged**: 65 s observation, ≤ 2 drain retrievals, `GET_SLOT` within 5 s of the nominal end, 2,500 ms pacing, 15,000 ms freshness, the 90 s deadline and strategy thresholds.
+- **Paced schedule for the observed case**: retrievals at +42.0 to +64.5 s, then `GET_SLOT` at ≥ +67.0 s, inside the window. The post-cutoff chain is unchanged (12.8–13.0 s measured), giving an illustrative completion around run +83 s. That is an estimate, not a guarantee.
+- **Not justified by the evidence**: more than 13 retrievals cannot help a burst arriving at this point, and the evidence does not show that 12 suffices for any future window.
+- **Decision**: whether to implement this narrow change offline, or to keep 20/9 and treat such bursts as unavailable, is the operator's decision. No new infrastructure milestone or provider is implied.
+
+No source, dependency, configuration or evidence changes were made. No network call, socket, capture, rerun, daemon, trade or wallet change occurred.
