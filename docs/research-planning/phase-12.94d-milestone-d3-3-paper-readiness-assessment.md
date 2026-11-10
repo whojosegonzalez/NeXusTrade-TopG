@@ -3523,3 +3523,78 @@ The operator approved a separately selected profile. It extends the existing col
 **Limits of this evidence**: D3 shows that the schedule can absorb a two-then-ten burst _when responses are fast and no further notifications arrive_. It does not show that 23/12 completes any real future window. The §8.24 arrival interval remains an assumption-dependent inference.
 
 Nothing has run live, and no evidence or wallet state changed.
+
+### 8.26 ACT/WSOL 23/12 Capture: Quiet Window, Separate Strategy Rejection
+
+**Classification**:
+
+- **Flow**: a **quiet result**, qualified as `QUIET_WINDOW` under the declared provider-relative PAPER assumptions.
+- **Strategy**: a separate **strategy rejection**, `BUY_GATE_REJECTED` / `MATURITY_WINDOW_GATE_FAILED`.
+
+It is **not** live validation of burst capacity, drain handling, queue ceiling 13 or known failed transactions. None of these occurred: 0 notifications, 0 retrievals. No position, retest, fill or exit was exercised.
+
+**Capture**: `data/research/diagnostics/candidate-decision-act-capacity-dee358e`, manifest `b01d051bc43b640a781ce7925edcda5418f2fa27a7be162e5a908191f6039fae`, commit `dee358e`. One operator run; its authorization is consumed and it was not repeated.
+
+#### Verified (read-only, offline)
+
+- **Integrity**: all 24 listed files verify, plus the manifest (25 files), with nothing unlisted. All 11 diagnostic captures (232 files) verify, the 9 earliest captures and the `24949a4` capture replay unchanged, and the wallet hash is unchanged.
+- **Profile**: the sealed `PAPER_ACTIVE_WINDOW_23_12` matches the exact definition (23 / 12 / queue 13, timing limits unchanged), in a PAPER_SIMULATION capture. The active-window evidence names the same profile, and the failed-transaction policy is sealed.
+- **Requests**: 11 of 23, all HTTP 200, with echoed Solana RPC ids. 0 of 12 retrievals.
+  - **Pacing**: Solana RPC requests are sequential, with a minimum spacing of 2,501 ms.
+  - **RugCheck**: overlapped with `LP_REFRESH` (855 ms).
+- **Observation and cutoff timing**:
+  - Observation started at run +2.642 s.
+  - 0 notifications, 0 backlog, 0 drain and 0 boundary-crossing retrievals.
+  - `GET_SLOT` was dispatched 8 ms after the fixed nominal end (4,992 ms before its deadline), with no retrieval after it.
+  - The cutoff was 1,929 ms before the recorded observation end.
+  - Keepalive: 3 pings, 3 matched pongs.
+- **Freshness and deadline**:
+  - Cutoff age at evaluation: 12,341 ms (margin 2,659 ms).
+  - Last request completed at run +80.609 s; the manifest was generated at run +80.847 s, within 90 s.
+- **Window**:
+  - History `ANCHOR_WITNESSED`, epoch 1, 0 signatures since the anchor, 0 in-window. The newest history row is 250 s before the cutoff.
+  - The only recorded gap is the post-evaluation `COORDINATOR_CLOSED`.
+  - Flow: `SUFFICIENT`, 0 buys / 0 sells, `isPaperQualified: true`, `QUIET_WINDOW`.
+- **Security evidence (recomputed from raw responses)**:
+  - Derived LP inaccessibility 99.981423% (passes the unchanged rule).
+  - Mint and freeze authorities explicitly disabled (`null`).
+  - RugCheck score 11,621 with danger risk present, top-10 holders 81.4%, 136,125 holders.
+  - Solana Tracker initial fraction 0.0007387 and current-holdings fraction 0.010572737752393688. These are kept separate, provider-reported and unverified.
+- **Strategy decision**: `BUY_GATE_REJECTED`. The first failing gate is `MATURITY_WINDOW_GATE` (asset age far beyond 300–900 s). The rejection is not marginal: `DEPTH_BALANCE_GATE`, `FLOW_ABSORPTION_GATE`, `VOLUME_SURGE_GATE`, `MIN_SELLS_GATE` and `BUNDLER_CONCENTRATION_GATE` also fail. ACT's rejection stands, and no threshold is relaxed.
+- **Replay**: `DECISION_REEVALUATED`, integrity verified (24 files), `ok`. It matches the recorded decision (`MATURITY_WINDOW_GATE_FAILED` at the recorded decision time). The quiet claim agrees with the raw activity: 0 in-window signatures, 0 since the anchor, 0 notifications, 0 retrievals.
+
+#### PAPER Integration Status (Source Inspection, No Execution)
+
+**Implemented but not validated live**:
+
+- active-window qualification;
+- the bounded drain;
+- queue ceiling 13;
+- validated failed transactions;
+- `RETEST_CONFIRMED` through `evaluateCandidateDecisionPoints` (offline synthetic tests only);
+- the exit-side flow path in `buildPositionMarketContext`, which already validates flow with `executionContext: "PAPER_SIMULATION"`;
+- position fills and exits under qualified flow.
+
+**Missing integration** (the daemon cannot currently enter on qualified flow):
+
+1. **Entry decision context**:
+   - **Where**: in `backend/src/scripts/paper-trading-daemon.ts`, the entry call `evaluateCandidateDecisionPoints({...})` (about line 1989) passes no `executionContext`.
+   - **Effect**: `validateAndSnapshotCandidateFlowResult` therefore treats any PAPER-qualified flow as production evidence and replaces it with `PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION` (collection gap). With `requireValidFlowCoverage: true`, the buy gate's short-horizon flow check then fails.
+   - **Consequence**: the exit path and the entry path disagree on context.
+2. **No PAPER flow provider is installed**:
+   - The daemon's `activeCandidateFlowProvider` defaults to `UnavailableCandidateFlowProvider` (`NO_FLOW_PROVIDER_CONFIGURED`).
+   - `setCandidateFlowProvider` has no caller anywhere in the source.
+   - The diagnostic's qualification is a one-shot sealed run (about 80 s per qualified window). The daemon needs per-candidate flow no older than 15 s at each tick, and a retest confirmation needs a second fresh window within the existing 90 s / 120 s expiry. This is a design question for a later task, not a threshold change.
+
+#### Recommendation: Smallest Next Task (Not Implemented)
+
+Make the daemon's entry decision PAPER-context-aware:
+
+- **Change**: pass `executionContext: "PAPER_SIMULATION"` in the `evaluateCandidateDecisionPoints` call in `paper-trading-daemon.ts`, matching the exit path.
+- **Offline regressions**:
+  - a stub provider's valid PAPER-qualified flow now reaches the existing buy/retest gates in the daemon's decision path;
+  - the default `UnavailableCandidateFlowProvider` still yields no entry;
+  - PAPER evidence stays rejected in a production context.
+- **Unchanged**: thresholds, providers and network behaviour.
+
+This removes a concrete, verified blocker but is **not sufficient on its own**: until a PAPER flow provider is installed (item 2), a short operator-run PAPER session still cannot arm or enter any candidate. No identical ACT run is proposed.
