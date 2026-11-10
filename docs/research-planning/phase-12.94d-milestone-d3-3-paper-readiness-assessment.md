@@ -3716,13 +3716,13 @@ All Solana RPC requests share one 2,500 ms dispatch-to-dispatch pacing (the daem
 - **Cycle length**: with N new signatures to retrieve, the cycle is 7.5 + 2.5·N s.
 - **Coverage**: the next publication falls at `GET_SLOT_k + 12.6 + 2.5·N` s, and snapshot k expires at `GET_SLOT_k + 13.9…15.7` s.
 
-| New signatures per cycle (N)                          | Cycle  | Coverage between snapshots                                   |
-| ----------------------------------------------------- | ------ | ------------------------------------------------------------ |
-| 0 (quiet, or active with already-resolved signatures) | 7.5 s  | Continuous (overlap ≥ 1.1 s at 300 ms latency)               |
-| 1                                                     | 10.0 s | Continuous or a gap of up to 1.2 s, depending on cutoff skew |
-| 2                                                     | 12.5 s | Gap 1.9–3.7 s each cycle                                     |
-| 3                                                     | 15.0 s | Gap 4.4–6.2 s each cycle                                     |
-| 4 (cap)                                               | 17.5 s | Gap 6.9–8.7 s each cycle                                     |
+| New signatures per cycle (N)                          | Cycle  | Coverage between snapshots                                                                                                                                                   |
+| ----------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0 (quiet, or active with already-resolved signatures) | 7.5 s  | Continuous only under favourable latency and cutoff timing (overlap ≥ 1.1 s at ≤ 300 ms latency and the measured skew range); not guaranteed                                 |
+| 1                                                     | 10.0 s | Can already introduce a gap (up to 1.2 s at the measured skew, wider with slower responses); under §8.29 the new notification also withdraws the current snapshot on arrival |
+| 2                                                     | 12.5 s | Gap 1.9–3.7 s each cycle                                                                                                                                                     |
+| 3                                                     | 15.0 s | Gap 4.4–6.2 s each cycle                                                                                                                                                     |
+| 4 (cap)                                               | 17.5 s | Gap 6.9–8.7 s each cycle                                                                                                                                                     |
 
 - **During a gap**: the previous snapshot expires naturally (`STALE_RECONCILIATION_EVIDENCE`), and nothing replaces its timestamps.
 - **Late notifications**: a notification received between `GET_SLOT` and evaluation leaves backlog. That refresh then publishes nothing (`PROCESSING_BACKLOG`, unchanged). In pools with arrivals every few seconds, many refreshes will not publish.
@@ -3730,12 +3730,14 @@ All Solana RPC requests share one 2,500 ms dispatch-to-dispatch pacing (the daem
 
 These figures assume latencies stay within the measured range. They are estimates, not guarantees.
 
+**Correction (§8.29)**: quiet continuity is conditional on response latency and cutoff timing, not assured. One new retrieval per cycle can already introduce a gap. Under the implemented withdrawal rule, any new unaccounted notification also withdraws the current snapshot immediately, so active pools are unavailable from each new swap until the next publishable refresh.
+
 #### 3. Immutable, Candidate-Bound Snapshots
 
 - **What is published**: only a `RECONCILED` result that qualifies under the PAPER quiet or active policy, deep-frozen with its original `sourceCutoff`, window, epoch, anchor, provider assumptions, unresolved uncertainties and `decisionTimestampMs` (its publication time).
 - **Freshness**: it is never re-stamped. Freshness is re-derived at each read from the original cutoff by the existing adapter and validator.
 - **Unavailable outcomes**: missing, stale (> 15,000 ms), future-dated, wrong-pool, wrong-mint, wrong-context and unqualified evidence all stay unavailable with their existing reasons.
-- **Failed refreshes**: a failed refresh publishes nothing. The previous snapshot keeps serving only until its own cutoff is 15 s old.
+- **Failed refreshes**: a failed refresh publishes nothing. **Corrected (§8.29)**: a failed refresh alone does not keep earlier snapshots usable when it reveals contradicting evidence. A delayed signature, unresolved transaction, recorded gap or epoch change withdraws every affected snapshot immediately, before its 15 s freshness expires, with no fallback to another affected snapshot.
 - **Retention**: at most the two newest snapshots, so a read whose `T` precedes the newest publication can still use the previous one causally.
 
 #### 4. Lifecycle, Cancellation, Reconnects, Backlog and Gaps
@@ -3759,9 +3761,9 @@ These figures assume latencies stay within the measured range. They are estimate
 - **Cadence**: the daemon evaluates a candidate at most every ~5 s (Loop B `scanIntervalMs`, plus its network calls).
 - **Disarm on unavailable flow**: on every tick, the buy gate requires sufficient 60 s flow. If flow is unavailable on any tick, the result is `BUY_GATE_REJECTED`, and the caller **deletes the armed state**. The next tick with fresh flow re-arms from scratch, with a new `armedAtMs` and peak. An armed candidate therefore survives only if **every** tick from arming to confirmation reads a valid snapshot.
 - **Quiet windows**: they can pass the short-horizon gate (0/0) but can **never confirm**, because both retest rules require buys > 0. Confirmation needs an active window.
-- **What is feasible unchanged**:
-  - **Rule A (pullback)**: can confirm on the second tick, about 5 s after arming. Both ticks may read the same snapshot, whose 8.8–10.7 s validity can span them.
-  - **Rule B (consolidation, ≥ 3 ticks or 30 s)** and waits approaching 90 s / 120 s: need overlapping snapshots on every tick. That holds only while each cycle brings at most one new signature (table above). With two or more new swaps per cycle, gaps recur and a tick landing in one disarms the candidate.
+- **What is feasible unchanged (corrected in §8.29)**: active-window retests are possible only under favourable timing; continuous availability is not guaranteed.
+  - **Rule A (pullback)**: can confirm on the second tick, about 5 s after arming, when both ticks read the same still-fresh active snapshot and no new notification arrives in between.
+  - **Rule B (consolidation, ≥ 3 ticks or 30 s)** and waits approaching 90 s / 120 s: need fresh flow on every tick. Any new swap withdraws the current snapshot, and refresh gaps can recur, so a tick landing in either disarms the candidate.
 - **No change proposed here**: treating unavailable flow while armed as "wait" instead of "disarm" would be a strategy and caller change. It requires a separate, explicit decision.
 
 #### 6. Request Budgets (Proposed; Subject to Review)
@@ -3774,7 +3776,7 @@ These figures assume latencies stay within the measured range. They are estimate
 | Per epoch   | 1 `PRIOR_ANCHOR`; `POOL_LAYOUT` once per session                                                                                              |
 | Session     | One candidate; subscription lifetime ≤ 600 s; ≤ 60 notifications/retrievals (`maxNotificationsBudget`); ≤ 1 reconnect; `maxTotalRequests` 300 |
 
-- **Arithmetic**: a fully quiet 600 s session uses 2 + 3 × 72 = 218 requests. Retrievals add at most 60, and a reconnect adds 1 anchor, for at most 279, under the cap of 300.
+- **Arithmetic (planning estimate, not a guarantee)**: a fully quiet 600 s session uses about 2 + 3 × 72 = 218 requests (the §8.29 virtual-clock simulation used 2 + 3 × 71 = 215). Retrievals add at most 60, and a reconnect adds 1 anchor, for at most about 279, under the cap of 300. These limits cover this provider only, not the daemon's separate API activity, and are not approved for live execution.
 - **Exhaustion**: reaching any limit stops refreshing and closes the subscription. All later reads are unavailable with an explicit reason (for example `PROVIDER_BUDGET_EXHAUSTED`). Nothing is reset or renewed automatically.
 
 #### Smallest Necessary Patch (For Later Approval)
@@ -3829,3 +3831,128 @@ These figures assume latencies stay within the measured range. They are estimate
 - Environment-based activation.
 - Using sealed captures as current flow.
 - An identical ACT run.
+
+### 8.29 Isolated PAPER Rolling Flow Provider (Offline Implementation; Not Installed)
+
+The operator approved an offline implementation of the §8.28 design, with corrections. These are applied here, and §8.28 is amended where its claims were too strong.
+
+- **Not installed**: the provider is not installed in the daemon, and nothing enables it at runtime (no CLI flag, environment variable or daemon call).
+- **Nothing ran live**: no network, socket, daemon, capture, wallet or session activity took place.
+
+#### Implementation
+
+- **Class**: `backend/src/candidate-scanner/PaperRollingCandidateFlowProvider.ts`, `PaperRollingCandidateFlowProvider implements CandidateFlowProvider`. It is bound to one fixed pool and mint, with `executionContext: "PAPER_SIMULATION"` only.
+- **Reuse, unchanged**:
+  - `RaydiumCandidateSubscriptionCoordinator`, `RaydiumAmmV4TransactionSourceAdapter` (with the PAPER failed-transaction policy) and `RollingTradeFlowTracker`;
+  - `ExactPoolHistoryEnumerator` (one page of 20) and `evaluateExactPoolWindowReconciliation` (both PAPER policies);
+  - `PaperReconciledCandidateFlowAdapter` and `buildStreamResolutionRecords`;
+  - the existing pool-layout parser.
+  - No existing source file changed.
+- **Inert import and construction**: transports and limits are injected and mandatory (no default networking, no default limits). Collection starts only with `start(signal)`, which may be called once.
+- **Pure reads**: `getCandidateFlow(target, T)` performs no I/O, timers, promises or collection-state mutation.
+  - **Selection**: it takes the newest snapshot published at or before `T`.
+  - **Conversion**: it converts the snapshot through the existing PAPER adapter at `T`. Freshness is therefore re-derived from the **original** cutoff against the unchanged 15,000 ms limit, and nothing is re-stamped.
+  - **When unavailable**: an explicit reason (not started, warming up, withdrawn, stopped, identity mismatch).
+  - **Shared snapshots**: two eligible ticks can read the same still-fresh snapshot.
+- **Immutable results**: published reconciliation results are deep-frozen. Withdrawal is tracked separately and never rewrites them.
+
+#### Withdrawal of Contradicted Evidence (Correction 1)
+
+A failed refresh no longer leaves earlier snapshots usable when contradicting evidence appears. Every affected snapshot is withdrawn at once and is never served again, even if it is still within its 15 s freshness. Reads do not fall back to another snapshot.
+
+| Evidence                                                                    | Rule (existing slot, window and epoch rules)                                                                                  | Withdrawal reason                                                                                               |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Stream notification for a signature absent from the snapshot's history page | Its block time is unknown on arrival, so it cannot be excluded from the window. Local receipt time is never used.             | `DELAYED_SIGNATURE_AT_OR_BEFORE_CUTOFF_SLOT` (slot ≤ cutoff slot) or `UNACCOUNTED_SIGNATURE_BLOCK_TIME_UNKNOWN` |
+| Later history page reveals an unaccounted signature                         | Excluded only if its slot is after the cutoff slot **and** its known block time is after the window end; otherwise withdrawn. | `DELAYED_SIGNATURE_IN_HISTORY`                                                                                  |
+| Retrieval that does not resolve                                             | Withdraws every snapshot that does not already account for the signature.                                                     | `UNRESOLVED_TRANSACTION:<outcome>`                                                                              |
+| Any newly recorded or merged tracker gap                                    | Gap times are local, so intersection cannot be safely excluded; all snapshots are withdrawn.                                  | `RECORDED_GAP:<reason>`                                                                                         |
+| Disconnect, coordinator state change, missing pong, epoch change            | All snapshots are withdrawn; previous-epoch resolutions are discarded; a full warm-up is required.                            | `EPOCH_INVALIDATED:<reason>`                                                                                    |
+| Stop, cancellation, lifetime or ceiling                                     | All snapshots are withdrawn.                                                                                                  | `PROVIDER_STOPPED:<reason>`                                                                                     |
+
+**Publication** also requires:
+
+- no gap recorded and no notification received between `GET_SLOT` and evaluation;
+- an empty backlog at evaluation;
+- an unchanged epoch;
+- a successful PAPER conversion at the publication time.
+
+**Consequence**: in an active pool, each new swap withdraws the current snapshot until the next publishable refresh.
+
+#### Cycles, Skipped Refreshes and Limits (Correction 3)
+
+- **Cycle**: a cycle starts when the previous one ends, or when a subscription is confirmed.
+  - It allows at most `maxRetrievalsPerCycle` retrievals, then one refresh: `GET_SLOT` → `GET_BLOCK_TIME` → one history page → evaluate → publish or not.
+  - If the allowance is used with work still pending, the cycle ends as `REFRESH_SKIPPED_RETRIEVAL_ALLOWANCE_EXHAUSTED`. The backlog is kept, and the next cycle starts at once.
+  - If backlog appears during the `GET_SLOT` pacing wait, no `GET_SLOT` is dispatched and the cycle continues.
+  - The first `GET_SLOT` of each epoch is not sent before subscription confirmation + 65,000 ms.
+- **Dispatcher**:
+  - **Serialized**: one dispatcher for all Solana RPC, with no overlap.
+  - **Pacing**: at least `rpcPacingMs` (≥ 2,500 ms) dispatch-to-dispatch.
+  - **Ledger**: every actual dispatch is recorded once in the session ledger. The ledger is authoritative.
+  - **Refusals**: a ceiling, the lifetime deadline or a 429 halt refuses dispatch and stops the provider instead of retrying.
+- **No resets**: counters are never reset, and reconnects do not extend the deadline.
+- **Offline test configuration only**: the values below are not approved for live execution, and they cover this provider only, not the daemon's separate API activity.
+
+| Limit                      | Test value                                               | Basis                                                         |
+| -------------------------- | -------------------------------------------------------- | ------------------------------------------------------------- |
+| Lifetime                   | 600,000 ms from `start()`                                | absolute; includes setup and reconnects                       |
+| Shared HTTP attempts       | 300                                                      | all purposes                                                  |
+| Notifications / retrievals | 60 / 60                                                  | the coordinator closes beyond 60 notifications                |
+| Reconnects                 | 1                                                        | a second loss stops the provider                              |
+| Retrievals per cycle       | 4                                                        |                                                               |
+| Queue ceiling              | 13                                                       | overflow is recorded as a gap                                 |
+| RPC pacing                 | 2,500 ms                                                 | unchanged                                                     |
+| Per-request timeout        | 5,000 ms                                                 | wall-clock timer                                              |
+| Subscription ack timeout   | 5,000 ms                                                 |                                                               |
+| Keepalive                  | ping every 20,000 ms; pong timeout 10,000 ms; ≤ 32 pings | 600 s / 20 s = 30 pings, not the diagnostic's 4               |
+| WebSocket data messages    | 80                                                       | ≤ 2 acks + 60 notifications, plus margin for unrelated frames |
+| WebSocket data bytes       | 1,048,576                                                |                                                               |
+| WebSocket control frames   | 80                                                       | ≤ 32 pongs plus occasional server pings                       |
+
+**Request arithmetic (planning estimate)**: a quiet 600 s session uses 2 + 3 per refresh. The simulated run used 215 (71 refreshes), under the 218 estimate.
+
+#### Offline Verification
+
+`PaperRollingCandidateFlowProvider.test.ts` (R1–R10) uses a synthetic chain:
+
+- a virtual clock and a slot-to-block-time mapping with configurable skew;
+- response latency;
+- delayed notifications and delayed history indexing;
+- in-memory WebSocket mocks with ping/pong.
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                   |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1   | Inert construction and reads (1,000 reads: zero fetches, zero transports); limit and context validation; `start` only once                                                                                                                                                                                              |
+| R2   | Exact warm-up schedule; repeated fresh quiet reads with `cutoffAgeMs = T − original cutoff ≤ 15 s`; two ticks 5 s apart read the same snapshot; other pool/mint unavailable; production and context-less validation still reject PAPER evidence                                                                         |
+| R3   | Conditional continuity: continuous at 100 ms latency and no skew. With −2 s skew and 600 ms latency, reads between snapshots are `STALE`, and the daemon boundary arms on fresh flow, then returns `BUY_GATE_REJECTED` in a gap (the caller's disarm)                                                                   |
+| R4   | Active window: 3 retrievals, all before `GET_SLOT`, one per signature; exact 2/1 counts; a favourable Rule A retest (`ARMED_FIRST_TICK` → `RETEST_CONFIRMED`) on two ticks of one snapshot; later windows age into a genuine `QUIET_WINDOW` with the anchor advanced to the last swap                                   |
+| R5   | Delayed notification inside a published window: withdrawn at its delivery time while still nominally fresh, with the frozen result byte-identical; a never-notified, late-indexed transaction: withdrawn when history reveals it, and the next window is unresolved; a corrupt active frame: recorded gap withdraws all |
+| R6   | A burst of 6: 4 retrievals, the refresh is skipped, the backlog is kept and drained, then 3/3 is published; a notification during refresh blocks publication; a validated failed transaction counts zero swaps; a malformed one leaves the window unavailable                                                           |
+| R7   | Disconnect: immediate `EPOCH_INVALIDATED`, a second `PRIOR_ANCHOR`, ≥ 65 s re-warm-up, fresh again only afterwards; a second disconnect gives `RECONNECT_CEILING_REACHED`. Ledger sequence contiguous, deadline unchanged. Missing pongs end each epoch, then the reconnect ceiling                                     |
+| R8   | HTTP (12), notification (5), retrieval (3) and WebSocket-message (3) ceilings each stop once with an explicit reason; at the HTTP ceiling the ledger and budget manager both read 12                                                                                                                                    |
+| R9   | Simulated 600 s lifetime: `LIFETIME_EXPIRED`; every dispatch before the deadline; spacing ≥ 2,500 ms with no overlap; concurrency 1; exact accounting; matched pongs; everything withdrawn and closed afterwards                                                                                                        |
+| R10  | `stop()` aborts a hung in-flight `GET_SLOT`; an external `AbortSignal` stops at its time; all transports closed                                                                                                                                                                                                         |
+
+- **Mutation check**: disabling each withdrawal rule (notification, history, gap) makes R5 fail.
+- **Results**:
+  - Provider suite 10/10, `CandidateFlowProvider` 54/54, `PaperActiveWindowQualification` 12/12 and `PaperTradingDaemon` 95/95.
+  - The backend typecheck, ESLint and Prettier checks pass.
+  - Each command ran under an external 60 s limit; none is left running.
+  - All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic inputs**: arrivals, latencies and skews are synthetic, and nothing is validated live.
+- **History re-check range**: it covers only signatures newer than the advanced anchor. Older late-indexed signatures are caught only by their notifications.
+- **Budget-manager count**: during a stop race, a retrieval refused after the adapter recorded its budget attempt can leave the budget manager one above the ledger. The ledger stays authoritative.
+- **Request timeout**: it uses a wall-clock timer, not the virtual clock.
+
+#### Remaining Integration Gaps (Separate Prerequisites Before Daemon Activation)
+
+1. **Decision time basis**: Loop B judges freshness at its loop-start `currentNow`, before the candidate's price and RugCheck fetches. It should evaluate with a timestamp taken immediately before `evaluatePaperDaemonEntryDecision`. This is not implemented.
+2. **PAPER security-provider integration**:
+   - **Current state**: the daemon's entry security inputs come from its own RugCheck fetch.
+   - **Not yet integrated**: the validated PAPER security evidence used by the diagnostic (LP inaccessibility, mint and freeze authority, bundler provenance). This was not traced or changed here and remains a separate prerequisite.
+3. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
+4. **Live limits**: none of the test values above is approved for live use.
+5. **Strategy unchanged**: disarming on unavailable flow, the retest rules, thresholds and the 15 s freshness limit are unchanged. Continuous availability for 90/120 s retests is not expected in active pools.
