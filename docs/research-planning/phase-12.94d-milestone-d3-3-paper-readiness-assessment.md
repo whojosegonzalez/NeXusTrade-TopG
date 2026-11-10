@@ -3451,7 +3451,7 @@ Limits, pacing, thresholds, the wallet and historical evidence are unchanged. No
 
 #### Evidenced Arrival Bounds
 
-The adapter queue is FIFO (`push`/`shift`), and a notification cannot precede its block's time. Times below are from observation start; block times are whole seconds, so they are lower bounds.
+The adapter queue is FIFO (`push`/`shift`). Times below are from observation start. **Correction (review of `ced5199`)**: the lower bounds rely on provider-reported block timestamps, which are whole seconds and estimated on-chain. They also assume those timestamps align with the local clock that recorded observation start and dispatch times. They are therefore assumption-dependent inferences, not measured receipt times. The upper bounds (dispatch times and the stop time) are local measurements.
 
 | Notification        | Evidence                                             | Arrival bound          |
 | ------------------- | ---------------------------------------------------- | ---------------------- |
@@ -3460,7 +3460,7 @@ The adapter queue is FIFO (`push`/`shift`), and a notification cannot precede it
 | #3–#12 (10 pending) | queued after #2 (FIFO); pending at the stop          | after #2, by +41.169 s |
 
 - **Between #1 and #2**: no notification arrived; otherwise it would have preceded #2.
-- **The burst**: at least **11 notifications (#2–#12) arrived within at most 1.92 s**.
+- **The burst (inferred)**: under the block-timestamp and clock-alignment assumptions above, at least 11 notifications (#2–#12) arrived within about 1.92 s. This is not a measured receipt interval. What is measured locally is that all 11 were received by +41.169 s and that #2 was received by +39.500 s. Receipt timestamps were not retained.
 - **Unknown**: individual arrival times within these bounds, any arrivals after +41.169 s, and the eventual complete window.
 
 #### Why the Queue Stopped Before the Retrieval Allowance Was Used
@@ -3482,8 +3482,44 @@ The adapter queue is FIFO (`push`/`shift`), and a notification cannot precede it
   - **a queue ceiling of 13** (retrieval cap + 1, so the queue never rejects a run the budget would accept);
   - **23 HTTP attempts** (11 base + 12).
 - **Unchanged**: 65 s observation, ≤ 2 drain retrievals, `GET_SLOT` within 5 s of the nominal end, 2,500 ms pacing, 15,000 ms freshness, the 90 s deadline and strategy thresholds.
-- **Paced schedule for the observed case**: retrievals at +42.0 to +64.5 s, then `GET_SLOT` at ≥ +67.0 s, inside the window. The post-cutoff chain is unchanged (12.8–13.0 s measured), giving an illustrative completion around run +83 s. That is an estimate, not a guarantee.
+- **Paced schedule for the observed case**: retrievals at +42.0 to +64.5 s, then `GET_SLOT` at ≥ +67.0 s, inside the window. The post-cutoff chain is unchanged (12.8–13.0 s measured), giving an illustrative completion around run +83 s. This holds **only if** responses stay as fast as measured and **no further notification** arrives after +41.169 s. It is not a guarantee, and no limit guarantees a complete future window.
 - **Not justified by the evidence**: more than 13 retrievals cannot help a burst arriving at this point, and the evidence does not show that 12 suffices for any future window.
 - **Decision**: whether to implement this narrow change offline, or to keep 20/9 and treat such bursts as unavailable, is the operator's decision. No new infrastructure milestone or provider is implied.
 
 No source, dependency, configuration or evidence changes were made. No network call, socket, capture, rerun, daemon, trade or wallet change occurred.
+
+### 8.25 Separately Selected PAPER_ACTIVE_WINDOW_23_12 Profile (Offline Implementation; Not Run Live)
+
+The operator approved a separately selected profile. It extends the existing collector, with no new evidence framework, provider or infrastructure.
+
+| Profile                     | Selection                                                                                                                                           | HTTP | Retrievals (drain incl.) | Queue/workload ceiling |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------ | ---------------------- |
+| `DEFAULT_14_3`              | runs without the active-window opt-in (unchanged)                                                                                                   | 14   | 3                        | 10                     |
+| `PAPER_ACTIVE_WINDOW_20_9`  | the active-window opt-in alone (unchanged)                                                                                                          | 20   | 9                        | 10                     |
+| `PAPER_ACTIVE_WINDOW_23_12` | explicit `paperCapacityProfile` / `--paper-capacity-profile PAPER_ACTIVE_WINDOW_23_12`, plus the active-window opt-in and PAPER_SIMULATION/BACKTEST | 23   | 12                       | 13                     |
+
+- **Timing limits** are identical for both PAPER profiles: 65 s nominal observation, ≤ 2 drain retrievals, `GET_SLOT` within 5 s of the nominal end, no retrieval after `GET_SLOT`, ≥ 2,500 ms pacing, 15,000 ms freshness and the 90 s deadline. Response limits, keepalive, epoch and gap checks, and strategy thresholds are unchanged.
+- **Selection validation**: unsupported, non-string or incompatible selections are rejected. That covers an unknown id, `DEFAULT_14_3`, a missing opt-in, a production context, and a non-default observation duration or deadline. The constructor and the CLI share the same validator. The CLI rejects before the dry-run exit, environment loading or any network activity. No environment variable selects a profile.
+- **Dry-run output**: names the selected profile and its request, retrieval and queue ceilings.
+- **Queue ceiling**: the selected ceiling now drives the adapter's `maxPendingQueueSize`, the queue/workload stop check and its message, and telemetry. No hard-coded 10 remains outside the two existing profile definitions.
+- **Unchanged**: scheduling, bounded drain, cancellation settlement, first-cause reporting, exactly-once accounting and the rule against sealing while work is pending all reuse the accepted mechanism.
+- **Replay**:
+  - the allowlist is extended explicitly with the exact 23/12 definition;
+  - all accepted ledger, pacing, drain, cutoff, resolution and raw-response checks still apply;
+  - the workload recorded at evaluation must be below the sealed profile's queue ceiling;
+  - removing the profile fields still applies the legacy 14/3 ceilings;
+  - relabelled, altered, inconsistent or over-budget captures fail closed;
+  - all 10 sealed captures remain byte-identical, and the 9 earlier captures replay identically to the pre-feature baseline.
+
+**Offline coverage** (SYNTHETIC arrivals and payloads; not a replay of measured notification arrivals):
+
+- **D1, selection**: default and 20/9 unchanged; valid explicit 23/12; invalid ids, the opt-in requirement and the context requirement; CLI rejection and dry-run output; no environment-variable selection.
+- **D2, capacity and replay**: 12 resolvable transactions within exactly 23 attempts qualify and replay. Nine tampering cases are rejected with their reasons: profile removal (legacy 14/3), consistent relabelling as 20/9, altered queue and request ceilings, a contradictory active-evidence profile, workload at the ceiling, a 1 ms pacing violation, an altered retrieval count, and an altered drain count.
+- **D3, two-then-ten burst**: a synthetic schedule inspired by the §8.24 shape (one notification, then one followed by ten more within 0.6 s). With immediate synthetic responses it drains within the unchanged schedule: 12 retrievals at run +16.55 s, +42.55 s, then +45.05 to +67.55 s (one drain retrieval), and `GET_SLOT` at +70.05 s. It qualifies and replays. The identical schedule under 20/9 stops with `STREAM_QUEUE_LIMIT_EXCEEDED` at ceiling 10.
+- **D4, over budget**: 13 notifications, including 3 validated failed transactions that each consume a retrieval, stop with `TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED` after 12 retrievals. A burst of 13 stops with `STREAM_QUEUE_LIMIT_EXCEEDED` at ceiling 13.
+- **D5, mixed**: 12 transactions, 4 of them validated failures, use 12 retrievals, count only the 8 swaps, and replay.
+- **D6, unavailable outcomes under 23/12**: a slow drain response (`CUTOFF_DISPATCH_WINDOW_EXCEEDED`), drain exhaustion (`PRE_CUTOFF_BACKLOG_REMAINING`), the 90 s deadline (`OVERALL_DIAGNOSTIC_TIMEOUT`) and a late in-window arrival after `GET_SLOT` (unqualified, with no retrieval afterwards) all remain unavailable.
+
+**Limits of this evidence**: D3 shows that the schedule can absorb a two-then-ten burst _when responses are fast and no further notifications arrive_. It does not show that 23/12 completes any real future window. The §8.24 arrival interval remains an assumption-dependent inference.
+
+Nothing has run live, and no evidence or wallet state changed.

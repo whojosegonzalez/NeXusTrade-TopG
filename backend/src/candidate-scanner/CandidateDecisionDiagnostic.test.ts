@@ -17,6 +17,8 @@ import {
   deriveBoundedScheduleCounts,
   DEFAULT_CAPACITY_PROFILE,
   PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
+  PAPER_ACTIVE_WINDOW_23_12_CAPACITY_PROFILE,
+  type DiagnosticCapacityProfile,
   evaluateAuthorityEvidence,
   CANONICAL_ZERO_ADDRESS,
   DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES,
@@ -3773,6 +3775,8 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
   async function runActive(params: {
     swaps: readonly ScheduledSwap[];
     paperActiveWindowFlow?: boolean;
+    /** Explicit PAPER capacity profile selection (requires paperActiveWindowFlow). */
+    paperCapacityProfile?: "PAPER_ACTIVE_WINDOW_20_9" | "PAPER_ACTIVE_WINDOW_23_12";
     requestTimeoutMs?: number;
     /** SYNTHETIC: JSON-RPC methods whose responses never arrive until aborted. */
     hangMethods?: readonly string[];
@@ -3960,6 +3964,9 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
       observationDurationMs: 65_000,
       ...(params.paperActiveWindowFlow !== undefined
         ? { paperActiveWindowFlow: params.paperActiveWindowFlow }
+        : {}),
+      ...(params.paperCapacityProfile !== undefined
+        ? { paperCapacityProfile: params.paperCapacityProfile }
         : {}),
       ...(params.requestTimeoutMs !== undefined
         ? { requestTimeoutMs: params.requestTimeoutMs }
@@ -5113,10 +5120,13 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
   const expectBoundedRunInvariants = (
     result: Awaited<ReturnType<typeof runActive>>,
     label = "",
+    profile: DiagnosticCapacityProfile = PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
   ) => {
-    expect(result.capacityProfile, label).toEqual(PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE);
-    expect(result.ledger.totalAttempts, label).toBeLessThanOrEqual(20);
-    expect(result.ledger.transactionDecodeAttempts, label).toBeLessThanOrEqual(9);
+    expect(result.capacityProfile, label).toEqual(profile);
+    expect(result.ledger.totalAttempts, label).toBeLessThanOrEqual(profile.maxTotalRequests);
+    expect(result.ledger.transactionDecodeAttempts, label).toBeLessThanOrEqual(
+      profile.maxTransactionRetrievals,
+    );
     for (const gap of solanaDispatchGaps(result.ledger.records)) {
       expect(gap, label).toBeGreaterThanOrEqual(2_500);
     }
@@ -5535,5 +5545,434 @@ describe("CandidateDecisionDiagnostic PAPER active-window opt-in (synthetic, off
     const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
     expect(replay.ok).toBe(false);
     expect(replay.status).toBe("INCOMPLETE_MANIFEST_COVERAGE");
+  });
+
+  // ---------------------------------------------------------------------------------------------------------
+  // Separately selected PAPER_ACTIVE_WINDOW_23_12 profile. All arrival schedules and transaction payloads below
+  // are SYNTHETIC; D3 is only inspired by the §8.24 workload shape (two resolved, then ten pending) and is not a
+  // replay of measured notification arrivals.
+  // ---------------------------------------------------------------------------------------------------------
+  const P23 = PAPER_ACTIVE_WINDOW_23_12_CAPACITY_PROFILE;
+  const runActive23 = (params: Omit<Parameters<typeof runActive>[0], "paperCapacityProfile">) =>
+    runActive({
+      ...params,
+      paperActiveWindowFlow: true,
+      paperCapacityProfile: "PAPER_ACTIVE_WINDOW_23_12",
+    });
+
+  it("D1. Profile selection: default and 20/9 unchanged; 23/12 only by explicit, compatible selection", async () => {
+    const transport = vi.fn(async () => new Response("{}", { status: 200 }));
+    const base = {
+      poolId: TEST_POOL_ID,
+      mintAddress: TEST_MINT,
+      rpcUrl: TEST_RPC_URL,
+      transport,
+      wsTransport: createMockWebSocketTransport(),
+    };
+    const paper = { ...base, executionContext: "PAPER_SIMULATION" as const };
+    expect(new CandidateDecisionDiagnostic(base).getCapacityProfile()).toEqual(
+      DEFAULT_CAPACITY_PROFILE,
+    );
+    expect(
+      new CandidateDecisionDiagnostic({
+        ...paper,
+        paperActiveWindowFlow: true,
+      }).getCapacityProfile(),
+    ).toEqual(PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE);
+    const selected = new CandidateDecisionDiagnostic({
+      ...paper,
+      paperActiveWindowFlow: true,
+      paperCapacityProfile: "PAPER_ACTIVE_WINDOW_23_12",
+    });
+    expect(selected.getCapacityProfile()).toEqual(P23);
+    expect(selected.getBudgetManager().getRemainingRequests()).toBe(23);
+    expect(
+      new CandidateDecisionDiagnostic({
+        ...paper,
+        paperActiveWindowFlow: true,
+        paperCapacityProfile: "PAPER_ACTIVE_WINDOW_20_9",
+      }).getCapacityProfile(),
+    ).toEqual(PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE);
+
+    const invalid: Array<[string, Record<string, unknown>, string]> = [
+      [
+        "unknown id",
+        {
+          ...paper,
+          paperActiveWindowFlow: true,
+          paperCapacityProfile: "PAPER_ACTIVE_WINDOW_99_99",
+        },
+        "Unsupported paperCapacityProfile",
+      ],
+      [
+        "default profile is not selectable",
+        { ...paper, paperActiveWindowFlow: true, paperCapacityProfile: "DEFAULT_14_3" },
+        "Unsupported paperCapacityProfile",
+      ],
+      [
+        "non-string selection",
+        { ...paper, paperActiveWindowFlow: true, paperCapacityProfile: 23 },
+        "Unsupported paperCapacityProfile",
+      ],
+      [
+        "without the active-window opt-in",
+        { ...paper, paperCapacityProfile: "PAPER_ACTIVE_WINDOW_23_12" },
+        "requires the PAPER active-window opt-in",
+      ],
+      [
+        "production context",
+        { ...base, paperCapacityProfile: "PAPER_ACTIVE_WINDOW_23_12" },
+        "requires the PAPER active-window opt-in",
+      ],
+      [
+        "23/12 with a non-default observation",
+        {
+          ...paper,
+          paperActiveWindowFlow: true,
+          paperCapacityProfile: "PAPER_ACTIVE_WINDOW_23_12",
+          observationDurationMs: 60_000,
+        },
+        "PAPER_ACTIVE_WINDOW_23_12 requires observationDurationMs 65000",
+      ],
+    ];
+    for (const [label, options, message] of invalid) {
+      expect(() => new CandidateDecisionDiagnostic(options as never), label).toThrow(message);
+    }
+    expect(transport).not.toHaveBeenCalled();
+
+    // CLI: invalid or incompatible selections fail before environment loading or any network activity; the
+    // dry-run identifies the selected profile and its request, retrieval and queue ceilings.
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const cli = (extra: string[]) =>
+      runCandidateDecisionDiagnosticCli(["--pool", TEST_POOL_ID, "--mint", TEST_MINT, ...extra]);
+    try {
+      await expect(
+        cli(["--paper", "--dry-run", "--paper-capacity-profile", "PAPER_ACTIVE_WINDOW_23_12"]),
+      ).rejects.toThrow("[CLI_INVALID_ARG] --paper-capacity-profile");
+      await expect(
+        cli([
+          "--paper",
+          "--paper-active-window",
+          "--dry-run",
+          "--paper-capacity-profile",
+          "PAPER_ACTIVE_WINDOW_30_30",
+        ]),
+      ).rejects.toThrow("Unsupported paperCapacityProfile");
+      await expect(
+        cli(["--paper-active-window", "--paper-capacity-profile", "PAPER_ACTIVE_WINDOW_23_12"]),
+      ).rejects.toThrow("[CLI_INVALID_ARG]");
+      logSpy.mockClear();
+      await cli([
+        "--paper",
+        "--paper-active-window",
+        "--dry-run",
+        "--paper-capacity-profile",
+        "PAPER_ACTIVE_WINDOW_23_12",
+      ]);
+      const output = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(output).toContain(
+        "Capacity Profile:   PAPER_ACTIVE_WINDOW_23_12 (23 HTTP attempts, 12 transaction retrievals, queue ceiling 13",
+      );
+      expect(output).toContain(
+        "Maximum request ledger: 23 attempts max under PAPER_ACTIVE_WINDOW_23_12",
+      );
+      // No environment-variable selection: a plausible variable leaves the opt-in on 20/9.
+      process.env.NEXUSTRADE_PAPER_CAPACITY_PROFILE = "PAPER_ACTIVE_WINDOW_23_12";
+      logSpy.mockClear();
+      await cli(["--paper", "--paper-active-window", "--dry-run"]);
+      expect(logSpy.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+        "Capacity Profile:   PAPER_ACTIVE_WINDOW_20_9 (20 HTTP attempts, 9 transaction retrievals, queue ceiling 10",
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.NEXUSTRADE_PAPER_CAPACITY_PROFILE;
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  it("D2. Twelve resolvable transactions within 23 HTTP attempts qualify and replay; profile tampering fails closed", async () => {
+    const result = await runActive23({
+      swaps: Array.from({ length: 12 }, (_, i) => ({
+        signature: syntheticSig(600 + i),
+        offsetMs: 11_000 + 4_500 * i,
+        slot: 461970845 + i,
+        side: (i % 2 === 0 ? "BUY" : "SELL") as "BUY" | "SELL",
+      })),
+    });
+    expectBoundedRunInvariants(result, "", P23);
+    expect(result.ledger.transactionDecodeAttempts).toBe(12);
+    expect(result.ledger.totalAttempts).toBe(23);
+    expect(result.observationSchedule!.drainRetrievals).toBe(0);
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(6);
+    expect(result.flowEvaluation?.recentSells60s).toBe(6);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(12);
+
+    const editActive = (mutate: (j: Record<string, unknown>) => void) => {
+      const j = JSON.parse(readFileSync(activeEvidencePath(), "utf8")) as Record<string, unknown>;
+      mutate(j);
+      writeFileSync(activeEvidencePath(), JSON.stringify(j), "utf8");
+    };
+    const cases: Array<[string, () => void, string]> = [
+      [
+        "all profile fields removed (legacy 14/3 enforced)",
+        () => {
+          editSealedReport((j) => {
+            delete j.capacityProfile;
+            delete j.observationSchedule;
+          });
+          editActive((j) => delete j.capacityProfile);
+        },
+        "(23 attempts, 23 records, 12 retrievals) contradict or exceed DEFAULT_14_3 (legacy interpretation) (14/3)",
+      ],
+      [
+        "relabelled as 20/9 (report and active evidence consistent)",
+        () => {
+          editSealedReport(
+            (j) => (j.capacityProfile = { ...PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE }),
+          );
+          editActive((j) => (j.capacityProfile = "PAPER_ACTIVE_WINDOW_20_9"));
+        },
+        "contradict or exceed PAPER_ACTIVE_WINDOW_20_9 (20/9)",
+      ],
+      [
+        "queue ceiling altered",
+        () => editSealedReport((j) => (j.capacityProfile = { ...P23, queueCeiling: 99 })),
+        "unsupported or internally inconsistent",
+      ],
+      [
+        "request ceiling altered",
+        () => editSealedReport((j) => (j.capacityProfile = { ...P23, maxTotalRequests: 24 })),
+        "unsupported or internally inconsistent",
+      ],
+      [
+        "active evidence profile contradicts the report",
+        () => editActive((j) => (j.capacityProfile = "PAPER_ACTIVE_WINDOW_20_9")),
+        "contradicts the report (PAPER_ACTIVE_WINDOW_23_12)",
+      ],
+      [
+        "workload at evaluation reaches the queue ceiling",
+        () => editActive((j) => (j.pendingWorkloadAtEvaluation = 13)),
+        "reaches the PAPER_ACTIVE_WINDOW_23_12 queue ceiling (13)",
+      ],
+      [
+        "timing: GET_BLOCK_TIME 1 ms after GET_SLOT",
+        () =>
+          editSealedReport(
+            (j) =>
+              (recordOf(j, "GET_BLOCK_TIME").dispatchedAtMs =
+                (recordOf(j, "GET_SLOT").dispatchedAtMs as number) + 1),
+          ),
+        "Solana RPC GET_BLOCK_TIME dispatched 1 ms after GET_SLOT (minimum 2500 ms)",
+      ],
+      [
+        "counts: retrieval counter altered",
+        () =>
+          editSealedReport(
+            (j) =>
+              ((
+                j.ledger as unknown as { transactionDecodeAttempts: number }
+              ).transactionDecodeAttempts = 11),
+          ),
+        "ledger totals",
+      ],
+      [
+        "schedule drain count altered",
+        () => editSealedReport((j) => (j.observationSchedule!.drainRetrievals = 1)),
+        "sealed drainRetrievals (1) contradicts the ledger (0)",
+      ],
+    ];
+    for (const [label, tamper, reason] of cases) {
+      const r = tamperAndReplay(tamper);
+      expect(r.ok, label).toBe(false);
+      expect(r.status, label).toBe("REPLAY_CAPACITY_EVIDENCE_INVALID");
+      expect(r.message, label).toContain(reason);
+      expect(r.decisionResult, label).toBeUndefined();
+    }
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok).toBe(true);
+  });
+
+  // SYNTHETIC schedule: one notification at run +16.0 s; then one at +41.8 s followed by ten more within 0.6 s,
+  // all delivered on the loop step at run +42.55 s. Payloads are synthetic; responses are immediate.
+  const SYNTHETIC_TWO_THEN_TEN: readonly ScheduledSwap[] = [
+    { signature: syntheticSig(700), offsetMs: 16_000, slot: 461970845, side: "SELL" },
+    { signature: syntheticSig(701), offsetMs: 41_800, slot: 461970850, side: "SELL" },
+    ...Array.from({ length: 10 }, (_, k) => ({
+      signature: syntheticSig(702 + k),
+      offsetMs: 41_900 + 50 * k,
+      slot: 461970851 + k,
+      side: (k % 2 === 0 ? "BUY" : "SELL") as "BUY" | "SELL",
+    })),
+  ];
+
+  it("D3. A synthetic two-then-ten burst drains within the unchanged schedule under 23/12 (and stops under 20/9)", async () => {
+    const result = await runActive23({ swaps: SYNTHETIC_TWO_THEN_TEN });
+    expectBoundedRunInvariants(result, "", P23);
+    const tx = result.ledger.records.filter((r) => r.purpose === "TRANSACTION_DECODING");
+    expect(tx.map((r) => r.dispatchedAtMs - RUN_START)).toEqual([
+      16_550,
+      42_550,
+      ...Array.from({ length: 10 }, (_, k) => 45_050 + 2_500 * k),
+    ]);
+    const schedule = result.observationSchedule!;
+    expect(schedule.drainRetrievals).toBe(1); // the 12th retrieval, at the nominal end
+    expect(schedule.getSlotDispatchedAtMs! - RUN_START).toBe(70_050);
+    expect(result.ledger.transactionDecodeAttempts).toBe(12);
+    expect(result.ledger.totalAttempts).toBe(23);
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(5);
+    expect(result.flowEvaluation?.recentSells60s).toBe(7);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.redecodedTransactions).toBe(12);
+
+    // The identical synthetic schedule under the unchanged 20/9 profile stops at its queue ceiling of 10.
+    rmSync(activeOutDir, { recursive: true, force: true });
+    const narrow = await runActive({ swaps: SYNTHETIC_TWO_THEN_TEN, paperActiveWindowFlow: true });
+    expect(narrow.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(narrow.message).toContain("ceiling of 10 notifications");
+    expect(narrow.capacityProfile).toEqual(PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE);
+  });
+
+  it("D4. Over-budget arrivals (failed transactions consuming retrievals) and queue exhaustion stay unavailable", async () => {
+    const overBudget = await runActive23({
+      swaps: Array.from({ length: 13 }, (_, i) => ({
+        signature: syntheticSig(720 + i),
+        offsetMs: 6_000 + 4_000 * i,
+        slot: 461970840 + i,
+        side: (i % 2 === 0 ? "BUY" : "SELL") as "BUY" | "SELL",
+        validFailure: i === 2 || i === 5 || i === 8,
+      })),
+    });
+    expect(overBudget.status).toBe("TRANSACTION_RETRIEVAL_BUDGET_EXHAUSTED");
+    expect(overBudget.capacityProfile).toEqual(P23);
+    expect(overBudget.ledger.transactionDecodeAttempts).toBe(12);
+    expect(overBudget.ledger.totalAttempts).toBe(14);
+    expect(overBudget.ledger.records.some((r) => r.purpose === "GET_SLOT")).toBe(false);
+    const telemetry = readJson<{
+      transactionRetrievalCap: number;
+      capacityProfile: string;
+      transactionRetrievals: Array<{ classification: string }>;
+    }>(path.join(activeOutDir, "evidence", "stream-telemetry.json"));
+    expect(telemetry.capacityProfile).toBe("PAPER_ACTIVE_WINDOW_23_12");
+    expect(telemetry.transactionRetrievalCap).toBe(12);
+    expect(
+      telemetry.transactionRetrievals.filter(
+        (r) => r.classification === "KNOWN_FAILED_TRANSACTION_ZERO_SWAPS",
+      ),
+    ).toHaveLength(3);
+    expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).status).toBe(
+      "INCOMPLETE_MANIFEST_COVERAGE",
+    );
+
+    rmSync(activeOutDir, { recursive: true, force: true });
+    const queueFull = await runActive23({
+      swaps: Array.from({ length: 13 }, (_, i) => ({
+        signature: syntheticSig(740 + i),
+        offsetMs: 30_000,
+        slot: 461970860 + i,
+        side: "BUY" as const,
+      })),
+    });
+    expect(queueFull.status).toBe("STREAM_QUEUE_LIMIT_EXCEEDED");
+    expect(queueFull.message).toContain("ceiling of 13 notifications (queue length: 13)");
+    expect(queueFull.ledger.transactionDecodeAttempts).toBe(0);
+    expect(queueFull.flowEvaluation).toBeUndefined();
+  });
+
+  it("D5. Mixed successful and validated failed transactions: failed ones consume retrievals and count zero swaps", async () => {
+    const result = await runActive23({
+      swaps: Array.from({ length: 12 }, (_, i) => ({
+        signature: syntheticSig(760 + i),
+        offsetMs: 11_000 + 4_500 * i,
+        slot: 461970845 + i,
+        side: (i % 2 === 0 ? "BUY" : "SELL") as "BUY" | "SELL",
+        validFailure: i === 1 || i === 4 || i === 7 || i === 10,
+      })),
+    });
+    expectBoundedRunInvariants(result, "", P23);
+    expect(result.ledger.transactionDecodeAttempts).toBe(12);
+    expect(result.ledger.totalAttempts).toBe(23);
+    expect(result.flowEvaluation?.isPaperQualified).toBe(true);
+    expect(result.flowEvaluation?.recentBuys60s).toBe(4);
+    expect(result.flowEvaluation?.recentSells60s).toBe(4);
+    const evidence = readJson<SealedActiveEvidence>(activeEvidencePath());
+    expect(
+      evidence.resolutions.filter((r) => r.status === "RESOLVED_FAILED_TRANSACTION"),
+    ).toHaveLength(4);
+    const replay = replayCandidateDecisionFromSealedEvidence(activeOutDir);
+    expect(replay.ok).toBe(true);
+    expect(replay.matchesRecordedDecision).toBe(true);
+    expect(replay.recomputedActiveWindowFlow?.knownFailedTransactions).toBe(4);
+  });
+
+  it("D6. Under 23/12: slow drain response, late arrival, drain exhaustion and the 90 s deadline remain unavailable", async () => {
+    const scenarios: Array<[string, Parameters<typeof runActive23>[0], string | null]> = [
+      [
+        "slow drain response",
+        {
+          txLatencyMs: 5_500,
+          swaps: [{ signature: syntheticSig(780), offsetMs: 67_000, slot: 461970860, side: "BUY" }],
+        },
+        "CUTOFF_DISPATCH_WINDOW_EXCEEDED",
+      ],
+      [
+        "drain exhaustion",
+        {
+          swaps: [0, 1, 2].map((i) => ({
+            signature: syntheticSig(781 + i),
+            offsetMs: 67_000 + 100 * i,
+            slot: 461970860 + i,
+            side: "BUY" as const,
+          })),
+        },
+        "PRE_CUTOFF_BACKLOG_REMAINING",
+      ],
+      [
+        "overall deadline",
+        {
+          historyAdvanceMs: 20_000,
+          swaps: [{ signature: syntheticSig(785), offsetMs: 20_000, slot: 461970850, side: "BUY" }],
+        },
+        "OVERALL_DIAGNOSTIC_TIMEOUT",
+      ],
+      [
+        "late in-window arrival after GET_SLOT",
+        {
+          swaps: [
+            { signature: syntheticSig(786), offsetMs: 20_000, slot: 461970850, side: "BUY" },
+            { signature: syntheticSig(787), offsetMs: 68_000, slot: 461970870, side: "BUY" },
+          ],
+        },
+        null,
+      ],
+    ];
+    for (const [label, params, status] of scenarios) {
+      rmSync(activeOutDir, { recursive: true, force: true });
+      const result = await runActive23(params);
+      expectBoundedRunInvariants(result, label, P23);
+      expect(result.flowEvaluation?.isPaperQualified, label).not.toBe(true);
+      expect(result.flowEvaluation?.recentBuys60s ?? null, label).toBeNull();
+      if (status) {
+        expect(result.status, label).toBe(status);
+        expect(result.ok, label).toBe(false);
+      } else {
+        // Completed run whose late signature stays unresolved: unqualified, no retrieval after GET_SLOT.
+        expect(result.flowEvaluation?.diagnosticReason, label).toContain(
+          "ACTIVE_WINDOW_UNQUALIFIED",
+        );
+        expect(replayCandidateDecisionFromSealedEvidence(activeOutDir).ok, label).toBe(true);
+      }
+      expect(
+        result.ledger.records.every((r) => r.dispatchedAtMs < RUN_START + 90_000),
+        label,
+      ).toBe(true);
+    }
   });
 });

@@ -342,10 +342,16 @@ export interface CandidateDecisionDiagnosticOptions {
   /**
    * OPT-IN (PAPER_SIMULATION / BACKTEST only): qualify fully reconciled ACTIVE 60-second windows whose every
    * in-window signature was resolved by the existing stream decode path. Selects the PAPER_ACTIVE_WINDOW_20_9
-   * capacity profile (20 HTTP attempts, 9 retrievals, bounded pre-cutoff drain). Omitted/false: quiet-window-only
+   * capacity profile (20 HTTP attempts, 9 retrievals, bounded pre-cutoff drain) unless paperCapacityProfile
+   * explicitly selects another supported PAPER profile. Omitted/false: quiet-window-only
    * flow qualification under the default 14/3 profile (unchanged default).
    */
   readonly paperActiveWindowFlow?: boolean | undefined;
+  /**
+   * Explicit PAPER capacity profile selection (requires paperActiveWindowFlow and PAPER_SIMULATION/BACKTEST).
+   * Omitted: the active-window opt-in uses PAPER_ACTIVE_WINDOW_20_9. Only supported PAPER profile ids are accepted.
+   */
+  readonly paperCapacityProfile?: PaperCapacityProfileId | undefined;
 }
 
 /** Maps a stream decode outcome to the resolution status the reconciliation evaluator consumes. */
@@ -425,8 +431,10 @@ export function buildStreamResolutionRecords(
  * Explicit diagnostic capacity profile. Replay accepts only the exact definitions below (never arbitrary numbers
  * supplied by a capture). Default runs use DEFAULT_14_3; only the PAPER active-window opt-in selects 20/9.
  */
+export type PaperCapacityProfileId = "PAPER_ACTIVE_WINDOW_20_9" | "PAPER_ACTIVE_WINDOW_23_12";
+
 export interface DiagnosticCapacityProfile {
-  readonly id: "DEFAULT_14_3" | "PAPER_ACTIVE_WINDOW_20_9";
+  readonly id: "DEFAULT_14_3" | PaperCapacityProfileId;
   /** HTTP attempts across all providers. */
   readonly maxTotalRequests: number;
   /** TRANSACTION_DECODING retrievals, including drain retrievals. */
@@ -470,10 +478,67 @@ export const PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE: DiagnosticCapacityProfile = O
   cutoffFreshnessMs: 15_000,
 });
 
+/**
+ * Separately selected PAPER profile (explicit selection only): 23 HTTP attempts, 12 retrievals (drain included),
+ * queue/workload ceiling 13 (retrieval cap + 1). All timing limits are the same as PAPER_ACTIVE_WINDOW_20_9.
+ */
+export const PAPER_ACTIVE_WINDOW_23_12_CAPACITY_PROFILE: DiagnosticCapacityProfile = Object.freeze({
+  id: "PAPER_ACTIVE_WINDOW_23_12",
+  maxTotalRequests: 23,
+  maxTransactionRetrievals: 12,
+  maxDrainRetrievals: 2,
+  cutoffDispatchWindowMs: 5_000,
+  nominalObservationMs: 65_000,
+  overallDeadlineMs: 90_000,
+  queueCeiling: 13,
+  rpcPacingMs: 2500,
+  cutoffFreshnessMs: 15_000,
+});
+
+/** Explicitly selectable PAPER profiles (selection by id; never by environment variable). */
+export const SELECTABLE_PAPER_CAPACITY_PROFILES: Readonly<
+  Record<PaperCapacityProfileId, DiagnosticCapacityProfile>
+> = Object.freeze({
+  PAPER_ACTIVE_WINDOW_20_9: PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
+  PAPER_ACTIVE_WINDOW_23_12: PAPER_ACTIVE_WINDOW_23_12_CAPACITY_PROFILE,
+});
+
+/** Replay allowlist: only these exact definitions are accepted. */
 const SUPPORTED_CAPACITY_PROFILES: readonly DiagnosticCapacityProfile[] = Object.freeze([
   DEFAULT_CAPACITY_PROFILE,
   PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
+  PAPER_ACTIVE_WINDOW_23_12_CAPACITY_PROFILE,
 ]);
+
+/**
+ * Validates an explicit PAPER capacity profile selection (shared by the constructor and the CLI, so invalid
+ * selections fail before environment loading or network activity). Returns the profile, or throws.
+ */
+export function resolvePaperCapacityProfileSelection(
+  selection: unknown,
+  context: { readonly paperActiveWindowFlow: boolean; readonly executionContext: unknown },
+): DiagnosticCapacityProfile | null {
+  if (selection === undefined) return null;
+  if (
+    typeof selection !== "string" ||
+    !Object.prototype.hasOwnProperty.call(SELECTABLE_PAPER_CAPACITY_PROFILES, selection)
+  ) {
+    throw new Error(
+      `[DIAGNOSTIC_INVALID_ARG] Unsupported paperCapacityProfile '${String(selection)}' (supported: ${Object.keys(SELECTABLE_PAPER_CAPACITY_PROFILES).join(", ")})`,
+    );
+  }
+  if (!context.paperActiveWindowFlow) {
+    throw new Error(
+      "[DIAGNOSTIC_INVALID_ARG] paperCapacityProfile requires the PAPER active-window opt-in (paperActiveWindowFlow)",
+    );
+  }
+  if (context.executionContext !== "PAPER_SIMULATION" && context.executionContext !== "BACKTEST") {
+    throw new Error(
+      "[DIAGNOSTIC_INVALID_ARG] paperCapacityProfile requires executionContext PAPER_SIMULATION or BACKTEST",
+    );
+  }
+  return SELECTABLE_PAPER_CAPACITY_PROFILES[selection as PaperCapacityProfileId];
+}
 
 /**
  * A projected retrieval dispatch within this guard of the nominal end is treated as a drain retrieval when
@@ -675,7 +740,7 @@ export interface CandidateDecisionDiagnosticResult {
   writeError?: string | undefined;
   /** Selected capacity profile (new captures; absent in historical captures = legacy 14/3 interpretation). */
   readonly capacityProfile?: DiagnosticCapacityProfile | undefined;
-  /** Bounded observation timing evidence (PAPER_ACTIVE_WINDOW_20_9 runs that started observing). */
+  /** Bounded observation timing evidence (PAPER active-window profile runs that started observing). */
   readonly observationSchedule?: BoundedObservationSchedule | undefined;
 }
 
@@ -905,9 +970,15 @@ export class CandidateDecisionDiagnostic {
 
     // Capacity profile: the PAPER active-window opt-in selects 20/9 with a fixed 65 s observation and 90 s deadline;
     // every other run keeps the default 14/3.
-    this.capacityProfile = this.paperActiveWindowFlow
-      ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE
-      : DEFAULT_CAPACITY_PROFILE;
+    const explicitProfile = resolvePaperCapacityProfileSelection(options.paperCapacityProfile, {
+      paperActiveWindowFlow: this.paperActiveWindowFlow,
+      executionContext: options.executionContext,
+    });
+    this.capacityProfile =
+      explicitProfile ??
+      (this.paperActiveWindowFlow
+        ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE
+        : DEFAULT_CAPACITY_PROFILE);
     if (
       this.capacityProfile.nominalObservationMs !== null &&
       this.observationDurationMs !== this.capacityProfile.nominalObservationMs
@@ -1750,7 +1821,7 @@ export class CandidateDecisionDiagnostic {
       const adapter = new RaydiumAmmV4TransactionSourceAdapter({
         poolContext: provisionalContext,
         rpcUrl: this.rpcUrl,
-        maxPendingQueueSize: 10, // Reviewed queue ceiling of 10 enforced at ingress
+        maxPendingQueueSize: this.capacityProfile.queueCeiling, // selected profile's queue ceiling at ingress
         transport: async (url, init) => {
           const bodyStr = typeof init?.body === "string" ? init.body : "";
           const parsed = JSON.parse(bodyStr) as {
@@ -2109,13 +2180,13 @@ export class CandidateDecisionDiagnostic {
 
       const checkQueueLimit = () => {
         if (
-          adapter.getPendingQueueLength() >= 10 ||
-          adapter.getActiveWorkload() >= 10 ||
+          adapter.getPendingQueueLength() >= this.capacityProfile.queueCeiling ||
+          adapter.getActiveWorkload() >= this.capacityProfile.queueCeiling ||
           (coordinator?.getMetrics().totalQueueOverflows ?? 0) > 0
         ) {
           stopWithLimit(
             "STREAM_QUEUE_LIMIT_EXCEEDED",
-            `WebSocket pending queue exceeded ceiling of 10 notifications (queue length: ${adapter.getPendingQueueLength()})`,
+            `WebSocket pending queue exceeded ceiling of ${this.capacityProfile.queueCeiling} notifications (queue length: ${adapter.getPendingQueueLength()})`,
           );
         }
       };
@@ -2263,7 +2334,7 @@ export class CandidateDecisionDiagnostic {
       // Process incoming stream messages up to observation duration or limits
       const targetEnd = observationStartMs + this.observationDurationMs;
 
-      // Bounded schedule (PAPER_ACTIVE_WINDOW_20_9): fixed nominal end, GET_SLOT dispatch deadline, at most
+      // Bounded schedule (PAPER active-window profiles): fixed nominal end, GET_SLOT dispatch deadline, at most
       // maxDrainRetrievals retrievals at/after the nominal end, and no retrieval after GET_SLOT.
       const profile = this.capacityProfile;
       const bounded = profile.cutoffDispatchWindowMs !== null;
@@ -4673,7 +4744,22 @@ function validateSealedCapacityEvidence(
       );
     }
     if (!bounded)
-      return fail("active-window evidence requires the PAPER_ACTIVE_WINDOW_20_9 profile");
+      return fail("active-window evidence requires a PAPER active-window capacity profile");
+  }
+
+  // Workload recorded at evaluation must be below the queue ceiling (the run stops at the ceiling).
+  if (activeEvidence && profile) {
+    const workload = activeEvidence.pendingWorkloadAtEvaluation;
+    if (
+      typeof workload !== "number" ||
+      !Number.isSafeInteger(workload) ||
+      workload < 0 ||
+      workload >= profile.queueCeiling
+    ) {
+      return fail(
+        `active-window workload at evaluation (${String(workload)}) is invalid or reaches the ${profile.id} queue ceiling (${profile.queueCeiling})`,
+      );
+    }
   }
 
   // Ledger totals and retrieval counts against the selected (or legacy) ceilings.

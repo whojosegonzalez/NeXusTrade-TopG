@@ -13,6 +13,9 @@ import {
   CandidateDecisionDiagnostic,
   DEFAULT_CAPACITY_PROFILE,
   PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE,
+  SELECTABLE_PAPER_CAPACITY_PROFILES,
+  resolvePaperCapacityProfileSelection,
+  type PaperCapacityProfileId,
   DIAGNOSTIC_DEFAULT_MAX_RESPONSE_BYTES,
   DIAGNOSTIC_MAX_RUGCHECK_RESPONSE_BYTES,
   validateRugCheckDiagnosticOptions,
@@ -89,6 +92,7 @@ export async function runCandidateDecisionDiagnosticCli(
         "rugcheck-max-bytes": { type: "string" },
         "overlap-rugcheck": { type: "boolean" },
         "paper-active-window": { type: "boolean" },
+        "paper-capacity-profile": { type: "string" },
       },
       // Strict parsing: a misspelled opt-in must fail rather than silently fall back to defaults.
       strict: true,
@@ -127,6 +131,11 @@ Options:
                     retrievals after the fixed 65 s nominal end), GET_SLOT within 5 s of that end, no retrieval
                     after GET_SLOT. Default runs keep DEFAULT_14_3 (14 attempts, 3 retrievals).
                     PAPER research only; provider-relative assumptions; not production completeness.
+  --paper-capacity-profile <id>
+                    OPT-IN (requires --paper and --paper-active-window): explicitly select a PAPER capacity
+                    profile. Supported: ${Object.keys(SELECTABLE_PAPER_CAPACITY_PROFILES).join(", ")}.
+                    PAPER_ACTIVE_WINDOW_23_12: 23 HTTP attempts, 12 transaction retrievals, queue ceiling 13; all
+                    timing limits unchanged. Never selected by an environment variable.
   --help            Show this help text
 `);
     return;
@@ -151,6 +160,18 @@ Options:
   const paperActiveWindowFlow = values["paper-active-window"] === true;
   if (paperActiveWindowFlow && values.paper !== true) {
     throw new Error("[CLI_INVALID_ARG] --paper-active-window requires --paper (PAPER_SIMULATION)");
+  }
+  const rawProfileSelection = values["paper-capacity-profile"];
+  let selectedPaperProfile: ReturnType<typeof resolvePaperCapacityProfileSelection>;
+  try {
+    selectedPaperProfile = resolvePaperCapacityProfileSelection(rawProfileSelection, {
+      paperActiveWindowFlow,
+      executionContext: values.paper === true ? "PAPER_SIMULATION" : "PRODUCTION",
+    });
+  } catch (err) {
+    throw new Error(
+      `[CLI_INVALID_ARG] --paper-capacity-profile: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   const isPaper = values.paper === true;
@@ -192,9 +213,9 @@ Options:
         : "QUIET-WINDOW PAPER qualification only (default)"
     }`,
   );
-  const capacityProfile = paperActiveWindowFlow
-    ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE
-    : DEFAULT_CAPACITY_PROFILE;
+  const capacityProfile =
+    selectedPaperProfile ??
+    (paperActiveWindowFlow ? PAPER_ACTIVE_WINDOW_CAPACITY_PROFILE : DEFAULT_CAPACITY_PROFILE);
   console.log(
     `Capacity Profile:   ${capacityProfile.id} (${capacityProfile.maxTotalRequests} HTTP attempts, ${capacityProfile.maxTransactionRetrievals} transaction retrievals, queue ceiling ${capacityProfile.queueCeiling}${
       capacityProfile.cutoffDispatchWindowMs !== null
@@ -244,6 +265,9 @@ Options:
     rugCheckMaxResponseBytes: rugCheckOptIns.rugCheckMaxResponseBytes,
     overlapRugCheckWithMintPacing: rugCheckOptIns.overlapRugCheckWithMintPacing,
     paperActiveWindowFlow,
+    ...(selectedPaperProfile
+      ? { paperCapacityProfile: selectedPaperProfile.id as PaperCapacityProfileId }
+      : {}),
   });
 
   const result = await diagnostic.run();
