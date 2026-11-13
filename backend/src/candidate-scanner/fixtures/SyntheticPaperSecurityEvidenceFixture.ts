@@ -24,6 +24,40 @@ export const SYNTHETIC_ACTIVE_AUTHORITY = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q
 /** A canonical base58 mint that is not the candidate (identity-mismatch cases). */
 export const SYNTHETIC_OTHER_MINT = "So11111111111111111111111111111111111111112";
 
+/** [SYNTHETIC] JSON-RPC request id used by the synthetic mint-account request and response. */
+export const SYNTHETIC_MINT_REQUEST_ID = 1;
+
+/**
+ * [SYNTHETIC] Mint-account evidence: request identity and SYNTHETIC transport metadata (HTTP 200,
+ * complete body, request id) around a synthetic response. Nothing here was observed on the wire.
+ */
+export function syntheticMintAccountEvidence(
+  retrievedAtMs: number,
+  options: {
+    readonly response?: unknown;
+    readonly requestedMint?: string;
+    readonly httpStatus?: number;
+    readonly bodyComplete?: boolean;
+    readonly expectedRequestId?: number | string;
+  } = {},
+): {
+  readonly requestedMint: string;
+  readonly retrievedAtMs: number;
+  readonly httpStatus: number;
+  readonly bodyComplete: boolean;
+  readonly expectedRequestId: number | string;
+  readonly response: unknown;
+} {
+  return {
+    requestedMint: options.requestedMint ?? SYNTHETIC_SECURITY_MINT,
+    retrievedAtMs,
+    httpStatus: options.httpStatus ?? 200,
+    bodyComplete: options.bodyComplete ?? true,
+    expectedRequestId: options.expectedRequestId ?? SYNTHETIC_MINT_REQUEST_ID,
+    response: "response" in options ? options.response : syntheticMintAccountResponse(),
+  };
+}
+
 /**
  * [SYNTHETIC] jsonParsed `getAccountInfo` response for the candidate mint. `info` overrides replace
  * fields; pass `{ mintAuthority: undefined }` style deletions through `omit`.
@@ -48,7 +82,7 @@ export function syntheticMintAccountResponse(
   for (const key of options.omit ?? []) delete info[key];
   return {
     jsonrpc: "2.0",
-    id: 1,
+    id: SYNTHETIC_MINT_REQUEST_ID,
     result: {
       context: { slot: options.slot ?? 462_100_000 },
       value: {

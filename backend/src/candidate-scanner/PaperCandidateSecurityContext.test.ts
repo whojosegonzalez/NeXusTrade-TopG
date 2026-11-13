@@ -34,6 +34,8 @@ import {
   SYNTHETIC_OTHER_MINT,
   SYNTHETIC_SECURITY_MINT as MINT,
   SYNTHETIC_SECURITY_POOL as POOL,
+  SYNTHETIC_MINT_REQUEST_ID,
+  syntheticMintAccountEvidence,
   syntheticMintAccountResponse,
   syntheticRugCheckReport,
 } from "./fixtures/SyntheticPaperSecurityEvidenceFixture.js";
@@ -82,11 +84,7 @@ const validEvidence = (
   overrides: Partial<PaperCandidateSecurityEvidence> = {},
 ): PaperCandidateSecurityEvidence => ({
   lp: VALID_LP,
-  mintAccount: {
-    requestedMint: MINT,
-    retrievedAtMs: T_MINT,
-    response: syntheticMintAccountResponse(),
-  },
+  mintAccount: syntheticMintAccountEvidence(T_MINT),
   rugCheck: providerResponse(T_RUGCHECK, syntheticRugCheckReport()),
   bundler: providerResponse(T_BUNDLER, CAPTURED_SOLANA_TRACKER_SANITIZED_PAYLOAD),
   ...overrides,
@@ -236,6 +234,8 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
       retrievedAtMs: T_MINT,
       decisionTimeMs: DECISION,
       retrievalAgeMs: 3_000,
+      httpStatus: 200,
+      requestId: SYNTHETIC_MINT_REQUEST_ID,
       tokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       parser: "JSON_PARSED",
       slot: 462_100_000,
@@ -348,11 +348,7 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
     const captured = await evaluate(
       validEvidence({
         lp: CAPTURED_RAY_WSOL_VALIDATION_RESULT,
-        mintAccount: {
-          requestedMint: MINT,
-          retrievedAtMs: capturedAt,
-          response: syntheticMintAccountResponse(),
-        },
+        mintAccount: syntheticMintAccountEvidence(capturedAt),
       }),
       { decisionTimeMs: capturedAt + 5_000 },
     );
@@ -377,7 +373,7 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
 
   it("S-03: missing authorities stay unknown; only explicitly observed nulls count as disabled", async () => {
     const mintEvidence = (response: unknown, requestedMint = MINT) => ({
-      mintAccount: { requestedMint, retrievedAtMs: T_MINT, response },
+      mintAccount: syntheticMintAccountEvidence(T_MINT, { response, requestedMint }),
     });
     const base64MintData = Buffer.alloc(82);
     base64MintData.writeUInt8(6, 44);
@@ -431,7 +427,7 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
       [
         "base64 layout (no raw parsed info)",
         mintEvidence(base64Response),
-        "RAW_PARSED_INFO_UNAVAILABLE",
+        "MINT_ACCOUNT_STRUCTURE_INVALID",
         "REJECTED_UNKNOWN_FREEZE_AUTHORITY",
       ],
       [
@@ -442,8 +438,8 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
       ],
       [
         "account not found",
-        mintEvidence({ result: { context: { slot: 1 }, value: null } }),
-        "SOLANA_RPC_NOT_FOUND",
+        mintEvidence({ jsonrpc: "2.0", id: 1, result: { context: { slot: 1 }, value: null } }),
+        "MINT_ACCOUNT_NOT_FOUND",
         "REJECTED_UNKNOWN_FREEZE_AUTHORITY",
       ],
       [
@@ -650,11 +646,7 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
     const T0 = T_BUNDLER;
     const sameInstant = async (): Promise<PaperCandidateSecurityEvidence> => ({
       lp: await lpAt(T0),
-      mintAccount: {
-        requestedMint: MINT,
-        retrievedAtMs: T0,
-        response: syntheticMintAccountResponse(),
-      },
+      mintAccount: syntheticMintAccountEvidence(T0),
       rugCheck: providerResponse(T0, syntheticRugCheckReport()),
       bundler: providerResponse(T0, CAPTURED_SOLANA_TRACKER_SANITIZED_PAYLOAD),
     });
@@ -784,5 +776,215 @@ describe("PaperCandidateSecurityContext (offline composition; not installed)", (
     ]) {
       expect(code).not.toMatch(forbidden);
     }
+  });
+  it("S-11: mint-account evidence needs a valid transport, JSON-RPC 2.0 envelope and account structure", async () => {
+    type Mutable = Record<string, unknown> & {
+      result: Record<string, unknown> & {
+        context: Record<string, unknown>;
+        value: Record<string, unknown> & { data: Record<string, unknown> };
+      };
+    };
+    const mutated = (mutate: (r: Mutable) => void) => {
+      const r = syntheticMintAccountResponse() as Mutable;
+      mutate(r);
+      return r;
+    };
+    const withResponse = (response: unknown) => syntheticMintAccountEvidence(T_MINT, { response });
+    const missingField = (field: string) => {
+      const e: Record<string, unknown> = { ...syntheticMintAccountEvidence(T_MINT) };
+      delete e[field];
+      return e as unknown as ReturnType<typeof syntheticMintAccountEvidence>;
+    };
+
+    const cases: readonly (readonly [
+      string,
+      ReturnType<typeof syntheticMintAccountEvidence>,
+      string,
+    ])[] = [
+      // The four independently reproduced mutations.
+      [
+        "RPC error alongside the result",
+        withResponse(
+          mutated((r) => (r.error = { code: -32005, message: "SYNTHETIC node is behind" })),
+        ),
+        "JSON_RPC_CONTRADICTORY_ERROR_AND_RESULT",
+      ],
+      [
+        "context slot -1",
+        withResponse(mutated((r) => (r.result.context.slot = -1))),
+        "CONTEXT_SLOT_INVALID",
+      ],
+      [
+        "executable account",
+        withResponse(mutated((r) => (r.result.value.executable = true))),
+        "MINT_ACCOUNT_EXECUTABLE",
+      ],
+      [
+        "jsonrpc and id missing",
+        withResponse(
+          mutated((r) => {
+            delete r.jsonrpc;
+            delete r.id;
+          }),
+        ),
+        "JSON_RPC_VERSION_INVALID",
+      ],
+      // JSON-RPC envelope.
+      ["id missing", withResponse(mutated((r) => delete r.id)), "JSON_RPC_ID_MISSING"],
+      ["wrong numeric id", withResponse(mutated((r) => (r.id = 2))), "JSON_RPC_ID_MISMATCH"],
+      [
+        "id as string of the same number",
+        withResponse(mutated((r) => (r.id = "1"))),
+        "JSON_RPC_ID_MISMATCH",
+      ],
+      ["null id", withResponse(mutated((r) => (r.id = null))), "JSON_RPC_ID_MISMATCH"],
+      [
+        "jsonrpc 1.0",
+        withResponse(mutated((r) => (r.jsonrpc = "1.0"))),
+        "JSON_RPC_VERSION_INVALID",
+      ],
+      [
+        "error response without result",
+        withResponse({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "SYNTHETIC" } }),
+        "JSON_RPC_ERROR",
+      ],
+      [
+        "error: null alongside the result",
+        withResponse(mutated((r) => (r.error = null))),
+        "JSON_RPC_CONTRADICTORY_ERROR_AND_RESULT",
+      ],
+      [
+        "result missing",
+        withResponse(mutated((r) => delete (r as Record<string, unknown>).result)),
+        "JSON_RPC_RESULT_MISSING",
+      ],
+      ["batch array body", withResponse([syntheticMintAccountResponse()]), "RESPONSE_NOT_JSON"],
+      // Context slot.
+      [
+        "slot missing",
+        withResponse(mutated((r) => delete r.result.context.slot)),
+        "CONTEXT_SLOT_INVALID",
+      ],
+      [
+        "slot fractional",
+        withResponse(mutated((r) => (r.result.context.slot = 1.5))),
+        "CONTEXT_SLOT_INVALID",
+      ],
+      [
+        "slot as string",
+        withResponse(mutated((r) => (r.result.context.slot = "462100000"))),
+        "CONTEXT_SLOT_INVALID",
+      ],
+      [
+        "context missing",
+        withResponse(mutated((r) => delete (r.result as Record<string, unknown>).context)),
+        "CONTEXT_SLOT_INVALID",
+      ],
+      // Account structure.
+      [
+        "executable missing",
+        withResponse(mutated((r) => delete r.result.value.executable)),
+        "MINT_ACCOUNT_STRUCTURE_INVALID",
+      ],
+      [
+        "lamports negative",
+        withResponse(mutated((r) => (r.result.value.lamports = -1))),
+        "MINT_ACCOUNT_STRUCTURE_INVALID",
+      ],
+      [
+        "parsed type not mint",
+        withResponse(syntheticMintAccountResponse({ type: "account" })),
+        "MINT_ACCOUNT_STRUCTURE_INVALID",
+      ],
+      [
+        "program label contradicts owner",
+        withResponse(mutated((r) => (r.result.value.data.program = "spl-token-2022"))),
+        "MINT_ACCOUNT_STRUCTURE_INVALID",
+      ],
+      // Transport and request metadata.
+      ["HTTP 500", syntheticMintAccountEvidence(T_MINT, { httpStatus: 500 }), "REQUEST_NOT_OK"],
+      ["HTTP 429", syntheticMintAccountEvidence(T_MINT, { httpStatus: 429 }), "REQUEST_NOT_OK"],
+      [
+        "incomplete body",
+        syntheticMintAccountEvidence(T_MINT, { bodyComplete: false }),
+        "RESPONSE_INCOMPLETE",
+      ],
+      [
+        "expected id mismatches the response",
+        syntheticMintAccountEvidence(T_MINT, { expectedRequestId: 7 }),
+        "JSON_RPC_ID_MISMATCH",
+      ],
+      ["httpStatus missing", missingField("httpStatus"), "INVALID_TRANSPORT_METADATA"],
+      ["bodyComplete missing", missingField("bodyComplete"), "INVALID_TRANSPORT_METADATA"],
+      ["expectedRequestId missing", missingField("expectedRequestId"), "INVALID_REQUEST_METADATA"],
+      [
+        "expectedRequestId empty",
+        syntheticMintAccountEvidence(T_MINT, { expectedRequestId: "" }),
+        "INVALID_REQUEST_METADATA",
+      ],
+      ["requestedMint missing", missingField("requestedMint"), "REQUEST_IDENTITY_MISMATCH"],
+      ["retrievedAtMs missing", missingField("retrievedAtMs"), "INVALID_RETRIEVAL_TIME"],
+    ];
+    for (const [label, mintAccount, status] of cases) {
+      const ctx = await evaluate(validEvidence({ mintAccount }));
+      expect(ctx.authorities.status, label).toBe(status);
+      expect(ctx.authorities.mintAuthority, label).toBeNull();
+      expect(ctx.authorities.freezeAuthority, label).toBeNull();
+      expect(ctx.authorities.mintAuthorityPassed, label).toBe(false);
+      expect(ctx.authorities.freezeAuthorityPassed, label).toBe(false);
+      expect(ctx.authorities.provenance, label).toBeNull();
+      expect(ctx.preAdmission, label).toEqual({
+        passed: false,
+        rejectionReason: "REJECTED_UNKNOWN_FREEZE_AUTHORITY",
+      });
+      // LP, RugCheck and bundler results are unaffected.
+      expect(ctx.lp.passed, label).toBe(true);
+      expect(ctx.rugCheck.status, label).toBe("AVAILABLE");
+      expect(ctx.bundler.status, label).toBe("QUALIFIED_PAPER_PROXY");
+    }
+
+    // Valid controls: a string request id echoed exactly, slot 0, and a Token-2022 mint.
+    const stringId = await evaluate(
+      validEvidence({
+        mintAccount: syntheticMintAccountEvidence(T_MINT, {
+          expectedRequestId: "SYNTHETIC-mint-1",
+          response: mutated((r) => (r.id = "SYNTHETIC-mint-1")),
+        }),
+      }),
+    );
+    expect(stringId.authorities.status).toBe("AVAILABLE");
+    expect(stringId.authorities.provenance?.requestId).toBe("SYNTHETIC-mint-1");
+    expect(stringId.preAdmission.passed).toBe(true);
+
+    const slotZero = await evaluate(
+      validEvidence({ mintAccount: withResponse(syntheticMintAccountResponse({ slot: 0 })) }),
+    );
+    expect(slotZero.authorities.provenance?.slot).toBe(0);
+    expect(slotZero.preAdmission.passed).toBe(true);
+
+    const token2022 = await evaluate(
+      validEvidence({
+        mintAccount: withResponse(
+          mutated((r) => {
+            r.result.value.owner = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+            r.result.value.data.program = "spl-token-2022";
+          }),
+        ),
+      }),
+    );
+    expect(token2022.authorities.status).toBe("AVAILABLE");
+    expect(token2022.authorities.provenance?.tokenProgram).toBe(
+      "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    );
+
+    // A validated envelope still treats omitted authorities as unknown.
+    const omitted = await evaluate(
+      validEvidence({
+        mintAccount: withResponse(syntheticMintAccountResponse({ omit: ["freezeAuthority"] })),
+      }),
+    );
+    expect(omitted.authorities.status).toBe("AVAILABLE");
+    expect(omitted.authorities.freezeAuthority?.status).toBe("OMITTED");
+    expect(omitted.preAdmission.rejectionReason).toBe("REJECTED_UNKNOWN_FREEZE_AUTHORITY");
   });
 });

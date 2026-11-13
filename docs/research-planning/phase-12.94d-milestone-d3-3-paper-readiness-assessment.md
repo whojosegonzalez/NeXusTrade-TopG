@@ -4073,12 +4073,12 @@ Independent review accepted the decision-time correction at `3cb0feb`. This sect
   - **Async**: the result is a promise only because the accepted LP bridge revalidates acquisition evidence asynchronously.
 - **Components reused, unchanged** (no validation is reimplemented):
 
-| Evidence                  | Accepted component                                                                               | Binding                                      |
-| ------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------- |
-| LP                        | `evaluateLpScreeningBridge` (Raydium AMM v4 LP accounting)                                       | exact pool and mint (pool-specific)          |
-| Mint and freeze authority | `parseSolanaRpcMintAccountResponse`, then `evaluateAuthorityEvidence` on the raw jsonParsed info | requested mint account                       |
-| RugCheck                  | `BuyGateTriggerService.validateRugCheckReportPayload`                                            | requested mint, and the payload's own `mint` |
-| Bundler proxy             | `parseSolanaTrackerBundlersResponse`, then `adaptPaperBundlerSnapshot`                           | requested mint                               |
+| Evidence                  | Accepted component                                                                                                                                                          | Binding                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| LP                        | `evaluateLpScreeningBridge` (Raydium AMM v4 LP accounting)                                                                                                                  | exact pool and mint (pool-specific)          |
+| Mint and freeze authority | the composition's transport, JSON-RPC 2.0 and account-structure checks, then `parseSolanaRpcMintAccountResponse` and `evaluateAuthorityEvidence` on the raw jsonParsed info | requested mint account                       |
+| RugCheck                  | `BuyGateTriggerService.validateRugCheckReportPayload`                                                                                                                       | requested mint, and the payload's own `mint` |
+| Bundler proxy             | `parseSolanaTrackerBundlersResponse`, then `adaptPaperBundlerSnapshot`                                                                                                      | requested mint                               |
 
 - **Token-level evidence**: authority, RugCheck and bundler results carry no pool provenance.
 - **Policy**: one fixed policy, `PAPER_SECURITY_CONTEXT_POLICY`, applies the existing explicit 15,000 ms decision-time limit. This is the limit the diagnostic applies to LP, mint-account, RugCheck and bundler evidence, and the bundler adapter's own limit.
@@ -4086,17 +4086,63 @@ Independent review accepted the decision-time correction at `3cb0feb`. This sect
   - **Causality**: token-level evidence retrieved after the decision time is `FUTURE_DATED_EVIDENCE`.
 - **Provenance preserved**:
   - **LP**: the bridge result unchanged (raw integer accounting, context slot, retrieval time, evidence origin).
-  - **Mint account**: requested mint, retrieval time, age, token program, parser and slot.
+  - **Mint account**: requested mint, retrieval time, age, HTTP status, request id, token program, parser and the validated context slot.
   - **RugCheck**: requested mint, retrieval time, age and HTTP status.
   - **Bundler**: the adapter's full provenance, including `PROVIDER_REPORTED_UNVERIFIED`, `PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION` and every unverified flag.
   - Supplied evidence is never mutated or re-stamped.
+
+#### Mint-Account Evidence Validation (Review of `af97863`)
+
+Independent review of `af97863` found that a successful mint parse was treated as sufficient evidence. Four reproduced mutations still returned `AVAILABLE`, passed both authority checks and passed pre-admission:
+
+- a non-null RPC error alongside the result;
+- `result.context.slot = -1`;
+- `result.value.executable = true`;
+- missing `jsonrpc` and `id`.
+
+**Correction**: the accepted parser is unchanged. The composition now validates the surrounding evidence before calling it.
+
+- **Evidence shape**: `PaperMintAccountEvidence` now carries `httpStatus`, `bodyComplete` and `expectedRequestId` alongside the requested mint, retrieval time and response.
+- **Checks, in order** (each failure leaves authorities unavailable with an explicit status, and pre-admission fails):
+
+| Check                                                                                                                                                                                                    | Failure status                                                                                             |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Request mint, retrieval time and the 15 s decision-time freshness (unchanged)                                                                                                                            | `REQUEST_IDENTITY_MISMATCH`, `INVALID_RETRIEVAL_TIME`, `FUTURE_DATED_EVIDENCE`, `STALE_RETRIEVAL_EVIDENCE` |
+| `httpStatus` a safe integer and `bodyComplete` a boolean                                                                                                                                                 | `INVALID_TRANSPORT_METADATA`                                                                               |
+| `expectedRequestId` a non-negative safe integer or non-empty string                                                                                                                                      | `INVALID_REQUEST_METADATA`                                                                                 |
+| HTTP 2xx, then a complete body                                                                                                                                                                           | `REQUEST_NOT_OK`, `RESPONSE_INCOMPLETE`                                                                    |
+| A single JSON object with `jsonrpc: "2.0"`                                                                                                                                                               | `RESPONSE_NOT_JSON`, `JSON_RPC_VERSION_INVALID`                                                            |
+| `id` present and strictly equal to the expected id (no type coercion)                                                                                                                                    | `JSON_RPC_ID_MISSING`, `JSON_RPC_ID_MISMATCH`                                                              |
+| No `error` member (any value, including `null`)                                                                                                                                                          | `JSON_RPC_CONTRADICTORY_ERROR_AND_RESULT` with a result, otherwise `JSON_RPC_ERROR`                        |
+| `result` an object                                                                                                                                                                                       | `JSON_RPC_RESULT_MISSING`                                                                                  |
+| `result.context.slot` a non-negative safe integer                                                                                                                                                        | `CONTEXT_SLOT_INVALID`                                                                                     |
+| Account present                                                                                                                                                                                          | `MINT_ACCOUNT_NOT_FOUND`                                                                                   |
+| `executable` exactly `false`                                                                                                                                                                             | `MINT_ACCOUNT_EXECUTABLE` (true) or `MINT_ACCOUNT_STRUCTURE_INVALID`                                       |
+| Safe non-negative `lamports`, string `owner`, jsonParsed `data.parsed` with `type: "mint"` and an `info` object, and a `data.program` label matching a supported owner (`spl-token` or `spl-token-2022`) | `MINT_ACCOUNT_STRUCTURE_INVALID`                                                                           |
+| The accepted parser (owner program, mint fields)                                                                                                                                                         | its own categories, e.g. `SOLANA_RPC_UNSUPPORTED_OWNER`                                                    |
+
+- **Authorities**: still evaluated from the validated raw `info` with `evaluateAuthorityEvidence`. Omitted authorities stay unknown; only a validated, explicitly observed `null` is `DISABLED`.
+- **Provenance**: the result's provenance adds the HTTP status, the request id and the validated slot (now always a number).
+- **Fixtures**: the synthetic fixture module adds `syntheticMintAccountEvidence`, with explicitly synthetic request and transport metadata (HTTP 200, complete body, request id 1). No historical capture was given metadata, and no sealed file changed.
+- **Unchanged**: LP, RugCheck and bundler semantics, all thresholds and the daemon.
+
+**Regression (S-11)**: every case below leaves both authority checks failed with null evaluations and no provenance. Pre-admission fails, while LP, RugCheck and bundler results are unaffected.
+
+- **The four reproduced mutations**: contradictory error and result, slot −1, executable account, and missing `jsonrpc` and `id`.
+- **Envelope**: missing `id`; wrong numeric id; the same number as a string; `null` id; `jsonrpc: "1.0"`; an error-only response; `error: null` with a result; missing result; a batch array.
+- **Slot**: missing, fractional, string, or no context.
+- **Account structure**: missing `executable`, negative lamports, non-mint parsed type, or a program label contradicting the owner.
+- **Transport and request metadata**: HTTP 500 and 429; an incomplete body; an expected id the response does not echo; missing `httpStatus`, `bodyComplete`, `expectedRequestId`, `requestedMint` or `retrievedAtMs`; an empty expected id.
+- **Valid controls**: a string request id echoed exactly, slot 0 and a Token-2022 mint are accepted, and an omitted authority in a valid envelope is still `OMITTED`.
+
+**Mutation checks** (source restored byte-identical afterwards): ignoring the error member, the slot rule, the executable rule, the version check, the id check, the HTTP status check or the completeness check each makes S-11 fail. Skipping the whole envelope check makes S-03 and S-11 fail.
 
 #### Preserved Security Semantics
 
 - **LP**: admission uses the bridge's exact integer comparison against the unchanged 90% threshold. Below-threshold LP is reported as observed (not unavailable) and fails pre-admission.
 - **Authorities**: only an explicitly observed `null` is `DISABLED`.
   - A missing field is `OMITTED` (unknown), even though the parser's normalized state treats it as disabled.
-  - Base64-layout responses carry no raw jsonParsed info, so authorities stay unavailable.
+  - Base64-layout responses carry no raw jsonParsed info, so authorities stay unavailable (`MINT_ACCOUNT_STRUCTURE_INVALID`).
   - Pre-admission reasons and their order (LP, then freeze, then mint) are the diagnostic's.
 - **RugCheck**: metrics come only from a 2xx response with a complete JSON body whose request and payload mint both match, and which the accepted validator accepts. RugCheck never supplies `bundlerPct`.
 - **Bundler**: `bundlerPct` is the normalized `initialPercentage`. Current holdings are returned separately and never used for Gate 11.
@@ -4105,7 +4151,7 @@ Independent review accepted the decision-time correction at `3cb0feb`. This sect
 
 #### Offline Verification
 
-`PaperCandidateSecurityContext.test.ts` (S-01 to S-10) uses only version-controlled fixtures:
+`PaperCandidateSecurityContext.test.ts` (S-01 to S-11) uses only version-controlled fixtures:
 
 - the existing synthetic and captured Raydium LP fixtures;
 - the sanitized 2026-11-06 Solana Tracker capture, used only as an explicitly dated replay at its original retrieval time;
@@ -4126,6 +4172,7 @@ The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and
 | S-08 | Six prohibited contexts evaluate nothing, and the RugCheck validator is never called                                                                                                                                                                                                                                                                                                                             |
 | S-09 | Favourable security inputs are still rejected by the flow gates (no verified flow) and by the live-liquidity floor                                                                                                                                                                                                                                                                                               |
 | S-10 | No fetch or timer is used during evaluation, and the module source contains no fetch, timer, environment, file or socket use                                                                                                                                                                                                                                                                                     |
+| S-11 | Mint-account transport, JSON-RPC 2.0 envelope, context slot and account structure are validated before the parser, including the four reproduced mutations; valid controls still pass                                                                                                                                                                                                                            |
 
 - **Mutation checks** (source restored byte-identical afterwards), each failing the expected tests:
   - treating an omitted authority as disabled (S-03);
@@ -4137,7 +4184,7 @@ The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and
   - defaulting missing holders to 0 (S-04);
   - accepting a truncated body (S-04, S-05).
 - **Results**:
-  - New suite 10/10.
+  - New suite 11/11.
   - `LpScreeningBridge`, `PaperSolanaTrackerBundlerAdapter`, `BuyGateTriggerService`, `SolanaRpcMintAccountParser`, `CandidateFlowProvider`, `PaperTradingDaemon`, `CandidateStreamEngine` and `CandidateDecisionDiagnostic` all pass.
   - The backend typecheck, ESLint and Prettier checks pass, each under an external 60 s limit with the installed local tools. None is left running.
   - All 11 captures verify, and the wallet hash is unchanged.
@@ -4145,7 +4192,7 @@ The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and
 **Limits of this evidence**:
 
 - **Synthetic inputs**: the mint-account and RugCheck inputs are synthetic. The bundler payload is a dated historical replay, and live provider responses are not exercised.
-- **Completeness is supplied**: HTTP status and body completeness are supplied by the caller. Enforcing response-size limits belongs to the future retrieval code.
+- **Completeness is supplied**: HTTP status, body completeness and the mint request id are supplied by the caller. Enforcing response-size limits and recording these values belongs to the future retrieval code.
 
 #### Exact Remaining Wiring Points (Not Implemented)
 

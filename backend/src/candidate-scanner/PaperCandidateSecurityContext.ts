@@ -6,8 +6,10 @@
  *
  * - LP: `evaluateLpScreeningBridge` (Raydium AMM v4 LP accounting, exact integer 90% comparison),
  *   bound to the exact pool and mint.
- * - Authorities: `parseSolanaRpcMintAccountResponse` plus `evaluateAuthorityEvidence` on the raw
- *   jsonParsed info, bound to the requested mint. Only an explicitly observed null is DISABLED.
+ * - Authorities: a complete 2xx JSON-RPC 2.0 response with the exact request id, no error member,
+ *   a valid context slot and a non-executable jsonParsed mint account; then
+ *   `parseSolanaRpcMintAccountResponse` plus `evaluateAuthorityEvidence` on the raw jsonParsed
+ *   info, bound to the requested mint. Only an explicitly observed null is DISABLED.
  * - RugCheck: `BuyGateTriggerService.validateRugCheckReportPayload` on a complete, successful
  *   response whose request and payload mint both match the requested mint.
  * - Bundler proxy: `parseSolanaTrackerBundlersResponse` plus `adaptPaperBundlerSnapshot`
@@ -68,14 +70,38 @@ export interface PaperSecurityTarget {
   readonly mintAddress: string;
 }
 
-/** Complete JSON-RPC `getAccountInfo` (jsonParsed) response for the requested mint account. */
+/** One HTTP retrieval of a JSON-RPC `getAccountInfo` (jsonParsed) response for the requested mint. */
 export interface PaperMintAccountEvidence {
   /** The account address that was requested (request identity; the response does not repeat it). */
   readonly requestedMint: string;
   /** Original local retrieval time, as recorded by the caller. */
   readonly retrievedAtMs: number;
+  readonly httpStatus: number;
+  /** True only when the whole body was received within the caller's response limit. */
+  readonly bodyComplete: boolean;
+  /** The JSON-RPC request `id` that was sent; the response must echo it exactly. */
+  readonly expectedRequestId: number | string;
+  /** Parsed JSON body. */
   readonly response: unknown;
 }
+
+/** Reasons a mint-account response is rejected before the accepted parser is called. */
+export type PaperMintAccountEnvelopeFailure =
+  | "INVALID_TRANSPORT_METADATA"
+  | "INVALID_REQUEST_METADATA"
+  | "REQUEST_NOT_OK"
+  | "RESPONSE_INCOMPLETE"
+  | "RESPONSE_NOT_JSON"
+  | "JSON_RPC_VERSION_INVALID"
+  | "JSON_RPC_ID_MISSING"
+  | "JSON_RPC_ID_MISMATCH"
+  | "JSON_RPC_ERROR"
+  | "JSON_RPC_CONTRADICTORY_ERROR_AND_RESULT"
+  | "JSON_RPC_RESULT_MISSING"
+  | "CONTEXT_SLOT_INVALID"
+  | "MINT_ACCOUNT_NOT_FOUND"
+  | "MINT_ACCOUNT_EXECUTABLE"
+  | "MINT_ACCOUNT_STRUCTURE_INVALID";
 
 /** One HTTP retrieval of token-level provider evidence (RugCheck report or Solana Tracker bundlers). */
 export interface PaperProviderResponseEvidence {
@@ -139,6 +165,7 @@ export interface PaperAuthorityResult {
   readonly status:
     | "AVAILABLE"
     | PaperTokenEvidenceUnavailableReason
+    | PaperMintAccountEnvelopeFailure
     | SolanaRpcMintParseFailureCategory
     | "RAW_PARSED_INFO_UNAVAILABLE";
   readonly mintAuthority: AuthorityEvaluation | null;
@@ -147,9 +174,11 @@ export interface PaperAuthorityResult {
   readonly freezeAuthorityPassed: boolean;
   readonly provenance:
     | (PaperRetrievalProvenance & {
+        readonly httpStatus: number;
+        readonly requestId: number | string;
         readonly tokenProgram: string;
         readonly parser: string;
-        readonly slot: number | null;
+        readonly slot: number;
         readonly authorityDerivation: "RAW_JSON_PARSED_INFO_VIA_EVALUATE_AUTHORITY_EVIDENCE";
       })
     | null;
@@ -329,6 +358,90 @@ async function evaluateLp(
   };
 }
 
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** jsonParsed `program` label for each supported token program. */
+const JSON_PARSED_PROGRAM_FOR_OWNER: Readonly<Record<string, string>> = Object.freeze({
+  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: "spl-token",
+  TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb: "spl-token-2022",
+});
+
+/**
+ * Transport, JSON-RPC 2.0 and account-structure checks around the accepted mint parser, which itself
+ * checks only the owner program and the parsed mint fields. Returns the slot and raw parsed info.
+ */
+function checkMintAccountEnvelope(
+  evidence: PaperMintAccountEvidence,
+):
+  | { readonly ok: true; readonly slot: number; readonly rawInfo: Record<string, unknown> }
+  | { readonly ok: false; readonly reason: PaperMintAccountEnvelopeFailure } {
+  const fail = (reason: PaperMintAccountEnvelopeFailure) => ({ ok: false as const, reason });
+
+  // Transport: explicit status and completeness, and the exact request id that was sent.
+  if (!Number.isSafeInteger(evidence.httpStatus) || typeof evidence.bodyComplete !== "boolean") {
+    return fail("INVALID_TRANSPORT_METADATA");
+  }
+  const expectedId: unknown = evidence.expectedRequestId;
+  const validExpectedId =
+    (typeof expectedId === "number" && Number.isSafeInteger(expectedId) && expectedId >= 0) ||
+    (typeof expectedId === "string" && expectedId.length > 0);
+  if (!validExpectedId) return fail("INVALID_REQUEST_METADATA");
+  if (evidence.httpStatus < 200 || evidence.httpStatus > 299) return fail("REQUEST_NOT_OK");
+  if (!evidence.bodyComplete) return fail("RESPONSE_INCOMPLETE");
+
+  // JSON-RPC 2.0 envelope: version, exact id, and no error member on a success response.
+  const response = evidence.response;
+  if (!isPlainObject(response)) return fail("RESPONSE_NOT_JSON");
+  if (response.jsonrpc !== "2.0") return fail("JSON_RPC_VERSION_INVALID");
+  if (!("id" in response)) return fail("JSON_RPC_ID_MISSING");
+  if (response.id !== expectedId) return fail("JSON_RPC_ID_MISMATCH");
+  const hasResult = "result" in response && response.result !== undefined;
+  if ("error" in response && response.error !== undefined) {
+    return fail(hasResult ? "JSON_RPC_CONTRADICTORY_ERROR_AND_RESULT" : "JSON_RPC_ERROR");
+  }
+  if (!isPlainObject(response.result)) return fail("JSON_RPC_RESULT_MISSING");
+
+  // Context slot: a non-negative safe integer.
+  const context = response.result.context;
+  const slot = isPlainObject(context) ? context.slot : undefined;
+  if (typeof slot !== "number" || !Number.isSafeInteger(slot) || slot < 0) {
+    return fail("CONTEXT_SLOT_INVALID");
+  }
+
+  // Account: present, non-executable, with jsonParsed mint data.
+  const value = response.result.value;
+  if (value === null) return fail("MINT_ACCOUNT_NOT_FOUND");
+  if (!isPlainObject(value)) return fail("MINT_ACCOUNT_STRUCTURE_INVALID");
+  if (value.executable === true) return fail("MINT_ACCOUNT_EXECUTABLE");
+  if (value.executable !== false) return fail("MINT_ACCOUNT_STRUCTURE_INVALID");
+  if (
+    typeof value.lamports !== "number" ||
+    !Number.isSafeInteger(value.lamports) ||
+    value.lamports < 0 ||
+    typeof value.owner !== "string"
+  ) {
+    return fail("MINT_ACCOUNT_STRUCTURE_INVALID");
+  }
+  const data = value.data;
+  const parsed = isPlainObject(data) ? data.parsed : undefined;
+  if (
+    !isPlainObject(data) ||
+    !isPlainObject(parsed) ||
+    parsed.type !== "mint" ||
+    !isPlainObject(parsed.info)
+  ) {
+    return fail("MINT_ACCOUNT_STRUCTURE_INVALID");
+  }
+  // The jsonParsed program label must agree with a supported owner. An unsupported owner is left
+  // to the accepted parser, which rejects it.
+  const expectedProgram = JSON_PARSED_PROGRAM_FOR_OWNER[value.owner];
+  if (expectedProgram !== undefined && data.program !== expectedProgram) {
+    return fail("MINT_ACCOUNT_STRUCTURE_INVALID");
+  }
+  return { ok: true, slot, rawInfo: parsed.info };
+}
+
 function evaluateAuthorities(
   mintAddress: string,
   evidence: PaperMintAccountEvidence | null | undefined,
@@ -341,6 +454,8 @@ function evaluateAuthorities(
   const retrieval = checkTokenRetrieval(evidence, mintAddress, decisionTimeMs);
   if (!retrieval.ok) return unavailable(retrieval.reason);
   const mintEvidence = evidence as PaperMintAccountEvidence;
+  const envelope = checkMintAccountEnvelope(mintEvidence);
+  if (!envelope.ok) return unavailable(envelope.reason);
 
   const parsed = parseSolanaRpcMintAccountResponse(
     mintEvidence.response,
@@ -352,11 +467,7 @@ function evaluateAuthorities(
   // As in the diagnostic, authorities come from the raw jsonParsed info, not the parser's
   // normalized state (which treats an absent field as disabled).
   if (parsed.data.parser !== "JSON_PARSED") return unavailable("RAW_PARSED_INFO_UNAVAILABLE");
-  const rawInfo = (
-    mintEvidence.response as {
-      result?: { value?: { data?: { parsed?: { info?: unknown } } } };
-    }
-  ).result?.value?.data?.parsed?.info;
+  const rawInfo = envelope.rawInfo;
 
   const mintAuthority = evaluateAuthorityEvidence(rawInfo, "mintAuthority");
   const freezeAuthority = evaluateAuthorityEvidence(rawInfo, "freezeAuthority");
@@ -368,9 +479,11 @@ function evaluateAuthorities(
     freezeAuthorityPassed: freezeAuthority.status === "DISABLED",
     provenance: {
       ...retrieval.provenance,
+      httpStatus: mintEvidence.httpStatus,
+      requestId: mintEvidence.expectedRequestId,
       tokenProgram: parsed.data.tokenProgram,
       parser: parsed.data.parser,
-      slot: parsed.data.slot ?? null,
+      slot: envelope.slot,
       authorityDerivation: "RAW_JSON_PARSED_INFO_VIA_EVALUATE_AUTHORITY_EVIDENCE",
     },
   };
