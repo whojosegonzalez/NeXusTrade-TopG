@@ -490,6 +490,8 @@ export function createHarness(
     provider,
     session,
     fetchFn,
+    createWebSocketTransport: createWs,
+    timers,
     sched,
     clock,
     transports,

@@ -4596,3 +4596,146 @@ Review of `1a92b76` confirmed the boundary corrections and the passing prefetch 
 | **Validated scanner LP mode**                                                                | **Remaining**: `CandidateStreamEngine` with `requireValidatedLp`, an LP evidence resolver and an LP freshness policy                                                                                                                                                              |
 | **Lifecycle wiring**                                                                         | **Remaining**: explicit selection of one pool and mint; opening and stopping the session with the daemon; `setCandidateFlowProvider` with the shared session; injecting the loader as the security path; obtaining the Solana Tracker key through the existing configuration path |
 | **Live approval**                                                                            | **Remaining**: none of the session, lane, loader or flow limits is approved for live use                                                                                                                                                                                          |
+
+### 8.34 PAPER Single-Candidate Coordinator (Offline; Not Installed)
+
+Independent review accepted the cache correction at `9654291`. This section adds the smallest offline coordinator for one fixed PAPER candidate. It replaces the manually timed test schedules with bounded scheduling and lifecycle control, using only the accepted components.
+
+- **Nothing ran live**: no real network call, socket, daemon run, runtime installation, capture, position, order or wallet change took place.
+- **Daemon unchanged**: the daemon's default path is unchanged. There is no CLI or environment activation.
+
+#### Design
+
+`backend/src/candidate-scanner/PaperSingleCandidateCoordinator.ts` builds the accepted components on one `PaperRequestSession`: the rolling flow provider, the security-evidence loader and cache, a validated-LP `CandidateStreamEngine` and the entry helper. It returns decision and status records only.
+
+- **Inert until started**: construction validates `PAPER_SIMULATION`, one canonical pool and mint, and explicit finite limits (session, flow, loader, cache and schedule). Transports, the Solana Tracker credential, the market parser, clock and timers are injected. Nothing is opened, sent or scheduled.
+- **Explicit lifecycle**: `start()` (callable once) opens the session, starts collection and the local tick. `stop()` clears scheduled work, cancels the loader, stops collection and closes the session. A late decision result is recorded as `DISCARDED_AFTER_STOP` and not acted on. The coordinator also stops on:
+  - the session deadline;
+  - a terminal session failure (first 429, redirect, shared ceiling);
+  - the end of flow collection;
+  - a spent refresh budget;
+  - a terminal decision.
+- **Bounded scheduling**:
+  - **Prefetch**: one per subscription epoch (at most `maxPrefetchEpochs`), at `observationStart + 65 s warm-up − prefetchLeadMs`, derived from the provider's own subscription time.
+  - **Selective refresh**: before a decision, only components due at the planned decision time are refreshed. Refreshes are coalesced (one at a time), and no decision starts while one is pending. All session, lane, loader and cache ceilings apply.
+  - **Spent budget**: a spent refresh or load budget stops the coordinator instead of retrying.
+  - **Decision spacing**: decisions are at least `decisionIntervalMs` apart unarmed. A confirmation is launched no earlier than its planned time (`arm + confirmDelayMs`). At most `maxDecisions` decisions are made.
+  - **Ticks**: the tick only reads local state (no request).
+- **Validated scanner intake**: once the first prefetch has settled, one accounted market request (`DEXSCREENER` lane) feeds `evaluatePoolAsync` on an engine with:
+  - `requireValidatedLp: true`;
+  - an explicit LP freshness policy at the intake time (15 s, no clock skew);
+  - a resolver that returns only the cached LP evidence bound to the fixed pool and mint;
+  - its transport disabled.
+
+  No discovery or scanner polling is started.
+  - **Placeholders cannot bypass**: the provider's `lpBurnPct` is replaced by the bridge projection. The pool record's mint and freeze authorities are set from the validated security composition: `null` only when explicitly observed `DISABLED`, otherwise the observed address or `UNVERIFIED_AUTHORITY`.
+  - **Identity**: a market snapshot for another pool or mint is rejected (`MARKET_IDENTITY_MISMATCH`).
+  - **On rejection**: any intake rejection ends the coordinator.
+
+- **Decisions**: `retrieveAndEvaluatePaperDaemonEntry` runs with the cache as its security path. Its spot price comes from the same accounted market request, and the direct RugCheck fetch is never used. The final decision-time checks are unchanged, and outcomes map to the daemon call site's rules:
+
+| Outcome                                          | Coordinator action                                                               |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `ARMED_FIRST_TICK`, `RETEST_WAITING`             | Arm or stay armed; plan the confirmation and refresh what would expire before it |
+| `BUY_GATE_REJECTED`, `SECURITY_REJECTED`         | Disarm                                                                           |
+| `RETEST_REJECTED`, `INSUFFICIENT_LIVE_LIQUIDITY` | Drop the candidate (stop)                                                        |
+| `RETEST_CONFIRMED`                               | Record and stop (`ENTRY_CONFIRMED_NO_EXECUTION`); no buy, no position            |
+
+The daemon's 120 s armed-state prune is applied unchanged. Legacy discovery, Birdeye polling, Smart Money probes and all other daemon traffic are outside this path.
+
+#### Test Configuration (Offline Only; Not Approved)
+
+| Limit                             | Value                                                                                                                                                                         |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session                           | 150,000 ms lifetime; 120 attempts; 5,000 ms timeout                                                                                                                           |
+| Solana RPC lane                   | 110 attempts; 2,500 ms pacing; 64 KiB                                                                                                                                         |
+| RugCheck and Solana Tracker lanes | 5 attempts each; 5,000 ms pacing; 256 KiB                                                                                                                                     |
+| DexScreener (market) lane         | 10 attempts; 1,000 ms pacing; 64 KiB                                                                                                                                          |
+| Flow provider                     | §8.29 test limits with a 150,000 ms lifetime and 100 attempts                                                                                                                 |
+| Loader and cache                  | 4 loads; LP acquisition bound 30,000 ms; 4 refreshes                                                                                                                          |
+| Schedule                          | prefetch lead 6,000 ms; confirmation delay 5,000 ms; decision interval 5,000 ms; decision lead 500 ms; refresh horizon 10,000 ms; tick 250 ms; 6 decisions; 2 prefetch epochs |
+| Scanner                           | `CANDIDATE_SCANNER_DEFAULTS`                                                                                                                                                  |
+
+#### Offline Verification
+
+`backend/src/paper/PaperSingleCandidateCoordinator.test.ts` (C-01 to C-05) runs the real components on the shared virtual scheduler with in-memory transports and a synthetic chain, market and security evidence.
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| C-01 | A coordinator-scheduled arm and confirmation (timeline below), with a prefetch time equal to `observationStart + 59 s`, scanner admission, all four components and the flow fresh at both decisions, and a selective post-arm refresh (LP reused). Market requests are one intake and one per decision, all in the ledger. Clean stop afterwards                                                 |
+| C-02 | Rejections under: a spent refresh budget (no decision consumes the would-be-stale mint; the coordinator stops); an adverse RugCheck during a pending refresh (no decision while pending; the confirmation fails Gate 11 and disarms); withdrawn flow after a disconnect (disarm, then a second, derived prefetch for the new epoch); and 4.9 s latency (no confirmation, nothing stale accepted) |
+| C-03 | The validated-LP scanner rejects below-threshold LP, missing LP, LP for another base mint, an active mint authority and an omitted freeze authority (both behind a provider-assumed `null`), and a market snapshot for another pool. No decision or spot request follows                                                                                                                         |
+| C-04 | Construction and 100 status reads send and schedule nothing. An explicit stop during the prefetch sends nothing more. Solana-lane exhaustion, the session deadline and the first 429 each end everything. Prohibited contexts, invalid identities and invalid limits are rejected at construction                                                                                                |
+| C-05 | 200 rounds of status reads during collection send nothing. One prefetch per epoch, one intake, at most the configured decisions and refreshes, and no rerun                                                                                                                                                                                                                                      |
+
+Every run also checks:
+
+- a contiguous ledger in which every transport call appears;
+- budget attempts equal to ledger dispatches;
+- each lane's pacing, with no Solana overlap;
+- every dispatch before the deadline;
+- after stop: no request in flight, no coordinator, session, provider or scheduler timer, nothing sent in a further 60 s, and `start()` refused.
+
+**Measured timelines** (seconds after collection start; synthetic chain, test configuration). The subscription was confirmed at 2.65 s.
+
+| Scenario             | Timeline                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Pass (C-01)**      | Prefetch 61.65 s (5 requests; LP retrieved 66.85 s, others 61.65 s) → scanner intake admitted 67.1 s → first active window published 74.35 s → **arm 74.6 s** (flow cutoff age 5.6 s; mint, RugCheck and bundler 12.95 s; LP 7.75 s) → selective refresh 74.6–79.35 s (mint, RugCheck, bundler) → **confirm 79.85 s** (cutoff age 10.85 s), launched at 79.75 s, after the planned 79.6 s. 20 requests (13 Solana, 2 RugCheck, 2 Solana Tracker, 3 market) |
+| Spent refresh budget | Arm 74.6 s; the post-arm refresh is refused; no further decision; stop                                                                                                                                                                                                                                                                                                                                                                                     |
+| Adverse replacement  | Arm 74.6 s; refresh 74.6–80.75 s (the danger report arrives at 74.7 s, while the mint request is slowed to 1.5 s); no decision while pending; confirmation 80.85 s fails Gate 11 (`RUGCHECK_DANGER_FLAG_FAILED`) and disarms; a later unarmed decision at 99.6 s is rejected the same way; the refresh budget is then spent and the coordinator stops                                                                                                      |
+| Withdrawn flow       | Arm 74.6 s; disconnect at the confirmation's market request; confirmation 79.85 s rejected (`EPOCH_INVALIDATED`) and disarmed; reconnect confirmed at 81.9 s; derived epoch-2 prefetch at 140.9 s; session deadline at 150 s                                                                                                                                                                                                                               |
+| 4.9 s Solana latency | Subscription 5.05 s; prefetch 64.05 s took until 83.75 s; at intake the mint evidence was 19.8 s old, so the authorities were not validated and the scanner rejected (`REJECTED_ACTIVE_MINT_AUTHORITY`, the scanner's label for "not verified as renounced")                                                                                                                                                                                               |
+
+- **Mutation checks** (source restored byte-identical afterwards), each caught:
+  - a prefetch not derived from the warm-up (C-01, C-02, C-04);
+  - decisions while a refresh is pending (all five tests);
+  - provider-assumed authorities reaching the scanner (C-03);
+  - the scanner outside validated-LP mode (C-03);
+  - a buy-gate rejection keeping the armed state (C-02);
+  - a spent refresh budget not being terminal (C-02);
+  - a confirmation launched before its planned time (C-01).
+- **Results**: 486 tests in 15 suites pass, in two groups each under an external 60 s limit:
+
+| Suite                                   | Passed  |
+| --------------------------------------- | ------- |
+| `PaperSingleCandidateCoordinator` (new) | 5/5     |
+| `PaperSessionEvidenceIntegration`       | 13/13   |
+| `PaperDaemonEntryIntegration`           | 7/7     |
+| `PaperTradingDaemon`                    | 100/100 |
+| `PaperCandidateSecurityContext`         | 11/11   |
+| `PaperRollingCandidateFlowProvider`     | 15/15   |
+| `CandidateStreamEngine`                 | 25/25   |
+| `LpScreeningBridge`                     | 34/34   |
+| `RaydiumAmmV4LpEvidenceAdapter`         | 22/22   |
+| `BuyGateTriggerService`                 | 64/64   |
+| `CandidateFlowProvider`                 | 54/54   |
+| `PaperActiveWindowQualification`        | 12/12   |
+| `PaperSolanaTrackerBundlerAdapter`      | 23/23   |
+| `SolanaRpcMintAccountParser`            | 6/6     |
+| `CandidateDecisionDiagnostic`           | 95/95   |
+
+The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None of the processes started is left running. All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic timing**: the chain, market, security responses and timings are synthetic. The passing schedule depends on them.
+- **Supplied parser**: the market parser is test-supplied. A runtime parser mapping the real market response is not built here.
+- **Scanner label**: the scanner reports an unverified authority with its existing `REJECTED_ACTIVE_*_AUTHORITY` labels.
+
+#### Exact Remaining Gaps
+
+**Activation** (none implemented or approved):
+
+1. **Explicit selection**: a CLI selection of one pool and mint (no environment enablement). Construct the coordinator only in that mode.
+2. **Real dependencies**: inject the real HTTP and WebSocket transports, the Solana RPC URL, the RugCheck and Solana Tracker endpoints, and the Solana Tracker key through the existing configuration path.
+3. **Market parser**: a pure market parser mapping the real DexScreener response (the daemon's `fetchDexScreenerSpotInfo` mapping, made pure) for the one accounted market request.
+4. **Isolate the mode**: disable the legacy loops in that mode: Raydium pool scans, Birdeye trending, DexScreener enrichment, the watchlist poller, radar sampling, the Smart Money probe, telemetry follow-ups and the position loop's own spot fetches. No unaccounted request may remain.
+5. **Lifecycle**: tie `start()`/`stop()` to daemon start and termination signals, and give the coordinator's report to the daemon's session report.
+6. **Live limits**: approve session, lane, flow, loader, cache and schedule limits.
+
+**Position lifecycle** (not started):
+
+1. **Execution**: on `ENTRY_CONFIRMED_NO_EXECUTION`, the daemon's simulated buy (`processScannedPool`, sizing and cohort rules) would have to be invoked under explicit approval.
+2. **Position monitoring**: exits through `buildPositionMarketContext` with the same flow provider and session, and the position's spot requests on the accounted market lane.
+3. **Collection lifetime**: the flow and session lifetimes (600 s in the §8.29 test limits) versus a position's holding period. Collection ending must leave the position with explicit unavailable-flow exit handling, not silent continuation.
+4. **Settlement**: the settlement journal and the frozen wallet, with no wallet change until separately approved.
