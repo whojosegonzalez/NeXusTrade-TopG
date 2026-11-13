@@ -685,6 +685,95 @@ export function evaluatePaperDaemonEntryDecision(
   return evaluateCandidateDecisionPoints({ ...params, executionContext: "PAPER_SIMULATION" });
 }
 
+/** Spot input accepted by the daemon entry path (a non-positive or missing price is unusable). */
+export type PaperDaemonEntrySpotInput = Omit<
+  EvaluateCandidateDecisionParams["baseSpotInfo"],
+  "spotPriceSol"
+> & { readonly spotPriceSol: number | null };
+
+/** Asynchronous entry inputs, retrieved in the daemon's order: spot price, then RugCheck. */
+export interface PaperDaemonEntryInputRetrievals<
+  TSpot extends PaperDaemonEntrySpotInput,
+  TRug extends EvaluateCandidateDecisionParams["rugMetrics"],
+> {
+  readonly fetchSpotInfo: (mintAddress: string, poolId: string) => Promise<TSpot | null>;
+  readonly fetchRugCheckMetrics: (mintAddress: string) => Promise<TRug>;
+}
+
+export interface RetrieveAndEvaluatePaperDaemonEntryParams<
+  TSpot extends PaperDaemonEntrySpotInput,
+  TRug extends EvaluateCandidateDecisionParams["rugMetrics"],
+> {
+  readonly candidate: EvaluateCandidateDecisionParams["candidate"];
+  readonly flowProvider: CandidateFlowProvider;
+  readonly buyGateService?: BuyGateTriggerService | undefined;
+  /** Read after the retrievals complete, as the daemon did before this extraction. */
+  readonly getExistingArmedState: () => ArmedPullbackState | undefined;
+  readonly retrievals: PaperDaemonEntryInputRetrievals<TSpot, TRug>;
+  /** Wall clock in production (`nowMs`); injected in tests. */
+  readonly clock: () => number;
+  /** Called once with a usable spot price, before the RugCheck retrieval (telemetry only). */
+  readonly onSpotInfoRetrieved?:
+    | ((spotInfo: TSpot & { readonly spotPriceSol: number }) => void)
+    | undefined;
+}
+
+export type PaperDaemonEntryEvaluation<
+  TSpot extends PaperDaemonEntrySpotInput,
+  TRug extends EvaluateCandidateDecisionParams["rugMetrics"],
+> =
+  | { readonly kind: "NO_ACTIVE_DEX_PAIR"; readonly spotInfo: TSpot | null }
+  | {
+      readonly kind: "EVALUATED";
+      readonly spotInfo: TSpot & { readonly spotPriceSol: number };
+      readonly rugMetrics: TRug;
+      /** Clock reading taken after every entry input was retrieved, immediately before evaluation. */
+      readonly decisionNowMs: number;
+      readonly decision: CandidateDecisionResult;
+    };
+
+/**
+ * The daemon's per-candidate entry path: retrieve spot price and RugCheck inputs, then evaluate the
+ * PAPER entry decision at the time the decision is actually made.
+ *
+ * The decision time is read from `clock` only after both retrievals have completed, and that single
+ * value is used for the candidate-flow read, its freshness validation, the buy gate and the retest
+ * gate (including retest expiry). Evidence timestamps are never altered: freshness is still derived
+ * from each snapshot's own cutoff against the unchanged 15 s limit, so evidence that was fresh when
+ * the loop started but aged during the retrievals is rejected, and a snapshot published during the
+ * retrievals can be read.
+ */
+export async function retrieveAndEvaluatePaperDaemonEntry<
+  TSpot extends PaperDaemonEntrySpotInput,
+  TRug extends EvaluateCandidateDecisionParams["rugMetrics"],
+>(
+  params: RetrieveAndEvaluatePaperDaemonEntryParams<TSpot, TRug>,
+): Promise<PaperDaemonEntryEvaluation<TSpot, TRug>> {
+  const { candidate, retrievals } = params;
+  const spotInfo = await retrievals.fetchSpotInfo(candidate.mintAddress, candidate.poolId);
+  if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+    return { kind: "NO_ACTIVE_DEX_PAIR", spotInfo };
+  }
+  const usableSpot = spotInfo as TSpot & { readonly spotPriceSol: number };
+  params.onSpotInfoRetrieved?.(usableSpot);
+
+  const rugMetrics = await retrievals.fetchRugCheckMetrics(candidate.mintAddress);
+
+  const existingArmedState = params.getExistingArmedState();
+  const decisionNowMs = params.clock();
+  const decision = evaluatePaperDaemonEntryDecision({
+    candidate,
+    baseSpotInfo: usableSpot,
+    rugMetrics,
+    flowProvider: params.flowProvider,
+    existingArmedState,
+    currentNowMs: decisionNowMs,
+    buyGateService: params.buyGateService,
+    requireVerifiedHolders: true,
+  });
+  return { kind: "EVALUATED", spotInfo: usableSpot, rugMetrics, decisionNowMs, decision };
+}
+
 export {
   resolveJournalPath,
   recoverSettlementJournal,
@@ -1962,26 +2051,37 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  const spotInfo = await fetchDexScreenerSpotInfo(
-                    candidate.mintAddress,
-                    candidate.poolId,
-                  );
-                  if (spotInfo && spotInfo.spotPriceSol && spotInfo.spotPriceSol > 0) {
-                    try {
-                      recordPreliminaryBuyTriggerObservation(
-                        candidate,
-                        spotInfo,
-                        sessionId,
-                        "gen-01-legacy-baseline",
-                        currentNow,
-                        telemetryObservations,
-                        telemetrySampling,
-                      );
-                    } catch (obsErr) {
-                      console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
-                    }
-                  }
-                  if (!spotInfo || !spotInfo.spotPriceSol || spotInfo.spotPriceSol <= 0) {
+                  // Retrieve spot price and RugCheck inputs, then evaluate the entry at the time the
+                  // decision is actually made (read after the retrievals, not at loop start).
+                  const entryEvaluation = await retrieveAndEvaluatePaperDaemonEntry({
+                    candidate,
+                    flowProvider: activeCandidateFlowProvider,
+                    buyGateService,
+                    getExistingArmedState: () => armedPullbackCandidates.get(candidate.mintAddress),
+                    retrievals: {
+                      fetchSpotInfo: fetchDexScreenerSpotInfo,
+                      // Fetch RugCheck anti-bundler metrics (bundler ratio, top10 concentration, holder count)
+                      fetchRugCheckMetrics: (mintAddress) =>
+                        BuyGateTriggerService.fetchRugCheckMetrics(mintAddress),
+                    },
+                    clock: nowMs,
+                    onSpotInfoRetrieved: (retrievedSpot) => {
+                      try {
+                        recordPreliminaryBuyTriggerObservation(
+                          candidate,
+                          retrievedSpot,
+                          sessionId,
+                          "gen-01-legacy-baseline",
+                          currentNow,
+                          telemetryObservations,
+                          telemetrySampling,
+                        );
+                      } catch (obsErr) {
+                        console.warn("[PaperDaemon] Failed to record market observation:", obsErr);
+                      }
+                    },
+                  });
+                  if (entryEvaluation.kind === "NO_ACTIVE_DEX_PAIR") {
                     recordTriggerRejection(
                       candidate,
                       "REJECTED_NO_ACTIVE_DEX_PAIR",
@@ -1997,23 +2097,10 @@ export async function run(): Promise<void> {
                     continue;
                   }
 
-                  // Fetch RugCheck anti-bundler metrics (bundler ratio, top10 concentration, holder count)
-                  const rugMetrics = await BuyGateTriggerService.fetchRugCheckMetrics(
-                    candidate.mintAddress,
-                  );
-
-                  // Candidate Decision Pipeline (Buy Gate & Retest Gate with candidate-bound flow)
-                  const existingArmed = armedPullbackCandidates.get(candidate.mintAddress);
-                  const decision = evaluatePaperDaemonEntryDecision({
-                    candidate,
-                    baseSpotInfo: spotInfo,
-                    rugMetrics,
-                    flowProvider: activeCandidateFlowProvider,
-                    existingArmedState: existingArmed,
-                    currentNowMs: currentNow,
-                    buyGateService,
-                    requireVerifiedHolders: true,
-                  });
+                  // Candidate Decision Pipeline (Buy Gate & Retest Gate with candidate-bound flow).
+                  // Records describing this decision use decisionNowMs; acquisition-derived fields
+                  // (pool record fetchedAt/openTimeSec, preliminary observation) keep their times.
+                  const { spotInfo, rugMetrics, decision, decisionNowMs } = entryEvaluation;
 
                   if (decision.outcome === "INSUFFICIENT_LIVE_LIQUIDITY") {
                     if (armedPullbackCandidates.has(candidate.mintAddress)) {
@@ -2029,7 +2116,7 @@ export async function run(): Promise<void> {
                       decision.flowResult.recentBuys60s,
                       decision.flowResult.recentSells60s,
                       "LiveLiquidityFloor",
-                      currentNow,
+                      decisionNowMs,
                       spotInfo,
                     );
                     console.log(
@@ -2051,7 +2138,7 @@ export async function run(): Promise<void> {
                       decision.flowResult.recentBuys60s,
                       decision.flowResult.recentSells60s,
                       "BuyGateService",
-                      currentNow,
+                      decisionNowMs,
                       spotInfo,
                     );
                     continue;
@@ -2098,7 +2185,7 @@ export async function run(): Promise<void> {
                       decision.flowResult.recentBuys60s,
                       decision.flowResult.recentSells60s,
                       retestResult.rejectionGateName,
-                      currentNow,
+                      decisionNowMs,
                       spotInfo,
                     );
 
@@ -2239,7 +2326,7 @@ export async function run(): Promise<void> {
 
                   const bought = daemon.processScannedPool(
                     targetPoolRecord,
-                    currentNow,
+                    decisionNowMs,
                     entryPriceSol,
                     dynamicSize,
                     {
@@ -2250,7 +2337,7 @@ export async function run(): Promise<void> {
                   );
                   if (bought) {
                     watchlistService.updateStatus(candidate.poolId, "BUY_TRIGGERED");
-                    tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, currentNow);
+                    tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, decisionNowMs);
                     try {
                       const dec = telemetryDecisions.recordDecision({
                         sessionId,
@@ -2258,8 +2345,8 @@ export async function run(): Promise<void> {
                         mintAddress: candidate.mintAddress,
                         poolId: candidate.poolId,
                         symbol: candidate.symbol,
-                        sourceTimestampMs: currentNow,
-                        ingestionTimestampMs: currentNow,
+                        sourceTimestampMs: decisionNowMs,
+                        ingestionTimestampMs: decisionNowMs,
                         poolOpenTimeMs:
                           targetPoolRecord.openTimeSec > 0
                             ? targetPoolRecord.openTimeSec * 1000
@@ -2346,7 +2433,7 @@ export async function run(): Promise<void> {
                     } catch (tErr) {
                       console.warn("[PaperDaemon] Telemetry buy recording error:", tErr);
                     }
-                    const timeStr = new Date(currentNow).toLocaleTimeString();
+                    const timeStr = new Date(decisionNowMs).toLocaleTimeString();
                     const usdStr = (
                       spotInfo.spotPriceUsd !== null && spotInfo.spotPriceUsd > 0
                         ? spotInfo.spotPriceUsd

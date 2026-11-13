@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -41,6 +41,7 @@ import {
   parseCliArgs,
   buildPositionMarketContext,
   evaluatePaperDaemonEntryDecision,
+  retrieveAndEvaluatePaperDaemonEntry,
   getCandidateFlowProvider,
   setCandidateFlowProvider,
 } from "../scripts/paper-trading-daemon.js";
@@ -4075,5 +4076,349 @@ describe("PAPER daemon entry decision context (synthetic, offline)", () => {
     setCandidateFlowProvider(injected);
     expect(entry(getCandidateFlowProvider()).outcome).toBe("ARMED_FIRST_TICK");
     expect(injected.calls).toBe(1);
+  });
+
+  describe("decision time is taken after the entry input retrievals (synthetic, offline)", () => {
+    const LOOP_START = NOW; // SYNTHETIC loop-start `currentNow`
+
+    interface PublishedSnapshot {
+      readonly publishedAtMs: number;
+      readonly windowEndMs: number;
+    }
+
+    /**
+     * SYNTHETIC provider with the rolling provider's read semantics: the newest snapshot published
+     * at or before the read time, converted at that time from its original cutoff (never re-stamped).
+     */
+    type PublishingProvider = CandidateFlowProvider & {
+      readonly snapshots: PublishedSnapshot[];
+      readonly reads: number[];
+    };
+    const publishingProvider = (initial: readonly PublishedSnapshot[] = []): PublishingProvider => {
+      const p: PublishingProvider = {
+        snapshots: initial.map((s) => Object.freeze({ ...s })),
+        reads: [],
+        getCandidateFlow(target: CandidateFlowTarget, evalMs: number) {
+          p.reads.push(evalMs);
+          const eligible = p.snapshots
+            .filter((s) => s.publishedAtMs <= evalMs)
+            .sort((a, b) => a.publishedAtMs - b.publishedAtMs)
+            .at(-1);
+          if (!eligible) {
+            return {
+              poolAddress: target.poolAddress,
+              tokenMint: target.tokenMint,
+              recentBuys60s: null,
+              recentSells60s: null,
+              flowCoverage: "COLLECTION_GAP",
+              isCoverageSufficient: false,
+              diagnosticReason: "SYNTHETIC: no snapshot published",
+              evaluationTimestampMs: evalMs,
+            } as CandidateFlowResult;
+          }
+          return syntheticPaperFlow(target, evalMs, { windowEndMs: eligible.windowEndMs });
+        },
+      };
+      return p;
+    };
+
+    type SpotInput =
+      | typeof SYNTH_SPOT
+      | (Omit<typeof SYNTH_SPOT, "spotPriceSol"> & {
+          spotPriceSol: number | null;
+        });
+
+    /** Injected clock plus mocked retrievals that advance it by their latency. */
+    const harness = (opts: {
+      provider: CandidateFlowProvider;
+      armed?: ArmedPullbackState | undefined;
+      spotLatencyMs?: number;
+      rugLatencyMs?: number;
+      spot?: SpotInput | null;
+      duringRugCheck?: (nowMs: number) => void;
+    }) => {
+      let virtualNow = LOOP_START;
+      const events: string[] = [];
+      const run = () =>
+        retrieveAndEvaluatePaperDaemonEntry({
+          candidate: SYNTH_CANDIDATE,
+          flowProvider: opts.provider,
+          getExistingArmedState: () => {
+            events.push("armed-state");
+            return opts.armed;
+          },
+          clock: () => {
+            events.push("clock");
+            return virtualNow;
+          },
+          retrievals: {
+            fetchSpotInfo: async (mintAddress, poolId) => {
+              expect([mintAddress, poolId]).toEqual([SYNTH_MINT, SYNTH_POOL]);
+              await Promise.resolve();
+              virtualNow += opts.spotLatencyMs ?? 0;
+              events.push("spot");
+              return opts.spot === undefined ? SYNTH_SPOT : opts.spot;
+            },
+            fetchRugCheckMetrics: async (mintAddress) => {
+              expect(mintAddress).toBe(SYNTH_MINT);
+              await Promise.resolve();
+              virtualNow += opts.rugLatencyMs ?? 0;
+              opts.duringRugCheck?.(virtualNow);
+              events.push("rugcheck");
+              return SYNTH_RUG;
+            },
+          },
+          onSpotInfoRetrieved: () => events.push("observation"),
+        });
+      return { run, events, now: () => virtualNow };
+    };
+
+    /** The pre-correction behaviour: the same inputs evaluated at the loop-start time. */
+    const atLoopStart = (provider: CandidateFlowProvider, armed?: ArmedPullbackState) =>
+      evaluatePaperDaemonEntryDecision({
+        candidate: SYNTH_CANDIDATE,
+        baseSpotInfo: SYNTH_SPOT,
+        rugMetrics: SYNTH_RUG,
+        flowProvider: provider,
+        existingArmedState: armed,
+        currentNowMs: LOOP_START,
+        requireVerifiedHolders: true,
+      });
+
+    it("DT-01: evidence fresh at loop start but older than 15 s at decision time is rejected", async () => {
+      // Cutoff 10 s before loop start; the retrievals take 6.5 s, so the decision-time age is 16.5 s.
+      const snapshot = { publishedAtMs: LOOP_START - 9_000, windowEndMs: LOOP_START - 10_000 };
+      for (const armed of [undefined, SYNTH_ARMED]) {
+        const provider = publishingProvider([snapshot]);
+        expect(atLoopStart(provider, armed).flowResult.isCoverageSufficient).toBe(true);
+
+        const h = harness({ provider, armed, spotLatencyMs: 3_000, rugLatencyMs: 3_500 });
+        const result = await h.run();
+        expect(result.kind).toBe("EVALUATED");
+        if (result.kind !== "EVALUATED") continue;
+        expect(result.decisionNowMs).toBe(LOOP_START + 6_500);
+        expect(h.events).toEqual(["spot", "observation", "rugcheck", "armed-state", "clock"]);
+        expect(provider.reads.at(-1)).toBe(result.decisionNowMs);
+        expect(result.decision.flowResult.isCoverageSufficient).toBe(false);
+        expect(result.decision.flowResult.recentBuys60s).toBeNull();
+        expect(result.decision.flowResult.diagnosticReason).toContain(
+          "STALE_RECONCILIATION_EVIDENCE: Research cutoff age (16500 ms)",
+        );
+        expect(result.decision.outcome).toBe("BUY_GATE_REJECTED");
+        // The published evidence keeps its original cutoff.
+        expect(provider.snapshots[0]).toEqual(snapshot);
+      }
+
+      // Boundary at decision time: exactly 15,000 ms is accepted, 15,001 ms is rejected.
+      for (const [rugLatencyMs, fresh] of [
+        [1_500, true],
+        [1_501, false],
+      ] as const) {
+        const provider = publishingProvider([snapshot]);
+        const h = harness({ provider, spotLatencyMs: 3_500, rugLatencyMs });
+        const result = await h.run();
+        if (result.kind !== "EVALUATED") throw new Error("expected evaluation");
+        expect(result.decision.flowResult.isCoverageSufficient).toBe(fresh);
+        expect(result.decision.outcome).toBe(fresh ? "ARMED_FIRST_TICK" : "BUY_GATE_REJECTED");
+      }
+    });
+
+    it("DT-02: a snapshot published during the input retrievals is consumed at the decision time", async () => {
+      let published: PublishedSnapshot | undefined;
+      for (const armed of [undefined, SYNTH_ARMED]) {
+        const provider = publishingProvider();
+        // At loop start nothing has been published yet.
+        expect(atLoopStart(provider, armed).flowResult.flowCoverage).toBe("COLLECTION_GAP");
+
+        const h = harness({
+          provider,
+          armed,
+          spotLatencyMs: 2_000,
+          rugLatencyMs: 3_000,
+          duringRugCheck: (now) => {
+            published = { publishedAtMs: now - 1_000, windowEndMs: now - 2_000 };
+            provider.snapshots.push(Object.freeze({ ...published }));
+          },
+        });
+        const result = await h.run();
+        if (result.kind !== "EVALUATED" || !published) throw new Error("expected evaluation");
+        const flow = result.decision.flowResult;
+        expect(result.decisionNowMs).toBe(LOOP_START + 5_000);
+        expect(flow.isCoverageSufficient).toBe(true);
+        expect(flow.isPaperQualified).toBe(true);
+        expect(flow.evaluationTimestampMs).toBe(result.decisionNowMs);
+        // Original cutoff preserved; the age is derived from it at the decision time.
+        expect(flow.paperQualificationContext?.researchWindowSpan.windowEndMs).toBe(
+          published.windowEndMs,
+        );
+        expect(flow.paperQualificationContext?.cutoffAgeMs).toBe(2_000);
+        expect(provider.snapshots).toEqual([published]);
+
+        if (armed) {
+          expect(result.decision.outcome).toBe("RETEST_CONFIRMED");
+          expect(result.decision.retestResult?.updatedArmedState.armedAtMs).toBe(armed.armedAtMs);
+        } else {
+          expect(result.decision.outcome).toBe("ARMED_FIRST_TICK");
+          // The new armed state starts at the decision time, not at loop start.
+          expect(result.decision.retestResult?.updatedArmedState.armedAtMs).toBe(
+            result.decisionNowMs,
+          );
+        }
+      }
+    });
+
+    it("DT-03: retest expiry is evaluated at the actual decision time", async () => {
+      // Fresh flow at the decision time in every case (cutoff 1 s before loop start).
+      const snapshot = { publishedAtMs: LOOP_START - 500, windowEndMs: LOOP_START - 1_000 };
+      const armedAt = (armedAtMs: number): ArmedPullbackState => ({ ...SYNTH_ARMED, armedAtMs });
+
+      // Armed 88 s before loop start: within the 90 s micro-cap expiry at loop start.
+      const armed = armedAt(LOOP_START - 88_000);
+      expect(atLoopStart(publishingProvider([snapshot]), armed).outcome).toBe("RETEST_CONFIRMED");
+
+      const h = harness({
+        provider: publishingProvider([snapshot]),
+        armed,
+        spotLatencyMs: 1_000,
+        rugLatencyMs: 1_500,
+      });
+      const expired = await h.run();
+      if (expired.kind !== "EVALUATED") throw new Error("expected evaluation");
+      expect(expired.decisionNowMs - armed.armedAtMs).toBe(90_500);
+      expect(expired.decision.flowResult.isCoverageSufficient).toBe(true);
+      expect(expired.decision.outcome).toBe("RETEST_REJECTED");
+      if (expired.decision.outcome === "RETEST_REJECTED") {
+        expect(expired.decision.retestResult.rejectionGateName).toBe("RetestTimeout");
+        expect(expired.decision.retestResult.rejectReason).toBe("REJECTED_PULLBACK_EXPIRED");
+        expect(expired.decision.retestResult.maxExpiryMs).toBe(90_000);
+      }
+
+      // Boundary at decision time: exactly 90,000 ms is still valid, 90,001 ms has expired.
+      const decisionAt = LOOP_START + 2_500;
+      for (const [ageMs, outcome] of [
+        [90_000, "RETEST_CONFIRMED"],
+        [90_001, "RETEST_REJECTED"],
+      ] as const) {
+        const boundary = harness({
+          provider: publishingProvider([snapshot]),
+          armed: armedAt(decisionAt - ageMs),
+          spotLatencyMs: 1_000,
+          rugLatencyMs: 1_500,
+        });
+        const result = await boundary.run();
+        if (result.kind !== "EVALUATED") throw new Error("expected evaluation");
+        expect(result.decisionNowMs).toBe(decisionAt);
+        expect(result.decision.outcome).toBe(outcome);
+      }
+    });
+
+    it("DT-04: missing or invalid flow stays unavailable; production still rejects PAPER evidence", async () => {
+      const fresh = { publishedAtMs: LOOP_START - 500, windowEndMs: LOOP_START - 1_000 };
+      const throwing: CandidateFlowProvider = {
+        getCandidateFlow() {
+          throw new Error("SYNTHETIC provider failure");
+        },
+      };
+      const cases: readonly (readonly [string, CandidateFlowProvider, string])[] = [
+        ["default provider", new UnavailableCandidateFlowProvider(), ""],
+        ["nothing published", publishingProvider(), "no snapshot published"],
+        ["provider exception", throwing, "PROVIDER_CALL_EXCEPTION"],
+        [
+          "other pool",
+          paperProvider({ poolAddress: "SYNTHETIC_OTHER_POOL" }),
+          "IDENTITY_MISMATCH_POOL",
+        ],
+        [
+          "BACKTEST provenance",
+          paperProvider({ paperExecutionContext: "BACKTEST" }),
+          "INVALID_PAPER_QUALIFICATION_PROVENANCE",
+        ],
+        [
+          "cutoff after decision time",
+          paperProvider({ windowEndMs: LOOP_START + 10_000 }),
+          "FUTURE_DATED_RECONCILIATION",
+        ],
+      ];
+      for (const [label, provider, reason] of cases) {
+        for (const armed of [undefined, SYNTH_ARMED]) {
+          const result = await harness({
+            provider,
+            armed,
+            spotLatencyMs: 2_000,
+            rugLatencyMs: 2_000,
+          }).run();
+          if (result.kind !== "EVALUATED") throw new Error(label);
+          expect(result.decision.flowResult.isCoverageSufficient, label).toBe(false);
+          expect(result.decision.flowResult.recentBuys60s, label).toBeNull();
+          expect(result.decision.flowResult.recentSells60s, label).toBeNull();
+          expect(result.decision.flowResult.diagnosticReason, label).toContain(reason);
+          expect(result.decision.outcome, label).toBe("BUY_GATE_REJECTED");
+        }
+      }
+
+      // No usable spot price: no RugCheck retrieval, no clock read and no flow read.
+      for (const spot of [
+        null,
+        { ...SYNTH_SPOT, spotPriceSol: 0 },
+        { ...SYNTH_SPOT, spotPriceSol: null },
+      ]) {
+        const provider = publishingProvider([fresh]);
+        const h = harness({ provider, spot });
+        const result = await h.run();
+        expect(result.kind).toBe("NO_ACTIVE_DEX_PAIR");
+        expect(h.events).toEqual(["spot"]);
+        expect(provider.reads).toEqual([]);
+      }
+
+      // The same fresh PAPER snapshot, read at the decision time, is rejected by the generic path.
+      const provider = publishingProvider([fresh]);
+      const paper = await harness({ provider, spotLatencyMs: 2_000, rugLatencyMs: 2_000 }).run();
+      if (paper.kind !== "EVALUATED") throw new Error("expected evaluation");
+      expect(paper.decision.flowResult.isCoverageSufficient).toBe(true);
+      for (const executionContext of [undefined, "PRODUCTION"] as const) {
+        const generic = evaluateCandidateDecisionPoints({
+          candidate: SYNTH_CANDIDATE,
+          baseSpotInfo: SYNTH_SPOT,
+          rugMetrics: SYNTH_RUG,
+          flowProvider: provider,
+          existingArmedState: SYNTH_ARMED,
+          currentNowMs: paper.decisionNowMs,
+          requireVerifiedHolders: true,
+          executionContext,
+        });
+        expect(generic.flowResult.isCoverageSufficient).toBe(false);
+        expect(generic.flowResult.diagnosticReason).toBe(
+          "PAPER_QUALIFIED_EVIDENCE_REJECTED_IN_PRODUCTION",
+        );
+        expect(generic.outcome).toBe("BUY_GATE_REJECTED");
+      }
+    });
+
+    it("DT-05: the daemon loop uses this path with the wall clock and records the decision time", () => {
+      const source = readFileSync(
+        fileURLToPath(new URL("../scripts/paper-trading-daemon.ts", import.meta.url)),
+        "utf8",
+      );
+      const loop = source.slice(source.indexOf("const runDiscoveryAndRadarLoop"));
+      expect(loop.length).toBeLessThan(source.length);
+      // One entry evaluation in the daemon: inside the retrieval helper, at the post-retrieval time.
+      expect(source.match(/evaluatePaperDaemonEntryDecision\(\{/g)).toHaveLength(1);
+      expect(source).toContain("currentNowMs: decisionNowMs,");
+      expect(loop).not.toMatch(/currentNowMs:\s*currentNow\b/);
+      expect(loop.match(/await retrieveAndEvaluatePaperDaemonEntry\(\{/g)).toHaveLength(1);
+      expect(loop).toContain("clock: nowMs,");
+      expect(loop).toContain("fetchSpotInfo: fetchDexScreenerSpotInfo,");
+      expect(loop).toContain("BuyGateTriggerService.fetchRugCheckMetrics(mintAddress)");
+      // The loop no longer performs the retrievals itself.
+      expect(loop).not.toMatch(/await fetchDexScreenerSpotInfo\(\s*candidate\./);
+      expect(loop).not.toMatch(/await BuyGateTriggerService\.fetchRugCheckMetrics\(/);
+      // Records describing the decision (rejections, the simulated buy, its telemetry) use it.
+      const decided = loop.slice(loop.indexOf("= entryEvaluation;"));
+      expect(decided.match(/^\s+decisionNowMs,$/gm)?.length).toBeGreaterThanOrEqual(4);
+      expect(decided).toContain(
+        "tracker.recordExecutedBuy(candidate.mintAddress, entryPriceSol, decisionNowMs);",
+      );
+      expect(decided).toContain("ingestionTimestampMs: decisionNowMs,");
+    });
   });
 });

@@ -3978,10 +3978,81 @@ Independent review found four boundary defects. All four are corrected in the pr
 
 #### Remaining Integration Gaps (Separate Prerequisites Before Daemon Activation)
 
-1. **Decision time basis**: Loop B judges freshness at its loop-start `currentNow`, before the candidate's price and RugCheck fetches. It should evaluate with a timestamp taken immediately before `evaluatePaperDaemonEntryDecision`. This is not implemented.
+1. **Decision time basis**: Loop B judged freshness at its loop-start `currentNow`, before the candidate's price and RugCheck fetches. **Corrected offline in §8.30**: the decision time is now read after those retrievals, immediately before evaluation.
 2. **PAPER security-provider integration**:
    - **Current state**: the daemon's entry security inputs come from its own RugCheck fetch.
    - **Not yet integrated**: the validated PAPER security evidence used by the diagnostic (LP inaccessibility, mint and freeze authority, bundler provenance). This was not traced or changed here and remains a separate prerequisite.
 3. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
 4. **Live limits**: none of the test values above is approved for live use.
 5. **Strategy unchanged**: disarming on unavailable flow, the retest rules, thresholds and the 15 s freshness limit are unchanged. Continuous availability for 90/120 s retests is not expected in active pools.
+
+### 8.30 PAPER Entry Decision Time Corrected (Offline; Provider Still Not Installed)
+
+Independent review accepted the §8.29 execution-boundary corrections at `3ffafa2`. The rolling provider remains uninstalled, and its test limits remain unapproved for live use. This section corrects the first remaining integration gap from §8.29.
+
+- **Nothing ran live**: no provider was installed, and no network call, socket, daemon run, capture, position, order or wallet change took place.
+
+#### Defect
+
+`runDiscoveryAndRadarLoop` reads `currentNow` once per iteration, before the raw-pool scan, the Birdeye poll, the DexScreener spot-price fetch and the RugCheck fetch. It then passed that loop-start value to `evaluatePaperDaemonEntryDecision` as `currentNowMs`.
+
+- **Effect**: evidence was judged at a time earlier than the decision itself. A snapshot that was fresh at loop start but older than 15 s by the time of the decision was accepted.
+- **Second effect**: a snapshot published while the inputs were being retrieved could not be read, because the read time preceded its publication.
+- **Retest expiry**: the 90/120 s expiry was also measured from the loop-start time.
+
+#### Correction
+
+- **Extracted path**: a new exported, import-safe helper, `retrieveAndEvaluatePaperDaemonEntry` in `paper-trading-daemon.ts`, now contains the daemon's per-candidate entry path. The loop calls it with the real retrievals (`fetchDexScreenerSpotInfo`, `BuyGateTriggerService.fetchRugCheckMetrics`) and `clock: nowMs`.
+  1. It retrieves the spot price. A missing or non-positive price returns `NO_ACTIVE_DEX_PAIR` before any RugCheck retrieval, clock read or flow read.
+  2. It reports a usable price to the existing preliminary-observation hook, as before.
+  3. It retrieves the RugCheck metrics.
+  4. It reads the existing armed state (after the retrievals, as before).
+  5. It reads the clock **once**, immediately before evaluation, and returns that value as `decisionNowMs`.
+- **One timestamp**: `decisionNowMs` is the time used for the candidate-flow read, its PAPER validation, the buy gate and the retest gate, including retest expiry and the `armedAtMs` of a newly armed candidate.
+- **Records describing the decision**: the live-liquidity, buy-gate and retest rejections, the simulated buy (`processScannedPool`), `recordExecutedBuy`, the `EXECUTED_BUY` decision record and the buy log line now use `decisionNowMs`.
+- **Unchanged times**:
+  - **Acquisition-derived fields** keep their times: the preliminary market observation, the `NO_ACTIVE_DEX_PAIR` rejection (no entry decision is made), and the fallback pool record's `fetchedAt`, `openTimeSec` and `poolOpenTimeMs`.
+  - **Evidence** is never re-stamped. Freshness is still derived from each snapshot's own cutoff against the unchanged 15,000 ms limit. Acquisition, cutoff and publication times are preserved.
+  - **Loop scheduling** is unchanged: the scan interval, warm-up, cooldown, observation-duration check and the 120 s armed-state prune still use the loop-start time.
+- **Strategy unchanged**: the `PAPER_SIMULATION` context, the 15 s freshness limit, the 90/120 s retest expiry, disarming on `BUY_GATE_REJECTED` and every threshold are unchanged. The correction is stricter, not looser: evidence that ages during the retrievals is now rejected.
+
+#### Offline Verification
+
+`PaperTradingDaemon.test.ts` adds DT-01 to DT-05. They exercise the helper the daemon calls, with:
+
+- an injected virtual clock;
+- mocked spot-price and RugCheck retrievals that advance the clock by their latency;
+- a synthetic provider with the rolling provider's read semantics: the newest snapshot published at or before the read time, converted from its original cutoff.
+
+Each test also evaluates the same inputs at the loop-start time, to show the pre-correction outcome.
+
+| Test  | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| DT-01 | A snapshot 10 s old at loop start is fresh there, but after 6.5 s of retrievals (16.5 s old) it is `STALE_RECONCILIATION_EVIDENCE` and the buy gate rejects, with and without an armed state. The order is spot price, observation, RugCheck, armed state, then clock, and the provider is read at that clock value. The snapshot's cutoff is unchanged. At the decision time, an age of exactly 15,000 ms is accepted and 15,001 ms is rejected |
+| DT-02 | Nothing is published at loop start (`COLLECTION_GAP`). A snapshot published during the RugCheck retrieval is read at the decision time: sufficient and PAPER-qualified, with the original cutoff and a 2 s age derived from it. It confirms an armed retest, and a new arming starts at the decision time                                                                                                                                        |
+| DT-03 | Armed 88 s before loop start, the retest confirms at loop start. After 2.5 s of retrievals (90.5 s) it is `RETEST_REJECTED` (`RetestTimeout`, `REJECTED_PULLBACK_EXPIRED`, 90,000 ms) with fresh flow. At the decision time, exactly 90,000 ms still confirms and 90,001 ms expires                                                                                                                                                              |
+| DT-04 | The default provider, no publication, a provider exception, another pool, `BACKTEST` provenance and a cutoff after the decision time all stay unavailable (null counts, `BUY_GATE_REJECTED`). A null, zero or missing spot price stops before RugCheck, the clock and the flow read. The generic path, without a context or with `PRODUCTION`, still rejects a fresh PAPER snapshot read at the decision time                                    |
+| DT-05 | Source check of the real call site: the loop calls the helper once with `clock: nowMs` and the real retrievals, no longer fetches those inputs itself, no longer passes `currentNowMs: currentNow`, and its decision records use `decisionNowMs`                                                                                                                                                                                                 |
+
+- **Mutation checks** (source restored byte-identical afterwards):
+  - Reading the clock before the retrievals makes DT-01 to DT-04 fail.
+  - Passing the loop-start time from the call site makes DT-05 fail.
+  - Recording the simulated buy at the loop-start time makes DT-05 fail.
+- **Results**:
+  - `PaperTradingDaemon` 100/100 (95 existing plus 5 new), `CandidateFlowProvider` 54/54, `PaperRollingCandidateFlowProvider` 15/15 and `PaperActiveWindowQualification` 12/12.
+  - The backend typecheck, ESLint and Prettier checks pass.
+  - Each command ran under an external 60 s limit; none is left running.
+  - All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic inputs**: the clock, latencies and snapshots are synthetic. Real fetch latencies are not measured here.
+- **Wiring check**: DT-05 checks the call site's source text. The loop itself is not run, because that would require the daemon.
+- **Scope**: the exit path (`buildPositionMarketContext`) and the other loops were not changed.
+
+#### Remaining Prerequisites Before Daemon Activation
+
+1. **PAPER security-provider integration**: the daemon's entry security inputs still come from its own RugCheck fetch. The validated PAPER security evidence used by the diagnostic (LP inaccessibility, mint and freeze authority, bundler provenance) is not integrated.
+2. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
+3. **Live limits**: none of the §8.29 test values is approved for live use.
+4. **Strategy unchanged**: continuous availability for 90/120 s retests is still not expected in active pools.
