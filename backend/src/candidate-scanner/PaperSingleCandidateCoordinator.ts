@@ -97,6 +97,8 @@ export interface PaperCoordinatorLimits {
 export type PaperCoordinatorMarketParser = (
   json: unknown,
   target: PaperSecurityTarget,
+  /** Session time the response was received (for the snapshot record only). */
+  receivedAtMs?: number,
 ) => {
   readonly pool: ScannedPoolRecord;
   readonly spot: PaperDaemonEntrySpotInput & { readonly spotPriceSol: number | null };
@@ -384,6 +386,16 @@ export class PaperSingleCandidateCoordinator {
 
   public getLoaderStatus() {
     return this.loader.getStatus();
+  }
+
+  /** The cached security evidence as readers see it (pure read; pending components withheld). */
+  public getSecurityEvidence() {
+    return this.cache.getEvidence();
+  }
+
+  /** The frozen reconciliation result behind a retained flow snapshot (pure read). */
+  public getFlowSnapshotResult(id: number) {
+    return this.provider.getSnapshotResult(id);
   }
 
   // ===========================================================================================
@@ -714,7 +726,7 @@ export class PaperSingleCandidateCoordinator {
     } catch {
       return null;
     }
-    return this.parse(json, this.target);
+    return this.parse(json, this.target, this.clock());
   }
 
   // ===========================================================================================

@@ -394,7 +394,8 @@ export function createHarness(
 
   const fetchFn = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
-    if (url !== TEST_RPC_URL) {
+    // RPC by origin (an RPC URL may carry a SYNTHETIC credential query); anything else is another host.
+    if (new URL(url).origin !== new URL(TEST_RPC_URL).origin) {
       // Other SYNTHETIC hosts (security and spot providers), answered after the normal latency.
       const path = new URL(url).pathname;
       fetchLog.push({ method: `${init?.method ?? "GET"} ${path}`, init, url });

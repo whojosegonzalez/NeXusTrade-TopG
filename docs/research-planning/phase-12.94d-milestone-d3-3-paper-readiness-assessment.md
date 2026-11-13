@@ -4766,7 +4766,7 @@ Independent review of `b996b8e` passed 76 focused tests and compilation. Two fur
 
 The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
 
-**Measured consequence** (C-06, epoch 2): after re-arming at 181.35 s, the due confirmations at 186.6 s and, after a further re-arm at 203.85 s, at 209.1 s were rejected (`PRE_ADMISSION_REJECTED:REJECTED_UNLOCKED_LP_RISK`). In each case the post-arm refresh included LP, which is two paced Solana requests on a busy lane, and was still pending at the planned confirmation time, so LP was withheld. Under the corrected rule this is the intended outcome. It is now the limiting condition for confirmation whenever LP must be refreshed between an arm and its confirmation (see the remaining gaps).
+**Measured consequence** (C-06, epoch 2): after re-arming at 181.35 s, the due confirmations at 186.6 s and, after a further re-arm at 203.85 s, at 209.1 s were rejected (`PRE_ADMISSION_REJECTED:REJECTED_UNLOCKED_LP_RISK`). In each case the post-arm refresh included LP, which is two paced Solana requests on a busy lane, and was still pending at the planned confirmation time, so LP was withheld. Under the corrected rule this is the intended outcome. In the measured C-06 schedules (5 s `confirmDelayMs`, a busy shared Solana lane paced at 2.5 s), the pending LP refresh was the limiting condition for confirmation (see the remaining gaps). This does not show that every LP refresh prevents confirmation: a refresh that completes before the planned confirmation, for example on a quieter lane or with a longer confirmation delay, would leave LP available (qualified in §8.35).
 
 #### Exact Remaining Gaps
 
@@ -4781,7 +4781,7 @@ The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the
 
 **Scheduling** (not implemented):
 
-1. **Refresh before arming**: refresh before arming so that every component stays valid through the planned confirmation, rather than relying on a post-arm refresh that must finish within `confirmDelayMs`. Measured in C-06: a post-arm refresh that includes LP does not finish within 5 s on a busy Solana lane.
+1. **Refresh before arming**: refresh before arming so that every component stays valid through the planned confirmation, rather than relying on a post-arm refresh that must finish within `confirmDelayMs`. Measured in C-06 only: in those schedules, a post-arm refresh that included LP did not finish within the 5 s delay on the busy shared Solana lane. Other schedules were not measured.
 
 **Position lifecycle** (not started):
 
@@ -4789,3 +4789,104 @@ The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the
 2. **Position monitoring**: exits through `buildPositionMarketContext` with the same flow provider and session, and the position's spot requests on the accounted market lane.
 3. **Collection lifetime**: the flow and session lifetimes (600 s in the §8.29 test limits) versus a position's holding period. Collection ending must leave the position with explicit unavailable-flow exit handling, not silent continuation.
 4. **Settlement**: the settlement journal and the frozen wallet, with no wallet change until separately approved.
+
+### 8.35 Operator Diagnostic for One Candidate (Offline; Live Execution Awaiting Approval)
+
+Review of a93d149 accepted the coordinator corrections. This step wraps the accepted `PaperSingleCandidateCoordinator` in a standalone, decision-only operator runner. Nothing ran against a network: no live command, socket, request, daemon, position, order or wallet change. **No live limits are approved.** The runner labels live execution `LIVE_EXECUTION_AWAITING_SEPARATE_OPERATOR_APPROVAL`. The operator commands and procedure are in [`paper-single-candidate-diagnostic-runbook.md`](./paper-single-candidate-diagnostic-runbook.md).
+
+**Qualification of §8.34.** The LP-refresh conclusion in §8.34 applies to the measured C-06 schedules only: a 5 s confirmation delay and a busy shared Solana lane paced at 2.5 s. There, the post-arm refresh that included LP was still pending at the planned confirmation, so LP was withheld and the confirmation was rejected. That does not show that every LP refresh prevents confirmation. A refresh that completes before the planned confirmation leaves LP available, and other lane loads and delays were not measured.
+
+#### Market Parsing (`DexScreenerSingleCandidateMarketParser`)
+
+A pure parser of the DexScreener `latest/dex/tokens/<mint>` response for the one accounted market request. It follows the daemon's mapping (`fetchDexScreenerSpotInfo`) for price and identity, and it fails closed:
+
+- **Identity**:
+  - exactly one pair whose `pairAddress` equals the target pool; none gives `POOL_NOT_FOUND`, more than one `AMBIGUOUS_POOL`; there is no fallback to another pair;
+  - `chainId` `solana` and `dexId` `raydium`; CLMM, CPMM and concentrated-liquidity labels are rejected;
+  - the base token must be the candidate mint and the quote token WSOL by address (a `SOL` symbol alone is not accepted); a WSOL-base pair is `UNSUPPORTED_ORIENTATION`.
+- **Units**: `priceNative` is SOL per token and `priceUsd` is USD per token; both must be positive decimal strings.
+- **Required metrics**: liquidity (USD), market cap (`fdv` is never substituted), five-minute buys and sells (safe integers), five-minute volume and `pairCreatedAt`. A missing or invalid value fails the parse.
+- **Optional metrics**: price changes are classified `UNAVAILABLE` when absent and are never invented.
+- **Creation time and provenance**: the original `pairCreatedAt` is kept with its source (`DEXSCREENER_PAIR_CREATED_AT`), as are the orientation, price units, per-metric provenance and the receipt time. Authorities stay `UNVERIFIED_AUTHORITY` and LP burn stays unknown until the validated-LP security evidence supplies them.
+
+Tests use a small, version-controlled synthetic fixture (`fixtures/SanitizedDexScreenerTokenPairsFixture.ts`): the exact pair plus a USDC-quote decoy and an Orca decoy. It is schema-shaped and labelled synthetic; it is not a capture, and no test reads a private capture directory.
+
+#### Runner (`backend/src/scripts/paper-single-candidate-diagnostic.ts`)
+
+- **Execution boundary**:
+  - an exact `--pool`, `--mint` and a new `--out-dir` inside `data/research/single-candidate/` are required;
+  - unknown, positional and repeated options are refused, so a second `--pool` cannot substitute the target;
+  - an existing directory is refused (`[OUTPUT_EXISTS]`) and historical captures are never touched;
+  - there is no discovery, no retry and no rerun.
+- **Dry run** (the default): validates the arguments, builds the complete plan and prints the boundary statement, the approval label, the plan digest and the plan. It loads no configuration, opens no socket, sends no request and writes nothing. Importing the daemon module for its configuration loader has no side effects: its environment load is deferred and its entry point is guarded.
+- **Live path** (`--live`, awaiting approval):
+  - `SOLANA_RPC_URL` and `SOLANA_TRACKER_API_KEY` come from the existing `loadDaemonEnvironment`; missing values stop the run before any request;
+  - the bounded HTTP transport and the WebSocket transport are wired only on this path;
+  - the coordinator runs until a terminal outcome; Ctrl+C maps to `OPERATOR_INTERRUPT`;
+  - cleanup is bounded, and successful, failed and interrupted runs are all sealed.
+- **Evidence**:
+  - files: plan, report, summary, request ledger, decisions, disarms, bounded market responses, security evidence and flow evidence;
+  - each is written exclusive-create, redacted, and refused (`[SEAL_REFUSED]`) if any secret remains;
+  - `evidence-manifest.json` follows the existing sealing pattern (SHA-256 and size per file, report reference, request ledger), plus the plan digest and approval label;
+  - `--verify <dir>` re-checks a sealed directory read-only.
+- **Separation**: `summary.json` reports flow qualification separately from strategy acceptance. `executed` is always `NONE (decision-only: no buy, no position)`.
+
+#### Proposed Limits and Allocation (Not Approved)
+
+| Group            | Proposed                                                                                                                                                                          |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session          | 600 s lifetime, 340 attempts, 10 s request timeout                                                                                                                                |
+| Lanes            | Solana RPC 320 at 2.5 s pacing (256 KiB); RugCheck 6 at 5 s (4 MiB); Solana Tracker 6 at 5 s (1 MiB); market 9 at 1 s (256 KiB)                                                   |
+| Flow             | 600 s lifetime, 300 HTTP attempts, 60 notifications, 60 retrievals, 1 reconnect, 4 per cycle, queue 13, 2.5 s pacing, 5 s timeout, keepalive 20 s/10 s with 32 pings, 80 messages |
+| Loader and cache | 30 s LP acquisition timeout, 6 loads, 6 refreshes                                                                                                                                 |
+| Schedule         | prefetch lead 6 s, confirmation delay 5 s, decision interval 5 s, decision lead 1.5 s, refresh horizon 10 s, 8 decisions, 2 prefetch epochs                                       |
+
+Worst-case allocation, computed by the runner (planning fails with `[PLAN_INVALID]` if any lane or the session cannot hold it):
+
+- **Solana RPC**: flow 300 (the one reconnect draws on the same budget) + security 3 × 6 loads = 318 of 320.
+- **RugCheck**: 6 of 6. **Solana Tracker**: 6 of 6.
+- **Market**: 1 intake + 8 decisions = 9 of 9.
+- **Session**: 339 of 340.
+
+At 2.5 s pacing the Solana lane carries at most about 240 requests in 600 s, so the deadline binds before the flow ceiling. The offline tests use shorter test limits, which are not approved live limits.
+
+#### Verification
+
+`paper-single-candidate-diagnostic.test.ts`, using the accepted coordinator with mocked transports and virtual time:
+
+| Test | Shows                                                                                                                                                                                                                                  |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-01 | The exact pair parses with its units, creation time, provenance and `UNAVAILABLE` classifications                                                                                                                                      |
+| P-02 | 24 malformed or unsupported inputs are rejected, including a missing pool, ambiguity, wrong chain or DEX, CLMM, reversed orientation, a `SOL`-symbol quote that is not WSOL, missing market cap with `fdv` present, and invalid counts |
+| D-01 | The dry run dispatches nothing, loads no configuration, writes nothing and prints the complete plan and allocation; an over-allocated schedule is refused                                                                              |
+| D-02 | Argument, repeated-option, output-directory and configuration refusals happen before any dispatch                                                                                                                                      |
+| D-03 | A mocked live run confirms with no buy; the manifest verifies; no secret is persisted; flow and strategy are reported separately; tampered, extra and missing files are detected; a rerun into the directory is refused                |
+| D-04 | A wrong-pool market response (with an echoed secret) and a first RugCheck 429 each end the run and are sealed, with the secret redacted                                                                                                |
+| D-05 | The session deadline ends the run and it is sealed                                                                                                                                                                                     |
+| D-06 | An interrupt at 62 s stops the run (`OPERATOR_INTERRUPT`), seals it, and leaves no later request or timer                                                                                                                              |
+
+- **Mutation checks** (sources restored byte-identical afterwards), each caught:
+
+| Mutation                                  | Caught by        |
+| ----------------------------------------- | ---------------- |
+| Dry run loads configuration               | D-01             |
+| Quote accepted by `SOL` symbol            | P-02             |
+| Fallback to another pair                  | P-02, D-04       |
+| `fdv` substituted for market cap          | P-02             |
+| No redaction                              | D-04             |
+| Overwrite allowed                         | D-02, D-03       |
+| Failed runs not sealed                    | D-04, D-05, D-06 |
+| Interrupt not wired                       | D-06             |
+| Repeated options accepted (last one wins) | D-02             |
+
+- **Results**: all pass under external 60 s limits: the diagnostic suite 8/8, `PaperSingleCandidateCoordinator` 7/7, `PaperSessionEvidenceIntegration` 13/13, `PaperDaemonEntryIntegration` 7/7, `PaperTradingDaemon` 100/100, `PaperRollingCandidateFlowProvider` 15/15, `PaperCandidateSecurityContext` 11/11 and `CandidateStreamEngine` 25/25. The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+
+Supporting changes: the coordinator passes its clock reading to the market parser as the receipt time and exposes its security evidence and flow snapshot results for sealing. The shared test harness now routes RPC requests by origin.
+
+#### Exact Remaining Gaps
+
+1. **Live approval**: the proposed limits and the live command await separate operator approval.
+2. **Operator execution**: no live run has happened, so neither the parser against a real response nor the live transports through this runner have been exercised. The first approved run is also the parser's first real-response check.
+3. **Scheduling**: refresh before arming (§8.34) is not implemented. Whether a post-arm LP refresh completes within the confirmation delay under live load is unmeasured.
+4. **Daemon activation**: the runner is standalone. Installing the coordinator in the PAPER daemon, isolating the legacy loops and tying lifecycle and reports together (§8.34 activation items 4 and 5) remain open.
+5. **Position lifecycle**: execution, monitoring, collection lifetime versus holding period, and settlement (§8.34) are not started. The runner stops at confirmation.
