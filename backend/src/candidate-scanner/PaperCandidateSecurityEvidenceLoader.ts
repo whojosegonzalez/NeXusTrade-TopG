@@ -23,11 +23,13 @@
 
 import { isCanonicalSolanaBase58, type ValidatedLpEvidenceInput } from "./LpScreeningBridge.js";
 import { RaydiumAmmV4LpEvidenceAdapter } from "./RaydiumAmmV4LpEvidenceAdapter.js";
-import type {
-  PaperCandidateSecurityEvidence,
-  PaperMintAccountEvidence,
-  PaperProviderResponseEvidence,
-  PaperSecurityTarget,
+import {
+  PAPER_SECURITY_CONTEXT_POLICY,
+  type PaperCandidateSecurityEvidence,
+  type PaperMintAccountEvidence,
+  type PaperProviderResponseEvidence,
+  type PaperSecurityEvidenceComponent,
+  type PaperSecurityTarget,
 } from "./PaperCandidateSecurityContext.js";
 import {
   PaperRequestSession,
@@ -63,6 +65,7 @@ export interface PaperSecurityEvidenceLoaderOptions {
 
 export type PaperSecurityEvidenceComponentOutcome =
   | { readonly status: "RETRIEVED"; readonly sessionSeqs: readonly number[] }
+  | { readonly status: "NOT_REQUESTED"; readonly sessionSeqs: readonly number[] }
   | {
       readonly status: "UNAVAILABLE";
       readonly reason: string;
@@ -86,6 +89,17 @@ export interface PaperSecurityEvidenceLoaderStatus {
   readonly cancelledReason: string | null;
   readonly records: readonly PaperSecurityEvidenceLoadRecord[];
 }
+
+const ALL_COMPONENTS: readonly PaperSecurityEvidenceComponent[] = Object.freeze([
+  "LP",
+  "MINT_ACCOUNT",
+  "RUGCHECK",
+  "BUNDLER",
+]);
+const NOT_REQUESTED: PaperSecurityEvidenceComponentOutcome = Object.freeze({
+  status: "NOT_REQUESTED",
+  sessionSeqs: Object.freeze([]) as readonly number[],
+});
 
 function parseJson(text: string | undefined): unknown {
   if (typeof text !== "string") return undefined;
@@ -180,6 +194,11 @@ export class PaperCandidateSecurityEvidenceLoader {
     this.limits = validateLimits(options.limits, this.session.limits.lanes.SOLANA_RPC.pacingMs);
   }
 
+  /** The shared session's clock. */
+  public now(): number {
+    return this.session.now();
+  }
+
   /** Read-only status (never starts acquisition; contains no credentials or URLs). */
   public getStatus(): PaperSecurityEvidenceLoaderStatus {
     return Object.freeze({
@@ -205,7 +224,12 @@ export class PaperCandidateSecurityEvidenceLoader {
   public async load(
     target: PaperSecurityTarget,
     signal?: AbortSignal,
+    components: readonly PaperSecurityEvidenceComponent[] = ALL_COMPONENTS,
   ): Promise<PaperCandidateSecurityEvidence> {
+    const wanted = new Set(components);
+    if (wanted.size === 0 || [...wanted].some((c) => !ALL_COMPONENTS.includes(c))) {
+      throw new Error("PAPER_SECURITY_LOADER_INVALID_COMPONENTS");
+    }
     if (target?.poolId !== this.target.poolId || target?.mintAddress !== this.target.mintAddress) {
       throw new Error("PAPER_SECURITY_LOADER_TARGET_MISMATCH");
     }
@@ -223,26 +247,37 @@ export class PaperCandidateSecurityEvidenceLoader {
     try {
       // Different lanes run concurrently; the Solana lane serializes and paces the LP acquisition and
       // the mint account with every other Solana request in the session (including flow).
+      // Only the requested components are retrieved (selective refresh); the others are untouched.
+      const skip = <T>(): Promise<{
+        readonly evidence: T | null;
+        readonly outcome: PaperSecurityEvidenceComponentOutcome;
+      }> => Promise.resolve({ evidence: null, outcome: NOT_REQUESTED });
       const [lp, mintAccount, rugCheck, bundler] = await Promise.all([
-        this.loadLp(signals),
-        this.loadMintAccount(signals),
-        this.loadProviderResponse(
-          "RUGCHECK",
-          "RUGCHECK_REPORT",
-          `${this.rugCheckApiUrl}/v1/tokens/${encodeURIComponent(this.target.mintAddress)}/report`,
-          { Accept: "application/json" },
-          signals,
-        ),
-        this.loadProviderResponse(
-          "SOLANA_TRACKER",
-          "SOLANA_TRACKER_BUNDLERS",
-          `${this.solanaTrackerApiUrl}/tokens/${encodeURIComponent(this.target.mintAddress)}/bundlers`,
-          {
-            Accept: "application/json",
-            ...(this.solanaTrackerApiKey ? { "x-api-key": this.solanaTrackerApiKey } : {}),
-          },
-          signals,
-        ),
+        wanted.has("LP") ? this.loadLp(signals) : skip<ValidatedLpEvidenceInput>(),
+        wanted.has("MINT_ACCOUNT")
+          ? this.loadMintAccount(signals)
+          : skip<PaperMintAccountEvidence>(),
+        !wanted.has("RUGCHECK")
+          ? skip<PaperProviderResponseEvidence>()
+          : this.loadProviderResponse(
+              "RUGCHECK",
+              "RUGCHECK_REPORT",
+              `${this.rugCheckApiUrl}/v1/tokens/${encodeURIComponent(this.target.mintAddress)}/report`,
+              { Accept: "application/json" },
+              signals,
+            ),
+        !wanted.has("BUNDLER")
+          ? skip<PaperProviderResponseEvidence>()
+          : this.loadProviderResponse(
+              "SOLANA_TRACKER",
+              "SOLANA_TRACKER_BUNDLERS",
+              `${this.solanaTrackerApiUrl}/tokens/${encodeURIComponent(this.target.mintAddress)}/bundlers`,
+              {
+                Accept: "application/json",
+                ...(this.solanaTrackerApiKey ? { "x-api-key": this.solanaTrackerApiKey } : {}),
+              },
+              signals,
+            ),
       ]);
       this.records.push(
         Object.freeze({
@@ -257,10 +292,10 @@ export class PaperCandidateSecurityEvidenceLoader {
       );
       this.loadsCompleted++;
       return {
-        lp: lp.evidence,
-        mintAccount: mintAccount.evidence,
-        rugCheck: rugCheck.evidence,
-        bundler: bundler.evidence,
+        ...(wanted.has("LP") ? { lp: lp.evidence } : {}),
+        ...(wanted.has("MINT_ACCOUNT") ? { mintAccount: mintAccount.evidence } : {}),
+        ...(wanted.has("RUGCHECK") ? { rugCheck: rugCheck.evidence } : {}),
+        ...(wanted.has("BUNDLER") ? { bundler: bundler.evidence } : {}),
       };
     } finally {
       this.inFlight = false;
@@ -495,5 +530,181 @@ export class PaperCandidateSecurityEvidenceLoader {
               sessionSeqs: seqs,
             },
     };
+  }
+}
+
+// =============================================================================================
+// Candidate-bound prefetch cache with selective refresh
+// =============================================================================================
+
+export interface PaperSecurityEvidenceCacheLimits {
+  /** Refresh calls allowed in this cache's lifetime (each is one loader load). Never renewed. */
+  readonly maxRefreshes: number;
+}
+
+export interface PaperSecurityEvidenceCacheRefreshRecord {
+  readonly refresh: number;
+  readonly requestedAtMs: number;
+  readonly plannedDecisionMs: number;
+  readonly components: readonly PaperSecurityEvidenceComponent[];
+  readonly completedAtMs: number;
+}
+
+export interface PaperSecurityEvidenceCacheStatus {
+  readonly refreshes: number;
+  readonly refusedRefreshes: number;
+  readonly records: readonly PaperSecurityEvidenceCacheRefreshRecord[];
+  /** Original retrieval time of each cached component (null when absent or not usable). */
+  readonly retrievedAtMs: Readonly<Record<PaperSecurityEvidenceComponent, number | null>>;
+}
+
+/**
+ * Candidate-bound prefetch state on top of the loader (no other acquisition path).
+ *
+ * - refreshFor(plannedDecisionMs) retrieves, before a decision, only the components that are
+ *   missing, were not retrieved, or would be older than the unchanged 15 s limit at the planned
+ *   decision time. Calls are explicit and bounded (maxRefreshes, plus the loader's own ceiling).
+ * - getEvidence() and the security path's loadEvidence() are pure reads of the cache: they never
+ *   acquire. Evidence keeps its original retrieval time; the composition alone decides validity at
+ *   the actual decision time, so nothing is extended or re-stamped.
+ * - A dispatched refresh attempt always replaces the cached component (fail closed, even when the
+ *   new response is unusable); a refused, never-sent attempt leaves the earlier evidence to age out.
+ */
+export class PaperSecurityEvidenceCache {
+  private readonly loader: PaperCandidateSecurityEvidenceLoader;
+  private readonly target: PaperSecurityTarget;
+  private readonly maxRefreshes: number;
+  private evidence: PaperCandidateSecurityEvidence = Object.freeze({});
+  private readonly retrievedAt: Record<PaperSecurityEvidenceComponent, number | null> = {
+    LP: null,
+    MINT_ACCOUNT: null,
+    RUGCHECK: null,
+    BUNDLER: null,
+  };
+  private refreshes = 0;
+  private refusedRefreshes = 0;
+  private readonly records: PaperSecurityEvidenceCacheRefreshRecord[] = [];
+
+  constructor(options: {
+    readonly loader: PaperCandidateSecurityEvidenceLoader;
+    readonly target: PaperSecurityTarget;
+    readonly limits: PaperSecurityEvidenceCacheLimits;
+  }) {
+    if (!(options?.loader instanceof PaperCandidateSecurityEvidenceLoader)) {
+      throw new Error("[PAPER_SECURITY_CACHE_INIT] loader is mandatory");
+    }
+    const max = options.limits?.maxRefreshes;
+    if (typeof max !== "number" || !Number.isSafeInteger(max) || max <= 0) {
+      throw new Error(
+        "[PAPER_SECURITY_CACHE_INIT] limits.maxRefreshes must be a positive safe integer",
+      );
+    }
+    this.loader = options.loader;
+    this.target = Object.freeze({ ...options.target });
+    this.maxRefreshes = max;
+  }
+
+  /** Pure read of the cached evidence (no acquisition). */
+  public getEvidence(): PaperCandidateSecurityEvidence {
+    return this.evidence;
+  }
+
+  /** Components that must be retrieved before a decision at `plannedDecisionMs` (pure). */
+  public componentsDueAt(plannedDecisionMs: number): readonly PaperSecurityEvidenceComponent[] {
+    return ALL_COMPONENTS.filter((c) => {
+      const at = this.retrievedAt[c];
+      return (
+        at === null ||
+        plannedDecisionMs - at > PAPER_SECURITY_CONTEXT_POLICY.maxEvidenceAgeMs ||
+        plannedDecisionMs < at
+      );
+    });
+  }
+
+  /** Security path for the entry helper: a pure cache read, never an acquisition. */
+  public asSecurityPath(): {
+    readonly executionContext: "PAPER_SIMULATION";
+    readonly loadEvidence: (target: PaperSecurityTarget) => Promise<PaperCandidateSecurityEvidence>;
+  } {
+    return {
+      executionContext: "PAPER_SIMULATION",
+      loadEvidence: (target) => {
+        if (
+          target?.poolId !== this.target.poolId ||
+          target?.mintAddress !== this.target.mintAddress
+        ) {
+          return Promise.reject(new Error("PAPER_SECURITY_CACHE_TARGET_MISMATCH"));
+        }
+        return Promise.resolve(this.evidence);
+      },
+    };
+  }
+
+  public getStatus(): PaperSecurityEvidenceCacheStatus {
+    return Object.freeze({
+      refreshes: this.refreshes,
+      refusedRefreshes: this.refusedRefreshes,
+      records: Object.freeze([...this.records]),
+      retrievedAtMs: Object.freeze({ ...this.retrievedAt }),
+    });
+  }
+
+  /**
+   * Retrieves the components due at the planned decision time. Returns the components refreshed
+   * (empty when nothing is due). Throws when the refresh ceiling is reached.
+   */
+  public async refreshFor(
+    plannedDecisionMs: number,
+    signal?: AbortSignal,
+  ): Promise<readonly PaperSecurityEvidenceComponent[]> {
+    const due = this.componentsDueAt(plannedDecisionMs);
+    if (due.length === 0) return due;
+    if (this.refreshes >= this.maxRefreshes) {
+      this.refusedRefreshes++;
+      throw new Error("PAPER_SECURITY_CACHE_REFRESH_CEILING_REACHED");
+    }
+    this.refreshes++;
+    const requestedAtMs = this.loader.now();
+    const loaded = await this.loader.load(this.target, signal, due);
+    const record = this.loader.getStatus().records.at(-1);
+    const next: Record<string, unknown> = { ...this.evidence };
+    const apply = (
+      component: PaperSecurityEvidenceComponent,
+      key: keyof PaperCandidateSecurityEvidence,
+      outcome: PaperSecurityEvidenceComponentOutcome | undefined,
+      retrievedAtMs: number | null,
+    ) => {
+      if (!due.includes(component) || !outcome) return;
+      // Never sent: keep the earlier evidence (it ages out on its original time).
+      if (outcome.status !== "RETRIEVED" && outcome.sessionSeqs.length === 0) return;
+      next[key] = loaded[key] ?? null;
+      this.retrievedAt[component] = outcome.status === "RETRIEVED" ? retrievedAtMs : null;
+    };
+    const lp = loaded.lp as { retrievedAtIso?: unknown } | null | undefined;
+    apply(
+      "LP",
+      "lp",
+      record?.lp,
+      typeof lp?.retrievedAtIso === "string" ? Date.parse(lp.retrievedAtIso) : null,
+    );
+    apply(
+      "MINT_ACCOUNT",
+      "mintAccount",
+      record?.mintAccount,
+      loaded.mintAccount?.retrievedAtMs ?? null,
+    );
+    apply("RUGCHECK", "rugCheck", record?.rugCheck, loaded.rugCheck?.retrievedAtMs ?? null);
+    apply("BUNDLER", "bundler", record?.bundler, loaded.bundler?.retrievedAtMs ?? null);
+    this.evidence = Object.freeze(next as PaperCandidateSecurityEvidence);
+    this.records.push(
+      Object.freeze({
+        refresh: this.refreshes,
+        requestedAtMs,
+        plannedDecisionMs,
+        components: Object.freeze([...due]),
+        completedAtMs: this.loader.now(),
+      }),
+    );
+    return due;
   }
 }

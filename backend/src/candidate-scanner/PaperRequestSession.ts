@@ -127,6 +127,10 @@ export interface PaperRequestDispatch {
   readonly linkSignals?: (() => readonly AbortSignal[]) | undefined;
   /** Called exactly once, synchronously, when the request is counted and about to be sent. */
   readonly onDispatched?: ((entry: PaperRequestLedgerEntry) => void) | undefined;
+  /** Owner's own per-request timeout; the stricter of this and the session's applies. */
+  readonly timeoutMs?: number | undefined;
+  /** Owner's own body ceiling; the stricter of this and the lane's applies. */
+  readonly maxResponseBytes?: number | undefined;
 }
 
 export interface PaperRequestSessionStatus {
@@ -142,6 +146,8 @@ export interface PaperRequestSessionStatus {
   readonly inFlight: number;
   readonly activeTimers: number;
   readonly ledger: readonly PaperRequestLedgerEntry[];
+  /** Refused (never sent, never counted) requests by reason, for observability. */
+  readonly refusalsByReason: Readonly<Record<string, number>>;
 }
 
 /** Session stops: the first cause wins and every listener (flow provider, loader) is told once. */
@@ -215,6 +221,13 @@ export function validatePaperRequestSessionLimits(limits: unknown): PaperRequest
   });
 }
 
+/** The stricter (smaller) of a session limit and an owner's optional positive limit. */
+function stricter(sessionLimit: number, ownerLimit: number | undefined): number {
+  return typeof ownerLimit === "number" && Number.isSafeInteger(ownerLimit) && ownerLimit > 0
+    ? Math.min(sessionLimit, ownerLimit)
+    : sessionLimit;
+}
+
 function cancelResponseBody(response: Response, reason: string): void {
   if (response.body) void boundedCancel(response.body, new Error(reason), 500);
 }
@@ -248,6 +261,7 @@ export class PaperRequestSession {
   private readonly inFlightByLane = laneRecord(() => 0);
   private readonly maxConcurrentByLane = laneRecord(() => 0);
   private jsonRpcIdSeq = 0;
+  private readonly refusalsByReason: Record<string, number> = {};
 
   constructor(options: PaperRequestSessionOptions) {
     if (!options || typeof options !== "object") {
@@ -343,6 +357,7 @@ export class PaperRequestSession {
       inFlight: PAPER_REQUEST_LANES.reduce((n, lane) => n + this.inFlightByLane[lane], 0),
       activeTimers: this.activeTimers.size,
       ledger: Object.freeze(this.ledger.map((e) => Object.freeze({ ...e }))),
+      refusalsByReason: Object.freeze({ ...this.refusalsByReason }),
     });
   }
 
@@ -413,6 +428,7 @@ export class PaperRequestSession {
   }
 
   private refuse(error: string): PaperRequestExchange {
+    this.refusalsByReason[error] = (this.refusalsByReason[error] ?? 0) + 1;
     if (SESSION_TERMINAL_REFUSALS.has(error)) this.stop(error);
     return { dispatched: false, ok: false, bodyComplete: false, error };
   }
@@ -467,7 +483,12 @@ export class PaperRequestSession {
         this.inFlightByLane[lane],
       );
       req.onDispatched?.(entry);
-      return await this.exchange(req, entry, laneLimits.maxResponseBytes);
+      return await this.exchange(
+        req,
+        entry,
+        stricter(laneLimits.maxResponseBytes, req.maxResponseBytes),
+        stricter(this.limits.requestTimeoutMs, req.timeoutMs),
+      );
     } finally {
       release();
     }
@@ -477,6 +498,7 @@ export class PaperRequestSession {
     req: PaperRequestDispatch,
     entry: MutableLedgerEntry,
     maxResponseBytes: number,
+    timeoutMs: number,
   ): Promise<PaperRequestExchange> {
     const controller = new AbortController();
     let timedOut = false;
@@ -487,7 +509,7 @@ export class PaperRequestSession {
     const timer = this.setTimer(() => {
       timedOut = true;
       controller.abort();
-    }, this.limits.requestTimeoutMs);
+    }, timeoutMs);
     let abortReject: ((e: Error) => void) | undefined;
     const aborted = new Promise<never>((_, reject) => {
       abortReject = reject;

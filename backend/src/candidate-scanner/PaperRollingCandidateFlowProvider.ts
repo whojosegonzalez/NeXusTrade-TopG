@@ -108,6 +108,8 @@ const TERMINAL_REFUSALS: ReadonlySet<string> = new Set([
   // A stopped or unopened shared session ends collection instead of being retried.
   "REQUEST_SESSION_STOPPED",
   "REQUEST_SESSION_NOT_OPEN",
+  // The shared Solana lane is exhausted: permanent for this session (counters are never reset).
+  "SOLANA_RPC_ATTEMPT_CEILING_REACHED",
 ]);
 
 /**
@@ -1654,6 +1656,9 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         }
         return linked;
       },
+      // The provider's own (possibly stricter) limits apply even in a shared session.
+      timeoutMs: this.limits.requestTimeoutMs,
+      maxResponseBytes: this.limits.maxResponseBytes,
       onDispatched: (entry) => {
         this.ledger.push({ entry, epoch: this.currentEpoch ?? 0 });
         if (purpose === "TRANSACTION_RETRIEVAL") this.transactionRetrievals++;

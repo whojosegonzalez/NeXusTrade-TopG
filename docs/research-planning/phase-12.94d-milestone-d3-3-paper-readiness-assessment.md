@@ -4409,16 +4409,13 @@ Every test also checks the shared invariants:
 - each lane's pacing, with no Solana overlap;
 - every dispatch before the deadline.
 
-**Finding: loading evidence during the entry path makes active flow stale under the current limits.**
+**Finding (tested in-path schedules only): loading evidence inside the entry path made active flow stale in every tested launch time.**
 
 - **Cause**: the load's three Solana requests are paced into the middle of a flow refresh (between `GET_SLOT` and `GET_BLOCK_TIME`). That delays the next publication past the final decision.
 - **Measured effect**: across thirteen launch times (0 to 15 s after the first fresh active window), the load took 10.4 to 14.9 s. In every case the newest snapshot at the final decision was more than 15 s old, and the decision correctly rejected it.
 - **Security evidence**: stayed just within its 15 s limit.
-- **Consequence**: with 2,500 ms shared Solana pacing, in-path loading cannot coexist with fresh active-window flow. Arming with fresh flow and valid security was shown (I-01) only with a fast mocked loader.
-- **Open design decision** (not approved; nothing changed here):
-  - loading evidence ahead of the decision and reusing it while still fresh;
-  - a separately budgeted Solana allowance for security requests;
-  - accepting that entries can arm only in quieter refresh phases.
+- **Scope of the result** (corrected): this holds for the thirteen tested in-path schedules, not for every possible schedule. Prefetching outside the decision path does fit the unchanged constraints (see Prefetch and Selective Refresh below).
+- **Design choice made later**: prefetch on the existing shared session; no separate Solana allowance or independent Solana lane (see below).
 
 - **Mutation checks** (sources restored byte-identical afterwards), each failing the expected tests:
   - disabling lane pacing (R2 to R15, B-01 to B-06);
@@ -4465,6 +4462,94 @@ The backend typecheck, ESLint and Prettier checks pass, each under an external l
 
   **Before installation**, the fixed-candidate PAPER mode should disable discovery, Birdeye polling, watchlist polling and radar sampling (a fixed candidate does not need them). It should route its one spot request through the session's `DEXSCREENER` lane and its security evidence through this loader, so that every request is in the one ledger. Anything retained must get its own explicit lane and ceiling.
 
+#### Boundary Corrections and Prefetch (Review of `da932fc`)
+
+Independent review of `da932fc` passed 106 focused tests and compilation, and reproduced two boundary defects. Both are corrected. Prefetching was then added under the existing shared session, with no separate Solana allowance and no independent Solana lane.
+
+1. **Solana-lane exhaustion no longer spins**:
+   - **Before**: with the Solana lane capped at five requests and global capacity remaining, the provider received `SOLANA_RPC_ATTEMPT_CEILING_REACHED` twenty times at the same virtual instant (+72,750 ms) until stopped by the auditor.
+   - **Now**: the lane refusal is terminal for flow collection. The provider stops once, withdraws every snapshot and settles. The session stays open, other lanes keep working, and no counter is reset.
+   - **Observability**: the session now records refusals by reason (never sent, never counted).
+2. **The provider's stricter limits apply in a shared session**:
+   - **Before**: shared mode checked pacing compatibility but used the session's timeout and response-size limits.
+   - **Now**: every dispatch carries the owner's own timeout and body limit, and the stricter of the owner's and the session's (or lane's) applies per request. Serialization and shared accounting are unchanged. The loader, which has no stricter limits of its own, uses the session's.
+
+#### Prefetch and Selective Refresh
+
+`PaperSecurityEvidenceCache` (in `PaperCandidateSecurityEvidenceLoader.ts`) is a small candidate-bound cache on top of the existing loader. The loader's `load()` now also accepts a component subset.
+
+- **Before the decision**: `refreshFor(plannedDecisionMs)` retrieves only the components that are missing, were not retrieved, or would be older than the unchanged 15 s at the planned decision time. The rule is exact: 15,000 ms is reusable, 15,001 ms is due.
+- **Pure reads**: `getEvidence()` and the cache's security path for the entry helper never acquire. Evidence keeps its original retrieval time, and the composition alone decides validity at the actual decision time. Nothing is extended or re-stamped.
+- **Fail closed**: a dispatched refresh attempt always replaces the cached component, even when the new response is unusable. A refused, never-sent attempt leaves the earlier evidence to age out on its original time.
+- **Bounded**: refreshes are explicit calls, limited by `maxRefreshes` and the loader's own load ceiling. There is no polling and no automatic budget renewal.
+- **One boundary**: everything still runs through the one session ledger and the one serialized Solana lane, with unchanged freshness, pacing, deadlines, thresholds and invalidation rules.
+
+**Measured passing schedule (B-10; synthetic chain, offline test limits)**. Times are relative to collection start.
+
+| Time           | Event                                                                                                                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 45.4–55.45 s   | Flow: three transaction retrievals                                                                                                                                                         |
+| 59.0 s         | Prefetch (5 requests): mint account (Solana), RugCheck, bundlers                                                                                                                           |
+| 61.5 s, 64.1 s | Prefetch: LP pool account and account batch (Solana; LP retrieved 64.2 s)                                                                                                                  |
+| 67.65–72.75 s  | Flow refresh (`GET_SLOT`, `GET_BLOCK_TIME`, history), not delayed by the prefetch; first active window published 72.75 s                                                                   |
+| 72.85 s        | **Arm** (`ARMED_FIRST_TICK`). Flow cutoff age 5.85 s; LP 8.65 s; mint, RugCheck and bundler 13.85 s                                                                                        |
+| 72.85–77.75 s  | Selective refresh for a confirmation 5 s later: mint account, RugCheck, bundlers (3 requests; LP reused). The mint request waits behind flow's `GET_SLOT` (75.15 s) and is sent at 77.65 s |
+| 77.95 s        | **Confirm** (`RETEST_CONFIRMED`). Flow cutoff age 10.95 s (same snapshot); LP 13.75 s; mint 0.3 s; RugCheck and bundler 5.1 s                                                              |
+
+The whole sequence used 8 security requests (5 + 3) and passed pre-admission and every gate at both decisions under the unchanged rules.
+
+**Measured prefetch sweep** (same chain; arm at the first fresh active tick; refresh for a confirmation 5 s later):
+
+| Prefetch at          | Arm                       | Confirm              | Limiting condition                                                                                                               |
+| -------------------- | ------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 45, 50, 55 s         | rejected at pre-admission | flow stale (85.35 s) | prefetched components older than 15 s at the 72.85 s arm; the later full refresh delays flow                                     |
+| 57 s                 | Gate 11 rejects           | (no armed state)     | RugCheck and bundler 15.85 s old at the arm (850 ms over)                                                                        |
+| **59, 61, 63, 65 s** | **armed**                 | **confirmed**        | oldest component at most 13.85 s at either decision                                                                              |
+| 68, 72 s             | rejected                  | (no armed state)     | the prefetch's Solana requests fall inside the first refresh and push the arm to 87.85 s, by which time components are over 15 s |
+
+**Rejections retained (B-11)**:
+
+- **No refresh** (the reviewer's scheduling regression): prefetch at +60 s and arm at 72.85 s. The confirmation at 77.95 s is rejected because the mint account is 17.95 s old (`PRE_ADMISSION_REJECTED:REJECTED_UNKNOWN_FREEZE_AUTHORITY`). Freshness is not extended.
+- **Withdrawal**: a disconnect right after the arm withdraws the flow; with fresh security the confirmation is `BUY_GATE_REJECTED` (`EPOCH_INVALIDATED`).
+- **Exhausted refresh budget**: with one refresh allowed, the second is refused before any request, and the confirmation is rejected.
+
+**Tests and checks**:
+
+- **New tests**: B-08 (Solana-lane exhaustion during a refresh: exactly one refusal, prompt settle, snapshots withdrawn, other lanes working, global and provider capacity remaining), B-09 (both stricter-limit mismatches: a 6 s `GET_SLOT` times out at the provider's 5 s inside a 9 s session; a 90 KB response is rejected under the provider's 64 KiB inside a 128 KiB lane), B-10 and B-11. The shared-session suite is now 11/11.
+- **Mutation checks** (sources restored byte-identical afterwards), each caught:
+  - Solana-lane exhaustion made non-terminal: the run hangs in the original spin and is killed at the 60 s limit;
+  - the provider timeout or body limit not applied, or the looser limit chosen (B-09);
+  - refreshing every component (B-10);
+  - ignoring the refresh ceiling (B-11);
+  - a decision read that acquires (B-10, B-11);
+  - a refresh-due rule extended by 1 s (B-10).
+- **Results**: 479 tests in 14 suites pass, run in two groups each under an external 60 s limit:
+
+| Suite                               | Passed  |
+| ----------------------------------- | ------- |
+| `PaperSessionEvidenceIntegration`   | 11/11   |
+| `PaperDaemonEntryIntegration`       | 7/7     |
+| `PaperTradingDaemon`                | 100/100 |
+| `PaperCandidateSecurityContext`     | 11/11   |
+| `PaperRollingCandidateFlowProvider` | 15/15   |
+| `CandidateFlowProvider`             | 54/54   |
+| `PaperActiveWindowQualification`    | 12/12   |
+| `LpScreeningBridge`                 | 34/34   |
+| `RaydiumAmmV4LpEvidenceAdapter`     | 22/22   |
+| `PaperSolanaTrackerBundlerAdapter`  | 23/23   |
+| `BuyGateTriggerService`             | 64/64   |
+| `SolanaRpcMintAccountParser`        | 6/6     |
+| `CandidateStreamEngine`             | 25/25   |
+| `CandidateDecisionDiagnostic`       | 95/95   |
+
+The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None of the processes started is left running. All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic timing**: the passing window (prefetch 59–65 s) depends on this synthetic chain's swap times, warm-up and 100 ms latencies. It is a measured example, not a general guarantee.
+- **The schedule is set by the test**: the cache only decides what is due. Choosing when to prefetch, and the planned decision times, is the caller's; no runtime scheduler was added.
+- **Tight margins**: the measured margins are small (LP 13.75 s and mint 13.85 s at the decisions; prefetch at 57 s misses by 850 ms).
+
 #### Completed Versus Remaining
 
 | Item                                                                                         | State                                                                                                                                                                                                                                                                             |
@@ -4472,7 +4557,9 @@ The backend typecheck, ESLint and Prettier checks pass, each under an external l
 | One request-accounting boundary (ledger, ceiling, Solana pacing) shared by flow and security | Done offline (§8.33)                                                                                                                                                                                                                                                              |
 | Bounded security-evidence retrieval reusing the accepted components                          | Done offline (§8.33)                                                                                                                                                                                                                                                              |
 | Entry path with pre-admission and final-time revalidation                                    | Done offline (§8.32)                                                                                                                                                                                                                                                              |
-| **In-path loading versus fresh active flow**                                                 | **Remaining design decision** (finding above)                                                                                                                                                                                                                                     |
+| Prefetch and selective refresh on the shared session                                         | Done offline (§8.33): one passing arm-and-confirm schedule measured; in-path loading remains unsuitable in the tested schedules                                                                                                                                                   |
+| Solana-lane exhaustion and the provider's stricter limits in a shared session                | Corrected offline (§8.33)                                                                                                                                                                                                                                                         |
+| **Prefetch scheduling at runtime**                                                           | **Remaining**: when to prefetch and refresh relative to flow refreshes, with explicit bounds, chosen by the future installation                                                                                                                                                   |
 | **Legacy traffic**                                                                           | **Remaining**: disable or account the daemon's discovery, polling and spot traffic in the fixed-candidate mode                                                                                                                                                                    |
 | **Validated scanner LP mode**                                                                | **Remaining**: `CandidateStreamEngine` with `requireValidatedLp`, an LP evidence resolver and an LP freshness policy                                                                                                                                                              |
 | **Lifecycle wiring**                                                                         | **Remaining**: explicit selection of one pool and mint; opening and stopping the session with the daemon; `setCandidateFlowProvider` with the shared session; injecting the loader as the security path; obtaining the Solana Tracker key through the existing configuration path |

@@ -21,8 +21,10 @@ import {
 } from "../candidate-scanner/PaperRequestSession.js";
 import {
   PaperCandidateSecurityEvidenceLoader,
+  PaperSecurityEvidenceCache,
   type PaperSecurityEvidenceLoaderLimits,
 } from "../candidate-scanner/PaperCandidateSecurityEvidenceLoader.js";
+import type { ArmedPullbackState } from "../candidate-scanner/BuyGateTriggerService.js";
 import {
   evaluatePaperCandidateSecurityContext,
   type PaperCandidateSecurityEvidence,
@@ -92,6 +94,16 @@ type Overrides = {
   readonly rugCheck?: (now: number) => Response;
   readonly bundlers?: (now: number) => Response;
   readonly latencyFor?: (methodOrPath: string, now: number) => number | undefined;
+  readonly respond?: Parameters<typeof createHarness>[0] extends infer O
+    ? O extends { readonly respond?: infer R }
+      ? R
+      : never
+    : never;
+  readonly providerLimits?: Parameters<typeof createHarness>[0] extends infer O
+    ? O extends { readonly limits?: infer L }
+      ? L
+      : never
+    : never;
 };
 
 /** Harness with one shared session over the SYNTHETIC transport (flow, security and spot). */
@@ -99,6 +111,8 @@ function sharedHarness(o: Overrides = {}) {
   const h = createHarness({
     swaps: ACTIVE_SWAPS,
     ...(o.latencyFor ? { latencyFor: o.latencyFor } : {}),
+    ...(o.respond ? { respond: o.respond } : {}),
+    ...(o.providerLimits ? { limits: o.providerLimits } : {}),
     rpcResult: (method, params) => {
       if (method === "getAccountInfo" && params[0] === MINT) {
         return { result: (syntheticMintAccountResponse() as { result: unknown }).result };
@@ -729,5 +743,313 @@ describe("Shared PAPER request session: flow + security loader + spot (synthetic
     });
     expect(env.h.fetchLog.length).toBe(sent);
     expect(env.session.getStatus().activeTimers).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Boundary corrections and prefetch with selective refresh
+// ---------------------------------------------------------------------------------------------
+
+type PrefetchTimeline = {
+  prefetchAtMs?: number;
+  prefetchRetrievedAt?: Readonly<Record<string, number | null>>;
+  armAtMs?: number;
+  armFlowCutoffAgeMs?: number | null;
+  armSecurityAgesMs?: Record<string, number | null>;
+  refreshComponents?: readonly string[];
+  refreshError?: string;
+  refreshCompletedAtMs?: number;
+  confirmAtMs?: number;
+  confirmFlowCutoffAgeMs?: number | null;
+  confirmSecurityAgesMs?: Record<string, number | null>;
+};
+
+const ages = (cache: PaperSecurityEvidenceCache, atMs: number) =>
+  Object.fromEntries(
+    Object.entries(cache.getStatus().retrievedAtMs).map(([k, v]) => [
+      k,
+      v === null ? null : atMs - v,
+    ]),
+  );
+const cutoffAge = (e: Entry | undefined) =>
+  e && e.kind === "EVALUATED"
+    ? (e.decision.flowResult.paperQualificationContext?.cutoffAgeMs ?? null)
+    : null;
+
+/**
+ * SYNTHETIC prefetch schedule: one prefetch, an arm at the first fresh active tick, an optional
+ * selective refresh for a confirmation `confirmDelayMs` later, then the confirmation.
+ */
+async function runPrefetchSchedule(
+  env: ReturnType<typeof sharedHarness>,
+  opts: {
+    readonly prefetchAtMs: number;
+    readonly confirmDelayMs: number;
+    readonly refreshBeforeConfirm: boolean;
+    readonly maxRefreshes?: number;
+    readonly afterArm?: () => void;
+  },
+) {
+  const { h, session } = env;
+  const cache = new PaperSecurityEvidenceCache({
+    loader: env.loader,
+    target: { poolId: POOL_ID, mintAddress: MINT },
+    limits: { maxRefreshes: opts.maxRefreshes ?? 3 },
+  });
+  const timeline: PrefetchTimeline = {};
+  let armed: ArmedPullbackState | undefined;
+  let arm: Entry | undefined;
+  let confirm: Entry | undefined;
+  let prefetched = false;
+  let armLaunched = false;
+  const pending: Promise<unknown>[] = [];
+  const decide = (spotPriceSol: number, existing?: ArmedPullbackState) =>
+    retrieveAndEvaluatePaperDaemonEntry({
+      candidate: synthCandidate(),
+      flowProvider: h.provider,
+      getExistingArmedState: () => existing,
+      clock: h.clock,
+      retrievals: {
+        fetchSpotInfo: sessionSpot(session, spotPriceSol),
+        fetchRugCheckMetrics: async () => {
+          throw new Error("the direct RugCheck retrieval must not be used");
+        },
+      },
+      security: cache.asSecurityPath(),
+    }) as Promise<Entry>;
+
+  session.open();
+  const collection = h.provider.start();
+  h.sched.at(START_MS + opts.prefetchAtMs, () => {
+    timeline.prefetchAtMs = opts.prefetchAtMs;
+    pending.push(
+      cache.refreshFor(START_MS + opts.prefetchAtMs + 15_000).then(() => {
+        prefetched = true;
+        timeline.prefetchRetrievedAt = Object.fromEntries(
+          Object.entries(cache.getStatus().retrievedAtMs).map(([k, v]) => [
+            k,
+            v === null ? null : v - START_MS,
+          ]),
+        );
+      }),
+    );
+  });
+  const tick = () => {
+    if (h.provider.getStatus().state === "STOPPED") return;
+    if (
+      !armLaunched &&
+      prefetched &&
+      isFreshActive(h.provider.getCandidateFlow(TARGET, h.sched.now))
+    ) {
+      armLaunched = true;
+      pending.push(
+        decide(PEAK_SOL).then(async (e) => {
+          if (e.kind === "NO_ACTIVE_DEX_PAIR") throw new Error("SYNTHETIC spot missing");
+          arm = e;
+          timeline.armAtMs = e.decisionNowMs - START_MS;
+          timeline.armFlowCutoffAgeMs = cutoffAge(e);
+          timeline.armSecurityAgesMs = ages(cache, e.decisionNowMs);
+          if (e.kind === "EVALUATED" && e.decision.outcome === "ARMED_FIRST_TICK") {
+            armed = e.decision.retestResult.updatedArmedState;
+          }
+          opts.afterArm?.();
+          const planned = e.decisionNowMs + opts.confirmDelayMs;
+          if (opts.refreshBeforeConfirm) {
+            try {
+              timeline.refreshComponents = await cache.refreshFor(planned);
+            } catch (err) {
+              timeline.refreshError = err instanceof Error ? err.message : String(err);
+            }
+            timeline.refreshCompletedAtMs = h.clock() - START_MS;
+          }
+          const at = Math.max(planned, h.clock());
+          await new Promise<void>((resolve) => h.sched.at(at, () => resolve()));
+          const c = await decide(PEAK_SOL * 0.88, armed);
+          if (c.kind === "NO_ACTIVE_DEX_PAIR") throw new Error("SYNTHETIC spot missing");
+          confirm = c;
+          timeline.confirmAtMs = c.decisionNowMs - START_MS;
+          timeline.confirmFlowCutoffAgeMs = cutoffAge(c);
+          timeline.confirmSecurityAgesMs = ages(cache, c.decisionNowMs);
+        }),
+      );
+    }
+    h.sched.add(tick, 250, "harness", true);
+  };
+  h.sched.add(tick, 0, "harness", true);
+  h.sched.at(START_MS + 140_000, () => h.provider.stop("TEST_WINDOW_END"), true);
+  const report = await drive(h.sched, collection);
+  await drive(h.sched, Promise.all(pending));
+  session.stop("TEST_END");
+  await drive(h.sched, Promise.resolve());
+  return { report, cache, timeline, arm, confirm };
+}
+
+describe("Shared-session boundary corrections and evidence prefetch (synthetic, offline)", () => {
+  it("B-08: an exhausted Solana lane during a refresh ends flow collection once, while global and provider capacity remain", async () => {
+    const env = sharedHarness({
+      lanes: { SOLANA_RPC: { maxAttempts: 6, pacingMs: 2_500, maxResponseBytes: 65_536 } },
+    });
+    env.session.open();
+    // Collection ends by itself (no test stop is scheduled), promptly and exactly once.
+    const report = await drive(env.h.sched, env.h.provider.start());
+    // Other lanes keep working after the Solana lane is exhausted; the session is still open.
+    expect(env.session.isOpen()).toBe(true);
+    await drive(
+      env.h.sched,
+      env.loader.load({ poolId: POOL_ID, mintAddress: MINT }, undefined, ["RUGCHECK"]),
+    );
+    env.session.stop("TEST_END");
+    const status = env.session.getStatus();
+    // Setup (2) + three retrievals + GET_SLOT = 6; the refresh's GET_BLOCK_TIME is refused.
+    expect(report.status.ledger.map((e) => e.purpose).at(-1)).toBe("GET_SLOT");
+    expect(report.stopReason).toBe("SOLANA_RPC_ATTEMPT_CEILING_REACHED");
+    expect(status.refusalsByReason.SOLANA_RPC_ATTEMPT_CEILING_REACHED).toBe(1);
+    expect(report.status.stoppedAtMs).toBe(report.status.ledger.at(-1)!.completedAtMs);
+    expect(report.status.snapshots.every((s) => s.withdrawnReason !== null)).toBe(true);
+    expect(env.h.provider.getCandidateFlow(TARGET, env.h.clock()).diagnosticReason).toContain(
+      "PAPER_ROLLING_FLOW_STOPPED: SOLANA_RPC_ATTEMPT_CEILING_REACHED",
+    );
+    // Global (330) and provider-local (300) capacity remained; counters were not reset.
+    expect(status.httpAttempts).toBeLessThan(SESSION_TEST_LIMITS.maxHttpAttempts);
+    expect(report.status.httpAttempts).toBeLessThan(300);
+    expect(status.attemptsByLane.SOLANA_RPC).toBe(6);
+    expect(status.attemptsByLane.RUGCHECK).toBe(1);
+    expect(env.loader.getStatus().records[0]!.rugCheck.status).toBe("RETRIEVED");
+    expect(status.stopReason).toBe("TEST_END"); // the session itself was not stopped by the lane
+    expectSessionInvariants(status);
+  });
+
+  it("B-09: the provider's stricter timeout and response limit apply inside a looser shared session", async () => {
+    // Shared timeout 9,000 ms; provider timeout 5,000 ms; the first GET_SLOT takes 6,000 ms.
+    const slow = sharedHarness({
+      session: { requestTimeoutMs: 9_000 },
+      latencyFor: (m, now) => (m === "getSlot" && now < START_MS + 70_000 ? 6_000 : undefined),
+    });
+    await runShared(slow, { stopAtMs: 90_000 });
+    const slot = slow.session.getStatus().ledger.find((e) => e.purpose === "GET_SLOT")!;
+    expect(slot.error).toBe("REQUEST_TIMED_OUT");
+    expect(slot.completedAtMs! - slot.dispatchedAtMs).toBe(5_000);
+    expect(slot.bodyComplete).toBe(false);
+
+    // Shared Solana body limit 131,072 bytes; provider limit 65,536; the first GET_SLOT is ~90 KB.
+    const large = sharedHarness({
+      lanes: { SOLANA_RPC: { maxAttempts: 315, pacingMs: 2_500, maxResponseBytes: 131_072 } },
+      respond: (ctx) =>
+        ctx.method === "getSlot" && ctx.call === 1
+          ? new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: ctx.id, result: 1, pad: "x".repeat(90_000) }),
+              { status: 200 },
+            )
+          : undefined,
+    });
+    await runShared(large, { stopAtMs: 90_000 });
+    const big = large.session.getStatus().ledger.find((e) => e.purpose === "GET_SLOT")!;
+    expect(big).toMatchObject({ error: "RESPONSE_TOO_LARGE", bodyComplete: false });
+    // The loader's requests still use the session's own (looser) lane limit.
+    for (const env of [slow, large]) expectSessionInvariants(env.session.getStatus());
+  });
+
+  it("B-10: prefetch with selective refresh keeps flow and every security component fresh at both the arm and the confirmation", async () => {
+    const env = sharedHarness();
+    const run = await runPrefetchSchedule(env, {
+      prefetchAtMs: 59_000,
+      confirmDelayMs: 5_000,
+      refreshBeforeConfirm: true,
+    });
+    const { arm, confirm, timeline, cache } = run;
+    expect(arm?.kind).toBe("EVALUATED");
+    expect(confirm?.kind).toBe("EVALUATED");
+    if (arm?.kind !== "EVALUATED" || confirm?.kind !== "EVALUATED") return;
+    expect(arm.decision.outcome).toBe("ARMED_FIRST_TICK");
+    expect(confirm.decision.outcome).toBe("RETEST_CONFIRMED");
+    for (const e of [arm, confirm]) {
+      const ctx = e.security!.context;
+      expect(ctx.preAdmission.passed).toBe(true);
+      expect([
+        ctx.lp.status,
+        ctx.authorities.status,
+        ctx.rugCheck.status,
+        ctx.bundler.status,
+      ]).toEqual(["AVAILABLE_QUALIFIED", "AVAILABLE", "AVAILABLE", "QUALIFIED_PAPER_PROXY"]);
+      expect(e.decision.flowResult.isCoverageSufficient).toBe(true);
+      expect(e.decision.flowResult.paperQualificationContext!.cutoffAgeMs).toBeLessThanOrEqual(
+        15_000,
+      );
+    }
+    for (const a of [timeline.armSecurityAgesMs!, timeline.confirmSecurityAgesMs!]) {
+      for (const age of Object.values(a)) expect(age!).toBeLessThanOrEqual(15_000);
+    }
+    // Selective: only the components that would expire before the confirmation were refreshed.
+    expect(timeline.refreshComponents).toEqual(["MINT_ACCOUNT", "RUGCHECK", "BUNDLER"]);
+    // The due rule is the unchanged 15 s limit, exactly: 15,000 ms is reusable, 15,001 ms is not.
+    const retrieved = cache.getStatus().retrievedAtMs;
+    expect(cache.componentsDueAt(retrieved.MINT_ACCOUNT! + 15_000)).not.toContain("MINT_ACCOUNT");
+    expect(cache.componentsDueAt(retrieved.MINT_ACCOUNT! + 15_001)).toContain("MINT_ACCOUNT");
+    expect(cache.componentsDueAt(retrieved.LP! + 15_000)).not.toContain("LP");
+    expect(cache.componentsDueAt(retrieved.LP! + 15_001)).toContain("LP");
+    const security = env.session.getStatus().ledger.filter((e) => e.owner === "SECURITY");
+    expect(security.filter((e) => e.purpose === "LP_ACQUISITION")).toHaveLength(2); // prefetch only
+    expect(security).toHaveLength(5 + 3);
+    expect(cache.getStatus().refreshes).toBe(2);
+    // Decision reads never acquired: every security request belongs to one of the two refreshes.
+    const refreshWindows = cache.getStatus().records.map((r) => [r.requestedAtMs, r.completedAtMs]);
+    expect(
+      security.every((e) =>
+        refreshWindows.some(([from, to]) => e.dispatchedAtMs >= from! && e.dispatchedAtMs <= to!),
+      ),
+    ).toBe(true);
+    expectSessionInvariants(env.session.getStatus());
+  });
+
+  it("B-11: without a refresh, after a withdrawal, or with the refresh budget spent, the confirmation is rejected", async () => {
+    // Scheduling regression: prefetch at +60 s, arm, then confirm 5 s later without a refresh.
+    const noRefresh = await runPrefetchSchedule(sharedHarness(), {
+      prefetchAtMs: 60_000,
+      confirmDelayMs: 5_000,
+      refreshBeforeConfirm: false,
+    });
+    expect(noRefresh.arm?.kind === "EVALUATED" && noRefresh.arm.decision.outcome).toBe(
+      "ARMED_FIRST_TICK",
+    );
+    expect(noRefresh.confirm?.kind).toBe("SECURITY_REJECTED");
+    if (noRefresh.confirm?.kind === "SECURITY_REJECTED") {
+      expect(noRefresh.confirm.security?.context.authorities.status).toBe(
+        "STALE_RETRIEVAL_EVIDENCE",
+      );
+      expect(noRefresh.confirm.reason).toBe(
+        "PRE_ADMISSION_REJECTED:REJECTED_UNKNOWN_FREEZE_AUTHORITY",
+      );
+    }
+
+    // Withdrawal: a disconnect right after the arm withdraws the flow; fresh security cannot confirm.
+    const withdrawnEnv = sharedHarness();
+    const withdrawn = await runPrefetchSchedule(withdrawnEnv, {
+      prefetchAtMs: 59_000,
+      confirmDelayMs: 5_000,
+      refreshBeforeConfirm: true,
+      afterArm: () => withdrawnEnv.h.transports.at(-1)!.emitClose(),
+    });
+    expect(withdrawn.confirm?.kind).toBe("EVALUATED");
+    if (withdrawn.confirm?.kind === "EVALUATED") {
+      expect(withdrawn.confirm.security?.context.preAdmission.passed).toBe(true);
+      expect(withdrawn.confirm.decision.flowResult.diagnosticReason).toContain("EPOCH_INVALIDATED");
+      expect(withdrawn.confirm.decision.outcome).toBe("BUY_GATE_REJECTED");
+    }
+
+    // Refresh budget spent (one refresh only): no further request, and the confirmation is rejected.
+    const spentEnv = sharedHarness();
+    const spent = await runPrefetchSchedule(spentEnv, {
+      prefetchAtMs: 59_000,
+      confirmDelayMs: 5_000,
+      refreshBeforeConfirm: true,
+      maxRefreshes: 1,
+    });
+    expect(spent.timeline.refreshError).toBe("PAPER_SECURITY_CACHE_REFRESH_CEILING_REACHED");
+    expect(spent.cache.getStatus().refusedRefreshes).toBe(1);
+    expect(spentEnv.session.getStatus().ledger.filter((e) => e.owner === "SECURITY")).toHaveLength(
+      5,
+    );
+    expect(spent.confirm?.kind).toBe("SECURITY_REJECTED");
+    for (const env of [withdrawnEnv, spentEnv]) expectSessionInvariants(env.session.getStatus());
   });
 });
