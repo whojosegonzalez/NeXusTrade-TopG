@@ -3793,7 +3793,7 @@ These figures assume latencies stay within the measured range. They are estimate
 3. **Decision time basis (review item)**:
    - **Problem**: Loop B captures `currentNow` once, before its network calls, so a candidate's flow freshness is judged at a time earlier than its price fetch.
    - **Change**: pass a timestamp taken immediately before `evaluatePaperDaemonEntryDecision`.
-   - **Effect**: freshness is measured at the actual decision moment. That is stricter, not looser.
+   - **Effect**: freshness is measured at the actual decision moment. (Qualified in §8.30: this rejects evidence that expired during the retrievals and also admits a newer snapshot published before the decision; thresholds are unchanged.)
 
 #### Focused Offline Tests (Synthetic Clock, Injected Transport and RPC)
 
@@ -4014,7 +4014,7 @@ Independent review accepted the §8.29 execution-boundary corrections at `3ffafa
   - **Acquisition-derived fields** keep their times: the preliminary market observation, the `NO_ACTIVE_DEX_PAIR` rejection (no entry decision is made), and the fallback pool record's `fetchedAt`, `openTimeSec` and `poolOpenTimeMs`.
   - **Evidence** is never re-stamped. Freshness is still derived from each snapshot's own cutoff against the unchanged 15,000 ms limit. Acquisition, cutoff and publication times are preserved.
   - **Loop scheduling** is unchanged: the scan interval, warm-up, cooldown, observation-duration check and the 120 s armed-state prune still use the loop-start time.
-- **Strategy unchanged**: the `PAPER_SIMULATION` context, the 15 s freshness limit, the 90/120 s retest expiry, disarming on `BUY_GATE_REJECTED` and every threshold are unchanged. The correction is stricter, not looser: evidence that ages during the retrievals is now rejected.
+- **Strategy unchanged**: the `PAPER_SIMULATION` context, the 15 s freshness limit, the 90/120 s retest expiry, disarming on `BUY_GATE_REJECTED` and every threshold are unchanged. The correction is not simply stricter. Judged at the actual decision time, evidence that expired during the retrievals is rejected, and a newer snapshot that became causally available before the decision can be used. The thresholds and limits are unchanged.
 
 #### Offline Verification
 
@@ -4052,7 +4052,119 @@ Each test also evaluates the same inputs at the loop-start time, to show the pre
 
 #### Remaining Prerequisites Before Daemon Activation
 
-1. **PAPER security-provider integration**: the daemon's entry security inputs still come from its own RugCheck fetch. The validated PAPER security evidence used by the diagnostic (LP inaccessibility, mint and freeze authority, bundler provenance) is not integrated.
+1. **PAPER security-provider integration**: the daemon's entry security inputs still come from its own RugCheck fetch. The validated PAPER security evidence used by the diagnostic (LP inaccessibility, mint and freeze authority, bundler provenance) is not integrated. **Offline composition added in §8.31; not installed.**
+2. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
+3. **Live limits**: none of the §8.29 test values is approved for live use.
+4. **Strategy unchanged**: continuous availability for 90/120 s retests is still not expected in active pools.
+
+### 8.31 Isolated PAPER Candidate Security Context (Offline Composition; Not Installed)
+
+Independent review accepted the decision-time correction at `3cb0feb`. This section adds the smallest offline composition of the accepted security-evidence components. It is not installed or activated in the daemon.
+
+- **Nothing ran live**: no network call, socket, daemon run, capture, position, order or wallet change took place, and no sealed file was modified.
+- **Daemon unchanged**: the daemon path and default production handling are unchanged.
+
+#### Composition
+
+`backend/src/candidate-scanner/PaperCandidateSecurityContext.ts` exports `evaluatePaperCandidateSecurityContext`. It takes supplied evidence, an exact target (pool and mint) and an explicit decision time, and returns the existing screening and gate inputs with provenance.
+
+- **PAPER boundary**: it requires `executionContext: "PAPER_SIMULATION"`. Any other value (`PRODUCTION`, `BACKTEST`, missing or miscased) evaluates nothing and returns `EXECUTION_CONTEXT_PROHIBITED`.
+- **No I/O**: the module makes no provider requests and uses no timers, files, sockets or environment variables. Construction is a plain call.
+  - **Async**: the result is a promise only because the accepted LP bridge revalidates acquisition evidence asynchronously.
+- **Components reused, unchanged** (no validation is reimplemented):
+
+| Evidence                  | Accepted component                                                                               | Binding                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| LP                        | `evaluateLpScreeningBridge` (Raydium AMM v4 LP accounting)                                       | exact pool and mint (pool-specific)          |
+| Mint and freeze authority | `parseSolanaRpcMintAccountResponse`, then `evaluateAuthorityEvidence` on the raw jsonParsed info | requested mint account                       |
+| RugCheck                  | `BuyGateTriggerService.validateRugCheckReportPayload`                                            | requested mint, and the payload's own `mint` |
+| Bundler proxy             | `parseSolanaTrackerBundlersResponse`, then `adaptPaperBundlerSnapshot`                           | requested mint                               |
+
+- **Token-level evidence**: authority, RugCheck and bundler results carry no pool provenance.
+- **Policy**: one fixed policy, `PAPER_SECURITY_CONTEXT_POLICY`, applies the existing explicit 15,000 ms decision-time limit. This is the limit the diagnostic applies to LP, mint-account, RugCheck and bundler evidence, and the bundler adapter's own limit.
+  - **No skew**: LP clock-skew tolerance is set to 0, so future-dated LP evidence stays unavailable. The bridge's 5 s default would have accepted it.
+  - **Causality**: token-level evidence retrieved after the decision time is `FUTURE_DATED_EVIDENCE`.
+- **Provenance preserved**:
+  - **LP**: the bridge result unchanged (raw integer accounting, context slot, retrieval time, evidence origin).
+  - **Mint account**: requested mint, retrieval time, age, token program, parser and slot.
+  - **RugCheck**: requested mint, retrieval time, age and HTTP status.
+  - **Bundler**: the adapter's full provenance, including `PROVIDER_REPORTED_UNVERIFIED`, `PAPER_PROXY_UNVERIFIED_LAUNCH_ALLOCATION` and every unverified flag.
+  - Supplied evidence is never mutated or re-stamped.
+
+#### Preserved Security Semantics
+
+- **LP**: admission uses the bridge's exact integer comparison against the unchanged 90% threshold. Below-threshold LP is reported as observed (not unavailable) and fails pre-admission.
+- **Authorities**: only an explicitly observed `null` is `DISABLED`.
+  - A missing field is `OMITTED` (unknown), even though the parser's normalized state treats it as disabled.
+  - Base64-layout responses carry no raw jsonParsed info, so authorities stay unavailable.
+  - Pre-admission reasons and their order (LP, then freeze, then mint) are the diagnostic's.
+- **RugCheck**: metrics come only from a 2xx response with a complete JSON body whose request and payload mint both match, and which the accepted validator accepts. RugCheck never supplies `bundlerPct`.
+- **Bundler**: `bundlerPct` is the normalized `initialPercentage`. Current holdings are returned separately and never used for Gate 11.
+- **No favourable defaults**: an unavailable metric is absent from `gateInputs.rugMetrics`, and `gateInputs.lpBurnPct` is null.
+- **No admission**: `evidenceBoundary.strategyGateAdmitted` is always false. Every other gate still applies.
+
+#### Offline Verification
+
+`PaperCandidateSecurityContext.test.ts` (S-01 to S-10) uses only version-controlled fixtures:
+
+- the existing synthetic and captured Raydium LP fixtures;
+- the sanitized 2026-11-06 Solana Tracker capture, used only as an explicitly dated replay at its original retrieval time;
+- a new labelled synthetic fixture module (`fixtures/SyntheticPaperSecurityEvidenceFixture.ts`) for mint-account and RugCheck responses;
+- a synthetic clock and synthetic candidate context.
+
+The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and `AntiRugEvaluator`) and the actual Gate 11 evaluator through the daemon's entry boundary (`evaluatePaperDaemonEntryDecision`).
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S-01 | Valid composition: 98.5% LP with raw integers, slot and retrieval time; both authorities `DISABLED` with slot and age; validated RugCheck metrics; bundler proxy 0.0000756 with current holdings 0.0005904 kept separately and every disclosure. Results are frozen and the input is unchanged. Scanner LP screening passes, Gate 11 passes and the buy gate arms. Acquisition evidence gives the same LP result |
+| S-02 | Exactly 90% qualifies; one more circulating LP unit does not (`REJECTED_UNLOCKED_LP_RISK`, also in the scanner). Dated replay of the captured RAY/WSOL LP (0.135682%) is below threshold. Missing LP is unavailable with null `lpBurnPct`                                                                                                                                                                        |
+| S-03 | Omitted, active and textual-placeholder authorities, base64 layout, wrong owner, account not found, another requested account and missing evidence all fail pre-admission with the diagnostic's reasons                                                                                                                                                                                                          |
+| S-04 | Missing, HTTP 429, truncated, non-JSON, payload-mint-missing, other-mint and invalid RugCheck responses give no metrics, and Gate 11 rejects (`REJECTED_RUGCHECK_UNINDEXED_OR_HOLDERS_UNKNOWN`). A validated report without holders or top holders leaves those metrics absent                                                                                                                                   |
+| S-05 | Initial 40%/current 60% gives a proxy of 0.4 (passes); initial 60%/current 10% gives 0.6 (`BUNDLER_CONCENTRATION_GATE_FAILED`). Missing initial, or a failed, truncated or other-mint response, gives `BUNDLER_CONCENTRATION_UNKNOWN`                                                                                                                                                                            |
+| S-06 | Another pool with the same mint: LP `IDENTITY_MISMATCH`, while token-level evidence still applies without pool provenance. Another mint: nothing is usable. Invalid targets evaluate nothing                                                                                                                                                                                                                     |
+| S-07 | All evidence aged exactly 15,000 ms is accepted; 15,001 ms is stale for each kind; 1 ms future-dated is rejected for each kind; original retrieval times are preserved; invalid decision and retrieval times are rejected                                                                                                                                                                                        |
+| S-08 | Six prohibited contexts evaluate nothing, and the RugCheck validator is never called                                                                                                                                                                                                                                                                                                                             |
+| S-09 | Favourable security inputs are still rejected by the flow gates (no verified flow) and by the live-liquidity floor                                                                                                                                                                                                                                                                                               |
+| S-10 | No fetch or timer is used during evaluation, and the module source contains no fetch, timer, environment, file or socket use                                                                                                                                                                                                                                                                                     |
+
+- **Mutation checks** (source restored byte-identical afterwards), each failing the expected tests:
+  - treating an omitted authority as disabled (S-03);
+  - using current holdings as the proxy (S-01, S-04, S-05);
+  - restoring the 5 s LP skew (S-01, S-07);
+  - dropping the RugCheck payload-mint check (S-04);
+  - extending token freshness by 1 ms (S-07);
+  - prohibiting only `PRODUCTION` (S-08);
+  - defaulting missing holders to 0 (S-04);
+  - accepting a truncated body (S-04, S-05).
+- **Results**:
+  - New suite 10/10.
+  - `LpScreeningBridge`, `PaperSolanaTrackerBundlerAdapter`, `BuyGateTriggerService`, `SolanaRpcMintAccountParser`, `CandidateFlowProvider`, `PaperTradingDaemon`, `CandidateStreamEngine` and `CandidateDecisionDiagnostic` all pass.
+  - The backend typecheck, ESLint and Prettier checks pass, each under an external 60 s limit with the installed local tools. None is left running.
+  - All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic inputs**: the mint-account and RugCheck inputs are synthetic. The bundler payload is a dated historical replay, and live provider responses are not exercised.
+- **Completeness is supplied**: HTTP status and body completeness are supplied by the caller. Enforcing response-size limits belongs to the future retrieval code.
+
+#### Exact Remaining Wiring Points (Not Implemented)
+
+1. **Scanner LP mode**: the daemon constructs `CandidateStreamEngine` (`paper-trading-daemon.ts`, `new CandidateStreamEngine({ ... })` in `run`) without `requireValidatedLp`, `lpEvidenceResolver` or `lpFreshnessPolicy`.
+   - **Effect**: scanner pre-screening still uses provider-reported LP percentages and the pool record's authority fields.
+   - **Needed**: enabling the existing validated-LP mode (`CandidateStreamEngine`'s `requireValidatedLp` branch) requires an LP evidence resolver that performs Raydium account retrieval, which is network work needing approval.
+2. **Direct RugCheck retrieval**: the entry path still calls `BuyGateTriggerService.fetchRugCheckMetrics` through `retrieveAndEvaluatePaperDaemonEntry`'s `fetchRugCheckMetrics` retrieval. That fetch:
+   - records no retrieval time or HTTP status;
+   - has no response-size limit;
+   - does not bind the payload's `mint`;
+   - has no decision-time freshness check.
+   - **Consequence**: it never supplies `bundlerPct`, so under `requireVerifiedHolders: true` the daemon's Gate 11 currently always rejects: with `BUNDLER_CONCENTRATION_UNKNOWN` once the earlier RugCheck checks pass (the case S-05 shows with a missing proxy).
+   - **Needed**: replace it with retrievals of the mint account, RugCheck report and Solana Tracker bundlers that record request identity, retrieval time, status and completeness. Then call `evaluatePaperCandidateSecurityContext` inside the entry helper at the same `decisionNowMs` used for flow. Pass `gateInputs.rugMetrics` as `rugMetrics`, use `gateInputs.lpBurnPct` for the candidate, and refuse entry when `preAdmission.passed` is false.
+3. **Budgets and credentials**: the additional per-candidate requests (RPC mint account, RugCheck, Solana Tracker) need pacing and budget limits and the Solana Tracker key's handling. None is approved.
+4. **Provider installation and live limits**: still separate prerequisites (§8.29, §8.30).
+
+#### Remaining Prerequisites Before Daemon Activation
+
+1. **Security wiring**: the scanner LP-mode and entry-path wiring points above, including the new retrievals and their budgets.
 2. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
 3. **Live limits**: none of the §8.29 test values is approved for live use.
 4. **Strategy unchanged**: continuous availability for 90/120 s retests is still not expected in active pools.
