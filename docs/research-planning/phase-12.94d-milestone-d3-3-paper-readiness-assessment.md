@@ -3888,34 +3888,56 @@ A failed refresh no longer leaves earlier snapshots usable when contradicting ev
 - **Dispatcher**:
   - **Serialized**: one dispatcher for all Solana RPC, with no overlap.
   - **Pacing**: at least `rpcPacingMs` (≥ 2,500 ms) dispatch-to-dispatch.
-  - **Ledger**: every actual dispatch is recorded once in the session ledger. The ledger is authoritative.
-  - **Refusals**: a ceiling, the lifetime deadline or a 429 halt refuses dispatch and stops the provider instead of retrying.
+  - **Accounting**: every actual dispatch is counted exactly once, in the session ledger and in the shared budget alike. Admission by the adapter or history enumerator is checked but never counted; a refused request is never counted.
+  - **Refusals**: a ceiling, the lifetime deadline, the first 429 or a redirect stops the provider instead of retrying. Caller cancellation and stop are rechecked immediately before each dispatch.
 - **No resets**: counters are never reset, and reconnects do not extend the deadline.
 - **Offline test configuration only**: the values below are not approved for live execution, and they cover this provider only, not the daemon's separate API activity.
 
-| Limit                      | Test value                                               | Basis                                                         |
-| -------------------------- | -------------------------------------------------------- | ------------------------------------------------------------- |
-| Lifetime                   | 600,000 ms from `start()`                                | absolute; includes setup and reconnects                       |
-| Shared HTTP attempts       | 300                                                      | all purposes                                                  |
-| Notifications / retrievals | 60 / 60                                                  | the coordinator closes beyond 60 notifications                |
-| Reconnects                 | 1                                                        | a second loss stops the provider                              |
-| Retrievals per cycle       | 4                                                        |                                                               |
-| Queue ceiling              | 13                                                       | overflow is recorded as a gap                                 |
-| RPC pacing                 | 2,500 ms                                                 | unchanged                                                     |
-| Per-request timeout        | 5,000 ms                                                 | wall-clock timer                                              |
-| Subscription ack timeout   | 5,000 ms                                                 |                                                               |
-| Keepalive                  | ping every 20,000 ms; pong timeout 10,000 ms; ≤ 32 pings | 600 s / 20 s = 30 pings, not the diagnostic's 4               |
-| WebSocket data messages    | 80                                                       | ≤ 2 acks + 60 notifications, plus margin for unrelated frames |
-| WebSocket data bytes       | 1,048,576                                                |                                                               |
-| WebSocket control frames   | 80                                                       | ≤ 32 pongs plus occasional server pings                       |
+| Limit                      | Test value                                               | Basis                                                              |
+| -------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------ |
+| Lifetime                   | 600,000 ms from `start()`                                | absolute; includes setup and reconnects                            |
+| Shared HTTP attempts       | 300                                                      | all purposes                                                       |
+| Notifications / retrievals | 60 / 60                                                  | the coordinator closes beyond 60 notifications                     |
+| Reconnects                 | 1                                                        | a second loss stops the provider                                   |
+| Retrievals per cycle       | 4                                                        |                                                                    |
+| Queue ceiling              | 13                                                       | overflow is recorded as a gap                                      |
+| RPC pacing                 | 2,500 ms                                                 | unchanged                                                          |
+| Per-request timeout        | 5,000 ms                                                 | headers and body together; injected timer (virtual in tests)       |
+| Response body              | 65,536 decoded bytes                                     | declared length checked first; streamed read cancelled on overflow |
+| Subscription ack timeout   | 5,000 ms                                                 |                                                                    |
+| Keepalive                  | ping every 20,000 ms; pong timeout 10,000 ms; ≤ 32 pings | 600 s / 20 s = 30 pings, not the diagnostic's 4                    |
+| WebSocket data messages    | 80                                                       | ≤ 2 acks + 60 notifications, plus margin for unrelated frames      |
+| WebSocket data bytes       | 1,048,576                                                |                                                                    |
+| WebSocket control frames   | 80                                                       | ≤ 32 pongs plus occasional server pings                            |
 
 **Request arithmetic (planning estimate)**: a quiet 600 s session uses 2 + 3 per refresh. The simulated run used 215 (71 refreshes), under the 218 estimate.
 
+#### Execution-Boundary Corrections (Review of `c446002`)
+
+Independent review found four boundary defects. All four are corrected in the provider only. The shared `GlobalResourceBudgetManager`, the adapter, the enumerator, the evaluator, strategy rules, freshness, pacing and snapshot invalidation are unchanged.
+
+1. **Absolute lifetime during operations**:
+   - **Before**: the deadline was checked only between operations. A mocked 2.25 s `getBlockTime` response carried a 72 s session to 74.25 s.
+   - **Now**: an injected deadline timer fires at the original deadline, even while a subscription ack, pacing wait, request or body read is pending. At expiry it withdraws snapshots, aborts pending work and refuses further dispatches.
+   - **Bounded waits**: every wait is capped at the deadline, cleanup is synchronous, and all provider timers are cleared. The original deadline and the first stop cause are preserved.
+   - **Keepalive**: now timer-driven. A missing pong withdraws snapshots and aborts in-flight epoch work at the pong timeout, independent of any pending RPC.
+2. **First 429 is terminal**:
+   - **Before**: the provider relied on the shared manager's three-consecutive-429 halt, and one 429 was followed by six more requests.
+   - **Now**: the first 429 is latched when headers arrive, without reading the body. It withdraws snapshots, cancels pending work and refuses every later dispatch.
+3. **Bounded responses, no redirects**:
+   - **Bodies**: read with the existing `readBoundedStream` under a finite decoded-byte ceiling. A declared `Content-Length` above it is rejected first, and the stream is cancelled on overflow, timeout or stop.
+   - **Redirects**: requests use `redirect: "manual"`. Any redirect is rejected without being followed and stops collection.
+   - **Retries**: none.
+4. **Admission and dispatch accounting**:
+   - **Before**: the adapter and enumerator could increment the shared budget before the dispatcher refused a cancelled request (4 ledger dispatches against 5 budget attempts).
+   - **Now**: a provider-local `PaperRollingDispatchBudget` subclass treats their `recordRequestAttempt()` as admission only, and the dispatcher counts each actual dispatch exactly once. Aggregate ceilings are unchanged, and nothing is reset.
+
 #### Offline Verification
 
-`PaperRollingCandidateFlowProvider.test.ts` (R1–R10) uses a synthetic chain:
+`PaperRollingCandidateFlowProvider.test.ts` (R1–R15) uses a synthetic chain:
 
-- a virtual clock and a slot-to-block-time mapping with configurable skew;
+- a deterministic virtual scheduler: every provider wait, timeout and mocked latency is a virtual timer, fired one at a time;
+- a slot-to-block-time mapping with configurable skew;
 - response latency;
 - delayed notifications and delayed history indexing;
 - in-memory WebSocket mocks with ping/pong.
@@ -3932,10 +3954,16 @@ A failed refresh no longer leaves earlier snapshots usable when contradicting ev
 | R8   | HTTP (12), notification (5), retrieval (3) and WebSocket-message (3) ceilings each stop once with an explicit reason; at the HTTP ceiling the ledger and budget manager both read 12                                                                                                                                    |
 | R9   | Simulated 600 s lifetime: `LIFETIME_EXPIRED`; every dispatch before the deadline; spacing ≥ 2,500 ms with no overlap; concurrency 1; exact accounting; matched pongs; everything withdrawn and closed afterwards                                                                                                        |
 | R10  | `stop()` aborts a hung in-flight `GET_SLOT`; an external `AbortSignal` stops at its time; all transports closed                                                                                                                                                                                                         |
+| R11  | Lifetime enforced inside operations: a 2.25 s `getBlockTime` is aborted at exactly 72,000 ms; a deadline inside a pacing wait sends nothing more; an unacknowledged reconnect stops at 70,000 ms; a stalled body is aborted and cancelled at the deadline; published snapshots are withdrawn at the deadline itself     |
+| R12  | A missing pong during a 9 s `GET_SLOT` withdraws snapshots and aborts that request at the pong timeout, not at its own 5 s timeout                                                                                                                                                                                      |
+| R13  | The first 429 (with a never-ending body) stops at its headers with 3 dispatches and 3 fetches; a retrieval 429 also stops; the shared manager still needs three consecutive 429s                                                                                                                                        |
+| R14  | Oversized body rejected (not terminal; the next refresh publishes); declared oversize rejected at headers; a 3-chunk streamed body assembled; a stalled body times out after exactly 5,000 ms and is cancelled; a 302 is not followed and stops collection                                                              |
+| R15  | Admission is not counted; a stop injected inside the adapter's and the enumerator's admission dispatches nothing more, settles, and leaves ledger, budget and fetch counts equal                                                                                                                                        |
 
-- **Mutation check**: disabling each withdrawal rule (notification, history, gap) makes R5 fail.
+- **Shared invariants (every test)**: ≥ 2,500 ms spacing, no overlap, contiguous ledger, every dispatch before the deadline, budget attempts equal to ledger dispatches, and no provider timer left after stop.
+- **Mutation checks**: disabling each withdrawal rule (notification, history, gap) makes R5 fail. Removing the deadline timer makes R11 fail, the 429 latch R13, the body ceiling or the manual-redirect rule R14, and the epoch abort on a missing pong R12. Counting admissions as dispatches makes R2–R5, among others, fail.
 - **Results**:
-  - Provider suite 10/10, `CandidateFlowProvider` 54/54, `PaperActiveWindowQualification` 12/12 and `PaperTradingDaemon` 95/95.
+  - Provider suite 15/15, `CandidateFlowProvider` 54/54, `PaperActiveWindowQualification` 12/12 and `PaperTradingDaemon` 95/95.
   - The backend typecheck, ESLint and Prettier checks pass.
   - Each command ran under an external 60 s limit; none is left running.
   - All 11 captures verify, and the wallet hash is unchanged.
@@ -3944,8 +3972,9 @@ A failed refresh no longer leaves earlier snapshots usable when contradicting ev
 
 - **Synthetic inputs**: arrivals, latencies and skews are synthetic, and nothing is validated live.
 - **History re-check range**: it covers only signatures newer than the advanced anchor. Older late-indexed signatures are caught only by their notifications.
-- **Budget-manager count**: during a stop race, a retrieval refused after the adapter recorded its budget attempt can leave the budget manager one above the ledger. The ledger stays authoritative.
-- **Request timeout**: it uses a wall-clock timer, not the virtual clock.
+- **Body cancellation**: cancelling a body uses the existing `boundedCancel` helper, which waits at most 500 ms of wall-clock time for an unresponsive stream.
+- **Non-epoch requests**: `POOL_LAYOUT` and `PRIOR_ANCHOR` are not aborted by epoch loss. They remain bounded by the request timeout, the deadline and stop.
+- **Live behaviour**: real WebSocket, HTTP and timer behaviour (as opposed to the mocks) is untested.
 
 #### Remaining Integration Gaps (Separate Prerequisites Before Daemon Activation)
 

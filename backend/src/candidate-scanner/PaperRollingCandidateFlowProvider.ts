@@ -17,10 +17,18 @@
  *    existing slot/window rules cannot exclude, and any disconnect, missing pong or epoch change.
  *    Withdrawal marks availability only; the frozen reconciliation results are never rewritten.
  * 4. One serialized Solana RPC dispatcher: at least `rpcPacingMs` (>= 2,500 ms) between dispatches, never
- *    overlapping, every actual dispatch recorded exactly once in the session ledger, and refused once the
- *    session ceiling, retrieval ceiling, lifetime deadline or a stop is reached. Counters are never reset.
- * 5. Absolute lifetime measured from start(), including setup and reconnects; never extended.
- * 6. All limits are supplied explicitly by the caller. No defaults are approved for live execution.
+ *    overlapping, every actual dispatch counted exactly once (session ledger and shared budget alike), and
+ *    refused once the session ceiling, retrieval ceiling, lifetime deadline, a 429 or a stop is reached.
+ *    Admission by the adapter or enumerator is checked but never counted as a dispatch. No counter resets.
+ * 5. Absolute lifetime measured from start(), including setup and reconnects; never extended. A deadline
+ *    timer stops collection at expiry even while a subscription ack, pacing wait, request or body read is
+ *    pending; every wait is capped at the deadline.
+ * 6. Keepalive is timer-driven: a missing pong withdraws snapshots and aborts in-flight epoch work at the
+ *    pong timeout, independent of any pending RPC.
+ * 7. HTTP responses: the first 429 is terminal (recognised from headers, before any body read); redirects are
+ *    rejected without being followed (terminal); bodies are read with a finite decoded-byte ceiling and
+ *    cancelled on overflow, timeout or stop. No automatic retries.
+ * 8. All limits are supplied explicitly by the caller. No defaults are approved for live execution.
  */
 
 import {
@@ -59,8 +67,15 @@ import type {
   CandidateFlowTarget,
 } from "./CandidateFlowProvider.js";
 import { buildStreamResolutionRecords } from "./CandidateDecisionDiagnostic.js";
-import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
-import type { ISolanaKeepaliveWebSocketTransport } from "./RaydiumTransportObservationProbe.js";
+import {
+  GlobalResourceBudgetManager,
+  type RequestPurpose,
+} from "../research/prospective/GlobalResourceBudgetManager.js";
+import {
+  boundedCancel,
+  readBoundedStream,
+  type ISolanaKeepaliveWebSocketTransport,
+} from "./RaydiumTransportObservationProbe.js";
 
 /** Fixed (not configurable) rules reused unchanged from the accepted diagnostic and evaluator. */
 export const PAPER_ROLLING_FLOW_FIXED_RULES = Object.freeze({
@@ -74,9 +89,26 @@ export const PAPER_ROLLING_FLOW_FIXED_RULES = Object.freeze({
   historyMaxPages: 1,
   maxSnapshotsRetained: 2,
   idleStepMs: 250,
+  ackPollMs: 50,
 });
 
 const PROVIDER_NAME = "SOLANA_RPC";
+
+/** Requests that belong to an established subscription epoch (aborted when the epoch is lost). */
+const EPOCH_SCOPED_PURPOSES: ReadonlySet<string> = new Set([
+  "GET_SLOT",
+  "GET_BLOCK_TIME",
+  "HISTORY_ENUMERATION",
+  "TRANSACTION_RETRIEVAL",
+]);
+
+/** Refusals that end collection instead of being retried. */
+const TERMINAL_REFUSALS: ReadonlySet<string> = new Set([
+  "LIFETIME_EXPIRED",
+  "HTTP_ATTEMPT_CEILING_REACHED",
+  "TRANSACTION_RETRIEVAL_CEILING_REACHED",
+  "BUDGET_MANAGER_DENIED",
+]);
 
 /**
  * Explicit collection limits. Every field is mandatory; no default is approved for live execution.
@@ -97,8 +129,10 @@ export interface PaperRollingFlowLimits {
   readonly queueCeiling: number;
   /** Minimum dispatch-to-dispatch spacing for Solana RPC (>= 2,500 ms). */
   readonly rpcPacingMs: number;
-  /** Per-request timeout (wall-clock timer). */
+  /** Per-request timeout (headers and body together). */
   readonly requestTimeoutMs: number;
+  /** Decoded response-body ceiling per request (bytes). */
+  readonly maxResponseBytes: number;
   readonly subscriptionAckTimeoutMs: number;
   readonly keepalivePingIntervalMs: number;
   readonly keepalivePongTimeoutMs: number;
@@ -111,6 +145,17 @@ export interface PaperRollingFlowLimits {
   readonly maxWsControlFrames: number;
 }
 
+/** Injectable timer scheduler (deterministic virtual timers in offline tests; global timers by default). */
+export interface PaperRollingFlowTimers {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const DEFAULT_TIMERS: PaperRollingFlowTimers = {
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 export interface PaperRollingCandidateFlowProviderOptions {
   readonly target: CandidateFlowTarget;
   readonly executionContext: "PAPER_SIMULATION";
@@ -121,7 +166,7 @@ export interface PaperRollingCandidateFlowProviderOptions {
   readonly createWebSocketTransport: () => ISolanaKeepaliveWebSocketTransport;
   readonly limits: PaperRollingFlowLimits;
   readonly clock?: (() => number) | undefined;
-  readonly sleep?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined;
+  readonly timers?: PaperRollingFlowTimers | undefined;
 }
 
 export type PaperRollingFlowRequestPurpose =
@@ -184,6 +229,7 @@ export interface PaperRollingFlowStatus {
   readonly notificationsReceived: number;
   readonly budgetManagerAttempts: number;
   readonly maxConcurrentRpc: number;
+  readonly activeTimers: number;
   readonly cycles: number;
   readonly refreshesAttempted: number;
   readonly refreshesPublished: number;
@@ -206,6 +252,26 @@ export interface PaperRollingFlowStatus {
 export interface PaperRollingFlowStopReport {
   readonly stopReason: string;
   readonly status: PaperRollingFlowStatus;
+}
+
+/**
+ * Provider-local budget: the adapter and history enumerator call recordRequestAttempt() for ADMISSION
+ * (pacing and ceiling checks, never counted); the provider's dispatcher counts each ACTUAL dispatch exactly
+ * once through recordActualDispatch(). The shared GlobalResourceBudgetManager class is unchanged for other
+ * callers, including its own three-consecutive-429 rule.
+ */
+export class PaperRollingDispatchBudget extends GlobalResourceBudgetManager {
+  public override recordRequestAttempt(
+    providerName: string,
+    purpose: RequestPurpose,
+    nowMs?: number,
+  ): boolean {
+    return this.canMakeRequest(providerName, nowMs, purpose).allowed;
+  }
+
+  public recordActualDispatch(nowMs: number): boolean {
+    return super.recordRequestAttempt(PROVIDER_NAME, "CANDIDATE_ENRICHMENT", nowMs);
+  }
 }
 
 interface PublishedSnapshot {
@@ -268,22 +334,10 @@ function parseJson(text: string | undefined): unknown {
   }
 }
 
-function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
+function cancelResponseBody(response: Response, reason: string): void {
+  if (response.body) {
+    void boundedCancel(response.body, new Error(reason), 500);
+  }
 }
 
 /** Validates explicit limits; throws `[PAPER_FLOW_PROVIDER_INIT]` on any invalid or unsafe value. */
@@ -302,6 +356,7 @@ export function validatePaperRollingFlowLimits(limits: unknown): PaperRollingFlo
     "queueCeiling",
     "rpcPacingMs",
     "requestTimeoutMs",
+    "maxResponseBytes",
     "subscriptionAckTimeoutMs",
     "keepalivePingIntervalMs",
     "keepalivePongTimeoutMs",
@@ -349,8 +404,9 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   private readonly createWebSocketTransport: () => ISolanaKeepaliveWebSocketTransport;
   private readonly limits: PaperRollingFlowLimits;
   private readonly clock: () => number;
-  private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly timers: PaperRollingFlowTimers;
   private readonly paperAdapter = new PaperReconciledCandidateFlowAdapter();
+  private readonly activeTimers = new Set<unknown>();
 
   // Lifecycle
   private state: PaperRollingFlowState = "NOT_STARTED";
@@ -364,7 +420,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
 
   // Components (created during start)
   private poolContext: TrackedRaydiumPoolContext | null = null;
-  private budgetManager: GlobalResourceBudgetManager | null = null;
+  private budgetManager: PaperRollingDispatchBudget | null = null;
   private tracker: RollingTradeFlowTracker | null = null;
   private adapter: RaydiumAmmV4TransactionSourceAdapter | null = null;
   private coordinator: RaydiumCandidateSubscriptionCoordinator | null = null;
@@ -381,7 +437,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   // Epoch
   private currentEpoch: number | null = null;
   private epochEstablished = false;
-  private awaitingSubscription = false;
+  private epochAbort: AbortController | null = null;
   private reconnects = 0;
   private observationStartMs = 0;
   private firstRefreshNotBeforeMs = 0;
@@ -406,7 +462,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   private matchedPongs = 0;
   private unmatchedPongs = 0;
   private outstandingPing: { readonly payload: Buffer; readonly sentAtMs: number } | null = null;
-  private nextPingAtMs = 0;
+  private pingTimer: unknown = null;
+  private pongTimer: unknown = null;
   private wsMessages = 0;
   private wsMessageBytes = 0;
   private wsControlFrames = 0;
@@ -457,7 +514,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.createWebSocketTransport = options.createWebSocketTransport;
     this.limits = validatePaperRollingFlowLimits(options.limits);
     this.clock = options.clock ?? (() => Date.now());
-    this.sleepFn = options.sleep ?? defaultSleep;
+    this.timers = options.timers ?? DEFAULT_TIMERS;
   }
 
   // ===========================================================================================
@@ -493,7 +550,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       return unavailable("PAPER_ROLLING_FLOW_INVALID_EVALUATION_TIMESTAMP");
     }
     if (this.state === "NOT_STARTED") return unavailable("PAPER_ROLLING_FLOW_NOT_STARTED");
-    if (this.state === "STOPPED") {
+    if (this.state === "STOPPED" || this.stopReason !== null) {
       return unavailable(`PAPER_ROLLING_FLOW_STOPPED: ${this.stopReason ?? "UNKNOWN"}`);
     }
 
@@ -540,6 +597,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       notificationsReceived: this.coordinator?.getMetrics().totalNotificationsReceived ?? 0,
       budgetManagerAttempts: this.budgetManager?.getTotalRequests() ?? 0,
       maxConcurrentRpc: this.maxConcurrentRpc,
+      activeTimers: this.activeTimers.size,
       cycles: this.cycles,
       refreshesAttempted: this.refreshesAttempted,
       refreshesPublished: this.refreshesPublished,
@@ -566,6 +624,58 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   }
 
   // ===========================================================================================
+  // Timers and bounded waits
+  // ===========================================================================================
+
+  private setTimer(fn: () => void, ms: number): unknown {
+    let handle: unknown = null;
+    handle = this.timers.setTimeout(
+      () => {
+        this.activeTimers.delete(handle);
+        fn();
+      },
+      Math.max(0, ms),
+    );
+    this.activeTimers.add(handle);
+    return handle;
+  }
+
+  private clearTimer(handle: unknown): void {
+    if (handle === null || handle === undefined) return;
+    if (this.activeTimers.delete(handle)) this.timers.clearTimeout(handle);
+  }
+
+  /** Waits at most `ms`, never past the lifetime deadline; resolves early on stop or `signal`. */
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    const session = this.sessionAbort?.signal;
+    const remaining =
+      this.deadlineMs === null ? ms : Math.max(0, Math.min(ms, this.deadlineMs - this.clock()));
+    return new Promise<void>((resolve) => {
+      if (session?.aborted || signal?.aborted) {
+        resolve();
+        return;
+      }
+      let handle: unknown = null;
+      const done = () => {
+        this.clearTimer(handle);
+        session?.removeEventListener("abort", done);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      handle = this.setTimer(done, remaining);
+      session?.addEventListener("abort", done, { once: true });
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  /** Signal that aborts on stop, deadline or loss of the current epoch. */
+  private epochSignal(): AbortSignal {
+    const signals = [this.sessionAbort!.signal];
+    if (this.epochAbort) signals.push(this.epochAbort.signal);
+    return AbortSignal.any(signals);
+  }
+
+  // ===========================================================================================
   // Lifecycle
   // ===========================================================================================
 
@@ -578,6 +688,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.startedAtMs = this.clock();
     this.deadlineMs = this.startedAtMs + this.limits.lifetimeMs;
     this.sessionAbort = new AbortController();
+    // Absolute deadline: fires even while an ack wait, pacing wait, request or body read is pending.
+    this.setTimer(() => this.requestStop("LIFETIME_EXPIRED"), this.limits.lifetimeMs);
     if (signal) {
       this.externalSignal = signal;
       if (signal.aborted) {
@@ -601,9 +713,15 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.requestStop(reason);
   }
 
+  /** First stop cause wins; snapshots are withdrawn and all pending work is aborted immediately. */
   private requestStop(reason: string): void {
-    if (this.stopReason === null) this.stopReason = reason;
+    if (this.stopReason === null) {
+      this.stopReason = reason;
+      this.stoppedAtMs = this.clock();
+    }
     this.withdrawAll(`PROVIDER_STOPPED:${this.stopReason}`);
+    this.clearKeepaliveTimers();
+    this.epochAbort?.abort();
     this.sessionAbort?.abort();
   }
 
@@ -636,8 +754,9 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     return { stopReason: this.stopReason ?? "UNKNOWN", status: this.getStatus() };
   }
 
+  /** Bounded, synchronous cleanup: no awaits, every provider timer cleared. */
   private cleanup(): void {
-    if (this.stopReason === null) this.stopReason = "COLLECTION_ENDED";
+    if (this.stopReason === null) this.requestStop("COLLECTION_ENDED");
     this.withdrawAll(`PROVIDER_STOPPED:${this.stopReason}`);
     this.sessionAbort?.abort();
     this.epochEstablished = false;
@@ -650,8 +769,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     if (this.externalSignal && this.externalAbortListener) {
       this.externalSignal.removeEventListener("abort", this.externalAbortListener);
     }
+    for (const handle of [...this.activeTimers]) this.clearTimer(handle);
     this.state = "STOPPED";
-    this.stoppedAtMs = this.clock();
   }
 
   // ===========================================================================================
@@ -659,7 +778,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   // ===========================================================================================
 
   private async setup(): Promise<boolean> {
-    this.budgetManager = new GlobalResourceBudgetManager({
+    this.budgetManager = new PaperRollingDispatchBudget({
       maxTotalRequests: this.limits.maxHttpAttempts,
       maxEnrichmentAttempts: this.limits.maxHttpAttempts,
       minReservedForwardRequests: 0,
@@ -729,7 +848,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       maxPendingQueueSize: this.limits.queueCeiling,
       tracker: this.tracker,
       clock: this.clock,
-      sleepFn: (ms) => this.sleepFn(ms, this.sessionAbort?.signal),
+      sleepFn: (ms) => this.sleep(ms),
       paperFailedTransactionPolicy: { enabled: true, executionContext: "PAPER_SIMULATION" },
     });
     this.coordinator = new RaydiumCandidateSubscriptionCoordinator({
@@ -784,19 +903,23 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.currentTransport = inner;
     inner.on("pong", (data: Buffer) => this.onPong(transportId, data));
     inner.on("ping", () => this.onControlFrame());
-    this.awaitingSubscription = true;
     this.coordinator!.attachTransport(wrapped);
     this.coordinator!.sendSubscriptionRequest();
 
-    const ackDeadline = this.clock() + this.limits.subscriptionAckTimeoutMs;
+    // Ack wait: bounded by the ack timeout AND the absolute lifetime deadline (sleep is capped).
+    const ackDeadline = Math.min(
+      this.clock() + this.limits.subscriptionAckTimeoutMs,
+      this.deadlineMs!,
+    );
     while (
       this.coordinator!.getStatus() !== "SUBSCRIBED" &&
       this.clock() < ackDeadline &&
       !this.isStopping()
     ) {
-      await this.sleepFn(50, this.sessionAbort?.signal);
+      await this.sleep(
+        Math.min(PAPER_ROLLING_FLOW_FIXED_RULES.ackPollMs, ackDeadline - this.clock()),
+      );
     }
-    this.awaitingSubscription = false;
     if (this.isStopping()) return false;
     if (this.coordinator!.getStatus() !== "SUBSCRIBED") {
       // Counts as a lost epoch; the caller decides whether a reconnect is still allowed.
@@ -806,8 +929,9 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.observationStartMs = this.clock();
     this.firstRefreshNotBeforeMs =
       this.observationStartMs + PAPER_ROLLING_FLOW_FIXED_RULES.nominalWarmUpMs;
-    this.nextPingAtMs = this.observationStartMs + this.limits.keepalivePingIntervalMs;
+    this.epochAbort = new AbortController();
     this.epochEstablished = true;
+    this.scheduleNextPing();
     return true;
   }
 
@@ -824,11 +948,14 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     }
   }
 
+  /** Withdraws every snapshot and aborts in-flight epoch work immediately. */
   private markEpochLost(reason: string): void {
     if (!this.epochEstablished) return;
     this.epochEstablished = false;
     this.outstandingPing = null;
+    this.clearKeepaliveTimers();
     this.withdrawAll(`EPOCH_INVALIDATED:${reason}`);
+    this.epochAbort?.abort();
   }
 
   /** One epoch: cycles of up to maxRetrievalsPerCycle retrievals followed by a refresh (or a skip). */
@@ -840,7 +967,6 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         break;
       }
       this.checkGaps();
-      this.keepaliveTick();
       if (!this.epochEstablished || this.isStopping()) break;
 
       if (this.adapter!.getPendingQueueLength() > 0) {
@@ -860,7 +986,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         }
         const before = this.transactionRetrievals;
         const result = await this.coordinator!.processNextPending({
-          signal: this.sessionAbort!.signal,
+          signal: this.epochSignal(),
           overallTimeoutMs: this.limits.rpcPacingMs + this.limits.requestTimeoutMs + 1_000,
         });
         if (this.transactionRetrievals > before) cycleRetrievals++;
@@ -871,14 +997,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
 
       const now = this.clock();
       if (now < this.firstRefreshNotBeforeMs) {
-        const untilPing = Math.max(1, this.nextPingAtMs - now);
-        await this.sleepFn(
-          Math.min(
-            PAPER_ROLLING_FLOW_FIXED_RULES.idleStepMs,
-            this.firstRefreshNotBeforeMs - now,
-            untilPing,
-          ),
-          this.sessionAbort?.signal,
+        await this.sleep(
+          Math.min(PAPER_ROLLING_FLOW_FIXED_RULES.idleStepMs, this.firstRefreshNotBeforeMs - now),
         );
         continue;
       }
@@ -953,12 +1073,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
           : null,
     );
     if (!slotRes.ok && !slotRes.dispatched) {
-      if (
-        slotRes.error === "BACKLOG_BEFORE_GET_SLOT" ||
-        slotRes.error === "EPOCH_LOST_BEFORE_GET_SLOT"
-      ) {
-        return { kind: "NO_DISPATCH" };
-      }
+      // Backlog, a lost epoch or a stop: no GET_SLOT was sent. Terminal refusals already stopped collection.
       return { kind: "NO_DISPATCH" };
     }
     this.refreshesAttempted++;
@@ -1017,8 +1132,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       operationDeadlineMs: this.limits.rpcPacingMs + this.limits.requestTimeoutMs + 1_000,
       lifecycleTarget: this.coordinator!,
       dispatchEpoch: epoch,
-      signal: this.sessionAbort!.signal,
-      sleepFn: (ms, sig) => this.sleepFn(ms, sig ?? this.sessionAbort?.signal),
+      signal: this.epochSignal(),
+      sleepFn: (ms, sig) => this.sleep(ms, sig),
     });
     const historyResult = await enumerator.enumerate();
     const historyRetrievedAtMs = this.clock();
@@ -1128,7 +1243,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         method: "getSignaturesForAddress",
         params: [p.address, cfg],
       }),
-      { recordOnBudget: false, signal: p.signal },
+      { signal: p.signal },
     );
     if (!exchange.ok) throw new Error(exchange.error ?? `HTTP ${String(exchange.status)}`);
     const json = parseJson(exchange.text) as { id?: unknown; result?: unknown } | undefined;
@@ -1236,7 +1351,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   }
 
   // ===========================================================================================
-  // WebSocket inspection, limits and keepalive
+  // WebSocket inspection, limits and timer-driven keepalive
   // ===========================================================================================
 
   private wrapTransport(
@@ -1321,21 +1436,29 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     if (Buffer.isBuffer(data) && data.equals(this.outstandingPing.payload)) {
       this.matchedPongs++;
       this.outstandingPing = null;
+      this.clearTimer(this.pongTimer);
+      this.pongTimer = null;
     } else {
       this.unmatchedPongs++;
     }
   }
 
-  private keepaliveTick(): void {
+  private clearKeepaliveTimers(): void {
+    this.clearTimer(this.pingTimer);
+    this.clearTimer(this.pongTimer);
+    this.pingTimer = null;
+    this.pongTimer = null;
+  }
+
+  private scheduleNextPing(): void {
+    this.clearTimer(this.pingTimer);
+    this.pingTimer = this.setTimer(() => this.onPingDue(), this.limits.keepalivePingIntervalMs);
+  }
+
+  /** Timer-driven: runs even while the collection loop awaits RPC work. */
+  private onPingDue(): void {
+    this.pingTimer = null;
     if (!this.epochEstablished || this.isStopping()) return;
-    const now = this.clock();
-    if (this.outstandingPing) {
-      if (now - this.outstandingPing.sentAtMs > this.limits.keepalivePongTimeoutMs) {
-        this.markEpochLost("MISSING_PONG");
-      }
-      return;
-    }
-    if (now < this.nextPingAtMs) return;
     if (this.pingsSent >= this.limits.maxKeepalivePings) {
       this.requestStop("KEEPALIVE_PING_CEILING_REACHED");
       return;
@@ -1349,8 +1472,12 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     payload.writeUInt32BE(this.transportSeq, 0);
     payload.writeUInt32BE(this.pingsSent + 1, 4);
     this.pingsSent++;
-    this.outstandingPing = { payload, sentAtMs: now };
-    this.nextPingAtMs = now + this.limits.keepalivePingIntervalMs;
+    this.outstandingPing = { payload, sentAtMs: this.clock() };
+    this.pongTimer = this.setTimer(() => {
+      this.pongTimer = null;
+      if (this.outstandingPing?.payload === payload) this.markEpochLost("MISSING_PONG");
+    }, this.limits.keepalivePongTimeoutMs);
+    this.scheduleNextPing();
     try {
       transport.ping(payload);
     } catch {
@@ -1366,7 +1493,6 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   private readonly adapterTransport = (async (_input: unknown, init?: RequestInit) => {
     const body = typeof init?.body === "string" ? init.body : "";
     const exchange = await this.dispatchRpc("TRANSACTION_RETRIEVAL", body, {
-      recordOnBudget: false,
       signal: init?.signal ?? undefined,
     });
     if (!exchange.dispatched || exchange.text === undefined || exchange.status === undefined) {
@@ -1402,7 +1528,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     const exchange = await this.dispatchRpc(
       purpose,
       JSON.stringify({ jsonrpc: "2.0", id, method, params }),
-      { recordOnBudget: true, ...(precondition ? { precondition } : {}) },
+      precondition ? { precondition } : {},
     );
     if (!exchange.dispatched) {
       return { ok: false, dispatched: false, error: exchange.error ?? "NOT_DISPATCHED" };
@@ -1428,9 +1554,19 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     return { ok: true, result: json.result, json };
   }
 
-  private dispatchRefusal(purpose: PaperRollingFlowRequestPurpose): string | null {
+  private dispatchRefusal(
+    purpose: PaperRollingFlowRequestPurpose,
+    callerSignal: AbortSignal | undefined,
+  ): string | null {
     if (this.isStopping()) return "PROVIDER_STOPPING";
     if (this.deadlineMs !== null && this.clock() >= this.deadlineMs) return "LIFETIME_EXPIRED";
+    if (callerSignal?.aborted) return "CALLER_CANCELLED";
+    if (EPOCH_SCOPED_PURPOSES.has(purpose) && (!this.epochEstablished || !this.epochAbort)) {
+      return "EPOCH_NOT_ESTABLISHED";
+    }
+    if (EPOCH_SCOPED_PURPOSES.has(purpose) && this.epochAbort?.signal.aborted) {
+      return "EPOCH_NOT_ESTABLISHED";
+    }
     if (this.ledger.length >= this.limits.maxHttpAttempts) return "HTTP_ATTEMPT_CEILING_REACHED";
     if (
       purpose === "TRANSACTION_RETRIEVAL" &&
@@ -1438,15 +1574,18 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     ) {
       return "TRANSACTION_RETRIEVAL_CEILING_REACHED";
     }
-    if (this.budgetManager?.is429HaltRequired()) return "HTTP_429_HALT";
     return null;
+  }
+
+  private refuse(error: string): RpcExchange {
+    if (TERMINAL_REFUSALS.has(error)) this.requestStop(error);
+    return { dispatched: false, ok: false, error };
   }
 
   private async dispatchRpc(
     purpose: PaperRollingFlowRequestPurpose,
     body: string,
     opts: {
-      readonly recordOnBudget: boolean;
       readonly precondition?: (() => string | null) | undefined;
       readonly signal?: AbortSignal | undefined;
     },
@@ -1458,30 +1597,26 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     });
     try {
       await previous;
-      // Pacing: dispatch-to-dispatch spacing; refusals re-checked after every wait.
+      // Pacing: dispatch-to-dispatch spacing; refusals re-checked after every (deadline-capped) wait.
       for (;;) {
-        const refusal = this.dispatchRefusal(purpose);
-        if (refusal) {
-          // Ceilings, the lifetime deadline and 429 halts are terminal: stop instead of retrying.
-          if (refusal !== "PROVIDER_STOPPING") this.requestStop(refusal);
-          return { dispatched: false, ok: false, error: refusal };
-        }
+        const refusal = this.dispatchRefusal(purpose, opts.signal);
+        if (refusal) return this.refuse(refusal);
         const wait =
           this.lastDispatchAtMs === null
             ? 0
             : this.lastDispatchAtMs + this.limits.rpcPacingMs - this.clock();
         if (wait <= 0) break;
-        await this.sleepFn(wait, this.sessionAbort?.signal);
+        await this.sleep(wait, opts.signal);
       }
       const pre = opts.precondition?.() ?? null;
       if (pre) return { dispatched: false, ok: false, error: pre };
+      // Immediate pre-dispatch recheck: stop, deadline, caller cancellation, epoch and ceilings.
+      const late = this.dispatchRefusal(purpose, opts.signal);
+      if (late) return this.refuse(late);
       const now = this.clock();
-      if (
-        opts.recordOnBudget &&
-        !this.budgetManager!.recordRequestAttempt(PROVIDER_NAME, "CANDIDATE_ENRICHMENT", now)
-      ) {
-        return { dispatched: false, ok: false, error: "BUDGET_MANAGER_DENIED" };
-      }
+      // The only place a dispatch is counted (admission by the adapter/enumerator is not counted).
+      if (!this.budgetManager!.recordActualDispatch(now))
+        return this.refuse("BUDGET_MANAGER_DENIED");
 
       const entry: MutableLedgerEntry = {
         seq: this.ledger.length + 1,
@@ -1499,19 +1634,31 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       this.maxConcurrentRpc = Math.max(this.maxConcurrentRpc, this.inFlightRpc);
 
       const controller = new AbortController();
+      let timedOut = false;
       const onAbort = () => controller.abort();
-      this.sessionAbort?.signal.addEventListener("abort", onAbort, { once: true });
-      opts.signal?.addEventListener("abort", onAbort, { once: true });
-      if (this.sessionAbort?.signal.aborted || opts.signal?.aborted) controller.abort();
-      const timer = setTimeout(() => controller.abort(), this.limits.requestTimeoutMs);
+      const linked: AbortSignal[] = [this.sessionAbort!.signal];
+      if (opts.signal) linked.push(opts.signal);
+      if (EPOCH_SCOPED_PURPOSES.has(purpose) && this.epochAbort) {
+        linked.push(this.epochAbort.signal);
+      }
+      for (const s of linked) s.addEventListener("abort", onAbort, { once: true });
+      if (linked.some((s) => s.aborted)) controller.abort();
+      const timer = this.setTimer(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.limits.requestTimeoutMs);
       let abortReject: ((e: Error) => void) | undefined;
       const aborted = new Promise<never>((_, reject) => {
         abortReject = reject;
       });
-      const onControllerAbort = () => abortReject?.(new Error("REQUEST_ABORTED_OR_TIMED_OUT"));
+      const onControllerAbort = () => abortReject?.(new Error("REQUEST_ABORTED"));
       controller.signal.addEventListener("abort", onControllerAbort, { once: true });
       if (controller.signal.aborted) onControllerAbort();
       aborted.catch(() => undefined);
+      const fail = (error: string, status?: number): RpcExchange => {
+        entry.error = error;
+        return { dispatched: true, ok: false, error, ...(status !== undefined ? { status } : {}) };
+      };
       try {
         const response = await Promise.race([
           this.fetchFn(this.rpcUrl, {
@@ -1519,24 +1666,54 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
             headers: { "content-type": "application/json" },
             body,
             signal: controller.signal,
+            redirect: "manual", // never follow redirects
           }),
           aborted,
         ]);
-        const text = await Promise.race([response.text(), aborted]);
         entry.httpStatus = response.status;
         this.budgetManager?.recordResponseStatus(response.status);
+        // First 429 is terminal for this provider; recognised from headers, before any body read.
+        if (response.status === 429) {
+          cancelResponseBody(response, "HTTP_429_RECEIVED");
+          this.requestStop("HTTP_429_RECEIVED");
+          return fail("HTTP_429_RECEIVED", 429);
+        }
+        if (
+          (response.status >= 300 && response.status < 400) ||
+          response.type === "opaqueredirect" ||
+          response.redirected
+        ) {
+          cancelResponseBody(response, "HTTP_REDIRECT_REJECTED");
+          this.requestStop("HTTP_REDIRECT_REJECTED");
+          return fail("HTTP_REDIRECT_REJECTED", response.status);
+        }
+        const declared = response.headers.get("content-length");
+        if (declared !== null && Number(declared) > this.limits.maxResponseBytes) {
+          cancelResponseBody(response, "RESPONSE_TOO_LARGE");
+          return fail("RESPONSE_TOO_LARGE", response.status);
+        }
+        let text = "";
+        if (response.body) {
+          const read = await Promise.race([
+            readBoundedStream(response.body, this.limits.maxResponseBytes, controller.signal),
+            aborted,
+          ]);
+          if (read.overflow) return fail("RESPONSE_TOO_LARGE", response.status);
+          text = read.bytes.toString("utf8");
+        }
         return { dispatched: true, ok: response.ok, status: response.status, text };
-      } catch (err) {
-        entry.error =
-          err instanceof Error && err.message === "REQUEST_ABORTED_OR_TIMED_OUT"
-            ? "REQUEST_ABORTED_OR_TIMED_OUT"
-            : "NETWORK_ERROR";
-        return { dispatched: true, ok: false, error: entry.error };
+      } catch {
+        return fail(
+          timedOut
+            ? "REQUEST_TIMED_OUT"
+            : controller.signal.aborted
+              ? "REQUEST_ABORTED"
+              : "NETWORK_ERROR",
+        );
       } finally {
-        clearTimeout(timer);
+        this.clearTimer(timer);
         controller.signal.removeEventListener("abort", onControllerAbort);
-        this.sessionAbort?.signal.removeEventListener("abort", onAbort);
-        opts.signal?.removeEventListener("abort", onAbort);
+        for (const s of linked) s.removeEventListener("abort", onAbort);
         this.inFlightRpc--;
         entry.completedAtMs = this.clock();
       }
