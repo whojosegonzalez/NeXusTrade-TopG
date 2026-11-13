@@ -4299,3 +4299,181 @@ Entries are launched relative to the first tick at which a fresh active window i
 | **Live-limit approval**                                                                                        | **Remaining**: none of the §8.29 test limits, or limits for the new acquisitions, is approved for live use                                                                                                                        |
 
 The strategy is unchanged: continuous availability for 90/120 s retests is still not expected in active pools.
+
+### 8.33 Bounded Security-Evidence Retrieval on One Shared Request Session (Offline; Not Installed)
+
+Independent review accepted the offline entry integration at `1befecc`. This section adds a bounded security-evidence loader for one fixed pool and mint. It shares one request-accounting boundary, and the Solana pacing, with the rolling flow provider.
+
+- **Nothing ran live**: no real network call, socket, daemon run, capture, position, order or wallet change took place. No environment file or credential was inspected, and no sealed file changed.
+- **Not installed**: the daemon's default path is unchanged. There is no runtime installation, CLI activation, automatic collection or rerun.
+
+#### One Request-Accounting Boundary
+
+`backend/src/candidate-scanner/PaperRequestSession.ts` is the rolling provider's dispatcher, extracted with its accepted rules:
+
+- serialization;
+- dispatch-to-dispatch pacing;
+- count-once accounting;
+- an absolute deadline;
+- stop on the first 429 at its headers;
+- redirects rejected and never followed;
+- bounded body reads with bounded cancellation;
+- a per-request timeout.
+
+It adds only what sharing needs:
+
+- **Lanes**: `SOLANA_RPC`, `RUGCHECK`, `SOLANA_TRACKER` and `DEXSCREENER`. Each has its own explicit attempt ceiling, pacing and response-size limit. Each lane is serialized; different lanes may run concurrently. Solana pacing must be at least 2,500 ms.
+- **One session ceiling**: a single HTTP-attempt ceiling and ledger across every lane and owner (`FLOW`, `SECURITY`, `SPOT`), never reset between refreshes or loads.
+- **Count once**: only an actual dispatch is counted, in the ledger and the shared budget alike. Admission checks, refusals and cancellations before dispatch are never counted. Callers' `recordRequestAttempt()` (the LP adapter, the transaction adapter, the history enumerator) is admission only.
+- **Session-wide stops**: the first 429, any redirect, the session deadline, the shared ceiling or a budget denial stops the session, and every owner is told once. A lane ceiling refuses only that lane.
+- **Ledger**: for each request it records:
+  - sequence, lane, owner and purpose;
+  - requested identity and JSON-RPC id;
+  - dispatch and completion times;
+  - HTTP status and body completeness;
+  - any error.
+
+  It never records URLs or headers, so credentials cannot appear in it. A status already received from the headers is kept when the body then times out.
+
+- **Inert until opened**: construction makes no request. Requests are possible only after an explicit `open()`, and only under `PAPER_SIMULATION`. Transport, clock, timers and every limit are injected, with no defaults.
+
+**Rolling provider**: `PaperRollingCandidateFlowProvider` now dispatches through a session.
+
+- **Private session**: built from its own limits, with only the Solana lane enabled. This is exactly the previous behaviour, and R1 to R15 pass unchanged.
+- **Shared session**: injected as `requestSession`, in place of `fetchFn`. The provider follows the session's stop. A stopped or unopened session is now a terminal refusal for the provider instead of being retried; without that, a missed stop would spin.
+- **Status**: the provider's ledger is its own share, with a `sessionSeq` field and `sessionHttpAttempts`.
+- **Budget class**: `PaperRollingDispatchBudget` is re-exported as the session's budget class.
+
+#### Bounded Security-Evidence Loader
+
+`backend/src/candidate-scanner/PaperCandidateSecurityEvidenceLoader.ts` returns `PaperCandidateSecurityEvidence` for one fixed pool and mint. Its `load(target)` fits `PaperDaemonEntrySecurityPath.loadEvidence`. It reuses the accepted components and validates nothing itself:
+
+| Component       | Request (session lane)                                                           | Reused component                                                                         |
+| --------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| LP              | pool account, then the account batch (Solana)                                    | `RaydiumAmmV4LpEvidenceAdapter` with the session's budget and a session-routed transport |
+| Mint account    | jsonParsed `getAccountInfo`, with a session-wide JSON-RPC id (Solana)            | — (validated later by the composition)                                                   |
+| RugCheck report | GET `/v1/tokens/<mint>/report` (RugCheck)                                        | —                                                                                        |
+| Bundlers        | GET `/tokens/<mint>/bundlers` with the injected key as a header (Solana Tracker) | —                                                                                        |
+
+- **Recorded evidence**: each component records its requested identity, request id, original retrieval time, HTTP status and body completeness.
+  - **Retrieval time**: the dispatch time (request initiation), which is the conservative choice.
+  - **Partial bodies**: a body that was not read completely is never parsed. Its payload is null, and the composition reports `RESPONSE_INCOMPLETE`.
+- **Boundaries**: import and construction are inert.
+  - **Construction requires**: `PAPER_SIMULATION`, a canonical fixed target, a session instance, explicit URLs, a truthful LP evidence origin and explicit limits.
+  - **`load()` refuses**: another target, a concurrent load, the load ceiling and a cancelled loader.
+  - **Cancellation**: `cancelLoads()` stops pending requests from being sent.
+  - **Status**: reads never acquire. The credential appears only in the outgoing request header, never in evidence, status or ledger.
+- **Spot price**: in the combined test path the spot request is a session-routed `DEXSCREENER` dispatch, so it is counted in the same ledger.
+
+#### Request-Budget Configuration (Offline Test Only; Not Approved)
+
+| Limit                             | Test value                                                |
+| --------------------------------- | --------------------------------------------------------- |
+| Session lifetime                  | 600,000 ms from `open()`                                  |
+| Session HTTP attempts (all lanes) | 330                                                       |
+| Per-request timeout               | 5,000 ms                                                  |
+| Solana RPC lane                   | 315 attempts; 2,500 ms pacing; 64 KiB bodies              |
+| RugCheck lane                     | 5 attempts; 5,000 ms pacing; 256 KiB bodies               |
+| Solana Tracker lane               | 5 attempts; 5,000 ms pacing; 256 KiB bodies               |
+| DexScreener (spot) lane           | 5 attempts; 1,000 ms pacing; 64 KiB bodies                |
+| Flow provider (its own share)     | §8.29 test limits: 300 attempts, 60 retrievals, and so on |
+| Loader                            | 3 loads; LP acquisition bound 30,000 ms                   |
+
+- **Per load**: at most 3 Solana, 1 RugCheck and 1 Solana Tracker request.
+- **Not approved**: none of these values is approved for live use.
+
+#### Offline Verification
+
+`backend/src/paper/PaperSessionEvidenceIntegration.test.ts` (B-01 to B-07) shares one session between three users:
+
+- the actual rolling provider;
+- the actual loader;
+- a session-routed spot mock.
+
+Everything runs on the shared virtual scheduler with in-memory transports, synthetic responses and a synthetic key. To support this, the shared test harness gained optional hooks: a shared session, Solana RPC result overrides, and other synthetic hosts.
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B-01 | Valid evidence (LP 98.5% via the actual acquisition, authorities, RugCheck, bundler) reaches the composition and the entry helper, and pre-admission passes. Flow, security and spot requests share one ledger, and security Solana requests are paced inside a flow refresh with no overlap. The ledger and evidence record identity, ids, times, status and completeness, and transport calls equal ledger dispatches. The key is sent only as a header. **Finding**: the decision is `BUY_GATE_REJECTED` because the flow is stale (see below) |
+| B-02 | No request before `open()`, from construction, or from status reads, flow reads or re-evaluating loaded evidence during collection. Prohibited contexts, invalid targets and limits, and a below-2,500 ms Solana pacing are rejected. A load for another target throws                                                                                                                                                                                                                                                                            |
+| B-03 | A shared ceiling of 6 stops the session and the provider after exactly 6 sends. A RugCheck lane ceiling of 0 refuses only that lane, is not counted, and leaves flow running                                                                                                                                                                                                                                                                                                                                                                      |
+| B-04 | The first 429 stops the session and the provider at its time, with nothing sent after it. A 70 s session stops both exactly at the deadline, and a request in flight is aborted at it. A loader-only session stops at its own deadline with nothing else pending. A loader cancellation sends nothing more and leaves flow unaffected                                                                                                                                                                                                             |
+| B-05 | An oversized RugCheck body (`RESPONSE_TOO_LARGE`) and a stalled bundler body (`REQUEST_TIMED_OUT`) give `RESPONSE_INCOMPLETE`, and a RugCheck report for another mint gives `PAYLOAD_MINT_MISMATCH`. A redirect is not followed and stops the session                                                                                                                                                                                                                                                                                             |
+| B-06 | Slow synthetic Solana responses (4.9 s) hold the shared lane: the load takes more than 15 s, the RugCheck and bundler evidence (dispatched at its start) is stale, and the final decision rejects                                                                                                                                                                                                                                                                                                                                                 |
+| B-07 | After stop: no collection, request or timer remains (session, provider and scheduler), and a later load sends nothing (`REQUEST_SESSION_STOPPED`)                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+Every test also checks the shared invariants:
+
+- a contiguous ledger;
+- budget attempts equal to ledger dispatches;
+- each lane's pacing, with no Solana overlap;
+- every dispatch before the deadline.
+
+**Finding: loading evidence during the entry path makes active flow stale under the current limits.**
+
+- **Cause**: the load's three Solana requests are paced into the middle of a flow refresh (between `GET_SLOT` and `GET_BLOCK_TIME`). That delays the next publication past the final decision.
+- **Measured effect**: across thirteen launch times (0 to 15 s after the first fresh active window), the load took 10.4 to 14.9 s. In every case the newest snapshot at the final decision was more than 15 s old, and the decision correctly rejected it.
+- **Security evidence**: stayed just within its 15 s limit.
+- **Consequence**: with 2,500 ms shared Solana pacing, in-path loading cannot coexist with fresh active-window flow. Arming with fresh flow and valid security was shown (I-01) only with a fast mocked loader.
+- **Open design decision** (not approved; nothing changed here):
+  - loading evidence ahead of the decision and reusing it while still fresh;
+  - a separately budgeted Solana allowance for security requests;
+  - accepting that entries can arm only in quieter refresh phases.
+
+- **Mutation checks** (sources restored byte-identical afterwards), each failing the expected tests:
+  - disabling lane pacing (R2 to R15, B-01 to B-06);
+  - counting refused requests (R7, R15, B-01 to B-05);
+  - not stopping on the first 429 (R13, B-04);
+  - following redirects (R14, B-05);
+  - removing the session deadline timer (B-04);
+  - unbounded bodies (R14, B-05);
+  - the loader marking incomplete bodies complete (B-05);
+  - the loader ignoring cancellation (B-04);
+  - the provider ignoring the shared session's stop (R13, R14, B-04).
+- **Results**: 475 tests in 14 suites pass:
+
+| Suite                                   | Passed  |
+| --------------------------------------- | ------- |
+| `PaperSessionEvidenceIntegration` (new) | 7/7     |
+| `PaperDaemonEntryIntegration`           | 7/7     |
+| `PaperTradingDaemon`                    | 100/100 |
+| `PaperCandidateSecurityContext`         | 11/11   |
+| `PaperRollingCandidateFlowProvider`     | 15/15   |
+| `CandidateFlowProvider`                 | 54/54   |
+| `PaperActiveWindowQualification`        | 12/12   |
+| `LpScreeningBridge`                     | 34/34   |
+| `RaydiumAmmV4LpEvidenceAdapter`         | 22/22   |
+| `PaperSolanaTrackerBundlerAdapter`      | 23/23   |
+| `BuyGateTriggerService`                 | 64/64   |
+| `SolanaRpcMintAccountParser`            | 6/6     |
+| `CandidateStreamEngine`                 | 25/25   |
+| `CandidateDecisionDiagnostic`           | 95/95   |
+
+The backend typecheck, ESLint and Prettier checks pass, each under an external limit with the installed local tools. None is left running. All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic inputs**: transports, responses, timings and the key are synthetic.
+- **Acquisition's own timer**: the accepted snapshot acquisition keeps its own real-time request timer as a backstop. It is cleared on every path, and the session's injected timeout governs.
+- **Acquisition's own count**: it may count a session-refused request in its own record. The session ledger is authoritative, and such an acquisition fails, leaving LP unavailable.
+- **Legacy traffic is outside the session**: the daemon's existing requests are not routed through it. These are:
+  - Raydium pool scans and Birdeye trending polls;
+  - DexScreener enrichment, the watchlist poller and radar sampling;
+  - the preliminary and position-loop spot fetches;
+  - the direct RugCheck fetch;
+  - the Smart Money probe.
+
+  **Before installation**, the fixed-candidate PAPER mode should disable discovery, Birdeye polling, watchlist polling and radar sampling (a fixed candidate does not need them). It should route its one spot request through the session's `DEXSCREENER` lane and its security evidence through this loader, so that every request is in the one ledger. Anything retained must get its own explicit lane and ceiling.
+
+#### Completed Versus Remaining
+
+| Item                                                                                         | State                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One request-accounting boundary (ledger, ceiling, Solana pacing) shared by flow and security | Done offline (§8.33)                                                                                                                                                                                                                                                              |
+| Bounded security-evidence retrieval reusing the accepted components                          | Done offline (§8.33)                                                                                                                                                                                                                                                              |
+| Entry path with pre-admission and final-time revalidation                                    | Done offline (§8.32)                                                                                                                                                                                                                                                              |
+| **In-path loading versus fresh active flow**                                                 | **Remaining design decision** (finding above)                                                                                                                                                                                                                                     |
+| **Legacy traffic**                                                                           | **Remaining**: disable or account the daemon's discovery, polling and spot traffic in the fixed-candidate mode                                                                                                                                                                    |
+| **Validated scanner LP mode**                                                                | **Remaining**: `CandidateStreamEngine` with `requireValidatedLp`, an LP evidence resolver and an LP freshness policy                                                                                                                                                              |
+| **Lifecycle wiring**                                                                         | **Remaining**: explicit selection of one pool and mint; opening and stopping the session with the daemon; `setCandidateFlowProvider` with the shared session; injecting the loader as the security path; obtaining the Solana Tracker key through the existing configuration path |
+| **Live approval**                                                                            | **Remaining**: none of the session, lane, loader or flow limits is approved for live use                                                                                                                                                                                          |

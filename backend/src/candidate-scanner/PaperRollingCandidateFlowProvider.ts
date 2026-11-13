@@ -68,14 +68,11 @@ import type {
 } from "./CandidateFlowProvider.js";
 import { buildStreamResolutionRecords } from "./CandidateDecisionDiagnostic.js";
 import {
-  GlobalResourceBudgetManager,
-  type RequestPurpose,
-} from "../research/prospective/GlobalResourceBudgetManager.js";
-import {
-  boundedCancel,
-  readBoundedStream,
-  type ISolanaKeepaliveWebSocketTransport,
-} from "./RaydiumTransportObservationProbe.js";
+  PaperRequestSession,
+  type PaperRequestLedgerEntry,
+  type PaperSessionDispatchBudget,
+} from "./PaperRequestSession.js";
+import type { ISolanaKeepaliveWebSocketTransport } from "./RaydiumTransportObservationProbe.js";
 
 /** Fixed (not configurable) rules reused unchanged from the accepted diagnostic and evaluator. */
 export const PAPER_ROLLING_FLOW_FIXED_RULES = Object.freeze({
@@ -108,6 +105,9 @@ const TERMINAL_REFUSALS: ReadonlySet<string> = new Set([
   "HTTP_ATTEMPT_CEILING_REACHED",
   "TRANSACTION_RETRIEVAL_CEILING_REACHED",
   "BUDGET_MANAGER_DENIED",
+  // A stopped or unopened shared session ends collection instead of being retried.
+  "REQUEST_SESSION_STOPPED",
+  "REQUEST_SESSION_NOT_OPEN",
 ]);
 
 /**
@@ -160,8 +160,16 @@ export interface PaperRollingCandidateFlowProviderOptions {
   readonly target: CandidateFlowTarget;
   readonly executionContext: "PAPER_SIMULATION";
   readonly rpcUrl: string;
-  /** Injected HTTP transport. Mandatory; no default networking. */
-  readonly fetchFn: typeof fetch;
+  /**
+   * Injected HTTP transport for a provider-private request session. Exactly one of fetchFn and
+   * requestSession is required; there is no default networking.
+   */
+  readonly fetchFn?: typeof fetch | undefined;
+  /**
+   * Shared request session (one HTTP-attempt ceiling, ledger and Solana pacing with other owners,
+   * such as the security-evidence loader). The session's owner opens and stops it.
+   */
+  readonly requestSession?: PaperRequestSession | undefined;
   /** Injected WebSocket transport factory (one call per epoch). Mandatory; no default networking. */
   readonly createWebSocketTransport: () => ISolanaKeepaliveWebSocketTransport;
   readonly limits: PaperRollingFlowLimits;
@@ -178,7 +186,10 @@ export type PaperRollingFlowRequestPurpose =
   | "TRANSACTION_RETRIEVAL";
 
 export interface PaperRollingFlowLedgerEntry {
+  /** Provider-local sequence (contiguous over this provider's own dispatches). */
   readonly seq: number;
+  /** Sequence in the request session's ledger (equal to seq for a private session). */
+  readonly sessionSeq: number;
   readonly purpose: PaperRollingFlowRequestPurpose;
   readonly epoch: number;
   readonly dispatchedAtMs: number;
@@ -224,7 +235,10 @@ export interface PaperRollingFlowStatus {
   readonly observationStartMs: number | null;
   readonly epochEstablished: boolean;
   readonly reconnects: number;
+  /** This provider's own dispatches. */
   readonly httpAttempts: number;
+  /** Every dispatch in the request session (equal to httpAttempts for a private session). */
+  readonly sessionHttpAttempts: number;
   readonly transactionRetrievals: number;
   readonly notificationsReceived: number;
   readonly budgetManagerAttempts: number;
@@ -255,24 +269,12 @@ export interface PaperRollingFlowStopReport {
 }
 
 /**
- * Provider-local budget: the adapter and history enumerator call recordRequestAttempt() for ADMISSION
- * (pacing and ceiling checks, never counted); the provider's dispatcher counts each ACTUAL dispatch exactly
- * once through recordActualDispatch(). The shared GlobalResourceBudgetManager class is unchanged for other
- * callers, including its own three-consecutive-429 rule.
+ * The budget is the request session's (one per session): the adapter and history enumerator call
+ * recordRequestAttempt() for ADMISSION only (never counted); the session counts each ACTUAL dispatch
+ * exactly once. Re-exported under the accepted name; the shared GlobalResourceBudgetManager class is
+ * unchanged for other callers.
  */
-export class PaperRollingDispatchBudget extends GlobalResourceBudgetManager {
-  public override recordRequestAttempt(
-    providerName: string,
-    purpose: RequestPurpose,
-    nowMs?: number,
-  ): boolean {
-    return this.canMakeRequest(providerName, nowMs, purpose).allowed;
-  }
-
-  public recordActualDispatch(nowMs: number): boolean {
-    return super.recordRequestAttempt(PROVIDER_NAME, "CANDIDATE_ENRICHMENT", nowMs);
-  }
-}
+export { PaperSessionDispatchBudget as PaperRollingDispatchBudget } from "./PaperRequestSession.js";
 
 interface PublishedSnapshot {
   readonly id: number;
@@ -287,14 +289,10 @@ interface PublishedSnapshot {
   readonly accountedSignatures: ReadonlySet<string>;
 }
 
-interface MutableLedgerEntry {
-  seq: number;
-  purpose: PaperRollingFlowRequestPurpose;
-  epoch: number;
-  dispatchedAtMs: number;
-  completedAtMs: number | null;
-  httpStatus: number | null;
-  error: string | null;
+/** This provider's dispatch: the session's (live-updated) ledger entry plus its epoch. */
+interface FlowDispatchRecord {
+  readonly entry: PaperRequestLedgerEntry;
+  readonly epoch: number;
 }
 
 interface RpcExchange {
@@ -331,12 +329,6 @@ function parseJson(text: string | undefined): unknown {
     return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) as unknown;
   } catch {
     return undefined;
-  }
-}
-
-function cancelResponseBody(response: Response, reason: string): void {
-  if (response.body) {
-    void boundedCancel(response.body, new Error(reason), 500);
   }
 }
 
@@ -400,7 +392,8 @@ export function validatePaperRollingFlowLimits(limits: unknown): PaperRollingFlo
 export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider {
   private readonly target: CandidateFlowTarget;
   private readonly rpcUrl: string;
-  private readonly fetchFn: typeof fetch;
+  private readonly session: PaperRequestSession;
+  private readonly ownsSession: boolean;
   private readonly createWebSocketTransport: () => ISolanaKeepaliveWebSocketTransport;
   private readonly limits: PaperRollingFlowLimits;
   private readonly clock: () => number;
@@ -420,18 +413,13 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
 
   // Components (created during start)
   private poolContext: TrackedRaydiumPoolContext | null = null;
-  private budgetManager: PaperRollingDispatchBudget | null = null;
+  private readonly budgetManager: PaperSessionDispatchBudget;
   private tracker: RollingTradeFlowTracker | null = null;
   private adapter: RaydiumAmmV4TransactionSourceAdapter | null = null;
   private coordinator: RaydiumCandidateSubscriptionCoordinator | null = null;
 
-  // Dispatcher
-  private rpcChain: Promise<void> = Promise.resolve();
-  private readonly ledger: MutableLedgerEntry[] = [];
-  private lastDispatchAtMs: number | null = null;
-  private inFlightRpc = 0;
-  private maxConcurrentRpc = 0;
-  private rpcIdSeq = 0;
+  // Dispatch accounting (the request session is authoritative; this is the provider's own share)
+  private readonly ledger: FlowDispatchRecord[] = [];
   private transactionRetrievals = 0;
 
   // Epoch
@@ -500,7 +488,17 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     if (typeof options.rpcUrl !== "string" || options.rpcUrl.length === 0) {
       throw new Error("[PAPER_FLOW_PROVIDER_INIT] rpcUrl is mandatory");
     }
-    if (typeof options.fetchFn !== "function") {
+    const shared = options.requestSession;
+    if (shared !== undefined) {
+      if (!(shared instanceof PaperRequestSession)) {
+        throw new Error("[PAPER_FLOW_PROVIDER_INIT] requestSession must be a PaperRequestSession");
+      }
+      if (options.fetchFn !== undefined) {
+        throw new Error(
+          "[PAPER_FLOW_PROVIDER_INIT] supply either fetchFn or requestSession, not both",
+        );
+      }
+    } else if (typeof options.fetchFn !== "function") {
       throw new Error("[PAPER_FLOW_PROVIDER_INIT] fetchFn is mandatory (no default networking)");
     }
     if (typeof options.createWebSocketTransport !== "function") {
@@ -510,11 +508,45 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     }
     this.target = Object.freeze({ poolAddress: t.poolAddress, tokenMint: t.tokenMint });
     this.rpcUrl = options.rpcUrl;
-    this.fetchFn = options.fetchFn;
     this.createWebSocketTransport = options.createWebSocketTransport;
     this.limits = validatePaperRollingFlowLimits(options.limits);
     this.clock = options.clock ?? (() => Date.now());
     this.timers = options.timers ?? DEFAULT_TIMERS;
+    if (shared !== undefined) {
+      if (shared.limits.lanes.SOLANA_RPC.pacingMs < this.limits.rpcPacingMs) {
+        throw new Error(
+          "[PAPER_FLOW_PROVIDER_INIT] the shared session's Solana pacing is below limits.rpcPacingMs",
+        );
+      }
+      this.session = shared;
+      this.ownsSession = false;
+    } else {
+      // Private session: the provider's own limits, Solana lane only (other lanes disabled).
+      const lane = (maxAttempts: number) => ({
+        maxAttempts,
+        pacingMs: this.limits.rpcPacingMs,
+        maxResponseBytes: this.limits.maxResponseBytes,
+      });
+      this.session = new PaperRequestSession({
+        executionContext: "PAPER_SIMULATION",
+        fetchFn: options.fetchFn!,
+        limits: {
+          lifetimeMs: this.limits.lifetimeMs,
+          maxHttpAttempts: this.limits.maxHttpAttempts,
+          requestTimeoutMs: this.limits.requestTimeoutMs,
+          lanes: {
+            SOLANA_RPC: lane(this.limits.maxHttpAttempts),
+            RUGCHECK: lane(0),
+            SOLANA_TRACKER: lane(0),
+            DEXSCREENER: lane(0),
+          },
+        },
+        clock: this.clock,
+        timers: this.timers,
+      });
+      this.ownsSession = true;
+    }
+    this.budgetManager = this.session.budget;
   }
 
   // ===========================================================================================
@@ -593,11 +625,13 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       epochEstablished: this.epochEstablished,
       reconnects: this.reconnects,
       httpAttempts: this.ledger.length,
+      sessionHttpAttempts: this.session.getStatus().httpAttempts,
       transactionRetrievals: this.transactionRetrievals,
       notificationsReceived: this.coordinator?.getMetrics().totalNotificationsReceived ?? 0,
-      budgetManagerAttempts: this.budgetManager?.getTotalRequests() ?? 0,
-      maxConcurrentRpc: this.maxConcurrentRpc,
-      activeTimers: this.activeTimers.size,
+      budgetManagerAttempts: this.budgetManager.getTotalRequests(),
+      maxConcurrentRpc: this.session.getMaxConcurrent("SOLANA_RPC"),
+      activeTimers:
+        this.activeTimers.size + (this.ownsSession ? this.session.getActiveTimerCount() : 0),
       cycles: this.cycles,
       refreshesAttempted: this.refreshesAttempted,
       refreshesPublished: this.refreshesPublished,
@@ -612,7 +646,16 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         messageBytes: this.wsMessageBytes,
         controlFrames: this.wsControlFrames,
       },
-      ledger: this.ledger.map((e) => ({ ...e })),
+      ledger: this.ledger.map((r, i) => ({
+        seq: i + 1,
+        sessionSeq: r.entry.seq,
+        purpose: r.entry.purpose as PaperRollingFlowRequestPurpose,
+        epoch: r.epoch,
+        dispatchedAtMs: r.entry.dispatchedAtMs,
+        completedAtMs: r.entry.completedAtMs,
+        httpStatus: r.entry.httpStatus,
+        error: r.entry.error,
+      })),
       snapshots: this.snapshots.map((s) => this.summarize(s)),
       cycleLog: this.cycleLog.map((c) => ({ ...c })),
     });
@@ -688,6 +731,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.startedAtMs = this.clock();
     this.deadlineMs = this.startedAtMs + this.limits.lifetimeMs;
     this.sessionAbort = new AbortController();
+    if (this.ownsSession) this.session.open();
     // Absolute deadline: fires even while an ack wait, pacing wait, request or body read is pending.
     this.setTimer(() => this.requestStop("LIFETIME_EXPIRED"), this.limits.lifetimeMs);
     if (signal) {
@@ -699,6 +743,11 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
         signal.addEventListener("abort", this.externalAbortListener, { once: true });
       }
     }
+    // A stopped session (429, redirect, shared ceiling, session deadline) stops collection.
+    if (!this.ownsSession && this.session.getStatus().state === "NOT_OPEN") {
+      this.requestStop("REQUEST_SESSION_NOT_OPEN");
+    }
+    this.session.onStop((reason) => this.requestStop(reason));
     return this.run();
   }
 
@@ -723,6 +772,8 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     this.clearKeepaliveTimers();
     this.epochAbort?.abort();
     this.sessionAbort?.abort();
+    // A private session ends with the provider; a shared one is stopped only by its owner.
+    if (this.ownsSession) this.session.stop(this.stopReason!);
   }
 
   private isStopping(): boolean {
@@ -778,14 +829,6 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
   // ===========================================================================================
 
   private async setup(): Promise<boolean> {
-    this.budgetManager = new PaperRollingDispatchBudget({
-      maxTotalRequests: this.limits.maxHttpAttempts,
-      maxEnrichmentAttempts: this.limits.maxHttpAttempts,
-      minReservedForwardRequests: 0,
-      minProviderSpacingMs: this.limits.rpcPacingMs,
-      clock: this.clock,
-    });
-
     const layout = await this.rpcCall("POOL_LAYOUT", "getAccountInfo", [
       this.target.poolAddress,
       { encoding: "base64", commitment: "confirmed" },
@@ -1077,7 +1120,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       return { kind: "NO_DISPATCH" };
     }
     this.refreshesAttempted++;
-    const getSlotDispatchedAtMs = this.ledger[this.ledger.length - 1]?.dispatchedAtMs ?? null;
+    const getSlotDispatchedAtMs = this.ledger[this.ledger.length - 1]?.entry.dispatchedAtMs ?? null;
     if (!slotRes.ok) return attempted(`GET_SLOT_FAILED: ${slotRes.error}`, getSlotDispatchedAtMs);
     const cutoffSlot = slotRes.result;
     if (typeof cutoffSlot !== "number" || !Number.isSafeInteger(cutoffSlot) || cutoffSlot < 0) {
@@ -1123,7 +1166,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       poolContext: this.poolContext!,
       knownAnchorSignature: anchor.signature,
       pageFetcher: (p) => this.fetchHistoryPage(p),
-      budgetManager: this.budgetManager!,
+      budgetManager: this.budgetManager,
       providerName: PROVIDER_NAME,
       clock: this.clock,
       pageSize: PAPER_ROLLING_FLOW_FIXED_RULES.historyPageSize,
@@ -1171,7 +1214,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       historyRetrievedAtMs,
       acquisitionCompletedAtMs: decisionTimestampMs,
       resolvedSignatures,
-      budgetManager: this.budgetManager!,
+      budgetManager: this.budgetManager,
       providerName: PROVIDER_NAME,
       minHostPacingMs: this.limits.rpcPacingMs,
       maxAllowedEvidenceAgeMs: PAPER_ROLLING_FLOW_FIXED_RULES.maxEvidenceAgeMs,
@@ -1234,7 +1277,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     const cfg: Record<string, unknown> = { limit: p.limit };
     if (p.before) cfg.before = p.before;
     if (p.commitment) cfg.commitment = p.commitment;
-    const id = ++this.rpcIdSeq;
+    const id = this.session.nextJsonRpcId();
     const exchange = await this.dispatchRpc(
       "HISTORY_ENUMERATION",
       JSON.stringify({
@@ -1524,7 +1567,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     params: readonly unknown[],
     precondition?: () => string | null,
   ): Promise<RpcCallResult> {
-    const id = ++this.rpcIdSeq;
+    const id = this.session.nextJsonRpcId();
     const exchange = await this.dispatchRpc(
       purpose,
       JSON.stringify({ jsonrpc: "2.0", id, method, params }),
@@ -1577,11 +1620,6 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
     return null;
   }
 
-  private refuse(error: string): RpcExchange {
-    if (TERMINAL_REFUSALS.has(error)) this.requestStop(error);
-    return { dispatched: false, ok: false, error };
-  }
-
   private async dispatchRpc(
     purpose: PaperRollingFlowRequestPurpose,
     body: string,
@@ -1590,135 +1628,46 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       readonly signal?: AbortSignal | undefined;
     },
   ): Promise<RpcExchange> {
-    const previous = this.rpcChain;
-    let release!: () => void;
-    this.rpcChain = new Promise<void>((resolve) => {
-      release = resolve;
+    const rpcId = (parseJson(body) as { id?: unknown } | undefined)?.id;
+    const waitSignals: AbortSignal[] = [this.sessionAbort!.signal];
+    if (opts.signal) waitSignals.push(opts.signal);
+    const exchange = await this.session.dispatch({
+      lane: "SOLANA_RPC",
+      owner: "FLOW",
+      purpose,
+      requestedIdentity: this.target.poolAddress,
+      url: this.rpcUrl,
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      jsonRpcId: typeof rpcId === "number" || typeof rpcId === "string" ? rpcId : null,
+      // Provider refusals first (stop, lifetime, cancellation, epoch, own ceilings), then the session's.
+      refusal: () => this.dispatchRefusal(purpose, opts.signal),
+      precondition: opts.precondition,
+      waitSignals,
+      // Linked at dispatch time: stop, the caller, and (for epoch-scoped work) the current epoch.
+      linkSignals: () => {
+        const linked: AbortSignal[] = [this.sessionAbort!.signal];
+        if (opts.signal) linked.push(opts.signal);
+        if (EPOCH_SCOPED_PURPOSES.has(purpose) && this.epochAbort) {
+          linked.push(this.epochAbort.signal);
+        }
+        return linked;
+      },
+      onDispatched: (entry) => {
+        this.ledger.push({ entry, epoch: this.currentEpoch ?? 0 });
+        if (purpose === "TRANSACTION_RETRIEVAL") this.transactionRetrievals++;
+      },
     });
-    try {
-      await previous;
-      // Pacing: dispatch-to-dispatch spacing; refusals re-checked after every (deadline-capped) wait.
-      for (;;) {
-        const refusal = this.dispatchRefusal(purpose, opts.signal);
-        if (refusal) return this.refuse(refusal);
-        const wait =
-          this.lastDispatchAtMs === null
-            ? 0
-            : this.lastDispatchAtMs + this.limits.rpcPacingMs - this.clock();
-        if (wait <= 0) break;
-        await this.sleep(wait, opts.signal);
-      }
-      const pre = opts.precondition?.() ?? null;
-      if (pre) return { dispatched: false, ok: false, error: pre };
-      // Immediate pre-dispatch recheck: stop, deadline, caller cancellation, epoch and ceilings.
-      const late = this.dispatchRefusal(purpose, opts.signal);
-      if (late) return this.refuse(late);
-      const now = this.clock();
-      // The only place a dispatch is counted (admission by the adapter/enumerator is not counted).
-      if (!this.budgetManager!.recordActualDispatch(now))
-        return this.refuse("BUDGET_MANAGER_DENIED");
-
-      const entry: MutableLedgerEntry = {
-        seq: this.ledger.length + 1,
-        purpose,
-        epoch: this.currentEpoch ?? 0,
-        dispatchedAtMs: now,
-        completedAtMs: null,
-        httpStatus: null,
-        error: null,
-      };
-      this.ledger.push(entry);
-      this.lastDispatchAtMs = now;
-      if (purpose === "TRANSACTION_RETRIEVAL") this.transactionRetrievals++;
-      this.inFlightRpc++;
-      this.maxConcurrentRpc = Math.max(this.maxConcurrentRpc, this.inFlightRpc);
-
-      const controller = new AbortController();
-      let timedOut = false;
-      const onAbort = () => controller.abort();
-      const linked: AbortSignal[] = [this.sessionAbort!.signal];
-      if (opts.signal) linked.push(opts.signal);
-      if (EPOCH_SCOPED_PURPOSES.has(purpose) && this.epochAbort) {
-        linked.push(this.epochAbort.signal);
-      }
-      for (const s of linked) s.addEventListener("abort", onAbort, { once: true });
-      if (linked.some((s) => s.aborted)) controller.abort();
-      const timer = this.setTimer(() => {
-        timedOut = true;
-        controller.abort();
-      }, this.limits.requestTimeoutMs);
-      let abortReject: ((e: Error) => void) | undefined;
-      const aborted = new Promise<never>((_, reject) => {
-        abortReject = reject;
-      });
-      const onControllerAbort = () => abortReject?.(new Error("REQUEST_ABORTED"));
-      controller.signal.addEventListener("abort", onControllerAbort, { once: true });
-      if (controller.signal.aborted) onControllerAbort();
-      aborted.catch(() => undefined);
-      const fail = (error: string, status?: number): RpcExchange => {
-        entry.error = error;
-        return { dispatched: true, ok: false, error, ...(status !== undefined ? { status } : {}) };
-      };
-      try {
-        const response = await Promise.race([
-          this.fetchFn(this.rpcUrl, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body,
-            signal: controller.signal,
-            redirect: "manual", // never follow redirects
-          }),
-          aborted,
-        ]);
-        entry.httpStatus = response.status;
-        this.budgetManager?.recordResponseStatus(response.status);
-        // First 429 is terminal for this provider; recognised from headers, before any body read.
-        if (response.status === 429) {
-          cancelResponseBody(response, "HTTP_429_RECEIVED");
-          this.requestStop("HTTP_429_RECEIVED");
-          return fail("HTTP_429_RECEIVED", 429);
-        }
-        if (
-          (response.status >= 300 && response.status < 400) ||
-          response.type === "opaqueredirect" ||
-          response.redirected
-        ) {
-          cancelResponseBody(response, "HTTP_REDIRECT_REJECTED");
-          this.requestStop("HTTP_REDIRECT_REJECTED");
-          return fail("HTTP_REDIRECT_REJECTED", response.status);
-        }
-        const declared = response.headers.get("content-length");
-        if (declared !== null && Number(declared) > this.limits.maxResponseBytes) {
-          cancelResponseBody(response, "RESPONSE_TOO_LARGE");
-          return fail("RESPONSE_TOO_LARGE", response.status);
-        }
-        let text = "";
-        if (response.body) {
-          const read = await Promise.race([
-            readBoundedStream(response.body, this.limits.maxResponseBytes, controller.signal),
-            aborted,
-          ]);
-          if (read.overflow) return fail("RESPONSE_TOO_LARGE", response.status);
-          text = read.bytes.toString("utf8");
-        }
-        return { dispatched: true, ok: response.ok, status: response.status, text };
-      } catch {
-        return fail(
-          timedOut
-            ? "REQUEST_TIMED_OUT"
-            : controller.signal.aborted
-              ? "REQUEST_ABORTED"
-              : "NETWORK_ERROR",
-        );
-      } finally {
-        this.clearTimer(timer);
-        controller.signal.removeEventListener("abort", onControllerAbort);
-        for (const s of linked) s.removeEventListener("abort", onAbort);
-        this.inFlightRpc--;
-        entry.completedAtMs = this.clock();
-      }
-    } finally {
-      release();
+    if (!exchange.dispatched && exchange.error && TERMINAL_REFUSALS.has(exchange.error)) {
+      this.requestStop(exchange.error);
     }
+    return {
+      dispatched: exchange.dispatched,
+      ok: exchange.ok,
+      status: exchange.status,
+      text: exchange.text,
+      error: exchange.error,
+    };
   }
 }

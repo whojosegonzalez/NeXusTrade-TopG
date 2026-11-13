@@ -24,6 +24,7 @@ import {
 } from "./fixtures/SyntheticRaydiumSwapTransactionFixture.js";
 import { encodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import type { ISolanaKeepaliveWebSocketTransport } from "./RaydiumTransportObservationProbe.js";
+import type { PaperRequestSession } from "./PaperRequestSession.js";
 
 /** OFFLINE TEST CONFIGURATION ONLY (§8.29). Not approved for live execution. */
 export const OFFLINE_TEST_LIMITS: PaperRollingFlowLimits = Object.freeze({
@@ -226,6 +227,28 @@ export function createHarness(
     /** Replace a response (returned after the normal latency). */
     readonly respond?: (ctx: RespondContext, sched: VirtualScheduler) => Response | undefined;
     readonly limits?: Partial<PaperRollingFlowLimits>;
+    /** Overrides the SYNTHETIC result of one Solana RPC call (return undefined for the default). */
+    readonly rpcResult?: (
+      method: string,
+      params: readonly unknown[],
+      now: number,
+    ) => { readonly result: unknown } | undefined;
+    /** Answers requests to hosts other than the SYNTHETIC RPC URL. */
+    readonly otherHttp?: (ctx: {
+      readonly url: string;
+      readonly path: string;
+      readonly init: RequestInit | undefined;
+      readonly now: number;
+    }) => Response | undefined;
+    /** Builds a shared request session over the harness transport; the provider then uses it. */
+    readonly session?: (deps: {
+      readonly fetchFn: typeof fetch;
+      readonly clock: () => number;
+      readonly timers: {
+        setTimeout(fn: () => void, ms: number): unknown;
+        clearTimeout(handle: unknown): void;
+      };
+    }) => PaperRequestSession;
   } = {},
 ) {
   const sched = new VirtualScheduler(START_MS);
@@ -370,6 +393,18 @@ export function createHarness(
   });
 
   const fetchFn = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    if (url !== TEST_RPC_URL) {
+      // Other SYNTHETIC hosts (security and spot providers), answered after the normal latency.
+      const path = new URL(url).pathname;
+      fetchLog.push({ method: `${init?.method ?? "GET"} ${path}`, init, url });
+      const now = sched.now;
+      await delay(opts.latencyFor?.(path, now) ?? latencyMs, init?.signal);
+      return (
+        opts.otherHttp?.({ url, path, init, now: sched.now }) ??
+        new Response("SYNTHETIC: no route", { status: 404 })
+      );
+    }
     const body = JSON.parse(String(init?.body)) as {
       id: number;
       method: string;
@@ -385,7 +420,10 @@ export function createHarness(
     }
     const now = sched.now;
     let result: unknown;
-    if (body.method === "getAccountInfo") {
+    const override = opts.rpcResult?.(body.method, body.params, now);
+    if (override !== undefined) {
+      result = override.result;
+    } else if (body.method === "getAccountInfo") {
       result = (
         JSON.parse(RAW_CAPTURED_RAY_WSOL_BOOTSTRAP_ACCOUNT_RPC_RESPONSE) as { result: unknown }
       ).result;
@@ -432,22 +470,26 @@ export function createHarness(
     return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { status: 200 });
   }) as unknown as typeof fetch;
 
+  const timers = {
+    setTimeout: (fn: () => void, ms: number) => sched.add(fn, ms, "provider"),
+    clearTimeout: (handle: unknown) => sched.clear(handle),
+  };
+  const session = opts.session?.({ fetchFn, clock, timers });
   const provider = new PaperRollingCandidateFlowProvider({
     target: TARGET,
     executionContext: "PAPER_SIMULATION",
     rpcUrl: TEST_RPC_URL,
-    fetchFn,
+    ...(session ? { requestSession: session } : { fetchFn }),
     createWebSocketTransport: createWs,
     limits: { ...OFFLINE_TEST_LIMITS, ...(opts.limits ?? {}) },
     clock,
-    timers: {
-      setTimeout: (fn, ms) => sched.add(fn, ms, "provider"),
-      clearTimeout: (handle) => sched.clear(handle),
-    },
+    timers,
   });
 
   return {
     provider,
+    session,
+    fetchFn,
     sched,
     clock,
     transports,
