@@ -556,7 +556,18 @@ export interface PaperSecurityEvidenceCacheStatus {
   readonly records: readonly PaperSecurityEvidenceCacheRefreshRecord[];
   /** Original retrieval time of each cached component (null when absent or not usable). */
   readonly retrievedAtMs: Readonly<Record<PaperSecurityEvidenceComponent, number | null>>;
+  /** Components withheld from readers while their refresh is pending. */
+  readonly pendingComponents: readonly PaperSecurityEvidenceComponent[];
 }
+
+const COMPONENT_KEY: Readonly<
+  Record<PaperSecurityEvidenceComponent, keyof PaperCandidateSecurityEvidence>
+> = Object.freeze({
+  LP: "lp",
+  MINT_ACCOUNT: "mintAccount",
+  RUGCHECK: "rugCheck",
+  BUNDLER: "bundler",
+});
 
 /**
  * Candidate-bound prefetch state on top of the loader (no other acquisition path).
@@ -569,6 +580,10 @@ export interface PaperSecurityEvidenceCacheStatus {
  *   the actual decision time, so nothing is extended or re-stamped.
  * - A dispatched refresh attempt always replaces the cached component (fail closed, even when the
  *   new response is unusable); a refused, never-sent attempt leaves the earlier evidence to age out.
+ * - While a refresh is pending, every requested component is withheld from readers (absent, hence
+ *   unavailable to the composition), so an earlier favourable component is never served after a
+ *   newer response may already contradict it. Pending state is cleared on settlement, cancellation
+ *   and exceptions; a load that fails after it started drops the requested components.
  */
 export class PaperSecurityEvidenceCache {
   private readonly loader: PaperCandidateSecurityEvidenceLoader;
@@ -581,6 +596,7 @@ export class PaperSecurityEvidenceCache {
     RUGCHECK: null,
     BUNDLER: null,
   };
+  private readonly pending = new Set<PaperSecurityEvidenceComponent>();
   private refreshes = 0;
   private refusedRefreshes = 0;
   private readonly records: PaperSecurityEvidenceCacheRefreshRecord[] = [];
@@ -604,9 +620,12 @@ export class PaperSecurityEvidenceCache {
     this.maxRefreshes = max;
   }
 
-  /** Pure read of the cached evidence (no acquisition). */
+  /** Pure read of the cached evidence (no acquisition); components being refreshed are withheld. */
   public getEvidence(): PaperCandidateSecurityEvidence {
-    return this.evidence;
+    if (this.pending.size === 0) return this.evidence;
+    const visible: Record<string, unknown> = { ...this.evidence };
+    for (const component of this.pending) delete visible[COMPONENT_KEY[component]];
+    return Object.freeze(visible as PaperCandidateSecurityEvidence);
   }
 
   /** Components that must be retrieved before a decision at `plannedDecisionMs` (pure). */
@@ -635,7 +654,7 @@ export class PaperSecurityEvidenceCache {
         ) {
           return Promise.reject(new Error("PAPER_SECURITY_CACHE_TARGET_MISMATCH"));
         }
-        return Promise.resolve(this.evidence);
+        return Promise.resolve(this.getEvidence());
       },
     };
   }
@@ -646,6 +665,7 @@ export class PaperSecurityEvidenceCache {
       refusedRefreshes: this.refusedRefreshes,
       records: Object.freeze([...this.records]),
       retrievedAtMs: Object.freeze({ ...this.retrievedAt }),
+      pendingComponents: Object.freeze([...this.pending]),
     });
   }
 
@@ -659,13 +679,34 @@ export class PaperSecurityEvidenceCache {
   ): Promise<readonly PaperSecurityEvidenceComponent[]> {
     const due = this.componentsDueAt(plannedDecisionMs);
     if (due.length === 0) return due;
+    if (this.pending.size > 0) throw new Error("PAPER_SECURITY_CACHE_REFRESH_IN_PROGRESS");
     if (this.refreshes >= this.maxRefreshes) {
       this.refusedRefreshes++;
       throw new Error("PAPER_SECURITY_CACHE_REFRESH_CEILING_REACHED");
     }
     this.refreshes++;
     const requestedAtMs = this.loader.now();
-    const loaded = await this.loader.load(this.target, signal, due);
+    const loadsBefore = this.loader.getStatus().loadsStarted;
+    for (const component of due) this.pending.add(component);
+    let loaded: PaperCandidateSecurityEvidence;
+    try {
+      loaded = await this.loader.load(this.target, signal, due);
+    } catch (err) {
+      // Refused before it started (nothing sent): earlier evidence is kept on its original time.
+      // Failed after it started: requests may have been sent, so the requested components are
+      // dropped rather than restored.
+      if (this.loader.getStatus().loadsStarted !== loadsBefore) {
+        const dropped: Record<string, unknown> = { ...this.evidence };
+        for (const component of due) {
+          dropped[COMPONENT_KEY[component]] = null;
+          this.retrievedAt[component] = null;
+        }
+        this.evidence = Object.freeze(dropped as PaperCandidateSecurityEvidence);
+      }
+      throw err;
+    } finally {
+      this.pending.clear();
+    }
     const record = this.loader.getStatus().records.at(-1);
     const next: Record<string, unknown> = { ...this.evidence };
     const apply = (

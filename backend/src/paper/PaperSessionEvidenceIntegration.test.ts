@@ -1053,3 +1053,234 @@ describe("Shared-session boundary corrections and evidence prefetch (synthetic, 
     for (const env of [withdrawnEnv, spentEnv]) expectSessionInvariants(env.session.getStatus());
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Security-cache refresh race (offline, synthetic; no flow collection is needed here)
+// ---------------------------------------------------------------------------------------------
+
+const DANGER_REPORT = syntheticRugCheckReport({
+  risks: [{ name: "SYNTHETIC danger risk", level: "danger" }],
+});
+
+/** Session + loader + cache, with everything prefetched clean at START (t = 0). */
+async function prefetchedCache(o: Overrides) {
+  const env = sharedHarness(o);
+  const cache = new PaperSecurityEvidenceCache({
+    loader: env.loader,
+    target: { poolId: POOL_ID, mintAddress: MINT },
+    limits: { maxRefreshes: 3 },
+  });
+  env.session.open();
+  await drive(env.h.sched, cache.refreshFor(START_MS + 15_000));
+  const until = (atMs: number) =>
+    drive(env.h.sched, new Promise<void>((resolve) => env.h.sched.at(START_MS + atMs, resolve)));
+  const evaluate = (atMs = env.h.clock()) =>
+    evaluatePaperCandidateSecurityContext({
+      executionContext: "PAPER_SIMULATION",
+      target: { poolId: POOL_ID, mintAddress: MINT },
+      decisionTimeMs: atMs,
+      evidence: cache.getEvidence(),
+    });
+  const entry = () =>
+    retrieveAndEvaluatePaperDaemonEntry({
+      candidate: synthCandidate(),
+      flowProvider: env.h.provider, // not started: flow stays unavailable throughout
+      getExistingArmedState: () => undefined,
+      clock: env.h.clock,
+      retrievals: {
+        fetchSpotInfo: sessionSpot(env.session),
+        fetchRugCheckMetrics: async () => {
+          throw new Error("the direct RugCheck retrieval must not be used");
+        },
+      },
+      security: cache.asSecurityPath(),
+    }) as Promise<Entry>;
+  return { env, cache, until, evaluate, entry };
+}
+
+const rugCheckLedger = (env: ReturnType<typeof sharedHarness>) =>
+  env.session.getStatus().ledger.filter((e) => e.lane === "RUGCHECK");
+
+describe("Security-cache refresh race (synthetic, offline)", () => {
+  it("B-12: an adverse RugCheck arriving while the mint refresh is pending is never masked by the earlier clean report", async () => {
+    let rugCheckCalls = 0;
+    const { env, cache, until, evaluate, entry } = await prefetchedCache({
+      rugCheck: () =>
+        ++rugCheckCalls === 1 ? json(syntheticRugCheckReport()) : json(DANGER_REPORT),
+      // The refreshed mint account (from 6 s) takes 4 s.
+      latencyFor: (m, now) =>
+        m === "getAccountInfo" && now >= START_MS + 6_000 ? 4_000 : undefined,
+    });
+    const clean = cache.getEvidence().rugCheck!;
+    const cleanSnapshot = JSON.stringify(clean);
+    expect((await evaluate()).rugCheck.metrics?.hasDangerRisk).toBe(false);
+
+    await until(6_000);
+    const refresh = cache.refreshFor(START_MS + 16_000);
+    expect(cache.getStatus().pendingComponents).toEqual(["MINT_ACCOUNT", "RUGCHECK", "BUNDLER"]);
+
+    // 6.5 s: the danger report has arrived; the mint request has not completed.
+    let midEntry: Entry | undefined;
+    let midVisible: string[] = [];
+    let midSecurityRequests: { rugCheckCompleted: boolean; mintCompleted: boolean } | undefined;
+    env.h.sched.at(START_MS + 6_500, () => {
+      midVisible = Object.keys(cache.getEvidence());
+      const ledger = env.session.getStatus().ledger;
+      midSecurityRequests = {
+        rugCheckCompleted: rugCheckLedger(env).at(-1)!.completedAtMs !== null,
+        // The refresh's own mint request (sent at or after 6 s) has not completed.
+        mintCompleted: ledger.some(
+          (e) =>
+            e.purpose === "CANDIDATE_MINT_ACCOUNT" &&
+            e.dispatchedAtMs >= START_MS + 6_000 &&
+            e.completedAtMs !== null &&
+            e.completedAtMs <= START_MS + 6_500,
+        ),
+      };
+      void entry().then((e) => (midEntry = e));
+    });
+    await until(7_000);
+    expect(midSecurityRequests).toEqual({ rugCheckCompleted: true, mintCompleted: false });
+    expect(midVisible).toEqual(["lp"]); // mint, RugCheck and bundler are withheld while pending
+    expect(midEntry?.kind).toBe("SECURITY_REJECTED");
+    if (midEntry?.kind === "SECURITY_REJECTED") {
+      const ctx = midEntry.security!.context;
+      expect(ctx.rugCheck.status).toBe("EVIDENCE_MISSING"); // not the earlier clean report
+      expect(ctx.rugCheck.metrics).toBeNull();
+      expect(ctx.lp.status).toBe("AVAILABLE_QUALIFIED"); // unaffected component stays available
+      expect(midEntry.reason).toBe("PRE_ADMISSION_REJECTED:REJECTED_UNKNOWN_FREEZE_AUTHORITY");
+    }
+
+    // After settlement: the adverse report is published with its own retrieval time.
+    await drive(env.h.sched, refresh);
+    expect(cache.getStatus().pendingComponents).toEqual([]);
+    expect(cache.getStatus().retrievedAtMs.RUGCHECK).toBe(START_MS + 6_000);
+    expect(cache.getEvidence().rugCheck?.retrievedAtMs).toBe(START_MS + 6_000);
+    const after = await evaluate();
+    expect(after.rugCheck.status).toBe("AVAILABLE");
+    expect(after.rugCheck.metrics?.hasDangerRisk).toBe(true);
+    expect(after.preAdmission.passed).toBe(true);
+    const afterEntry = await drive(env.h.sched, entry());
+    // The adverse report reaches Gate 11, which fails on it (flow is not collected in this test).
+    expect(afterEntry.kind).toBe("EVALUATED");
+    if (afterEntry.kind === "EVALUATED") {
+      expect(afterEntry.rugMetrics).toMatchObject({ hasDangerRisk: true });
+      expect(
+        afterEntry.decision.buyGateResult.gates.find((g) => g.name === "BUNDLER_CONCENTRATION_GATE")
+          ?.passed,
+      ).toBe(false);
+      expect(afterEntry.decision.outcome).toBe("BUY_GATE_REJECTED");
+    }
+    // The earlier clean evidence object was never rewritten.
+    expect(JSON.stringify(clean)).toBe(cleanSnapshot);
+    env.session.stop("TEST_END");
+    expectSessionInvariants(env.session.getStatus());
+  });
+
+  it("B-13: failed, cancelled and never-sent refreshes; a failure after start drops rather than restores", async () => {
+    // (a) A dispatched refresh that fails (HTTP 500) replaces the clean report; it is not restored.
+    let failedCalls = 0;
+    const failed = await prefetchedCache({
+      rugCheck: () =>
+        ++failedCalls === 1
+          ? json(syntheticRugCheckReport())
+          : new Response("SYNTHETIC", { status: 500 }),
+    });
+    await failed.until(6_000);
+    const failedRefresh = failed.cache.refreshFor(START_MS + 16_000);
+    await failed.until(6_050);
+    expect(failed.cache.getEvidence().rugCheck).toBeUndefined();
+    await drive(failed.env.h.sched, failedRefresh);
+    expect(failed.cache.getEvidence().rugCheck?.httpStatus).toBe(500);
+    expect(failed.cache.getStatus().retrievedAtMs.RUGCHECK).toBeNull();
+    expect((await failed.evaluate()).rugCheck.status).toBe("REQUEST_NOT_OK");
+    failed.env.session.stop("TEST_END");
+
+    // (b) Cancellation mid-refresh: the in-flight RugCheck (sent) is aborted and replaced; the mint
+    // request still waiting for Solana pacing is never sent, so the earlier mint evidence is kept on
+    // its original time; pending state is cleared; a later refresh is refused before it starts.
+    const cancelled = await prefetchedCache({
+      latencyFor: (m, now) =>
+        m.endsWith("/report") && now >= START_MS + 6_000 ? 3_000 : undefined,
+    });
+    const mintBefore = cancelled.cache.getEvidence().mintAccount;
+    await cancelled.until(6_000);
+    const cancelledRefresh = cancelled.cache.refreshFor(START_MS + 16_000);
+    cancelled.env.h.sched.at(START_MS + 6_500, () =>
+      cancelled.env.loader.cancelLoads("TEST_CANCEL"),
+    );
+    await drive(cancelled.env.h.sched, cancelledRefresh);
+    expect(cancelled.cache.getStatus().pendingComponents).toEqual([]);
+    expect(rugCheckLedger(cancelled.env).at(-1)).toMatchObject({
+      error: "REQUEST_ABORTED",
+      bodyComplete: false,
+    });
+    expect(cancelled.cache.getEvidence().rugCheck?.bodyComplete).toBe(false);
+    // Aborted before headers arrived: no status, so the composition reports REQUEST_NOT_OK.
+    expect(cancelled.cache.getEvidence().rugCheck?.httpStatus).toBe(0);
+    expect((await cancelled.evaluate()).rugCheck.status).toBe("REQUEST_NOT_OK");
+    expect(cancelled.env.loader.getStatus().records.at(-1)!.mintAccount).toMatchObject({
+      reason: "LOADER_CANCELLED",
+      sessionSeqs: [],
+    });
+    expect(cancelled.cache.getEvidence().mintAccount).toBe(mintBefore);
+    expect((await cancelled.evaluate(START_MS + 15_000)).authorities.status).toBe("AVAILABLE");
+    expect((await cancelled.evaluate(START_MS + 15_001)).authorities.status).toBe(
+      "STALE_RETRIEVAL_EVIDENCE",
+    );
+    const sentBefore = cancelled.env.h.fetchLog.length;
+    const evidenceBefore = cancelled.cache.getEvidence();
+    await expect(cancelled.cache.refreshFor(START_MS + 30_000)).rejects.toThrow(
+      "PAPER_SECURITY_LOADER_CANCELLED",
+    );
+    expect(cancelled.cache.getStatus().pendingComponents).toEqual([]);
+    expect(cancelled.cache.getEvidence()).toBe(evidenceBefore);
+    expect(cancelled.env.h.fetchLog.length).toBe(sentBefore);
+    cancelled.env.session.stop("TEST_END");
+
+    // (c) Never-sent refusal (RugCheck lane ceiling of 1): the clean report is kept, only on its
+    // original 15 s, and stays due for refresh.
+    const refused = await prefetchedCache({
+      lanes: { RUGCHECK: { maxAttempts: 1, pacingMs: 5_000, maxResponseBytes: 262_144 } },
+    });
+    const cleanBefore = refused.cache.getEvidence().rugCheck;
+    await refused.until(6_000);
+    await drive(refused.env.h.sched, refused.cache.refreshFor(START_MS + 16_000));
+    expect(refused.env.loader.getStatus().records.at(-1)!.rugCheck).toMatchObject({
+      reason: "RUGCHECK_ATTEMPT_CEILING_REACHED",
+      sessionSeqs: [],
+    });
+    expect(refused.cache.getEvidence().rugCheck).toBe(cleanBefore);
+    expect((await refused.evaluate(START_MS + 15_000)).rugCheck.status).toBe("AVAILABLE");
+    expect((await refused.evaluate(START_MS + 15_001)).rugCheck.status).toBe(
+      "STALE_RETRIEVAL_EVIDENCE",
+    );
+    expect(refused.cache.componentsDueAt(START_MS + 16_000)).toContain("RUGCHECK");
+    refused.env.session.stop("TEST_END");
+
+    // (d) A load that fails after it started: pending cleared, requested components dropped.
+    const thrown = await prefetchedCache({});
+    await thrown.until(6_000);
+    const original = thrown.env.loader.load.bind(thrown.env.loader);
+    vi.spyOn(thrown.env.loader, "load").mockImplementation(async (...args) => {
+      await original(...args);
+      throw new Error("SYNTHETIC failure after the load started");
+    });
+    await expect(
+      drive(thrown.env.h.sched, thrown.cache.refreshFor(START_MS + 16_000)),
+    ).rejects.toThrow("SYNTHETIC failure after the load started");
+    expect(thrown.cache.getStatus().pendingComponents).toEqual([]);
+    const visible = thrown.cache.getEvidence();
+    expect([visible.mintAccount, visible.rugCheck, visible.bundler]).toEqual([null, null, null]);
+    expect(visible.lp).not.toBeNull(); // not requested, unaffected
+    const dropped = await thrown.evaluate();
+    expect([dropped.authorities.status, dropped.rugCheck.status, dropped.bundler.status]).toEqual([
+      "EVIDENCE_MISSING",
+      "EVIDENCE_MISSING",
+      "EVIDENCE_MISSING",
+    ]);
+    thrown.env.session.stop("TEST_END");
+    for (const e of [failed, cancelled, refused, thrown])
+      expectSessionInvariants(e.env.session.getStatus());
+  });
+});

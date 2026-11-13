@@ -4480,7 +4480,7 @@ Independent review of `da932fc` passed 106 focused tests and compilation, and re
 
 - **Before the decision**: `refreshFor(plannedDecisionMs)` retrieves only the components that are missing, were not retrieved, or would be older than the unchanged 15 s at the planned decision time. The rule is exact: 15,000 ms is reusable, 15,001 ms is due.
 - **Pure reads**: `getEvidence()` and the cache's security path for the entry helper never acquire. Evidence keeps its original retrieval time, and the composition alone decides validity at the actual decision time. Nothing is extended or re-stamped.
-- **Fail closed**: a dispatched refresh attempt always replaces the cached component, even when the new response is unusable. A refused, never-sent attempt leaves the earlier evidence to age out on its original time.
+- **Fail closed**: a dispatched refresh attempt always replaces the cached component, even when the new response is unusable. A refused, never-sent attempt leaves the earlier evidence to age out on its original time. While a refresh is pending, its requested components are withheld from readers (corrected after review of `1a92b76`; see below).
 - **Bounded**: refreshes are explicit calls, limited by `maxRefreshes` and the loader's own load ceiling. There is no polling and no automatic budget renewal.
 - **One boundary**: everything still runs through the one session ledger and the one serialized Solana lane, with unchanged freshness, pacing, deadlines, thresholds and invalidation rules.
 
@@ -4550,6 +4550,37 @@ The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None o
 - **The schedule is set by the test**: the cache only decides what is due. Choosing when to prefetch, and the planned decision times, is the caller's; no runtime scheduler was added.
 - **Tight margins**: the measured margins are small (LP 13.75 s and mint 13.85 s at the decisions; prefetch at 57 s misses by 850 ms).
 
+#### Cache Refresh Race (Review of `1a92b76`)
+
+Review of `1a92b76` confirmed the boundary corrections and the passing prefetch schedule (110 focused tests and compilation passed). It reproduced one race in `PaperSecurityEvidenceCache.refreshFor()`:
+
+- **Before**: replacements became visible only when the whole selective load finished. A new RugCheck report with a danger flag completed while the mint request was still pending, but `getEvidence()` kept returning the earlier clean report until the load settled.
+- **Now**: every component requested by a pending refresh is withheld from readers (`getEvidence()` and the cache's security path alike) until the refresh settles. A withheld component is absent, so the composition reports it as `EVIDENCE_MISSING`. Reads remain free of I/O, and components not being refreshed stay available.
+- **After settlement**:
+  - **Published**: each new component appears with its original retrieval time.
+  - **Failed**: a dispatched attempt that failed or was unusable replaces the earlier favourable component and does not restore it.
+  - **Never sent**: a refusal before sending keeps the earlier evidence only on its original 15 s.
+- **Cancellation and exceptions**: pending state is cleared on every path. A load refused before it started keeps the earlier evidence; a load that fails after it started drops the requested components. Stored evidence is never rewritten, and freshness is not extended.
+- **Concurrency**: a second refresh while one is pending is refused (`PAPER_SECURITY_CACHE_REFRESH_IN_PROGRESS`).
+
+**Regressions** (`PaperSessionEvidenceIntegration.test.ts`):
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B-12 | Everything prefetched clean at 0 s; a refresh at 6 s requests mint, RugCheck and bundler (LP not due). At 6.5 s the danger report has arrived and the refreshed mint request has not completed. Only LP is visible, and an entry during this interval sees RugCheck as `EVIDENCE_MISSING`, not the clean report, and is rejected at pre-admission. After settlement the danger report is published with its own retrieval time (6 s), pre-admission passes, and Gate 11 fails on it. The earlier clean evidence object is unchanged                                          |
+| B-13 | A refresh answered with HTTP 500 replaces the clean report (`REQUEST_NOT_OK`), with nothing restored. A cancellation mid-refresh aborts the in-flight RugCheck (replaced, unusable) and keeps the never-sent mint evidence only until its original 15 s (accepted at 15,000 ms, stale at 15,001 ms); a later refresh is refused before sending anything. A never-sent RugCheck (lane ceiling) keeps the clean report only on its original 15 s and stays due. A load that fails after starting clears pending state and drops the requested components, leaving LP available |
+| B-10 | The successful prefetch arm-and-confirm schedule still passes unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+- **Mutation checks** (source restored byte-identical afterwards), each caught:
+  - reads ignoring pending components (B-12, B-13);
+  - the security path bypassing withholding (B-12);
+  - a failure after start restoring previous evidence (B-13);
+  - pending state not cleared on failure (B-13);
+  - a never-sent refusal discarding previous evidence (B-13);
+  - a failed refresh restoring previous evidence (B-13).
+- **Results**: under external 60 s limits, `PaperSessionEvidenceIntegration` 13/13, `PaperDaemonEntryIntegration` 7/7, `PaperTradingDaemon` 100/100, `PaperCandidateSecurityContext` 11/11, `PaperRollingCandidateFlowProvider` 15/15 and `RaydiumAmmV4LpEvidenceAdapter` 22/22. The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+- **Scope**: this correction is limited to the cache. No runtime scheduler, scanner wiring or activation was added.
+
 #### Completed Versus Remaining
 
 | Item                                                                                         | State                                                                                                                                                                                                                                                                             |
@@ -4559,6 +4590,7 @@ The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None o
 | Entry path with pre-admission and final-time revalidation                                    | Done offline (§8.32)                                                                                                                                                                                                                                                              |
 | Prefetch and selective refresh on the shared session                                         | Done offline (§8.33): one passing arm-and-confirm schedule measured; in-path loading remains unsuitable in the tested schedules                                                                                                                                                   |
 | Solana-lane exhaustion and the provider's stricter limits in a shared session                | Corrected offline (§8.33)                                                                                                                                                                                                                                                         |
+| Security-cache refresh race (pending components withheld from readers)                       | Corrected offline (§8.33)                                                                                                                                                                                                                                                         |
 | **Prefetch scheduling at runtime**                                                           | **Remaining**: when to prefetch and refresh relative to flow refreshes, with explicit bounds, chosen by the future installation                                                                                                                                                   |
 | **Legacy traffic**                                                                           | **Remaining**: disable or account the daemon's discovery, polling and spot traffic in the fixed-candidate mode                                                                                                                                                                    |
 | **Validated scanner LP mode**                                                                | **Remaining**: `CandidateStreamEngine` with `requireValidatedLp`, an LP evidence resolver and an LP freshness policy                                                                                                                                                              |
