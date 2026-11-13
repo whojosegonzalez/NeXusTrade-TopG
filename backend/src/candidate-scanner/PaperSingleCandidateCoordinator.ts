@@ -137,6 +137,8 @@ export interface PaperCoordinatorDecisionRecord {
   readonly reason: string | null;
   readonly flowReason: string | null;
   readonly flowCutoffAgeMs: number | null;
+  /** Age derived from the original creation time at the actual decision time. */
+  readonly assetAgeSecondsAtDecision: number | null;
   readonly preAdmissionPassed: boolean | null;
   readonly securityStatuses: Readonly<Record<string, string>> | null;
   readonly action:
@@ -167,6 +169,19 @@ export interface PaperCoordinatorStatus {
     readonly reason: string | null;
   };
   readonly armedAtMs: number | null;
+  /** The pool's original creation time, as observed at intake (never re-stamped). */
+  readonly creation: {
+    readonly openTimeSec: number;
+    readonly provenance: string;
+    readonly observedAtMs: number;
+    readonly ageAtIntakeSec: number;
+  } | null;
+  /** When and why an armed candidate was disarmed. */
+  readonly disarms: readonly {
+    readonly atMs: number;
+    readonly decisionSeq: number | null;
+    readonly reason: string;
+  }[];
   readonly decisions: readonly PaperCoordinatorDecisionRecord[];
   readonly refreshErrors: readonly string[];
   readonly skippedTicks: Readonly<Record<string, number>>;
@@ -244,7 +259,14 @@ export class PaperSingleCandidateCoordinator {
     atMs: null,
     reason: null,
   };
-  private candidate: WatchlistCandidateItem | null = null;
+  private candidateAt: ((atMs: number) => WatchlistCandidateItem) | null = null;
+  private creation: {
+    readonly openTimeSec: number;
+    readonly provenance: string;
+    readonly observedAtMs: number;
+    readonly ageAtIntakeSec: number;
+  } | null = null;
+  private readonly disarms: { atMs: number; decisionSeq: number | null; reason: string }[] = [];
   private armed: ArmedPullbackState | undefined;
   private nextDecisionNotBeforeMs = 0;
   private decisionInFlight = false;
@@ -339,6 +361,8 @@ export class PaperSingleCandidateCoordinator {
       }),
       intake: Object.freeze({ ...this.intake }),
       armedAtMs: this.armed?.armedAtMs ?? null,
+      creation: this.creation,
+      disarms: Object.freeze(this.disarms.map((d) => Object.freeze({ ...d }))),
       decisions: Object.freeze([...this.decisions]),
       refreshErrors: Object.freeze([...this.refreshErrors]),
       skippedTicks: Object.freeze({ ...this.skippedTicks }),
@@ -394,6 +418,8 @@ export class PaperSingleCandidateCoordinator {
     if (this.stopReason !== null) return;
     this.stopReason = reason;
     this.stoppedAtMs = this.clock();
+    // An armed state never outlives the coordinator.
+    if (this.armed) this.recordLocalDisarm(this.stoppedAtMs, `COORDINATOR_STOPPED:${reason}`);
     for (const handle of [...this.activeTimers]) this.clearTimer(handle);
     this.tickHandle = null;
     this.loader.cancelLoads(`COORDINATOR_STOPPED:${reason}`);
@@ -515,17 +541,34 @@ export class PaperSingleCandidateCoordinator {
   private advance(): void {
     const now = this.clock();
     // The daemon's 120 s armed-state prune (unchanged).
-    if (this.armed && now - this.armed.armedAtMs > 120_000) this.armed = undefined;
+    if (this.armed && now - this.armed.armedAtMs > 120_000) {
+      this.recordLocalDisarm(now, "ARMED_STATE_PRUNED_AFTER_120_S");
+    }
     if (this.decisionInFlight) return this.skip("DECISION_IN_FLIGHT");
-    if (this.refreshInFlight) return this.skip("REFRESH_PENDING");
     if (this.intake.state === "REJECTED") return;
     // Scanner intake runs once, after the first prefetch has settled. The scanner itself decides
     // on missing, mismatched or below-threshold LP evidence.
     if (this.intake.state === "PENDING") {
+      if (this.refreshInFlight) return this.skip("REFRESH_PENDING");
       if (this.cache.getStatus().refreshes === 0) return this.skip("PREFETCH_NOT_DONE");
       if (!this.intakeInFlight) this.runIntake();
       return this.skip("INTAKE_PENDING");
     }
+    // An armed candidate's planned decision is never postponed until evidence looks favourable:
+    // when it is due, the existing entry path runs whatever the evidence. Unavailable flow or
+    // withheld, stale or pending security is rejected there, and the existing rules disarm.
+    // (Local polling ticks between decisions do not decide.)
+    if (this.armed && now >= this.nextDecisionNotBeforeMs) {
+      if (this.decisions.length >= this.schedule.maxDecisions) {
+        // No decision can be made: the armed state is not kept without one.
+        this.recordLocalDisarm(now, "DECISION_BUDGET_SPENT_WHILE_ARMED");
+        this.stop("DECISION_BUDGET_EXHAUSTED_WHILE_ARMED");
+        return;
+      }
+      this.launchDecision(now);
+      return;
+    }
+    if (this.refreshInFlight) return this.skip("REFRESH_PENDING");
     const flow: CandidateFlowResult = this.provider.getCandidateFlow(
       { poolAddress: this.target.poolId, tokenMint: this.target.mintAddress },
       now,
@@ -606,28 +649,44 @@ export class PaperSingleCandidateCoordinator {
           return;
         }
         const nowSec = Math.floor(now / 1000);
-        this.candidate = {
-          poolId: this.target.poolId,
-          mintAddress: this.target.mintAddress,
-          symbol: pool.symbol,
-          liquidityUsd: pool.liquidityUsd,
-          marketCapUsd: pool.marketCapUsd,
-          lmcRatio: pool.marketCapUsd > 0 ? pool.liquidityUsd / pool.marketCapUsd : 0,
-          lpBurnPct: result.candidate.lpBurnPct,
-          assetAgeSeconds: Math.max(0, nowSec - pool.openTimeSec),
-          volume5mUsd: pool.volume5mUsd,
-          buys5m: pool.buys5m,
-          sells5m: pool.sells5m,
-          buyToSellRatio: pool.sells5m > 0 ? pool.buys5m / pool.sells5m : pool.buys5m,
-          status: "WATCHING",
-          discoveredAt: new Date(now).toISOString(),
-          lastEvaluatedAt: new Date(now).toISOString(),
-        } as WatchlistCandidateItem;
+        // The pool's original creation time and its provenance are kept; age is derived from it at
+        // each actual decision time and never reset by later market requests.
+        this.creation = Object.freeze({
+          openTimeSec: pool.openTimeSec,
+          provenance: pool.metricProvenance?.tokenAgeSec ?? "OBSERVED",
+          observedAtMs: now,
+          ageAtIntakeSec: Math.max(0, nowSec - pool.openTimeSec),
+        });
+        const discoveredAt = new Date(now).toISOString();
+        const lpBurnPct = result.candidate.lpBurnPct;
+        this.candidateAt = (atMs: number): WatchlistCandidateItem =>
+          ({
+            poolId: this.target.poolId,
+            mintAddress: this.target.mintAddress,
+            symbol: pool.symbol,
+            liquidityUsd: pool.liquidityUsd,
+            marketCapUsd: pool.marketCapUsd,
+            lmcRatio: pool.marketCapUsd > 0 ? pool.liquidityUsd / pool.marketCapUsd : 0,
+            lpBurnPct,
+            assetAgeSeconds: Math.max(0, Math.floor(atMs / 1000) - pool.openTimeSec),
+            volume5mUsd: pool.volume5mUsd,
+            buys5m: pool.buys5m,
+            sells5m: pool.sells5m,
+            buyToSellRatio: pool.sells5m > 0 ? pool.buys5m / pool.sells5m : pool.buys5m,
+            status: "WATCHING",
+            discoveredAt,
+            lastEvaluatedAt: new Date(atMs).toISOString(),
+          }) as WatchlistCandidateItem;
         this.intake = { state: "ADMITTED", atMs: now, reason: null };
       })().finally(() => {
         this.intakeInFlight = false;
       }),
     );
+  }
+
+  private recordLocalDisarm(now: number, reason: string): void {
+    this.disarms.push({ atMs: now, decisionSeq: null, reason });
+    this.armed = undefined;
   }
 
   private rejectIntake(now: number, reason: string): void {
@@ -663,8 +722,9 @@ export class PaperSingleCandidateCoordinator {
   // ===========================================================================================
 
   private launchDecision(launchedAtMs: number): void {
-    const candidate = this.candidate;
-    if (!candidate) return;
+    const candidateAt = this.candidateAt;
+    if (!candidateAt) return;
+    const candidate = candidateAt(launchedAtMs);
     this.decisionInFlight = true;
     const wasArmed = this.armed !== undefined;
     const seq = ++this.decisionSeq;
@@ -683,6 +743,8 @@ export class PaperSingleCandidateCoordinator {
             ),
         },
         security: this.cache.asSecurityPath(),
+        // Age, cohort, maturity and retest use the actual post-retrieval decision time.
+        candidateAtDecision: candidateAt,
       })
         .then((entry) => this.onDecision(seq, launchedAtMs, wasArmed, entry))
         .finally(() => {
@@ -708,6 +770,7 @@ export class PaperSingleCandidateCoordinator {
           reason: null,
           flowReason: null,
           flowCutoffAgeMs: null,
+          assetAgeSecondsAtDecision: null,
           preAdmissionPassed: null,
           securityStatuses: null,
           action: "DISCARDED_AFTER_STOP" as const,
@@ -759,6 +822,13 @@ export class PaperSingleCandidateCoordinator {
           break;
       }
     }
+    if (action === "DISARMED" || (action === "DROPPED" && wasArmed)) {
+      this.disarms.push({
+        atMs: entry.kind === "NO_ACTIVE_DEX_PAIR" ? now : entry.decisionNowMs,
+        decisionSeq: seq,
+        reason: reason ?? flowReason ?? outcome ?? entry.kind,
+      });
+    }
     this.decisions.push(
       Object.freeze({
         ...base,
@@ -768,6 +838,10 @@ export class PaperSingleCandidateCoordinator {
         reason,
         flowReason,
         flowCutoffAgeMs,
+        assetAgeSecondsAtDecision:
+          entry.kind === "NO_ACTIVE_DEX_PAIR" || !this.creation
+            ? null
+            : Math.max(0, Math.floor(entry.decisionNowMs / 1000) - this.creation.openTimeSec),
         preAdmissionPassed: ctx?.preAdmission.passed ?? null,
         securityStatuses: ctx
           ? Object.freeze({

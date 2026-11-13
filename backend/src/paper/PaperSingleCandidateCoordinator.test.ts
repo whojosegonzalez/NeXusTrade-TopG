@@ -48,6 +48,9 @@ const RUGCHECK_URL = "http://rugcheck.synthetic.test";
 const TRACKER_URL = "http://solanatracker.synthetic.test";
 const MARKET_URL = `http://dexscreener.synthetic.test/latest/dex/tokens/${MINT}`;
 const PEAK_SOL = 0.0001;
+const START_SEC = Math.floor(START_MS / 1000);
+/** SYNTHETIC fixed pool creation time: 600 s old at the 67 s intake. */
+const CREATED_AT_SEC = START_SEC + 67 - 600;
 const OTHER_POOL = "Em6rHi68trYgBFyJ5261A2nhwuQWfLcirgzZZYoRcrkX"; // canonical, not the candidate
 /** SYNTHETIC: three swaps whose 60 s window stays complete for cutoffs between 55 s and 105 s. */
 const ACTIVE_SWAPS = [
@@ -126,6 +129,11 @@ type EnvOptions = {
   readonly rugCheck?: (call: number, now: number) => Response;
   readonly market?: (now: number) => Record<string, unknown>;
   readonly latencyFor?: (methodOrPath: string, now: number) => number | undefined;
+  readonly swaps?: Parameters<typeof createHarness>[0] extends infer O
+    ? O extends { readonly swaps?: infer S }
+      ? S
+      : never
+    : never;
 };
 
 /** Harness transports + one coordinator over them. The harness's own provider is never started. */
@@ -133,7 +141,7 @@ function coordinatorEnv(o: EnvOptions = {}) {
   let rugCheckCalls = 0;
   const ref: { coordinator?: PaperSingleCandidateCoordinator } = {};
   const h: Harness = createHarness({
-    swaps: ACTIVE_SWAPS,
+    swaps: o.swaps ?? ACTIVE_SWAPS,
     ...(o.latencyFor ? { latencyFor: o.latencyFor } : {}),
     rpcResult: (method, params) => {
       if (method === "getAccountInfo" && params[0] === MINT) {
@@ -166,7 +174,7 @@ function coordinatorEnv(o: EnvOptions = {}) {
           priceSol: armed ? PEAK_SOL * 0.88 : PEAK_SOL,
           liquidityUsd: 65_000,
           marketCapUsd: 250_000,
-          openTimeSec: Math.floor(now / 1000) - 600,
+          openTimeSec: CREATED_AT_SEC, // fixed creation time in every response
           volume5mUsd: 15_000,
           txCount5m: 55,
           buys5m: 40,
@@ -267,6 +275,11 @@ describe("PaperSingleCandidateCoordinator (synthetic, offline)", () => {
     const [prefetch] = status.schedule.prefetches;
     expect(prefetch!.atMs).toBe(prefetch!.observationStartMs + 65_000 - 6_000);
     expect(status.intake).toMatchObject({ state: "ADMITTED", reason: null });
+    // One fixed creation time throughout; age is derived from it at each decision.
+    expect(status.creation).toMatchObject({ openTimeSec: CREATED_AT_SEC, ageAtIntakeSec: 600 });
+    for (const d of status.decisions) {
+      expect(d.assetAgeSecondsAtDecision).toBe(Math.floor(d.decisionAtMs! / 1000) - CREATED_AT_SEC);
+    }
     expect(status.decisions.map((d) => [d.outcome, d.action])).toEqual([
       ["ARMED_FIRST_TICK", "ARMED"],
       ["RETEST_CONFIRMED", "CONFIRMED"],
@@ -332,19 +345,28 @@ describe("PaperSingleCandidateCoordinator (synthetic, offline)", () => {
     await run(adverse);
     const ad = decisionsOf(adverse);
     expect(ad[0]).toMatchObject({ outcome: "ARMED_FIRST_TICK" });
-    expect(adverse.coordinator.getStatus().skippedTicks.REFRESH_PENDING).toBeGreaterThan(0);
     const refresh = adverse.coordinator.getCacheStatus().records[1]!;
-    expect(
-      ad.every(
-        (d) => d.launchedAtMs < refresh.requestedAtMs || d.launchedAtMs >= refresh.completedAtMs,
-      ),
-    ).toBe(true);
-    expect(ad[1]).toMatchObject({
+    // The confirmation fell due while the refresh was pending: it ran at its time (not postponed),
+    // saw the refreshed components withheld, was rejected, and disarmed.
+    const due = ad[1]!;
+    expect(due.launchedAtMs).toBeGreaterThanOrEqual(ad[0]!.decisionAtMs! + 5_000);
+    expect(due.launchedAtMs).toBeGreaterThan(refresh.requestedAtMs);
+    expect(due.launchedAtMs).toBeLessThan(refresh.completedAtMs);
+    expect(due).toMatchObject({ kind: "SECURITY_REJECTED", action: "DISARMED" });
+    expect(due.securityStatuses).toMatchObject({ rugCheck: "EVIDENCE_MISSING" });
+    expect(adverse.coordinator.getStatus().disarms[0]).toMatchObject({
+      atMs: due.decisionAtMs,
+      decisionSeq: due.seq,
+    });
+    // Unarmed decisions wait for the refresh; the published danger report then fails Gate 11.
+    const after = ad.slice(2);
+    expect(after.every((d) => d.launchedAtMs >= refresh.completedAtMs)).toBe(true);
+    expect(after[0]).toMatchObject({
       outcome: "BUY_GATE_REJECTED",
       reason: "RUGCHECK_DANGER_FLAG_FAILED",
-      action: "DISARMED",
     });
     expect(ad.some((d) => d.action === "CONFIRMED")).toBe(false);
+    expect(ad.filter((d) => d.action === "ARMED")).toHaveLength(1);
     await expectCleanStop(adverse);
 
     // Withdrawn flow: a disconnect right after the arm; the confirmation is rejected and disarms;
@@ -551,5 +573,105 @@ describe("PaperSingleCandidateCoordinator (synthetic, offline)", () => {
       env.coordinator.getSessionStatus().ledger.filter((e) => e.purpose === "MARKET_INTAKE"),
     ).toHaveLength(1);
     await expectCleanStop(env);
+  });
+
+  it("C-06: flow unavailable before a due decision disarms at that decision; fresh evidence later re-arms anew", async () => {
+    // SYNTHETIC: a second burst of swaps after the reconnect, so the new epoch can qualify again.
+    const env = coordinatorEnv({
+      swaps: [
+        ...ACTIVE_SWAPS,
+        { signature: sig(51), atMs: 135_000, side: "BUY" as const },
+        { signature: sig(52), atMs: 140_000, side: "BUY" as const },
+        { signature: sig(53), atMs: 145_000, side: "SELL" as const },
+      ],
+      limits: {
+        session: { lifetimeMs: 250_000, maxHttpAttempts: 260 },
+        flow: { lifetimeMs: 250_000, maxHttpAttempts: 200 },
+        loader: { maxLoads: 8 },
+        cache: { maxRefreshes: 8 },
+      },
+      lanes: {
+        SOLANA_RPC: { maxAttempts: 240, pacingMs: 2_500, maxResponseBytes: 65_536 },
+        RUGCHECK: { maxAttempts: 8, pacingMs: 5_000, maxResponseBytes: 262_144 },
+        SOLANA_TRACKER: { maxAttempts: 8, pacingMs: 5_000, maxResponseBytes: 262_144 },
+      },
+    });
+    // Disconnect after the arm (74.6 s) and before the planned confirmation (79.6 s).
+    env.h.sched.at(START_MS + 76_000, () => env.h.transports.at(-1)!.emitClose());
+    const report = await run(env);
+    const [arm, due, ...later] = report.status.decisions;
+    expect(arm).toMatchObject({ outcome: "ARMED_FIRST_TICK", action: "ARMED" });
+    // At the due time the existing path ran with unavailable flow and disarmed.
+    expect(due!.launchedAtMs).toBeGreaterThanOrEqual(arm!.decisionAtMs! + 5_000);
+    expect(due!.launchedAtMs).toBeLessThan(arm!.decisionAtMs! + 5_000 + 250 + 1);
+    expect(due).toMatchObject({ outcome: "BUY_GATE_REJECTED", action: "DISARMED", armed: true });
+    expect(due!.flowReason).toMatch(/EPOCH_INVALIDATED|WARMING_UP|NO_PUBLISHED_SNAPSHOT/);
+    expect(report.status.disarms[0]).toMatchObject({
+      atMs: due!.decisionAtMs,
+      decisionSeq: due!.seq,
+    });
+    // No decision ran while flow stayed unavailable unarmed, and the old armed state was not revived:
+    // the next arm is a new one, at its own decision time, after the epoch-2 warm-up.
+    const rearm = later.find((d) => d.action === "ARMED");
+    expect(rearm).toBeDefined();
+    expect(rearm!.armed).toBe(false);
+    expect(later.every((d) => d.launchedAtMs > due!.decisionAtMs!)).toBe(true);
+    const prefetches = report.status.schedule.prefetches;
+    expect(prefetches.map((p) => p.epoch)).toEqual([1, 2]);
+    expect(rearm!.decisionAtMs!).toBeGreaterThan(prefetches[1]!.observationStartMs + 65_000);
+    expect(rearm!.preAdmissionPassed).toBe(true);
+    expect(rearm!.flowCutoffAgeMs!).toBeLessThanOrEqual(15_000);
+    expectSessionInvariants(env);
+    await expectCleanStop(env);
+  });
+
+  it("C-07: maturity is derived at the actual decision time from the fixed creation time", async () => {
+    // Non-established SYNTHETIC context (market cap below the viral-runner floor): the 900 s
+    // maturity ceiling applies. Liquidity and market cap keep the scanner's L/MC window.
+    const nonEstablished = { liquidityUsd: 30_000, marketCapUsd: 120_000 };
+
+    // (a) Between intake and decision: 899 s at the 67 s intake, about 906 s at the first decision.
+    const crossing = coordinatorEnv({
+      market: () => ({ ...nonEstablished, openTimeSec: START_SEC + 67 - 899 }),
+    });
+    const a = await run(crossing);
+    expect(a.status.intake).toMatchObject({ state: "ADMITTED" });
+    expect(a.status.creation).toMatchObject({
+      openTimeSec: START_SEC + 67 - 899,
+      ageAtIntakeSec: 899,
+    });
+    const first = a.status.decisions[0]!;
+    expect(first.assetAgeSecondsAtDecision).toBeGreaterThan(900);
+    expect(first).toMatchObject({
+      outcome: "BUY_GATE_REJECTED",
+      reason: "MATURITY_WINDOW_GATE_FAILED",
+    });
+    expect(a.status.decisions.some((d) => d.action === "ARMED")).toBe(false);
+    await expectCleanStop(crossing);
+
+    // (b) During the awaited retrieval: exactly 900 s when the decision starts (74.5 s), 901 s at the
+    // actual decision time after a 600 ms market response.
+    const during = coordinatorEnv({
+      market: () => ({ ...nonEstablished, openTimeSec: START_SEC + 74 - 900 }),
+      latencyFor: (m) => (m === `/latest/dex/tokens/${MINT}` ? 600 : undefined),
+    });
+    const b = await run(during);
+    const d0 = b.status.decisions[0]!;
+    expect(Math.floor(d0.launchedAtMs / 1000) - (START_SEC + 74 - 900)).toBe(900);
+    expect(d0.assetAgeSecondsAtDecision).toBe(901);
+    expect(d0).toMatchObject({
+      outcome: "BUY_GATE_REJECTED",
+      reason: "MATURITY_WINDOW_GATE_FAILED",
+    });
+    expect(b.status.decisions.some((d) => d.action === "ARMED")).toBe(false);
+    await expectCleanStop(during);
+
+    // (c) Control: well inside the window, the same context arms and confirms.
+    const inside = coordinatorEnv({
+      market: () => ({ ...nonEstablished, openTimeSec: START_SEC + 67 - 600 }),
+    });
+    const c = await run(inside);
+    expect(c.status.decisions.map((d) => d.action)).toEqual(["ARMED", "CONFIRMED"]);
+    for (const env of [crossing, during, inside]) expectSessionInvariants(env);
   });
 });

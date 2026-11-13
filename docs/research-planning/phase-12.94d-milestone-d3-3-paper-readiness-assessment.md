@@ -4678,13 +4678,13 @@ Every run also checks:
 
 **Measured timelines** (seconds after collection start; synthetic chain, test configuration). The subscription was confirmed at 2.65 s.
 
-| Scenario             | Timeline                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Pass (C-01)**      | Prefetch 61.65 s (5 requests; LP retrieved 66.85 s, others 61.65 s) → scanner intake admitted 67.1 s → first active window published 74.35 s → **arm 74.6 s** (flow cutoff age 5.6 s; mint, RugCheck and bundler 12.95 s; LP 7.75 s) → selective refresh 74.6–79.35 s (mint, RugCheck, bundler) → **confirm 79.85 s** (cutoff age 10.85 s), launched at 79.75 s, after the planned 79.6 s. 20 requests (13 Solana, 2 RugCheck, 2 Solana Tracker, 3 market) |
-| Spent refresh budget | Arm 74.6 s; the post-arm refresh is refused; no further decision; stop                                                                                                                                                                                                                                                                                                                                                                                     |
-| Adverse replacement  | Arm 74.6 s; refresh 74.6–80.75 s (the danger report arrives at 74.7 s, while the mint request is slowed to 1.5 s); no decision while pending; confirmation 80.85 s fails Gate 11 (`RUGCHECK_DANGER_FLAG_FAILED`) and disarms; a later unarmed decision at 99.6 s is rejected the same way; the refresh budget is then spent and the coordinator stops                                                                                                      |
-| Withdrawn flow       | Arm 74.6 s; disconnect at the confirmation's market request; confirmation 79.85 s rejected (`EPOCH_INVALIDATED`) and disarmed; reconnect confirmed at 81.9 s; derived epoch-2 prefetch at 140.9 s; session deadline at 150 s                                                                                                                                                                                                                               |
-| 4.9 s Solana latency | Subscription 5.05 s; prefetch 64.05 s took until 83.75 s; at intake the mint evidence was 19.8 s old, so the authorities were not validated and the scanner rejected (`REJECTED_ACTIVE_MINT_AUTHORITY`, the scanner's label for "not verified as renounced")                                                                                                                                                                                               |
+| Scenario             | Timeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Pass (C-01)**      | Prefetch 61.65 s (5 requests; LP retrieved 66.85 s, others 61.65 s) → scanner intake admitted 67.1 s → first active window published 74.35 s → **arm 74.6 s** (flow cutoff age 5.6 s; mint, RugCheck and bundler 12.95 s; LP 7.75 s) → selective refresh 74.6–79.35 s (mint, RugCheck, bundler) → **confirm 79.85 s** (cutoff age 10.85 s), launched at 79.75 s, after the planned 79.6 s. 20 requests (13 Solana, 2 RugCheck, 2 Solana Tracker, 3 market)              |
+| Spent refresh budget | Arm 74.6 s; the post-arm refresh is refused; no further decision; stop                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Adverse replacement  | Arm 74.6 s; refresh 74.6–80.75 s (the danger report arrives at 74.7 s, while the mint request is slowed to 1.5 s). The confirmation is **due** at 79.6 s: it runs at 79.75 s (decision 79.85 s) with the refreshed components withheld, is rejected (`SECURITY_REJECTED`, RugCheck `EVIDENCE_MISSING`) and disarms. Later unarmed decisions wait for the refresh and fail Gate 11 on the published danger report (`RUGCHECK_DANGER_FLAG_FAILED`) (corrected; see below) |
+| Withdrawn flow       | Arm 74.6 s; disconnect at the confirmation's market request; confirmation 79.85 s rejected (`EPOCH_INVALIDATED`) and disarmed; reconnect confirmed at 81.9 s; derived epoch-2 prefetch at 140.9 s; session deadline at 150 s                                                                                                                                                                                                                                            |
+| 4.9 s Solana latency | Subscription 5.05 s; prefetch 64.05 s took until 83.75 s; at intake the mint evidence was 19.8 s old, so the authorities were not validated and the scanner rejected (`REJECTED_ACTIVE_MINT_AUTHORITY`, the scanner's label for "not verified as renounced")                                                                                                                                                                                                            |
 
 - **Mutation checks** (source restored byte-identical afterwards), each caught:
   - a prefetch not derived from the warm-up (C-01, C-02, C-04);
@@ -4722,6 +4722,52 @@ The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None o
 - **Supplied parser**: the market parser is test-supplied. A runtime parser mapping the real market response is not built here.
 - **Scanner label**: the scanner reports an unverified authority with its existing `REJECTED_ACTIVE_*_AUTHORITY` labels.
 
+#### Corrections (Review of `b996b8e`)
+
+Independent review of `b996b8e` passed 76 focused tests and compilation. Two further mocked checks found behaviour that differed from the existing strategy. Both are corrected narrowly. No threshold, freshness limit or strategy rule changed.
+
+1. **Armed state is not preserved by skipping a due decision**:
+   - **Before**: `advance()` returned `FLOW_UNAVAILABLE` or `REFRESH_PENDING` before running the entry path. After an arm at +74.6 s and a disconnect before the next decision, the original `armedAtMs` was still held at +82.75 s, with no rejection or disarm recorded.
+   - **Now**: when an armed candidate's planned decision is due (`arm + confirmDelayMs`), the existing entry path runs at that time whatever the evidence. Unavailable flow is rejected there (`BUY_GATE_REJECTED`), and withheld, stale or pending security is rejected too (`SECURITY_REJECTED`); the existing rules then disarm. The 250 ms local checks between decisions still do not decide, and unarmed warm-up still waits.
+   - **Recorded**: every disarm is recorded with its time, decision and reason, including the existing 120 s prune and a stop while armed. If the decision budget is spent when a decision is due, the candidate is disarmed and the coordinator stops; the armed state is never kept without a decision.
+   - **Re-arming**: fresh evidence can re-arm the candidate through the normal path, with a new armed state; the old one is never revived.
+2. **Maturity is derived at the actual decision time**:
+   - **Before**: `runIntake()` computed `assetAgeSeconds` once. With one fixed creation time, a candidate that was 899 s old at intake was still treated as 899 s old at the arm (actually 906 s) and the confirmation (911 s), and a non-established candidate armed and confirmed.
+   - **Now**: the pool's original creation time and its provenance are kept from intake (`status.creation`). The entry helper gained an optional `candidateAtDecision` hook, called after every awaited retrieval at the final decision time. The coordinator derives the age there, so the cohort, maturity and retest checks see the actual age. The hook must keep the same pool and mint, and the validated LP is still applied on top. The daemon does not pass the hook, so its behaviour is unchanged.
+   - **No re-stamping**: no creation time is manufactured, and later market requests never reset the age. The synthetic market fixture now uses one fixed creation time in every response (previously each response computed "now − 600 s").
+
+**Regressions** (`PaperSingleCandidateCoordinator.test.ts`):
+
+| Test           | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C-06           | Disconnect at 76 s, after the arm (74.6 s) and before the due confirmation (79.6 s). The due decision runs at 79.75 s with unavailable flow (`PAPER_ROLLING_FLOW_SNAPSHOT_WITHDRAWN: EPOCH_INVALIDATED`), is rejected and disarms; the disarm is recorded at 79.85 s. No decision runs while flow stays unavailable and the candidate is unarmed. After the reconnect (subscription 79.4 s, derived prefetch 138.4 s, a new burst of synthetic swaps), the candidate re-arms afresh at 181.35 s, unarmed beforehand, with fresh flow and passed pre-admission |
+| C-02 (updated) | A pending refresh spanning a due decision: the confirmation runs at its due time, sees the refreshed components withheld, is rejected and disarms. Unarmed decisions then wait for the refresh                                                                                                                                                                                                                                                                                                                                                                |
+| C-07           | Non-established context (market cap below the viral-runner floor, so the 900 s ceiling applies). 899 s at intake becomes 906 s at the first decision, which `MATURITY_WINDOW_GATE` rejects. During an awaited retrieval: 900 s when the decision starts (74.5 s) becomes 901 s at the actual decision time (75.1 s, after a 600 ms market response), and is rejected. A control 600 s old at intake arms and confirms                                                                                                                                         |
+| C-01 (updated) | The fixed creation time is reported, age at intake is 600 s, and each decision's age equals the decision time minus the creation time. The valid schedule still arms and confirms                                                                                                                                                                                                                                                                                                                                                                             |
+
+- **Mutation checks** (sources restored byte-identical afterwards), each caught:
+  - skipping a due decision when flow is unavailable or a refresh is pending (C-02, C-06);
+  - the coordinator not passing the decision-time candidate (C-07);
+  - age frozen at intake (C-07);
+  - the helper ignoring the decision-time candidate (C-07).
+- **Results**: under external 60 s limits:
+
+| Suite                               | Passed  |
+| ----------------------------------- | ------- |
+| `PaperSingleCandidateCoordinator`   | 7/7     |
+| `PaperSessionEvidenceIntegration`   | 13/13   |
+| `PaperDaemonEntryIntegration`       | 7/7     |
+| `PaperTradingDaemon`                | 100/100 |
+| `PaperCandidateSecurityContext`     | 11/11   |
+| `PaperRollingCandidateFlowProvider` | 15/15   |
+| `CandidateStreamEngine`             | 25/25   |
+| `BuyGateTriggerService`             | 64/64   |
+| `CandidateFlowProvider`             | 54/54   |
+
+The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+
+**Measured consequence** (C-06, epoch 2): after re-arming at 181.35 s, the due confirmations at 186.6 s and, after a further re-arm at 203.85 s, at 209.1 s were rejected (`PRE_ADMISSION_REJECTED:REJECTED_UNLOCKED_LP_RISK`). In each case the post-arm refresh included LP, which is two paced Solana requests on a busy lane, and was still pending at the planned confirmation time, so LP was withheld. Under the corrected rule this is the intended outcome. It is now the limiting condition for confirmation whenever LP must be refreshed between an arm and its confirmation (see the remaining gaps).
+
 #### Exact Remaining Gaps
 
 **Activation** (none implemented or approved):
@@ -4732,6 +4778,10 @@ The backend typecheck, ESLint and Prettier pass, each under a 60 s limit. None o
 4. **Isolate the mode**: disable the legacy loops in that mode: Raydium pool scans, Birdeye trending, DexScreener enrichment, the watchlist poller, radar sampling, the Smart Money probe, telemetry follow-ups and the position loop's own spot fetches. No unaccounted request may remain.
 5. **Lifecycle**: tie `start()`/`stop()` to daemon start and termination signals, and give the coordinator's report to the daemon's session report.
 6. **Live limits**: approve session, lane, flow, loader, cache and schedule limits.
+
+**Scheduling** (not implemented):
+
+1. **Refresh before arming**: refresh before arming so that every component stays valid through the planned confirmation, rather than relying on a post-arm refresh that must finish within `confirmDelayMs`. Measured in C-06: a post-arm refresh that includes LP does not finish within 5 s on a busy Solana lane.
 
 **Position lifecycle** (not started):
 

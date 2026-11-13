@@ -738,6 +738,14 @@ export interface RetrieveAndEvaluatePaperDaemonEntryParams<
     | undefined;
   /** Optional PAPER security-evidence path; when omitted the existing RugCheck retrieval is used. */
   readonly security?: PaperDaemonEntrySecurityPath | undefined;
+  /**
+   * Optional: derives the candidate at the actual decision time (after every awaited retrieval),
+   * e.g. its age from the original pool creation time. Must keep the same pool and mint. When
+   * omitted, `candidate` is used as given (the daemon's existing behaviour).
+   */
+  readonly candidateAtDecision?:
+    | ((decisionNowMs: number) => EvaluateCandidateDecisionParams["candidate"])
+    | undefined;
 }
 
 /** The security context used for a decision, and the time it was evaluated at. */
@@ -841,7 +849,6 @@ export async function retrieveAndEvaluatePaperDaemonEntry<
       return rejected(`PRE_ADMISSION_REJECTED:${context.preAdmission.rejectionReason}`, security);
     }
     // Validated inputs only: the provider-reported LP value and the direct RugCheck fetch are not used.
-    gateCandidate = { ...candidate, lpBurnPct: context.gateInputs.lpBurnPct };
     rugMetrics = context.gateInputs.rugMetrics;
   } else {
     rugMetrics = await retrievals.fetchRugCheckMetrics(candidate.mintAddress);
@@ -861,6 +868,20 @@ export async function retrieveAndEvaluatePaperDaemonEntry<
         security,
       };
     }
+  }
+  if (params.candidateAtDecision) {
+    const atDecision = params.candidateAtDecision(decisionNowMs);
+    if (
+      atDecision.poolId !== candidate.poolId ||
+      atDecision.mintAddress !== candidate.mintAddress
+    ) {
+      throw new Error("PAPER_ENTRY_CANDIDATE_IDENTITY_CHANGED_AT_DECISION");
+    }
+    gateCandidate = atDecision;
+  }
+  if (security) {
+    // Validated LP only: the provider-reported value is replaced.
+    gateCandidate = { ...gateCandidate, lpBurnPct: security.context.gateInputs.lpBurnPct };
   }
   const decision = evaluatePaperDaemonEntryDecision({
     candidate: gateCandidate,
