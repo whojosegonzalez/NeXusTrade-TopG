@@ -50,6 +50,13 @@ import {
   validateAndSnapshotCandidateFlowResult,
 } from "../candidate-scanner/CandidateFlowProvider.js";
 import { ContinuousQuietIntervalTracker } from "../candidate-scanner/ContinuousQuietIntervalTracker.js";
+import {
+  evaluatePaperCandidateSecurityContext,
+  findPaperSecurityEvidenceExpiredAt,
+  type PaperCandidateSecurityContextResult,
+  type PaperCandidateSecurityEvidence,
+  type PaperSecurityTarget,
+} from "../candidate-scanner/PaperCandidateSecurityContext.js";
 import { CounterfactualOpportunityTracker } from "../candidate-scanner/CounterfactualOpportunityTracker.js";
 import type { ScannedPoolRecord } from "../candidate-scanner/CandidateScannerTypes.js";
 import {
@@ -700,6 +707,19 @@ export interface PaperDaemonEntryInputRetrievals<
   readonly fetchRugCheckMetrics: (mintAddress: string) => Promise<TRug>;
 }
 
+/**
+ * Optional, explicitly injected PAPER security-evidence path for the entry helper. When supplied, the
+ * daemon's direct RugCheck retrieval is not used: security inputs come only from the accepted
+ * composition (`evaluatePaperCandidateSecurityContext`) over evidence supplied by `loadEvidence`.
+ * Nothing installs this path in the daemon; the default daemon behaviour is unchanged.
+ */
+export interface PaperDaemonEntrySecurityPath {
+  /** Passed to the composition unchanged; anything but `PAPER_SIMULATION` is rejected there. */
+  readonly executionContext: "PAPER_SIMULATION";
+  /** Supplies evidence for the exact candidate (supplied evidence or a mocked loader; no acquisition). */
+  readonly loadEvidence: (target: PaperSecurityTarget) => Promise<PaperCandidateSecurityEvidence>;
+}
+
 export interface RetrieveAndEvaluatePaperDaemonEntryParams<
   TSpot extends PaperDaemonEntrySpotInput,
   TRug extends EvaluateCandidateDecisionParams["rugMetrics"],
@@ -716,6 +736,14 @@ export interface RetrieveAndEvaluatePaperDaemonEntryParams<
   readonly onSpotInfoRetrieved?:
     | ((spotInfo: TSpot & { readonly spotPriceSol: number }) => void)
     | undefined;
+  /** Optional PAPER security-evidence path; when omitted the existing RugCheck retrieval is used. */
+  readonly security?: PaperDaemonEntrySecurityPath | undefined;
+}
+
+/** The security context used for a decision, and the time it was evaluated at. */
+export interface PaperDaemonEntrySecurityRecord {
+  readonly context: PaperCandidateSecurityContextResult;
+  readonly evaluatedAtMs: number;
 }
 
 export type PaperDaemonEntryEvaluation<
@@ -724,12 +752,22 @@ export type PaperDaemonEntryEvaluation<
 > =
   | { readonly kind: "NO_ACTIVE_DEX_PAIR"; readonly spotInfo: TSpot | null }
   | {
+      /** Only with an injected security path: entry is blocked before arming or confirmation. */
+      readonly kind: "SECURITY_REJECTED";
+      readonly spotInfo: TSpot & { readonly spotPriceSol: number };
+      readonly reason: string;
+      readonly decisionNowMs: number;
+      readonly security: PaperDaemonEntrySecurityRecord | null;
+    }
+  | {
       readonly kind: "EVALUATED";
       readonly spotInfo: TSpot & { readonly spotPriceSol: number };
-      readonly rugMetrics: TRug;
+      /** The direct RugCheck result, or the security composition's validated gate inputs. */
+      readonly rugMetrics: TRug | PaperCandidateSecurityContextResult["gateInputs"]["rugMetrics"];
       /** Clock reading taken after every entry input was retrieved, immediately before evaluation. */
       readonly decisionNowMs: number;
       readonly decision: CandidateDecisionResult;
+      readonly security?: PaperDaemonEntrySecurityRecord | undefined;
     };
 
 /**
@@ -742,6 +780,12 @@ export type PaperDaemonEntryEvaluation<
  * from each snapshot's own cutoff against the unchanged 15 s limit, so evidence that was fresh when
  * the loop started but aged during the retrievals is rejected, and a snapshot published during the
  * retrievals can be read.
+ *
+ * With an injected `security` path, the RugCheck retrieval is replaced by the evidence loader and
+ * the accepted security composition. After its awaited validation, the clock is read again for the
+ * final decision; every component that supplied evidence must still be within the 15 s policy at that
+ * final time, pre-admission (LP, freeze and mint authority) must pass, and only then are the validated
+ * LP and security metrics passed to the unchanged gates. Any failure blocks arming and confirmation.
  */
 export async function retrieveAndEvaluatePaperDaemonEntry<
   TSpot extends PaperDaemonEntrySpotInput,
@@ -757,12 +801,69 @@ export async function retrieveAndEvaluatePaperDaemonEntry<
   const usableSpot = spotInfo as TSpot & { readonly spotPriceSol: number };
   params.onSpotInfoRetrieved?.(usableSpot);
 
-  const rugMetrics = await retrievals.fetchRugCheckMetrics(candidate.mintAddress);
+  let gateCandidate = candidate;
+  let rugMetrics: TRug | PaperCandidateSecurityContextResult["gateInputs"]["rugMetrics"];
+  let security: PaperDaemonEntrySecurityRecord | undefined;
+  if (params.security) {
+    const target: PaperSecurityTarget = {
+      poolId: candidate.poolId,
+      mintAddress: candidate.mintAddress,
+    };
+    const rejected = (reason: string, record: PaperDaemonEntrySecurityRecord | null) =>
+      ({
+        kind: "SECURITY_REJECTED",
+        spotInfo: usableSpot,
+        reason,
+        decisionNowMs: params.clock(),
+        security: record,
+      }) as const;
+    let evidence: PaperCandidateSecurityEvidence;
+    try {
+      evidence = await params.security.loadEvidence(target);
+    } catch (err) {
+      return rejected(
+        `SECURITY_EVIDENCE_LOAD_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+        null,
+      );
+    }
+    const evaluatedAtMs = params.clock();
+    const context = await evaluatePaperCandidateSecurityContext({
+      executionContext: params.security.executionContext,
+      target,
+      decisionTimeMs: evaluatedAtMs,
+      evidence,
+    });
+    security = { context, evaluatedAtMs };
+    if (context.status !== "EVALUATED") {
+      return rejected(`SECURITY_CONTEXT_NOT_EVALUATED:${context.status}`, security);
+    }
+    if (!context.preAdmission.passed) {
+      return rejected(`PRE_ADMISSION_REJECTED:${context.preAdmission.rejectionReason}`, security);
+    }
+    // Validated inputs only: the provider-reported LP value and the direct RugCheck fetch are not used.
+    gateCandidate = { ...candidate, lpBurnPct: context.gateInputs.lpBurnPct };
+    rugMetrics = context.gateInputs.rugMetrics;
+  } else {
+    rugMetrics = await retrievals.fetchRugCheckMetrics(candidate.mintAddress);
+  }
 
   const existingArmedState = params.getExistingArmedState();
   const decisionNowMs = params.clock();
+  if (security) {
+    // The security validation was awaited: recheck its evidence at the final decision time.
+    const expired = findPaperSecurityEvidenceExpiredAt(security.context, decisionNowMs);
+    if (expired.length > 0) {
+      return {
+        kind: "SECURITY_REJECTED",
+        spotInfo: usableSpot,
+        reason: `SECURITY_EVIDENCE_EXPIRED_AT_DECISION:${expired.join(",")}`,
+        decisionNowMs,
+        security,
+      };
+    }
+  }
   const decision = evaluatePaperDaemonEntryDecision({
-    candidate,
+    candidate: gateCandidate,
     baseSpotInfo: usableSpot,
     rugMetrics,
     flowProvider: params.flowProvider,
@@ -771,7 +872,14 @@ export async function retrieveAndEvaluatePaperDaemonEntry<
     buyGateService: params.buyGateService,
     requireVerifiedHolders: true,
   });
-  return { kind: "EVALUATED", spotInfo: usableSpot, rugMetrics, decisionNowMs, decision };
+  return {
+    kind: "EVALUATED",
+    spotInfo: usableSpot,
+    rugMetrics,
+    decisionNowMs,
+    decision,
+    ...(security ? { security } : {}),
+  };
 }
 
 export {
@@ -2081,6 +2189,23 @@ export async function run(): Promise<void> {
                       }
                     },
                   });
+                  if (entryEvaluation.kind === "SECURITY_REJECTED") {
+                    // Unreachable here: the daemon installs no PAPER security path. Fail closed.
+                    armedPullbackCandidates.delete(candidate.mintAddress);
+                    recordTriggerRejection(
+                      candidate,
+                      entryEvaluation.reason,
+                      entryEvaluation.spotInfo.spotPriceSol,
+                      entryEvaluation.spotInfo.spotPriceUsd,
+                      null,
+                      null,
+                      null,
+                      "PaperCandidateSecurityContext",
+                      entryEvaluation.decisionNowMs,
+                      entryEvaluation.spotInfo,
+                    );
+                    continue;
+                  }
                   if (entryEvaluation.kind === "NO_ACTIVE_DEX_PAIR") {
                     recordTriggerRejection(
                       candidate,

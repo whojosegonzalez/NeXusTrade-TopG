@@ -683,3 +683,43 @@ export async function evaluatePaperCandidateSecurityContext(
     bundler: evaluateBundler(target.mintAddress, evidence.bundler, decisionTimeMs),
   });
 }
+
+export type PaperSecurityEvidenceComponent = "LP" | "MINT_ACCOUNT" | "RUGCHECK" | "BUNDLER";
+
+/**
+ * Rechecks, at a later final decision time, the original retrieval time of every component that
+ * contributed available evidence, against the same 15 s policy (no extension, no skew). Freshness is
+ * monotonic in time, so a context evaluated at `ctx.decisionTimeMs` remains valid at `finalTimeMs`
+ * exactly when every listed component is still within the limit. Returns the components that are not;
+ * a final time earlier than the evaluation time returns every available component.
+ */
+export function findPaperSecurityEvidenceExpiredAt(
+  ctx: PaperCandidateSecurityContextResult,
+  finalTimeMs: number,
+): readonly PaperSecurityEvidenceComponent[] {
+  const retrievals: (readonly [PaperSecurityEvidenceComponent, number])[] = [];
+  if (ctx.lp.lpBurnPct !== null && ctx.lp.screening?.retrievedAtIso) {
+    retrievals.push(["LP", Date.parse(ctx.lp.screening.retrievedAtIso)]);
+  }
+  if (ctx.authorities.status === "AVAILABLE" && ctx.authorities.provenance) {
+    retrievals.push(["MINT_ACCOUNT", ctx.authorities.provenance.retrievedAtMs]);
+  }
+  if (ctx.rugCheck.status === "AVAILABLE" && ctx.rugCheck.provenance) {
+    retrievals.push(["RUGCHECK", ctx.rugCheck.provenance.retrievedAtMs]);
+  }
+  if (ctx.bundler.status === "QUALIFIED_PAPER_PROXY" && ctx.bundler.provenance) {
+    retrievals.push(["BUNDLER", ctx.bundler.provenance.localRetrievedAtMs]);
+  }
+  const regressed = ctx.decisionTimeMs === null || finalTimeMs < ctx.decisionTimeMs;
+  return retrievals
+    .filter(([, retrievedAtMs]) => {
+      const ageMs = finalTimeMs - retrievedAtMs;
+      return (
+        regressed ||
+        !Number.isFinite(ageMs) ||
+        ageMs < 0 ||
+        ageMs > PAPER_SECURITY_CONTEXT_POLICY.maxEvidenceAgeMs
+      );
+    })
+    .map(([component]) => component);
+}

@@ -4199,7 +4199,7 @@ The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and
 1. **Scanner LP mode**: the daemon constructs `CandidateStreamEngine` (`paper-trading-daemon.ts`, `new CandidateStreamEngine({ ... })` in `run`) without `requireValidatedLp`, `lpEvidenceResolver` or `lpFreshnessPolicy`.
    - **Effect**: scanner pre-screening still uses provider-reported LP percentages and the pool record's authority fields.
    - **Needed**: enabling the existing validated-LP mode (`CandidateStreamEngine`'s `requireValidatedLp` branch) requires an LP evidence resolver that performs Raydium account retrieval, which is network work needing approval.
-2. **Direct RugCheck retrieval**: the entry path still calls `BuyGateTriggerService.fetchRugCheckMetrics` through `retrieveAndEvaluatePaperDaemonEntry`'s `fetchRugCheckMetrics` retrieval. That fetch:
+2. **Direct RugCheck retrieval** (the entry-side connection is now available offline as an injectable path, §8.32; the daemon still uses this fetch): the entry path still calls `BuyGateTriggerService.fetchRugCheckMetrics` through `retrieveAndEvaluatePaperDaemonEntry`'s `fetchRugCheckMetrics` retrieval. That fetch:
    - records no retrieval time or HTTP status;
    - has no response-size limit;
    - does not bind the payload's `mint`;
@@ -4215,3 +4215,87 @@ The tests exercise the existing scanner LP screening (`projectBridgedLpPool` and
 2. **Provider installation**: an explicit CLI selection of one pool and mint, `setCandidateFlowProvider`, and `start`/`stop` tied to daemon termination. This needs separate approval.
 3. **Live limits**: none of the §8.29 test values is approved for live use.
 4. **Strategy unchanged**: continuous availability for 90/120 s retests is still not expected in active pools.
+
+### 8.32 PAPER Entry Components Connected Offline (Injectable; Not Installed)
+
+Independent review accepted the mint-response correction at `b158626`. This section connects the accepted security composition (§8.31) and the rolling flow provider (§8.29) to the existing PAPER entry-decision path for one fixed candidate, offline.
+
+- **Nothing ran live**: no real provider call, socket, daemon run, capture, position, order or wallet change took place, and no sealed file changed.
+- **Daemon default unchanged**: the daemon passes no security path and installs no provider. There is no CLI flag, environment variable or automatic start.
+
+#### Connection
+
+`retrieveAndEvaluatePaperDaemonEntry` (in `paper-trading-daemon.ts`) accepts an optional, explicitly injected `security` path: `{ executionContext: "PAPER_SIMULATION", loadEvidence(target) }`. The loader supplies evidence (supplied evidence or a mock); this patch adds no acquisition.
+
+With the path, the helper:
+
+1. retrieves the spot price, as before (a missing price still returns `NO_ACTIVE_DEX_PAIR`);
+2. loads security evidence for the exact pool and mint, instead of calling the direct RugCheck retrieval (a loader failure is `SECURITY_EVIDENCE_LOAD_FAILED`);
+3. reads the clock and runs `evaluatePaperCandidateSecurityContext` at that time. Any context other than `PAPER_SIMULATION` is `SECURITY_CONTEXT_NOT_EVALUATED:EXECUTION_CONTEXT_PROHIBITED`;
+4. **enforces pre-admission**: a failed LP, freeze or mint precondition returns `SECURITY_REJECTED` (`PRE_ADMISSION_REJECTED:<reason>`). No flow read, buy gate or retest gate is reached, so neither arming nor confirmation can happen, whatever the separately available Gate 11 inputs;
+5. reads the armed state and the clock again for the **final decision time**. The security validation was awaited, so `findPaperSecurityEvidenceExpiredAt` rechecks every component that supplied evidence against the unchanged 15 s policy at this final time. Any expiry is `SECURITY_EVIDENCE_EXPIRED_AT_DECISION:<components>`;
+6. passes only validated inputs to the unchanged gates:
+   - the candidate's `lpBurnPct` is the validated LP value (the provider-reported value is replaced);
+   - `rugMetrics` are the composition's gate inputs (unavailable metrics are absent, `bundlerPct` only from the PAPER proxy);
+   - the flow read, its PAPER validation and the buy and retest gates all use the same final decision time.
+
+- **Returned**: the decision with the security context and its evaluation time. Original retrieval, cutoff and publication times are preserved. `SECURITY_REJECTED` carries the reason and the context.
+- **Call site**: the loop handles `SECURITY_REJECTED` fail-closed (disarm and record the rejection), but it is unreachable there because no path is injected.
+- **Freshness recheck**: freshness is monotonic in time. A context evaluated earlier is valid at a later final time exactly when each contributing retrieval is still within the limit. A final time earlier than the evaluation time rejects every component.
+- **Test support**: the rolling provider's virtual scheduler and in-memory HTTP and WebSocket mocks moved unchanged into `PaperRollingCandidateFlowProvider.test-support.ts`, shared by its own suite (still 15/15) and the integration suite. The synthetic fixture module adds a synthetic Solana Tracker payload, because the historical capture cannot be re-dated to the synthetic chain's clock.
+
+#### Offline Verification
+
+`backend/src/paper/PaperDaemonEntryIntegration.test.ts` (I-01 to I-07) runs:
+
+- the actual `PaperRollingCandidateFlowProvider` over a synthetic active chain (two buys and one sell) with mocked transports and virtual time;
+- the actual security composition over synthetic evidence from a mocked loader with virtual latency;
+- the helper with mocked spot retrieval, and the existing buy and retest evaluators.
+
+Entries are launched relative to the first tick at which a fresh active window is readable. Decisions are returned only; nothing is bought.
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I-01 | Valid security and a qualified active window: `ARMED_FIRST_TICK`, then `RETEST_CONFIRMED` (`RETEST_PULLBACK_DISCOUNT`) 5 s later, with the arming time equal to the first decision time. The final time is the clock after both awaited retrievals (+500 ms), the flow read uses it, and its window end is that of a published, unwithdrawn snapshot. The gates receive the validated LP (98.5, not the placeholder 100) and the composition's metrics, and the direct RugCheck retrieval is never called |
+| I-02 | An active mint authority (with and without an armed state), below-threshold LP and an omitted freeze authority are rejected at pre-admission, although the Gate 11 inputs are favourable. No gate or flow read is reached                                                                                                                                                                                                                                                                                 |
+| I-03 | Stale security (all components 15,001 ms old) fails pre-admission. Stale RugCheck alone fails Gate 11. Warm-up flow and flow withdrawn by a disconnect during the awaited spot retrieval both give `BUY_GATE_REJECTED`                                                                                                                                                                                                                                                                                    |
+| I-04 | Evidence 14 s old at evaluation, with 2 s of awaited validation reported by the injected clock, is rejected at the final time (`LP,MINT_ACCOUNT,RUGCHECK,BUNDLER`). With 1 s (15 s total) it arms. Flow fresh at launch but stopped during the spot retrieval is unavailable at the final time                                                                                                                                                                                                            |
+| I-05 | Empty evidence, a failing loader, a mint account for another mint, a candidate for another mint and a `PRODUCTION` security context are rejected. The generic production path rejects the provider's fresh PAPER flow, a read for another mint is unavailable, and the provider refuses `PRODUCTION`, `BACKTEST` and missing contexts at construction                                                                                                                                                     |
+| I-06 | With valid security and flow, `MIN_LIQUIDITY_GATE` still rejects (Gate 11 passes), and the live-liquidity floor still rejects                                                                                                                                                                                                                                                                                                                                                                             |
+| I-07 | 500 reads and 5 entry decisions during collection add no request or transport, and global `fetch` is never called. After stop, flow is `PAPER_ROLLING_FLOW_STOPPED`, an entry is rejected, no further request is made, and no provider timer remains                                                                                                                                                                                                                                                      |
+
+- **Mutation checks** (sources restored byte-identical afterwards), each failing the expected tests:
+  - rechecking at the security evaluation time instead of the final time (I-04);
+  - not enforcing pre-admission (I-02, I-03, I-05);
+  - keeping the provider's LP placeholder for the gates (I-01);
+  - using the direct RugCheck retrieval alongside the security path (I-01, I-03, I-04, I-06, I-07);
+  - evaluating the entry at the security evaluation time (I-04);
+  - disabling the final-time expiry recheck (I-04).
+- **Results**:
+  - Integration suite 7/7, `PaperTradingDaemon` 100/100, `PaperCandidateSecurityContext` 11/11, `PaperRollingCandidateFlowProvider` 15/15.
+  - `CandidateFlowProvider` 54/54, `PaperActiveWindowQualification` 12/12, `LpScreeningBridge` 34/34, `PaperSolanaTrackerBundlerAdapter` 23/23, `BuyGateTriggerService` 64/64, `SolanaRpcMintAccountParser` 6/6, `CandidateStreamEngine` 25/25 and `CandidateDecisionDiagnostic` 95/95 (446 in all).
+  - The backend typecheck, ESLint and Prettier checks pass, each under an external limit with the installed local tools. None is left running.
+  - All 11 captures verify, and the wallet hash is unchanged.
+
+**Limits of this evidence**:
+
+- **Synthetic inputs**: the chain, candidate, prices and security evidence are synthetic, and the transports are mocks.
+- **Simulated validation time**: in I-04, elapsed validation time is reported by the injected clock, because the composition does no timed work in virtual time.
+- **Not exercised here**: the daemon loop, its scheduling and its other loops.
+
+#### Completed Offline Versus Remaining Operational Work
+
+| Item                                                                                                           | State                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Entry decision context (`PAPER_SIMULATION`)                                                                    | Done (§8.27)                                                                                                                                                                                                                      |
+| Rolling flow provider with bounded execution                                                                   | Done offline, not installed (§8.29)                                                                                                                                                                                               |
+| Actual decision time                                                                                           | Done (§8.30)                                                                                                                                                                                                                      |
+| Security composition with validated mint-account evidence                                                      | Done offline (§8.31)                                                                                                                                                                                                              |
+| Flow and security connected to the entry and retest evaluators, with pre-admission and final-time revalidation | Done offline as an injectable path (§8.32)                                                                                                                                                                                        |
+| **Bounded acquisition**                                                                                        | **Remaining**: retrieval of the mint account, RugCheck report, Solana Tracker bundlers and Raydium LP accounts that records request identity, request id, retrieval time, HTTP status and completeness under response-size limits |
+| **Shared request accounting and pacing**                                                                       | **Remaining**: one budget and pacing model across those requests, the rolling provider's RPC and the daemon's existing API activity (DexScreener, Birdeye), with the Solana Tracker key's handling                                |
+| **Validated scanner LP mode**                                                                                  | **Remaining**: `CandidateStreamEngine` with `requireValidatedLp`, an LP evidence resolver and an LP freshness policy                                                                                                              |
+| **Lifecycle installation**                                                                                     | **Remaining**: explicit selection of one pool and mint, `setCandidateFlowProvider`, injecting the security path at the call site, and provider `start`/`stop` tied to daemon termination                                          |
+| **Live-limit approval**                                                                                        | **Remaining**: none of the §8.29 test limits, or limits for the new acquisitions, is approved for live use                                                                                                                        |
+
+The strategy is unchanged: continuous availability for 90/120 s retests is still not expected in active pools.

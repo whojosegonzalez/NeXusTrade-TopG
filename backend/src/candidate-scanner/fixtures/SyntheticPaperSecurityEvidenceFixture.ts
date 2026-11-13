@@ -113,3 +113,31 @@ export function syntheticRugCheckReport(
     ...overrides,
   };
 }
+
+/**
+ * [SYNTHETIC] Solana Tracker `/bundlers` response body with the fields the accepted parser reads.
+ * Used where evidence must be dated to a synthetic clock; the sanitized historical capture is used
+ * only for dated replay at its own retrieval time.
+ */
+export function syntheticSolanaTrackerBundlersPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    total: 12,
+    balance: 1_000,
+    percentage: 2.5,
+    initialBalance: 800,
+    initialPercentage: 2,
+    wallets: [
+      {
+        wallet: SYNTHETIC_ACTIVE_AUTHORITY,
+        initialBalance: 800,
+        initialPercentage: 2,
+        balance: 1_000,
+        percentage: 2.5,
+        bundleTime: 1_700_000_000_000,
+      },
+    ],
+    ...overrides,
+  };
+}
