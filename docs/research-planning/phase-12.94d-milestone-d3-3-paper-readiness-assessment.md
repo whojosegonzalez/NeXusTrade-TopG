@@ -5098,44 +5098,43 @@ The operator ran the reviewed sequence at `c440cef` after a session-only configu
 **Outcome**: `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_RETRIEVABLE_SIGNATURE_IN_SAMPLE`): a valid bounded-sample no-target result.
 
 - **It does not establish a strategy rejection**: no candidate reached the runner.
-- **It does not establish market-wide absence**: nothing about eligible pools across the market follows from it.
-- **What it does show**: the pinned fee destination's 20 newest transactions, as indexed by this provider, span about 24 days. The 18 successful ones were not decoded, so how many were pool creations is unknown.
+- **It does not establish market-wide absence**: nothing about eligible pools across the market follows from a single bounded query.
+- **What it does show**: the pinned fee destination's 20 newest transactions, as indexed by this specific provider, span about 24 days. Because the 18 successful transactions were not retrieved or decoded, how many (if any) represented AMM v4 pool initializations is unverified.
 
 #### AMM v4 versus CPMM support (local code)
 
-| Capability                          | Raydium AMM v4                                                                                                                                                 | Raydium CPMM                                                                                                    |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Discovery: Raydium API v3 list      | Listed (`scanner-discover.ts`, `CandidateStreamEngine`); default order, first page                                                                             | Listed. On 2026-11-09, 15 of 20 pools were CPMM, mostly 7–271 h old; the 5 AMM v4 pools had no usable open time |
-| Discovery: on-chain                 | Stage A fee-destination precheck (one-shot sample); events collector (program-wide logs, `initialize2`)                                                        | Events collector only (program-wide logs, `Initialize`); no fee-destination or creation-specific source         |
-| Initialization parsing              | `PoolInitializationParser`: `initialize2`, 21 accounts, `open_time`, fee destination at index 14                                                               | `PoolInitializationParser`: Anchor `initialize`, 20 accounts                                                    |
-| Pool account parsing                | `RaydiumAmmParser` (runner, flow, security)                                                                                                                    | `RaydiumCpmmParser` (637-byte layout, reserves) and `VerificationDispatchService`: research pilot only          |
-| Market parsing (runner)             | Accepted                                                                                                                                                       | Rejected (`UNSUPPORTED_RAYDIUM_POOL_TYPE` for CPMM labels)                                                      |
-| LP evidence and screening           | `RaydiumAmmV4LpEvidenceAdapter`, `RaydiumAmmV4SnapshotValidator`, `LpScreeningBridge` (validated-LP intake)                                                    | None                                                                                                            |
-| Flow: subscription and transactions | `RaydiumCandidateSubscriptionCoordinator`, `RaydiumAmmV4TransactionSourceAdapter`, `RaydiumAmmV4SwapDecoder` (ray_log and vault deltas), window reconciliation | None: no CPMM swap decoder, adapter or reconciliation; the flow provider's setup accepts only the AMM v4 layout |
-| Stage B runner end to end           | Supported                                                                                                                                                      | Not supported                                                                                                   |
+| Capability                          | Raydium AMM v4                                                                                                                                                 | Raydium CPMM                                                                                                                                                                                                                                            |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discovery: Raydium API v3 list      | Listed (`scanner-discover.ts`, `CandidateStreamEngine`); default order, first page                                                                             | Listed. On 2026-11-09, 15 of 20 pools were CPMM, mostly 7–271 h old (this snapshot demonstrates presence of CPMM listings, but does not establish current fresh-pool market distribution or protocol share); the 5 AMM v4 pools had no usable open time |
+| Discovery: on-chain                 | Stage A fee-destination precheck (one-shot sample); events collector (program-wide logs, `initialize2`)                                                        | Events collector only (program-wide logs, `Initialize`); no fee-destination or creation-specific source                                                                                                                                                 |
+| Initialization parsing              | `PoolInitializationParser`: `initialize2`, 21 accounts, `open_time`, fee destination at index 14                                                               | `PoolInitializationParser`: Anchor `initialize`, 20 accounts                                                                                                                                                                                            |
+| Pool account parsing                | `RaydiumAmmParser` (runner, flow, security)                                                                                                                    | `RaydiumCpmmParser` (637-byte layout, reserves) and `VerificationDispatchService`: research pilot only                                                                                                                                                  |
+| Market parsing (runner)             | Accepted                                                                                                                                                       | Rejected (`UNSUPPORTED_RAYDIUM_POOL_TYPE` for CPMM labels)                                                                                                                                                                                              |
+| LP evidence and screening           | `RaydiumAmmV4LpEvidenceAdapter`, `RaydiumAmmV4SnapshotValidator`, `LpScreeningBridge` (validated-LP intake)                                                    | None                                                                                                                                                                                                                                                    |
+| Flow: subscription and transactions | `RaydiumCandidateSubscriptionCoordinator`, `RaydiumAmmV4TransactionSourceAdapter`, `RaydiumAmmV4SwapDecoder` (ray_log and vault deltas), window reconciliation | None: no CPMM swap decoder, adapter or reconciliation; the flow provider's setup accepts only the AMM v4 layout                                                                                                                                         |
+| Stage B runner end to end           | Supported                                                                                                                                                      | Not supported                                                                                                                                                                                                                                           |
 
 The runner can therefore only use an AMM v4 / WSOL pool with the candidate as base. CPMM support stops at initialization and pool-account parsing in the research pilot.
 
 #### Smallest useful discovery that could supply a runner-supported target
 
-A repeated one-shot sample is not useful. If fee-destination activity resembles this sample, which averaged under one transaction per day, a single 20-signature look will rarely find a pool inside the 8.7-minute start window. No arrival model is validated, so no probability is assigned.
+In this provider-relative sample, the 20 newest transactions spanned ~24 days, and none fell within the 0–760 s retrieval prefilter (12 minutes 40 seconds). Because the 18 successful transactions were not retrieved or decoded, no pool-creation rate or arrival frequency can be inferred or validated from this observation alone. While future periodic lookups could encounter a newly initialized pool, a point-in-time query requires a creation to have occurred within the 12-minute 40-second retrieval prefilter (0–760 s) immediately preceding the query, and to fall within the separate 8-minute 40-second planning start window (240–760 s on `pairCreatedAt`) at handoff.
 
-The smallest useful proposal that keeps the runner frozen is a **bounded passive creation watch**:
+To eliminate the timing coincidence required by periodic polling without asserting an unvalidated arrival rate, the smallest useful proposal that keeps the runner frozen is a **bounded passive creation watch**:
 
 - **Subscription**: one WebSocket `logsSubscribe` that `mentions` only the pinned fee destination (`7YttLkHD…j2G5`), so it receives creation-related transactions rather than program-wide swap traffic.
-- **Stop**: at the first notification, or at a fixed duration and message ceiling.
+- **Stop**: at the first qualifying notification, or at a fixed duration and message ceiling.
 - **Handoff to the existing path**: the notified signature then goes through the existing Stage A validation: `getTransaction`, `initialize2` decoding with account 14 checked, candidate-base / WSOL-quote orientation, and the required DexScreener check with the window computed on `pairCreatedAt`. Then comes the existing handoff, so Stage B, the strategy and the limits stay unchanged.
 
 **What it needs**:
 
-- **Code (offline, then review)**: a watch mode for Stage A (one subscription, keepalive, notification parsing, sealed observations) and its regressions.
-- **Approval**: a separate approval of its duration and ceilings. Given the observed sample, an hours-long process may be needed and still yield nothing; it was not authorized in earlier rounds.
-
-**Expected limitation**: a fresh AMM v4 pool must still pass the scanner at intake: 300–900 s old, liquidity/market cap 0.15–0.30, LP burn ≥ 90 %, at least 20 transactions in five minutes, and buys ≥ sells. So even a successful watch may end in a valid scanner rejection.
+- **Code (offline, then review)**: a companion watch module (one subscription, keepalive, notification parsing, sealed observations) and its regressions.
+- **Approval**: a separate approval of its duration and ceilings.
+- **Expected limitation**: a fresh AMM v4 pool must still pass the scanner at intake: 300–900 s old, liquidity/market cap 0.15–0.30, LP burn ≥ 90 %, at least 20 transactions in five minutes, and buys ≥ sells. So even a successful watch may end in a valid scanner rejection.
 
 #### Broader protocol support (scope only; not implemented)
 
-Local discovery evidence suggests fresh Raydium pools now appear mainly as CPMM. Supporting them end to end would need these components, each a separately reviewed offline task:
+While the Nov 9 snapshot observed predominantly older CPMM pools (7–271 h) rather than fresh AMM v4 pools, that single 20-pool indexer page does not establish current fresh-pool market distribution across Solana. However, supporting CPMM would expand the strategy's intake beyond AMM v4. Supporting CPMM end to end would need these components, each a separately reviewed offline task:
 
 1. **Discovery**: a CPMM creation source. Either a creation-specific account pinned to an upstream `raydium-cp-swap` revision (analogous to the AMM v4 fee destination; not available locally), or LaunchLab migration events. Plus a Stage A variant using the existing CPMM `initialize` parser.
 2. **Market parsing**: accept CPMM labels for the exact pool. CPMM orders its two mints by address, so WSOL can be either token; the runner's orientation handling must support WSOL as token 0 or token 1 without inventing data.
@@ -5149,8 +5148,113 @@ This is substantially larger than the creation watch and touches the reviewed ru
 
 #### Recommended next step
 
-Implement the **bounded passive AMM v4 creation watch** offline for review (no live use): a Stage A watch mode subscribing only to the pinned fee destination, feeding the existing validation and handoff, with its own sealed evidence and regressions.
+Implement the **bounded passive AMM v4 creation watch** offline for review (no live use): a companion watch module subscribing only to the pinned fee destination, feeding the existing validation and handoff, with its own sealed evidence and regressions.
 
 - **Why**: it is the smallest change that can supply a target the frozen runner supports, and it measures directly whether runner-supported creations still occur.
-- **Operator decision**: its live duration and ceilings need separate approval, informed by this sample's low activity.
+- **Operator decision**: its live duration and ceilings need separate approval.
 - **If it yields nothing usable**: CPMM support, scoped above, is the larger alternative.
+
+### 8.38 Proposed Bounded AMM v4 Passive Creation-Watch Design (Proposed / Unapproved)
+
+> [!IMPORTANT]
+> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. The first component—the bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`)—is implemented as an inert, offline-tested module. HTTP validation, evidence persistence, handoff integration, and CLI activation remain subsequent tasks.
+
+#### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
+
+The creation watch discovers at most one provisional fresh Raydium AMM v4 / WSOL candidate in real time without polling, while preserving the reviewed Stage B runner (`6855efb0e4ab5023e2c556030c42613a0ee86f53`) completely unchanged.
+
+To preserve the existing one-shot precheck script (`backend/src/scripts/fresh-amm-v4-precheck.ts`) and its proven sampling behavior intact, the watch is structured around a small companion collector and validation pipeline.
+
+**Separation of Concerns**:
+
+- **Pure Validation Logic**: Zero I/O, zero network, zero timer state, and zero filesystem writes:
+  - Envelope decoding and validation (`usableJson`, `rpcResult`).
+  - Notification parsing and validation: JSON-RPC 2.0 schema, subscription ID binding, canonical base58 signature format via `isValidSolanaSignature` (validating decoding to 64 bytes without arbitrary character-length restrictions), slot integer validation, and strict `err === null` checking.
+  - Transaction evaluation (`evaluateInitializationExchange`): validates `initialize2` instruction discriminator, account index 14 matching the fee destination, coin/pc mint orientation.
+  - Market parsing (`parseDexScreenerTokenPairs`): validates pool ID, base/quote token alignment, extracts `pairCreatedAtMs`, and computes the candidate start window.
+- **Acquisition (Stateful I/O & Network)**:
+  - WebSocket notification collector (`BoundedAmmV4CreationWatch.ts`): connection establishment, subscription dispatch, frame buffering, keepalive ping/pong scheduling, and bounded teardown.
+  - Bounded HTTP execution via `PaperRequestSession` (pacing, timeout, byte bounds, exchange observation).
+  - File persistence exclusively handled by `PrecheckWriter` using exclusive-create (`wx`) mode.
+
+#### 8.38.2 Component Reuse & Accurate Module Boundaries
+
+| Component / Function                                   | Reused Capability                                                                    | Correct Boundary & Disclaimers                                                                                                                                                                                                          |
+| :----------------------------------------------------- | :----------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WsWebSocketTransport` / Keepalive Scheduler           | WebSocket connection, raw frame transport, ping/pong scheduling                      | Transport wrapper. With no reconnect allowed, the first unmatched pong timeout terminates the session.                                                                                                                                  |
+| `PaperRequestSession`                                  | Bounded HTTP dispatch, lane pacing, per-request timeouts, response exchange observer | Dispatches and bounds HTTP exchanges; does **not** persist evidence files (evidence persistence is handled by `PrecheckWriter`).                                                                                                        |
+| `SolanaRpcTransactionFetcher.parseTransactionResponse` | Structural Solana transaction result normalization                                   | Normalizes transaction results; does **not** validate the outer JSON-RPC 2.0 envelope (`jsonrpc === "2.0"`, id echo, null error). Outer envelope validation is handled by precheck helpers.                                             |
+| `PoolInitializationParser`                             | Instruction identification and account key resolution for `initialize2`              | Decodes instructions and resolves keys; does **not** perform the precheck's fee-account check (account index 14 == `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`). That verification is performed by `evaluateInitializationExchange`. |
+| `evaluateInitializationExchange`                       | Transaction verification                                                             | Reused directly from `fresh-amm-v4-precheck.ts` to evaluate the retrieved initialization transaction.                                                                                                                                   |
+| `DexScreenerSingleCandidateMarketParser`               | Market pair validation and `pairCreatedAt` extraction                                | Pure market parser; validates token-base / WSOL-quote and returns creation timestamp.                                                                                                                                                   |
+| `paper-pilot-handoff.ts`                               | Verification of pin, manifest digests, and start-window clock checks                 | Extended to verify watched discovery evidence and independently re-derive selection without fabricated signature pages.                                                                                                                 |
+
+#### 8.38.3 Exact Notification-to-Selection Proof Chain
+
+The companion watch module captures an auditable chain of provider observations. Cryptographic hashes protect sealed-file integrity; they do not establish cryptographic proof of market completeness:
+
+1. **Subscription Acknowledgement**:
+   - Outgoing request: `{"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":["7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5"]},{"commitment":"confirmed"}]}`.
+   - Acknowledgement frame must arrive within 5,000 ms.
+   - Must satisfy: `jsonrpc === "2.0"`, `id === 1`, `error == null`, and `result` must be a safe positive integer (`subId > 0`). This `subId` is bound for the session.
+2. **Notification Frame Validation**:
+   - Incoming frame must have `jsonrpc === "2.0"` and `method === "logsNotification"`.
+   - `params.subscription` must strictly match `subId` (reject unsolicited or mismatched notifications).
+   - `params.result.context.slot` must be a safe positive integer (`slot > 0`).
+   - `params.result.value.err` must be strictly `null`. A non-null error indicates a failed transaction and is ignored/recorded as a failed notification without triggering HTTP retrieval.
+   - `params.result.value.signature` must be a canonical Solana base58 string satisfying `isValidSolanaSignature` (decoding to 64 bytes).
+3. **Evidence Sealing**:
+   - Socket is immediately closed upon capturing the first valid notification.
+   - `ws-observations.json` seals the incoming/outgoing frames, subscription ID, timestamps, and notification payload.
+   - The captured signature is passed to `PaperRequestSession` to dispatch:
+     - `exchanges/0001.json`: `getTransaction` (`PRECHECK_TRANSACTION`).
+     - `exchanges/0002.json`: DexScreener token endpoint (`PRECHECK_MARKET`).
+   - `selection.json` records discovery mode `WATCH_LOGS_SUBSCRIBE`, the subscription ID, slot, and signature.
+4. **Independent Handoff Re-derivation (`paper-pilot-handoff.ts`)**:
+   - Handoff reads `ws-observations.json`, `request-ledger.json`, `exchanges/0001.json`, and `exchanges/0002.json`.
+   - Re-derives the watched signature from the sealed WebSocket notification frame.
+   - Re-derives the transaction evaluation and market pair without fabricating a signature-page response.
+   - Verifies that the notified signature, slot, and pool identity strictly match `selection.json` and the sealed exchanges.
+   - Rejects mismatched signatures, slots, subscription IDs, missing exchanges, or unknown discovery modes.
+   - Reads the injected clock immediately before deciding: age on `pairCreatedAt` must be within the planning start window (240–760 s).
+5. **Provisional Status**:
+   - A watch candidate is **PROVISIONAL**. Discovery establishes on-chain pool initialization and market indexing; it does **not** establish strategy eligibility (LP burn, authorities, 5m transactions) or qualified trading flow.
+
+#### 8.38.4 Lifecycle, Ceilings & Boundary Handling
+
+- **Proposed Watch Ceiling**: 15 minutes (900,000 ms).
+- **Session Limits**:
+  - Subscription acknowledgement timeout: 5,000 ms.
+  - Incoming WebSocket application messages: max 100 frames.
+  - Cumulative application payload ceiling: 1,048,576 bytes (1 MiB).
+  - Client keepalive pings: at most 45 client keepalive pings.
+  - Incoming control frames ceiling: at most 128 incoming control frames, counting received pings and pongs.
+  - Keepalive schedule: ping sent every 20,000 ms (20 s), matching-pong timeout 10,000 ms (10 s). **No missed pings**: with no reconnect permitted, the first unmatched pong ends the watch (`KEEPALIVE_TIMEOUT`).
+  - HTTP requests (post-watch validation): max 2 attempts (1 Solana RPC `getTransaction`, 1 DexScreener token GET).
+  - Overall session deadline: 930,000 ms (15 min watch + 30 s validation headroom).
+- **Validation Deadline Contract**:
+  - Validation gets at most 30 seconds from notification receipt, also bounded by the overall deadline:
+    $$\text{validationDeadlineAtMs} = \min(\text{notificationReceivedAtMs} + 30\,000, \text{overallDeadlineAtMs})$$
+  - An early notification (e.g. at $t = 60\text{ s}$) gives validation at most 30 s ($t = 90\text{ s}$); validation never runs until the 15-minute mark. Individual HTTP requests still observe their shorter 10-second request timeout.
+- **Stop Conditions**:
+  - `NOTIFICATION_CAPTURED`: First qualifying notification captured; socket closed cleanly; advances to validation.
+  - `WATCH_DEADLINE_EXCEEDED`: 15 minutes elapsed with no qualifying notification observed; seals observations; exits with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (sub-code `NO_QUALIFYING_NOTIFICATION_OBSERVED`).
+  - `TRANSPORT_CLOSED`: Remote server closes socket prematurely.
+  - `MALFORMED_FRAME`: WebSocket delivers invalid JSON or frame violating schema.
+  - `OPERATOR_INTERRUPT`: SIGINT / Ctrl+C triggers bounded teardown (max 5,000 ms), closes socket, and seals partial evidence.
+  - `EVIDENCE_CAPTURE_FAILED`: Exclusive-create write failure halts dispatch immediately without retry; marks `EVIDENCE_INCOMPLETE`.
+
+#### 8.38.5 Synthetic Acceptance Cases (Offline Tests Only)
+
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion watch module without opening live sockets or using a public CLI bypass flag:
+
+1. **TC-W01: Happy Path Selection**: Synthetic subscription ack followed by a valid AMM v4 creation notification; `getTransaction` returns matching `initialize2` with account 14 as fee destination; DexScreener returns pair inside planning start window. Verifies `TARGET_SELECTED` and sealed evidence.
+2. **TC-W02: Subscription Ack Timeout**: Synthetic transport delays ack beyond 5,000 ms. Verifies fail-closed termination (`SUBSCRIBE_ACK_TIMEOUT`) and clean socket teardown.
+3. **TC-W03: Subscription ID Mismatch**: Synthetic notification arrives with `subscription` ID differing from the acknowledged ID. Verifies rejection of unsolicited notification.
+4. **TC-W04: Failed Transaction Notification**: Notification arrives with `err: { "InstructionError": [0, "Custom"] }`. Verifies transaction is ignored/rejected without dispatching HTTP `getTransaction`.
+5. **TC-W05: Non-AMM v4 Transaction**: Notified transaction retrieves successfully but decodes to a non-AMM v4 instruction or CPMM initialization. Verifies `DECODED_NONMATCH`.
+6. **TC-W06: Fee Destination Mismatch**: Notified transaction is AMM v4 `initialize2`, but account 14 is not `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`. Verifies `DECODED_NONMATCH:INVALID_FEE_DESTINATION`.
+7. **TC-W07: Unmatched Pong Timeout**: Synthetic transport drops pong. At 10,000 ms after ping, watch terminates with `KEEPALIVE_TIMEOUT` (no reconnect).
+8. **TC-W08: Watch Deadline Expiry**: Synthetic transport delivers pongs for 15 minutes with no qualifying creation notification. Verifies clean exit with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_QUALIFYING_NOTIFICATION_OBSERVED`).
+9. **TC-W09: Early Notification Validation Cap**: Notification arrives at $t = 10\text{ s}$; synthetic RPC hangs. Verifies individual request times out within 10 s and validation aborts within 30 s, rather than waiting 15 minutes.
+10. **TC-W10: Handoff Re-derivation**: Synthetic watch evidence directory is validated by `paper-pilot-handoff.ts`. Verifies independent signature extraction, exchange matching, and start-window verification without fabricated signature pages.

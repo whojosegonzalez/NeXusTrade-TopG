@@ -1,8 +1,8 @@
 # PAPER Single-Candidate Pilot — Proposal for Review
 
-**Status:** proposal only; nothing in it has been executed or approved. No provider request, socket, capture, daemon activation or rerun is authorized by this document. The Stage B runner reviewed at `6855efb0e4ab5023e2c556030c42613a0ee86f53` is used unchanged (see the [runbook](./paper-single-candidate-diagnostic-runbook.md) and assessment §8.35–§8.36). Stage A and the conditional wrapper are implemented offline and await review; every limit in this document is **proposed, not approved**.
+**Current status (2026-11-14):** Stage A precheck and the conditional wrapper were reviewed at commit `c440cef7eaba004e0fc15e9899f3ed58e9b7426c` and executed once under operator authorization into `data/research/prechecks/fresh-amm-v4-01` (manifest `5b65751d2adaf7e27e342d00262ffe0e8ac2ea73447b91f6de5b5fa6a146ac16`). The offline pin check passed, but Stage A terminated cleanly without a target (`SAMPLE_PRODUCED_NO_SUITABLE_TARGET`: 18 signatures outside the 0–760 s retrieval prefilter [12m 40s], 2 failed on-chain; 0 transactions retrieved, 0 market calls, 0 sockets), returning exit 3. Consequently, the live handoff check was not reached, and Stage B was not initiated. The single-execution authorization is exhausted; no further provider request, socket, capture, daemon activation, or rerun is currently authorized. Detailed analysis and the next-discovery assessment are recorded in assessment §8.37, with the proposed companion creation-watch design in §8.38.
 
-**First live sequence (2026-11-14)**: Stage A ran once at `c440cef` and sealed a valid bounded-sample no-target result (`data/research/prechecks/fresh-amm-v4-01`, manifest `5b65751d…ac16`). Stage B did not run. The result and the next-discovery assessment are in assessment §8.37.
+**Historical proposal context:** This document was drafted as the prospective design and approval basis for the two-stage pilot sequence. The Stage B runner reviewed at `6855efb0e4ab5023e2c556030c42613a0ee86f53` remains frozen and unchanged (see the [runbook](./paper-single-candidate-diagnostic-runbook.md) and assessment §8.35–§8.36). The historical planning text and limits below are preserved for architectural and design reference.
 
 **Summary:**
 
@@ -78,7 +78,9 @@ A target named today from local evidence would be at least about 430,000 s old.
 - **Already answered offline**: the parser question (§1.3).
 - **What remains open**: the runner queries `/latest/dex/tokens/<mint>`, and a real multi-pair response from that endpoint has not been captured. The per-pair schema is the same as the captured `/latest/dex/pairs` responses, and any mismatch fails closed as `INTAKE_REJECTED:MARKET_INTAKE_UNAVAILABLE`, an outcome the pilot would report as an acquisition finding.
 
-### 1.5 Stage A: bounded on-chain precheck (implemented offline; awaiting review)
+### 1.5 Stage A: bounded on-chain precheck
+
+_(Historical proposal text preserved below. Current status: reviewed and executed once under operator authorization in `data/research/prechecks/fresh-amm-v4-01`, ending with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET`. Stage B was never initiated. See assessment §8.37.)_
 
 **Implementation**: `backend/src/scripts/fresh-amm-v4-precheck.ts`. It reuses the existing `PaperRequestSession`, the existing transaction normalizer (`SolanaRpcTransactionFetcher.parseTransactionResponse`), the existing `initialize2` decoder (`PoolInitializationParser`) and the runner's own DexScreener parser and market endpoint. Its default is a dry run (no configuration, request or file); `--live` dispatches.
 
@@ -142,7 +144,11 @@ The overall outcome is one of:
 
 **Not yet known**: the current creation rate of AMM v4 / WSOL pools. A result without a target is likely and valid.
 
-### 1.6 Enforced conditional handoff (implemented offline; awaiting review)
+**Next discovery direction**: To eliminate the timing coincidence required by point-in-time signature page sampling without polling or altering the Stage B runner, a companion creation-watch design is proposed in assessment §8.38.
+
+### 1.6 Enforced conditional handoff
+
+_(Historical proposal text preserved below. Current status: reviewed at `c440cef`; verified in offline tests. In the single live execution, the pin check passed, but Stage A returned exit 3 (`SAMPLE_PRODUCED_NO_SUITABLE_TARGET`), so the wrapper halted before the live handoff check was reached.)_
 
 **Handoff check**: `backend/src/scripts/paper-pilot-handoff.ts`, read-only (git and local files). It answers `ALLOWED`, `WAIT` or `REFUSED`:
 
@@ -307,6 +313,8 @@ Flow qualification and strategy acceptance are reported separately (`summary.jso
 - **No reruns**: the runner refuses an existing output directory. Stage A and Stage B are each one attempt.
 
 ## 6. Approval sequence requested
+
+_(Historical proposal context: this two-stage sequence was authorized for a single execution on 2026-11-14. Following the `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` result, this authorization is exhausted. Any future execution requires a separate proposal and approval.)_
 
 1. **Review the offline implementation**: Stage A, the handoff check, the wrapper and their regressions. The Raydium source revision for the pinned fee destination is recorded (`91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6`).
 2. **One combined, conditional operator approval**, because the start window is too short for a second approval round after the precheck. It must name:
