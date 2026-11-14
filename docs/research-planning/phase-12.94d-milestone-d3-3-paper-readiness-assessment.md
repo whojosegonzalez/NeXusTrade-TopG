@@ -5080,3 +5080,77 @@ The review of `6515fcb` reproduced four defects and supplied the verified upstre
 The twelve earlier mutations are still each caught.
 
 - **Results**: the precheck suite 6/6 and the handoff suite 6/6, under external 60 s limits. The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+
+### 8.37 Stage A Live Result (Bounded-Sample No Target) and Next-Discovery Assessment
+
+#### Recorded result
+
+The operator ran the reviewed sequence at `c440cef` after a session-only configuration preflight (`SOLANA_RPC_URL` mapped from the existing `SOLANA_RPC_BASE_URL`; no value printed). Two earlier invocations had stopped at `MISSING_CONFIGURATION` before any request or directory creation.
+
+- **Capture**: `data/research/prechecks/fresh-amm-v4-01`, manifest SHA-256 `5b65751d2adaf7e27e342d00262ffe0e8ac2ea73447b91f6de5b5fa6a146ac16`.
+- **Verification** (independent review, and repeated here read-only with the reviewed functions): integrity and every exchange reference pass, with no missing exchange or capture failure. Re-deriving the selection from the sealed response reproduces `selection.json` exactly.
+- **Requests**: exactly one `getSignaturesForAddress` on the pinned fee destination, HTTP 200, 4,676 bytes, unredacted; session stop `PRECHECK_COMPLETE`.
+- **Sample**: 20 signatures: 18 `NOT_RETRIEVED_OUTSIDE_PREFILTER` and 2 `NOT_RETRIEVED_FAILED_TRANSACTION`. The newest is 2026-11-13T06:34:32Z, about 30.3 h before retrieval at 2026-11-14T12:53:39Z. The oldest is 2026-10-20T05:28:01Z, so the 20 records span about 577 h (about 24 days).
+- **Not reached**: no transaction retrieval, market request, WebSocket or Stage B.
+- **Second invocation**: it stopped on the existing precheck directory, with no further provider request.
+- **Wallet**: hash unchanged.
+
+**Outcome**: `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_RETRIEVABLE_SIGNATURE_IN_SAMPLE`): a valid bounded-sample no-target result.
+
+- **It does not establish a strategy rejection**: no candidate reached the runner.
+- **It does not establish market-wide absence**: nothing about eligible pools across the market follows from it.
+- **What it does show**: the pinned fee destination's 20 newest transactions, as indexed by this provider, span about 24 days. The 18 successful ones were not decoded, so how many were pool creations is unknown.
+
+#### AMM v4 versus CPMM support (local code)
+
+| Capability                          | Raydium AMM v4                                                                                                                                                 | Raydium CPMM                                                                                                    |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Discovery: Raydium API v3 list      | Listed (`scanner-discover.ts`, `CandidateStreamEngine`); default order, first page                                                                             | Listed. On 2026-11-09, 15 of 20 pools were CPMM, mostly 7–271 h old; the 5 AMM v4 pools had no usable open time |
+| Discovery: on-chain                 | Stage A fee-destination precheck (one-shot sample); events collector (program-wide logs, `initialize2`)                                                        | Events collector only (program-wide logs, `Initialize`); no fee-destination or creation-specific source         |
+| Initialization parsing              | `PoolInitializationParser`: `initialize2`, 21 accounts, `open_time`, fee destination at index 14                                                               | `PoolInitializationParser`: Anchor `initialize`, 20 accounts                                                    |
+| Pool account parsing                | `RaydiumAmmParser` (runner, flow, security)                                                                                                                    | `RaydiumCpmmParser` (637-byte layout, reserves) and `VerificationDispatchService`: research pilot only          |
+| Market parsing (runner)             | Accepted                                                                                                                                                       | Rejected (`UNSUPPORTED_RAYDIUM_POOL_TYPE` for CPMM labels)                                                      |
+| LP evidence and screening           | `RaydiumAmmV4LpEvidenceAdapter`, `RaydiumAmmV4SnapshotValidator`, `LpScreeningBridge` (validated-LP intake)                                                    | None                                                                                                            |
+| Flow: subscription and transactions | `RaydiumCandidateSubscriptionCoordinator`, `RaydiumAmmV4TransactionSourceAdapter`, `RaydiumAmmV4SwapDecoder` (ray_log and vault deltas), window reconciliation | None: no CPMM swap decoder, adapter or reconciliation; the flow provider's setup accepts only the AMM v4 layout |
+| Stage B runner end to end           | Supported                                                                                                                                                      | Not supported                                                                                                   |
+
+The runner can therefore only use an AMM v4 / WSOL pool with the candidate as base. CPMM support stops at initialization and pool-account parsing in the research pilot.
+
+#### Smallest useful discovery that could supply a runner-supported target
+
+A repeated one-shot sample is not useful. If fee-destination activity resembles this sample, which averaged under one transaction per day, a single 20-signature look will rarely find a pool inside the 8.7-minute start window. No arrival model is validated, so no probability is assigned.
+
+The smallest useful proposal that keeps the runner frozen is a **bounded passive creation watch**:
+
+- **Subscription**: one WebSocket `logsSubscribe` that `mentions` only the pinned fee destination (`7YttLkHD…j2G5`), so it receives creation-related transactions rather than program-wide swap traffic.
+- **Stop**: at the first notification, or at a fixed duration and message ceiling.
+- **Handoff to the existing path**: the notified signature then goes through the existing Stage A validation: `getTransaction`, `initialize2` decoding with account 14 checked, candidate-base / WSOL-quote orientation, and the required DexScreener check with the window computed on `pairCreatedAt`. Then comes the existing handoff, so Stage B, the strategy and the limits stay unchanged.
+
+**What it needs**:
+
+- **Code (offline, then review)**: a watch mode for Stage A (one subscription, keepalive, notification parsing, sealed observations) and its regressions.
+- **Approval**: a separate approval of its duration and ceilings. Given the observed sample, an hours-long process may be needed and still yield nothing; it was not authorized in earlier rounds.
+
+**Expected limitation**: a fresh AMM v4 pool must still pass the scanner at intake: 300–900 s old, liquidity/market cap 0.15–0.30, LP burn ≥ 90 %, at least 20 transactions in five minutes, and buys ≥ sells. So even a successful watch may end in a valid scanner rejection.
+
+#### Broader protocol support (scope only; not implemented)
+
+Local discovery evidence suggests fresh Raydium pools now appear mainly as CPMM. Supporting them end to end would need these components, each a separately reviewed offline task:
+
+1. **Discovery**: a CPMM creation source. Either a creation-specific account pinned to an upstream `raydium-cp-swap` revision (analogous to the AMM v4 fee destination; not available locally), or LaunchLab migration events. Plus a Stage A variant using the existing CPMM `initialize` parser.
+2. **Market parsing**: accept CPMM labels for the exact pool. CPMM orders its two mints by address, so WSOL can be either token; the runner's orientation handling must support WSOL as token 0 or token 1 without inventing data.
+3. **Pool layout in the flow provider**: use `RaydiumCpmmParser` for the target layout, vaults and mints, including Token-2022 programs.
+4. **Swap decoding and flow**: a CPMM swap decoder (`swap_base_input` and `swap_base_output`, vault balance deltas; CPMM has no `ray_log`), plus its transaction-source adapter, subscription binding and window reconciliation, with authoritative fixtures.
+5. **LP evidence**: CPMM LP-mint burn and lock evidence, with an acquisition path and validator equivalent to the AMM v4 snapshot validator.
+6. **Security**: Token-2022 extension risks (for example transfer fees, permanent delegate, transfer hooks) in the security context.
+7. **Runner and coordinator**: protocol-aware target identity, layout and intake checks. Strategy thresholds unchanged.
+
+This is substantially larger than the creation watch and touches the reviewed runner, so the Stage B runner would need a new review.
+
+#### Recommended next step
+
+Implement the **bounded passive AMM v4 creation watch** offline for review (no live use): a Stage A watch mode subscribing only to the pinned fee destination, feeding the existing validation and handoff, with its own sealed evidence and regressions.
+
+- **Why**: it is the smallest change that can supply a target the frozen runner supports, and it measures directly whether runner-supported creations still occur.
+- **Operator decision**: its live duration and ceilings need separate approval, informed by this sample's low activity.
+- **If it yields nothing usable**: CPMM support, scoped above, is the larger alternative.

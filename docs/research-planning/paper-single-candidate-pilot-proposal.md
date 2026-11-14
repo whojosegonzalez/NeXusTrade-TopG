@@ -2,6 +2,8 @@
 
 **Status:** proposal only; nothing in it has been executed or approved. No provider request, socket, capture, daemon activation or rerun is authorized by this document. The Stage B runner reviewed at `6855efb0e4ab5023e2c556030c42613a0ee86f53` is used unchanged (see the [runbook](./paper-single-candidate-diagnostic-runbook.md) and assessment §8.35–§8.36). Stage A and the conditional wrapper are implemented offline and await review; every limit in this document is **proposed, not approved**.
 
+**First live sequence (2026-11-14)**: Stage A ran once at `c440cef` and sealed a valid bounded-sample no-target result (`data/research/prechecks/fresh-amm-v4-01`, manifest `5b65751d…ac16`). Stage B did not run. The result and the next-discovery assessment are in assessment §8.37.
+
 **Summary:**
 
 - **Target**: no strategy-eligible target can be named offline. The strategy admits only pools 5–15 minutes old, and the newest local evidence is five days old.
