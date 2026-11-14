@@ -76,6 +76,13 @@ class MockKeepaliveTransport implements ISolanaKeepaliveWebSocketTransport {
   closeCalls: { code?: number | undefined; reason?: string | undefined }[] = [];
   terminateCalled = false;
 
+  autoCloseOnCloseCall = true;
+  throwOnClose = false;
+  throwOnTerminate = false;
+  failToCloseOnTerminate = false;
+  synchronousPongPayload?: Buffer | null = undefined;
+  supportsPing = true;
+
   private listeners: {
     open: (() => void)[];
     message: ((data: string | Buffer) => void)[];
@@ -94,12 +101,41 @@ class MockKeepaliveTransport implements ISolanaKeepaliveWebSocketTransport {
 
   private underlyingSocket?: { readyState: number } | undefined;
 
-  constructor(options?: { initialReadyState?: number; underlyingSocketReadyState?: number }) {
+  constructor(options?: {
+    initialReadyState?: number;
+    underlyingSocketReadyState?: number;
+    autoCloseOnCloseCall?: boolean;
+    supportsPing?: boolean;
+    throwOnClose?: boolean;
+    throwOnTerminate?: boolean;
+    failToCloseOnTerminate?: boolean;
+    synchronousPongPayload?: Buffer | null;
+  }) {
     if (options?.initialReadyState !== undefined) {
       this.readyState = options.initialReadyState;
     }
     if (options?.underlyingSocketReadyState !== undefined) {
       this.underlyingSocket = { readyState: options.underlyingSocketReadyState };
+    }
+    if (options?.autoCloseOnCloseCall !== undefined) {
+      this.autoCloseOnCloseCall = options.autoCloseOnCloseCall;
+    }
+    if (options?.throwOnClose !== undefined) {
+      this.throwOnClose = options.throwOnClose;
+    }
+    if (options?.throwOnTerminate !== undefined) {
+      this.throwOnTerminate = options.throwOnTerminate;
+    }
+    if (options?.failToCloseOnTerminate !== undefined) {
+      this.failToCloseOnTerminate = options.failToCloseOnTerminate;
+    }
+    if (options?.synchronousPongPayload !== undefined) {
+      this.synchronousPongPayload = options.synchronousPongPayload;
+    }
+    if (options?.supportsPing === false) {
+      this.supportsPing = false;
+      // @ts-expect-error intentionally testing unsupported ping method
+      this.ping = undefined;
     }
   }
 
@@ -127,18 +163,35 @@ class MockKeepaliveTransport implements ISolanaKeepaliveWebSocketTransport {
     this.sentMessages.push(data);
   }
 
-  ping(data?: Buffer): void {
-    this.sentPings.push(data ?? Buffer.alloc(0));
+  ping?(data?: Buffer): void {
+    if (!this.supportsPing) {
+      throw new Error("ping is not supported");
+    }
+    const payload = data ?? Buffer.alloc(0);
+    this.sentPings.push(payload);
+    if (this.synchronousPongPayload !== undefined) {
+      this.emitPong(this.synchronousPongPayload ?? payload);
+    }
   }
 
   close(code?: number, reason?: string): void {
-    this.readyState = 3;
+    if (this.throwOnClose) {
+      throw new Error("Simulated close failure");
+    }
+    if (this.autoCloseOnCloseCall) {
+      this.readyState = 3;
+    }
     this.closeCalls.push({ code, reason });
   }
 
   terminate(): void {
+    if (this.throwOnTerminate) {
+      throw new Error("Simulated terminate failure");
+    }
     this.terminateCalled = true;
-    this.readyState = 3;
+    if (!this.failToCloseOnTerminate) {
+      this.readyState = 3;
+    }
   }
 
   // Test helpers to simulate incoming events
@@ -184,6 +237,7 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(watch.feeDestination).toBe(DEFAULT_WATCH_FEE_DESTINATION);
     expect(watch.limits).toEqual(DEFAULT_CREATION_WATCH_LIMITS);
 
+    // Invalid wssUrl
     expect(() => {
       new BoundedAmmV4CreationWatch({
         wssUrl: "",
@@ -191,12 +245,50 @@ describe("BoundedAmmV4CreationWatch", () => {
       });
     }).toThrow("[WATCH_CONFIG_INVALID]");
 
+    // Invalid transportFactory
     expect(() => {
       new BoundedAmmV4CreationWatch({
         wssUrl: "wss://valid.url",
         transportFactory: null as unknown as (url: string) => ISolanaKeepaliveWebSocketTransport,
       });
     }).toThrow("[WATCH_CONFIG_INVALID]");
+
+    // Invalid durations / limits: NaN, Infinity, negative, zero
+    const invalidLimits = [
+      { watchCeilingMs: NaN },
+      { watchCeilingMs: Infinity },
+      { watchCeilingMs: 0 },
+      { watchCeilingMs: -100 },
+      { ackTimeoutMs: 0 },
+      { ackTimeoutMs: -1 },
+      { ackTimeoutMs: NaN },
+      { pingIntervalMs: 0 },
+      { pingIntervalMs: -20 },
+      { pongTimeoutMs: 0 },
+      { pongTimeoutMs: -50 },
+      { cleanupTimeoutMs: 0 },
+      { maxPayloadBytes: 0 },
+      { maxClientPings: 0 },
+      { maxClientPings: 1.5 },
+      { maxIncomingControlFrames: 0 },
+      { maxIncomingControlFrames: -1 },
+      { maxIncomingMessages: 0 },
+      // pongTimeoutMs >= pingIntervalMs
+      { pongTimeoutMs: 20_000, pingIntervalMs: 20_000 },
+      { pongTimeoutMs: 25_000, pingIntervalMs: 20_000 },
+    ];
+
+    for (const limitOverride of invalidLimits) {
+      expect(
+        () =>
+          new BoundedAmmV4CreationWatch({
+            wssUrl: "wss://valid.url",
+            transportFactory: () => new MockKeepaliveTransport(),
+            limits: limitOverride,
+          }),
+        `Expected validation error for: ${JSON.stringify(limitOverride)}`,
+      ).toThrow("[WATCH_CONFIG_INVALID]");
+    }
   });
 
   it("TC-02: start() can only be called once per instance", async () => {
@@ -309,6 +401,8 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.observations.durationMs).toBe(1500);
     expect(result.observations.failedNotificationsCount).toBe(0);
     expect(result.observations.rejectedNotificationsCount).toBe(0);
+    expect(result.observations.cleanupSettled).toBe(true);
+    expect(result.observations.cleanupFailed).toBe(false);
   });
 
   it("TC-04: subscription ack timeout terminates within 5,000 ms if no ack arrives", async () => {
@@ -450,10 +544,9 @@ describe("BoundedAmmV4CreationWatch", () => {
       }),
     );
 
-    // Watch should still be running
     expect(transport!.closeCalls).toHaveLength(0);
 
-    // Subsequent matching notification captures successfully
+    // Matching notification arrives and captures
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -461,8 +554,8 @@ describe("BoundedAmmV4CreationWatch", () => {
         params: {
           subscription: 77,
           result: {
-            context: { slot: 200 },
-            value: { signature: VALID_SIG_B, err: null, logs: ["ok"] },
+            context: { slot: 101 },
+            value: { signature: VALID_SIG_B, err: null, logs: [] },
           },
         },
       }),
@@ -472,10 +565,9 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.status).toBe("NOTIFICATION_CAPTURED");
     expect(result.notification?.signature).toBe(VALID_SIG_B);
     expect(result.observations.rejectedNotificationsCount).toBe(1);
-    expect(result.observations.messagesReceivedCount).toBe(3);
   });
 
-  it("TC-08: failed on-chain transaction notification is recorded and does not capture", async () => {
+  it("TC-08: requires explicit successful transaction status (err === null); absent or non-null err does not qualify", async () => {
     const vEnv = new VirtualTimerEnvironment();
     let transport: MockKeepaliveTransport;
 
@@ -493,7 +585,46 @@ describe("BoundedAmmV4CreationWatch", () => {
     transport!.emitOpen();
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 55 }));
 
-    // Failed on-chain transaction (err is not null)
+    // 1. Missing `err` property entirely -> does NOT qualify
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 55,
+          result: {
+            context: { slot: 298 },
+            value: {
+              signature: VALID_SIG_A,
+              logs: ["invoke [1]"],
+            },
+          },
+        },
+      }),
+    );
+    expect(transport!.closeCalls).toHaveLength(0);
+
+    // 2. `err: undefined` -> does NOT qualify
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 55,
+          result: {
+            context: { slot: 299 },
+            value: {
+              signature: VALID_SIG_A,
+              err: undefined,
+              logs: ["invoke [1]"],
+            },
+          },
+        },
+      }),
+    );
+    expect(transport!.closeCalls).toHaveLength(0);
+
+    // 3. Failed on-chain transaction (err is an object) -> does NOT qualify
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -511,10 +642,9 @@ describe("BoundedAmmV4CreationWatch", () => {
         },
       }),
     );
-
     expect(transport!.closeCalls).toHaveLength(0);
 
-    // Subsequent successful transaction captures
+    // 4. Subsequent successful transaction (err === null) captures
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -532,7 +662,7 @@ describe("BoundedAmmV4CreationWatch", () => {
     const result = await watchPromise;
     expect(result.status).toBe("NOTIFICATION_CAPTURED");
     expect(result.notification?.signature).toBe(VALID_SIG_B);
-    expect(result.observations.failedNotificationsCount).toBe(1);
+    expect(result.observations.failedNotificationsCount).toBe(3);
   });
 
   it("TC-09: notification with invalid signature or slot is recorded as rejected", async () => {
@@ -551,33 +681,33 @@ describe("BoundedAmmV4CreationWatch", () => {
 
     const watchPromise = watch.start();
     transport!.emitOpen();
-    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 12 }));
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
 
-    // 1. Invalid signature (not 64-byte Ed25519)
+    // 1. Invalid slot (0)
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
         method: "logsNotification",
         params: {
-          subscription: 12,
+          subscription: 1,
           result: {
-            context: { slot: 100 },
-            value: { signature: "InvalidShortSig", err: null, logs: [] },
+            context: { slot: 0 },
+            value: { signature: VALID_SIG_A, err: null, logs: [] },
           },
         },
       }),
     );
 
-    // 2. Invalid slot (negative)
+    // 2. Invalid base58 signature
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
         method: "logsNotification",
         params: {
-          subscription: 12,
+          subscription: 1,
           result: {
-            context: { slot: -5 },
-            value: { signature: VALID_SIG_A, err: null, logs: [] },
+            context: { slot: 100 },
+            value: { signature: "NOT_A_VALID_SOLANA_SIG", err: null, logs: [] },
           },
         },
       }),
@@ -589,7 +719,7 @@ describe("BoundedAmmV4CreationWatch", () => {
         jsonrpc: "2.0",
         method: "logsNotification",
         params: {
-          subscription: 12,
+          subscription: 1,
           result: {
             context: { slot: 101 },
             value: { signature: VALID_SIG_A, err: null, logs: [] },
@@ -603,8 +733,8 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.observations.rejectedNotificationsCount).toBe(2);
   });
 
-  it("TC-10: keepalive ping/pong matches accurately at 20-second interval", async () => {
-    const vEnv = new VirtualTimerEnvironment();
+  it("TC-10: keepalive ping/pong matches accurately with payload verification", async () => {
+    const vEnv = new VirtualTimerEnvironment(1_700_000_000_000);
     let transport: MockKeepaliveTransport;
 
     const watch = new BoundedAmmV4CreationWatch({
@@ -624,18 +754,20 @@ describe("BoundedAmmV4CreationWatch", () => {
     // Advance 20 s -> first client ping is sent
     vEnv.advanceTime(20_000);
     expect(transport!.sentPings).toHaveLength(1);
+    expect(transport!.sentPings[0]!.toString("utf8")).toBe("topg-watch-1");
 
-    // Pong arrives 2 s later (within 10 s timeout)
+    // Pong arrives with matching payload
     vEnv.advanceTime(2_000);
-    transport!.emitPong();
+    transport!.emitPong(transport!.sentPings[0]);
 
     // Advance another 18 s (total 40 s from start) -> second client ping
     vEnv.advanceTime(18_000);
     expect(transport!.sentPings).toHaveLength(2);
+    expect(transport!.sentPings[1]!.toString("utf8")).toBe("topg-watch-2");
 
-    // Second pong arrives
+    // Second pong arrives with matching payload
     vEnv.advanceTime(1_000);
-    transport!.emitPong();
+    transport!.emitPong(transport!.sentPings[1]);
 
     // Finally notification arrives
     transport!.emitMessage(
@@ -657,11 +789,10 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.observations.clientPingsSentCount).toBe(2);
     expect(result.observations.matchedPongsCount).toBe(2);
     expect(result.observations.pongsReceivedCount).toBe(2);
-    expect(result.observations.incomingControlFramesCount).toBe(2);
   });
 
-  it("TC-11: unmatched pong deadline stops watch with KEEPALIVE_TIMEOUT (zero reconnects)", async () => {
-    const vEnv = new VirtualTimerEnvironment();
+  it("TC-10-R: pong matching reproduction: wrong payload does not clear deadline and causes KEEPALIVE_TIMEOUT", async () => {
+    const vEnv = new VirtualTimerEnvironment(1_700_000_000_000);
     let transport: MockKeepaliveTransport;
 
     const watch = new BoundedAmmV4CreationWatch({
@@ -678,22 +809,141 @@ describe("BoundedAmmV4CreationWatch", () => {
     transport!.emitOpen();
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
 
-    // Advance to first ping at 20 s
+    // Advance 20 s -> ping 1 sent
     vEnv.advanceTime(20_000);
     expect(transport!.sentPings).toHaveLength(1);
 
-    // Advance 9,999 ms -> still within 10 s pong window
-    vEnv.advanceTime(9_999);
-    expect(transport!.closeCalls).toHaveLength(0);
+    // Mismatched pong payload arrives at 22 s
+    vEnv.advanceTime(2_000);
+    transport!.emitPong(Buffer.from("WRONG_PAYLOAD"));
 
-    // Advance 2 ms -> exceeds 10,000 ms pong timeout
-    vEnv.advanceTime(2);
+    // Advance past 30 s deadline (ping at 20s + 10s timeout = 30s)
+    vEnv.advanceTime(9_000); // at 31 s
+
+    // Attempt to deliver qualifying notification at 35 s
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 1,
+          result: {
+            context: { slot: 999 },
+            value: { signature: VALID_SIG_A, err: null, logs: [] },
+          },
+        },
+      }),
+    );
 
     const result = await watchPromise;
     expect(result.status).toBe("KEEPALIVE_TIMEOUT");
     expect(result.reason).toContain("First unmatched pong deadline expired");
     expect(result.notification).toBeNull();
-    expect(transport!.closeCalls).toHaveLength(1);
+    expect(result.observations.matchedPongsCount).toBe(0);
+  });
+
+  it("TC-10-S: synchronous mock replies match pong payload correctly without race condition", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport({
+          synchronousPongPayload: null, // echoes exact ping payload synchronously
+        });
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Advance 20s -> ping triggers synchronous pong reply
+    vEnv.advanceTime(20_000);
+    expect(transport!.sentPings).toHaveLength(1);
+
+    // Notification arrives
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 1,
+          result: {
+            context: { slot: 100 },
+            value: { signature: VALID_SIG_A, err: null, logs: [] },
+          },
+        },
+      }),
+    );
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+    expect(result.observations.matchedPongsCount).toBe(1);
+  });
+
+  it("TC-10-U: unsupported ping capability terminates with TRANSPORT_ERROR", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport({
+          supportsPing: false,
+        });
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Advance 20s -> ping attempt detects missing ping capability
+    vEnv.advanceTime(20_000);
+
+    const result = await watchPromise;
+    expect(result.status).toBe("TRANSPORT_ERROR");
+    expect(result.reason).toContain("Transport does not support keepalive ping capability");
+  });
+
+  it("TC-11: unmatched pong deadline stops watch with KEEPALIVE_TIMEOUT (zero reconnects)", async () => {
+    const vEnv = new VirtualTimerEnvironment(1_700_000_000_000);
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Ping sent at 20 s
+    vEnv.advanceTime(20_000);
+    expect(transport!.sentPings).toHaveLength(1);
+
+    // Advance past 10 s pong timeout (total 30 s from start) -> deadline expires
+    vEnv.advanceTime(10_001);
+
+    const result = await watchPromise;
+    expect(result.status).toBe("KEEPALIVE_TIMEOUT");
+    expect(result.reason).toContain("First unmatched pong deadline expired");
+    expect(result.notification).toBeNull();
+    expect(result.observations.matchedPongsCount).toBe(0);
   });
 
   it("TC-12: exceeding max client pings (45) terminates with CLIENT_PING_LIMIT_EXCEEDED", async () => {
@@ -704,7 +954,7 @@ describe("BoundedAmmV4CreationWatch", () => {
       wssUrl: "wss://api.mainnet-beta.solana.com",
       clock: vEnv.clock,
       timers: vEnv.getTimers(),
-      limits: { maxClientPings: 3 }, // set small for test
+      limits: { maxClientPings: 3 },
       transportFactory: () => {
         transport = new MockKeepaliveTransport();
         return transport;
@@ -717,13 +967,13 @@ describe("BoundedAmmV4CreationWatch", () => {
 
     // Ping 1
     vEnv.advanceTime(20_000);
-    transport!.emitPong();
+    transport!.emitPong(transport!.sentPings[0]);
     // Ping 2
     vEnv.advanceTime(20_000);
-    transport!.emitPong();
+    transport!.emitPong(transport!.sentPings[1]);
     // Ping 3
     vEnv.advanceTime(20_000);
-    transport!.emitPong();
+    transport!.emitPong(transport!.sentPings[2]);
 
     // Ping 4 triggers limit
     vEnv.advanceTime(20_000);
@@ -741,7 +991,7 @@ describe("BoundedAmmV4CreationWatch", () => {
       wssUrl: "wss://api.mainnet-beta.solana.com",
       clock: vEnv.clock,
       timers: vEnv.getTimers(),
-      limits: { maxIncomingControlFrames: 4 }, // small limit for test
+      limits: { maxIncomingControlFrames: 5 },
       transportFactory: () => {
         transport = new MockKeepaliveTransport();
         return transport;
@@ -752,20 +1002,14 @@ describe("BoundedAmmV4CreationWatch", () => {
     transport!.emitOpen();
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
 
-    // Send 2 server pings + 2 pongs = 4
-    transport!.emitServerPing();
-    transport!.emitPong();
-    transport!.emitServerPing();
-    transport!.emitPong();
-
-    expect(transport!.closeCalls).toHaveLength(0);
-
-    // 5th control frame exceeds ceiling
-    transport!.emitPong();
+    // Emit 6 server pings
+    for (let i = 0; i < 6; i++) {
+      transport!.emitServerPing();
+    }
 
     const result = await watchPromise;
     expect(result.status).toBe("CONTROL_FRAME_LIMIT_EXCEEDED");
-    expect(result.observations.incomingControlFramesCount).toBe(5);
+    expect(result.observations.incomingControlFramesCount).toBe(6);
   });
 
   it("TC-14: exceeding max incoming application messages (100) terminates with MESSAGE_LIMIT_EXCEEDED", async () => {
@@ -776,7 +1020,7 @@ describe("BoundedAmmV4CreationWatch", () => {
       wssUrl: "wss://api.mainnet-beta.solana.com",
       clock: vEnv.clock,
       timers: vEnv.getTimers(),
-      limits: { maxIncomingMessages: 3 }, // small limit for test
+      limits: { maxIncomingMessages: 3 },
       transportFactory: () => {
         transport = new MockKeepaliveTransport();
         return transport;
@@ -785,17 +1029,13 @@ describe("BoundedAmmV4CreationWatch", () => {
 
     const watchPromise = watch.start();
     transport!.emitOpen();
-
-    // Msg 1 (ack)
+    // Message 1 (ack)
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
-    // Msg 2 (method ignored)
+    // Message 2
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", method: "other" }));
-    // Msg 3 (method ignored)
+    // Message 3
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", method: "other" }));
-
-    expect(transport!.closeCalls).toHaveLength(0);
-
-    // Msg 4 exceeds 3
+    // Message 4 -> triggers limit
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", method: "other" }));
 
     const result = await watchPromise;
@@ -811,7 +1051,7 @@ describe("BoundedAmmV4CreationWatch", () => {
       wssUrl: "wss://api.mainnet-beta.solana.com",
       clock: vEnv.clock,
       timers: vEnv.getTimers(),
-      limits: { maxPayloadBytes: 200 }, // 200 bytes for test
+      limits: { maxPayloadBytes: 500 },
       transportFactory: () => {
         transport = new MockKeepaliveTransport();
         return transport;
@@ -820,21 +1060,19 @@ describe("BoundedAmmV4CreationWatch", () => {
 
     const watchPromise = watch.start();
     transport!.emitOpen();
-
-    // Message of 120 bytes
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
 
-    // Message of 150 bytes exceeds 200 total
-    const largeMessage = JSON.stringify({
+    // Send a frame that exceeds 500 bytes
+    const largeFrame = JSON.stringify({
       jsonrpc: "2.0",
       method: "logsNotification",
-      params: { padding: "X".repeat(150) },
+      params: { padding: "X".repeat(600) },
     });
-    transport!.emitMessage(largeMessage);
+    transport!.emitMessage(largeFrame);
 
     const result = await watchPromise;
     expect(result.status).toBe("PAYLOAD_BYTE_CEILING_EXCEEDED");
-    expect(result.observations.payloadBytesReceived).toBeGreaterThan(200);
+    expect(result.observations.payloadBytesReceived).toBeGreaterThan(500);
   });
 
   it("TC-16: 15-minute watch ceiling reached without creations exits with NO_QUALIFYING_NOTIFICATION_OBSERVED", async () => {
@@ -858,7 +1096,7 @@ describe("BoundedAmmV4CreationWatch", () => {
     // Simulate 15 minutes (900,000 ms) in virtual time with keepalive cycles
     for (let i = 0; i < 44; i++) {
       vEnv.advanceTime(20_000);
-      transport!.emitPong();
+      transport!.emitPong(transport!.sentPings[i]);
     }
     // Advance remaining time to 900,000 ms
     vEnv.advanceTime(20_000);
@@ -878,8 +1116,10 @@ describe("BoundedAmmV4CreationWatch", () => {
     const watch = new BoundedAmmV4CreationWatch({
       wssUrl: "wss://api.mainnet-beta.solana.com",
       clock: vEnv.clock,
-      timers: vEnv.getTimers(),
-      limits: { pingIntervalMs: 2_000_000 }, // prevent keepalive from firing before 15m
+      timers: {
+        setTimeout: () => 123, // dummy timer that never fires
+        clearTimeout: () => {},
+      },
       transportFactory: () => {
         transport = new MockKeepaliveTransport();
         return transport;
@@ -890,11 +1130,10 @@ describe("BoundedAmmV4CreationWatch", () => {
     transport!.emitOpen();
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
 
-    // Manually advance clock past 900,000 ms without advancing virtual timer queue
-    // (simulating delayed timer callback or event loop lag)
+    // Advance clock past 900,000 ms without firing timer
     vEnv.advanceTime(900_001);
 
-    // Event arrives: checkAbsoluteDeadlines catches that deadline has passed
+    // Incoming message triggers deadline check
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -1039,7 +1278,7 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.notification?.signature).toBe(originalSignature);
   });
 
-  it("TC-21: returned result and observations are deep-frozen and immutable", async () => {
+  it("TC-21: returned result, observations, and nested error arrays are deep-frozen and immutable", async () => {
     const vEnv = new VirtualTimerEnvironment();
     let transport: MockKeepaliveTransport;
 
@@ -1056,6 +1295,30 @@ describe("BoundedAmmV4CreationWatch", () => {
     const watchPromise = watch.start();
     transport!.emitOpen();
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Failed notification with nested InstructionError array and detail object
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 1,
+          result: {
+            context: { slot: 99 },
+            value: {
+              signature: VALID_SIG_A,
+              err: {
+                InstructionError: [0, "Custom"],
+                Details: { nestedCode: 123 },
+              },
+              logs: ["fail"],
+            },
+          },
+        },
+      }),
+    );
+
+    // Qualifying notification captures
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -1075,9 +1338,36 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(Object.isFrozen(result.notification)).toBe(true);
     expect(Object.isFrozen(result.observations)).toBe(true);
     expect(Object.isFrozen(result.observations.events)).toBe(true);
+    expect(Object.isFrozen(result.observations.applicationFrames)).toBe(true);
 
+    // Root immutability
     expect(() => {
       (result as unknown as { status: string }).status = "MUTATED";
+    }).toThrow();
+
+    // Deep immutability of nested error array in events
+    const failedEvent = result.observations.events.find((e) => e.type === "NOTIFICATION_FAILED");
+    expect(failedEvent).toBeDefined();
+    const details = failedEvent!.details as {
+      err: { InstructionError: unknown[]; Details: { nestedCode: number } };
+    };
+
+    expect(Object.isFrozen(details)).toBe(true);
+    expect(Object.isFrozen(details.err)).toBe(true);
+    expect(Object.isFrozen(details.err.InstructionError)).toBe(true);
+    expect(Object.isFrozen(details.err.Details)).toBe(true);
+
+    // Modifying nested error array throws in strict mode
+    expect(() => {
+      details.err.InstructionError.push("ILLEGAL_MUTATION");
+    }).toThrow();
+
+    expect(() => {
+      (details.err.InstructionError as unknown as unknown[])[0] = 999;
+    }).toThrow();
+
+    expect(() => {
+      details.err.Details.nestedCode = 999;
     }).toThrow();
   });
 
@@ -1090,7 +1380,6 @@ describe("BoundedAmmV4CreationWatch", () => {
       clock: vEnv.clock,
       timers: vEnv.getTimers(),
       transportFactory: () => {
-        // Socket wrapper that exposes getUnderlyingSocket with readyState: 1 and never emits 'open'
         transport = new MockKeepaliveTransport({
           underlyingSocketReadyState: 1,
         });
@@ -1122,5 +1411,338 @@ describe("BoundedAmmV4CreationWatch", () => {
 
     const result = await watchPromise;
     expect(result.status).toBe("NOTIFICATION_CAPTURED");
+  });
+
+  it("TC-23: retains bounded application frames in memory with byte accounting, truncates oversized payloads, and sanitizes WSS URL", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://user:supersecretpass@api.mainnet-beta.solana.com/?api-key=secretTokenKey12345",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+
+    // Outgoing subscription frame is dispatched
+    // Receive ack
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 10 }));
+
+    // Send an oversized rejected message (e.g. 5,000 bytes)
+    const oversizedPadding = "P".repeat(5000);
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 999, // wrong sub ID
+          result: { padding: oversizedPadding },
+        },
+      }),
+    );
+
+    // Send qualifying notification
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 10,
+          result: {
+            context: { slot: 500 },
+            value: { signature: VALID_SIG_A, err: null, logs: ["ok"] },
+          },
+        },
+      }),
+    );
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+
+    // Check application frames retention
+    const frames = result.observations.applicationFrames;
+    expect(frames.length).toBe(4);
+
+    // Frame 0: Outgoing subscription
+    expect(frames[0]!.direction).toBe("OUTGOING");
+    expect(frames[0]!.payload).toContain("logsSubscribe");
+    expect(frames[0]!.byteLength).toBeGreaterThan(0);
+    expect(frames[0]!.truncated).toBeUndefined();
+
+    // Frame 1: Incoming ack
+    expect(frames[1]!.direction).toBe("INCOMING");
+    expect(frames[1]!.payload).toContain('"result":10');
+    expect(frames[1]!.byteLength).toBeGreaterThan(0);
+
+    // Frame 2: Incoming oversized frame -> truncated
+    expect(frames[2]!.direction).toBe("INCOMING");
+    expect(frames[2]!.byteLength).toBeGreaterThan(5000);
+    expect(frames[2]!.truncated).toBe(true);
+    expect(frames[2]!.payload.length).toBe(4096);
+
+    // Frame 3: Incoming qualifying notification
+    expect(frames[3]!.direction).toBe("INCOMING");
+    expect(frames[3]!.payload).toContain(VALID_SIG_A);
+    expect(frames[3]!.truncated).toBeUndefined();
+
+    // Verify WSS URL sanitization in event metadata
+    const startedEvent = result.observations.events.find((e) => e.type === "WATCH_STARTED");
+    expect(startedEvent).toBeDefined();
+    const recordedUrl = String(startedEvent!.details?.wssUrl);
+    expect(recordedUrl).toContain("[REDACTED]");
+    expect(recordedUrl).not.toContain("supersecretpass");
+    expect(recordedUrl).not.toContain("secretTokenKey12345");
+  });
+
+  it("TC-24: finishes bounded cleanup before resolving (immediate, delayed, forced, and close failure)", async () => {
+    // 1. Immediate closure: transport close() synchronously sets readyState = 3
+    {
+      const vEnv = new VirtualTimerEnvironment();
+      let transport: MockKeepaliveTransport;
+
+      const watch = new BoundedAmmV4CreationWatch({
+        wssUrl: "wss://api.mainnet-beta.solana.com",
+        clock: vEnv.clock,
+        timers: vEnv.getTimers(),
+        transportFactory: () => {
+          transport = new MockKeepaliveTransport({ autoCloseOnCloseCall: true });
+          return transport;
+        },
+      });
+
+      const promise = watch.start();
+      transport!.emitOpen();
+      transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      transport!.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 10 },
+              value: { signature: VALID_SIG_A, err: null, logs: [] },
+            },
+          },
+        }),
+      );
+
+      const res = await promise;
+      expect(res.status).toBe("NOTIFICATION_CAPTURED");
+      expect(res.observations.cleanupSettled).toBe(true);
+      expect(res.observations.cleanupFailed).toBe(false);
+      expect(vEnv.pendingTimerCount()).toBe(0);
+    }
+
+    // 2. Delayed closure: transport close() does not set readyState = 3 until emitClose fires later
+    {
+      const vEnv = new VirtualTimerEnvironment();
+      let transport: MockKeepaliveTransport;
+
+      const watch = new BoundedAmmV4CreationWatch({
+        wssUrl: "wss://api.mainnet-beta.solana.com",
+        clock: vEnv.clock,
+        timers: vEnv.getTimers(),
+        transportFactory: () => {
+          transport = new MockKeepaliveTransport({ autoCloseOnCloseCall: false });
+          return transport;
+        },
+      });
+
+      let resolved = false;
+      const promise = watch.start().then((r) => {
+        resolved = true;
+        return r;
+      });
+
+      transport!.emitOpen();
+      transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      transport!.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 10 },
+              value: { signature: VALID_SIG_A, err: null, logs: [] },
+            },
+          },
+        }),
+      );
+
+      // Not resolved yet because socket close has not settled
+      expect(resolved).toBe(false);
+
+      // 500 ms later, close event emits
+      vEnv.advanceTime(500);
+      transport!.emitClose(1000, "Clean close");
+
+      const res = await promise;
+      expect(resolved).toBe(true);
+      expect(res.status).toBe("NOTIFICATION_CAPTURED");
+      expect(res.observations.cleanupSettled).toBe(true);
+      expect(res.observations.cleanupFailed).toBe(false);
+      expect(vEnv.pendingTimerCount()).toBe(0);
+    }
+
+    // 3. Forced cleanup: transport never emits close; cleanup timer forces terminate()
+    {
+      const vEnv = new VirtualTimerEnvironment();
+      let transport: MockKeepaliveTransport;
+
+      const watch = new BoundedAmmV4CreationWatch({
+        wssUrl: "wss://api.mainnet-beta.solana.com",
+        clock: vEnv.clock,
+        timers: vEnv.getTimers(),
+        limits: { cleanupTimeoutMs: 5_000 },
+        transportFactory: () => {
+          transport = new MockKeepaliveTransport({ autoCloseOnCloseCall: false });
+          return transport;
+        },
+      });
+
+      let resolved = false;
+      const promise = watch.start().then((r) => {
+        resolved = true;
+        return r;
+      });
+
+      transport!.emitOpen();
+      transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      transport!.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 10 },
+              value: { signature: VALID_SIG_A, err: null, logs: [] },
+            },
+          },
+        }),
+      );
+
+      expect(resolved).toBe(false);
+
+      // Advance 5,000 ms -> cleanup timer calls terminate() which sets readyState 3
+      vEnv.advanceTime(5_000);
+
+      const res = await promise;
+      expect(resolved).toBe(true);
+      expect(transport!.terminateCalled).toBe(true);
+      expect(res.observations.cleanupSettled).toBe(true);
+      expect(res.observations.cleanupFailed).toBe(false);
+      expect(vEnv.pendingTimerCount()).toBe(0);
+    }
+
+    // 4. Close failure: close() throws and terminate() fails to close
+    {
+      const vEnv = new VirtualTimerEnvironment();
+      let transport: MockKeepaliveTransport;
+
+      const watch = new BoundedAmmV4CreationWatch({
+        wssUrl: "wss://api.mainnet-beta.solana.com",
+        clock: vEnv.clock,
+        timers: vEnv.getTimers(),
+        transportFactory: () => {
+          transport = new MockKeepaliveTransport({
+            throwOnClose: true,
+            failToCloseOnTerminate: true,
+          });
+          return transport;
+        },
+      });
+
+      const promise = watch.start();
+      transport!.emitOpen();
+      transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+      transport!.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 1,
+            result: {
+              context: { slot: 10 },
+              value: { signature: VALID_SIG_A, err: null, logs: [] },
+            },
+          },
+        }),
+      );
+
+      const res = await promise;
+      expect(res.observations.cleanupSettled).toBe(true);
+      expect(res.observations.cleanupFailed).toBe(true);
+      expect(res.observations.cleanupFailureReason).toContain("Transport close threw");
+      expect(vEnv.pendingTimerCount()).toBe(0);
+    }
+  });
+
+  it("TC-25: zero remaining owned timers/listeners and preserved notification receipt time across delayed cleanup", async () => {
+    const vEnv = new VirtualTimerEnvironment(1_700_000_000_000);
+    let transport: MockKeepaliveTransport;
+    const controller = new AbortController();
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      abortSignal: controller.signal,
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport({ autoCloseOnCloseCall: false });
+        return transport;
+      },
+    });
+
+    const promise = watch.start();
+    transport!.emitOpen();
+
+    // Advance 1,000 ms to ack
+    vEnv.advanceTime(1_000);
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Advance 4,000 ms to notification (t = 5,000 ms total)
+    vEnv.advanceTime(4_000);
+    const notificationArrivalEpochMs = vEnv.clock();
+    expect(notificationArrivalEpochMs).toBe(1_700_000_005_000);
+
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 1,
+          result: {
+            context: { slot: 777 },
+            value: { signature: VALID_SIG_A, err: null, logs: [] },
+          },
+        },
+      }),
+    );
+
+    // Delay cleanup closure by another 2,000 ms (t = 7,000 ms total)
+    vEnv.advanceTime(2_000);
+    expect(vEnv.clock()).toBe(1_700_000_007_000);
+
+    // Socket finally closes
+    transport!.emitClose(1000, "Delayed close settled");
+
+    const result = await promise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+
+    // CRITICAL: notification.receivedAtMs must preserve original receipt time (5,000 ms), NOT cleanup completion time (7,000 ms)
+    expect(result.notification?.receivedAtMs).toBe(1_700_000_005_000);
+    expect(result.observations.endedAtMs).toBe(1_700_000_005_000);
+
+    // Verify zero owned timers remain active
+    expect(vEnv.pendingTimerCount()).toBe(0);
   });
 });

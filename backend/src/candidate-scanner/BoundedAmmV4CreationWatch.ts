@@ -13,20 +13,25 @@
  *    fee destination (7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5). Zero reconnects, zero retries.
  * 4. Rigorous Acknowledgement Binding: Enforces request/subscription ID binding before
  *    processing notifications. Validates slot, canonical 64-byte Base58 signature
- *    (via isValidSolanaSignature), and transaction error status.
- * 5. Bounded Accounting: Enforces strict ceilings on watch duration (15 min), ack deadline (5 s),
- *    incoming messages (100), payload bytes (1 MiB), client keepalive pings (45), and incoming
- *    control frames (128). Unmatched pong deadline stops the watch immediately.
- * 6. Auditable Observations: Preserves an immutable, deep-frozen record of all raw provider events
- *    and accounting metrics. Does not claim cryptographic proof of market completeness.
- * 7. Single Capture & Bounded Teardown: Captures at most the first qualifying notification and
- *    terminates within a 5-second cleanup bound. Late events cannot mutate the completed result.
+ *    (via isValidSolanaSignature), and transaction error status (strictly requires err === null).
+ * 5. Bounded Accounting & Pong Matching: Enforces strict ceilings on watch duration (15 min),
+ *    ack deadline (5 s), incoming messages (100), payload bytes (1 MiB), client keepalive pings (45),
+ *    and incoming control frames (128). Pongs are verified byte-for-byte against the outstanding
+ *    ping payload; unmatched pongs do not clear the deadline, and the first unmatched pong deadline
+ *    stops the watch.
+ * 6. Auditable Observations & Deep Immutability: Preserves a recursively cloned and frozen
+ *    record of application frames, provider events, and accounting metrics. Does not claim
+ *    cryptographic proof of market completeness.
+ * 7. Single Capture & Settled Teardown: Captures at most the first qualifying notification and
+ *    settles teardown within a bounded cleanup ceiling before resolving. Late events cannot mutate
+ *    the completed result.
  */
 
 import { isValidSolanaSignature } from "./ExactPoolHistoryEnumerator.js";
 import { RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION } from "../scripts/fresh-amm-v4-precheck.js";
 import type { ISolanaKeepaliveWebSocketTransport } from "./RaydiumTransportObservationProbe.js";
 import { getWebSocketTransportReadyState } from "./CandidateDecisionDiagnostic.js";
+import { sanitizeSolanaRpcUrl } from "../research/pilot/SolanaRpcLiveObservationClient.js";
 
 export const DEFAULT_WATCH_FEE_DESTINATION = RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION;
 
@@ -84,6 +89,14 @@ export interface BoundedWatchObservationEvent {
   readonly details?: Record<string, unknown> | undefined;
 }
 
+export interface BoundedWatchApplicationFrame {
+  readonly direction: "INCOMING" | "OUTGOING";
+  readonly timestampMs: number;
+  readonly byteLength: number;
+  readonly payload: string;
+  readonly truncated?: boolean | undefined;
+}
+
 export interface CapturedNotificationData {
   readonly signature: string;
   readonly slot: number;
@@ -108,6 +121,10 @@ export interface BoundedWatchObservations {
   readonly incomingControlFramesCount: number;
   readonly failedNotificationsCount: number;
   readonly rejectedNotificationsCount: number;
+  readonly cleanupSettled: boolean;
+  readonly cleanupFailed: boolean;
+  readonly cleanupFailureReason?: string | undefined;
+  readonly applicationFrames: readonly BoundedWatchApplicationFrame[];
   readonly events: readonly BoundedWatchObservationEvent[];
 }
 
@@ -133,16 +150,42 @@ export interface BoundedAmmV4CreationWatchOptions {
   readonly limits?: Partial<BoundedAmmV4CreationWatchLimits> | undefined;
 }
 
-function deepFreeze<T>(obj: T): T {
-  if (obj === null || typeof obj !== "object") return obj;
-  Object.freeze(obj);
-  for (const key of Object.keys(obj as object)) {
-    const val = (obj as Record<string, unknown>)[key];
-    if (val !== null && typeof val === "object" && !Object.isFrozen(val)) {
-      deepFreeze(val);
-    }
+/**
+ * Sanitizes or redacts credential-bearing WSS URLs for safe inclusion in event metadata.
+ */
+export function sanitizeWssUrl(rawUrl: string): string {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return "[REDACTED_WSS_URL]";
   }
-  return obj;
+  try {
+    const sanitized = sanitizeSolanaRpcUrl(rawUrl);
+    return sanitized.sanitizedUrl;
+  } catch {
+    return "[REDACTED_WSS_URL]";
+  }
+}
+
+/**
+ * Recursively deep-clones and freezes all nested structures, ensuring that
+ * nested objects, arrays, and properties cannot be mutated.
+ */
+export function deepCloneAndFreeze<T>(input: T): T {
+  if (input === null || typeof input !== "object") {
+    return input;
+  }
+  if (Buffer.isBuffer(input)) {
+    const copy = Buffer.from(input);
+    return Object.freeze(copy) as unknown as T;
+  }
+  if (Array.isArray(input)) {
+    const copy = input.map((item) => deepCloneAndFreeze(item));
+    return Object.freeze(copy) as unknown as T;
+  }
+  const copy: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(input)) {
+    copy[key] = deepCloneAndFreeze(val);
+  }
+  return Object.freeze(copy) as T;
 }
 
 export class BoundedAmmV4CreationWatch {
@@ -164,6 +207,7 @@ export class BoundedAmmV4CreationWatch {
   private overallDeadlineAtMs = 0;
   private ackDeadlineAtMs = 0;
   private pendingPongDeadlineAtMs: number | null = null;
+  private expectedPongPayload: Buffer | null = null;
 
   private readonly requestId = 1;
   private subscriptionId: number | null = null;
@@ -179,13 +223,25 @@ export class BoundedAmmV4CreationWatch {
   private failedNotificationsCount = 0;
   private rejectedNotificationsCount = 0;
 
+  private cleanupSettled = false;
+  private cleanupFailed = false;
+  private cleanupFailureReason: string | undefined = undefined;
+  private onCleanupCloseHook: (() => void) | null = null;
+
+  private terminationStatus: BoundedWatchTerminationStatus = "NO_QUALIFYING_NOTIFICATION_OBSERVED";
+  private terminationReason = "";
+
   private readonly events: BoundedWatchObservationEvent[] = [];
+  private readonly applicationFrames: BoundedWatchApplicationFrame[] = [];
+  private static readonly MAX_RETAINED_APPLICATION_FRAMES = 128;
+  private static readonly MAX_RETAINED_FRAME_BYTES = 4096;
 
   private ackTimer: unknown = null;
   private overallTimer: unknown = null;
   private pingTimer: unknown = null;
   private pongTimeoutTimer: unknown = null;
   private cleanupTimer: unknown = null;
+  private abortListener: (() => void) | null = null;
 
   private resolveRunPromise: ((result: BoundedAmmV4CreationWatchResult) => void) | null = null;
 
@@ -195,6 +251,52 @@ export class BoundedAmmV4CreationWatch {
     }
     if (typeof options.transportFactory !== "function") {
       throw new Error("[WATCH_CONFIG_INVALID] transportFactory must be a function");
+    }
+    if (
+      options.feeDestination !== undefined &&
+      (typeof options.feeDestination !== "string" || !options.feeDestination.trim())
+    ) {
+      throw new Error(
+        "[WATCH_CONFIG_INVALID] feeDestination must be a non-empty string if provided",
+      );
+    }
+
+    const limits = {
+      ...DEFAULT_CREATION_WATCH_LIMITS,
+      ...(options.limits ?? {}),
+    };
+
+    const validatePositiveFinite = (val: number, name: string) => {
+      if (typeof val !== "number" || !Number.isFinite(val) || Number.isNaN(val) || val <= 0) {
+        throw new Error(
+          `[WATCH_CONFIG_INVALID] ${name} must be a positive finite number, got ${val}`,
+        );
+      }
+    };
+
+    const validatePositiveSafeInteger = (val: number, name: string) => {
+      if (typeof val !== "number" || !Number.isSafeInteger(val) || val <= 0) {
+        throw new Error(
+          `[WATCH_CONFIG_INVALID] ${name} must be a positive safe integer, got ${val}`,
+        );
+      }
+    };
+
+    validatePositiveFinite(limits.watchCeilingMs, "watchCeilingMs");
+    validatePositiveFinite(limits.ackTimeoutMs, "ackTimeoutMs");
+    validatePositiveFinite(limits.pingIntervalMs, "pingIntervalMs");
+    validatePositiveFinite(limits.pongTimeoutMs, "pongTimeoutMs");
+    validatePositiveFinite(limits.cleanupTimeoutMs, "cleanupTimeoutMs");
+    validatePositiveFinite(limits.maxPayloadBytes, "maxPayloadBytes");
+
+    validatePositiveSafeInteger(limits.maxClientPings, "maxClientPings");
+    validatePositiveSafeInteger(limits.maxIncomingControlFrames, "maxIncomingControlFrames");
+    validatePositiveSafeInteger(limits.maxIncomingMessages, "maxIncomingMessages");
+
+    if (limits.pongTimeoutMs >= limits.pingIntervalMs) {
+      throw new Error(
+        `[WATCH_CONFIG_INVALID] pongTimeoutMs (${limits.pongTimeoutMs}) must be strictly less than pingIntervalMs (${limits.pingIntervalMs})`,
+      );
     }
 
     this.wssUrl = options.wssUrl;
@@ -206,15 +308,12 @@ export class BoundedAmmV4CreationWatch {
       clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
     };
     this.abortSignal = options.abortSignal;
-    this.limits = Object.freeze({
-      ...DEFAULT_CREATION_WATCH_LIMITS,
-      ...(options.limits ?? {}),
-    });
+    this.limits = Object.freeze(limits);
   }
 
   /**
    * Starts the bounded WebSocket creation watch.
-   * Resolves when a qualifying notification is captured or when a stop condition is met.
+   * Resolves only after closure or bounded forced cleanup settles.
    */
   start(): Promise<BoundedAmmV4CreationWatchResult> {
     if (this.started) {
@@ -228,7 +327,7 @@ export class BoundedAmmV4CreationWatch {
     this.recordEvent({
       type: "WATCH_STARTED",
       details: {
-        wssUrl: this.wssUrl,
+        wssUrl: sanitizeWssUrl(this.wssUrl),
         feeDestination: this.feeDestination,
         watchCeilingMs: this.limits.watchCeilingMs,
       },
@@ -243,13 +342,10 @@ export class BoundedAmmV4CreationWatch {
       }
 
       if (this.abortSignal) {
-        this.abortSignal.addEventListener(
-          "abort",
-          () => {
-            this.terminate("OPERATOR_CANCELLED", "Operator abort signal triggered");
-          },
-          { once: true },
-        );
+        this.abortListener = () => {
+          this.terminate("OPERATOR_CANCELLED", "Operator abort signal triggered");
+        };
+        this.abortSignal.addEventListener("abort", this.abortListener, { once: true });
       }
 
       this.overallTimer = this.timers.setTimeout(() => {
@@ -297,8 +393,8 @@ export class BoundedAmmV4CreationWatch {
       this.handleMessage(data);
     });
 
-    transport.on("pong", () => {
-      this.handlePong();
+    transport.on("pong", (data?: Buffer) => {
+      this.handlePong(data);
     });
 
     transport.on("ping", () => {
@@ -310,6 +406,14 @@ export class BoundedAmmV4CreationWatch {
     });
 
     transport.on("close", (code: number, reason: string) => {
+      if (this.terminated) {
+        if (this.onCleanupCloseHook) {
+          const hook = this.onCleanupCloseHook;
+          this.onCleanupCloseHook = null;
+          hook();
+        }
+        return;
+      }
       this.terminate(
         "TRANSPORT_CLOSED",
         `Transport closed prematurely (code: ${code}${reason ? `, reason: ${reason}` : ""})`,
@@ -332,6 +436,8 @@ export class BoundedAmmV4CreationWatch {
       method: "logsSubscribe",
       params: [{ mentions: [this.feeDestination] }, { commitment: "confirmed" }],
     });
+
+    this.recordApplicationFrame("OUTGOING", subscribeFrame);
 
     try {
       this.transport?.send(subscribeFrame);
@@ -379,7 +485,17 @@ export class BoundedAmmV4CreationWatch {
       return;
     }
 
+    if (typeof this.transport?.ping !== "function") {
+      this.terminate(
+        "TRANSPORT_ERROR",
+        "Transport does not support keepalive ping capability (ping method is missing)",
+      );
+      return;
+    }
+
     this.clientPingsSentCount++;
+    const pingPayload = Buffer.from(`topg-watch-${this.clientPingsSentCount}`);
+    this.expectedPongPayload = pingPayload;
     this.pendingPongDeadlineAtMs = this.clock() + this.limits.pongTimeoutMs;
 
     this.recordEvent({
@@ -387,22 +503,11 @@ export class BoundedAmmV4CreationWatch {
       details: {
         pingNumber: this.clientPingsSentCount,
         deadlineAtMs: this.pendingPongDeadlineAtMs,
+        expectedPayload: pingPayload.toString("utf8"),
       },
     });
 
-    try {
-      if (typeof this.transport?.ping === "function") {
-        this.transport.ping(Buffer.from(`topg-watch-${this.clientPingsSentCount}`));
-      }
-    } catch (err) {
-      this.terminate(
-        "TRANSPORT_ERROR",
-        `Failed to send ping frame: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return;
-    }
-
-    // Arm single-shot pong timeout
+    // Arm single-shot pong timeout BEFORE dispatch so synchronous mock replies work correctly
     if (this.pongTimeoutTimer !== null) {
       this.timers.clearTimeout(this.pongTimeoutTimer);
     }
@@ -417,9 +522,19 @@ export class BoundedAmmV4CreationWatch {
 
     // Schedule subsequent ping
     this.scheduleNextKeepalivePing();
+
+    try {
+      this.transport.ping(pingPayload);
+    } catch (err) {
+      this.terminate(
+        "TRANSPORT_ERROR",
+        `Failed to send ping frame: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
   }
 
-  private handlePong(): void {
+  private handlePong(data?: Buffer | string | unknown): void {
     if (this.terminated) return;
     if (this.checkAbsoluteDeadlines()) return;
 
@@ -434,8 +549,23 @@ export class BoundedAmmV4CreationWatch {
       return;
     }
 
-    if (this.pendingPongDeadlineAtMs !== null) {
-      if (this.clock() > this.pendingPongDeadlineAtMs) {
+    // Convert data to Buffer for payload comparison
+    let receivedBuffer: Buffer | null = null;
+    if (Buffer.isBuffer(data)) {
+      receivedBuffer = data;
+    } else if (typeof data === "string") {
+      receivedBuffer = Buffer.from(data, "utf8");
+    } else if (data instanceof Uint8Array) {
+      receivedBuffer = Buffer.from(data);
+    }
+
+    const isMatch =
+      this.expectedPongPayload !== null &&
+      receivedBuffer !== null &&
+      receivedBuffer.equals(this.expectedPongPayload);
+
+    if (isMatch) {
+      if (this.pendingPongDeadlineAtMs !== null && this.clock() > this.pendingPongDeadlineAtMs) {
         this.terminate(
           "KEEPALIVE_TIMEOUT",
           "Pong received after matching pong deadline expired; zero reconnects",
@@ -443,6 +573,7 @@ export class BoundedAmmV4CreationWatch {
         return;
       }
       this.matchedPongsCount++;
+      this.expectedPongPayload = null;
       this.pendingPongDeadlineAtMs = null;
       if (this.pongTimeoutTimer !== null) {
         this.timers.clearTimeout(this.pongTimeoutTimer);
@@ -453,7 +584,18 @@ export class BoundedAmmV4CreationWatch {
         details: { matchedCount: this.matchedPongsCount },
       });
     } else {
-      this.recordEvent({ type: "UNSOLICITED_PONG_RECEIVED" });
+      // Unrelated, stale, or unsolicited pong: does NOT clear deadline
+      this.recordEvent({
+        type: "UNSOLICITED_OR_UNMATCHED_PONG_RECEIVED",
+        details: {
+          hasOutstandingPing: this.expectedPongPayload !== null,
+          payloadReceived: receivedBuffer
+            ? receivedBuffer.toString("utf8")
+            : typeof data === "string"
+              ? data
+              : null,
+        },
+      });
     }
   }
 
@@ -480,6 +622,8 @@ export class BoundedAmmV4CreationWatch {
     if (this.checkAbsoluteDeadlines()) return;
 
     const byteLength = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length;
+    this.recordApplicationFrame("INCOMING", data, byteLength);
+
     this.payloadBytesReceived += byteLength;
     this.messagesReceivedCount++;
 
@@ -628,12 +772,19 @@ export class BoundedAmmV4CreationWatch {
 
     const valueObj = resultObj.value as Record<string, unknown>;
 
-    // Explicit on-chain error check: failed transactions are recorded but not qualifying
-    if ("err" in valueObj && valueObj.err !== null && valueObj.err !== undefined) {
+    // Explicit on-chain status check: require err === null; absent, undefined, or non-null status must not qualify
+    if (!("err" in valueObj) || valueObj.err !== null) {
       this.failedNotificationsCount++;
       this.recordEvent({
         type: "NOTIFICATION_FAILED",
-        details: { reason: "ON_CHAIN_TRANSACTION_FAILED", slot, err: valueObj.err },
+        details: {
+          reason: "NON_NULL_OR_MISSING_TRANSACTION_ERROR",
+          slot,
+          err:
+            "err" in valueObj && valueObj.err !== undefined
+              ? valueObj.err
+              : "ABSENT_OR_UNDEFINED_ERR",
+        },
       });
       return;
     }
@@ -652,7 +803,7 @@ export class BoundedAmmV4CreationWatch {
       ? valueObj.logs.filter((l: unknown): l is string => typeof l === "string")
       : [];
 
-    // Capture first qualifying notification
+    // Capture first qualifying notification (preserves original receipt time)
     const receivedAtMs = this.clock();
     this.capturedNotification = Object.freeze({
       signature: sig,
@@ -706,13 +857,21 @@ export class BoundedAmmV4CreationWatch {
     if (this.terminated) return;
     this.terminated = true;
     this.endedAtMs = this.clock();
+    this.terminationStatus = status;
+    this.terminationReason = reason;
 
     this.recordEvent({
       type: "WATCH_TERMINATED",
       details: { status, reason, endedAtMs: this.endedAtMs },
     });
 
-    // Clear all scheduled timers
+    // Remove AbortSignal listener immediately
+    if (this.abortSignal && this.abortListener) {
+      this.abortSignal.removeEventListener("abort", this.abortListener);
+      this.abortListener = null;
+    }
+
+    // Clear all operating timers
     if (this.ackTimer !== null) {
       this.timers.clearTimeout(this.ackTimer);
       this.ackTimer = null;
@@ -730,34 +889,122 @@ export class BoundedAmmV4CreationWatch {
       this.pongTimeoutTimer = null;
     }
 
-    // Close transport cleanly within cleanup bounds
-    if (this.transport) {
-      try {
-        this.transport.close(1000, reason);
-      } catch {
-        // Ignore synchronous close exceptions during teardown
-      }
+    this.settleCleanup();
+  }
 
-      // Ensure cleanup ceiling enforces socket termination
-      const transportToClean = this.transport;
-      this.cleanupTimer = this.timers.setTimeout(() => {
-        try {
-          if (typeof (transportToClean as { terminate?: () => void }).terminate === "function") {
-            (transportToClean as { terminate: () => void }).terminate();
-          }
-        } catch {
-          // Ignore termination exceptions during cleanup
-        }
-      }, this.limits.cleanupTimeoutMs);
+  private settleCleanup(): void {
+    const readyState = getWebSocketTransportReadyState(this.transport);
+    if (!this.transport || readyState === 3 /* CLOSED */) {
+      this.cleanupSettled = true;
+      this.cleanupFailed = false;
+      this.recordEvent({ type: "CLEANUP_SETTLED" });
+      this.finishAndResolve();
+      return;
     }
 
+    let resolved = false;
+    const markSettled = (failed: boolean, failureReason?: string) => {
+      if (resolved) return;
+      resolved = true;
+      this.cleanupSettled = true;
+      this.cleanupFailed = failed;
+      if (failureReason) {
+        this.cleanupFailureReason = failureReason;
+      }
+      if (this.cleanupTimer !== null) {
+        this.timers.clearTimeout(this.cleanupTimer);
+        this.cleanupTimer = null;
+      }
+      if (failed) {
+        this.recordEvent({
+          type: "CLEANUP_FAILED",
+          details: { reason: failureReason ?? "UNKNOWN_CLEANUP_FAILURE" },
+        });
+      } else {
+        this.recordEvent({ type: "CLEANUP_SETTLED" });
+      }
+      this.finishAndResolve();
+    };
+
+    // Arm cleanup deadline timer
+    this.cleanupTimer = this.timers.setTimeout(() => {
+      this.cleanupTimer = null;
+      // If still not closed, try forced termination
+      try {
+        if (typeof (this.transport as { terminate?: () => void })?.terminate === "function") {
+          (this.transport as { terminate: () => void }).terminate();
+        }
+      } catch (err) {
+        this.recordEvent({
+          type: "TRANSPORT_TERMINATE_ERROR",
+          details: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+
+      const stateAfterTerminate = getWebSocketTransportReadyState(this.transport);
+      if (stateAfterTerminate === 3) {
+        this.recordEvent({
+          type: "CLEANUP_FORCE_TERMINATED",
+          details: { timeoutMs: this.limits.cleanupTimeoutMs },
+        });
+        markSettled(false);
+      } else {
+        markSettled(
+          true,
+          `Transport failed to close within cleanup ceiling (${this.limits.cleanupTimeoutMs} ms)`,
+        );
+      }
+    }, this.limits.cleanupTimeoutMs);
+
+    // Call close cleanly
+    try {
+      this.transport.close(1000, this.terminationReason);
+    } catch (err) {
+      this.recordEvent({
+        type: "TRANSPORT_CLOSE_ERROR",
+        details: { error: err instanceof Error ? err.message : String(err) },
+      });
+      try {
+        if (typeof (this.transport as { terminate?: () => void })?.terminate === "function") {
+          (this.transport as { terminate: () => void }).terminate();
+        }
+      } catch {
+        // ignore
+      }
+      const stateAfterErr = getWebSocketTransportReadyState(this.transport);
+      if (stateAfterErr === 3) {
+        markSettled(false);
+      } else {
+        markSettled(
+          true,
+          `Transport close threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return;
+    }
+
+    // If close() synchronously set readyState to 3:
+    if (getWebSocketTransportReadyState(this.transport) === 3) {
+      markSettled(false);
+      return;
+    }
+
+    // Otherwise, wait for transport's 'close' event
+    this.onCleanupCloseHook = () => {
+      markSettled(false);
+    };
+  }
+
+  private finishAndResolve(): void {
+    if (!this.resolveRunPromise) return;
+
     const durationMs = Math.max(0, this.endedAtMs - this.startedAtMs);
-    const observations: BoundedWatchObservations = deepFreeze({
+    const observations: BoundedWatchObservations = {
       startedAtMs: this.startedAtMs,
       endedAtMs: this.endedAtMs,
       durationMs,
-      terminationStatus: status,
-      terminationReason: reason,
+      terminationStatus: this.terminationStatus,
+      terminationReason: this.terminationReason,
       subscriptionId: this.subscriptionId,
       messagesReceivedCount: this.messagesReceivedCount,
       payloadBytesReceived: this.payloadBytesReceived,
@@ -768,21 +1015,60 @@ export class BoundedAmmV4CreationWatch {
       incomingControlFramesCount: this.incomingControlFramesCount,
       failedNotificationsCount: this.failedNotificationsCount,
       rejectedNotificationsCount: this.rejectedNotificationsCount,
+      cleanupSettled: this.cleanupSettled,
+      cleanupFailed: this.cleanupFailed,
+      ...(this.cleanupFailureReason ? { cleanupFailureReason: this.cleanupFailureReason } : {}),
+      applicationFrames: [...this.applicationFrames],
       events: [...this.events],
-    });
+    };
 
-    const result: BoundedAmmV4CreationWatchResult = deepFreeze({
-      status,
-      reason,
+    const result: BoundedAmmV4CreationWatchResult = {
+      status: this.terminationStatus,
+      reason: this.terminationReason,
       notification: this.capturedNotification,
       observations,
-    });
+    };
 
-    if (this.resolveRunPromise) {
-      const resolve = this.resolveRunPromise;
-      this.resolveRunPromise = null;
-      resolve(result);
+    const deepFrozenResult = deepCloneAndFreeze(result);
+
+    const resolve = this.resolveRunPromise;
+    this.resolveRunPromise = null;
+    resolve(deepFrozenResult);
+  }
+
+  private recordApplicationFrame(
+    direction: "INCOMING" | "OUTGOING",
+    data: string | Buffer,
+    actualByteLength?: number,
+  ): void {
+    if (
+      this.applicationFrames.length >= BoundedAmmV4CreationWatch.MAX_RETAINED_APPLICATION_FRAMES
+    ) {
+      return;
     }
+    const byteLength =
+      actualByteLength ??
+      (typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length);
+    const text = typeof data === "string" ? data : data.toString("utf8");
+
+    let payload: string;
+    let truncated = false;
+    if (byteLength > BoundedAmmV4CreationWatch.MAX_RETAINED_FRAME_BYTES) {
+      payload = text.slice(0, BoundedAmmV4CreationWatch.MAX_RETAINED_FRAME_BYTES);
+      truncated = true;
+    } else {
+      payload = text;
+    }
+
+    this.applicationFrames.push(
+      Object.freeze({
+        direction,
+        timestampMs: this.clock(),
+        byteLength,
+        payload,
+        ...(truncated ? { truncated: true } : {}),
+      }),
+    );
   }
 
   private recordEvent(event: {
