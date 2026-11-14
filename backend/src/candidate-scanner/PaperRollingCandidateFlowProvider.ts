@@ -588,13 +588,7 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       return unavailable(`PAPER_ROLLING_FLOW_STOPPED: ${this.stopReason ?? "UNKNOWN"}`);
     }
 
-    // Newest snapshot published at or before T (a snapshot published after T is never used).
-    let selected: PublishedSnapshot | undefined;
-    for (const s of this.snapshots) {
-      if (s.publishedAtMs <= evaluationTimestampMs) {
-        if (!selected || s.publishedAtMs > selected.publishedAtMs) selected = s;
-      }
-    }
+    const selected = this.selectSnapshotAt(evaluationTimestampMs);
     if (!selected) {
       return unavailable(
         this.snapshotSeq === 0
@@ -611,6 +605,64 @@ export class PaperRollingCandidateFlowProvider implements CandidateFlowProvider 
       executionContext: "PAPER_SIMULATION",
       maxAllowedEvidenceAgeMs: PAPER_ROLLING_FLOW_FIXED_RULES.maxEvidenceAgeMs,
       allowActiveWindowQualification: true,
+    });
+  }
+
+  /** Newest snapshot published at or before T (a snapshot published after T is never used). */
+  private selectSnapshotAt(evaluationTimestampMs: number): PublishedSnapshot | undefined {
+    let selected: PublishedSnapshot | undefined;
+    for (const s of this.snapshots) {
+      if (s.publishedAtMs <= evaluationTimestampMs) {
+        if (!selected || s.publishedAtMs > selected.publishedAtMs) selected = s;
+      }
+    }
+    return selected;
+  }
+
+  /**
+   * Evidence reference (pure read): the snapshot a read at T selects under the same rule as
+   * getCandidateFlow, with its frozen reconciliation result and the history signatures it accounted
+   * for. Null when no snapshot is eligible. Holding the reference keeps it after retirement.
+   */
+  public getSnapshotReferenceAt(evaluationTimestampMs: number): {
+    readonly summary: PaperRollingFlowSnapshotSummary;
+    readonly result: WindowReconciliationResult;
+    readonly accountedSignatures: readonly string[];
+  } | null {
+    const s = this.selectSnapshotAt(evaluationTimestampMs);
+    if (!s) return null;
+    return Object.freeze({
+      summary: Object.freeze(this.summarize(s)),
+      result: s.result,
+      accountedSignatures: Object.freeze([...s.accountedSignatures].sort()),
+    });
+  }
+
+  /** Gaps recorded by the rolling tracker so far (pure read; copies). */
+  public getRecordedGaps(): readonly {
+    readonly gapStartMs: number;
+    readonly gapEndMs: number;
+    readonly reason: string | null;
+  }[] {
+    return Object.freeze(
+      (this.tracker?.getRecordedGaps() ?? []).map((g) =>
+        Object.freeze({ gapStartMs: g.gapStartMs, gapEndMs: g.gapEndMs, reason: g.reason ?? null }),
+      ),
+    );
+  }
+
+  /** Current epoch state (pure read, cheap): for evidence receipt records. */
+  public getEpochState(): {
+    readonly currentEpoch: number | null;
+    readonly epochEstablished: boolean;
+    readonly transportSeq: number;
+    readonly gapVersion: number;
+  } {
+    return Object.freeze({
+      currentEpoch: this.currentEpoch,
+      epochEstablished: this.epochEstablished,
+      transportSeq: this.transportSeq,
+      gapVersion: this.gapVersion,
     });
   }
 

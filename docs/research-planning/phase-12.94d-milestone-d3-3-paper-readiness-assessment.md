@@ -4824,11 +4824,11 @@ Tests use a small, version-controlled synthetic fixture (`fixtures/SanitizedDexS
   - the bounded HTTP transport and the WebSocket transport are wired only on this path;
   - the coordinator runs until a terminal outcome; Ctrl+C maps to `OPERATOR_INTERRUPT`;
   - cleanup is bounded, and successful, failed and interrupted runs are all sealed.
-- **Evidence**:
-  - files: plan, report, summary, request ledger, decisions, disarms, bounded market responses, security evidence and flow evidence;
-  - each is written exclusive-create, redacted, and refused (`[SEAL_REFUSED]`) if any secret remains;
-  - `evidence-manifest.json` follows the existing sealing pattern (SHA-256 and size per file, report reference, request ledger), plus the plan digest and approval label;
-  - `--verify <dir>` re-checks a sealed directory read-only.
+- **Evidence** (as corrected below, after the review of b4cb9e2):
+  - files: plan, report, summary, request ledger, the request-exchange index with one response-evidence file per dispatched request (`exchanges/`), decisions, decision inputs, disarms, bounded market responses, security evidence, flow evidence (with gaps and epoch state) and WebSocket observations;
+  - each is written exclusive-create, with configured credentials redacted, and refused (`[SEAL_REFUSED]`) if any credential remains;
+  - `evidence-manifest.json` follows the existing sealing pattern (SHA-256 and size per file, report reference, request ledger), plus kind, version, plan digest and approval label;
+  - `--verify <dir>` checks integrity only and fails closed.
 - **Separation**: `summary.json` reports flow qualification separately from strategy acceptance. `executed` is always `NONE (decision-only: no buy, no position)`.
 
 #### Proposed Limits and Allocation (Not Approved)
@@ -4883,10 +4883,65 @@ At 2.5 s pacing the Solana lane carries at most about 240 requests in 600 s, so 
 
 Supporting changes: the coordinator passes its clock reading to the market parser as the receipt time and exposes its security evidence and flow snapshot results for sealing. The shared test harness now routes RPC requests by origin.
 
+#### Corrections (Review of b4cb9e2)
+
+The independent review of b4cb9e2 passed 186 affected tests and backend compilation and reproduced three gaps. Each is corrected before the runner is presented for live approval. Strategy, scheduling and the proposed limits are unchanged; the target, live limits and execution remain unapproved.
+
+1. **Decisions could not be revalidated from the evidence.** A mocked confirmation run dispatched three `TRANSACTION_RETRIEVAL` requests, but no sealed file held their responses. The runner kept only the final security cache and the provider's retained snapshots, so the inputs of earlier decisions could be replaced or retired before sealing.
+   - **Response evidence**: the request session has an optional read-only observer, told once per dispatched request after it completes. It sees only what the session already read within its bounds, sends nothing and cannot change an exchange. No verification requests were added.
+   - **Contents**: the runner writes one file per request, holding the request's safe identity (lane, owner, purpose, requested identity, JSON-RPC id, method and public parameters; no request headers; the RPC URL as a placeholder), the timing, status and selected headers, and the body with its state (`COMPLETE`, `PARTIAL_OVERFLOW` or `NOT_READ`). A partial prefix is marked and is never complete evidence. `receivedBytesSha256` covers the original bytes (the retained prefix only, for a partial body) and is distinguished from the manifest's digests of the sanitized files. `bodyRedacted` and `reproducesReceivedDigest` show when redaction changed a body.
+   - **WebSocket observations**: each event is recorded once, with its receipt time, transport and the flow epoch state at receipt. Payloads are kept up to the flow's own message-byte ceiling, and anything dropped is counted. Recorded gaps and the epoch state are sealed with the flow evidence.
+   - **Decision inputs**: the coordinator now records what each decision actually reads, through the same calls with unchanged results:
+     - **Flow**: each read with the snapshot it selected (summary, frozen reconciliation result and accounted signatures), the epoch state and the recorded gaps.
+     - **Security**: each read with the evidence as seen, the withheld components and, for each component, the refresh that produced it and that refresh's request sequence numbers.
+
+     These records stay valid after the cache or snapshot is replaced or retired. The provider gained a pure `getSnapshotReferenceAt` (the same selection rule as `getCandidateFlow`), `getRecordedGaps` and `getEpochState`.
+
+2. **The verifier passed invalid manifests.** It accepted a modified `reportFile.sha256` and a directory containing only a manifest with `files: []` whose report reference pointed at the manifest. It now fails closed:
+   - **Structure**: the manifest's kind and version must be valid, and every required core entry must be listed.
+   - **Entries**: duplicate, absolute and traversal paths are rejected, as are invalid sizes, digests and categories.
+   - **References**: the report reference must match both its entry and its file, the plan digest must match `plan.json` and `report.json`, and response files must match the index.
+   - **Files**: unlisted and non-regular entries are rejected, checked recursively.
+   - **Scope**: every result states that it is integrity verification only, not a replay of the strategy.
+3. **Credentials reached the terminal.** A mocked WebSocket-construction exception carrying the RPC URL and the tracker key was redacted in the sealed files, but the final `[LIVE] Stop reason` line printed both. After configuration is loaded, every printed line, the stop reason, the recorded failure and any propagated error (including on the sealing path) are now redacted, while stop codes and the first failure cause stay readable. The derived WebSocket URL is now a redaction secret too.
+   - **Evidence redaction**: evidence content now has only configured credentials replaced, in literal and escaped forms. The shared generic pattern redaction rewrote provider data such as JSON keys named `token`, which would have destroyed response evidence. Terminal output keeps the generic patterns as well.
+
+**Regressions** (`paper-single-candidate-diagnostic.test.ts`, mocked transports and virtual time):
+
+| Test       | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E-01       | A run of four decisions in which the consumed snapshots are retired and the security cache is replaced by the end (stopped by the spent refresh budget). Every ledger entry has response evidence with matching identity, JSON-RPC id and received digest. The pool context derived from the sealed layout response matches. The three sealed transactions re-decode with the existing decoder, and for every decision's consumed window (two distinct snapshots, both retired by the end) the in-window signature count and the buy and sell counts reconcile with the recorded snapshot, reconciliation result and flow result. The first decision's mint evidence equals the sealed response of the refresh that produced it, although the cache has been replaced since. A decision made during a pending refresh records the withheld component as absent |
+| E-02       | A RugCheck body over a 64-byte limit is sealed as `PARTIAL_OVERFLOW`: never complete evidence, retained prefix at most 64 bytes, digest over the prefix only. The prefix never became security evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| V-01       | Fail-closed verification: a modified report reference, a manifest-only directory (with and without a valid header), invalid JSON, duplicate, absolute, drive and traversal paths, invalid sizes, digests and categories, a plan edited with a matching manifest entry, a changed plan digest, unlisted files in `exchanges/` and a nested directory, a missing response file and an unindexed response file are each reported; the CLI states the integrity-only scope                                                                                                                                                                                                                                                                                                                                                                                         |
+| R-01       | A credential-bearing WebSocket-construction exception: neither the captured terminal output, the returned stop reason nor any sealed file contains the tracker key, the RPC key, the RPC URL or the WebSocket URL. The stop code and failure cause remain. An error propagated from the output sink is redacted too                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| D-03, D-04 | Updated: one response file per request and complete evidence; the 429 is `NOT_READ` with no body; the echoing market response is sealed redacted and no longer claims to reproduce its received digest                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+- **Mutation checks** (sources restored byte-identical afterwards):
+
+| Mutation                                          | Caught by                    |
+| ------------------------------------------------- | ---------------------------- |
+| Exchange observer never told                      | D-03, D-04, E-01, E-02, V-01 |
+| Partial body marked complete                      | E-02                         |
+| Decision flow reads not kept                      | E-01                         |
+| Security source not bound to its refresh requests | E-01                         |
+| Response body not redacted                        | D-04                         |
+| Propagated error not redacted                     | R-01                         |
+| Stop-reason redaction removed                     | R-01                         |
+| Output and stop-reason redaction both removed     | R-01                         |
+| Report reference unchecked                        | V-01                         |
+| Required entries not enforced                     | V-01                         |
+| Non-recursive unlisted-file check                 | V-01                         |
+| Plan digest unchecked                             | V-01                         |
+| Traversal paths accepted                          | V-01                         |
+
+Removing only the output-line redaction is not detected, because the stop reason is already redacted before it is printed (two layers of defence). Removing the stop-reason layer, or both, is caught.
+
+- **Results**: all pass under external 60 s limits: the diagnostic suite 12/12, `PaperSingleCandidateCoordinator` 7/7, `PaperSessionEvidenceIntegration` 13/13, `PaperDaemonEntryIntegration` 7/7, `PaperTradingDaemon` 100/100, `PaperRollingCandidateFlowProvider` 15/15, `PaperCandidateSecurityContext` 11/11 and `CandidateStreamEngine` 25/25 (190 tests). The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+
 #### Exact Remaining Gaps
 
 1. **Live approval**: the proposed limits and the live command await separate operator approval.
-2. **Operator execution**: no live run has happened, so neither the parser against a real response nor the live transports through this runner have been exercised. The first approved run is also the parser's first real-response check.
+2. **Operator execution**: no live run has happened, so neither the parser against a real response nor the live transports through this runner have been exercised. The first approved run is also the parser's first real-response check, and the first time the response-evidence and WebSocket-observation records hold real provider data (worst case about 112 MiB of response bodies under the proposed lane limits, before JSON escaping; bounded).
 3. **Scheduling**: refresh before arming (§8.34) is not implemented. Whether a post-arm LP refresh completes within the confirmation delay under live load is unmeasured.
 4. **Daemon activation**: the runner is standalone. Installing the coordinator in the PAPER daemon, isolating the legacy loops and tying lifecycle and reports together (§8.34 activation items 4 and 5) remain open.
 5. **Position lifecycle**: execution, monitoring, collection lifetime versus holding period, and settlement (§8.34) are not started. The runner stops at confirmation.

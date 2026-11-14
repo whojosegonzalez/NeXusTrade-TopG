@@ -73,6 +73,42 @@ export interface PaperRequestSessionOptions {
   readonly limits: PaperRequestSessionLimits;
   readonly clock?: (() => number) | undefined;
   readonly timers?: PaperRequestSessionTimers | undefined;
+  /**
+   * Optional read-only evidence observer, told once per DISPATCHED request after it completes. It
+   * receives only what the session already read within its bounds; it cannot send, retry or change
+   * an exchange, and an observer error never affects the request.
+   */
+  readonly onExchangeComplete?: ((evidence: PaperRequestExchangeEvidence) => void) | undefined;
+}
+
+/** Response headers passed to an exchange observer (no request headers are ever passed). */
+export const PAPER_EXCHANGE_EVIDENCE_HEADERS = Object.freeze([
+  "content-type",
+  "content-length",
+  "retry-after",
+] as const);
+
+/** What one dispatched request sent and what the session read back (bounded). */
+export interface PaperRequestExchangeEvidence {
+  /** The ledger entry as completed. */
+  readonly entry: PaperRequestLedgerEntry;
+  readonly method: "GET" | "POST";
+  /** The dispatched URL. It may carry credentials: an observer must redact it before persisting. */
+  readonly url: string;
+  readonly requestBody: string | null;
+  readonly responseHeaders: Readonly<Record<string, string>>;
+  /**
+   * COMPLETE: the whole body was read within the limit. PARTIAL_OVERFLOW: only the retained prefix
+   * (`body`) of a body that exceeded the limit; never complete evidence. NOT_READ: no body bytes
+   * were retained (no response, 429, redirect, declared-size refusal, or a timeout, abort or
+   * network error before or during the body read).
+   */
+  readonly bodyState: "COMPLETE" | "PARTIAL_OVERFLOW" | "NOT_READ";
+  /** The bytes as received and retained by the session (null when NOT_READ). */
+  readonly body: Buffer | null;
+  /** Decoded bytes observed while reading (exceeds the retained length on overflow). */
+  readonly observedBodyBytes: number | null;
+  readonly maxResponseBytes: number;
 }
 
 export interface PaperRequestLedgerEntry {
@@ -244,6 +280,9 @@ export class PaperRequestSession {
   private readonly fetchFn: typeof fetch;
   private readonly clockFn: () => number;
   private readonly timers: PaperRequestSessionTimers;
+  private readonly onExchangeComplete:
+    | ((evidence: PaperRequestExchangeEvidence) => void)
+    | undefined;
   private readonly activeTimers = new Set<unknown>();
 
   private state: "NOT_OPEN" | "OPEN" | "STOPPED" = "NOT_OPEN";
@@ -277,6 +316,13 @@ export class PaperRequestSession {
     this.fetchFn = options.fetchFn;
     this.clockFn = options.clock ?? (() => Date.now());
     this.timers = options.timers ?? DEFAULT_TIMERS;
+    if (
+      options.onExchangeComplete !== undefined &&
+      typeof options.onExchangeComplete !== "function"
+    ) {
+      throw new Error("[PAPER_REQUEST_SESSION_INIT] onExchangeComplete must be a function");
+    }
+    this.onExchangeComplete = options.onExchangeComplete;
     // Spacing is enforced per lane by the session before a dispatch is recorded, so the budget's own
     // spacing is the smallest lane pacing and can never deny a dispatch the session has paced.
     this.budget = new PaperSessionDispatchBudget({
@@ -359,6 +405,16 @@ export class PaperRequestSession {
       ledger: Object.freeze(this.ledger.map((e) => Object.freeze({ ...e }))),
       refusalsByReason: Object.freeze({ ...this.refusalsByReason }),
     });
+  }
+
+  /** Ledger length (cheap read). */
+  public getLedgerLength(): number {
+    return this.ledger.length;
+  }
+
+  /** Frozen copies of the ledger entries from position `start` on (cheap read). */
+  public getLedgerSince(start: number): readonly PaperRequestLedgerEntry[] {
+    return Object.freeze(this.ledger.slice(start).map((e) => Object.freeze({ ...e })));
   }
 
   public getActiveTimerCount(): number {
@@ -518,6 +574,11 @@ export class PaperRequestSession {
     controller.signal.addEventListener("abort", onControllerAbort, { once: true });
     if (controller.signal.aborted) onControllerAbort();
     aborted.catch(() => undefined);
+    // Evidence for the optional observer: only what this exchange already read, within its bounds.
+    let responseHeaders: Record<string, string> = {};
+    let bodyState: PaperRequestExchangeEvidence["bodyState"] = "NOT_READ";
+    let bodyBytes: Buffer | null = null;
+    let observedBodyBytes: number | null = null;
     const fail = (error: string, status?: number): PaperRequestExchange => {
       entry.error = error;
       return {
@@ -541,6 +602,12 @@ export class PaperRequestSession {
         aborted,
       ]);
       entry.httpStatus = response.status;
+      if (this.onExchangeComplete) {
+        for (const name of PAPER_EXCHANGE_EVIDENCE_HEADERS) {
+          const value = response.headers?.get?.(name);
+          if (typeof value === "string") responseHeaders = { ...responseHeaders, [name]: value };
+        }
+      }
       this.budget.recordResponseStatus(response.status);
       // The first 429 stops the whole session; recognised from headers, before any body read.
       if (response.status === 429) {
@@ -568,9 +635,18 @@ export class PaperRequestSession {
           readBoundedStream(response.body, maxResponseBytes, controller.signal),
           aborted,
         ]);
-        if (read.overflow) return fail("RESPONSE_TOO_LARGE", response.status);
+        bodyBytes = read.bytes;
+        observedBodyBytes = read.totalObservedBytes;
+        if (read.overflow) {
+          bodyState = "PARTIAL_OVERFLOW";
+          return fail("RESPONSE_TOO_LARGE", response.status);
+        }
         text = read.bytes.toString("utf8");
+      } else {
+        bodyBytes = Buffer.alloc(0);
+        observedBodyBytes = 0;
       }
+      bodyState = "COMPLETE";
       entry.bodyComplete = true;
       return {
         dispatched: true,
@@ -596,6 +672,25 @@ export class PaperRequestSession {
       for (const s of linked) s.removeEventListener("abort", onAbort);
       this.inFlightByLane[req.lane]--;
       entry.completedAtMs = this.clockFn();
+      if (this.onExchangeComplete) {
+        try {
+          this.onExchangeComplete(
+            Object.freeze({
+              entry: Object.freeze({ ...entry }),
+              method: req.method,
+              url: req.url,
+              requestBody: req.body ?? null,
+              responseHeaders: Object.freeze(responseHeaders),
+              bodyState,
+              body: bodyState === "NOT_READ" ? null : bodyBytes,
+              observedBodyBytes: bodyState === "NOT_READ" ? null : observedBodyBytes,
+              maxResponseBytes,
+            }),
+          );
+        } catch {
+          // An observer never affects the exchange; the observer records its own failures.
+        }
+      }
     }
   }
 }

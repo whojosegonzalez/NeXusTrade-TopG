@@ -38,16 +38,20 @@ import { isCanonicalSolanaBase58 } from "./LpScreeningBridge.js";
 import {
   PAPER_SECURITY_CONTEXT_POLICY,
   evaluatePaperCandidateSecurityContext,
+  type PaperCandidateSecurityEvidence,
+  type PaperSecurityEvidenceComponent,
   type PaperSecurityTarget,
 } from "./PaperCandidateSecurityContext.js";
 import {
   PaperCandidateSecurityEvidenceLoader,
   PaperSecurityEvidenceCache,
   type PaperSecurityEvidenceCacheLimits,
+  type PaperSecurityEvidenceCacheStatus,
   type PaperSecurityEvidenceLoaderLimits,
 } from "./PaperCandidateSecurityEvidenceLoader.js";
 import {
   PaperRequestSession,
+  type PaperRequestExchangeEvidence,
   type PaperRequestSessionLimits,
   type PaperRequestSessionTimers,
 } from "./PaperRequestSession.js";
@@ -125,9 +129,63 @@ export interface PaperSingleCandidateCoordinatorOptions {
   readonly limits: PaperCoordinatorLimits;
   readonly clock?: (() => number) | undefined;
   readonly timers?: PaperRequestSessionTimers | undefined;
+  /** Optional read-only evidence observer for every dispatched request (see PaperRequestSession). */
+  readonly onRequestExchange?: ((evidence: PaperRequestExchangeEvidence) => void) | undefined;
 }
 
 export type PaperCoordinatorState = "NOT_STARTED" | "RUNNING" | "STOPPED";
+
+/** One flow read made by a decision, with the snapshot it selected (kept after retirement). */
+export interface PaperCoordinatorFlowRead {
+  readonly evaluationTimestampMs: number;
+  readonly result: CandidateFlowResult;
+  readonly snapshot: ReturnType<PaperRollingCandidateFlowProvider["getSnapshotReferenceAt"]>;
+  readonly epochState: ReturnType<PaperRollingCandidateFlowProvider["getEpochState"]>;
+  readonly recordedGaps: ReturnType<PaperRollingCandidateFlowProvider["getRecordedGaps"]>;
+}
+
+/** Where a cached security component came from: its refresh and that refresh's requests. */
+export interface PaperCoordinatorSecuritySource {
+  readonly present: boolean;
+  readonly retrievedAtMs: number | null;
+  readonly refresh: number | null;
+  readonly refreshRequestSeqs: readonly number[];
+}
+
+/** One security-evidence read made by a decision (or by intake), as the reader saw it. */
+export interface PaperCoordinatorSecurityRead {
+  readonly readAtMs: number;
+  readonly evidence: PaperCandidateSecurityEvidence;
+  readonly pendingComponents: readonly PaperSecurityEvidenceComponent[];
+  readonly sources: Readonly<
+    Record<PaperSecurityEvidenceComponent, PaperCoordinatorSecuritySource>
+  >;
+}
+
+/** The inputs a decision actually consumed (flow and security reads, in order). */
+export interface PaperCoordinatorDecisionInputs {
+  readonly seq: number;
+  readonly launchedAtMs: number;
+  readonly flowReads: readonly PaperCoordinatorFlowRead[];
+  readonly securityReads: readonly PaperCoordinatorSecurityRead[];
+}
+
+/** The session requests each security refresh dispatched (refreshes run one at a time). */
+export interface PaperCoordinatorSecurityRefreshRequests {
+  readonly refresh: number;
+  readonly plannedDecisionMs: number;
+  readonly requestSeqs: readonly number[];
+  readonly settled: boolean;
+}
+
+const SECURITY_COMPONENT_KEYS: Readonly<
+  Record<PaperSecurityEvidenceComponent, keyof PaperCandidateSecurityEvidence>
+> = Object.freeze({
+  LP: "lp",
+  MINT_ACCOUNT: "mintAccount",
+  RUGCHECK: "rugCheck",
+  BUNDLER: "bundler",
+});
 
 export interface PaperCoordinatorDecisionRecord {
   readonly seq: number;
@@ -276,6 +334,9 @@ export class PaperSingleCandidateCoordinator {
   private intakeInFlight = false;
   private decisionSeq = 0;
   private readonly decisions: PaperCoordinatorDecisionRecord[] = [];
+  private readonly decisionInputs: PaperCoordinatorDecisionInputs[] = [];
+  private readonly intakeSecurityReads: PaperCoordinatorSecurityRead[] = [];
+  private readonly securityRefreshRequests: PaperCoordinatorSecurityRefreshRequests[] = [];
   private readonly refreshErrors: string[] = [];
   private readonly skippedTicks: Record<string, number> = {};
   private tickHandle: unknown = null;
@@ -316,6 +377,7 @@ export class PaperSingleCandidateCoordinator {
       limits: options.limits.session,
       clock: this.clock,
       timers: this.timers,
+      onExchangeComplete: options.onRequestExchange,
     });
     this.provider = new PaperRollingCandidateFlowProvider({
       target: { poolAddress: this.target.poolId, tokenMint: this.target.mintAddress },
@@ -396,6 +458,60 @@ export class PaperSingleCandidateCoordinator {
   /** The frozen reconciliation result behind a retained flow snapshot (pure read). */
   public getFlowSnapshotResult(id: number) {
     return this.provider.getSnapshotResult(id);
+  }
+
+  /** Flow epoch state and recorded gaps (pure reads). */
+  public getFlowEpochState() {
+    return this.provider.getEpochState();
+  }
+
+  public getFlowRecordedGaps() {
+    return this.provider.getRecordedGaps();
+  }
+
+  /** The inputs each decision consumed, kept even after the cache or snapshot was replaced. */
+  public getDecisionInputs(): readonly PaperCoordinatorDecisionInputs[] {
+    return Object.freeze([...this.decisionInputs]);
+  }
+
+  /** The security evidence intake read (validated-LP scanner input). */
+  public getIntakeSecurityReads(): readonly PaperCoordinatorSecurityRead[] {
+    return Object.freeze([...this.intakeSecurityReads]);
+  }
+
+  /** The session requests each security refresh dispatched. */
+  public getSecurityRefreshRequests(): readonly PaperCoordinatorSecurityRefreshRequests[] {
+    return Object.freeze(this.securityRefreshRequests.map((r) => Object.freeze({ ...r })));
+  }
+
+  /** A security read as the reader saw it, with the source of every component (pure). */
+  private securityRead(evidence: PaperCandidateSecurityEvidence): PaperCoordinatorSecurityRead {
+    const cache: PaperSecurityEvidenceCacheStatus = this.cache.getStatus();
+    const sources = {} as Record<PaperSecurityEvidenceComponent, PaperCoordinatorSecuritySource>;
+    for (const component of Object.keys(
+      SECURITY_COMPONENT_KEYS,
+    ) as PaperSecurityEvidenceComponent[]) {
+      const present = evidence[SECURITY_COMPONENT_KEYS[component]] !== undefined;
+      // A dispatched refresh always replaces the component, so its source is the last completed
+      // refresh that included it.
+      const record = [...cache.records].reverse().find((r) => r.components.includes(component));
+      const refresh = present && record ? record.refresh : null;
+      sources[component] = Object.freeze({
+        present,
+        retrievedAtMs: present ? cache.retrievedAtMs[component] : null,
+        refresh,
+        refreshRequestSeqs:
+          refresh === null
+            ? []
+            : (this.securityRefreshRequests.find((r) => r.refresh === refresh)?.requestSeqs ?? []),
+      });
+    }
+    return Object.freeze({
+      readAtMs: this.clock(),
+      evidence,
+      pendingComponents: cache.pendingComponents,
+      sources: Object.freeze(sources),
+    });
   }
 
   // ===========================================================================================
@@ -532,9 +648,27 @@ export class PaperSingleCandidateCoordinator {
     if (this.refreshInFlight || !this.isActive()) return;
     if (this.cache.componentsDueAt(plannedDecisionMs).length === 0) return;
     this.refreshInFlight = true;
+    // Refreshes run one at a time and are the only SECURITY dispatches, so the SECURITY entries
+    // added to the ledger while this one runs are exactly its requests.
+    const ledgerBefore = this.session.getLedgerLength();
+    const refreshesBefore = this.cache.getStatus().refreshes;
+    const pending = this.cache.refreshFor(plannedDecisionMs);
+    const refreshNo = this.cache.getStatus().refreshes;
+    const record =
+      refreshNo > refreshesBefore
+        ? { refresh: refreshNo, plannedDecisionMs, requestSeqs: [] as number[], settled: false }
+        : null;
+    if (record) this.securityRefreshRequests.push(record);
     this.track(
-      this.cache
-        .refreshFor(plannedDecisionMs)
+      pending
+        .finally(() => {
+          if (!record) return;
+          record.requestSeqs = this.session
+            .getLedgerSince(ledgerBefore)
+            .filter((e) => e.owner === "SECURITY")
+            .map((e) => e.seq);
+          record.settled = true;
+        })
         .catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
           this.refreshErrors.push(message);
@@ -619,11 +753,13 @@ export class PaperSingleCandidateCoordinator {
         }
         // Authorities come only from the validated security path: an authority not explicitly
         // observed as disabled is never presented to the scanner as renounced.
+        const intakeEvidence = this.cache.getEvidence();
+        this.intakeSecurityReads.push(this.securityRead(intakeEvidence));
         const security = await evaluatePaperCandidateSecurityContext({
           executionContext: "PAPER_SIMULATION",
           target: this.target,
           decisionTimeMs: now,
-          evidence: this.cache.getEvidence(),
+          evidence: intakeEvidence,
         });
         const authority = (e: (typeof security.authorities)["mintAuthority"]) =>
           e?.status === "DISABLED" ? null : (e?.address ?? UNVERIFIED_AUTHORITY);
@@ -740,10 +876,30 @@ export class PaperSingleCandidateCoordinator {
     this.decisionInFlight = true;
     const wasArmed = this.armed !== undefined;
     const seq = ++this.decisionSeq;
+    // Record what this decision actually reads (the same calls, unchanged results), so its inputs
+    // stay reviewable after the cache or the flow snapshot is replaced or retired.
+    const flowReads: PaperCoordinatorFlowRead[] = [];
+    const securityReads: PaperCoordinatorSecurityRead[] = [];
+    this.decisionInputs.push(Object.freeze({ seq, launchedAtMs, flowReads, securityReads }));
+    const securityPath = this.cache.asSecurityPath();
     this.track(
       retrieveAndEvaluatePaperDaemonEntry({
         candidate,
-        flowProvider: this.provider,
+        flowProvider: {
+          getCandidateFlow: (target, evaluationTimestampMs) => {
+            const result = this.provider.getCandidateFlow(target, evaluationTimestampMs);
+            flowReads.push(
+              Object.freeze({
+                evaluationTimestampMs,
+                result,
+                snapshot: this.provider.getSnapshotReferenceAt(evaluationTimestampMs),
+                epochState: this.provider.getEpochState(),
+                recordedGaps: this.provider.getRecordedGaps(),
+              }),
+            );
+            return result;
+          },
+        },
         buyGateService: this.buyGate,
         getExistingArmedState: () => this.armed,
         clock: this.clock,
@@ -754,7 +910,14 @@ export class PaperSingleCandidateCoordinator {
               new Error("the direct RugCheck retrieval is not used by the coordinator"),
             ),
         },
-        security: this.cache.asSecurityPath(),
+        security: {
+          executionContext: securityPath.executionContext,
+          loadEvidence: async (target) => {
+            const evidence = await securityPath.loadEvidence(target);
+            securityReads.push(this.securityRead(evidence));
+            return evidence;
+          },
+        },
         // Age, cohort, maturity and retest use the actual post-retrieval decision time.
         candidateAtDecision: candidateAt,
       })

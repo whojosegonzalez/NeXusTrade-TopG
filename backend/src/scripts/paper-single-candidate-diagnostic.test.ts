@@ -5,9 +5,20 @@
  */
 import os from "node:os";
 import path from "node:path";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CORE_EVIDENCE_FILES,
   LIVE_APPROVAL_STATUS,
   PROPOSED_SINGLE_CANDIDATE_LIMITS,
   buildRequestAllocation,
@@ -16,6 +27,8 @@ import {
   verifyPaperSingleCandidateEvidence,
   type PaperSingleCandidateDiagnosticDeps,
 } from "./paper-single-candidate-diagnostic.js";
+import { decodeRaydiumTransactionSwaps } from "../candidate-scanner/RaydiumAmmV4SwapDecoder.js";
+import { WSOL_MINT, parseRaydiumAmmV4Account } from "../research/pilot/RaydiumAmmParser.js";
 import {
   parseDexScreenerTokenPairs,
   WSOL_MINT_ADDRESS,
@@ -24,6 +37,7 @@ import type { PaperCoordinatorLimits } from "../candidate-scanner/PaperSingleCan
 import {
   MINT,
   OFFLINE_TEST_LIMITS,
+  POOL_CONTEXT,
   POOL_ID,
   START_MS,
   TEST_RPC_URL,
@@ -146,14 +160,84 @@ const outArgs = (name: string) => [
 const readJson = (dir: string, file: string) =>
   JSON.parse(readFileSync(path.join(dir, file), "utf8"));
 
-/** No secret anywhere in the sealed directory. */
+/** The credential-bearing WebSocket URL derived from the SYNTHETIC RPC URL. */
+const SYNTHETIC_WS_URL = ENV.SOLANA_RPC_URL.replace(/^http:/, "ws:");
+const SECRETS = [SYNTHETIC_RPC_KEY, SYNTHETIC_TRACKER_KEY, ENV.SOLANA_RPC_URL, SYNTHETIC_WS_URL];
+
+/** Every file in a directory tree (relative, forward-slashed). */
+function filesUnder(dir: string, rel = ""): string[] {
+  return readdirSync(path.join(dir, rel)).flatMap((name) => {
+    const child = rel ? `${rel}/${name}` : name;
+    return statSync(path.join(dir, child)).isDirectory() ? filesUnder(dir, child) : [child];
+  });
+}
+
+/** No secret anywhere in the sealed directory, including response-evidence subdirectories. */
 function expectNoSecrets(dir: string) {
-  for (const name of readdirSync(dir)) {
+  for (const name of filesUnder(dir)) {
     const content = readFileSync(path.join(dir, name), "utf8");
-    for (const secret of [SYNTHETIC_RPC_KEY, SYNTHETIC_TRACKER_KEY, ENV.SOLANA_RPC_URL]) {
+    for (const secret of SECRETS) {
       expect(content.includes(secret), `${name} contains a secret`).toBe(false);
     }
   }
+}
+
+/** Parsed JSON from sealed files (shape checked by the assertions). */
+type Loose = ReturnType<typeof JSON.parse>;
+
+const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+
+/** SYNTHETIC: market at the peak for `peakCalls` calls, then a 12% pullback. */
+const peakThenPullback = (peakCalls: number) => (call: number) =>
+  json(
+    syntheticDexScreenerTokenPairsResponse({
+      pairCreatedAtMs: PAIR_CREATED_AT_MS,
+      priceNative: call <= peakCalls ? "0.0001" : "0.000088",
+    }),
+  );
+
+interface SealedExchange {
+  seq: number;
+  lane: string;
+  owner: string;
+  purpose: string;
+  jsonRpcId: number | null;
+  httpStatus: number | null;
+  error: string | null;
+  request: { url: string; rpcMethod: string | null; rpcParams: unknown[] | null };
+  response: {
+    bodyState: string;
+    completeEvidence: boolean;
+    retainedBytes: number | null;
+    observedBytes: number | null;
+    receivedBytesSha256: string | null;
+    receivedDigestScope: string | null;
+    reproducesReceivedDigest: boolean;
+    bodyRedacted: boolean;
+    bodyEncoding: string | null;
+    body: string | null;
+  };
+}
+
+const sealedExchanges = (dir: string): SealedExchange[] =>
+  (readJson(dir, "request-exchanges.json").exchanges as { file: string }[]).map(
+    (x) => readJson(dir, x.file) as SealedExchange,
+  );
+
+/** A copy of a sealed run, with its manifest optionally rewritten (for verifier tests). */
+function tamperedCopy(
+  source: string,
+  name: string,
+  edit?: (manifest: Record<string, Loose>) => void,
+): string {
+  const dir = path.join(tempProject(), name);
+  cpSync(source, dir, { recursive: true });
+  if (edit) {
+    const manifest = readJson(dir, "evidence-manifest.json");
+    edit(manifest);
+    writeFileSync(path.join(dir, "evidence-manifest.json"), JSON.stringify(manifest));
+  }
+  return dir;
 }
 
 describe("DexScreener single-candidate market parser (synthetic, schema-shaped fixture)", () => {
@@ -409,12 +493,25 @@ describe("PAPER single-candidate operator diagnostic (offline)", () => {
     expect(result.stopReason).toBe("ENTRY_CONFIRMED_NO_EXECUTION");
     expect(env.loadEnvironment).toHaveBeenCalledTimes(1);
     const dir = result.outDir!;
-    expect(readdirSync(dir).sort()).toEqual([...result.plan.evidenceFiles].sort());
-    expect(verifyPaperSingleCandidateEvidence(dir)).toEqual({ ok: true, problems: [] });
+    expect(readdirSync(dir).sort()).toEqual([...CORE_EVIDENCE_FILES, "exchanges"].sort());
+    expect(verifyPaperSingleCandidateEvidence(dir)).toMatchObject({ ok: true, problems: [] });
     const verifyLines: string[] = [];
     expect(runVerifyCli(dir, (l) => verifyLines.push(l))).toBe(true); // the operator --verify mode
-    expect(JSON.parse(verifyLines[0]!)).toEqual({ ok: true, problems: [] });
+    // The verifier states its scope: integrity, not strategy replay.
+    expect(JSON.parse(verifyLines[0]!)).toMatchObject({
+      ok: true,
+      problems: [],
+      scope: expect.stringMatching(/^INTEGRITY_ONLY: .*does not replay or re-validate/),
+    });
     expectNoSecrets(dir);
+    // One bounded response-evidence file per dispatched request.
+    expect(readdirSync(path.join(dir, "exchanges"))).toHaveLength(env.h.fetchLog.length);
+    expect(readJson(dir, "summary.json").evidence).toMatchObject({
+      complete: true,
+      exchangesRecorded: env.h.fetchLog.length,
+      missingExchangeSeqs: [],
+      captureFailures: 0,
+    });
 
     const summary = readJson(dir, "summary.json");
     expect(summary.flowQualification.refreshesPublished).toBeGreaterThan(0);
@@ -490,6 +587,19 @@ describe("PAPER single-candidate operator diagnostic (offline)", () => {
     expect(market.map((m) => m.result.reason)).toEqual(["POOL_NOT_FOUND"]);
     expect(readJson(a.outDir!, "decisions.json")).toEqual([]);
     expectNoSecrets(a.outDir!);
+    // The echoing response is still sealed (redacted), and it no longer claims to reproduce the
+    // digest of the bytes as received.
+    expect(readJson(a.outDir!, "summary.json").evidence).toMatchObject({
+      complete: true,
+      captureFailures: 0,
+    });
+    const echo = sealedExchanges(a.outDir!).find((x) => x.purpose === "MARKET_INTAKE")!;
+    expect(echo.response).toMatchObject({
+      bodyState: "COMPLETE",
+      bodyRedacted: true,
+      reproducesReceivedDigest: false,
+    });
+    expect(echo.response.body).toContain("[REDACTED]");
 
     const throttled = liveEnv({ rugCheck: () => new Response("SYNTHETIC", { status: 429 }) });
     const b = await drive(
@@ -500,6 +610,13 @@ describe("PAPER single-candidate operator diagnostic (offline)", () => {
     expect(verifyPaperSingleCandidateEvidence(b.outDir!).ok).toBe(true);
     expect(readJson(b.outDir!, "summary.json").strategyAcceptance.outcome).toBe("NOT_CONFIRMED");
     expectNoSecrets(b.outDir!);
+    // The throttled request is recorded truthfully: status kept, no body, never complete evidence.
+    const throttledExchange = sealedExchanges(b.outDir!).find((x) => x.httpStatus === 429)!;
+    expect(throttledExchange).toMatchObject({
+      purpose: "RUGCHECK_REPORT",
+      error: "HTTP_429_RECEIVED",
+      response: { bodyState: "NOT_READ", completeEvidence: false, body: null },
+    });
   });
 
   it("D-05: the session deadline ends the run; evidence is sealed and nothing is sent after it", async () => {
@@ -556,5 +673,399 @@ describe("PAPER single-candidate operator diagnostic (offline)", () => {
       new Promise<void>((resolve) => env.h.sched.at(env.h.clock() + 60_000, resolve)),
     );
     expect(env.h.fetchLog.length).toBe(sentAtInterrupt);
+  });
+});
+
+describe("PAPER single-candidate diagnostic evidence (offline)", () => {
+  it("E-01: sealed responses re-decode independently and reconcile with every decision's consumed flow and security inputs, after replacement", async () => {
+    // SYNTHETIC: the pullback comes late, so the run makes several decisions while snapshots are
+    // retired and security components are replaced.
+    const env = liveEnv({ market: peakThenPullback(5) });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("replaced"), "--live"], env.deps),
+    );
+    const dir = r.outDir!;
+    expect(verifyPaperSingleCandidateEvidence(dir).ok).toBe(true);
+    expectNoSecrets(dir);
+
+    // Every dispatched request has bounded response evidence bound to its ledger entry.
+    const ledger = readJson(dir, "request-ledger.json").ledger as {
+      seq: number;
+      lane: string;
+      owner: string;
+      purpose: string;
+      jsonRpcId: number | null;
+      httpStatus: number | null;
+    }[];
+    const exchanges = sealedExchanges(dir);
+    expect(exchanges.map((x) => x.seq)).toEqual(ledger.map((e) => e.seq));
+    expect(ledger.length).toBe(env.h.fetchLog.length);
+    exchanges.forEach((x, i) => {
+      const e = ledger[i]!;
+      expect(x).toMatchObject({
+        seq: e.seq,
+        lane: e.lane,
+        owner: e.owner,
+        purpose: e.purpose,
+        jsonRpcId: e.jsonRpcId,
+        httpStatus: e.httpStatus,
+      });
+      expect(x.response).toMatchObject({
+        bodyState: "COMPLETE",
+        completeEvidence: true,
+        reproducesReceivedDigest: true,
+        receivedDigestScope: "ORIGINAL_COMPLETE_BODY_BYTES",
+        bodyEncoding: "utf8",
+      });
+      expect(sha256(Buffer.from(x.response.body!, "utf8"))).toBe(x.response.receivedBytesSha256);
+      if (x.lane === "SOLANA_RPC") {
+        expect(x.request.url).toBe("SOLANA_RPC_URL (configuration; not recorded)");
+        expect((JSON.parse(x.response.body!) as { id: unknown }).id).toBe(x.jsonRpcId);
+      }
+    });
+    const rpc = (method: string) => exchanges.filter((x) => x.request.rpcMethod === method);
+    const body = (x: SealedExchange) => JSON.parse(x.response.body!) as { result: Loose };
+
+    // Independent pool context from the sealed pool-layout response.
+    const layout = rpc("getAccountInfo").find((x) => x.purpose === "POOL_LAYOUT")!;
+    const parsed = parseRaydiumAmmV4Account(
+      Buffer.from(body(layout).result.value.data[0] as string, "base64"),
+      POOL_ID,
+    );
+    if (!parsed.ok) throw new Error("sealed pool layout does not parse");
+    expect(parsed.orientation).toBe("TOKEN_BASE_SOL_QUOTE");
+    const poolContext = {
+      poolId: POOL_ID,
+      candidateTokenMint: parsed.state.baseMint,
+      quoteTokenMint: parsed.state.quoteMint,
+      baseVault: parsed.state.baseVault,
+      quoteVault: parsed.state.quoteVault,
+      baseMint: parsed.state.baseMint,
+      quoteMint: parsed.state.quoteMint,
+      orientation: "TOKEN_BASE_SOL_QUOTE" as const,
+    };
+    expect(poolContext).toEqual(POOL_CONTEXT);
+    expect(poolContext.quoteMint).toBe(WSOL_MINT);
+
+    // History block times and transactions, from the sealed responses only.
+    const blockTimeOf = new Map<string, number | null>();
+    for (const x of rpc("getSignaturesForAddress")) {
+      for (const rec of body(x).result as { signature: string; blockTime: number | null }[]) {
+        blockTimeOf.set(rec.signature, rec.blockTime);
+      }
+    }
+    const transactions = new Map<string, unknown>(
+      rpc("getTransaction").map((x) => [String(x.request.rpcParams![0]), body(x).result]),
+    );
+    const flowEvidence = readJson(dir, "flow-evidence.json");
+    expect(transactions.size).toBe(flowEvidence.status.transactionRetrievals);
+    expect(transactions.size).toBe(3);
+
+    // Each decision's consumed window: re-decode its in-window transactions with the existing
+    // decoder and reconcile with the recorded counts, including windows retired since.
+    const inputs = readJson(dir, "decision-inputs.json");
+    const finalSnapshotIds = (flowEvidence.snapshots as { summary: { id: number } }[]).map(
+      (s) => s.summary.id,
+    );
+    let reconciled = 0;
+    const retiredWindows = new Set<number>();
+    for (const decision of inputs.decisions) {
+      for (const read of decision.flowReads) {
+        if (!read.snapshot) continue;
+        const { summary, result, accountedSignatures } = read.snapshot;
+        const inWindow = (accountedSignatures as string[]).filter((s) => {
+          const bt = blockTimeOf.get(s);
+          return (
+            typeof bt === "number" &&
+            bt * 1000 >= summary.windowStartMs &&
+            bt * 1000 <= summary.windowEndMs
+          );
+        });
+        expect(inWindow.length).toBe(result.underlyingOutcomes.windowSignaturesCount);
+        let buys = 0;
+        let sells = 0;
+        for (const s of inWindow) {
+          expect(transactions.has(s), `sealed transaction for ${s}`).toBe(true);
+          const decoded = decodeRaydiumTransactionSwaps(transactions.get(s), poolContext);
+          expect(decoded.ok).toBe(true);
+          for (const event of decoded.events) {
+            if (event.side === "BUY") buys++;
+            else sells++;
+          }
+        }
+        expect({ buys, sells }).toEqual({
+          buys: summary.recentBuys60s,
+          sells: summary.recentSells60s,
+        });
+        expect(result.flowCounts).toMatchObject({ recentBuys60s: buys, recentSells60s: sells });
+        if (read.result.isCoverageSufficient) {
+          expect(read.result).toMatchObject({ recentBuys60s: buys, recentSells60s: sells });
+        }
+        reconciled++;
+        if (!finalSnapshotIds.includes(summary.id)) retiredWindows.add(summary.id);
+      }
+    }
+    expect(reconciled).toBeGreaterThanOrEqual(3);
+    expect(retiredWindows.size).toBeGreaterThanOrEqual(2); // consumed windows retired by the end
+
+    // Security inputs of the first decision: bound to the requests of the refresh that produced
+    // them, and kept although the cache has been replaced since.
+    const first = inputs.decisions[0].securityReads[0];
+    const finalCache = readJson(dir, "security-evidence.json").cache;
+    expect(first.sources.MINT_ACCOUNT.retrievedAtMs).not.toBe(
+      finalCache.retrievedAtMs.MINT_ACCOUNT,
+    );
+    expect(first.sources.LP.retrievedAtMs).not.toBe(finalCache.retrievedAtMs.LP);
+    const refresh = (inputs.securityRefreshes as { refresh: number; requestSeqs: number[] }[]).find(
+      (x) => x.refresh === first.sources.MINT_ACCOUNT.refresh,
+    )!;
+    expect(first.sources.MINT_ACCOUNT.refreshRequestSeqs).toEqual(refresh.requestSeqs);
+    const mintExchange = exchanges.find(
+      (x) => refresh.requestSeqs.includes(x.seq) && x.purpose === "CANDIDATE_MINT_ACCOUNT",
+    )!;
+    expect(first.evidence.mintAccount.response).toEqual(body(mintExchange));
+    // A decision made while a refresh was pending records the withheld component as absent.
+    const withheld = (inputs.decisions as { securityReads: Loose[] }[]).find((d) =>
+      d.securityReads.some((s) => s.sources.LP.present === false),
+    );
+    expect(withheld).toBeDefined();
+  });
+
+  it("E-02: a body over the limit is kept only as a marked partial prefix and never as complete evidence", async () => {
+    const lanes = TEST_LIMITS.session.lanes;
+    const env = liveEnv({
+      limits: {
+        ...TEST_LIMITS,
+        session: {
+          ...TEST_LIMITS.session,
+          lanes: { ...lanes, RUGCHECK: { ...lanes.RUGCHECK, maxResponseBytes: 64 } },
+        },
+      },
+    });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("partial"), "--live"], env.deps),
+    );
+    const dir = r.outDir!;
+    expect(verifyPaperSingleCandidateEvidence(dir).ok).toBe(true);
+    const partial = sealedExchanges(dir).find((x) => x.purpose === "RUGCHECK_REPORT")!;
+    expect(partial).toMatchObject({
+      error: "RESPONSE_TOO_LARGE",
+      response: {
+        bodyState: "PARTIAL_OVERFLOW",
+        completeEvidence: false,
+        receivedDigestScope: "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY",
+      },
+    });
+    expect(partial.response.retainedBytes).toBeLessThanOrEqual(64);
+    expect(partial.response.observedBytes!).toBeGreaterThan(64);
+    const prefix =
+      partial.response.bodyEncoding === "base64"
+        ? Buffer.from(partial.response.body!, "base64")
+        : Buffer.from(partial.response.body!, "utf8");
+    expect(prefix.length).toBe(partial.response.retainedBytes);
+    expect(sha256(prefix)).toBe(partial.response.receivedBytesSha256);
+    expect(readJson(dir, "summary.json").evidence.bodies.partial).toBeGreaterThanOrEqual(1);
+    // The partial prefix never became security evidence.
+    expect(readJson(dir, "security-evidence.json").evidence?.rugCheck?.response ?? null).toBeNull();
+  });
+
+  it("V-01: the verifier fails closed on manifest, path, digest, reference and recursive-entry problems", async () => {
+    const env = liveEnv();
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("sealed"), "--live"], env.deps),
+    );
+    const sealed = r.outDir!;
+    expect(verifyPaperSingleCandidateEvidence(sealed)).toMatchObject({ ok: true, problems: [] });
+    const problems = (dir: string) => {
+      const v = verifyPaperSingleCandidateEvidence(dir);
+      expect(v.ok).toBe(false);
+      expect(v.scope).toMatch(/^INTEGRITY_ONLY/);
+      return v.problems;
+    };
+
+    // A modified report reference.
+    expect(
+      problems(
+        tamperedCopy(sealed, "report-ref", (m) => {
+          m.reportFile.sha256 = "0".repeat(64);
+        }),
+      ),
+    ).toEqual(
+      expect.arrayContaining(["REPORT_FILE_ENTRY_MISMATCH", "REPORT_FILE_DIGEST_MISMATCH"]),
+    );
+
+    // A directory holding only a manifest that lists nothing and points at itself.
+    const bare = path.join(tempProject(), "bare");
+    mkdirSync(bare);
+    for (const header of [
+      {},
+      { kind: "PAPER_SINGLE_CANDIDATE_EVIDENCE_MANIFEST", manifestVersion: 2 },
+    ]) {
+      writeFileSync(
+        path.join(bare, "evidence-manifest.json"),
+        JSON.stringify({
+          ...header,
+          planDigestSha256: "0".repeat(64),
+          files: [],
+          reportFile: { path: "evidence-manifest.json", sha256: "0".repeat(64), bytes: 0 },
+        }),
+      );
+      expect(problems(bare)).toEqual(
+        expect.arrayContaining([
+          "REQUIRED_ENTRY_MISSING:report.json",
+          "REQUIRED_ENTRY_MISSING:plan.json",
+          "REQUIRED_ENTRY_MISSING:request-exchanges.json",
+          "REPORT_FILE_PATH_INVALID",
+          "REPORT_NOT_LISTED",
+        ]),
+      );
+    }
+    writeFileSync(path.join(bare, "evidence-manifest.json"), "not json");
+    expect(problems(bare)).toEqual(["MANIFEST_INVALID_JSON"]);
+
+    // Duplicate, absolute and traversal paths; invalid sizes, digests and categories.
+    const entryOf = (m: Record<string, Loose>, p: string) =>
+      (m.files as Record<string, Loose>[]).find((f) => f.path === p)!;
+    expect(
+      problems(
+        tamperedCopy(sealed, "paths", (m) => {
+          const plan = entryOf(m, "plan.json");
+          m.files.push(
+            { ...plan },
+            { ...plan, path: "/etc/passwd" },
+            { ...plan, path: "C:/Windows/win.ini" },
+            { ...plan, path: "../outside.json" },
+            { ...plan, path: "exchanges/../plan.json" },
+            { ...plan, path: "exchanges\\0001.json" },
+          );
+          entryOf(m, "decisions.json").bytes = -1;
+          (entryOf(m, "disarms.json") as Loose).bytes = 1.5;
+          (entryOf(m, "summary.json") as Loose).sha256 = "abc";
+          (entryOf(m, "flow-evidence.json") as Loose).category = "REPORT";
+        }),
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        "DUPLICATE_PATH:plan.json",
+        "INVALID_SIZE:decisions.json",
+        "INVALID_SIZE:disarms.json",
+        "INVALID_DIGEST:summary.json",
+        "INVALID_CATEGORY:flow-evidence.json",
+        "MODIFIED:decisions.json",
+      ]),
+    );
+    const invalidPaths = problems(
+      tamperedCopy(sealed, "paths-only", (m) => {
+        const plan = entryOf(m, "plan.json");
+        m.files.push(
+          { ...plan, path: "/etc/passwd" },
+          { ...plan, path: "C:/Windows/win.ini" },
+          { ...plan, path: "../outside.json" },
+          { ...plan, path: "exchanges/../plan.json" },
+          { ...plan, path: "exchanges\\0001.json" },
+        );
+      }),
+    ).filter((p) => p.startsWith("INVALID_PATH:"));
+    expect(invalidPaths).toHaveLength(5);
+
+    // Plan-digest references: the sealed plan and the report must agree with the manifest.
+    const planEdited = tamperedCopy(sealed, "plan-edited");
+    const planPath = path.join(planEdited, "plan.json");
+    writeFileSync(planPath, readFileSync(planPath, "utf8").replace('"LIVE"', '"DRY_RUN"'));
+    const rewritten = readJson(planEdited, "evidence-manifest.json");
+    Object.assign(entryOf(rewritten, "plan.json"), {
+      sha256: sha256(readFileSync(planPath)),
+      bytes: readFileSync(planPath).length,
+    });
+    writeFileSync(path.join(planEdited, "evidence-manifest.json"), JSON.stringify(rewritten));
+    expect(problems(planEdited)).toEqual(["PLAN_DIGEST_MISMATCH"]);
+    expect(
+      problems(
+        tamperedCopy(sealed, "plan-ref", (m) => {
+          m.planDigestSha256 = "1".repeat(64);
+        }),
+      ),
+    ).toEqual(["PLAN_DIGEST_MISMATCH", "REPORT_PLAN_DIGEST_MISMATCH"]);
+
+    // Recursive: unlisted and missing response evidence in the subdirectory, and an unindexed one.
+    const extra = tamperedCopy(sealed, "extra");
+    writeFileSync(path.join(extra, "exchanges", "9999.json"), "{}");
+    mkdirSync(path.join(extra, "exchanges", "nested"));
+    writeFileSync(path.join(extra, "exchanges", "nested", "x.json"), "{}");
+    expect(problems(extra)).toEqual([
+      "UNLISTED:exchanges/9999.json",
+      "UNLISTED:exchanges/nested/x.json",
+    ]);
+    const missing = tamperedCopy(sealed, "missing");
+    rmSync(path.join(missing, "exchanges", "0003.json"));
+    expect(problems(missing)).toEqual(["MISSING:exchanges/0003.json"]);
+    const unindexed = tamperedCopy(sealed, "unindexed", (m) => {
+      const first = entryOf(m, "exchanges/0001.json");
+      m.files.push({ ...first, path: "exchanges/0001-copy.json" });
+    });
+    cpSync(
+      path.join(unindexed, "exchanges", "0001.json"),
+      path.join(unindexed, "exchanges", "0001-copy.json"),
+    );
+    expect(problems(unindexed)).toEqual(["RESPONSE_NOT_INDEXED:exchanges/0001-copy.json"]);
+
+    // The CLI reports a failure and its scope.
+    const lines: string[] = [];
+    expect(runVerifyCli(missing, (l) => lines.push(l))).toBe(false);
+    expect(JSON.parse(lines[0]!)).toMatchObject({
+      ok: false,
+      scope: expect.stringMatching(/^INTEGRITY_ONLY/),
+    });
+  });
+
+  it("R-01: a credential-bearing transport exception is redacted from terminal output, stop reasons, sealed files and propagated errors", async () => {
+    const env = liveEnv();
+    const failingWs = vi.fn((wsUrl: string): never => {
+      // SYNTHETIC exception echoing every configured credential.
+      throw new Error(
+        `SYNTHETIC socket failure ${wsUrl} key=${SYNTHETIC_TRACKER_KEY} rpc=${ENV.SOLANA_RPC_URL}`,
+      );
+    });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("ws-failure"), "--live"], {
+        ...env.deps,
+        createWebSocketTransport: failingWs,
+      }),
+    );
+    expect(failingWs).toHaveBeenCalledWith(SYNTHETIC_WS_URL);
+    // Useful stop code and first failure cause are kept; the credentials are not.
+    expect(r.stopReason).toMatch(
+      /^FLOW_COLLECTION_ENDED:INTERNAL_ERROR: SYNTHETIC socket failure /,
+    );
+    expect(r.stopReason).toContain("[REDACTED]");
+    const output = env.lines.join("\n");
+    expect(output).toContain("[LIVE] Stop reason: FLOW_COLLECTION_ENDED:INTERNAL_ERROR");
+    for (const secret of SECRETS) {
+      expect(output.includes(secret), "terminal output contains a credential").toBe(false);
+      expect(r.stopReason!.includes(secret)).toBe(false);
+    }
+    expectNoSecrets(r.outDir!);
+    expect(verifyPaperSingleCandidateEvidence(r.outDir!).ok).toBe(true);
+
+    // A propagated error (here from the output sink) is redacted before it leaves the runner.
+    const sink = liveEnv();
+    const run = runPaperSingleCandidateDiagnostic([...outArgs("sink-failure"), "--live"], {
+      ...sink.deps,
+      log: (line) => {
+        if (line.includes("Configuration loaded")) {
+          throw new Error(`SYNTHETIC sink failure ${ENV.SOLANA_RPC_URL} ${SYNTHETIC_TRACKER_KEY}`);
+        }
+      },
+    });
+    const error = await run.then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(error?.message).toMatch(/^SYNTHETIC sink failure /);
+    for (const secret of SECRETS) expect(error!.message.includes(secret)).toBe(false);
   });
 });
