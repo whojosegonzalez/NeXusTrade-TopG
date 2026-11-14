@@ -5169,7 +5169,7 @@ To preserve the existing one-shot precheck script (`backend/src/scripts/fresh-am
 
 - **Pure Validation Logic**: Zero I/O, zero network, zero timer state, and zero filesystem writes:
   - Envelope decoding and validation (`usableJson`, `rpcResult`).
-  - Notification parsing and validation: JSON-RPC 2.0 schema, subscription ID binding, canonical base58 signature format via `isValidSolanaSignature` (validating decoding to 64 bytes without arbitrary character-length restrictions), slot integer validation, and strict `err === null` checking.
+  - Notification parsing and validation: JSON-RPC 2.0 schema, subscription ID binding, canonical base58 signature format via `isValidSolanaSignature` (validating decoding to 64 bytes without arbitrary character-length restrictions), slot integer validation, and strict `err === null` checking (absent, undefined, or non-null status strictly rejected and counted as a failed notification).
   - Transaction evaluation (`evaluateInitializationExchange`): validates `initialize2` instruction discriminator, account index 14 matching the fee destination, coin/pc mint orientation.
   - Market parsing (`parseDexScreenerTokenPairs`): validates pool ID, base/quote token alignment, extracts `pairCreatedAtMs`, and computes the candidate start window.
 - **Acquisition (Stateful I/O & Network)**:
@@ -5201,10 +5201,13 @@ The companion watch module captures an auditable chain of provider observations.
    - Incoming frame must have `jsonrpc === "2.0"` and `method === "logsNotification"`.
    - `params.subscription` must strictly match `subId` (reject unsolicited or mismatched notifications).
    - `params.result.context.slot` must be a safe positive integer (`slot > 0`).
-   - `params.result.value.err` must be strictly `null`. A non-null error indicates a failed transaction and is ignored/recorded as a failed notification without triggering HTTP retrieval.
+   - `params.result.value.err` must be explicitly present and strictly `null` (`err === null`). Absent `err` properties, `undefined` status, or non-null error objects indicate unverified or failed transactions; they are recorded as failed notifications (`NOTIFICATION_FAILED`) and do not qualify for capture.
    - `params.result.value.signature` must be a canonical Solana base58 string satisfying `isValidSolanaSignature` (decoding to 64 bytes).
-3. **Evidence Sealing**:
-   - Socket is immediately closed upon capturing the first valid notification.
+3. **Evidence Retention, Deep Immutability & Sealing**:
+   - Socket teardown is initiated upon capturing the first valid notification.
+   - Bounded application frames (`applicationFrames`) are retained in memory with receipt timestamps, directions (`INCOMING` / `OUTGOING`), and byte accounting; oversized frames are truncated to 4,096 bytes with `truncated: true` to prevent memory bloat while preserving accurate `byteLength`.
+   - Credential-bearing WSS URLs in event metadata are sanitized/redacted with `[REDACTED]` tokens or placeholders.
+   - Returned results and observation records are recursively cloned and deep-frozen (`deepCloneAndFreeze`), ensuring nested error arrays (e.g. `details.err.InstructionError`) and configuration limits are immutable.
    - `ws-observations.json` seals the incoming/outgoing frames, subscription ID, timestamps, and notification payload.
    - The captured signature is passed to `PaperRequestSession` to dispatch:
      - `exchanges/0001.json`: `getTransaction` (`PRECHECK_TRANSACTION`).
@@ -5223,21 +5226,28 @@ The companion watch module captures an auditable chain of provider observations.
 #### 8.38.4 Lifecycle, Ceilings & Boundary Handling
 
 - **Proposed Watch Ceiling**: 15 minutes (900,000 ms).
-- **Session Limits**:
+- **Session Limits & Configuration Validation**:
   - Subscription acknowledgement timeout: 5,000 ms.
   - Incoming WebSocket application messages: max 100 frames.
   - Cumulative application payload ceiling: 1,048,576 bytes (1 MiB).
   - Client keepalive pings: at most 45 client keepalive pings.
   - Incoming control frames ceiling: at most 128 incoming control frames, counting received pings and pongs.
-  - Keepalive schedule: ping sent every 20,000 ms (20 s), matching-pong timeout 10,000 ms (10 s). **No missed pings**: with no reconnect permitted, the first unmatched pong ends the watch (`KEEPALIVE_TIMEOUT`).
+  - Keepalive schedule: ping sent every 20,000 ms (20 s), matching-pong timeout 10,000 ms (10 s).
+  - **Pong Payload Matching & Integrity**: Each ping sends payload `Buffer.from("topg-watch-" + pingCount)`. Received pongs are verified byte-for-byte against the outstanding ping payload. Unrelated, stale, or unsolicited pongs do not clear the deadline. Timeout state is armed before dispatch to guarantee deterministic execution for synchronous mock replies. If the injected transport lacks ping capability, the watch terminates immediately with `TRANSPORT_ERROR`.
+  - **Fail-Closed Limit Validation**: Constructor rejects invalid configurations (`NaN`, `Infinity`, `<= 0` durations/counts, non-safe integers for message/frame counts, or `pongTimeoutMs >= pingIntervalMs`).
   - HTTP requests (post-watch validation): max 2 attempts (1 Solana RPC `getTransaction`, 1 DexScreener token GET).
   - Overall session deadline: 930,000 ms (15 min watch + 30 s validation headroom).
 - **Validation Deadline Contract**:
   - Validation gets at most 30 seconds from notification receipt, also bounded by the overall deadline:
     $$\text{validationDeadlineAtMs} = \min(\text{notificationReceivedAtMs} + 30\,000, \text{overallDeadlineAtMs})$$
   - An early notification (e.g. at $t = 60\text{ s}$) gives validation at most 30 s ($t = 90\text{ s}$); validation never runs until the 15-minute mark. Individual HTTP requests still observe their shorter 10-second request timeout.
+- **Settled Teardown Contract**:
+  - `start()` resolves only after socket closure or bounded forced cleanup (max 5,000 ms) settles.
+  - All owned operating timers are cleared, and `AbortSignal` listeners are removed upon settling, leaving zero lingering background timers or listeners.
+  - If `close()` throws and `terminate()` fails to close the socket within the cleanup bound, the watch records `CLEANUP_FAILED` and resolves with `cleanupSettled: true, cleanupFailed: true` and an explicit failure reason.
+  - The qualifying notification's original receipt timestamp (`notification.receivedAtMs`) is preserved and never overwritten by subsequent cleanup duration.
 - **Stop Conditions**:
-  - `NOTIFICATION_CAPTURED`: First qualifying notification captured; socket closed cleanly; advances to validation.
+  - `NOTIFICATION_CAPTURED`: First qualifying notification captured; teardown settled cleanly; advances to validation.
   - `WATCH_DEADLINE_EXCEEDED`: 15 minutes elapsed with no qualifying notification observed; seals observations; exits with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (sub-code `NO_QUALIFYING_NOTIFICATION_OBSERVED`).
   - `TRANSPORT_CLOSED`: Remote server closes socket prematurely.
   - `MALFORMED_FRAME`: WebSocket delivers invalid JSON or frame violating schema.
@@ -5251,10 +5261,12 @@ All test cases are executed offline by injecting synthetic WebSocket events and 
 1. **TC-W01: Happy Path Selection**: Synthetic subscription ack followed by a valid AMM v4 creation notification; `getTransaction` returns matching `initialize2` with account 14 as fee destination; DexScreener returns pair inside planning start window. Verifies `TARGET_SELECTED` and sealed evidence.
 2. **TC-W02: Subscription Ack Timeout**: Synthetic transport delays ack beyond 5,000 ms. Verifies fail-closed termination (`SUBSCRIBE_ACK_TIMEOUT`) and clean socket teardown.
 3. **TC-W03: Subscription ID Mismatch**: Synthetic notification arrives with `subscription` ID differing from the acknowledged ID. Verifies rejection of unsolicited notification.
-4. **TC-W04: Failed Transaction Notification**: Notification arrives with `err: { "InstructionError": [0, "Custom"] }`. Verifies transaction is ignored/rejected without dispatching HTTP `getTransaction`.
+4. **TC-W04: Failed Transaction Notification & Explicit err === null**: Notification arrives with `err: { "InstructionError": [0, "Custom"] }` or with `err` missing/undefined. Verifies transaction is recorded as `NOTIFICATION_FAILED` and ignored without qualifying for candidate capture or dispatching HTTP retrieval.
 5. **TC-W05: Non-AMM v4 Transaction**: Notified transaction retrieves successfully but decodes to a non-AMM v4 instruction or CPMM initialization. Verifies `DECODED_NONMATCH`.
 6. **TC-W06: Fee Destination Mismatch**: Notified transaction is AMM v4 `initialize2`, but account 14 is not `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`. Verifies `DECODED_NONMATCH:INVALID_FEE_DESTINATION`.
-7. **TC-W07: Unmatched Pong Timeout**: Synthetic transport drops pong. At 10,000 ms after ping, watch terminates with `KEEPALIVE_TIMEOUT` (no reconnect).
-8. **TC-W08: Watch Deadline Expiry**: Synthetic transport delivers pongs for 15 minutes with no qualifying creation notification. Verifies clean exit with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_QUALIFYING_NOTIFICATION_OBSERVED`).
+7. **TC-W07: Pong Payload Matching & Unmatched Timeout**: Synthetic transport sends mismatched pong payload or drops pong. At 10,000 ms after ping, watch terminates with `KEEPALIVE_TIMEOUT` (no reconnect); unmatched pongs do not clear the deadline.
+8. **TC-W08: Watch Deadline Expiry**: Synthetic transport delivers matching pongs for 15 minutes with no qualifying creation notification. Verifies clean exit with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_QUALIFYING_NOTIFICATION_OBSERVED`).
 9. **TC-W09: Early Notification Validation Cap**: Notification arrives at $t = 10\text{ s}$; synthetic RPC hangs. Verifies individual request times out within 10 s and validation aborts within 30 s, rather than waiting 15 minutes.
 10. **TC-W10: Handoff Re-derivation**: Synthetic watch evidence directory is validated by `paper-pilot-handoff.ts`. Verifies independent signature extraction, exchange matching, and start-window verification without fabricated signature pages.
+11. **TC-W11: Deep Immutability & Application Frame Retention**: Returned result and observation records are deep-frozen; nested error arrays (e.g. `InstructionError`) cannot be modified in strict mode; bounded application frames are retained in memory with byte accounting and oversized payloads truncated; credential-bearing WSS URLs are sanitized.
+12. **TC-W12: Settled Teardown & Timer Invariant**: `start()` resolves only after socket closure or bounded forced cleanup settles, leaving zero owned timers and zero remaining `AbortSignal` listeners while preserving original notification receipt time.
