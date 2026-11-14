@@ -4989,3 +4989,49 @@ The review of `6855efb` accepted the offline corrections, including both origina
 - **Proposal**: a bounded on-chain precheck (Stage A; not implemented) of at most 3 Solana RPC requests and 1 optional DexScreener request. It reads the AMM v4 pool-creation fee destination's newest signatures and decodes at most 2 `initialize2` transactions with the existing parser, self-verifying the fee destination at account 14. It names at most one fresh AMM v4 / WSOL pool inside the window. Then at most one pilot run (Stage B) of the runner pinned to `6855efb`, with the reviewed limits unchanged, into `data/research/single-candidate/pilot-01-6855efb`, under one combined, conditional approval.
 - **Unverified**: the fee-destination address (local fixtures hold a placeholder) and the current creation rate of AMM v4 / WSOL pools. `NO_TARGET_IN_WINDOW` is a likely and valid result.
 - **Boundary**: decision-only. No fills, positions, orders or wallet changes.
+
+#### Stage A and the Conditional Handoff (Offline Implementation; Review of 475baa9)
+
+The review of `475baa9` asked for Stage A and an enforced handoff to be implemented offline, with corrections. Nothing was executed: no provider request, socket, capture, daemon activation, trade or rerun. Stage B and the reviewed runner are unchanged; only new files were added, so the runner and everything it depends on remain byte-identical to `6855efb`. Every limit remains proposed, not approved.
+
+- **Timing claims corrected**: the runner timeline and the 240–760 s start window are **planning estimates**. Eight decisions at least 5 s apart do not establish a 120 s last-decision deadline: flow outages, retrievals and refreshes can delay decisions. The runtime maturity checks are authoritative.
+- **Age sources kept apart**: the initialization transaction's block time (and the signature page's), the instruction-requested `open_time`, and DexScreener `pairCreatedAt` are sealed separately with their provenance. The runner derives age from `pairCreatedAt`, so the single DexScreener check is **required**, validates the exact identity with the runner's own parser and endpoint, and is the sole basis of the start window. Missing or unusable market evidence stops the handoff.
+- **Fee destination and orientation pinned**: the destination is `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5` (Raydium `program/src/processor.rs`; `initialize2` account index 14 per `program/src/instruction.rs`).
+  - **Source revision**: the `master` branch as cited by the review. The commit SHA was not retrieved offline and should be recorded at review.
+  - **Per-transaction validation**: each transaction must have a valid JSON-RPC envelope with the echoed id, be the requested signature at the paged slot, have succeeded on-chain, decode to exactly one AMM v4 `initialize2`, and reference the destination at its own account index 14.
+  - **Orientation**: only candidate base / WSOL quote is selected.
+- **Sampling stated honestly**: at most 20 signatures are inspected and at most two transactions retrieved. A result without a target establishes only that this bounded sample produced none. Request failures, unavailable evidence and decoded non-matches keep distinct statuses per signature and distinct overall outcomes. A selected target is provisional.
+- **Enforced handoff**: `paper-pilot-handoff.ts` checks, in order, the pin, the evidence integrity, the reproduction of the selection from the sealed responses, the identity, the window on `pairCreatedAt` and a new pilot directory (details in the proposal §1.6).
+  - **Wrapper**: `scripts/paper-pilot-sequence.ps1` is inert without `-Execute`. With it, it runs each step at most once, rechecks the handoff immediately before Stage B, waits at most once (bounded), and never retries, substitutes or polls.
+- **Combined ceilings for the future approval**: 344 HTTP attempts (4 + 340), including 62 transaction retrievals (2 + 60), and up to two sequential WebSocket connections (Stage B's single reconnect).
+
+**Regressions** (SYNTHETIC responses, virtual time):
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A-01 | Selection: failed, undated, out-of-prefilter and beyond-sample records are not retrieved; the newest eligible is a WSOL-base non-match; the next is selected. Three distinct time sources are preserved; the window comes from `pairCreatedAt`. Exactly 3 paced RPC requests + 1 market GET on the runner's endpoint. Sealed evidence verifies and re-derives; no credential appears     |
+| A-02 | Rejected identities with distinct statuses: fee destination mismatch at index 14, no WSOL quote, signature mismatch, failed transaction, RPC id mismatch, null result, request failures; outcomes `SAMPLE_PRODUCED_NO_SUITABLE_TARGET`, `EVIDENCE_UNAVAILABLE`, `REQUEST_FAILED`; no market request without a match; a market response for another pool is `MARKET_EVIDENCE_UNAVAILABLE` |
+| A-03 | Timestamps: an old `pairCreatedAt` closes the window (candidate kept, not selected); missing `pairCreatedAt` and a failed market request stop the handoff                                                                                                                                                                                                                                |
+| A-04 | Bounds: 20 eligible signatures still give 2 retrievals; a 21-record page is unusable evidence with no further request; the first 429 stops after 1 request; a hanging provider ends within the deadline; the dry run dispatches nothing, loads no configuration and writes nothing                                                                                                       |
+| H-01 | The handoff allows exactly the sealed identity inside the window (inclusive bounds), answers one bounded `WAIT` before it, and refuses after it or too far ahead                                                                                                                                                                                                                         |
+| H-02 | Refusals for an unknown commit, changed code/configuration, modified or untracked files, a modified runner dependency, an unexpected addition and a deleted allowed file; no identity is released                                                                                                                                                                                        |
+| H-03 | Refusals for modified and unlisted evidence, a substituted identity with a consistently rewritten manifest, an edited sealed response, a missing precheck, an existing or misplaced pilot directory, and a precheck without a target                                                                                                                                                     |
+
+- **Mutation checks** (sources restored byte-identical), each caught:
+
+| Mutation                                       | Caught by              |
+| ---------------------------------------------- | ---------------------- |
+| Fee destination at index 14 not checked        | A-02, H-03             |
+| WSOL-base orientation accepted                 | A-01, A-03, H-01, H-03 |
+| Returned signature not checked                 | A-02                   |
+| JSON-RPC id not checked                        | A-02                   |
+| Window from block time, not pairCreatedAt      | A-01, A-03, H-01       |
+| Three retrievals in the sample                 | A-01, A-04             |
+| Expired window allowed                         | H-01                   |
+| Unbounded wait                                 | H-01                   |
+| Sealed selection trusted without re-derivation | H-03                   |
+| Dirty files ignored                            | H-02                   |
+| Change kind ignored (only names checked)       | H-02                   |
+| Existing pilot directory allowed               | H-03                   |
+
+- **Results**: the precheck suite 4/4 and the handoff suite 3/3, under external 60 s limits. The backend typecheck, ESLint and Prettier pass, and the wrapper parses under Windows PowerShell 5.1. All 11 captures verify, and the wallet hash is unchanged.
