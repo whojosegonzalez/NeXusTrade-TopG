@@ -396,9 +396,58 @@ function deepRedactStrings(value: unknown, redact: (text: string) => string): un
   return value;
 }
 
+/** Bytes after credential redaction, ready for text or base64 storage. */
+export interface SanitizedBytes {
+  readonly bytes: Buffer;
+  /** True when anything was replaced (the stored bytes no longer reproduce the original digest). */
+  readonly redacted: boolean;
+  readonly encoding: "utf8" | "base64";
+  /** The stored form: UTF-8 text when the sanitized bytes are valid UTF-8, otherwise base64. */
+  readonly stored: string;
+}
+
+/**
+ * Byte-level credential redaction, applied BEFORE any text or reversible (base64) encoding, so
+ * credentials cannot survive inside non-text bodies. Each configured credential's UTF-8 byte
+ * sequence (and its escaped form) is replaced. When the bytes were cut short (a partial body), a
+ * trailing fragment of at least 4 bytes that begins a credential is replaced too. Throws
+ * `[SEAL_REFUSED]` if any credential would remain.
+ */
+function byteRedactor(secrets: readonly string[]) {
+  // Latin-1 maps every byte to one character and back, so byte sequences are matched exactly.
+  const byteSecrets = secrets.map((s) => Buffer.from(s, "utf8").toString("latin1"));
+  const redactLatin1 = literalRedactor(byteSecrets);
+  return (original: Buffer, truncated: boolean): SanitizedBytes => {
+    let text = redactLatin1(original.toString("latin1"));
+    if (truncated) {
+      for (const s of byteSecrets) {
+        for (let n = Math.min(s.length - 1, text.length); n >= 4; n--) {
+          if (text.endsWith(s.slice(0, n))) {
+            text = `${text.slice(0, text.length - n)}[REDACTED]`;
+            break;
+          }
+        }
+      }
+    }
+    for (const s of byteSecrets) {
+      if (text.includes(s)) throw new Error("[SEAL_REFUSED] a credential would remain in bytes");
+    }
+    const bytes = Buffer.from(text, "latin1");
+    const asUtf8 = bytes.toString("utf8");
+    const isUtf8 = Buffer.from(asUtf8, "utf8").equals(bytes);
+    return {
+      bytes,
+      redacted: !bytes.equals(original),
+      encoding: isUtf8 ? "utf8" : "base64",
+      stored: isUtf8 ? asUtf8 : bytes.toString("base64"),
+    };
+  };
+}
+
 /** Exclusive (never overwriting) writes of sanitized files; a residual secret refuses the write. */
 function sealedWriter(outDir: string, secrets: readonly string[]) {
   const redact = literalRedactor(secrets);
+  const sanitizeBytes = byteRedactor(secrets);
   const entries: ManifestFileEntry[] = [];
   const writeText = (rel: string, content: string, category: ManifestFileEntry["category"]) => {
     for (const secret of secrets) {
@@ -418,16 +467,20 @@ function sealedWriter(outDir: string, secrets: readonly string[]) {
   };
   const writeJson = (rel: string, data: unknown, category: ManifestFileEntry["category"]) =>
     writeText(rel, serializeJsonPreservingBigInts(deepRedactStrings(data, redact)), category);
-  return { entries, writeText, writeJson, redact };
+  return { entries, writeText, writeJson, redact, sanitizeBytes };
 }
 
 /**
  * One dispatched request's safe identity and bounded response evidence. Request headers are never
- * recorded; the RPC URL is replaced by a placeholder; other URLs and the body are redacted. The
- * received-bytes digest is of the ORIGINAL bytes (before redaction); the manifest's digests are of
- * the sanitized files.
+ * recorded; the RPC URL is replaced by a placeholder; other URLs are redacted, and the body is
+ * redacted at byte level before it is stored as text or base64. The received-bytes digest is of
+ * the ORIGINAL bytes (before redaction); the manifest's digests are of the sanitized files.
  */
-function exchangeRecord(e: PaperRequestExchangeEvidence, redact: (text: string) => string) {
+function exchangeRecord(
+  e: PaperRequestExchangeEvidence,
+  redact: (text: string) => string,
+  sanitizeBytes: (bytes: Buffer, truncated: boolean) => SanitizedBytes,
+) {
   const entry = e.entry;
   let bodyKind: "NONE" | "JSON_RPC" | "OTHER" = e.requestBody === null ? "NONE" : "OTHER";
   let rpcMethod: string | null = null;
@@ -449,20 +502,9 @@ function exchangeRecord(e: PaperRequestExchangeEvidence, redact: (text: string) 
     }
   }
   const received = e.body;
-  let body: string | null = null;
-  let bodyEncoding: "utf8" | "base64" | null = null;
-  let bodyRedacted = false;
-  if (received !== null) {
-    const text = received.toString("utf8");
-    if (Buffer.from(text, "utf8").equals(received)) {
-      body = redact(text);
-      bodyEncoding = "utf8";
-      bodyRedacted = body !== text;
-    } else {
-      body = received.toString("base64");
-      bodyEncoding = "base64";
-    }
-  }
+  const sanitized =
+    received === null ? null : sanitizeBytes(received, e.bodyState === "PARTIAL_OVERFLOW");
+  const bodyRedacted = sanitized?.redacted ?? false;
   return {
     kind: "PAPER_REQUEST_EXCHANGE_EVIDENCE",
     seq: entry.seq,
@@ -498,10 +540,12 @@ function exchangeRecord(e: PaperRequestExchangeEvidence, redact: (text: string) 
           : e.bodyState === "COMPLETE"
             ? "ORIGINAL_COMPLETE_BODY_BYTES"
             : "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY",
-      bodyEncoding,
+      /** utf8 when the sanitized bytes are valid UTF-8; otherwise base64 of the sanitized bytes. */
+      bodyEncoding: sanitized?.encoding ?? null,
+      storedBytes: sanitized?.bytes.length ?? null,
       bodyRedacted,
       reproducesReceivedDigest: received !== null && !bodyRedacted,
-      body,
+      body: sanitized?.stored ?? null,
     },
   };
 }
@@ -516,43 +560,73 @@ type WsObservationKind =
   | "PONG"
   | "PING_RECEIVED";
 
+/** WebSocket observation accounting: payload omissions and dropped event records are separate. */
 interface WsObservationLog {
   transportsCreated: number;
-  retainedBytes: number;
-  dropped: number;
+  /** Incoming message payload bytes retained (own allowance). */
+  incomingRetainedBytes: number;
+  /** Outgoing (subscription) payload bytes retained (own allowance, never shared with incoming). */
+  outgoingRetainedBytes: number;
+  /** Recorded events whose payload did not fit its allowance (metadata kept, payload missing). */
+  incomingPayloadsOmitted: number;
+  outgoingPayloadsOmitted: number;
+  /** Events not recorded at all because the record ceiling was reached. */
+  recordsDropped: number;
   readonly observations: Record<string, unknown>[];
+}
+
+export interface WsObservationCaps {
+  readonly maxRecords: number;
+  /** The flow's own message-byte ceiling: every incoming payload the flow accepts fits. */
+  readonly incomingPayloadBytes: number;
+  readonly outgoingPayloadBytes: number;
 }
 
 /**
  * Bounded WebSocket observation: records each event once (its own listeners are registered first,
- * at creation) with its receipt time and the flow epoch state at receipt. Message and send payloads
- * are retained up to the flow's own message-byte ceiling; beyond it only metadata is kept, and
- * beyond the entry ceiling only a dropped count. Every member of the transport is passed through.
+ * at creation) with its receipt time and the flow epoch state at receipt. Incoming and outgoing
+ * payloads have separate allowances, each equal to the flow's own message-byte ceiling, so every
+ * incoming payload the flow accepts is retained. A payload that does not fit is counted as omitted
+ * (and its event still recorded); an event beyond the record ceiling is counted as dropped. Either
+ * makes the capture incomplete. Payloads are redacted at byte level before text or base64 storage.
+ * Every member of the transport is passed through.
  */
 function observeWebSocket(
   inner: ISolanaKeepaliveWebSocketTransport,
   index: number,
   log: WsObservationLog,
-  caps: { readonly maxEntries: number; readonly maxRetainedBytes: number },
+  caps: WsObservationCaps,
   clock: () => number,
   epochState: () => unknown,
   redact: (text: string) => string,
+  sanitizeBytes: (bytes: Buffer, truncated: boolean) => SanitizedBytes,
 ): ISolanaKeepaliveWebSocketTransport {
   const record = (kind: WsObservationKind, data?: string | Buffer, extra: object = {}) => {
-    if (log.observations.length >= caps.maxEntries) {
-      log.dropped++;
+    if (log.observations.length >= caps.maxRecords) {
+      log.recordsDropped++;
       return;
     }
-    const bytes =
-      data === undefined ? null : typeof data === "string" ? Buffer.byteLength(data) : data.length;
-    let retained: string | null = null;
-    if (
-      bytes !== null &&
-      (kind === "MESSAGE" || kind === "SEND") &&
-      log.retainedBytes + bytes <= caps.maxRetainedBytes
-    ) {
-      retained = redact(typeof data === "string" ? data : data!.toString("utf8"));
-      log.retainedBytes += bytes;
+    const raw =
+      data === undefined ? null : typeof data === "string" ? Buffer.from(data, "utf8") : data;
+    const bytes = raw === null ? null : raw.length;
+    let payload: SanitizedBytes | null = null;
+    let payloadOmitted = false;
+    if (raw !== null && kind === "MESSAGE") {
+      if (log.incomingRetainedBytes + raw.length <= caps.incomingPayloadBytes) {
+        payload = sanitizeBytes(raw, false);
+        log.incomingRetainedBytes += raw.length;
+      } else {
+        payloadOmitted = true;
+        log.incomingPayloadsOmitted++;
+      }
+    } else if (raw !== null && kind === "SEND") {
+      if (log.outgoingRetainedBytes + raw.length <= caps.outgoingPayloadBytes) {
+        payload = sanitizeBytes(raw, false);
+        log.outgoingRetainedBytes += raw.length;
+      } else {
+        payloadOmitted = true;
+        log.outgoingPayloadsOmitted++;
+      }
     }
     log.observations.push({
       seq: log.observations.length + 1,
@@ -561,8 +635,11 @@ function observeWebSocket(
       atMs: clock(),
       epochAtReceipt: epochState(),
       bytes,
-      dataRetained: retained !== null,
-      data: retained,
+      dataRetained: payload !== null,
+      payloadOmitted,
+      dataEncoding: payload?.encoding ?? null,
+      dataRedacted: payload?.redacted ?? false,
+      data: payload?.stored ?? null,
       ...extra,
     });
   };
@@ -756,7 +833,7 @@ async function runLive(ctx: {
   const onRequestExchange = (e: PaperRequestExchangeEvidence) => {
     const rel = exchangeEvidencePath(e.entry.seq);
     try {
-      const record = exchangeRecord(e, writer.redact);
+      const record = exchangeRecord(e, writer.redact, writer.sanitizeBytes);
       const meta = writer.writeJson(rel, record, "RESPONSE");
       exchangeIndex.push({
         seq: record.seq,
@@ -780,17 +857,22 @@ async function runLive(ctx: {
 
   const wsLog: WsObservationLog = {
     transportsCreated: 0,
-    retainedBytes: 0,
-    dropped: 0,
+    incomingRetainedBytes: 0,
+    outgoingRetainedBytes: 0,
+    incomingPayloadsOmitted: 0,
+    outgoingPayloadsOmitted: 0,
+    recordsDropped: 0,
     observations: [],
   };
-  const wsCaps = {
-    maxEntries:
+  // Existing bounds only: the flow's message, control-frame, ping and reconnect ceilings.
+  const wsCaps: WsObservationCaps = {
+    maxRecords:
       limits.flow.maxWsMessages +
       limits.flow.maxWsControlFrames +
       2 * limits.flow.maxKeepalivePings +
       8 * (limits.flow.maxReconnects + 1),
-    maxRetainedBytes: limits.flow.maxWsMessageBytes,
+    incomingPayloadBytes: limits.flow.maxWsMessageBytes,
+    outgoingPayloadBytes: limits.flow.maxWsMessageBytes,
   };
 
   const marketResponses: {
@@ -823,6 +905,7 @@ async function runLive(ctx: {
             clock,
             () => coordinator?.getFlowEpochState() ?? null,
             writer.redact,
+            writer.sanitizeBytes,
           );
         },
       },
@@ -891,7 +974,11 @@ async function runLive(ctx: {
   const bodyStates = (state: string) => exchangeIndex.filter((x) => x.bodyState === state).length;
   const decisionInputs = coordinator?.getDecisionInputs() ?? [];
   const evidenceComplete =
-    missingExchangeSeqs.length === 0 && captureFailures.length === 0 && wsLog.dropped === 0;
+    missingExchangeSeqs.length === 0 &&
+    captureFailures.length === 0 &&
+    wsLog.recordsDropped === 0 &&
+    wsLog.incomingPayloadsOmitted === 0 &&
+    wsLog.outgoingPayloadsOmitted === 0;
   const summary = {
     stopReason,
     failure,
@@ -932,7 +1019,9 @@ async function runLive(ctx: {
       captureFailures: captureFailures.length,
       decisionInputsRecorded: decisionInputs.length,
       wsObservations: wsLog.observations.length,
-      wsObservationsDropped: wsLog.dropped,
+      wsRecordsDropped: wsLog.recordsDropped,
+      wsIncomingPayloadsOmitted: wsLog.incomingPayloadsOmitted,
+      wsOutgoingPayloadsOmitted: wsLog.outgoingPayloadsOmitted,
     },
   };
   const snapshotResults = (flow?.snapshots ?? []).map((s) => ({
@@ -981,8 +1070,11 @@ async function runLive(ctx: {
     "ws-observations.json": {
       transportsCreated: wsLog.transportsCreated,
       caps: wsCaps,
-      retainedBytes: wsLog.retainedBytes,
-      dropped: wsLog.dropped,
+      incomingRetainedBytes: wsLog.incomingRetainedBytes,
+      outgoingRetainedBytes: wsLog.outgoingRetainedBytes,
+      incomingPayloadsOmitted: wsLog.incomingPayloadsOmitted,
+      outgoingPayloadsOmitted: wsLog.outgoingPayloadsOmitted,
+      recordsDropped: wsLog.recordsDropped,
       observations: wsLog.observations,
     },
   };
@@ -1010,7 +1102,7 @@ async function runLive(ctx: {
   out(`[LIVE] Stop reason: ${stopReason}`);
   if (!evidenceComplete) {
     out(
-      `[LIVE] Evidence INCOMPLETE: ${missingExchangeSeqs.length} missing exchange(s), ${captureFailures.length} capture failure(s), ${wsLog.dropped} dropped WebSocket observation(s)`,
+      `[LIVE] Evidence INCOMPLETE: ${missingExchangeSeqs.length} missing exchange(s), ${captureFailures.length} capture failure(s), ${wsLog.incomingPayloadsOmitted} incoming and ${wsLog.outgoingPayloadsOmitted} outgoing WebSocket payload(s) omitted, ${wsLog.recordsDropped} WebSocket record(s) dropped`,
     );
   }
   out(

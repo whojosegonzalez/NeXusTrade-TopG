@@ -4890,7 +4890,7 @@ The independent review of b4cb9e2 passed 186 affected tests and backend compilat
 1. **Decisions could not be revalidated from the evidence.** A mocked confirmation run dispatched three `TRANSACTION_RETRIEVAL` requests, but no sealed file held their responses. The runner kept only the final security cache and the provider's retained snapshots, so the inputs of earlier decisions could be replaced or retired before sealing.
    - **Response evidence**: the request session has an optional read-only observer, told once per dispatched request after it completes. It sees only what the session already read within its bounds, sends nothing and cannot change an exchange. No verification requests were added.
    - **Contents**: the runner writes one file per request, holding the request's safe identity (lane, owner, purpose, requested identity, JSON-RPC id, method and public parameters; no request headers; the RPC URL as a placeholder), the timing, status and selected headers, and the body with its state (`COMPLETE`, `PARTIAL_OVERFLOW` or `NOT_READ`). A partial prefix is marked and is never complete evidence. `receivedBytesSha256` covers the original bytes (the retained prefix only, for a partial body) and is distinguished from the manifest's digests of the sanitized files. `bodyRedacted` and `reproducesReceivedDigest` show when redaction changed a body.
-   - **WebSocket observations**: each event is recorded once, with its receipt time, transport and the flow epoch state at receipt. Payloads are kept up to the flow's own message-byte ceiling, and anything dropped is counted. Recorded gaps and the epoch state are sealed with the flow evidence.
+   - **WebSocket observations**: each event is recorded once, with its receipt time, transport and the flow epoch state at receipt. Payloads are kept within the flow's own message-byte ceiling (separate incoming and outgoing allowances, and counted omissions, after the review of bebe191 below). Recorded gaps and the epoch state are sealed with the flow evidence.
    - **Decision inputs**: the coordinator now records what each decision actually reads, through the same calls with unchanged results:
      - **Flow**: each read with the snapshot it selected (summary, frozen reconciliation result and accounted signatures), the epoch state and the recorded gaps.
      - **Security**: each read with the evidence as seen, the withheld components and, for each component, the refresh that produced it and that refresh's request sequence numbers.
@@ -4937,6 +4937,40 @@ The independent review of b4cb9e2 passed 186 affected tests and backend compilat
 Removing only the output-line redaction is not detected, because the stop reason is already redacted before it is printed (two layers of defence). Removing the stop-reason layer, or both, is caught.
 
 - **Results**: all pass under external 60 s limits: the diagnostic suite 12/12, `PaperSingleCandidateCoordinator` 7/7, `PaperSessionEvidenceIntegration` 13/13, `PaperDaemonEntryIntegration` 7/7, `PaperTradingDaemon` 100/100, `PaperRollingCandidateFlowProvider` 15/15, `PaperCandidateSecurityContext` 11/11 and `CandidateStreamEngine` 25/25 (190 tests). The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
+
+#### Corrections (Review of bebe191)
+
+The independent review of bebe191 confirmed the evidence, verifier and terminal-redaction fixes (190 affected tests and the backend typecheck passed) and reproduced two further issues in the runner. Both are corrected. Strategy rules, scheduling, request limits and the proposed limits are unchanged.
+
+1. **Non-text bodies could keep credentials.** A body that was not valid UTF-8 was stored as base64 of the original bytes, without redaction. A mocked RugCheck response of byte `0xff` followed by the Tracker key was sealed with `bodyRedacted: false`; decoding the stored body recovered the key, and integrity verification still passed.
+   - **Fix**: bodies and WebSocket payloads are now redacted at byte level, before any text or base64 encoding. Each configured credential's byte sequence and escaped form is replaced. In a partial body, a trailing fragment of at least 4 bytes that begins a credential is replaced too.
+   - **Storage**: the sanitized bytes are stored as UTF-8 text when valid, otherwise as base64 of the sanitized bytes, with `storedBytes`.
+   - **Digests**: `receivedBytesSha256` still covers the original bytes. `bodyRedacted` and `reproducesReceivedDigest` now report redaction for non-text bodies too.
+   - **Refusal**: if a credential would remain, that body is refused and recorded as a capture failure, which marks the capture incomplete.
+2. **Missing WebSocket payloads could still be reported as complete.** Incoming messages and outgoing subscription requests shared one retained-byte allowance. A payload that did not fit was stored without its data, but nothing was counted, so `summary.evidence.complete` stayed true. In the reviewer's reproduction, the flow ceiling was 1,024 bytes and the incoming messages totalled 877 bytes; one 280-byte incoming payload was omitted while the run confirmed.
+   - **Separate allowances**: incoming and outgoing payloads now have their own allowances, each equal to the flow's existing message-byte ceiling. Every incoming payload the flow accepts is therefore kept.
+   - **Separate counts**: omitted payloads (incoming and outgoing) are counted apart from dropped event records.
+   - **Completeness**: any omission or drop makes the capture incomplete in the summary and in an `[LIVE] Evidence INCOMPLETE` line. Integrity verification is unaffected, because completeness is reported, not inferred from hashes.
+
+**Regressions**:
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| N-01 | An invalid-UTF-8 RugCheck body echoing the key and both URLs is stored as base64 with `bodyRedacted: true` and `reproducesReceivedDigest: false`. The received digest still matches the original bytes, the decoded stored bytes contain no credential and keep the non-text bytes, and a 64-byte partial body cut inside the key has the fragment redacted. The secret scan now decodes every stored body and payload |
+| W-01 | Under a 1,024-byte flow ceiling, incoming payloads fit within it but incoming plus outgoing exceed it (the reviewer's pressure). The run arms and confirms on qualified flow, every incoming payload is retained exactly, nothing is omitted or dropped, and the capture is complete                                                                                                                                   |
+| W-02 | Under a 600-byte ceiling crossed by the incoming messages, the omitted payload is recorded (event kept, data absent), counted, and the capture is reported incomplete in the summary and the terminal, while integrity verification passes                                                                                                                                                                             |
+
+- **Mutation checks** (source restored byte-identical), each caught:
+
+| Mutation                                            | Caught by |
+| --------------------------------------------------- | --------- |
+| Base64 stores the original, unredacted bytes        | N-01      |
+| Trailing credential fragment of a partial body kept | N-01      |
+| Shared incoming and outgoing payload allowance      | W-01      |
+| Omitted incoming payloads ignored by completeness   | W-02      |
+| Omitted incoming payload not counted                | W-02      |
+
+- **Results**: all pass under external 60 s limits: the diagnostic suite 15/15 and the seven other affected suites unchanged (193 tests). The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.
 
 #### Exact Remaining Gaps
 

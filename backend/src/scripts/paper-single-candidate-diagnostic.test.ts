@@ -180,6 +180,33 @@ function expectNoSecrets(dir: string) {
       expect(content.includes(secret), `${name} contains a secret`).toBe(false);
     }
   }
+  // The DECODED retained bytes too: response bodies and WebSocket payloads stored as base64 or text.
+  for (const { label, bytes } of storedPayloads(dir)) {
+    for (const secret of SECRETS) {
+      expect(bytes.includes(Buffer.from(secret, "utf8")), `${label} decodes to a secret`).toBe(
+        false,
+      );
+    }
+  }
+}
+
+/** Every stored response body and WebSocket payload, decoded to the bytes it represents. */
+function storedPayloads(dir: string): { label: string; bytes: Buffer }[] {
+  const decode = (stored: string, encoding: string) =>
+    encoding === "base64" ? Buffer.from(stored, "base64") : Buffer.from(stored, "utf8");
+  const out: { label: string; bytes: Buffer }[] = [];
+  for (const name of filesUnder(dir).filter((n) => n.startsWith("exchanges/"))) {
+    const r = JSON.parse(readFileSync(path.join(dir, name), "utf8")).response;
+    if (typeof r.body === "string")
+      out.push({ label: name, bytes: decode(r.body, r.bodyEncoding) });
+  }
+  const ws = JSON.parse(readFileSync(path.join(dir, "ws-observations.json"), "utf8"));
+  for (const o of ws.observations as { seq: number; data: string | null; dataEncoding: string }[]) {
+    if (typeof o.data === "string") {
+      out.push({ label: `ws#${o.seq}`, bytes: decode(o.data, o.dataEncoding) });
+    }
+  }
+  return out;
 }
 
 /** Parsed JSON from sealed files (shape checked by the assertions). */
@@ -1067,5 +1094,149 @@ describe("PAPER single-candidate diagnostic evidence (offline)", () => {
     );
     expect(error?.message).toMatch(/^SYNTHETIC sink failure /);
     for (const secret of SECRETS) expect(error!.message.includes(secret)).toBe(false);
+  });
+});
+
+describe("PAPER single-candidate diagnostic evidence retention (offline)", () => {
+  it("N-01: a non-text body is redacted at byte level before base64 storage; its received digest stays separate", async () => {
+    // SYNTHETIC invalid-UTF-8 RugCheck body that echoes every configured credential.
+    const original = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from(` ${SYNTHETIC_TRACKER_KEY} ${ENV.SOLANA_RPC_URL} ${SYNTHETIC_WS_URL} `, "utf8"),
+      Buffer.from([0xc3]),
+    ]);
+    const env = liveEnv({ rugCheck: () => new Response(original, { status: 200 }) });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("binary"), "--live"], env.deps),
+    );
+    const dir = r.outDir!;
+    expect(verifyPaperSingleCandidateEvidence(dir).ok).toBe(true);
+    const x = sealedExchanges(dir).find((e) => e.purpose === "RUGCHECK_REPORT")!;
+    expect(x.response).toMatchObject({
+      bodyState: "COMPLETE",
+      bodyEncoding: "base64",
+      bodyRedacted: true,
+      reproducesReceivedDigest: false,
+      retainedBytes: original.length,
+    });
+    // The original digest is kept separately and the stored bytes no longer reproduce it.
+    expect(x.response.receivedBytesSha256).toBe(sha256(original));
+    const decoded = Buffer.from(x.response.body!, "base64");
+    expect(sha256(decoded)).not.toBe(x.response.receivedBytesSha256);
+    for (const secret of SECRETS) expect(decoded.includes(Buffer.from(secret))).toBe(false);
+    expect(decoded.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfe])); // non-text bytes kept
+    expect(decoded.toString("latin1")).toContain("[REDACTED]");
+    expectNoSecrets(dir); // decodes every stored body and payload
+
+    // A partial body cut inside a credential: the trailing fragment is redacted as well.
+    const lanes = TEST_LIMITS.session.lanes;
+    const cut = liveEnv({
+      rugCheck: () =>
+        new Response(
+          Buffer.concat([
+            Buffer.from([0xff]),
+            Buffer.from(`${"x".repeat(49)}${SYNTHETIC_TRACKER_KEY}`),
+          ]),
+          { status: 200 },
+        ),
+      limits: {
+        ...TEST_LIMITS,
+        session: {
+          ...TEST_LIMITS.session,
+          lanes: { ...lanes, RUGCHECK: { ...lanes.RUGCHECK, maxResponseBytes: 64 } },
+        },
+      },
+    });
+    const c = await drive(
+      cut.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("binary-cut"), "--live"], cut.deps),
+    );
+    const partial = sealedExchanges(c.outDir!).find((e) => e.purpose === "RUGCHECK_REPORT")!;
+    expect(partial.response).toMatchObject({
+      bodyState: "PARTIAL_OVERFLOW",
+      completeEvidence: false,
+      retainedBytes: 64,
+      bodyRedacted: true,
+      reproducesReceivedDigest: false,
+    });
+    const prefix = Buffer.from(partial.response.body!, partial.response.bodyEncoding as "base64");
+    const fragment = SYNTHETIC_TRACKER_KEY.slice(0, 64 - 50); // the part that fit before the cut
+    expect(prefix.includes(Buffer.from(fragment))).toBe(false);
+    expect(prefix.toString("latin1").endsWith("[REDACTED]")).toBe(true);
+    expectNoSecrets(c.outDir!);
+  });
+
+  it("W-01: incoming WebSocket payloads keep their own allowance; a qualified, confirmed run under retention pressure is complete", async () => {
+    // OFFLINE TEST LIMIT: a 1,024-byte flow message ceiling. Incoming plus outgoing payloads exceed
+    // it, which a shared allowance could not hold.
+    const env = liveEnv({
+      limits: { ...TEST_LIMITS, flow: { ...TEST_LIMITS.flow, maxWsMessageBytes: 1_024 } },
+    });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("ws-pressure"), "--live"], env.deps),
+    );
+    expect(r.stopReason).toBe("ENTRY_CONFIRMED_NO_EXECUTION");
+    const dir = r.outDir!;
+    const decisions = readJson(dir, "decisions.json") as {
+      outcome: string;
+      flowCutoffAgeMs: number | null;
+    }[];
+    expect(decisions.map((d) => d.outcome)).toEqual(["ARMED_FIRST_TICK", "RETEST_CONFIRMED"]);
+    expect(decisions.every((d) => d.flowCutoffAgeMs !== null)).toBe(true); // qualified flow
+    const ws = readJson(dir, "ws-observations.json");
+    const messages = (ws.observations as Loose[]).filter((o) => o.kind === "MESSAGE");
+    const sends = (ws.observations as Loose[]).filter((o) => o.kind === "SEND");
+    const incoming = messages.reduce((n: number, o: Loose) => n + (o.bytes as number), 0);
+    const outgoing = sends.reduce((n: number, o: Loose) => n + (o.bytes as number), 0);
+    expect(incoming).toBeLessThanOrEqual(1_024);
+    expect(incoming + outgoing).toBeGreaterThan(1_024); // the pressure the shared allowance failed
+    expect(
+      messages.every((o: Loose) => o.dataRetained === true && o.payloadOmitted === false),
+    ).toBe(true);
+    expect(ws).toMatchObject({
+      incomingRetainedBytes: incoming,
+      incomingPayloadsOmitted: 0,
+      outgoingPayloadsOmitted: 0,
+      recordsDropped: 0,
+    });
+    // The retained payloads are the messages as received.
+    const notification = messages.find((o: Loose) => String(o.data).includes("logsNotification"));
+    expect(Buffer.byteLength(notification.data as string)).toBe(notification.bytes);
+    expect(readJson(dir, "summary.json").evidence).toMatchObject({
+      complete: true,
+      wsIncomingPayloadsOmitted: 0,
+      wsOutgoingPayloadsOmitted: 0,
+      wsRecordsDropped: 0,
+    });
+    expectNoSecrets(dir);
+  });
+
+  it("W-02: an omitted incoming WebSocket payload makes the capture incomplete", async () => {
+    // OFFLINE TEST LIMIT: a 600-byte flow ceiling, crossed by the incoming messages.
+    const env = liveEnv({
+      limits: { ...TEST_LIMITS, flow: { ...TEST_LIMITS.flow, maxWsMessageBytes: 600 } },
+    });
+    const r = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("ws-omitted"), "--live"], env.deps),
+    );
+    const dir = r.outDir!;
+    expect(verifyPaperSingleCandidateEvidence(dir).ok).toBe(true); // integrity is separate
+    const ws = readJson(dir, "ws-observations.json");
+    expect(ws.incomingPayloadsOmitted).toBeGreaterThanOrEqual(1);
+    const omitted = (ws.observations as Loose[]).find((o) => o.payloadOmitted === true);
+    expect(omitted).toMatchObject({ kind: "MESSAGE", dataRetained: false, data: null });
+    expect(omitted.bytes).toBeGreaterThan(0);
+    expect(ws.incomingRetainedBytes).toBeLessThanOrEqual(600);
+    expect(readJson(dir, "summary.json").evidence).toMatchObject({
+      complete: false,
+      wsRecordsDropped: 0,
+    });
+    expect(readJson(dir, "summary.json").evidence.wsIncomingPayloadsOmitted).toBe(
+      ws.incomingPayloadsOmitted,
+    );
+    expect(env.lines.some((l) => l.startsWith("[LIVE] Evidence INCOMPLETE:"))).toBe(true);
   });
 });
