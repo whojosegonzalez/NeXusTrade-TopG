@@ -35,20 +35,25 @@ import {
   PRECHECK_MANIFEST_KIND,
   PRECHECK_MANIFEST_VERSION,
   derivePrecheckSelection,
+  precheckExchangePath,
   type PrecheckExchange,
   type PrecheckSelection,
 } from "./fresh-amm-v4-precheck.js";
 
 /** The runner reviewed for Stage B; it and its dependencies must be unchanged since. */
 export const REVIEWED_RUNNER_COMMIT = "6855efb0e4ab5023e2c556030c42613a0ee86f53" as const;
-/** Tracked code and configuration that must equal the pinned commit and be clean. */
-export const PIN_PATHS = Object.freeze([
-  "backend",
-  "shared",
-  "package.json",
-  "pnpm-lock.yaml",
-  "pnpm-workspace.yaml",
-  "scripts/paper-pilot-sequence.ps1",
+/**
+ * Inherited runtime configuration outside backend/ and shared/: the root TypeScript base
+ * configuration (extended by backend/tsconfig.json; it maps @nexustrade/shared), the package
+ * manager configuration and the Node version declarations. Tooling-only files (ESLint, Prettier,
+ * EditorConfig) and the example environment file do not affect the run. The secret .env file is
+ * untracked and deliberately never inspected: its values stay out of every check and output.
+ */
+export const INHERITED_RUNTIME_CONFIGURATION = Object.freeze([
+  "tsconfig.base.json",
+  ".npmrc",
+  ".node-version",
+  ".nvmrc",
 ]);
 /** The runner's dependency surface, compared with the reviewed runner commit. */
 export const RUNNER_DEPENDENCY_PATHS = Object.freeze([
@@ -57,6 +62,12 @@ export const RUNNER_DEPENDENCY_PATHS = Object.freeze([
   "package.json",
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",
+  ...INHERITED_RUNTIME_CONFIGURATION,
+]);
+/** Tracked code and configuration that must equal the pinned commit and be clean. */
+export const PIN_PATHS = Object.freeze([
+  ...RUNNER_DEPENDENCY_PATHS,
+  "scripts/paper-pilot-sequence.ps1",
 ]);
 /** The only changes allowed in that surface since the reviewed runner: these added files. */
 export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
@@ -207,20 +218,123 @@ export interface HandoffResult {
   readonly evaluatedAtIso: string;
 }
 
+const LEDGER_FIELDS = [
+  "purpose",
+  "lane",
+  "jsonRpcId",
+  "dispatchedAtMs",
+  "completedAtMs",
+  "httpStatus",
+  "error",
+] as const;
+
+/**
+ * Validates every response reference BEFORE any indexed response is read, then reads only the
+ * canonical, manifest-listed files and checks each against the request ledger. Returns the
+ * exchanges or the refusals. Outside, duplicate, unlisted or miscategorised references, missing
+ * exchanges, capture failures and inconsistent accounting all refuse.
+ */
+export function loadVerifiedExchanges(
+  dir: string,
+): { ok: true; exchanges: PrecheckExchange[] } | { ok: false; refusals: string[] } {
+  const fail = (refusals: string[]) => ({ ok: false as const, refusals });
+  let manifest: { files?: unknown };
+  let index: Record<string, unknown>;
+  let ledgerFile: Record<string, unknown>;
+  try {
+    manifest = readJson(dir, "evidence-manifest.json") as { files?: unknown };
+    index = readJson(dir, "request-exchanges.json") as Record<string, unknown>;
+    ledgerFile = readJson(dir, "request-ledger.json") as Record<string, unknown>;
+  } catch {
+    return fail(["INVALID_EVIDENCE:UNREADABLE"]);
+  }
+  const listed = new Map<string, unknown>();
+  for (const f of Array.isArray(manifest.files)
+    ? (manifest.files as Record<string, unknown>[])
+    : []) {
+    if (typeof f?.path === "string") listed.set(f.path, f.category);
+  }
+  if (!Array.isArray(index.missingExchangeSeqs) || !Array.isArray(index.captureFailures)) {
+    return fail(["INVALID_EXCHANGE_REFERENCE:INDEX_MALFORMED"]);
+  }
+  if (index.missingExchangeSeqs.length > 0) return fail(["EVIDENCE_INCOMPLETE:MISSING_EXCHANGES"]);
+  if (index.captureFailures.length > 0) return fail(["EVIDENCE_INCOMPLETE:CAPTURE_FAILURES"]);
+  if (!Array.isArray(index.exchanges)) return fail(["INVALID_EXCHANGE_REFERENCE:INDEX_MALFORMED"]);
+  const problems: string[] = [];
+  const seqs = new Set<number>();
+  const files = new Set<string>();
+  for (const [i, raw] of (index.exchanges as unknown[]).entries()) {
+    const x = (raw ?? {}) as Record<string, unknown>;
+    const seq = x.seq;
+    if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1) {
+      problems.push(`INVALID_EXCHANGE_REFERENCE:#${i}:SEQ`);
+      continue;
+    }
+    // The only acceptable reference is the canonical, confined path for that sequence number.
+    if (x.file !== precheckExchangePath(seq)) {
+      problems.push(`INVALID_EXCHANGE_REFERENCE:#${i}:PATH`);
+      continue;
+    }
+    if (listed.get(x.file) !== "RESPONSE") {
+      problems.push(`INVALID_EXCHANGE_REFERENCE:#${i}:NOT_A_LISTED_RESPONSE`);
+      continue;
+    }
+    if (seqs.has(seq) || files.has(x.file)) {
+      problems.push(`INVALID_EXCHANGE_REFERENCE:#${i}:DUPLICATE`);
+      continue;
+    }
+    seqs.add(seq);
+    files.add(x.file);
+  }
+  for (const [p, category] of listed) {
+    if (category === "RESPONSE" && !files.has(p))
+      problems.push(`INVALID_EXCHANGE_REFERENCE:UNINDEXED:${p}`);
+  }
+  if (problems.length > 0) return fail(problems);
+
+  // Accounting: the ledger and the index name exactly the same requests.
+  const ledger = Array.isArray(ledgerFile.ledger)
+    ? (ledgerFile.ledger as Record<string, unknown>[])
+    : null;
+  if (!ledger || ledgerFile.httpAttempts !== ledger.length)
+    return fail(["LEDGER_MISMATCH:ACCOUNTING"]);
+  const ledgerSeqs = ledger.map((e) => e.seq);
+  const indexSeqs = [...seqs].sort((a, b) => a - b);
+  if (JSON.stringify(ledgerSeqs) !== JSON.stringify(indexSeqs)) {
+    return fail(["LEDGER_MISMATCH:SEQUENCE_SET"]);
+  }
+  // Only now are the (canonical, listed, verified) response files read.
+  const exchanges: PrecheckExchange[] = [];
+  for (const seq of indexSeqs) {
+    let record: PrecheckExchange;
+    try {
+      record = readJson(dir, precheckExchangePath(seq)) as PrecheckExchange;
+    } catch {
+      return fail([`INVALID_EVIDENCE:UNREADABLE:${precheckExchangePath(seq)}`]);
+    }
+    const entry = ledger.find((e) => e.seq === seq)!;
+    if (record.seq !== seq || LEDGER_FIELDS.some((k) => record[k] !== entry[k])) {
+      return fail([`LEDGER_MISMATCH:EXCHANGE_${seq}`]);
+    }
+    exchanges.push(record);
+  }
+  return { ok: true, exchanges };
+}
+
 /** Every pre-Stage-B check, in order; nothing is substituted or retried. */
 export function evaluatePilotHandoff(input: {
   readonly projectRoot: string;
   readonly precheckDir: string;
   readonly pilotOutDir: string;
   readonly pinnedCommit: string;
-  readonly nowMs: number;
+  /** Read only after validation, immediately before deciding (injected for tests). */
+  readonly clock: () => number;
   readonly git: GitRunner;
 }): HandoffResult {
-  const evaluatedAtIso = new Date(input.nowMs).toISOString();
   const refuse = (refusals: readonly string[]): HandoffResult => ({
     decision: "REFUSED",
     refusals,
-    evaluatedAtIso,
+    evaluatedAtIso: new Date(input.clock()).toISOString(),
   });
   const pin = checkPin(input.pinnedCommit, input.git);
   if (pin.length > 0) return refuse(pin);
@@ -230,14 +344,12 @@ export function evaluatePilotHandoff(input: {
   const evidence = verifyPrecheckEvidence(precheckDir);
   if (evidence.length > 0) return refuse(evidence.map((p) => `INVALID_EVIDENCE:${p}`));
 
+  const loaded = loadVerifiedExchanges(precheckDir);
+  if (!loaded.ok) return refuse(loaded.refusals);
+  const exchanges = loaded.exchanges;
   let sealed: PrecheckSelection;
-  let exchanges: PrecheckExchange[];
   try {
     sealed = readJson(precheckDir, "selection.json") as PrecheckSelection;
-    const index = readJson(precheckDir, "request-exchanges.json") as {
-      exchanges: { seq: number; file: string }[];
-    };
-    exchanges = index.exchanges.map((x) => readJson(precheckDir, x.file) as PrecheckExchange);
   } catch {
     return refuse(["INVALID_EVIDENCE:UNREADABLE"]);
   }
@@ -268,8 +380,11 @@ export function evaluatePilotHandoff(input: {
   if (existsSync(pilotOutDir)) return refuse(["PILOT_OUTPUT_EXISTS"]);
 
   // Start window on the runner's own age source (PLANNING ESTIMATE; runtime checks decide).
+  // The clock is read here, after every validation, immediately before deciding.
+  const nowMs = input.clock();
+  const evaluatedAtIso = new Date(nowMs).toISOString();
   const openTimeSec = t.market.runnerOpenTimeSec;
-  const ageSecNow = Math.floor(input.nowMs / 1000) - openTimeSec;
+  const ageSecNow = Math.floor(nowMs / 1000) - openTimeSec;
   const opensAtMs = (openTimeSec + PLANNING_START_WINDOW.minAgeSec) * 1000;
   const closesAtMs = (openTimeSec + PLANNING_START_WINDOW.maxAgeSec) * 1000;
   const base = {
@@ -289,7 +404,7 @@ export function evaluatePilotHandoff(input: {
     return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_EXPIRED"] };
   }
   if (ageSecNow < PLANNING_START_WINDOW.minAgeSec) {
-    const waitMs = opensAtMs - input.nowMs;
+    const waitMs = opensAtMs - nowMs;
     if (waitMs > MAX_WAIT_MS) {
       return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_TOO_FAR_AHEAD"] };
     }
@@ -312,14 +427,13 @@ function main(argv: readonly string[]): number {
   const projectRoot = path.resolve(findWorkspaceRoot());
   const git = defaultGit(projectRoot);
   const pinnedCommit = String(values["pinned-commit"] ?? "");
-  const nowMs = Date.now();
   if (values["pin-only"] === true) {
     const problems = checkPin(pinnedCommit, git);
     console.log(
       JSON.stringify({
         decision: problems.length === 0 ? "PIN_OK" : "REFUSED",
         refusals: problems,
-        evaluatedAtIso: new Date(nowMs).toISOString(),
+        evaluatedAtIso: new Date().toISOString(),
       }),
     );
     return problems.length === 0 ? 0 : 1;
@@ -329,7 +443,7 @@ function main(argv: readonly string[]): number {
     precheckDir: String(values["precheck-dir"] ?? ""),
     pilotOutDir: String(values["pilot-out-dir"] ?? ""),
     pinnedCommit,
-    nowMs,
+    clock: () => Date.now(),
     git,
   });
   console.log(JSON.stringify(result));

@@ -82,8 +82,8 @@ A target named today from local evidence would be at least about 430,000 s old.
 
 **Pinned fee destination**: `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`, the AMM v4 create-pool fee destination.
 
-- **Source**: declared in Raydium's mainnet [`program/src/processor.rs`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/processor.rs); it is account index 14 of the upstream `initialize2` account vector ([`program/src/instruction.rs`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/instruction.rs)), matching the accepted parser's vector.
-- **Source revision**: the `master` branch as cited in the operator review of 2026-11-14. The commit SHA was **not** retrieved, because no network access was authorized; it should be recorded at review. The plan seals this statement.
+- **Source revision**: Raydium `raydium-amm` revision `91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6`, retrieved and checked by the review of `6515fcb`. The plan seals the revision and both immutable references.
+- **Source**: the [fee-address declaration](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/processor.rs), and the [`initialize2` account vector](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/instruction.rs), where it is account index 14, matching the accepted parser's vector.
 - **Self-verification**: every selected transaction must reference this address at its own `initialize2` account index 14.
 
 **Requests (proposed limits)**: at most **3 Solana RPC requests and 1 market GET**, no WebSocket. Solana pacing 2,500 ms; the first 429 or any redirect stops the session; no retry; 10 s per request; 1 MiB per response; **30 s absolute deadline**. All other lanes are disabled.
@@ -125,6 +125,9 @@ The overall outcome is one of:
 - `MARKET_EVIDENCE_UNAVAILABLE`
 - `START_WINDOW_ALREADY_CLOSED`, which keeps the candidate's timestamps but does not select it
 - `EVIDENCE_INVALID`
+- `EVIDENCE_INCOMPLETE`
+
+**Evidence-write failure**: if a dispatched request's evidence cannot be sealed, dispatch stops at once and that request is never repeated. The run is reported as `EVIDENCE_INCOMPLETE`, with the original cause (`CAPTURE_FAILED: …`), the request ledger and the missing sequence numbers preserved. No selection is derived, and the handoff refuses.
 
 **A selected target is PROVISIONAL**: security and strategy eligibility are still unverified; the runner decides at runtime. The market indicators sealed with it are informational only.
 
@@ -147,18 +150,22 @@ The overall outcome is one of:
    - `package.json`
    - `pnpm-lock.yaml`
    - `pnpm-workspace.yaml`
+   - inherited root runtime configuration: `tsconfig.base.json` (extended by `backend/tsconfig.json`; it maps `@nexustrade/shared`), `.npmrc`, `.node-version` and `.nvmrc`
    - the wrapper
 
-   Since the reviewed runner commit `6855efb`, only the Stage A and handoff files may have been **added** in the runner's dependency surface; any other change refuses (`REVIEWED_RUNNER_DEPENDENCY_CHANGED`).
+   Tooling-only files (ESLint, Prettier, EditorConfig) and `.env.example` do not affect the run. The secret `.env` is untracked and is never inspected, passed to git or printed.
+
+   Since the reviewed runner commit `6855efb`, only the Stage A and handoff files may have been **added** in the runner's dependency surface, which includes the inherited configuration; any other change refuses (`REVIEWED_RUNNER_DEPENDENCY_CHANGED`).
 
 2. **Evidence**: the sealed precheck must verify. It is refused on:
    - a wrong manifest kind or version
    - invalid or duplicate paths
    - a missing, modified or unlisted file (checked recursively)
    - a plan-digest mismatch
-3. **Reproduction**: re-deriving the selection from the sealed responses must reproduce `selection.json` exactly. The outcome must be `TARGET_SELECTED`, and the identity canonical, candidate base / WSOL quote. Nothing is substituted.
-4. **Start window**: the age on `pairCreatedAt` must be within 240–760 s (a planning estimate). Before the window opens, the check answers `WAIT` with the exact wait, at most 240 s. After it closes, it refuses (`START_WINDOW_EXPIRED`).
+3. **Response references**: every reference is validated **before any response is read**. Each must be the canonical, confined path for its sequence number (`exchanges/NNNN.json`), listed in the verified manifest as a response, and unique; every listed response must be indexed. The ledger and the index must name exactly the same requests, and each response's purpose, lane, JSON-RPC id, times, status and error must agree with its ledger entry. Missing exchanges and capture failures refuse (`EVIDENCE_INCOMPLETE`). Only the canonical files are ever read, so a reference pointing outside the seal is refused without being opened.
+4. **Reproduction**: re-deriving the selection from those responses must reproduce `selection.json` exactly. The outcome must be `TARGET_SELECTED`, and the identity canonical, candidate base / WSOL quote. Nothing is substituted.
 5. **Output**: the pilot directory must be new and inside `data/research/single-candidate/`.
+6. **Start window**: the clock is read **after every validation, immediately before deciding**. The age on `pairCreatedAt` must then be within 240–760 s (a planning estimate). Before the window opens, the check answers `WAIT` with the exact wait, at most 240 s. After it closes, including when it closes during validation, it refuses (`START_WINDOW_EXPIRED`).
 
 **Wrapper**: `scripts/paper-pilot-sequence.ps1` (PowerShell 5.1 compatible). It is **inert unless `-Execute` is given**: it then runs only the pin check and the precheck dry run, and prints the plan. With `-Execute`:
 
@@ -299,7 +306,7 @@ Flow qualification and strategy acceptance are reported separately (`summary.jso
 
 ## 6. Approval sequence requested
 
-1. **Review the offline implementation**: Stage A, the handoff check, the wrapper and their regressions. Record the Raydium source revision for the pinned fee destination.
+1. **Review the offline implementation**: Stage A, the handoff check, the wrapper and their regressions. The Raydium source revision for the pinned fee destination is recorded (`91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6`).
 2. **One combined, conditional operator approval**, because the start window is too short for a second approval round after the precheck. It must name:
    - the pinned commit and the exact step-2 command of §3;
    - exactly one Stage A precheck;

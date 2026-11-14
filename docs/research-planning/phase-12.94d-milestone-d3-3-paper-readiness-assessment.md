@@ -4997,7 +4997,7 @@ The review of `475baa9` asked for Stage A and an enforced handoff to be implemen
 - **Timing claims corrected**: the runner timeline and the 240–760 s start window are **planning estimates**. Eight decisions at least 5 s apart do not establish a 120 s last-decision deadline: flow outages, retrievals and refreshes can delay decisions. The runtime maturity checks are authoritative.
 - **Age sources kept apart**: the initialization transaction's block time (and the signature page's), the instruction-requested `open_time`, and DexScreener `pairCreatedAt` are sealed separately with their provenance. The runner derives age from `pairCreatedAt`, so the single DexScreener check is **required**, validates the exact identity with the runner's own parser and endpoint, and is the sole basis of the start window. Missing or unusable market evidence stops the handoff.
 - **Fee destination and orientation pinned**: the destination is `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5` (Raydium `program/src/processor.rs`; `initialize2` account index 14 per `program/src/instruction.rs`).
-  - **Source revision**: the `master` branch as cited by the review. The commit SHA was not retrieved offline and should be recorded at review.
+  - **Source revision**: recorded after the review of `6515fcb` as `91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6` (see below).
   - **Per-transaction validation**: each transaction must have a valid JSON-RPC envelope with the echoed id, be the requested signature at the paged slot, have succeeded on-chain, decode to exactly one AMM v4 `initialize2`, and reference the destination at its own account index 14.
   - **Orientation**: only candidate base / WSOL quote is selected.
 - **Sampling stated honestly**: at most 20 signatures are inspected and at most two transactions retrieved. A result without a target establishes only that this bounded sample produced none. Request failures, unavailable evidence and decoded non-matches keep distinct statuses per signature and distinct overall outcomes. A selected target is provisional.
@@ -5035,3 +5035,48 @@ The review of `475baa9` asked for Stage A and an enforced handoff to be implemen
 | Existing pilot directory allowed               | H-03                   |
 
 - **Results**: the precheck suite 4/4 and the handoff suite 3/3, under external 60 s limits. The backend typecheck, ESLint and Prettier pass, and the wrapper parses under Windows PowerShell 5.1. All 11 captures verify, and the wallet hash is unchanged.
+
+#### Handoff and Precheck Corrections (Review of 6515fcb)
+
+The review of `6515fcb` reproduced four defects and supplied the verified upstream revision. All are corrected offline. The Stage B runner, the strategy and the proposed limits are unchanged; nothing live was executed.
+
+1. **Time read too early.** The handoff CLI read the clock before the git and evidence checks: invoked at age 759 s, with mocked checks advancing to 763 s, it still allowed at a reported 759 s. The clock is now injected and read **after every validation, immediately before deciding**. Crossing the closing boundary during validation refuses (`START_WINDOW_EXPIRED`, reported at the decision time).
+2. **Response references trusted.** The handoff read whatever paths `request-exchanges.json` named: an exchange redirected to `../../../../outside-signatures.json`, holding an identical response, with the index's digest updated, was allowed. Every reference is now validated **before any response is read**:
+   - **Canonical**: each must be the confined path for its sequence number (`exchanges/NNNN.json`).
+   - **Listed**: each must appear in the verified manifest as a response, and every listed response must be indexed.
+   - **Unique**: no sequence number or path may repeat.
+   - **Accounted**: the ledger and the index must name exactly the same requests, with an accounting check; each response's purpose, lane, JSON-RPC id, times, status and error must equal its ledger entry.
+   - **Complete**: missing exchanges and capture failures refuse (`EVIDENCE_INCOMPLETE`).
+
+   Only canonical files are ever opened.
+
+3. **Request repeated after an evidence-write failure.** A failed exchange write was invisible to the derivation, so the first request was sent again (`getSignaturesForAddress` twice), and the run was classified `SAMPLE_PRODUCED_NO_SUITABLE_TARGET`. Dispatch now stops at the first capture failure. The run is reported as `EVIDENCE_INCOMPLETE` with the original cause, the ledger (session stop reason `EVIDENCE_CAPTURE_FAILED`) and the missing sequence numbers preserved, and the handoff refuses it.
+4. **Inherited configuration missing from the pin.** `backend/tsconfig.json` extends `../tsconfig.base.json`, which was outside both path lists. The pin and the runner-dependency surface now include `tsconfig.base.json`, `.npmrc`, `.node-version` and `.nvmrc`. Tooling-only files and `.env.example` do not affect the run, and the secret `.env` stays untracked and is never inspected or printed.
+5. **Upstream revision recorded.** The fee destination's source is now pinned to Raydium `raydium-amm` revision `91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6`, retrieved and checked by the review. The plan seals immutable references to the [fee-address declaration](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/processor.rs) and the [`initialize2` account vector](https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/instruction.rs).
+
+**Regressions**:
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                      |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H-04 | Invoked at 759 s with validation advancing to 763 s: refused, `START_WINDOW_EXPIRED` at 763 s. Validation ending inside the window (239 s → 241 s) allows                                                                                                                                                                                                  |
+| H-05 | The reviewer's outside reference (identical response) and an unreadable outside file are both refused on the reference itself, without the outside file being opened. Absolute, duplicate and unindexed references, missing exchanges, capture failures, ledger accounting and a ledger/response disagreement each refuse; the untouched seal still allows |
+| H-06 | Each inherited root configuration file, when changed, dirty or modified since the reviewed runner, refuses. No pin path names the environment file, no git call mentions it, and refusals carry codes only                                                                                                                                                 |
+| A-05 | A forced failure of the first evidence write: exactly one request (no repeat), outcome `EVIDENCE_INCOMPLETE` with the original cause, the ledger and the missing sequence number preserved, the seal intact, and the handoff refuses                                                                                                                       |
+| A-06 | The plan records revision `91739d8…31b6` and both immutable references, with no branch reference                                                                                                                                                                                                                                                           |
+
+- **Mutation checks** (sources restored byte-identical), each caught:
+
+| Mutation                                   | Caught by |
+| ------------------------------------------ | --------- |
+| Clock read before validation               | H-04      |
+| Non-canonical reference accepted           | H-05      |
+| Duplicate reference accepted               | H-05      |
+| Capture failures ignored by the handoff    | H-05      |
+| Response not compared with the ledger      | H-05      |
+| Dispatch continues after a capture failure | A-05      |
+| Incomplete evidence not reported           | A-05      |
+| Root `tsconfig.base.json` not pinned       | H-06      |
+
+The twelve earlier mutations are still each caught.
+
+- **Results**: the precheck suite 6/6 and the handoff suite 6/6, under external 60 s limits. The backend typecheck, ESLint and Prettier pass. All 11 captures verify, and the wallet hash is unchanged.

@@ -3,17 +3,19 @@
  * bounds, on SYNTHETIC responses and virtual time. No real network, socket or daemon.
  */
 import path from "node:path";
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  FEE_DESTINATION_SOURCE,
   PLANNING_START_WINDOW,
   PRECHECK_LIMITS,
   RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION,
   derivePrecheckSelection,
   runFreshPoolPrecheck,
+  type EvidenceFileWriter,
   type PrecheckExchange,
 } from "./fresh-amm-v4-precheck.js";
-import { verifyPrecheckEvidence } from "./paper-pilot-handoff.js";
+import { loadVerifiedExchanges, verifyPrecheckEvidence } from "./paper-pilot-handoff.js";
 import {
   ENV,
   FEE,
@@ -25,6 +27,7 @@ import {
   POOL,
   SYNTHETIC_RPC_KEY,
   WSOL_MINT,
+  drive,
   json,
   key,
   marketResponse,
@@ -353,5 +356,63 @@ describe("Stage A fresh AMM v4 precheck (offline, SYNTHETIC)", () => {
     expect(RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION).toBe(
       "7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5",
     );
+  });
+});
+
+describe("Stage A precheck corrections (review of 6515fcb)", () => {
+  it("A-05: a failed evidence write stops dispatch; the request is never repeated and the evidence is reported incomplete", async () => {
+    const env = precheckEnv(standardScenario());
+    roots.push(env.projectRoot);
+    let failed = 0;
+    const writeEvidenceFile: EvidenceFileWriter = (file, content, options) => {
+      if (failed === 0 && path.basename(file) === "0001.json") {
+        failed++;
+        throw new Error("SYNTHETIC disk write failure");
+      }
+      writeFileSync(file, content, options);
+    };
+    const r = await drive(
+      env.sched,
+      runFreshPoolPrecheck(["--out-dir", "data/research/prechecks/a05", "--live"], {
+        ...env.deps,
+        writeEvidenceFile,
+      }),
+    );
+    // Exactly one request: the signature page was not requested a second time.
+    expect(env.fetchLog.map((f) => f.rpcMethod)).toEqual(["getSignaturesForAddress"]);
+    expect(r.selection).toMatchObject({
+      outcome: "EVIDENCE_INCOMPLETE",
+      reason: "CAPTURE_FAILED: SYNTHETIC disk write failure",
+      target: null,
+    });
+    const dir = r.outDir!;
+    const ledger = readJson(dir, "request-ledger.json");
+    expect(ledger.ledger).toHaveLength(1);
+    expect(ledger.stopReason).toBe("EVIDENCE_CAPTURE_FAILED");
+    expect(readJson(dir, "request-exchanges.json")).toMatchObject({
+      exchanges: [],
+      missingExchangeSeqs: [1],
+      captureFailures: ["SYNTHETIC disk write failure"],
+      stoppedBy: "EVIDENCE_CAPTURE_FAILED",
+    });
+    // The seal itself is intact; the handoff refuses incomplete evidence.
+    expect(verifyPrecheckEvidence(dir)).toEqual([]);
+    expect(loadVerifiedExchanges(dir)).toEqual({
+      ok: false,
+      refusals: ["EVIDENCE_INCOMPLETE:MISSING_EXCHANGES"],
+    });
+  });
+
+  it("A-06: the plan records the verified upstream revision as immutable references", async () => {
+    expect(FEE_DESTINATION_SOURCE).toMatchObject({
+      address: "7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5",
+      accountIndex: 14,
+      revision: "91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6",
+      declaredIn:
+        "https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/processor.rs",
+      accountVector:
+        "https://github.com/raydium-io/raydium-amm/blob/91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6/program/src/instruction.rs",
+    });
+    expect(JSON.stringify(FEE_DESTINATION_SOURCE)).not.toMatch(/\/blob\/master\//);
   });
 });

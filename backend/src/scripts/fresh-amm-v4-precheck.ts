@@ -64,13 +64,15 @@ export const PRECHECK_APPROVAL_STATUS =
 export const RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION =
   "7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5" as const;
 export const INITIALIZE2_FEE_DESTINATION_INDEX = 14 as const;
+export const RAYDIUM_SOURCE_REVISION = "91739d8d9f5cf347e0ce14ebe4d2bb7069fb31b6" as const;
 export const FEE_DESTINATION_SOURCE = Object.freeze({
   address: RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION,
   accountIndex: INITIALIZE2_FEE_DESTINATION_INDEX,
-  declaredIn: "https://github.com/raydium-io/raydium-amm/blob/master/program/src/processor.rs",
-  accountVector: "https://github.com/raydium-io/raydium-amm/blob/master/program/src/instruction.rs",
-  revision:
-    "master branch, as cited in the operator review of 2026-11-14; the commit SHA was not retrieved (no network access offline) and must be recorded at review. Every selected transaction re-verifies the address at account index 14.",
+  revision: RAYDIUM_SOURCE_REVISION,
+  declaredIn: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_SOURCE_REVISION}/program/src/processor.rs`,
+  accountVector: `https://github.com/raydium-io/raydium-amm/blob/${RAYDIUM_SOURCE_REVISION}/program/src/instruction.rs`,
+  verification:
+    "Revision retrieved and checked by the operator review of 6515fcb. Every selected transaction re-verifies the address at its own initialize2 account index 14.",
 });
 
 /** PROPOSED Stage A request limits (not approved). Other lanes are disabled. */
@@ -202,7 +204,9 @@ export type PrecheckOutcomeCategory =
   | "EVIDENCE_UNAVAILABLE"
   | "MARKET_EVIDENCE_UNAVAILABLE"
   | "START_WINDOW_ALREADY_CLOSED"
-  | "EVIDENCE_INVALID";
+  | "EVIDENCE_INVALID"
+  /** A request was sent but its evidence could not be sealed; dispatch stopped there. */
+  | "EVIDENCE_INCOMPLETE";
 
 export interface PrecheckSelection {
   readonly outcome: PrecheckOutcomeCategory;
@@ -217,6 +221,9 @@ export type PrecheckNextRequest =
   | { readonly kind: "TRANSACTION"; readonly signature: string }
   | { readonly kind: "MARKET"; readonly poolId: string; readonly mintAddress: string }
   | null;
+
+const INCOMPLETE_STATEMENT =
+  "Incomplete evidence: a dispatched request could not be sealed, so dispatch stopped and no selection is derived. The original cause and the request ledger are preserved.";
 
 const SAMPLE_STATEMENT =
   "Bounded sample: at most 20 signatures inspected and at most 2 transactions retrieved. A result without a target establishes only that this sample produced no suitable target.";
@@ -668,7 +675,11 @@ function byteSanitizer(secrets: readonly string[]) {
   };
 }
 
-function precheckWriter(outDir: string, secrets: readonly string[]) {
+function precheckWriter(
+  outDir: string,
+  secrets: readonly string[],
+  writeFile: EvidenceFileWriter = writeFileSync,
+) {
   const entries: {
     path: string;
     category: "EVIDENCE" | "RESPONSE";
@@ -699,7 +710,7 @@ function precheckWriter(outDir: string, secrets: readonly string[]) {
       if (content.includes(s))
         throw new Error(`[SEAL_REFUSED] a credential would be persisted in ${rel}`);
     }
-    writeFileSync(path.join(outDir, ...rel.split("/")), content, { encoding: "utf8", flag: "wx" });
+    writeFile(path.join(outDir, ...rel.split("/")), content, { encoding: "utf8", flag: "wx" });
     const meta = {
       path: rel,
       category,
@@ -786,7 +797,16 @@ export interface FreshPoolPrecheckDeps {
   readonly timers?: PaperRequestSessionTimers | undefined;
   readonly projectRoot?: string | undefined;
   readonly log?: ((line: string) => void) | undefined;
+  /** Offline tests only: replaces the exclusive evidence writer (to force a write failure). */
+  readonly writeEvidenceFile?: EvidenceFileWriter | undefined;
 }
+
+/** Exclusive evidence write (signature of fs.writeFileSync as used here). */
+export type EvidenceFileWriter = (
+  file: string,
+  content: string,
+  options: { readonly encoding: "utf8"; readonly flag: "wx" },
+) => void;
 
 export interface FreshPoolPrecheckResult {
   readonly mode: "DRY_RUN" | "LIVE";
@@ -897,7 +917,7 @@ export async function runFreshPoolPrecheck(
     mkdirSync(path.dirname(outDir), { recursive: true });
     mkdirSync(outDir);
     mkdirSync(path.join(outDir, "exchanges"));
-    const writer = precheckWriter(outDir, secrets);
+    const writer = precheckWriter(outDir, secrets, deps.writeEvidenceFile);
     writer.write("plan.json", plan, "EVIDENCE");
     const exchanges: PrecheckExchange[] = [];
     const captureFailures: string[] = [];
@@ -966,10 +986,33 @@ export async function runFreshPoolPrecheck(
         stoppedBy = exchange.error ?? "NOT_DISPATCHED";
         break;
       }
+      // A request whose evidence could not be sealed is never repeated: the derivation cannot see
+      // it, so dispatch stops here and the run is reported as incomplete evidence.
+      if (captureFailures.length > 0) {
+        stoppedBy = "EVIDENCE_CAPTURE_FAILED";
+        break;
+      }
     }
-    session.stop("PRECHECK_COMPLETE");
-    const { selection } = derivePrecheckSelection(exchanges, { complete: true });
+    session.stop(
+      stoppedBy === "EVIDENCE_CAPTURE_FAILED" ? "EVIDENCE_CAPTURE_FAILED" : "PRECHECK_COMPLETE",
+    );
     const status = session.getStatus();
+    const missingSeqs = status.ledger
+      .map((e) => e.seq)
+      .filter((seq) => !exchanges.some((x) => x.seq === seq));
+    const selection: PrecheckSelection =
+      captureFailures.length > 0 || missingSeqs.length > 0
+        ? {
+            outcome: "EVIDENCE_INCOMPLETE",
+            reason:
+              captureFailures.length > 0
+                ? `CAPTURE_FAILED: ${captureFailures[0]}`
+                : `MISSING_EXCHANGES: ${missingSeqs.join(",")}`,
+            sampleStatement: INCOMPLETE_STATEMENT,
+            signatures: [],
+            target: null,
+          }
+        : derivePrecheckSelection(exchanges, { complete: true }).selection;
     writer.write("request-ledger.json", status, "EVIDENCE");
     writer.write(
       "request-exchanges.json",
@@ -977,9 +1020,7 @@ export async function runFreshPoolPrecheck(
         exchanges: [...exchanges]
           .sort((a, b) => a.seq - b.seq)
           .map((x) => ({ seq: x.seq, file: precheckExchangePath(x.seq), purpose: x.purpose })),
-        missingExchangeSeqs: status.ledger
-          .map((e) => e.seq)
-          .filter((s) => !exchanges.some((x) => x.seq === s)),
+        missingExchangeSeqs: missingSeqs,
         captureFailures,
         stoppedBy,
       },
