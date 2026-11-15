@@ -18,16 +18,21 @@
  *   reproduction flags. A residual credential refuses the seal before anything is written.
  * - Terminal causes (completion, a watch that ended without capture, operator cancellation, run
  *   failure) are recorded explicitly and must agree with the supplied results.
+ * - Exchange records are bound to the policy limits resolved independently from the supplied
+ *   context: each body's state, declared and effective limit, digest scope, lengths and flags
+ *   must be what the bounded request session produces under those limits.
  *
  * Verification is fail-closed and keeps three answers apart:
  * - integrity: manifest schema/version, required entries, unique confined paths, regular files
- *   (no links), sizes, hashes, no unlisted files at any depth, plan/report references and
- *   exchange-index/ledger agreement, all checked before any response file is consumed;
+ *   (no links), sizes, hashes, no unlisted files at any depth, plan/report references,
+ *   exchange-index/ledger agreement and the policy context, all checked before any response file
+ *   is consumed; then each response's body accounting against the resolved limits;
  * - completeness: whether the sealed evidence could support a selected target at all;
  * - re-derivation: for a recorded validation, the reviewed discovery verification and pure
  *   candidate derivation re-run on the sealed evidence and policy context and are compared with
- *   the recorded result. Interrupted or cancelled runs keep their recorded outcome; redaction that
- *   prevents exact re-derivation is reported as LIMITED_BY_REDACTION.
+ *   the recorded result. Interrupted or cancelled runs keep their recorded outcome. A difference
+ *   is LIMITED_BY_REDACTION only when the redacted evidence it depends on could have caused it;
+ *   contradictions in evidence that redaction did not touch remain MISMATCH.
  */
 
 import path from "node:path";
@@ -38,10 +43,12 @@ import { serializeJsonPreservingBigInts } from "../research/pilot/RaydiumAmmV4Sn
 import {
   PRECHECK_ROOT_SEGMENTS,
   RPC_URL_PLACEHOLDER,
+  evaluateInitializationExchange,
   precheckExchangePath,
   type EvidenceFileWriter,
   type PrecheckExchange,
 } from "./fresh-amm-v4-precheck.js";
+import { SINGLE_CANDIDATE_PUBLIC_ENDPOINTS } from "./paper-single-candidate-diagnostic.js";
 import {
   DEFAULT_WATCH_VALIDATION_LIMITS,
   PROVISIONAL_TARGET_DISCLAIMER,
@@ -51,8 +58,10 @@ import {
   resolveWatchValidationLimits,
   validateWatchedDiscoveryEvidence,
   type WatchCandidateOutcome,
+  type WatchCandidateValidationLimits,
   type WatchCandidateValidationResult,
   type WatchEvidenceContext,
+  type WatchedDiscoveryEvidence,
 } from "../candidate-scanner/AmmV4WatchCandidateValidation.js";
 import type { BoundedAmmV4CreationWatchResult } from "../candidate-scanner/BoundedAmmV4CreationWatch.js";
 
@@ -268,6 +277,43 @@ interface SanitizedBytes {
   readonly bytes: Buffer;
 }
 
+/**
+ * Number of complete credential characters matched from `t[pos]` (secret character `k` onwards)
+ * when the match runs exactly to the end of `t`, or -1. Each character may appear literally or as
+ * `\u00XX` (the reviewed escaped form; case-insensitive like `buildEscapedSecretRegex`), and the
+ * text may end inside an escape sequence. A match of the whole secret is not a trailing fragment
+ * (whole forms are redacted before this runs). `lower` is the lower-cased Latin-1 text and
+ * `secret` the Latin-1 credential.
+ */
+function fragmentCharsToEnd(lower: string, pos: number, secret: string, k: number): number {
+  if (pos === lower.length) return k < secret.length ? k : -1;
+  if (k === secret.length) return -1;
+  const ch = secret[k] as string;
+  let best = -1;
+  if (lower[pos] === ch.toLowerCase()) best = fragmentCharsToEnd(lower, pos + 1, secret, k + 1);
+  const escape = `\\u00${ch.charCodeAt(0).toString(16).padStart(2, "0")}`.toLowerCase();
+  const rest = lower.slice(pos, pos + escape.length);
+  if (rest === escape) {
+    best = Math.max(best, fragmentCharsToEnd(lower, pos + escape.length, secret, k + 1));
+  } else if (pos + rest.length === lower.length && escape.startsWith(rest)) {
+    best = Math.max(best, k); // the retained prefix ends inside this character's escape sequence
+  }
+  return best;
+}
+
+/**
+ * Start of the longest trailing credential fragment (literal, escaped or mixed, possibly cut inside
+ * an escape sequence) covering at least MIN_TRAILING_FRAGMENT credential characters, or null.
+ */
+function trailingFragmentStart(text: string, secret: string): number | null {
+  const lower = text.toLowerCase();
+  const span = secret.length * 6; // an escaped character is at most six bytes
+  for (let start = Math.max(0, text.length - span); start < text.length; start++) {
+    if (fragmentCharsToEnd(lower, start, secret, 0) >= MIN_TRAILING_FRAGMENT) return start;
+  }
+  return null;
+}
+
 /** Credential redaction on bytes (Latin-1 maps bytes 1:1), applied before text or base64 storage. */
 function byteSanitizer(secrets: readonly string[]) {
   const forms = secrets.map((s) => {
@@ -280,15 +326,12 @@ function byteSanitizer(secrets: readonly string[]) {
       text = text.split(f.latin1).join(REDACTED);
       if (f.escaped) text = text.replace(f.escaped, REDACTED);
     }
-    // A bounded prefix can end inside a credential: redact a trailing leading fragment.
+    // A bounded prefix can end inside a credential in any form (literal, escaped or mixed, even
+    // inside an escape sequence): redact the trailing fragment.
     if (partial) {
       for (const f of forms) {
-        for (let k = Math.min(f.latin1.length - 1, text.length); k >= MIN_TRAILING_FRAGMENT; k--) {
-          if (text.endsWith(f.latin1.slice(0, k))) {
-            text = text.slice(0, text.length - k) + REDACTED_PARTIAL;
-            break;
-          }
-        }
+        const start = trailingFragmentStart(text, f.latin1);
+        if (start !== null) text = text.slice(0, start) + REDACTED_PARTIAL;
       }
     }
     for (const f of forms) {
@@ -297,6 +340,9 @@ function byteSanitizer(secrets: readonly string[]) {
         f.escaped.lastIndex = 0;
         if (f.escaped.test(text)) throw new Error("[SEAL_REFUSED] escaped credential remains");
         f.escaped.lastIndex = 0;
+      }
+      if (partial && trailingFragmentStart(text, f.latin1) !== null) {
+        throw new Error("[SEAL_REFUSED] a trailing credential fragment remains");
       }
     }
     const bytes = Buffer.from(text, "latin1");
@@ -343,6 +389,95 @@ function textRedactor(secrets: readonly string[]) {
     return c;
   };
   return { redact, deep, takeCount };
+}
+
+const COMPLETE_DIGEST_SCOPE = "ORIGINAL_COMPLETE_BODY_BYTES";
+const PREFIX_DIGEST_SCOPE = "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY";
+
+/** The response ceiling the reviewed validator's request session applies to a lane. */
+function laneResponseLimit(lane: unknown, limits: WatchCandidateValidationLimits): number | null {
+  if (lane === "SOLANA_RPC") return limits.rpcMaxResponseBytes;
+  if (lane === "DEXSCREENER") return limits.dexscreenerMaxResponseBytes;
+  return null;
+}
+
+/**
+ * Body accounting that the bounded request session can produce under the independently resolved
+ * lane limit L:
+ * - COMPLETE: no error, a status, retained = observed <= L, complete-body digest scope;
+ * - PARTIAL_OVERFLOW: RESPONSE_TOO_LARGE, a status, exactly L retained bytes of observed > L,
+ *   prefix-only digest scope;
+ * - NOT_READ: an error and no body, counts, digests, scope or encoding.
+ * The declared maxResponseBytes must equal L, `completeEvidence` must equal COMPLETE, stored
+ * lengths and the canonical encoding must match the stored bytes, and the redaction and
+ * reproduction flags must agree with the digests. `stored` is the decoded stored body and
+ * `storedDigest` its declared digest. Returns problem names (empty when consistent).
+ */
+function bodyAccountingProblems(
+  ex: { readonly lane: unknown; readonly error: unknown; readonly httpStatus: unknown },
+  r: Record<string, unknown>,
+  stored: Buffer | null,
+  storedDigest: unknown,
+  limits: WatchCandidateValidationLimits,
+): string[] {
+  const limit = laneResponseLimit(ex.lane, limits);
+  if (limit === null) return ["LANE_UNKNOWN"];
+  const p: string[] = [];
+  if (r.maxResponseBytes !== limit) p.push("DECLARED_LIMIT_MISMATCH");
+  const state = r.bodyState;
+  if (r.completeEvidence !== (state === "COMPLETE")) p.push("COMPLETE_EVIDENCE_FLAG");
+  if (state === "NOT_READ") {
+    if (
+      stored !== null ||
+      r.retainedBytes !== null ||
+      r.observedBytes !== null ||
+      r.receivedBytesSha256 !== null ||
+      r.receivedDigestScope !== null ||
+      r.bodyEncoding !== null ||
+      r.storedBytes !== null ||
+      r.bodyRedacted !== false ||
+      r.reproducesReceivedDigest !== false
+    ) {
+      p.push("UNREAD_BODY_ACCOUNTING");
+    }
+    if (typeof ex.error !== "string") p.push("UNREAD_BODY_WITHOUT_ERROR");
+    return p;
+  }
+  if (state !== "COMPLETE" && state !== "PARTIAL_OVERFLOW") return [...p, "BODY_STATE_UNKNOWN"];
+  if (stored === null) return [...p, "BODY_MISSING"];
+  if (!isSafeInt(ex.httpStatus)) p.push("HTTP_STATUS_MISSING");
+  if (r.storedBytes !== stored.length) p.push("STORED_BYTES");
+  const utf8 = Buffer.from(stored.toString("utf8"), "utf8").equals(stored);
+  if (r.bodyEncoding !== (utf8 ? "utf8" : "base64")) p.push("BODY_ENCODING");
+  if (typeof r.receivedBytesSha256 !== "string" || !HEX64.test(r.receivedBytesSha256)) {
+    p.push("RECEIVED_DIGEST");
+  }
+  if (!isSafeInt(r.retainedBytes) || !isSafeInt(r.observedBytes)) return [...p, "BYTE_COUNTS"];
+  if (state === "COMPLETE") {
+    if (ex.error !== null) p.push("COMPLETE_BODY_WITH_ERROR");
+    if (r.retainedBytes > limit) p.push("RETAINED_EXCEEDS_LIMIT");
+    if (r.observedBytes !== r.retainedBytes) p.push("OBSERVED_BYTES");
+    if (r.receivedDigestScope !== COMPLETE_DIGEST_SCOPE) p.push("DIGEST_SCOPE");
+  } else {
+    if (ex.error !== "RESPONSE_TOO_LARGE") p.push("PARTIAL_BODY_ERROR");
+    if (r.retainedBytes !== limit) p.push("RETAINED_PREFIX_LENGTH");
+    if (r.observedBytes <= limit) p.push("OBSERVED_BYTES");
+    if (r.receivedDigestScope !== PREFIX_DIGEST_SCOPE) p.push("DIGEST_SCOPE");
+  }
+  if (r.bodyRedacted === false) {
+    if (
+      r.retainedBytes !== stored.length ||
+      r.reproducesReceivedDigest !== true ||
+      r.receivedBytesSha256 !== storedDigest
+    ) {
+      p.push("UNREDACTED_BODY_DIGEST");
+    }
+  } else if (r.bodyRedacted === true) {
+    if (r.reproducesReceivedDigest !== false || r.receivedBytesSha256 === storedDigest) {
+      p.push("REDACTED_BODY_FLAGS");
+    }
+  } else p.push("REDACTION_FLAG");
+  return p;
 }
 
 function decodeStoredBody(body: unknown, encoding: unknown): Buffer | null | "INVALID" {
@@ -437,6 +572,7 @@ interface PreparedFile {
 function sealedExchangeRecord(
   ex: PrecheckExchange,
   sanitize: ReturnType<typeof byteSanitizer>,
+  limits: WatchCandidateValidationLimits,
 ): { record: Record<string, unknown>; ledger: Record<string, unknown>; redacted: boolean } {
   const r = ex.response as Record<string, unknown>;
   if (r.bodyRedacted !== false) {
@@ -446,22 +582,23 @@ function sealedExchangeRecord(
   if (original === "INVALID") {
     throw new Error(`[SEAL_INPUT_INVALID] exchange ${ex.seq} body does not decode`);
   }
-  const bodyState = r.bodyState;
-  if (bodyState !== "COMPLETE" && bodyState !== "PARTIAL_OVERFLOW" && bodyState !== "NOT_READ") {
-    throw new Error(`[SEAL_INPUT_INVALID] exchange ${ex.seq} body state is unknown`);
-  }
-  if (original === null) {
-    if (r.receivedBytesSha256 !== null || bodyState !== "NOT_READ") {
-      throw new Error(`[SEAL_INPUT_INVALID] exchange ${ex.seq} body accounting is inconsistent`);
-    }
-  } else if (
-    bodyState === "NOT_READ" ||
-    r.receivedBytesSha256 !== sha256(original) ||
-    r.retainedBytes !== original.length ||
-    (typeof r.maxResponseBytes === "number" && original.length > r.maxResponseBytes)
-  ) {
+  if (original !== null && r.receivedBytesSha256 !== sha256(original)) {
     throw new Error(`[SEAL_INPUT_INVALID] exchange ${ex.seq} body does not match its digest`);
   }
+  // Bound to the independently resolved policy limits, never to the record's own claims.
+  const accounting = bodyAccountingProblems(
+    ex,
+    r,
+    original,
+    original === null ? null : sha256(original),
+    limits,
+  );
+  if (accounting.length > 0) {
+    throw new Error(
+      `[SEAL_INPUT_INVALID] exchange ${ex.seq} body accounting contradicts the resolved policy limits (${accounting.join(",")})`,
+    );
+  }
+  const bodyState = r.bodyState as "COMPLETE" | "PARTIAL_OVERFLOW" | "NOT_READ";
   const s = original === null ? null : sanitize(original, bodyState === "PARTIAL_OVERFLOW");
   const headers: Record<string, unknown> = {};
   if (isRecord(r.headers)) {
@@ -501,8 +638,8 @@ function sealedExchangeRecord(
         original === null
           ? null
           : bodyState === "COMPLETE"
-            ? "ORIGINAL_COMPLETE_BODY_BYTES"
-            : "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY",
+            ? COMPLETE_DIGEST_SCOPE
+            : PREFIX_DIGEST_SCOPE,
       bodyEncoding: s?.encoding ?? null,
       storedBytes: s?.bytes.length ?? null,
       sanitizedBytesSha256,
@@ -739,7 +876,7 @@ export function sealWatchEvidence(input: SealWatchEvidenceInput): SealWatchEvide
     const ledger: Record<string, unknown>[] = [];
     const redactedBodies: number[] = [];
     for (const ex of exchanges) {
-      const sealed = sealedExchangeRecord(ex, sanitize);
+      const sealed = sealedExchangeRecord(ex, sanitize, resolvedLimits);
       add(precheckExchangePath(ex.seq), sealed.record, "RESPONSE");
       ledger.push(sealed.ledger);
       if (sealed.redacted) redactedBodies.push(ex.seq);
@@ -1332,7 +1469,53 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   ) {
     problems.push("SELECTION_DIFFERS_FROM_VALIDATION");
   }
-  if (problems.length > 0) return integrityFailure();
+
+  // Policy context: limits resolved independently by the reviewed resolver from the supplied
+  // context (the recorded `resolvedLimits` are only compared, never trusted).
+  const supplied = pick(contextDoc, "suppliedContext");
+  const suppliedLimits = pick(supplied, "limits");
+  const suppliedDeadline = pick(supplied, "overallDeadlineAtMs");
+  let limits: WatchCandidateValidationLimits | null = null;
+  if (
+    pick(contextDoc, "kind") !== "PAPER_WATCH_POLICY_CONTEXT" ||
+    !isRecord(supplied) ||
+    !(suppliedLimits === null || isRecord(suppliedLimits)) ||
+    !(suppliedDeadline === null || isSafeInt(suppliedDeadline))
+  ) {
+    problems.push("CONTEXT_MALFORMED");
+  } else {
+    try {
+      limits = resolveWatchValidationLimits(
+        isRecord(suppliedLimits)
+          ? (suppliedLimits as Partial<WatchCandidateValidationLimits>)
+          : undefined,
+      );
+    } catch {
+      problems.push("CONTEXT_LIMITS_INVALID");
+    }
+  }
+  if (limits !== null && canonical(pick(contextDoc, "resolvedLimits")) !== canonical(limits)) {
+    problems.push("CONTEXT_RESOLVED_LIMITS_MISMATCH");
+  }
+  if (
+    canonical(pick(contextDoc, "reviewedWatchPolicy")) !== canonical(REVIEWED_WATCH_POLICY) ||
+    canonical(pick(contextDoc, "defaultValidationLimits")) !==
+      canonical(DEFAULT_WATCH_VALIDATION_LIMITS)
+  ) {
+    problems.push("CONTEXT_POLICY_MISMATCH");
+  }
+  const recordedDeadline =
+    recorded === true && isRecord(result) ? (result.validationDeadlineAtMs ?? null) : null;
+  if (
+    pick(contextDoc, "recordedValidationDeadlineAtMs") !== recordedDeadline ||
+    pick(contextDoc, "recomputedValidationDeadlineAtMs") !==
+      (recorded === true && isRecord(result) && isRecord(result.discovery)
+        ? recordedDeadline
+        : null)
+  ) {
+    problems.push("CONTEXT_DEADLINE_MISMATCH");
+  }
+  if (problems.length > 0 || limits === null) return integrityFailure();
 
   // 7. Response files: kind, ledger agreement, digests (consumed only now).
   const exchanges: PrecheckExchange[] = [];
@@ -1378,33 +1561,24 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
       continue;
     }
     if (stored === null) {
-      if (
-        resp.sanitizedBytesSha256 !== null ||
-        resp.receivedBytesSha256 !== null ||
-        resp.bodyRedacted !== false
-      ) {
-        problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}`);
+      if (resp.sanitizedBytesSha256 !== null) {
+        problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}:SANITIZED_DIGEST`);
       }
-    } else {
-      if (sha256(stored) !== resp.sanitizedBytesSha256 || stored.length !== resp.storedBytes) {
-        problems.push(`EXCHANGE_BODY_DIGEST_MISMATCH:${ix.seq}`);
-      }
-      if (typeof resp.receivedBytesSha256 !== "string" || !HEX64.test(resp.receivedBytesSha256)) {
-        problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}`);
-      } else if (resp.bodyRedacted === false) {
-        if (
-          resp.receivedBytesSha256 !== resp.sanitizedBytesSha256 ||
-          resp.reproducesReceivedDigest !== true ||
-          resp.retainedBytes !== stored.length
-        ) {
-          problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}`);
-        }
-      } else if (resp.bodyRedacted === true) {
-        if (resp.reproducesReceivedDigest !== false)
-          problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}`);
-        redactedBodies.push(ix.seq);
-      } else problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}`);
+    } else if (sha256(stored) !== resp.sanitizedBytesSha256) {
+      problems.push(`EXCHANGE_BODY_DIGEST_MISMATCH:${ix.seq}`);
     }
+    // Body state, declared and effective limits, digest scope, lengths and flags, against the
+    // independently resolved lane limit.
+    for (const name of bodyAccountingProblems(
+      { lane: pick(ex, "lane"), error: pick(ex, "error"), httpStatus: pick(ex, "httpStatus") },
+      resp,
+      stored,
+      resp.sanitizedBytesSha256,
+      limits,
+    )) {
+      problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}:${name}`);
+    }
+    if (stored !== null && resp.bodyRedacted === true) redactedBodies.push(ix.seq);
     bodyStates.push({ seq: ix.seq, state: resp.bodyState });
     exchanges.push(ex as unknown as PrecheckExchange);
   }
@@ -1420,16 +1594,40 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   ) {
     problems.push("REDACTION_CLAIM_MISMATCH");
   }
+  // Literal-redaction claims name listed files that actually carry the marker; the summary flags
+  // agree with the claims (a claim can only widen what the re-derivation attributes to redaction).
+  const literalByFile = pick(redactionClaim, "literalByFile");
+  const literalCount = new Map<string, number>();
+  if (!isRecord(literalByFile)) problems.push("REDACTION_CLAIM_MISMATCH:literalByFile");
+  else {
+    for (const [p, n] of Object.entries(literalByFile)) {
+      if (!isSafeInt(n) || !listed.has(p) || p === WATCH_EVIDENCE_FILES.report) {
+        problems.push(`REDACTION_CLAIM_MISMATCH:${p}`);
+        continue;
+      }
+      const markers = (contents.get(p) as Buffer).toString("utf8").split(REDACTED).length - 1;
+      if (n > markers) problems.push(`REDACTION_CLAIM_UNSUPPORTED:${p}`);
+      if (n > 0) literalCount.set(p, n);
+    }
+  }
+  const literalDerivation = [...literalCount.keys()].filter(
+    (p) => DERIVATION_FILES.includes(p) || RESPONSE_PATH.test(p),
+  );
+  const claimedApplied =
+    redactedBodies.length > 0 || (redactedFrames?.length ?? 0) > 0 || literalCount.size > 0;
+  const claimedReproducible =
+    redactedBodies.length === 0 &&
+    (redactedFrames?.length ?? 0) === 0 &&
+    literalDerivation.length === 0;
+  if (
+    pick(redactionClaim, "applied") !== claimedApplied ||
+    pick(redactionClaim, "reproducible") !== claimedReproducible
+  ) {
+    problems.push("REDACTION_CLAIM_MISMATCH:flags");
+  }
   if (problems.length > 0) return integrityFailure();
 
   // Completeness: could this sealed evidence support a selected target at all?
-  const literalByFile = pick(redactionClaim, "literalByFile");
-  const literalDerivation = isRecord(literalByFile)
-    ? Object.entries(literalByFile).filter(
-        ([p, n]) =>
-          typeof n === "number" && n > 0 && (DERIVATION_FILES.includes(p) || RESPONSE_PATH.test(p)),
-      )
-    : [];
   const reasons: string[] = [];
   if (code !== "COMPLETED") reasons.push(`TERMINAL_CAUSE:${code}`);
   if (watchStatus !== "NOTIFICATION_CAPTURED")
@@ -1441,13 +1639,13 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   }
   for (const s of redactedBodies) reasons.push(`BODY_REDACTED:${s}`);
   for (const f of redactedFrames ?? []) reasons.push(`FRAME_REDACTED:${String(f)}`);
-  for (const [p] of literalDerivation) reasons.push(`LITERAL_REDACTION:${p}`);
+  for (const p of literalDerivation) reasons.push(`LITERAL_REDACTION:${p}`);
   if (recordedOutcome !== "TARGET_SELECTED") reasons.push(`OUTCOME:${recordedOutcome ?? "NONE"}`);
   const completeness = { sufficientForSelection: reasons.length === 0, reasons };
 
-  // Re-derivation with the reviewed functions on the sealed evidence and policy context.
-  const redactionApplied =
-    redactedBodies.length > 0 || (redactedFrames?.length ?? 0) > 0 || literalDerivation.length > 0;
+  // Re-derivation with the reviewed functions on the sealed evidence and policy context. Which
+  // evidence redaction touched is tracked per input, so only a difference that the redacted
+  // evidence could have caused is reported as a limitation.
   const rederivation = rederive({
     recorded: recorded === true,
     result: isRecord(result) ? result : null,
@@ -1456,7 +1654,14 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
     watchResult,
     contextDoc,
     exchanges,
-    redactionApplied,
+    scope: {
+      frames:
+        (redactedFrames?.length ?? 0) > 0 ||
+        literalCount.has(WATCH_EVIDENCE_FILES.watchObservations),
+      recorded: literalCount.has(WATCH_EVIDENCE_FILES.validation),
+      bodies: new Set(redactedBodies),
+      exchangeLiteral: new Set(indexed.filter((x) => literalCount.has(x.file)).map((x) => x.seq)),
+    },
   });
   const verified = rederivation.status !== "MISMATCH";
   return {
@@ -1473,6 +1678,239 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   };
 }
 
+/** Which sealed inputs credential redaction changed. */
+interface RedactionScope {
+  /** Watch frame bytes or watch-observation strings (the discovery verification's inputs). */
+  readonly frames: boolean;
+  /** Strings of the recorded validation result (the comparison's recorded side). */
+  readonly recorded: boolean;
+  /** Response bodies by exchange seq. */
+  readonly bodies: ReadonlySet<number>;
+  /** Strings of exchange records (request identity, errors, headers) by seq. */
+  readonly exchangeLiteral: ReadonlySet<number>;
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Deep equality where, with `allowRedacted`, a recorded string carrying the redaction marker
+ * matches a derived string that equals it outside the redacted spans. Numbers, booleans, null
+ * and structure must match exactly.
+ */
+function sameModuloRedaction(derived: unknown, recorded: unknown, allowRedacted: boolean): boolean {
+  if (typeof recorded === "string" && typeof derived === "string") {
+    if (derived === recorded) return true;
+    if (!allowRedacted || !recorded.includes(REDACTED)) return false;
+    const pattern = recorded.split(REDACTED).map(escapeRegExp).join("[\\s\\S]+");
+    return new RegExp(`^${pattern}$`).test(derived);
+  }
+  if (Array.isArray(recorded) || Array.isArray(derived)) {
+    return (
+      Array.isArray(recorded) &&
+      Array.isArray(derived) &&
+      recorded.length === derived.length &&
+      recorded.every((v, i) => sameModuloRedaction(derived[i], v, allowRedacted))
+    );
+  }
+  if (isRecord(recorded) || isRecord(derived)) {
+    if (!isRecord(recorded) || !isRecord(derived)) return false;
+    const keys = (o: Record<string, unknown>) =>
+      Object.keys(o)
+        .filter((k) => o[k] !== undefined)
+        .sort();
+    const rk = keys(recorded);
+    return (
+      canonical(rk) === canonical(keys(derived)) &&
+      rk.every((k) => sameModuloRedaction(derived[k], recorded[k], allowRedacted))
+    );
+  }
+  return canonical(derived) === canonical(recorded);
+}
+
+/** Discovery fields that are numbers: credential redaction can never change them. */
+const NUMERIC_DISCOVERY_FIELDS = [
+  "slot",
+  "subscriptionId",
+  "notificationReceivedAtMs",
+  "watchStartedAtMs",
+] as const;
+
+/**
+ * With redacted frames the discovery proof cannot be re-verified exactly, but the recorded
+ * discovery's numbers must still agree with the sealed watch metadata, which redaction does not
+ * change. Returns a contradiction, or null.
+ */
+function frameMetadataContradiction(
+  watchResult: unknown,
+  discovery: Record<string, unknown>,
+): string | null {
+  const obs = pick(watchResult, "observations");
+  const frames = pick(obs, "applicationFrames");
+  const last = Array.isArray(frames) ? frames[frames.length - 1] : undefined;
+  let frameSlot: unknown;
+  try {
+    const payload = pick(last, "payload");
+    frameSlot =
+      typeof payload === "string"
+        ? pick(pick(pick(pick(JSON.parse(payload), "params"), "result"), "context"), "slot")
+        : undefined;
+  } catch {
+    frameSlot = undefined;
+  }
+  const checks: [string, unknown, unknown][] = [
+    ["watchStartedAtMs", discovery.watchStartedAtMs, pick(obs, "startedAtMs")],
+    ["notificationReceivedAtMs", discovery.notificationReceivedAtMs, pick(last, "timestampMs")],
+    ["subscriptionId", discovery.subscriptionId, pick(obs, "subscriptionId")],
+    ["slot", discovery.slot, pick(pick(watchResult, "notification"), "slot")],
+    ...(typeof frameSlot === "number"
+      ? [["slot (notification frame)", discovery.slot, frameSlot] as [string, unknown, unknown]]
+      : []),
+  ];
+  const bad = checks.filter(([, a, b]) => !isSafeInt(a) || a !== b).map(([n]) => n);
+  return bad.length > 0
+    ? `Recorded discovery numbers contradict the sealed watch metadata (${bad.join(", ")}); redaction cannot change numbers`
+    : null;
+}
+
+/** Recorded outcomes reachable only after the transaction qualified and the market body was read. */
+const MARKET_BODY_OUTCOMES: ReadonlySet<string> = new Set([
+  "TARGET_SELECTED",
+  "START_WINDOW_ALREADY_CLOSED",
+  "MARKET_NONMATCH",
+  "MARKET_EVIDENCE_UNAVAILABLE",
+]);
+const TARGET_OUTCOMES: ReadonlySet<string> = new Set([
+  "TARGET_SELECTED",
+  "START_WINDOW_ALREADY_CLOSED",
+]);
+const TRANSACTION_STAGE_INVALID_REASONS: ReadonlySet<string> = new Set([
+  "MARKET_REQUEST_WITHOUT_QUALIFIED_TRANSACTION",
+  "MARKET_REQUEST_NOT_FOR_DECODED_MINT",
+]);
+
+type RedactionCause = "TRANSACTION_BODY" | "MARKET_BODY" | "EXCHANGE_RECORD";
+
+/**
+ * The redacted evidence that the pure derivation actually consumed and that stopped it, or null
+ * when the derivation's result depends on no redacted evidence (then any difference from the
+ * recorded result is a contradiction that redaction cannot explain).
+ */
+function redactionCauseOf(
+  pure: { readonly outcome: string; readonly reason: string | null },
+  exchanges: readonly PrecheckExchange[],
+  discovery: WatchedDiscoveryEvidence,
+  scope: RedactionScope,
+): RedactionCause | null {
+  // Redacted request identity or error strings feed the request policy itself; attributed
+  // conservatively (the recorded result is still checked for independent contradictions).
+  if (scope.exchangeLiteral.size > 0) return "EXCHANGE_RECORD";
+  const [tx, market] = exchanges;
+  if (
+    tx &&
+    scope.bodies.has(tx.seq) &&
+    (pure.reason === "EVIDENCE_UNAVAILABLE:BODY_REDACTED" ||
+      pure.reason === "MARKET_REQUEST_WITHOUT_QUALIFIED_TRANSACTION")
+  ) {
+    const ev = evaluateInitializationExchange(tx, {
+      signature: discovery.signature,
+      slot: discovery.slot,
+    });
+    if (!ev.ok && ev.status === "EVIDENCE_UNAVAILABLE:BODY_REDACTED") return "TRANSACTION_BODY";
+  }
+  if (
+    market &&
+    scope.bodies.has(market.seq) &&
+    pure.outcome === "MARKET_EVIDENCE_UNAVAILABLE" &&
+    pure.reason === "BODY_REDACTED"
+  ) {
+    return "MARKET_BODY";
+  }
+  return null;
+}
+
+/**
+ * Parts of the recorded result that do not depend on the redacted evidence must still agree with
+ * the sealed evidence. Returns a contradiction, or null.
+ */
+function recordedContradiction(
+  cause: RedactionCause,
+  result: Record<string, unknown>,
+  recordedOutcome: string | null,
+  discovery: WatchedDiscoveryEvidence,
+  exchanges: readonly PrecheckExchange[],
+  recordedRedacted: boolean,
+): string | null {
+  const same = (derived: unknown, recordedValue: unknown) =>
+    sameModuloRedaction(derived, recordedValue, recordedRedacted);
+  const outcome = recordedOutcome ?? "";
+  const target = result.target;
+  if (TARGET_OUTCOMES.has(outcome) !== isRecord(target)) {
+    return "The recorded target's presence contradicts the recorded outcome";
+  }
+  const [tx, market] = exchanges;
+  if (cause === "TRANSACTION_BODY") {
+    if (
+      outcome === "EXCHANGE_EVIDENCE_INVALID" &&
+      !TRANSACTION_STAGE_INVALID_REASONS.has(String(result.reason))
+    ) {
+      return "The sealed request policy passes, but the recorded result rejected it; the redacted transaction body cannot explain that";
+    }
+    if (!market && MARKET_BODY_OUTCOMES.has(outcome) && outcome !== "MARKET_EVIDENCE_UNAVAILABLE") {
+      return "The recorded outcome needs a market exchange that was never sealed";
+    }
+  }
+  if (cause === "MARKET_BODY") {
+    if (!MARKET_BODY_OUTCOMES.has(outcome)) {
+      return "The sealed transaction qualifies and the market body was read, but the recorded outcome is not one that follows; the redacted market body cannot explain that";
+    }
+  }
+  if (!isRecord(target)) return null;
+  const init = pick(target, "initialization");
+  const marketPart = pick(target, "market");
+  if (!tx || !market) return "A recorded target needs both exchanges";
+  if (
+    pick(init, "slot") !== discovery.slot ||
+    pick(init, "exchangeSeq") !== tx.seq ||
+    pick(marketPart, "exchangeSeq") !== market.seq ||
+    pick(marketPart, "receivedAtMs") !== market.completedAtMs ||
+    !same(discovery.signature, pick(init, "signature")) ||
+    !same(
+      market.request.url,
+      SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.marketUrlFor(String(target.mintAddress)),
+    )
+  ) {
+    return "The recorded target's discovery, exchange or market-request identity contradicts the sealed evidence";
+  }
+  if (cause === "MARKET_BODY") {
+    // The unredacted transaction body re-derives the initialization independently.
+    const ev = evaluateInitializationExchange(tx, {
+      signature: discovery.signature,
+      slot: discovery.slot,
+    });
+    if (!ev.ok) return "The sealed transaction no longer qualifies";
+    const derived = {
+      poolId: ev.init.poolId,
+      mintAddress: ev.init.mintAddress,
+      signature: ev.init.signature,
+      slot: ev.init.slot,
+      transactionBlockTimeSec: ev.init.transactionBlockTimeSec,
+      instructionRequestedOpenTimeSec: ev.init.instructionRequestedOpenTimeSec,
+    };
+    const recordedInit = {
+      poolId: target.poolId,
+      mintAddress: target.mintAddress,
+      signature: pick(init, "signature"),
+      slot: pick(init, "slot"),
+      transactionBlockTimeSec: pick(init, "transactionBlockTimeSec"),
+      instructionRequestedOpenTimeSec: pick(init, "instructionRequestedOpenTimeSec"),
+    };
+    if (!same(derived, recordedInit)) {
+      return "The recorded target's initialization contradicts the unredacted transaction evidence";
+    }
+  }
+  return null;
+}
+
 function rederive(a: {
   recorded: boolean;
   result: Record<string, unknown> | null;
@@ -1481,7 +1919,7 @@ function rederive(a: {
   watchResult: unknown;
   contextDoc: unknown;
   exchanges: readonly PrecheckExchange[];
-  redactionApplied: boolean;
+  scope: RedactionScope;
 }): WatchEvidenceVerification["rederivation"] {
   const out = (
     status: WatchRederivationStatus,
@@ -1501,10 +1939,10 @@ function rederive(a: {
       "Operator cancellation is an acquisition event; the recorded outcome is preserved and no target is derived",
     );
   }
-  const differs = (detail: string, o: string | null = null, r: string | null = null) =>
-    a.redactionApplied
-      ? out("LIMITED_BY_REDACTION", `Redaction prevents exact re-derivation: ${detail}`, o, r)
-      : out("MISMATCH", detail, o, r);
+  const limited = (detail: string, o: string | null = null, r: string | null = null) =>
+    out("LIMITED_BY_REDACTION", `Redaction prevents exact re-derivation: ${detail}`, o, r);
+  const mismatch = (detail: string, o: string | null = null, r: string | null = null) =>
+    out("MISMATCH", detail, o, r);
 
   const supplied = pick(a.contextDoc, "suppliedContext");
   const deadlineAt = pick(supplied, "overallDeadlineAtMs");
@@ -1514,66 +1952,134 @@ function rederive(a: {
     ...(isRecord(limits) ? { limits: limits as WatchEvidenceContext["limits"] } : {}),
   };
   const result = a.result;
+  const recordedDiscovery = isRecord(result.discovery) ? result.discovery : null;
   const completedAtMs = typeof result.completedAtMs === "number" ? result.completedAtMs : undefined;
+
+  // 1. Discovery (inputs: the watch frames). Redaction there can only explain a difference when
+  //    the frames were redacted; the derivation then continues from the recorded discovery, whose
+  //    numbers must still agree with the sealed watch metadata.
   const verification = validateWatchedDiscoveryEvidence(
     a.watchResult as BoundedAmmV4CreationWatchResult,
-    {
-      nowMs: completedAtMs,
-    },
+    { nowMs: completedAtMs },
   );
+  type Rederivation = ReturnType<typeof out>;
+  const continueFromRecorded = (
+    why: string,
+    o: string | null,
+    r: string | null,
+  ): { stop: Rederivation } | { discovery: WatchedDiscoveryEvidence; limitation: string } => {
+    if (!a.scope.frames) return { stop: mismatch(why, o, r) };
+    if (recordedDiscovery === null) {
+      return {
+        stop: limited(
+          `${why}; the watch frames are redacted and no recorded discovery remains to check`,
+          o,
+          r,
+        ),
+      };
+    }
+    const contradiction = frameMetadataContradiction(a.watchResult, recordedDiscovery);
+    if (contradiction !== null) return { stop: mismatch(contradiction, o, r) };
+    return {
+      discovery: recordedDiscovery as unknown as WatchedDiscoveryEvidence,
+      limitation: `${why}; the watch frames are redacted, so the recorded discovery (whose numbers agree with the sealed watch metadata) is used for the remaining checks`,
+    };
+  };
+  let discovery: WatchedDiscoveryEvidence;
+  let discoveryLimitation: string | null = null;
   if (!verification.ok) {
     const outcome =
       verification.status === "DISCOVERY_TAMPERED"
         ? "DISCOVERY_TAMPERED"
         : "DISCOVERY_EVIDENCE_INVALID";
-    return outcome === a.recordedOutcome &&
-      verification.reason === result.reason &&
-      a.exchanges.length === 0
-      ? out(
-          "REPRODUCED",
-          "Discovery verification re-derives the recorded rejection",
-          outcome,
-          verification.reason,
-        )
-      : differs(
-          "Discovery verification of the sealed frames disagrees with the recorded result",
-          outcome,
-          verification.reason,
-        );
-  }
-  if (
+    if (
+      outcome === a.recordedOutcome &&
+      a.exchanges.length === 0 &&
+      sameModuloRedaction(verification.reason, result.reason, a.scope.recorded)
+    ) {
+      return verification.reason === result.reason
+        ? out(
+            "REPRODUCED",
+            "Discovery verification re-derives the recorded rejection",
+            outcome,
+            verification.reason,
+          )
+        : limited("the recorded rejection reason is redacted", outcome, verification.reason);
+    }
+    const next = continueFromRecorded(
+      "Discovery verification of the sealed frames disagrees with the recorded result",
+      outcome,
+      verification.reason,
+    );
+    if ("stop" in next) return next.stop;
+    discovery = next.discovery;
+    discoveryLimitation = next.limitation;
+  } else if (
     a.recordedOutcome === "DISCOVERY_TAMPERED" ||
     a.recordedOutcome === "DISCOVERY_EVIDENCE_INVALID"
   ) {
-    return differs(
+    return (a.scope.frames ? limited : mismatch)(
       "Sealed frames verify, but the recorded result rejected discovery",
       "DISCOVERY_VERIFIED",
     );
+  } else if (
+    recordedDiscovery === null ||
+    NUMERIC_DISCOVERY_FIELDS.some((k) => verification.discovery[k] !== recordedDiscovery[k])
+  ) {
+    return mismatch(
+      "Re-derived discovery differs from the recorded discovery in fields redaction cannot change",
+    );
+  } else if (canonical(verification.discovery) !== canonical(recordedDiscovery)) {
+    if (
+      !a.scope.frames &&
+      sameModuloRedaction(verification.discovery, recordedDiscovery, a.scope.recorded)
+    ) {
+      discovery = verification.discovery;
+      discoveryLimitation = "the recorded discovery strings are redacted";
+    } else {
+      const next = continueFromRecorded(
+        "Re-derived discovery strings differ from the recorded discovery",
+        null,
+        null,
+      );
+      if ("stop" in next) return next.stop;
+      discovery = next.discovery;
+      discoveryLimitation = next.limitation;
+    }
+  } else {
+    discovery = verification.discovery;
   }
-  if (canonical(verification.discovery) !== canonical(result.discovery)) {
-    return differs("Re-derived discovery differs from the recorded discovery");
-  }
+
+  // 2. Deadline (numbers and policy context only; redaction cannot change it).
   let deadline: number;
   try {
-    deadline = computeWatchValidationDeadline(verification.discovery, context);
+    deadline = computeWatchValidationDeadline(discovery, context);
   } catch {
-    return differs("Sealed policy context is invalid");
+    return mismatch("Sealed policy context is invalid");
   }
   if (deadline !== result.validationDeadlineAtMs) {
-    return differs("Re-derived validation deadline differs from the recorded deadline");
+    return mismatch("Re-derived validation deadline differs from the recorded deadline");
   }
-  const pure = evaluateWatchCandidateEvidence(verification.discovery, a.exchanges, context);
+
+  // 3. Pure candidate derivation on the sealed exchanges.
+  const pure = evaluateWatchCandidateEvidence(discovery, a.exchanges, context);
   if (
     pure.outcome === a.recordedOutcome &&
     pure.reason === result.reason &&
     canonical(pure.target) === canonical(result.target)
   ) {
-    return out(
-      "REPRODUCED",
-      "Pure derivation re-derives the recorded outcome, reason and target",
-      pure.outcome,
-      pure.reason,
-    );
+    return discoveryLimitation === null
+      ? out(
+          "REPRODUCED",
+          "Pure derivation re-derives the recorded outcome, reason and target",
+          pure.outcome,
+          pure.reason,
+        )
+      : limited(
+          `${discoveryLimitation}; the exchanges re-derive the recorded outcome, reason and target`,
+          pure.outcome,
+          pure.reason,
+        );
   }
   if (ACQUISITION_OUTCOMES.has(a.recordedOutcome ?? "") && pure.outcome !== "TARGET_SELECTED") {
     return out(
@@ -1583,5 +2089,47 @@ function rederive(a: {
       pure.reason,
     );
   }
-  return differs("Pure derivation disagrees with the recorded result", pure.outcome, pure.reason);
+  const cause = redactionCauseOf(pure, a.exchanges, discovery, a.scope);
+  if (cause === null) {
+    if (
+      a.scope.recorded &&
+      pure.outcome === a.recordedOutcome &&
+      sameModuloRedaction(
+        { reason: pure.reason, target: pure.target },
+        { reason: result.reason, target: result.target },
+        true,
+      )
+    ) {
+      return limited(
+        "the recorded reason or target strings are redacted; everything else re-derives",
+        pure.outcome,
+        pure.reason,
+      );
+    }
+    return mismatch(
+      "Pure derivation disagrees with the recorded result, and it consumed no redacted evidence that could explain the difference",
+      pure.outcome,
+      pure.reason,
+    );
+  }
+  const contradiction = recordedContradiction(
+    cause,
+    result,
+    a.recordedOutcome,
+    discovery,
+    a.exchanges,
+    a.scope.recorded,
+  );
+  if (contradiction !== null) return mismatch(contradiction, pure.outcome, pure.reason);
+  const what =
+    cause === "TRANSACTION_BODY"
+      ? "the redacted transaction body stops the derivation"
+      : cause === "MARKET_BODY"
+        ? "the redacted market body stops the derivation; the transaction-derived target parts re-derive"
+        : "redacted exchange record strings feed the request checks";
+  return limited(
+    discoveryLimitation === null ? what : `${discoveryLimitation}; ${what}`,
+    pure.outcome,
+    pure.reason,
+  );
 }

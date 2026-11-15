@@ -317,6 +317,52 @@ async function selectedRun() {
   return { env, validation, calls };
 }
 
+const LIMIT_64 = Object.freeze({ dexscreenerMaxResponseBytes: 64 });
+
+/** A market body cut at 64 bytes by the reviewed validator, sealed under the same limits. */
+async function partialMarketRun(raw: Buffer) {
+  const env = await captureWatch();
+  const validation = await validate(env, makeMockFetch(env.sched, { marketRawBody: raw }), {
+    limits: LIMIT_64,
+  });
+  const sealed = seal({
+    watchResult: env.watchResult,
+    validation,
+    policyContext: { limits: LIMIT_64 },
+  });
+  return { validation, ...sealed };
+}
+
+/** A selected run whose market body echoes the RPC key (plain and escaped): it is redacted. */
+async function redactedMarketRun() {
+  const env = await captureWatch();
+  const marketText = JSON.stringify({
+    ...(marketResponse(START_MS - 300_000) as Record<string, unknown>),
+    token: "SYNTHETIC-generic-token-field",
+    echo: `request key ${RPC_KEY}`,
+  });
+  const validation = await validate(
+    env,
+    makeMockFetch(env.sched, { marketRawBody: Buffer.from(marketText, "utf8") }),
+  );
+  expect(validation.outcome).toBe("TARGET_SELECTED");
+  return { validation, ...seal({ watchResult: env.watchResult, validation }) };
+}
+
+let forgeries = 0;
+/** Verifies a re-forged copy (consistent hashes) and returns its verification. */
+function verifyForged(dir: string, edits: Record<string, (doc: Loose) => void>) {
+  const d = copyRun(dir, `forged-${++forgeries}`);
+  reforge(d, edits);
+  return verifyWatchEvidence(d);
+}
+
+/** Both copies of the recorded validation result (validation.json and selection.json). */
+const editRecorded = (edit: (r: Loose) => void): Record<string, (doc: Loose) => void> => ({
+  [WATCH_EVIDENCE_FILES.validation]: (doc) => edit(doc.result),
+  [WATCH_EVIDENCE_FILES.selection]: (doc) => edit(doc),
+});
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -1112,5 +1158,359 @@ describe("fresh AMM v4 watch evidence (offline sealing and verification)", () =>
       expect.arrayContaining(["FRAME_REDACTED:2", "LITERAL_REDACTION:watch-observations.json"]),
     );
     expect(vc).toMatchObject({ verified: true, selectionConfirmed: false });
+  });
+
+  it("W-08: escaped and mixed credential fragments at the end of a partial body are redacted, also when cut inside an escape", async () => {
+    const tail = " and more bytes after the cut";
+    const cases = [
+      // The review reproduction: an escaped first character, then literal characters.
+      { raw: `${"x".repeat(50)}\\u0053${RPC_KEY.slice(1)}${tail}`, keep: 50 },
+      // Mixed literal/escaped characters (upper-case hex), cut inside the next escape sequence.
+      { raw: `${"x".repeat(52)}SY\\u004ETH\\u0045${RPC_KEY.slice(6)}${tail}`, keep: 52 },
+      // Four literal characters, cut right after the backslash that starts an escape.
+      { raw: `${"x".repeat(59)}SYNT\\u0048${RPC_KEY.slice(5)}${tail}`, keep: 59 },
+      // Every character escaped (lower-case hex), cut inside the fifth escape.
+      {
+        raw: `${"x".repeat(37)}\\u0053\\u0059\\u004e\\u0054\\u0048${RPC_KEY.slice(5)}${tail}`,
+        keep: 37,
+      },
+    ];
+    for (const c of cases) {
+      const raw = Buffer.from(c.raw, "utf8");
+      const run = await partialMarketRun(raw);
+      expect(run.result.ok).toBe(true);
+      expect(run.validation.exchanges[1]!.response.body).toBe(c.raw.slice(0, 64));
+      expectNoSecrets(run.dir);
+      const market = readJson(run.dir, "exchanges/0002.json");
+      const body = `${"x".repeat(c.keep)}[REDACTED_PARTIAL]`;
+      expect(market.response).toMatchObject({
+        bodyState: "PARTIAL_OVERFLOW",
+        completeEvidence: false,
+        retainedBytes: 64,
+        maxResponseBytes: 64,
+        receivedDigestScope: "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY",
+        bodyEncoding: "utf8",
+        storedBytes: Buffer.byteLength(body),
+        bodyRedacted: true,
+        reproducesReceivedDigest: false,
+        body,
+      });
+      // The original-prefix digest is kept; the sanitized digest covers exactly the stored bytes.
+      expect(market.response.receivedBytesSha256).toBe(sha256(raw.subarray(0, 64)));
+      expect(market.response.sanitizedBytesSha256).toBe(sha256(Buffer.from(body, "utf8")));
+      const report = readJson(run.dir, WATCH_EVIDENCE_FILES.report);
+      expect(report.redaction).toMatchObject({ applied: true, bodies: [2], reproducible: false });
+      const v = verifyWatchEvidence(run.dir);
+      expect(v.integrity).toEqual({ ok: true, problems: [] });
+      expect(v.completeness.reasons).toContain("BODY_REDACTED:2");
+      // The overflow decides the outcome before the body is read, so it still reproduces.
+      expect(v.rederivation).toMatchObject({
+        status: "REPRODUCED",
+        rederivedOutcome: run.validation.outcome,
+      });
+    }
+
+    // Fewer than four credential characters before the cut stay below the fragment threshold.
+    const short = `${"x".repeat(57)}SYN\\u0054${RPC_KEY.slice(4)}${tail}`;
+    const below = await partialMarketRun(Buffer.from(short, "utf8"));
+    expect(readJson(below.dir, "exchanges/0002.json").response).toMatchObject({
+      body: short.slice(0, 64),
+      bodyRedacted: false,
+      reproducesReceivedDigest: true,
+    });
+  });
+
+  it("W-09: exchange evidence is bound to the independently resolved limits and consistent body accounting", async () => {
+    const { env, validation } = await selectedRun();
+    // Both actual bodies are far larger than the 64-byte limits forged below.
+    const bodies = validation.exchanges.map((e) => Number(e.response.retainedBytes));
+    expect(bodies.every((n) => n > 64)).toBe(true);
+
+    // (a) The review reproduction: limits far below the actual bodies are refused before writing.
+    const tooSmall = seal({
+      watchResult: env.watchResult,
+      validation,
+      policyContext: { limits: { rpcMaxResponseBytes: 64, dexscreenerMaxResponseBytes: 64 } },
+    });
+    expect(tooSmall.result).toMatchObject({ ok: false, status: "SEAL_INPUT_INVALID" });
+    if (tooSmall.result.ok) throw new Error("unreachable");
+    expect(tooSmall.result.reason).toContain("DECLARED_LIMIT_MISMATCH");
+    expect(tooSmall.result.reason).toContain("RETAINED_EXCEEDS_LIMIT");
+    expect(existsSync(tooSmall.dir)).toBe(false);
+
+    // (b) Evidence acquired under a stricter limit cannot be sealed under the default context.
+    const partial = await partialMarketRun(Buffer.from("y".repeat(200), "utf8"));
+    expect(partial.result.ok).toBe(true);
+    const env64 = await captureWatch();
+    const v64 = await validate(
+      env64,
+      makeMockFetch(env64.sched, { marketRawBody: Buffer.from("y".repeat(200)) }),
+      { limits: LIMIT_64 },
+    );
+    const defaultContext = seal({ watchResult: env64.watchResult, validation: v64 });
+    expect(defaultContext.result).toMatchObject({
+      status: "SEAL_INPUT_INVALID",
+      reason: expect.stringContaining("exchange 2 body accounting"),
+    });
+    expect(existsSync(defaultContext.dir)).toBe(false);
+
+    // (c) Contradictory supplied response metadata is refused before writing.
+    const contradictory = (edit: (r: Loose) => void): WatchCandidateValidationResult => {
+      const v = JSON.parse(JSON.stringify(validation)) as Loose;
+      edit(v.exchanges[1].response);
+      return v as WatchCandidateValidationResult;
+    };
+    for (const edit of [
+      (r: Loose) => void (r.completeEvidence = false),
+      (r: Loose) => void (r.receivedDigestScope = "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY"),
+      (r: Loose) => void (r.maxResponseBytes = 1),
+      (r: Loose) => void (r.observedBytes = 0),
+      (r: Loose) => void (r.storedBytes += 1),
+    ]) {
+      const s = seal({ watchResult: env.watchResult, validation: contradictory(edit) });
+      expect(s.result).toMatchObject({ status: "SEAL_INPUT_INVALID" });
+      expect(existsSync(s.dir)).toBe(false);
+    }
+
+    // (d) Verification enforces the same accounting independently (re-forged, consistent hashes).
+    const { dir } = seal({ watchResult: env.watchResult, validation });
+    expect(verifyWatchEvidence(dir).selectionConfirmed).toBe(true);
+    const problemsOf = (edits: Record<string, (doc: Loose) => void>) => {
+      const v = verifyForged(dir, edits);
+      expect(v).toMatchObject({ verified: false, selectionConfirmed: false });
+      expect(v.rederivation.status).toBe("NOT_ATTEMPTED");
+      return v.integrity.problems;
+    };
+    const market = (edit: (r: Loose) => void) => ({
+      "exchanges/0002.json": (doc: Loose) => edit(doc.response),
+    });
+    // The review reproduction: all four contradictions at once.
+    expect(
+      problemsOf(
+        market((r) => {
+          r.completeEvidence = false;
+          r.receivedDigestScope = "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY";
+          r.maxResponseBytes = 1;
+          r.observedBytes = 0;
+        }),
+      ),
+    ).toEqual([
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:DECLARED_LIMIT_MISMATCH",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:COMPLETE_EVIDENCE_FLAG",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:OBSERVED_BYTES",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:DIGEST_SCOPE",
+    ]);
+    const single: [(r: Loose) => void, string[]][] = [
+      [(r) => void (r.completeEvidence = false), ["COMPLETE_EVIDENCE_FLAG"]],
+      [
+        (r) => void (r.receivedDigestScope = "ORIGINAL_RETAINED_PREFIX_BYTES_ONLY"),
+        ["DIGEST_SCOPE"],
+      ],
+      [(r) => void (r.maxResponseBytes = 1), ["DECLARED_LIMIT_MISMATCH"]],
+      [(r) => void (r.observedBytes = 0), ["OBSERVED_BYTES"]],
+      [(r) => void (r.storedBytes += 1), ["STORED_BYTES"]],
+      [(r) => void (r.retainedBytes += 1), ["OBSERVED_BYTES", "UNREDACTED_BODY_DIGEST"]],
+      [(r) => void (r.reproducesReceivedDigest = false), ["UNREDACTED_BODY_DIGEST"]],
+      [(r) => void (r.bodyEncoding = "base64"), ["BODY_UNDECODABLE"]],
+    ];
+    for (const [edit, names] of single) {
+      const problems = problemsOf(market(edit));
+      expect(problems).toEqual(
+        names[0] === "BODY_UNDECODABLE"
+          ? ["EXCHANGE_BODY_UNDECODABLE:2"]
+          : names.map((n) => `EXCHANGE_BODY_ACCOUNTING_INVALID:2:${n}`),
+      );
+    }
+    // A complete body recorded with an overflow error (ledger kept consistent).
+    expect(
+      problemsOf({
+        "exchanges/0001.json": (doc) => void (doc.error = "RESPONSE_TOO_LARGE"),
+        [WATCH_EVIDENCE_FILES.requestLedger]: (doc) =>
+          void (doc.entries[0].error = "RESPONSE_TOO_LARGE"),
+      }),
+    ).toEqual(["EXCHANGE_BODY_ACCOUNTING_INVALID:1:COMPLETE_BODY_WITH_ERROR"]);
+
+    // (e) Limits forged into the sealed context: the bodies exceed them, even when the declared
+    //     limits are forged too; and the recorded resolved limits are only compared, never trusted.
+    const forgedLimits = { rpcMaxResponseBytes: 64, dexscreenerMaxResponseBytes: 64 };
+    const contextEdit = (doc: Loose) => {
+      doc.suppliedContext.limits = forgedLimits;
+      Object.assign(doc.resolvedLimits, forgedLimits);
+    };
+    expect(problemsOf({ [WATCH_EVIDENCE_FILES.context]: contextEdit })).toEqual([
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:1:DECLARED_LIMIT_MISMATCH",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:1:RETAINED_EXCEEDS_LIMIT",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:DECLARED_LIMIT_MISMATCH",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:RETAINED_EXCEEDS_LIMIT",
+    ]);
+    expect(
+      problemsOf({
+        [WATCH_EVIDENCE_FILES.context]: contextEdit,
+        "exchanges/0001.json": (doc) => void (doc.response.maxResponseBytes = 64),
+        "exchanges/0002.json": (doc) => void (doc.response.maxResponseBytes = 64),
+      }),
+    ).toEqual([
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:1:RETAINED_EXCEEDS_LIMIT",
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:RETAINED_EXCEEDS_LIMIT",
+    ]);
+    expect(
+      problemsOf({
+        [WATCH_EVIDENCE_FILES.context]: (doc) => void (doc.resolvedLimits.rpcMaxResponseBytes = 64),
+      }),
+    ).toEqual(["CONTEXT_RESOLVED_LIMITS_MISMATCH"]);
+    expect(
+      problemsOf({
+        [WATCH_EVIDENCE_FILES.context]: (doc) => void (doc.recordedValidationDeadlineAtMs += 1),
+      }),
+    ).toEqual(["CONTEXT_DEADLINE_MISMATCH"]);
+
+    // (f) A partial body must retain exactly the limit of a larger observed body.
+    expect(verifyWatchEvidence(partial.dir).integrity.ok).toBe(true);
+    const partialForged = verifyForged(partial.dir, {
+      "exchanges/0002.json": (doc) => void (doc.response.observedBytes = 64),
+    });
+    expect(partialForged.integrity.problems).toEqual([
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:OBSERVED_BYTES",
+    ]);
+    const partialWithoutError = verifyForged(partial.dir, {
+      "exchanges/0002.json": (doc) => void (doc.error = null),
+      [WATCH_EVIDENCE_FILES.requestLedger]: (doc) => void (doc.entries[1].error = null),
+    });
+    expect(partialWithoutError.integrity.problems).toEqual([
+      "EXCHANGE_BODY_ACCOUNTING_INVALID:2:PARTIAL_BODY_ERROR",
+    ]);
+  });
+
+  it("W-10: redaction is a limitation only for the evidence it touched; independent contradictions stay MISMATCH", async () => {
+    const run = await redactedMarketRun();
+    const base = verifyWatchEvidence(run.dir);
+    expect(base.rederivation).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      rederivedReason: "BODY_REDACTED",
+    });
+    expect(base).toMatchObject({ verified: true, selectionConfirmed: false });
+
+    // (a) The review reproduction: the discovery slot +99, while the untouched frames derive the
+    //     original slot. The market-body redaction cannot explain it.
+    const slot = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.discovery.slot += 99)),
+    );
+    expect(slot.integrity.ok).toBe(true);
+    expect(slot.rederivation.status).toBe("MISMATCH");
+    expect(slot.rederivation.detail).toMatch(/fields redaction cannot change/);
+    expect(slot).toMatchObject({ verified: false, selectionConfirmed: false });
+    // Discovery strings come from unredacted frames: a body redaction cannot excuse them either.
+    const logs = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.discovery.logs = ["Program log: forged"])),
+    );
+    expect(logs.rederivation.status).toBe("MISMATCH");
+    expect(logs.rederivation.detail).toBe(
+      "Re-derived discovery strings differ from the recorded discovery",
+    );
+
+    // (b) The transaction-derived target parts re-derive from the unredacted transaction body.
+    const pool = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.poolId = "11111111111111111111111111111112")),
+    );
+    expect(pool.rederivation.status).toBe("MISMATCH");
+    expect(pool).toMatchObject({ verified: false, selectionConfirmed: false });
+    const block = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.initialization.transactionBlockTimeSec += 1)),
+    );
+    expect(block.rederivation.status).toBe("MISMATCH");
+    const received = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.market.receivedAtMs += 1)),
+    );
+    expect(received.rederivation.status).toBe("MISMATCH");
+
+    // (c) A recorded outcome that cannot follow the qualifying, unredacted transaction is not
+    //     explained by the market-body redaction.
+    const nonmatch = {
+      recordedOutcome: "TRANSACTION_NONMATCH",
+      runOutcome: "TRANSACTION_NONMATCH",
+      reason: "DECODED_NONMATCH:NO_AMM_V4_INITIALIZE2",
+    };
+    const failed = verifyForged(run.dir, {
+      [WATCH_EVIDENCE_FILES.validation]: (doc) =>
+        void Object.assign(doc.result, {
+          ok: false,
+          outcome: nonmatch.recordedOutcome,
+          reason: nonmatch.reason,
+          target: null,
+        }),
+      [WATCH_EVIDENCE_FILES.selection]: (doc) =>
+        void Object.assign(doc, { ...nonmatch, selected: false, target: null }),
+      [WATCH_EVIDENCE_FILES.report]: (doc) =>
+        void Object.assign(doc, {
+          recordedOutcome: nonmatch.recordedOutcome,
+          runOutcome: nonmatch.runOutcome,
+          selected: false,
+        }),
+    });
+    expect(failed.integrity.ok).toBe(true);
+    expect(failed.rederivation.status).toBe("MISMATCH");
+    expect(failed.verified).toBe(false);
+
+    // (d) The deadline depends only on numbers and the policy context: never a redaction limit.
+    const deadline = verifyForged(run.dir, {
+      [WATCH_EVIDENCE_FILES.validation]: (doc) => void (doc.result.validationDeadlineAtMs -= 1),
+      [WATCH_EVIDENCE_FILES.context]: (doc) => {
+        doc.recordedValidationDeadlineAtMs -= 1;
+        doc.recomputedValidationDeadlineAtMs -= 1;
+      },
+    });
+    expect(deadline.rederivation).toMatchObject({
+      status: "MISMATCH",
+      detail: "Re-derived validation deadline differs from the recorded deadline",
+    });
+
+    // (e) Values that only the redacted market body determines remain a stated limitation.
+    const indicator = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.market.informationalIndicators.liquidityUsd += 1)),
+    );
+    expect(indicator.rederivation.status).toBe("LIMITED_BY_REDACTION");
+    expect(indicator).toMatchObject({ verified: true, selectionConfirmed: false });
+
+    // (f) Redacted frames: the recorded discovery's numbers must agree with the sealed watch
+    //     metadata, and the unredacted exchanges are still checked against the recorded result.
+    const frameEnv = await captureWatch({
+      script: [
+        { atMs: 600, data: ACK },
+        { atMs: 10_000, data: notificationFrame([`Program log: ${WSS_KEY}`]) },
+      ],
+    });
+    const frameValidation = await validate(frameEnv, makeMockFetch(frameEnv.sched));
+    const frames = seal({ watchResult: frameEnv.watchResult, validation: frameValidation });
+    expect(verifyWatchEvidence(frames.dir).rederivation.status).toBe("LIMITED_BY_REDACTION");
+    const frameSlot = verifyForged(
+      frames.dir,
+      editRecorded((r) => void (r.discovery.slot += 99)),
+    );
+    expect(frameSlot.rederivation.status).toBe("MISMATCH");
+    expect(frameSlot.rederivation.detail).toMatch(/contradict the sealed watch metadata/);
+    const framePool = verifyForged(
+      frames.dir,
+      editRecorded((r) => void (r.target.poolId = "11111111111111111111111111111112")),
+    );
+    expect(framePool.rederivation.status).toBe("MISMATCH");
+    expect(framePool).toMatchObject({ verified: false, selectionConfirmed: false });
+
+    // (g) A redaction claim cannot be invented to unlock the limitation.
+    const { env, validation } = await selectedRun();
+    const clean = seal({ watchResult: env.watchResult, validation });
+    const claimed = verifyForged(clean.dir, {
+      [WATCH_EVIDENCE_FILES.report]: (doc) =>
+        void (doc.redaction.literalByFile[WATCH_EVIDENCE_FILES.validation] = 1),
+    });
+    expect(claimed.integrity.problems).toEqual([
+      "REDACTION_CLAIM_UNSUPPORTED:validation.json",
+      "REDACTION_CLAIM_MISMATCH:flags",
+    ]);
   });
 });

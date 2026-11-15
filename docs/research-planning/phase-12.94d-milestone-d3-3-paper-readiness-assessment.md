@@ -5161,7 +5161,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
 > 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 19 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the reviews of `5ec9ee8` (§8.38.6) and `92f6c9f` (§8.38.7).
-> 3. Offline sealing and fail-closed verification of supplied watch evidence (`backend/src/scripts/fresh-amm-v4-watch-evidence.ts`), verified by 7 focused offline tests (`fresh-amm-v4-watch-evidence.test.ts`) (§8.38.8).
+> 3. Offline sealing and fail-closed verification of supplied watch evidence (`backend/src/scripts/fresh-amm-v4-watch-evidence.ts`), verified by 10 focused offline tests (`fresh-amm-v4-watch-evidence.test.ts`), including the review corrections after `4179ad1` (§8.38.8).
 >
 > Sealing is completed; it is not yet wired into anything. Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run), CLI activation (a watch entry point running collector → validator → sealer) and live execution remain planned and are not started. No live limits are approved.
 
@@ -5270,7 +5270,7 @@ The companion watch module captures an auditable chain of provider observations.
 
 #### 8.38.5 Synthetic Acceptance Cases & Verified Test Suites (Offline Tests Only)
 
-All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 5 focused test suites, 71 tests pass deterministically in virtual time: the 64 after the §8.38.6 and §8.38.7 corrections, plus the 7 sealing tests in §8.38.8:
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 5 focused test suites, 74 tests pass deterministically in virtual time: the 64 after the §8.38.6 and §8.38.7 corrections, plus the 10 sealing tests in §8.38.8:
 
 ##### 1. Bounded WebSocket Collector Suite (`BoundedAmmV4CreationWatch.test.ts` — 33 Tests)
 
@@ -5440,10 +5440,17 @@ After the review of `885323e` accepted the validation component (64 focused test
   - `COMPLETED` needs a captured watch and a recorded validation.
   - A watch without capture has no validation.
   - The policy context must reproduce the recorded validation deadline.
+- **Policy limits**: the limits are resolved independently from the supplied context by the reviewed `resolveWatchValidationLimits`, and every exchange record must be what the bounded request session produces under them, otherwise the seal is `SEAL_INPUT_INVALID` with nothing written:
+  - the declared `maxResponseBytes` equals the resolved lane limit (RPC or market);
+  - `COMPLETE`: no error, a status, retained = observed bytes and at most the limit, complete-body digest scope;
+  - `PARTIAL_OVERFLOW`: `RESPONSE_TOO_LARGE`, exactly the limit retained of a larger observed body, prefix-only digest scope;
+  - `NOT_READ`: an error and no body, counts, digests, scope or encoding;
+  - `completeEvidence` equals `COMPLETE`; the stored length, canonical encoding (UTF-8 only when the bytes round-trip), digests and the redaction and reproduction flags agree.
 - **Selection**: `selected` is true only for `COMPLETED` with `TARGET_SELECTED`. A cancelled or failed run keeps its cause and outcome even when its evidence would otherwise select.
 - **Redaction**:
   - **What is redacted**: the credentials are expanded the same way as in the precheck: the URL, query values of at least 6 characters, user/password and path segments of at least 16 characters, plus any further values of at least 6 characters.
-  - **Bodies and frames**: redacted on bytes, both plain and `\u`-escaped forms, before UTF-8 or base64 encoding. A partial body that ends inside a credential also has the trailing fragment (at least 4 bytes) redacted.
+  - **Bodies and frames**: redacted on bytes, both plain and `\u`-escaped forms, before UTF-8 or base64 encoding.
+  - **Partial bodies**: a retained prefix that ends inside a credential has the trailing fragment redacted (`[REDACTED_PARTIAL]`) when it covers at least 4 credential characters. Each character may be literal or `\u00XX`-escaped (case-insensitive, as in the reviewed escaped-form regex), in any mix, and the prefix may end inside an escape sequence. A residual fragment refuses the seal.
   - **Other strings**: redacted by literal value only, so generic provider fields such as `token` are kept.
   - **Never stored**: request headers. Credentials never appear in logs, results or files. Any residual credential refuses the seal (`SEAL_REFUSED`) before anything is written.
   - **Digests**: each exchange records `receivedBytesSha256` (the original bytes; prefix-only scope for partial bodies) separately from `sanitizedBytesSha256` (the stored bytes), with `bodyRedacted` and `reproducesReceivedDigest`. A redacted frame keeps its original byte length and records its original and sanitized digests in `frameRedactions`.
@@ -5460,56 +5467,101 @@ After the review of `885323e` accepted the validation component (64 focused test
    - no unlisted file or directory at any depth;
    - the plan digest in both the manifest and the report, and the report's file references;
    - the exchange index against the manifest and ledger;
-   - the attempt accounting, and consistency of the validation, selection and terminal cause.
+   - the attempt accounting, and consistency of the validation, selection and terminal cause;
+   - the policy context: limits resolved independently from the supplied context (the recorded `resolvedLimits` are compared, never trusted), the reviewed policy and defaults, and the recorded and recomputed deadlines.
 
-   Then each response file is checked against its ledger entry and stored-body digest, and request headers must be absent.
+   Then each response file is checked against its ledger entry and stored-body digest, request headers must be absent, and its body accounting must satisfy the same rules as at sealing, against the independently resolved limits. Finally, the report's redaction claims must match the sealed files: redacted bodies and frames, literal redactions only in listed files that carry at least as many markers as claimed, and the `applied` and `reproducible` flags.
 
 2. **Completeness**: lists why the sealed evidence could not support a target. The reasons are a terminal cause other than completion, a watch without capture, no validation, missing exchanges, partial or unread bodies, redacted bodies or frames, and an outcome other than `TARGET_SELECTED`. A correctly sealed incomplete run passes integrity with `sufficientForSelection: false`.
 3. **Re-derivation**: for a recorded validation, the reviewed `validateWatchedDiscoveryEvidence` (at the recorded completion time), `computeWatchValidationDeadline` and `evaluateWatchCandidateEvidence` run on the sealed frames, exchanges and policy context, and the result is compared with the recorded discovery, deadline, outcome, reason and target.
    - `REPRODUCED`: the sealed evidence re-derives the recorded result.
    - `MISMATCH`: a contradiction; the run is not verified.
-   - `LIMITED_BY_REDACTION`: the results differ, and redaction changed the inputs the re-derivation consumes.
+   - `LIMITED_BY_REDACTION`: the results differ, and the difference depends on evidence that redaction changed. This is decided per input, never globally:
+     - **Discovery**: its numbers (slot, subscription id, receipt and start times) cannot be changed by redaction, so any difference there is `MISMATCH`. A difference in its strings is a limitation only when the watch frames were redacted; the checks then continue from the recorded discovery, whose numbers must still agree with the sealed watch metadata and the notification frame.
+     - **Deadline**: depends only on numbers and the policy context, so a difference is always `MISMATCH`.
+     - **Candidate derivation**: a difference is a limitation only when the derivation was stopped by a redacted body it consumed (the transaction body, or the market body after the transaction qualified), or when exchange-record strings were redacted. The parts of the recorded result that do not depend on that evidence must still agree: the outcome must be one that can follow (after a read market body: selection, closed start window, market non-match or unavailable market evidence), a target needs both exchanges and must match the discovery, the exchange numbers, the market receipt time and the market request URL, and with only the market body redacted the target's initialization (pool, mint, signature, slot and times) must re-derive from the unredacted transaction body.
+     - **Recorded strings**: when `validation.json` itself carries redaction markers, a recorded string matches a derived one only outside the redacted spans.
    - `NOT_ELIGIBLE`: no validation was recorded; or the run was cancelled by the operator (the recorded outcome is preserved and no target is ever derived); or the outcome came from acquisition (an interruption or an undispatched request) and the exchanges alone re-derive something other than a selection.
 
 `selectionConfirmed` is true only when integrity holds, the evidence is complete and the selection is `REPRODUCED`.
 
-**Synthetic tests** (`fresh-amm-v4-watch-evidence.test.ts`, 7 tests). Genuine collector and validator output on the virtual scheduler, with artifacts in the test's own OS temporary directories:
+**Synthetic tests** (`fresh-amm-v4-watch-evidence.test.ts`, 10 tests). Genuine collector and validator output on the virtual scheduler, with artifacts in the test's own OS temporary directories:
 
-| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| W-01 | A selected run seals, round-trips and is `REPRODUCED` with `selectionConfirmed`. Frames, request identity, raw bodies, context and selection are preserved; no credential is in any file or decoded body. The seal makes no further fetch. Re-sealing into the same directory is refused with the bytes unchanged. A policy context that does not reproduce the deadline, or exchange records that differ from the validation, are refused with nothing written                                              |
-| W-02 | A watch with no notification (collector ceiling) seals as `WATCH_ENDED_WITHOUT_CAPTURE` with no validation and no exchanges. It verifies with explicit completeness reasons and `NOT_ELIGIBLE`. Mislabelled causes are refused                                                                                                                                                                                                                                                                               |
-| W-03 | Watch cancellation and in-flight validation cancellation are preserved (`NOT_ELIGIBLE`); relabelling either is refused. A run cancelled after complete, usable evidence stays `OPERATOR_CANCELLED` with no target and is never confirmed. A run failure after a selected validation keeps `RUN_FAILED`, with its detail redacted and `selected: false`. Re-forged records with consistent hashes (cancelled evidence relabelled `COMPLETED`/`SESSION_STOPPED`; a changed target) are `MISMATCH`              |
-| W-04 | A 64-byte market limit keeps the retained prefix with prefix-only digest scope and re-derives the recorded non-selection. A prefix that ends inside the key has the fragment redacted (`[REDACTED_PARTIAL]`)                                                                                                                                                                                                                                                                                                 |
-| W-05 | An injected write failure on `exchanges/0002.json` gives `ARTIFACT_WRITE_FAILED` with exactly one attempt, no manifest, the run cause and recorded outcome preserved, and a redacted error. Verification reports `MANIFEST_MISSING`. The partial directory is never reused. Missing or too-short credentials are refused without echoing them                                                                                                                                                                |
-| W-06 | Size and hash changes, extra files at the root and in `exchanges/`, nested directories, outside, absolute, backslash and dot paths, duplicates (including by case), a missing required entry, version/kind/schema errors, a missing or corrupt manifest and a hard link are each rejected. So are re-forged reference corruptions with consistent hashes: index, unindexed response, report references, plan digest, ledger fields and order, stored body, request headers, selected flag and terminal cause |
-| W-07 | A UTF-8 market body echoing the key (plain and `\u`-escaped) next to a generic `token` field: the key is redacted, `token` is kept, the digests differ, and verification is `LIMITED_BY_REDACTION` with the limitation reported. A non-text RPC body is redacted on bytes, stored as sanitized base64 and reproduces its recorded rejection. A watch frame echoing the WSS key is redacted with its original digest and length kept, and is `LIMITED_BY_REDACTION`                                           |
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| W-01 | A selected run seals, round-trips and is `REPRODUCED` with `selectionConfirmed`. Frames, request identity, raw bodies, context and selection are preserved; no credential is in any file or decoded body. The seal makes no further fetch. Re-sealing into the same directory is refused with the bytes unchanged. A policy context that does not reproduce the deadline, or exchange records that differ from the validation, are refused with nothing written                                                                                                                                                                                                                    |
+| W-02 | A watch with no notification (collector ceiling) seals as `WATCH_ENDED_WITHOUT_CAPTURE` with no validation and no exchanges. It verifies with explicit completeness reasons and `NOT_ELIGIBLE`. Mislabelled causes are refused                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| W-03 | Watch cancellation and in-flight validation cancellation are preserved (`NOT_ELIGIBLE`); relabelling either is refused. A run cancelled after complete, usable evidence stays `OPERATOR_CANCELLED` with no target and is never confirmed. A run failure after a selected validation keeps `RUN_FAILED`, with its detail redacted and `selected: false`. Re-forged records with consistent hashes (cancelled evidence relabelled `COMPLETED`/`SESSION_STOPPED`; a changed target) are `MISMATCH`                                                                                                                                                                                    |
+| W-04 | A 64-byte market limit keeps the retained prefix with prefix-only digest scope and re-derives the recorded non-selection. A prefix that ends inside the key has the fragment redacted (`[REDACTED_PARTIAL]`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| W-05 | An injected write failure on `exchanges/0002.json` gives `ARTIFACT_WRITE_FAILED` with exactly one attempt, no manifest, the run cause and recorded outcome preserved, and a redacted error. Verification reports `MANIFEST_MISSING`. The partial directory is never reused. Missing or too-short credentials are refused without echoing them                                                                                                                                                                                                                                                                                                                                      |
+| W-06 | Size and hash changes, extra files at the root and in `exchanges/`, nested directories, outside, absolute, backslash and dot paths, duplicates (including by case), a missing required entry, version/kind/schema errors, a missing or corrupt manifest and a hard link are each rejected. So are re-forged reference corruptions with consistent hashes: index, unindexed response, report references, plan digest, ledger fields and order, stored body, request headers, selected flag and terminal cause                                                                                                                                                                       |
+| W-07 | A UTF-8 market body echoing the key (plain and `\u`-escaped) next to a generic `token` field: the key is redacted, `token` is kept, the digests differ, and verification is `LIMITED_BY_REDACTION` with the limitation reported. A non-text RPC body is redacted on bytes, stored as sanitized base64 and reproduces its recorded rejection. A watch frame echoing the WSS key is redacted with its original digest and length kept, and is `LIMITED_BY_REDACTION`                                                                                                                                                                                                                 |
+| W-08 | Escaped and mixed credential fragments at the end of a 64-byte market prefix, through the real validator: the review reproduction (`\u0053` then literal characters), mixed literal/escaped characters with upper-case hex cut inside the next escape, four literal characters cut right after a backslash, and all-escaped characters cut inside an escape. Each is stored as `[REDACTED_PARTIAL]` with `bodyRedacted: true`, the original-prefix digest kept, the sanitized digest and stored length of the stored bytes, and the recorded outcome reproduced. Three characters before the cut stay below the threshold and are stored unchanged                                 |
+| W-09 | The review reproduction (64-byte limits for 1,556- and 843-byte bodies) is refused before writing, as is evidence acquired under a 64-byte limit sealed under the default context, and supplied records with contradictory `completeEvidence`, digest scope, declared limit, observed or stored bytes. Re-forged records with consistent hashes fail integrity with the named problem: the review reproduction (all four at once), each field alone, a complete body with an overflow error, limits forged into the context (also with the declared limits forged), forged resolved limits, a forged deadline, and a partial body with too few observed bytes or no overflow error |
+| W-10 | With a redacted market body: the review reproduction (discovery slot +99 in both recorded copies) is `MISMATCH` with `verified: false`, as are a forged discovery string, pool, block time, market receipt time, an outcome that cannot follow the qualifying transaction, and a forged deadline. A changed market indicator, which only the redacted body determines, stays `LIMITED_BY_REDACTION`. With redacted frames, a forged slot contradicts the sealed watch metadata and a forged pool contradicts the unredacted exchanges (`MISMATCH`). An invented literal-redaction claim fails integrity                                                                            |
 
-- **Mutation checks** (source restored byte-identical), each caught:
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit). The earlier 22, re-run against the corrected source (two re-anchored because the code they targeted was rewritten: the stored-digest check and the redaction limitation), each caught:
 
-| Mutation                                                 | Caught by    |
-| -------------------------------------------------------- | ------------ |
-| Non-exclusive write flag                                 | 6 passed (7) |
-| Existing output directory accepted                       | 5 passed (7) |
-| Failed write skipped, sealing continues                  | 6 passed (7) |
-| Failed write retried once                                | 6 passed (7) |
-| Bodies stored without byte redaction                     | 5 passed (7) |
-| No trailing-fragment redaction for partial bodies        | 6 passed (7) |
-| Escaped credential forms not redacted in bytes           | 6 passed (7) |
-| Watch frames not byte-redacted                           | 6 passed (7) |
-| Cancellation may be relabelled                           | 6 passed (7) |
-| Selection flag ignores the terminal cause                | 6 passed (7) |
-| Policy context not checked against the recorded deadline | 6 passed (7) |
-| Hard links accepted                                      | 6 passed (7) |
-| Unsafe or outside paths accepted                         | 6 passed (7) |
-| Duplicate entries accepted                               | 6 passed (7) |
-| Unlisted files accepted                                  | 6 passed (7) |
-| Plan digest not checked                                  | 6 passed (7) |
-| Exchange files not compared with the ledger              | 6 passed (7) |
-| Stored body digest not checked                           | 6 passed (7) |
-| Completeness ignores the terminal cause                  | 5 passed (7) |
-| Cancelled validation re-derived like a completed one     | 6 passed (7) |
-| Redaction reported as mismatch instead of limitation     | 6 passed (7) |
-| Re-derivation ignores the recorded target                | 6 passed (7) |
+| Mutation                                                 | Caught by              |
+| -------------------------------------------------------- | ---------------------- |
+| Non-exclusive write flag                                 | W-05                   |
+| Existing output directory accepted                       | W-01, W-05             |
+| Failed write skipped, sealing continues                  | W-05                   |
+| Failed write retried once                                | W-05                   |
+| Bodies stored without byte redaction                     | W-04, W-07, W-08, W-10 |
+| No trailing-fragment redaction for partial bodies        | W-04, W-08             |
+| Escaped credential forms not redacted in bytes           | W-07                   |
+| Watch frames not byte-redacted                           | W-07                   |
+| Cancellation may be relabelled                           | W-03                   |
+| Selection flag ignores the terminal cause                | W-03                   |
+| Policy context not checked against the recorded deadline | W-01                   |
+| Hard links accepted                                      | W-06                   |
+| Unsafe or outside paths accepted                         | W-06                   |
+| Duplicate entries accepted                               | W-06                   |
+| Unlisted files accepted                                  | W-06                   |
+| Plan digest not checked                                  | W-06                   |
+| Exchange files not compared with the ledger              | W-06                   |
+| Completeness ignores the terminal cause                  | W-02, W-03             |
+| Cancelled validation re-derived like a completed one     | W-03                   |
+| Re-derivation ignores the recorded target                | W-03, W-10             |
+| Stored body digest not checked                           | W-06                   |
+| Redaction reported as mismatch instead of limitation     | W-07, W-10             |
 
-- **Results**: under external 60 s limits, the new suite passes 7/7, and the validation 19/19, collector 33/33, precheck 6/6 and handoff 6/6 suites are unchanged (71 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket or daemon was used.
+The 22 added for the review corrections, each caught:
+
+| Mutation                                                      | Caught by  |
+| ------------------------------------------------------------- | ---------- |
+| Escaped characters not matched in trailing fragments          | W-08       |
+| Cut inside an escape sequence not recognised                  | W-08       |
+| Fragment matching case-sensitive                              | W-04, W-08 |
+| Seal ignores body accounting against resolved limits          | W-09       |
+| Declared limit not compared with the resolved limit           | W-09       |
+| Complete body not bounded by the resolved limit               | W-09       |
+| CompleteEvidence flag not checked                             | W-09       |
+| Digest scope not checked                                      | W-09       |
+| Observed bytes not checked                                    | W-09       |
+| Overflow error not required for partial bodies                | W-09       |
+| Verification skips body accounting                            | W-09       |
+| Recorded resolved limits not compared                         | W-09       |
+| Context deadline not compared                                 | W-09       |
+| Discovery numbers not compared                                | W-10       |
+| Any redaction excuses discovery differences (global override) | W-10       |
+| Recorded contradictions not checked                           | W-10       |
+| Initialization not re-derived from the unredacted transaction | W-10       |
+| Outcome set after a read market body not enforced             | W-10       |
+| Frame metadata cross-check skipped                            | W-10       |
+| Literal redaction claims not checked for markers              | W-10       |
+| Redaction summary flags not checked                           | W-10       |
+| Market receipt time not cross-checked                         | W-10       |
+
+- **Results**: under external 60 s limits, the suite passes 10/10, and the validation 19/19, collector 33/33, precheck 6/6 and handoff 6/6 suites are unchanged (74 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket or daemon was used.
+
+**Review corrections after `4179ad1`** (offline; collector, validator, precheck, handoff, wrapper, Stage B, strategy, historical evidence and wallet unchanged). An independent review reproduced three issues. Each new regression fails on the `4179ad1` source at exactly the reported reproduction and passes on the corrected source:
+
+| Issue                                                                       | Reproduction (review)                                                                                                                                                                                                                                                                                | Correction                                                                                                                                                                                                                                 | Regression |
+| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
+| Credential fragments survived escaped partial bodies                        | A market body of 50 `x` bytes, `\u0053`, then the rest of the key, cut at 64 bytes by the mocked validator, sealed with the escaped prefix unchanged and `bodyRedacted: false`                                                                                                                       | Trailing-fragment detection covers literal, escaped and mixed forms, including cuts inside an escape sequence; a residual fragment refuses the seal                                                                                        | W-08       |
+| Selection confirmed despite violated byte limits and contradictory metadata | The selected fixture sealed with 64-byte RPC and market limits (bodies of 1,556 and 843 bytes) and verified with `selectionConfirmed: true`; separately, a response re-forged to `completeEvidence: false`, prefix-only scope, `maxResponseBytes: 1` and `observedBytes: 0` kept confirmed selection | Exchange records are bound to limits resolved independently from the supplied context; body state, declared and effective limits, digest scope, lengths and flags are checked before writing and again, independently, during verification | W-09       |
+| Unrelated redaction masked a genuine contradiction                          | With a redacted market body, the discovery slot +99 in `validation.json` and `selection.json` returned `LIMITED_BY_REDACTION` and `verified: true`                                                                                                                                                   | The global redaction override is replaced by per-input attribution: only a difference that the redacted evidence could have caused is a limitation, and the parts of the recorded result that do not depend on it must still agree         | W-10       |
+
+Remaining, stated limitations: values that only a redacted body determines (for a redacted market body: the pair creation time, the start window and the informational indicators) cannot be re-derived exactly, so such a run is `LIMITED_BY_REDACTION` and never `selectionConfirmed`. Redacted exchange-record strings are attributed conservatively. The existing rule for outcomes that only acquisition can produce (`NOT_ELIGIBLE` when the exchanges alone re-derive something other than a selection) is unchanged.
