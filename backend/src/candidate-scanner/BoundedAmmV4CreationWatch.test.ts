@@ -1413,7 +1413,7 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(result.status).toBe("NOTIFICATION_CAPTURED");
   });
 
-  it("TC-23: retains bounded application frames in memory with byte accounting, truncates oversized payloads, and sanitizes WSS URL", async () => {
+  it("TC-23: retains accepted application frames completely without truncation, tracks byte accounting, and sanitizes WSS URL", async () => {
     const vEnv = new VirtualTimerEnvironment();
     let transport: MockKeepaliveTransport;
 
@@ -1434,15 +1434,15 @@ describe("BoundedAmmV4CreationWatch", () => {
     // Receive ack
     transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 10 }));
 
-    // Send an oversized rejected message (e.g. 5,000 bytes)
-    const oversizedPadding = "P".repeat(5000);
+    // Send a 5,000-byte non-qualifying message (well within the default 1 MiB watch ceiling)
+    const padding = "P".repeat(5000);
     transport!.emitMessage(
       JSON.stringify({
         jsonrpc: "2.0",
         method: "logsNotification",
         params: {
           subscription: 999, // wrong sub ID
-          result: { padding: oversizedPadding },
+          result: { padding },
         },
       }),
     );
@@ -1465,31 +1465,34 @@ describe("BoundedAmmV4CreationWatch", () => {
     const result = await watchPromise;
     expect(result.status).toBe("NOTIFICATION_CAPTURED");
 
-    // Check application frames retention
+    // Check application frames retention: every accepted frame is completely preserved
     const frames = result.observations.applicationFrames;
     expect(frames.length).toBe(4);
 
     // Frame 0: Outgoing subscription
     expect(frames[0]!.direction).toBe("OUTGOING");
+    expect(frames[0]!.isComplete).toBe(true);
     expect(frames[0]!.payload).toContain("logsSubscribe");
     expect(frames[0]!.byteLength).toBeGreaterThan(0);
-    expect(frames[0]!.truncated).toBeUndefined();
 
     // Frame 1: Incoming ack
     expect(frames[1]!.direction).toBe("INCOMING");
+    expect(frames[1]!.isComplete).toBe(true);
     expect(frames[1]!.payload).toContain('"result":10');
     expect(frames[1]!.byteLength).toBeGreaterThan(0);
 
-    // Frame 2: Incoming oversized frame -> truncated
+    // Frame 2: Incoming 5,000-byte message -> completely preserved without 4,096-byte truncation
     expect(frames[2]!.direction).toBe("INCOMING");
+    expect(frames[2]!.isComplete).toBe(true);
     expect(frames[2]!.byteLength).toBeGreaterThan(5000);
-    expect(frames[2]!.truncated).toBe(true);
-    expect(frames[2]!.payload.length).toBe(4096);
+    expect(frames[2]!.payload).not.toBeNull();
+    expect(frames[2]!.payload!.length).toBeGreaterThan(5000);
+    expect(() => JSON.parse(frames[2]!.payload!)).not.toThrow();
 
     // Frame 3: Incoming qualifying notification
     expect(frames[3]!.direction).toBe("INCOMING");
+    expect(frames[3]!.isComplete).toBe(true);
     expect(frames[3]!.payload).toContain(VALID_SIG_A);
-    expect(frames[3]!.truncated).toBeUndefined();
 
     // Verify WSS URL sanitization in event metadata
     const startedEvent = result.observations.events.find((e) => e.type === "WATCH_STARTED");
@@ -1498,6 +1501,301 @@ describe("BoundedAmmV4CreationWatch", () => {
     expect(recordedUrl).toContain("[REDACTED]");
     expect(recordedUrl).not.toContain("supersecretpass");
     expect(recordedUrl).not.toContain("secretTokenKey12345");
+  });
+
+  it("TC-23-A: qualifying creation notification above 4,096 bytes retains complete frame and re-parses as valid JSON", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Construct a qualifying creation notification of ~6,249 bytes (50 detailed log entries)
+    const logs50 = Array.from(
+      { length: 50 },
+      (_, i) =>
+        `Program log: Instruction initialize2 step ${i} completed successfully with candidate account validation token swap path confirmed`,
+    );
+
+    const validLargeNotification = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "logsNotification",
+      params: {
+        subscription: 1,
+        result: {
+          context: { slot: 305100999 },
+          value: {
+            signature: VALID_SIG_A,
+            err: null,
+            logs: logs50,
+          },
+        },
+      },
+    });
+
+    const expectedByteLength = Buffer.byteLength(validLargeNotification, "utf8");
+    expect(expectedByteLength).toBeGreaterThan(4096);
+    expect(expectedByteLength).toBeGreaterThan(6000);
+
+    transport!.emitMessage(validLargeNotification);
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+    expect(result.notification?.signature).toBe(VALID_SIG_A);
+
+    // Check that the qualifying frame at index 2 is completely preserved without truncation
+    const frames = result.observations.applicationFrames;
+    expect(frames.length).toBe(3); // Frame 0: Outgoing sub, Frame 1: Ack, Frame 2: Qualifying notification
+    const qualifyingFrame = frames[2]!;
+
+    expect(qualifyingFrame.direction).toBe("INCOMING");
+    expect(qualifyingFrame.isComplete).toBe(true);
+    expect(qualifyingFrame.byteLength).toBe(expectedByteLength);
+    expect(qualifyingFrame.payload).not.toBeNull();
+    expect(qualifyingFrame.payload!.length).toBe(validLargeNotification.length);
+
+    // Exact JSON re-parsing succeeds without SyntaxError
+    const reparsed = JSON.parse(qualifyingFrame.payload!);
+    expect(reparsed.method).toBe("logsNotification");
+    expect(reparsed.params.result.value.signature).toBe(VALID_SIG_A);
+    expect(reparsed.params.result.value.logs).toHaveLength(50);
+  });
+
+  it("TC-23-B: multibyte UTF-8 content maintains exact byte accounting and preserves complete characters", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Notification containing multibyte UTF-8 sequences (emoji, Greek, CJK, accents)
+    const multibyteLog = "Initialisation de pool: «NeXusTrade™ 🚀» • 闪电 • 100% α-β-γ";
+    const notificationJson = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "logsNotification",
+      params: {
+        subscription: 1,
+        result: {
+          context: { slot: 200 },
+          value: {
+            signature: VALID_SIG_A,
+            err: null,
+            logs: [multibyteLog],
+          },
+        },
+      },
+    });
+
+    const expectedByteLength = Buffer.byteLength(notificationJson, "utf8");
+    // Verify that multibyte byte count is strictly greater than string character length
+    expect(expectedByteLength).toBeGreaterThan(notificationJson.length);
+
+    transport!.emitMessage(notificationJson);
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+
+    const qualifyingFrame = result.observations.applicationFrames[2]!;
+    expect(qualifyingFrame.isComplete).toBe(true);
+    expect(qualifyingFrame.byteLength).toBe(expectedByteLength);
+    expect(Buffer.byteLength(qualifyingFrame.payload!, "utf8")).toBe(expectedByteLength);
+
+    // Re-parsed payload matches exact characters without corruption
+    const reparsed = JSON.parse(qualifyingFrame.payload!);
+    expect(reparsed.params.result.value.logs[0]).toBe(multibyteLog);
+  });
+
+  it("TC-23-C: exact payload reconstruction and JSON re-parsing across all accepted session frames", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 42 }));
+
+    // Rejected notification (wrong sub ID)
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 999,
+          result: { context: { slot: 1 }, value: { signature: VALID_SIG_B, err: null, logs: [] } },
+        },
+      }),
+    );
+
+    // Qualifying notification
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 42,
+          result: {
+            context: { slot: 100 },
+            value: { signature: VALID_SIG_A, err: null, logs: ["done"] },
+          },
+        },
+      }),
+    );
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+
+    // Every accepted frame must re-parse cleanly as valid JSON
+    for (const frame of result.observations.applicationFrames) {
+      expect(frame.isComplete).toBe(true);
+      expect(frame.payload).not.toBeNull();
+      const parsed = JSON.parse(frame.payload!);
+      expect(parsed).toBeTypeOf("object");
+      expect(parsed).not.toBeNull();
+    }
+  });
+
+  it("TC-23-D: an over-ceiling frame stops before payload decoding and retains metadata only", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      limits: { maxPayloadBytes: 2500 },
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Send an incoming frame of 4,000 bytes (Buffer), exceeding 2,500 ceiling
+    const rawOversizedBuffer = Buffer.alloc(4000, 0x41); // 4,000 bytes of 'A'
+    transport!.emitMessage(rawOversizedBuffer);
+
+    const result = await watchPromise;
+    expect(result.status).toBe("PAYLOAD_BYTE_CEILING_EXCEEDED");
+
+    const frames = result.observations.applicationFrames;
+    expect(frames.length).toBe(3); // Outgoing sub, Ack, Over-ceiling frame
+
+    // Frame 0: Outgoing sub -> complete
+    expect(frames[0]!.isComplete).toBe(true);
+    expect(frames[0]!.payload).not.toBeNull();
+
+    // Frame 1: Ack -> complete
+    expect(frames[1]!.isComplete).toBe(true);
+    expect(frames[1]!.payload).not.toBeNull();
+
+    // Frame 2: Over-ceiling frame -> metadata only, payload is null
+    const overflowFrame = frames[2]!;
+    expect(overflowFrame.direction).toBe("INCOMING");
+    expect(overflowFrame.isComplete).toBe(false);
+    expect(overflowFrame.payload).toBeNull();
+    expect(overflowFrame.overflow).toBe(true);
+    expect(overflowFrame.overflowReason).toBe("PAYLOAD_BYTE_CEILING_EXCEEDED");
+    expect(overflowFrame.byteLength).toBe(4000);
+  });
+
+  it("TC-23-E: no accepted capture whose required frame was omitted (supports beyond hardcoded 128 limit)", async () => {
+    const vEnv = new VirtualTimerEnvironment();
+    let transport: MockKeepaliveTransport;
+
+    const watch = new BoundedAmmV4CreationWatch({
+      wssUrl: "wss://api.mainnet-beta.solana.com",
+      clock: vEnv.clock,
+      timers: vEnv.getTimers(),
+      limits: { maxIncomingMessages: 150 }, // configured above previous 128 hardcoded limit
+      transportFactory: () => {
+        transport = new MockKeepaliveTransport();
+        return transport;
+      },
+    });
+
+    const watchPromise = watch.start();
+    transport!.emitOpen();
+    transport!.emitMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 1 }));
+
+    // Send 130 non-matching notifications (wrong sub ID) -> messages 2 to 131
+    for (let i = 0; i < 130; i++) {
+      transport!.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "logsNotification",
+          params: {
+            subscription: 999,
+            result: {
+              context: { slot: i + 1 },
+              value: { signature: VALID_SIG_B, err: null, logs: [] },
+            },
+          },
+        }),
+      );
+    }
+
+    // Message 132: valid qualifying creation notification
+    transport!.emitMessage(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "logsNotification",
+        params: {
+          subscription: 1,
+          result: {
+            context: { slot: 300000 },
+            value: { signature: VALID_SIG_A, err: null, logs: ["success"] },
+          },
+        },
+      }),
+    );
+
+    const result = await watchPromise;
+    expect(result.status).toBe("NOTIFICATION_CAPTURED");
+
+    // All frames are preserved: 1 outgoing sub + 1 ack + 130 rejected + 1 qualifying = 133 frames
+    const frames = result.observations.applicationFrames;
+    expect(frames.length).toBe(133);
+
+    // The qualifying creation notification is preserved at index 132 in full
+    const qualifyingFrame = frames[132]!;
+    expect(qualifyingFrame.isComplete).toBe(true);
+    expect(qualifyingFrame.payload).not.toBeNull();
+    expect(qualifyingFrame.payload).toContain(VALID_SIG_A);
+    expect(qualifyingFrame.byteLength).toBe(Buffer.byteLength(qualifyingFrame.payload!, "utf8"));
   });
 
   it("TC-24: finishes bounded cleanup before resolving (immediate, delayed, forced, and close failure)", async () => {

@@ -20,8 +20,9 @@
  *    ping payload; unmatched pongs do not clear the deadline, and the first unmatched pong deadline
  *    stops the watch.
  * 6. Auditable Observations & Deep Immutability: Preserves a recursively cloned and frozen
- *    record of application frames, provider events, and accounting metrics. Does not claim
- *    cryptographic proof of market completeness.
+ *    record of complete application frames (without arbitrary truncation), provider events, and
+ *    accounting metrics. Over-ceiling frames retain bounded metadata only without decoding or copying
+ *    oversized payloads. Does not claim cryptographic proof of market completeness.
  * 7. Single Capture & Settled Teardown: Captures at most the first qualifying notification and
  *    settles teardown within a bounded cleanup ceiling before resolving. Late events cannot mutate
  *    the completed result.
@@ -89,13 +90,29 @@ export interface BoundedWatchObservationEvent {
   readonly details?: Record<string, unknown> | undefined;
 }
 
-export interface BoundedWatchApplicationFrame {
+export interface BoundedWatchCompleteFrame {
   readonly direction: "INCOMING" | "OUTGOING";
   readonly timestampMs: number;
   readonly byteLength: number;
   readonly payload: string;
-  readonly truncated?: boolean | undefined;
+  readonly isComplete: true;
+  readonly overflow?: false | undefined;
+  readonly overflowReason?: undefined;
 }
+
+export interface BoundedWatchOverflowFrameMetadata {
+  readonly direction: "INCOMING";
+  readonly timestampMs: number;
+  readonly byteLength: number;
+  readonly payload: null;
+  readonly isComplete: false;
+  readonly overflow: true;
+  readonly overflowReason: "PAYLOAD_BYTE_CEILING_EXCEEDED" | "MESSAGE_LIMIT_EXCEEDED";
+}
+
+export type BoundedWatchApplicationFrame =
+  | BoundedWatchCompleteFrame
+  | BoundedWatchOverflowFrameMetadata;
 
 export interface CapturedNotificationData {
   readonly signature: string;
@@ -233,8 +250,6 @@ export class BoundedAmmV4CreationWatch {
 
   private readonly events: BoundedWatchObservationEvent[] = [];
   private readonly applicationFrames: BoundedWatchApplicationFrame[] = [];
-  private static readonly MAX_RETAINED_APPLICATION_FRAMES = 128;
-  private static readonly MAX_RETAINED_FRAME_BYTES = 4096;
 
   private ackTimer: unknown = null;
   private overallTimer: unknown = null;
@@ -437,7 +452,8 @@ export class BoundedAmmV4CreationWatch {
       params: [{ mentions: [this.feeDestination] }, { commitment: "confirmed" }],
     });
 
-    this.recordApplicationFrame("OUTGOING", subscribeFrame);
+    const subscribeByteLength = Buffer.byteLength(subscribeFrame, "utf8");
+    this.recordCompleteFrame("OUTGOING", subscribeFrame, subscribeByteLength);
 
     try {
       this.transport?.send(subscribeFrame);
@@ -621,13 +637,16 @@ export class BoundedAmmV4CreationWatch {
     if (this.terminated) return;
     if (this.checkAbsoluteDeadlines()) return;
 
-    const byteLength = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length;
-    this.recordApplicationFrame("INCOMING", data, byteLength);
+    const incomingByteLength =
+      typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length;
 
-    this.payloadBytesReceived += byteLength;
-    this.messagesReceivedCount++;
+    // Check payload byte ceiling BEFORE decoding or copying payload
+    if (this.payloadBytesReceived + incomingByteLength > this.limits.maxPayloadBytes) {
+      this.payloadBytesReceived += incomingByteLength;
+      this.messagesReceivedCount++;
 
-    if (this.payloadBytesReceived > this.limits.maxPayloadBytes) {
+      this.recordOverflowMetadata("INCOMING", incomingByteLength, "PAYLOAD_BYTE_CEILING_EXCEEDED");
+
       this.terminate(
         "PAYLOAD_BYTE_CEILING_EXCEEDED",
         `Received payload bytes (${this.payloadBytesReceived}) exceeded ceiling (${this.limits.maxPayloadBytes})`,
@@ -635,7 +654,13 @@ export class BoundedAmmV4CreationWatch {
       return;
     }
 
-    if (this.messagesReceivedCount > this.limits.maxIncomingMessages) {
+    // Check incoming messages ceiling BEFORE decoding or copying payload
+    if (this.messagesReceivedCount + 1 > this.limits.maxIncomingMessages) {
+      this.payloadBytesReceived += incomingByteLength;
+      this.messagesReceivedCount++;
+
+      this.recordOverflowMetadata("INCOMING", incomingByteLength, "MESSAGE_LIMIT_EXCEEDED");
+
       this.terminate(
         "MESSAGE_LIMIT_EXCEEDED",
         `Incoming application messages (${this.messagesReceivedCount}) exceeded ceiling (${this.limits.maxIncomingMessages})`,
@@ -643,7 +668,13 @@ export class BoundedAmmV4CreationWatch {
       return;
     }
 
+    // Accepted within ceilings: update accounting, decode payload to string, and retain complete frame
+    this.payloadBytesReceived += incomingByteLength;
+    this.messagesReceivedCount++;
+
     const text = typeof data === "string" ? data : data.toString("utf8");
+    this.recordCompleteFrame("INCOMING", text, incomingByteLength);
+
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -1036,37 +1067,36 @@ export class BoundedAmmV4CreationWatch {
     resolve(deepFrozenResult);
   }
 
-  private recordApplicationFrame(
+  private recordCompleteFrame(
     direction: "INCOMING" | "OUTGOING",
-    data: string | Buffer,
-    actualByteLength?: number,
+    payload: string,
+    byteLength: number,
   ): void {
-    if (
-      this.applicationFrames.length >= BoundedAmmV4CreationWatch.MAX_RETAINED_APPLICATION_FRAMES
-    ) {
-      return;
-    }
-    const byteLength =
-      actualByteLength ??
-      (typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.length);
-    const text = typeof data === "string" ? data : data.toString("utf8");
-
-    let payload: string;
-    let truncated = false;
-    if (byteLength > BoundedAmmV4CreationWatch.MAX_RETAINED_FRAME_BYTES) {
-      payload = text.slice(0, BoundedAmmV4CreationWatch.MAX_RETAINED_FRAME_BYTES);
-      truncated = true;
-    } else {
-      payload = text;
-    }
-
     this.applicationFrames.push(
       Object.freeze({
         direction,
         timestampMs: this.clock(),
         byteLength,
         payload,
-        ...(truncated ? { truncated: true } : {}),
+        isComplete: true as const,
+      }),
+    );
+  }
+
+  private recordOverflowMetadata(
+    direction: "INCOMING",
+    byteLength: number,
+    overflowReason: "PAYLOAD_BYTE_CEILING_EXCEEDED" | "MESSAGE_LIMIT_EXCEEDED",
+  ): void {
+    this.applicationFrames.push(
+      Object.freeze({
+        direction,
+        timestampMs: this.clock(),
+        byteLength,
+        payload: null,
+        isComplete: false as const,
+        overflow: true as const,
+        overflowReason,
       }),
     );
   }
