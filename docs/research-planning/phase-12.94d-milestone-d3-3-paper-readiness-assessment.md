@@ -5160,7 +5160,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 > **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Two offline components are completed and verified:
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
-> 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 17 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the review of `5ec9ee8` (§8.38.6).
+> 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 19 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the reviews of `5ec9ee8` (§8.38.6) and `92f6c9f` (§8.38.7).
 >
 > File persistence (`PrecheckWriter` integration), handoff integration (`paper-pilot-handoff.ts`), and CLI activation (`fresh-amm-v4-precheck.ts --watch`) remain subsequent planned integration tasks.
 
@@ -5268,7 +5268,7 @@ The companion watch module captures an auditable chain of provider observations.
 
 #### 8.38.5 Synthetic Acceptance Cases & Verified Test Suites (Offline Tests Only)
 
-All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 62 tests pass deterministically in virtual time (after the §8.38.6 hardening):
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 64 tests pass deterministically in virtual time (after the §8.38.6 and §8.38.7 corrections):
 
 ##### 1. Bounded WebSocket Collector Suite (`BoundedAmmV4CreationWatch.test.ts` — 33 Tests)
 
@@ -5285,7 +5285,7 @@ All test cases are executed offline by injecting synthetic WebSocket events and 
 11. **TC-W11: Deep Immutability & Redaction**: Returned result and observation records are deep-frozen; nested error arrays cannot be modified in strict mode; credential-bearing WSS URLs are redacted.
 12. **TC-W12: Control-Frame Ceilings**: Strict enforcement of 45 client pings and 128 incoming control frames.
 
-##### 2. Watched Candidate Validation Suite (`AmmV4WatchCandidateValidation.test.ts` — 17 Tests; TC-V13–V17 in §8.38.6)
+##### 2. Watched Candidate Validation Suite (`AmmV4WatchCandidateValidation.test.ts` — 19 Tests; TC-V13–V17 in §8.38.6, TC-V18–V19 in §8.38.7)
 
 1. **TC-V01: Happy Path Validation & Selection**: Valid discovery evidence followed by successful `getTransaction` (Raydium AMM v4 `initialize2` with fee destination at account index 14) and DexScreener token GET within planning start window (240–760s). Verifies `TARGET_SELECTED`, exactly 2 HTTP requests dispatched, RPC URL redaction (`RPC_URL_PLACEHOLDER`), and distinct timestamps preserved without overwriting (`transactionBlockTimeSec !== instructionRequestedOpenTimeSec !== pairCreatedAtMs`).
 2. **TC-V02: Pre-Send Rejection on Unsuitable Watch Status**: Rejects collector results with non-captured status (`KEEPALIVE_TIMEOUT`) or null notification metadata with zero HTTP sends (`httpAttempts: 0`).
@@ -5362,3 +5362,41 @@ The independent review of `5ec9ee8` passed 57 focused tests and the backend type
 | Non-UTF-8 bytes labelled UTF-8                       | TC-V17         |
 
 - **Results**: under external 60 s limits, the validation suite passes 17/17, the collector 33/33, the precheck 6/6 and the handoff 6/6 (62 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the precheck manifest (`5b65751d…ac16`) are unchanged.
+
+#### 8.38.7 Deadline Corrections (Review of 92f6c9f)
+
+The review of `92f6c9f` confirmed the §8.38.6 fixes and reproduced two remaining deadline failures. Both are corrected in `AmmV4WatchCandidateValidation.ts` and its tests only. `PaperRequestSession`, the reviewed collector, the precheck, the handoff, the wrapper, Stage B and the strategy are unchanged. Nothing was executed.
+
+1. **Verification could consume the remaining time and a late request still went out.**
+   - **Defect**: the clock was read once before discovery verification, the session lifetime was computed from that stale time, and the relative lifetime only started at `session.open()`. Reproduction (genuine collector output): first read at deadline − 1 ms, 2 ms elapsed during verification and setup, and the request was dispatched at deadline + 1 ms.
+   - **Absolute deadline**: it is now immutable, computed once from verified evidence, and enforced at three layers:
+     - **Before setup**: a fresh clock is read after verification and again immediately before the session is created; if the deadline has passed, nothing is set up or sent.
+     - **At every dispatch admission**: each request carries the existing `PaperRequestDispatch.refusal` hook, which compares the clock with the absolute deadline. The session checks it before and after pacing waits and immediately before counting and sending, so no request is counted or sent at or after the deadline.
+     - **In flight**: an owned guard timer, scheduled after the session opens, stops the session at the absolute deadline and aborts in-flight work there, even if the session's relative lifetime would end later. It is cleared on every exit, with the session stop and listener removal.
+   - **Classification**: a deadline refusal or cut-off is `VALIDATION_DEADLINE_EXPIRED`, and the request evidence is kept.
+2. **Pure derivation ignored the per-request timeout.** A 20,000 ms transaction exchange followed by the market exchange, all inside the 30 s window, still re-derived as `TARGET_SELECTED`.
+   - **Fix**: the shared request policy now rejects any exchange whose duration exceeds the resolved per-request timeout (reviewed 10,000 ms, or a stricter supplied value; looser values are capped) as `EXCHANGE_EVIDENCE_INVALID` (`EXCHANGE_n_EXCEEDED_REQUEST_TIMEOUT`).
+   - **Failure records**: timeout and cancellation records keep their error, so they are request failures and never qualify as successful late responses, even if a body is present.
+
+**Regressions**:
+
+| Test   | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TC-V18 | (a) The deadline passes during verification and setup (first read deadline − 1 ms, then +2 ms): zero fetch calls, zero counted attempts. (b) It passes between the requests: the market request is refused at admission and only the transaction was sent. (c) An in-flight request is aborted at exactly the deadline (completion recorded at the deadline), and offline re-derivation agrees. (d) With the clock stepping 2 ms during session setup, the request is still aborted at the absolute deadline. No provider timer or abort listener remains in any case |
+| TC-V19 | The reviewer's 20 s transaction is rejected (`EXCHANGE_1_EXCEEDED_REQUEST_TIMEOUT`). A stricter supplied timeout applies, and a looser one is capped. A timeout record carrying a body is a request failure, and a market request after it is invalid. Live, a response slower than 10 s is recorded as `REQUEST_TIMED_OUT` after exactly 10,000 ms and re-derives identically                                                                                                                                                                                        |
+
+TC-V16's 60 s case now moves the market dispatch close to its completion, so it isolates the deadline rule from the new timeout rule.
+
+- **Mutation checks** (source restored byte-identical), each caught:
+
+| Mutation                                                | Caught by                              |
+| ------------------------------------------------------- | -------------------------------------- |
+| Stale pre-verification clock for admission and lifetime | TC-V18                                 |
+| No absolute-deadline admission guard                    | TC-V18                                 |
+| No deadline guard timer (session lifetime only)         | TC-V18                                 |
+| Deadline guard timer not cleared                        | TC-V10, TC-V13, TC-V15, TC-V18, TC-V19 |
+| Per-request timeout not applied in derivation           | TC-V19                                 |
+
+The twelve §8.38.6 mutations are still each caught.
+
+- **Results**: under external 60 s limits, the validation suite passes 19/19, the collector 33/33, the precheck 6/6 and the handoff 6/6 (64 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the precheck manifest are unchanged.

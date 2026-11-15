@@ -231,6 +231,9 @@ export interface WatchEvidenceContext {
   readonly limits?: Partial<WatchCandidateValidationLimits> | undefined;
 }
 
+/** Stop and refusal reason when the immutable absolute validation deadline is reached. */
+const DEADLINE_STOP = "VALIDATION_DEADLINE_EXPIRED";
+
 const sha256 = (s: string | Buffer): string => createHash("sha256").update(s).digest("hex");
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -614,6 +617,7 @@ function exchangePolicyViolation(
   exchanges: readonly PrecheckExchange[],
   validationDeadlineAtMs: number,
   maxHttpAttempts: number,
+  requestTimeoutMs: number,
 ): string | null {
   if (exchanges.length > maxHttpAttempts) return "REQUEST_BOUND_EXCEEDED";
   for (const [i, ex] of exchanges.entries()) {
@@ -627,6 +631,11 @@ function exchangePolicyViolation(
       ex.completedAtMs < ex.dispatchedAtMs
     ) {
       return `EXCHANGE_${ex.seq}_COMPLETION_INVALID`;
+    }
+    // The per-request timeout bounds every exchange; a longer one is not a compliant record, and
+    // a timeout or cancellation record never qualifies (its error makes it a request failure).
+    if (ex.completedAtMs - ex.dispatchedAtMs > requestTimeoutMs) {
+      return `EXCHANGE_${ex.seq}_EXCEEDED_REQUEST_TIMEOUT`;
     }
     if (ex.completedAtMs > validationDeadlineAtMs) {
       return `EXCHANGE_${ex.seq}_AFTER_VALIDATION_DEADLINE`;
@@ -693,7 +702,13 @@ export function evaluateWatchCandidateEvidence(
     target: null,
   });
 
-  const violation = exchangePolicyViolation(discovery, exchanges, deadline, limits.maxHttpAttempts);
+  const violation = exchangePolicyViolation(
+    discovery,
+    exchanges,
+    deadline,
+    limits.maxHttpAttempts,
+    limits.requestTimeoutMs,
+  );
   if (violation !== null) return invalid(violation);
 
   const txExchange = exchanges[0];
@@ -984,15 +999,15 @@ export async function executeWatchCandidateValidation(
 
   // 2. Deadline from verified evidence and the strictest applicable limit.
   const validationDeadlineAtMs = computeWatchValidationDeadline(discovery, context);
-  if (startNowMs >= validationDeadlineAtMs) {
-    return {
-      ok: false,
-      outcome: "VALIDATION_DEADLINE_EXPIRED",
-      reason: "Validation deadline expired before HTTP dispatch could begin",
-      target: null,
-      ...base(discovery, validationDeadlineAtMs, [], 0),
-    };
-  }
+  const expiredBeforeDispatch = (): WatchCandidateValidationResult => ({
+    ok: false,
+    outcome: "VALIDATION_DEADLINE_EXPIRED",
+    reason: "Validation deadline expired before HTTP dispatch could begin",
+    target: null,
+    ...base(discovery, validationDeadlineAtMs, [], 0),
+  });
+  // A fresh clock after verification: verification time counts against the absolute deadline.
+  if (clock() >= validationDeadlineAtMs) return expiredBeforeDispatch();
   if (options.abortSignal?.aborted) {
     return {
       ok: false,
@@ -1003,9 +1018,13 @@ export async function executeWatchCandidateValidation(
     };
   }
 
-  // 3. Owned, bounded request session.
+  // 3. Owned, bounded request session. The absolute deadline is immutable: its remaining time is
+  //    re-read here, every dispatch admission re-checks it (refusal guard), and an owned guard
+  //    timer stops the session (aborting in-flight work) when it is reached.
+  const remainingMs = validationDeadlineAtMs - clock();
+  if (remainingMs <= 0) return expiredBeforeDispatch();
   const sessionLimits: PaperRequestSessionLimits = {
-    lifetimeMs: Math.max(1, validationDeadlineAtMs - startNowMs),
+    lifetimeMs: remainingMs,
     maxHttpAttempts: limits.maxHttpAttempts,
     requestTimeoutMs: limits.requestTimeoutMs,
     lanes: {
@@ -1039,6 +1058,16 @@ export async function executeWatchCandidateValidation(
   const onAbort = () => session.stop("CALLER_CANCELLED");
   options.abortSignal?.addEventListener("abort", onAbort, { once: true });
   session.open();
+  const guardTimers: PaperRequestSessionTimers = options.timers ?? {
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  };
+  const deadlineGuard = guardTimers.setTimeout(
+    () => session.stop(DEADLINE_STOP),
+    Math.max(0, validationDeadlineAtMs - clock()),
+  );
+  /** Admission guard: no request is counted or sent at or after the absolute deadline. */
+  const deadlineRefusal = () => (clock() >= validationDeadlineAtMs ? DEADLINE_STOP : null);
 
   const httpAttempts = () => session.getStatus().httpAttempts;
   const finish = (
@@ -1056,6 +1085,16 @@ export async function executeWatchCandidateValidation(
     const evaluation = evaluateWatchCandidateEvidence(discovery, recordedExchanges, context);
     return finish(evaluation.outcome, evaluation.reason, evaluation.target);
   };
+  /** The absolute deadline stopped the session or refused or cut off this request. */
+  const deadlineReached = (error: string | null | undefined): boolean => {
+    const stopReason = session.getStatus().stopReason;
+    return (
+      stopReason === DEADLINE_STOP ||
+      stopReason === "LIFETIME_EXPIRED" ||
+      error === DEADLINE_STOP ||
+      error === "LIFETIME_EXPIRED"
+    );
+  };
   /** Failure classification for a request that did not produce usable evidence. */
   const interrupted = (
     error: string | undefined,
@@ -1064,9 +1103,8 @@ export async function executeWatchCandidateValidation(
     if (options.abortSignal?.aborted) {
       return finish("OPERATOR_CANCELLED", `OPERATOR_CANCELLED: ${error ?? "NOT_DISPATCHED"}`, null);
     }
-    const stopReason = session.getStatus().stopReason;
-    if (stopReason === "LIFETIME_EXPIRED" || error === "LIFETIME_EXPIRED") {
-      return finish("VALIDATION_DEADLINE_EXPIRED", error ?? "LIFETIME_EXPIRED", null);
+    if (deadlineReached(error)) {
+      return finish("VALIDATION_DEADLINE_EXPIRED", error ?? DEADLINE_STOP, null);
     }
     if (error === "REQUEST_SESSION_STOPPED") return finish("SESSION_STOPPED", error, null);
     return error === undefined ? null : finish(requestFailure, error, null);
@@ -1094,6 +1132,7 @@ export async function executeWatchCandidateValidation(
       }),
       jsonRpcId: txRpcId,
       waitSignals: options.abortSignal ? [options.abortSignal] : undefined,
+      refusal: deadlineRefusal,
     });
     if (!tx.dispatched) {
       return (
@@ -1101,7 +1140,7 @@ export async function executeWatchCandidateValidation(
         finish("TRANSACTION_REQUEST_FAILED", "NOT_DISPATCHED", null)
       );
     }
-    if (options.abortSignal?.aborted || session.getStatus().stopReason === "LIFETIME_EXPIRED") {
+    if (options.abortSignal?.aborted || deadlineReached(tx.error)) {
       const cut = interrupted(
         tx.error ?? "INTERRUPTED_AFTER_RESPONSE",
         "TRANSACTION_REQUEST_FAILED",
@@ -1134,6 +1173,7 @@ export async function executeWatchCandidateValidation(
       method: "GET",
       headers: { Accept: "application/json" },
       waitSignals: options.abortSignal ? [options.abortSignal] : undefined,
+      refusal: deadlineRefusal,
     });
     if (!market.dispatched) {
       return (
@@ -1141,7 +1181,7 @@ export async function executeWatchCandidateValidation(
         finish("MARKET_REQUEST_FAILED", "NOT_DISPATCHED", null)
       );
     }
-    if (options.abortSignal?.aborted) {
+    if (options.abortSignal?.aborted || deadlineReached(market.error)) {
       const cut = interrupted(
         market.error ?? "INTERRUPTED_AFTER_RESPONSE",
         "MARKET_REQUEST_FAILED",
@@ -1152,6 +1192,7 @@ export async function executeWatchCandidateValidation(
   } finally {
     // Unconditional cleanup: no timer or listener outlives the call (first stop cause is kept).
     options.abortSignal?.removeEventListener("abort", onAbort);
+    guardTimers.clearTimeout(deadlineGuard);
     session.stop("WATCH_VALIDATION_FINISHED");
   }
 }

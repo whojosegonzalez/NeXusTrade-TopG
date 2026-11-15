@@ -848,7 +848,14 @@ describe("AmmV4WatchCandidateValidation hardening (review of 5ec9ee8)", () => {
       ["duplicate sequence", [tx!, edit(market!, (x) => (x.seq = 1))], "EXCHANGE_SEQUENCE_INVALID"],
       [
         "market completed 60 s after receipt",
-        [tx!, edit(market!, (x) => (x.completedAtMs = d.notificationReceivedAtMs + 60_000))],
+        [
+          tx!,
+          edit(market!, (x) => {
+            // Within the per-request timeout, so only the deadline rule applies.
+            x.dispatchedAtMs = d.notificationReceivedAtMs + 59_900;
+            x.completedAtMs = d.notificationReceivedAtMs + 60_000;
+          }),
+        ],
         "EXCHANGE_2_AFTER_VALIDATION_DEADLINE",
       ],
       [
@@ -970,5 +977,176 @@ describe("AmmV4WatchCandidateValidation hardening (review of 5ec9ee8)", () => {
     const r = await validate(env, { fetchFn: makeMockFetch(env.sched, { marketRawBody: bytes }) });
     expect(r).toMatchObject({ outcome: "MARKET_EVIDENCE_UNAVAILABLE", reason: "BODY_NOT_TEXT" });
     expect(r.exchanges[1]!.response.bodyEncoding).toBe("base64");
+  });
+});
+
+describe("AmmV4WatchCandidateValidation deadline corrections (review of 92f6c9f)", () => {
+  const DEADLINE = NOTIFY_AT + 30_000;
+
+  it("TC-V18: the immutable absolute deadline is enforced after verification, at every admission and in flight", async () => {
+    // (a) The deadline passes during verification/setup: first read deadline - 1, then +2 ms.
+    const setup = await captureWatch();
+    await advanceTo(setup.sched, DEADLINE - 1);
+    let reads = 0;
+    const a = trackedController();
+    const setupCalls: unknown[] = [];
+    const crossed = await validate(setup, {
+      fetchFn: makeMockFetch(setup.sched, { onCall: (c) => setupCalls.push(c) }),
+      clock: () => (++reads === 1 ? setup.sched.now : setup.sched.now + 2),
+      abortSignal: a.controller.signal,
+    });
+    expect(crossed).toMatchObject({
+      outcome: "VALIDATION_DEADLINE_EXPIRED",
+      httpAttempts: 0,
+      validationDeadlineAtMs: DEADLINE,
+    });
+    expect(setupCalls).toHaveLength(0);
+    expect(setup.sched.count("provider")).toBe(0);
+    expect(a.registered.size).toBe(0);
+
+    // (b) The deadline passes between the two requests: the market request is never admitted.
+    const between = await captureWatch();
+    await advanceTo(between.sched, DEADLINE - 5_000);
+    let skew = 0;
+    const b = trackedController();
+    const betweenCalls: string[] = [];
+    const cut = await validate(between, {
+      fetchFn: makeMockFetch(between.sched, {
+        delayMs: 4_999,
+        onCall: (c) => betweenCalls.push(c.url),
+      }),
+      clock: () => between.sched.now + skew,
+      onExchangeComplete: () => {
+        skew = 2; // the clock reads deadline + 1 when the market request would be admitted
+      },
+      abortSignal: b.controller.signal,
+    });
+    expect(cut).toMatchObject({
+      outcome: "VALIDATION_DEADLINE_EXPIRED",
+      reason: "VALIDATION_DEADLINE_EXPIRED",
+      httpAttempts: 1,
+    });
+    expect(betweenCalls).toHaveLength(1);
+    expect(cut.exchanges).toHaveLength(1);
+    expect(cut.exchanges[0]).toMatchObject({ purpose: "PRECHECK_TRANSACTION", error: null });
+    expect(between.sched.count("provider")).toBe(0);
+    expect(b.registered.size).toBe(0);
+
+    // (c) A request still in flight is aborted at the original absolute deadline.
+    const inflight = await captureWatch();
+    await advanceTo(inflight.sched, DEADLINE - 5_000);
+    const c = trackedController();
+    const aborted = await validate(inflight, {
+      fetchFn: makeMockFetch(inflight.sched, { delayMs: 8_000 }),
+      abortSignal: c.controller.signal,
+    });
+    expect(aborted).toMatchObject({ outcome: "VALIDATION_DEADLINE_EXPIRED", httpAttempts: 1 });
+    expect(aborted.exchanges[0]).toMatchObject({
+      error: "REQUEST_ABORTED",
+      completedAtMs: DEADLINE,
+    });
+    expect(inflight.sched.now).toBe(DEADLINE);
+    expect(inflight.sched.count("provider")).toBe(0);
+    expect(c.registered.size).toBe(0);
+    // Offline re-derivation reaches the same classification.
+    expect(evaluateWatchCandidateEvidence(aborted.discovery!, aborted.exchanges).outcome).toBe(
+      "VALIDATION_DEADLINE_EXPIRED",
+    );
+
+    // (d) The clock steps forward 2 ms during session setup (after the remaining-time read and
+    // before the session opens). The session's relative lifetime would then end 2 ms after the
+    // deadline; the deadline guard still aborts the in-flight request at the absolute deadline.
+    const drifting = await captureWatch();
+    await advanceTo(drifting.sched, DEADLINE - 5_000);
+    let clockReads = 0;
+    const stepped = await validate(drifting, {
+      fetchFn: makeMockFetch(drifting.sched, { delayMs: 8_000 }),
+      // Reads: 1 verification, 2 fresh check, 3 remaining time; from read 4 (session open) +2 ms.
+      clock: () => drifting.sched.now + (++clockReads >= 4 ? 2 : 0),
+    });
+    expect(stepped.outcome).toBe("VALIDATION_DEADLINE_EXPIRED");
+    expect(stepped.exchanges[0]).toMatchObject({
+      error: "REQUEST_ABORTED",
+      completedAtMs: DEADLINE,
+    });
+    expect(drifting.sched.count("provider")).toBe(0);
+  });
+
+  it("TC-V19: pure derivation applies the per-request timeout; timeout records never qualify as late successes", async () => {
+    const env = await captureWatch();
+    const live = await validate(env, { fetchFn: makeMockFetch(env.sched) });
+    expect(live.outcome).toBe("TARGET_SELECTED");
+    const d = live.discovery!;
+    const [tx, market] = live.exchanges as PrecheckExchange[];
+    const edit = (ex: PrecheckExchange, change: (x: Loose) => void): PrecheckExchange => {
+      const copy = structuredClone(ex) as Loose;
+      change(copy);
+      return copy;
+    };
+
+    // The reviewer's reproduction: a 20 s transaction, then the market request, all inside 30 s.
+    const slowTx = edit(tx!, (x) => (x.completedAtMs = x.dispatchedAtMs + 20_000));
+    const afterSlow = edit(market!, (x) => {
+      x.dispatchedAtMs = slowTx.completedAtMs as number;
+      x.completedAtMs = (slowTx.completedAtMs as number) + 100;
+    });
+    expect((afterSlow.completedAtMs as number) < DEADLINE).toBe(true);
+    expect(evaluateWatchCandidateEvidence(d, [slowTx, afterSlow])).toMatchObject({
+      ok: false,
+      outcome: "EXCHANGE_EVIDENCE_INVALID",
+      reason: "EXCHANGE_1_EXCEEDED_REQUEST_TIMEOUT",
+    });
+
+    // A stricter supplied timeout applies too (the live exchanges took 100 ms each).
+    expect(
+      evaluateWatchCandidateEvidence(d, [tx!, market!], { limits: { requestTimeoutMs: 50 } }),
+    ).toMatchObject({
+      outcome: "EXCHANGE_EVIDENCE_INVALID",
+      reason: "EXCHANGE_1_EXCEEDED_REQUEST_TIMEOUT",
+    });
+    // ...and a looser one is capped at the reviewed 10 s.
+    expect(
+      evaluateWatchCandidateEvidence(d, [slowTx, afterSlow], {
+        limits: { requestTimeoutMs: 60_000 },
+      }).reason,
+    ).toBe("EXCHANGE_1_EXCEEDED_REQUEST_TIMEOUT");
+
+    // A timeout record that still carries a body never qualifies as a successful response.
+    const timedOut = edit(tx!, (x) => {
+      x.error = "REQUEST_TIMED_OUT";
+      x.completedAtMs = x.dispatchedAtMs + 10_000;
+    });
+    expect(evaluateWatchCandidateEvidence(d, [timedOut])).toMatchObject({
+      ok: false,
+      outcome: "TRANSACTION_REQUEST_FAILED",
+      reason: "REQUEST_FAILED:REQUEST_TIMED_OUT",
+    });
+    const marketAfterTimeout = edit(market!, (x) => {
+      x.dispatchedAtMs = timedOut.completedAtMs as number;
+      x.completedAtMs = (timedOut.completedAtMs as number) + 100;
+    });
+    expect(evaluateWatchCandidateEvidence(d, [timedOut, marketAfterTimeout])).toMatchObject({
+      outcome: "EXCHANGE_EVIDENCE_INVALID",
+      reason: "MARKET_REQUEST_WITHOUT_QUALIFIED_TRANSACTION",
+    });
+
+    // Live: a response slower than the timeout is recorded truthfully and re-derives the same way.
+    const slow = await captureWatch();
+    const timeout = await validate(slow, {
+      fetchFn: makeMockFetch(slow.sched, { delayMs: 10_500 }),
+    });
+    expect(timeout).toMatchObject({
+      outcome: "TRANSACTION_REQUEST_FAILED",
+      reason: "REQUEST_FAILED:REQUEST_TIMED_OUT",
+      httpAttempts: 1,
+    });
+    const record = timeout.exchanges[0]!;
+    expect(record).toMatchObject({ error: "REQUEST_TIMED_OUT" });
+    expect((record.completedAtMs as number) - record.dispatchedAtMs).toBe(10_000);
+    expect(evaluateWatchCandidateEvidence(timeout.discovery!, timeout.exchanges)).toMatchObject({
+      outcome: "TRANSACTION_REQUEST_FAILED",
+      reason: "REQUEST_FAILED:REQUEST_TIMED_OUT",
+    });
+    expect(slow.sched.count("provider")).toBe(0);
   });
 });
