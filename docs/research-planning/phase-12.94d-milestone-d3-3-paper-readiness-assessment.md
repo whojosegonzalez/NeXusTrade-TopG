@@ -5157,12 +5157,13 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 ### 8.38 Proposed Bounded AMM v4 Passive Creation-Watch Design (Proposed / Unapproved)
 
 > [!IMPORTANT]
-> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Two offline components are completed and verified:
+> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Three offline components are completed and verified:
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
 > 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 19 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the reviews of `5ec9ee8` (§8.38.6) and `92f6c9f` (§8.38.7).
+> 3. Offline sealing and fail-closed verification of supplied watch evidence (`backend/src/scripts/fresh-amm-v4-watch-evidence.ts`), verified by 7 focused offline tests (`fresh-amm-v4-watch-evidence.test.ts`) (§8.38.8).
 >
-> File persistence (`PrecheckWriter` integration), handoff integration (`paper-pilot-handoff.ts`), and CLI activation (`fresh-amm-v4-precheck.ts --watch`) remain subsequent planned integration tasks.
+> Sealing is completed; it is not yet wired into anything. Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run), CLI activation (a watch entry point running collector → validator → sealer) and live execution remain planned and are not started. No live limits are approved.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -5181,7 +5182,7 @@ To preserve the existing one-shot precheck script (`backend/src/scripts/fresh-am
 - **Acquisition (Stateful I/O & Network)**:
   - WebSocket notification collector (`BoundedAmmV4CreationWatch.ts`): connection establishment, subscription dispatch, frame buffering, keepalive ping/pong scheduling, and bounded teardown (**Completed & Verified**).
   - Watched candidate validation orchestrator (`AmmV4WatchCandidateValidation.ts`): performs pre-send discovery verification, enforces absolute validation deadline ($\min(t_{\text{notif}} + 30\text{s}, t_{\text{overall}})$), dispatches at most 2 HTTP requests via `PaperRequestSession` (Solana RPC 2.5s pacing, DexScreener 1.0s pacing, 1 MiB response cap), and gates DexScreener dispatch strictly on valid AMM v4 transaction initialization (**Completed & Verified**).
-  - File persistence exclusively handled by `PrecheckWriter` using exclusive-create (`wx`) mode (**Planned**).
+  - Evidence sealing and verification (`fresh-amm-v4-watch-evidence.ts`): exclusive-create (`wx`) writes of supplied evidence into a new directory, byte-level credential redaction, and fail-closed verification with selection re-derivation. It reuses the reviewed `PrecheckWriter` pattern without changing the precheck (**Completed & Verified**, §8.38.8). Wiring it into a watch run is **Planned**.
 
 #### 8.38.2 Component Reuse & Accurate Module Boundaries
 
@@ -5190,12 +5191,13 @@ To preserve the existing one-shot precheck script (`backend/src/scripts/fresh-am
 | `BoundedAmmV4CreationWatch`                            | Passive WebSocket notification collection                                            | **Completed Component**. Bounded collector for Raydium AMM v4 creation candidates. 15 min ceiling, 5s ack timeout, 20s/10s keepalive with byte-matched pongs, complete frame retention, pre-decode overflow guards, settled teardown.   |
 | `AmmV4WatchCandidateValidation`                        | Watched candidate HTTP retrieval & pure target derivation                            | **Completed Component**. Validates discovery proof chain before send, bounds validation to $\min(t_{\text{notif}} + 30\text{s}, t_{\text{overall}})$, bounds HTTP to $\le 2$ attempts, preserves distinct timestamps, redacts RPC URLs. |
 | `WsWebSocketTransport` / Keepalive Scheduler           | WebSocket connection, raw frame transport, ping/pong scheduling                      | Transport wrapper. With no reconnect allowed, the first unmatched pong timeout terminates the session.                                                                                                                                  |
-| `PaperRequestSession`                                  | Bounded HTTP dispatch, lane pacing, per-request timeouts, response exchange observer | Dispatches and bounds HTTP exchanges; does **not** persist evidence files (evidence persistence is handled by `PrecheckWriter`).                                                                                                        |
+| `PaperRequestSession`                                  | Bounded HTTP dispatch, lane pacing, per-request timeouts, response exchange observer | Dispatches and bounds HTTP exchanges; does **not** persist evidence files (watched evidence is sealed by `fresh-amm-v4-watch-evidence.ts`, §8.38.8).                                                                                    |
 | `SolanaRpcTransactionFetcher.parseTransactionResponse` | Structural Solana transaction result normalization                                   | Normalizes transaction results; does **not** validate the outer JSON-RPC 2.0 envelope (`jsonrpc === "2.0"`, id echo, null error). Outer envelope validation is handled by precheck helpers.                                             |
 | `PoolInitializationParser`                             | Instruction identification and account key resolution for `initialize2`              | Decodes instructions and resolves keys; does **not** perform the precheck's fee-account check (account index 14 == `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`). That verification is performed by `evaluateInitializationExchange`. |
 | `evaluateInitializationExchange`                       | Transaction verification                                                             | Reused directly from `fresh-amm-v4-precheck.ts` to evaluate the retrieved initialization transaction.                                                                                                                                   |
 | `DexScreenerSingleCandidateMarketParser`               | Market pair validation and `pairCreatedAt` extraction                                | Pure market parser; validates token-base / WSOL-quote and returns creation timestamp.                                                                                                                                                   |
-| `paper-pilot-handoff.ts`                               | Verification of pin, manifest digests, and start-window clock checks                 | **Planned Extension**. Extended to verify watched discovery evidence and independently re-derive selection without fabricated signature pages.                                                                                          |
+| `fresh-amm-v4-watch-evidence.ts`                       | Sealing and verification of supplied watch evidence                                  | **Completed Component** (§8.38.8). Exclusive-create sealing, byte-level redaction, fail-closed integrity, completeness and re-derivation. Not yet integrated.                                                                           |
+| `paper-pilot-handoff.ts`                               | Verification of pin, manifest digests, and start-window clock checks                 | **Planned Extension** (not started). It is to consume `verifyWatchEvidence` and accept only `selectionConfirmed` runs, without fabricated signature pages.                                                                              |
 
 #### 8.38.3 Exact Notification-to-Selection Proof Chain
 
@@ -5268,7 +5270,7 @@ The companion watch module captures an auditable chain of provider observations.
 
 #### 8.38.5 Synthetic Acceptance Cases & Verified Test Suites (Offline Tests Only)
 
-All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 64 tests pass deterministically in virtual time (after the §8.38.6 and §8.38.7 corrections):
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 5 focused test suites, 71 tests pass deterministically in virtual time: the 64 after the §8.38.6 and §8.38.7 corrections, plus the 7 sealing tests in §8.38.8:
 
 ##### 1. Bounded WebSocket Collector Suite (`BoundedAmmV4CreationWatch.test.ts` — 33 Tests)
 
@@ -5400,3 +5402,114 @@ TC-V16's 60 s case now moves the market dispatch close to its completion, so it 
 The twelve §8.38.6 mutations are still each caught.
 
 - **Results**: under external 60 s limits, the validation suite passes 19/19, the collector 33/33, the precheck 6/6 and the handoff 6/6 (64 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the precheck manifest are unchanged.
+
+#### 8.38.8 Offline Watch Evidence Sealing and Verification (Completed)
+
+After the review of `885323e` accepted the validation component (64 focused tests and both deadline reproductions), the offline artifact layer is implemented in `backend/src/scripts/fresh-amm-v4-watch-evidence.ts`, with its tests in `fresh-amm-v4-watch-evidence.test.ts`. It seals and verifies **supplied** evidence only. It collects nothing, reads no credentials from the environment, constructs no transport and starts no daemon. The collector, validator, one-shot precheck, handoff, wrapper, Stage B runner, strategy, historical evidence and wallet are unchanged. Nothing was executed against a provider.
+
+**Completed versus planned**:
+
+| Step                                                                          | Status                                          |
+| ----------------------------------------------------------------------------- | ----------------------------------------------- |
+| Sealing supplied watch evidence (`sealWatchEvidence`)                         | **Completed & verified offline**                |
+| Fail-closed verification and selection re-derivation (`verifyWatchEvidence`)  | **Completed & verified offline**                |
+| Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run)   | **Planned**: not started                        |
+| CLI activation (a watch entry point that runs collector → validator → sealer) | **Planned**: not started                        |
+| Live execution                                                                | **Not authorized**: no live limits are approved |
+
+`PrecheckWriter` is not reused as a class. The layer copies the reviewed sealing and redaction pattern instead, so the existing runners stay untouched.
+
+**Sealing (`sealWatchEvidence`)**:
+
+- **Inputs**: the plan, the collector result, the validation result (or `null`), the bounded exchange records (by default the validation result's own records; supplied records must equal them), the terminal cause, the policy/deadline context, and the credentials, which must be supplied explicitly.
+- **Directory**: a new directory `data/research/prechecks/<runName>` (a safe name). An existing directory is refused (`OUTPUT_DIRECTORY_UNAVAILABLE`) and nothing in it is touched.
+- **Writes**: every file is prepared in memory first. Each write is an exclusive create (`wx`), and the manifest is written last.
+- **Files**:
+  - `plan.json`
+  - `context.json`: the supplied context, the resolved limits, the reviewed watch policy, and the recorded and recomputed deadlines.
+  - `watch-observations.json`: the collector result, with frames, counters, events and termination.
+  - `exchanges/NNNN.json`: request and response identity, timing, the allowlisted response headers, body state, retained/observed/maximum byte counts, digests and the bounded body.
+  - `request-ledger.json`
+  - `request-exchanges.json`: the index, with `missingExchangeCount`.
+  - `validation.json`
+  - `selection.json`
+  - `report.json`
+  - `evidence-manifest.json`
+- **Terminal causes**: one of `COMPLETED`, `WATCH_ENDED_WITHOUT_CAPTURE`, `OPERATOR_CANCELLED` (at the WATCH, VALIDATION or RUN stage) or `RUN_FAILED` (a detail is required). The cause must agree with the results, otherwise the seal is `SEAL_INPUT_INVALID` with nothing written:
+  - A cancelled watch or validation must be recorded as cancellation.
+  - `COMPLETED` needs a captured watch and a recorded validation.
+  - A watch without capture has no validation.
+  - The policy context must reproduce the recorded validation deadline.
+- **Selection**: `selected` is true only for `COMPLETED` with `TARGET_SELECTED`. A cancelled or failed run keeps its cause and outcome even when its evidence would otherwise select.
+- **Redaction**:
+  - **What is redacted**: the credentials are expanded the same way as in the precheck: the URL, query values of at least 6 characters, user/password and path segments of at least 16 characters, plus any further values of at least 6 characters.
+  - **Bodies and frames**: redacted on bytes, both plain and `\u`-escaped forms, before UTF-8 or base64 encoding. A partial body that ends inside a credential also has the trailing fragment (at least 4 bytes) redacted.
+  - **Other strings**: redacted by literal value only, so generic provider fields such as `token` are kept.
+  - **Never stored**: request headers. Credentials never appear in logs, results or files. Any residual credential refuses the seal (`SEAL_REFUSED`) before anything is written.
+  - **Digests**: each exchange records `receivedBytesSha256` (the original bytes; prefix-only scope for partial bodies) separately from `sanitizedBytesSha256` (the stored bytes), with `bodyRedacted` and `reproducesReceivedDigest`. A redacted frame keeps its original byte length and records its original and sanitized digests in `frameRedactions`.
+  - **Report**: lists the redacted frames and bodies and the literal redactions per file. When redaction touches evidence that the re-derivation consumes, it sets `reproducible: false` with an explicit limitation.
+- **Write failure**: the result is `ARTIFACT_WRITE_FAILED`, naming the failed file and the files already written. The original run cause and recorded outcome are preserved, and the error is redacted. There is no retry and no manifest, so the run is never reported as sealed. The layer cannot trigger acquisition: it takes no fetch or transport.
+
+**Verification (`verifyWatchEvidence`)** is read-only and keeps three answers apart:
+
+1. **Integrity** (fail-closed). Checked before any response file is parsed:
+   - the manifest kind and version;
+   - the entry schema, and safe, confined, unique paths (case-insensitive), so traversal, absolute and backslash paths are rejected without being read;
+   - categories, required entries, and regular files with no symbolic or hard links on any path component;
+   - sizes and hashes;
+   - no unlisted file or directory at any depth;
+   - the plan digest in both the manifest and the report, and the report's file references;
+   - the exchange index against the manifest and ledger;
+   - the attempt accounting, and consistency of the validation, selection and terminal cause.
+
+   Then each response file is checked against its ledger entry and stored-body digest, and request headers must be absent.
+
+2. **Completeness**: lists why the sealed evidence could not support a target. The reasons are a terminal cause other than completion, a watch without capture, no validation, missing exchanges, partial or unread bodies, redacted bodies or frames, and an outcome other than `TARGET_SELECTED`. A correctly sealed incomplete run passes integrity with `sufficientForSelection: false`.
+3. **Re-derivation**: for a recorded validation, the reviewed `validateWatchedDiscoveryEvidence` (at the recorded completion time), `computeWatchValidationDeadline` and `evaluateWatchCandidateEvidence` run on the sealed frames, exchanges and policy context, and the result is compared with the recorded discovery, deadline, outcome, reason and target.
+   - `REPRODUCED`: the sealed evidence re-derives the recorded result.
+   - `MISMATCH`: a contradiction; the run is not verified.
+   - `LIMITED_BY_REDACTION`: the results differ, and redaction changed the inputs the re-derivation consumes.
+   - `NOT_ELIGIBLE`: no validation was recorded; or the run was cancelled by the operator (the recorded outcome is preserved and no target is ever derived); or the outcome came from acquisition (an interruption or an undispatched request) and the exchanges alone re-derive something other than a selection.
+
+`selectionConfirmed` is true only when integrity holds, the evidence is complete and the selection is `REPRODUCED`.
+
+**Synthetic tests** (`fresh-amm-v4-watch-evidence.test.ts`, 7 tests). Genuine collector and validator output on the virtual scheduler, with artifacts in the test's own OS temporary directories:
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| W-01 | A selected run seals, round-trips and is `REPRODUCED` with `selectionConfirmed`. Frames, request identity, raw bodies, context and selection are preserved; no credential is in any file or decoded body. The seal makes no further fetch. Re-sealing into the same directory is refused with the bytes unchanged. A policy context that does not reproduce the deadline, or exchange records that differ from the validation, are refused with nothing written                                              |
+| W-02 | A watch with no notification (collector ceiling) seals as `WATCH_ENDED_WITHOUT_CAPTURE` with no validation and no exchanges. It verifies with explicit completeness reasons and `NOT_ELIGIBLE`. Mislabelled causes are refused                                                                                                                                                                                                                                                                               |
+| W-03 | Watch cancellation and in-flight validation cancellation are preserved (`NOT_ELIGIBLE`); relabelling either is refused. A run cancelled after complete, usable evidence stays `OPERATOR_CANCELLED` with no target and is never confirmed. A run failure after a selected validation keeps `RUN_FAILED`, with its detail redacted and `selected: false`. Re-forged records with consistent hashes (cancelled evidence relabelled `COMPLETED`/`SESSION_STOPPED`; a changed target) are `MISMATCH`              |
+| W-04 | A 64-byte market limit keeps the retained prefix with prefix-only digest scope and re-derives the recorded non-selection. A prefix that ends inside the key has the fragment redacted (`[REDACTED_PARTIAL]`)                                                                                                                                                                                                                                                                                                 |
+| W-05 | An injected write failure on `exchanges/0002.json` gives `ARTIFACT_WRITE_FAILED` with exactly one attempt, no manifest, the run cause and recorded outcome preserved, and a redacted error. Verification reports `MANIFEST_MISSING`. The partial directory is never reused. Missing or too-short credentials are refused without echoing them                                                                                                                                                                |
+| W-06 | Size and hash changes, extra files at the root and in `exchanges/`, nested directories, outside, absolute, backslash and dot paths, duplicates (including by case), a missing required entry, version/kind/schema errors, a missing or corrupt manifest and a hard link are each rejected. So are re-forged reference corruptions with consistent hashes: index, unindexed response, report references, plan digest, ledger fields and order, stored body, request headers, selected flag and terminal cause |
+| W-07 | A UTF-8 market body echoing the key (plain and `\u`-escaped) next to a generic `token` field: the key is redacted, `token` is kept, the digests differ, and verification is `LIMITED_BY_REDACTION` with the limitation reported. A non-text RPC body is redacted on bytes, stored as sanitized base64 and reproduces its recorded rejection. A watch frame echoing the WSS key is redacted with its original digest and length kept, and is `LIMITED_BY_REDACTION`                                           |
+
+- **Mutation checks** (source restored byte-identical), each caught:
+
+| Mutation                                                 | Caught by    |
+| -------------------------------------------------------- | ------------ |
+| Non-exclusive write flag                                 | 6 passed (7) |
+| Existing output directory accepted                       | 5 passed (7) |
+| Failed write skipped, sealing continues                  | 6 passed (7) |
+| Failed write retried once                                | 6 passed (7) |
+| Bodies stored without byte redaction                     | 5 passed (7) |
+| No trailing-fragment redaction for partial bodies        | 6 passed (7) |
+| Escaped credential forms not redacted in bytes           | 6 passed (7) |
+| Watch frames not byte-redacted                           | 6 passed (7) |
+| Cancellation may be relabelled                           | 6 passed (7) |
+| Selection flag ignores the terminal cause                | 6 passed (7) |
+| Policy context not checked against the recorded deadline | 6 passed (7) |
+| Hard links accepted                                      | 6 passed (7) |
+| Unsafe or outside paths accepted                         | 6 passed (7) |
+| Duplicate entries accepted                               | 6 passed (7) |
+| Unlisted files accepted                                  | 6 passed (7) |
+| Plan digest not checked                                  | 6 passed (7) |
+| Exchange files not compared with the ledger              | 6 passed (7) |
+| Stored body digest not checked                           | 6 passed (7) |
+| Completeness ignores the terminal cause                  | 5 passed (7) |
+| Cancelled validation re-derived like a completed one     | 6 passed (7) |
+| Redaction reported as mismatch instead of limitation     | 6 passed (7) |
+| Re-derivation ignores the recorded target                | 6 passed (7) |
+
+- **Results**: under external 60 s limits, the new suite passes 7/7, and the validation 19/19, collector 33/33, precheck 6/6 and handoff 6/6 suites are unchanged (71 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket or daemon was used.
