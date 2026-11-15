@@ -203,7 +203,10 @@ export function terminalCauseProblem(
     case "OPERATOR_CANCELLED":
       return (cause.stage === "WATCH" && watchCancelled && !hasValidation) ||
         (cause.stage === "VALIDATION" && captured && validationCancelled) ||
-        (cause.stage === "RUN" && captured && !hasValidation)
+        // After capture: before validation, or after a validation that itself finished (its
+        // result and exchanges are kept; the run is not actionable). A cancelled validation keeps
+        // its own VALIDATION-stage cause.
+        (cause.stage === "RUN" && captured && !validationCancelled)
         ? null
         : "CANCELLATION_CAUSE_INCONSISTENT";
     default:

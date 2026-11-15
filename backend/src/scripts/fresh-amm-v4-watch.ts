@@ -154,7 +154,11 @@ export interface FreshAmmV4WatchResult {
   readonly watchStatus?: string | undefined;
   readonly validationOutcome?: string | null | undefined;
   readonly terminalCause?: WatchRunTerminalCause | undefined;
-  /** Cancellation requested after validation finished: sealing still ran with the true cause. */
+  /**
+   * Cancellation observed after validation finished and before sealing started: the completed
+   * validation and its exchanges are sealed unchanged, but the run is sealed as OPERATOR_CANCELLED
+   * at RUN, so it is never actionable.
+   */
   readonly cancellationAfterValidation?: boolean | undefined;
   readonly seal?:
     | {
@@ -513,13 +517,21 @@ async function runLive(a: {
     log(`[LIVE] Validation: ${validation?.outcome ?? "NOT_RECORDED"}`);
   }
   stage("AFTER_VALIDATION");
-  // Cancellation after validation finished cannot change what was acquired: sealing runs with the
-  // true cause, and the request is reported.
-  const cancellationAfterValidation =
-    validation !== null && validation.outcome !== "OPERATOR_CANCELLED" && signal?.aborted === true;
-
-  // 3. Seal (never cancelled, never retried).
   stage("BEFORE_SEAL");
+
+  // 3. Cancellation is checked after the stage hooks, immediately before the sealer is called. A
+  //    cancellation observed here turns a completed run into a cancelled one (the completed
+  //    validation and its exchanges are kept); an earlier failure or cancellation cause is kept.
+  const cancellationAfterValidation = cause.code === "COMPLETED" && signal?.aborted === true;
+  if (cancellationAfterValidation) {
+    cause = {
+      code: "OPERATOR_CANCELLED",
+      stage: "RUN",
+      detail: "Operator cancellation after validation finished, before sealing",
+    };
+  }
+
+  // 4. Seal (uninterrupted: nothing checks the signal from here on; never retried).
   const sealed = sealWatchEvidence({
     projectRoot: a.projectRoot,
     runName: target.runName,
@@ -560,10 +572,12 @@ async function runLive(a: {
   log(`[LIVE] Evidence sealed: ${target.rel} (manifest sha256 ${sealed.manifestSha256})`);
   log(`[LIVE] Terminal cause: ${sealed.runCause.code} at ${sealed.runCause.stage}`);
   if (cancellationAfterValidation) {
-    log("[LIVE] Cancellation was requested after validation finished; the evidence was sealed.");
+    log(
+      "[LIVE] Cancelled after validation finished: the evidence is sealed as OPERATOR_CANCELLED and is not actionable.",
+    );
   }
 
-  // 4. Offline verification of what was sealed.
+  // 5. Offline verification of what was sealed.
   const report = verificationReport(verifyWatchEvidence(target.outDir));
   logVerification(log, "LIVE", report);
   log("[LIVE] Ends here: no Stage B launch and no start-window wait.");

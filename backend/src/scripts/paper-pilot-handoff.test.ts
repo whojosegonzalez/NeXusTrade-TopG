@@ -983,6 +983,22 @@ describe("Watched-evidence handoff (offline integration)", () => {
     });
     runs.push(["forged pool", forged, ["WATCH_SELECTION_MISMATCH"]]);
 
+    // Cancellation observed after a completed, selected validation (sealed at RUN): the usable
+    // evidence is retained and re-derives exactly, but continuation is not authorized.
+    runs.push([
+      "cancelled after a completed validation",
+      sealRun(root, "cancelled-after-validation", {
+        watchResult: env.watchResult,
+        validation,
+        terminalCause: {
+          code: "OPERATOR_CANCELLED",
+          stage: "RUN",
+          detail: "Operator cancellation after validation finished, before sealing",
+        },
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:TERMINAL_CAUSE:OPERATOR_CANCELLED"],
+    ]);
+
     for (const [label, rel, expected] of runs) {
       const r = watched(root, rel, now);
       expect(r.decision, label).toBe("REFUSED");

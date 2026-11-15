@@ -27,6 +27,11 @@ import {
   type WatchRunStageBoundary,
 } from "./fresh-amm-v4-watch.js";
 import { WATCH_EVIDENCE_FILES, verifyWatchEvidence } from "./fresh-amm-v4-watch-evidence.js";
+import {
+  ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER,
+  evaluateWatchedPilotHandoff,
+  type GitRunner,
+} from "./paper-pilot-handoff.js";
 import { DEFAULT_CREATION_WATCH_LIMITS } from "../candidate-scanner/BoundedAmmV4CreationWatch.js";
 import {
   DEFAULT_WATCH_VALIDATION_LIMITS,
@@ -261,6 +266,17 @@ function expectCleanedUp(h: Harness, r: FreshAmmV4WatchResult) {
 
 const readJson = (h: Harness, rel: string): Loose =>
   JSON.parse(readFileSync(path.join(h.abs(RUN), ...rel.split("/")), "utf8"));
+
+/** A fake git runner for which the code pin passes (handoff assertions only). */
+const allowedGit: GitRunner = (args) => {
+  if (args[0] === "diff" && args[1] === "--name-status") {
+    return {
+      status: 0,
+      stdout: ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`).join("\n"),
+    };
+  }
+  return { status: 0, stdout: args[0] === "rev-parse" ? "a".repeat(40) : "" };
+};
 
 const rpcMethods = (h: Harness) =>
   h.calls
@@ -534,24 +550,139 @@ describe("fresh AMM v4 watch entry point (offline)", () => {
       expectCleanedUp(h, r);
     }
 
-    // After validation finished: what was acquired is sealed with its true cause and the request
-    // is reported; nothing further runs.
-    const h = harness();
-    const r = await h.run(["--out-dir", RUN, "--live"], {
-      onStage: (s) => s === "AFTER_VALIDATION" && h.controller.abort(),
+    // After validation finished, from either hook (the review reproduction): the completed
+    // validation and both exchanges are sealed unchanged, but the run is sealed as cancelled at
+    // RUN, is not selected, is not confirmed and is refused by the watched handoff.
+    for (const boundary of ["AFTER_VALIDATION", "BEFORE_SEAL"] as const) {
+      const h = harness();
+      const r = await h.run(["--out-dir", RUN, "--live"], {
+        onStage: (s) => s === boundary && h.controller.abort(),
+      });
+      expect(r, boundary).toMatchObject({
+        exitCode: WATCH_EXIT_CODES.NOT_CONFIRMED,
+        validationOutcome: "TARGET_SELECTED",
+        terminalCause: {
+          code: "OPERATOR_CANCELLED",
+          stage: "RUN",
+          detail: "Operator cancellation after validation finished, before sealing",
+        },
+        cancellationAfterValidation: true,
+        seal: { ok: true, status: "SEALED" },
+        verification: {
+          integrity: { ok: true, problems: [] },
+          completeness: {
+            sufficientForSelection: false,
+            reasons: ["TERMINAL_CAUSE:OPERATOR_CANCELLED"],
+          },
+          rederivation: "REPRODUCED",
+          selectionConfirmed: false,
+          confirmedTarget: null,
+        },
+      });
+      expect(h.calls, boundary).toHaveLength(2);
+      expect(readJson(h, WATCH_EVIDENCE_FILES.selection), boundary).toMatchObject({
+        selected: false,
+        recordedOutcome: "TARGET_SELECTED",
+        runOutcome: "OPERATOR_CANCELLED",
+        terminalCause: { code: "OPERATOR_CANCELLED", stage: "RUN" },
+      });
+      // Usable completed evidence is retained...
+      const v = verifyWatchEvidence(h.abs(RUN));
+      expect(readJson(h, WATCH_EVIDENCE_FILES.validation).result).toMatchObject({
+        outcome: "TARGET_SELECTED",
+        target: { poolId: POOL, mintAddress: MINT },
+      });
+      expect(existsSync(path.join(h.abs(RUN), "exchanges", "0001.json"))).toBe(true);
+      expect(existsSync(path.join(h.abs(RUN), "exchanges", "0002.json"))).toBe(true);
+      expect(v).toMatchObject({ verified: true, selectionConfirmed: false, confirmedTarget: null });
+      // ...without authorizing continuation.
+      const handoff = evaluateWatchedPilotHandoff({
+        projectRoot: h.projectRoot,
+        watchEvidenceDir: RUN,
+        pilotOutDir: "data/research/single-candidate/pilot-after-cancel",
+        pinnedCommit: "a".repeat(40),
+        clock: () => (Math.floor((START_MS - 300_000) / 1000) + 300) * 1000,
+        git: allowedGit,
+      });
+      expect(handoff.decision, boundary).toBe("REFUSED");
+      expect(handoff.poolId, boundary).toBeUndefined();
+      expect(handoff.mintAddress, boundary).toBeUndefined();
+      expect(handoff.refusals, boundary).toEqual([
+        "WATCH_EVIDENCE_INCOMPLETE:TERMINAL_CAUSE:OPERATOR_CANCELLED",
+        "WATCH_SELECTION_NOT_CONFIRMED",
+      ]);
+      expect(
+        h.lines.some((l) => l.includes("sealed as OPERATOR_CANCELLED and is not actionable")),
+        boundary,
+      ).toBe(true);
+      expectNoSecrets(h);
+      expectCleanedUp(h, r);
+      // Verifying the cancelled run reports exit 3; after tampering, the integrity exit 4.
+      expect((await h.run(["--verify", RUN])).exitCode, boundary).toBe(
+        WATCH_EXIT_CODES.NOT_CONFIRMED,
+      );
+      const selection = path.join(h.abs(RUN), WATCH_EVIDENCE_FILES.selection);
+      writeFileSync(selection, readFileSync(selection, "utf8").replace(POOL, MINT));
+      expect((await h.run(["--verify", RUN])).exitCode, boundary).toBe(
+        WATCH_EXIT_CODES.INTEGRITY_FAILED,
+      );
+    }
+
+    // An earlier cause is kept when cancellation is also observed before sealing.
+    const earlier: [string, Parameters<typeof harness>[0], Record<string, unknown>][] = [
+      [
+        "no capture",
+        { script: [{ atMs: 600, data: ACK }] },
+        { terminalCause: { code: "WATCH_ENDED_WITHOUT_CAPTURE", stage: "WATCH" } },
+      ],
+      [
+        "failed cleanup",
+        { transport: { throwOnClose: true, stayOpen: true } },
+        { terminalCause: { code: "RUN_FAILED", stage: "WATCH" } },
+      ],
+    ];
+    for (const [label, options, expected] of earlier) {
+      const h = harness(options);
+      const r = await h.run(["--out-dir", RUN, "--live"], {
+        onStage: (s) => s === "BEFORE_SEAL" && h.controller.abort(),
+      });
+      expect(r, label).toMatchObject({
+        exitCode: WATCH_EXIT_CODES.NOT_CONFIRMED,
+        cancellationAfterValidation: false,
+        seal: { ok: true },
+        ...expected,
+      });
+    }
+    // A cancelled validation keeps its VALIDATION-stage cause.
+    const inValidation = harness({ fetch: { rpcDelayMs: 1_000 } });
+    inValidation.sched.at(NOTIFY_AT + 500, () => inValidation.controller.abort());
+    const cancelled = await inValidation.run(["--out-dir", RUN, "--live"]);
+    expect(cancelled).toMatchObject({
+      terminalCause: { code: "OPERATOR_CANCELLED", stage: "VALIDATION" },
+      cancellationAfterValidation: false,
     });
-    expect(r).toMatchObject({
-      validationOutcome: "TARGET_SELECTED",
-      terminalCause: { code: "COMPLETED", stage: "VALIDATION" },
-      cancellationAfterValidation: true,
-      seal: { ok: true },
-      verification: { selectionConfirmed: true },
+
+    // A write failure keeps its exit code for a cancelled run; sealing itself is not interrupted
+    // (the failure is the writer's, reported once, with the cancelled cause).
+    const failing = harness();
+    let writes = 0;
+    const w = await failing.run(["--out-dir", RUN, "--live"], {
+      onStage: (s) => s === "BEFORE_SEAL" && failing.controller.abort(),
+      writeEvidenceFile: (file, content, options) => {
+        writes++;
+        if (file.replace(/\\/g, "/").endsWith("exchanges/0002.json")) {
+          throw new Error("SYNTHETIC disk full");
+        }
+        writeFileSync(file, content, options);
+      },
     });
-    expect(h.lines.some((l) => l.includes("Cancellation was requested after validation"))).toBe(
-      true,
-    );
-    expect(h.calls).toHaveLength(2);
-    expectCleanedUp(h, r);
+    expect(writes).toBeGreaterThan(1);
+    expect(failing.calls).toHaveLength(2);
+    expect(w).toMatchObject({
+      exitCode: WATCH_EXIT_CODES.SEAL_FAILED,
+      terminalCause: { code: "OPERATOR_CANCELLED", stage: "RUN" },
+      seal: { ok: false, status: "ARTIFACT_WRITE_FAILED" },
+    });
   });
 
   it("E-06: request failures are recorded once, sealed as validation rejections and never retried", async () => {

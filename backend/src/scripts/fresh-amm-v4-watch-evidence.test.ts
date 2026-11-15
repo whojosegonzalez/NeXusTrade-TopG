@@ -23,6 +23,7 @@ import {
 import { afterAll, describe, expect, it } from "vitest";
 import {
   sealWatchEvidence,
+  terminalCauseProblem,
   verifyWatchEvidence,
   WATCH_EVIDENCE_FILES,
   WATCH_EVIDENCE_REQUIRED_FILES,
@@ -1676,5 +1677,110 @@ describe("fresh AMM v4 watch evidence (offline sealing and verification)", () =>
     expect(idRedacted.integrity.ok).toBe(true);
     expect(idRedacted.rederivation.status).toBe("MISMATCH");
     expect(idRedacted.rederivation.detail).toMatch(/does not qualify/);
+  });
+  it("W-12: cancellation after a completed validation is sealed at RUN, keeps the evidence and is never confirmed", async () => {
+    const cancelledRun: WatchRunTerminalCause = {
+      code: "OPERATOR_CANCELLED",
+      stage: "RUN",
+      detail: "Operator cancellation after validation finished, before sealing",
+    };
+    // The minimal extension: RUN-stage cancellation after capture, with or without a finished
+    // validation; every other combination stays inconsistent.
+    const captured = "NOTIFICATION_CAPTURED";
+    expect(terminalCauseProblem(cancelledRun, captured, "TARGET_SELECTED")).toBeNull();
+    expect(terminalCauseProblem(cancelledRun, captured, "MARKET_NONMATCH")).toBeNull();
+    expect(terminalCauseProblem(cancelledRun, captured, null)).toBeNull();
+    expect(terminalCauseProblem(cancelledRun, captured, "OPERATOR_CANCELLED")).toBe(
+      "CANCELLATION_CAUSE_INCONSISTENT",
+    );
+    expect(terminalCauseProblem(cancelledRun, "NO_QUALIFYING_NOTIFICATION_OBSERVED", null)).toBe(
+      "CANCELLATION_CAUSE_INCONSISTENT",
+    );
+    expect(terminalCauseProblem(cancelledRun, "OPERATOR_CANCELLED", null)).toBe(
+      "CANCELLATION_CAUSE_INCONSISTENT",
+    );
+    expect(
+      terminalCauseProblem({ ...cancelledRun, stage: "WATCH" }, captured, "TARGET_SELECTED"),
+    ).toBe("CANCELLATION_CAUSE_INCONSISTENT");
+    expect(
+      terminalCauseProblem({ ...cancelledRun, stage: "VALIDATION" }, captured, "TARGET_SELECTED"),
+    ).toBe("CANCELLATION_CAUSE_INCONSISTENT");
+    expect(terminalCauseProblem(COMPLETED, captured, "OPERATOR_CANCELLED")).toBe(
+      "CANCELLATION_NOT_PRESERVED",
+    );
+
+    // A completed, selected validation sealed under a RUN-stage cancellation.
+    const { env, validation } = await selectedRun();
+    const { result, dir } = seal({
+      watchResult: env.watchResult,
+      validation,
+      terminalCause: cancelledRun,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      runCause: cancelledRun,
+      recordedOutcome: "TARGET_SELECTED",
+    });
+    expect(readJson(dir, WATCH_EVIDENCE_FILES.selection)).toMatchObject({
+      selected: false,
+      recordedOutcome: "TARGET_SELECTED",
+      runOutcome: "OPERATOR_CANCELLED",
+      terminalCause: cancelledRun,
+    });
+    // The usable completed evidence is retained unchanged...
+    expect(readJson(dir, WATCH_EVIDENCE_FILES.validation).result).toMatchObject({
+      outcome: "TARGET_SELECTED",
+      target: validation.target,
+    });
+    expect(readJson(dir, "exchanges/0001.json").purpose).toBe("PRECHECK_TRANSACTION");
+    expect(readJson(dir, "exchanges/0002.json").purpose).toBe("PRECHECK_MARKET");
+    // ...re-derives exactly, and is still never confirmed or released.
+    const v = verifyWatchEvidence(dir);
+    expect(v).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      completeness: {
+        sufficientForSelection: false,
+        reasons: ["TERMINAL_CAUSE:OPERATOR_CANCELLED"],
+      },
+      rederivation: { status: "REPRODUCED" },
+      runOutcome: "OPERATOR_CANCELLED",
+      recordedOutcome: "TARGET_SELECTED",
+      verified: true,
+      selectionConfirmed: false,
+      confirmedTarget: null,
+    });
+    expect(v.terminalCause).toEqual(cancelledRun);
+
+    // Strict consistency is retained at sealing: a cancelled validation keeps its own stage.
+    const cancelledValidation: WatchCandidateValidationResult = {
+      ...validation,
+      ok: false,
+      outcome: "OPERATOR_CANCELLED",
+      reason: "OPERATOR_CANCELLED: INTERRUPTED_AFTER_RESPONSE",
+      target: null,
+    };
+    const wrongStage = seal({
+      watchResult: env.watchResult,
+      validation: cancelledValidation,
+      terminalCause: cancelledRun,
+    });
+    expect(wrongStage.result).toMatchObject({
+      ok: false,
+      status: "SEAL_INPUT_INVALID",
+      reason: expect.stringContaining("CANCELLATION_CAUSE_INCONSISTENT"),
+    });
+    expect(existsSync(wrongStage.dir)).toBe(false);
+
+    // Relabelling the sealed cancellation as completion (consistent hashes) is caught by the
+    // selection and report consistency checks unless every copy is forged.
+    const relabelled = copyRun(dir, "cancelled-relabelled");
+    reforge(relabelled, {
+      [WATCH_EVIDENCE_FILES.selection]: (doc) => {
+        doc.selected = true;
+      },
+    });
+    const vr = verifyWatchEvidence(relabelled);
+    expect(vr.integrity.ok).toBe(false);
+    expect(vr).toMatchObject({ selectionConfirmed: false, confirmedTarget: null });
   });
 });
