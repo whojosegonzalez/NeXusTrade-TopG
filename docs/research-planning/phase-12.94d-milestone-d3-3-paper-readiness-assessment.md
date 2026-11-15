@@ -5160,7 +5160,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 > **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Two offline components are completed and verified:
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
-> 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 12 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`).
+> 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 17 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the review of `5ec9ee8` (§8.38.6).
 >
 > File persistence (`PrecheckWriter` integration), handoff integration (`paper-pilot-handoff.ts`), and CLI activation (`fresh-amm-v4-precheck.ts --watch`) remain subsequent planned integration tasks.
 
@@ -5250,7 +5250,8 @@ The companion watch module captures an auditable chain of provider observations.
   - Overall session deadline: 930,000 ms (15 min watch + 30 s validation headroom).
 - **Validation Deadline Contract**:
   - Validation gets at most 30 seconds from notification receipt, also bounded by the overall deadline:
-    $$\text{validationDeadlineAtMs} = \min(\text{notificationReceivedAtMs} + 30\,000, \text{overallDeadlineAtMs})$$
+    $\text{validationDeadlineAtMs} = \min(\text{notificationReceivedAtMs} + 30\,000, \text{overallDeadlineAtMs})$
+  - The receipt time is the retained qualifying frame's timestamp (cross-checked against the summary), and the overall deadline is the strictest of watch start + 930 s and any supplied deadline (§8.38.6).
   - An early notification (e.g. at $t = 60\text{ s}$) gives validation at most 30 s ($t = 90\text{ s}$); validation never runs until the 15-minute mark. Individual HTTP requests still observe their shorter 10-second request timeout.
 - **Settled Teardown Contract**:
   - `start()` resolves only after socket closure or bounded forced cleanup (max 5,000 ms) settles.
@@ -5267,7 +5268,7 @@ The companion watch module captures an auditable chain of provider observations.
 
 #### 8.38.5 Synthetic Acceptance Cases & Verified Test Suites (Offline Tests Only)
 
-All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 57 tests pass deterministically in virtual time:
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 62 tests pass deterministically in virtual time (after the §8.38.6 hardening):
 
 ##### 1. Bounded WebSocket Collector Suite (`BoundedAmmV4CreationWatch.test.ts` — 33 Tests)
 
@@ -5284,7 +5285,7 @@ All test cases are executed offline by injecting synthetic WebSocket events and 
 11. **TC-W11: Deep Immutability & Redaction**: Returned result and observation records are deep-frozen; nested error arrays cannot be modified in strict mode; credential-bearing WSS URLs are redacted.
 12. **TC-W12: Control-Frame Ceilings**: Strict enforcement of 45 client pings and 128 incoming control frames.
 
-##### 2. Watched Candidate Validation Suite (`AmmV4WatchCandidateValidation.test.ts` — 12 Tests)
+##### 2. Watched Candidate Validation Suite (`AmmV4WatchCandidateValidation.test.ts` — 17 Tests; TC-V13–V17 in §8.38.6)
 
 1. **TC-V01: Happy Path Validation & Selection**: Valid discovery evidence followed by successful `getTransaction` (Raydium AMM v4 `initialize2` with fee destination at account index 14) and DexScreener token GET within planning start window (240–760s). Verifies `TARGET_SELECTED`, exactly 2 HTTP requests dispatched, RPC URL redaction (`RPC_URL_PLACEHOLDER`), and distinct timestamps preserved without overwriting (`transactionBlockTimeSec !== instructionRequestedOpenTimeSec !== pairCreatedAtMs`).
 2. **TC-V02: Pre-Send Rejection on Unsuitable Watch Status**: Rejects collector results with non-captured status (`KEEPALIVE_TIMEOUT`) or null notification metadata with zero HTTP sends (`httpAttempts: 0`).
@@ -5303,3 +5304,61 @@ All test cases are executed offline by injecting synthetic WebSocket events and 
 
 - 6 tests in `fresh-amm-v4-precheck.test.ts`: validates one-shot sampling precheck, bounded retrieval, fee destination enforcement, and sealed evidence generation.
 - 6 tests in `paper-pilot-handoff.test.ts`: validates evidence manifest integrity, pin verification, and start-window clock checks.
+
+#### 8.38.6 Watched Candidate Validation Hardening (Review of 5ec9ee8)
+
+The independent review of `5ec9ee8` passed 57 focused tests and the backend typecheck, and reproduced five defects in `AmmV4WatchCandidateValidation.ts`. All are corrected in that module and its tests only. The reviewed collector (`65f1f67`), the one-shot precheck, the handoff, the wrapper, Stage B and the strategy are unchanged. File persistence, CLI activation and live execution remain later work; nothing was executed.
+
+1. **Receipt-time substitution extended the deadline.** The receipt time came from `notification.receivedAtMs`, so changing it from +10 s to +70 s let validation started at +40 s send both requests and select a target.
+   - **Source of the receipt time**: it is now the qualifying notification's **retained frame timestamp**.
+   - **Cross-checks**: the summary must agree with that frame. `notification.receivedAtMs` must lie between the frame time and the termination time; the termination time may be at most 1 s after the frame (the collector records all three in one synchronous handler); and the capture and termination events must match.
+   - **Timestamps**: future (relative to the validation clock), invalid or out-of-order timestamps are rejected before anything is sent.
+   - **Deadline**: computed from verified evidence and the strictest applicable limit: min(frame receipt + 30 s, watch start + 930 s, any limits deadline, any caller deadline). Overrides may only tighten (window, attempts, timeout and response ceilings capped at the reviewed values; pacing never below them), and invalid values are refused before any I/O.
+2. **Discovery verification accepted impossible collector histories**: a subscription with an extra mention and `processed` commitment, and an incomplete overflow frame before the acknowledgement. Verification now mirrors the collector:
+   - **Subscription**: exactly one outgoing frame, first, byte-identical to the reviewed subscription (`mentions` only the pinned fee destination, `confirmed`, request id 1).
+   - **Acknowledgement**: it must be the next frame, valid, and before the 5 s acknowledgement deadline.
+   - **Intermediate frames**: only frames the collector survives without capturing (ignored methods, wrong-subscription or invalid-slot rejections, failed notifications). A frame that would have terminated the collector, or an earlier qualifying notification, is rejected.
+   - **Last frame**: it must be the qualifying notification.
+   - **Completeness and accounting**: every frame complete (an overflow terminates the collector); each byte length equals its payload's UTF-8 length; timestamps non-decreasing within the watch interval.
+   - **Counters**: message, payload-byte, rejected and failed counters must equal what the frames imply, within the reviewed ceilings. Subscription id, signature, slot and logs must match.
+   - **Positive fixtures** are now genuine output of the reviewed collector, run against a scripted in-memory transport on the virtual scheduler.
+3. **Request sessions stayed open after return.** A successful two-request run left one provider timer and one `AbortSignal` listener. The owned session is now stopped and the abort listener removed in an unconditional `finally`, with the first stop cause preserved.
+   - **Cancellation**: operator cancellation (before dispatch, or while a request is in flight) is classified as `OPERATOR_CANCELLED` with the original cause (`OPERATOR_CANCELLED: REQUEST_ABORTED`) and the request evidence kept. A request cut off by the session deadline is `VALIDATION_DEADLINE_EXPIRED`.
+4. **Pure derivation ignored request and deadline violations**: an appended duplicate market exchange, and a market completion moved to 60 s after receipt, still selected a target. `evaluateWatchCandidateEvidence` now derives the same deadline from the verified discovery evidence and enforces the acquisition rules, rejecting violations as `EXCHANGE_EVIDENCE_INVALID`:
+   - **Bounds and order**: at most the allowed number of exchanges, with contiguous sequence numbers in dispatch order.
+   - **Transaction request**: first, `POST`, with the redacted RPC URL and `getTransaction` for the notified signature, dispatched no earlier than the receipt.
+   - **Market request**: second, `GET`, for the decoded mint's endpoint, dispatched only after the transaction completed, and never after a non-qualifying transaction.
+   - **Deadline**: every completion no later than the deadline.
+
+   Acquisition returns this same pure result. The only exception is operator cancellation, which comes from the abort signal.
+
+5. **Non-UTF-8 evidence carried false digest claims.** Bytes `[255, 65, 66]` were stored as lossy UTF-8 text labelled `utf8` with `reproducesReceivedDigest: true`. Valid UTF-8 is now stored as text and anything else as base64; both decode back to the original bytes, so the digest claim holds. Non-text bodies never qualify as JSON (`BODY_NOT_TEXT`). The record keeps the body state, original byte counts, `storedBytes` and `receivedDigestScope` (complete body, or retained prefix only).
+
+**Regressions** (`AmmV4WatchCandidateValidation.test.ts`, now 17 tests; TC-V01–V12 rewritten on genuine collector output):
+
+| Test   | Shows                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TC-V13 | The reviewer's substitution (+70 s metadata, started at +40 s) and a fully consistent summary shift are both rejected with zero sends. Future evidence is rejected. The deadline is the frame receipt + 30 s, capped against loosening and tightened by a caller deadline. A run started 1 ms before the deadline is cut off there, with no timer left                                                                        |
+| TC-V14 | Ten impossible histories are rejected with zero sends: extra mention with `processed` commitment, overflow frame before the acknowledgement, second outgoing frame, a terminating frame, an earlier qualifying notification, a wrong byte length, a wrong counter, a late acknowledgement, out-of-order frames and a missing capture event. A genuine history with ignored, rejected and failed frames still selects a target |
+| TC-V15 | After success, request failure and in-flight operator cancellation, no provider timer and no abort listener remain. Cancellation during the RPC is `OPERATOR_CANCELLED: REQUEST_ABORTED`, with one recorded exchange and no market request                                                                                                                                                                                    |
+| TC-V16 | Pure derivation rejects a duplicate third market exchange, a duplicate sequence number, a market completion 60 s after receipt, reordered exchanges, another signature, an unredacted RPC URL, a market request before the transaction completed, a transaction before the notification, a market request after a failed transaction, another mint's endpoint, and a caller deadline before completion                        |
+| TC-V17 | `[255, 65, 66]` is stored as base64 that decodes to the original bytes and reproduces the digest; UTF-8 text reproduces its digest; a partial body is marked with the prefix-only digest scope; a non-UTF-8 market body is `MARKET_EVIDENCE_UNAVAILABLE` / `BODY_NOT_TEXT`                                                                                                                                                    |
+
+- **Mutation checks** (source restored byte-identical), each caught:
+
+| Mutation                                             | Caught by      |
+| ---------------------------------------------------- | -------------- |
+| Receipt from summary metadata, consistency unchecked | TC-V13         |
+| Future timestamps accepted                           | TC-V13         |
+| Caller deadline ignored                              | TC-V13, TC-V16 |
+| Subscription policy not compared                     | TC-V03, TC-V14 |
+| Terminating intermediate frames skipped              | TC-V14         |
+| Collector counters unchecked                         | TC-V14         |
+| Session not stopped on exit                          | TC-V15         |
+| Abort listener not removed                           | TC-V15         |
+| In-flight cancellation classified as request failure | TC-V15         |
+| Pure derivation ignores the request policy           | TC-V16         |
+| Late exchanges accepted                              | TC-V16         |
+| Non-UTF-8 bytes labelled UTF-8                       | TC-V17         |
+
+- **Results**: under external 60 s limits, the validation suite passes 17/17, the collector 33/33, the precheck 6/6 and the handoff 6/6 (62 tests). The backend typecheck, ESLint and Prettier pass. The wallet hash and the precheck manifest (`5b65751d…ac16`) are unchanged.
