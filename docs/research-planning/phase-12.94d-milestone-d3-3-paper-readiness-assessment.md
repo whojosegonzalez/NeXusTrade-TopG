@@ -5157,14 +5157,15 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 ### 8.38 Proposed Bounded AMM v4 Passive Creation-Watch Design (Proposed / Unapproved)
 
 > [!IMPORTANT]
-> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Four offline components are completed and verified:
+> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Five offline components are completed and verified:
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
 > 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 19 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the reviews of `5ec9ee8` (§8.38.6) and `92f6c9f` (§8.38.7).
 > 3. Offline sealing and fail-closed verification of supplied watch evidence (`backend/src/scripts/fresh-amm-v4-watch-evidence.ts`), verified by 11 focused offline tests (`fresh-amm-v4-watch-evidence.test.ts`), including the review corrections after `4179ad1` and `0bcdc2f` (§8.38.8).
 > 4. Offline handoff integration (`evaluateWatchedPilotHandoff` in `backend/src/scripts/paper-pilot-handoff.ts`): a sealed watch run whose selection `verifyWatchEvidence` confirms is evaluated against the same pin, identity, output and start-window rules as the precheck, verified by 12 handoff tests (§8.38.9).
+> 5. The watch entry point (`backend/src/scripts/fresh-amm-v4-watch.ts`) composing collector → validator → sealer → verifier, with help, dry-run, verify and explicit live modes, verified offline by 10 tests through injected synthetic dependencies only (§8.38.10).
 >
-> The watched handoff is an exported function only: the CLI and the PowerShell wrapper still use the precheck handoff. CLI activation (a watch entry point running collector → validator → sealer → handoff) and live execution remain planned and are not started. No live limits are approved.
+> The watched handoff is an exported function only: the handoff CLI and the PowerShell wrapper still use the precheck handoff, and the watch entry point ends after sealing and reporting (no Stage B launch, no start-window wait, no watched-handoff flag). Live execution of the watch is not authorized, and no operator live command is provided until the entry point has been reviewed. No live limits are approved.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -5662,3 +5663,100 @@ The runner is not repinned and no directory is allowed. Modifications, deletions
 - **Results**: under external 60 s limits, the handoff suite passes 12/12, watch evidence 11/11, validation 19/19, collector 33/33 and precheck 6/6 (81 tests). The backend typecheck, ESLint and Prettier pass. The wrapper, the wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket, daemon or pilot was used.
 
 **Not started**: CLI activation (a watch entry point running collector → validator → sealer → handoff, and any wrapper change) and live execution. No live limits are approved.
+
+#### 8.38.10 Watch Entry Point: Collector → Validator → Sealer (Completed Offline; Live Execution Not Authorized)
+
+After the review of `0ddfcf8` accepted the watched-evidence handoff, the watch entry point is implemented in `backend/src/scripts/fresh-amm-v4-watch.ts`, with its tests in `fresh-amm-v4-watch.test.ts`. It composes the reviewed collector, candidate validator, evidence sealer and verifier; it adds no acquisition logic of its own. Acquisition was exercised only through injected synthetic dependencies: no provider request, socket, capture, daemon or pilot was run. The collector, validator, sealer, handoff, PowerShell wrapper, Stage B runner, strategy, historical evidence and wallet are unchanged. No operator live command is provided until this implementation has been reviewed.
+
+**Modes** (`runFreshAmmV4Watch(args, deps)` is exported and every dependency is injectable; importing the module performs no I/O, and the `process.argv` guard only runs it as a script):
+
+| Mode              | Arguments                | What it does                                                                                                                                                                                                     |
+| ----------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Help              | `--help` (alone)         | Prints the usage and the proposed plan. Nothing is loaded, opened, sent or written                                                                                                                               |
+| Dry run (default) | `--out-dir <dir>`        | Validates the new output location and prints the plan and its digest. Nothing is loaded, opened, sent or written                                                                                                 |
+| Verify            | `--verify <dir>`         | Runs the reviewed `verifyWatchEvidence` on a sealed run inside `data/research/prechecks/` and reports integrity, completeness, re-derivation and confirmed selection separately. No configuration and no network |
+| Live              | `--out-dir <dir> --live` | Acquisition (below). Awaiting separate operator approval                                                                                                                                                         |
+
+Conflicting or malformed arguments are refused before anything else: `--help` with any other option, `--verify` with `--live` or `--out-dir`, `--live` without `--out-dir`, a repeated option, a positional argument, an unknown option, or an empty `--verify`.
+
+**Exit codes**:
+
+| Code | Meaning                                                                                                                                           |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | Help or dry run printed; or a sealed (live) or verified (verify) run whose selection is confirmed                                                 |
+| 1    | Invalid arguments, configuration or output location (nothing opened or written), or an unexpected error                                           |
+| 3    | Sealed or verified with integrity, but no confirmed selection (no capture, cancellation, validation rejection, run failure, redaction limitation) |
+| 4    | Integrity failure                                                                                                                                 |
+| 5    | Sealing failed; nothing is reacquired                                                                                                             |
+
+Errors print only fixed text raised by the entry point (`CLI_INVALID_ARG`, `OUTPUT_EXISTS`, `MISSING_CONFIGURATION`, `WATCH_FAILED_UNSEALED`); any other error prints only its bracketed code, never its free text.
+
+**Live sequence**:
+
+1. **Output location**: the directory must be new and directly inside `data/research/prechecks/`, with the sealer's run-name rule. It is checked before configuration is loaded and again immediately before the transport can open.
+2. **Configuration**: only now does the existing `loadDaemonEnvironment` run. `SOLANA_RPC_URL` must be an http or https URL that parses; the WebSocket URL is derived from it (http→ws, https→wss), as in the single-candidate diagnostic. Neither value is printed.
+3. **Watch**: one `BoundedAmmV4CreationWatch` with the reviewed defaults and no override: one connection and one `logsSubscribe` on the pinned fee destination, no reconnect or retry, 900 s ceiling, 5 s acknowledgement, keepalive (20 s ping, 10 s pong, 45 pings), 100 messages, 1 MiB payload, 128 control frames and a 5 s cleanup ceiling. At most one qualifying notification is captured. The entry point owns the transport factory and, after the collector settles, terminates anything still open and reports it.
+4. **Validation**: only after a captured notification with settled, successful cleanup, and only if the operator has not cancelled in between. `executeWatchCandidateValidation` runs with the reviewed defaults: one `getTransaction`, then one market request only for a qualifying AMM v4 initialization; 10 s request timeouts, 1 MiB responses, the reviewed pacing, and the deadline min(notification receipt + 30 s, watch start + 930 s). No signature page is collected and there is no fallback discovery.
+5. **Sealing**: every terminal path is sealed with its original cause, and the credentials are passed explicitly to the reviewed sealer for redaction:
+
+   | Path                                                                                           | Sealed cause                                                                            |
+   | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+   | No qualifying notification (ceiling, acknowledgement timeout, transport error, limits)         | `WATCH_ENDED_WITHOUT_CAPTURE` at `WATCH`                                                |
+   | Cancellation before or during the watch                                                        | `OPERATOR_CANCELLED` at `WATCH`                                                         |
+   | Capture whose cleanup failed or did not settle                                                 | `RUN_FAILED` at `WATCH` (`COLLECTOR_CLEANUP_NOT_SETTLED`), no validation                |
+   | Cancellation after capture, before validation                                                  | `OPERATOR_CANCELLED` at `RUN`, no validation                                            |
+   | Cancellation during validation                                                                 | `OPERATOR_CANCELLED` at `VALIDATION`                                                    |
+   | Validation threw (not exercised: the reviewed validator returns a result on every tested path) | `RUN_FAILED` at `VALIDATION`                                                            |
+   | Any other validation result (selection, rejection, request failure, deadline)                  | `COMPLETED` at `VALIDATION`                                                             |
+   | Cancellation after validation finished                                                         | `COMPLETED` (what was acquired is unchanged), reported as `cancellationAfterValidation` |
+
+   A write failure or an output directory that appeared during the run returns exit 5 with the sealer's status. Nothing is retried or reacquired.
+
+6. **Verification and report**: the sealed run is verified with the reviewed verifier, and integrity, completeness, re-derivation and confirmed selection are reported separately. The run ends there: no Stage B launch, no start-window wait and no watched-handoff CLI flag.
+
+**Pin allowlist**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly `fresh-amm-v4-watch.ts` and `fresh-amm-v4-watch.test.ts`. H-12 was updated to match and also refuses `fresh-amm-v4-watch.test-support.ts` and `fresh-amm-v4-watch-handoff.ts` additions.
+
+**Synthetic tests** (`fresh-amm-v4-watch.test.ts`, 10 tests). The tests use a scripted in-memory WebSocket transport, a mocked fetch that rejects any other URL, the shared virtual scheduler, and each test's own temporary project root:
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E-01 | Help, dry run and verify load no configuration, open no transport, send nothing and write nothing. The plan states the reviewed limits (one connection and subscription, no reconnect or retry, 900 s, 2 attempts, 10 s timeouts, 1 MiB responses, 30 s and 930 s deadlines). Ten conflicting or malformed argument sets are refused                    |
+| E-02 | Output outside the root, the root itself, nested, badly named or hidden, a parent path, and an existing directory are refused before configuration. Missing, empty, non-http, `ftp` and unparsable `SOLANA_RPC_URL` are refused after one configuration load, with fixed text, no transport, no request and no file. Other errors print only their code |
+| E-03 | A captured notification is validated, sealed and verified as a confirmed selection (exit 0). One transport, one subscription on the pinned fee destination, `getTransaction` then the market request and nothing else; the deadline is notification + 30 s; no credential in any printed line or stored file; no owned timer or open transport remains  |
+| E-04 | No notification ends at exactly the 900 s ceiling, is sealed as `WATCH_ENDED_WITHOUT_CAPTURE` without validation or requests, and is not confirmed (exit 3)                                                                                                                                                                                             |
+| E-05 | Cancellation before the watch (no transport opened), during the watch, between capture and validation (no request), and during an in-flight transaction request is sealed with its true cause (exit 3). Cancellation after validation seals `COMPLETED` and reports the request                                                                         |
+| E-06 | An RPC 503, a market network failure and a request slower than the 10 s timeout are each recorded once, sealed as validation rejections and never retried                                                                                                                                                                                               |
+| E-07 | A slow boundary past notification + 30 s sends nothing (`VALIDATION_DEADLINE_EXPIRED`); a request in flight at the deadline is cut off; a notification at 899 s gets the earlier of the two bounds                                                                                                                                                      |
+| E-08 | A capture whose transport cannot close is sealed as `RUN_FAILED` at `WATCH` without validation; the entry point's own termination attempt is reported (`transportsForceClosed: 1`, `transportsStillOpen: 1`) and no owned timer remains                                                                                                                 |
+| E-09 | A write failure on `exchanges/0002.json` gives exit 5 with `ARTIFACT_WRITE_FAILED`, no manifest, the original cause and outcome, and exactly the two original requests. An output directory created during the run is refused by the sealer, also without reacquisition                                                                                 |
+| E-10 | `--verify` on the sealed run reports the four lines separately (exit 0), a tampered `selection.json` gives exit 4, and a run outside the precheck root is refused; no configuration is loaded                                                                                                                                                           |
+
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit). 20 were run and 19 are caught. The one that survives is equivalent, and a stronger variant is caught:
+
+| Mutation                                               | Caught by                                                                                                                                       |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Help loads configuration                               | E-01                                                                                                                                            |
+| Dry run loads configuration                            | E-01                                                                                                                                            |
+| Verify loads configuration                             | E-01, E-10                                                                                                                                      |
+| `--help` combined with other options                   | E-01                                                                                                                                            |
+| `--verify` combined with `--live` or `--out-dir`       | E-01                                                                                                                                            |
+| Existing output not refused before configuration       | E-02                                                                                                                                            |
+| Nested output accepted                                 | E-02                                                                                                                                            |
+| Validation despite failed cleanup                      | E-08                                                                                                                                            |
+| Validation despite cancellation between stages         | E-05                                                                                                                                            |
+| Validation cancellation recorded as completion         | E-05                                                                                                                                            |
+| Collector limits overridden (600 s ceiling)            | E-04, E-07                                                                                                                                      |
+| Validator deadline overridden                          | E-03, E-05, E-06, E-07, E-09, E-10                                                                                                              |
+| Owned transports not closed after the watch            | E-08                                                                                                                                            |
+| Seal failure reported as success                       | E-09                                                                                                                                            |
+| Any error text printed                                 | E-02                                                                                                                                            |
+| Cancellation after validation not reported             | E-05                                                                                                                                            |
+| Live verification skipped (sealer result trusted)      | E-04                                                                                                                                            |
+| Verify mode not confined to the precheck root          | E-10                                                                                                                                            |
+| Configuration endpoint not parsed                      | E-02                                                                                                                                            |
+| Derived WebSocket URL not passed to the sealer         | not caught: equivalent, because that URL is derived from the RPC URL and its only secret part, the key, is already redacted through the RPC URL |
+| No credentials passed to the sealer (stronger variant) | E-03 to E-10                                                                                                                                    |
+
+- **Results**: under external 60 s limits, in two groups: the entry point 10/10, handoff 12/12, watch evidence 11/11 and precheck 6/6 (39 tests); validation 19/19 and collector 33/33 (52 tests); 91 in all. The backend typecheck, ESLint and Prettier pass. The wrapper, the wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket, daemon or pilot was used.
+
+**Not started**: any live run of the watch (separate operator approval and a reviewed live command are required), a watched-handoff CLI flag, wrapper changes and Stage B. No live limits are approved.

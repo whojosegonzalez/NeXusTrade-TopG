@@ -1155,7 +1155,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(watched(root, selected, now).refusals).toEqual(["PILOT_OUTPUT_EXISTS"]);
   });
 
-  it("H-12: the pin allows exactly the six reviewed watch files added since the runner, and nothing else", () => {
+  it("H-12: the pin allows exactly the reviewed watch files and the watch entry point added since the runner, and nothing else", () => {
     const added = [
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts",
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test.ts",
@@ -1163,6 +1163,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.test.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test.ts",
+      "backend/src/scripts/fresh-amm-v4-watch.ts",
+      "backend/src/scripts/fresh-amm-v4-watch.test.ts",
     ];
     expect([...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER]).toEqual([
       "backend/src/scripts/fresh-amm-v4-precheck.ts",
@@ -1190,6 +1192,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
     for (const extra of [
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
+      "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",
+      "backend/src/scripts/fresh-amm-v4-watch-handoff.ts",
       "backend/src/candidate-scanner",
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts/extra.ts",
     ]) {

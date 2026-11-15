@@ -93,6 +93,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.test.ts",
   "backend/src/scripts/fresh-amm-v4-watch-evidence.ts",
   "backend/src/scripts/fresh-amm-v4-watch-evidence.test.ts",
+  // The watch entry point composing them (section 8.38.10).
+  "backend/src/scripts/fresh-amm-v4-watch.ts",
+  "backend/src/scripts/fresh-amm-v4-watch.test.ts",
 ]);
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
