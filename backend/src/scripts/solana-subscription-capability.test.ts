@@ -7,7 +7,15 @@
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   CAPABILITY_EXIT_CODES,
@@ -16,6 +24,7 @@ import {
   CAPABILITY_USAGE,
   SUBSCRIBE_FRAME,
   classifyIncoming,
+  classifyIncomingBytes,
   printableCapabilityError,
   runSubscriptionCapabilityCheck,
   unsubscribeFrame,
@@ -57,9 +66,9 @@ interface FakeOptions {
   /** When the transport opens (ms after start); null never. */
   openAtMs?: number | null;
   /** Reply to the subscribe request (after replyDelayMs); null no reply. */
-  onSubscribe?: string | null;
+  onSubscribe?: string | Buffer | null;
   /** Reply to the unsubscribe request; null no reply. */
-  onUnsubscribe?: string | null;
+  onUnsubscribe?: string | Buffer | null;
   replyDelayMs?: number;
   /** Extra scripted incoming messages (ms after start). */
   script?: readonly { atMs: number; data: string }[];
@@ -94,7 +103,7 @@ class FakeTransport implements ISolanaKeepaliveWebSocketTransport {
       this.sched.add(() => this.incoming(reply), this.o.replyDelayMs ?? 50, "harness");
     }
   }
-  incoming(data: string): void {
+  incoming(data: string | Buffer): void {
     if (this.readyState === 1) this.emit("message", data);
   }
   close(): void {
@@ -187,6 +196,41 @@ function expectNoSecrets(h: Harness) {
     const text = readFileSync(path.join(h.abs(RUN), f), "utf8");
     for (const s of SECRETS) expect(text.includes(s), `${s} in ${f}`).toBe(false);
   }
+  if (names.includes(CAPABILITY_FILES.probe)) {
+    for (const fr of probeJson(h).frames as Loose[]) {
+      if (fr.storedEncoding !== "base64") continue;
+      const decoded = Buffer.from(fr.payload as string, "base64");
+      for (const s of SECRETS)
+        expect(decoded.includes(Buffer.from(s)), `${s} in frame ${fr.seq}`).toBe(false);
+    }
+  }
+}
+
+/** Rewrites probe.json (and the manifest entry and summary) consistently, then verifies. */
+function reforgeProbe(dir: string, edit: (probe: Loose) => void) {
+  const probePath = path.join(dir, CAPABILITY_FILES.probe);
+  const probe = JSON.parse(readFileSync(probePath, "utf8")) as Loose;
+  edit(probe);
+  const text = JSON.stringify(probe, null, 2) + "\n";
+  writeFileSync(probePath, text);
+  const manifestPath = path.join(dir, CAPABILITY_FILES.manifest);
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Loose;
+  if (probe && typeof probe === "object" && !Array.isArray(probe)) {
+    manifest.outcome = probe.outcome;
+    manifest.capabilityConfirmed = probe.capabilityConfirmed;
+  }
+  const entry = manifest.files.find((x: Loose) => x.path === CAPABILITY_FILES.probe);
+  entry.sha256 = createHash("sha256").update(text).digest("hex");
+  entry.bytes = Buffer.byteLength(text);
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+  return verifySubscriptionCapabilityEvidence(dir);
+}
+
+/** A fresh copy of a sealed run (each forgery starts from the genuine evidence). */
+function copyRun(h: Harness, name: string): string {
+  const target = path.join(h.projectRoot, "data/research/capability-checks", name);
+  cpSync(h.abs(RUN), target, { recursive: true });
+  return target;
 }
 
 function expectSettled(h: Harness, r: CapabilityRunResult) {
@@ -579,7 +623,7 @@ describe("Solana subscription-only capability check (offline)", () => {
       outcome: "MESSAGE_LIMIT_EXCEEDED",
       counts: { incomingMessages: 11, notifications: 10 },
     });
-    expect(m.probe!.frames.at(-1)).toMatchObject({ overflow: "MESSAGE_LIMIT", payload: null });
+    expect(m.probe!.frames.at(-1)).toMatchObject({ overflow: "MESSAGE_LIMIT", bytes: null });
     expect(m.verification).toMatchObject({
       integrity: { ok: true },
       outcome: "MESSAGE_LIMIT_EXCEEDED",
@@ -596,7 +640,7 @@ describe("Solana subscription-only capability check (offline)", () => {
       outcome: "PAYLOAD_LIMIT_EXCEEDED",
       counts: { incomingMessages: 1 },
     });
-    expect(l.probe!.frames.at(-1)).toMatchObject({ overflow: "PAYLOAD_LIMIT", payload: null });
+    expect(l.probe!.frames.at(-1)).toMatchObject({ overflow: "PAYLOAD_LIMIT", bytes: null });
     expect(
       readFileSync(path.join(large.abs(RUN), CAPABILITY_FILES.probe), "utf8").length,
     ).toBeLessThan(20_000);
@@ -756,5 +800,290 @@ describe("Solana subscription-only capability check (offline)", () => {
     expect(verifySubscriptionCapabilityEvidence(dir).integrity.problems).toContain(
       "UNLISTED:extra.json",
     );
+  });
+  it("S-14: verification requires the complete, ordered proof and fails closed on malformed records", async () => {
+    const h = harness({ onSubscribe: ack(), onUnsubscribe: ack(true, 2) });
+    const r = await live(h);
+    expect(r.verification?.capabilityConfirmed).toBe(true);
+    const sealed = probeJson(h);
+    const ackFrame = (sealed.frames as Loose[]).find(
+      (f) => f.direction === "INCOMING" && f.payload === ack(),
+    );
+    const reject = (v: ReturnType<typeof verifySubscriptionCapabilityEvidence>, label: string) => {
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.capabilityConfirmed, label).toBe(false);
+      expect(v.outcome, label).toBeNull();
+    };
+
+    // Review fixture 1: no recorded requests or unsubscribe response, counters and status adjusted.
+    const noRequest = reforgeProbe(copyRun(h, "no-request"), (p) => {
+      const kept = (p.frames as Loose[]).filter((f) => f.seq === ackFrame.seq);
+      p.frames = kept.map((f, i) => ({ ...f, seq: i + 1 }));
+      p.counts = {
+        ...p.counts,
+        outgoingFrames: 0,
+        incomingMessages: 1,
+        incomingPayloadBytes: ackFrame.originalBytes,
+      };
+      p.unsubscribe = { status: "NOT_SENT", sentAtMs: null, responseAtMs: null, errorCode: null };
+    });
+    reject(noRequest, "no subscribe request");
+    expect(noRequest.integrity.problems).toEqual(
+      expect.arrayContaining(["ACKNOWLEDGEMENT_MISMATCH", "OUTCOME_NOT_REPRODUCED"]),
+    );
+
+    // Review fixture 2: the acknowledgement and its receipt time moved before the start.
+    const early = reforgeProbe(copyRun(h, "early-ack"), (p) => {
+      for (const f of p.frames as Loose[]) if (f.seq === ackFrame.seq) f.atMs = p.startedAtMs - 1;
+      p.acknowledgement.receivedAtMs = p.startedAtMs - 1;
+    });
+    reject(early, "acknowledgement before the start");
+    expect(early.integrity.problems).toContain(`FRAME_INVALID:${ackFrame.seq}:TIME`);
+
+    // The acknowledgement before the subscribe request (consistent times, swapped order).
+    const swapped = reforgeProbe(copyRun(h, "swapped"), (p) => {
+      const [sub, a, ...rest] = p.frames as Loose[];
+      p.frames = [{ ...a, seq: 1, atMs: sub.atMs }, { ...sub, seq: 2 }, ...rest];
+      p.acknowledgement.receivedAtMs = sub.atMs;
+    });
+    reject(swapped, "acknowledgement before the request");
+
+    // An altered subscribe request, an unsubscribe for another id, and an unsubscribe before the ack.
+    const otherRequest = reforgeProbe(copyRun(h, "other-request"), (p) => {
+      const f = (p.frames as Loose[])[0];
+      const text = SUBSCRIBE_FRAME.replace("confirmed", "processed");
+      Object.assign(f, {
+        payload: text,
+        originalBytes: Buffer.byteLength(text),
+        storedBytes: Buffer.byteLength(text),
+        originalSha256: createHash("sha256").update(text).digest("hex"),
+        storedSha256: createHash("sha256").update(text).digest("hex"),
+      });
+    });
+    reject(otherRequest, "altered subscribe request");
+    expect(otherRequest.integrity.problems).toContain("SUBSCRIBE_REQUEST_INVALID");
+    const otherId = reforgeProbe(copyRun(h, "other-id"), (p) => {
+      const f = (p.frames as Loose[]).filter((x) => x.direction === "OUTGOING")[1];
+      const text = unsubscribeFrame(SUB_ID + 1);
+      Object.assign(f, {
+        payload: text,
+        originalBytes: Buffer.byteLength(text),
+        storedBytes: Buffer.byteLength(text),
+        originalSha256: createHash("sha256").update(text).digest("hex"),
+        storedSha256: createHash("sha256").update(text).digest("hex"),
+      });
+    });
+    expect(otherId.integrity.problems).toContain("UNSUBSCRIBE_REQUEST_INVALID");
+
+    // Digests, byte accounting, counters and status.
+    const payloadEdit = reforgeProbe(copyRun(h, "payload-edit"), (p) => {
+      (p.frames as Loose[])[1].payload = ack(SUB_ID + 1);
+    });
+    expect(payloadEdit.integrity.problems.some((x) => x.startsWith("FRAME_INVALID:2:"))).toBe(true);
+    const originalEdit = reforgeProbe(copyRun(h, "original-edit"), (p) => {
+      (p.frames as Loose[])[1].originalSha256 = "0".repeat(64);
+    });
+    expect(originalEdit.integrity.problems).toContain(
+      "FRAME_INVALID:2:UNREDACTED_DIFFERS_FROM_ORIGINAL",
+    );
+    const countEdit = reforgeProbe(copyRun(h, "count-edit"), (p) => {
+      p.counts.notifications = 1;
+    });
+    expect(countEdit.integrity.problems).toContain("COUNTS_MISMATCH");
+    const statusEdit = reforgeProbe(copyRun(h, "status-edit"), (p) => {
+      p.unsubscribe.status = "SENT_UNOBSERVED";
+      p.unsubscribe.responseAtMs = null;
+    });
+    expect(statusEdit.integrity.problems).toContain("UNSUBSCRIBE_MISMATCH");
+    const confirmEdit = reforgeProbe(copyRun(h, "reasons-edit"), (p) => {
+      p.cancelled = true;
+      p.cancellationPhase = "BEFORE_SEALING";
+    });
+    expect(confirmEdit.integrity.problems).toEqual(
+      expect.arrayContaining(["REASONS_MISMATCH", "CONFIRMATION_MISMATCH"]),
+    );
+
+    // Malformed records are verification failures, never exceptions.
+    const malformed: [string, (p: Loose) => void][] = [
+      ["frames not an array", (p) => void (p.frames = "x")],
+      ["frame not an object", (p) => void ((p.frames as Loose[])[0] = 7)],
+      [
+        "time as a string",
+        (p) => void ((p.frames as Loose[])[0].atMs = String((p.frames as Loose[])[0].atMs)),
+      ],
+      ["counts missing", (p) => void delete p.counts],
+      ["acknowledgement as a string", (p) => void (p.acknowledgement = "4242")],
+      ["unsubscribe missing", (p) => void delete p.unsubscribe],
+      ["cleanup missing", (p) => void delete p.cleanup],
+      ["start missing", (p) => void delete p.startedAtMs],
+      ["outcome unknown", (p) => void (p.outcome = "MAYBE")],
+      [
+        "base64 not canonical",
+        (p) =>
+          void Object.assign((p.frames as Loose[])[1], { storedEncoding: "base64", payload: "!!" }),
+      ],
+    ];
+    for (const [label, edit] of malformed) {
+      let v: ReturnType<typeof verifySubscriptionCapabilityEvidence> | undefined;
+      expect(() => {
+        v = reforgeProbe(copyRun(h, `malformed-${label.replace(/ /g, "-")}`), edit);
+      }, label).not.toThrow();
+      reject(v!, label);
+    }
+    for (const [label, text] of [
+      ["null", "null"],
+      ["array", "[]"],
+      ["not JSON", "{"],
+    ] as const) {
+      const dir = copyRun(h, `probe-${label.replace(/ /g, "-")}`);
+      const probePath = path.join(dir, CAPABILITY_FILES.probe);
+      writeFileSync(probePath, text);
+      const manifestPath = path.join(dir, CAPABILITY_FILES.manifest);
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Loose;
+      const entry = manifest.files.find((x: Loose) => x.path === CAPABILITY_FILES.probe);
+      entry.sha256 = createHash("sha256").update(text).digest("hex");
+      entry.bytes = Buffer.byteLength(text);
+      writeFileSync(manifestPath, JSON.stringify(manifest));
+      reject(verifySubscriptionCapabilityEvidence(dir), label);
+    }
+    // The genuine evidence still verifies.
+    expect(verifySubscriptionCapabilityEvidence(h.abs(RUN)).capabilityConfirmed).toBe(true);
+  });
+
+  it("S-15: a cancellation after the probe settles and before sealing seals a cancelled, unconfirmed run", async () => {
+    const h = harness({ onSubscribe: ack(), onUnsubscribe: ack(true, 2) });
+    let aborted = false;
+    const r = await live(h, {
+      log: (line: string) => {
+        h.lines.push(line);
+        if (line.startsWith("[LIVE] Outcome:")) {
+          h.controller.abort();
+          aborted = true;
+        }
+      },
+    });
+    expect(aborted).toBe(true);
+    expect(h.controller.signal.aborted).toBe(true);
+    expect(r).toMatchObject({
+      exitCode: CAPABILITY_EXIT_CODES.NOT_CONFIRMED,
+      probe: {
+        outcome: "SUBSCRIPTION_ACKNOWLEDGED",
+        acknowledgement: { subscriptionId: SUB_ID },
+        unsubscribe: { status: "OBSERVED" },
+        cancelled: true,
+        cancellationPhase: "BEFORE_SEALING",
+        capabilityConfirmed: false,
+        reasons: ["CANCELLED"],
+      },
+      seal: { ok: true },
+      verification: {
+        integrity: { ok: true, problems: [] },
+        outcome: "SUBSCRIPTION_ACKNOWLEDGED",
+        capabilityConfirmed: false,
+      },
+    });
+    // The acknowledgement evidence is kept; sealing was not interrupted.
+    expect(readdirSync(h.abs(RUN)).sort()).toEqual([
+      "evidence-manifest.json",
+      "plan.json",
+      "probe.json",
+    ]);
+    expect(probeJson(h)).toMatchObject({
+      cancelled: true,
+      cancellationPhase: "BEFORE_SEALING",
+      acknowledgement: { subscriptionId: SUB_ID },
+      capabilityConfirmed: false,
+    });
+    expect(h.lines.some((l) => l.includes("sealed as cancelled; not confirmed"))).toBe(true);
+    // Offline verification cannot confirm it.
+    expect((await h.run(["--verify", RUN])).exitCode).toBe(CAPABILITY_EXIT_CODES.NOT_CONFIRMED);
+    // Relabelling it as not cancelled (consistent hashes) fails verification.
+    const relabelled = reforgeProbe(copyRun(h, "uncancelled"), (p) => {
+      p.cancellationPhase = "DURING_PROBE";
+    });
+    expect(relabelled.capabilityConfirmed).toBe(false);
+    expect(relabelled.integrity.ok).toBe(true);
+    const uncancelled = reforgeProbe(copyRun(h, "uncancelled-2"), (p) => {
+      p.cancelled = false;
+    });
+    expect(uncancelled.integrity.problems).toContain("CANCELLATION_RECORD_INVALID");
+    expectSettled(h, r);
+  });
+
+  it("S-16: received bytes are accounted before decoding; invalid UTF-8 is malformed; non-text bytes are redacted at byte level", async () => {
+    // The review reproduction: a JSON-RPC error whose message contains byte 0xFF.
+    const raw = Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"'),
+      Buffer.from([0xff]),
+      Buffer.from('"}}'),
+    ]);
+    expect(raw.length).toBe(58);
+    expect(Buffer.from(raw.toString("utf8"), "utf8").length).toBe(60); // the lossy conversion
+    expect(classifyIncomingBytes(raw, { unsubscribeSent: false })).toEqual({
+      kind: "MALFORMED",
+      reason: "INVALID_UTF8",
+    });
+    const h = harness({ onSubscribe: raw });
+    const r = await live(h);
+    expect(r.probe).toMatchObject({
+      outcome: "MALFORMED_RESPONSE",
+      detail: "INVALID_UTF8",
+      rejection: null,
+    });
+    const frame = r.probe!.frames.find((f) => f.direction === "INCOMING")!;
+    expect(frame.byteLength).toBe(58);
+    expect(frame.originalSha256).toBe(createHash("sha256").update(raw).digest("hex"));
+    expect(Buffer.compare(frame.bytes!, raw)).toBe(0);
+    const sealedFrame = (probeJson(h).frames as Loose[]).find((f) => f.direction === "INCOMING");
+    expect(sealedFrame).toMatchObject({
+      originalBytes: 58,
+      originalSha256: createHash("sha256").update(raw).digest("hex"),
+      storedEncoding: "base64",
+      storedBytes: 58,
+      storedSha256: createHash("sha256").update(raw).digest("hex"),
+      payload: raw.toString("base64"),
+      payloadRedacted: false,
+    });
+    expect(probeJson(h).counts.incomingPayloadBytes).toBe(58);
+    expect(r.verification).toMatchObject({
+      integrity: { ok: true },
+      outcome: "MALFORMED_RESPONSE",
+      capabilityConfirmed: false,
+    });
+
+    // Credential-bearing non-text bytes: redacted at byte level, stored as base64, accounted apart.
+    const secretRaw = Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"'),
+      Buffer.from([0xfe]),
+      Buffer.from(` key ${WS_KEY} at ${WS_URL}`),
+      Buffer.from([0xff]),
+      Buffer.from('"}}'),
+    ]);
+    const c = harness({ onSubscribe: secretRaw });
+    const cr = await live(c);
+    expect(cr.probe?.outcome).toBe("MALFORMED_RESPONSE");
+    const sf = (probeJson(c).frames as Loose[]).find((f) => f.direction === "INCOMING");
+    const stored = Buffer.from(sf.payload as string, "base64");
+    expect(sf).toMatchObject({
+      originalBytes: secretRaw.length,
+      originalSha256: createHash("sha256").update(secretRaw).digest("hex"),
+      storedEncoding: "base64",
+      storedBytes: stored.length,
+      payloadRedacted: true,
+    });
+    expect(sf.storedSha256).toBe(createHash("sha256").update(stored).digest("hex"));
+    expect(sf.storedSha256).not.toBe(sf.originalSha256);
+    expect(stored.includes(Buffer.from(WS_KEY))).toBe(false);
+    expect(stored.includes(Buffer.from("[REDACTED]"))).toBe(true);
+    expect(stored[stored.indexOf(Buffer.from('"message":"')) + 11]).toBe(0xfe); // other bytes intact
+    expectNoSecrets(c);
+    expect(cr.verification).toMatchObject({ integrity: { ok: true }, capabilityConfirmed: false });
+
+    // A valid acknowledgement delivered as bytes is unaffected.
+    const b = harness({
+      onSubscribe: Buffer.from(ack()),
+      onUnsubscribe: Buffer.from(ack(true, 2)),
+    });
+    expect((await live(b)).verification?.capabilityConfirmed).toBe(true);
   });
 });

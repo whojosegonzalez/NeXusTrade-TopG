@@ -19,8 +19,14 @@
  * Local sealing and verification run afterwards and are overhead outside those bounds.
  *
  * Success requires a strictly validated JSON-RPC acknowledgement for request id 1 with a valid
- * subscription id, received before the deadline, with no cancellation and with cleanup settled.
- * An unsubscribe acknowledgement is recorded as observed or unobserved; sending it proves nothing.
+ * subscription id, received after the subscribe request and before the deadline, with no
+ * cancellation (during the probe or before sealing) and with cleanup settled. An unsubscribe
+ * acknowledgement is recorded as observed or unobserved; sending it proves nothing.
+ *
+ * Frames keep their original bytes: lengths and digests are taken at receipt, before any decoding,
+ * and messages are decoded as strict UTF-8 (invalid UTF-8 is malformed protocol data). At sealing,
+ * credentials are redacted at byte level before UTF-8 or base64 storage, and original and stored
+ * accounting are recorded separately.
  *
  * Importing this module performs no I/O. Help and the default dry run load no configuration, open
  * no transport and write nothing; `--verify` reads a sealed run offline. Acquisition needs the
@@ -48,7 +54,10 @@ import {
   type ISolanaKeepaliveWebSocketTransport,
 } from "../candidate-scanner/RaydiumTransportObservationProbe.js";
 import { getWebSocketTransportReadyState } from "../candidate-scanner/CandidateDecisionDiagnostic.js";
-import { redactSensitiveText } from "../candidate-scanner/SolanaTrackerBundlerCaptureTool.js";
+import {
+  buildEscapedSecretRegex,
+  redactSensitiveText,
+} from "../candidate-scanner/SolanaTrackerBundlerCaptureTool.js";
 import { findWorkspaceRoot } from "../paper/CanonicalPaths.js";
 import { loadDaemonEnvironment } from "./paper-trading-daemon.js";
 import {
@@ -126,11 +135,17 @@ export interface CapabilityFrame {
   readonly seq: number;
   readonly direction: "OUTGOING" | "INCOMING";
   readonly atMs: number;
+  /** Length of the original bytes, taken at receipt (or dispatch) before any decoding. */
   readonly byteLength: number;
-  /** The payload text; null when it was not retained (over a limit). */
-  readonly payload: string | null;
+  /** SHA-256 of the original bytes, taken at receipt (or dispatch) before any decoding. */
+  readonly originalSha256: string;
+  /** The original bytes; null when they were not retained (over a limit). */
+  readonly bytes: Buffer | null;
   readonly overflow: null | "MESSAGE_LIMIT" | "PAYLOAD_LIMIT";
 }
+
+/** Where a cancellation was observed: during the probe, or after it settled and before sealing. */
+export type CancellationPhase = "DURING_PROBE" | "BEFORE_SEALING";
 
 export interface SubscriptionProbeResult {
   readonly outcome: CapabilityOutcome;
@@ -166,6 +181,7 @@ export interface SubscriptionProbeResult {
     readonly clientPings: 0;
   };
   readonly cancelled: boolean;
+  readonly cancellationPhase: CancellationPhase | null;
   readonly cleanup: {
     readonly settled: boolean;
     readonly failed: boolean;
@@ -253,6 +269,26 @@ export function classifyIncoming(
     return { kind: "MALFORMED", reason: "RESPONSE_SHAPE_INVALID" };
   }
   return { kind: "MISMATCHED_ID" };
+}
+
+/** Strict UTF-8 decoding: null for any invalid sequence (never replacement characters). */
+export function decodeStrictUtf8(bytes: Uint8Array): string | null {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Classification of the original bytes: invalid UTF-8 is malformed protocol data. */
+export function classifyIncomingBytes(
+  bytes: Uint8Array,
+  expect: { readonly unsubscribeSent: boolean },
+): ClassifiedMessage {
+  const text = decodeStrictUtf8(bytes);
+  return text === null
+    ? { kind: "MALFORMED", reason: "INVALID_UTF8" }
+    : classifyIncoming(text, expect);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -360,6 +396,7 @@ export function runSubscriptionProbe(
           clientPings: 0,
         },
         cancelled,
+        cancellationPhase: cancelled ? "DURING_PROBE" : null,
         cleanup: { ...cleanup },
         capabilityConfirmed: reasons.length === 0,
         reasons,
@@ -411,12 +448,14 @@ export function runSubscriptionProbe(
         return false;
       }
       outgoingFrames++;
+      const bytes = Buffer.from(text, "utf8");
       frames.push({
         seq: frames.length + 1,
         direction: "OUTGOING",
         atMs: clock(),
-        byteLength: Buffer.byteLength(text, "utf8"),
-        payload: text,
+        byteLength: bytes.length,
+        originalSha256: sha256(bytes),
+        bytes,
         overflow: null,
       });
       return true;
@@ -442,12 +481,14 @@ export function runSubscriptionProbe(
           : incomingPayloadBytes > L.maxIncomingPayloadBytes
             ? ("PAYLOAD_LIMIT" as const)
             : null;
+      // Length and digest of the original bytes, before any decoding.
       frames.push({
         seq: frames.length + 1,
         direction: "INCOMING",
         atMs,
         byteLength: bytes.length,
-        payload: overflow === null ? bytes.toString("utf8") : null,
+        originalSha256: sha256(bytes),
+        bytes: overflow === null ? bytes : null,
         overflow,
       });
       if (overflow === "MESSAGE_LIMIT") {
@@ -459,7 +500,7 @@ export function runSubscriptionProbe(
         return;
       }
       if (atMs >= deadlineAtMs) return; // the deadline timer decides
-      const c = classifyIncoming(bytes.toString("utf8"), {
+      const c = classifyIncomingBytes(bytes, {
         unsubscribeSent: unsubscribe.status !== "NOT_SENT",
       });
       switch (c.kind) {
@@ -474,8 +515,8 @@ export function runSubscriptionProbe(
           acknowledgement = { subscriptionId: c.subscriptionId, receivedAtMs: atMs };
           phase = "AWAITING_UNSUBSCRIBE_ACK";
           if (!o.abortSignal?.aborted && clock() < deadlineAtMs && !isClosed()) {
-            const sentAtMs = clock();
             if (send(unsubscribeFrame(c.subscriptionId))) {
+              const sentAtMs = (frames[frames.length - 1] as CapabilityFrame).atMs;
               unsubscribe = { ...unsubscribe, status: "SENT_UNOBSERVED", sentAtMs };
             } else if (!done) {
               unsubscribe = { ...unsubscribe, status: "SEND_FAILED" };
@@ -573,7 +614,28 @@ export function credentialSecrets(urls: readonly string[]): string[] {
   return [...secrets].sort((a, b) => b.length - a.length);
 }
 
-const sha256 = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
+const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
+
+/**
+ * Byte-level credential redaction (the reviewed sealers' pattern): bytes are mapped one-to-one to
+ * Latin-1, each secret's UTF-8 bytes are replaced in literal and `\u00XX`-escaped form with the
+ * reviewed `buildEscapedSecretRegex`, and the result is mapped back. No keyword heuristics, so
+ * protocol bytes without a credential are never altered.
+ */
+export function redactCredentialBytes(bytes: Buffer, secrets: readonly string[]): Buffer {
+  let text = bytes.toString("latin1");
+  for (const s of secrets) {
+    if (s.length < 4) continue;
+    const latin1 = Buffer.from(s, "utf8").toString("latin1");
+    text = text.split(latin1).join("[REDACTED]");
+    try {
+      text = text.replace(buildEscapedSecretRegex(latin1), "[REDACTED]");
+    } catch {
+      // A secret that cannot form a pattern is still replaced literally above.
+    }
+  }
+  return Buffer.from(text, "latin1");
+}
 
 export type CapabilityFileWriter = (
   file: string,
@@ -598,13 +660,40 @@ export function sealSubscriptionCapabilityEvidence(input: {
 }): SealCapabilityResult {
   const redact = (t: string) => redactSensitiveText(t, input.secrets);
   const r = input.result;
+  // Original accounting (taken at receipt) and stored accounting (after byte-level redaction) are
+  // kept apart; the stored bytes are UTF-8 text when valid UTF-8, otherwise base64.
+  let residual = false;
   const frames = r.frames.map((f) => {
-    const stored = f.payload === null ? null : redact(f.payload);
+    const base = {
+      seq: f.seq,
+      direction: f.direction,
+      atMs: f.atMs,
+      originalBytes: f.byteLength,
+      originalSha256: f.originalSha256,
+      overflow: f.overflow,
+    };
+    if (f.bytes === null) {
+      return {
+        ...base,
+        storedEncoding: null,
+        storedBytes: null,
+        storedSha256: null,
+        payload: null,
+        payloadRedacted: false,
+      };
+    }
+    const stored = redactCredentialBytes(f.bytes, input.secrets);
+    for (const secret of input.secrets) {
+      if (secret.length >= 4 && stored.includes(Buffer.from(secret, "utf8"))) residual = true;
+    }
+    const text = decodeStrictUtf8(stored);
     return {
-      ...f,
-      payload: stored,
-      payloadRedacted: f.payload !== null && stored !== f.payload,
-      receivedSha256: f.payload === null ? null : sha256(Buffer.from(f.payload, "utf8")),
+      ...base,
+      storedEncoding: text === null ? "base64" : "utf8",
+      storedBytes: stored.length,
+      storedSha256: sha256(stored),
+      payload: text ?? stored.toString("base64"),
+      payloadRedacted: !stored.equals(f.bytes),
     };
   });
   const probe = {
@@ -620,6 +709,13 @@ export function sealSubscriptionCapabilityEvidence(input: {
     cleanup: { ...r.cleanup, reason: r.cleanup.reason === null ? null : redact(r.cleanup.reason) },
     frames,
   };
+  if (residual) {
+    return {
+      ok: false,
+      status: "SEAL_REFUSED",
+      reason: "a credential would be persisted in a stored frame",
+    };
+  }
   const contents: [string, string][] = [
     [CAPABILITY_FILES.plan, redact(JSON.stringify(input.plan, null, 2)) + "\n"],
     [CAPABILITY_FILES.probe, redact(JSON.stringify(probe, null, 2)) + "\n"],
@@ -685,10 +781,295 @@ export interface CapabilityVerification {
   readonly manifestSha256: string | null;
 }
 
-/** Fail-closed offline verification: integrity, then re-derivation from the sealed frames. */
+const HEX64 = /^[0-9a-f]{64}$/;
+const isSafeTime = (v: unknown): v is number =>
+  typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+const isSafeCount = isSafeTime;
+const OUTCOMES: readonly string[] = [
+  "SUBSCRIPTION_ACKNOWLEDGED",
+  "SUBSCRIPTION_REJECTED",
+  "ACK_TIMEOUT",
+  "TRANSPORT_ERROR",
+  "TRANSPORT_CLOSED",
+  "MALFORMED_RESPONSE",
+  "MISMATCHED_RESPONSE_ID",
+  "MESSAGE_LIMIT_EXCEEDED",
+  "PAYLOAD_LIMIT_EXCEEDED",
+  "OPERATOR_CANCELLED",
+];
+const UNSUBSCRIBE_STATUSES: readonly string[] = [
+  "NOT_SENT",
+  "SENT_UNOBSERVED",
+  "OBSERVED",
+  "REJECTED",
+  "SEND_FAILED",
+];
+
+interface StoredFrame {
+  readonly seq: number;
+  readonly direction: "OUTGOING" | "INCOMING";
+  readonly atMs: number;
+  readonly originalBytes: number;
+  readonly overflow: null | "MESSAGE_LIMIT" | "PAYLOAD_LIMIT";
+  /** The stored bytes (after redaction); null for an over-limit frame. */
+  readonly stored: Buffer | null;
+  readonly redacted: boolean;
+}
+
+/**
+ * Schema, digest and byte accounting of one sealed frame. Returns the frame, or a problem.
+ * An unredacted frame's stored bytes must be exactly its original bytes (length and digest).
+ */
+function storedFrame(raw: unknown, index: number, startedAtMs: number): StoredFrame | string {
+  const bad = (what: string) => `FRAME_INVALID:${index + 1}:${what}`;
+  if (!isRecord(raw)) return bad("NOT_AN_OBJECT");
+  if (raw.seq !== index + 1) return bad("SEQ");
+  if (raw.direction !== "OUTGOING" && raw.direction !== "INCOMING") return bad("DIRECTION");
+  if (!isSafeTime(raw.atMs) || raw.atMs < startedAtMs) return bad("TIME");
+  if (!isSafeCount(raw.originalBytes)) return bad("ORIGINAL_BYTES");
+  if (typeof raw.originalSha256 !== "string" || !HEX64.test(raw.originalSha256)) {
+    return bad("ORIGINAL_DIGEST");
+  }
+  const overflow = raw.overflow;
+  if (overflow !== null && overflow !== "MESSAGE_LIMIT" && overflow !== "PAYLOAD_LIMIT") {
+    return bad("OVERFLOW");
+  }
+  if (overflow !== null && raw.direction === "OUTGOING") return bad("OVERFLOW");
+  if (typeof raw.payloadRedacted !== "boolean") return bad("REDACTION_FLAG");
+  const base = {
+    seq: raw.seq,
+    direction: raw.direction,
+    atMs: raw.atMs,
+    originalBytes: raw.originalBytes,
+    overflow,
+  } as const;
+  if (overflow !== null) {
+    if (
+      raw.payload !== null ||
+      raw.storedEncoding !== null ||
+      raw.storedBytes !== null ||
+      raw.storedSha256 !== null ||
+      raw.payloadRedacted !== false
+    ) {
+      return bad("OVERFLOW_PAYLOAD_RETAINED");
+    }
+    return { ...base, stored: null, redacted: false };
+  }
+  if (typeof raw.payload !== "string") return bad("PAYLOAD");
+  let stored: Buffer;
+  if (raw.storedEncoding === "utf8") {
+    stored = Buffer.from(raw.payload, "utf8");
+  } else if (raw.storedEncoding === "base64") {
+    stored = Buffer.from(raw.payload, "base64");
+    if (stored.toString("base64") !== raw.payload) return bad("BASE64_NOT_CANONICAL");
+    if (decodeStrictUtf8(stored) !== null) return bad("BASE64_FOR_TEXT");
+  } else {
+    return bad("ENCODING");
+  }
+  if (raw.storedBytes !== stored.length) return bad("STORED_BYTES");
+  if (raw.storedSha256 !== sha256(stored)) return bad("STORED_DIGEST");
+  if (raw.payloadRedacted === false) {
+    if (stored.length !== raw.originalBytes || raw.storedSha256 !== raw.originalSha256) {
+      return bad("UNREDACTED_DIFFERS_FROM_ORIGINAL");
+    }
+  } else if (raw.storedSha256 === raw.originalSha256) {
+    return bad("REDACTION_FLAG");
+  }
+  return { ...base, stored, redacted: raw.payloadRedacted };
+}
+
+interface Replay {
+  readonly problems: string[];
+  readonly subscribeAtMs: number | null;
+  readonly ack: { subscriptionId: number; receivedAtMs: number } | null;
+  readonly rejection: { code: number; message: string; receivedAtMs: number } | null;
+  readonly unsubscribe: {
+    status: UnsubscribeStatus;
+    sentAtMs: number | null;
+    responseAtMs: number | null;
+    errorCode: number | null;
+  };
+  readonly counts: {
+    incomingMessages: number;
+    incomingPayloadBytes: number;
+    outgoingFrames: number;
+    notifications: number;
+  };
+  /** The outcome the frames themselves decide, if any. */
+  readonly terminal: CapabilityOutcome | null;
+  readonly decisiveRedacted: boolean;
+  readonly lastAtMs: number | null;
+}
+
+/**
+ * Replays the sealed frames in order with the probe's own rules: the exact subscribe request
+ * first (after the transport opened, before the deadline), an acknowledgement only after it, the
+ * unsubscribe only for the acknowledged id, nothing after a terminating frame, and the fixed
+ * incoming limits. Frames at or after the deadline are counted but decide nothing.
+ */
+function replayFrames(
+  frames: readonly StoredFrame[],
+  startedAtMs: number,
+  openedAtMs: number | null,
+): Replay {
+  const L = CAPABILITY_LIMITS;
+  const deadlineAtMs = startedAtMs + L.acquisitionDeadlineMs;
+  const problems: string[] = [];
+  let subscribeAtMs: number | null = null;
+  let ack: Replay["ack"] = null;
+  let rejection: Replay["rejection"] = null;
+  const unsubscribe: Replay["unsubscribe"] = {
+    status: "NOT_SENT",
+    sentAtMs: null,
+    responseAtMs: null,
+    errorCode: null,
+  };
+  const counts = {
+    incomingMessages: 0,
+    incomingPayloadBytes: 0,
+    outgoingFrames: 0,
+    notifications: 0,
+  };
+  let terminal: CapabilityOutcome | null = null;
+  let awaitingUnsubscribeDecision = false;
+  let decisiveRedacted = false;
+  let previousAtMs = startedAtMs;
+  for (const f of frames) {
+    if (f.atMs < previousAtMs) problems.push(`FRAME_ORDER_INVALID:${f.seq}`);
+    previousAtMs = f.atMs;
+    if (terminal !== null) {
+      problems.push(`FRAME_AFTER_TERMINATION:${f.seq}`);
+      break;
+    }
+    if (awaitingUnsubscribeDecision) {
+      awaitingUnsubscribeDecision = false;
+      if (f.direction !== "OUTGOING") {
+        // The probe ends at once when it does not send the unsubscribe.
+        terminal = "SUBSCRIPTION_ACKNOWLEDGED";
+        problems.push(`FRAME_AFTER_TERMINATION:${f.seq}`);
+        break;
+      }
+    }
+    if (f.direction === "OUTGOING") {
+      counts.outgoingFrames++;
+      const text = f.stored === null || f.redacted ? null : decodeStrictUtf8(f.stored);
+      if (counts.outgoingFrames === 1) {
+        if (
+          text !== SUBSCRIBE_FRAME ||
+          openedAtMs === null ||
+          f.atMs < openedAtMs ||
+          f.atMs >= deadlineAtMs
+        ) {
+          problems.push("SUBSCRIBE_REQUEST_INVALID");
+        }
+        subscribeAtMs = f.atMs;
+      } else if (counts.outgoingFrames === 2) {
+        if (
+          ack === null ||
+          unsubscribe.status !== "NOT_SENT" ||
+          text !== unsubscribeFrame(ack.subscriptionId) ||
+          f.atMs < ack.receivedAtMs ||
+          f.atMs >= deadlineAtMs
+        ) {
+          problems.push("UNSUBSCRIBE_REQUEST_INVALID");
+        }
+        unsubscribe.status = "SENT_UNOBSERVED";
+        unsubscribe.sentAtMs = f.atMs;
+      } else {
+        problems.push("TOO_MANY_OUTGOING_FRAMES");
+      }
+      continue;
+    }
+    counts.incomingMessages++;
+    counts.incomingPayloadBytes += f.originalBytes;
+    const expectedOverflow =
+      counts.incomingMessages > L.maxIncomingMessages
+        ? "MESSAGE_LIMIT"
+        : counts.incomingPayloadBytes > L.maxIncomingPayloadBytes
+          ? "PAYLOAD_LIMIT"
+          : null;
+    if (f.overflow !== expectedOverflow) problems.push(`OVERFLOW_ACCOUNTING_INVALID:${f.seq}`);
+    if (expectedOverflow !== null) {
+      terminal =
+        expectedOverflow === "MESSAGE_LIMIT" ? "MESSAGE_LIMIT_EXCEEDED" : "PAYLOAD_LIMIT_EXCEEDED";
+      continue;
+    }
+    if (f.atMs >= deadlineAtMs || f.stored === null) continue;
+    const c = classifyIncomingBytes(f.stored, {
+      unsubscribeSent: unsubscribe.status !== "NOT_SENT",
+    });
+    if (f.redacted && c.kind !== "NOTIFICATION") decisiveRedacted = true;
+    switch (c.kind) {
+      case "NOTIFICATION":
+        counts.notifications++;
+        break;
+      case "SUBSCRIBE_ACK":
+        if (
+          subscribeAtMs === null ||
+          ack !== null ||
+          rejection !== null ||
+          f.atMs < subscribeAtMs
+        ) {
+          terminal = "MALFORMED_RESPONSE";
+        } else {
+          ack = { subscriptionId: c.subscriptionId, receivedAtMs: f.atMs };
+          awaitingUnsubscribeDecision = true;
+        }
+        break;
+      case "SUBSCRIBE_ERROR":
+        if (
+          subscribeAtMs === null ||
+          ack !== null ||
+          rejection !== null ||
+          f.atMs < subscribeAtMs
+        ) {
+          terminal = "MALFORMED_RESPONSE";
+        } else {
+          rejection = { code: c.code, message: c.message, receivedAtMs: f.atMs };
+          terminal = "SUBSCRIPTION_REJECTED";
+        }
+        break;
+      case "UNSUBSCRIBE_ACK":
+        unsubscribe.status = "OBSERVED";
+        unsubscribe.responseAtMs = f.atMs;
+        terminal = "SUBSCRIPTION_ACKNOWLEDGED";
+        break;
+      case "UNSUBSCRIBE_REJECTED":
+        unsubscribe.status = "REJECTED";
+        unsubscribe.responseAtMs = f.atMs;
+        unsubscribe.errorCode = c.code;
+        terminal = "SUBSCRIPTION_ACKNOWLEDGED";
+        break;
+      case "MISMATCHED_ID":
+        terminal = "MISMATCHED_RESPONSE_ID";
+        break;
+      default:
+        terminal = "MALFORMED_RESPONSE";
+    }
+  }
+  if (awaitingUnsubscribeDecision) terminal = "SUBSCRIPTION_ACKNOWLEDGED";
+  return {
+    problems,
+    subscribeAtMs,
+    ack,
+    rejection,
+    unsubscribe,
+    counts,
+    terminal,
+    decisiveRedacted,
+    lastAtMs: frames.length > 0 ? (frames[frames.length - 1] as StoredFrame).atMs : null,
+  };
+}
+
+/**
+ * Fail-closed offline verification: integrity of the sealed files, then the complete, ordered
+ * proof re-derived from the sealed frames, and every recorded fact, time, counter and digest
+ * checked against it. Malformed records are verification failures; nothing here throws.
+ */
 export function verifySubscriptionCapabilityEvidence(dir: string): CapabilityVerification {
   const problems: string[] = [];
-  const fail = (manifestSha256: string | null = null): CapabilityVerification => ({
+  let manifestSha256: string | null = null;
+  const fail = (): CapabilityVerification => ({
     integrity: { ok: false, problems: [...problems] },
     outcome: null,
     capabilityConfirmed: false,
@@ -696,203 +1077,260 @@ export function verifySubscriptionCapabilityEvidence(dir: string): CapabilityVer
     manifestSha256,
   });
   try {
-    const st = lstatSync(dir);
-    if (st.isSymbolicLink() || !st.isDirectory()) problems.push("OUTPUT_DIRECTORY_INVALID");
+    try {
+      const st = lstatSync(dir);
+      if (st.isSymbolicLink() || !st.isDirectory()) problems.push("OUTPUT_DIRECTORY_INVALID");
+    } catch {
+      problems.push("OUTPUT_DIRECTORY_MISSING");
+    }
+    if (problems.length > 0) return fail();
+    let manifest: unknown;
+    try {
+      const manifestBytes = readFileSync(path.join(dir, CAPABILITY_FILES.manifest));
+      manifestSha256 = sha256(manifestBytes);
+      manifest = JSON.parse(manifestBytes.toString("utf8"));
+    } catch {
+      problems.push("MANIFEST_MISSING_OR_INVALID");
+      return fail();
+    }
+    if (
+      !isRecord(manifest) ||
+      manifest.kind !== CAPABILITY_MANIFEST_KIND ||
+      manifest.version !== CAPABILITY_EVIDENCE_VERSION ||
+      !Array.isArray(manifest.files)
+    ) {
+      problems.push("MANIFEST_KIND_INVALID");
+      return fail();
+    }
+    const expected: readonly string[] = [CAPABILITY_FILES.plan, CAPABILITY_FILES.probe];
+    const entries = manifest.files as unknown[];
+    if (
+      entries.length !== expected.length ||
+      entries.some(
+        (f, i) =>
+          !isRecord(f) ||
+          f.path !== expected[i] ||
+          typeof f.sha256 !== "string" ||
+          !HEX64.test(f.sha256) ||
+          !isSafeCount(f.bytes),
+      )
+    ) {
+      problems.push("MANIFEST_FILES_INVALID");
+      return fail();
+    }
+    for (const name of readdirSync(dir)) {
+      const st = lstatSync(path.join(dir, name));
+      if (st.isSymbolicLink() || !st.isFile()) problems.push(`UNEXPECTED_ENTRY:${name}`);
+      else if (name !== CAPABILITY_FILES.manifest && !expected.includes(name)) {
+        problems.push(`UNLISTED:${name}`);
+      }
+    }
+    const texts = new Map<string, Buffer>();
+    for (const f of entries as Record<string, unknown>[]) {
+      const name = f.path as string;
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(path.join(dir, name));
+      } catch {
+        problems.push(`MISSING:${name}`);
+        continue;
+      }
+      if (sha256(bytes) !== f.sha256 || bytes.length !== f.bytes) {
+        problems.push(`MODIFIED:${name}`);
+        continue;
+      }
+      texts.set(name, bytes);
+    }
+    if (problems.length > 0) return fail();
+
+    let p: unknown;
+    try {
+      JSON.parse((texts.get(CAPABILITY_FILES.plan) as Buffer).toString("utf8"));
+      p = JSON.parse((texts.get(CAPABILITY_FILES.probe) as Buffer).toString("utf8"));
+    } catch {
+      problems.push("EVIDENCE_NOT_JSON");
+      return fail();
+    }
+    if (
+      !isRecord(p) ||
+      p.kind !== CAPABILITY_PROBE_KIND ||
+      p.version !== CAPABILITY_EVIDENCE_VERSION
+    ) {
+      problems.push("PROBE_KIND_INVALID");
+      return fail();
+    }
+    if (JSON.stringify(p.limits) !== JSON.stringify(CAPABILITY_LIMITS))
+      problems.push("LIMITS_MISMATCH");
+    if (p.subscribeFrame !== SUBSCRIBE_FRAME) problems.push("SUBSCRIBE_FRAME_RECORD_INVALID");
+    const outcome = p.outcome;
+    if (typeof outcome !== "string" || !OUTCOMES.includes(outcome)) {
+      problems.push("OUTCOME_INVALID");
+      return fail();
+    }
+    if (manifest.outcome !== outcome || manifest.capabilityConfirmed !== p.capabilityConfirmed) {
+      problems.push("MANIFEST_SUMMARY_MISMATCH");
+    }
+
+    // Times.
+    const startedAtMs = p.startedAtMs;
+    if (!isSafeTime(startedAtMs)) {
+      problems.push("TIMES_INVALID:START");
+      return fail();
+    }
+    const deadlineAtMs = startedAtMs + CAPABILITY_LIMITS.acquisitionDeadlineMs;
+    const openedAtMs = p.openedAtMs === null ? null : p.openedAtMs;
+    if (p.deadlineAtMs !== deadlineAtMs) problems.push("TIMES_INVALID:DEADLINE");
+    if (openedAtMs !== null && (!isSafeTime(openedAtMs) || openedAtMs < startedAtMs)) {
+      problems.push("TIMES_INVALID:OPENED");
+    }
+    if (!isSafeTime(p.endedAtMs) || p.endedAtMs < startedAtMs) problems.push("TIMES_INVALID:ENDED");
+    if (
+      !isSafeTime(p.cleanupEndedAtMs) ||
+      !isSafeTime(p.endedAtMs) ||
+      p.cleanupEndedAtMs < p.endedAtMs ||
+      p.cleanupEndedAtMs > p.endedAtMs + CAPABILITY_LIMITS.cleanupTimeoutMs
+    ) {
+      problems.push("TIMES_INVALID:CLEANUP");
+    }
+
+    // Frames: schema, digests and byte accounting, then the ordered replay.
+    if (!Array.isArray(p.frames)) {
+      problems.push("FRAMES_INVALID");
+      return fail();
+    }
+    const frames: StoredFrame[] = [];
+    for (const [i, raw] of (p.frames as unknown[]).entries()) {
+      const f = storedFrame(raw, i, startedAtMs);
+      if (typeof f === "string") problems.push(f);
+      else frames.push(f);
+    }
+    if (problems.length > 0) return fail();
+    const replay = replayFrames(frames, startedAtMs, openedAtMs as number | null);
+    problems.push(...replay.problems);
+    if (replay.lastAtMs !== null && isSafeTime(p.endedAtMs) && p.endedAtMs < replay.lastAtMs) {
+      problems.push("TIMES_INVALID:ENDED_BEFORE_LAST_FRAME");
+    }
+    if (frames.length > 0 && p.transportCreated !== true) problems.push("TRANSPORT_RECORD_INVALID");
+    if (openedAtMs !== null && p.transportCreated !== true)
+      problems.push("TRANSPORT_RECORD_INVALID");
+
+    // Recorded facts against the replay.
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const ack = p.acknowledgement;
+    if (
+      !same(
+        ack === null
+          ? null
+          : isRecord(ack)
+            ? { subscriptionId: ack.subscriptionId, receivedAtMs: ack.receivedAtMs }
+            : ack,
+        replay.ack,
+      ) ||
+      (isRecord(ack) && Object.keys(ack).length !== 2)
+    ) {
+      problems.push("ACKNOWLEDGEMENT_MISMATCH");
+    }
+    const rej = p.rejection;
+    if (
+      (rej === null) !== (replay.rejection === null) ||
+      (isRecord(rej) &&
+        replay.rejection !== null &&
+        (rej.code !== replay.rejection.code ||
+          rej.receivedAtMs !== replay.rejection.receivedAtMs ||
+          (!replay.decisiveRedacted && rej.message !== replay.rejection.message))) ||
+      (rej !== null && !isRecord(rej))
+    ) {
+      problems.push("REJECTION_MISMATCH");
+    }
+    const unsub = isRecord(p.unsubscribe) ? p.unsubscribe : null;
+    const statusMatches =
+      unsub !== null &&
+      typeof unsub.status === "string" &&
+      UNSUBSCRIBE_STATUSES.includes(unsub.status) &&
+      (unsub.status === replay.unsubscribe.status ||
+        (unsub.status === "SEND_FAILED" &&
+          replay.unsubscribe.status === "NOT_SENT" &&
+          replay.ack !== null));
+    if (
+      !statusMatches ||
+      unsub?.sentAtMs !== replay.unsubscribe.sentAtMs ||
+      unsub?.responseAtMs !== replay.unsubscribe.responseAtMs ||
+      unsub?.errorCode !== replay.unsubscribe.errorCode
+    ) {
+      problems.push("UNSUBSCRIBE_MISMATCH");
+    }
+    if (
+      !same(p.counts, {
+        incomingMessages: replay.counts.incomingMessages,
+        incomingPayloadBytes: replay.counts.incomingPayloadBytes,
+        outgoingFrames: replay.counts.outgoingFrames,
+        notifications: replay.counts.notifications,
+        clientPings: 0,
+      })
+    ) {
+      problems.push("COUNTS_MISMATCH");
+    }
+
+    // The outcome must follow from the frames.
+    const endedAtDeadline = isSafeTime(p.endedAtMs) && p.endedAtMs >= deadlineAtMs;
+    const outcomeReproduced =
+      replay.terminal !== null
+        ? outcome === replay.terminal
+        : outcome === "ACK_TIMEOUT"
+          ? replay.ack === null && endedAtDeadline
+          : outcome === "SUBSCRIPTION_ACKNOWLEDGED"
+            ? replay.ack !== null &&
+              replay.unsubscribe.status === "SENT_UNOBSERVED" &&
+              endedAtDeadline
+            : outcome === "TRANSPORT_ERROR" ||
+              outcome === "TRANSPORT_CLOSED" ||
+              outcome === "OPERATOR_CANCELLED";
+    if (!outcomeReproduced) problems.push("OUTCOME_NOT_REPRODUCED");
+
+    // Cancellation, cleanup, reasons and the confirmation itself.
+    const cleanup = isRecord(p.cleanup) ? p.cleanup : null;
+    const cancelled = p.cancelled;
+    const phase = p.cancellationPhase;
+    if (
+      typeof cancelled !== "boolean" ||
+      (cancelled ? phase !== "DURING_PROBE" && phase !== "BEFORE_SEALING" : phase !== null) ||
+      (outcome === "OPERATOR_CANCELLED" && phase !== "DURING_PROBE")
+    ) {
+      problems.push("CANCELLATION_RECORD_INVALID");
+    }
+    if (
+      cleanup === null ||
+      cleanup.settled !== true ||
+      typeof cleanup.failed !== "boolean" ||
+      typeof cleanup.forced !== "boolean"
+    ) {
+      problems.push("CLEANUP_RECORD_INVALID");
+    }
+    const expectedReasons = [
+      ...(outcome !== "SUBSCRIPTION_ACKNOWLEDGED" ? [`OUTCOME:${outcome}`] : []),
+      ...(cancelled === true ? ["CANCELLED"] : []),
+      ...(cleanup?.failed === true ? ["CLEANUP_FAILED"] : []),
+    ];
+    if (!same(p.reasons, expectedReasons)) problems.push("REASONS_MISMATCH");
+    if (p.capabilityConfirmed !== (expectedReasons.length === 0))
+      problems.push("CONFIRMATION_MISMATCH");
+    if (problems.length > 0) return fail();
+    return {
+      integrity: { ok: true, problems: [] },
+      outcome: outcome as CapabilityOutcome,
+      // A redacted decisive frame cannot be re-derived exactly, so it never confirms.
+      capabilityConfirmed:
+        expectedReasons.length === 0 &&
+        replay.ack !== null &&
+        replay.subscribeAtMs !== null &&
+        !replay.decisiveRedacted,
+      subscriptionId: replay.ack?.subscriptionId ?? null,
+      manifestSha256,
+    };
   } catch {
-    problems.push("OUTPUT_DIRECTORY_MISSING");
-  }
-  if (problems.length > 0) return fail();
-  let manifestText: string;
-  let manifest: unknown;
-  try {
-    manifestText = readFileSync(path.join(dir, CAPABILITY_FILES.manifest), "utf8");
-    manifest = JSON.parse(manifestText);
-  } catch {
-    problems.push("MANIFEST_MISSING_OR_INVALID");
+    problems.push("EVIDENCE_RECORD_MALFORMED");
     return fail();
   }
-  const manifestSha256 = sha256(manifestText);
-  if (
-    !isRecord(manifest) ||
-    manifest.kind !== CAPABILITY_MANIFEST_KIND ||
-    manifest.version !== CAPABILITY_EVIDENCE_VERSION ||
-    !Array.isArray(manifest.files)
-  ) {
-    problems.push("MANIFEST_KIND_INVALID");
-    return fail(manifestSha256);
-  }
-  const expected: readonly string[] = [CAPABILITY_FILES.plan, CAPABILITY_FILES.probe];
-  const listed = (manifest.files as unknown[]).map((f) => (isRecord(f) ? f.path : undefined));
-  if (JSON.stringify(listed) !== JSON.stringify(expected)) problems.push("MANIFEST_FILES_INVALID");
-  for (const name of readdirSync(dir)) {
-    const st = lstatSync(path.join(dir, name));
-    if (st.isSymbolicLink() || !st.isFile()) problems.push(`UNEXPECTED_ENTRY:${name}`);
-    else if (name !== CAPABILITY_FILES.manifest && !expected.includes(name))
-      problems.push(`UNLISTED:${name}`);
-  }
-  const texts = new Map<string, string>();
-  for (const f of manifest.files as unknown[]) {
-    if (!isRecord(f) || typeof f.path !== "string" || !expected.includes(f.path)) continue;
-    let text: string;
-    try {
-      text = readFileSync(path.join(dir, f.path), "utf8");
-    } catch {
-      problems.push(`MISSING:${f.path}`);
-      continue;
-    }
-    if (sha256(text) !== f.sha256 || Buffer.byteLength(text, "utf8") !== f.bytes) {
-      problems.push(`MODIFIED:${f.path}`);
-      continue;
-    }
-    texts.set(f.path, text);
-  }
-  if (problems.length > 0) return fail(manifestSha256);
-  let p: Record<string, unknown>;
-  try {
-    p = JSON.parse(texts.get(CAPABILITY_FILES.probe) as string) as Record<string, unknown>;
-  } catch {
-    problems.push("PROBE_NOT_JSON");
-    return fail(manifestSha256);
-  }
-  if (p.kind !== CAPABILITY_PROBE_KIND || p.version !== CAPABILITY_EVIDENCE_VERSION) {
-    problems.push("PROBE_KIND_INVALID");
-  }
-  if (JSON.stringify(p.limits) !== JSON.stringify(CAPABILITY_LIMITS))
-    problems.push("LIMITS_MISMATCH");
-  const outcome = p.outcome as CapabilityOutcome;
-  if (manifest.outcome !== outcome || manifest.capabilityConfirmed !== p.capabilityConfirmed) {
-    problems.push("MANIFEST_SUMMARY_MISMATCH");
-  }
-  const frames = Array.isArray(p.frames) ? (p.frames as Record<string, unknown>[]) : [];
-  const counts = isRecord(p.counts) ? p.counts : {};
-  const outgoing = frames.filter((f) => f.direction === "OUTGOING");
-  const incoming = frames.filter((f) => f.direction === "INCOMING");
-  const deadlineAtMs = p.deadlineAtMs as number;
-  if (
-    typeof p.startedAtMs !== "number" ||
-    deadlineAtMs !== p.startedAtMs + CAPABILITY_LIMITS.acquisitionDeadlineMs
-  ) {
-    problems.push("DEADLINE_INVALID");
-  }
-  if (outgoing.length > CAPABILITY_LIMITS.maxOutgoingFrames)
-    problems.push("TOO_MANY_OUTGOING_FRAMES");
-  if (outgoing.length > 0 && outgoing[0]!.payload !== SUBSCRIBE_FRAME)
-    problems.push("SUBSCRIBE_FRAME_INVALID");
-  if (
-    counts.outgoingFrames !== outgoing.length ||
-    counts.incomingMessages !== incoming.length ||
-    counts.incomingPayloadBytes !== incoming.reduce((n, f) => n + (f.byteLength as number), 0) ||
-    counts.clientPings !== 0 ||
-    incoming.length > CAPABILITY_LIMITS.maxIncomingMessages + 1
-  ) {
-    problems.push("COUNTS_INVALID");
-  }
-  // Re-derive from the frames in order, with the same classifier the probe used.
-  let derivedAck: { subscriptionId: number; receivedAtMs: number } | null = null;
-  let derivedRejection: { code: number; message: string } | null = null;
-  let unsubscribeSent = false;
-  let unsubscribeObserved = false;
-  let decisiveRedacted = false;
-  let violation: CapabilityOutcome | null = null;
-  for (const f of frames) {
-    if (f.direction === "OUTGOING") {
-      if (f !== outgoing[0]) {
-        if (derivedAck === null || f.payload !== unsubscribeFrame(derivedAck.subscriptionId)) {
-          problems.push("UNSUBSCRIBE_FRAME_INVALID");
-        }
-        unsubscribeSent = true;
-      }
-      continue;
-    }
-    if (f.overflow !== null || typeof f.payload !== "string" || (f.atMs as number) >= deadlineAtMs)
-      continue;
-    const c = classifyIncoming(f.payload, { unsubscribeSent });
-    if (f.payloadRedacted === true && c.kind !== "NOTIFICATION") decisiveRedacted = true;
-    if (violation !== null) continue;
-    if (c.kind === "SUBSCRIBE_ACK" && derivedAck === null && derivedRejection === null) {
-      derivedAck = { subscriptionId: c.subscriptionId, receivedAtMs: f.atMs as number };
-    } else if (c.kind === "SUBSCRIBE_ERROR" && derivedAck === null && derivedRejection === null) {
-      derivedRejection = { code: c.code, message: c.message };
-    } else if (c.kind === "UNSUBSCRIBE_ACK") {
-      unsubscribeObserved = true;
-    } else if (c.kind === "MISMATCHED_ID") {
-      violation = "MISMATCHED_RESPONSE_ID";
-    } else if (
-      c.kind === "MALFORMED" ||
-      c.kind === "SUBSCRIBE_ACK" ||
-      c.kind === "SUBSCRIBE_ERROR"
-    ) {
-      violation = "MALFORMED_RESPONSE";
-    }
-  }
-  const ack = isRecord(p.acknowledgement) ? p.acknowledgement : null;
-  if (
-    (ack === null) !== (derivedAck === null) ||
-    (ack !== null &&
-      (ack.subscriptionId !== derivedAck!.subscriptionId ||
-        ack.receivedAtMs !== derivedAck!.receivedAtMs))
-  ) {
-    problems.push("ACKNOWLEDGEMENT_MISMATCH");
-  }
-  const rej = isRecord(p.rejection) ? p.rejection : null;
-  if (
-    (rej === null) !== (derivedRejection === null) ||
-    (rej !== null && rej.code !== derivedRejection!.code)
-  ) {
-    problems.push("REJECTION_MISMATCH");
-  }
-  const unsub = isRecord(p.unsubscribe) ? p.unsubscribe : {};
-  if (unsubscribeSent !== (unsub.status !== "NOT_SENT" && unsub.status !== "SEND_FAILED")) {
-    problems.push("UNSUBSCRIBE_STATUS_MISMATCH");
-  }
-  if (unsubscribeObserved !== (unsub.status === "OBSERVED"))
-    problems.push("UNSUBSCRIBE_STATUS_MISMATCH");
-  const last = incoming[incoming.length - 1];
-  const outcomeConsistent = (() => {
-    switch (outcome) {
-      case "SUBSCRIPTION_ACKNOWLEDGED":
-        return derivedAck !== null && violation === null;
-      case "SUBSCRIPTION_REJECTED":
-        return derivedRejection !== null && derivedAck === null;
-      case "MALFORMED_RESPONSE":
-      case "MISMATCHED_RESPONSE_ID":
-        return violation === outcome;
-      case "MESSAGE_LIMIT_EXCEEDED":
-        return last?.overflow === "MESSAGE_LIMIT";
-      case "PAYLOAD_LIMIT_EXCEEDED":
-        return last?.overflow === "PAYLOAD_LIMIT";
-      case "ACK_TIMEOUT":
-        return (
-          derivedAck === null &&
-          derivedRejection === null &&
-          violation === null &&
-          (p.endedAtMs as number) >= deadlineAtMs
-        );
-      case "TRANSPORT_ERROR":
-      case "TRANSPORT_CLOSED":
-      case "OPERATOR_CANCELLED":
-        return derivedRejection === null && violation === null;
-      default:
-        return false;
-    }
-  })();
-  if (!outcomeConsistent) problems.push("OUTCOME_NOT_REPRODUCED");
-  const cleanup = isRecord(p.cleanup) ? p.cleanup : {};
-  const derivedConfirmed =
-    outcome === "SUBSCRIPTION_ACKNOWLEDGED" &&
-    p.cancelled === false &&
-    cleanup.settled === true &&
-    cleanup.failed === false;
-  if (p.capabilityConfirmed !== derivedConfirmed) problems.push("CONFIRMATION_MISMATCH");
-  if (problems.length > 0) return fail(manifestSha256);
-  return {
-    integrity: { ok: true, problems: [] },
-    outcome,
-    // A redacted acknowledgement cannot be re-derived exactly, so it never confirms.
-    capabilityConfirmed: derivedConfirmed && !decisiveRedacted,
-    subscriptionId: derivedAck?.subscriptionId ?? null,
-    manifestSha256,
-  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1098,13 +1536,35 @@ export async function runSubscriptionCapabilityCheck(
   log(
     `[LIVE] Unsubscribe: ${probe.unsubscribe.status}; cleanup ${probe.cleanup.failed ? "FAILED" : "settled"}`,
   );
+  // Cancellation is rechecked here, after every callback above and immediately before sealing. A
+  // cancellation observed now keeps the probe's evidence (including a valid acknowledgement) but
+  // seals the overall run as cancelled and not confirmed. Sealing itself is not interrupted.
+  const cancelledBeforeSealing = deps.signal?.aborted === true && !probe.cancelled;
+  const result: SubscriptionProbeResult = cancelledBeforeSealing
+    ? {
+        ...probe,
+        cancelled: true,
+        cancellationPhase: "BEFORE_SEALING",
+        capabilityConfirmed: false,
+        reasons: [
+          ...(probe.outcome !== "SUBSCRIPTION_ACKNOWLEDGED" ? [`OUTCOME:${probe.outcome}`] : []),
+          "CANCELLED",
+          ...(probe.cleanup.failed ? ["CLEANUP_FAILED"] : []),
+        ],
+      }
+    : probe;
   const seal = sealSubscriptionCapabilityEvidence({
     outDir,
     plan,
-    result: probe,
+    result,
     secrets,
     writeFile: deps.writeFile,
   });
+  if (cancelledBeforeSealing) {
+    log(
+      "[LIVE] Cancelled after the probe settled and before sealing: sealed as cancelled; not confirmed.",
+    );
+  }
   if (!seal.ok) {
     log(`[LIVE] Sealing FAILED: ${seal.status} (no rerun)`);
     return {
@@ -1112,7 +1572,7 @@ export async function runSubscriptionCapabilityCheck(
       exitCode: CAPABILITY_EXIT_CODES.SEAL_FAILED,
       planDigestSha256,
       outDir: rel,
-      probe,
+      probe: result,
       seal,
     };
   }
@@ -1130,7 +1590,7 @@ export async function runSubscriptionCapabilityCheck(
         : CAPABILITY_EXIT_CODES.NOT_CONFIRMED,
     planDigestSha256,
     outDir: rel,
-    probe,
+    probe: result,
     seal,
     verification,
   };
