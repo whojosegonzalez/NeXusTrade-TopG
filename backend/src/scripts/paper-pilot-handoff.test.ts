@@ -21,7 +21,9 @@ import {
   defaultGit,
   evaluatePilotHandoff,
   evaluateWatchedPilotHandoff,
+  HANDOFF_EXIT_CODES,
   loadVerifiedExchanges,
+  runHandoffCli,
   type GitRunner,
 } from "./paper-pilot-handoff.js";
 import {
@@ -1181,7 +1183,15 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test.ts",
       "backend/src/scripts/fresh-amm-v4-watch.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test.ts",
+      "backend/src/scripts/paper-pilot-sequence.test.ts",
     ];
+    // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
+    expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
+    expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.core.ps1");
+    expect(PIN_PATHS.filter((p) => p.startsWith("scripts/"))).toEqual([
+      "scripts/paper-pilot-sequence.ps1",
+      "scripts/paper-pilot-sequence.core.ps1",
+    ]);
     expect([...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER]).toEqual([
       "backend/src/scripts/fresh-amm-v4-precheck.ts",
       "backend/src/scripts/fresh-amm-v4-precheck.test.ts",
@@ -1241,5 +1251,108 @@ describe("Watched-evidence handoff (offline integration)", () => {
       expect(kind, line).toBe("A");
       expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(file);
     }
+  });
+  it("H-13: the handoff CLI routes explicit precheck or watch inputs, refuses conflicts, and exits with its decision's code", async () => {
+    const root = watchRoot();
+    const { env, validation } = await selectedWatch();
+    const run = sealRun(root, "watch-cli", { watchResult: env.watchResult, validation });
+    const cli = (args: string[], nowMs: number, projectRoot = root, git = fakeGit().git) => {
+      const lines: string[] = [];
+      const code = runHandoffCli(["--pinned-commit", PINNED, ...args], {
+        projectRoot,
+        git,
+        clock: () => nowMs,
+        log: (l) => lines.push(l),
+      });
+      expect(lines, args.join(" ")).toHaveLength(1);
+      const decision = JSON.parse(lines[0]!) as Loose;
+      // The exit code always matches the structured decision.
+      expect(code, args.join(" ")).toBe(
+        HANDOFF_EXIT_CODES[decision.decision as keyof typeof HANDOFF_EXIT_CODES],
+      );
+      return { code, decision };
+    };
+    const watchArgs = ["--watch-evidence-dir", run, "--pilot-out-dir", PILOT];
+    const manifestSha256 = sha256(
+      readFileSync(path.join(root, ...run.split("/"), WATCH_EVIDENCE_FILES.manifest)),
+    );
+
+    // Watch evidence: the verified manifest digest is part of the decision.
+    const allowedNow = cli(watchArgs, watchAge(300));
+    expect(allowedNow).toMatchObject({
+      code: 0,
+      decision: {
+        decision: "ALLOWED",
+        refusals: [],
+        poolId: POOL,
+        mintAddress: MINT,
+        pilotOutDir: PILOT,
+        evidenceSource: "WATCH_EVIDENCE",
+        manifestSha256,
+      },
+    });
+    expect(cli(watchArgs, watchAge(239))).toMatchObject({
+      code: 2,
+      decision: { decision: "WAIT", waitMs: 1000, manifestSha256 },
+    });
+    expect(cli(watchArgs, watchAge(761))).toMatchObject({
+      code: 1,
+      decision: { decision: "REFUSED", refusals: ["START_WINDOW_EXPIRED"] },
+    });
+    // The digest is the one the verifier read.
+    expect(verifyWatchEvidence(path.join(root, ...run.split("/"))).manifestSha256).toBe(
+      manifestSha256,
+    );
+
+    // The precheck invocation is unchanged: same decision as the function, no watch fields.
+    const precheck = await sealedPrecheck();
+    const viaCli = cli(
+      ["--precheck-dir", PRECHECK, "--pilot-out-dir", PILOT],
+      atAge(300),
+      precheck.root,
+    );
+    expect(viaCli.decision).toEqual(
+      JSON.parse(JSON.stringify(evaluate(precheck.root, atAge(300)))) as Loose,
+    );
+    expect(viaCli.decision).toMatchObject({ decision: "ALLOWED", poolId: POOL });
+    expect(viaCli.decision.evidenceSource).toBeUndefined();
+    expect(viaCli.decision.manifestSha256).toBeUndefined();
+    // Precheck evidence given as watch evidence (and the reverse) is refused, never re-routed.
+    expect(
+      cli(["--watch-evidence-dir", PRECHECK, "--pilot-out-dir", PILOT], atAge(300), precheck.root)
+        .code,
+    ).toBe(1);
+    expect(cli(["--precheck-dir", run, "--pilot-out-dir", PILOT], watchAge(300)).code).toBe(1);
+
+    // Conflicting or missing inputs.
+    for (const [args, refusal] of [
+      [
+        [...watchArgs, "--precheck-dir", PRECHECK],
+        "HANDOFF_INPUT_CONFLICT:PRECHECK_AND_WATCH_EVIDENCE",
+      ],
+      [
+        ["--pin-only", "--watch-evidence-dir", run],
+        "HANDOFF_INPUT_CONFLICT:PIN_ONLY_WITH_EVIDENCE",
+      ],
+      [["--pin-only", "--precheck-dir", PRECHECK], "HANDOFF_INPUT_CONFLICT:PIN_ONLY_WITH_EVIDENCE"],
+      [["--pin-only", "--pilot-out-dir", PILOT], "HANDOFF_INPUT_CONFLICT:PIN_ONLY_WITH_EVIDENCE"],
+      [["--pilot-out-dir", PILOT], "HANDOFF_INPUT_MISSING:EVIDENCE_DIR"],
+      [
+        ["--watch-evidence-dir", "", "--pilot-out-dir", PILOT],
+        "HANDOFF_INPUT_MISSING:WATCH_EVIDENCE_DIR",
+      ],
+    ] as const) {
+      expect(cli([...args], watchAge(300)), args.join(" ")).toMatchObject({
+        code: 1,
+        decision: { decision: "REFUSED", refusals: [refusal] },
+      });
+    }
+    expect(cli(["--pin-only"], watchAge(300))).toMatchObject({
+      code: 0,
+      decision: { decision: "PIN_OK", refusals: [] },
+    });
+    expect(() =>
+      runHandoffCli(["--pinned-commit", PINNED, "--unknown"], { log: () => {} }),
+    ).toThrow();
   });
 });

@@ -1118,6 +1118,8 @@ export interface WatchEvidenceVerification {
    * reopen the evidence files.
    */
   readonly confirmedTarget: WatchCandidateTarget | null;
+  /** SHA-256 of the exact manifest bytes this verification parsed (null if none were read). */
+  readonly manifestSha256: string | null;
 }
 
 /** Recorded outcomes that can come from acquisition events the exchange records alone do not show. */
@@ -1216,7 +1218,9 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
     verified: false,
     selectionConfirmed: false,
     confirmedTarget: null,
+    manifestSha256,
   });
+  let manifestSha256: string | null = null;
 
   // 1. The directory and the manifest.
   try {
@@ -1237,7 +1241,9 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   }
   let manifest: unknown;
   try {
-    manifest = JSON.parse(readFileSync(path.join(outDir, WATCH_EVIDENCE_FILES.manifest), "utf8"));
+    const manifestBytes = readFileSync(path.join(outDir, WATCH_EVIDENCE_FILES.manifest));
+    manifestSha256 = sha256(manifestBytes);
+    manifest = JSON.parse(manifestBytes.toString("utf8"));
   } catch {
     problems.push("MANIFEST_NOT_JSON");
     return integrityFailure();
@@ -1700,6 +1706,7 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
       selectionConfirmed && isRecord(result) && isRecord(result.target)
         ? deepFreeze(structuredClone(result.target) as unknown as WatchCandidateTarget)
         : null,
+    manifestSha256,
   };
 }
 

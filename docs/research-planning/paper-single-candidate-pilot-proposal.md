@@ -2,6 +2,8 @@
 
 **Current status (2026-11-14):** Stage A precheck and the conditional wrapper were reviewed at commit `c440cef7eaba004e0fc15e9899f3ed58e9b7426c` and executed once under operator authorization into `data/research/prechecks/fresh-amm-v4-01` (manifest `5b65751d2adaf7e27e342d00262ffe0e8ac2ea73447b91f6de5b5fa6a146ac16`). The offline pin check passed, but Stage A terminated cleanly without a target (`SAMPLE_PRODUCED_NO_SUITABLE_TARGET`: 18 signatures outside the 0–760 s retrieval prefilter [12m 40s], 2 failed on-chain; 0 transactions retrieved, 0 market calls, 0 sockets), returning exit 3. Consequently, the live handoff check was not reached, and Stage B was not initiated. The single-execution authorization is exhausted; no further provider request, socket, capture, daemon activation, or rerun is currently authorized. Detailed analysis and the next-discovery assessment are recorded in assessment §8.37, with the proposed companion creation-watch design in §8.38.
 
+**Watch-mode update (2026-11-15; offline, for review, unapproved):** the wrapper now also has an explicit watch mode (`-Watch -WatchOutDir <new directory directly under data/research/prechecks/>`, mutually exclusive with `-PrecheckOutDir`). It runs one bounded creation watch (collector → validator → sealer, assessment §8.38.10) instead of the signature-page precheck and continues to the unchanged Stage B sequence only on a confirmed selection; see §1.7 and assessment §8.38.11. No live run is authorized and no operator live command is given.
+
 **Historical proposal context:** This document was drafted as the prospective design and approval basis for the two-stage pilot sequence. The Stage B runner reviewed at `6855efb0e4ab5023e2c556030c42613a0ee86f53` remains frozen and unchanged (see the [runbook](./paper-single-candidate-diagnostic-runbook.md) and assessment §8.35–§8.36). The historical planning text and limits below are preserved for architectural and design reference.
 
 **Summary:**
@@ -191,6 +193,31 @@ Every failure throws and stops the sequence. There is no retry, substitution or 
 
 - **`scanner-discover.ts`**: it reads the default-ordered first page of the Raydium API v3 list, sorts by TVL and has no upper age bound. On 2026-11-09 it returned no qualifying pool.
 - **Events collector**: it subscribes to all logs of the AMM v4 program (every swap) under a 500-message ceiling, which can be exhausted in seconds without seeing a creation.
+
+### 1.7 Watch mode of the wrapper (proposed; offline only)
+
+**Why**: the one live Stage A run found no target because a point-in-time signature page rarely contains a pool inside the 0–760 s prefilter (§8.37). The watch observes creations as they happen, so a candidate is young when it is found.
+
+**What changes**: only discovery. In watch mode, step 3 of the wrapper runs `fresh-amm-v4-watch.ts --out-dir <dir> --live` once instead of the precheck. Then:
+
+- **Continuing**: only its exit 0 (a sealed, verified, confirmed selection) continues. Any other exit ends the sequence; nothing falls back to the precheck and nothing is repeated.
+- **Handoff**: both handoff checks use `--watch-evidence-dir`. They must allow the identical pool, mint, pilot directory and sealed manifest digest, and the final check rechecks the code pin, the evidence and the current start window immediately before Stage B.
+- **Stage B**: the dry run, the final handoff, at most one Stage B run, its verification and the wallet checks are unchanged. The watch evidence is also verified offline at the end, on every path.
+
+**Inert check**: without `-Execute`, watch mode runs only the pin check and the watch dry run. It loads no credentials, opens no transport and writes no evidence.
+
+**Proposed combined ceilings (not approved)**:
+
+- **Watch**: one WebSocket connection, no reconnect, at most 900 s of watching. The collector's cleanup (at most 5 s) and sealing are overhead outside that.
+- **Validation**: at most one RPC request and one DexScreener request (10 s timeouts, 1 MiB responses), ending by min(notification + 30 s, watch start + 930 s).
+- **Wait**: at most one, at most 240 s + 1 s.
+- **Stage B**: its reviewed limits, unchanged (600 s lifetimes, at most 340 HTTP attempts).
+- **Overhead**: offline handoffs and pin checks (git calls bounded by 20 s each), child start-ups, and local sealing and verification.
+- **In all**: network time of at most 930 s for discovery plus Stage B's 600 s. The full breakdown is in assessment §8.38.11.
+
+**Cancellation**: Ctrl+C stops the wrapper (the watch seals its own cancellation), no later live step runs, and the final verification and wallet checks are still attempted. A watch verification racing the child's own sealing is reported as a final-check failure next to the cancellation; the sealed run can be re-verified offline.
+
+**Operator command**: none is given until this integration has been reviewed and a combined approval exists.
 
 ## 2. Limits (proposed, not approved)
 

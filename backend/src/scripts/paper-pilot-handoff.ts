@@ -22,7 +22,8 @@
  * A separate, explicit entry point (`evaluateWatchedPilotHandoff`) accepts sealed watch evidence
  * instead of a precheck. It never guesses the format: it consumes only `verifyWatchEvidence` and
  * proceeds only on a confirmed selection, using the target from that verification's own snapshot.
- * The CLI and the PowerShell wrapper keep using the precheck handoff only.
+ * The CLI selects it only with the explicit `--watch-evidence-dir` option (mutually exclusive with
+ * `--precheck-dir`); the precheck invocation and its results are unchanged.
  */
 
 import path from "node:path";
@@ -78,6 +79,7 @@ export const RUNNER_DEPENDENCY_PATHS = Object.freeze([
 export const PIN_PATHS = Object.freeze([
   ...RUNNER_DEPENDENCY_PATHS,
   "scripts/paper-pilot-sequence.ps1",
+  "scripts/paper-pilot-sequence.core.ps1",
 ]);
 /** The only changes allowed in that surface since the reviewed runner: these added files. */
 export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
@@ -96,6 +98,8 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The watch entry point composing them (section 8.38.10).
   "backend/src/scripts/fresh-amm-v4-watch.ts",
   "backend/src/scripts/fresh-amm-v4-watch.test.ts",
+  // The wrapper's orchestration tests (section 8.38.11).
+  "backend/src/scripts/paper-pilot-sequence.test.ts",
 ]);
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
@@ -237,6 +241,8 @@ export interface HandoffResult {
   readonly pilotOutDir?: string | undefined;
   /** Set only by the watched-evidence handoff. */
   readonly evidenceSource?: "WATCH_EVIDENCE" | undefined;
+  /** Watched handoff only: SHA-256 of the sealed manifest bytes that were verified. */
+  readonly manifestSha256?: string | undefined;
   readonly evaluatedAtIso: string;
 }
 
@@ -283,7 +289,7 @@ function decideStartWindow(
   projectRoot: string,
   pilotOutAbs: string,
   clock: () => number,
-  extra: Pick<HandoffResult, "evidenceSource"> = {},
+  extra: Pick<HandoffResult, "evidenceSource" | "manifestSha256"> = {},
 ): HandoffResult {
   const nowMs = clock();
   const evaluatedAtIso = new Date(nowMs).toISOString();
@@ -523,8 +529,11 @@ export function evaluateWatchedPilotHandoff(input: {
   }
   if (notConfirmed.length > 0 || v.confirmedTarget === null) return refuse(notConfirmed);
 
-  // The target of the verified snapshot; nothing is reread from disk.
+  // The target and manifest digest of the verified snapshot; nothing is reread from disk.
   const t = v.confirmedTarget;
+  if (typeof v.manifestSha256 !== "string" || !SHA256_HEX.test(v.manifestSha256)) {
+    return refuse(["WATCH_EVIDENCE_MANIFEST_DIGEST_MISSING"]);
+  }
   if (!targetIdentityValid(t)) return refuse(["TARGET_IDENTITY_INVALID"]);
   if (!Number.isSafeInteger(t.market.runnerOpenTimeSec) || t.market.runnerOpenTimeSec <= 0) {
     return refuse(["START_WINDOW_SOURCE_INVALID"]);
@@ -535,49 +544,108 @@ export function evaluateWatchedPilotHandoff(input: {
 
   return decideStartWindow(t, input.projectRoot, output.abs, input.clock, {
     evidenceSource: "WATCH_EVIDENCE",
+    manifestSha256: v.manifestSha256,
   });
 }
 
-function main(argv: readonly string[]): number {
+/** Handoff exit codes, one per structured decision. */
+export const HANDOFF_EXIT_CODES = Object.freeze({ ALLOWED: 0, PIN_OK: 0, REFUSED: 1, WAIT: 2 });
+
+export interface HandoffCliDeps {
+  readonly projectRoot?: string | undefined;
+  readonly git?: GitRunner | undefined;
+  readonly clock?: (() => number) | undefined;
+  readonly log?: ((line: string) => void) | undefined;
+}
+
+/**
+ * The handoff CLI. Prints exactly one JSON line and returns the exit code of its decision:
+ * `--pin-only`; or `--precheck-dir` (the reviewed one-shot precheck, unchanged); or
+ * `--watch-evidence-dir` (sealed watch evidence). The evidence inputs are mutually exclusive and
+ * one is required; nothing is inferred from the evidence format.
+ */
+export function runHandoffCli(argv: readonly string[], deps: HandoffCliDeps = {}): number {
+  const log = deps.log ?? ((line: string) => console.log(line));
+  const clock = deps.clock ?? (() => Date.now());
+  const refuseInput = (refusal: string): number => {
+    log(
+      JSON.stringify({
+        decision: "REFUSED",
+        refusals: [refusal],
+        evaluatedAtIso: new Date(clock()).toISOString(),
+      }),
+    );
+    return HANDOFF_EXIT_CODES.REFUSED;
+  };
   const { values } = parseArgs({
     args: [...argv],
     options: {
       "pinned-commit": { type: "string" },
       "pin-only": { type: "boolean" },
       "precheck-dir": { type: "string" },
+      "watch-evidence-dir": { type: "string" },
       "pilot-out-dir": { type: "string" },
     },
     strict: true,
   });
-  const projectRoot = path.resolve(findWorkspaceRoot());
-  const git = defaultGit(projectRoot);
+  const projectRoot = path.resolve(deps.projectRoot ?? findWorkspaceRoot());
+  const git = deps.git ?? defaultGit(projectRoot);
   const pinnedCommit = String(values["pinned-commit"] ?? "");
+  const precheckDir = values["precheck-dir"];
+  const watchDir = values["watch-evidence-dir"];
   if (values["pin-only"] === true) {
+    if (
+      precheckDir !== undefined ||
+      watchDir !== undefined ||
+      values["pilot-out-dir"] !== undefined
+    ) {
+      return refuseInput("HANDOFF_INPUT_CONFLICT:PIN_ONLY_WITH_EVIDENCE");
+    }
     const problems = checkPin(pinnedCommit, git);
-    console.log(
+    log(
       JSON.stringify({
         decision: problems.length === 0 ? "PIN_OK" : "REFUSED",
         refusals: problems,
-        evaluatedAtIso: new Date().toISOString(),
+        evaluatedAtIso: new Date(clock()).toISOString(),
       }),
     );
-    return problems.length === 0 ? 0 : 1;
+    return problems.length === 0 ? HANDOFF_EXIT_CODES.PIN_OK : HANDOFF_EXIT_CODES.REFUSED;
   }
-  const result = evaluatePilotHandoff({
-    projectRoot,
-    precheckDir: String(values["precheck-dir"] ?? ""),
-    pilotOutDir: String(values["pilot-out-dir"] ?? ""),
-    pinnedCommit,
-    clock: () => Date.now(),
-    git,
-  });
-  console.log(JSON.stringify(result));
-  return result.decision === "ALLOWED" ? 0 : result.decision === "WAIT" ? 2 : 1;
+  if (precheckDir !== undefined && watchDir !== undefined) {
+    return refuseInput("HANDOFF_INPUT_CONFLICT:PRECHECK_AND_WATCH_EVIDENCE");
+  }
+  if (watchDir !== undefined && (typeof watchDir !== "string" || watchDir === "")) {
+    return refuseInput("HANDOFF_INPUT_MISSING:WATCH_EVIDENCE_DIR");
+  }
+  const pilotOutDir = String(values["pilot-out-dir"] ?? "");
+  const result =
+    watchDir !== undefined
+      ? evaluateWatchedPilotHandoff({
+          projectRoot,
+          watchEvidenceDir: String(watchDir),
+          pilotOutDir,
+          pinnedCommit,
+          clock,
+          git,
+        })
+      : precheckDir !== undefined
+        ? evaluatePilotHandoff({
+            projectRoot,
+            precheckDir: String(precheckDir),
+            pilotOutDir,
+            pinnedCommit,
+            clock,
+            git,
+          })
+        : null;
+  if (result === null) return refuseInput("HANDOFF_INPUT_MISSING:EVIDENCE_DIR");
+  log(JSON.stringify(result));
+  return HANDOFF_EXIT_CODES[result.decision];
 }
 
 if (process.argv[1] && process.argv[1].endsWith("paper-pilot-handoff.ts")) {
   try {
-    process.exit(main(process.argv.slice(2)));
+    process.exit(runHandoffCli(process.argv.slice(2)));
   } catch (err) {
     console.log(
       JSON.stringify({
