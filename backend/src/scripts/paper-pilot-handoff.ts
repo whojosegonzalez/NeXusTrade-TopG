@@ -100,6 +100,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   "backend/src/scripts/fresh-amm-v4-watch.test.ts",
   // The wrapper's orchestration tests (section 8.38.11).
   "backend/src/scripts/paper-pilot-sequence.test.ts",
+  // The subscription-only capability check and its tests (section 8.38.13).
+  "backend/src/scripts/solana-subscription-capability.ts",
+  "backend/src/scripts/solana-subscription-capability.test.ts",
 ]);
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;

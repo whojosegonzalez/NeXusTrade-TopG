@@ -1184,6 +1184,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/fresh-amm-v4-watch.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test.ts",
       "backend/src/scripts/paper-pilot-sequence.test.ts",
+      "backend/src/scripts/solana-subscription-capability.ts",
+      "backend/src/scripts/solana-subscription-capability.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");

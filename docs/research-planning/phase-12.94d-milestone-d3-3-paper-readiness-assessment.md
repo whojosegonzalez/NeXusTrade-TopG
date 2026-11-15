@@ -5168,6 +5168,8 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin refuses until an independent review advances the runner baseline (§8.38.12).
 >
+> The subscription-only capability check (`backend/src/scripts/solana-subscription-capability.ts`) is implemented and verified offline by 13 tests. The live probe needs independent review and a separate approval; Solana streaming entitlement on the free Alchemy plan is unverified (§8.38.13).
+>
 > The watch entry point itself still ends after sealing and reporting. Live execution is not authorized, and no operator live command is provided until the wrapper integration has been reviewed. No live limits are approved.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
@@ -5980,3 +5982,96 @@ The 20 earlier wrapper and handoff mutations were rerun against the corrected so
   - `TRANSPORT_ERROR`.
 - **Use of the result**: only `SUBSCRIPTION_ACKNOWLEDGED` would justify proposing another bounded watch. Any other result ends there, with no automatic retry or endpoint switching.
 - **Prerequisites before it runs**: the operator sets `SOLANA_WS_URL` to the provider's documented streaming endpoint; the account entitlement and quota are confirmed outside this repository; the check is implemented and reviewed; and a separate approval for a single run is given.
+
+#### 8.38.13 Subscription-Only Capability Check (Completed Offline; Probe Not Run)
+
+After the review of `83a320a` accepted the endpoint correction, the subscription-only capability check proposed in §8.38.12 is implemented in `backend/src/scripts/solana-subscription-capability.ts`, with its tests alongside. It was exercised only with injected fakes. No provider request, socket, probe execution, purchase or account change was made, and no operator live command is given; the live probe needs independent review and a separate approval.
+
+**Account status (operator-reported 2026-11-15; not checked by this work)**: the Alchemy account is free-only with paid usage disabled; the dashboard shows Active Plan: Free, a 30M-CU monthly quota and 40 CUs used. **Solana streaming (WebSocket subscription) entitlement remains unverified.** Alchemy's agent-skills page is reference only; no skill was installed and no wallet or gateway was set up. The API-key configuration is unchanged.
+
+**What it establishes**: only whether the explicitly configured `SOLANA_WS_URL` accepts one fixed `logsSubscribe` (`mentions: [7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5]`, `commitment: confirmed`). It says nothing about pool availability.
+
+**Modes**:
+
+| Mode              | Arguments                | What it does                                                                                                                                       |
+| ----------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Help              | `--help` (alone)         | Prints the usage and the plan; nothing loaded, opened or written                                                                                   |
+| Dry run (default) | `--out-dir <dir>`        | Validates a new directory directly inside `data/research/capability-checks/` and prints the plan and its digest; nothing loaded, opened or written |
+| Verify            | `--verify <dir>`         | Verifies a sealed check offline; no configuration and no network                                                                                   |
+| Live              | `--out-dir <dir> --live` | The probe below. Awaiting separate approval                                                                                                        |
+
+Conflicting or malformed arguments are refused. The exit codes are: 0 for help, a dry run or a confirmed capability; 1 for invalid input, configuration or output (nothing opened or written) or an unexpected error; 3 when sealed or verified but not confirmed; 4 for an integrity failure; 5 when sealing failed. Errors print fixed text or a bracketed code only.
+
+**Live probe**:
+
+- **Configuration**: it reuses the reviewed `resolveSolanaEndpoints` and additionally requires `wsSource: SOLANA_WS_URL`. A scheme-derived endpoint is never used, for any provider. Validation happens before any transport.
+- **Connection and frames**: one connection, with no reconnect, retry, fallback or follow-up, and no HTTP or RPC API call. At most two outgoing application frames: the fixed subscribe, then one `logsUnsubscribe` for the acknowledged id while still permitted (before the deadline, not cancelled, transport open). No client keepalive ping.
+- **Deadline**: one absolute 5,000 ms acquisition deadline, armed before the transport is constructed. It covers connection setup and the acknowledgement, and is never reset by open or intermediate messages. Messages at or after it are counted but decide nothing. The unsubscribe acknowledgement is awaited only within the same deadline.
+- **Success**: only a strictly validated JSON-RPC 2.0 response for request id 1 counts. It must have exactly `{jsonrpc, id, result}`, with `result` a non-negative safe integer subscription id, and arrive before the deadline. The capability is confirmed only if, in addition, there was no cancellation and cleanup settled without failure.
+- **Classified as failures**:
+  - `{jsonrpc, id, error: {code, message[, data]}}` for id 1 is `SUBSCRIPTION_REJECTED`, with the code and message kept;
+  - any other id is `MISMATCHED_RESPONSE_ID`;
+  - any other shape, a duplicate acknowledgement, a server request or an unexpected notification method is `MALFORMED_RESPONSE`.
+- **Unsubscribe**: recorded as `OBSERVED` (`result: true`), `REJECTED` (`false` or an error), `SENT_UNOBSERVED`, `SEND_FAILED` or `NOT_SENT`. Sending it proves nothing.
+- **Incoming bounds**: at most 10 incoming application messages and 64 KiB of cumulative payload. Notifications (`logsNotification`) count against both and are never decoded; over-limit frames keep their size and digest only.
+- **Cleanup**: close, then at most 5,000 ms of settled cleanup; `terminate()` is attempted at the ceiling, and a transport still open after it is a failed cleanup. Cancellation at any time, including during cleanup, and a failed cleanup both prevent a confirmed result.
+- **Other outcomes**: `ACK_TIMEOUT` (with the phase), `TRANSPORT_ERROR`, `TRANSPORT_CLOSED`, `MESSAGE_LIMIT_EXCEEDED`, `PAYLOAD_LIMIT_EXCEEDED` and `OPERATOR_CANCELLED`. The acknowledgement and rejection facts are kept with any outcome.
+- **Overhead**: local sealing and verification happen after these bounds and are not part of them. No overall wall-clock total is promised.
+
+**Evidence**: an exclusive-create directory holding `plan.json`, `probe.json` and `evidence-manifest.json`, all written with the `wx` flag.
+
+- **Contents**: the bounded protocol frames (direction, time, size, payload when retained), the counts, the outcome, the acknowledgement, rejection and unsubscribe facts, the cleanup record and the reasons. Nothing claims a completed watch or a target.
+- **Redaction**: credentials from both configured URLs are redacted with the reviewed `redactSensitiveText` primitive. Each frame records whether it was redacted and the digest of its original bytes, and a residual credential refuses the seal.
+- **Write failure**: it is reported with exit 5, and the probe is never repeated.
+
+**Offline verification** (`verifySubscriptionCapabilityEvidence`):
+
+- **Integrity**: the manifest, the exact file set (no extras or links), sizes and digests, the fixed limits, and the deadline being start + 5,000 ms.
+- **Re-derivation**: the acknowledgement, rejection and unsubscribe facts are re-derived from the sealed frames with the same classifier, in order and before the deadline. They must match the record, the outcome must be reproducible from the frames, and the confirmation must follow from the outcome, cancellation and cleanup record.
+- **Redaction**: a redacted decisive frame never confirms.
+
+**Pin**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly the two new files, and H-12 asserts the list. The Stage B baseline (`6855efb`) and its two expected refusals (the modified runner and its test, §8.38.12) are unchanged.
+
+**Synthetic tests** (`solana-subscription-capability.test.ts`, 13 tests; scripted transport, virtual time, owned temporary directories):
+
+| Test | Shows                                                                                                                                                                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| S-01 | Help, dry run and verify are inert (no configuration, transport, write or fetch); the fixed limits and subscribe frame; nine conflicting or malformed argument sets refused                            |
+| S-02 | Bad or existing output directories and five configuration errors (including a non-Alchemy RPC without `SOLANA_WS_URL`) refused before any transport                                                    |
+| S-03 | A valid acknowledgement, exactly the subscribe and one unsubscribe, the unsubscribe acknowledgement observed: confirmed (exit 0) and verified; no fetch, no ping, no credential, no owned timer left   |
+| S-04 | An unobserved unsubscribe ends at start + 5,000 ms (`SENT_UNOBSERVED`); `false` or an error is `REJECTED`; an acknowledgement after the deadline is `ACK_TIMEOUT` with no unsubscribe                  |
+| S-05 | `-32601` "Method 'logsSubscribe' not found" recorded as `SUBSCRIPTION_REJECTED` (exit 3), with nothing else sent                                                                                       |
+| S-06 | Three mismatched ids, 18 malformed responses and a duplicate acknowledgement never confirm; classifier cases                                                                                           |
+| S-07 | A connection that never opens, a late open with notifications, and an acknowledgement after 5,000 ms: `ACK_TIMEOUT` at exactly start + 5,000 ms, never reset; an open after the deadline sends nothing |
+| S-08 | Cancellation before construction (no transport), while connecting, after the acknowledgement and during cleanup: never confirmed                                                                       |
+| S-09 | 11 messages give `MESSAGE_LIMIT_EXCEEDED`; a 70 KB notification gives `PAYLOAD_LIMIT_EXCEEDED`, not retained; notifications counted only                                                               |
+| S-10 | A transport that cannot close fails cleanup exactly 5,000 ms after termination and is not confirmed; a slow close completed by `terminate()` is a forced, settled cleanup                              |
+| S-11 | Credential-bearing construction and socket errors and a key echoed in a frame are redacted in the sealed detail, frames and output; a remote close is `TRANSPORT_CLOSED`                               |
+| S-12 | A write failure gives exit 5 with a redacted reason and no second probe; an output directory created during the run is refused, also without a rerun                                                   |
+| S-13 | Tampering without the manifest, a forged success with consistent hashes (re-derivation shows the rejection) and an extra file all fail verification                                                    |
+
+A defect found while testing was fixed: a `terminate()` whose close event arrives synchronously was recorded as an unforced cleanup.
+
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit): all 15 caught.
+
+| Mutation                                           | Caught by                                                                                                                                                   |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deadline reset on open                             | S-04, S-07                                                                                                                                                  |
+| Negative subscription ids accepted                 | S-06                                                                                                                                                        |
+| Another request id accepted as the acknowledgement | S-06                                                                                                                                                        |
+| Cancellation does not prevent confirmation         | S-08                                                                                                                                                        |
+| Cleanup failure does not prevent confirmation      | S-10                                                                                                                                                        |
+| Message limit not enforced                         | S-09                                                                                                                                                        |
+| Payload limit not enforced                         | S-09                                                                                                                                                        |
+| Sending the unsubscribe recorded as observed       | S-03, S-04, S-06, S-08, S-10, S-12                                                                                                                          |
+| Verifier skips outcome re-derivation               | S-13                                                                                                                                                        |
+| Sealing without redaction                          | S-11, S-12                                                                                                                                                  |
+| Any id-less message treated as a notification      | S-06                                                                                                                                                        |
+| Extra error members accepted                       | S-06                                                                                                                                                        |
+| Extra response members accepted                    | S-06                                                                                                                                                        |
+| Messages at or after the deadline still decide     | S-07. It survived the first run, because the deadline timer always ran first; S-07 now handles an acknowledgement exactly at the deadline, before the timer |
+| Forced termination not recorded                    | S-10                                                                                                                                                        |
+
+- **Results**: under external 60 s limits, in two groups: the capability check 13/13, Stage B runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (65 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 135 in all. The backend typecheck, ESLint and Prettier pass. The wallet hash, both captures' manifests and the configuration are unchanged.
+
+**Not started**: any live probe (independent review and a separate single-run approval are required). No live limits are approved.
