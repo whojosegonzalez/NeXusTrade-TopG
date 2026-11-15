@@ -125,6 +125,7 @@ function Invoke-PilotSequence {
   $state = @{
     Outcome = $null; Failure = $null; CheckFailures = New-Object System.Collections.ArrayList
     Step = 'START'; LiveStarted = $false; AcquisitionRan = $false; StageBRan = $false
+    FinalChecksDone = $false
     PoolId = $null; MintAddress = $null; ManifestSha256 = $null
     Steps = New-Object System.Collections.ArrayList
   }
@@ -247,37 +248,63 @@ function Invoke-PilotSequence {
       $state.Outcome = 'CANCELLED'
       $state.Failure = "$script:PilotSequenceCancelled interrupted during $($state.Step)"
     }
-    if ($state.LiveStarted) {
-      # Final offline checks on every path once a live step may have run; their failures never
-      # replace the original failure. Nothing here is live.
-      $finalCheck = {
-        param($label, $action)
-        try { & $action } catch { [void]$state.CheckFailures.Add("$label could not run: $($_.Exception.Message)") }
-      }
-      if ($state.StageBRan) {
-        & $finalCheck 'Stage B verification' {
-          [void]$state.Steps.Add('STAGE_B_VERIFY')
-          $v = & $Hooks.RunChild 'STAGE_B_VERIFY' @($s.Runner, '--verify', $pilot)
-          & $Hooks.Log $v.Output
-          if ($v.Code -ne 0) { [void]$state.CheckFailures.Add("Stage B integrity verification failed (exit $($v.Code))") }
+    # The final checks and the summary run on every path, including a pipeline stop (operator
+    # Ctrl+C) in which this function never returns. A pipeline stop skips every catch block, so
+    # nothing here can swallow it: once this block ends, the stop keeps propagating.
+    $state.FinalChecksDone = $false
+    try {
+      if ($state.LiveStarted) {
+        # Final offline checks on every path once a live step may have run; their failures never
+        # replace the original failure. Nothing here is live.
+        $finalCheck = {
+          param($label, $action)
+          try { & $action } catch { [void]$state.CheckFailures.Add("$label could not run: $($_.Exception.Message)") }
+        }
+        if ($state.StageBRan) {
+          & $finalCheck 'Stage B verification' {
+            [void]$state.Steps.Add('STAGE_B_VERIFY')
+            $v = & $Hooks.RunChild 'STAGE_B_VERIFY' @($s.Runner, '--verify', $pilot)
+            & $Hooks.Log $v.Output
+            if ($v.Code -ne 0) { [void]$state.CheckFailures.Add("Stage B integrity verification failed (exit $($v.Code))") }
+          }
+        }
+        if ($mode -eq 'WATCH' -and $state.AcquisitionRan) {
+          & $finalCheck 'Watch evidence verification' {
+            [void]$state.Steps.Add('WATCH_VERIFY')
+            $v = & $Hooks.RunChild 'WATCH_VERIFY' @($s.Watch, '--verify', $evidence)
+            & $Hooks.Log $v.Output
+            # 0 confirmed, 3 integrity holds but not confirmed; anything else is an integrity failure.
+            if ($v.Code -ne 0 -and $v.Code -ne 3) { [void]$state.CheckFailures.Add("watch evidence integrity verification failed (exit $($v.Code))") }
+          }
+        }
+        & $finalCheck 'Wallet check' {
+          [void]$state.Steps.Add('WALLET_AFTER')
+          if ((& $Hooks.WalletHash) -ne $Config.WalletSha256) { [void]$state.CheckFailures.Add('wallet hash changed (final check)') }
         }
       }
-      if ($mode -eq 'WATCH' -and $state.AcquisitionRan) {
-        & $finalCheck 'Watch evidence verification' {
-          [void]$state.Steps.Add('WATCH_VERIFY')
-          $v = & $Hooks.RunChild 'WATCH_VERIFY' @($s.Watch, '--verify', $evidence)
-          & $Hooks.Log $v.Output
-          # 0 confirmed, 3 integrity holds but not confirmed; anything else is an integrity failure.
-          if ($v.Code -ne 0 -and $v.Code -ne 3) { [void]$state.CheckFailures.Add("watch evidence integrity verification failed (exit $($v.Code))") }
+      $state.FinalChecksDone = $true
+    } finally {
+      if ($state.LiveStarted -and -not $state.FinalChecksDone) {
+        [void]$state.CheckFailures.Add('final checks interrupted before they finished')
+        if ($state.Outcome -eq 'COMPLETE') {
+          $state.Outcome = 'CANCELLED'
+          $state.Failure = "$script:PilotSequenceCancelled interrupted during the final checks"
         }
-      }
-      & $finalCheck 'Wallet check' {
-        [void]$state.Steps.Add('WALLET_AFTER')
-        if ((& $Hooks.WalletHash) -ne $Config.WalletSha256) { [void]$state.CheckFailures.Add('wallet hash changed (final check)') }
       }
       if ($state.Outcome -eq 'COMPLETE' -and $state.CheckFailures.Count -gt 0) {
         $state.Outcome = 'STOPPED'
         $state.Failure = "$script:PilotSequenceRefused final check failed: $($state.CheckFailures[0])"
+      }
+      # The one summary (the entry script prints none): the outcome, the original failure, then
+      # each secondary final-check failure on its own line.
+      foreach ($line in @(
+          "Outcome: $($state.Outcome)"
+          $(if ($state.Failure) { [string]$state.Failure })
+          @($state.CheckFailures | ForEach-Object { "Final check failure: $_" })
+        )) {
+        if ($line) {
+          try { & $log $line } catch { }
+        }
       }
     }
   }

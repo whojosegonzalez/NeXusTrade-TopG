@@ -197,24 +197,37 @@ $report = @{
 Write-Output ('PILOT_SEQUENCE_TEST_REPORT ' + ($report | ConvertTo-Json -Depth 10 -Compress))
 `;
 
-/** A genuine pipeline stop (as operator Ctrl+C): catch blocks are skipped, finally blocks run. */
+/**
+ * A genuine PowerShell pipeline stop: a real `PipelineStoppedException` thrown from a stubbed hook,
+ * so catch blocks are skipped and only finally blocks run (as when Ctrl+C stops the wrapper). It
+ * does not deliver a console Ctrl+C to any native child. Configured through the environment:
+ * where to stop, the discovery exit code, the final wallet hash and the watch verification code.
+ */
 const STOP_DRIVER = String.raw`
 $ErrorActionPreference = 'Stop'
 . ([scriptblock]::Create([IO.File]::ReadAllText($env:PILOT_CORE)))
 $calls = New-Object System.Collections.ArrayList
+$logs = New-Object System.Collections.ArrayList
+$wallet = @{ n = 0 }
 $hooks = @{
   RunChild = {
     param($Step, [string[]]$Arguments)
     [void]$calls.Add($Step)
-    if ($Step -eq 'PIN') { return @{ Code = 0; Output = '{"decision":"PIN_OK","refusals":[]}' } }
     if ($Step -eq $env:PILOT_STOP_AT) { throw (New-Object System.Management.Automation.PipelineStoppedException) }
+    if ($Step -eq 'PIN') { return @{ Code = 0; Output = '{"decision":"PIN_OK","refusals":[]}' } }
+    if ($Step -eq 'DISCOVERY_LIVE') { return @{ Code = [int]$env:PILOT_LIVE_CODE; Output = 'SYNTHETIC watch' } }
+    if ($Step -eq 'WATCH_VERIFY') { return @{ Code = [int]$env:PILOT_WATCH_VERIFY_CODE; Output = 'SYNTHETIC verify' } }
     return @{ Code = 0; Output = 'SYNTHETIC' }
   }
   Wait = { param([long]$Ms) [void]$calls.Add('WAIT') }
-  WalletHash = { [void]$calls.Add('WALLET'); 'W' }
+  WalletHash = {
+    [void]$calls.Add('WALLET')
+    $wallet.n++
+    if ($wallet.n -eq 1) { 'W' } else { $env:PILOT_FINAL_WALLET }
+  }
   PathExists = { param($Path) $false }
   IsCancelled = { $false }
-  Log = { param($Line) }
+  Log = { param($Line) [void]$logs.Add([string]$Line) }
 }
 $config = @{
   Mode = 'WATCH'; PinnedCommit = ('a' * 40); EvidenceOutDir = 'data/research/prechecks/w'
@@ -223,9 +236,9 @@ $config = @{
 }
 try {
   $r = Invoke-PilotSequence -Config $config -Hooks $hooks
-  [IO.File]::WriteAllText($env:PILOT_REPORT, 'RETURNED')
+  [IO.File]::WriteAllText($env:PILOT_REPORT, 'RETURNED' + [char]10)
 } finally {
-  [IO.File]::AppendAllText($env:PILOT_REPORT, 'CALLS ' + ($calls -join ','))
+  [IO.File]::AppendAllText($env:PILOT_REPORT, ('CALLS ' + ($calls -join ',')) + [char]10 + ($logs -join [char]10))
 }
 `;
 
@@ -704,13 +717,13 @@ runOn("paper pilot sequence wrapper (offline orchestration, stubbed children)", 
       "wallet hash changed (final check)",
     ]);
   });
-  it("P-09: a genuine pipeline stop (operator Ctrl+C) during the watch skips every later step but still runs the final checks", async () => {
+  it("P-09: a real PowerShell pipeline stop still reports the cancellation and every final-check failure, and no later step runs", async () => {
     const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
     const dir = mkdtempSync(path.join(os.tmpdir(), "pilot-sequence-stop-"));
-    try {
-      const reportFile = path.join(dir, "report.txt");
+    const stop = (name: string, env: Record<string, string>) => {
+      const reportFile = path.join(dir, `${name}.txt`);
       spawnSync(
         "powershell.exe",
         [
@@ -721,22 +734,107 @@ runOn("paper pilot sequence wrapper (offline orchestration, stubbed children)", 
         ],
         {
           encoding: "utf8",
-          timeout: 30_000,
+          timeout: 20_000,
           env: {
             ...process.env,
             PILOT_CORE: CORE,
             PILOT_REPORT: reportFile,
-            PILOT_STOP_AT: "DISCOVERY_LIVE",
+            PILOT_LIVE_CODE: "0",
+            PILOT_FINAL_WALLET: "W",
+            PILOT_WATCH_VERIFY_CODE: "0",
+            ...env,
           },
           windowsHide: true,
         },
       );
-      const text = readFileSync(reportFile, "utf8");
-      // The function never returned (the pipeline stopped), and only the final checks followed.
-      expect(text.startsWith("RETURNED")).toBe(false);
-      expect(text).toBe("CALLS PIN,DISCOVERY_DRY_RUN,WALLET,DISCOVERY_LIVE,WATCH_VERIFY,WALLET");
+      const [first, ...logs] = readFileSync(reportFile, "utf8").split(/\r?\n/);
+      return { first: first!, logs };
+    };
+    const summary = (logs: string[]) =>
+      logs.slice(logs.findIndex((l) => l.startsWith("[PILOT_SEQUENCE] Outcome: ")));
+    const STOPPED_IN_WATCH =
+      "[PILOT_SEQUENCE] [PILOT_SEQUENCE_CANCELLED] interrupted during DISCOVERY_LIVE";
+    try {
+      // A pipeline stop during the watch, with a final wallet mismatch.
+      const wallet = stop("wallet", { PILOT_STOP_AT: "DISCOVERY_LIVE", PILOT_FINAL_WALLET: "X" });
+      // The function never returned, and only the final checks followed the stopped watch.
+      expect(wallet.first).toBe(
+        "CALLS PIN,DISCOVERY_DRY_RUN,WALLET,DISCOVERY_LIVE,WATCH_VERIFY,WALLET",
+      );
+      expect(summary(wallet.logs)).toEqual([
+        "[PILOT_SEQUENCE] Outcome: CANCELLED",
+        STOPPED_IN_WATCH,
+        "[PILOT_SEQUENCE] Final check failure: wallet hash changed (final check)",
+      ]);
+
+      // A pipeline stop during the watch, with a failed watch verification.
+      const verify = stop("verify", {
+        PILOT_STOP_AT: "DISCOVERY_LIVE",
+        PILOT_WATCH_VERIFY_CODE: "4",
+      });
+      expect(verify.first).toBe(
+        "CALLS PIN,DISCOVERY_DRY_RUN,WALLET,DISCOVERY_LIVE,WATCH_VERIFY,WALLET",
+      );
+      expect(summary(verify.logs)).toEqual([
+        "[PILOT_SEQUENCE] Outcome: CANCELLED",
+        STOPPED_IN_WATCH,
+        "[PILOT_SEQUENCE] Final check failure: watch evidence integrity verification failed (exit 4)",
+      ]);
+
+      // A pipeline stop with passing final checks reports the cancellation alone.
+      const clean = stop("clean", { PILOT_STOP_AT: "DISCOVERY_LIVE" });
+      expect(summary(clean.logs)).toEqual([
+        "[PILOT_SEQUENCE] Outcome: CANCELLED",
+        STOPPED_IN_WATCH,
+      ]);
+
+      // A pipeline stop during the final checks keeps the original failure and reports the
+      // interruption; the remaining checks do not run.
+      const late = stop("late", { PILOT_LIVE_CODE: "3", PILOT_STOP_AT: "WATCH_VERIFY" });
+      expect(late.first).toBe("CALLS PIN,DISCOVERY_DRY_RUN,WALLET,DISCOVERY_LIVE,WATCH_VERIFY");
+      expect(summary(late.logs)).toEqual([
+        "[PILOT_SEQUENCE] Outcome: STOPPED",
+        "[PILOT_SEQUENCE] [PILOT_SEQUENCE_REFUSED] WATCH did not confirm a selected target (exit 3); sequence ends, no fallback, no retry",
+        "[PILOT_SEQUENCE] Final check failure: final checks interrupted before they finished",
+      ]);
+
+      for (const r of [wallet, verify, clean, late]) {
+        // Never a return, exactly one summary, and no later live step.
+        expect(r.first.startsWith("RETURNED")).toBe(false);
+        expect(r.logs.filter((l) => l.startsWith("[PILOT_SEQUENCE] Outcome: "))).toHaveLength(1);
+        for (const step of [
+          "HANDOFF_FIRST",
+          "WAIT",
+          "STAGE_B_DRY_RUN",
+          "HANDOFF_FINAL",
+          "STAGE_B_LIVE",
+        ]) {
+          expect(r.first.split(" ")[1]!.split(","), step).not.toContain(step);
+        }
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 40_000);
+  }, 50_000);
+
+  it("P-10: every ordinary path prints exactly one summary, from the core; the entry prints none", async () => {
+    const { readFileSync } = await import("node:fs");
+    for (const s of report.scenarios) {
+      const outcomes = s.logs.filter((l) => l.startsWith("[PILOT_SEQUENCE] Outcome: "));
+      expect(outcomes, s.name).toEqual([`[PILOT_SEQUENCE] Outcome: ${s.result.Outcome}`]);
+      const at = s.logs.indexOf(outcomes[0]!);
+      const expected = [
+        ...(s.result.Failure ? [`[PILOT_SEQUENCE] ${s.result.Failure}`] : []),
+        ...s.result.CheckFailures.map((f) => `[PILOT_SEQUENCE] Final check failure: ${f}`),
+      ];
+      // The summary closes the log: outcome, original failure, then each secondary failure once.
+      expect(s.logs.slice(at + 1), s.name).toEqual(expected);
+    }
+    const entry = readFileSync(ENTRY, "utf8");
+    expect(entry).not.toContain("Outcome:");
+    expect(entry).not.toContain("Final check failure");
+    expect(entry).toContain(
+      "Log         = { param($Line) [Console]::Out.WriteLine([string]$Line) }",
+    );
+  });
 });

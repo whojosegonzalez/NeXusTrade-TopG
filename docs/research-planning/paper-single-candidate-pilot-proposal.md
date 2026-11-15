@@ -215,7 +215,7 @@ Every failure throws and stops the sequence. There is no retry, substitution or 
 - **Overhead**: offline handoffs and pin checks (git calls bounded by 20 s each), child start-ups, and local sealing and verification.
 - **In all**: network time of at most 930 s for discovery plus Stage B's 600 s. The full breakdown is in assessment §8.38.11.
 
-**Cancellation**: Ctrl+C stops the wrapper (the watch seals its own cancellation), no later live step runs, and the final verification and wallet checks are still attempted. A watch verification racing the child's own sealing is reported as a final-check failure next to the cancellation; the sealed run can be re-verified offline.
+**Cancellation**: Ctrl+C is expected to stop the wrapper and to reach the watch child, which seals its own cancellation. No later live step runs. The final verification and wallet checks are still attempted, and one summary (the outcome, the original failure and each final-check failure) is printed from the sequence core's `finally` block, which runs even when the core never returns. The offline test (P-09) throws a real PowerShell pipeline-stop exception against stubbed hooks only. It does not deliver a console Ctrl+C to the Node child or prove that the child's sealing has finished. A watch verification racing the child's own sealing is reported as a final-check failure next to the cancellation, and the sealed run can be re-verified offline.
 
 **Operator command**: none is given until this integration has been reviewed and a combined approval exists.
 

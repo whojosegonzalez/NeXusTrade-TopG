@@ -31,7 +31,8 @@
   Final checks run on every path once a live step may have run, and never replace the original
   failure: Stage B integrity verification (if Stage B ran), watch evidence verification (if the
   watch ran), and the wallet hash. Operator Ctrl+C stops the sequence; the final checks are
-  attempted in the finally block.
+  attempted and the summary (outcome, original failure, final-check failures) is printed from the
+  sequence core's finally block, which runs even though the core then never returns.
 
 .PARAMETER PinnedCommit
   The reviewed commit (40 hex characters) the working tree must match.
@@ -94,19 +95,14 @@ $hooks = @{
   # Operator cancellation is Ctrl+C: it stops this script (and reaches the child in the same
   # console, which seals its own cancellation); the finally block still attempts the final checks.
   IsCancelled = { $false }
-  Log         = { param($Line) Write-Host $Line }
+  # Written straight to the console, not through the PowerShell pipeline, so the core's summary
+  # still prints while a pipeline stop (Ctrl+C) is propagating through its finally blocks.
+  Log         = { param($Line) [Console]::Out.WriteLine([string]$Line) }
 }
 
-$result = $null
-try {
-  $result = Invoke-PilotSequence -Config $config -Hooks $hooks
-} finally {
-  if ($null -ne $result) {
-    Write-Host "[PILOT_SEQUENCE] Outcome: $($result.Outcome)"
-    if ($result.Failure) { Write-Host "[PILOT_SEQUENCE] $($result.Failure)" }
-    foreach ($f in $result.CheckFailures) { Write-Host "[PILOT_SEQUENCE] Final check failure: $f" }
-  }
-}
+# The core prints the one summary (outcome, original failure, final-check failures) from its own
+# finally block, which also runs when a pipeline stop means it never returns here.
+$result = Invoke-PilotSequence -Config $config -Hooks $hooks
 if ($result.Outcome -eq 'INERT') { exit 0 }
 if ($result.Outcome -eq 'COMPLETE') {
   Write-Host '[PILOT_SEQUENCE] Sequence complete (decision-only; no buy, no position). No rerun.'
