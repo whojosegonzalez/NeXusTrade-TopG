@@ -203,7 +203,7 @@ export interface PaperSingleCandidatePlan {
   readonly outDir: string;
   readonly endpoints: {
     readonly solanaRpc: "SOLANA_RPC_URL (configuration; never printed)";
-    readonly solanaWebSocket: "derived from SOLANA_RPC_URL (http->ws, https->wss)";
+    readonly solanaWebSocket: "SOLANA_WS_URL (configuration; never printed), required for Alchemy RPC hosts; otherwise derived from SOLANA_RPC_URL (http->ws, https->wss)";
     readonly rugCheck: string;
     readonly solanaTracker: string;
     readonly solanaTrackerKeySource: "SOLANA_TRACKER_API_KEY (configuration; never printed)";
@@ -265,7 +265,8 @@ export function buildPaperSingleCandidatePlan(input: {
     outDir: input.outDirRelative,
     endpoints: {
       solanaRpc: "SOLANA_RPC_URL (configuration; never printed)",
-      solanaWebSocket: "derived from SOLANA_RPC_URL (http->ws, https->wss)",
+      solanaWebSocket:
+        "SOLANA_WS_URL (configuration; never printed), required for Alchemy RPC hosts; otherwise derived from SOLANA_RPC_URL (http->ws, https->wss)",
       rugCheck: SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.rugCheckApiUrl,
       solanaTracker: SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.solanaTrackerApiUrl,
       solanaTrackerKeySource: "SOLANA_TRACKER_API_KEY (configuration; never printed)",
@@ -296,6 +297,88 @@ export function buildPaperSingleCandidatePlan(input: {
 }
 
 const sha256 = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
+
+/**
+ * Solana endpoint configuration shared by the live entry points (pure; no I/O, never printed).
+ *
+ * `SOLANA_RPC_URL` (http or https) carries every HTTP request. The WebSocket endpoint is the
+ * separately validated `SOLANA_WS_URL` (ws or wss; wss when the RPC URL is https) when it is set.
+ * Without it, the WebSocket URL is derived from the RPC URL by changing only the scheme, except for
+ * providers known to serve streaming on a different host (Alchemy), for which the explicit setting
+ * is required. There is no automatic switching, fallback or retry between endpoints.
+ */
+export const SOLANA_WS_URL_KEY = "SOLANA_WS_URL" as const;
+
+export const SOLANA_ENDPOINT_ERRORS = Object.freeze({
+  rpc: "[MISSING_CONFIGURATION] SOLANA_RPC_URL (http or https) is required for --live",
+  wsInvalid: "[INVALID_CONFIGURATION] SOLANA_WS_URL must be a ws or wss URL",
+  wsDowngrade: "[INVALID_CONFIGURATION] SOLANA_WS_URL must use wss when SOLANA_RPC_URL uses https",
+  wsRequired:
+    "[MISSING_CONFIGURATION] SOLANA_WS_URL (ws or wss) is required for this SOLANA_RPC_URL provider; its WebSocket endpoint is not derived from the HTTP endpoint",
+});
+
+/** RPC hosts whose WebSocket endpoint is not the HTTP endpoint with another scheme. */
+export function requiresExplicitSolanaWebSocket(rpcHostname: string): boolean {
+  const h = rpcHostname.toLowerCase().replace(/\.$/, "");
+  return h === "alchemy.com" || h.endsWith(".alchemy.com");
+}
+
+export type SolanaEndpointResolution =
+  | {
+      readonly ok: true;
+      readonly rpcUrl: string;
+      readonly wsUrl: string;
+      readonly wsSource: "SOLANA_WS_URL" | "DERIVED_FROM_SOLANA_RPC_URL";
+    }
+  | { readonly ok: false; readonly error: string };
+
+const parsedUrl = (raw: string): URL | null => {
+  try {
+    return new URL(raw);
+  } catch {
+    return null;
+  }
+};
+
+export function resolveSolanaEndpoints(
+  env: Readonly<Record<string, string | undefined>>,
+): SolanaEndpointResolution {
+  const rpcUrl = env.SOLANA_RPC_URL ?? "";
+  const rpc = parsedUrl(rpcUrl);
+  if (
+    !/^https?:\/\//i.test(rpcUrl) ||
+    rpc === null ||
+    (rpc.protocol !== "http:" && rpc.protocol !== "https:") ||
+    rpc.hostname === ""
+  ) {
+    return { ok: false, error: SOLANA_ENDPOINT_ERRORS.rpc };
+  }
+  const wsRaw = env[SOLANA_WS_URL_KEY];
+  if (wsRaw !== undefined && wsRaw !== "") {
+    const ws = parsedUrl(wsRaw);
+    if (
+      !/^wss?:\/\//i.test(wsRaw) ||
+      ws === null ||
+      (ws.protocol !== "ws:" && ws.protocol !== "wss:") ||
+      ws.hostname === ""
+    ) {
+      return { ok: false, error: SOLANA_ENDPOINT_ERRORS.wsInvalid };
+    }
+    if (rpc.protocol === "https:" && ws.protocol !== "wss:") {
+      return { ok: false, error: SOLANA_ENDPOINT_ERRORS.wsDowngrade };
+    }
+    return { ok: true, rpcUrl, wsUrl: wsRaw, wsSource: "SOLANA_WS_URL" };
+  }
+  if (requiresExplicitSolanaWebSocket(rpc.hostname)) {
+    return { ok: false, error: SOLANA_ENDPOINT_ERRORS.wsRequired };
+  }
+  return {
+    ok: true,
+    rpcUrl,
+    wsUrl: rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:"),
+    wsSource: "DERIVED_FROM_SOLANA_RPC_URL",
+  };
+}
 
 export interface PaperSingleCandidateDiagnosticDeps {
   /** Configuration source for the live path (default: process.env after the existing loader). */
@@ -760,17 +843,16 @@ export async function runPaperSingleCandidateDiagnostic(
   // ------------------------------------------------------------------------------------------
   (deps.loadEnvironment ?? loadDaemonEnvironment)();
   const env = deps.env ?? process.env;
-  const rpcUrl = env.SOLANA_RPC_URL ?? "";
-  const apiKey = env.SOLANA_TRACKER_API_KEY ?? "";
-  if (!/^https?:\/\//i.test(rpcUrl)) {
-    throw new Error(
-      "[MISSING_CONFIGURATION] SOLANA_RPC_URL (http or https) is required for --live",
-    );
+  const endpoints = resolveSolanaEndpoints(env);
+  if (!endpoints.ok && endpoints.error === SOLANA_ENDPOINT_ERRORS.rpc) {
+    throw new Error(endpoints.error);
   }
+  const apiKey = env.SOLANA_TRACKER_API_KEY ?? "";
   if (apiKey === "") {
     throw new Error("[MISSING_CONFIGURATION] SOLANA_TRACKER_API_KEY is required for --live");
   }
-  const wsUrl = rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
+  if (!endpoints.ok) throw new Error(endpoints.error);
+  const { rpcUrl, wsUrl } = endpoints;
   const secrets = secretsFrom(rpcUrl, apiKey, wsUrl);
   const redact = (text: string) => redactSensitiveText(text, secrets);
   // Every line printed after configuration is loaded, and every error propagated, is redacted.

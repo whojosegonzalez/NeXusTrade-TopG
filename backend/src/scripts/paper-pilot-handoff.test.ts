@@ -1232,24 +1232,37 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
     ]);
 
-    // Read-only git on this repository: every change to the runner's surface since the reviewed
-    // runner, up to the current commit, is an allowed addition.
+    // Read-only git on this repository (working tree, so committed and uncommitted changes count):
+    // every addition since the reviewed runner is allowed. The endpoint-configuration change
+    // (section 8.38.12) modifies the reviewed runner and its test; the guard refuses exactly those
+    // two until an independent review advances the runner baseline. It is not relaxed here.
+    const RUNNER_CHANGED_PENDING_REVIEW = [
+      "backend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+      "backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ];
     const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
-    const head = git(["rev-parse", "HEAD"]).stdout.trim();
     const diff = git([
       "diff",
       "--name-status",
       "--no-renames",
       REVIEWED_RUNNER_COMMIT,
-      head,
       "--",
       ...RUNNER_DEPENDENCY_PATHS,
     ]);
     expect(diff.status).toBe(0);
-    for (const line of diff.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
-      const [kind, file] = line.split("\t");
-      expect(kind, line).toBe("A");
-      expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(file);
+    const changes = diff.stdout.split(/\r?\n/).filter((l) => l.trim() !== "");
+    for (const line of changes.filter((l) => l.startsWith("A\t"))) {
+      expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(line.split("\t")[1]);
+    }
+    expect(changes.filter((l) => !l.startsWith("A\t")).sort()).toEqual(
+      RUNNER_CHANGED_PENDING_REVIEW.map((f) => `M\t${f}`),
+    );
+    expect(
+      checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout: diff.stdout } }).git),
+    ).toEqual(RUNNER_CHANGED_PENDING_REVIEW.map((f) => `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${f}`));
+    expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
+    for (const f of RUNNER_CHANGED_PENDING_REVIEW) {
+      expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(f);
     }
   });
   it("H-13: the handoff CLI routes explicit precheck or watch inputs, refuses conflicts, and exits with its decision's code", async () => {

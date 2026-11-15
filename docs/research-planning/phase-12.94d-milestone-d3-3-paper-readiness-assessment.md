@@ -5166,6 +5166,8 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 > 5. The watch entry point (`backend/src/scripts/fresh-amm-v4-watch.ts`) composing collector → validator → sealer → verifier, with help, dry-run, verify and explicit live modes, verified offline by 10 tests through injected synthetic dependencies only (§8.38.10).
 > 6. The conditional watch-to-pilot wrapper integration: an explicit `--watch-evidence-dir` handoff option and a `-Watch -WatchOutDir` wrapper mode that runs one watch and continues to Stage B only on a confirmed selection, binding both handoff checks to the same sealed manifest digest, pool and mint. It is verified offline with stubbed children by 10 wrapper tests and 13 handoff tests (§8.38.11).
 >
+> The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin refuses until an independent review advances the runner baseline (§8.38.12).
+>
 > The watch entry point itself still ends after sealing and reporting. Live execution is not authorized, and no operator live command is provided until the wrapper integration has been reviewed. No live limits are approved.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
@@ -5904,3 +5906,77 @@ The 20 earlier wrapper and handoff mutations were rerun against the corrected so
 - **Results**: under external 60 s limits, in two groups: the wrapper 10/10, handoff 13/13, watch entry point 10/10, watch evidence 12/12 and precheck 6/6 (51 tests); validation 19/19 and collector 33/33 (52 tests); 103 in all. The backend typecheck, ESLint and Prettier pass, and both PowerShell files parse under 5.1. The wallet hash and the Stage A precheck manifest are unchanged.
 
 **Not started**: any live run (separate combined operator approval and a reviewed operator command are required). No live limits are approved.
+
+#### 8.38.12 Operator Watch Capture `fresh-amm-v4-watch-01` and WebSocket Endpoint Configuration (Offline Correction)
+
+**Capture, independently verified offline.** The run is `data/research/prechecks/fresh-amm-v4-watch-01`; evidence under `data/research/` is not committed, as for the earlier precheck capture. Checks:
+
+- **Integrity:** the manifest SHA-256 is `4160666ccda77c94faa74c6c687d8a4625cc2fbfbf3b33160528d6b861f7960c`, as reported. The directory holds exactly the 8 listed files plus the manifest (9 in all), with no extras, and the reviewed `verifyWatchEvidence` reports integrity OK.
+- **Watch:** it started at 2026-11-15 11:55:00.428 UTC and ended `SUBSCRIBE_REJECTED` 207 ms later. It used one connection (one `TRANSPORT_OPENED`), sent one `logsSubscribe` (id 1, `mentions: [7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5]`, `commitment: confirmed`) and received one frame (93 bytes): JSON-RPC error `-32601`, "Method 'logsSubscribe' not found". There was no subscription id, no ping, no notification, and cleanup settled without failure.
+- **Sealed cause:** `WATCH_ENDED_WITHOUT_CAPTURE` at `WATCH`, with the rejection as its detail. The ledger and exchange index record 0 HTTP attempts, so validation was never recorded and nothing was selected.
+- **Verifier:** completeness is insufficient (`TERMINAL_CAUSE:WATCH_ENDED_WITHOUT_CAPTURE`, `WATCH_DID_NOT_CAPTURE:SUBSCRIBE_REJECTED`, `VALIDATION_NOT_RECORDED`, `OUTCOME:NONE`), the re-derivation is `NOT_ELIGIBLE`, `verified` is true and `selectionConfirmed` false. No redaction was needed.
+- **Afterwards:** there was no handoff and no Stage B, and the wallet hash is unchanged (`7f2c2353…20ed9`).
+
+**Interpretation**: this was a subscription setup failure at the configured WebSocket endpoint. It is not a quiet window and says nothing about pool availability. The likely cause is the endpoint itself: the entry points derived the WebSocket URL by changing only the scheme of the RPC URL, while Alchemy documents Solana subscriptions on a separate streaming host (Alchemy's `logsSubscribe` and Solana subscription-endpoint references). This was not re-tested: no provider request, socket or probe was made.
+
+**Correction (offline)**: a small shared, pure resolver, `resolveSolanaEndpoints` in `paper-single-candidate-diagnostic.ts`, is used by both the watch entry point and the Stage B runner:
+
+- **HTTP**: every HTTP request still uses `SOLANA_RPC_URL`, which must be an http(s) URL that parses (unchanged error text).
+- **WebSocket**: a new, separately validated `SOLANA_WS_URL` is used exactly as given when set. It must be a ws(s) URL that parses, and must be wss when the RPC URL is https.
+- **Without `SOLANA_WS_URL`**:
+  - a known Alchemy RPC host (`alchemy.com` or any `*.alchemy.com`) is refused with `[MISSING_CONFIGURATION] SOLANA_WS_URL (ws or wss) is required for this SOLANA_RPC_URL provider`;
+  - every other provider keeps the reviewed scheme-only derivation, so its routing is unchanged.
+- **No switching**: there is no automatic endpoint switching, fallback or retry.
+- **Order and inert modes**: configuration is validated before any transport, request or write. Imports, help, dry run and verify stay inert and load no configuration.
+- **Redaction**: both URLs, with their credential parts, are redacted independently, in printed lines, errors and sealed evidence. Errors carry fixed text only.
+- **Plans**: both plans now describe the WebSocket endpoint as `SOLANA_WS_URL (configuration; never printed), required for Alchemy RPC hosts; otherwise derived from SOLANA_RPC_URL (http->ws, https->wss)`.
+- **Configuration files**: none were edited. The operator adds `SOLANA_WS_URL` to their own configuration.
+
+**Unverified (account side)**: whether the configured account is entitled to Solana WebSocket subscriptions on the streaming host, and the related streaming quota or billing, are **unverified**. No purchase or account change was made.
+
+**Stage B pin impact**: the runner `backend/src/scripts/paper-single-candidate-diagnostic.ts` and its test are now **modified** relative to the reviewed runner `6855efb`. Until an independent review advances the runner baseline, `checkPin` therefore refuses with `REVIEWED_RUNNER_DEPENDENCY_CHANGED` for both files, and so do the wrapper and both handoffs, in precheck and watch mode alike. The guard is deliberately not relaxed: the allowlist and `REVIEWED_RUNNER_COMMIT` are unchanged. H-12 now asserts, against the working tree, that every addition is allowed, that the only other changes are those two modifications, and that the guard refuses exactly them.
+
+**Synthetic tests**:
+
+| Test                     | Shows                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C-01 (new, runner suite) | The pure resolver: scheme-only derivation for non-Alchemy hosts (including look-alikes such as `notalchemy.com` and `alchemy.com.synthetic.invalid`); Alchemy hosts (case-insensitive, trailing dot) need `SOLANA_WS_URL`; an explicit endpoint is used as given; 9 invalid configurations are refused with fixed text that contains no URL                                                                                        |
+| C-02 (new)               | The runner with a distinct streaming host and credential: every WebSocket goes to `SOLANA_WS_URL` and every RPC request to `SOLANA_RPC_URL`, under the same limits. Neither credential nor URL appears in any line, file or decoded payload, and the evidence verifies. Without `SOLANA_WS_URL` the reviewed derived URL is used                                                                                                   |
+| C-03 (new)               | An Alchemy RPC without `SOLANA_WS_URL`, a ws downgrade and an http(s) `SOLANA_WS_URL` are refused before any dispatch, transport or write                                                                                                                                                                                                                                                                                          |
+| E-11 (new, watch suite)  | The watch with a distinct streaming host and credential: one transport to `SOLANA_WS_URL`, the same two HTTP requests to the RPC and market endpoints, no credential or URL printed or sealed, and a confirmed selection. A transport failure whose message carries the endpoint is sealed with it redacted. Seven missing or invalid configurations are refused before any transport, request or write, with printable fixed text |
+| H-12 (updated)           | The pin impact above                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+- **Mutation checks** (sources restored byte-identical after every run, each run under a 60 s limit): all 9 caught.
+
+| Mutation                                                 | Caught by                                                                                                                                                         |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Alchemy hosts not required to configure `SOLANA_WS_URL`  | C-01, C-03, E-11                                                                                                                                                  |
+| An explicit `SOLANA_WS_URL` ignored (always derived)     | C-01, C-02, C-03, E-11                                                                                                                                            |
+| An https RPC with a ws endpoint accepted                 | C-01, C-03, E-11                                                                                                                                                  |
+| The `SOLANA_WS_URL` scheme not validated                 | E-11                                                                                                                                                              |
+| The runner derives its WebSocket despite an explicit one | C-02                                                                                                                                                              |
+| The watch sealer not given the WebSocket credential      | E-11. It survived the first run, because a successful run never stores the endpoint unsanitized; E-11 now also seals a transport failure whose message carries it |
+| Any host containing "alchemy" treated as Alchemy         | C-01                                                                                                                                                              |
+| The watch derives its WebSocket despite an explicit one  | E-11                                                                                                                                                              |
+| The modified runner allowlisted (pin relaxed)            | H-12                                                                                                                                                              |
+
+- **Results**: under external 60 s limits, in two groups: the runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (52 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 122 in all. The backend typecheck, ESLint and Prettier pass. The wallet hash and the Stage A precheck manifest are unchanged. No provider request, socket, capability probe or rerun was made.
+
+**Proposed subscription-only capability check (for review; not implemented or run)**:
+
+- **Purpose**: establish only that the configured `SOLANA_WS_URL` accepts `logsSubscribe` for the pinned fee destination, before any further watch attempt. It says nothing about pool availability.
+- **Scope**:
+  - one WebSocket connection to `SOLANA_WS_URL`;
+  - one `logsSubscribe` (`mentions: [7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5]`, `commitment: confirmed`);
+  - wait only for the acknowledgement, at most the reviewed 5 s;
+  - one `logsUnsubscribe` for the returned id if acknowledged, then close;
+  - no HTTP request, no validation, no handoff, no Stage B, no reconnect and no retry.
+- **Ceilings**: 1 connection, at most 2 outgoing frames, at most 10 incoming messages and 64 KiB, about 5 s for the acknowledgement plus the reviewed 5 s cleanup ceiling, and about 11 s wall-clock in all.
+- **Notifications**: any arriving before the close are counted only, never decoded, stored or validated.
+- **Result** (sealed into a new directory with the existing redaction; both URLs redacted):
+  - `SUBSCRIPTION_ACKNOWLEDGED` with an integer id;
+  - `SUBSCRIPTION_REJECTED` with the JSON-RPC error code and message;
+  - `ACK_TIMEOUT`;
+  - `TRANSPORT_ERROR`.
+- **Use of the result**: only `SUBSCRIPTION_ACKNOWLEDGED` would justify proposing another bounded watch. Any other result ends there, with no automatic retry or endpoint switching.
+- **Prerequisites before it runs**: the operator sets `SOLANA_WS_URL` to the provider's documented streaming endpoint; the account entitlement and quota are confirmed outside this repository; the check is implemented and reviewed; and a separate approval for a single run is given.

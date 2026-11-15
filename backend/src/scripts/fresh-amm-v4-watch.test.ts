@@ -28,6 +28,10 @@ import {
 } from "./fresh-amm-v4-watch.js";
 import { WATCH_EVIDENCE_FILES, verifyWatchEvidence } from "./fresh-amm-v4-watch-evidence.js";
 import {
+  SOLANA_ENDPOINT_ERRORS,
+  resolveSolanaEndpoints,
+} from "./paper-single-candidate-diagnostic.js";
+import {
   ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER,
   evaluateWatchedPilotHandoff,
   type GitRunner,
@@ -132,6 +136,7 @@ function harness(
     transport?: { throwOnClose?: boolean; stayOpen?: boolean };
     fetch?: FetchOptions;
     env?: Record<string, string | undefined>;
+    expectWsUrl?: string;
   } = {},
 ) {
   const projectRoot = mkdtempSync(path.join(os.tmpdir(), "watch-entry-test-"));
@@ -206,7 +211,7 @@ function harness(
       loads++;
     },
     createWebSocketTransport: (url: string) => {
-      expect(url).toBe(WS_URL);
+      expect(url).toBe(o.expectWsUrl ?? WS_URL);
       const t = new ScriptedTransport(o.transport);
       transports.push(t);
       sched.add(() => t.open(), 0, "harness");
@@ -855,5 +860,101 @@ describe("fresh AMM v4 watch entry point (offline)", () => {
     );
     expect(h.loads()).toBe(loadsAfterLive);
     expect(h.transports).toHaveLength(1);
+  });
+  it("E-11: an explicit WebSocket endpoint is used as configured; Alchemy needs it; HTTP stays on the RPC endpoint", async () => {
+    // Distinct hosts and credentials: HTTP on the RPC host, the watch on the streaming host.
+    const STREAM_KEY = "SYNTHETIC-stream-key-246813579";
+    const STREAM_URL = `wss://stream.synthetic.invalid/v2/${STREAM_KEY}`;
+    const h = harness({
+      env: { SOLANA_RPC_URL: RPC_URL, SOLANA_WS_URL: STREAM_URL },
+      expectWsUrl: STREAM_URL,
+    });
+    const r = await h.run(["--out-dir", RUN, "--live"]);
+    expect(r).toMatchObject({
+      exitCode: WATCH_EXIT_CODES.OK,
+      validationOutcome: "TARGET_SELECTED",
+      verification: { integrity: { ok: true }, selectionConfirmed: true },
+    });
+    expect(h.transports).toHaveLength(1);
+    // The two requests go to the RPC endpoint and the market endpoint only, exactly as before.
+    expect(h.calls.map((c) => c.url)).toEqual([
+      RPC_URL,
+      `https://api.dexscreener.com/latest/dex/tokens/${MINT}`,
+    ]);
+    expect(rpcMethods(h)).toEqual(["getTransaction"]);
+    // Neither credential, nor either URL, is printed or stored.
+    const secrets = [...SECRETS, STREAM_URL, STREAM_KEY];
+    for (const line of h.lines) for (const s of secrets) expect(line.includes(s), line).toBe(false);
+    for (const f of listFiles(h.abs(RUN))) {
+      const text = readFileSync(path.join(h.abs(RUN), ...f.split("/")), "utf8");
+      for (const s of secrets) expect(text.includes(s), `${s} in ${f}`).toBe(false);
+    }
+    expect(readJson(h, WATCH_EVIDENCE_FILES.plan).endpoints.webSocket).toMatch(
+      /^SOLANA_WS_URL \(configuration; never printed\), required for Alchemy RPC hosts/,
+    );
+    expectCleanedUp(h, r);
+
+    // A transport failure whose message carries the explicit endpoint: the sealer redacts the
+    // WebSocket credential it was given, in the sealed cause and the observations.
+    const failing = harness({
+      env: { SOLANA_RPC_URL: RPC_URL, SOLANA_WS_URL: STREAM_URL },
+      expectWsUrl: STREAM_URL,
+    });
+    const f = await failing.run(["--out-dir", RUN, "--live"], {
+      createWebSocketTransport: (url: string) => {
+        throw new Error(`SYNTHETIC connect failure to ${url}`);
+      },
+    });
+    expect(f).toMatchObject({
+      exitCode: WATCH_EXIT_CODES.NOT_CONFIRMED,
+      watchStatus: "TRANSPORT_ERROR",
+      terminalCause: { code: "WATCH_ENDED_WITHOUT_CAPTURE", stage: "WATCH" },
+      seal: { ok: true },
+    });
+    expect(f.terminalCause?.detail).toContain("SYNTHETIC connect failure");
+    expect(failing.calls).toEqual([]);
+    for (const line of failing.lines)
+      for (const s of secrets) expect(line.includes(s), line).toBe(false);
+    for (const file of listFiles(failing.abs(RUN))) {
+      const text = readFileSync(path.join(failing.abs(RUN), ...file.split("/")), "utf8");
+      for (const s of secrets) expect(text.includes(s), `${s} in ${file}`).toBe(false);
+    }
+    expect(JSON.stringify(readJson(failing, WATCH_EVIDENCE_FILES.watchObservations))).toContain(
+      "SYNTHETIC connect failure to [REDACTED]",
+    );
+
+    // Refused before any transport, request or write.
+    const ALCHEMY_RPC = "https://solana-mainnet.g.alchemy.com/v2/SYNTHETIC-alchemy-key-1357";
+    for (const [env, message] of [
+      [{ SOLANA_RPC_URL: ALCHEMY_RPC }, SOLANA_ENDPOINT_ERRORS.wsRequired],
+      [{ SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "" }, SOLANA_ENDPOINT_ERRORS.wsRequired],
+      [
+        { SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "ws://stream.synthetic.invalid/x" },
+        SOLANA_ENDPOINT_ERRORS.wsDowngrade,
+      ],
+      [
+        { SOLANA_RPC_URL: RPC_URL, SOLANA_WS_URL: "https://stream.synthetic.invalid/x" },
+        SOLANA_ENDPOINT_ERRORS.wsInvalid,
+      ],
+      [{ SOLANA_RPC_URL: RPC_URL, SOLANA_WS_URL: "wss://" }, SOLANA_ENDPOINT_ERRORS.wsInvalid],
+      [
+        { SOLANA_RPC_URL: RPC_URL, SOLANA_WS_URL: " wss://stream.synthetic.invalid/x" },
+        SOLANA_ENDPOINT_ERRORS.wsInvalid,
+      ],
+      [{ SOLANA_WS_URL: STREAM_URL }, SOLANA_ENDPOINT_ERRORS.rpc],
+    ] as const) {
+      const c = harness({ env });
+      const err = await c.run(["--out-dir", RUN, "--live"]).catch((e: unknown) => e);
+      expect((err as Error).message, JSON.stringify(Object.keys(env))).toBe(message);
+      expect(printableError(err)).toBe(message);
+      expect(c.loads()).toBe(1);
+      expect(c.transports).toEqual([]);
+      expect(c.calls).toEqual([]);
+      expect(readdirSync(c.projectRoot)).toEqual([]);
+    }
+    // The Alchemy RPC host with its explicit streaming endpoint is accepted (no request here).
+    expect(
+      resolveSolanaEndpoints({ SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: STREAM_URL }),
+    ).toEqual({ ok: true, rpcUrl: ALCHEMY_RPC, wsUrl: STREAM_URL, wsSource: "SOLANA_WS_URL" });
   });
 });

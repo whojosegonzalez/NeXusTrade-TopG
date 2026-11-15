@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -21,7 +22,9 @@ import {
   CORE_EVIDENCE_FILES,
   LIVE_APPROVAL_STATUS,
   PROPOSED_SINGLE_CANDIDATE_LIMITS,
+  SOLANA_ENDPOINT_ERRORS,
   buildRequestAllocation,
+  resolveSolanaEndpoints,
   runPaperSingleCandidateDiagnostic,
   runVerifyCli,
   verifyPaperSingleCandidateEvidence,
@@ -1238,5 +1241,160 @@ describe("PAPER single-candidate diagnostic evidence retention (offline)", () =>
       ws.incomingPayloadsOmitted,
     );
     expect(env.lines.some((l) => l.startsWith("[LIVE] Evidence INCOMPLETE:"))).toBe(true);
+  });
+});
+
+describe("Solana endpoint configuration (offline)", () => {
+  const STREAM_KEY = "SYNTHETIC-stream-key-112233445566";
+  const STREAM_URL = `wss://stream.synthetic.invalid/v2/${STREAM_KEY}`;
+  const ALCHEMY_RPC = "https://solana-mainnet.g.alchemy.com/v2/SYNTHETIC-alchemy-key-9753";
+
+  it("C-01: the pure resolver keeps HTTP on SOLANA_RPC_URL, validates SOLANA_WS_URL separately and requires it for Alchemy", () => {
+    const derived = (rpcUrl: string, wsUrl: string) => ({
+      ok: true,
+      rpcUrl,
+      wsUrl,
+      wsSource: "DERIVED_FROM_SOLANA_RPC_URL",
+    });
+    // Other providers keep the reviewed scheme-only derivation.
+    expect(resolveSolanaEndpoints({ SOLANA_RPC_URL: "http://127.0.0.1:8899/?k=x" })).toEqual(
+      derived("http://127.0.0.1:8899/?k=x", "ws://127.0.0.1:8899/?k=x"),
+    );
+    expect(resolveSolanaEndpoints({ SOLANA_RPC_URL: "https://rpc.synthetic.invalid/k" })).toEqual(
+      derived("https://rpc.synthetic.invalid/k", "wss://rpc.synthetic.invalid/k"),
+    );
+    // Hosts that merely contain the name are not Alchemy.
+    expect(resolveSolanaEndpoints({ SOLANA_RPC_URL: "https://notalchemy.com/k" }).ok).toBe(true);
+    expect(
+      resolveSolanaEndpoints({ SOLANA_RPC_URL: "https://alchemy.com.synthetic.invalid/k" }).ok,
+    ).toBe(true);
+    // Alchemy hosts need the explicit endpoint; nothing is derived, switched or retried.
+    for (const host of ["solana-mainnet.g.alchemy.com", "ALCHEMY.COM", "x.alchemy.com."]) {
+      expect(resolveSolanaEndpoints({ SOLANA_RPC_URL: `https://${host}/v2/k` }), host).toEqual({
+        ok: false,
+        error: SOLANA_ENDPOINT_ERRORS.wsRequired,
+      });
+    }
+    expect(
+      resolveSolanaEndpoints({ SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: STREAM_URL }),
+    ).toEqual({
+      ok: true,
+      rpcUrl: ALCHEMY_RPC,
+      wsUrl: STREAM_URL,
+      wsSource: "SOLANA_WS_URL",
+    });
+    // An explicit endpoint is used as given for any provider, after its own validation.
+    expect(
+      resolveSolanaEndpoints({
+        SOLANA_RPC_URL: "http://127.0.0.1:8899/",
+        SOLANA_WS_URL: STREAM_URL,
+      }),
+    ).toMatchObject({ ok: true, wsUrl: STREAM_URL, wsSource: "SOLANA_WS_URL" });
+    const refused: [Record<string, string | undefined>, string][] = [
+      [{}, SOLANA_ENDPOINT_ERRORS.rpc],
+      [{ SOLANA_RPC_URL: "ws://x" }, SOLANA_ENDPOINT_ERRORS.rpc],
+      [{ SOLANA_RPC_URL: "http://" }, SOLANA_ENDPOINT_ERRORS.rpc],
+      [{ SOLANA_RPC_URL: "ftp://x/y" }, SOLANA_ENDPOINT_ERRORS.rpc],
+      [{ SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "" }, SOLANA_ENDPOINT_ERRORS.wsRequired],
+      [
+        { SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "https://x/y" },
+        SOLANA_ENDPOINT_ERRORS.wsInvalid,
+      ],
+      [{ SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "wss://" }, SOLANA_ENDPOINT_ERRORS.wsInvalid],
+      [
+        { SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "not a url" },
+        SOLANA_ENDPOINT_ERRORS.wsInvalid,
+      ],
+      [
+        { SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "ws://x/y" },
+        SOLANA_ENDPOINT_ERRORS.wsDowngrade,
+      ],
+    ];
+    for (const [env, error] of refused) {
+      expect(resolveSolanaEndpoints(env), JSON.stringify(Object.keys(env))).toEqual({
+        ok: false,
+        error,
+      });
+    }
+    // No error carries a configured value.
+    for (const e of Object.values(SOLANA_ENDPOINT_ERRORS)) {
+      expect(e.includes("://")).toBe(false);
+    }
+  });
+
+  it("C-02: the runner uses the explicit WebSocket endpoint, keeps HTTP routing and limits, and redacts both credentials", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("no network in tests"));
+    const env = liveEnv();
+    const deps = { ...env.deps, env: { ...ENV, SOLANA_WS_URL: STREAM_URL } };
+    const result = await drive(
+      env.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("explicit-ws"), "--live"], deps),
+    );
+    expect(result.stopReason).toBe("ENTRY_CONFIRMED_NO_EXECUTION");
+    expect(result.plan.limits).toEqual(TEST_LIMITS);
+    // Every WebSocket goes to the explicit endpoint; every RPC request to SOLANA_RPC_URL.
+    expect(env.createWs.mock.calls.length).toBeGreaterThan(0);
+    for (const call of env.createWs.mock.calls as unknown as string[][])
+      expect(call[0]).toBe(STREAM_URL);
+    expect(env.h.fetchLog.length).toBeGreaterThan(0);
+    for (const f of env.h.fetchLog) {
+      expect(f.url.startsWith("wss:") || f.url.includes("stream.synthetic.invalid"), f.url).toBe(
+        false,
+      );
+    }
+    expect(env.h.fetchLog.some((f) => f.url.startsWith(TEST_RPC_URL))).toBe(true);
+    expect(result.plan.endpoints.solanaWebSocket).toMatch(
+      /^SOLANA_WS_URL \(configuration; never printed\)/,
+    );
+    // Neither credential nor either URL in any line, stored file or decoded payload.
+    const secrets = [...SECRETS, STREAM_URL, STREAM_KEY];
+    for (const line of env.lines)
+      for (const s of secrets) expect(line.includes(s), line).toBe(false);
+    const dir = result.outDir!;
+    for (const name of filesUnder(dir)) {
+      const content = readFileSync(path.join(dir, name), "utf8");
+      for (const s of secrets) expect(content.includes(s), `${name} contains a secret`).toBe(false);
+    }
+    for (const { label, bytes } of storedPayloads(dir)) {
+      for (const s of secrets) expect(bytes.includes(Buffer.from(s, "utf8")), label).toBe(false);
+    }
+    expect(verifyPaperSingleCandidateEvidence(dir)).toMatchObject({ ok: true, problems: [] });
+
+    // Without SOLANA_WS_URL a non-Alchemy RPC keeps the reviewed derived WebSocket URL.
+    const derived = liveEnv();
+    await drive(
+      derived.h.sched,
+      runPaperSingleCandidateDiagnostic([...outArgs("derived-ws"), "--live"], derived.deps),
+    );
+    for (const call of derived.createWs.mock.calls as unknown as string[][]) {
+      expect(call[0]).toBe(SYNTHETIC_WS_URL);
+    }
+  });
+
+  it("C-03: missing or invalid WebSocket configuration is refused before any dispatch, transport or write", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("no network in tests"));
+    for (const [extra, message] of [
+      [{ SOLANA_RPC_URL: ALCHEMY_RPC }, SOLANA_ENDPOINT_ERRORS.wsRequired],
+      [
+        { SOLANA_RPC_URL: ALCHEMY_RPC, SOLANA_WS_URL: "ws://stream.synthetic.invalid/x" },
+        SOLANA_ENDPOINT_ERRORS.wsDowngrade,
+      ],
+      [{ SOLANA_WS_URL: "https://stream.synthetic.invalid/x" }, SOLANA_ENDPOINT_ERRORS.wsInvalid],
+    ] as const) {
+      const env = liveEnv();
+      const err = await runPaperSingleCandidateDiagnostic([...outArgs("cfg"), "--live"], {
+        ...env.deps,
+        env: { ...ENV, ...extra },
+      }).catch((e: unknown) => e);
+      expect((err as Error).message, message).toBe(message);
+      expect(env.createWs).not.toHaveBeenCalled();
+      expect(env.h.fetchLog).toEqual([]);
+      expect(existsSync(path.join(env.root, "data/research/single-candidate/cfg"))).toBe(false);
+      for (const line of env.lines)
+        expect(line.includes("SYNTHETIC-alchemy-key"), line).toBe(false);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

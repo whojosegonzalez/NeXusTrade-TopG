@@ -46,6 +46,7 @@ import {
   type ISolanaKeepaliveWebSocketTransport,
 } from "../candidate-scanner/RaydiumTransportObservationProbe.js";
 import { getWebSocketTransportReadyState } from "../candidate-scanner/CandidateDecisionDiagnostic.js";
+import { resolveSolanaEndpoints } from "./paper-single-candidate-diagnostic.js";
 import type { PaperRequestSessionTimers } from "../candidate-scanner/PaperRequestSession.js";
 import { serializeJsonPreservingBigInts } from "../research/pilot/RaydiumAmmV4SnapshotAcquisition.js";
 import { findWorkspaceRoot } from "../paper/CanonicalPaths.js";
@@ -193,7 +194,8 @@ export function buildWatchPlan(outDirRelative: string, mode: "DRY_RUN" | "LIVE")
     outDir: outDirRelative,
     endpoints: {
       solanaRpc: "SOLANA_RPC_URL (configuration; never printed)",
-      webSocket: "derived from SOLANA_RPC_URL (http->ws, https->wss; never printed)",
+      webSocket:
+        "SOLANA_WS_URL (configuration; never printed), required for Alchemy RPC hosts; otherwise derived from SOLANA_RPC_URL (http->ws, https->wss)",
       market:
         "https://api.dexscreener.com/latest/dex/tokens/<decoded candidate mint> (the runner's endpoint)",
     },
@@ -328,6 +330,7 @@ const OWN_ERROR_CODES = new Set([
   "CLI_INVALID_ARG",
   "OUTPUT_EXISTS",
   "MISSING_CONFIGURATION",
+  "INVALID_CONFIGURATION",
   "WATCH_FAILED_UNSEALED",
 ]);
 export const printableError = (err: unknown): string =>
@@ -390,19 +393,11 @@ export async function runFreshAmmV4Watch(
   // ------------------------------------------------------------------------------------------
   (deps.loadEnvironment ?? loadDaemonEnvironment)();
   const env = deps.env ?? process.env;
-  const rpcUrl = env.SOLANA_RPC_URL ?? "";
-  let validEndpoint = /^https?:\/\//i.test(rpcUrl);
-  try {
-    new URL(rpcUrl);
-  } catch {
-    validEndpoint = false;
-  }
-  if (!validEndpoint) {
-    throw new Error(
-      "[MISSING_CONFIGURATION] SOLANA_RPC_URL (http or https) is required for --live",
-    );
-  }
-  const wssUrl = rpcUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
+  // The shared resolver: HTTP requests use SOLANA_RPC_URL; the WebSocket uses SOLANA_WS_URL, or
+  // the scheme-derived URL only for providers that serve both on one host. Nothing is printed.
+  const endpoints = resolveSolanaEndpoints(env);
+  if (!endpoints.ok) throw new Error(endpoints.error);
+  const { rpcUrl, wsUrl: wssUrl } = endpoints;
   return runLive({ deps, log, projectRoot, target, plan, planDigestSha256, rpcUrl, wssUrl });
 }
 
