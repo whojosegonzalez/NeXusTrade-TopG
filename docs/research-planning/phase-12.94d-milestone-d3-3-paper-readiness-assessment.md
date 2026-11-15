@@ -5157,7 +5157,12 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 ### 8.38 Proposed Bounded AMM v4 Passive Creation-Watch Design (Proposed / Unapproved)
 
 > [!IMPORTANT]
-> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. The first component—the bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`)—is implemented as an inert, offline-tested module. HTTP validation, evidence persistence, handoff integration, and CLI activation remain subsequent tasks.
+> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Two offline components are completed and verified:
+>
+> 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
+> 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 12 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`).
+>
+> File persistence (`PrecheckWriter` integration), handoff integration (`paper-pilot-handoff.ts`), and CLI activation (`fresh-amm-v4-precheck.ts --watch`) remain subsequent planned integration tasks.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -5168,26 +5173,29 @@ To preserve the existing one-shot precheck script (`backend/src/scripts/fresh-am
 **Separation of Concerns**:
 
 - **Pure Validation Logic**: Zero I/O, zero network, zero timer state, and zero filesystem writes:
+  - Discovery proof chain verification (`validateWatchedDiscoveryEvidence`): re-derives signature, slot, and subscription binding from retained complete frames; enforces pinned fee destination (`7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`), safe integer subscription ID, slot $> 0$, explicit `err === null`, and canonical 64-byte Solana signature. Compares derived values against collector metadata; any discrepancy or cleanup failure halts immediately with zero HTTP sends.
   - Envelope decoding and validation (`usableJson`, `rpcResult`).
-  - Notification parsing and validation: JSON-RPC 2.0 schema, subscription ID binding, canonical base58 signature format via `isValidSolanaSignature` (validating decoding to 64 bytes without arbitrary character-length restrictions), slot integer validation, and strict `err === null` checking (absent, undefined, or non-null status strictly rejected and counted as a failed notification).
   - Transaction evaluation (`evaluateInitializationExchange`): validates `initialize2` instruction discriminator, account index 14 matching the fee destination, coin/pc mint orientation.
   - Market parsing (`parseDexScreenerTokenPairs`): validates pool ID, base/quote token alignment, extracts `pairCreatedAtMs`, and computes the candidate start window.
+  - Pure selection derivation (`evaluateWatchCandidateEvidence`): reconstructs provisional candidate target from verified discovery evidence and recorded HTTP exchanges, enforcing planning start window and preserving distinct timestamp semantics.
 - **Acquisition (Stateful I/O & Network)**:
-  - WebSocket notification collector (`BoundedAmmV4CreationWatch.ts`): connection establishment, subscription dispatch, frame buffering, keepalive ping/pong scheduling, and bounded teardown.
-  - Bounded HTTP execution via `PaperRequestSession` (pacing, timeout, byte bounds, exchange observation).
-  - File persistence exclusively handled by `PrecheckWriter` using exclusive-create (`wx`) mode.
+  - WebSocket notification collector (`BoundedAmmV4CreationWatch.ts`): connection establishment, subscription dispatch, frame buffering, keepalive ping/pong scheduling, and bounded teardown (**Completed & Verified**).
+  - Watched candidate validation orchestrator (`AmmV4WatchCandidateValidation.ts`): performs pre-send discovery verification, enforces absolute validation deadline ($\min(t_{\text{notif}} + 30\text{s}, t_{\text{overall}})$), dispatches at most 2 HTTP requests via `PaperRequestSession` (Solana RPC 2.5s pacing, DexScreener 1.0s pacing, 1 MiB response cap), and gates DexScreener dispatch strictly on valid AMM v4 transaction initialization (**Completed & Verified**).
+  - File persistence exclusively handled by `PrecheckWriter` using exclusive-create (`wx`) mode (**Planned**).
 
 #### 8.38.2 Component Reuse & Accurate Module Boundaries
 
 | Component / Function                                   | Reused Capability                                                                    | Correct Boundary & Disclaimers                                                                                                                                                                                                          |
 | :----------------------------------------------------- | :----------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BoundedAmmV4CreationWatch`                            | Passive WebSocket notification collection                                            | **Completed Component**. Bounded collector for Raydium AMM v4 creation candidates. 15 min ceiling, 5s ack timeout, 20s/10s keepalive with byte-matched pongs, complete frame retention, pre-decode overflow guards, settled teardown.   |
+| `AmmV4WatchCandidateValidation`                        | Watched candidate HTTP retrieval & pure target derivation                            | **Completed Component**. Validates discovery proof chain before send, bounds validation to $\min(t_{\text{notif}} + 30\text{s}, t_{\text{overall}})$, bounds HTTP to $\le 2$ attempts, preserves distinct timestamps, redacts RPC URLs. |
 | `WsWebSocketTransport` / Keepalive Scheduler           | WebSocket connection, raw frame transport, ping/pong scheduling                      | Transport wrapper. With no reconnect allowed, the first unmatched pong timeout terminates the session.                                                                                                                                  |
 | `PaperRequestSession`                                  | Bounded HTTP dispatch, lane pacing, per-request timeouts, response exchange observer | Dispatches and bounds HTTP exchanges; does **not** persist evidence files (evidence persistence is handled by `PrecheckWriter`).                                                                                                        |
 | `SolanaRpcTransactionFetcher.parseTransactionResponse` | Structural Solana transaction result normalization                                   | Normalizes transaction results; does **not** validate the outer JSON-RPC 2.0 envelope (`jsonrpc === "2.0"`, id echo, null error). Outer envelope validation is handled by precheck helpers.                                             |
 | `PoolInitializationParser`                             | Instruction identification and account key resolution for `initialize2`              | Decodes instructions and resolves keys; does **not** perform the precheck's fee-account check (account index 14 == `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`). That verification is performed by `evaluateInitializationExchange`. |
 | `evaluateInitializationExchange`                       | Transaction verification                                                             | Reused directly from `fresh-amm-v4-precheck.ts` to evaluate the retrieved initialization transaction.                                                                                                                                   |
 | `DexScreenerSingleCandidateMarketParser`               | Market pair validation and `pairCreatedAt` extraction                                | Pure market parser; validates token-base / WSOL-quote and returns creation timestamp.                                                                                                                                                   |
-| `paper-pilot-handoff.ts`                               | Verification of pin, manifest digests, and start-window clock checks                 | Extended to verify watched discovery evidence and independently re-derive selection without fabricated signature pages.                                                                                                                 |
+| `paper-pilot-handoff.ts`                               | Verification of pin, manifest digests, and start-window clock checks                 | **Planned Extension**. Extended to verify watched discovery evidence and independently re-derive selection without fabricated signature pages.                                                                                          |
 
 #### 8.38.3 Exact Notification-to-Selection Proof Chain
 
@@ -5257,19 +5265,41 @@ The companion watch module captures an auditable chain of provider observations.
   - `OPERATOR_INTERRUPT`: SIGINT / Ctrl+C triggers bounded teardown (max 5,000 ms), closes socket, and seals partial evidence.
   - `EVIDENCE_CAPTURE_FAILED`: Exclusive-create write failure halts dispatch immediately without retry; marks `EVIDENCE_INCOMPLETE`.
 
-#### 8.38.5 Synthetic Acceptance Cases (Offline Tests Only)
+#### 8.38.5 Synthetic Acceptance Cases & Verified Test Suites (Offline Tests Only)
 
-All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion watch module without opening live sockets or using a public CLI bypass flag:
+All test cases are executed offline by injecting synthetic WebSocket events and mocked HTTP transports into the companion modules without opening live sockets, accessing real networks, or using a public CLI bypass flag. Across all 4 focused test suites, 57 tests pass deterministically in virtual time:
 
-1. **TC-W01: Happy Path Selection**: Synthetic subscription ack followed by a valid AMM v4 creation notification; `getTransaction` returns matching `initialize2` with account 14 as fee destination; DexScreener returns pair inside planning start window. Verifies `TARGET_SELECTED` and sealed evidence.
+##### 1. Bounded WebSocket Collector Suite (`BoundedAmmV4CreationWatch.test.ts` — 33 Tests)
+
+1. **TC-W01: Happy Path Selection**: Synthetic subscription ack followed by a valid AMM v4 creation notification; verifies clean capture, settled teardown, and notification metadata.
 2. **TC-W02: Subscription Ack Timeout**: Synthetic transport delays ack beyond 5,000 ms. Verifies fail-closed termination (`SUBSCRIBE_ACK_TIMEOUT`) and clean socket teardown.
 3. **TC-W03: Subscription ID Mismatch**: Synthetic notification arrives with `subscription` ID differing from the acknowledged ID. Verifies rejection of unsolicited notification.
-4. **TC-W04: Failed Transaction Notification & Explicit err === null**: Notification arrives with `err: { "InstructionError": [0, "Custom"] }` or with `err` missing/undefined. Verifies transaction is recorded as `NOTIFICATION_FAILED` and ignored without qualifying for candidate capture or dispatching HTTP retrieval.
-5. **TC-W05: Non-AMM v4 Transaction**: Notified transaction retrieves successfully but decodes to a non-AMM v4 instruction or CPMM initialization. Verifies `DECODED_NONMATCH`.
-6. **TC-W06: Fee Destination Mismatch**: Notified transaction is AMM v4 `initialize2`, but account 14 is not `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`. Verifies `DECODED_NONMATCH:INVALID_FEE_DESTINATION`.
-7. **TC-W07: Pong Payload Matching & Unmatched Timeout**: Synthetic transport sends mismatched pong payload or drops pong. At 10,000 ms after ping, watch terminates with `KEEPALIVE_TIMEOUT` (no reconnect); unmatched pongs do not clear the deadline.
-8. **TC-W08: Watch Deadline Expiry**: Synthetic transport delivers matching pongs for 15 minutes with no qualifying creation notification. Verifies clean exit with `SAMPLE_PRODUCED_NO_SUITABLE_TARGET` (`NO_QUALIFYING_NOTIFICATION_OBSERVED`).
-9. **TC-W09: Early Notification Validation Cap**: Notification arrives at $t = 10\text{ s}$; synthetic RPC hangs. Verifies individual request times out within 10 s and validation aborts within 30 s, rather than waiting 15 minutes.
-10. **TC-W10: Handoff Re-derivation**: Synthetic watch evidence directory is validated by `paper-pilot-handoff.ts`. Verifies independent signature extraction, exchange matching, and start-window verification without fabricated signature pages.
-11. **TC-W11: Deep Immutability & Application Frame Retention**: Returned result and observation records are deep-frozen; nested error arrays (e.g. `InstructionError`) cannot be modified in strict mode; bounded application frames are retained in memory with byte accounting, complete frame preservation without arbitrary truncation for accepted frames, pre-decode metadata retention for over-ceiling frames, and WSS credential redaction.
-12. **TC-W12: Settled Teardown & Timer Invariant**: `start()` resolves only after socket closure or bounded forced cleanup settles, leaving zero owned timers and zero remaining `AbortSignal` listeners while preserving original notification receipt time.
+4. **TC-W04: Failed Transaction Notification & Explicit `err === null`**: Notification arrives with `err: { "InstructionError": [0, "Custom"] }` or with `err` missing/undefined. Verifies transaction is recorded as `NOTIFICATION_FAILED` and ignored without qualifying for candidate capture.
+5. **TC-W05: Pong Payload Matching & Unmatched Timeout**: Synthetic transport sends mismatched pong payload or drops pong. At 10,000 ms after ping, watch terminates with `KEEPALIVE_TIMEOUT` (no reconnect); unmatched pongs do not clear the deadline.
+6. **TC-W06: Watch Deadline Expiry**: Synthetic transport delivers matching pongs for 15 minutes with no qualifying creation notification. Verifies clean exit with `NO_QUALIFYING_NOTIFICATION_OBSERVED`.
+7. **TC-W07: Settled Teardown & Timer Invariant**: `start()` resolves only after socket closure or bounded forced cleanup settles, leaving zero owned timers and zero remaining `AbortSignal` listeners while preserving original notification receipt time.
+8. **TC-W08: Complete Frame Preservation**: Accepted application frames are preserved completely in their entirety without arbitrary 4,096-byte truncation, maintaining exact multibyte UTF-8 byte integrity and JSON re-parsing.
+9. **TC-W09: Pre-Decode Overflow Guards**: Ceilings are verified before decoding payload buffers; over-ceiling frames retain bounded metadata only (`isComplete: false, overflow: true, overflowReason: ...`) and terminate under corresponding limits without storing oversized strings.
+10. **TC-W10: Zero Retention Loss & Sizing**: Retention capacity is derived from configured message limits plus the isolated outgoing subscription, eliminating arbitrary retention caps.
+11. **TC-W11: Deep Immutability & Redaction**: Returned result and observation records are deep-frozen; nested error arrays cannot be modified in strict mode; credential-bearing WSS URLs are redacted.
+12. **TC-W12: Control-Frame Ceilings**: Strict enforcement of 45 client pings and 128 incoming control frames.
+
+##### 2. Watched Candidate Validation Suite (`AmmV4WatchCandidateValidation.test.ts` — 12 Tests)
+
+1. **TC-V01: Happy Path Validation & Selection**: Valid discovery evidence followed by successful `getTransaction` (Raydium AMM v4 `initialize2` with fee destination at account index 14) and DexScreener token GET within planning start window (240–760s). Verifies `TARGET_SELECTED`, exactly 2 HTTP requests dispatched, RPC URL redaction (`RPC_URL_PLACEHOLDER`), and distinct timestamps preserved without overwriting (`transactionBlockTimeSec !== instructionRequestedOpenTimeSec !== pairCreatedAtMs`).
+2. **TC-V02: Pre-Send Rejection on Unsuitable Watch Status**: Rejects collector results with non-captured status (`KEEPALIVE_TIMEOUT`) or null notification metadata with zero HTTP sends (`httpAttempts: 0`).
+3. **TC-V03: Pre-Send Rejection on Tampered Discovery Evidence**: Rejects tampered frames (fee destination mismatch, subscription ID mismatch, non-null `err`, missing `err` property, invalid signature, or metadata/frame mismatch) with zero HTTP sends.
+4. **TC-V04: Pre-Send Rejection on Collector Cleanup Failure**: Rejects collector results with `cleanupFailed: true` with zero HTTP sends.
+5. **TC-V05: Pre-Send Rejection on Expired Validation Deadline**: Rejects candidates when clock exceeds $\min(t_{\text{notif}} + 30\text{s}, t_{\text{overall}})$ before HTTP dispatch with zero HTTP sends (`VALIDATION_DEADLINE_EXPIRED`).
+6. **TC-V06: Solana RPC Failure Pipeline Halt**: RPC failure (HTTP 500) halts pipeline with exactly 1 attempt; DexScreener is never dispatched.
+7. **TC-V07: Non-AMM v4 Transaction Pipeline Halt**: Transaction with fee destination mismatch or non-AMM v4 program decodes to `DECODED_NONMATCH` and halts pipeline with exactly 1 attempt; DexScreener is never dispatched.
+8. **TC-V08: Market Request Failure or Non-Match**: DexScreener HTTP 500 or zero matching pairs returns appropriate outcome with 2 HTTP attempts.
+9. **TC-V09: Start Window Already Closed**: DexScreener pair older than 760s returns `START_WINDOW_ALREADY_CLOSED` while preserving constructed candidate target and distinct timestamps.
+10. **TC-V10: First-429 Stop Behavior**: Solana RPC HTTP 429 triggers immediate session stop; DexScreener is not dispatched.
+11. **TC-V11: Operator Cancellation Halts Validation Cleanly**: Injected `AbortSignal` halts dispatch cleanly (`OPERATOR_CANCELLED`).
+12. **TC-V12: Pure Derivation Offline Re-Execution**: Pure function `evaluateWatchCandidateEvidence` re-derives identical target and outcome offline from recorded discovery and exchange evidence without network or session.
+
+##### 3. Precheck & Handoff Integration Baseline (`fresh-amm-v4-precheck.test.ts` & `paper-pilot-handoff.test.ts` — 12 Tests)
+
+- 6 tests in `fresh-amm-v4-precheck.test.ts`: validates one-shot sampling precheck, bounded retrieval, fee destination enforcement, and sealed evidence generation.
+- 6 tests in `paper-pilot-handoff.test.ts`: validates evidence manifest integrity, pin verification, and start-window clock checks.
