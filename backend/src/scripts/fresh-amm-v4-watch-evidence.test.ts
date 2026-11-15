@@ -153,6 +153,7 @@ function makeMockFetch(
   o: {
     rpcStatus?: number;
     rpcRawBody?: Buffer;
+    rpcHeaders?: Record<string, string>;
     marketResponse?: unknown;
     marketRawBody?: Buffer;
     calls?: string[];
@@ -191,7 +192,7 @@ function makeMockFetch(
             openTime: Math.floor(START_MS / 1000) - 290,
           }),
         }),
-        { status: 200, headers: { "content-type": "application/json" } },
+        { status: 200, headers: { "content-type": "application/json", ...o.rpcHeaders } },
       );
     }
     if (o.marketRawBody) return new Response(new Uint8Array(o.marketRawBody), { status: 200 });
@@ -1512,5 +1513,168 @@ describe("fresh AMM v4 watch evidence (offline sealing and verification)", () =>
       "REDACTION_CLAIM_UNSUPPORTED:validation.json",
       "REDACTION_CLAIM_MISMATCH:flags",
     ]);
+  });
+
+  it("W-11: exchange-record redaction excuses only differences in fields the derivation reads", async () => {
+    // The review reproduction: the RPC key in the transaction response's allowlisted retry-after
+    // header, sealed normally. Both bodies stay unredacted.
+    const env = await captureWatch();
+    const validation = await validate(
+      env,
+      makeMockFetch(env.sched, { rpcHeaders: { "retry-after": RPC_KEY } }),
+    );
+    expect(validation.outcome).toBe("TARGET_SELECTED");
+    const run = seal({ watchResult: env.watchResult, validation });
+    expect(run.result.ok).toBe(true);
+    expectNoSecrets(run.dir);
+    const txFile = readJson(run.dir, "exchanges/0001.json");
+    expect(txFile.response.headers["retry-after"]).toBe("[REDACTED]");
+    expect(txFile.response.bodyRedacted).toBe(false);
+    expect(readJson(run.dir, "exchanges/0002.json").response.bodyRedacted).toBe(false);
+    const report = readJson(run.dir, WATCH_EVIDENCE_FILES.report);
+    expect(report.redaction.literalByFile["exchanges/0001.json"]).toBe(1);
+    expect(report.redaction.bodies).toEqual([]);
+
+    // (a) Genuine, unchanged target: the derivation reads no header, so it re-derives exactly;
+    //     the conservative selection restriction still withholds confirmation.
+    const genuine = verifyWatchEvidence(run.dir);
+    expect(genuine.integrity.ok).toBe(true);
+    expect(genuine.rederivation).toMatchObject({
+      status: "REPRODUCED",
+      recordedOutcome: "TARGET_SELECTED",
+      rederivedOutcome: "TARGET_SELECTED",
+    });
+    expect(genuine.completeness.reasons).toContain("LITERAL_REDACTION:exchanges/0001.json");
+    expect(genuine).toMatchObject({ verified: true, selectionConfirmed: false });
+
+    // (b) The review reproduction: a forged pool address. The unredacted transaction body proves
+    //     the original pool; a redacted header cannot explain the change.
+    const pool = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.poolId = "11111111111111111111111111111112")),
+    );
+    expect(pool.integrity.ok).toBe(true);
+    expect(pool.rederivation.status).toBe("MISMATCH");
+    expect(pool.rederivation.detail).toMatch(/consumed no redacted evidence/);
+    expect(pool).toMatchObject({ verified: false, selectionConfirmed: false });
+    const block = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.initialization.transactionBlockTimeSec += 1)),
+    );
+    expect(block.rederivation.status).toBe("MISMATCH");
+    const indicator = verifyForged(
+      run.dir,
+      editRecorded((r) => void (r.target.market.informationalIndicators.liquidityUsd += 1)),
+    );
+    expect(indicator.rederivation.status).toBe("MISMATCH");
+    expect(indicator.verified).toBe(false);
+
+    // (c) A redacted field the derivation does read (the market request URL) is a limitation,
+    //     while every fact the unredacted transaction derives is still checked.
+    const marketUrlRedacted = {
+      "exchanges/0002.json": (doc: Loose) =>
+        void (doc.request.url = String(doc.request.url).replace(
+          String(validation.target!.mintAddress),
+          "[REDACTED]",
+        )),
+      [WATCH_EVIDENCE_FILES.report]: (doc: Loose) =>
+        void (doc.redaction.literalByFile["exchanges/0002.json"] = 1),
+    };
+    const urlLimited = verifyForged(run.dir, marketUrlRedacted);
+    expect(urlLimited.integrity.ok).toBe(true);
+    expect(urlLimited.rederivation).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      rederivedReason: "MARKET_REQUEST_NOT_FOR_DECODED_MINT",
+    });
+    expect(urlLimited.rederivation.detail).toMatch(/exchange 2: request\.url/);
+    expect(urlLimited).toMatchObject({ verified: true, selectionConfirmed: false });
+    const urlPool = verifyForged(run.dir, {
+      ...marketUrlRedacted,
+      ...editRecorded((r) => void (r.target.poolId = "11111111111111111111111111111112")),
+    });
+    expect(urlPool.rederivation.status).toBe("MISMATCH");
+    expect(urlPool.rederivation.detail).toMatch(/unredacted transaction evidence/);
+    expect(urlPool).toMatchObject({ verified: false, selectionConfirmed: false });
+    const nonmatch = {
+      recordedOutcome: "TRANSACTION_NONMATCH",
+      runOutcome: "TRANSACTION_NONMATCH",
+      reason: "DECODED_NONMATCH:NO_AMM_V4_INITIALIZE2",
+    };
+    const urlStage = verifyForged(run.dir, {
+      ...marketUrlRedacted,
+      [WATCH_EVIDENCE_FILES.validation]: (doc) =>
+        void Object.assign(doc.result, {
+          ok: false,
+          outcome: nonmatch.recordedOutcome,
+          reason: nonmatch.reason,
+          target: null,
+        }),
+      [WATCH_EVIDENCE_FILES.selection]: (doc) =>
+        void Object.assign(doc, { ...nonmatch, selected: false, target: null }),
+      [WATCH_EVIDENCE_FILES.report]: (doc) => {
+        marketUrlRedacted[WATCH_EVIDENCE_FILES.report](doc);
+        Object.assign(doc, {
+          recordedOutcome: nonmatch.recordedOutcome,
+          runOutcome: nonmatch.runOutcome,
+          selected: false,
+        });
+      },
+    });
+    expect(urlStage.integrity.ok).toBe(true);
+    expect(urlStage.rederivation.status).toBe("MISMATCH");
+    expect(urlStage.rederivation.detail).toMatch(/stops at the transaction stage/);
+    // Both bodies are unredacted, so the whole target re-derives with the URL at its qualifying
+    // value: even a market-derived value cannot be changed under a redacted request URL.
+    const urlIndicator = verifyForged(run.dir, {
+      ...marketUrlRedacted,
+      ...editRecorded((r) => void (r.target.market.informationalIndicators.liquidityUsd += 1)),
+    });
+    expect(urlIndicator.rederivation.status).toBe("MISMATCH");
+    expect(urlIndicator.rederivation.detail).toMatch(/at their qualifying values/);
+
+    // (d) A redacted transaction request field the decode reads (the requested signature): the
+    //     unredacted transaction body still proves the initialization.
+    const paramRedacted = {
+      "exchanges/0001.json": (doc: Loose) => void (doc.request.rpcParams[0] = "[REDACTED]"),
+      [WATCH_EVIDENCE_FILES.report]: (doc: Loose) =>
+        void (doc.redaction.literalByFile["exchanges/0001.json"] = 2),
+    };
+    const paramLimited = verifyForged(run.dir, paramRedacted);
+    expect(paramLimited.integrity.ok).toBe(true);
+    expect(paramLimited.rederivation).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      rederivedReason: "TRANSACTION_REQUEST_IDENTITY_INVALID",
+    });
+    expect(paramLimited.rederivation.detail).toMatch(/exchange 1: request\.rpcParams/);
+    expect(paramLimited).toMatchObject({ verified: true, selectionConfirmed: false });
+    const paramPool = verifyForged(run.dir, {
+      ...paramRedacted,
+      ...editRecorded((r) => void (r.target.poolId = "11111111111111111111111111111112")),
+    });
+    expect(paramPool.rederivation.status).toBe("MISMATCH");
+    expect(paramPool).toMatchObject({ verified: false, selectionConfirmed: false });
+    // A redacted string that cannot hold the qualifying value ("0" is not base58) means the
+    // original request could not have qualified either.
+    const paramImpossible = verifyForged(run.dir, {
+      ...paramRedacted,
+      "exchanges/0001.json": (doc: Loose) => void (doc.request.rpcParams[0] = "0[REDACTED]"),
+    });
+    expect(paramImpossible.rederivation.status).toBe("MISMATCH");
+    // Markers without a literal-redaction claim for that file are not redaction at all.
+    const unclaimed = verifyForged(run.dir, {
+      "exchanges/0002.json": marketUrlRedacted["exchanges/0002.json"],
+    });
+    expect(unclaimed.integrity.ok).toBe(true);
+    expect(unclaimed.rederivation.status).toBe("MISMATCH");
+    // A redacted JSON-RPC id is a string, but the sealed body answers a numeric id: the original
+    // request could not have qualified, so a recorded target is a contradiction.
+    const idRedacted = verifyForged(run.dir, {
+      "exchanges/0001.json": (doc: Loose) => void (doc.jsonRpcId = "[REDACTED]"),
+      [WATCH_EVIDENCE_FILES.report]: (doc: Loose) =>
+        void (doc.redaction.literalByFile["exchanges/0001.json"] = 2),
+    });
+    expect(idRedacted.integrity.ok).toBe(true);
+    expect(idRedacted.rederivation.status).toBe("MISMATCH");
+    expect(idRedacted.rederivation.detail).toMatch(/does not qualify/);
   });
 });

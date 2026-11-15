@@ -1520,6 +1520,7 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
   // 7. Response files: kind, ledger agreement, digests (consumed only now).
   const exchanges: PrecheckExchange[] = [];
   const redactedBodies: number[] = [];
+  const consumedLiteral: { file: string; seq: number; fields: string[] }[] = [];
   const bodyStates: { seq: number; state: unknown }[] = [];
   for (const [i, ix] of indexed.entries()) {
     let ex: unknown;
@@ -1579,6 +1580,8 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
       problems.push(`EXCHANGE_BODY_ACCOUNTING_INVALID:${ix.seq}:${name}`);
     }
     if (stored !== null && resp.bodyRedacted === true) redactedBodies.push(ix.seq);
+    const consumed = consumedRedactedFields(ex);
+    if (consumed.length > 0) consumedLiteral.push({ file: ix.file, seq: ix.seq, fields: consumed });
     bodyStates.push({ seq: ix.seq, state: resp.bodyState });
     exchanges.push(ex as unknown as PrecheckExchange);
   }
@@ -1660,7 +1663,11 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
         literalCount.has(WATCH_EVIDENCE_FILES.watchObservations),
       recorded: literalCount.has(WATCH_EVIDENCE_FILES.validation),
       bodies: new Set(redactedBodies),
-      exchangeLiteral: new Set(indexed.filter((x) => literalCount.has(x.file)).map((x) => x.seq)),
+      // Only claimed literal redaction inside fields the derivation reads; a redacted response
+      // header (or any other unread string) cannot explain a derivation difference.
+      exchangeLiteral: new Map(
+        consumedLiteral.filter((c) => literalCount.has(c.file)).map((c) => [c.seq, c.fields]),
+      ),
     },
   });
   const verified = rederivation.status !== "MISMATCH";
@@ -1686,8 +1693,43 @@ interface RedactionScope {
   readonly recorded: boolean;
   /** Response bodies by exchange seq. */
   readonly bodies: ReadonlySet<number>;
-  /** Strings of exchange records (request identity, errors, headers) by seq. */
-  readonly exchangeLiteral: ReadonlySet<number>;
+  /**
+   * Exchange-record fields that the pure derivation reads and that carry the redaction marker, by
+   * seq (claimed files only). Response headers and other unread strings are never listed.
+   */
+  readonly exchangeLiteral: ReadonlyMap<number, readonly string[]>;
+}
+
+/**
+ * Exchange-record fields the pure derivation reads: the request policy (purpose, lane, method,
+ * URL, RPC method and params), the transaction decode (JSON-RPC id, error) and the body checks
+ * (state, encoding). The body itself is excluded: its redaction is tracked as a body redaction,
+ * and an unredacted body is bound to the received bytes by the accounting checks.
+ */
+function consumedRedactedFields(ex: unknown): string[] {
+  const marked = (v: unknown): boolean =>
+    typeof v === "string"
+      ? v.includes(REDACTED)
+      : Array.isArray(v)
+        ? v.some(marked)
+        : isRecord(v)
+          ? Object.entries(v).some(([k, x]) => k.includes(REDACTED) || marked(x))
+          : false;
+  const req = pick(ex, "request");
+  const resp = pick(ex, "response");
+  const fields: [string, unknown][] = [
+    ["purpose", pick(ex, "purpose")],
+    ["lane", pick(ex, "lane")],
+    ["jsonRpcId", pick(ex, "jsonRpcId")],
+    ["error", pick(ex, "error")],
+    ["request.method", pick(req, "method")],
+    ["request.url", pick(req, "url")],
+    ["request.rpcMethod", pick(req, "rpcMethod")],
+    ["request.rpcParams", pick(req, "rpcParams")],
+    ["response.bodyState", pick(resp, "bodyState")],
+    ["response.bodyEncoding", pick(resp, "bodyEncoding")],
+  ];
+  return fields.filter(([, v]) => marked(v)).map(([name]) => name);
 }
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1801,9 +1843,6 @@ function redactionCauseOf(
   discovery: WatchedDiscoveryEvidence,
   scope: RedactionScope,
 ): RedactionCause | null {
-  // Redacted request identity or error strings feed the request policy itself; attributed
-  // conservatively (the recorded result is still checked for independent contradictions).
-  if (scope.exchangeLiteral.size > 0) return "EXCHANGE_RECORD";
   const [tx, market] = exchanges;
   if (
     tx &&
@@ -1825,7 +1864,110 @@ function redactionCauseOf(
   ) {
     return "MARKET_BODY";
   }
+  // Redacted fields that the derivation reads (request identity, JSON-RPC id, error strings) feed
+  // the request policy and decode; attributed conservatively, while the recorded result is still
+  // checked against every fact the unredacted evidence derives independently.
+  if (scope.exchangeLiteral.size > 0) return "EXCHANGE_RECORD";
   return null;
+}
+
+/** Recorded outcomes that stop at the transaction stage. */
+const TRANSACTION_STAGE_OUTCOMES: ReadonlySet<string> = new Set([
+  "TRANSACTION_REQUEST_FAILED",
+  "TRANSACTION_EVIDENCE_UNAVAILABLE",
+  "TRANSACTION_NONMATCH",
+]);
+
+/** Exchange fields the transaction decode reads whose qualifying value the evidence fixes. */
+const DECODE_SUBSTITUTED_FIELDS: ReadonlySet<string> = new Set([
+  "request.rpcMethod",
+  "request.rpcParams",
+  "jsonRpcId",
+]);
+
+/**
+ * The sealed exchanges with each redacted field the derivation reads replaced by the value a
+ * compliant, qualifying request carries, where the redacted string admits that value (the marker
+ * spans could hide it). Bodies, times and sequence numbers stay as sealed, so everything the
+ * derivation computes from them is unchanged: the original exchanges derive exactly what these
+ * derive, or fail a check on a redacted field. A redacted string that cannot hold the qualifying
+ * value (and a redacted error, which was non-null) is left as sealed: the original failed too.
+ */
+function qualifyingSubstitution(
+  exchanges: readonly PrecheckExchange[],
+  discovery: WatchedDiscoveryEvidence,
+  scope: RedactionScope,
+): { exchanges: PrecheckExchange[]; substituted: Map<number, string[]> } {
+  const substituted = new Map<number, string[]>();
+  const out: PrecheckExchange[] = [];
+  for (const [i, sealed] of exchanges.entries()) {
+    const fields = scope.exchangeLiteral.get(sealed.seq) ?? [];
+    if (fields.length === 0 || i > 1) {
+      out.push(sealed);
+      continue;
+    }
+    const ex = JSON.parse(JSON.stringify(sealed)) as Record<string, unknown> & {
+      request: Record<string, unknown>;
+    };
+    const done: string[] = [];
+    const put = (name: string, holder: Record<string, unknown>, key: string, value: unknown) => {
+      const current = holder[key];
+      if (
+        fields.includes(name) &&
+        typeof current === "string" &&
+        typeof value === "string" &&
+        sameModuloRedaction(value, current, true)
+      ) {
+        holder[key] = value;
+        done.push(name);
+      }
+    };
+    if (i === 0) {
+      put("purpose", ex, "purpose", "PRECHECK_TRANSACTION");
+      put("lane", ex, "lane", "SOLANA_RPC");
+      put("request.method", ex.request, "method", "POST");
+      put("request.url", ex.request, "url", RPC_URL_PLACEHOLDER);
+      put("request.rpcMethod", ex.request, "rpcMethod", "getTransaction");
+      const params = ex.request.rpcParams;
+      if (Array.isArray(params)) {
+        put(
+          "request.rpcParams",
+          params as unknown as Record<string, unknown>,
+          "0",
+          discovery.signature,
+        );
+      }
+      let bodyId: unknown;
+      try {
+        bodyId = pick(JSON.parse(String(sealed.response.body)), "id");
+      } catch {
+        bodyId = undefined;
+      }
+      put("jsonRpcId", ex, "jsonRpcId", bodyId);
+    } else {
+      put("purpose", ex, "purpose", "PRECHECK_MARKET");
+      put("lane", ex, "lane", "DEXSCREENER");
+      put("request.method", ex.request, "method", "GET");
+      const tx = out[0];
+      const txEval = tx
+        ? evaluateInitializationExchange(tx, {
+            signature: discovery.signature,
+            slot: discovery.slot,
+          })
+        : null;
+      if (txEval?.ok === true) {
+        put(
+          "request.url",
+          ex.request,
+          "url",
+          SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.marketUrlFor(txEval.init.mintAddress),
+        );
+      }
+    }
+    if (done.length > 0) substituted.set(sealed.seq, done);
+    out.push(ex as unknown as PrecheckExchange);
+  }
+  return { exchanges: out, substituted };
 }
 
 /**
@@ -1838,16 +1980,40 @@ function recordedContradiction(
   recordedOutcome: string | null,
   discovery: WatchedDiscoveryEvidence,
   exchanges: readonly PrecheckExchange[],
-  recordedRedacted: boolean,
+  scope: RedactionScope,
+  context: WatchEvidenceContext,
 ): string | null {
   const same = (derived: unknown, recordedValue: unknown) =>
-    sameModuloRedaction(derived, recordedValue, recordedRedacted);
+    sameModuloRedaction(derived, recordedValue, scope.recorded);
   const outcome = recordedOutcome ?? "";
   const target = result.target;
   if (TARGET_OUTCOMES.has(outcome) !== isRecord(target)) {
     return "The recorded target's presence contradicts the recorded outcome";
   }
   const [tx, market] = exchanges;
+  // With an unredacted body, the transaction's evaluation is an independent fact. It is exact when
+  // no field the decode reads was substituted; with substituted fields it is what the body derives
+  // if the request qualified (the original derived exactly that, or failed).
+  const qualifying = qualifyingSubstitution(exchanges, discovery, scope);
+  const txQualifying = qualifying.exchanges[0];
+  const txEval =
+    tx && txQualifying && !scope.bodies.has(tx.seq)
+      ? evaluateInitializationExchange(txQualifying, {
+          signature: discovery.signature,
+          slot: discovery.slot,
+        })
+      : null;
+  const txExact =
+    tx !== undefined &&
+    !(qualifying.substituted.get(tx.seq) ?? []).some((f) => DECODE_SUBSTITUTED_FIELDS.has(f));
+  if (txEval !== null) {
+    if (txEval.ok && txExact && TRANSACTION_STAGE_OUTCOMES.has(outcome)) {
+      return "The unredacted transaction evidence qualifies, but the recorded outcome stops at the transaction stage; redaction cannot explain that";
+    }
+    if (!txEval.ok && MARKET_BODY_OUTCOMES.has(outcome)) {
+      return "The unredacted transaction evidence does not qualify, but the recorded outcome needs a qualified transaction; redaction cannot explain that";
+    }
+  }
   if (cause === "TRANSACTION_BODY") {
     if (
       outcome === "EXCHANGE_EVIDENCE_INVALID" &&
@@ -1868,25 +2034,26 @@ function recordedContradiction(
   const init = pick(target, "initialization");
   const marketPart = pick(target, "market");
   if (!tx || !market) return "A recorded target needs both exchanges";
+  const expectedMarketUrl = SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.marketUrlFor(
+    String(target.mintAddress),
+  );
+  const marketUrlMatches =
+    same(market.request.url, expectedMarketUrl) ||
+    (scope.exchangeLiteral.get(market.seq)?.includes("request.url") === true &&
+      sameModuloRedaction(expectedMarketUrl, market.request.url, true));
   if (
     pick(init, "slot") !== discovery.slot ||
     pick(init, "exchangeSeq") !== tx.seq ||
     pick(marketPart, "exchangeSeq") !== market.seq ||
     pick(marketPart, "receivedAtMs") !== market.completedAtMs ||
     !same(discovery.signature, pick(init, "signature")) ||
-    !same(
-      market.request.url,
-      SINGLE_CANDIDATE_PUBLIC_ENDPOINTS.marketUrlFor(String(target.mintAddress)),
-    )
+    !marketUrlMatches
   ) {
     return "The recorded target's discovery, exchange or market-request identity contradicts the sealed evidence";
   }
-  if (cause === "MARKET_BODY") {
+  if (txEval !== null) {
     // The unredacted transaction body re-derives the initialization independently.
-    const ev = evaluateInitializationExchange(tx, {
-      signature: discovery.signature,
-      slot: discovery.slot,
-    });
+    const ev = txEval;
     if (!ev.ok) return "The sealed transaction no longer qualifies";
     const derived = {
       poolId: ev.init.poolId,
@@ -1906,6 +2073,14 @@ function recordedContradiction(
     };
     if (!same(derived, recordedInit)) {
       return "The recorded target's initialization contradicts the unredacted transaction evidence";
+    }
+  }
+  // With both bodies unredacted, the whole target re-derives from the qualifying substitution: a
+  // recorded target must be exactly what it derives.
+  if (cause === "EXCHANGE_RECORD" && exchanges.every((ex) => !scope.bodies.has(ex.seq))) {
+    const derived = evaluateWatchCandidateEvidence(discovery, qualifying.exchanges, context);
+    if (derived.outcome !== outcome || !same(derived.target, target)) {
+      return "The recorded target differs from what the unredacted bodies derive even with the redacted request fields at their qualifying values; redaction cannot explain that";
     }
   }
   return null;
@@ -2118,7 +2293,8 @@ function rederive(a: {
     a.recordedOutcome,
     discovery,
     a.exchanges,
-    a.scope.recorded,
+    a.scope,
+    context,
   );
   if (contradiction !== null) return mismatch(contradiction, pure.outcome, pure.reason);
   const what =
@@ -2126,7 +2302,9 @@ function rederive(a: {
       ? "the redacted transaction body stops the derivation"
       : cause === "MARKET_BODY"
         ? "the redacted market body stops the derivation; the transaction-derived target parts re-derive"
-        : "redacted exchange record strings feed the request checks";
+        : `redacted exchange fields that the derivation reads (${[...a.scope.exchangeLiteral]
+            .map(([seq, fields]) => `exchange ${seq}: ${fields.join(", ")}`)
+            .join("; ")}) feed the request checks; the independently derivable parts agree`;
   return limited(
     discoveryLimitation === null ? what : `${discoveryLimitation}; ${what}`,
     pure.outcome,
