@@ -5157,13 +5157,14 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 ### 8.38 Proposed Bounded AMM v4 Passive Creation-Watch Design (Proposed / Unapproved)
 
 > [!IMPORTANT]
-> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Three offline components are completed and verified:
+> **Status**: PROPOSED AND UNAPPROVED. No provider request, WebSocket connection, daemon process, or live capture is authorized by this design. All implementation, mock harnesses, and regression verifications are strictly offline. Four offline components are completed and verified:
 >
 > 1. The bounded WebSocket notification collector (`backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts`), verified by 33 focused offline tests (`BoundedAmmV4CreationWatch.test.ts`).
 > 2. Watched candidate retrieval, market validation, and pure selection derivation (`backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts`), verified by 19 focused offline tests (`AmmV4WatchCandidateValidation.test.ts`), hardened after the reviews of `5ec9ee8` (§8.38.6) and `92f6c9f` (§8.38.7).
 > 3. Offline sealing and fail-closed verification of supplied watch evidence (`backend/src/scripts/fresh-amm-v4-watch-evidence.ts`), verified by 11 focused offline tests (`fresh-amm-v4-watch-evidence.test.ts`), including the review corrections after `4179ad1` and `0bcdc2f` (§8.38.8).
+> 4. Offline handoff integration (`evaluateWatchedPilotHandoff` in `backend/src/scripts/paper-pilot-handoff.ts`): a sealed watch run whose selection `verifyWatchEvidence` confirms is evaluated against the same pin, identity, output and start-window rules as the precheck, verified by 12 handoff tests (§8.38.9).
 >
-> Sealing is completed; it is not yet wired into anything. Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run), CLI activation (a watch entry point running collector → validator → sealer) and live execution remain planned and are not started. No live limits are approved.
+> The watched handoff is an exported function only: the CLI and the PowerShell wrapper still use the precheck handoff. CLI activation (a watch entry point running collector → validator → sealer → handoff) and live execution remain planned and are not started. No live limits are approved.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -5413,7 +5414,7 @@ After the review of `885323e` accepted the validation component (64 focused test
 | ----------------------------------------------------------------------------- | ----------------------------------------------- |
 | Sealing supplied watch evidence (`sealWatchEvidence`)                         | **Completed & verified offline**                |
 | Fail-closed verification and selection re-derivation (`verifyWatchEvidence`)  | **Completed & verified offline**                |
-| Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run)   | **Planned**: not started                        |
+| Handoff integration (`paper-pilot-handoff.ts` consuming a sealed watch run)   | **Completed & verified offline** (§8.38.9)      |
 | CLI activation (a watch entry point that runs collector → validator → sealer) | **Planned**: not started                        |
 | Live execution                                                                | **Not authorized**: no live limits are approved |
 
@@ -5599,3 +5600,65 @@ The uncaught mutation only makes a conservative rule stricter: with a decode fie
 | Exchange-record redaction masked an unrelated contradiction | The RPC key in the transaction response's `retry-after` header, sealed normally with both bodies unredacted; `target.poolId` changed to `11111111111111111111111111111112` in `validation.json` and `selection.json` returned `LIMITED_BY_REDACTION`, `verified: true` and `selectionConfirmed: false` | Exchange-record redaction is scoped to the fields the derivation reads, in files with a literal-redaction claim; a redacted header no longer explains any difference. When read fields are redacted, the unredacted transaction body still re-derives the initialization, and with both bodies unredacted the recorded target must equal what the exchanges derive with the redacted fields at their qualifying values | W-11       |
 
 Remaining, stated limitations: values that only a redacted body determines (for a redacted market body: the pair creation time, the start window and the informational indicators) cannot be re-derived exactly, so such a run is `LIMITED_BY_REDACTION` and never `selectionConfirmed`. With a redacted field that the transaction decode reads, a recorded transaction-stage outcome is not contradicted by a qualifying substituted transaction (the original request may have failed that check), and the exact transaction-stage reason is not re-derived. Header-only redaction keeps the conservative selection restriction: the run re-derives exactly (`REPRODUCED`) but is not `selectionConfirmed`. The existing rule for outcomes that only acquisition can produce (`NOT_ELIGIBLE` when the exchanges alone re-derive something other than a selection) is unchanged.
+
+#### 8.38.9 Offline Watched-Evidence Handoff Integration (Completed)
+
+After the review of `29bb588` accepted the watch-evidence correction, the handoff consumes a sealed watch run offline. It is an explicit, exported function, `evaluateWatchedPilotHandoff` in `backend/src/scripts/paper-pilot-handoff.ts`, separate from the precheck handoff. Nothing selects between the two by guessing the evidence format, and no signature-page evidence is fabricated. The one-shot precheck handoff, its CLI (`main` is byte-identical) and the PowerShell wrapper are unchanged and still use precheck evidence only. The collector, validator, acquisition behaviour, Stage B runner, strategy, historical evidence and wallet are unchanged. Nothing was executed against a provider, and no socket, daemon, pilot or sleep was used.
+
+**Verifier change** (`fresh-amm-v4-watch-evidence.ts`): `verifyWatchEvidence` now also returns `confirmedTarget`. It is the recorded target from the same in-memory snapshot that was verified, deep-copied and deeply frozen, and is set only when `selectionConfirmed` is true; otherwise it is `null`.
+
+**Watched handoff (`evaluateWatchedPilotHandoff`)**, in order. Each step refuses on failure, and no pool or mint is released before the start-window decision:
+
+1. **Code and configuration pin**: the same `checkPin` as the precheck handoff, run before any evidence is read.
+2. **Evidence location**: the directory must lie strictly inside `data/research/prechecks/` (`WATCH_EVIDENCE_LOCATION_INVALID`) and exist (`WATCH_EVIDENCE_MISSING`).
+3. **Verification**: `verifyWatchEvidence` runs once. Integrity problems refuse as `INVALID_EVIDENCE:<problem>`. The handoff proceeds only with sufficient completeness, a `REPRODUCED` re-derivation, `verified`, `selectionConfirmed` and a non-null `confirmedTarget`. Otherwise it refuses with `WATCH_EVIDENCE_INCOMPLETE:<reason>`, `WATCH_SELECTION_<status>` and `WATCH_SELECTION_NOT_CONFIRMED`. Cancellation, run failure, a watch without capture, partial or missing exchanges, any redaction (including header-only) and mismatches therefore all refuse.
+4. **Identity**: only `confirmedTarget` is used; `selection.json` is never reopened. The pool and mint must be canonical base58 and distinct, the candidate must not be WSOL, the quote must be WSOL and the orientation `CANDIDATE_BASE_WSOL_QUOTE` (`TARGET_IDENTITY_INVALID`). The runner's open time must be a positive safe integer (`START_WINDOW_SOURCE_INVALID`).
+5. **Output**: the pilot directory must be new and strictly inside `data/research/single-candidate/` (`PILOT_OUTPUT_INVALID`, `PILOT_OUTPUT_EXISTS`).
+6. **Start window** (planning estimate on the runner's age source, DexScreener `pairCreatedAt`): the injected clock is read after verification, immediately before deciding. An age of 240–760 s gives `ALLOWED`. A younger pool gives one `WAIT` with the exact wait, at most 240 s; anything further ahead is `START_WINDOW_TOO_FAR_AHEAD`. An age over 760 s is `START_WINDOW_EXPIRED`. The function returns `ALLOWED`, `WAIT` or `REFUSED` and never sleeps, retries or executes anything. Watched results carry `evidenceSource: "WATCH_EVIDENCE"`.
+
+The identity, output-directory and window rules are shared helpers, and the precheck handoff calls the same helpers in the same order, so its results are unchanged (H-01 to H-06 pass as before).
+
+**Pin allowlist**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly the six reviewed files added since the runner baseline (`6855efb`):
+
+- `BoundedAmmV4CreationWatch.ts` and `.test.ts`;
+- `AmmV4WatchCandidateValidation.ts` and `.test.ts`;
+- `fresh-amm-v4-watch-evidence.ts` and `.test.ts`.
+
+The runner is not repinned and no directory is allowed. Modifications, deletions, renames (compared without rename detection, so a deletion plus an unexpected addition) and unexpected additions still refuse. A read-only `git diff --name-status` from `6855efb` to the current commit confirms that every change to the runner's surface is an allowed addition.
+
+**Synthetic tests** (`paper-pilot-handoff.test.ts`, 6 new tests; the 6 precheck tests are unchanged). The tests use genuine collector output on a scripted in-memory transport, the reviewed validator against mocked requests, evidence sealed into each test's own temporary project root, and a fake git runner except in H-12's read-only repository comparison:
+
+| Test | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H-07 | A confirmed watched selection is `ALLOWED` with the verified pool and mint, age 300 s, the runner's age source and the pin calls. `confirmedTarget` equals the validator's target and is frozen. Boundaries: 240 s, 760 s and 760.999 s are allowed; 761 s is `START_WINDOW_EXPIRED`; 239 s waits exactly 1 s; age 0 waits the maximum 240 s; one millisecond earlier is `START_WINDOW_TOO_FAR_AHEAD`                                                                                                                                                                                                                                                                                                                                        |
+| H-08 | The clock is never read during verification. Invoked at 759 s, a verification that ends at 763 s refuses `START_WINDOW_EXPIRED` at 763 s; one that starts at 239 s and ends at 241 s is allowed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| H-09 | Each non-confirmed outcome refuses with its reasons and releases no identity: a watch without capture, cancellation during the watch, cancellation during validation, a run failure after a selected validation, a partial market body (64-byte limit), a redacted market body (`LIMITED_BY_REDACTION`), header-only redaction (`REPRODUCED` but `LITERAL_REDACTION`), and a forged pool (`MISMATCH`). The verifier returns `confirmedTarget: null` for each                                                                                                                                                                                                                                                                                 |
+| H-10 | Altered evidence refuses: `selection.json` alone re-forged, a sealed byte changed without the manifest, and a response re-forged consistently. Missing evidence and evidence outside `data/research/prechecks/` (another root, the root itself, a parent path, an absolute path) refuse. Precheck evidence is refused by the watched handoff and watch evidence by the precheck handoff. Files re-forged to another pool after verification cannot redirect the handoff, because it uses the verified snapshot. Claimed but unconfirmed, untargeted, unverified, limited or incomplete verifications release nothing; non-canonical, pool-equals-mint, WSOL-candidate and reversed-orientation identities and a non-integer open time refuse |
+| H-11 | Pin failures (unknown commit, changed, dirty, runner dependency modified) refuse before any evidence is verified. Invalid pilot directories (another root, the root itself, a parent path) and an existing one refuse                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| H-12 | The allowlist is exactly the five earlier files plus the six reviewed watch files. Modifying or deleting each of the six, a rename, additions next to them, a directory entry and a modified runner file all refuse. Read-only git on this repository shows only allowed additions since `6855efb`                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit), all 17 caught:
+
+| Mutation                                                 | Caught by  |
+| -------------------------------------------------------- | ---------- |
+| Completeness not required                                | H-09, H-10 |
+| `REPRODUCED` not required                                | H-09, H-10 |
+| `selectionConfirmed` not required                        | H-10       |
+| `verified` not required                                  | H-10       |
+| Verifier exposes a target without confirmation           | H-09       |
+| Target reopened from `selection.json` after verification | H-10       |
+| Watched identity not checked                             | H-10       |
+| Market age source not checked                            | H-10       |
+| Clock read before verification                           | H-08       |
+| Evidence location not confined                           | H-10       |
+| Watched output directory not checked                     | H-11       |
+| Watched pin skipped                                      | H-07, H-11 |
+| Allowlist matches by directory                           | H-02, H-12 |
+| Allowlist accepts modifications                          | H-02, H-12 |
+| Closing boundary inclusive                               | H-01, H-07 |
+| Wait bound inclusive                                     | H-07       |
+| Reviewed watch files not allowlisted                     | H-12       |
+
+- **Results**: under external 60 s limits, the handoff suite passes 12/12, watch evidence 11/11, validation 19/19, collector 33/33 and precheck 6/6 (81 tests). The backend typecheck, ESLint and Prettier pass. The wrapper, the wallet hash and the Stage A precheck manifest are unchanged, and no capture, provider request, socket, daemon or pilot was used.
+
+**Not started**: CLI activation (a watch entry point running collector → validator → sealer → handoff, and any wrapper change) and live execution. No live limits are approved.

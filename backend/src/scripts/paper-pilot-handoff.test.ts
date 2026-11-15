@@ -1,11 +1,15 @@
 /**
  * Conditional handoff (offline): code/configuration pin, evidence integrity, re-derivation of the
  * sealed target, the start window on the runner's age source, and the pilot output directory.
- * SYNTHETIC precheck evidence and a fake git runner; no network.
+ * SYNTHETIC precheck evidence and a fake git runner; no network. The watched-evidence handoff uses
+ * GENUINE collector output on a scripted in-memory transport, the reviewed validator against a
+ * scripted fetch, and evidence sealed into this test's own temporary directories.
  */
+import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER,
@@ -14,7 +18,9 @@ import {
   RUNNER_DEPENDENCY_PATHS,
   REVIEWED_RUNNER_COMMIT,
   checkPin,
+  defaultGit,
   evaluatePilotHandoff,
+  evaluateWatchedPilotHandoff,
   loadVerifiedExchanges,
   type GitRunner,
 } from "./paper-pilot-handoff.js";
@@ -23,11 +29,35 @@ import {
   MINT,
   NOW_SEC,
   POOL,
+  START_MS,
+  TEST_RPC_URL,
+  VirtualScheduler,
+  drive,
+  initTransactionResult,
   key,
+  marketResponse,
   precheckEnv,
   sig,
   standardScenario,
 } from "./fresh-amm-v4-precheck.test-support.js";
+import { PRECHECK_ROOT_SEGMENTS } from "./fresh-amm-v4-precheck.js";
+import {
+  WATCH_EVIDENCE_FILES,
+  sealWatchEvidence,
+  verifyWatchEvidence,
+  type WatchEvidenceVerification,
+  type WatchRunTerminalCause,
+} from "./fresh-amm-v4-watch-evidence.js";
+import {
+  executeWatchCandidateValidation,
+  type WatchCandidateValidationResult,
+  type WatchEvidenceContext,
+} from "../candidate-scanner/AmmV4WatchCandidateValidation.js";
+import {
+  BoundedAmmV4CreationWatch,
+  type BoundedAmmV4CreationWatchLimits,
+} from "../candidate-scanner/BoundedAmmV4CreationWatch.js";
+import type { ISolanaKeepaliveWebSocketTransport } from "../candidate-scanner/RaydiumTransportObservationProbe.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -468,5 +498,728 @@ describe("Handoff corrections (review of 6515fcb)", () => {
     const r = evaluate(root, now, git);
     expect(calls.flat().some((a) => a.includes(".env"))).toBe(false);
     expect(r.refusals).toEqual(["RELEVANT_FILES_DIRTY"]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Watched-evidence handoff: SYNTHETIC collector + validator harness (as in the reviewed
+// watch-evidence tests), sealed into this test's own temporary project roots.
+// ---------------------------------------------------------------------------------------------
+
+const WATCH_SIG =
+  "CeD7gRMFdZKnrBxCWczhvDmfAz4ke5NFKvqAi9jSwzCQReUhecVgBJb112WuuR9eVmzFDwMsQDWEa1WWhbF3aoB";
+const WATCH_NOTIFY_AT = START_MS + 10_000;
+const WATCH_RPC_KEY = "SYNTHETIC-secret-key-123";
+const WATCH_RPC_URL = `${TEST_RPC_URL}/?key=${WATCH_RPC_KEY}`;
+const WATCH_CREDENTIALS = Object.freeze({
+  rpcUrl: WATCH_RPC_URL,
+  wssUrl: "wss://synthetic.invalid/watch?api-key=SYNTHETIC-wss-key-456789",
+});
+const WATCH_PLAN = Object.freeze({ kind: "SYNTHETIC_WATCH_RUN_PLAN", mode: "OFFLINE_TEST" });
+const WATCH_PAIR_CREATED_AT_MS = START_MS - 300_000;
+const WATCH_OPEN_SEC = Math.floor(WATCH_PAIR_CREATED_AT_MS / 1000);
+const watchAge = (ageSec: number) => (WATCH_OPEN_SEC + ageSec) * 1000;
+const WATCH_COMPLETED: WatchRunTerminalCause = {
+  code: "COMPLETED",
+  stage: "VALIDATION",
+  detail: null,
+};
+
+class ScriptedTransport implements ISolanaKeepaliveWebSocketTransport {
+  readyState = 0;
+  readonly sent: string[] = [];
+  private readonly listeners: Record<string, ((...args: never[]) => void)[]> = {};
+  on = ((event: string, listener: (...args: never[]) => void) => {
+    (this.listeners[event] ??= []).push(listener);
+  }) as ISolanaKeepaliveWebSocketTransport["on"];
+  send(data: string): void {
+    this.sent.push(data);
+  }
+  close(): void {
+    this.readyState = 3;
+  }
+  terminate(): void {
+    this.readyState = 3;
+  }
+  ping(data?: Buffer): void {
+    for (const l of this.listeners.pong ?? []) (l as (d: Buffer) => void)(data ?? Buffer.alloc(0));
+  }
+  open(): void {
+    this.readyState = 1;
+    for (const l of this.listeners.open ?? []) (l as () => void)();
+  }
+  message(data: string | Buffer): void {
+    for (const l of this.listeners.message ?? []) (l as (d: string | Buffer) => void)(data);
+  }
+}
+
+const WATCH_ACK = JSON.stringify({ jsonrpc: "2.0", id: 1, result: 42 });
+const WATCH_NOTIFICATION = JSON.stringify({
+  jsonrpc: "2.0",
+  method: "logsNotification",
+  params: {
+    subscription: 42,
+    result: {
+      context: { slot: 250_000 },
+      value: { err: null, signature: WATCH_SIG, logs: ["Program log: initialize2"] },
+    },
+  },
+});
+
+async function captureWatch(
+  o: {
+    script?: readonly { atMs: number; data: string }[];
+    limits?: Partial<BoundedAmmV4CreationWatchLimits>;
+    abortAtMs?: number;
+  } = {},
+) {
+  const sched = new VirtualScheduler(START_MS);
+  const transport = new ScriptedTransport();
+  const controller = new AbortController();
+  const watch = new BoundedAmmV4CreationWatch({
+    wssUrl: "wss://synthetic.invalid/watch",
+    clock: () => sched.now,
+    timers: {
+      setTimeout: (fn: () => void, ms: number) => sched.add(fn, ms, "harness"),
+      clearTimeout: (h: unknown) => sched.clear(h),
+    },
+    transportFactory: () => transport,
+    abortSignal: controller.signal,
+    ...(o.limits ? { limits: o.limits } : {}),
+  });
+  const running = watch.start();
+  transport.open();
+  const script = o.script ?? [
+    { atMs: 600, data: WATCH_ACK },
+    { atMs: 10_000, data: WATCH_NOTIFICATION },
+  ];
+  for (const s of script) sched.at(START_MS + s.atMs, () => transport.message(s.data));
+  if (o.abortAtMs !== undefined) sched.at(START_MS + o.abortAtMs, () => controller.abort());
+  const watchResult = await drive(sched, running);
+  const timers = {
+    setTimeout: (fn: () => void, ms: number) => sched.add(fn, ms, "provider"),
+    clearTimeout: (h: unknown) => sched.clear(h),
+  };
+  return { sched, timers, watchResult };
+}
+type WatchEnv = Awaited<ReturnType<typeof captureWatch>>;
+
+/** Mocked validation requests (no network): the RPC transaction, then the market pairs. */
+function mockFetch(
+  sched: VirtualScheduler,
+  o: { marketRawBody?: Buffer; rpcHeaders?: Record<string, string> } = {},
+) {
+  const delay = (signal?: AbortSignal | null) =>
+    new Promise<void>((resolve, reject) => {
+      const id = sched.add(() => resolve(), 100, "harness");
+      signal?.addEventListener(
+        "abort",
+        () => {
+          sched.clear(id);
+          reject(new Error("aborted"));
+        },
+        { once: true },
+      );
+    });
+  return (async (input: unknown, init?: RequestInit): Promise<Response> => {
+    const url = String(input);
+    await delay(init?.signal);
+    if (url.startsWith(TEST_RPC_URL)) {
+      const id = (JSON.parse(String(init?.body)) as { id: number }).id;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          result: initTransactionResult({
+            signature: WATCH_SIG,
+            slot: 250_000,
+            blockTime: Math.floor(START_MS / 1000) - 300,
+            openTime: Math.floor(START_MS / 1000) - 290,
+          }),
+        }),
+        { status: 200, headers: { "content-type": "application/json", ...o.rpcHeaders } },
+      );
+    }
+    if (o.marketRawBody) return new Response(new Uint8Array(o.marketRawBody), { status: 200 });
+    return new Response(JSON.stringify(marketResponse(WATCH_PAIR_CREATED_AT_MS)), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+}
+
+function validateWatch(
+  env: WatchEnv,
+  fetchFn: typeof fetch,
+  extra: { abortSignal?: AbortSignal; limits?: WatchEvidenceContext["limits"] } = {},
+): Promise<WatchCandidateValidationResult> {
+  return drive(
+    env.sched,
+    executeWatchCandidateValidation({
+      watchResult: env.watchResult,
+      rpcUrl: WATCH_RPC_URL,
+      clock: () => env.sched.now,
+      timers: env.timers,
+      fetchFn,
+      ...extra,
+    }),
+  );
+}
+
+/** A fresh temporary project root (removed after each test). */
+function watchRoot(): string {
+  const r = mkdtempSync(path.join(os.tmpdir(), "handoff-watch-test-"));
+  roots.push(r);
+  return r;
+}
+
+const watchRel = (runName: string) => [...PRECHECK_ROOT_SEGMENTS, runName].join("/");
+
+/** Seals one run into `root` and returns its relative directory. */
+function sealRun(
+  root: string,
+  runName: string,
+  over: {
+    watchResult: WatchEnv["watchResult"];
+    validation?: WatchCandidateValidationResult | null;
+    terminalCause?: WatchRunTerminalCause;
+    policyContext?: WatchEvidenceContext;
+  },
+): string {
+  const r = sealWatchEvidence({
+    projectRoot: root,
+    runName,
+    plan: WATCH_PLAN,
+    validation: over.validation ?? null,
+    terminalCause: over.terminalCause ?? WATCH_COMPLETED,
+    credentials: WATCH_CREDENTIALS,
+    clock: () => START_MS + 60_000,
+    watchResult: over.watchResult,
+    ...(over.policyContext ? { policyContext: over.policyContext } : {}),
+  });
+  expect(r.ok, runName).toBe(true);
+  return watchRel(runName);
+}
+
+async function selectedWatch() {
+  const env = await captureWatch();
+  const validation = await validateWatch(env, mockFetch(env.sched));
+  expect(validation.outcome).toBe("TARGET_SELECTED");
+  return { env, validation };
+}
+
+/** Re-forges sealed JSON documents with consistent manifest entries (integrity still passes). */
+function reforgeWatch(dir: string, edits: Record<string, (doc: Loose) => void>): void {
+  const manifestPath = path.join(dir, WATCH_EVIDENCE_FILES.manifest);
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  for (const [rel, edit] of Object.entries(edits)) {
+    const file = path.join(dir, ...rel.split("/"));
+    const doc = JSON.parse(readFileSync(file, "utf8"));
+    edit(doc);
+    const content = JSON.stringify(doc, null, 2) + "\n";
+    writeFileSync(file, content);
+    const entry = (manifest.files as Loose[]).find((e) => e.path === rel);
+    if (entry) {
+      entry.sha256 = sha256(content);
+      entry.bytes = Buffer.byteLength(content);
+    }
+  }
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+}
+
+function copyWatch(root: string, rel: string, name: string): string {
+  cpSync(path.join(root, ...rel.split("/")), path.join(root, ...watchRel(name).split("/")), {
+    recursive: true,
+  });
+  return watchRel(name);
+}
+
+const OTHER_POOL = "11111111111111111111111111111112";
+
+const watched = (
+  root: string,
+  evidence: string,
+  nowMs: number,
+  o: { git?: GitRunner; pilot?: string; verify?: (dir: string) => WatchEvidenceVerification } = {},
+) =>
+  evaluateWatchedPilotHandoff({
+    projectRoot: root,
+    watchEvidenceDir: evidence,
+    pilotOutDir: o.pilot ?? PILOT,
+    pinnedCommit: PINNED,
+    clock: () => nowMs,
+    git: o.git ?? fakeGit().git,
+    ...(o.verify ? { verify: o.verify } : {}),
+  });
+
+describe("Watched-evidence handoff (offline integration)", () => {
+  it("H-07: a confirmed watched selection is handed off with the verified identity; WAIT and expiry boundaries", async () => {
+    const root = watchRoot();
+    const { env, validation } = await selectedWatch();
+    const run = sealRun(root, "watch-selected", { watchResult: env.watchResult, validation });
+    const v = verifyWatchEvidence(path.join(root, ...run.split("/")));
+    expect(v).toMatchObject({ selectionConfirmed: true, rederivation: { status: "REPRODUCED" } });
+    expect(v.confirmedTarget).toEqual(validation.target);
+    expect(Object.isFrozen(v.confirmedTarget)).toBe(true);
+    expect(Object.isFrozen(v.confirmedTarget?.market)).toBe(true);
+    expect(validation.target?.market.runnerOpenTimeSec).toBe(WATCH_OPEN_SEC);
+
+    const { git, calls } = fakeGit();
+    expect(watched(root, run, watchAge(300), { git })).toMatchObject({
+      decision: "ALLOWED",
+      refusals: [],
+      poolId: POOL,
+      mintAddress: MINT,
+      ageSecNow: 300,
+      ageSource: "DEXSCREENER_PAIR_CREATED_AT",
+      pilotOutDir: PILOT,
+      evidenceSource: "WATCH_EVIDENCE",
+      startWindow: { status: expect.stringMatching(/^PLANNING_ESTIMATE/) },
+    });
+    expect(
+      calls.some(
+        (c) => c[0] === "diff" && c[1] === "--quiet" && PIN_PATHS.every((p) => c.includes(p)),
+      ),
+    ).toBe(true);
+    expect(calls.some((c) => c.includes(REVIEWED_RUNNER_COMMIT) && c.includes(PINNED))).toBe(true);
+
+    // Window boundaries on the runner's age source (240-760 s), one bounded WAIT at most.
+    expect(watched(root, run, watchAge(240)).decision).toBe("ALLOWED");
+    expect(watched(root, run, watchAge(760)).decision).toBe("ALLOWED");
+    expect(watched(root, run, watchAge(760) + 999).decision).toBe("ALLOWED");
+    expect(watched(root, run, watchAge(761))).toMatchObject({
+      decision: "REFUSED",
+      refusals: ["START_WINDOW_EXPIRED"],
+      ageSecNow: 761,
+      poolId: POOL,
+    });
+    const wait = watched(root, run, watchAge(239));
+    expect(wait).toMatchObject({ decision: "WAIT", refusals: ["START_WINDOW_NOT_YET_OPEN"] });
+    expect(wait.waitMs).toBe(1000);
+    const longest = watched(root, run, watchAge(0));
+    expect(longest).toMatchObject({ decision: "WAIT", waitMs: 240_000 });
+    expect(watched(root, run, watchAge(0) - 1)).toMatchObject({
+      decision: "REFUSED",
+      refusals: ["START_WINDOW_TOO_FAR_AHEAD"],
+    });
+  });
+
+  it("H-08: the clock is read after verification; crossing either boundary during verification decides on the later time", async () => {
+    const root = watchRoot();
+    const { env, validation } = await selectedWatch();
+    const run = sealRun(root, "watch-timing", { watchResult: env.watchResult, validation });
+
+    let now = watchAge(759);
+    let clockReadsDuringVerification = 0;
+    let verifying = false;
+    const slowVerify = (dir: string) => {
+      verifying = true;
+      const v = verifyWatchEvidence(dir);
+      verifying = false;
+      now = watchAge(763); // verification took four seconds
+      return v;
+    };
+    const r = evaluateWatchedPilotHandoff({
+      projectRoot: root,
+      watchEvidenceDir: run,
+      pilotOutDir: PILOT,
+      pinnedCommit: PINNED,
+      clock: () => {
+        if (verifying) clockReadsDuringVerification++;
+        return now;
+      },
+      git: fakeGit().git,
+      verify: slowVerify,
+    });
+    expect(r).toMatchObject({
+      decision: "REFUSED",
+      refusals: ["START_WINDOW_EXPIRED"],
+      ageSecNow: 763,
+    });
+    expect(r.evaluatedAtIso).toBe(new Date(watchAge(763)).toISOString());
+    expect(clockReadsDuringVerification).toBe(0);
+
+    let early = watchAge(239);
+    expect(
+      evaluateWatchedPilotHandoff({
+        projectRoot: root,
+        watchEvidenceDir: run,
+        pilotOutDir: PILOT,
+        pinnedCommit: PINNED,
+        clock: () => early,
+        git: fakeGit().git,
+        verify: (dir) => {
+          const v = verifyWatchEvidence(dir);
+          early = watchAge(241);
+          return v;
+        },
+      }),
+    ).toMatchObject({ decision: "ALLOWED", ageSecNow: 241 });
+  });
+
+  it("H-09: every non-confirmed watched outcome refuses without releasing an identity", async () => {
+    const root = watchRoot();
+    const now = watchAge(300);
+    const { env, validation } = await selectedWatch();
+    const runs: [string, string, string[]][] = [];
+
+    // A watch without capture, and operator cancellation during the watch.
+    const quiet = await captureWatch({
+      script: [{ atMs: 600, data: WATCH_ACK }],
+      limits: { watchCeilingMs: 20_000 },
+    });
+    runs.push([
+      "watch ended without capture",
+      sealRun(root, "no-capture", {
+        watchResult: quiet.watchResult,
+        terminalCause: { code: "WATCH_ENDED_WITHOUT_CAPTURE", stage: "WATCH", detail: null },
+      }),
+      [
+        "WATCH_EVIDENCE_INCOMPLETE:VALIDATION_NOT_RECORDED",
+        "WATCH_SELECTION_NOT_ELIGIBLE",
+        "WATCH_SELECTION_NOT_CONFIRMED",
+      ],
+    ]);
+    const cancelledWatch = await captureWatch({
+      script: [{ atMs: 600, data: WATCH_ACK }],
+      abortAtMs: 5_000,
+    });
+    runs.push([
+      "cancelled during the watch",
+      sealRun(root, "cancelled-watch", {
+        watchResult: cancelledWatch.watchResult,
+        terminalCause: { code: "OPERATOR_CANCELLED", stage: "WATCH", detail: "operator stop" },
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:TERMINAL_CAUSE:OPERATOR_CANCELLED"],
+    ]);
+
+    // Operator cancellation while the transaction request is in flight.
+    const inflight = await captureWatch();
+    const controller = new AbortController();
+    inflight.sched.at(WATCH_NOTIFY_AT + 50, () => controller.abort());
+    const cancelled = await validateWatch(inflight, mockFetch(inflight.sched), {
+      abortSignal: controller.signal,
+    });
+    expect(cancelled.outcome).toBe("OPERATOR_CANCELLED");
+    runs.push([
+      "cancelled during validation",
+      sealRun(root, "cancelled-validation", {
+        watchResult: inflight.watchResult,
+        validation: cancelled,
+        terminalCause: { code: "OPERATOR_CANCELLED", stage: "VALIDATION", detail: null },
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:OUTCOME:OPERATOR_CANCELLED", "WATCH_SELECTION_NOT_ELIGIBLE"],
+    ]);
+
+    // A run failure after a selected validation: the validation reproduces, the run does not count.
+    runs.push([
+      "run failure",
+      sealRun(root, "run-failed", {
+        watchResult: env.watchResult,
+        validation,
+        terminalCause: { code: "RUN_FAILED", stage: "RUN", detail: "synthetic failure" },
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:TERMINAL_CAUSE:RUN_FAILED", "WATCH_SELECTION_NOT_CONFIRMED"],
+    ]);
+
+    // Partial market evidence (64-byte limit): no selection.
+    const limited = { dexscreenerMaxResponseBytes: 64 };
+    const partialEnv = await captureWatch();
+    const partial = await validateWatch(partialEnv, mockFetch(partialEnv.sched), {
+      limits: limited,
+    });
+    expect(partial.outcome).not.toBe("TARGET_SELECTED");
+    runs.push([
+      "partial market body",
+      sealRun(root, "partial-market", {
+        watchResult: partialEnv.watchResult,
+        validation: partial,
+        policyContext: { limits: limited },
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:PARTIAL_OR_UNREAD_BODY:2:PARTIAL_OVERFLOW"],
+    ]);
+
+    // A redacted market body: LIMITED_BY_REDACTION.
+    const redactedEnv = await captureWatch();
+    const marketText = JSON.stringify({
+      ...(marketResponse(WATCH_PAIR_CREATED_AT_MS) as Record<string, unknown>),
+      echo: `request key ${WATCH_RPC_KEY}`,
+    });
+    const redacted = await validateWatch(
+      redactedEnv,
+      mockFetch(redactedEnv.sched, { marketRawBody: Buffer.from(marketText, "utf8") }),
+    );
+    expect(redacted.outcome).toBe("TARGET_SELECTED");
+    runs.push([
+      "redacted market body",
+      sealRun(root, "redacted-market", {
+        watchResult: redactedEnv.watchResult,
+        validation: redacted,
+      }),
+      ["WATCH_EVIDENCE_INCOMPLETE:BODY_REDACTED:2", "WATCH_SELECTION_LIMITED_BY_REDACTION"],
+    ]);
+
+    // Header-only redaction re-derives exactly but keeps the conservative restriction.
+    const headerEnv = await captureWatch();
+    const header = await validateWatch(
+      headerEnv,
+      mockFetch(headerEnv.sched, { rpcHeaders: { "retry-after": WATCH_RPC_KEY } }),
+    );
+    runs.push([
+      "redacted response header",
+      sealRun(root, "redacted-header", { watchResult: headerEnv.watchResult, validation: header }),
+      [
+        "WATCH_EVIDENCE_INCOMPLETE:LITERAL_REDACTION:exchanges/0001.json",
+        "WATCH_SELECTION_NOT_CONFIRMED",
+      ],
+    ]);
+
+    // A mismatch: the recorded pool forged in both copies with consistent hashes.
+    const selected = sealRun(root, "selected", { watchResult: env.watchResult, validation });
+    const forged = copyWatch(root, selected, "forged-pool");
+    reforgeWatch(path.join(root, ...forged.split("/")), {
+      [WATCH_EVIDENCE_FILES.validation]: (doc) => void (doc.result.target.poolId = OTHER_POOL),
+      [WATCH_EVIDENCE_FILES.selection]: (doc) => void (doc.target.poolId = OTHER_POOL),
+    });
+    runs.push(["forged pool", forged, ["WATCH_SELECTION_MISMATCH"]]);
+
+    for (const [label, rel, expected] of runs) {
+      const r = watched(root, rel, now);
+      expect(r.decision, label).toBe("REFUSED");
+      for (const e of expected) expect(r.refusals, label).toContain(e);
+      expect(r.refusals, label).toContain("WATCH_SELECTION_NOT_CONFIRMED");
+      expect(r.poolId, label).toBeUndefined();
+      expect(r.mintAddress, label).toBeUndefined();
+      expect(r.evidenceSource, label).toBe("WATCH_EVIDENCE");
+      // The verifier itself exposes no target unless the selection is confirmed.
+      expect(verifyWatchEvidence(path.join(root, ...rel.split("/"))).confirmedTarget, label).toBe(
+        null,
+      );
+    }
+    // The untouched selected run is still handed off.
+    expect(watched(root, selected, now).decision).toBe("ALLOWED");
+  });
+
+  it("H-10: altered, missing or misplaced evidence refuses; the target comes only from the verified snapshot", async () => {
+    const root = watchRoot();
+    const now = watchAge(300);
+    const { env, validation } = await selectedWatch();
+    const selected = sealRun(root, "selected", { watchResult: env.watchResult, validation });
+    const abs = (rel: string) => path.join(root, ...rel.split("/"));
+
+    // selection.json alone re-forged to another pool: the copies disagree (integrity).
+    const selectionOnly = copyWatch(root, selected, "selection-only");
+    reforgeWatch(abs(selectionOnly), {
+      [WATCH_EVIDENCE_FILES.selection]: (doc) => void (doc.target.poolId = OTHER_POOL),
+    });
+    const s1 = watched(root, selectionOnly, now);
+    expect(s1.decision).toBe("REFUSED");
+    expect(s1.refusals.every((r) => r.startsWith("INVALID_EVIDENCE:"))).toBe(true);
+    expect(s1.poolId).toBeUndefined();
+
+    // A sealed byte changed without the manifest.
+    const tampered = copyWatch(root, selected, "tampered");
+    const txFile = path.join(abs(tampered), "exchanges", "0001.json");
+    writeFileSync(txFile, readFileSync(txFile, "utf8").replace(POOL, OTHER_POOL));
+    expect(
+      watched(root, tampered, now).refusals.some((r) => r.startsWith("INVALID_EVIDENCE:")),
+    ).toBe(true);
+
+    // A sealed response re-forged consistently: the selection no longer reproduces.
+    const response = copyWatch(root, selected, "response-forged");
+    reforgeWatch(abs(response), {
+      "exchanges/0002.json": (doc) => void (doc.request.url = String(doc.request.url) + "x"),
+    });
+    expect(watched(root, response, now).decision).toBe("REFUSED");
+
+    // Missing, outside or root-level evidence, and precheck evidence (no format guessing).
+    expect(watched(root, watchRel("missing"), now).refusals).toEqual(["WATCH_EVIDENCE_MISSING"]);
+    for (const outside of [
+      "data/research/single-candidate/watch",
+      PRECHECK_ROOT_SEGMENTS.join("/"),
+      "../elsewhere",
+      path.join(os.tmpdir(), "watch"),
+    ]) {
+      expect(watched(root, outside, now).refusals, outside).toEqual([
+        "WATCH_EVIDENCE_LOCATION_INVALID",
+      ]);
+    }
+    const precheck = await sealedPrecheck();
+    const asWatch = watched(precheck.root, PRECHECK, atAge(300));
+    expect(asWatch.decision).toBe("REFUSED");
+    expect(asWatch.refusals.every((r) => r.startsWith("INVALID_EVIDENCE:"))).toBe(true);
+    // ...and the precheck handoff does not accept watch evidence either.
+    expect(evaluate(root, now, undefined, PILOT, selected).decision).toBe("REFUSED");
+
+    // The verified snapshot's target is used: changing the files after verification (consistently
+    // re-forged) cannot redirect the handoff, because nothing is reopened.
+    const snapshot = copyWatch(root, selected, "snapshot");
+    const r = watched(root, snapshot, now, {
+      verify: (dir) => {
+        const v = verifyWatchEvidence(dir);
+        reforgeWatch(dir, {
+          [WATCH_EVIDENCE_FILES.validation]: (doc) => void (doc.result.target.poolId = OTHER_POOL),
+          [WATCH_EVIDENCE_FILES.selection]: (doc) => void (doc.target.poolId = OTHER_POOL),
+        });
+        return v;
+      },
+    });
+    expect(r).toMatchObject({ decision: "ALLOWED", poolId: POOL, mintAddress: MINT });
+    expect(verifyWatchEvidence(abs(snapshot)).selectionConfirmed).toBe(false);
+
+    // A verification without a confirmed target never releases one, whatever else it claims.
+    const v = verifyWatchEvidence(abs(selected));
+    const claims: [string, WatchEvidenceVerification][] = [
+      ["unconfirmed", { ...v, selectionConfirmed: false }],
+      ["no target", { ...v, confirmedTarget: null }],
+      ["not verified", { ...v, verified: false }],
+      ["limited", { ...v, rederivation: { ...v.rederivation, status: "LIMITED_BY_REDACTION" } }],
+      ["incomplete", { ...v, completeness: { sufficientForSelection: false, reasons: ["X"] } }],
+    ];
+    for (const [label, claim] of claims) {
+      const c = watched(root, selected, now, { verify: () => claim });
+      expect(c.decision, label).toBe("REFUSED");
+      expect(c.poolId, label).toBeUndefined();
+    }
+    // A confirmed target with a non-canonical identity or orientation is refused.
+    const target = v.confirmedTarget!;
+    const identities: [string, Loose][] = [
+      ["pool = mint", { ...target, poolId: target.mintAddress }],
+      ["non-canonical pool", { ...target, poolId: "0OIl" }],
+      ["WSOL candidate", { ...target, mintAddress: target.quoteMint }],
+      ["orientation", { ...target, orientation: "WSOL_BASE_CANDIDATE_QUOTE" }],
+    ];
+    for (const [label, t] of identities) {
+      expect(
+        watched(root, selected, now, { verify: () => ({ ...v, confirmedTarget: t }) }).refusals,
+        label,
+      ).toEqual(["TARGET_IDENTITY_INVALID"]);
+    }
+    expect(
+      watched(root, selected, now, {
+        verify: () => ({
+          ...v,
+          confirmedTarget: { ...target, market: { ...target.market, runnerOpenTimeSec: 1.5 } },
+        }),
+      }).refusals,
+    ).toEqual(["START_WINDOW_SOURCE_INVALID"]);
+  });
+
+  it("H-11: pin failures and invalid or existing output directories refuse the watched handoff", async () => {
+    const root = watchRoot();
+    const now = watchAge(300);
+    const { env, validation } = await selectedWatch();
+    const selected = sealRun(root, "selected", { watchResult: env.watchResult, validation });
+    let verifications = 0;
+    const counting = (dir: string) => {
+      verifications++;
+      return verifyWatchEvidence(dir);
+    };
+
+    const pinCases: [string, GitRunner, string][] = [
+      [
+        "unknown commit",
+        fakeGit({ revParse: { status: 1, stdout: "" } }).git,
+        "PINNED_COMMIT_UNKNOWN",
+      ],
+      [
+        "changed",
+        fakeGit({ diffQuiet: { status: 1, stdout: "" } }).git,
+        "CODE_OR_CONFIGURATION_CHANGED",
+      ],
+      ["dirty", fakeGit({ dirty: ["backend"] }).git, "RELEVANT_FILES_DIRTY"],
+      [
+        "runner dependency modified",
+        fakeGit({ changedSinceRunner: ["backend"] }).git,
+        "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend",
+      ],
+    ];
+    for (const [label, git, refusal] of pinCases) {
+      const r = watched(root, selected, now, { git, verify: counting });
+      expect(r.decision, label).toBe("REFUSED");
+      expect(r.refusals, label).toContain(refusal);
+      expect(r.poolId, label).toBeUndefined();
+    }
+    expect(verifications).toBe(0); // the pin is checked before any evidence is read
+
+    expect(
+      watched(root, selected, now, { pilot: "data/research/diagnostics/pilot" }).refusals,
+    ).toEqual(["PILOT_OUTPUT_INVALID"]);
+    expect(
+      watched(root, selected, now, { pilot: "data/research/single-candidate" }).refusals,
+    ).toEqual(["PILOT_OUTPUT_INVALID"]);
+    expect(watched(root, selected, now, { pilot: "../pilot" }).refusals).toEqual([
+      "PILOT_OUTPUT_INVALID",
+    ]);
+    mkdirSync(path.join(root, PILOT), { recursive: true });
+    expect(watched(root, selected, now).refusals).toEqual(["PILOT_OUTPUT_EXISTS"]);
+  });
+
+  it("H-12: the pin allows exactly the six reviewed watch files added since the runner, and nothing else", () => {
+    const added = [
+      "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts",
+      "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test.ts",
+      "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts",
+      "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.test.ts",
+      "backend/src/scripts/fresh-amm-v4-watch-evidence.ts",
+      "backend/src/scripts/fresh-amm-v4-watch-evidence.test.ts",
+    ];
+    expect([...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER]).toEqual([
+      "backend/src/scripts/fresh-amm-v4-precheck.ts",
+      "backend/src/scripts/fresh-amm-v4-precheck.test.ts",
+      "backend/src/scripts/fresh-amm-v4-precheck.test-support.ts",
+      "backend/src/scripts/paper-pilot-handoff.ts",
+      "backend/src/scripts/paper-pilot-handoff.test.ts",
+      ...added,
+    ]);
+    expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
+    const pinWith = (stdout: string) =>
+      checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout } }).git);
+    expect(pinWith(added.map((f) => `A\t${f}`).join("\n"))).toEqual([]);
+    for (const f of added) {
+      expect(pinWith(`M\t${f}`), f).toEqual([`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${f}`]);
+      expect(pinWith(`D\t${f}`), f).toEqual([`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${f}`]);
+    }
+    // A rename (compared without rename detection) is a deletion plus an unexpected addition.
+    const renamed = "backend/src/candidate-scanner/BoundedAmmV4CreationWatchRenamed.ts";
+    expect(pinWith(`D\t${added[0]}\nA\t${renamed}`)).toEqual([
+      `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${added[0]}`,
+      `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${renamed}`,
+    ]);
+    // Unexpected additions next to the reviewed files, and directories, are not allowed.
+    for (const extra of [
+      "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test-support.ts",
+      "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
+      "backend/src/candidate-scanner",
+      "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts/extra.ts",
+    ]) {
+      expect(pinWith(`A\t${extra}`), extra).toEqual([
+        `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${extra}`,
+      ]);
+    }
+    // The runner itself is not repinned: a modified runner file is still refused.
+    expect(pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts")).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ]);
+
+    // Read-only git on this repository: every change to the runner's surface since the reviewed
+    // runner, up to the current commit, is an allowed addition.
+    const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
+    const head = git(["rev-parse", "HEAD"]).stdout.trim();
+    const diff = git([
+      "diff",
+      "--name-status",
+      "--no-renames",
+      REVIEWED_RUNNER_COMMIT,
+      head,
+      "--",
+      ...RUNNER_DEPENDENCY_PATHS,
+    ]);
+    expect(diff.status).toBe(0);
+    for (const line of diff.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
+      const [kind, file] = line.split("\t");
+      expect(kind, line).toBe("A");
+      expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(file);
+    }
   });
 });

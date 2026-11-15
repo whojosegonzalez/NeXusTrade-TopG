@@ -58,6 +58,7 @@ import {
   resolveWatchValidationLimits,
   validateWatchedDiscoveryEvidence,
   type WatchCandidateOutcome,
+  type WatchCandidateTarget,
   type WatchCandidateValidationLimits,
   type WatchCandidateValidationResult,
   type WatchEvidenceContext,
@@ -1108,6 +1109,12 @@ export interface WatchEvidenceVerification {
   readonly verified: boolean;
   /** Only true for a completed run whose sealed evidence re-derives the recorded target exactly. */
   readonly selectionConfirmed: boolean;
+  /**
+   * The recorded target, taken from the same in-memory snapshot that was verified, only when
+   * `selectionConfirmed` is true; otherwise null. Deeply frozen: callers use this value and never
+   * reopen the evidence files.
+   */
+  readonly confirmedTarget: WatchCandidateTarget | null;
 }
 
 /** Recorded outcomes that can come from acquisition events the exchange records alone do not show. */
@@ -1205,6 +1212,7 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
     recordedOutcome: null,
     verified: false,
     selectionConfirmed: false,
+    confirmedTarget: null,
   });
 
   // 1. The directory and the manifest.
@@ -1671,6 +1679,8 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
     },
   });
   const verified = rederivation.status !== "MISMATCH";
+  const selectionConfirmed =
+    verified && completeness.sufficientForSelection && rederivation.status === "REPRODUCED";
   return {
     outDir,
     integrity: { ok: true, problems: [] },
@@ -1680,9 +1690,22 @@ export function verifyWatchEvidence(outDir: string): WatchEvidenceVerification {
     runOutcome,
     recordedOutcome,
     verified,
-    selectionConfirmed:
-      verified && completeness.sufficientForSelection && rederivation.status === "REPRODUCED",
+    selectionConfirmed,
+    // The re-derivation reproduced exactly this snapshot's recorded target (a fresh copy, so no
+    // later change to the files or to the parsed documents can reach it).
+    confirmedTarget:
+      selectionConfirmed && isRecord(result) && isRecord(result.target)
+        ? deepFreeze(structuredClone(result.target) as unknown as WatchCandidateTarget)
+        : null,
   };
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const v of Object.values(value)) deepFreeze(v);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 /** Which sealed inputs credential redaction changed. */

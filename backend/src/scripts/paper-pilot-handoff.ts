@@ -18,6 +18,11 @@
  * 5. Output: the pilot directory is new and inside the single-candidate evidence root.
  *
  * Nothing is substituted: Stage B uses exactly the sealed pool and mint.
+ *
+ * A separate, explicit entry point (`evaluateWatchedPilotHandoff`) accepts sealed watch evidence
+ * instead of a precheck. It never guesses the format: it consumes only `verifyWatchEvidence` and
+ * proceeds only on a confirmed selection, using the target from that verification's own snapshot.
+ * The CLI and the PowerShell wrapper keep using the precheck handoff only.
  */
 
 import path from "node:path";
@@ -34,11 +39,16 @@ import {
   PRECHECK_CORE_FILES,
   PRECHECK_MANIFEST_KIND,
   PRECHECK_MANIFEST_VERSION,
+  PRECHECK_ROOT_SEGMENTS,
   derivePrecheckSelection,
   precheckExchangePath,
   type PrecheckExchange,
   type PrecheckSelection,
 } from "./fresh-amm-v4-precheck.js";
+import {
+  verifyWatchEvidence,
+  type WatchEvidenceVerification,
+} from "./fresh-amm-v4-watch-evidence.js";
 
 /** The runner reviewed for Stage B; it and its dependencies must be unchanged since. */
 export const REVIEWED_RUNNER_COMMIT = "6855efb0e4ab5023e2c556030c42613a0ee86f53" as const;
@@ -76,6 +86,13 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   "backend/src/scripts/fresh-amm-v4-precheck.test-support.ts",
   "backend/src/scripts/paper-pilot-handoff.ts",
   "backend/src/scripts/paper-pilot-handoff.test.ts",
+  // The reviewed watch collector, candidate validator and watch-evidence layer (section 8.38).
+  "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts",
+  "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test.ts",
+  "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.ts",
+  "backend/src/candidate-scanner/AmmV4WatchCandidateValidation.test.ts",
+  "backend/src/scripts/fresh-amm-v4-watch-evidence.ts",
+  "backend/src/scripts/fresh-amm-v4-watch-evidence.test.ts",
 ]);
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
@@ -215,7 +232,87 @@ export interface HandoffResult {
     | undefined;
   readonly waitMs?: number | undefined;
   readonly pilotOutDir?: string | undefined;
+  /** Set only by the watched-evidence handoff. */
+  readonly evidenceSource?: "WATCH_EVIDENCE" | undefined;
   readonly evaluatedAtIso: string;
+}
+
+/** The identity Stage B receives: canonical, distinct, candidate base / WSOL quote. */
+interface HandoffTarget {
+  readonly poolId: string;
+  readonly mintAddress: string;
+  readonly quoteMint: string;
+  readonly orientation: string;
+  readonly market: { readonly runnerOpenTimeSec: number };
+}
+
+function targetIdentityValid(t: HandoffTarget): boolean {
+  return (
+    isCanonicalSolanaBase58(t.poolId) &&
+    isCanonicalSolanaBase58(t.mintAddress) &&
+    t.poolId !== t.mintAddress &&
+    t.mintAddress !== WSOL_MINT &&
+    t.quoteMint === WSOL_MINT &&
+    t.orientation === "CANDIDATE_BASE_WSOL_QUOTE"
+  );
+}
+
+/** The pilot directory must be new and strictly inside the single-candidate evidence root. */
+function checkPilotOutput(
+  projectRoot: string,
+  pilotOutDir: string,
+): { problem: string } | { abs: string } {
+  const abs = path.resolve(projectRoot, pilotOutDir);
+  const root = path.join(projectRoot, ...EVIDENCE_ROOT_SEGMENTS);
+  const rel = path.relative(root, abs);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel))
+    return { problem: "PILOT_OUTPUT_INVALID" };
+  if (existsSync(abs)) return { problem: "PILOT_OUTPUT_EXISTS" };
+  return { abs };
+}
+
+/**
+ * Start window on the runner's own age source (PLANNING ESTIMATE; runtime checks decide). The
+ * clock is read here, after every validation, immediately before deciding.
+ */
+function decideStartWindow(
+  t: HandoffTarget,
+  projectRoot: string,
+  pilotOutAbs: string,
+  clock: () => number,
+  extra: Pick<HandoffResult, "evidenceSource"> = {},
+): HandoffResult {
+  const nowMs = clock();
+  const evaluatedAtIso = new Date(nowMs).toISOString();
+  const openTimeSec = t.market.runnerOpenTimeSec;
+  const ageSecNow = Math.floor(nowMs / 1000) - openTimeSec;
+  const opensAtMs = (openTimeSec + PLANNING_START_WINDOW.minAgeSec) * 1000;
+  const closesAtMs = (openTimeSec + PLANNING_START_WINDOW.maxAgeSec) * 1000;
+  const base = {
+    poolId: t.poolId,
+    mintAddress: t.mintAddress,
+    ageSecNow,
+    ageSource: "DEXSCREENER_PAIR_CREATED_AT",
+    startWindow: {
+      opensAtIso: new Date(opensAtMs).toISOString(),
+      closesAtIso: new Date(closesAtMs).toISOString(),
+      status: PLANNING_START_WINDOW.status,
+    },
+    pilotOutDir: path.relative(projectRoot, pilotOutAbs).replace(/\\/g, "/"),
+    ...extra,
+    evaluatedAtIso,
+  };
+  if (ageSecNow > PLANNING_START_WINDOW.maxAgeSec) {
+    return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_EXPIRED"] };
+  }
+  if (ageSecNow < PLANNING_START_WINDOW.minAgeSec) {
+    const waitMs = opensAtMs - nowMs;
+    if (waitMs > MAX_WAIT_MS) {
+      return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_TOO_FAR_AHEAD"] };
+    }
+    return { ...base, decision: "WAIT", refusals: ["START_WINDOW_NOT_YET_OPEN"], waitMs };
+  }
+  return { ...base, decision: "ALLOWED", refusals: [] };
 }
 
 const LEDGER_FIELDS = [
@@ -361,56 +458,81 @@ export function evaluatePilotHandoff(input: {
     return refuse(["SELECTION_NOT_REPRODUCIBLE_FROM_SEALED_RESPONSES"]);
   }
   const t = sealed.target;
-  if (
-    !isCanonicalSolanaBase58(t.poolId) ||
-    !isCanonicalSolanaBase58(t.mintAddress) ||
-    t.poolId === t.mintAddress ||
-    t.mintAddress === WSOL_MINT ||
-    t.quoteMint !== WSOL_MINT ||
-    t.orientation !== "CANDIDATE_BASE_WSOL_QUOTE"
-  ) {
-    return refuse(["TARGET_IDENTITY_INVALID"]);
+  if (!targetIdentityValid(t)) return refuse(["TARGET_IDENTITY_INVALID"]);
+
+  const output = checkPilotOutput(input.projectRoot, input.pilotOutDir);
+  if ("problem" in output) return refuse([output.problem]);
+
+  return decideStartWindow(t, input.projectRoot, output.abs, input.clock);
+}
+
+/**
+ * Explicit handoff from sealed WATCH evidence (offline; never selected by format detection).
+ *
+ * Proceeds only when `verifyWatchEvidence` reports integrity, sufficient completeness, a
+ * `REPRODUCED` re-derivation and `selectionConfirmed`, and then uses `confirmedTarget` from that
+ * same verification: selection.json is never reopened. Cancellation, run failure, a watch without
+ * capture, missing exchanges, redaction limitations and mismatches all refuse. The code pin,
+ * canonical identity and orientation, output-directory checks and the 240-760 s planning window
+ * on the runner's age source are the same as for the precheck. Returns ALLOWED, WAIT or REFUSED;
+ * it never sleeps, retries or executes anything.
+ */
+export function evaluateWatchedPilotHandoff(input: {
+  readonly projectRoot: string;
+  /** A sealed watch run directory inside the precheck evidence root. */
+  readonly watchEvidenceDir: string;
+  readonly pilotOutDir: string;
+  readonly pinnedCommit: string;
+  /** Read only after verification, immediately before deciding (injected for tests). */
+  readonly clock: () => number;
+  readonly git: GitRunner;
+  /** Test seam only; in use this is always the reviewed `verifyWatchEvidence`. */
+  readonly verify?: (dir: string) => WatchEvidenceVerification;
+}): HandoffResult {
+  const refuse = (refusals: readonly string[]): HandoffResult => ({
+    decision: "REFUSED",
+    refusals,
+    evidenceSource: "WATCH_EVIDENCE",
+    evaluatedAtIso: new Date(input.clock()).toISOString(),
+  });
+  const pin = checkPin(input.pinnedCommit, input.git);
+  if (pin.length > 0) return refuse(pin);
+
+  const evidenceRoot = path.join(input.projectRoot, ...PRECHECK_ROOT_SEGMENTS);
+  const evidenceDir = path.resolve(input.projectRoot, input.watchEvidenceDir);
+  const evidenceRel = path.relative(evidenceRoot, evidenceDir);
+  if (evidenceRel === "" || evidenceRel.startsWith("..") || path.isAbsolute(evidenceRel)) {
+    return refuse(["WATCH_EVIDENCE_LOCATION_INVALID"]);
+  }
+  if (!existsSync(evidenceDir)) return refuse(["WATCH_EVIDENCE_MISSING"]);
+
+  const v = (input.verify ?? verifyWatchEvidence)(evidenceDir);
+  if (!v.integrity.ok) return refuse(v.integrity.problems.map((p) => `INVALID_EVIDENCE:${p}`));
+  const notConfirmed: string[] = [];
+  if (!v.completeness.sufficientForSelection) {
+    notConfirmed.push(...v.completeness.reasons.map((r) => `WATCH_EVIDENCE_INCOMPLETE:${r}`));
+  }
+  if (v.rederivation.status !== "REPRODUCED") {
+    notConfirmed.push(`WATCH_SELECTION_${v.rederivation.status}`);
+  }
+  if (!v.verified || !v.selectionConfirmed || v.confirmedTarget === null) {
+    notConfirmed.push("WATCH_SELECTION_NOT_CONFIRMED");
+  }
+  if (notConfirmed.length > 0 || v.confirmedTarget === null) return refuse(notConfirmed);
+
+  // The target of the verified snapshot; nothing is reread from disk.
+  const t = v.confirmedTarget;
+  if (!targetIdentityValid(t)) return refuse(["TARGET_IDENTITY_INVALID"]);
+  if (!Number.isSafeInteger(t.market.runnerOpenTimeSec) || t.market.runnerOpenTimeSec <= 0) {
+    return refuse(["START_WINDOW_SOURCE_INVALID"]);
   }
 
-  const pilotOutDir = path.resolve(input.projectRoot, input.pilotOutDir);
-  const root = path.join(input.projectRoot, ...EVIDENCE_ROOT_SEGMENTS);
-  const rel = path.relative(root, pilotOutDir);
-  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel))
-    return refuse(["PILOT_OUTPUT_INVALID"]);
-  if (existsSync(pilotOutDir)) return refuse(["PILOT_OUTPUT_EXISTS"]);
+  const output = checkPilotOutput(input.projectRoot, input.pilotOutDir);
+  if ("problem" in output) return refuse([output.problem]);
 
-  // Start window on the runner's own age source (PLANNING ESTIMATE; runtime checks decide).
-  // The clock is read here, after every validation, immediately before deciding.
-  const nowMs = input.clock();
-  const evaluatedAtIso = new Date(nowMs).toISOString();
-  const openTimeSec = t.market.runnerOpenTimeSec;
-  const ageSecNow = Math.floor(nowMs / 1000) - openTimeSec;
-  const opensAtMs = (openTimeSec + PLANNING_START_WINDOW.minAgeSec) * 1000;
-  const closesAtMs = (openTimeSec + PLANNING_START_WINDOW.maxAgeSec) * 1000;
-  const base = {
-    poolId: t.poolId,
-    mintAddress: t.mintAddress,
-    ageSecNow,
-    ageSource: "DEXSCREENER_PAIR_CREATED_AT",
-    startWindow: {
-      opensAtIso: new Date(opensAtMs).toISOString(),
-      closesAtIso: new Date(closesAtMs).toISOString(),
-      status: PLANNING_START_WINDOW.status,
-    },
-    pilotOutDir: path.relative(input.projectRoot, pilotOutDir).replace(/\\/g, "/"),
-    evaluatedAtIso,
-  };
-  if (ageSecNow > PLANNING_START_WINDOW.maxAgeSec) {
-    return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_EXPIRED"] };
-  }
-  if (ageSecNow < PLANNING_START_WINDOW.minAgeSec) {
-    const waitMs = opensAtMs - nowMs;
-    if (waitMs > MAX_WAIT_MS) {
-      return { ...base, decision: "REFUSED", refusals: ["START_WINDOW_TOO_FAR_AHEAD"] };
-    }
-    return { ...base, decision: "WAIT", refusals: ["START_WINDOW_NOT_YET_OPEN"], waitMs };
-  }
-  return { ...base, decision: "ALLOWED", refusals: [] };
+  return decideStartWindow(t, input.projectRoot, output.abs, input.clock, {
+    evidenceSource: "WATCH_EVIDENCE",
+  });
 }
 
 function main(argv: readonly string[]): number {
