@@ -5172,7 +5172,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The single operator capability probe against the alternative Helius WebSocket endpoint (`solana-subscription-02`, 2026-11-16) completed with `SUBSCRIPTION_ACKNOWLEDGED`, verified manifest hash `56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`, subscription ack at +526 ms, unsubscribe ack at +658 ms, settled cleanup at +790 ms, 2 outgoing frames, 2 incoming messages / 80 bytes payload, zero notifications, and clean exit 0. Offline verification confirms integrity and capability; this establishes subscription and unsubscription access, not notification delivery or sustained reliability (§8.38.14).
 >
-> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788` at +540 ms from watch start, +134 ms from subscribe dispatch), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, no validation/selection (`validation.json`: `recorded: false`, `result: null`), cleanup settled at `1794830320187` (+133 ms), report sealed at `1794830320194` (+140 ms), no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (native watch verifier exit code 3, distinct from wrapper exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery; time-of-day variance (11:43–11:58 UTC) remains an untested hypothesis (§8.38.15). A one-request retrospective metadata checker bound to that interval is implemented offline and not run (§8.38.16; it cannot establish provider fault), and the CPMM reassessment remains preliminary and quarantined, with unversioned upstream references (§8.38.17). No further live execution is authorized.
+> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788` at +540 ms from watch start, +134 ms from subscribe dispatch), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, no validation/selection (`validation.json`: `recorded: false`, `result: null`), cleanup settled at `1794830320187` (+133 ms), report sealed at `1794830320194` (+140 ms), no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (native watch verifier exit code 3, distinct from wrapper exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery; time-of-day variance (11:43–11:58 UTC) remains an untested hypothesis (§8.38.15). The one-request retrospective metadata check bound to that interval ran once (`amm-v4-watch-02-01`): it sealed `MALFORMED_RESPONSE` because of an unexpected `transactionIndex` field and still verifies unchanged. A separate read-only reanalysis under record schema version 2 finds the returned page entirely older than the interval (§8.38.16, §8.38.19; it cannot establish provider fault), and the CPMM reassessment remains preliminary and quarantined, with unversioned upstream references (§8.38.17). No further live execution is authorized.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -6305,7 +6305,7 @@ Following the successful subscription capability check in `solana-subscription-0
 **Analytical Significance**:
 This observation establishes that over a contiguous 15-minute window, zero transaction notifications mentioning the pinned fee destination were received on this Helius WebSocket session. In accordance with strict empirical truthing, this single observation does **not** infer market-wide AMM v4 inactivity, nor does it prove that provider notification delivery was defective. Time-of-day activity variance (the watch ran between 11:43 and 11:58 UTC) remains an untested hypothesis; no claim of a slow overall market or optimal trading hours is made.
 
-#### 8.38.16 Retrospective Metadata Check for Watch 02 (Implemented Offline; Request Not Run)
+#### 8.38.16 Retrospective Metadata Check for Watch 02 (Implemented Offline; Run Once, See §8.38.19)
 
 **Correction (2026-11-16)**: an earlier version of this section proposed an optional `getTransaction` follow-up, and claimed that a decoded in-interval `initialize2` would demonstrate "an upstream log-delivery gap or subscription filtering omission on the provider". Both are withdrawn:
 
@@ -6486,7 +6486,7 @@ Mutation checks for the corrections: all 11 caught.
 
 - **Results**: the affected suites pass under external 60 s limits: retrospective 18, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (88); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 158 in all. On the uncorrected source, R-14 to R-17 fail, reproducing each gap, including both late dispatch and late successful completion; R-04 fails only on the renamed coverage label. The backend typecheck, ESLint and Prettier pass. The pin tests pass, including H-12 for the two new files; the pin policy, the baseline and the exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`) and the precheck 01, watch 01 and watch 02 manifests are unchanged, and no retrospective evidence directory exists.
 
-**Not started**: the request itself (independent review and a separate single-run approval are required).
+**Run**: the single approved request ran once on 2026-11-16 (`amm-v4-watch-02-01`); its capture, record schema version 2, offline reanalysis and the shutdown change are recorded in §8.38.19. No rerun is authorised.
 
 #### 8.38.17 Preliminary CPMM Support Reassessment and Staged Offline Implementation Proposal
 
@@ -6540,3 +6540,104 @@ Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium
 - Sealed watch 02 manifest added and verified: `data/research/prechecks/fresh-amm-v4-watch-02/evidence-manifest.json` (`9DA4BE7556CDCBD4DB653F0483C8C28A425B5D1AFF49F8CAC06E178DDB827C99`).
 - Pin check: `checkPin` in `backend/src/scripts/paper-pilot-handoff.ts` with tightened parser accepts reviewed endpoint modifications (`PIN_OK`, exit 0).
 - Test suite results: 140/140 passed across Group 1 (70/70, including S-18 18/18) and Group 2 (70/70). Backend typecheck and ESLint clean.
+
+#### 8.38.19 Retrospective Capture `amm-v4-watch-02-01`: Schema Version 2, Historical Verification, Offline Reanalysis and Shutdown
+
+**Capture (operator run, as reported and verified offline)**: `data/research/retrospective-checks/amm-v4-watch-02-01`, manifest SHA-256 `71f05220233c973d2bdbd95b6e7d3e40b0712266ccd713097b76e452cfeabeeb`.
+
+- **Request**: one `getSignaturesForAddress` request, dispatched at `1794861711750` (2026-11-16T20:41:51.750Z) and completed 160 ms later with HTTP 200. No retry, no second request.
+- **Body**: `COMPLETE`, 4,675 bytes observed and retained, unredacted (response SHA-256 `41cf772fa43d38ded536e8f88e0a7b8eb380e769762a3ef17a8babdc2f214734`).
+- **Sealed outcome**: `MALFORMED_RESPONSE` (`RECORD_SHAPE_INVALID:0`), page not obtained.
+- **Process exit**: after sealing, Windows Node v24.17.0 aborted with a `UV_HANDLE_CLOSING` assertion, so the CLI's exit code was lost. The capture is intact.
+
+**Cause of the rejection**: every one of the 20 records carries the six expected fields plus `transactionIndex` (non-negative integers from 7 to 1,095). The version 1 record schema allowed exactly the six fields, so the first record was rejected. The rejection was correct under that policy.
+
+**1. Schema compatibility (record schema version 2)**:
+
+- New captures are sealed as record version 2 (`retrospective.json` and manifest `version: 2`).
+- Version 2 keeps the six required fields and allows only the optional `transactionIndex`. When present, it must be a non-negative safe integer; `null`, negative, fractional, string, boolean, object, array, `NaN` and unsafe values give `TRANSACTION_INDEX_INVALID:<i>`.
+- A missing required field or any other unknown field is still `RECORD_SHAPE_INVALID:<i>`.
+- Version 2 page records report `transactionIndex` (or `null` when absent). Version 1 page records keep their original shape.
+- Request limits, the plan, the pin policy and the configuration are unchanged.
+
+**2. Historical verification (explicit versioned interpretation)**:
+
+- Verification replays each capture with the record schema of the version it was sealed under. The record and manifest versions must agree and be supported (1 or 2).
+- A version 1 capture is never re-judged by version 2 rules. Relabelling a version 1 capture as version 2, or a version 2 capture as version 1, fails replay.
+- `amm-v4-watch-02-01` was not modified. It still verifies: integrity `OK`, record version 1, outcome `MALFORMED_RESPONSE`, page not obtained, offline `--verify` exit 3.
+
+**3. Offline reanalysis (separate, read-only)**:
+
+- `--reanalyze <dir> --source-manifest <sha256>` (and `reanalyzeRetrospectiveCapture`) reads one earlier-version capture and interprets its stored bytes under record schema version 2. It writes, seals and sends nothing.
+- It requires:
+  - the source to verify intact under its own version;
+  - the given manifest digest to match;
+  - a timely, complete, unredacted HTTP 200 body with no cancellation.
+- Its report (kind `PAPER_AMM_V4_WATCH_RETROSPECTIVE_REANALYSIS`) states:
+  - the source digest, record version, response digest, and the original acquisition outcome and verification;
+  - `acquisitionOutcomeChanged: false` and `pageObtainedByAcquisition: false`;
+  - the fixed limitations plus one more: this is an offline reinterpretation, not an acquisition.
+- Exit codes: 0 when the reanalysis yields a valid page, 3 when it does not or the source is not eligible, 4 for an integrity or digest mismatch, 1 for invalid arguments.
+
+**Reanalysis of `amm-v4-watch-02-01`** (tied to manifest `71f05220…eabeeb`; the sealed outcome remains `MALFORMED_RESPONSE`):
+
+| Item                        | Value                                                                                                     |
+| --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Result                      | A valid page under record schema version 2 (all 20 `transactionIndex` values valid)                       |
+| Coverage                    | `PAGE_OLDER_THAN_INTERVAL`                                                                                |
+| Observation                 | `NO_INTERVAL_RECORDS_IN_PAGE` (no reasons: no null times, no boundary records, no order anomaly)          |
+| Records                     | 20 (a full page), all `finalized`, all before the interval; 0 boundary, 0 inside, 0 after, 0 unknown time |
+| Failed-transaction metadata | 2 records, both before the interval                                                                       |
+| Newest block time           | `1794551672` (2026-11-13T06:34:32Z), 277,748 s (3.21 days) before the interval start                      |
+| Oldest block time           | `1792474081` (2026-10-20T05:28:01Z)                                                                       |
+| Slots                       | `468827826` to `459114160`                                                                                |
+
+**Independent check**: a read-only test reads the sealed JSON without the analyser. It confirms the payload digest, 20 records with exactly the seven fields, non-negative integer `transactionIndex` values, newest `1794551672`, oldest `1792474081`, all before `1794829420`, and two non-null `err` values. This matches the independent projection supplied with the request.
+
+**What it does and does not show**:
+
+- It is an observation about this one page, read about nine hours after the watch. The 20 newest signatures returned for the fee destination at `confirmed` commitment all predate the watch interval by at least 3.2 days, so this page shows no address activity during the interval.
+- This is consistent with watch 02 receiving zero notifications. It does not prove complete history, the absence of AMM v4 creations by other routes, faithful streaming or any provider behaviour.
+- Block time is not notification arrival time, and the two failed records are address activity only.
+- It is not an acquisition result: `amm-v4-watch-02-01` did not obtain a page, and no rerun is authorised.
+
+**4. CLI shutdown**:
+
+- **Finding**: the entry point called `process.exit()` as soon as the result was known, on both the success and the error path. The session had stopped and cleared its timers, but the HTTP connection used for the single request may still have been closing. Exiting immediately while a libuv handle is closing is a known way to hit the Windows `UV_HANDLE_CLOSING` assertion. This is the likely cause, but it is not confirmed.
+- **Change**: the entry point now sets `process.exitCode` and lets the event loop drain.
+  - An unref'd backstop (5,000 ms) forces exit with the same code and a fixed notice, `[AMM_V4_WATCH_RETROSPECTIVE_SHUTDOWN_FORCED]`, only if something keeps the process alive beyond that bound. It never delays a process that drains on its own, and it is not a sleep.
+  - Exit codes and their meanings are unchanged; no other CLI changed.
+- **Child-process checks** (synthetic project root, no configuration or credentials in the environment, each child bounded at 20 s):
+  - help, invalid arguments, a dry run (nothing written), verify (missing, version 2 page, version 1 capture) and reanalysis (match and digest mismatch) exit on their own with the expected codes 0, 1, 0, 4, 0, 3, 0 and 4, without the backstop;
+  - a synthetic driver shows natural settlement without the notice, and a lingering handle force-exited after a short synthetic bound with the same code.
+- **Reproduction limits**: the native abort was not reproduced. It needs a real network connection, which is not authorised offline, and the child-process checks exercise only non-network paths. Whether the change removes the abort on a live run is unverified. A Node runtime upgrade can be proposed separately; none was made.
+
+**Tests** (`amm-v4-watch-retrospective.test.ts`, 24 tests):
+
+| Test  | Shows                                                                                                                                                                                                                                                                                                                   |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R-18  | `transactionIndex` absent, valid (0, 1, 1,095, max safe) and invalid (nine values); required and unknown fields still enforced; version 1 still rejects the field; a live capture with it is sealed as version 2 and obtained                                                                                           |
+| R-19  | A synthetic version 1 capture keeps `MALFORMED_RESPONSE`; a version 1 record claiming the page, version relabelling either way, record/manifest version disagreement and an unsupported version all fail                                                                                                                |
+| R-20  | Reanalysis: a separate read-only report tied to the manifest digest, with the original outcome and verification kept apart; digest mismatch, invalid digest, tampered source, current-version source and an ineligible (HTTP 503) source are refused; the CLI path's exit codes and argument conflicts; nothing written |
+| R-20b | The real capture (read-only): verification unchanged; reanalysis values above; independent projection; files unchanged                                                                                                                                                                                                  |
+| R-21  | The CLI in child processes with a synthetic root: graceful exit with the expected codes                                                                                                                                                                                                                                 |
+| R-22  | Settlement without and with a lingering handle; the entry point has no immediate `process.exit`                                                                                                                                                                                                                         |
+
+- **Mutation checks**: all 12 new mutants are caught. The earlier 11 correction mutants are all caught again. Of the original 15, 14 are caught again; Y12 still cannot be caught, because the 10 s request timeout enforces the same bound, and Y12c is caught. Every source was restored byte-identical, and each run had a 60 s limit.
+
+| Mutant | Change                                                 | Caught by                                                                                           |
+| ------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| W01    | `transactionIndex` not validated                       | R-18                                                                                                |
+| W02    | Version 2 allows no optional field                     | R-18, R-19, R-20, R-20b, R-21                                                                       |
+| W03    | `transactionIndex` not recorded                        | R-18                                                                                                |
+| W04    | Replay uses the current schema, not the sealed version | R-19, R-20, R-20b, R-21                                                                             |
+| W05    | Record and manifest versions need not agree            | R-19                                                                                                |
+| W06    | Reanalysis ignores the source manifest digest          | R-20, R-21                                                                                          |
+| W07    | Reanalysis accepts a current-version source            | R-20                                                                                                |
+| W08    | Reanalysis accepts any HTTP status                     | R-20                                                                                                |
+| W09    | Reanalysis under the version 1 schema                  | R-20, R-20b, R-21                                                                                   |
+| W10    | Entry point exits immediately                          | R-22 (a source check only: without a socket, an immediate exit behaves the same in a child process) |
+| W11    | Shutdown backstop keeps the process alive              | R-21, R-22                                                                                          |
+| W12    | No shutdown backstop                                   | R-22                                                                                                |
+
+- **Results**: the affected suites pass under external 60 s limits: retrospective 24, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (94); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 164 in all. The backend typecheck, ESLint and Prettier pass. No pin change was needed: the pin policy, baseline and exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`), the precheck 01, watch 01 and watch 02 manifests, the two capability-check manifests, and all three files of `amm-v4-watch-02-01` (manifest `71f05220…eabeeb`) are unchanged. No credential was read, and no request, socket, rerun, watch or pilot was started.

@@ -7,7 +7,8 @@
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   cpSync,
   existsSync,
@@ -25,11 +26,15 @@ import {
   RETROSPECTIVE_FILES,
   RETROSPECTIVE_LIMITATIONS,
   RETROSPECTIVE_LIMITS,
+  RETROSPECTIVE_REANALYSIS_LIMITATIONS,
   RETROSPECTIVE_RPC_PARAMS,
+  RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE,
+  RETROSPECTIVE_SHUTDOWN_GRACE_MS,
   RETROSPECTIVE_USAGE,
   analyzeSignaturesResponse,
   bindWatchRun,
   printableRetrospectiveError,
+  reanalyzeRetrospectiveCapture,
   runRetrospectiveCheck,
   timeClassOf,
   verifyRetrospectiveEvidence,
@@ -65,6 +70,7 @@ interface Rec {
   err?: unknown;
   memo?: string | null;
   confirmationStatus?: string;
+  transactionIndex?: unknown;
 }
 const rec = (n: number, slot: number, blockTime: number | null, extra: Partial<Rec> = {}) => ({
   signature: sig(n),
@@ -227,6 +233,72 @@ function reforge(
   entry.bytes = Buffer.byteLength(text);
   writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
   return verifyRetrospectiveEvidence(dir);
+}
+
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const SCRIPT = fileURLToPath(new URL("./amm-v4-watch-retrospective.ts", import.meta.url));
+const TSX_LOADER = pathToFileURL(
+  fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url)),
+).href;
+/** Child processes get no configuration or credentials: only what Windows needs to start Node. */
+const CHILD_ENV = Object.fromEntries(
+  ["PATH", "Path", "SystemRoot", "TEMP", "TMP"]
+    .filter((k) => process.env[k] !== undefined)
+    .map((k) => [k, process.env[k] as string]),
+);
+const sha = (b: string | Buffer) => createHash("sha256").update(b).digest("hex");
+const manifestDigest = (dir: string) =>
+  sha(readFileSync(path.join(dir, RETROSPECTIVE_FILES.manifest)));
+const dirDigest = (dir: string) =>
+  sha(
+    readdirSync(dir)
+      .sort()
+      .map((f) => `${f}:${sha(readFileSync(path.join(dir, f)))}`)
+      .join("|"),
+  );
+
+/**
+ * Copies the harness capture and rewrites it as the original strict (version 1) policy would have
+ * sealed it: a page with fields outside the version 1 schema becomes MALFORMED_RESPONSE. Then an
+ * optional edit; the record and manifest are re-hashed consistently.
+ */
+function asVersion1(
+  h: Harness,
+  name: string,
+  edit?: (r: Loose) => void,
+  manifestVersion: number = 1,
+) {
+  const dir = path.join(h.projectRoot, "data/research/retrospective-checks", name);
+  cpSync(h.abs(RUN), dir, { recursive: true });
+  const file = path.join(dir, RETROSPECTIVE_FILES.retrospective);
+  const r = JSON.parse(readFileSync(file, "utf8")) as Loose;
+  r.version = 1;
+  if (r.outcome === "PAGE_RECEIVED") {
+    const a = analyzeSignaturesResponse(
+      Buffer.from(r.response.payload as string, "utf8"),
+      r.request.jsonRpcId as number,
+      1,
+    );
+    if (a.kind === "MALFORMED") {
+      r.outcome = "MALFORMED_RESPONSE";
+      r.detail = a.reason;
+      r.page = null;
+      r.pageObtained = false;
+    }
+  }
+  edit?.(r);
+  const text = `${JSON.stringify(r, null, 2)}\n`;
+  writeFileSync(file, text);
+  const manifestPath = path.join(dir, RETROSPECTIVE_FILES.manifest);
+  const m = JSON.parse(readFileSync(manifestPath, "utf8")) as Loose;
+  m.version = manifestVersion;
+  m.outcome = r.outcome;
+  m.pageObtained = r.pageObtained;
+  const entry = m.files.find((x: Loose) => x.path === RETROSPECTIVE_FILES.retrospective);
+  entry.sha256 = sha(text);
+  entry.bytes = Buffer.byteLength(text);
+  writeFileSync(manifestPath, `${JSON.stringify(m, null, 2)}\n`);
+  return dir;
 }
 
 const analyze = (records: unknown[]) => {
@@ -1138,4 +1210,391 @@ describe("AMM v4 watch 02 retrospective metadata check (offline)", () => {
       observationReasons: ["NULL_BLOCK_TIME"],
     });
   });
+
+  it("R-18: record schema version 2 accepts an optional non-negative transactionIndex, nothing else", async () => {
+    const one = (extra: Partial<Rec>, schema?: 1 | 2) =>
+      analyzeSignaturesResponse(Buffer.from(page([rec(1, 10, START_SEC + 1, extra)])), 1, schema);
+    // Absent: still valid; reported as null in a version 2 record.
+    const absent = one({});
+    expect(absent.kind).toBe("PAGE");
+    if (absent.kind === "PAGE") expect(absent.page.records[0]?.transactionIndex).toBeNull();
+    // Valid values.
+    for (const v of [0, 1, 1095, Number.MAX_SAFE_INTEGER]) {
+      const a = one({ transactionIndex: v });
+      expect(a.kind, String(v)).toBe("PAGE");
+      if (a.kind === "PAGE") expect(a.page.records[0]?.transactionIndex).toBe(v);
+    }
+    // Invalid values.
+    for (const v of [-1, 1.5, "7", null, true, {}, [], Number.MAX_SAFE_INTEGER + 1, NaN]) {
+      expect(one({ transactionIndex: v }), JSON.stringify(v)).toEqual({
+        kind: "MALFORMED",
+        reason: "TRANSACTION_INDEX_INVALID:0",
+      });
+    }
+    // Required fields and unrelated unknown fields are still enforced.
+    expect(
+      analyzeSignaturesResponse(
+        Buffer.from(page([{ ...withoutMemo(rec(1, 10, START_SEC + 1)), transactionIndex: 3 }])),
+        1,
+      ),
+    ).toEqual({ kind: "MALFORMED", reason: "RECORD_SHAPE_INVALID:0" });
+    expect(one({ transactionIndex: 3, slotIndex: 3 } as Partial<Rec>)).toEqual({
+      kind: "MALFORMED",
+      reason: "RECORD_SHAPE_INVALID:0",
+    });
+    // Version 1 (the original strict policy) still rejects the field, and keeps its record shape.
+    expect(one({ transactionIndex: 3 }, 1)).toEqual({
+      kind: "MALFORMED",
+      reason: "RECORD_SHAPE_INVALID:0",
+    });
+    const v1 = one({}, 1);
+    if (v1.kind === "PAGE") expect("transactionIndex" in (v1.page.records[0] ?? {})).toBe(false);
+    // A live capture with the field is sealed as version 2, verified and obtained.
+    const records = SPANNING.map((r, i) => ({ ...r, transactionIndex: 10 + i }));
+    const h = harness({ fetch: { body: page(records) } });
+    const r = await live(h);
+    expect(r).toMatchObject({
+      exitCode: RETROSPECTIVE_EXIT_CODES.OK,
+      acquisition: { outcome: "PAGE_RECEIVED" },
+      verification: { integrity: { ok: true }, pageObtained: true, recordVersion: 2 },
+    });
+    expect(recordJson(h)).toMatchObject({
+      version: 2,
+      page: { records: [{ transactionIndex: 10 }, {}, {}, { transactionIndex: 13 }] },
+    });
+    const bad = harness({
+      fetch: { body: page([rec(1, 10, START_SEC + 1, { transactionIndex: -1 })]) },
+    });
+    expect((await live(bad)).acquisition).toMatchObject({
+      outcome: "MALFORMED_RESPONSE",
+      detail: "TRANSACTION_INDEX_INVALID:0",
+    });
+  });
+
+  it("R-19: a version 1 capture is replayed under the version 1 policy; versions cannot be swapped", async () => {
+    const records = SPANNING.map((r, i) => ({ ...r, transactionIndex: 10 + i }));
+    const h = harness({ fetch: { body: page(records) } });
+    await live(h);
+    // A capture sealed by the original strict policy: MALFORMED_RESPONSE, still intact.
+    const v1 = asVersion1(h, "v1-capture");
+    expect(verifyRetrospectiveEvidence(v1)).toMatchObject({
+      integrity: { ok: true },
+      outcome: "MALFORMED_RESPONSE",
+      pageObtained: false,
+      recordVersion: 1,
+    });
+    expect(
+      JSON.parse(readFileSync(path.join(v1, RETROSPECTIVE_FILES.retrospective), "utf8")),
+    ).toMatchObject({
+      version: 1,
+      outcome: "MALFORMED_RESPONSE",
+      detail: "RECORD_SHAPE_INVALID:0",
+    });
+    // A version 1 record claiming the page fails replay under version 1.
+    const claimed = asVersion1(h, "v1-claims-page", (r) => {
+      r.outcome = "PAGE_RECEIVED";
+      r.detail = null;
+      r.pageObtained = true;
+    });
+    expect(verifyRetrospectiveEvidence(claimed)).toMatchObject({
+      integrity: { ok: false, problems: expect.arrayContaining(["OUTCOME_NOT_REPRODUCED"]) },
+      pageObtained: false,
+    });
+    // Relabelling the version 1 capture as version 2 (its outcome kept) fails replay under version 2.
+    const relabelled = asVersion1(h, "v1-as-v2", (r) => void (r.version = 2), 2);
+    expect(verifyRetrospectiveEvidence(relabelled).integrity.problems).toContain(
+      "OUTCOME_NOT_REPRODUCED",
+    );
+    // Relabelling a version 2 page capture as version 1 fails replay under version 1.
+    const down = reforge(h, "v2-as-v1", (r) => void (r.version = 1));
+    expect(down.integrity.ok).toBe(false);
+    // Record and manifest versions must agree, and must be supported.
+    expect(
+      verifyRetrospectiveEvidence(asVersion1(h, "v1-manifest-v2", undefined, 2)).integrity.problems,
+    ).toContain("RECORD_KIND_INVALID");
+    expect(
+      verifyRetrospectiveEvidence(asVersion1(h, "v3", (r) => void (r.version = 3), 3)).integrity
+        .problems,
+    ).toContain("MANIFEST_INVALID");
+  });
+
+  it("R-20: offline reanalysis is separate, read-only and tied to the source manifest digest", async () => {
+    const records = SPANNING.map((r, i) => ({ ...r, transactionIndex: 10 + i }));
+    const h = harness({ fetch: { body: page(records) } });
+    await live(h);
+    const v1 = asVersion1(h, "v1-source");
+    const digest = manifestDigest(v1);
+    const before = dirDigest(v1);
+    const re = reanalyzeRetrospectiveCapture(v1, digest);
+    expect(re).toMatchObject({
+      ok: true,
+      sourceIntact: true,
+      report: {
+        kind: "PAPER_AMM_V4_WATCH_RETROSPECTIVE_REANALYSIS",
+        source: {
+          manifestSha256: digest,
+          recordVersion: 1,
+          acquisition: {
+            outcome: "MALFORMED_RESPONSE",
+            detail: "RECORD_SHAPE_INVALID:0",
+            pageObtained: false,
+          },
+          verification: {
+            integrity: "OK",
+            recordSchemaVersion: 1,
+            outcome: "MALFORMED_RESPONSE",
+            pageObtained: false,
+          },
+        },
+        interpretation: { recordSchemaVersion: 2, optionalRecordFields: ["transactionIndex"] },
+        result: {
+          kind: "PAGE",
+          page: { coverage: "PAGE_SPANS_INTERVAL", observation: "INTERVAL_RECORDS_IN_PAGE" },
+        },
+        acquisitionOutcomeChanged: false,
+        pageObtainedByAcquisition: false,
+      },
+    });
+    expect(re.report?.limitations).toEqual(RETROSPECTIVE_REANALYSIS_LIMITATIONS);
+    // The source is untouched, and still verifies with its original outcome.
+    expect(dirDigest(v1)).toBe(before);
+    expect(verifyRetrospectiveEvidence(v1)).toMatchObject({ outcome: "MALFORMED_RESPONSE" });
+    // Source problems.
+    expect(reanalyzeRetrospectiveCapture(v1, "0".repeat(64))).toMatchObject({
+      ok: false,
+      sourceIntact: false,
+      problems: ["SOURCE_MANIFEST_MISMATCH"],
+    });
+    expect(reanalyzeRetrospectiveCapture(v1, "XYZ").problems).toEqual([
+      "SOURCE_MANIFEST_DIGEST_INVALID",
+    ]);
+    const tampered = asVersion1(h, "v1-tampered");
+    writeFileSync(path.join(tampered, RETROSPECTIVE_FILES.plan), "{}\n");
+    expect(reanalyzeRetrospectiveCapture(tampered, manifestDigest(tampered))).toMatchObject({
+      ok: false,
+      sourceIntact: false,
+      problems: expect.arrayContaining(["SOURCE_INTEGRITY_FAILED"]),
+    });
+    expect(reanalyzeRetrospectiveCapture(h.abs(RUN), manifestDigest(h.abs(RUN)))).toMatchObject({
+      ok: false,
+      sourceIntact: true,
+      problems: ["SOURCE_ALREADY_CURRENT_VERSION"],
+    });
+    const http = harness({ fetch: { status: 503, body: "busy" } });
+    await live(http);
+    const ineligible = asVersion1(http, "v1-http-503");
+    expect(verifyRetrospectiveEvidence(ineligible).outcome).toBe("HTTP_ERROR");
+    expect(reanalyzeRetrospectiveCapture(ineligible, manifestDigest(ineligible))).toMatchObject({
+      ok: false,
+      sourceIntact: true,
+      problems: ["SOURCE_RESPONSE_NOT_ELIGIBLE"],
+    });
+    // The CLI path: read-only, exit codes kept apart from acquisition.
+    const rel = "data/research/retrospective-checks/v1-source";
+    const ok = await h.run(["--reanalyze", rel, "--source-manifest", digest]);
+    expect(ok).toMatchObject({ mode: "REANALYZE", exitCode: RETROSPECTIVE_EXIT_CODES.OK });
+    expect(h.lines.some((l) => l.includes("sealed outcome MALFORMED_RESPONSE (unchanged)"))).toBe(
+      true,
+    );
+    expect((await h.run(["--reanalyze", rel, "--source-manifest", "0".repeat(64)])).exitCode).toBe(
+      RETROSPECTIVE_EXIT_CODES.INTEGRITY_FAILED,
+    );
+    expect(
+      (
+        await h.run([
+          "--reanalyze",
+          "data/research/retrospective-checks/retro-01",
+          "--source-manifest",
+          manifestDigest(h.abs(RUN)),
+        ])
+      ).exitCode,
+    ).toBe(RETROSPECTIVE_EXIT_CODES.NO_PAGE);
+    for (const args of [
+      ["--reanalyze", rel],
+      ["--reanalyze", rel, "--source-manifest", "ABC"],
+      ["--source-manifest", digest],
+      ["--reanalyze", rel, "--source-manifest", digest, "--live"],
+      ["--reanalyze", rel, "--source-manifest", digest, "--verify", rel],
+      ["--reanalyze", "elsewhere/v1-source", "--source-manifest", digest],
+    ]) {
+      await expect(h.run(args), args.join(" ")).rejects.toThrow("[CLI_INVALID_ARG]");
+    }
+    expect(h.calls).toHaveLength(1);
+    expect(h.loads()).toBe(1);
+    expect(dirDigest(v1)).toBe(before);
+  });
+
+  const REAL_CAPTURE = path.join(
+    REPO_ROOT,
+    "data",
+    "research",
+    "retrospective-checks",
+    "amm-v4-watch-02-01",
+  );
+  const REAL_CAPTURE_MANIFEST = "71f05220233c973d2bdbd95b6e7d3e40b0712266ccd713097b76e452cfeabeeb";
+  it.skipIf(!existsSync(REAL_CAPTURE))(
+    "R-20b: the sealed capture amm-v4-watch-02-01 keeps its outcome; its reanalysis is independently checked (read-only)",
+    () => {
+      const before = dirDigest(REAL_CAPTURE);
+      expect(verifyRetrospectiveEvidence(REAL_CAPTURE)).toEqual({
+        integrity: { ok: true, problems: [] },
+        outcome: "MALFORMED_RESPONSE",
+        pageObtained: false,
+        observation: null,
+        manifestSha256: REAL_CAPTURE_MANIFEST,
+        recordVersion: 1,
+      });
+      const re = reanalyzeRetrospectiveCapture(REAL_CAPTURE, REAL_CAPTURE_MANIFEST);
+      expect(re).toMatchObject({
+        ok: true,
+        report: {
+          source: {
+            manifestSha256: REAL_CAPTURE_MANIFEST,
+            recordVersion: 1,
+            responseBytes: 4675,
+            acquisition: { outcome: "MALFORMED_RESPONSE", detail: "RECORD_SHAPE_INVALID:0" },
+          },
+          result: {
+            kind: "PAGE",
+            page: {
+              coverage: "PAGE_OLDER_THAN_INTERVAL",
+              observation: "NO_INTERVAL_RECORDS_IN_PAGE",
+              observationReasons: [],
+              fullPage: true,
+              newestKnownBlockTime: 1_794_551_672,
+              oldestKnownBlockTime: 1_792_474_081,
+              counts: {
+                returned: 20,
+                beforeInterval: 20,
+                boundaryStart: 0,
+                insideInterval: 0,
+                boundaryEnd: 0,
+                afterInterval: 0,
+                unknownTime: 0,
+                failedTotal: 2,
+                failedInsideOrBoundary: 0,
+              },
+            },
+          },
+          acquisitionOutcomeChanged: false,
+        },
+      });
+      // Independent projection straight from the sealed JSON (not through the analyser).
+      const sealed = JSON.parse(
+        readFileSync(path.join(REAL_CAPTURE, RETROSPECTIVE_FILES.retrospective), "utf8"),
+      ) as Loose;
+      const body = JSON.parse(sealed.response.payload as string) as Loose;
+      expect(
+        createHash("sha256")
+          .update(sealed.response.payload as string)
+          .digest("hex"),
+      ).toBe(sealed.response.originalSha256);
+      const rows = body.result as Loose[];
+      expect(rows).toHaveLength(20);
+      const times = rows.map((x) => x.blockTime as number);
+      expect(Math.max(...times)).toBe(1_794_551_672);
+      expect(Math.min(...times)).toBe(1_792_474_081);
+      expect(times.every((t) => Number.isInteger(t) && t < START_SEC)).toBe(true);
+      expect(rows.filter((x) => x.err !== null)).toHaveLength(2);
+      for (const x of rows) {
+        expect(Object.keys(x).sort()).toEqual([
+          "blockTime",
+          "confirmationStatus",
+          "err",
+          "memo",
+          "signature",
+          "slot",
+          "transactionIndex",
+        ]);
+        expect(Number.isSafeInteger(x.transactionIndex) && x.transactionIndex >= 0).toBe(true);
+      }
+      expect(dirDigest(REAL_CAPTURE)).toBe(before);
+    },
+  );
+
+  it("R-21: the CLI shuts down gracefully in a child process with its exit codes kept (synthetic root)", async () => {
+    const records = SPANNING.map((r, i) => ({ ...r, transactionIndex: 10 + i }));
+    const h = harness({ fetch: { body: page(records) } });
+    await live(h);
+    const v1 = asVersion1(h, "v1-child");
+    mkdirSync(path.join(h.projectRoot, ".git"));
+    const child = (args: readonly string[]) => {
+      const r = spawnSync(process.execPath, ["--import", TSX_LOADER, SCRIPT, ...args], {
+        cwd: h.projectRoot,
+        encoding: "utf8",
+        timeout: 20_000,
+        killSignal: "SIGKILL",
+        windowsHide: true,
+        env: CHILD_ENV,
+      });
+      expect(r.error, args.join(" ")).toBeUndefined();
+      expect(r.signal, args.join(" ")).toBeNull();
+      expect(r.stderr, args.join(" ")).not.toContain(RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE);
+      return r;
+    };
+    const root = "data/research/retrospective-checks";
+    expect(child(["--help"]).status).toBe(RETROSPECTIVE_EXIT_CODES.OK);
+    const bad = child(["--bogus"]);
+    expect(bad.status).toBe(RETROSPECTIVE_EXIT_CODES.INVALID);
+    expect(bad.stderr).toContain("[AMM_V4_WATCH_RETROSPECTIVE_ERROR]");
+    expect(child(["--out-dir", `${root}/child-dry-run`]).status).toBe(RETROSPECTIVE_EXIT_CODES.OK);
+    expect(existsSync(h.abs(`${root}/child-dry-run`))).toBe(false);
+    expect(child(["--verify", `${root}/missing`]).status).toBe(
+      RETROSPECTIVE_EXIT_CODES.INTEGRITY_FAILED,
+    );
+    expect(child(["--verify", RUN]).status).toBe(RETROSPECTIVE_EXIT_CODES.OK);
+    expect(child(["--verify", `${root}/v1-child`]).status).toBe(RETROSPECTIVE_EXIT_CODES.NO_PAGE);
+    const re = child(["--reanalyze", `${root}/v1-child`, "--source-manifest", manifestDigest(v1)]);
+    expect(re.status).toBe(RETROSPECTIVE_EXIT_CODES.OK);
+    expect(re.stdout).toContain("sealed outcome MALFORMED_RESPONSE (unchanged)");
+    expect(
+      child(["--reanalyze", `${root}/v1-child`, "--source-manifest", "0".repeat(64)]).status,
+    ).toBe(RETROSPECTIVE_EXIT_CODES.INTEGRITY_FAILED);
+  }, 55_000);
+
+  it("R-22: graceful settlement drains naturally; a lingering handle is force-exited after the bound", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "retrospective-settle-"));
+    roots.push(dir);
+    const driver = path.join(dir, "settle-driver.mts");
+    writeFileSync(
+      driver,
+      [
+        `import { settleRetrospectiveProcess } from ${JSON.stringify(pathToFileURL(SCRIPT).href)};`,
+        `const [code, grace, linger] = process.argv.slice(2).map(Number);`,
+        `if (linger) setInterval(() => undefined, 1_000);`,
+        `settleRetrospectiveProcess(code, grace);`,
+        `console.log("SETTLED");`,
+      ].join("\n"),
+    );
+    const run = (args: string[]) => {
+      const started = Date.now();
+      const r = spawnSync(process.execPath, ["--import", TSX_LOADER, driver, ...args], {
+        cwd: dir,
+        encoding: "utf8",
+        timeout: 20_000,
+        killSignal: "SIGKILL",
+        windowsHide: true,
+        env: CHILD_ENV,
+      });
+      return { ...r, elapsedMs: Date.now() - started };
+    };
+    // Nothing pending: the process ends on its own with the code, without the backstop.
+    const natural = run(["3", "15000", "0"]);
+    expect(natural.error).toBeUndefined();
+    expect(natural.status).toBe(3);
+    expect(natural.stdout).toContain("SETTLED");
+    expect(natural.stderr).not.toContain(RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE);
+    expect(natural.elapsedMs).toBeLessThan(15_000);
+    // A lingering referenced handle: forced after the (short, synthetic) bound with the same code.
+    const forced = run(["4", "300", "1"]);
+    expect(forced.error).toBeUndefined();
+    expect(forced.status).toBe(4);
+    expect(forced.stderr).toContain(RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE);
+    expect(RETROSPECTIVE_SHUTDOWN_GRACE_MS).toBe(5_000);
+    // The entry point no longer exits immediately.
+    const source = readFileSync(SCRIPT, "utf8");
+    const entry = source.slice(source.lastIndexOf("if (process.argv[1]"));
+    expect(entry).not.toContain("process.exit(");
+    expect(entry.match(/settleRetrospectiveProcess\(/g)).toHaveLength(2);
+  }, 55_000);
 });

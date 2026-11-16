@@ -97,7 +97,31 @@ export const RETROSPECTIVE_LIMITS = Object.freeze({
 export const RETROSPECTIVE_ROOT_SEGMENTS = ["data", "research", "retrospective-checks"] as const;
 export const RETROSPECTIVE_MANIFEST_KIND = "PAPER_AMM_V4_WATCH_RETROSPECTIVE_MANIFEST" as const;
 export const RETROSPECTIVE_KIND = "PAPER_AMM_V4_WATCH_RETROSPECTIVE" as const;
-export const RETROSPECTIVE_VERSION = 1 as const;
+/**
+ * Sealed-record versions. Each version fixes how its response bytes are interpreted on replay:
+ *   1: every signature record has exactly the six fields below (the original strict policy);
+ *   2: the same six required fields, plus the optional `transactionIndex` (a non-negative integer).
+ * New captures are sealed as the current version; a version 1 capture is always replayed with the
+ * version 1 policy, so its recorded outcome is never re-judged by later rules.
+ */
+export type RecordSchemaVersion = 1 | 2;
+export const RETROSPECTIVE_VERSION: RecordSchemaVersion = 2;
+export const RETROSPECTIVE_SUPPORTED_VERSIONS: readonly RecordSchemaVersion[] = Object.freeze([
+  1, 2,
+]);
+export const RETROSPECTIVE_REQUIRED_RECORD_FIELDS = Object.freeze([
+  "blockTime",
+  "confirmationStatus",
+  "err",
+  "memo",
+  "signature",
+  "slot",
+]);
+export const RETROSPECTIVE_OPTIONAL_RECORD_FIELDS: Readonly<
+  Record<RecordSchemaVersion, readonly string[]>
+> = Object.freeze({ 1: Object.freeze([]), 2: Object.freeze(["transactionIndex"]) });
+const isSupportedVersion = (v: unknown): v is RecordSchemaVersion =>
+  RETROSPECTIVE_SUPPORTED_VERSIONS.includes(v as RecordSchemaVersion);
 export const RETROSPECTIVE_FILES = Object.freeze({
   plan: "plan.json",
   retrospective: "retrospective.json",
@@ -172,6 +196,8 @@ export interface PageRecord {
   readonly confirmationStatus: "confirmed" | "finalized";
   readonly memoPresent: boolean;
   readonly timeClass: TimeClass;
+  /** Version 2 records only: the reported index within its block, or null when absent. */
+  readonly transactionIndex?: number | null;
 }
 
 export interface PageAnalysis {
@@ -207,7 +233,6 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 const isSafeCount = (v: unknown): v is number =>
   typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-const RECORD_KEYS = "blockTime,confirmationStatus,err,memo,signature,slot";
 
 export function timeClassOf(blockTime: number | null): TimeClass {
   if (blockTime === null) return "UNKNOWN_TIME";
@@ -221,11 +246,18 @@ export function timeClassOf(blockTime: number | null): TimeClass {
 /**
  * Strict analysis of the response body bytes: strict UTF-8, a JSON-RPC 2.0 envelope echoing the
  * request id, either exactly {jsonrpc, id, result} or {jsonrpc, id, error:{code, message[, data]}},
- * at most 20 records, each exactly {signature, slot, err, memo, blockTime, confirmationStatus} with
- * a canonical signature, a safe slot, a nullable safe block time and a confirmed or finalized
- * status; no duplicate signature; slots newest first.
+ * at most 20 records, each with exactly the required {signature, slot, err, memo, blockTime,
+ * confirmationStatus} plus only the optional fields of the record schema version (version 2:
+ * `transactionIndex`, a non-negative safe integer when present), with a canonical signature, a safe
+ * slot, a nullable safe block time and a confirmed or finalized status; no duplicate signature;
+ * slots newest first. Any other field is rejected.
  */
-export function analyzeSignaturesResponse(body: Uint8Array, requestId: number): ResponseAnalysis {
+export function analyzeSignaturesResponse(
+  body: Uint8Array,
+  requestId: number,
+  schemaVersion: RecordSchemaVersion = RETROSPECTIVE_VERSION,
+): ResponseAnalysis {
+  const optionalFields = RETROSPECTIVE_OPTIONAL_RECORD_FIELDS[schemaVersion];
   const malformed = (reason: string): ResponseAnalysis => ({ kind: "MALFORMED", reason });
   const text = decodeStrictUtf8(body);
   if (text === null) return malformed("INVALID_UTF8");
@@ -258,7 +290,13 @@ export function analyzeSignaturesResponse(body: Uint8Array, requestId: number): 
   const records: PageRecord[] = [];
   let previousSlot: number | null = null;
   for (const [i, raw] of (m.result as unknown[]).entries()) {
-    if (!isRecord(raw) || Object.keys(raw).sort().join(",") !== RECORD_KEYS) {
+    if (
+      !isRecord(raw) ||
+      RETROSPECTIVE_REQUIRED_RECORD_FIELDS.some((k) => !Object.hasOwn(raw, k)) ||
+      Object.keys(raw).some(
+        (k) => !RETROSPECTIVE_REQUIRED_RECORD_FIELDS.includes(k) && !optionalFields.includes(k),
+      )
+    ) {
       return malformed(`RECORD_SHAPE_INVALID:${i}`);
     }
     if (!isValidSolanaSignature(raw.signature)) return malformed(`SIGNATURE_INVALID:${i}`);
@@ -272,6 +310,9 @@ export function analyzeSignaturesResponse(body: Uint8Array, requestId: number): 
       return malformed(`ERR_INVALID:${i}`);
     }
     if (!(raw.memo === null || typeof raw.memo === "string")) return malformed(`MEMO_INVALID:${i}`);
+    const hasIndex = Object.hasOwn(raw, "transactionIndex");
+    if (hasIndex && !isSafeCount(raw.transactionIndex))
+      return malformed(`TRANSACTION_INDEX_INVALID:${i}`);
     if (seen.has(raw.signature)) return malformed(`DUPLICATE_SIGNATURE:${i}`);
     seen.add(raw.signature);
     if (previousSlot !== null && raw.slot > previousSlot) return malformed(`NOT_NEWEST_FIRST:${i}`);
@@ -287,6 +328,9 @@ export function analyzeSignaturesResponse(body: Uint8Array, requestId: number): 
       confirmationStatus: raw.confirmationStatus,
       memoPresent: raw.memo !== null,
       timeClass: timeClassOf(blockTime),
+      ...(schemaVersion >= 2
+        ? { transactionIndex: hasIndex ? (raw.transactionIndex as number) : null }
+        : {}),
     });
   }
   return { kind: "PAGE", page: analyzePage(records) };
@@ -583,7 +627,7 @@ export async function runRetrospectiveRequest(o: {
     e.entry.httpStatus === 200 &&
     e.bodyState === "COMPLETE" &&
     e.body !== null
-      ? analyzeSignaturesResponse(e.body, requestId)
+      ? analyzeSignaturesResponse(e.body, requestId, RETROSPECTIVE_VERSION)
       : null;
   const cancelledDuring = cancelled && e.entry.error !== null;
   const completedAfterDeadline =
@@ -800,6 +844,8 @@ export interface RetrospectiveVerification {
   readonly pageObtained: boolean;
   readonly observation: PageObservation | null;
   readonly manifestSha256: string | null;
+  /** The sealed record version, whose record schema the replay used (null when not reached). */
+  readonly recordVersion: RecordSchemaVersion | null;
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -829,6 +875,7 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
     pageObtained: false,
     observation: null,
     manifestSha256,
+    recordVersion: null,
   });
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   try {
@@ -855,7 +902,7 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
     if (
       !isRecord(manifest) ||
       manifest.kind !== RETROSPECTIVE_MANIFEST_KIND ||
-      manifest.version !== RETROSPECTIVE_VERSION ||
+      !isSupportedVersion(manifest.version) ||
       !Array.isArray(manifest.files) ||
       manifest.files.length !== expected.length ||
       (manifest.files as unknown[]).some(
@@ -910,10 +957,12 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
     ) {
       problems.push("PLAN_INVALID");
     }
-    if (!isRecord(r) || r.kind !== RETROSPECTIVE_KIND || r.version !== RETROSPECTIVE_VERSION) {
+    if (!isRecord(r) || r.kind !== RETROSPECTIVE_KIND || r.version !== manifest.version) {
       problems.push("RECORD_KIND_INVALID");
       return fail();
     }
+    // Replayed with the record schema of the version the capture was sealed under.
+    const schemaVersion = r.version as RecordSchemaVersion;
     // Fixed binding, limits, statements and request.
     if (!same(r.binding, RETROSPECTIVE_BINDING)) problems.push("BINDING_MISMATCH");
     const bc = isRecord(r.bindingCheck) ? r.bindingCheck : null;
@@ -1086,7 +1135,7 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
         stored !== null &&
         !redacted
       ) {
-        analysis = analyzeSignaturesResponse(stored, req.jsonRpcId as number);
+        analysis = analyzeSignaturesResponse(stored, req.jsonRpcId as number, schemaVersion);
       }
       const cancelledDuring = cancelled === true && phase === "DURING_REQUEST" && error !== null;
       // Only a timely complete 200 body that was redacted depends on an analysis that cannot be
@@ -1132,11 +1181,130 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
       pageObtained: expectedObtained && !redacted && expectedPage !== null,
       observation: !redacted && expectedPage !== null ? expectedPage.observation : null,
       manifestSha256,
+      recordVersion: schemaVersion,
     };
   } catch {
     problems.push("EVIDENCE_RECORD_MALFORMED");
     return fail();
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Offline reanalysis (separate and read-only; the sealed capture and its verification are unchanged)
+// ---------------------------------------------------------------------------------------------
+
+export const RETROSPECTIVE_REANALYSIS_KIND = "PAPER_AMM_V4_WATCH_RETROSPECTIVE_REANALYSIS" as const;
+export const RETROSPECTIVE_REANALYSIS_VERSION = 1 as const;
+export const RETROSPECTIVE_REANALYSIS_LIMITATIONS = Object.freeze([
+  ...RETROSPECTIVE_LIMITATIONS,
+  "This is an offline reinterpretation of the sealed response bytes under a later record schema, tied to the source manifest digest. It is not an acquisition: the sealed outcome, its verification and pageObtained are unchanged.",
+]);
+
+export interface RetrospectiveReanalysis {
+  readonly ok: boolean;
+  /** Source problems: integrity or digest (`sourceIntact` false), or eligibility. */
+  readonly problems: readonly string[];
+  readonly sourceIntact: boolean;
+  readonly analysis: ResponseAnalysis | null;
+  readonly report: Readonly<Record<string, unknown>> | null;
+}
+
+/**
+ * Re-reads one sealed capture recorded under an earlier record schema and interprets its stored
+ * response bytes under the current schema. It reads only: nothing is sealed, rewritten or sent.
+ * The source must verify intact under its own version and match the given manifest digest, and
+ * its response must be a timely, complete, unredacted HTTP 200 body with no cancellation.
+ */
+export function reanalyzeRetrospectiveCapture(
+  dir: string,
+  expectedManifestSha256: string,
+): RetrospectiveReanalysis {
+  const problems: string[] = [];
+  const failed = (sourceIntact: boolean): RetrospectiveReanalysis => ({
+    ok: false,
+    problems: [...problems],
+    sourceIntact,
+    analysis: null,
+    report: null,
+  });
+  if (!HEX64.test(expectedManifestSha256)) {
+    problems.push("SOURCE_MANIFEST_DIGEST_INVALID");
+    return failed(false);
+  }
+  const original = verifyRetrospectiveEvidence(dir);
+  if (!original.integrity.ok) {
+    problems.push("SOURCE_INTEGRITY_FAILED", ...original.integrity.problems);
+    return failed(false);
+  }
+  if (original.manifestSha256 !== expectedManifestSha256) {
+    problems.push("SOURCE_MANIFEST_MISMATCH");
+    return failed(false);
+  }
+  if (original.recordVersion === null || original.recordVersion >= RETROSPECTIVE_VERSION) {
+    problems.push("SOURCE_ALREADY_CURRENT_VERSION");
+    return failed(true);
+  }
+  // Verified intact above; the shapes below were checked by the verifier.
+  const r = JSON.parse(
+    readFileSync(path.join(dir, RETROSPECTIVE_FILES.retrospective), "utf8"),
+  ) as Record<string, unknown>;
+  const req = r.request as Record<string, unknown>;
+  const resp = r.response as Record<string, unknown> | null;
+  if (
+    resp === null ||
+    resp.bodyState !== "COMPLETE" ||
+    resp.httpStatus !== 200 ||
+    req.error !== null ||
+    resp.payloadRedacted !== false ||
+    resp.storedEncoding !== "utf8" ||
+    typeof resp.payload !== "string" ||
+    r.cancelled !== false ||
+    (req.completedAtMs as number) > (r.deadlineAtMs as number)
+  ) {
+    problems.push("SOURCE_RESPONSE_NOT_ELIGIBLE");
+    return failed(true);
+  }
+  const bytes = Buffer.from(resp.payload, "utf8");
+  const analysis = analyzeSignaturesResponse(bytes, req.jsonRpcId as number, RETROSPECTIVE_VERSION);
+  const report = {
+    kind: RETROSPECTIVE_REANALYSIS_KIND,
+    version: RETROSPECTIVE_REANALYSIS_VERSION,
+    source: {
+      manifestSha256: original.manifestSha256,
+      recordVersion: original.recordVersion,
+      responseSha256: sha256(bytes),
+      responseBytes: bytes.length,
+      acquisition: {
+        outcome: r.outcome,
+        detail: r.detail,
+        pageObtained: r.pageObtained,
+        dispatchedAtMs: req.dispatchedAtMs,
+        completedAtMs: req.completedAtMs,
+      },
+      verification: {
+        integrity: "OK",
+        recordSchemaVersion: original.recordVersion,
+        outcome: original.outcome,
+        pageObtained: original.pageObtained,
+      },
+    },
+    interpretation: {
+      recordSchemaVersion: RETROSPECTIVE_VERSION,
+      requiredRecordFields: RETROSPECTIVE_REQUIRED_RECORD_FIELDS,
+      optionalRecordFields: RETROSPECTIVE_OPTIONAL_RECORD_FIELDS[RETROSPECTIVE_VERSION],
+    },
+    binding: RETROSPECTIVE_BINDING,
+    result:
+      analysis.kind === "PAGE"
+        ? { kind: "PAGE", page: analysis.page }
+        : analysis.kind === "RPC_ERROR"
+          ? { kind: "RPC_ERROR", code: analysis.code }
+          : { kind: "MALFORMED", reason: analysis.reason },
+    acquisitionOutcomeChanged: false,
+    pageObtainedByAcquisition: false,
+    limitations: RETROSPECTIVE_REANALYSIS_LIMITATIONS,
+  };
+  return { ok: true, problems: [], sourceIntact: true, analysis, report };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,10 +1321,14 @@ export const RETROSPECTIVE_EXIT_CODES = Object.freeze({
 
 export const RETROSPECTIVE_USAGE = [
   "Usage: amm-v4-watch-retrospective [--help] | --out-dir <dir> [--live] | --verify <dir>",
+  "       | --reanalyze <dir> --source-manifest <sha256>",
   "  --help            Print this usage and the plan (nothing loaded, read, sent or written).",
   "  --out-dir <dir>   A new directory directly inside data/research/retrospective-checks/ (default: dry run).",
   "  --live            One getSignaturesForAddress request (separate approval required).",
   "  --verify <dir>    Verify a sealed check offline (no configuration, no network).",
+  "  --reanalyze <dir> Reinterpret an earlier-version capture's sealed bytes under the current",
+  "                    record schema (read-only; its sealed outcome is unchanged). Requires",
+  "  --source-manifest <sha256>  the capture's evidence-manifest.json digest.",
   "Exit codes: 0 page obtained or informational, 1 invalid input or error, 3 no valid page,",
   "            4 integrity failure, 5 sealing failed.",
 ].join("\n");
@@ -1197,7 +1369,7 @@ export interface RetrospectiveDeps {
 }
 
 export interface RetrospectiveRunResult {
-  readonly mode: "HELP" | "DRY_RUN" | "LIVE" | "VERIFY";
+  readonly mode: "HELP" | "DRY_RUN" | "LIVE" | "VERIFY" | "REANALYZE";
   readonly exitCode: number;
   readonly planDigestSha256?: string | undefined;
   readonly outDir?: string | undefined;
@@ -1205,6 +1377,7 @@ export interface RetrospectiveRunResult {
   readonly record?: Readonly<Record<string, unknown>> | undefined;
   readonly seal?: SealRetrospectiveResult | undefined;
   readonly verification?: RetrospectiveVerification | undefined;
+  readonly reanalysis?: RetrospectiveReanalysis | undefined;
 }
 
 const RUN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -1236,6 +1409,8 @@ export async function runRetrospectiveCheck(
         live: { type: "boolean" },
         "out-dir": { type: "string" },
         verify: { type: "string" },
+        reanalyze: { type: "string" },
+        "source-manifest": { type: "string" },
       },
       strict: true,
       allowPositionals: false,
@@ -1269,6 +1444,55 @@ export async function runRetrospectiveCheck(
   }
   const projectRoot = path.resolve(deps.projectRoot ?? findWorkspaceRoot());
   const root = path.join(projectRoot, ...RETROSPECTIVE_ROOT_SEGMENTS);
+  if (values["source-manifest"] !== undefined && values.reanalyze === undefined) {
+    throw cliError("--source-manifest is used only with --reanalyze");
+  }
+  if (values.reanalyze !== undefined) {
+    if (values.live === true || values["out-dir"] !== undefined || values.verify !== undefined) {
+      throw cliError("--reanalyze cannot be combined with --live, --out-dir or --verify");
+    }
+    const expected = String(values["source-manifest"] ?? "");
+    if (!HEX64.test(expected)) {
+      throw cliError("--reanalyze requires --source-manifest <64 lowercase hex digits>");
+    }
+    const dir = path.resolve(projectRoot, String(values.reanalyze));
+    if (values.reanalyze === "" || path.dirname(dir) !== root) {
+      throw cliError(
+        `--reanalyze must name a run directly inside ${RETROSPECTIVE_ROOT_SEGMENTS.join("/")}/`,
+      );
+    }
+    const re = reanalyzeRetrospectiveCapture(dir, expected);
+    log("[REANALYZE] Read-only: nothing loaded, sent, sealed or rewritten.");
+    if (!re.ok || re.report === null || re.analysis === null) {
+      log(`[REANALYZE] Not reanalysed: ${re.problems.join(", ")}`);
+      return {
+        mode: "REANALYZE",
+        exitCode: re.sourceIntact
+          ? RETROSPECTIVE_EXIT_CODES.NO_PAGE
+          : RETROSPECTIVE_EXIT_CODES.INTEGRITY_FAILED,
+        reanalysis: re,
+      };
+    }
+    const src = re.report.source as {
+      readonly recordVersion: unknown;
+      readonly acquisition: { readonly outcome: unknown };
+    };
+    log(
+      `[REANALYZE] Source: manifest ${expected}; record version ${String(src.recordVersion)}; sealed outcome ${String(src.acquisition.outcome)} (unchanged)`,
+    );
+    log(
+      `[REANALYZE] Interpretation: record schema version ${RETROSPECTIVE_VERSION}; result ${re.analysis.kind === "PAGE" ? `PAGE (${re.analysis.page.coverage}, ${re.analysis.page.observation})` : re.analysis.kind}`,
+    );
+    log(JSON.stringify(re.report));
+    return {
+      mode: "REANALYZE",
+      exitCode:
+        re.analysis.kind === "PAGE"
+          ? RETROSPECTIVE_EXIT_CODES.OK
+          : RETROSPECTIVE_EXIT_CODES.NO_PAGE,
+      reanalysis: re,
+    };
+  }
   if (values.verify !== undefined) {
     if (values.live === true || values["out-dir"] !== undefined) {
       throw cliError("--verify cannot be combined with --live or --out-dir");
@@ -1392,6 +1616,29 @@ export async function runRetrospectiveCheck(
   };
 }
 
+/**
+ * Upper bound on graceful shutdown after the result is known. The exit code is set and the event
+ * loop is allowed to drain (the session has already stopped and cleared its own timers; an idle
+ * HTTP connection may still be closing). Only if something keeps the process alive past this bound
+ * is the exit forced, with the same code and a fixed notice. The timer is unref'd, so it never
+ * delays a process that drains on its own.
+ */
+export const RETROSPECTIVE_SHUTDOWN_GRACE_MS = 5_000;
+export const RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE = "[AMM_V4_WATCH_RETROSPECTIVE_SHUTDOWN_FORCED]";
+
+/** Sets the exit code instead of exiting at once (an immediate exit can tear down closing handles). */
+export function settleRetrospectiveProcess(
+  exitCode: number,
+  graceMs: number = RETROSPECTIVE_SHUTDOWN_GRACE_MS,
+): void {
+  process.exitCode = exitCode;
+  const backstop = setTimeout(() => {
+    console.error(RETROSPECTIVE_SHUTDOWN_FORCED_NOTICE, `after ${graceMs} ms`);
+    process.exit(exitCode);
+  }, graceMs);
+  backstop.unref();
+}
+
 if (process.argv[1] && process.argv[1].endsWith("amm-v4-watch-retrospective.ts")) {
   const controller = new AbortController();
   const onSignal = () => controller.abort();
@@ -1399,11 +1646,11 @@ if (process.argv[1] && process.argv[1].endsWith("amm-v4-watch-retrospective.ts")
   runRetrospectiveCheck(process.argv.slice(2), { signal: controller.signal })
     .then((r) => {
       process.removeListener("SIGINT", onSignal);
-      process.exit(r.exitCode);
+      settleRetrospectiveProcess(r.exitCode);
     })
     .catch((err: unknown) => {
       process.removeListener("SIGINT", onSignal);
       console.error("[AMM_V4_WATCH_RETROSPECTIVE_ERROR]", printableRetrospectiveError(err));
-      process.exit(RETROSPECTIVE_EXIT_CODES.INVALID);
+      settleRetrospectiveProcess(RETROSPECTIVE_EXIT_CODES.INVALID);
     });
 }
