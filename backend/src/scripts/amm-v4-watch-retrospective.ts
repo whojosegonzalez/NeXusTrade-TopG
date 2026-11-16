@@ -1301,7 +1301,7 @@ export function reanalyzeRetrospectiveCapture(
           ? { kind: "RPC_ERROR", code: analysis.code }
           : { kind: "MALFORMED", reason: analysis.reason },
     acquisitionOutcomeChanged: false,
-    pageObtainedByAcquisition: false,
+    newAcquisitionPerformed: false,
     limitations: RETROSPECTIVE_REANALYSIS_LIMITATIONS,
   };
   return { ok: true, problems: [], sourceIntact: true, analysis, report };

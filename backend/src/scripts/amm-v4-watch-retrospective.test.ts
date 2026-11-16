@@ -284,6 +284,8 @@ function asVersion1(
       r.detail = a.reason;
       r.page = null;
       r.pageObtained = false;
+    } else if (a.kind === "PAGE") {
+      r.page = a.page;
     }
   }
   edit?.(r);
@@ -1352,7 +1354,7 @@ describe("AMM v4 watch 02 retrospective metadata check (offline)", () => {
           page: { coverage: "PAGE_SPANS_INTERVAL", observation: "INTERVAL_RECORDS_IN_PAGE" },
         },
         acquisitionOutcomeChanged: false,
-        pageObtainedByAcquisition: false,
+        newAcquisitionPerformed: false,
       },
     });
     expect(re.report?.limitations).toEqual(RETROSPECTIVE_REANALYSIS_LIMITATIONS);
@@ -1422,6 +1424,58 @@ describe("AMM v4 watch 02 retrospective metadata check (offline)", () => {
     expect(h.calls).toHaveLength(1);
     expect(h.loads()).toBe(1);
     expect(dirDigest(v1)).toBe(before);
+
+    // Synthetic regression: an intact version-1 PAGE_RECEIVED capture without transactionIndex.
+    // Reanalysis preserves the original successful acquisition (pageObtained: true) while
+    // explicitly reporting that no new acquisition occurred (newAcquisitionPerformed: false).
+    const hPage = harness({ fetch: { body: page(SPANNING) } });
+    await live(hPage);
+    const v1Page = asVersion1(hPage, "v1-page-success");
+    const v1PageDigest = manifestDigest(v1Page);
+    const v1PageBefore = dirDigest(v1Page);
+    expect(verifyRetrospectiveEvidence(v1Page)).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      outcome: "PAGE_RECEIVED",
+      pageObtained: true,
+      recordVersion: 1,
+    });
+    const rePage = reanalyzeRetrospectiveCapture(v1Page, v1PageDigest);
+    expect(rePage).toMatchObject({
+      ok: true,
+      sourceIntact: true,
+      report: {
+        kind: "PAPER_AMM_V4_WATCH_RETROSPECTIVE_REANALYSIS",
+        source: {
+          manifestSha256: v1PageDigest,
+          recordVersion: 1,
+          acquisition: {
+            outcome: "PAGE_RECEIVED",
+            pageObtained: true,
+          },
+          verification: {
+            integrity: "OK",
+            recordSchemaVersion: 1,
+            outcome: "PAGE_RECEIVED",
+            pageObtained: true,
+          },
+        },
+        interpretation: { recordSchemaVersion: 2, optionalRecordFields: ["transactionIndex"] },
+        result: {
+          kind: "PAGE",
+          page: { coverage: "PAGE_SPANS_INTERVAL", observation: "INTERVAL_RECORDS_IN_PAGE" },
+        },
+        acquisitionOutcomeChanged: false,
+        newAcquisitionPerformed: false,
+      },
+    });
+    expect(rePage.report?.limitations).toEqual(RETROSPECTIVE_REANALYSIS_LIMITATIONS);
+    expect(dirDigest(v1Page)).toBe(v1PageBefore);
+    const relPage = "data/research/retrospective-checks/v1-page-success";
+    const okPage = await hPage.run(["--reanalyze", relPage, "--source-manifest", v1PageDigest]);
+    expect(okPage).toMatchObject({ mode: "REANALYZE", exitCode: RETROSPECTIVE_EXIT_CODES.OK });
+    expect(hPage.lines.some((l) => l.includes("sealed outcome PAGE_RECEIVED (unchanged)"))).toBe(
+      true,
+    );
   });
 
   const REAL_CAPTURE = path.join(
