@@ -5172,7 +5172,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The single operator capability probe against the alternative Helius WebSocket endpoint (`solana-subscription-02`, 2026-11-16) completed with `SUBSCRIPTION_ACKNOWLEDGED`, verified manifest hash `56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`, subscription ack at +526 ms, unsubscribe ack at +658 ms, settled cleanup at +790 ms, 2 outgoing frames, 2 incoming messages / 80 bytes payload, zero notifications, and clean exit 0. Offline verification confirms integrity and capability; this establishes subscription and unsubscription access, not notification delivery or sustained reliability (§8.38.14).
 >
-> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788`), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, settled cleanup at 133 ms, no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery (§8.38.15). Proposed retrospective check and CPMM reassessment are provided in §8.38.16–§8.38.17. No further live execution is authorized.
+> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788` at +540 ms from watch start, +134 ms from subscribe dispatch), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, no validation/selection (`validation.json`: `recorded: false`, `result: null`), cleanup settled at `1794830320187` (+133 ms), report sealed at `1794830320194` (+140 ms), no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (native watch verifier exit code 3, distinct from wrapper exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery; time-of-day variance (11:43–11:58 UTC) remains an untested hypothesis (§8.38.15). Proposed retrospective check and preliminary CPMM reassessment are provided in §8.38.16–§8.38.17. No further live execution is authorized.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -6286,11 +6286,11 @@ Following the successful subscription capability check in `solana-subscription-0
 - **Evidence Directory**: `data/research/prechecks/fresh-amm-v4-watch-02`
 - **Manifest SHA-256**: `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`
 - **Session Duration**: Started at `2026-11-16T11:43:40.030Z` (`1794829420030`), ended at `2026-11-16T11:58:40.054Z` (`1794830320054`). Duration: 900,024 ms (exactly 900,000 ms ceiling + 24 ms timer overshoot).
-- **Transport & Subscription**: WebSocket connection opened at +405 ms (`1794829420435`). Outgoing `logsSubscribe` frame dispatched at +406 ms mentioning `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`. Upstream acknowledgement received at +540 ms (`1794829420570`, 134 ms after dispatch), confirming `subscriptionId: 30271788`.
+- **Transport & Subscription**: WebSocket connection opened at +405 ms (`1794829420435`). Outgoing `logsSubscribe` frame dispatched at +406 ms (`1794829420436`) mentioning `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`. Upstream acknowledgement received at `1794829420570` (+540 ms from watch start, or +134 ms from subscribe frame dispatch), confirming `subscriptionId: 30271788`.
 - **Keepalive Ping/Pong Accounting**: Exactly 44 client pings dispatched (every 20 s) and 44 matching pongs received within the 10 s timeout (0 server pings, 44 incoming control frames).
 - **Application Traffic Accounting**: Zero transaction notifications received (0 failed, 0 rejected). Total incoming messages: 1 (subscription acknowledgement, 42 bytes). Total outgoing application frames: 1 (subscription request, 149 bytes). Total HTTP requests: 0 (`request-ledger.json: []`, `request-exchanges.json: []`).
-- **Validation & Selection**: Neither attempted nor performed (`validation.json: { outcome: null, reasons: [] }`, `selection.json: { selected: false, target: null, runOutcome: "WATCH_ENDED_WITHOUT_CAPTURE", watchStatus: "NO_QUALIFYING_NOTIFICATION_OBSERVED" }`).
-- **Cleanup**: Settled 133 ms after watch termination (`endedAtMs: 1794830320054`, `CLEANUP_SETTLED: 1794830320187`, `cleanupEndedAtMs: 1794830320194`, `cleanupFailed: false`).
+- **Validation & Selection**: Neither attempted nor performed (`validation.json`: `recorded: false`, `result: null`; `selection.json`: `selected: false`, `target: null`, `runOutcome: "WATCH_ENDED_WITHOUT_CAPTURE"`, `watchStatus: "NO_QUALIFYING_NOTIFICATION_OBSERVED"`).
+- **Cleanup**: `CLEANUP_SETTLED` occurred at `timestampMs: 1794830320187` (+133 ms after watch termination at `1794830320054`). The evidence report was sealed at `report.sealedAtMs: 1794830320194` (+140 ms after termination). Note: `report.sealedAtMs` records the evidence report sealing timestamp; it is not a `cleanupEndedAtMs` field.
 - **Downstream Boundaries**: No pilot handoff evaluated, no wait scheduled, no Stage B run initiated; virtual wallet balance (7.9259 SOL) and hash unchanged.
 - **Offline Verification**:
   ```powershell
@@ -6300,10 +6300,10 @@ Following the successful subscription capability check in `solana-subscription-0
   - `[VERIFY] Integrity: OK` (manifest digest, file digests, frame accounting verified).
   - `[VERIFY] Completeness: INSUFFICIENT` (`TERMINAL_CAUSE:WATCH_ENDED_WITHOUT_CAPTURE`, `WATCH_DID_NOT_CAPTURE:NO_QUALIFYING_NOTIFICATION_OBSERVED`, `VALIDATION_NOT_RECORDED`, `OUTCOME:NONE`).
   - `[VERIFY] Re-derivation: NOT_ELIGIBLE` (no captured notification to re-derive).
-  - `[VERIFY] Selection: NOT CONFIRMED` (CLI exit code 1).
+  - `[VERIFY] Selection: NOT CONFIRMED` (native watch verifier Node exit code 3 `NOT_CONFIRMED`, distinct from the conditional wrapper's exit code 1).
 
 **Analytical Significance**:
-This observation establishes that over a contiguous 15-minute window, zero transaction notifications mentioning the pinned fee destination were received on this Helius WebSocket session. In accordance with strict empirical truthing, this single observation does **not** infer market-wide AMM v4 inactivity, nor does it prove that provider notification delivery was defective.
+This observation establishes that over a contiguous 15-minute window, zero transaction notifications mentioning the pinned fee destination were received on this Helius WebSocket session. In accordance with strict empirical truthing, this single observation does **not** infer market-wide AMM v4 inactivity, nor does it prove that provider notification delivery was defective. Time-of-day activity variance (the watch ran between 11:43 and 11:58 UTC) remains an untested hypothesis; no claim of a slow overall market or optimal trading hours is made.
 
 #### 8.38.16 Bounded Retrospective Activity Check Proposal (Fee Destination Interval Analysis)
 
@@ -6311,47 +6311,72 @@ To evaluate whether the lack of notifications in `fresh-amm-v4-watch-02` was con
 
 - **Target Address**: AMM v4 pool-creation fee destination `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`.
 - **Target Interval**: Unix epoch `[1794829420, 1794830320]` (`2026-11-16T11:43:40Z` to `2026-11-16T11:58:40Z`).
-- **Protocol Bounds**:
+- **Single-Request Query Semantics**: One `getSignaturesForAddress` request with `limit: 20` returns the latest paged slice of signatures from the chain tip (or requested anchor), **not** a time-filtered complete history.
+- **Protocol Bounds & Operational Rules**:
   - Endpoint: Configured `SOLANA_RPC_URL` (HTTP).
-  - Request: At most 1 `getSignaturesForAddress` query with `limit: 20`.
-  - Filter: Match returned transaction `blockTime` against the recorded 15-minute interval.
-  - Transactions: At most 1 `getTransaction` retrieval only if a signature falls strictly within the interval, to verify whether it was an `initialize2` transaction. Otherwise 0 transaction retrievals.
-- **What Limited History Coverage Could Establish**:
-  - _If signatures exist within the interval_: Establishes that on-chain transactions mentioning the fee destination were confirmed but not delivered by the WebSocket stream, identifying an upstream filtering or streaming delivery failure on the provider.
-  - _If zero signatures exist within the interval_: Establishes that the WebSocket stream's lack of notifications was completely faithful to on-chain reality at that fee destination during those 15 minutes.
-- **What Limited History Coverage Could NOT Establish**:
-  - Does not establish AMM v4 activity or absence outside the 15-minute interval.
-  - Does not establish ongoing WebSocket delivery reliability for future sessions (since receiving 0 messages when 0 events occur is expected behavior).
-  - Does not establish pool creation rates on other programs (CPMM, CLMM, Pump.fun, etc.) or alternative creation routes.
+  - Method: `getSignaturesForAddress("7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5", { limit: 20, commitment: "confirmed" })`.
+  - Request Timeout: 10,000 ms single-request timeout.
+  - Response Limit: At most 64 KiB maximum response payload.
+  - Commitment: `confirmed`.
+  - Pacing: Minimum 2,500 ms RPC pacing before any subsequent request.
+  - Stopping Rules:
+    - Exactly 1 `getSignaturesForAddress` call; no automatic pagination.
+    - If all 20 returned signatures have `blockTime > 1794830320` (all newer than interval end): classify as `COVERAGE_INCONCLUSIVE` (the single latest page did not reach back to the watch interval); 0 transaction retrievals.
+    - If signatures span across the interval and zero signatures fall within `[1794829420, 1794830320]`: classify as `ZERO_INTERVAL_MATCHES_IN_PAGE`; 0 transaction retrievals.
+    - If at least one signature falls strictly within the interval: at most 1 `getTransaction` retrieval (jsonParsed, max response 1 MiB, timeout 10,000 ms) on the newest matching signature, solely to inspect whether it represents an AMM v4 `initialize2` instruction.
+    - Fail closed on any network error, HTTP non-200, timeout, or malformed JSON envelope with zero retries.
 
-#### 8.38.17 CPMM Support Reassessment and Staged Offline Implementation Proposal
+**Inference Limits of Limited History Coverage**:
 
-Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`, `raydium-cp-swap`) represents Raydium's modern constant-product architecture. Reassessing CPMM support against existing local code and authoritative upstream references reveals substantial existing parsing assets alongside well-defined missing modules:
+- **What it COULD establish**:
+  - _If a confirmed signature within the interval is retrieved and decoded as `initialize2`_: Establishes that a genuine AMM v4 creation transaction occurred on-chain that was omitted from the WebSocket stream, demonstrating an upstream log-delivery gap or subscription filtering omission on the provider.
+- **What it COULD NOT establish**:
+  - _Zero interval matches_: Zero matches on this single page must **not** establish zero historical on-chain activity across the network or provider, nor does it establish faithful WebSocket delivery.
+  - _Unretrieved signature_: An interval signature indicates provider-reported address activity, not necessarily `initialize2` or successful pool creation (it could be a failed transaction, another instruction, or an unrelated transfer).
+  - _Attribution obstacles_: Estimated or null `blockTime` (Solana block timestamps can exhibit multi-second validator vote jitter or be null), commitment differences (`confirmed` vs `finalized`), boundary uncertainty (transactions confirmed near the 900 s window start or stop), and missing subscription slot anchors prevent automatic attribution of a provider delivery failure.
+  - _Broader market_: Does not establish AMM v4 creation rates outside that single 15-minute window, nor does it establish ongoing WebSocket delivery reliability for future sessions (receiving 0 notifications when 0 events occur is expected behavior).
+  - _Other protocols_: Does not establish creation rates on other programs (CPMM, CLMM, Pump.fun, etc.) or alternative launch routes.
 
-**1. Existing Reusable Local Assets**:
+#### 8.38.17 Preliminary CPMM Support Reassessment and Staged Offline Implementation Proposal
+
+> [!IMPORTANT]
+> **Status: PRELIMINARY DESIGN ASSESSMENT & SCOPING ONLY.**
+> CPMM support is not implemented or approved for execution. Raydium CPMM targets remain strictly **quarantined from strategy admission** until discovery, market orientation, swap flow, LP verification, and security context integration are complete, tested, and independently reviewed.
+
+Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Reassessing CPMM support against current local code and authoritative upstream references reveals substantial existing parsing assets alongside well-defined missing modules:
+
+**1. Pinned Upstream References & Version Coverage**:
+
+- Upstream repository: `https://github.com/raydium-io/raydium-cp-swap`
+- Pinned instruction: Anchor instruction `initialize` per `raydium-cp-swap/programs/cp-swap/src/instructions/initialize.rs` (Anchor discriminator `0xafaf6d1f0d989bed`, 20 accounts).
+- Pinned account layout: `PoolState` struct per `raydium-cp-swap/programs/cp-swap/src/states/pool.rs` (637 bytes packed layout, Anchor account discriminator `0xf7ede3f5d7c3de46`).
+- Note: Upstream may have evolved across releases; local parsers reflect this specific pinned reference version.
+
+**2. Existing Reusable Local Parsing Assets**:
 
 - `PoolInitializationParser.ts`: Strict Anchor discriminator `0xafaf6d1f0d989bed` (`sha256("global:initialize")[0..8]`), 20-account vector per `raydium-cp-swap/instructions/initialize.rs` (including account 12 `create_pool_fee`), payload length $\ge 32$ bytes (`open_time` at bytes 24..32, `init_amount_0/1` at bytes 8..24), and v0 ALT address resolution.
 - `RaydiumCpmmParser.ts`: Complete 637-byte zero-copy layout parser for `PoolState` (`0xf7ede3f5d7c3de46`), authority PDA validation (`RAYDIUM_CPMM_AUTHORITY`), exact BigInt fee liabilities subtraction (protocol, fund, creator fees), quote cohort classification (WSOL, USDC, USDT), and dual SPL Token / Token-2022 support.
-- `AuthoritativeCpmmFixtures.ts`: Authoritative binary fixture generators producing exact on-chain `PoolState` representations.
+- `AuthoritativeCpmmFixtures.ts`: **Synthetic test fixtures** (generating configured binary buffers for offline testing), not captured on-chain evidence.
 
-**2. Missing Protocol Modules & Implementation Gaps**:
+**3. Missing Protocol Modules & Implementation Gaps**:
 
-- **Discovery**: No CPMM creation-fee destination or migration-event watch module.
-- **Market & Orientation**: `DexScreenerSingleCandidateMarketParser.ts` explicitly rejects CPMM labels. Upstream CPMM sorts mints canonically by address (`mint_0 < mint_1`), so WSOL can be token 0 or token 1; local orientation logic must support bidirectional candidate/WSOL mapping without fabricating data.
-- **Swap Decoding & Flow**: CPMM has no `ray_log`. Requires Anchor `swap_base_input` / `swap_base_output` decoding or vault balance delta tracking for five-minute activity, buy/sell volume, and flow qualification.
-- **LP Evidence & Screening**: CPMM LP mint supply and lock/burn verification (checking LP burn to dead addresses or locks in known locker programs).
-- **Security Context**: Token-2022 extension risks (transfer fees, freeze authority, transfer hooks, non-transferable mints) in the security context.
+- **Discovery**: No CPMM creation-fee destination or migration-event watch module exists.
+- **Market Parsing & Orientation**: `DexScreenerSingleCandidateMarketParser.ts` explicitly rejects `"CPMM"`. Upstream CPMM sorts mints canonically by byte address (`mint_0 < mint_1`), so WSOL can be token 0 or token 1; local orientation logic must support bidirectional candidate/WSOL mapping without fabricating data.
+- **Swap Decoding & Flow**: CPMM has no `ray_log`. Requires Anchor `swap_base_input` / `swap_base_output` decoding or vault balance delta tracking.
+  - _Metric Distinction_: Five-minute market metrics ($\ge 20$ trades, average size $15–$2,500) from DexScreener must be kept distinct from the runtime 60-second qualified-flow window with $\le 15$ s cutoff.
+- **LP Evidence & Screening**: Requires protocol-correct CPMM LP accounting. A purported "dead address" (such as `11111111111111111111111111111111` or incinerator) alone is **not** proof of permanently inaccessible LP. Accounting must verify on-chain LP mint supply and burn deltas or accredited locker program states to confirm $\ge 90\%$ burn/lock.
+- **Security Context & Token-2022**: Binary parser recognition of Token-2022 programs (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`) must be separated from security admission. Token-2022 introduces extension risks (transfer fees, freeze authority, transfer hooks, non-transferable mints). **Deferring Token-2022** (restricting initial CPMM scope strictly to canonical SPL Token mints, rejecting any pool with Token-2022 base or quote) is an initial-scope option to reduce complexity and risk.
 - **Runner & Coordinator**: Protocol-aware target identity, intake, and flow checks; strategy thresholds (liquidity 0.15–0.30, burn $\ge 90\%$, flow, age 300–900 s) remain completely unchanged.
 
-**3. Staged Offline Implementation Proposal**:
+**4. Staged Offline Implementation Roadmap**:
 
-| Stage       | Focus                                 | Target Files                                                                                                                                | Acceptance Criteria                                                                                                                                              |
-| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Stage 1** | **Market & Pool State Parsers**       | `backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts` | Accepts `"CPMM"` market label; handles bidirectional WSOL orientation (WSOL as token 0 or 1); maps `PoolState` reserves and decimals; rejects non-WSOL pairs.    |
-| **Stage 2** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                      | Decodes `swap_base_input` and `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates 5-minute trade count and volume. |
-| **Stage 3** | **LP Evidence & Token-2022 Security** | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`            | Audits LP burn/lock percentage ($\ge 90\%$); audits Token-2022 mint extensions (rejects transfer fee $> 0$, active freeze authority, transfer hooks).            |
-| **Stage 4** | **CPMM Creation Discovery**           | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                 | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination.                          |
-| **Stage 5** | **Runner & Handoff Integration**      | `backend/src/scripts/paper-single-candidate-diagnostic.ts`<br>`backend/src/scripts/paper-pilot-handoff.ts`                                  | Protocol-aware runner accepts either AMM v4 or CPMM targets; strategy thresholds unchanged; handoff enforces exact protocol-aware code pin.                      |
+| Stage       | Focus                             | Target Files                                                                                                                                | Acceptance Criteria                                                                                                                                                            |
+| :---------- | :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1** | **Market & Pool State Parsers**   | `backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts` | Accepts `"CPMM"` market label; handles bidirectional WSOL orientation (WSOL as token 0 or 1); maps `PoolState` reserves and decimals; rejects non-WSOL pairs.                  |
+| **Stage 2** | **CPMM Swap Decoding & Flow**     | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                      | Decodes `swap_base_input` and `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates 60 s qualified flow window and 5 min activity. |
+| **Stage 3** | **LP Evidence & Security Policy** | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`            | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                 |
+| **Stage 4** | **CPMM Creation Discovery**       | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                 | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination.                                        |
+| **Stage 5** | **Runner & Handoff Integration**  | `backend/src/scripts/paper-single-candidate-diagnostic.ts`<br>`backend/src/scripts/paper-pilot-handoff.ts`                                  | Protocol-aware runner accepts either AMM v4 or CPMM targets; strategy thresholds unchanged; handoff enforces exact protocol-aware code pin.                                    |
 
 #### 8.38.18 Integrity and Invariant Verification
 
