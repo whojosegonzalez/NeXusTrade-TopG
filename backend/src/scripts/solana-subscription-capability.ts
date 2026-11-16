@@ -168,6 +168,8 @@ export interface SubscriptionProbeResult {
   } | null;
   readonly unsubscribe: {
     readonly status: UnsubscribeStatus;
+    /** When the unsubscribe was attempted (sent, or failed to send); null when not attempted. */
+    readonly attemptedAtMs: number | null;
     readonly sentAtMs: number | null;
     readonly responseAtMs: number | null;
     readonly errorCode: number | null;
@@ -336,6 +338,7 @@ export function runSubscriptionProbe(
       -readonly [K in keyof SubscriptionProbeResult["unsubscribe"]]: SubscriptionProbeResult["unsubscribe"][K];
     } = {
       status: "NOT_SENT",
+      attemptedAtMs: null,
       sentAtMs: null,
       responseAtMs: null,
       errorCode: null,
@@ -436,16 +439,19 @@ export function runSubscriptionProbe(
       if (isClosed()) settle(false, false, null);
     }
 
-    const send = (text: string): boolean => {
-      if (outgoingFrames >= L.maxOutgoingFrames || transport === null) return false;
+    /**
+     * Sends one application frame and records it. On failure it returns the cause and does not
+     * terminate: the caller records the failed attempt first, then finishes (cleanup may settle
+     * synchronously inside finish).
+     */
+    const send = (text: string): { ok: true } | { ok: false; cause: string } => {
+      if (outgoingFrames >= L.maxOutgoingFrames || transport === null) {
+        return { ok: false, cause: "not permitted" };
+      }
       try {
         transport.send(text);
       } catch (err) {
-        finish(
-          "TRANSPORT_ERROR",
-          `send failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return false;
+        return { ok: false, cause: err instanceof Error ? err.message : String(err) };
       }
       outgoingFrames++;
       const bytes = Buffer.from(text, "utf8");
@@ -458,7 +464,7 @@ export function runSubscriptionProbe(
         bytes,
         overflow: null,
       });
-      return true;
+      return { ok: true };
     };
 
     const onOpen = () => {
@@ -466,7 +472,8 @@ export function runSubscriptionProbe(
       openedAtMs = clock();
       if (clock() >= deadlineAtMs) return; // the deadline timer decides
       phase = "AWAITING_ACK";
-      send(SUBSCRIBE_FRAME);
+      const sent = send(SUBSCRIBE_FRAME);
+      if (!sent.ok) finish("TRANSPORT_ERROR", `subscribe send failed: ${sent.cause}`);
     };
 
     const onMessage = (data: string | Buffer) => {
@@ -515,16 +522,24 @@ export function runSubscriptionProbe(
           acknowledgement = { subscriptionId: c.subscriptionId, receivedAtMs: atMs };
           phase = "AWAITING_UNSUBSCRIBE_ACK";
           if (!o.abortSignal?.aborted && clock() < deadlineAtMs && !isClosed()) {
-            if (send(unsubscribeFrame(c.subscriptionId))) {
-              const sentAtMs = (frames[frames.length - 1] as CapabilityFrame).atMs;
-              unsubscribe = { ...unsubscribe, status: "SENT_UNOBSERVED", sentAtMs };
-            } else if (!done) {
-              unsubscribe = { ...unsubscribe, status: "SEND_FAILED" };
+            const attemptedAtMs = clock();
+            const sent = send(unsubscribeFrame(c.subscriptionId));
+            if (!sent.ok) {
+              // Recorded before finishing: settlement may happen synchronously inside finish.
+              // The acknowledgement is kept; the run is a conservative TRANSPORT_ERROR.
+              unsubscribe = { ...unsubscribe, status: "SEND_FAILED", attemptedAtMs };
+              finish("TRANSPORT_ERROR", `unsubscribe send failed: ${sent.cause}`);
+              return;
             }
+            const sentAtMs = (frames[frames.length - 1] as CapabilityFrame).atMs;
+            unsubscribe = {
+              ...unsubscribe,
+              status: "SENT_UNOBSERVED",
+              attemptedAtMs: sentAtMs,
+              sentAtMs,
+            };
           }
-          if (!done && unsubscribe.status !== "SENT_UNOBSERVED") {
-            finish("SUBSCRIPTION_ACKNOWLEDGED", null);
-          }
+          if (unsubscribe.status !== "SENT_UNOBSERVED") finish("SUBSCRIPTION_ACKNOWLEDGED", null);
           return;
         case "SUBSCRIBE_ERROR":
           if (phase !== "AWAITING_ACK") {
@@ -897,6 +912,8 @@ interface Replay {
   };
   /** The outcome the frames themselves decide, if any. */
   readonly terminal: CapabilityOutcome | null;
+  /** The frames end with a valid acknowledgement and no unsubscribe frame after it. */
+  readonly ackWithoutUnsubscribe: boolean;
   readonly decisiveRedacted: boolean;
   readonly lastAtMs: number | null;
 }
@@ -1047,8 +1064,10 @@ function replayFrames(
         terminal = "MALFORMED_RESPONSE";
     }
   }
+  const ackWithoutUnsubscribe = awaitingUnsubscribeDecision;
   if (awaitingUnsubscribeDecision) terminal = "SUBSCRIPTION_ACKNOWLEDGED";
   return {
+    ackWithoutUnsubscribe,
     problems,
     subscribeAtMs,
     ack,
@@ -1243,16 +1262,38 @@ export function verifySubscriptionCapabilityEvidence(dir: string): CapabilityVer
       problems.push("REJECTION_MISMATCH");
     }
     const unsub = isRecord(p.unsubscribe) ? p.unsubscribe : null;
+    // A failed unsubscribe attempt leaves no frame. It is accepted only where the frames end with
+    // the acknowledgement and no unsubscribe frame, and only as a TRANSPORT_ERROR run.
+    const failedUnsubscribe =
+      unsub !== null &&
+      unsub.status === "SEND_FAILED" &&
+      replay.ackWithoutUnsubscribe &&
+      replay.ack !== null &&
+      outcome === "TRANSPORT_ERROR";
     const statusMatches =
       unsub !== null &&
       typeof unsub.status === "string" &&
       UNSUBSCRIBE_STATUSES.includes(unsub.status) &&
-      (unsub.status === replay.unsubscribe.status ||
-        (unsub.status === "SEND_FAILED" &&
-          replay.unsubscribe.status === "NOT_SENT" &&
-          replay.ack !== null));
+      (unsub.status === "SEND_FAILED"
+        ? failedUnsubscribe
+        : unsub.status === replay.unsubscribe.status);
+    const attemptedAtMs = unsub?.attemptedAtMs;
+    const attemptMatches =
+      unsub === null
+        ? false
+        : unsub.status === "NOT_SENT"
+          ? attemptedAtMs === null
+          : unsub.status === "SEND_FAILED"
+            ? isSafeTime(attemptedAtMs) &&
+              replay.ack !== null &&
+              attemptedAtMs >= replay.ack.receivedAtMs &&
+              attemptedAtMs < deadlineAtMs &&
+              isSafeTime(p.endedAtMs) &&
+              attemptedAtMs <= p.endedAtMs
+            : attemptedAtMs === replay.unsubscribe.sentAtMs;
     if (
       !statusMatches ||
+      !attemptMatches ||
       unsub?.sentAtMs !== replay.unsubscribe.sentAtMs ||
       unsub?.responseAtMs !== replay.unsubscribe.responseAtMs ||
       unsub?.errorCode !== replay.unsubscribe.errorCode
@@ -1275,7 +1316,9 @@ export function verifySubscriptionCapabilityEvidence(dir: string): CapabilityVer
     const endedAtDeadline = isSafeTime(p.endedAtMs) && p.endedAtMs >= deadlineAtMs;
     const outcomeReproduced =
       replay.terminal !== null
-        ? outcome === replay.terminal
+        ? failedUnsubscribe
+          ? outcome === "TRANSPORT_ERROR"
+          : outcome === replay.terminal
         : outcome === "ACK_TIMEOUT"
           ? replay.ack === null && endedAtDeadline
           : outcome === "SUBSCRIPTION_ACKNOWLEDGED"

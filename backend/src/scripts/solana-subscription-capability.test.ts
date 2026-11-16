@@ -77,12 +77,15 @@ interface FakeOptions {
   slowClose?: boolean;
   stayOpen?: boolean;
   sendThrows?: boolean;
+  /** send() throws only for the logsUnsubscribe request. */
+  unsubscribeSendThrows?: boolean;
 }
 
 class FakeTransport implements ISolanaKeepaliveWebSocketTransport {
   readyState = 0;
   readonly sent: string[] = [];
   pings = 0;
+  sendCalls = 0;
   closeCalls = 0;
   private readonly listeners: Record<string, ((...args: never[]) => void)[]> = {};
   constructor(
@@ -96,7 +99,11 @@ class FakeTransport implements ISolanaKeepaliveWebSocketTransport {
     for (const l of this.listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args);
   }
   send(data: string): void {
+    this.sendCalls++;
     if (this.o.sendThrows) throw new Error("SYNTHETIC send failure");
+    if (this.o.unsubscribeSendThrows && data.includes("logsUnsubscribe")) {
+      throw new Error("SYNTHETIC unsubscribe send failure");
+    }
     this.sent.push(data);
     const reply = this.sent.length === 1 ? this.o.onSubscribe : this.o.onUnsubscribe;
     if (reply !== null && reply !== undefined) {
@@ -1085,5 +1092,140 @@ describe("Solana subscription-only capability check (offline)", () => {
       onUnsubscribe: Buffer.from(ack(true, 2)),
     });
     expect((await live(b)).verification?.capabilityConfirmed).toBe(true);
+  });
+  it("S-17: a failed unsubscribe send is recorded before settlement; the run is a verified, unconfirmed TRANSPORT_ERROR", async () => {
+    // The review reproduction: a valid acknowledgement, then send throws only for logsUnsubscribe.
+    // The fake closes synchronously, so cleanup settles inside finish.
+    const h = harness({ onSubscribe: ack(), unsubscribeSendThrows: true });
+    const r = await live(h);
+    expect(r).toMatchObject({
+      exitCode: CAPABILITY_EXIT_CODES.NOT_CONFIRMED,
+      probe: {
+        outcome: "TRANSPORT_ERROR",
+        detail: "unsubscribe send failed: SYNTHETIC unsubscribe send failure",
+        acknowledgement: { subscriptionId: SUB_ID },
+        unsubscribe: { status: "SEND_FAILED", sentAtMs: null, responseAtMs: null, errorCode: null },
+        counts: { outgoingFrames: 1, incomingMessages: 1 },
+        cancelled: false,
+        cleanup: { settled: true, failed: false, forced: false },
+        capabilityConfirmed: false,
+        reasons: ["OUTCOME:TRANSPORT_ERROR"],
+      },
+      seal: { ok: true },
+      verification: {
+        integrity: { ok: true, problems: [] },
+        outcome: "TRANSPORT_ERROR",
+        capabilityConfirmed: false,
+        subscriptionId: SUB_ID,
+      },
+    });
+    const attemptedAtMs = r.probe!.unsubscribe.attemptedAtMs!;
+    expect(attemptedAtMs).toBe(r.probe!.acknowledgement!.receivedAtMs);
+    expect(attemptedAtMs).toBeLessThan(DEADLINE);
+    // Exactly the subscribe and one unsubscribe attempt; no retry, no second connection.
+    expect(h.transports).toHaveLength(1);
+    expect(h.transports[0]!.sendCalls).toBe(2);
+    expect(h.transports[0]!.sent).toEqual([SUBSCRIBE_FRAME]);
+    expect(h.transports[0]!.readyState).toBe(3);
+    expect(probeJson(h).unsubscribe).toEqual({
+      status: "SEND_FAILED",
+      attemptedAtMs,
+      sentAtMs: null,
+      responseAtMs: null,
+      errorCode: null,
+    });
+    expect((await h.run(["--verify", RUN])).exitCode).toBe(CAPABILITY_EXIT_CODES.NOT_CONFIRMED);
+    expectSettled(h, r);
+
+    // The acceptance is specific: forged variants of the failed-attempt evidence fail.
+    const forged: [string, (p: Loose) => void][] = [
+      [
+        "relabelled as acknowledged",
+        (p) =>
+          Object.assign(p, {
+            outcome: "SUBSCRIPTION_ACKNOWLEDGED",
+            capabilityConfirmed: true,
+            reasons: [],
+          }),
+      ],
+      [
+        "attempt before the acknowledgement",
+        (p) => void (p.unsubscribe.attemptedAtMs = p.startedAtMs),
+      ],
+      ["attempt after the deadline", (p) => void (p.unsubscribe.attemptedAtMs = p.deadlineAtMs)],
+      ["attempt missing", (p) => void (p.unsubscribe.attemptedAtMs = null)],
+      ["status not sent", (p) => void (p.unsubscribe.status = "NOT_SENT")],
+    ];
+    for (const [label, edit] of forged) {
+      const v = reforgeProbe(copyRun(h, `failed-unsub-${label.replace(/ /g, "-")}`), edit);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.capabilityConfirmed, label).toBe(false);
+    }
+    // SEND_FAILED is not accepted where an unsubscribe frame exists, or without an acknowledgement.
+    const sent = harness({ onSubscribe: ack(), onUnsubscribe: ack(true, 2) });
+    await live(sent);
+    const withFrame = reforgeProbe(copyRun(sent, "send-failed-with-frame"), (p) => {
+      Object.assign(p, {
+        outcome: "TRANSPORT_ERROR",
+        capabilityConfirmed: false,
+        reasons: ["OUTCOME:TRANSPORT_ERROR"],
+      });
+      p.unsubscribe = {
+        status: "SEND_FAILED",
+        attemptedAtMs: p.acknowledgement.receivedAtMs,
+        sentAtMs: null,
+        responseAtMs: null,
+        errorCode: null,
+      };
+    });
+    expect(withFrame.integrity.ok).toBe(false);
+    // Only the status relabelled: every other unsubscribe field still matches the sent frame.
+    const relabelledStatus = reforgeProbe(copyRun(sent, "send-failed-status-only"), (p) => {
+      Object.assign(p, {
+        outcome: "TRANSPORT_ERROR",
+        capabilityConfirmed: false,
+        reasons: ["OUTCOME:TRANSPORT_ERROR"],
+      });
+      p.unsubscribe.status = "SEND_FAILED";
+    });
+    expect(relabelledStatus.integrity.problems).toContain("UNSUBSCRIBE_MISMATCH");
+    const rejected = harness({ onSubscribe: rpcError(-32601, "Method 'logsSubscribe' not found") });
+    await live(rejected);
+    const withoutAck = reforgeProbe(copyRun(rejected, "send-failed-without-ack"), (p) => {
+      Object.assign(p, { outcome: "TRANSPORT_ERROR", reasons: ["OUTCOME:TRANSPORT_ERROR"] });
+      p.unsubscribe = {
+        status: "SEND_FAILED",
+        attemptedAtMs: p.rejection.receivedAtMs,
+        sentAtMs: null,
+        responseAtMs: null,
+        errorCode: null,
+      };
+    });
+    expect(withoutAck.integrity.ok).toBe(false);
+
+    // A failed initial subscribe send: nothing recorded as sent, TRANSPORT_ERROR, verified.
+    const sub = harness({ onSubscribe: ack(), sendThrows: true });
+    const s = await live(sub);
+    expect(s).toMatchObject({
+      exitCode: CAPABILITY_EXIT_CODES.NOT_CONFIRMED,
+      probe: {
+        outcome: "TRANSPORT_ERROR",
+        detail: "subscribe send failed: SYNTHETIC send failure",
+        acknowledgement: null,
+        unsubscribe: { status: "NOT_SENT", attemptedAtMs: null },
+        counts: { outgoingFrames: 0, incomingMessages: 0 },
+        cleanup: { settled: true, failed: false },
+        capabilityConfirmed: false,
+      },
+      verification: {
+        integrity: { ok: true },
+        outcome: "TRANSPORT_ERROR",
+        capabilityConfirmed: false,
+      },
+    });
+    expect(sub.transports).toHaveLength(1);
+    expect(sub.transports[0]!.sendCalls).toBe(1);
+    expect((await sub.run(["--verify", RUN])).exitCode).toBe(CAPABILITY_EXIT_CODES.NOT_CONFIRMED);
+    expectSettled(sub, s);
   });
 });
