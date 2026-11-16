@@ -103,6 +103,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The subscription-only capability check and its tests (section 8.38.13).
   "backend/src/scripts/solana-subscription-capability.ts",
   "backend/src/scripts/solana-subscription-capability.test.ts",
+  // The watch 02 retrospective metadata check and its tests (section 8.38.16).
+  "backend/src/scripts/amm-v4-watch-retrospective.ts",
+  "backend/src/scripts/amm-v4-watch-retrospective.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

@@ -5136,7 +5136,7 @@ To eliminate the timing coincidence required by periodic polling without asserti
 
 While the Nov 9 snapshot observed predominantly older CPMM pools (7–271 h) rather than fresh AMM v4 pools, that single 20-pool indexer page does not establish current fresh-pool market distribution across Solana. However, supporting CPMM would expand the strategy's intake beyond AMM v4. Supporting CPMM end to end would need these components, each a separately reviewed offline task:
 
-1. **Discovery**: a CPMM creation source. Either a creation-specific account pinned to an upstream `raydium-cp-swap` revision (analogous to the AMM v4 fee destination; not available locally), or LaunchLab migration events. Plus a Stage A variant using the existing CPMM `initialize` parser.
+1. **Discovery**: a CPMM creation source. Either a creation-specific account taken from a recorded upstream `raydium-cp-swap` commit (analogous to the AMM v4 fee destination; no commit is recorded and none is available locally), or LaunchLab migration events. Plus a Stage A variant using the existing CPMM `initialize` parser.
 2. **Market parsing**: accept CPMM labels for the exact pool. CPMM orders its two mints by address, so WSOL can be either token; the runner's orientation handling must support WSOL as token 0 or token 1 without inventing data.
 3. **Pool layout in the flow provider**: use `RaydiumCpmmParser` for the target layout, vaults and mints, including Token-2022 programs.
 4. **Swap decoding and flow**: a CPMM swap decoder (`swap_base_input` and `swap_base_output`, vault balance deltas; CPMM has no `ray_log`), plus its transaction-source adapter, subscription binding and window reconciliation, with authoritative fixtures.
@@ -5172,7 +5172,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The single operator capability probe against the alternative Helius WebSocket endpoint (`solana-subscription-02`, 2026-11-16) completed with `SUBSCRIPTION_ACKNOWLEDGED`, verified manifest hash `56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`, subscription ack at +526 ms, unsubscribe ack at +658 ms, settled cleanup at +790 ms, 2 outgoing frames, 2 incoming messages / 80 bytes payload, zero notifications, and clean exit 0. Offline verification confirms integrity and capability; this establishes subscription and unsubscription access, not notification delivery or sustained reliability (§8.38.14).
 >
-> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788` at +540 ms from watch start, +134 ms from subscribe dispatch), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, no validation/selection (`validation.json`: `recorded: false`, `result: null`), cleanup settled at `1794830320187` (+133 ms), report sealed at `1794830320194` (+140 ms), no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (native watch verifier exit code 3, distinct from wrapper exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery; time-of-day variance (11:43–11:58 UTC) remains an untested hypothesis (§8.38.15). Proposed retrospective check and preliminary CPMM reassessment are provided in §8.38.16–§8.38.17. No further live execution is authorized.
+> The second operator watch capture (`fresh-amm-v4-watch-02`, 2026-11-16) completed with manifest hash `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`, verified offline: 900,024 ms duration (24 ms overshoot), subscription acknowledged (`id: 30271788` at +540 ms from watch start, +134 ms from subscribe dispatch), 44 pings with 44 matching pongs, zero notifications received, zero HTTP calls, no validation/selection (`validation.json`: `recorded: false`, `result: null`), cleanup settled at `1794830320187` (+133 ms), report sealed at `1794830320194` (+140 ms), no handoff/wait/Stage B, wallet unchanged, and selection completeness insufficient (native watch verifier exit code 3, distinct from wrapper exit 1). This 15-minute sample does not infer market-wide inactivity or broken delivery; time-of-day variance (11:43–11:58 UTC) remains an untested hypothesis (§8.38.15). A one-request retrospective metadata checker bound to that interval is implemented offline and not run (§8.38.16; it cannot establish provider fault), and the CPMM reassessment remains preliminary and quarantined, with unversioned upstream references (§8.38.17). No further live execution is authorized.
 
 #### 8.38.1 Architectural Scope & Separation of Pure Validation from Acquisition
 
@@ -6305,37 +6305,149 @@ Following the successful subscription capability check in `solana-subscription-0
 **Analytical Significance**:
 This observation establishes that over a contiguous 15-minute window, zero transaction notifications mentioning the pinned fee destination were received on this Helius WebSocket session. In accordance with strict empirical truthing, this single observation does **not** infer market-wide AMM v4 inactivity, nor does it prove that provider notification delivery was defective. Time-of-day activity variance (the watch ran between 11:43 and 11:58 UTC) remains an untested hypothesis; no claim of a slow overall market or optimal trading hours is made.
 
-#### 8.38.16 Bounded Retrospective Activity Check Proposal (Fee Destination Interval Analysis)
+#### 8.38.16 Retrospective Metadata Check for Watch 02 (Implemented Offline; Request Not Run)
 
-To evaluate whether the lack of notifications in `fresh-amm-v4-watch-02` was consistent with on-chain transaction history or indicated a WebSocket delivery omission, a bounded retrospective activity check is proposed for review (not implemented, not executed).
+**Correction (2026-11-16)**: an earlier version of this section proposed an optional `getTransaction` follow-up, and claimed that a decoded in-interval `initialize2` would demonstrate "an upstream log-delivery gap or subscription filtering omission on the provider". Both are withdrawn:
 
-- **Target Address**: AMM v4 pool-creation fee destination `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`.
-- **Target Interval**: Unix epoch `[1794829420, 1794830320]` (`2026-11-16T11:43:40Z` to `2026-11-16T11:58:40Z`).
-- **Single-Request Query Semantics**: One `getSignaturesForAddress` request with `limit: 20` returns the latest paged slice of signatures from the chain tip (or requested anchor), **not** a time-filtered complete history.
-- **Protocol Bounds & Operational Rules**:
-  - Endpoint: Configured `SOLANA_RPC_URL` (HTTP).
-  - Method: `getSignaturesForAddress("7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5", { limit: 20, commitment: "confirmed" })`.
-  - Request Timeout: 10,000 ms single-request timeout.
-  - Response Limit: At most 64 KiB maximum response payload.
-  - Commitment: `confirmed`.
-  - Pacing: Minimum 2,500 ms RPC pacing before any subsequent request.
-  - Stopping Rules:
-    - Exactly 1 `getSignaturesForAddress` call; no automatic pagination.
-    - If all 20 returned signatures have `blockTime > 1794830320` (all newer than interval end): classify as `COVERAGE_INCONCLUSIVE` (the single latest page did not reach back to the watch interval); 0 transaction retrievals.
-    - If signatures span across the interval and zero signatures fall within `[1794829420, 1794830320]`: classify as `ZERO_INTERVAL_MATCHES_IN_PAGE`; 0 transaction retrievals.
-    - If at least one signature falls strictly within the interval: at most 1 `getTransaction` retrieval (jsonParsed, max response 1 MiB, timeout 10,000 ms) on the newest matching signature, solely to inspect whether it represents an AMM v4 `initialize2` instruction.
-    - Fail closed on any network error, HTTP non-200, timeout, or malformed JSON envelope with zero retries.
+- **Scope**: the check makes exactly one `getSignaturesForAddress` request and zero `getTransaction` calls.
+- **Provider fault**: no result of this check, and no single decoded transaction, can establish a provider fault. A record in the interval is equally consistent with timing (block time against notification arrival), boundary placement, commitment, logs-mention semantics, transaction failure, or the subscription's own acknowledgement time (`1794829420570`, 540 ms after the watch start).
 
-**Inference Limits of Limited History Coverage**:
+**Implementation**: `backend/src/scripts/amm-v4-watch-retrospective.ts`, with its tests alongside. It was exercised only with injected fakes. No credential was read, no provider request was made and no socket was opened, and no operator live command is given; the request needs independent review and a separate approval.
 
-- **What it COULD establish**:
-  - _If a confirmed signature within the interval is retrieved and decoded as `initialize2`_: Establishes that a genuine AMM v4 creation transaction occurred on-chain that was omitted from the WebSocket stream, demonstrating an upstream log-delivery gap or subscription filtering omission on the provider.
-- **What it COULD NOT establish**:
-  - _Zero interval matches_: Zero matches on this single page must **not** establish zero historical on-chain activity across the network or provider, nor does it establish faithful WebSocket delivery.
-  - _Unretrieved signature_: An interval signature indicates provider-reported address activity, not necessarily `initialize2` or successful pool creation (it could be a failed transaction, another instruction, or an unrelated transfer).
-  - _Attribution obstacles_: Estimated or null `blockTime` (Solana block timestamps can exhibit multi-second validator vote jitter or be null), commitment differences (`confirmed` vs `finalized`), boundary uncertainty (transactions confirmed near the 900 s window start or stop), and missing subscription slot anchors prevent automatic attribution of a provider delivery failure.
-  - _Broader market_: Does not establish AMM v4 creation rates outside that single 15-minute window, nor does it establish ongoing WebSocket delivery reliability for future sessions (receiving 0 notifications when 0 events occur is expected behavior).
-  - _Other protocols_: Does not establish creation rates on other programs (CPMM, CLMM, Pump.fun, etc.) or alternative launch routes.
+**Binding to watch 02** (fixed constants, not configurable):
+
+- **Run and digest**: run `data/research/prechecks/fresh-amm-v4-watch-02`, manifest SHA-256 `9da4be7556cdcbd4db653f0483c8c28a425b5d1aff49f8cac06e178ddb827c99`.
+- **Interval**: exactly `1794829420030`–`1794830320054` ms.
+- **Address**: `7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`, asserted equal to the reviewed fee destination.
+- **Check before anything else**: in live mode the binding is checked first, before configuration is loaded. The reviewed `verifyWatchEvidence` must report integrity and exactly this manifest digest, and the sealed watch observations must record exactly this interval. A mismatch stops with `[WATCH_BINDING_FAILED]` and nothing is sent. A read-only test confirms that the real sealed watch 02 satisfies the binding.
+
+**Request and proposed limits**:
+
+| Item                 | Value                                                                                                                                         |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Endpoint             | `SOLANA_RPC_URL` (HTTP only; validated by the reviewed resolver; never printed or recorded)                                                   |
+| Request              | One `getSignaturesForAddress("7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5", { limit: 20, commitment: "confirmed" })`                         |
+| Not made             | `getTransaction` (0), WebSocket (0), pagination (0), retries (0), redirects (refused by the session), fallback, discovery, strategy decisions |
+| Transport            | The reviewed `PaperRequestSession` (one attempt, `redirect: "manual"`, first 429 or any redirect stops the session)                           |
+| Acquisition deadline | 10,000 ms session lifetime from before dispatch, with a 10,000 ms request timeout                                                             |
+| Response limit       | 64 KiB of decoded body (declared oversize refused before reading; otherwise cut at the limit and never parsed)                                |
+| Cleanup              | The session stops after the single request, aborting anything in flight; its body cancellation is bounded                                     |
+| Overhead             | Local sealing and offline verification run after these bounds and are not part of them                                                        |
+
+**Validation of the response** (strict; anything else is `MALFORMED_RESPONSE` with a reason):
+
+- strict UTF-8;
+- a JSON-RPC 2.0 envelope echoing the request id, either exactly `{jsonrpc, id, result}` or `{jsonrpc, id, error:{code, message[, data]}}` (the latter is `RPC_ERROR`);
+- at most 20 records, each exactly `{signature, slot, err, memo, blockTime, confirmationStatus}` with:
+  - a canonical 64-byte base58 signature;
+  - a safe non-negative slot;
+  - a null or safe non-negative block time;
+  - `err` null, a string or an object;
+  - `memo` null or a string;
+  - `confirmationStatus` `confirmed` or `finalized`;
+- no duplicate signature, and slots newest first.
+
+A block-time order that disagrees with slot order is reported as an anomaly, not hidden.
+
+**What a valid page reports: about that page only.**
+
+- **Block time per record**: the interval seconds are `1794829420` (the start, at .030 s) to `1794830320` (the end, at .054 s). Each record is classed as `BEFORE_INTERVAL`, `BOUNDARY_START` (the second containing the start), `INSIDE_INTERVAL`, `BOUNDARY_END` (the second containing the end), `AFTER_INTERVAL` or `UNKNOWN_TIME` (null). The boundary seconds are ambiguous because block time is second-granular.
+- **Coverage**:
+  - `EMPTY_PAGE`;
+  - `COVERAGE_UNKNOWN` (all block times null);
+  - `PAGE_NEWER_THAN_INTERVAL` (the page did not reach back to the interval);
+  - `PAGE_PARTIALLY_OVERLAPS_INTERVAL`;
+  - `PAGE_SPANS_INTERVAL`;
+  - `PAGE_OLDER_THAN_INTERVAL`.
+- **Observation**:
+  - `INTERVAL_RECORDS_IN_PAGE`;
+  - `BOUNDARY_RECORDS_ONLY` (`BOUNDARY_AMBIGUOUS`);
+  - `NO_INTERVAL_RECORDS_IN_PAGE` (only when the page spans the interval or is older than it, with no null times);
+  - `COVERAGE_INCONCLUSIVE` (with the reason: null block times, an empty page, a page newer than or partially overlapping the interval, or unknown coverage).
+- **Failed transactions**: records with a non-null `err` are counted, and flagged `FAILED_TRANSACTION_METADATA` when inside or on a boundary.
+
+Every sealed result carries these fixed limitations:
+
+- the observation concerns this one returned page;
+- block time is a validator-estimated block timestamp, not the watch's notification arrival time;
+- boundary seconds are ambiguous, and null times cannot be placed;
+- no result proves complete historical coverage, a successful pool creation, faithful streaming or a provider fault;
+- address activity, including failed transactions, is not evidence of `initialize2`.
+
+**Evidence and verification**: exclusive-create `data/research/retrospective-checks/<name>/` holding `plan.json`, `retrospective.json` (kind `PAPER_AMM_V4_WATCH_RETROSPECTIVE`) and `evidence-manifest.json`.
+
+- **What is sealed**:
+  - the binding and its check;
+  - the fixed limits, limitations and request (the RPC URL replaced by a placeholder);
+  - the bounded response with original and stored lengths and digests kept apart;
+  - the outcome, the page analysis or RPC error, and the cancellation record.
+- **Redaction**: at byte level before UTF-8 or base64 storage, using the reviewed capability-check primitive; headers and free text through `redactSensitiveText`. A residual credential refuses the seal.
+- **No watch claims**: there are no watch-completion, selection or target fields.
+- **Offline `--verify`**: checks integrity (manifest, exact file set, digests), the fixed binding, limits, limitations and request, the times and the response accounting. It then re-derives the outcome, the page analysis and any RPC error from the sealed bytes with the same analyser.
+- **Redacted body**: a page whose bytes were redacted (for example, an echoed credential) cannot be re-derived exactly and is never reported as obtained.
+- **Malformed records**: verification failures, never exceptions.
+
+**Outcomes and exit codes**:
+
+- `PAGE_RECEIVED`;
+- `RPC_ERROR`, `MALFORMED_RESPONSE` and `HTTP_ERROR`;
+- `RESPONSE_LIMIT_EXCEEDED`;
+- `DEADLINE_EXPIRED`;
+- `TRANSPORT_ERROR`;
+- `SESSION_STOPPED` (429 or redirect);
+- `OPERATOR_CANCELLED` and `NOT_DISPATCHED`.
+
+Cancellation is rechecked after all callbacks and immediately before sealing. A late cancellation keeps the page but records `cancelled: true` (`BEFORE_SEALING`) and not obtained.
+
+Exit codes: 0 for help, a dry run, or a valid, reproducible, uncancelled page; 1 for invalid input, configuration, output or binding (nothing sent or written); 3 when sealed or verified without a valid page; 4 for an integrity failure; 5 when sealing failed (never re-requested). Help and the default dry run load no configuration, read no evidence, send nothing and write nothing.
+
+**Pin**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly `amm-v4-watch-retrospective.ts` and its test. H-12 asserts the list, that both pass as additions, and that modifying or deleting either is refused, as are neighbouring support or CLI file names. The baseline `6855efb` and the two exact-version endpoint exceptions are unchanged.
+
+**Synthetic tests** (`amm-v4-watch-retrospective.test.ts`, 14 tests; scripted fetch, virtual time, injected binding, owned temporary directories):
+
+| Test  | Shows                                                                                                                                                                                                                                                                                    |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R-01  | Help, dry run and verify are inert (no configuration, binding read, request or write); the plan's binding, request and limits; nine conflicting or malformed argument sets refused                                                                                                       |
+| R-02  | Bad or existing output directories, a failed binding (before configuration) and missing or invalid `SOLANA_RPC_URL` are refused before any request; the real binding check fails on a project without the evidence; an Alchemy RPC without `SOLANA_WS_URL` is accepted (HTTP only)       |
+| R-02b | The real sealed watch 02 satisfies the binding (read-only)                                                                                                                                                                                                                               |
+| R-03  | One request with exactly the planned body and `redirect: "manual"`; a spanning page with interval records is sealed, verified and reported; no watch or target fields; no credential stored                                                                                              |
+| R-04  | Pages newer than, older than, spanning without matches, partially overlapping, empty and full                                                                                                                                                                                            |
+| R-05  | Boundary seconds, the first and last inside seconds, null times, all-null pages and block-time order anomalies                                                                                                                                                                           |
+| R-06  | Failed-transaction metadata (`err` object or string) counted and flagged, nothing more                                                                                                                                                                                                   |
+| R-07  | 23 malformed bodies (envelope, id, shape, count, signature, slot, time, status, err, memo, duplicates, order, invalid UTF-8), an RPC error and HTTP 503: never a page                                                                                                                    |
+| R-08  | A response over 64 KiB is cut at the limit and not parsed; a declared oversize is refused before reading                                                                                                                                                                                 |
+| R-09  | A stalled request ends at the 10 s deadline, with one attempt and no owned timer left                                                                                                                                                                                                    |
+| R-10  | Cancellation before dispatch (no request), during the request, and after a valid page before sealing (kept, not obtained; exit 3 live and offline)                                                                                                                                       |
+| R-11  | A credential-bearing network error, an echoed key, credential-bearing non-text bytes and a credential in a header are redacted; an echoed page is not obtained; a redirect and a 429 stop the session after one attempt                                                                  |
+| R-12  | A write failure gives exit 5 with a redacted reason and no second request; an output directory created during the run is refused                                                                                                                                                         |
+| R-13  | Tampering without the manifest, 15 consistently re-hashed forgeries (observation, counts, record time, outcome, binding, interval, binding check, limitations, limits, request, digest, payload, deadline, obtained flag, cancellation) and five malformed records all fail verification |
+
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit): 15 run, 14 caught; one equivalent mutant.
+
+| Mutant | Change                                                            | Caught by                                                                              |
+| ------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Y01    | The interval-start second counted as inside                       | R-05                                                                                   |
+| Y02    | A null block time treated as before the interval                  | R-05                                                                                   |
+| Y03    | Echoed request id not checked                                     | R-07                                                                                   |
+| Y04    | Duplicate signatures accepted                                     | R-07                                                                                   |
+| Y05    | `processed` confirmation status accepted                          | R-07                                                                                   |
+| Y06    | A page newer than the interval read as having no interval records | R-04                                                                                   |
+| Y07    | Response limit raised to 1 MiB                                    | R-02, R-03, R-06 to R-11                                                               |
+| Y08    | No cancellation recheck before sealing                            | R-10                                                                                   |
+| Y09    | Watch binding not enforced                                        | R-02                                                                                   |
+| Y10    | Verifier skips page re-derivation                                 | R-13                                                                                   |
+| Y11    | Stored body not redacted                                          | R-11                                                                                   |
+| Y12    | Session lifetime alone raised to 60 s                             | Not caught: equivalent, because the 10 s request timeout still ends the single request |
+| Y12c   | Both the lifetime and the request timeout raised to 60 s          | R-09                                                                                   |
+| Y13    | Failed transactions not reported                                  | R-06                                                                                   |
+| Y14    | More than 20 records accepted                                     | R-07                                                                                   |
+| Y15    | Slot order not enforced                                           | R-07                                                                                   |
+
+The fee-destination equality assertion in the binding is a constant guard (the address is a fixed constant equal to the reviewed one); the test asserts the equality directly.
+
+- **Results**: the affected suites pass under external 60 s limits: retrospective 14, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (84); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 154 in all. The backend typecheck, ESLint and Prettier pass. The pin tests pass, including H-12 for the two new files; the baseline and the exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`) and the precheck 01, watch 01 and watch 02 manifests are unchanged, and no retrospective evidence directory exists.
+
+**Not started**: the request itself (independent review and a separate single-run approval are required).
 
 #### 8.38.17 Preliminary CPMM Support Reassessment and Staged Offline Implementation Proposal
 
@@ -6343,19 +6455,21 @@ To evaluate whether the lack of notifications in `fresh-amm-v4-watch-02` was con
 > **Status: PRELIMINARY DESIGN ASSESSMENT & SCOPING ONLY.**
 > CPMM support is not implemented or approved for execution. Raydium CPMM targets remain strictly **quarantined from strategy admission** until discovery, market orientation, swap flow, LP verification, and security context integration are complete, tested, and independently reviewed.
 
-Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Reassessing CPMM support against current local code and authoritative upstream references reveals substantial existing parsing assets alongside well-defined missing modules:
+Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Reassessing CPMM support against current local code and unversioned upstream references (see item 1) reveals substantial existing parsing assets alongside well-defined missing modules:
 
-**1. Pinned Upstream References & Version Coverage**:
+**1. Upstream References (Unversioned)**:
 
-- Upstream repository: `https://github.com/raydium-io/raydium-cp-swap`
-- Pinned instruction: Anchor instruction `initialize` per `raydium-cp-swap/programs/cp-swap/src/instructions/initialize.rs` (Anchor discriminator `0xafaf6d1f0d989bed`, 20 accounts).
-- Pinned account layout: `PoolState` struct per `raydium-cp-swap/programs/cp-swap/src/states/pool.rs` (637 bytes packed layout, Anchor account discriminator `0xf7ede3f5d7c3de46`).
-- Note: Upstream may have evolved across releases; local parsers reflect this specific pinned reference version.
+**Correction (2026-11-16)**: an earlier version of this item called these references "pinned" and said that the local parsers reflect "this specific pinned reference version". No commit, tag or release was recorded, so nothing here is pinned. Every reference below is **unversioned** until actual commit permalinks (`https://github.com/raydium-io/raydium-cp-swap/blob/<commit>/…`) are supplied and the local layouts are re-checked against them.
+
+- Upstream repository (unversioned): `https://github.com/raydium-io/raydium-cp-swap`
+- Instruction (unversioned): Anchor instruction `initialize` as described in `programs/cp-swap/src/instructions/initialize.rs` (Anchor discriminator `0xafaf6d1f0d989bed`, 20 accounts, as encoded in the local parser).
+- Account layout (unversioned): `PoolState` as described in `programs/cp-swap/src/states/pool.rs` (637 bytes, Anchor account discriminator `0xf7ede3f5d7c3de46`, as encoded in the local parser).
+- Version coverage: unknown. Upstream may differ between revisions, and no local parser has been checked against a recorded revision.
 
 **2. Existing Reusable Local Parsing Assets**:
 
-- `PoolInitializationParser.ts`: Strict Anchor discriminator `0xafaf6d1f0d989bed` (`sha256("global:initialize")[0..8]`), 20-account vector per `raydium-cp-swap/instructions/initialize.rs` (including account 12 `create_pool_fee`), payload length $\ge 32$ bytes (`open_time` at bytes 24..32, `init_amount_0/1` at bytes 8..24), and v0 ALT address resolution.
-- `RaydiumCpmmParser.ts`: Complete 637-byte zero-copy layout parser for `PoolState` (`0xf7ede3f5d7c3de46`), authority PDA validation (`RAYDIUM_CPMM_AUTHORITY`), exact BigInt fee liabilities subtraction (protocol, fund, creator fees), quote cohort classification (WSOL, USDC, USDT), and dual SPL Token / Token-2022 support.
+- `PoolInitializationParser.ts`: Strict Anchor discriminator `0xafaf6d1f0d989bed` (`sha256("global:initialize")[0..8]`), 20-account vector following the unversioned upstream `initialize.rs` (including account 12 `create_pool_fee`), payload length $\ge 32$ bytes (`open_time` at bytes 24..32, `init_amount_0/1` at bytes 8..24), and v0 ALT address resolution.
+- `RaydiumCpmmParser.ts`: 637-byte zero-copy layout parser for `PoolState` (following the unversioned upstream `pool.rs`) (`0xf7ede3f5d7c3de46`), authority PDA validation (`RAYDIUM_CPMM_AUTHORITY`), exact BigInt fee liabilities subtraction (protocol, fund, creator fees), quote cohort classification (WSOL, USDC, USDT), and dual SPL Token / Token-2022 support.
 - `AuthoritativeCpmmFixtures.ts`: **Synthetic test fixtures** (generating configured binary buffers for offline testing), not captured on-chain evidence.
 
 **3. Missing Protocol Modules & Implementation Gaps**:
