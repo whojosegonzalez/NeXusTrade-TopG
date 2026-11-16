@@ -6488,48 +6488,254 @@ Mutation checks for the corrections: all 11 caught.
 
 **Run**: the single approved request ran once on 2026-11-16 (`amm-v4-watch-02-01`); its capture, record schema version 2, offline reanalysis and the shutdown change are recorded in §8.38.19. No rerun is authorised.
 
-#### 8.38.17 Preliminary CPMM Support Reassessment and Staged Offline Implementation Proposal
+#### 8.38.17 Preliminary CPMM Support Reassessment and Isolated Pool-State Adapter Design Proposal
 
 > [!IMPORTANT]
 > **Status: PRELIMINARY DESIGN ASSESSMENT & SCOPING ONLY.**
-> CPMM support is not implemented or approved for execution. Raydium CPMM targets remain strictly **quarantined from strategy admission** until discovery, market orientation, swap flow, LP verification, and security context integration are complete, tested, and independently reviewed.
+> CPMM support is not implemented or approved for execution. Raydium CPMM targets remain strictly **quarantined from strategy admission** until discovery, market orientation, swap flow, LP verification, and security context integration are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified.
 
-Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Reassessing CPMM support against current local code and unversioned upstream references (see item 1) reveals substantial existing parsing assets alongside well-defined missing modules:
+Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the narrowly scoped design proposal for the first isolated CPMM component: the pure pool-state adapter `RaydiumCpmmPoolStateAdapter.ts` and its acceptance tests.
 
-**1. Upstream References (Unversioned)**:
+---
 
-**Correction (2026-11-16)**: an earlier version of this item called these references "pinned" and said that the local parsers reflect "this specific pinned reference version". No commit, tag or release was recorded, so nothing here is pinned. Every reference below is **unversioned** until actual commit permalinks (`https://github.com/raydium-io/raydium-cp-swap/blob/<commit>/…`) are supplied and the local layouts are re-checked against them.
+##### 1. Official Upstream Source, Immutable Commit Permalinks & Verification Boundary
 
-- Upstream repository (unversioned): `https://github.com/raydium-io/raydium-cp-swap`
-- Instruction (unversioned): Anchor instruction `initialize` as described in `programs/cp-swap/src/instructions/initialize.rs` (Anchor discriminator `0xafaf6d1f0d989bed`, 20 accounts, as encoded in the local parser).
-- Account layout (unversioned): `PoolState` as described in `programs/cp-swap/src/states/pool.rs` (637 bytes, Anchor account discriminator `0xf7ede3f5d7c3de46`, as encoded in the local parser).
-- Version coverage: unknown. Upstream may differ between revisions, and no local parser has been checked against a recorded revision.
+The local layout, authority derivation, vault contracts, and reserve accounting rules were checked against the authoritative open-source Raydium CPMM repository:
 
-**2. Existing Reusable Local Parsing Assets**:
+- **Upstream Repository**: [`https://github.com/raydium-io/raydium-cp-swap`](https://github.com/raydium-io/raydium-cp-swap)
+- **Immutable Commit Permalink**: [`https://github.com/raydium-io/raydium-cp-swap/commit/b3187ae`](https://github.com/raydium-io/raydium-cp-swap/commit/b3187ae) (Pull Request #80: _"Feat/creator fee share"_, author: `RainRaydium`, `0x777A`)
+- **Authoritative Source File Permalinks**:
+  - `PoolState` Account Struct: [`programs/cp-swap/src/states/pool.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae/programs/cp-swap/src/states/pool.rs)
+  - `initialize` Instruction Accounts: [`programs/cp-swap/src/instructions/initialize.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae/programs/cp-swap/src/instructions/initialize.rs)
+  - Authority PDA Constant Seed (`AUTH_SEED`): [`programs/cp-swap/src/lib.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae/programs/cp-swap/src/lib.rs)
 
-- `PoolInitializationParser.ts`: Strict Anchor discriminator `0xafaf6d1f0d989bed` (`sha256("global:initialize")[0..8]`), 20-account vector following the unversioned upstream `initialize.rs` (including account 12 `create_pool_fee`), payload length $\ge 32$ bytes (`open_time` at bytes 24..32, `init_amount_0/1` at bytes 8..24), and v0 ALT address resolution.
-- `RaydiumCpmmParser.ts`: 637-byte zero-copy layout parser for `PoolState` (following the unversioned upstream `pool.rs`) (`0xf7ede3f5d7c3de46`), authority PDA validation (`RAYDIUM_CPMM_AUTHORITY`), exact BigInt fee liabilities subtraction (protocol, fund, creator fees), quote cohort classification (WSOL, USDC, USDT), and dual SPL Token / Token-2022 support.
-- `AuthoritativeCpmmFixtures.ts`: **Synthetic test fixtures** (generating configured binary buffers for offline testing), not captured on-chain evidence.
+**Verification Against Upstream Commit `b3187ae`**:
 
-**3. Missing Protocol Modules & Implementation Gaps**:
+1. **Binary Layout Alignment**:
+   - `PoolState` is declared with `#[account(zero_copy(unsafe))]` and `#[repr(C, packed)]`.
+   - First 8 bytes: Anchor account discriminator `sha256("account:PoolState")[0..8] = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46]`.
+   - Total binary length: exactly **637 bytes** (verified by unit test `test_pool_state_len` in upstream `pool.rs`).
+   - Field offsets match local constants in `RaydiumCpmmParser.ts` byte-for-byte:
+     - 10 Pubkeys (32 bytes each, offsets 8..328): `amm_config` (8), `pool_creator` (40), `token_0_vault` (72), `token_1_vault` (104), `lp_mint` (136), `token_0_mint` (168), `token_1_mint` (200), `token_0_program` (232), `token_1_program` (264), `observation_key` (296).
+     - Byte flags and decimals (5 bytes, offsets 328..333): `auth_bump` (328), `status` (329), `lp_mint_decimals` (330), `mint_0_decimals` (331), `mint_1_decimals` (332).
+     - Little-endian u64 fields (56 bytes, offsets 333..389): `lp_supply` (333), `protocol_fees_token_0` (341), `protocol_fees_token_1` (349), `fund_fees_token_0` (357), `fund_fees_token_1` (365), `open_time` (373), `recent_epoch` (381).
+     - Creator fee fields (offsets 389..413): `creator_fee_on` (389, u8), `enable_creator_fee` (390, u8), `padding_1` (391..397, `[u8; 6]`), `creator_fees_token_0` (397..405, u64), `creator_fees_token_1` (405..413, u64).
+     - Trailing padding (offsets 413..637): `padding` (224 bytes, `[u64; 28]`).
+2. **Program & Authority Derivation**:
+   - Canonical CPMM Program ID: `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`.
+   - Global Vault & LP Mint Authority PDA derived with constant seed `b"vault_and_lp_mint_auth_seed"` (`AUTH_SEED` in `lib.rs`).
+   - PDA computation: `PublicKey.findProgramAddressSync([Buffer.from("vault_and_lp_mint_auth_seed")], CPMM_PROGRAM_ID)`.
+   - Constant Authority Address: `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL` (canonical bump 254 / `0xfe`).
+3. **Vault Relationships**:
+   - Token vaults (`token_0_vault`, `token_1_vault`) are standard Solana token accounts (165 bytes).
+   - In upstream `initialize.rs`, vaults are initialized with owner set to the global Authority PDA (`GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL`).
+   - Mint fields must match `token_0_mint` and `token_1_mint`.
+   - SPL token account state must be `1: Initialized` (byte 108).
+4. **Reserve Accounting Engine**:
+   - In upstream `pool.rs`, `vault_amount_without_fee(vault_amount, total_fees)` computes:
+     `effective_reserve = vault_amount - (protocol_fees + fund_fees + creator_fees)`.
+   - Accounting is exact non-negative integer subtraction: if `vault_amount < total_fees`, the pool is insolvent.
 
-- **Discovery**: No CPMM creation-fee destination or migration-event watch module exists.
-- **Market Parsing & Orientation**: `DexScreenerSingleCandidateMarketParser.ts` explicitly rejects `"CPMM"`. Upstream CPMM sorts mints canonically by byte address (`mint_0 < mint_1`), so WSOL can be token 0 or token 1; local orientation logic must support bidirectional candidate/WSOL mapping without fabricating data.
-- **Swap Decoding & Flow**: CPMM has no `ray_log`. Requires Anchor `swap_base_input` / `swap_base_output` decoding or vault balance delta tracking.
-  - _Metric Distinction_: Five-minute market metrics ($\ge 20$ trades, average size $15–$2,500) from DexScreener must be kept distinct from the runtime 60-second qualified-flow window with $\le 15$ s cutoff.
-- **LP Evidence & Screening**: Requires protocol-correct CPMM LP accounting. A purported "dead address" (such as `11111111111111111111111111111111` or incinerator) alone is **not** proof of permanently inaccessible LP. Accounting must verify on-chain LP mint supply and burn deltas or accredited locker program states to confirm $\ge 90\%$ burn/lock.
-- **Security Context & Token-2022**: Binary parser recognition of Token-2022 programs (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`) must be separated from security admission. Token-2022 introduces extension risks (transfer fees, freeze authority, transfer hooks, non-transferable mints). **Deferring Token-2022** (restricting initial CPMM scope strictly to canonical SPL Token mints, rejecting any pool with Token-2022 base or quote) is an initial-scope option to reduce complexity and risk.
-- **Runner & Coordinator**: Protocol-aware target identity, intake, and flow checks; strategy thresholds (liquidity 0.15–0.30, burn $\ge 90\%$, flow, age 300–900 s) remain completely unchanged.
+> [!WARNING]
+> **Source Matching vs. Deployed Program Verification Boundary**:
+> The local byte layout, discriminator, offsets, and accounting formulas match the official open-source GitHub source code at commit `b3187ae`.
+> However, **on-chain deployed bytecode verification remains unverified**: there is no independent, cryptographic verified build proof (e.g. Anchor verifiable build hash linking Mainnet bytecode of `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` to commit `b3187ae`) verified in this workspace.
+> The proposed adapter enforces strict adherence to the open-source protocol layout, but documents the on-chain deployed bytecode correspondence as an **unverified external dependency**.
 
-**4. Staged Offline Implementation Roadmap**:
+---
 
-| Stage       | Focus                             | Target Files                                                                                                                                | Acceptance Criteria                                                                                                                                                            |
-| :---------- | :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Stage 1** | **Market & Pool State Parsers**   | `backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts` | Accepts `"CPMM"` market label; handles bidirectional WSOL orientation (WSOL as token 0 or 1); maps `PoolState` reserves and decimals; rejects non-WSOL pairs.                  |
-| **Stage 2** | **CPMM Swap Decoding & Flow**     | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                      | Decodes `swap_base_input` and `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates 60 s qualified flow window and 5 min activity. |
-| **Stage 3** | **LP Evidence & Security Policy** | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`            | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                 |
-| **Stage 4** | **CPMM Creation Discovery**       | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                 | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination.                                        |
-| **Stage 5** | **Runner & Handoff Integration**  | `backend/src/scripts/paper-single-candidate-diagnostic.ts`<br>`backend/src/scripts/paper-pilot-handoff.ts`                                  | Protocol-aware runner accepts either AMM v4 or CPMM targets; strategy thresholds unchanged; handoff enforces exact protocol-aware code pin.                                    |
+##### 2. Analysis of Existing Local Parsers: Reusable Components vs. Corrections Needed
+
+Review of existing pilot components (`RaydiumCpmmParser.ts`, `PoolInitializationParser.ts`, `AuthoritativeCpmmFixtures.ts`) against the single-candidate coordinator requirements reveals what can be reused and what must be narrowed:
+
+1. **Reusable Parsing Assets**:
+   - `RaydiumCpmmParser.ts`:
+     - Constant offsets (`RAYDIUM_CPMM_OFFSETS`), buffer length (`637`), discriminator (`0xf7ede3f5d7c3de46`), and canonical authority (`GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL`).
+     - Zero-copy binary decoding of pubkeys, decimals, and little-endian u64 integers.
+     - Pure BigInt fee liability subtraction (`vault - (protocol + fund + creator)`).
+     - SPL Token vault account parsing (165 bytes, authority verification, account state check).
+   - `AuthoritativeCpmmFixtures.ts`:
+     - Binary buffer generator for testing 637-byte CPMM pool states and 165-byte vaults.
+     - **Strict Labelling Invariant**: Must be explicitly documented in all tests and comments as **synthetic in-memory byte generators**, not on-chain captured evidence.
+
+2. **Assumptions Requiring Correction / Narrowing in the Candidate-Scanner Adapter**:
+   - **Strict Restriction to Canonical SPL Token (De-scoping Token-2022)**:
+     - `RaydiumCpmmParser.ts` permits Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`) in `ALLOWED_TOKEN_PROGRAMS`.
+     - In the single-candidate candidate-scanner adapter, Token-2022 is **strictly rejected fail-closed** (`UNSUPPORTED_TOKEN_PROGRAM: TOKEN_2022_REJECTED`). Both candidate and WSOL vaults/programs must be canonical SPL Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`).
+   - **Strict Restriction to Candidate/WSOL Pairs (De-scoping Stablecoins/Exotics)**:
+     - `RaydiumCpmmParser.ts` contains quote-cohort logic classifying `STABLECOIN_USD` and `EXOTIC_CROSS`.
+     - The candidate adapter is exclusively for single-candidate evaluation against WSOL (`So11111111111111111111111111111111111111112`). Pools without WSOL or pools with WSOL on both sides must be refused (`NON_WSOL_PAIR`, `IDENTICAL_MINTS`).
+   - **Target Candidate Binding**:
+     - `RaydiumCpmmParser.ts` does not validate target identity. The candidate adapter must accept an explicit `target` (`{ poolAddress, candidateMint }`), verifying that the pool address matches and that exactly one mint matches the candidate mint.
+   - **Bidirectional Orientation Normalization**:
+     - Upstream CPMM canonically sorts mints (`mint_0 < mint_1`). Consequently, WSOL can be `token_0` or `token_1`.
+     - The candidate adapter must automatically resolve whether WSOL is token 0 or token 1, mapping the candidate mint to canonical `base` fields and WSOL to canonical `quote` fields (base reserve, quote reserve, base decimals, quote decimals, and spot price in SOL per base token).
+   - **Explicit Refusal Discriminated Union**:
+     - The candidate adapter must return a typed result (`ok: true` with structured data, or `ok: false` with an explicit, exhaustive refusal code and descriptive error message).
+
+---
+
+##### 3. Proposed Module Contract: `RaydiumCpmmPoolStateAdapter.ts`
+
+- **Proposed Target Path**: `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`
+- **Pure Entrypoint**:
+  ```typescript
+  export function adaptRaydiumCpmmPoolState(
+    input: RaydiumCpmmPoolStateInput,
+  ): RaydiumCpmmPoolStateResult;
+  ```
+
+**TypeScript Contract Specification**:
+
+```typescript
+export interface RaydiumCpmmPoolTarget {
+  readonly poolAddress: string;
+  readonly candidateMint: string;
+}
+
+export interface RaydiumCpmmRawAccount {
+  readonly data: Uint8Array | Buffer;
+  readonly ownerProgramId: string;
+  readonly slot?: number | undefined;
+}
+
+export interface RaydiumCpmmVaultAccount extends RaydiumCpmmRawAccount {
+  readonly vaultAddress: string;
+}
+
+export interface RaydiumCpmmPoolStateInput {
+  readonly target: RaydiumCpmmPoolTarget;
+  readonly poolAccount: RaydiumCpmmRawAccount;
+  readonly vault0Account: RaydiumCpmmVaultAccount;
+  readonly vault1Account: RaydiumCpmmVaultAccount;
+}
+
+export type RaydiumCpmmPairOrientation =
+  | "TOKEN_0_BASE_WSOL_QUOTE" // token_0 is candidate, token_1 is WSOL
+  | "TOKEN_1_BASE_WSOL_QUOTE"; // token_1 is candidate, token_0 is WSOL
+
+export interface RaydiumCpmmPoolStateSuccess {
+  readonly ok: true;
+  readonly poolAddress: string;
+  readonly candidateMint: string;
+  readonly wsolMint: string; // Canonical WSOL: So11111111111111111111111111111111111111112
+  readonly orientation: RaydiumCpmmPairOrientation;
+  readonly baseDecimals: number;
+  readonly quoteDecimals: number; // 9
+  readonly baseVaultAddress: string;
+  readonly quoteVaultAddress: string;
+  readonly baseVaultRaw: bigint;
+  readonly quoteVaultRaw: bigint;
+  readonly baseTotalFeesRaw: bigint;
+  readonly quoteTotalFeesRaw: bigint;
+  readonly baseEffectiveReserveRaw: bigint;
+  readonly quoteEffectiveReserveRaw: bigint;
+  readonly baseEffectiveReserveDecimal: number;
+  readonly quoteEffectiveReserveDecimal: number;
+  readonly spotPriceSol: number; // SOL per base token
+  readonly poolOpenTimeSec: number;
+  readonly lpMint: string;
+  readonly lpSupply: bigint;
+  readonly verification: {
+    readonly ownerVerified: true;
+    readonly vaultAuthoritiesVerified: true;
+    readonly tokenProgramsVerified: true;
+    readonly slotProvenance: {
+      readonly complete: boolean;
+      readonly slotDiscrepancy: boolean;
+      readonly poolSlot?: number | undefined;
+      readonly vault0Slot?: number | undefined;
+      readonly vault1Slot?: number | undefined;
+    };
+  };
+}
+
+export interface RaydiumCpmmPoolStateFailure {
+  readonly ok: false;
+  readonly refusalCode: RaydiumCpmmPoolStateRefusalCode;
+  readonly message: string;
+}
+
+export type RaydiumCpmmPoolStateResult = RaydiumCpmmPoolStateSuccess | RaydiumCpmmPoolStateFailure;
+```
+
+**Exhaustive Refusal Taxonomy**:
+
+| Refusal Code                   | Condition / Rejection Rationale                                                                          |
+| :----------------------------- | :------------------------------------------------------------------------------------------------------- |
+| `POOL_BUFFER_INVALID_LENGTH`   | Pool account buffer length !== 637 bytes.                                                                |
+| `POOL_DISCRIMINATOR_MISMATCH`  | Account bytes 0..8 !== `0xf7ede3f5d7c3de46` (Anchor `PoolState`).                                        |
+| `POOL_OWNER_UNAUTHORIZED`      | Pool account owner !== `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`.                                   |
+| `POOL_ADDRESS_MISMATCH`        | Pool address provided does not match target candidate pool address.                                      |
+| `CANDIDATE_MINT_MISMATCH`      | Neither token 0 mint nor token 1 mint matches target candidate mint.                                     |
+| `NON_WSOL_PAIR`                | Neither token 0 mint nor token 1 mint is canonical WSOL (`So11111111111111111111111111111111111111112`). |
+| `IDENTICAL_MINTS`              | Token 0 mint === token 1 mint (contradictory / invalid pool).                                            |
+| `UNSUPPORTED_TOKEN_PROGRAM`    | Token 0 or token 1 program !== canonical SPL Token (explicitly rejects Token-2022).                      |
+| `INVALID_DECIMALS`             | Decimals > 18 for candidate mint, WSOL mint, or LP mint.                                                 |
+| `VAULT_BUFFER_INVALID_LENGTH`  | Vault 0 or vault 1 buffer length !== 165 bytes (SPL Token account).                                      |
+| `VAULT_ADDRESS_MISMATCH`       | Provided vault address does not match `token_0_vault` or `token_1_vault` recorded in pool state.         |
+| `VAULT_OWNER_UNAUTHORIZED`     | Vault owner program !== canonical SPL Token program.                                                     |
+| `VAULT_MINT_MISMATCH`          | Vault decoded mint does not match the corresponding pool token mint.                                     |
+| `VAULT_AUTHORITY_UNAUTHORIZED` | Vault decoded authority !== canonical CPMM authority `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL`.     |
+| `VAULT_STATE_NOT_INITIALIZED`  | Vault account state !== 1 (e.g. uninitialized 0 or frozen 2).                                            |
+| `INSOLVENT_RESERVES`           | Vault raw balance < accrued fee liabilities (`protocol_fees + fund_fees + creator_fees`).                |
+| `ZERO_EFFECTIVE_RESERVES`      | Effective reserve after fee liability deduction === 0n.                                                  |
+| `SLOT_DISCREPANCY`             | When strict slot coherence is required: pool slot !== vault0 slot, or vault0 slot !== vault1 slot.       |
+
+---
+
+##### 4. Proposed Acceptance Test Suite: `RaydiumCpmmPoolStateAdapter.test.ts`
+
+- **Proposed Target Path**: `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`
+- **Fixture Policy**: Tests use synthetic in-memory byte generators derived from `AuthoritativeCpmmFixtures.ts` (clearly labelled as synthetic test fixtures).
+
+**Test Coverage Plan (8 Groups)**:
+
+1. **Group 1: Pool Buffer & Discriminator Validation**:
+   - Accepts valid 637-byte buffer with discriminator `0xf7ede3f5d7c3de46`.
+   - Rejects truncated buffer (< 637 bytes) with `POOL_BUFFER_INVALID_LENGTH`.
+   - Rejects oversized buffer (> 637 bytes) with `POOL_BUFFER_INVALID_LENGTH`.
+   - Rejects wrong discriminator with `POOL_DISCRIMINATOR_MISMATCH`.
+2. **Group 2: Account Ownership & Authority Invariants**:
+   - Rejects pool account owned by non-CPMM program with `POOL_OWNER_UNAUTHORIZED`.
+   - Verifies vault authority matches `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL`; rejects arbitrary authority with `VAULT_AUTHORITY_UNAUTHORIZED`.
+   - Rejects uninitialized or frozen vaults with `VAULT_STATE_NOT_INITIALIZED`.
+3. **Group 3: Bidirectional WSOL Orientation**:
+   - **Case A**: Token 0 = Candidate Mint, Token 1 = WSOL. Asserts orientation is `TOKEN_0_BASE_WSOL_QUOTE`, base reserves map to token 0, quote reserves map to token 1, spot price equals `quoteDecimal / baseDecimal`.
+   - **Case B**: Token 0 = WSOL, Token 1 = Candidate Mint. Asserts orientation is `TOKEN_1_BASE_WSOL_QUOTE`, base reserves map to token 1, quote reserves map to token 0, spot price equals `quoteDecimal / baseDecimal`.
+4. **Group 4: Strict Token Scope & Token-2022 Rejection**:
+   - Rejects pool where `token_0_program` is Token-2022 with `UNSUPPORTED_TOKEN_PROGRAM`.
+   - Rejects pool where `token_1_program` is Token-2022 with `UNSUPPORTED_TOKEN_PROGRAM`.
+   - Rejects vault account owned by Token-2022 program with `VAULT_OWNER_UNAUTHORIZED`.
+5. **Group 5: Exact Integer Reserve Accounting & Insolvency**:
+   - Verifies exact BigInt subtraction of `protocol_fees + fund_fees + creator_fees`.
+   - Rejects pool when vault balance is less than total fees with `INSOLVENT_RESERVES`.
+   - Rejects pool when effective reserve is zero with `ZERO_EFFECTIVE_RESERVES`.
+6. **Group 6: Target Identity & Mint Binding**:
+   - Rejects pool address mismatch against target with `POOL_ADDRESS_MISMATCH`.
+   - Rejects candidate mint mismatch against target with `CANDIDATE_MINT_MISMATCH`.
+   - Rejects non-WSOL pair (e.g. USDC/Bonk) with `NON_WSOL_PAIR`.
+   - Rejects dual-WSOL pair (token 0 === token 1 === WSOL) with `IDENTICAL_MINTS`.
+7. **Group 7: Vault Account Validation**:
+   - Rejects vault buffer length !== 165 bytes with `VAULT_BUFFER_INVALID_LENGTH`.
+   - Rejects vault address mismatch against pool state with `VAULT_ADDRESS_MISMATCH`.
+   - Rejects vault mint mismatch against pool state with `VAULT_MINT_MISMATCH`.
+8. **Group 8: Slot Provenance & Observation Causality**:
+   - When all slots match (pool slot === vault0 slot === vault1 slot), flags `complete: true`, `slotDiscrepancy: false`.
+   - When vault slots differ (vault0 slot !== vault1 slot), flags `slotDiscrepancy: true` or refuses with `SLOT_DISCREPANCY`.
+   - When pool slot differs from vault slots, flags `slotDiscrepancy: true`.
+
+---
+
+##### 5. Staged Offline Implementation Roadmap
+
+| Stage       | Focus                                 | Target Files                                                                                                                                                | Acceptance Criteria                                                                                                                                                            |
+| :---------- | :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                       | Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; fail-closed on inconsistencies. (Proposed above)     |
+| **Stage 2** | **Market Parser CPMM Enablement**     | `backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.test.ts` | Allows `"CPMM"` label; accepts bidirectional candidate/WSOL market pairs; maps 5-minute volume and transaction counts; preserves AMM v4 behavior.                              |
+| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                                      | Decodes `swap_base_input` and `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates 60 s qualified flow window and 5 min activity. |
+| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                            | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                 |
+| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                                 | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner. |
 
 #### 8.38.18 Integrity and Invariant Verification
 
