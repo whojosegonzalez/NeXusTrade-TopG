@@ -5168,7 +5168,9 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin refuses until an independent review advances the runner baseline (§8.38.12).
 >
-> The subscription-only capability check (`backend/src/scripts/solana-subscription-capability.ts`) is implemented and verified offline by 18 tests, including S-18 query-parameter credential redaction and Helius alternative preparation (§8.38.13, §8.38.14). The live probe needs independent review and a separate approval; Alchemy ticket #27494 remains open and Helius is prepared offline as an explicitly selected alternative.
+> The single operator capability probe against the configured Alchemy WebSocket endpoint (`solana-subscription-01`, 2026-11-15) completed with `TRANSPORT_ERROR` during the WebSocket handshake (`Unexpected server response: 403`), zero application frames, settled cleanup, verified manifest hash `25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`, and support ticket #27494 was submitted; the refusal's cause and account streaming entitlement remain unknown (§8.38.13).
+>
+> Separately, Helius is prepared offline as an explicitly selected alternative proposal (`solana-subscription-02`, §8.38.14), verified offline with 18 capability tests including query-parameter credential redaction (S-18). It remains unexecuted and awaiting separate operator approval; no provider requests, sockets, or live commands are authorized.
 >
 > The watch entry point itself still ends after sealing and reporting. Live execution is not authorized, and no operator live command is provided until the wrapper integration has been reviewed. No live limits are approved.
 
@@ -5983,9 +5985,21 @@ The 20 earlier wrapper and handoff mutations were rerun against the corrected so
 - **Use of the result**: only `SUBSCRIPTION_ACKNOWLEDGED` would justify proposing another bounded watch. Any other result ends there, with no automatic retry or endpoint switching.
 - **Prerequisites before it runs**: the operator sets `SOLANA_WS_URL` to the provider's documented streaming endpoint; the account entitlement and quota are confirmed outside this repository; the check is implemented and reviewed; and a separate approval for a single run is given.
 
-#### 8.38.13 Subscription-Only Capability Check (Completed Offline; Probe Not Run)
+#### 8.38.13 Subscription-Only Capability Check & Completed Alchemy Capture (solana-subscription-01)
 
-After the review of `83a320a` accepted the endpoint correction, the subscription-only capability check proposed in §8.38.12 is implemented in `backend/src/scripts/solana-subscription-capability.ts`, with its tests alongside. It was exercised only with injected fakes. No provider request, socket, probe execution, purchase or account change was made, and no operator live command is given; the live probe needs independent review and a separate approval.
+After the review of `83a320a` accepted the endpoint correction, the subscription-only capability check proposed in §8.38.12 was implemented in `backend/src/scripts/solana-subscription-capability.ts`, with its tests alongside.
+
+**Completed Operator Capture (`solana-subscription-01`, 2026-11-15)**:
+The single approved capability check was executed by the operator against the configured Alchemy WebSocket endpoint. Offline verification (`node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/solana-subscription-capability.ts --verify data/research/capability-checks/solana-subscription-01`) confirms:
+
+- **Integrity**: `OK` (manifest digest, files, sizes, limits all verified; CLI exits 3 `NOT_CONFIRMED`).
+- **Outcome**: `TRANSPORT_ERROR` during the WebSocket connection handshake (`detail: "Unexpected server response: 403"`).
+- **Transport**: `transportCreated: true`, `openedAtMs: null` (connection never reached the open state).
+- **Frames**: `[]` (zero outgoing application frames sent, zero incoming application messages received).
+- **Unsubscribe**: `NOT_SENT`.
+- **Cleanup**: settled without failure (`settled: true, failed: false, forced: false, reason: null`).
+- **Sealed Evidence Manifest Hash**: `25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`.
+- **Alchemy Ticket**: Support ticket #27494 was submitted regarding the handshake HTTP 403 response. The refusal's exact cause and whether Solana streaming is entitled on the free Alchemy plan remain unknown.
 
 **Account status (operator-reported 2026-11-15; not checked by this work)**: the Alchemy account is free-only with paid usage disabled; the dashboard shows Active Plan: Free, a 30M-CU monthly quota and 40 CUs used. **Solana streaming (WebSocket subscription) entitlement remains unverified.** Alchemy's agent-skills page is reference only; no skill was installed and no wallet or gateway was set up. The API-key configuration is unchanged.
 
@@ -6131,7 +6145,7 @@ S-17 covers both send failures:
 | Failed-attempt time not checked                                     | S-17                                                                                                                      |
 | Failed subscribe send does not finish                               | S-17                                                                                                                      |
 
-- **Results**: under external 60 s limits, in two groups: the capability check 18/18, Stage B runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (70 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 140 in all. The backend typecheck, ESLint and Prettier pass. **Pin**: the pin tests pass, including H-12. Separately, the runtime pin check still refuses exactly the two expected files (the modified Stage B runner and its test, §8.38.12), because the baseline `6855efb` is unchanged pending review. The wallet hash, both captures' manifests and the configuration are unchanged.
+- **Results**: under external 60 s limits, in two groups: the capability check 17/17, Stage B runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (69 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 139 in all. The backend typecheck, ESLint and Prettier pass. **Pin**: the pin tests pass, including H-12. Separately, the runtime pin check still refuses exactly the two expected files (the modified Stage B runner and its test, §8.38.12), because the baseline `6855efb` is unchanged pending review. The wallet hash, both captures' manifests and the configuration are unchanged.
 
 **Not started**: any live probe (independent review and a separate single-run approval are required). No live limits are approved.
 
@@ -6157,7 +6171,7 @@ While Alchemy support ticket #27494 remains open, Helius is prepared offline as 
    - Sorts secrets descending by length (longest match replaced first: full URL, then isolated API key).
 3. `redactSensitiveText` / `redactBuffer`:
    - Redacts full URLs and isolated key strings to `[REDACTED]` in console logs, error messages, probe metadata, and frame payloads.
-4. **Sufficiency Finding**: Existing runtime source code in `resolveSolanaEndpoints` and `solana-subscription-capability.ts` is 100% sufficient and requires zero modifications.
+4. **Sufficiency Finding**: Existing configuration and redaction paths pass synthetic checks; actual Helius access is untested. Zero runtime code modifications are required.
 
 **Regression Verification (S-18)**:
 Added test `S-18` in `backend/src/scripts/solana-subscription-capability.test.ts`:
@@ -6173,12 +6187,27 @@ Added test `S-18` in `backend/src/scripts/solana-subscription-capability.test.ts
 - Verified socket runtime error redacting query-parameter key to `[REDACTED]`.
 - Verified server error frame echoing query-parameter key redacted in frame evidence and probe outcome detail.
 
-**PowerShell Runbook (Offline Review)**:
-Privately loads the existing `HELIUS_API_KEY` from `.env` via `loadDaemonEnvironment()` from `backend/src/scripts/paper-trading-daemon.js`, temporarily supplies matching Helius Mainnet HTTP and explicit WebSocket endpoints, runs the dry-run command, and restores prior session environment variables in a `finally` block without printing any credentials or full URLs.
+**Endpoint Validation & Hardened PowerShell Runbook**:
+
+The default capability check dry run (`--out-dir ...` without `--live`) evaluates command-line arguments and prints the fixed execution plan and plan digest; by design, it performs zero filesystem credential reads, does not load `.env`, and does not validate environment configuration.
+
+Therefore, the prepared endpoints must be separately validated through the existing pure resolver (`resolveSolanaEndpoints`) without printing credentials or complete URLs. On success, the resolver confirms `wsSource: "SOLANA_WS_URL"`; on failure, it reports fixed diagnostic error tokens without leaking values.
+
+The PowerShell runbook below is hardened to:
+
+1. Explicitly select `U:\Projects\TopG`.
+2. Enforce terminating error handling (`$ErrorActionPreference = 'Stop'`).
+3. Privately load `HELIUS_API_KEY` via `loadDaemonEnvironment()` from `backend/src/scripts/paper-trading-daemon.js`.
+4. Check each child process exit code (`$LASTEXITCODE -ne 0`) and verify non-empty output before consuming it or continuing.
+5. In-memory validate the configured endpoints via the pure resolver `resolveSolanaEndpoints(process.env)`.
+6. Run the offline capability dry run.
+7. Always restore prior session endpoint environment variables and clear in-memory key state in a `finally` block on success or failure.
 
 ```powershell
 # NeXusTrade — Helius Endpoint Configuration & Capability Dry-Run Runbook
 # Offline preparation only. No live requests, sockets, wallet changes, or .env mutations.
+$ErrorActionPreference = 'Stop'
+Set-Location -LiteralPath 'U:\Projects\TopG'
 $prevRpc = $env:SOLANA_RPC_URL
 $prevWs = $env:SOLANA_WS_URL
 try {
@@ -6193,16 +6222,41 @@ import('./backend/src/scripts/paper-trading-daemon.js').then(m => {
   process.stdout.write(k);
 });
 '@
-  $heliusKey = ($nodeScript | node backend/node_modules/tsx/dist/cli.mjs -).Trim()
-  if (-not $heliusKey) {
-    throw "HELIUS_API_KEY could not be loaded via loadDaemonEnvironment()."
+  $rawKey = ($nodeScript | node backend/node_modules/tsx/dist/cli.mjs -)
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rawKey)) {
+    throw "Failed to privately load HELIUS_API_KEY (child exit code $LASTEXITCODE)."
   }
+  $heliusKey = $rawKey.Trim()
 
   $env:SOLANA_RPC_URL = "https://mainnet.helius-rpc.com/?api-key=$heliusKey"
   $env:SOLANA_WS_URL = "wss://mainnet.helius-rpc.com/?api-key=$heliusKey"
 
-  # Dry run (offline only; loads no config, opens no transport, writes nothing):
+  # Validate endpoints through pure resolver (dry run does not validate environment configuration):
+  $valScript = @'
+import('./backend/src/scripts/paper-single-candidate-diagnostic.js').then(m => {
+  const res = m.resolveSolanaEndpoints(process.env);
+  if (!res.ok) {
+    console.error('Endpoint validation failed:', res.error);
+    process.exit(1);
+  }
+  if (res.wsSource !== 'SOLANA_WS_URL') {
+    console.error('Endpoint validation failed: expected explicit SOLANA_WS_URL');
+    process.exit(1);
+  }
+  console.log('Endpoints successfully validated via pure resolver (credentials remain unprinted).');
+});
+'@
+  $valOutput = ($valScript | node backend/node_modules/tsx/dist/cli.mjs -)
+  if ($LASTEXITCODE -ne 0) {
+    throw "Pure resolver validation failed (child exit code $LASTEXITCODE)."
+  }
+  Write-Host $valOutput
+
+  # Execute capability dry run (offline only; loads no config, opens no transport, writes nothing):
   node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/solana-subscription-capability.ts --out-dir data/research/capability-checks/solana-subscription-02
+  if ($LASTEXITCODE -ne 0) {
+    throw "Capability dry run failed (child exit code $LASTEXITCODE)."
+  }
 } finally {
   $env:SOLANA_RPC_URL = $prevRpc
   $env:SOLANA_WS_URL = $prevWs
@@ -6222,4 +6276,4 @@ import('./backend/src/scripts/paper-trading-daemon.js').then(m => {
 - Sealed precheck manifest unchanged: `data/research/prechecks/fresh-amm-v4-01/evidence-manifest.json` (`5B65751D2ADAF7E27E342D00262FFE0E8AC2EA73447B91F6DE5B5FA6A146AC16`).
 - Sealed probe 01 manifest unchanged: `data/research/capability-checks/solana-subscription-01/evidence-manifest.json` (`25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`).
 - Pin check: preserves Stage B baseline `6855efb0e4ab5023e2c556030c42613a0ee86f53` and its exact two expected refusals (`paper-single-candidate-diagnostic.ts` and its test, §8.38.12).
-- Test suite: 140/140 passed across Group 1 (70/70) and Group 2 (70/70). Backend typecheck and ESLint clean.
+- Test suite results: 140/140 passed across Group 1 (70/70, including S-18 18/18) and Group 2 (70/70). Backend typecheck and ESLint clean.
