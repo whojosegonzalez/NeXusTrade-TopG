@@ -187,17 +187,21 @@ export function checkPin(pinnedCommit: string, git: GitRunner): string[] {
     problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
   } else {
     const found = new Map<string, { mode: string; type: string; oid: string }>();
-    let malformed = false;
+    let comparisonFailed = false;
     for (const line of treeResult.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
       const match = /^([0-7]{6})\s+([a-z]+)\s+([0-9a-f]{40})\t(.*)$/.exec(line);
       if (!match) {
-        malformed = true;
+        comparisonFailed = true;
         break;
       }
       const [, mode, type, oid, path] = match;
+      if (!reviewedPaths.includes(path!) || found.has(path!)) {
+        comparisonFailed = true;
+        break;
+      }
       found.set(path!, { mode: mode!, type: type!, oid: oid! });
     }
-    if (malformed) {
+    if (comparisonFailed) {
       problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
     } else {
       for (const [file, expected] of Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)) {

@@ -6272,10 +6272,10 @@ The single approved capability check was executed by the operator against the co
 - **Transport**: `transportCreated: true`, `openedAtMs: 1794825891624` (+394 ms after start at `2026-11-16T10:44:51.230Z`).
 - **Subscription**: acknowledgement received at `1794825891756` (+526 ms after start), `subscriptionId: 28059160`.
 - **Unsubscribe**: status `OBSERVED`, sent at `1794825891756` (+526 ms), acknowledgement received at `1794825891888` (+658 ms after start), result `true`.
-- **Cleanup**: `cleanupSettledAtMs: 1794825892020` (+790 ms after start), `closedAtMs: 1794825892020`, clean normal closure (code 1000).
+- **Cleanup**: `cleanupEndedAtMs: 1794825892020` (+790 ms after start); settled/nonfailed/nonforced cleanup (`settled: true`, `failed: false`, `forced: false`).
 - **Frames & Messages**: 2 outgoing frames (149-byte subscribe + 71-byte unsubscribe = 220 bytes), 2 incoming messages (42-byte ack + 38-byte unsub ack = 80 bytes payload), 0 notifications, 0 client pings.
 - **Redaction**: Zero credentials leaked in logs, JSON evidence, or frame payloads. Query parameters and secrets properly redacted.
-- **Significance & Boundaries**: Confirms active WebSocket `logsSubscribe` and unsubscription capability for Raydium AMM v4 program mentions on Helius Mainnet. It does not establish notification frequency, delivery completeness, filtering accuracy, or connection stability across a sustained 900 s watch session.
+- **Significance & Boundaries**: Confirms active WebSocket `logsSubscribe` and unsubscription capability for the AMM v4 creation-fee destination mentions (`7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5`) on Helius Mainnet. It does not establish notification frequency, delivery completeness, filtering accuracy, or connection stability across a sustained 900 s watch session.
 
 **Integrity and Invariant Verification**:
 

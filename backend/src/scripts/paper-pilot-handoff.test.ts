@@ -1316,6 +1316,57 @@ describe("Watched-evidence handoff (offline integration)", () => {
       }),
     ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
 
+    // Valid two-entry result: exactly one entry for each reviewed path with matching mode, type, and oid
+    const validTreeStdout =
+      "100644 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+      "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts";
+    expect(
+      pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"), {
+        status: 0,
+        stdout: validTreeStdout,
+      }),
+    ).toEqual([]);
+
+    // 7. Conflicting duplicates (order 1: wrong blob first, then valid entry)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "100644 blob 1111111111111111111111111111111111111111\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+          validTreeStdout,
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
+    // 8. Conflicting duplicates (order 2: valid entry first, then wrong blob)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          validTreeStdout +
+          "\n100644 blob 1111111111111111111111111111111111111111\tbackend/src/scripts/paper-single-candidate-diagnostic.ts",
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
+    // 9. Identical duplicates (valid entry repeated)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "100644 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+          validTreeStdout,
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
+    // 10. Unexpected extra path
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          validTreeStdout +
+          "\n100644 blob 2222222222222222222222222222222222222222\tbackend/src/scripts/unexpected-file.ts",
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
     // Read-only git on this repository:
     // Every addition since reviewed runner is allowed, and the endpoint modifications
     // match REVIEWED_ENDPOINT_MODIFICATIONS, so checkPin succeeds with zero refusals.
