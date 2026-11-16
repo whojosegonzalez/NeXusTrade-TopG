@@ -25,6 +25,7 @@ import {
   SUBSCRIBE_FRAME,
   classifyIncoming,
   classifyIncomingBytes,
+  credentialSecrets,
   printableCapabilityError,
   runSubscriptionCapabilityCheck,
   unsubscribeFrame,
@@ -34,7 +35,10 @@ import {
 } from "./solana-subscription-capability.js";
 import type { ISolanaKeepaliveWebSocketTransport } from "../candidate-scanner/RaydiumTransportObservationProbe.js";
 import { RAYDIUM_AMM_V4_CREATE_POOL_FEE_DESTINATION } from "./fresh-amm-v4-precheck.js";
-import { SOLANA_ENDPOINT_ERRORS } from "./paper-single-candidate-diagnostic.js";
+import {
+  SOLANA_ENDPOINT_ERRORS,
+  resolveSolanaEndpoints,
+} from "./paper-single-candidate-diagnostic.js";
 import { START_MS, VirtualScheduler, drive } from "./fresh-amm-v4-precheck.test-support.js";
 
 type Loose = ReturnType<typeof JSON.parse>;
@@ -191,8 +195,8 @@ function listFiles(dir: string): string[] {
   return readdirSync(dir);
 }
 
-function expectNoSecrets(h: Harness) {
-  for (const line of h.lines) for (const s of SECRETS) expect(line.includes(s), line).toBe(false);
+function expectNoSecrets(h: Harness, secrets: readonly string[] = SECRETS) {
+  for (const line of h.lines) for (const s of secrets) expect(line.includes(s), line).toBe(false);
   let names: string[] = [];
   try {
     names = listFiles(h.abs(RUN));
@@ -201,13 +205,13 @@ function expectNoSecrets(h: Harness) {
   }
   for (const f of names) {
     const text = readFileSync(path.join(h.abs(RUN), f), "utf8");
-    for (const s of SECRETS) expect(text.includes(s), `${s} in ${f}`).toBe(false);
+    for (const s of secrets) expect(text.includes(s), `${s} in ${f}`).toBe(false);
   }
   if (names.includes(CAPABILITY_FILES.probe)) {
     for (const fr of probeJson(h).frames as Loose[]) {
       if (fr.storedEncoding !== "base64") continue;
       const decoded = Buffer.from(fr.payload as string, "base64");
-      for (const s of SECRETS)
+      for (const s of secrets)
         expect(decoded.includes(Buffer.from(s)), `${s} in frame ${fr.seq}`).toBe(false);
     }
   }
@@ -1227,5 +1231,88 @@ describe("Solana subscription-only capability check (offline)", () => {
     expect(sub.transports[0]!.sendCalls).toBe(1);
     expect((await sub.run(["--verify", RUN])).exitCode).toBe(CAPABILITY_EXIT_CODES.NOT_CONFIRMED);
     expectSettled(sub, s);
+  });
+
+  it("S-18: query-parameter credentials on WebSocket and RPC are redacted everywhere across transport errors, frames and sealed evidence", async () => {
+    const Q_RPC_KEY = "SYNTHETIC-helius-rpc-key-123456789";
+    const Q_WS_KEY = "SYNTHETIC-helius-ws-key-987654321";
+    const Q_RPC_URL = `https://mainnet.helius-rpc.invalid/?api-key=${Q_RPC_KEY}`;
+    const Q_WS_URL = `wss://mainnet.helius-rpc.invalid/?api-key=${Q_WS_KEY}`;
+    const Q_SECRETS = [Q_RPC_URL, Q_WS_URL, Q_RPC_KEY, Q_WS_KEY];
+    const Q_ENV = Object.freeze({ SOLANA_RPC_URL: Q_RPC_URL, SOLANA_WS_URL: Q_WS_URL });
+
+    // 1. credentialSecrets and resolveSolanaEndpoints validation
+    const extracted = credentialSecrets([Q_RPC_URL, Q_WS_URL]);
+    expect(extracted).toContain(Q_RPC_URL);
+    expect(extracted).toContain(Q_WS_URL);
+    expect(extracted).toContain(Q_RPC_KEY);
+    expect(extracted).toContain(Q_WS_KEY);
+    for (let i = 1; i < extracted.length; i++) {
+      expect(extracted[i - 1]!.length).toBeGreaterThanOrEqual(extracted[i]!.length);
+    }
+    const resolved = resolveSolanaEndpoints(Q_ENV);
+    expect(resolved).toEqual({
+      ok: true,
+      rpcUrl: Q_RPC_URL,
+      wsUrl: Q_WS_URL,
+      wsSource: "SOLANA_WS_URL",
+    });
+
+    // 2. Successful probe with query-parameter WebSocket URL
+    const ok = harness({ onSubscribe: ack(), onUnsubscribe: ack(true, 2), env: Q_ENV });
+    const rOk = await live(ok);
+    expect(rOk).toMatchObject({
+      exitCode: CAPABILITY_EXIT_CODES.OK,
+      probe: {
+        outcome: "SUBSCRIPTION_ACKNOWLEDGED",
+        capabilityConfirmed: true,
+      },
+    });
+    expect(ok.urls).toEqual([Q_WS_URL]);
+    expectNoSecrets(ok, Q_SECRETS);
+    const vOk = await ok.run(["--verify", RUN]);
+    expect(vOk.exitCode).toBe(CAPABILITY_EXIT_CODES.OK);
+
+    // 3. Transport construction error redacting query-parameter URL
+    const thrown = harness({ env: Q_ENV });
+    const rThrown = await live(thrown, {
+      createWebSocketTransport: (url: string) => {
+        throw new Error(`SYNTHETIC connect failure to ${url}`);
+      },
+    });
+    expect(rThrown.probe).toMatchObject({ outcome: "TRANSPORT_ERROR", transportCreated: false });
+    expect(probeJson(thrown).detail).toBe(
+      "transport construction failed: SYNTHETIC connect failure to [REDACTED]",
+    );
+    expectNoSecrets(thrown, Q_SECRETS);
+    expect(rThrown.verification?.integrity.ok).toBe(true);
+
+    // 4. Socket runtime error redacting query-parameter key
+    const errored = harness({ onSubscribe: null, env: Q_ENV });
+    errored.sched.at(START_MS + 1_000, () =>
+      errored.transports[0]!.emit(
+        "error",
+        new Error(`SYNTHETIC socket error at ${Q_WS_URL} key ${Q_WS_KEY}`),
+      ),
+    );
+    const rErrored = await live(errored);
+    expect(rErrored.probe?.outcome).toBe("TRANSPORT_ERROR");
+    expect(probeJson(errored).detail).not.toContain(Q_WS_KEY);
+    expect(probeJson(errored).detail).not.toContain(Q_WS_URL);
+    expectNoSecrets(errored, Q_SECRETS);
+
+    // 5. Echo of the query-parameter key in a server frame is redacted, and never confirms
+    const echo = harness({
+      env: Q_ENV,
+      onSubscribe: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32602, message: `bad query key ${Q_WS_KEY}` },
+      }),
+    });
+    const rEcho = await live(echo);
+    expect(rEcho.probe?.outcome).toBe("SUBSCRIPTION_REJECTED");
+    expectNoSecrets(echo, Q_SECRETS);
+    expect(rEcho.verification?.capabilityConfirmed).toBe(false);
   });
 });

@@ -5168,7 +5168,7 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 >
 > The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin refuses until an independent review advances the runner baseline (§8.38.12).
 >
-> The subscription-only capability check (`backend/src/scripts/solana-subscription-capability.ts`) is implemented and verified offline by 17 tests, including the corrections after `78be91c` and `aadf1e9`. The live probe needs independent review and a separate approval; Solana streaming entitlement on the free Alchemy plan is unverified (§8.38.13).
+> The subscription-only capability check (`backend/src/scripts/solana-subscription-capability.ts`) is implemented and verified offline by 18 tests, including S-18 query-parameter credential redaction and Helius alternative preparation (§8.38.13, §8.38.14). The live probe needs independent review and a separate approval; Alchemy ticket #27494 remains open and Helius is prepared offline as an explicitly selected alternative.
 >
 > The watch entry point itself still ends after sealing and reporting. Live execution is not authorized, and no operator live command is provided until the wrapper integration has been reviewed. No live limits are approved.
 
@@ -6131,6 +6131,95 @@ S-17 covers both send failures:
 | Failed-attempt time not checked                                     | S-17                                                                                                                      |
 | Failed subscribe send does not finish                               | S-17                                                                                                                      |
 
-- **Results**: under external 60 s limits, in two groups: the capability check 17/17, Stage B runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (69 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 139 in all. The backend typecheck, ESLint and Prettier pass. **Pin**: the pin tests pass, including H-12. Separately, the runtime pin check still refuses exactly the two expected files (the modified Stage B runner and its test, §8.38.12), because the baseline `6855efb` is unchanged pending review. The wallet hash, both captures' manifests and the configuration are unchanged.
+- **Results**: under external 60 s limits, in two groups: the capability check 18/18, Stage B runner 18/18, watch entry point 11/11, handoff 13/13 and wrapper 10/10 (70 tests); watch evidence 12/12, precheck 6/6, validation 19/19 and collector 33/33 (70 tests); 140 in all. The backend typecheck, ESLint and Prettier pass. **Pin**: the pin tests pass, including H-12. Separately, the runtime pin check still refuses exactly the two expected files (the modified Stage B runner and its test, §8.38.12), because the baseline `6855efb` is unchanged pending review. The wallet hash, both captures' manifests and the configuration are unchanged.
 
 **Not started**: any live probe (independent review and a separate single-run approval are required). No live limits are approved.
+
+#### 8.38.14 Offline Preparation of Helius Alternative (Ticket #27494 Mitigation)
+
+**Context & Scope Boundaries**:
+While Alchemy support ticket #27494 remains open, Helius is prepared offline as an explicitly selected alternative provider for the single capability probe.
+
+- **Explicit, Never Automatic**: Zero automatic provider fallback is implemented in code. The provider is selected exclusively by the operator setting environment variables (`SOLANA_RPC_URL` and `SOLANA_WS_URL`) pointing to matching endpoints.
+- **Provider Consistency**: No mixed-provider capture. Both RPC and WebSocket must point to the same provider (`mainnet.helius-rpc.com`).
+- **Zero Scope Expansion**: No new SDK, no new dependency, no billing changes, no wallet changes, and no provider requests, sockets, or live commands are executed.
+
+**Sufficiency of Existing Runtime Code**:
+
+1. `resolveSolanaEndpoints` (`backend/src/scripts/paper-single-candidate-diagnostic.ts`):
+   - Accepts `SOLANA_RPC_URL` (requires `http:` or `https:`, non-empty host).
+   - Accepts `SOLANA_WS_URL` (requires `ws:` or `wss:`, non-empty host, non-downgraded).
+   - Helius endpoints `https://mainnet.helius-rpc.com/?api-key=<KEY>` and `wss://mainnet.helius-rpc.com/?api-key=<KEY>` validate cleanly and return `{ ok: true, rpcUrl, wsUrl, wsSource: "SOLANA_WS_URL" }`.
+2. `credentialSecrets` (`backend/src/scripts/solana-subscription-capability.ts`):
+   - Parses each configured URL via `new URL(raw)`.
+   - Collects the raw URL.
+   - Extracts all search parameter values of length $\ge 6$ (`u.searchParams.values()`). For Helius, `?api-key=<KEY>` extracts the 36-character key.
+   - Sorts secrets descending by length (longest match replaced first: full URL, then isolated API key).
+3. `redactSensitiveText` / `redactBuffer`:
+   - Redacts full URLs and isolated key strings to `[REDACTED]` in console logs, error messages, probe metadata, and frame payloads.
+4. **Sufficiency Finding**: Existing runtime source code in `resolveSolanaEndpoints` and `solana-subscription-capability.ts` is 100% sufficient and requires zero modifications.
+
+**Regression Verification (S-18)**:
+Added test `S-18` in `backend/src/scripts/solana-subscription-capability.test.ts`:
+
+- Tested synthetic query-parameter credentials (`?api-key=...`) on both HTTP and WebSocket URLs.
+- Verified pure `credentialSecrets` extraction and length-descending sorting.
+- Verified `resolveSolanaEndpoints` accepts query-parameter endpoints without downgrade or error.
+- Verified end-to-end simulated probe with query-parameter WebSocket URL:
+  - Confirmed capability (`SUBSCRIPTION_ACKNOWLEDGED`, `capabilityConfirmed: true`).
+  - Zero secrets in console output, `plan.json`, `probe.json`, `evidence-manifest.json`, and base64 payloads.
+  - Offline `--verify` cleanly reproduces and confirms integrity.
+- Verified transport construction error redacting query-parameter URL to `[REDACTED]`.
+- Verified socket runtime error redacting query-parameter key to `[REDACTED]`.
+- Verified server error frame echoing query-parameter key redacted in frame evidence and probe outcome detail.
+
+**PowerShell Runbook (Offline Review)**:
+Privately loads the existing `HELIUS_API_KEY` from `.env` via `loadDaemonEnvironment()` from `backend/src/scripts/paper-trading-daemon.js`, temporarily supplies matching Helius Mainnet HTTP and explicit WebSocket endpoints, runs the dry-run command, and restores prior session environment variables in a `finally` block without printing any credentials or full URLs.
+
+```powershell
+# NeXusTrade — Helius Endpoint Configuration & Capability Dry-Run Runbook
+# Offline preparation only. No live requests, sockets, wallet changes, or .env mutations.
+$prevRpc = $env:SOLANA_RPC_URL
+$prevWs = $env:SOLANA_WS_URL
+try {
+  $nodeScript = @'
+import('./backend/src/scripts/paper-trading-daemon.js').then(m => {
+  m.loadDaemonEnvironment();
+  const k = process.env.HELIUS_API_KEY;
+  if (!k) {
+    console.error('HELIUS_API_KEY is not set in environment or .env');
+    process.exit(1);
+  }
+  process.stdout.write(k);
+});
+'@
+  $heliusKey = ($nodeScript | node backend/node_modules/tsx/dist/cli.mjs -).Trim()
+  if (-not $heliusKey) {
+    throw "HELIUS_API_KEY could not be loaded via loadDaemonEnvironment()."
+  }
+
+  $env:SOLANA_RPC_URL = "https://mainnet.helius-rpc.com/?api-key=$heliusKey"
+  $env:SOLANA_WS_URL = "wss://mainnet.helius-rpc.com/?api-key=$heliusKey"
+
+  # Dry run (offline only; loads no config, opens no transport, writes nothing):
+  node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/solana-subscription-capability.ts --out-dir data/research/capability-checks/solana-subscription-02
+} finally {
+  $env:SOLANA_RPC_URL = $prevRpc
+  $env:SOLANA_WS_URL = $prevWs
+  $heliusKey = $null
+}
+```
+
+**Proposed Single-Probe Scope**:
+
+- **Target Evidence Directory**: `data/research/capability-checks/solana-subscription-02/` (fresh path; `solana-subscription-01/` preserved).
+- **Bounds**: Identical to reviewed capability limits: 1 connection, 0 reconnects, 0 retries, 5,000 ms acquisition deadline, at most 2 outgoing frames (subscribe + unsubscribe), at most 10 incoming messages, at most 64 KiB payload, 0 client keepalive pings, 0 HTTP requests, 5,000 ms cleanup timeout.
+- **Status**: PENDING SEPARATE OPERATOR APPROVAL. Do not execute.
+
+**Integrity and Invariant Verification**:
+
+- Virtual wallet balance and hash unchanged: 7.9259 SOL, `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`.
+- Sealed precheck manifest unchanged: `data/research/prechecks/fresh-amm-v4-01/evidence-manifest.json` (`5B65751D2ADAF7E27E342D00262FFE0E8AC2EA73447B91F6DE5B5FA6A146AC16`).
+- Sealed probe 01 manifest unchanged: `data/research/capability-checks/solana-subscription-01/evidence-manifest.json` (`25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`).
+- Pin check: preserves Stage B baseline `6855efb0e4ab5023e2c556030c42613a0ee86f53` and its exact two expected refusals (`paper-single-candidate-diagnostic.ts` and its test, §8.38.12).
+- Test suite: 140/140 passed across Group 1 (70/70) and Group 2 (70/70). Backend typecheck and ESLint clean.
