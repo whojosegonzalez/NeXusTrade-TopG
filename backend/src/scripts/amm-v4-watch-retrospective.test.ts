@@ -202,22 +202,27 @@ function expectSettled(h: Harness, r: RetrospectiveRunResult) {
   void r;
 }
 
-/** Rewrites retrospective.json (with its manifest entry and summary) consistently, then verifies. */
-function reforge(h: Harness, name: string, edit: (r: Loose) => void) {
+/** Rewrites one sealed file (with its manifest entry and summary) consistently, then verifies. */
+function reforge(
+  h: Harness,
+  name: string,
+  edit: (r: Loose) => void,
+  target: string = RETROSPECTIVE_FILES.retrospective,
+) {
   const dir = path.join(h.projectRoot, "data/research/retrospective-checks", name);
   cpSync(h.abs(RUN), dir, { recursive: true });
-  const file = path.join(dir, RETROSPECTIVE_FILES.retrospective);
+  const file = path.join(dir, target);
   const r = JSON.parse(readFileSync(file, "utf8")) as Loose;
   edit(r);
   const text = JSON.stringify(r, null, 2) + "\n";
   writeFileSync(file, text);
   const manifestPath = path.join(dir, RETROSPECTIVE_FILES.manifest);
   const m = JSON.parse(readFileSync(manifestPath, "utf8")) as Loose;
-  if (r && typeof r === "object" && !Array.isArray(r)) {
+  if (target === RETROSPECTIVE_FILES.retrospective && r && typeof r === "object") {
     m.outcome = r.outcome;
     m.pageObtained = r.pageObtained;
   }
-  const entry = m.files.find((x: Loose) => x.path === RETROSPECTIVE_FILES.retrospective);
+  const entry = m.files.find((x: Loose) => x.path === target);
   entry.sha256 = createHash("sha256").update(text).digest("hex");
   entry.bytes = Buffer.byteLength(text);
   writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\n");
@@ -441,10 +446,10 @@ describe("AMM v4 watch 02 retrospective metadata check (offline)", () => {
       coverage: "PAGE_SPANS_INTERVAL",
       observation: "NO_INTERVAL_RECORDS_IN_PAGE",
     });
-    // Partial overlap: the oldest returned record is inside the interval.
+    // Newer-side partial overlap: the oldest returned record is inside the interval.
     const partial = analyze([rec(1, 30, END_SEC + 5), rec(2, 20, START_SEC + 100)]);
     expect(partial).toMatchObject({
-      coverage: "PAGE_PARTIALLY_OVERLAPS_INTERVAL",
+      coverage: "PAGE_OVERLAPS_INTERVAL_END",
       observation: "INTERVAL_RECORDS_IN_PAGE",
     });
     // Empty page and a full page.
@@ -846,5 +851,291 @@ describe("AMM v4 watch 02 retrospective metadata check (offline)", () => {
     expect(verifyRetrospectiveEvidence(h.abs(RUN)).integrity.problems).toContain(
       "UNLISTED:extra.json",
     );
+  });
+
+  it("R-14: recorded acquisition timing: dispatch before the deadline, success within it", async () => {
+    const h = harness();
+    const ok = await live(h);
+    expect(ok.verification).toMatchObject({ integrity: { ok: true }, pageObtained: true });
+    const deadline = recordJson(h).deadlineAtMs as number;
+    expect(deadline).toBe(START_MS + 10_000);
+    // Late dispatch (at or after the absolute deadline), with consistent completion and end times.
+    for (const delta of [0, 1, 5_000]) {
+      const v = reforge(h, `late-dispatch-${delta}`, (r) => {
+        r.request.dispatchedAtMs = deadline + delta;
+        r.request.completedAtMs = deadline + delta + 100;
+        r.endedAtMs = deadline + delta + 100;
+      });
+      expect(v.integrity.ok, `dispatch +${delta}`).toBe(false);
+      expect(v.integrity.problems, `dispatch +${delta}`).toContain("DISPATCH_AFTER_DEADLINE");
+      expect(v.pageObtained).toBe(false);
+    }
+    // Late successful completion still claiming a received page.
+    for (const delta of [1, 5_000]) {
+      const v = reforge(h, `late-complete-${delta}`, (r) => {
+        r.request.completedAtMs = deadline + delta;
+        r.endedAtMs = deadline + delta;
+      });
+      expect(v.integrity.ok, `complete +${delta}`).toBe(false);
+      expect(v.integrity.problems, `complete +${delta}`).toContain("OUTCOME_NOT_REPRODUCED");
+      expect(v.pageObtained).toBe(false);
+    }
+    // Completion exactly at the deadline is within it.
+    expect(
+      reforge(h, "complete-at-deadline", (r) => {
+        r.request.completedAtMs = deadline;
+        r.endedAtMs = deadline;
+      }),
+    ).toMatchObject({ integrity: { ok: true }, pageObtained: true });
+    // Local post-acquisition processing overhead after the deadline is allowed.
+    expect(reforge(h, "overhead", (r) => void (r.endedAtMs = deadline + 30_000))).toMatchObject({
+      integrity: { ok: true },
+      pageObtained: true,
+    });
+    // A genuinely late complete response (the acquisition clock started 5 ms before the session):
+    // recorded as a deadline failure, the page kept but never obtained.
+    let first = true;
+    const skew = harness({ fetch: { delayMs: 9_998 } });
+    const s = await live(skew, {
+      clock: () => {
+        if (first) {
+          first = false;
+          return skew.sched.now - 5;
+        }
+        return skew.sched.now;
+      },
+    });
+    expect(s).toMatchObject({
+      exitCode: RETROSPECTIVE_EXIT_CODES.NO_PAGE,
+      acquisition: { outcome: "DEADLINE_EXPIRED", deadlineAtMs: START_MS + 9_995 },
+      record: { pageObtained: false, page: { observation: "INTERVAL_RECORDS_IN_PAGE" } },
+      verification: { integrity: { ok: true }, outcome: "DEADLINE_EXPIRED", pageObtained: false },
+    });
+    expect(recordJson(skew).request).toMatchObject({
+      error: null,
+      completedAtMs: START_MS + 9_998,
+    });
+    // Genuine failure captures keep their outcomes, including cleanup after the deadline.
+    const stalled = harness({ fetch: { delayMs: 15_000 } });
+    await live(stalled);
+    const st = recordJson(stalled);
+    expect(st.request.completedAtMs).toBeGreaterThanOrEqual(st.deadlineAtMs);
+    expect(verifyRetrospectiveEvidence(stalled.abs(RUN))).toMatchObject({
+      integrity: { ok: true },
+      outcome: "DEADLINE_EXPIRED",
+    });
+    expect(
+      reforge(stalled, "stalled-cleanup", (r) => {
+        r.request.completedAtMs = r.deadlineAtMs + 400;
+        r.endedAtMs = r.deadlineAtMs + 900;
+      }),
+    ).toMatchObject({ integrity: { ok: true }, outcome: "DEADLINE_EXPIRED", pageObtained: false });
+    const cancelled = harness({ fetch: { delayMs: 5_000 } });
+    cancelled.sched.at(START_MS + 1_000, () => cancelled.controller.abort());
+    await live(cancelled);
+    expect(verifyRetrospectiveEvidence(cancelled.abs(RUN))).toMatchObject({
+      integrity: { ok: true },
+      outcome: "OPERATOR_CANCELLED",
+    });
+    expect(
+      reforge(cancelled, "cancelled-cleanup", (r) => {
+        r.request.completedAtMs = r.deadlineAtMs + 400;
+        r.endedAtMs = r.deadlineAtMs + 900;
+      }),
+    ).toMatchObject({ integrity: { ok: true }, outcome: "OPERATOR_CANCELLED" });
+  });
+
+  it("R-15: response accounting: body state and observed/original/stored bytes agree", async () => {
+    const h = harness();
+    await live(h);
+    const small = recordJson(h).response.originalBytes as number;
+    expect(small).toBeLessThan(65_536);
+    // The reviewed reproduction.
+    const over = reforge(h, "acct-observed-over", (r) => void (r.response.observedBytes = 65_537));
+    expect(over.integrity.ok).toBe(false);
+    expect(over.integrity.problems).toContain("RESPONSE_ACCOUNTING_INVALID");
+    expect(over.pageObtained).toBe(false);
+    const forged: [string, (r: Loose) => void][] = [
+      ["observed above original", (r) => void (r.response.observedBytes = small + 1)],
+      ["observed below original", (r) => void (r.response.observedBytes = small - 1)],
+      ["observed missing", (r) => void (r.response.observedBytes = null)],
+      ["unknown body state", (r) => void (r.response.bodyState = "MOSTLY_COMPLETE")],
+      ["not read with a body", (r) => void (r.response.bodyState = "NOT_READ")],
+      ["overflow below the limit", (r) => void (r.response.bodyState = "PARTIAL_OVERFLOW")],
+      ["status missing with a body", (r) => void (r.response.httpStatus = null)],
+    ];
+    for (const [label, edit] of forged) {
+      const v = reforge(h, `acct-${label.replace(/ /g, "-")}`, edit);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.integrity.problems, label).toContain("RESPONSE_ACCOUNTING_INVALID");
+      expect(v.pageObtained, label).toBe(false);
+    }
+    // A genuine partial overflow: the retained prefix is exactly the limit; more was observed.
+    const big = page(
+      Array.from({ length: 20 }, (_, i) =>
+        rec(i + 1, 1000 - i, END_SEC + 1, { memo: "x".repeat(4000) }),
+      ),
+    );
+    const of = harness({ fetch: { body: big } });
+    await live(of);
+    expect(recordJson(of).response).toMatchObject({
+      bodyState: "PARTIAL_OVERFLOW",
+      originalBytes: 65_536,
+    });
+    expect(recordJson(of).response.observedBytes).toBeGreaterThan(65_536);
+    expect(verifyRetrospectiveEvidence(of.abs(RUN))).toMatchObject({
+      integrity: { ok: true },
+      outcome: "RESPONSE_LIMIT_EXCEEDED",
+    });
+    const overflowForged: [string, (r: Loose) => void][] = [
+      ["overflow observed at the limit", (r) => void (r.response.observedBytes = 65_536)],
+      ["overflow without its error", (r) => void (r.request.error = "NETWORK_ERROR")],
+      ["overflow marked complete", (r) => void (r.response.bodyState = "COMPLETE")],
+    ];
+    for (const [label, edit] of overflowForged) {
+      const v = reforge(of, `acct-${label.replace(/ /g, "-")}`, edit);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.integrity.problems, label).toContain("RESPONSE_ACCOUNTING_INVALID");
+    }
+    // A genuine declared oversize: nothing read.
+    const declared = harness({ fetch: { body: "[]", headers: { "content-length": "70000" } } });
+    await live(declared);
+    expect(recordJson(declared).response).toMatchObject({
+      bodyState: "NOT_READ",
+      observedBytes: null,
+      originalBytes: null,
+      payload: null,
+    });
+    expect(verifyRetrospectiveEvidence(declared.abs(RUN))).toMatchObject({
+      integrity: { ok: true },
+      outcome: "RESPONSE_LIMIT_EXCEEDED",
+    });
+    const notReadForged: [string, (r: Loose) => void][] = [
+      ["not read with observed bytes", (r) => void (r.response.observedBytes = 0)],
+      ["not read without an error", (r) => void (r.request.error = null)],
+    ];
+    for (const [label, edit] of notReadForged) {
+      const v = reforge(declared, `acct-${label.replace(/ /g, "-")}`, edit);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.integrity.problems, label).toContain("RESPONSE_ACCOUNTING_INVALID");
+    }
+    // Genuine NOT_READ failures without a status (a transport error) still verify.
+    const thrown = harness({ fetch: { throwError: "SYNTHETIC reset" } });
+    await live(thrown);
+    expect(recordJson(thrown).response).toMatchObject({ bodyState: "NOT_READ", httpStatus: null });
+    expect(verifyRetrospectiveEvidence(thrown.abs(RUN))).toMatchObject({
+      integrity: { ok: true },
+      outcome: "TRANSPORT_ERROR",
+    });
+  });
+
+  it("R-16: plan.json is validated against the fixed plan and the record", async () => {
+    const h = harness();
+    await live(h);
+    const plan = JSON.parse(readFileSync(path.join(h.abs(RUN), RETROSPECTIVE_FILES.plan), "utf8"));
+    expect(plan).toMatchObject({ mode: "LIVE", outDir: RUN });
+    // The reviewed reproduction: more requests and a larger page in the plan.
+    const both = reforge(
+      h,
+      "plan-limits-params",
+      (p) => {
+        p.limits.httpRequests = 50;
+        p.request.rpcParams[1].limit = 1000;
+      },
+      RETROSPECTIVE_FILES.plan,
+    );
+    expect(both.integrity.ok).toBe(false);
+    expect(both.integrity.problems).toContain("PLAN_INVALID");
+    expect(both.pageObtained).toBe(false);
+    const forged: [string, (p: Loose) => void][] = [
+      ["http requests", (p) => void (p.limits.httpRequests = 50)],
+      ["page limit param", (p) => void (p.request.rpcParams[1].limit = 1000)],
+      ["commitment", (p) => void (p.request.rpcParams[1].commitment = "processed")],
+      ["method", (p) => void (p.request.rpcMethod = "getTransaction")],
+      ["address", (p) => void (p.binding.address = sig(9))],
+      ["interval", (p) => void (p.binding.intervalStartMs -= 1)],
+      ["limitations", (p) => void p.limitations.pop()],
+      ["mode", (p) => void (p.mode = "DRY_RUN")],
+      ["kind", (p) => void (p.kind = "SOMETHING_ELSE")],
+      ["approval", (p) => void (p.approval = "APPROVED")],
+      ["sequence", (p) => void p.sequence.push("Retry on failure")],
+      ["endpoint", (p) => void (p.endpoint = "https://example.invalid")],
+      ["extra field", (p) => void (p.fallback = true)],
+      ["outDir outside the root", (p) => void (p.outDir = "data/research/prechecks/x")],
+      ["outDir traversal", (p) => void (p.outDir = "data/research/retrospective-checks/..")],
+      ["outDir missing", (p) => void delete p.outDir],
+    ];
+    for (const [label, edit] of forged) {
+      const v = reforge(h, `plan-${label.replace(/ /g, "-")}`, edit, RETROSPECTIVE_FILES.plan);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.integrity.problems, label).toContain("PLAN_INVALID");
+      expect(v.pageObtained, label).toBe(false);
+    }
+    // A plan that is not an object fails closed.
+    const arrDir = path.join(h.projectRoot, "data/research/retrospective-checks", "plan-array");
+    cpSync(h.abs(RUN), arrDir, { recursive: true });
+    const arrText = "[]\n";
+    writeFileSync(path.join(arrDir, RETROSPECTIVE_FILES.plan), arrText);
+    const mPath = path.join(arrDir, RETROSPECTIVE_FILES.manifest);
+    const m = JSON.parse(readFileSync(mPath, "utf8")) as Loose;
+    const entry = m.files.find((x: Loose) => x.path === RETROSPECTIVE_FILES.plan);
+    entry.sha256 = createHash("sha256").update(arrText).digest("hex");
+    entry.bytes = Buffer.byteLength(arrText);
+    writeFileSync(mPath, JSON.stringify(m, null, 2) + "\n");
+    expect(verifyRetrospectiveEvidence(arrDir).integrity.problems).toContain("PLAN_INVALID");
+    // A valid offline copy under another name, or outside the evidence root, still verifies.
+    const copy = path.join(h.projectRoot, "elsewhere", "copied-evidence");
+    cpSync(h.abs(RUN), copy, { recursive: true });
+    expect(verifyRetrospectiveEvidence(copy)).toMatchObject({
+      integrity: { ok: true },
+      pageObtained: true,
+    });
+  });
+
+  it("R-17: a page spans the interval only when its known range brackets both boundaries", () => {
+    // The reviewed reproduction: one record inside, one before, none after the interval.
+    expect(analyze([rec(1, 30, START_SEC + 100), rec(2, 20, START_SEC - 100)])).toMatchObject({
+      coverage: "PAGE_OVERLAPS_INTERVAL_START",
+      observation: "INTERVAL_RECORDS_IN_PAGE",
+    });
+    // Newer side: past the end, but not back before the start.
+    expect(analyze([rec(1, 30, END_SEC + 5), rec(2, 20, START_SEC + 100)])).toMatchObject({
+      coverage: "PAGE_OVERLAPS_INTERVAL_END",
+      observation: "INTERVAL_RECORDS_IN_PAGE",
+    });
+    // Entirely within the interval.
+    expect(analyze([rec(1, 30, END_SEC - 5), rec(2, 20, START_SEC + 5)])).toMatchObject({
+      coverage: "PAGE_WITHIN_INTERVAL",
+      observation: "INTERVAL_RECORDS_IN_PAGE",
+    });
+    // Both boundaries bracketed.
+    expect(analyze([rec(1, 30, END_SEC + 1), rec(2, 20, START_SEC - 1)]).coverage).toBe(
+      "PAGE_SPANS_INTERVAL",
+    );
+    // A boundary second does not bracket its boundary: it stays ambiguous.
+    expect(analyze([rec(1, 30, END_SEC), rec(2, 20, START_SEC - 50)])).toMatchObject({
+      coverage: "PAGE_OVERLAPS_INTERVAL_START",
+      observation: "BOUNDARY_RECORDS_ONLY",
+      observationReasons: ["BOUNDARY_AMBIGUOUS"],
+    });
+    expect(analyze([rec(1, 30, END_SEC + 50), rec(2, 20, START_SEC)])).toMatchObject({
+      coverage: "PAGE_OVERLAPS_INTERVAL_END",
+      observation: "BOUNDARY_RECORDS_ONLY",
+      observationReasons: ["BOUNDARY_AMBIGUOUS"],
+    });
+    // Null times keep the page inconclusive whatever the known range.
+    expect(
+      analyze([rec(1, 30, START_SEC + 100), rec(2, 20, null), rec(3, 10, START_SEC - 100)]),
+    ).toMatchObject({
+      coverage: "PAGE_OVERLAPS_INTERVAL_START",
+      observationReasons: ["NULL_BLOCK_TIME"],
+    });
+    expect(
+      analyze([rec(1, 30, END_SEC + 1), rec(2, 20, null), rec(3, 10, START_SEC - 1)]),
+    ).toMatchObject({
+      coverage: "PAGE_SPANS_INTERVAL",
+      observation: "COVERAGE_INCONCLUSIVE",
+      observationReasons: ["NULL_BLOCK_TIME"],
+    });
   });
 });

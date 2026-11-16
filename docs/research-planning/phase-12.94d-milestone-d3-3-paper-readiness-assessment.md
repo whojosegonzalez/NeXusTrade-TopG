@@ -6312,6 +6312,13 @@ This observation establishes that over a contiguous 15-minute window, zero trans
 - **Scope**: the check makes exactly one `getSignaturesForAddress` request and zero `getTransaction` calls.
 - **Provider fault**: no result of this check, and no single decoded transaction, can establish a provider fault. A record in the interval is equally consistent with timing (block time against notification arrival), boundary placement, commitment, logs-mention semantics, transaction failure, or the subscription's own acknowledgement time (`1794829420570`, 540 ms after the watch start).
 
+**Correction (2026-11-16, after independent review of `ca168c4`)**: four gaps were reproduced and are corrected in the checker, its tests and this section. Nothing else changed: one request, the 10 s deadline, the 64 KiB cap, the pin policy, configuration, the wallet and sealed evidence are as before.
+
+1. **Timing**: verification did not enforce the recorded acquisition timing. Moving dispatch or a successful completion past the deadline still verified as an obtained page. Now dispatch must precede the deadline, and a successful exchange completing after it is `DEADLINE_EXPIRED`.
+2. **Accounting**: a `COMPLETE` body with `observedBytes` 65,537 still verified. Body states and their byte relationships are now checked.
+3. **Plan**: `plan.json` was parsed and discarded, so a plan raised to 50 requests and a page limit of 1000 still verified. It must now equal the fixed live plan.
+4. **Coverage**: a page with records at `START+100` and `START-100` was labelled `PAGE_SPANS_INTERVAL`. Spanning now requires both boundaries to be bracketed, and this page is `PAGE_OVERLAPS_INTERVAL_START`.
+
 **Implementation**: `backend/src/scripts/amm-v4-watch-retrospective.ts`, with its tests alongside. It was exercised only with injected fakes. No credential was read, no provider request was made and no socket was opened, and no operator live command is given; the request needs independent review and a separate approval.
 
 **Binding to watch 02** (fixed constants, not configurable):
@@ -6355,15 +6362,17 @@ A block-time order that disagrees with slot order is reported as an anomaly, not
 - **Coverage**:
   - `EMPTY_PAGE`;
   - `COVERAGE_UNKNOWN` (all block times null);
-  - `PAGE_NEWER_THAN_INTERVAL` (the page did not reach back to the interval);
-  - `PAGE_PARTIALLY_OVERLAPS_INTERVAL`;
-  - `PAGE_SPANS_INTERVAL`;
-  - `PAGE_OLDER_THAN_INTERVAL`.
+  - `PAGE_NEWER_THAN_INTERVAL` (the oldest known time is after the end second: the page did not reach back to the interval);
+  - `PAGE_OVERLAPS_INTERVAL_END` (past the end second, but not back before the start second);
+  - `PAGE_WITHIN_INTERVAL` (the known range lies within the interval seconds, boundary seconds included);
+  - `PAGE_OVERLAPS_INTERVAL_START` (back before the start second, but not past the end second);
+  - `PAGE_SPANS_INTERVAL` (only when the known range brackets both boundaries: a known time strictly before the start second and one strictly after the end second; a boundary second never brackets its boundary);
+  - `PAGE_OLDER_THAN_INTERVAL` (the newest known time is before the start second).
 - **Observation**:
   - `INTERVAL_RECORDS_IN_PAGE`;
   - `BOUNDARY_RECORDS_ONLY` (`BOUNDARY_AMBIGUOUS`);
   - `NO_INTERVAL_RECORDS_IN_PAGE` (only when the page spans the interval or is older than it, with no null times);
-  - `COVERAGE_INCONCLUSIVE` (with the reason: null block times, an empty page, a page newer than or partially overlapping the interval, or unknown coverage).
+  - `COVERAGE_INCONCLUSIVE` (with the reason: null block times, an empty page, a page newer than the interval, or unknown coverage). A partially overlapping or within-interval page always holds an inside or boundary record, so it is reported as one of the first two observations.
 - **Failed transactions**: records with a non-null `err` are counted, and flagged `FAILED_TRANSACTION_METADATA` when inside or on a boundary.
 
 Every sealed result carries these fixed limitations:
@@ -6383,7 +6392,17 @@ Every sealed result carries these fixed limitations:
   - the outcome, the page analysis or RPC error, and the cancellation record.
 - **Redaction**: at byte level before UTF-8 or base64 storage, using the reviewed capability-check primitive; headers and free text through `redactSensitiveText`. A residual credential refuses the seal.
 - **No watch claims**: there are no watch-completion, selection or target fields.
-- **Offline `--verify`**: checks integrity (manifest, exact file set, digests), the fixed binding, limits, limitations and request, the times and the response accounting. It then re-derives the outcome, the page analysis and any RPC error from the sealed bytes with the same analyser.
+- **Offline `--verify`**: checks integrity (manifest, exact file set, digests), then:
+  - `plan.json`: it must equal the fixed live plan exactly (kind, mode `LIVE`, approval status, endpoint description, binding, request, limits, limitations and sequence), and its recorded `outDir` must be one run name directly under `data/research/retrospective-checks/`. The directory being verified may be an offline copy elsewhere or under another name;
+  - the fixed binding, limits, limitations and request in `retrospective.json`;
+  - the times: the single request must be dispatched strictly before the absolute deadline (`startedAtMs` + 10,000 ms). Completion and `endedAtMs` may lie later, for a timeout, cancellation cleanup or local post-acquisition processing;
+  - the response accounting by body state:
+    - `COMPLETE`: no error, a status, and every observed byte retained (`observedBytes` equal to the original length, at most 64 KiB);
+    - `PARTIAL_OVERFLOW`: `RESPONSE_TOO_LARGE`, a status, exactly 65,536 bytes retained and more than 65,536 observed;
+    - `NOT_READ`: an error and no retained or observed bytes (status optional, for example a declared oversize, a 429, a redirect or a transport error);
+    - any other body state fails.
+  - It then re-derives the outcome, the page analysis and any RPC error from the sealed bytes with the same analyser.
+- **Late completion**: an exchange that completes without error after the acquisition deadline is `DEADLINE_EXPIRED` (detail `COMPLETED_AFTER_DEADLINE`), during acquisition and on re-derivation. Its page is kept but never obtained. This can only arise from the few milliseconds between taking the start time and opening the session.
 - **Redacted body**: a page whose bytes were redacted (for example, an echoed credential) cannot be re-derived exactly and is never reported as obtained.
 - **Malformed records**: verification failures, never exceptions.
 
@@ -6403,36 +6422,40 @@ Exit codes: 0 for help, a dry run, or a valid, reproducible, uncancelled page; 1
 
 **Pin**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly `amm-v4-watch-retrospective.ts` and its test. H-12 asserts the list, that both pass as additions, and that modifying or deleting either is refused, as are neighbouring support or CLI file names. The baseline `6855efb` and the two exact-version endpoint exceptions are unchanged.
 
-**Synthetic tests** (`amm-v4-watch-retrospective.test.ts`, 14 tests; scripted fetch, virtual time, injected binding, owned temporary directories):
+**Synthetic tests** (`amm-v4-watch-retrospective.test.ts`, 18 tests; scripted fetch, virtual time, injected binding, owned temporary directories):
 
-| Test  | Shows                                                                                                                                                                                                                                                                                    |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R-01  | Help, dry run and verify are inert (no configuration, binding read, request or write); the plan's binding, request and limits; nine conflicting or malformed argument sets refused                                                                                                       |
-| R-02  | Bad or existing output directories, a failed binding (before configuration) and missing or invalid `SOLANA_RPC_URL` are refused before any request; the real binding check fails on a project without the evidence; an Alchemy RPC without `SOLANA_WS_URL` is accepted (HTTP only)       |
-| R-02b | The real sealed watch 02 satisfies the binding (read-only)                                                                                                                                                                                                                               |
-| R-03  | One request with exactly the planned body and `redirect: "manual"`; a spanning page with interval records is sealed, verified and reported; no watch or target fields; no credential stored                                                                                              |
-| R-04  | Pages newer than, older than, spanning without matches, partially overlapping, empty and full                                                                                                                                                                                            |
-| R-05  | Boundary seconds, the first and last inside seconds, null times, all-null pages and block-time order anomalies                                                                                                                                                                           |
-| R-06  | Failed-transaction metadata (`err` object or string) counted and flagged, nothing more                                                                                                                                                                                                   |
-| R-07  | 23 malformed bodies (envelope, id, shape, count, signature, slot, time, status, err, memo, duplicates, order, invalid UTF-8), an RPC error and HTTP 503: never a page                                                                                                                    |
-| R-08  | A response over 64 KiB is cut at the limit and not parsed; a declared oversize is refused before reading                                                                                                                                                                                 |
-| R-09  | A stalled request ends at the 10 s deadline, with one attempt and no owned timer left                                                                                                                                                                                                    |
-| R-10  | Cancellation before dispatch (no request), during the request, and after a valid page before sealing (kept, not obtained; exit 3 live and offline)                                                                                                                                       |
-| R-11  | A credential-bearing network error, an echoed key, credential-bearing non-text bytes and a credential in a header are redacted; an echoed page is not obtained; a redirect and a 429 stop the session after one attempt                                                                  |
-| R-12  | A write failure gives exit 5 with a redacted reason and no second request; an output directory created during the run is refused                                                                                                                                                         |
-| R-13  | Tampering without the manifest, 15 consistently re-hashed forgeries (observation, counts, record time, outcome, binding, interval, binding check, limitations, limits, request, digest, payload, deadline, obtained flag, cancellation) and five malformed records all fail verification |
+| Test  | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R-01  | Help, dry run and verify are inert (no configuration, binding read, request or write); the plan's binding, request and limits; nine conflicting or malformed argument sets refused                                                                                                                                                                                                                                                                                        |
+| R-02  | Bad or existing output directories, a failed binding (before configuration) and missing or invalid `SOLANA_RPC_URL` are refused before any request; the real binding check fails on a project without the evidence; an Alchemy RPC without `SOLANA_WS_URL` is accepted (HTTP only)                                                                                                                                                                                        |
+| R-02b | The real sealed watch 02 satisfies the binding (read-only)                                                                                                                                                                                                                                                                                                                                                                                                                |
+| R-03  | One request with exactly the planned body and `redirect: "manual"`; a spanning page with interval records is sealed, verified and reported; no watch or target fields; no credential stored                                                                                                                                                                                                                                                                               |
+| R-04  | Pages newer than, older than, spanning without matches, overlapping the end, empty and full                                                                                                                                                                                                                                                                                                                                                                               |
+| R-05  | Boundary seconds, the first and last inside seconds, null times, all-null pages and block-time order anomalies                                                                                                                                                                                                                                                                                                                                                            |
+| R-06  | Failed-transaction metadata (`err` object or string) counted and flagged, nothing more                                                                                                                                                                                                                                                                                                                                                                                    |
+| R-07  | 23 malformed bodies (envelope, id, shape, count, signature, slot, time, status, err, memo, duplicates, order, invalid UTF-8), an RPC error and HTTP 503: never a page                                                                                                                                                                                                                                                                                                     |
+| R-08  | A response over 64 KiB is cut at the limit and not parsed; a declared oversize is refused before reading                                                                                                                                                                                                                                                                                                                                                                  |
+| R-09  | A stalled request ends at the 10 s deadline, with one attempt and no owned timer left                                                                                                                                                                                                                                                                                                                                                                                     |
+| R-10  | Cancellation before dispatch (no request), during the request, and after a valid page before sealing (kept, not obtained; exit 3 live and offline)                                                                                                                                                                                                                                                                                                                        |
+| R-11  | A credential-bearing network error, an echoed key, credential-bearing non-text bytes and a credential in a header are redacted; an echoed page is not obtained; a redirect and a 429 stop the session after one attempt                                                                                                                                                                                                                                                   |
+| R-12  | A write failure gives exit 5 with a redacted reason and no second request; an output directory created during the run is refused                                                                                                                                                                                                                                                                                                                                          |
+| R-13  | Tampering without the manifest, 15 consistently re-hashed forgeries (observation, counts, record time, outcome, binding, interval, binding check, limitations, limits, request, digest, payload, deadline, obtained flag, cancellation) and five malformed records all fail verification                                                                                                                                                                                  |
+| R-14  | Timing: a forged dispatch at, 1 ms after or 5 s after the deadline fails (`DISPATCH_AFTER_DEADLINE`); a forged successful completion 1 ms or 5 s late still claiming a page fails (`OUTCOME_NOT_REPRODUCED`); completion exactly at the deadline and 30 s of post-acquisition overhead verify; a genuinely late complete response is `DEADLINE_EXPIRED`, page kept, not obtained; genuine timeout and cancellation captures, including later cleanup, keep their outcomes |
+| R-15  | Accounting: a `COMPLETE` body with `observedBytes` 65,537 (the reviewed reproduction), above, below or missing against its original length, an unknown body state, `NOT_READ` with a body, an overflow below the limit or a missing status all fail; genuine partial-overflow, declared-oversize and transport-error records verify, and forged variants of each fail                                                                                                     |
+| R-16  | Plan: the reviewed reproduction (`httpRequests` 50 and page limit 1000, manifest re-hashed) fails with `PLAN_INVALID`, as do 16 other changes (requests, params, commitment, method, address, interval, limitations, mode, kind, approval, sequence, endpoint, an extra field, and an `outDir` outside the root, traversing or missing) and a non-object plan; a valid copy elsewhere still verifies                                                                      |
+| R-17  | Coverage: the reviewed page (`START+100`, `START-100`) is `PAGE_OVERLAPS_INTERVAL_START`, not spanning; newer-side, within-interval and spanning pages; boundary seconds never bracket a boundary (`BOUNDARY_AMBIGUOUS` kept); null times stay inconclusive                                                                                                                                                                                                               |
 
-- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit): 15 run, 14 caught; one equivalent mutant.
+- **Mutation checks** (source restored byte-identical after every run, each run under a 60 s limit). The original 15 were re-run against the corrected source: 14 caught, Y12 still equivalent, Y12c caught. Several are now also caught by the new tests:
 
 | Mutant | Change                                                            | Caught by                                                                              |
 | ------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Y01    | The interval-start second counted as inside                       | R-05                                                                                   |
-| Y02    | A null block time treated as before the interval                  | R-05                                                                                   |
+| Y01    | The interval-start second counted as inside                       | R-05, R-17                                                                             |
+| Y02    | A null block time treated as before the interval                  | R-05, R-17                                                                             |
 | Y03    | Echoed request id not checked                                     | R-07                                                                                   |
 | Y04    | Duplicate signatures accepted                                     | R-07                                                                                   |
 | Y05    | `processed` confirmation status accepted                          | R-07                                                                                   |
 | Y06    | A page newer than the interval read as having no interval records | R-04                                                                                   |
-| Y07    | Response limit raised to 1 MiB                                    | R-02, R-03, R-06 to R-11                                                               |
+| Y07    | Response limit raised to 1 MiB                                    | R-02, R-03, R-06 to R-11, R-14 to R-16                                                 |
 | Y08    | No cancellation recheck before sealing                            | R-10                                                                                   |
 | Y09    | Watch binding not enforced                                        | R-02                                                                                   |
 | Y10    | Verifier skips page re-derivation                                 | R-13                                                                                   |
@@ -6445,7 +6468,23 @@ Exit codes: 0 for help, a dry run, or a valid, reproducible, uncancelled page; 1
 
 The fee-destination equality assertion in the binding is a constant guard (the address is a fixed constant equal to the reviewed one); the test asserts the equality directly.
 
-- **Results**: the affected suites pass under external 60 s limits: retrospective 14, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (84); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 154 in all. The backend typecheck, ESLint and Prettier pass. The pin tests pass, including H-12 for the two new files; the baseline and the exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`) and the precheck 01, watch 01 and watch 02 manifests are unchanged, and no retrospective evidence directory exists.
+Mutation checks for the corrections: all 11 caught.
+
+| Mutant | Change                                                    | Caught by |
+| ------ | --------------------------------------------------------- | --------- |
+| Z01    | Late dispatch not checked                                 | R-14      |
+| Z02    | Dispatch exactly at the deadline accepted                 | R-14      |
+| Z03    | Late successful completion not an outcome rule            | R-14      |
+| Z04    | Verifier ignores late completion                          | R-14      |
+| Z05    | Acquisition ignores late completion                       | R-14      |
+| Z06    | `COMPLETE` observed bytes not tied to the original length | R-15      |
+| Z07    | Partial overflow need not exceed the limit                | R-15      |
+| Z08    | `NOT_READ` observed bytes not checked                     | R-15      |
+| Z09    | Plan not compared with the fixed plan                     | R-16      |
+| Z10    | Plan `outDir` form not checked                            | R-16      |
+| Z11    | Spanning without the end bracketed (the previous rule)    | R-17      |
+
+- **Results**: the affected suites pass under external 60 s limits: retrospective 18, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (88); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 158 in all. On the uncorrected source, R-14 to R-17 fail, reproducing each gap, including both late dispatch and late successful completion; R-04 fails only on the renamed coverage label. The backend typecheck, ESLint and Prettier pass. The pin tests pass, including H-12 for the two new files; the pin policy, the baseline and the exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`) and the precheck 01, watch 01 and watch 02 manifests are unchanged, and no retrospective evidence directory exists.
 
 **Not started**: the request itself (independent review and a separate single-run approval are required).
 

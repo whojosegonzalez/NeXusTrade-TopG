@@ -136,12 +136,24 @@ export type TimeClass =
   | "AFTER_INTERVAL"
   | "UNKNOWN_TIME";
 
+/**
+ * Where the page's known block-time range lies against the interval seconds. A boundary is
+ * bracketed only by a known time strictly beyond its (ambiguous) boundary second.
+ */
 export type PageCoverage =
   | "EMPTY_PAGE"
   | "COVERAGE_UNKNOWN"
+  /** Oldest known time after the end second: the page did not reach back to the interval. */
   | "PAGE_NEWER_THAN_INTERVAL"
-  | "PAGE_PARTIALLY_OVERLAPS_INTERVAL"
+  /** Reaches past the end second, but not back before the start second. */
+  | "PAGE_OVERLAPS_INTERVAL_END"
+  /** Known range within the interval seconds (boundary seconds included). */
+  | "PAGE_WITHIN_INTERVAL"
+  /** Reaches back before the start second, but not past the end second. */
+  | "PAGE_OVERLAPS_INTERVAL_START"
+  /** Reaches before the start second and past the end second. */
   | "PAGE_SPANS_INTERVAL"
+  /** Newest known time before the start second. */
   | "PAGE_OLDER_THAN_INTERVAL";
 
 export type PageObservation =
@@ -305,18 +317,24 @@ function analyzePage(records: readonly PageRecord[]): PageAnalysis {
           r.timeClass === "BOUNDARY_END"),
     ).length,
   };
-  const coverage: PageCoverage =
-    records.length === 0
-      ? "EMPTY_PAGE"
-      : oldestKnownBlockTime === null || newestKnownBlockTime === null
-        ? "COVERAGE_UNKNOWN"
-        : oldestKnownBlockTime > endSec
-          ? "PAGE_NEWER_THAN_INTERVAL"
-          : newestKnownBlockTime < startSec
-            ? "PAGE_OLDER_THAN_INTERVAL"
-            : oldestKnownBlockTime < startSec
-              ? "PAGE_SPANS_INTERVAL"
-              : "PAGE_PARTIALLY_OVERLAPS_INTERVAL";
+  let coverage: PageCoverage;
+  if (records.length === 0) coverage = "EMPTY_PAGE";
+  else if (oldestKnownBlockTime === null || newestKnownBlockTime === null)
+    coverage = "COVERAGE_UNKNOWN";
+  else if (oldestKnownBlockTime > endSec) coverage = "PAGE_NEWER_THAN_INTERVAL";
+  else if (newestKnownBlockTime < startSec) coverage = "PAGE_OLDER_THAN_INTERVAL";
+  else {
+    const bracketsStart = oldestKnownBlockTime < startSec;
+    const bracketsEnd = newestKnownBlockTime > endSec;
+    coverage =
+      bracketsStart && bracketsEnd
+        ? "PAGE_SPANS_INTERVAL"
+        : bracketsStart
+          ? "PAGE_OVERLAPS_INTERVAL_START"
+          : bracketsEnd
+            ? "PAGE_OVERLAPS_INTERVAL_END"
+            : "PAGE_WITHIN_INTERVAL";
+  }
   const reasons: string[] = [];
   let observation: PageObservation;
   if (counts.insideInterval > 0) {
@@ -443,6 +461,7 @@ function outcomeOf(
   stopReason: string | null,
   cancelled: boolean,
   analysis: ResponseAnalysis | null,
+  completedAfterDeadline: boolean,
 ): RetrospectiveOutcome {
   if (cancelled && error !== null) return "OPERATOR_CANCELLED";
   if (error === "RESPONSE_TOO_LARGE") return "RESPONSE_LIMIT_EXCEEDED";
@@ -451,6 +470,9 @@ function outcomeOf(
   }
   if (error === "HTTP_429_RECEIVED" || error === "HTTP_REDIRECT_REJECTED") return "SESSION_STOPPED";
   if (error !== null) return error === "NETWORK_ERROR" ? "TRANSPORT_ERROR" : "SESSION_STOPPED";
+  // An exchange that finished without error only counts if it finished within the acquisition
+  // deadline (measured from before the session opened); otherwise nothing it returned is obtained.
+  if (completedAfterDeadline) return "DEADLINE_EXPIRED";
   if (httpStatus !== 200) return "HTTP_ERROR";
   if (bodyState !== "COMPLETE" || analysis === null) return "MALFORMED_RESPONSE";
   return analysis.kind === "PAGE"
@@ -564,6 +586,8 @@ export async function runRetrospectiveRequest(o: {
       ? analyzeSignaturesResponse(e.body, requestId)
       : null;
   const cancelledDuring = cancelled && e.entry.error !== null;
+  const completedAfterDeadline =
+    e.entry.error === null && (e.entry.completedAtMs ?? Infinity) > deadlineAtMs;
   const outcome = outcomeOf(
     e.entry.error,
     e.entry.httpStatus,
@@ -571,12 +595,14 @@ export async function runRetrospectiveRequest(o: {
     recordedStop,
     cancelledDuring,
     analysis,
+    completedAfterDeadline,
   );
   return {
     ...base,
     outcome,
-    detail:
-      analysis?.kind === "MALFORMED"
+    detail: completedAfterDeadline
+      ? "COMPLETED_AFTER_DEADLINE"
+      : analysis?.kind === "MALFORMED"
         ? analysis.reason
         : analysis?.kind === "RPC_ERROR"
           ? `JSON-RPC error ${analysis.code}`
@@ -777,6 +803,10 @@ export interface RetrospectiveVerification {
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
+/** A sealed plan's recorded output directory: one run name directly under the evidence root. */
+const PLAN_OUT_DIR = new RegExp(
+  `^${RETROSPECTIVE_ROOT_SEGMENTS.join("/")}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`,
+);
 const OUTCOMES: readonly string[] = [
   "PAGE_RECEIVED",
   "RPC_ERROR",
@@ -860,13 +890,25 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
       else files.set(f.path as string, bytes);
     }
     if (problems.length > 0) return fail();
+    let plan: unknown;
     let r: unknown;
     try {
-      JSON.parse((files.get(RETROSPECTIVE_FILES.plan) as Buffer).toString("utf8"));
+      plan = JSON.parse((files.get(RETROSPECTIVE_FILES.plan) as Buffer).toString("utf8"));
       r = JSON.parse((files.get(RETROSPECTIVE_FILES.retrospective) as Buffer).toString("utf8"));
     } catch {
       problems.push("EVIDENCE_NOT_JSON");
       return fail();
+    }
+    // The sealed plan is exactly the fixed live plan (only sealed by a live run). Its recorded
+    // output directory must be a valid name under the evidence root; the directory being verified
+    // may be an offline copy elsewhere.
+    if (
+      !isRecord(plan) ||
+      typeof plan.outDir !== "string" ||
+      !PLAN_OUT_DIR.test(plan.outDir) ||
+      !same(plan, buildRetrospectivePlan(plan.outDir, "LIVE"))
+    ) {
+      problems.push("PLAN_INVALID");
     }
     if (!isRecord(r) || r.kind !== RETROSPECTIVE_KIND || r.version !== RETROSPECTIVE_VERSION) {
       problems.push("RECORD_KIND_INVALID");
@@ -950,7 +992,12 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
         !Number.isSafeInteger(req.jsonRpcId)
       ) {
         problems.push("REQUEST_TIMES_INVALID");
+        return fail();
       }
+      // The single request is only ever dispatched before the absolute deadline. Completion and
+      // the end time may lie later (a timeout, cancellation cleanup, local processing overhead).
+      if (req.dispatchedAtMs >= (r.deadlineAtMs as number))
+        problems.push("DISPATCH_AFTER_DEADLINE");
       if (resp.maxResponseBytes !== RETROSPECTIVE_LIMITS.maxResponseBytes)
         problems.push("RESPONSE_LIMIT_MISMATCH");
       let stored: Buffer | null = null;
@@ -1002,6 +1049,36 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
       const error = req.error === null ? null : String(req.error);
       const httpStatus = resp.httpStatus === null ? null : Number(resp.httpStatus);
       const bodyState = String(resp.bodyState);
+      // Body-state accounting, as the reviewed session records it:
+      //   COMPLETE: no error, a status, every observed byte retained (within the limit);
+      //   PARTIAL_OVERFLOW: RESPONSE_TOO_LARGE, a status, exactly the limit retained, more observed;
+      //   NOT_READ: an error, no bytes retained or observed (status optional).
+      const statusValid = httpStatus === null || Number.isSafeInteger(httpStatus);
+      const observed = resp.observedBytes;
+      const accountingValid =
+        statusValid &&
+        (bodyState === "COMPLETE"
+          ? error === null &&
+            httpStatus !== null &&
+            stored !== null &&
+            isSafeCount(observed) &&
+            observed === resp.originalBytes
+          : bodyState === "PARTIAL_OVERFLOW"
+            ? error === "RESPONSE_TOO_LARGE" &&
+              httpStatus !== null &&
+              stored !== null &&
+              resp.originalBytes === RETROSPECTIVE_LIMITS.maxResponseBytes &&
+              isSafeCount(observed) &&
+              observed > RETROSPECTIVE_LIMITS.maxResponseBytes
+            : bodyState === "NOT_READ"
+              ? error !== null && stored === null && observed === null
+              : false);
+      if (!accountingValid) {
+        problems.push("RESPONSE_ACCOUNTING_INVALID");
+        return fail();
+      }
+      const completedAfterDeadline =
+        error === null && (req.completedAtMs as number) > (r.deadlineAtMs as number);
       if (
         error === null &&
         httpStatus === 200 &&
@@ -1012,11 +1089,14 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
         analysis = analyzeSignaturesResponse(stored, req.jsonRpcId as number);
       }
       const cancelledDuring = cancelled === true && phase === "DURING_REQUEST" && error !== null;
+      // Only a timely complete 200 body that was redacted depends on an analysis that cannot be
+      // re-derived; every other outcome is re-derived from the record.
       const reproducible = !(
         error === null &&
         httpStatus === 200 &&
         bodyState === "COMPLETE" &&
-        redacted
+        redacted &&
+        !completedAfterDeadline
       );
       if (reproducible) {
         const derived = outcomeOf(
@@ -1026,6 +1106,7 @@ export function verifyRetrospectiveEvidence(dir: string): RetrospectiveVerificat
           r.sessionStopReason === null ? null : String(r.sessionStopReason),
           cancelledDuring,
           analysis,
+          completedAfterDeadline,
         );
         if (derived !== outcome) problems.push("OUTCOME_NOT_REPRODUCED");
       }
