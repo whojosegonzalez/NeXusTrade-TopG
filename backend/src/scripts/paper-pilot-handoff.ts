@@ -104,6 +104,30 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   "backend/src/scripts/solana-subscription-capability.ts",
   "backend/src/scripts/solana-subscription-capability.test.ts",
 ]);
+
+export interface ReviewedTreeEntry {
+  readonly mode: string;
+  readonly type: string;
+  readonly oid: string;
+}
+
+/**
+ * Exact-version exceptions for the two modified endpoint files reviewed at
+ * 83a320a38a00b3ac868e1472e1d07b6379acee51. Both must be ordinary files with mode 100644.
+ */
+export const REVIEWED_ENDPOINT_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =
+  Object.freeze({
+    "backend/src/scripts/paper-single-candidate-diagnostic.ts": Object.freeze({
+      mode: "100644",
+      type: "blob",
+      oid: "42435317b0817f5463fcac804847faefee35c69b",
+    }),
+    "backend/src/scripts/paper-single-candidate-diagnostic.test.ts": Object.freeze({
+      mode: "100644",
+      type: "blob",
+      oid: "e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab",
+    }),
+  });
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
 
@@ -146,11 +170,52 @@ export function checkPin(pinnedCommit: string, git: GitRunner): string[] {
   } else {
     for (const line of changed.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
       const [kind, file] = line.split("\t");
-      if (kind !== "A" || !ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.includes(file ?? "")) {
+      if (file && file in REVIEWED_ENDPOINT_MODIFICATIONS) {
+        if (kind !== "M") {
+          problems.push(`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${file}`);
+        }
+      } else if (kind !== "A" || !ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.includes(file ?? "")) {
         problems.push(`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${file ?? line}`);
       }
     }
   }
+
+  // Verify candidate pinned commit's tree entries against reviewed endpoint modifications.
+  const reviewedPaths = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
+  const treeResult = git(["ls-tree", pinnedCommit, "--", ...reviewedPaths]);
+  if (treeResult.status !== 0) {
+    problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
+  } else {
+    const found = new Map<string, { mode: string; type: string; oid: string }>();
+    let malformed = false;
+    for (const line of treeResult.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
+      const match = /^([0-7]{6})\s+([a-z]+)\s+([0-9a-f]{40})\t(.*)$/.exec(line);
+      if (!match) {
+        malformed = true;
+        break;
+      }
+      const [, mode, type, oid, path] = match;
+      found.set(path!, { mode: mode!, type: type!, oid: oid! });
+    }
+    if (malformed) {
+      problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
+    } else {
+      for (const [file, expected] of Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)) {
+        const actual = found.get(file);
+        if (
+          !actual ||
+          actual.mode !== expected.mode ||
+          actual.type !== expected.type ||
+          actual.oid !== expected.oid
+        ) {
+          if (!problems.includes(`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${file}`)) {
+            problems.push(`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${file}`);
+          }
+        }
+      }
+    }
+  }
+
   return problems;
 }
 

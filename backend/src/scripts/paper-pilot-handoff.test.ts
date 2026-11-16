@@ -17,6 +17,7 @@ import {
   PIN_PATHS,
   RUNNER_DEPENDENCY_PATHS,
   REVIEWED_RUNNER_COMMIT,
+  REVIEWED_ENDPOINT_MODIFICATIONS,
   checkPin,
   defaultGit,
   evaluatePilotHandoff,
@@ -79,7 +80,7 @@ type GitAnswer = { status: number; stdout: string };
  * (modified in the working tree) or changedSinceRunner (modified since the reviewed runner).
  */
 function fakeGit(
-  o: Partial<Record<"revParse" | "diffQuiet" | "status" | "nameStatus", GitAnswer>> & {
+  o: Partial<Record<"revParse" | "diffQuiet" | "status" | "nameStatus" | "lsTree", GitAnswer>> & {
     readonly changed?: readonly string[];
     readonly dirty?: readonly string[];
     readonly changedSinceRunner?: readonly string[];
@@ -115,6 +116,16 @@ function fakeGit(
         o.nameStatus ?? {
           status: 0,
           stdout: ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`).join("\n"),
+        }
+      );
+    }
+    if (args[0] === "ls-tree") {
+      return (
+        o.lsTree ?? {
+          status: 0,
+          stdout: Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)
+            .map(([file, e]) => `${e.mode} ${e.type} ${e.oid}\t${file}`)
+            .join("\n"),
         }
       );
     }
@@ -1203,8 +1214,11 @@ describe("Watched-evidence handoff (offline integration)", () => {
       ...added,
     ]);
     expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
-    const pinWith = (stdout: string) =>
-      checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout } }).git);
+    const pinWith = (stdout: string, lsTree?: GitAnswer) =>
+      checkPin(
+        PINNED,
+        fakeGit({ nameStatus: { status: 0, stdout }, ...(lsTree ? { lsTree } : {}) }).git,
+      );
     expect(pinWith(added.map((f) => `A\t${f}`).join("\n"))).toEqual([]);
     for (const f of added) {
       expect(pinWith(`M\t${f}`), f).toEqual([`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${f}`]);
@@ -1229,19 +1243,82 @@ describe("Watched-evidence handoff (offline integration)", () => {
         `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${extra}`,
       ]);
     }
-    // The runner itself is not repinned: a modified runner file is still refused.
-    expect(pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts")).toEqual([
+    // Other runner dependencies (not in REVIEWED_ENDPOINT_MODIFICATIONS) are refused when modified.
+    expect(pinWith("M\tbackend/src/candidate-scanner/PaperRequestSession.ts")).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/candidate-scanner/PaperRequestSession.ts",
+    ]);
+
+    // Exact-version exceptions: reviewed endpoint modifications are accepted when matching.
+    const reviewedModFiles = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
+    expect(pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"))).toEqual([]);
+
+    // Failure cases for reviewed endpoint modifications:
+    // 1. Unreviewed blob
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "100644 blob 1111111111111111111111111111111111111111\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+      }),
+    ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
     ]);
 
-    // Read-only git on this repository (working tree, so committed and uncommitted changes count):
-    // every addition since the reviewed runner is allowed. The endpoint-configuration change
-    // (section 8.38.12) modifies the reviewed runner and its test; the guard refuses exactly those
-    // two until an independent review advances the runner baseline. It is not relaxed here.
-    const RUNNER_CHANGED_PENDING_REVIEW = [
-      "backend/src/scripts/paper-single-candidate-diagnostic.test.ts",
-      "backend/src/scripts/paper-single-candidate-diagnostic.ts",
-    ];
+    // 2. Wrong mode (executable 100755)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "100755 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+      }),
+    ).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ]);
+
+    // 3. Wrong type (tree 040000)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "040000 tree 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+      }),
+    ).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ]);
+
+    // 4. Deletion / rename
+    expect(
+      pinWith("D\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout:
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+      }),
+    ).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ]);
+
+    // 5. Lookup failure (status 1)
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 1,
+        stdout: "",
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
+    // 6. Malformed tree output
+    expect(
+      pinWith("M\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
+        status: 0,
+        stdout: "malformed ls-tree output without proper formatting",
+      }),
+    ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
+
+    // Read-only git on this repository:
+    // Every addition since reviewed runner is allowed, and the endpoint modifications
+    // match REVIEWED_ENDPOINT_MODIFICATIONS, so checkPin succeeds with zero refusals.
     const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
     const diff = git([
       "diff",
@@ -1257,13 +1334,13 @@ describe("Watched-evidence handoff (offline integration)", () => {
       expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(line.split("\t")[1]);
     }
     expect(changes.filter((l) => !l.startsWith("A\t")).sort()).toEqual(
-      RUNNER_CHANGED_PENDING_REVIEW.map((f) => `M\t${f}`),
+      reviewedModFiles.sort().map((f) => `M\t${f}`),
     );
     expect(
       checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout: diff.stdout } }).git),
-    ).toEqual(RUNNER_CHANGED_PENDING_REVIEW.map((f) => `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${f}`));
+    ).toEqual([]);
     expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
-    for (const f of RUNNER_CHANGED_PENDING_REVIEW) {
+    for (const f of reviewedModFiles) {
       expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(f);
     }
   });

@@ -5166,11 +5166,11 @@ Implement the **bounded passive AMM v4 creation watch** offline for review (no l
 > 5. The watch entry point (`backend/src/scripts/fresh-amm-v4-watch.ts`) composing collector → validator → sealer → verifier, with help, dry-run, verify and explicit live modes, verified offline by 10 tests through injected synthetic dependencies only (§8.38.10).
 > 6. The conditional watch-to-pilot wrapper integration: an explicit `--watch-evidence-dir` handoff option and a `-Watch -WatchOutDir` wrapper mode that runs one watch and continues to Stage B only on a confirmed selection, binding both handoff checks to the same sealed manifest digest, pool and mint. It is verified offline with stubbed children by 10 wrapper tests and 13 handoff tests (§8.38.11).
 >
-> The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin refuses until an independent review advances the runner baseline (§8.38.12).
+> The first operator watch capture (`fresh-amm-v4-watch-01`, 2026-11-15) ended `SUBSCRIBE_REJECTED` (JSON-RPC -32601 at the scheme-derived WebSocket endpoint). The endpoint configuration was corrected offline (`SOLANA_WS_URL`), and the Stage B pin check has been updated with exact-version exceptions for the two modified endpoint files reviewed at `83a320a` (`paper-single-candidate-diagnostic.ts` and its test), transitioning the runtime pin check to `PIN_OK` while keeping `REVIEWED_RUNNER_COMMIT` at `6855efb0e4ab5023e2c556030c42613a0ee86f53` (§8.38.12, §8.38.14).
 >
 > The single operator capability probe against the configured Alchemy WebSocket endpoint (`solana-subscription-01`, 2026-11-15) completed with `TRANSPORT_ERROR` during the WebSocket handshake (`Unexpected server response: 403`), zero application frames, settled cleanup, verified manifest hash `25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`, and support ticket #27494 was submitted; the refusal's cause and account streaming entitlement remain unknown (§8.38.13).
 >
-> Separately, Helius is prepared offline as an explicitly selected alternative proposal (`solana-subscription-02`, §8.38.14), verified offline with 18 capability tests including query-parameter credential redaction (S-18). It remains unexecuted and awaiting separate operator approval; no provider requests, sockets, or live commands are authorized.
+> The single operator capability probe against the alternative Helius WebSocket endpoint (`solana-subscription-02`, 2026-11-16) completed with `SUBSCRIPTION_ACKNOWLEDGED`, verified manifest hash `56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`, subscription ack at +526 ms, unsubscribe ack at +658 ms, settled cleanup at +790 ms, 2 outgoing frames, 2 incoming messages / 80 bytes payload, zero notifications, and clean exit 0. Offline verification confirms integrity and capability; this establishes subscription and unsubscription access, not notification delivery or sustained reliability (§8.38.14).
 >
 > The watch entry point itself still ends after sealing and reporting. Live execution is not authorized, and no operator live command is provided until the wrapper integration has been reviewed. No live limits are approved.
 
@@ -6264,16 +6264,24 @@ import('./backend/src/scripts/paper-single-candidate-diagnostic.js').then(m => {
 }
 ```
 
-**Proposed Single-Probe Scope**:
+**Completed Operator Capture (`solana-subscription-02`, 2026-11-16)**:
+The single approved capability check was executed by the operator against the configured Helius Mainnet WebSocket endpoint (`wss://mainnet.helius-rpc.com/?api-key=...`) using the hardened PowerShell runbook. Offline verification (`node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/solana-subscription-capability.ts --verify data/research/capability-checks/solana-subscription-02`) confirms:
 
-- **Target Evidence Directory**: `data/research/capability-checks/solana-subscription-02/` (fresh path; `solana-subscription-01/` preserved).
-- **Bounds**: Identical to reviewed capability limits: 1 connection, 0 reconnects, 0 retries, 5,000 ms acquisition deadline, at most 2 outgoing frames (subscribe + unsubscribe), at most 10 incoming messages, at most 64 KiB payload, 0 client keepalive pings, 0 HTTP requests, 5,000 ms cleanup timeout.
-- **Status**: PENDING SEPARATE OPERATOR APPROVAL. Do not execute.
+- **Integrity**: `OK` (manifest digest, files, sizes, limits all verified; CLI exits 0 `CONFIRMED`).
+- **Outcome**: `SUBSCRIPTION_ACKNOWLEDGED` (`detail: null`, `capabilityConfirmed: true`).
+- **Transport**: `transportCreated: true`, `openedAtMs: 1794825891624` (+394 ms after start at `2026-11-16T10:44:51.230Z`).
+- **Subscription**: acknowledgement received at `1794825891756` (+526 ms after start), `subscriptionId: 28059160`.
+- **Unsubscribe**: status `OBSERVED`, sent at `1794825891756` (+526 ms), acknowledgement received at `1794825891888` (+658 ms after start), result `true`.
+- **Cleanup**: `cleanupSettledAtMs: 1794825892020` (+790 ms after start), `closedAtMs: 1794825892020`, clean normal closure (code 1000).
+- **Frames & Messages**: 2 outgoing frames (149-byte subscribe + 71-byte unsubscribe = 220 bytes), 2 incoming messages (42-byte ack + 38-byte unsub ack = 80 bytes payload), 0 notifications, 0 client pings.
+- **Redaction**: Zero credentials leaked in logs, JSON evidence, or frame payloads. Query parameters and secrets properly redacted.
+- **Significance & Boundaries**: Confirms active WebSocket `logsSubscribe` and unsubscription capability for Raydium AMM v4 program mentions on Helius Mainnet. It does not establish notification frequency, delivery completeness, filtering accuracy, or connection stability across a sustained 900 s watch session.
 
 **Integrity and Invariant Verification**:
 
 - Virtual wallet balance and hash unchanged: 7.9259 SOL, `7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`.
 - Sealed precheck manifest unchanged: `data/research/prechecks/fresh-amm-v4-01/evidence-manifest.json` (`5B65751D2ADAF7E27E342D00262FFE0E8AC2EA73447B91F6DE5B5FA6A146AC16`).
 - Sealed probe 01 manifest unchanged: `data/research/capability-checks/solana-subscription-01/evidence-manifest.json` (`25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`).
-- Pin check: preserves Stage B baseline `6855efb0e4ab5023e2c556030c42613a0ee86f53` and its exact two expected refusals (`paper-single-candidate-diagnostic.ts` and its test, §8.38.12).
+- Sealed probe 02 manifest added and verified: `data/research/capability-checks/solana-subscription-02/evidence-manifest.json` (`56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`).
+- Pin check: `checkPin` in `backend/src/scripts/paper-pilot-handoff.ts` was updated with exact-version exceptions for the two modified endpoint files reviewed at `83a320a` (`paper-single-candidate-diagnostic.ts` [blob `42435317b0817f5463fcac804847faefee35c69b`, mode 100644] and `paper-single-candidate-diagnostic.test.ts` [blob `e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab`, mode 100644]). The candidate pinned commit tree entries match these fixed reviewed values, transitioning the runtime pin check to `PIN_OK` (exit 0) while keeping `REVIEWED_RUNNER_COMMIT` at `6855efb0e4ab5023e2c556030c42613a0ee86f53`.
 - Test suite results: 140/140 passed across Group 1 (70/70, including S-18 18/18) and Group 2 (70/70). Backend typecheck and ESLint clean.
