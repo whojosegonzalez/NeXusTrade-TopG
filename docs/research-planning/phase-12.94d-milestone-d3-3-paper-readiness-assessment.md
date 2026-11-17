@@ -6785,13 +6785,13 @@ export type RaydiumCpmmPoolStateResult = RaydiumCpmmPoolStateSuccess | RaydiumCp
 
 ##### 5. Staged Offline Implementation Roadmap & Explicit Quarantining Boundaries
 
-| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                                                                                                                                              |
-| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Implemented & Verified Offline (Commit `06b0ea6c`)**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` unmodified. 43/43 tests passing.                                                                                       |
-| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`                             | **Designed (Offline Specification Complete)**: Decodes `swap_base_input` (`0x8fbe5adac41e33de`) and `swap_base_output` (`0x37d96256a34ab4ad`); binds 13-account layout to verified pool and vaults; isolates invocation subtree via `stackHeight` and logs; proves executed amounts via inner SPL Token transfers (rejecting parameter substitution and balance deltas); classifies buy/sell relative to candidate; exact integer amounts (`bigint`); typed outcome union; reuses validated failed-transaction rules; 8 test groups designed. |
-| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                                                                                                                                 |
+| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Implemented & Verified Offline (Commit `06b0ea6c`)**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` unmodified. 43/43 tests passing.                                                                                                                                                                                                                                                                         |
+| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`                             | **Designed (Offline Specification Complete)**: Decodes `swap_base_input` (`0x8fbe5adac41e33de`) and `swap_base_output` (`0x37d96256a34ab4ad`); binds 13-account layout to verified pool and vaults; isolates invocation subtree via `stackHeight` and logs; proves executed amounts via inner SPL Token `TransferChecked` transfers (rejecting parameter substitution and balance deltas); classifies buy/sell relative to candidate; exact integer amounts (`bigint`); typed outcome union (`SWAP_DECODED`, `NO_MATCHING_SWAPS`, `UNRESOLVED_EVIDENCE`, `TRANSACTION_FAILED`); defers protocol-aware failed-transaction validator extension outside initial decoder scope; 8 adversarial test groups designed (unimplemented). |
+| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 ---
 
@@ -7095,9 +7095,10 @@ The CPMM swap instruction discriminators, account ordering, and execution semant
 - **Authoritative Source File Permalinks**:
   - `swap_base_input` Instruction: [`programs/cp-swap/src/instructions/swap_base_input.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/instructions/swap_base_input.rs)
   - `swap_base_output` Instruction: [`programs/cp-swap/src/instructions/swap_base_output.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/instructions/swap_base_output.rs)
+  - Token Transfer Utilities: [`programs/cp-swap/src/utils/token.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/utils/token.rs)
   - `PoolState` Account Struct: [`programs/cp-swap/src/states/pool.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/pool.rs)
   - Program Authority PDA & Seeds: [`programs/cp-swap/src/lib.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/lib.rs)
-  - Event Logging Definitions: [`programs/cp-swap/src/events.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/events.rs)
+  - Event Definitions: [`programs/cp-swap/src/states/events.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/events.rs)
 
 > [!WARNING]
 > **Source Correspondence vs. Deployed Bytecode Verification Boundary**:
@@ -7105,7 +7106,7 @@ The CPMM swap instruction discriminators, account ordering, and execution semant
 > However, **on-chain deployed bytecode correspondence remains strictly unverified**: no independent cryptographic verifiable build proof (linking Mainnet bytecode of `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` to commit `b3187ae53a1b95a201f855a59024a12ca8f5b51a`) has been established in this workspace.
 > The proposed adapter enforces strict adherence to the open-source protocol layout, but documents the on-chain deployed bytecode correspondence as an **unverified external dependency**.
 
-###### B. Instruction Discriminators, Account Ordering & Execution Evidence
+###### B. Instruction Discriminators, Account Struct & Event Execution Semantics
 
 1. **Exact Anchor Instruction Discriminators & Data Layouts**:
    Anchor instructions use an 8-byte discriminator computed as `sha256("global:<instruction_name>")[0..8]`:
@@ -7118,53 +7119,111 @@ The CPMM swap instruction discriminators, account ordering, and execution semant
      - Instruction Parameters: `max_amount_in` (`u64` little-endian, offset 8..16), `amount_out` (`u64` little-endian, offset 16..24).
      - Minimum Data Length: exactly 24 bytes.
 
-2. **Strict Account Ordering (Exact 13 Accounts)**:
-   In upstream `swap_base_input.rs` and `swap_base_output.rs`, the account struct expects exactly 13 accounts in fixed order:
-   - `0: payer` (Signer, Writable): User/wallet initiating and paying for the transaction.
+2. **Source Account Struct vs. Strict 13-Account Acceptance Policy**:
+   In upstream `swap_base_input.rs` and `swap_base_output.rs`, the Anchor `#[derive(Accounts)]` struct declares 13 named accounts:
+   - `0: payer` (`Signer<'info>`): The transaction signer paying transaction fees. **Note on signer and writability**: Upstream source declares `payer` as a `Signer<'info>` without the `#[account(mut)]` attribute. It is NOT required to be writable by the program. In compiled messages, `payer` must be a transaction-level signer, but need not be writable unless fee-paying or modified elsewhere.
    - `1: authority` (Readonly): Program authority PDA derived from seed `b"vault_and_lp_mint_auth_seed"`. Must match canonical address `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL` with canonical bump 253.
    - `2: amm_config` (Readonly): AMM pool configuration account governing fees.
    - `3: pool_state` (Writable): Target liquidity pool account address.
-   - `4: input_token_account` (Writable): User's source token account to pull input tokens from.
-   - `5: output_token_account` (Writable): User's destination token account to receive output tokens.
+   - `4: input_token_account` (Writable): User source token account.
+   - `5: output_token_account` (Writable): User destination token account.
    - `6: input_vault` (Writable): Pool vault corresponding to the input token.
    - `7: output_vault` (Writable): Pool vault corresponding to the output token.
    - `8: input_token_program` (Readonly): Canonical SPL Token program (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`).
    - `9: output_token_program` (Readonly): Canonical SPL Token program (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`).
    - `10: input_token_mint` (Readonly): Mint address of the input token.
    - `11: output_token_mint` (Readonly): Mint address of the output token.
-   - `12: observation_state` (Writable): Oracle observation account tracking TWAP prices.
-   - **Account Count Policy**: For canonical SPL Token pools, instructions must supply **exactly 13 accounts**. Instructions with $< 13$ accounts fail closed with `UNSUPPORTED_ACCOUNT_COUNT` or `MALFORMED_INSTRUCTION_DATA`. Instructions with $> 13$ accounts (e.g. Token-2022 transfer fee remaining accounts) fail closed with `UNSUPPORTED_ACCOUNT_COUNT` under this adapter's restrictive canonical SPL Token policy.
+   - `12: observation_state` (Writable): Oracle observation account tracking price history.
+   - **Distinction between Program Accounts and Decoder Policy**: While the Anchor program allows arbitrary remaining accounts via `ctx.remaining_accounts` (e.g. for Token-2022 transfer fee configurations), requiring **exactly 13 accounts** is an explicit, **restrictive acceptance policy of this decoder**. Under this policy, any instruction supplying $< 13$ accounts fails closed with `UNSUPPORTED_ACCOUNT_COUNT` or `MALFORMED_INSTRUCTION_DATA`, and any instruction supplying $> 13$ accounts is refused with `UNSUPPORTED_ACCOUNT_COUNT` to enforce the strict canonical SPL Token boundary.
 
-3. **Execution Evidence & Build Feature Analysis**:
-   - In `raydium-cp-swap`, program log messages and `SwapEvent` emissions are conditionally gated by `#[cfg(feature = "enable-log")]` or emitted via Anchor `emit!` (`Program data: <base64>`) / `emit_cpi!`.
-   - Production mainnet builds may disable verbose logging to optimize compute units (CUs), and RPC providers frequently truncate or omit program log buffers under high transaction loads.
-   - **Primary / Authoritative Execution Evidence**: Proof of actual trade completion must come from **inner SPL Token transfer instructions** (`Transfer` tag 3 or `TransferChecked` tag 12) strictly isolated within the invocation subtree slice.
-   - **Secondary Evidence**: Execution logs (`Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C invoke [depth]` to `Program ... success`) verify the invocation lifecycle and confirm that no runtime errors occurred.
-   - **Event Cross-Check**: If a `SwapEvent` is present in logs, its logged input/output quantities must match the inner transfer quantities byte-for-byte; any discrepancy fails closed with `CONFLICTING_EVIDENCE`.
+3. **Source Accuracy: Event Definitions & Committed Execution Semantics**:
+   - `SwapEvent` is defined in [`programs/cp-swap/src/states/events.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/events.rs).
+   - In `swap_base_input.rs` and `swap_base_output.rs`, the swap functions invoke standard Anchor `emit!(SwapEvent { ... })`. This emission is **outside** the `#[cfg(feature = "enable-log")]` debug message block, does not require that feature, and does not use `emit_cpi!`.
+   - **Critical Execution Ordering**: Inside the instruction handler, `emit!(SwapEvent)` is executed **before** the subsequent token vault transfers (`transfer_from_pool_vault_to_user`) or final state assertions complete.
+   - Consequently, encountering an emitted event log (`Program data: ...`) does NOT establish that the swap committed. If subsequent transfers fail, or if a later instruction in the transaction aborts, the entire transaction reverts.
+   - **Committed Execution Requirement**: A swap is established as committed only when:
+     1. Overall transaction execution succeeded (`meta.err === null`).
+     2. The CPMM invocation frame reached confirmed completion (`Program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C success`).
+     3. The inner token transfers within the invocation subtree executed successfully.
+   - **Log Completeness Notice**: Transaction logs may be omitted or truncated depending on RPC client configuration, retrieval options, or transport constraints; logs alone do not constitute committed execution evidence.
 
-###### C. Binding Invariants, Identity Verification & Subtree Boundary Isolation
+###### C. Exact Transfer Evidence: Pinned `TransferChecked` Helpers
 
-1. **Candidate Pool & Account Identity Binding**:
-   - `signature`: Validated canonical Solana 64-byte signature at `txPayload.transaction.signatures[0]`.
-   - `programId`: Must strictly match `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`. Any instruction calling another program is skipped (or parsed as an inner transfer if SPL Token).
-   - `pool_state` (account index 3): Must strictly match `poolContext.poolId`. Instructions for other pools increment `nonMatchingPoolSwapsCount` and are skipped without error.
-   - `authority` (account index 1): Must strictly match `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL`. Discrepancies fail closed with `VAULT_AUTHORITY_UNAUTHORIZED`.
-   - `token programs` (indices 8 & 9): Both must strictly match `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`. Any instruction referencing Token-2022 fails closed with `UNSUPPORTED_TOKEN_PROGRAM`.
-   - `vault set`: Vaults `{accounts[6], accounts[7]}` must be a strict set permutation of `{poolContext.baseVault, poolContext.quoteVault}`. Any foreign vault fails closed with `VAULT_MISMATCH`.
-   - `mint set`: Mints `{accounts[10], accounts[11]}` must be a strict set permutation of `{poolContext.candidateTokenMint, poolContext.quoteTokenMint}`. Any foreign mint fails closed with `MINT_MISMATCH`.
-   - `vault-mint consistency`: `input_vault` must correspond to `input_token_mint`, and `output_vault` must correspond to `output_token_mint`. Any mismatch fails closed with `CONFLICTING_EVIDENCE`.
+1. **Pinned Helper Implementation**:
+   In [`programs/cp-swap/src/utils/token.rs`](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/utils/token.rs), the pinned swap helpers `transfer_from_user_to_pool_vault` and `transfer_from_pool_vault_to_user` invoke `token_2022::transfer_checked`. When operating on standard SPL Token accounts, this issues a Cross-Program Invocation to the SPL Token Program (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`) with instruction tag `12` (`TransferChecked`).
 
-2. **Invocation Subtree Boundary Isolation**:
-   - **Top-Level Instructions**: For top-level CPMM instructions in `message.instructions`, all inner instructions grouped under `outerInstructionIndex` in `meta.innerInstructions` are scoped.
-   - **Inner CPI Calls**: For routed swaps or inner CPI calls (e.g. Jupiter routing through CPMM), the subtree slice `[innerIdx + 1, subtreeEnd)` is isolated using:
-     - `stackHeight`: Descendants must have `stackHeight > currentInstruction.stackHeight`. The slice terminates at the first instruction with `stackHeight <= currentInstruction.stackHeight`.
-     - Execution Logs: `Program CPMM... invoke [depth]` to `Program CPMM... success`. The count of descendant invocations must match the inner slice length.
-     - Contradictions between `stackHeight` and execution logs fail closed with `CONFLICTING_EVIDENCE`. Unresolvable boundaries fail closed with `UNSUPPORTED_CALL_TREE`.
-   - **Multi-Swaps & Unrelated Transfers**:
-     - Multiple swaps in a single transaction (e.g. multi-hop route, arbitrage) are each isolated into their own independent subtree slice and assigned a distinct `swapIndex`.
-     - Inner transfers occurring outside the invocation subtree slice (e.g. fee payments to routers, unrelated transfers in other outer instructions) are strictly ignored and never attributed to the swap.
+2. **Binary Layout of `TransferChecked` (Tag 12)**:
+   - Offset 0: `12` (`u8`, discriminator for `TransferChecked`).
+   - Offset 1..9: `amount` (`u64` little-endian integer, exact atomic token units).
+   - Offset 9: `decimals` (`u8`, expected mint decimals).
+   - Total Instruction Data Length: exactly **10 bytes**.
 
-###### D. Establishing Actual Executed Amounts: Inner Transfers vs. Rejected Alternatives
+3. **Account Layout of `TransferChecked` (4 Accounts)**:
+   - `0: source` [writable]: Source token account releasing funds.
+   - `1: mint` [readonly]: Token mint account.
+   - `2: destination` [writable]: Destination token account receiving funds.
+   - `3: authority` [signer]: Authority authorizing the transfer.
+   - **Distinction between Pinned `TransferChecked` and Plain `Transfer`**: Pinned upstream source exclusively issues `TransferChecked` (tag 12, 10 bytes, 4 accounts with explicit mint and decimals verification). Plain `Transfer` (tag 3, 9 bytes, 3 accounts: `[source, destination, authority]`) lacks mint and decimal validation in instruction data. While a decoder could theoretically accept plain `Transfer` as an unpinned legacy compatibility tolerance, canonical pinned evidence strictly requires `TransferChecked`.
+
+4. **Input Transfer Verification (`transfer_from_user_to_pool_vault`)**:
+   - `source`: Must match `input_token_account` (swap instruction account index 4).
+   - `mint`: Must match `input_token_mint` (swap instruction account index 10).
+   - `destination`: Must match `input_vault` (swap instruction account index 6).
+   - `authority`: Must match `payer` (swap instruction account index 0).
+   - `decimals`: Must match the expected input mint decimals from pool context (9 for WSOL, `baseDecimals` for candidate).
+   - `amount`: Exact atomic `u64` quantity.
+
+5. **Output Transfer Verification (`transfer_from_pool_vault_to_user`)**:
+   - `source`: Must match `output_vault` (swap instruction account index 7).
+   - `mint`: Must match `output_token_mint` (swap instruction account index 11).
+   - `destination`: Must match `output_token_account` (swap instruction account index 5).
+   - `authority`: Must match CPMM authority PDA `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL` (swap instruction account index 1).
+   - `decimals`: Must match the expected output mint decimals from pool context (9 for WSOL, `baseDecimals` for candidate).
+   - `amount`: Exact atomic `u64` quantity.
+
+6. **Transfer Matching & Anomaly Handling**:
+   - Within the invocation subtree slice, exactly one valid in-transfer and exactly one valid out-transfer must match the swap accounts.
+   - **Missing Transfers**: 0 matching in-transfers or 0 matching out-transfers fails closed with `CONFLICTING_EVIDENCE`.
+   - **Extra / Ambiguous Transfers**: Multiple transfers matching in/out endpoints, or unexpected extraneous token transfers within the CPMM invocation subtree, fail closed with `CONFLICTING_EVIDENCE`.
+   - **Endpoint Mismatch**: Transfer accounts contradicting pool vaults or mints fail closed with `VAULT_MISMATCH` or `CONFLICTING_EVIDENCE`.
+   - **Canonical Scope**: Token program must be canonical SPL Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`); Token-2022 fails closed with `UNSUPPORTED_TOKEN_PROGRAM`.
+   - **Raw Integer Accounting**: Amounts are preserved as exact `bigint` atomic units without conversion.
+
+###### D. Call-Tree Resolution Algorithm & Subtree Boundary Isolation
+
+1. **Deterministic Matching of Compiled Instructions, Inner Instructions & Stack Frames**:
+   - Top-level compiled instructions in `message.instructions` execute at `depth = 1` (`stackHeight = 1`).
+   - Inner instructions in `meta.innerInstructions` are grouped by outer instruction index `g.index`.
+   - In Solana JSON-RPC `getTransaction` (with `maxSupportedTransactionVersion: 0`), inner instructions optionally carry `stackHeight: number` (integer $\ge 2$).
+   - Execution logs in `meta.logMessages` follow the pattern:
+     - `Program <ProgramId> invoke [<depth>]`
+     - `Program <ProgramId> success`
+     - `Program <ProgramId> failed: <error>`
+     - `Program data: <base64>`
+   - A deterministic LIFO call stack tracks program invocations: each `invoke [depth]` pushes `{ programId, depth }`; each `success` or `failed` pops the active top frame. Strict LIFO must hold: if popped program ID does not match stack top, the log stream is inconsistent and all frames fail closed.
+
+2. **Subtree Boundary Resolution for Inner Instructions**:
+   For an inner CPMM instruction at `relevantInners[innerIdx]` with `stackHeight = H`:
+   - **Deterministic Structural Boundary**: Descendant instructions belonging to this invocation must have `stackHeight > H`. The subtree slice spans from `innerIdx + 1` up to the first subsequent inner instruction `k` where `relevantInners[k].stackHeight <= H`. If no such instruction exists, the slice extends to `relevantInners.length`.
+   - **Cross-Checking Against Execution Logs**: If logs are present, the decoder matches the instruction to the corresponding invocation frame in execution order. If `innerInst.stackHeight !== currentFrame.depth`, the structural call tree contradicts execution logs, failing closed with `CONFLICTING_EVIDENCE`.
+   - **No Count-Equality Assumptions**: The algorithm does NOT assume an unexplained equality between log invocation counts and inner-instruction counts proves correspondence, as not all logged actions correspond 1:1 to inner instruction records in RPC payloads.
+
+3. **Explicit Handling of Missing or Truncated Evidence**:
+   - **Missing `stackHeight`**: If `stackHeight` is omitted by the RPC provider:
+     - If the CPMM instruction is the final inner instruction in the group (`innerIdx + 1 === relevantInners.length`), all remaining inner instructions belong to it.
+     - If subsequent inner instructions exist without `stackHeight`, the boundary cannot be deterministically proven without risking conflating sibling instructions. The decoder must fail closed with `UNSUPPORTED_CALL_TREE`.
+   - **Missing or Truncated Logs**:
+     - For top-level instructions: if `logMessages` is absent or truncated, but overall `meta.err === null`, and inner transfers uniquely verify execution, top-level execution is confirmed by transaction success.
+     - For inner CPI instructions: without valid execution logs confirming that the CPMM frame completed, success of the inner invocation cannot be established (the inner call could have failed if caught by a router). Inner CPI swaps without valid logs fail closed with `INVOCATION_FAILED`.
+
+4. **Multi-Swaps, Sibling Swaps, Nested Calls & Unrelated Transfers**:
+   - **Sibling Swaps**: In transactions containing multiple swaps in the same outer instruction, swap 1's subtree slice terminates before swap 2 begins (when `stackHeight <= H`). Each swap is evaluated strictly in its own slice.
+   - **Nested Calls / Routers**: When a router invokes CPMM, CPMM executes at depth 2 and calls SPL Token at depth 3. The SPL Token transfers at depth 3 are scoped to the depth-2 CPMM frame. When CPMM finishes, depth drops back to 1.
+   - **Repeated Program IDs**: Tracking explicit depth and stack position prevents conflating multiple invocations of `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` in the same transaction.
+   - **CPI vs. Transaction Signers**: In CPI, `authority` PDA (`GpMZb...`) is authorized via runtime seeds, not transaction-level signatures. The decoder verifies that the inner transfer authority equals the expected authority PDA, without expecting transaction-level signer flags.
+   - **Unrelated Transfers**: Transfers belonging to the outer router or other instructions have `stackHeight <= H` or lie outside the slice, and are strictly ignored.
+
+###### E. Establishing Executed Amounts: Inner Transfers vs. Rejected Alternatives
 
 1. **Rejection of Instruction Parameters**:
    - In `swap_base_input`, `minimum_amount_out` is a slippage protection floor; the actual received amount depends on pool invariant math and fees and is almost always higher.
@@ -7178,21 +7237,17 @@ The CPMM swap instruction discriminators, account ordering, and execution semant
    - Account balance tables can also be incomplete or omit intermediate accounts.
    - **Contract Invariant**: Pre/post balance deltas must NEVER be used to derive single-pool swap amounts.
 
-3. **Authoritative Method: Invocation-Scoped Inner SPL Transfers**:
-   - During CPMM swap execution, the program makes two CPI transfers via the SPL Token program:
-     1. **In-Transfer**: `source === accounts[4] (user_source)` $\to$ `destination === accounts[6] (input_vault)`.
-     2. **Out-Transfer**: `source === accounts[7] (output_vault)` $\to$ `destination === accounts[5] (user_destination)`.
-   - The decoder parses SPL Token instructions (`tag 3: Transfer` or `tag 12: TransferChecked`) strictly inside the invocation subtree slice.
-   - **Validation Rules**:
-     - Exactly one matching in-transfer and exactly one matching out-transfer must be present. Missing or multiple transfers fail closed with `CONFLICTING_EVIDENCE`.
-     - Executed input amount = `inTransfer.amount`.
-     - Executed output amount = `outTransfer.amount`.
-     - **Slippage Constraint Verification**:
-       - For `swap_base_input`: asserts `inTransfer.amount === amount_in` and `outTransfer.amount >= minimum_amount_out`.
-       - For `swap_base_output`: asserts `outTransfer.amount === amount_out` and `inTransfer.amount <= max_amount_in`.
-       - Violations fail closed with `CONFLICTING_EVIDENCE`.
+3. **Authoritative Inner Transfer Accounting**:
+   - Executed input amount = `inTransfer.amount` (atomic units).
+   - Executed output amount = `outTransfer.amount` (atomic units).
+   - **Slippage Bounds Verification**:
+     - `swap_base_input`: asserts `inTransfer.amount === amount_in` and `outTransfer.amount >= minimum_amount_out`.
+     - `swap_base_output`: asserts `outTransfer.amount === amount_out` and `inTransfer.amount <= max_amount_in`.
+     - Violations fail closed with `CONFLICTING_EVIDENCE`.
+   - **Reserve Reconstruction Boundary**: Transfer amounts represent only the input spent and output received for that individual trade. They do NOT reconstruct pool-wide effective reserves or total liquidity (which require full vault balances and fee liability accounting).
+   - **Router Identity Boundary**: When trades execute through an aggregator or router, `payer` or source token accounts may belong to intermediate router contracts rather than the end-user wallet.
 
-###### E. Buy/Sell Classification, Exact Integers & Unique Event Identifiers
+###### F. Buy/Sell Classification, Exact Integers, Decimals & Unique Event IDs
 
 1. **Candidate-Relative Buy/Sell Classification**:
    Trade direction is determined strictly relative to the candidate token, independent of whether the on-chain pool is `TOKEN_0_BASE_WSOL_QUOTE` or `TOKEN_1_BASE_WSOL_QUOTE`:
@@ -7209,20 +7264,40 @@ The CPMM swap instruction discriminators, account ordering, and execution semant
    - WSOL decimals are fixed at 9. Candidate token decimals are preserved from `poolContext.baseDecimals`.
    - **Fee Model**: In CPMM, protocol fees, fund fees, and creator fees remain in the pool vaults and are accounted for as liabilities on the `PoolState` account. The in-transfer represents the gross input provided by the user; the out-transfer represents the net output received. The decoder records these actual transferred quantities without manufacturing synthetic fees.
 
-3. **Unique Trade Event Identifier**:
+3. **Stable Unique Trade Event Identifier**:
    - Each decoded swap event is assigned an immutable unique identifier:
-     `eventId = `${signature}:${outerInstructionIndex}:${swapIndex}``
-   - Guarantees complete uniqueness across multiple swaps in a transaction and across all slots.
+     `eventId = `${signature}:${outerInstructionIndex}:${swapExecutionIndex}``
+   - `swapExecutionIndex` is the 0-based absolute execution index of the swap within the transaction (e.g. 0 for top-level instruction, or inner instruction index for CPI calls), **independent of target filtering**. This ensures stable, immutable identifiers across multi-pool consumers.
 
-###### F. Account Resolution Invariants (Anti-Compaction & Anti-Shifting)
+4. **Timestamp Provenance and Receipt-Time Input**:
+   - Compatible with `TradeEvent`:
+     - `slot`: Valid non-negative safe integer.
+     - `blockTimeSec`: `Math.floor(txPayload.blockTime)`.
+     - `eventTimestampMs`: `blockTimeSec * 1000`.
+     - `receiptTimestampMs`: `options?.receiptTimestampMs ?? clock()`.
+     - `timestampProvenance`: `options?.fallbackProvenance ?? "ON_CHAIN_BLOCK_TIME"`.
+   - Missing, negative, NaN, or non-integer `blockTime` fails closed with `MISSING_UPSTREAM_TIMESTAMP` (never manufactures time).
 
-- Supports `legacy`, `version 0` (with Address Lookup Tables), and `version 1` (SIMD-0385 inline keys only).
+###### G. Account Resolution Invariants (Anti-Compaction & Anti-Shifting)
+
+- Supports `legacy`, `version 0` (with Address Lookup Tables), and `version 1` (SIMD-0385 inline keys only) transactions encoded via standard JSON-RPC `getTransaction` (`encoding: "json"`).
 - Resolves static keys + `loadedAddresses.writable` + `loadedAddresses.readonly` into a flat array of 32-byte Base58 strings.
+- **Version Boundaries**:
+  - `version 0`: appends `loadedAddresses.writable` and `loadedAddresses.readonly` without compaction, filtering, or double-appending.
+  - `legacy` and `version 1`: loaded addresses are not permitted; if `meta.loadedAddresses` contains keys, fails closed with `UNSUPPORTED_TRANSACTION_VERSION`.
 - **Anti-Compaction Invariant**: If any account key in `message.accountKeys` or `meta.loadedAddresses` is null, undefined, empty, or not canonical Base58, `resolveTransactionAccounts` must return `null` and fail closed. It must **never** filter, drop, or compact entries, as instruction account indices refer to exact array offsets. Shifting indices would misidentify pool and vault accounts.
 
-###### G. Typed Outcome Union & Refusal Taxonomy
+###### H. Typed Outcome Union & Refusal Taxonomy
+
+The decoder returns a typed union distinguishing four separate execution outcomes:
 
 ```typescript
+export type DecodeRaydiumCpmmSwapOutcome =
+  | "SWAP_DECODED"
+  | "NO_MATCHING_SWAPS"
+  | "UNRESOLVED_EVIDENCE"
+  | "TRANSACTION_FAILED";
+
 export type DecodeRaydiumCpmmSwapFailureReason =
   | "INVALID_PAYLOAD"
   | "INVALID_POOL_CONTEXT"
@@ -7244,41 +7319,109 @@ export type DecodeRaydiumCpmmSwapFailureReason =
   | "UNSUPPORTED_TRANSACTION_VERSION"
   | "AMBIGUOUS_DIRECTION"
   | "CONFLICTING_EVIDENCE";
+
+export interface DecodedCpmmSwapSuccessResult {
+  readonly ok: true;
+  readonly status: "SWAP_DECODED";
+  readonly signature: string;
+  readonly slot: number;
+  readonly events: readonly TradeEvent[];
+  readonly diagnostics: {
+    readonly totalInstructionsScanned: number;
+    readonly matchingSwapsCount: number;
+    readonly nonMatchingPoolSwapsCount: number;
+  };
+}
+
+export interface DecodedCpmmNoMatchingSwapsResult {
+  readonly ok: true;
+  readonly status: "NO_MATCHING_SWAPS";
+  readonly signature: string;
+  readonly slot: number;
+  readonly events: readonly [];
+  readonly diagnostics: {
+    readonly totalInstructionsScanned: number;
+    readonly matchingSwapsCount: 0;
+    readonly nonMatchingPoolSwapsCount: number;
+  };
+}
+
+export interface DecodedCpmmUnresolvedResult {
+  readonly ok: false;
+  readonly status: "UNRESOLVED_EVIDENCE";
+  readonly reason: DecodeRaydiumCpmmSwapFailureReason;
+  readonly message: string;
+  readonly signature?: string | undefined;
+  readonly slot?: number | undefined;
+  readonly events: readonly [];
+}
+
+export interface DecodedCpmmTransactionFailedResult {
+  readonly ok: false;
+  readonly status: "TRANSACTION_FAILED";
+  readonly reason: "TRANSACTION_FAILED";
+  readonly message: string;
+  readonly signature?: string | undefined;
+  readonly slot?: number | undefined;
+  readonly events: readonly [];
+}
+
+export type DecodeRaydiumCpmmTransactionResult =
+  | DecodedCpmmSwapSuccessResult
+  | DecodedCpmmNoMatchingSwapsResult
+  | DecodedCpmmUnresolvedResult
+  | DecodedCpmmTransactionFailedResult;
 ```
+
+> [!CRITICAL]
+> **Safety Invariant: Unsupported or Incomplete Evidence Must Never Become a Zero-Swap Result**:
+> A transaction is classified as `NO_MATCHING_SWAPS` **only** if:
+>
+> 1. Overall transaction execution succeeded (`meta.err === null`).
+> 2. All instructions and inner subtrees were successfully scanned without structural ambiguity.
+> 3. Zero instructions referenced the target candidate pool.
+>
+> If an instruction touching the target pool fails decoding, contains malformed data, presents contradictory transfers, or has an unresolvable subtree boundary, the decoder **must fail closed as `UNRESOLVED_EVIDENCE`**. Unsupported evidence must never be masked as a proven zero-swap result.
 
 **Exhaustive Refusal Taxonomy**:
 
-| Refusal Reason                    | Trigger Condition                                                                                                  |
-| :-------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
-| `INVALID_PAYLOAD`                 | Input payload is null, undefined, or not a valid object.                                                           |
-| `INVALID_POOL_CONTEXT`            | Candidate pool context fails boundary validation (mismatched mints, invalid keys, identical vaults).               |
-| `MISSING_SIGNATURE`               | Transaction payload lacks a valid Base58 signature at index 0.                                                     |
-| `INVALID_SLOT`                    | Transaction slot is negative, NaN, non-integer, or missing.                                                        |
-| `TRANSACTION_NOT_SUCCESSFUL`      | Transaction metadata missing or `meta.err` is undefined.                                                           |
-| `TRANSACTION_FAILED`              | Transaction failed on-chain (`meta.err !== null`). Reusable via validated failed transaction policy.               |
-| `INVOCATION_FAILED`               | Execution logs indicate the CPMM program invocation failed or did not reach success.                               |
-| `MISSING_UPSTREAM_TIMESTAMP`      | Transaction lacks a valid positive `blockTime`. On-chain timestamp is never manufactured.                          |
-| `NO_MATCHING_SWAPS_FOUND`         | Transaction contains no CPMM swap instructions matching the target pool ID.                                        |
-| `IDENTITY_MISMATCH`               | Pool state account does not match target pool ID.                                                                  |
-| `VAULT_MISMATCH`                  | Instruction vault accounts do not match verified pool vault addresses.                                             |
-| `MINT_MISMATCH`                   | Instruction token mints do not match target candidate mint and canonical WSOL.                                     |
-| `UNSUPPORTED_INSTRUCTION`         | Instruction discriminator does not match `swap_base_input` or `swap_base_output`.                                  |
-| `UNSUPPORTED_ACCOUNT_COUNT`       | Instruction accounts array length !== 13.                                                                          |
-| `UNSUPPORTED_TOKEN_PROGRAM`       | Instruction token program is not canonical SPL Token (e.g. Token-2022).                                            |
-| `UNSUPPORTED_CALL_TREE`           | Subtree boundary cannot be determined from stackHeight or execution log depth.                                     |
-| `MALFORMED_INSTRUCTION_DATA`      | Instruction data underflow (< 24 bytes), invalid Borsh integer decoding, or invalid account indices.               |
-| `UNSUPPORTED_TRANSACTION_VERSION` | Transaction version is not legacy, 0, or 1.                                                                        |
-| `AMBIGUOUS_DIRECTION`             | Swap direction cannot be established from inner transfers.                                                         |
-| `CONFLICTING_EVIDENCE`            | Inner transfer amounts contradict instruction limits, multiple in/out transfers exist, or logs contradict details. |
+| Refusal Reason                    | Outcome Classification | Trigger Condition                                                                                                  |
+| :-------------------------------- | :--------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| `INVALID_PAYLOAD`                 | `UNRESOLVED_EVIDENCE`  | Input payload is null, undefined, or not a valid object.                                                           |
+| `INVALID_POOL_CONTEXT`            | `UNRESOLVED_EVIDENCE`  | Candidate pool context fails boundary validation (mismatched mints, invalid keys, identical vaults).               |
+| `MISSING_SIGNATURE`               | `UNRESOLVED_EVIDENCE`  | Transaction payload lacks a valid Base58 signature at index 0.                                                     |
+| `INVALID_SLOT`                    | `UNRESOLVED_EVIDENCE`  | Transaction slot is negative, NaN, non-integer, or missing.                                                        |
+| `TRANSACTION_NOT_SUCCESSFUL`      | `UNRESOLVED_EVIDENCE`  | Transaction metadata missing or `meta.err` is undefined.                                                           |
+| `TRANSACTION_FAILED`              | `TRANSACTION_FAILED`   | Transaction failed on-chain (`meta.err !== null`).                                                                 |
+| `INVOCATION_FAILED`               | `UNRESOLVED_EVIDENCE`  | Execution logs indicate the CPMM invocation failed, did not reach success, or logs are missing for an inner CPI.   |
+| `MISSING_UPSTREAM_TIMESTAMP`      | `UNRESOLVED_EVIDENCE`  | Transaction lacks a valid positive `blockTime`. On-chain timestamp is never manufactured.                          |
+| `IDENTITY_MISMATCH`               | `UNRESOLVED_EVIDENCE`  | Instruction targets candidate pool but account indices are contradictory.                                          |
+| `VAULT_MISMATCH`                  | `UNRESOLVED_EVIDENCE`  | Instruction vault accounts do not match verified pool vault addresses.                                             |
+| `MINT_MISMATCH`                   | `UNRESOLVED_EVIDENCE`  | Instruction token mints do not match target candidate mint and canonical WSOL.                                     |
+| `UNSUPPORTED_INSTRUCTION`         | `UNRESOLVED_EVIDENCE`  | Instruction discriminator does not match `swap_base_input` or `swap_base_output`.                                  |
+| `UNSUPPORTED_ACCOUNT_COUNT`       | `UNRESOLVED_EVIDENCE`  | Instruction accounts array length !== 13.                                                                          |
+| `UNSUPPORTED_TOKEN_PROGRAM`       | `UNRESOLVED_EVIDENCE`  | Instruction token program is not canonical SPL Token (e.g. Token-2022).                                            |
+| `UNSUPPORTED_CALL_TREE`           | `UNRESOLVED_EVIDENCE`  | Subtree boundary cannot be determined from stackHeight or call tree structure.                                     |
+| `MALFORMED_INSTRUCTION_DATA`      | `UNRESOLVED_EVIDENCE`  | Instruction data underflow (< 24 bytes), invalid Borsh integer decoding, or invalid account indices.               |
+| `UNSUPPORTED_TRANSACTION_VERSION` | `UNRESOLVED_EVIDENCE`  | Transaction version is not legacy, 0, or 1, or version 1 contains loaded addresses.                                |
+| `AMBIGUOUS_DIRECTION`             | `UNRESOLVED_EVIDENCE`  | Swap direction cannot be established from inner transfers.                                                         |
+| `CONFLICTING_EVIDENCE`            | `UNRESOLVED_EVIDENCE`  | Inner transfer amounts contradict instruction limits, multiple in/out transfers exist, or logs contradict details. |
 
-###### H. Validated Failed-Transaction Policy Integration
+###### I. Failed-Transaction Handling & Separation of PAPER Zero-Swap Policy
 
-- When `meta.err !== null`, the decoder returns `{ ok: false, reason: "TRANSACTION_FAILED" }`.
-- Under the explicit **PAPER active-window opt-in**, the failed transaction is re-validated through `validateFailedTransactionEvidence` adapted for CPMM (confirming exact signature, supported version, verified slot and blockTime, recognized Solana `TransactionError`, and explicit reference to the candidate pool and CPMM program ID `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`).
-- If validated, it yields a `ValidatedFailedTransaction` with `committedSwapCount: 0` and zero loss gaps.
-- In default, production, and daemon execution paths, the opt-in is absent, and failed transactions are classified as `DECODE_FAILED` with a stream loss gap.
+1. **Decoder Boundary**:
+   When `meta.err !== null`, the decoder strictly returns:
+   `{ ok: false, status: "TRANSACTION_FAILED", reason: "TRANSACTION_FAILED", message: "..." }`.
 
-###### I. TypeScript Contract Interfaces
+2. **Separation from `ValidatedFailedTransactionEvidence.ts`**:
+   - Inspection of [`ValidatedFailedTransactionEvidence.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/ValidatedFailedTransactionEvidence.ts) confirms that the current validator is **hardcoded specifically to Raydium AMM v4**:
+     - Imports `RAYDIUM_AMM_V4_PROGRAM_ID`, `decodeRaydiumTransactionSwaps`, and `TrackedRaydiumPoolContext`.
+     - Explicitly checks `allKeys.includes(RAYDIUM_AMM_V4_PROGRAM_ID)`.
+   - **Contract Invariant**: CPMM CANNOT use `ValidatedFailedTransactionEvidence.ts` unchanged.
+   - Any protocol-aware extension (e.g. `validateCpmmFailedTransactionEvidence` or generalizing `validateFailedTransactionEvidence` to accept parameterized program IDs) and any PAPER zero-swap integration are **outside the initial decoder implementation scope**.
+   - Generic validation rules (verifying signature, supported version, verified slot and blockTime, and recognized `TransactionError`) remain an independent architectural layer. Existing AMM v4 validators and policies remain completely unchanged.
+
+###### J. Proposed TypeScript Interfaces
 
 ```typescript
 export interface TrackedCpmmPoolContext {
@@ -7294,30 +7437,49 @@ export interface TrackedCpmmPoolContext {
   readonly quoteDecimals: number; // 9
 }
 
-export interface DecodedCpmmSwapEventResult {
-  readonly ok: true;
-  readonly signature: string;
+export interface DecodableInstruction {
+  readonly programIdIndex?: number | undefined;
+  readonly programId?: string | undefined;
+  readonly accounts: readonly (number | string)[];
+  readonly data: string | Uint8Array | readonly number[];
+  readonly stackHeight?: number | undefined;
+}
+
+export interface DecodableInnerInstructionsGroup {
+  readonly index: number;
+  readonly instructions: readonly DecodableInstruction[];
+}
+
+export interface DecodableTransactionPayload {
   readonly slot: number;
-  readonly events: readonly TradeEvent[];
-  readonly diagnostics: {
-    readonly totalInstructionsScanned: number;
-    readonly matchingSwapsCount: number;
-    readonly nonMatchingPoolSwapsCount: number;
+  readonly blockTime?: number | null | undefined;
+  readonly version?: number | "legacy" | null | undefined;
+  readonly transaction: {
+    readonly signatures: readonly string[];
+    readonly message: {
+      readonly accountKeys: readonly (string | { readonly pubkey: string })[];
+      readonly instructions: readonly DecodableInstruction[];
+      readonly addressTableLookups?: readonly unknown[] | undefined;
+    };
+  };
+  readonly meta: {
+    readonly err: unknown | null;
+    readonly innerInstructions?: readonly DecodableInnerInstructionsGroup[] | undefined;
+    readonly logMessages?: readonly string[] | undefined;
+    readonly loadedAddresses?:
+      | {
+          readonly writable?: readonly string[] | undefined;
+          readonly readonly?: readonly string[] | undefined;
+        }
+      | undefined;
   };
 }
 
-export interface DecodeCpmmSwapFailureResult {
-  readonly ok: false;
-  readonly reason: DecodeRaydiumCpmmSwapFailureReason;
-  readonly message: string;
-  readonly signature?: string | undefined;
-  readonly slot?: number | undefined;
-  readonly events: readonly [];
+export interface DecodeSwapOptions {
+  readonly clock?: (() => number) | undefined;
+  readonly receiptTimestampMs?: number | undefined;
+  readonly fallbackProvenance?: TradeTimestampProvenance | undefined;
 }
-
-export type DecodeRaydiumCpmmTransactionResult =
-  | DecodedCpmmSwapEventResult
-  | DecodeCpmmSwapFailureResult;
 
 export function decodeRaydiumCpmmTransactionSwaps(
   payload: DecodableTransactionPayload | unknown,
@@ -7331,9 +7493,10 @@ export function decodeRaydiumCpmmTransactionSwaps(
 ##### 9. Proposed Acceptance Test Suite: `RaydiumCpmmSwapDecoder.test.ts`
 
 - **Proposed Target Path**: `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`
-- **Fixture Policy**: Tests use synthetic in-memory transaction builders. All test payloads are clearly documented as **synthetic in-memory byte generators**, not on-chain captured evidence.
+- **Design Status**: **SPECIFICATION ONLY**. The test matrix below defines the required adversarial verification cases for the proposed decoder. **These proposed tests have not yet passed because the implementation does not yet exist.**
+- **Fixture Policy**: Tests will use synthetic in-memory transaction builders. All test payloads are clearly documented as **synthetic in-memory byte generators**, not on-chain captured evidence.
 
-**Test Matrix (8 Groups, 36 Test Cases)**:
+**Adversarial Test Matrix (8 Groups, 36 Test Cases)**:
 
 1. **Group 1: Instruction Discriminators & Data Layout Validation (5 tests)**:
    - Validates `swap_base_input` with 8-byte discriminator `0x8fbe5adac41e33de` and 24-byte payload.
@@ -7344,6 +7507,7 @@ export function decodeRaydiumCpmmTransactionSwaps(
 
 2. **Group 2: Account Layout & Exact-Pool Binding (6 tests)**:
    - Accepts exact 13-account layout matching target pool, vaults, mints, and authority.
+   - Accepts transaction where `payer` (account 0) is a signer but not writable.
    - Rejects instruction account count < 13 with `UNSUPPORTED_ACCOUNT_COUNT`.
    - Rejects instruction account count > 13 with `UNSUPPORTED_ACCOUNT_COUNT`.
    - Ignores CPMM instruction with different `pool_state` (increments `nonMatchingPoolSwapsCount`).
@@ -7358,8 +7522,8 @@ export function decodeRaydiumCpmmTransactionSwaps(
      - Input WSOL $\to$ Output Candidate: classifies as `BUY`; attributes `solAmount = inTransfer`, `tokenAmount = outTransfer`.
      - Input Candidate $\to$ Output WSOL: classifies as `SELL`; attributes `tokenAmount = inTransfer`, `solAmount = outTransfer`.
 
-4. **Group 4: Exact Integer Amount Derivation & Inner Transfer Parsing (6 tests)**:
-   - Derives exact `bigint` executed amounts from inner SPL Token `Transfer` (tag 3) and `TransferChecked` (tag 12).
+4. **Group 4: Exact TransferChecked Evidence & Slippage Boundary Enforcement (6 tests)**:
+   - Derives exact `bigint` executed amounts from inner SPL Token `TransferChecked` (tag 12, 10 bytes, 4 accounts with matching mint and decimals).
    - Rejects when user-source $\to$ input-vault transfer is missing with `CONFLICTING_EVIDENCE`.
    - Rejects when output-vault $\to$ user-destination transfer is missing with `CONFLICTING_EVIDENCE`.
    - Rejects multiple conflicting in-transfers with `CONFLICTING_EVIDENCE`.
@@ -7369,24 +7533,25 @@ export function decodeRaydiumCpmmTransactionSwaps(
 5. **Group 5: Invocation Subtree Resolution & CPI Isolation (4 tests)**:
    - Successfully decodes top-level CPMM swap instruction with inner SPL transfers.
    - Successfully decodes inner CPI CPMM swap isolated by `stackHeight` within an outer routing instruction.
-   - Successfully decodes multiple swaps in a single transaction, generating unique event IDs `${signature}:${outerIdx}:${swapIdx}`.
+   - Successfully decodes sibling swaps in a single transaction, generating stable unique event IDs `${signature}:${outerIdx}:${swapExecutionIdx}`.
    - Strictly excludes unrelated transfers occurring outside the invocation subtree slice.
 
-6. **Group 6: Transaction Success, Failed Transactions & Status Handling (4 tests)**:
+6. **Group 6: Transaction Execution Status, Failure Taxonomy & Rejection of Manufactured Zero-Swaps (5 tests)**:
    - Rejects transaction with missing `meta` object with `TRANSACTION_NOT_SUCCESSFUL`.
    - Returns `TRANSACTION_FAILED` when `meta.err !== null`.
-   - Validates failed transaction under PAPER opt-in yielding `KNOWN_FAILED_TRANSACTION_ZERO_COMMITTED_SWAPS`.
+   - Confirms that incomplete or malformed evidence on a candidate-touching transaction yields `UNRESOLVED_EVIDENCE` and **never** a proven `NO_MATCHING_SWAPS` result.
+   - Successfully returns `NO_MATCHING_SWAPS` only when the transaction succeeded and verified instructions touch non-target pools.
    - Rejects transaction missing `blockTime` with `MISSING_UPSTREAM_TIMESTAMP` (never manufactures time).
 
 7. **Group 7: Transaction Versions & Account Resolution (4 tests)**:
    - Resolves legacy transaction account keys.
    - Resolves version 0 transaction accounts with Address Lookup Tables (`loadedAddresses.writable` / `readonly`).
-   - Resolves version 1 (SIMD-0385) transaction accounts without lookups.
+   - Resolves version 1 (SIMD-0385) transaction accounts without lookups; rejects version 1 with loaded addresses.
    - Anti-Compaction: Returns null and fails closed on invalid/null account keys without shifting array indices.
 
-8. **Group 8: Conflicting Evidence & Fail-Closed Safety (4 tests)**:
+8. **Group 8: Adversarial Edge Cases & Conflicting Evidence (4 tests)**:
    - Fails closed with `CONFLICTING_EVIDENCE` when `stackHeight` contradicts log depth.
-   - Fails closed with `UNSUPPORTED_CALL_TREE` when inner instruction call-tree boundary is unresolvable.
+   - Fails closed with `UNSUPPORTED_CALL_TREE` when inner instruction call-tree boundary is unresolvable due to missing `stackHeight`.
    - Fails closed with `UNSUPPORTED_TOKEN_PROGRAM` when Token-2022 program is supplied.
    - Deep freezes all returned `TradeEvent` objects and arrays (`Object.isFrozen(result.events)`).
 
@@ -7398,16 +7563,20 @@ export function decodeRaydiumCpmmTransactionSwaps(
    - Upstream commit `b3187ae53a1b95a201f855a59024a12ca8f5b51a` has been verified for instruction discriminators, struct layouts, and authority derivation.
    - However, verifiable build verification of on-chain deployed bytecode for `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` remains **unverified**. Mainnet program deployment correspondence is documented as an unverified external dependency.
 
-2. **Event Log Availability & Feature Flag Dependency**:
-   - `raydium-cp-swap` conditionally compiles extended logging behind `#[cfg(feature = "enable-log")]`.
-   - In production environments, log messages may omit `SwapEvent` or be truncated by RPC rate limits.
-   - The decoder design deliberately avoids relying on log events as primary evidence, using inner SPL Token transfers as the unforgeable ground truth for executed amounts.
+2. **Protocol-Aware Failed-Transaction Validation Extension (Outside Initial Scope)**:
+   - The existing `ValidatedFailedTransactionEvidence.ts` is explicitly hardcoded to AMM v4.
+   - Extending failed-transaction zero-swap validation to CPMM requires designing a protocol-aware validator that verifies CPMM program identity and account bindings.
+   - This extension is explicitly **deferred outside the initial swap decoder scope**, preserving all existing AMM v4 policies intact.
 
-3. **Router Account Aliasing in Multi-Hop Trades**:
+3. **Log Completeness and RPC Retrieval Constraints**:
+   - The decoder design deliberately avoids relying on log events as authoritative evidence of committed execution, using inner SPL Token `TransferChecked` instructions as the unforgeable ground truth for executed amounts.
+   - For inner CPI swaps, execution logs remain necessary to prove that the inner invocation completed without being caught by an outer router error handler.
+
+4. **Router Account Aliasing in Multi-Hop Trades**:
    - When trades execute through aggregators (e.g. Jupiter), the `payer` and destination token accounts may belong to intermediate router PDAs rather than the end-user wallet.
-   - The decoder accurately captures the pool's volume and reserves by tracking vault in/out transfers, but the caller must note that `userSourceOwner` may reflect a router authority in routed trades.
+   - The decoder accurately captures the pool's volume and reserves by tracking vault in/out transfers, but callers must recognize that `payer` may reflect a router authority rather than a retail trader.
 
-4. **Quarantining from Strategy Admission**:
+5. **Quarantining from Strategy Admission**:
    - CPMM candidates remain strictly quarantined from Stage B execution and strategy admission until Stages 3, 4, and 5 are fully implemented, verified offline, and independently reviewed.
    - `DexScreenerSingleCandidateMarketParser.ts` retains its active rejection of `"CPMM"` pools without modification.
 
