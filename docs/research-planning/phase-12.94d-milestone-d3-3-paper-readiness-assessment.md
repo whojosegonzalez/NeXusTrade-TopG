@@ -6488,14 +6488,16 @@ Mutation checks for the corrections: all 11 caught.
 
 **Run**: the single approved request ran once on 2026-11-16 (`amm-v4-watch-02-01`); its capture, record schema version 2, offline reanalysis and the shutdown change are recorded in §8.38.19. No rerun is authorised.
 
-#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter and Pure Market Parser Design Proposal
+#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter and Pure Market Parser
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY DESIGN ASSESSMENT & SCOPING (STAGE 1 IMPLEMENTED & VERIFIED; STAGE 2 DESIGNED).**
-> The pure pool-state adapter (`RaydiumCpmmPoolStateAdapter.ts`, 40/40 tests) has been implemented and verified offline at commit `52809e64`. Below is the design specification for the next pure component: `DexScreenerCpmmCandidateMarketParser.ts` and its acceptance tests.
-> Raydium CPMM targets remain strictly **quarantined from strategy admission** until discovery, market orientation, swap flow, LP verification, and security context integration are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; the proposed CPMM market parser remains strictly pure and unconnected to coordinator or runner execution.
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1 & 2 IMPLEMENTED & VERIFIED OFFLINE).**
+>
+> - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
+> - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline.
+>   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
-Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`) and the design proposal for the Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`) with its acceptance tests.
+Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`) and Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`) with their verified acceptance tests and explicit behavioral invariants.
 
 ---
 
@@ -6782,21 +6784,21 @@ export type RaydiumCpmmPoolStateResult = RaydiumCpmmPoolStateSuccess | RaydiumCp
 
 ##### 5. Staged Offline Implementation Roadmap & Explicit Quarantining Boundaries
 
-| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                |
-| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                             |
-| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Design Proposed Below**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` and its CPMM rejection unmodified. |
-| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                                  | Decodes `swap_base_input` / `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates **60 s qualified-flow window ($\le 15$ s cutoff)**, strictly distinct from provider-reported 5-minute market metrics.                                                                                                                                                                          |
-| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                               |
-| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                |
+| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                       |
+| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                                    |
+| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Implemented & Verified Offline**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` unmodified. 43/43 tests passing. |
+| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmFlowAdapter.ts`                                  | Decodes `swap_base_input` / `swap_base_output` or vault transfer deltas without `ray_log`; classifies buy vs sell; calculates **60 s qualified-flow window ($\le 15$ s cutoff freshness, maximum age of latest observation, not a permitted notification gap)**, strictly distinct from provider-reported 5-minute market metrics.                                                                                                  |
+| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                                      |
+| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                       |
 
 ---
 
-##### 6. Proposed Module Contract: `DexScreenerCpmmCandidateMarketParser.ts`
+##### 6. Implemented Module Contract: `DexScreenerCpmmCandidateMarketParser.ts`
 
-- **Proposed Target Path**: `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`
+- **Target Path**: [`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts)
 - **Architectural Isolation Invariant**:
-  The existing market parser [`DexScreenerSingleCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts) and its explicit rejection of `"CPMM"` pools remain **completely active and unmodified**. The proposed `DexScreenerCpmmCandidateMarketParser.ts` is an isolated, pure parser specifically designed for CPMM market payloads. It remains completely unconnected to the coordinator, runner, and live admission paths until all CPMM stages have been implemented, tested, and reviewed.
+  The existing market parser [`DexScreenerSingleCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerSingleCandidateMarketParser.ts) and its explicit rejection of `"CPMM"` pools remain **completely active and unmodified**. The implemented `DexScreenerCpmmCandidateMarketParser.ts` is an isolated, pure parser specifically designed for CPMM market payloads. It remains completely unconnected to the coordinator, runner, and live admission paths until all CPMM stages have been implemented, tested, and reviewed.
 
 - **Pure Entrypoint**:
   ```typescript
@@ -6837,6 +6839,7 @@ export type DexScreenerCpmmMarketParseFailureReason =
   | "NO_PAIRS"
   | "POOL_NOT_FOUND"
   | "AMBIGUOUS_POOL"
+  | "INVALID_POOL_STATE"
   | "POOL_STATE_BINDING_MISMATCH"
   | "CHAIN_NOT_SOLANA"
   | "DEX_NOT_RAYDIUM"
@@ -6852,7 +6855,8 @@ export type DexScreenerCpmmMarketParseFailureReason =
   | "MARKET_CAP_UNAVAILABLE"
   | "CREATION_TIME_UNAVAILABLE"
   | "M5_TXNS_UNAVAILABLE"
-  | "M5_VOLUME_UNAVAILABLE";
+  | "M5_VOLUME_UNAVAILABLE"
+  | "RECEIVED_AT_INVALID";
 
 export interface DexScreenerCpmmMarketProvenance {
   readonly provider: "DEXSCREENER";
@@ -6877,11 +6881,12 @@ export interface DexScreenerCpmmMarketProvenance {
   };
   readonly metricWindows: {
     readonly providerRolling5m: "5m";
-    readonly strategyQualifiedFlowWindow: "UNCONNECTED"; // Strict boundary: 60s qualified flow is not provided by market data
+    readonly strategyQualifiedFlowWindow: "UNCONNECTED";
   };
-  readonly onChainSpotCrossCheck: {
+  readonly priceObservations: {
     readonly spotPriceSolMarket: number;
     readonly spotPriceSolOnChainApprox: number;
+    readonly comparisonPerformed: false;
   };
   readonly receivedAtMs: number | null;
   readonly classifications: Readonly<Record<string, DexScreenerCpmmFieldClassification>>;
@@ -6910,14 +6915,16 @@ export type DexScreenerCpmmMarketParseResult =
 
 **Core Invariants and Behavioral Rules**:
 
-1. **Strict Cryptographic & Protocol Binding (Anti-Manufacturing Rule)**:
-   - Provider labels alone (`labels: ["CPMM"]`) are unverified external metadata and **must never establish protocol identity**.
+1. **Structural Consistency with Caller-Supplied Pool State**:
+   - Matching is strictly **structural consistency** with caller-supplied adapter output, **not cryptographic authentication**. Provider labels or matching public keys do not independently prove on-chain protocol identity or verified contract execution.
    - The parser requires an explicit, structurally verified `poolState: RaydiumCpmmPoolStateSuccess` input.
    - The parser verifies:
      - `target.poolAddress === poolState.poolAddress`
      - `target.candidateMint === poolState.candidateMint`
      - `poolState.wsolMint === WSOL_MINT_ADDRESS`
-       If target and poolState disagree, the parser fails closed immediately with `POOL_STATE_BINDING_MISMATCH`.
+     - `poolState.orientation` is a recognized orientation (`TOKEN_0_BASE_WSOL_QUOTE` or `TOKEN_1_BASE_WSOL_QUOTE`)
+     - `poolState.spotPriceSolApprox` is a finite non-negative number and `swapActivationTimeSec` is a bigint.
+       If target and poolState disagree, or poolState is not a valid recognized state, the parser fails closed deterministically with `POOL_STATE_BINDING_MISMATCH` or `INVALID_POOL_STATE`.
    - The matching DexScreener pair must satisfy:
      - `pair.pairAddress === target.poolAddress`
      - `pair.baseToken.address === target.candidateMint`
@@ -6925,151 +6932,143 @@ export type DexScreenerCpmmMarketParseResult =
      - `pair.chainId === "solana"`
      - `pair.dexId === "raydium"`
      - `pair.labels` must explicitly include `"CPMM"` (case-insensitive); if missing, fail closed with `DEX_LABEL_NOT_CPMM`.
-   - This double-gating ensures that a pool is admitted only if both on-chain binary state and external market indexing consistently confirm its CPMM identity.
 
-2. **Decoupling On-Chain Ordering from DexScreener Representation**:
-   - Upstream Raydium CPMM enforces on-chain canonical byte ordering: `token_0_mint < token_1_mint`.
-   - As a result, the on-chain pool state is either `TOKEN_0_BASE_WSOL_QUOTE` (when candidate mint < WSOL) or `TOKEN_1_BASE_WSOL_QUOTE` (when WSOL < candidate mint).
-   - In contrast, DexScreener's API defines its own `baseToken` and `quoteToken` conventions.
-   - The supported DexScreener orientation requires `baseToken.address === candidateMint` and `quoteToken.address === WSOL_MINT_ADDRESS` (`"TOKEN_BASE_WSOL_QUOTE"`).
-   - Both on-chain orientations map into this supported DexScreener orientation cleanly. Provenance preserves both:
-     - `onChainOrientation: poolState.orientation` (capturing AMM vault ledger order)
-     - `dexScreenerOrientation: "TOKEN_BASE_WSOL_QUOTE"` (capturing provider quote-currency convention)
+2. **Source-Backed API Facts vs. Adopted Interpretations**:
+   - Source-backed official reference: [`https://docs.dexscreener.com/api/reference`](https://docs.dexscreener.com/api/reference) defines `baseToken`, `quoteToken`, `priceNative`, `priceUsd`, `txns.m5.buys`, `txns.m5.sells`, `volume.m5`, `liquidity.usd`, `marketCap`, and `pairCreatedAt`.
+   - Adopted interpretations marked as unverified assumptions:
+     - Interpreting `priceNative` as SOL per candidate token assumes DexScreener's quote token native currency convention holds.
+     - Interpreting `buys` and `sells` as candidate purchases and candidate sales relies on standard exchange convention where buy = buying base token with quote token.
+   - Synthetic unit tests verify structural transformations and fail-closed handling, **not external provider semantics**.
 
-3. **Price, Volume, Market Cap & Transaction-Side Semantics**:
-   - According to official DEX Screener documentation:
-     - `priceNative`: Price of `baseToken` expressed in the native currency of `quoteToken` (SOL per candidate token).
-     - `priceUsd`: USD price of `baseToken` (USD per candidate token).
-     - `txns.m5.buys`: Count of buy transactions where `baseToken` was purchased with `quoteToken`.
-     - `txns.m5.sells`: Count of sell transactions where `baseToken` was sold for `quoteToken`.
-     - `volume.m5`: Total pair trading volume in USD over the rolling 5-minute window.
-     - `marketCap`: Aggregate market capitalization of `baseToken` in USD.
-     - `priceChange.m5`: Percentage price change of `baseToken` over the rolling 5-minute window.
-   - **Why Inverted Pairs (`base = WSOL`, `quote = candidate`) Cannot Be Inverted**:
-     - `priceUsd` on an inverted pair reports the USD price of **SOL** (~$150–$250), not the candidate token. Inverting ($1 / \text{SOL\_USD}$) yields SOL per USD, which is nonsensical.
-     - `marketCap` on an inverted pair reports the market cap of **SOL** ($100B+), not the candidate token.
-     - `txns.buys` on an inverted pair represents purchasing SOL with candidate tokens, which constitutes a candidate token sale.
-     - `priceChange` measures SOL price momentum, not candidate momentum; percentage momentum cannot be inverted via simple negation due to non-linear percentage math.
-   - **Refusal Policy**:
-     Any payload with `baseToken.address === WSOL_MINT_ADDRESS` and `quoteToken.address === candidateMint` must be rejected immediately with `UNSUPPORTED_ORIENTATION`. No arithmetic inversion heuristic is permitted.
+3. **Restrictive CPMM Label Policy & Orientation**:
+   - Requiring `"CPMM"` in `labels` is this parser's restrictive policy, not an API guarantee.
+   - Rejects conflicting unsupported Raydium labels (`"CLMM"`, `"V3"`, `"CL"`) with `UNSUPPORTED_RAYDIUM_POOL_TYPE`.
+   - Supports only candidate-base and WSOL-quote provider orientation (`"TOKEN_BASE_WSOL_QUOTE"`).
+   - Rejects reversed pairs (`base = WSOL`, `quote = candidate`) fail-closed with `UNSUPPORTED_ORIENTATION` without inversion.
+   - Supports either on-chain token ordering (`TOKEN_0_BASE_WSOL_QUOTE` vs `TOKEN_1_BASE_WSOL_QUOTE`) independently, preserving both on-chain and provider orientations in provenance.
 
-4. **Rolling 5-Minute Metrics Preserved Separately from Qualified Flow**:
-   - DexScreener `txns.m5` and `volume.m5` are external, rolling 5-minute aggregations.
-   - The parser populates `buys5m`, `sells5m`, `volume5mUsd`, and `txCount5m = buys5m + sells5m` as `OBSERVED` fields with 5-minute provenance.
-   - **No Naive Scaling**: The parser **never divides 5-minute counts by 5** to fabricate 60-second trade flow.
-   - Strategy-level momentum and retest qualification depend strictly on `RollingTradeFlowTracker.ts` and on-chain swap events (`RaydiumCpmmSwapDecoder.ts`), with strict $\le 15\text{s}$ gap cutoffs and proven execution logs.
+4. **Separate Price Observations**:
+   - Records the provider spot price (`spotPriceSolMarket`) and on-chain pool-state spot approximation (`spotPriceSolOnChainApprox`) separately under `priceObservations` with `comparisonPerformed: false`.
+   - Does not assert a discrepancy threshold or claim simultaneous/fresh observations.
 
-5. **Creation Time vs. Swap Activation Time Provenance**:
-   - `pair.pairCreatedAt` (epoch milliseconds) is validated as a safe positive integer and mapped to `openTimeSec = Math.floor(pairCreatedAt / 1000)`.
-   - Its provenance is preserved strictly as `source: "DEXSCREENER_PAIR_CREATED_AT"`.
-   - The parser **never overwrites or substitutes `openTimeSec` with `poolState.swapActivationTimeSec`**.
-   - Pool creators can set `open_time` arbitrarily in the past or future; `pairCreatedAt` reflects external indexing discovery. Both timestamps are recorded separately in provenance.
+5. **Creation vs. Swap Activation Time & Flow Decoupling**:
+   - Preserves provider-reported `pairCreatedAt` (epoch milliseconds) and derived `openTimeSec` with provenance `source: "DEXSCREENER_PAIR_CREATED_AT"`.
+   - Does not claim `pairCreatedAt` proves on-chain creation or first indexing time.
+   - Preserves `swapActivationTimeSec` separately with provenance `source: "RAYDIUM_CPMM_OPEN_TIME"`; **never substitutes swap activation time for creation time**.
+   - Preserves 5-minute rolling metrics (`buys5m`, `sells5m`, `volume5mUsd`, `txCount5m`) separately from strategy qualified flow. Never divides by 5.
+   - Note: In the strategy's rolling trade flow tracker, $\le 15\text{s}$ represents **cutoff freshness** (maximum age of latest observation), not a permitted notification gap.
 
-6. **Missing Data & Security Boundary Invariants**:
-   - `decimals`: DexScreener does not supply verified token decimals. Recorded as `0` and classified as `"UNAVAILABLE"`.
-   - `lpBurnPct`: Market data cannot verify LP token supply, burns, or lockup contracts. Recorded as `null` and classified as `"UNAVAILABLE"`.
-   - `mintAuthority` and `freezeAuthority`: Market data cannot verify SPL mint authority status. Recorded as `"UNVERIFIED_AUTHORITY"` and classified as `"UNAVAILABLE"`.
-   - All required market fields (`priceNative`, `priceUsd`, `liquidity.usd`, `marketCap`, `pairCreatedAt`, `txns.m5.buys`, `txns.m5.sells`, `volume.m5`, `symbol`) must be present and valid; any missing or invalid field fails closed with an explicit refusal code.
-   - Optional fields (`priceChange.m5`, `priceChange.h1`) are mapped to `momentum5mBps` and `priceChange1hPct` when valid; if omitted or undefined, they remain omitted from `spot` and are classified as `"UNAVAILABLE"`.
+6. **Numeric Validations (No FDV Substitution)**:
+   - Prices (`priceNative`, `priceUsd`) must be positive finite decimal strings.
+   - `liquidity.usd`, `marketCap`, and `volume.m5` must be finite non-negative numbers.
+   - **Never substitutes FDV for missing marketCap**: responses with FDV but missing marketCap fail closed with `MARKET_CAP_UNAVAILABLE`.
+   - `buys5m`, `sells5m`, and their sum (`txCount5m`) must be non-negative safe integers.
+
+7. **Date Formatting & Derived-Value Validation**:
+   - Validates supplied `receivedAtMs` before date formatting: non-integer, negative, `NaN`, `Infinity`, or out-of-range values fail closed with typed refusal `RECEIVED_AT_INVALID` without throwing runtime exceptions.
+   - Optional price change conversions (`priceChange.m5` to `momentum5mBps`) must never produce infinite, `NaN`, or unsafe derived values; non-finite or overflowing values remain `UNAVAILABLE`.
+
+8. **Security Fields Boundary & Immutability**:
+   - Security fields (`decimals: 0`, `lpBurnPct: null`, `mintAuthority`, `freezeAuthority`) remain explicitly `UNAVAILABLE`.
+   - The legacy `decimals: 0` placeholder is not described as observed token decimals.
+   - Inputs are never mutated; newly constructed outputs and provenance objects are deeply frozen (`Object.freeze`).
 
 **Exhaustive Refusal Taxonomy**:
 
 | Refusal Reason                  | Trigger Condition                                                                                        |
 | :------------------------------ | :------------------------------------------------------------------------------------------------------- |
-| `MALFORMED_RESPONSE`            | Input `json` is not an object or `pairs` property is not an array.                                       |
+| `MALFORMED_RESPONSE`            | Input `json` is not an object, `target` is not a record, or `pairs` is not an array.                     |
 | `NO_PAIRS`                      | `pairs` array is empty (`length === 0`).                                                                 |
 | `POOL_NOT_FOUND`                | No pair in `pairs` matches `target.poolAddress`.                                                         |
 | `AMBIGUOUS_POOL`                | Multiple pairs in `pairs` match `target.poolAddress`.                                                    |
+| `INVALID_POOL_STATE`            | `poolState` is null/failed, orientation unrecognized, spot price invalid, or activation time not bigint. |
 | `POOL_STATE_BINDING_MISMATCH`   | Target address or mint does not match supplied `poolState` (`poolAddress`, `candidateMint`, `wsolMint`). |
 | `CHAIN_NOT_SOLANA`              | `pair.chainId !== "solana"`.                                                                             |
 | `DEX_NOT_RAYDIUM`               | `pair.dexId !== "raydium"`.                                                                              |
 | `DEX_LABEL_NOT_CPMM`            | `pair.labels` does not include `"CPMM"` (case-insensitive).                                              |
 | `UNSUPPORTED_RAYDIUM_POOL_TYPE` | `pair.labels` contains unsupported Raydium labels (e.g. `"CLMM"`, `"V3"`, `"CL"`).                       |
-| `UNSUPPORTED_ORIENTATION`       | `baseToken` is WSOL and `quoteToken` is candidate mint (inverted pair).                                  |
+| `UNSUPPORTED_ORIENTATION`       | `baseToken` is WSOL and `quoteToken` is candidate mint (reversed pair).                                  |
 | `BASE_MINT_MISMATCH`            | `pair.baseToken.address !== target.candidateMint`.                                                       |
 | `QUOTE_NOT_WSOL`                | `pair.quoteToken.address !== WSOL_MINT_ADDRESS`.                                                         |
 | `SYMBOL_UNAVAILABLE`            | `pair.baseToken.symbol` is missing, not a string, or empty.                                              |
 | `PRICE_NATIVE_INVALID`          | `pair.priceNative` is missing, not a positive decimal string, or $\le 0$.                                |
 | `PRICE_USD_INVALID`             | `pair.priceUsd` is missing, not a positive decimal string, or $\le 0$.                                   |
 | `LIQUIDITY_UNAVAILABLE`         | `pair.liquidity.usd` is missing, non-numeric, negative, NaN, or infinite.                                |
-| `MARKET_CAP_UNAVAILABLE`        | `pair.marketCap` is missing, non-numeric, negative, NaN, or infinite.                                    |
+| `MARKET_CAP_UNAVAILABLE`        | `pair.marketCap` is missing, non-numeric, negative, NaN, or infinite (FDV not substituted).              |
 | `CREATION_TIME_UNAVAILABLE`     | `pair.pairCreatedAt` is missing, non-integer, or $\le 0$.                                                |
-| `M5_TXNS_UNAVAILABLE`           | `pair.txns.m5.buys` or `pair.txns.m5.sells` is missing, negative, or non-integer.                        |
+| `M5_TXNS_UNAVAILABLE`           | `pair.txns.m5.buys`/`sells` missing, negative, non-integer, or sum overflows `MAX_SAFE_INTEGER`.         |
 | `M5_VOLUME_UNAVAILABLE`         | `pair.volume.m5` is missing, non-numeric, negative, NaN, or infinite.                                    |
+| `RECEIVED_AT_INVALID`           | `receivedAtMs` is non-integer, negative, NaN, infinite, or out of ECMAScript Date range.                 |
 
 ---
 
-##### 7. Proposed Acceptance Test Suite: `DexScreenerCpmmCandidateMarketParser.test.ts`
+##### 7. Implemented Acceptance Test Suite: `DexScreenerCpmmCandidateMarketParser.test.ts`
 
-- **Proposed Target Path**: `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts`
-- **Fixture Policy**:
-  Tests use synthetic in-memory JSON fixtures representing official DexScreener token-pairs responses (`/latest/dex/tokens/<mint>`). All fixtures must be accompanied by valid, matching synthetic `RaydiumCpmmPoolStateSuccess` instances generated via `adaptRaydiumCpmmPoolState` or mock success records.
+- **Target Path**: [`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts)
+- **Status**: **43/43 tests passing offline** (13 ms execution time).
 
-**Test Coverage Plan (8 Groups)**:
+**Test Coverage Summary (8 Groups)**:
 
-1. **Group 1: Target & Pool-State Cryptographic Binding**:
+1. **Group 1: Target & Pool-State Structural Binding (8 tests)**:
    - Successfully parses when target, poolState, and DexScreener pair agree on pool address and candidate mint.
    - Fails closed with `POOL_STATE_BINDING_MISMATCH` if `target.poolAddress !== poolState.poolAddress`.
    - Fails closed with `POOL_STATE_BINDING_MISMATCH` if `target.candidateMint !== poolState.candidateMint`.
    - Fails closed with `POOL_STATE_BINDING_MISMATCH` if `poolState.wsolMint !== WSOL_MINT_ADDRESS`.
+   - Fails closed with `INVALID_POOL_STATE` if `poolState.ok` is false or null.
+   - Fails closed with `INVALID_POOL_STATE` if poolState orientation is unrecognized.
+   - Fails closed with `INVALID_POOL_STATE` if poolState spot price is negative or non-finite.
+   - Fails closed with `INVALID_POOL_STATE` if poolState swapActivationTimeSec is not a bigint.
    - Fails closed with `POOL_NOT_FOUND` if DexScreener response contains no pair matching `target.poolAddress`.
    - Fails closed with `AMBIGUOUS_POOL` if DexScreener response contains duplicate pairs for `target.poolAddress`.
 
-2. **Group 2: Provider Protocol Identification & CPMM Label Requirement**:
-   - Successfully accepts pair with `labels: ["CPMM"]` and `labels: ["cpmm"]` (case-insensitive).
-   - Successfully accepts pair with multiple labels including CPMM (e.g. `labels: ["CPMM", "HOT"]`).
-   - Fails closed with `DEX_LABEL_NOT_CPMM` if `labels` is missing or empty (`[]`).
-   - Fails closed with `DEX_LABEL_NOT_CPMM` if `labels` does not include CPMM (e.g. `labels: ["AMM"]`).
+2. **Group 2: Provider Protocol Identification & CPMM Label Requirement (5 tests)**:
+   - Successfully accepts pair with `labels: ["CPMM"]`, `labels: ["cpmm"]` (case-insensitive), or multiple labels.
+   - Fails closed with `DEX_LABEL_NOT_CPMM` if `labels` is missing, empty, or does not include CPMM.
    - Fails closed with `UNSUPPORTED_RAYDIUM_POOL_TYPE` if `labels` contains `"CLMM"`, `"V3"`, or `"CL"`.
    - Fails closed with `CHAIN_NOT_SOLANA` if `chainId !== "solana"`.
    - Fails closed with `DEX_NOT_RAYDIUM` if `dexId !== "raydium"`.
 
-3. **Group 3: Orientation Decoupling & Inversion Refusal**:
+3. **Group 3: Orientation Decoupling & Inversion Refusal (5 tests)**:
    - Successfully parses standard orientation: `baseToken.address === candidateMint`, `quoteToken.address === WSOL_MINT_ADDRESS`.
-   - Verifies handling with on-chain Orientation A (`TOKEN_0_BASE_WSOL_QUOTE`): records `onChainOrientation: "TOKEN_0_BASE_WSOL_QUOTE"` and `dexScreenerOrientation: "TOKEN_BASE_WSOL_QUOTE"`.
-   - Verifies handling with on-chain Orientation B (`TOKEN_1_BASE_WSOL_QUOTE`): records `onChainOrientation: "TOKEN_1_BASE_WSOL_QUOTE"` and `dexScreenerOrientation: "TOKEN_BASE_WSOL_QUOTE"`.
-   - Fails closed with `UNSUPPORTED_ORIENTATION` if pair is inverted (`baseToken = WSOL`, `quoteToken = candidateMint`), asserting that prices, market caps, and tx counts cannot be inverted safely.
+   - Maps on-chain Orientation A (`TOKEN_0_BASE_WSOL_QUOTE`) to `onChainOrientation: "TOKEN_0_BASE_WSOL_QUOTE"` and `dexScreenerOrientation: "TOKEN_BASE_WSOL_QUOTE"`.
+   - Maps on-chain Orientation B (`TOKEN_1_BASE_WSOL_QUOTE`) to `onChainOrientation: "TOKEN_1_BASE_WSOL_QUOTE"` and `dexScreenerOrientation: "TOKEN_BASE_WSOL_QUOTE"`.
+   - Fails closed with `UNSUPPORTED_ORIENTATION` if pair is reversed (`baseToken = WSOL`, `quoteToken = candidateMint`) without inversion.
    - Fails closed with `BASE_MINT_MISMATCH` if `baseToken.address` does not match candidate mint.
-   - Fails closed with `QUOTE_NOT_WSOL` if `quoteToken.address` is not canonical WSOL (e.g. USDC).
+   - Fails closed with `QUOTE_NOT_WSOL` if `quoteToken.address` is not canonical WSOL.
 
-4. **Group 4: Price, Liquidity, and Market Cap Validation**:
-   - Parses valid positive decimal strings for `priceNative` (e.g. `"0.0000421"`, `"1.5e-6"`).
-   - Parses valid positive decimal strings for `priceUsd` (e.g. `"0.00842"`).
-   - Fails closed with `PRICE_NATIVE_INVALID` on `""`, `"0"`, `"-0.5"`, `"abc"`, `null`, or undefined.
-   - Fails closed with `PRICE_USD_INVALID` on `""`, `"0"`, `"-0.5"`, `"abc"`, `null`, or undefined.
+4. **Group 4: Price, Liquidity, and Market Cap Validation (No FDV Substitution) (6 tests)**:
+   - Parses valid positive decimal strings for `priceNative` and `priceUsd` (including scientific notation).
+   - Fails closed with `PRICE_NATIVE_INVALID` on non-positive, zero, or malformed priceNative (`"0"`, `"-0.01"`, `"abc"`, `""`, null).
+   - Fails closed with `PRICE_USD_INVALID` on non-positive, zero, or malformed priceUsd (`"0"`, `"-1"`, `"NaN"`).
    - Fails closed with `LIQUIDITY_UNAVAILABLE` if `liquidity.usd` is missing, negative, NaN, or non-finite.
    - Fails closed with `MARKET_CAP_UNAVAILABLE` if `marketCap` is missing, negative, NaN, or non-finite.
-   - Verifies on-chain spot cross-check: reports both `spotPriceSolMarket` and `spotPriceSolOnChainApprox` in provenance without conflating them.
+   - Fails closed with `MARKET_CAP_UNAVAILABLE` on FDV-only responses, verifying FDV is never substituted for marketCap.
+   - Records separate market and pool-state price observations with `comparisonPerformed: false`.
 
-5. **Group 5: Creation Time & Provenance Preservation**:
-   - Validates positive safe integer `pairCreatedAt` in milliseconds (e.g. `1731750000000`).
-   - Maps `openTimeSec = Math.floor(pairCreatedAt / 1000)` with provenance `source: "DEXSCREENER_PAIR_CREATED_AT"`.
+5. **Group 5: Creation Time, Swap Activation Time, and Metric Windows (3 tests)**:
+   - Preserves safe positive integer `pairCreatedAt` in milliseconds with `source: "DEXSCREENER_PAIR_CREATED_AT"`.
+   - Maps `openTimeSec = Math.floor(pairCreatedAt / 1000)` without overwriting by `poolState.swapActivationTimeSec`.
    - Fails closed with `CREATION_TIME_UNAVAILABLE` if `pairCreatedAt` is 0, negative, floating-point, or missing.
-   - Verifies that `openTimeSec` is **never overwritten by `poolState.swapActivationTimeSec`**, even when they differ significantly (e.g. pool configured with a future swap unlock time).
+   - Records metric windows separating `providerRolling5m: "5m"` from `strategyQualifiedFlowWindow: "UNCONNECTED"`.
 
-6. **Group 6: Rolling 5-Minute Metrics & Flow Decoupling**:
-   - Parses valid non-negative integer `txns.m5.buys` and `txns.m5.sells`.
-   - Parses valid non-negative number `volume.m5`.
-   - Computes `txCount5m = buys5m + sells5m`.
-   - Fails closed with `M5_TXNS_UNAVAILABLE` if `buys` or `sells` is missing, negative, or non-integer.
+6. **Group 6: 5-Minute Rolling Flow and Unsafe Integer Counts (4 tests)**:
+   - Preserves 5-minute `buys5m`, `sells5m`, `txCount5m`, and `volume5mUsd` without scaling or dividing by 5.
+   - Fails closed with `M5_TXNS_UNAVAILABLE` on missing, negative, or non-integer buys/sells.
+   - Fails closed with `M5_TXNS_UNAVAILABLE` when `buys + sells` sum overflows `Number.MAX_SAFE_INTEGER`.
    - Fails closed with `M5_VOLUME_UNAVAILABLE` if `volume.m5` is missing, negative, NaN, or non-numeric.
-   - Asserts that 5-minute metrics remain isolated and are **not scaled, divided by 5, or mapped to 60-second strategy trade flow**.
 
-7. **Group 7: Unavailable Security Fields & Optional Price Changes**:
-   - Verifies that `decimals` is recorded as `0` and classified as `"UNAVAILABLE"`.
-   - Verifies that `lpBurnPct` is recorded as `null` and classified as `"UNAVAILABLE"`.
-   - Verifies that `mintAuthority` and `freezeAuthority` are `"UNVERIFIED_AUTHORITY"` and classified as `"UNAVAILABLE"`.
-   - Optional fields:
-     - When `priceChange.m5` is present, maps to `momentum5mBps = Math.round(m5 * 100)` and classifies as `"OBSERVED"`.
-     - When `priceChange.m5` is missing, leaves `momentum5mBps` undefined and classifies as `"UNAVAILABLE"`.
-     - When `priceChange.h1` is present, maps to `priceChange1hPct` and classifies as `"OBSERVED"`.
-     - When `priceChange.h1` is missing, leaves `priceChange1hPct` undefined and classifies as `"UNAVAILABLE"`.
+7. **Group 7: Date Handling and Optional Price Change Conversions (4 tests)**:
+   - Formats valid `receivedAtMs` into ISO `fetchedAt` string.
+   - Leaves `fetchedAt` empty string when `receivedAtMs` is null or undefined.
+   - Fails closed with `RECEIVED_AT_INVALID` on `NaN`, negative, infinite, non-integer, or out-of-range dates without throwing.
+   - Safely handles optional price changes and classifies them `UNAVAILABLE` on overflow or non-finite numbers.
 
-8. **Group 8: Malformed Responses & Structural Robustness**:
-   - Fails closed with `MALFORMED_RESPONSE` on `null`, `undefined`, numbers, or string inputs.
-   - Fails closed with `MALFORMED_RESPONSE` if `pairs` is not an array.
-   - Fails closed with `NO_PAIRS` if `pairs` is empty (`[]`).
-   - Fails closed with `SYMBOL_UNAVAILABLE` if `baseToken.symbol` is missing, whitespace-only, or not a string.
+8. **Group 8: Security Fields Boundary, Immutability and Structural Malformation (8 tests)**:
+   - Verifies that `decimals: 0`, `lpBurnPct: null`, `mintAuthority`, and `freezeAuthority` remain explicitly `UNAVAILABLE`.
+   - Fails closed with `MALFORMED_RESPONSE` on non-object inputs or missing pairs array.
+   - Fails closed with `NO_PAIRS` if pairs array is empty.
+   - Fails closed with `SYMBOL_UNAVAILABLE` on missing, whitespace-only, or non-string token symbol.
+   - Preserves input immutability (inputs not altered) and verifies deep freezing of all newly constructed output structures.
    - Verifies all returned objects and provenance metadata are deeply frozen (`Object.freeze`).
 
 ---

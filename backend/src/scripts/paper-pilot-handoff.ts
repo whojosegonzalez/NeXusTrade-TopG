@@ -109,6 +109,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated CPMM pool-state adapter and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts",
   "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts",
+  // The isolated pure CPMM market parser and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts",
+  "backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
