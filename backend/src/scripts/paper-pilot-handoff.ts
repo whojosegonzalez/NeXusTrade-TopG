@@ -106,6 +106,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The watch 02 retrospective metadata check and its tests (section 8.38.16).
   "backend/src/scripts/amm-v4-watch-retrospective.ts",
   "backend/src/scripts/amm-v4-watch-retrospective.test.ts",
+  // The isolated CPMM pool-state adapter and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts",
+  "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

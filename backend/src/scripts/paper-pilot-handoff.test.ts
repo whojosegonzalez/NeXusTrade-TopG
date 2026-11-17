@@ -1199,6 +1199,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/solana-subscription-capability.test.ts",
       "backend/src/scripts/amm-v4-watch-retrospective.ts",
       "backend/src/scripts/amm-v4-watch-retrospective.test.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1235,6 +1237,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
     // Unexpected additions next to the reviewed files, and directories, are not allowed.
     for (const extra of [
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test-support.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test-support.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapterExtra.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch-handoff.ts",
