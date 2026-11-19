@@ -112,6 +112,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated pure CPMM market parser and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts",
   "backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts",
+  // The isolated pure CPMM swap decoder and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts",
+  "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

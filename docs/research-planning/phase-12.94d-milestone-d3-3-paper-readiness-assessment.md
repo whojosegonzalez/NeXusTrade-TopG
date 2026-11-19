@@ -6488,14 +6488,14 @@ Mutation checks for the corrections: all 11 caught.
 
 **Run**: the single approved request ran once on 2026-11-16 (`amm-v4-watch-02-01`); its capture, record schema version 2, offline reanalysis and the shutdown change are recorded in §8.38.19. No rerun is authorised.
 
-#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, and Proposed Swap Decoder Design
+#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser and Isolated Swap Decoder
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1 & 2 IMPLEMENTED & VERIFIED OFFLINE; STAGE 3 DESIGN CORRECTED 2026-11-19, NOT IMPLEMENTED).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
-> - **Stage 3**: Pure CPMM swap decoder (`RaydiumCpmmSwapDecoder.ts`): design specification only, independently reviewed and corrected on 2026-11-19 against commit `b3187ae53a1b95a201f855a59024a12ca8f5b51a` and official Solana documentation (item 8). The corrections cover timestamp provenance bound to `blockTime`, invocation-level signer rules, exact call-tree matching and the fact that a failed CPI cannot be caught. No source or test exists; the proposed tests in item 9 have not run. Ready to implement as an isolated module after review of the corrected design (item 10).
+> - **Stage 3**: Pure CPMM swap decoder ([`RaydiumCpmmSwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts), 16/16 tests, 15/15 targeted mutants caught) implemented and verified offline on 2026-11-19, following the corrected design (items 8–10) and the implementation clarifications in item 11. It is isolated: no flow, admission, failed-transaction or PAPER zero-swap integration.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -6785,13 +6785,13 @@ export type RaydiumCpmmPoolStateResult = RaydiumCpmmPoolStateSuccess | RaydiumCp
 
 ##### 5. Staged Offline Implementation Roadmap & Explicit Quarantining Boundaries
 
-| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Implemented & Verified Offline (Commit `06b0ea6c`)**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` unmodified. 43/43 tests passing.                                                                                                                                                                                                                                                                                                                                                 |
-| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`                             | **Design Corrected (2026-11-19; Not Implemented)**: decodes `swap_base_input` (`8fbe5adac41e33de`) and `swap_base_output` (`37d96256a34ab4ad`) against the pinned 13-account `Swap` struct; executed amounts only from the two direct-child SPL Token `TransferChecked` CPIs of the swap frame, rebuilt exactly from `stackHeight`; invocation-level signer rules (no transaction-signer requirement for routed calls); failed CPIs cannot be caught, so `meta.err === null` proves completion and logs are optional corroboration; `blockTime`-only provenance with injected receipt time; `json` encoding, legacy and v0 only; four-way outcome union with no partial results; failed-transaction validator and PAPER zero-swap integration deferred; adversarial matrix specified (item 9), not run. |
-| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Stage       | Focus                                 | Target Files                                                                                                                                            | Acceptance Criteria & Quarantining Invariants                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| :---------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stage 1** | **Isolated Pool-State Adapter**       | `backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.test.ts`                   | **Implemented & Verified Offline (Commit `52809e64`)**: Pure adapter maps 637-byte `PoolState` + two 165-byte vaults; bidirectional WSOL; canonical SPL only; exact integer fees; canonical bump 253; strict slot equality; fail-closed on inconsistencies. 40/40 tests passing.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Stage 2** | **Isolated Pure CPMM Market Parser**  | `backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts`<br>`backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts` | **Implemented & Verified Offline (Commit `06b0ea6c`)**: Pure parser binds exact pool and candidate mint to verified `RaydiumCpmmPoolStateSuccess`; requires `"CPMM"` label; accepts supported orientation (`candidate` base, `WSOL` quote); refuses inverted or ambiguous orientation; maps 5-minute rolling metrics; preserves `pairCreatedAt` provenance. Keeps existing `DexScreenerSingleCandidateMarketParser.ts` unmodified. 43/43 tests passing.                                                                                                                                                                                                                                                  |
+| **Stage 3** | **CPMM Swap Decoding & Flow**         | `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts`<br>`backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`                             | **Implemented & Verified Offline as an Isolated Module (2026-11-19)**: `swap_base_input` / `swap_base_output` decoded against the pinned 13-account struct; executed amounts only from the two direct-child SPL Token `TransferChecked` CPIs of each swap frame, rebuilt exactly from `stackHeight`; invocation-level signer rules; recorded failures refused regardless of log completeness; `blockTime`-only provenance with injected receipt time; `json`, legacy and v0 only; bounded before decoding; four-way outcome union with no partial results. 16/16 tests and 15/15 targeted mutants (item 11). Flow integration, failed-transaction validation and PAPER zero-swap policy remain deferred. |
+| **Stage 4** | **LP Evidence & Security Policy**     | `backend/src/candidate-scanner/RaydiumCpmmLpEvidenceAdapter.ts`<br>`backend/src/candidate-scanner/Token2022SecurityValidator.ts`                        | Verifies protocol-correct LP burn/lock ($\ge 90\%$); audits Token-2022 extensions or enforces canonical SPL Token restriction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **Stage 5** | **CPMM Creation Discovery & Handoff** | `backend/src/scripts/fresh-cpmm-precheck.ts`<br>`backend/src/candidate-scanner/BoundedCpmmCreationWatch.ts`                                             | Implements bounded sampling/watch using `PoolInitializationParser.ts` CPMM discriminator; extracts pool ID, mints, and fee destination; integrates into protocol-aware runner with full offline verification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ---
 
@@ -7076,7 +7076,7 @@ export type DexScreenerCpmmMarketParseResult =
 
 ##### 8. Proposed Module Contract: `RaydiumCpmmSwapDecoder.ts` (Corrected Design; Not Implemented)
 
-**Status**: design specification only. No decoder source or test exists. This section was independently reviewed and corrected on 2026-11-19, replacing the design committed in `94b4a9e` and `9e17cff`. The implemented Stage 1 and Stage 2 modules (§8.38.17 items 3–7) are unchanged and remain disconnected from admission.
+**Status**: implemented offline on 2026-11-19 as an isolated module; the implementation results, clarifications and limitations are in item 11. The design below was independently reviewed and corrected on 2026-11-19, replacing the design committed in `94b4a9e` and `9e17cff`. The implemented Stage 1 and Stage 2 modules (§8.38.17 items 3–7) are unchanged and remain disconnected from admission.
 
 **Corrections in this review**:
 
@@ -7552,9 +7552,9 @@ Reuse:
 
 ---
 
-##### 9. Proposed Adversarial Test Matrix: `RaydiumCpmmSwapDecoder.test.ts` (Specification; Not Run)
+##### 9. Adversarial Test Matrix: `RaydiumCpmmSwapDecoder.test.ts` (Specification; Implemented in Item 11)
 
-These cases are specifications. Nothing has been implemented or run. All fixtures are synthetic in-memory `json`-encoding payloads built from the pinned layouts, not captured evidence. "Refused" means `UNRESOLVED_EVIDENCE` with the reason shown.
+These cases were written as specifications before implementation. They are implemented in the 16 tests described in item 11, which records the results. All fixtures are synthetic in-memory `json`-encoding payloads built from the pinned layouts, not captured evidence. "Refused" means `UNRESOLVED_EVIDENCE` with the reason shown.
 
 | Group                          | Case                                                                                                                        | Expected                                                                         |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
@@ -7642,14 +7642,135 @@ Mutation checks are to be defined when the implementation exists. Each rule abov
 4. **Version 1**: the documented v1 format (inline keys, no lookup tables) is refused until a reviewed v1 `json` response fixture exists.
 5. **`amm_config` and `observation_state`**: these are not bound, because the implemented Stage 1 adapter does not expose them. The program enforces both. Binding them would need a reviewed adapter extension, which is not part of this task: the adapter must stay unchanged.
 6. **SIMD-0268**: heights 6–9 are accepted structurally; activation status is not checked by a pure decoder.
-7. **SPL Token encoding**: the `TransferChecked` byte encoding was not re-read from SPL Token source in this review (item A).
+7. **SPL Token encoding**: the `TransferChecked` byte encoding was not re-read from SPL Token source in this review (item A). It has since been confirmed at `program@v9.0.0` (item 11).
 8. **Deposits, withdrawals and fee collection** on the target pool refuse the transaction (`UNSUPPORTED_INSTRUCTION`). Whether liquidity changes need their own representation is a Stage 3 flow-provider question.
 9. **Token-2022**, failed-transaction validation and PAPER zero-swap integration remain deferred.
 
 **Readiness**:
 
-- **Ready to implement** as an isolated, pure module with its synthetic test suite, once this corrected design has had independent review. The contract is precise for: timestamps, signers, failure semantics, call-tree matching with a bounded algorithm, transfer binding, event consistency, encodings, the outcome union and stable IDs.
+- **Ready to implement** as an isolated, pure module with its synthetic test suite, once this corrected design has had independent review (it passed review and was implemented; see item 11). The contract is precise for: timestamps, signers, failure semantics, call-tree matching with a bounded algorithm, transfer binding, event consistency, encodings, the outcome union and stable IDs.
 - **Not ready** for any connection to flow, admission, failed-transaction policy or live evidence. Quarantine remains, and Stages 1 and 2 stay unchanged and disconnected.
+
+---
+
+##### 11. Stage 3 Implementation Results and Limitations (2026-11-19)
+
+**Implemented offline**: `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts` and `backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts`, following items 8–10 with the clarifications below. The module is pure and isolated. Nothing imports it except its test. It is not connected to flow tracking, admission, the failed-transaction validator or any PAPER zero-swap policy. The Stage 1 adapter, the Stage 2 parser, the AMM v4 decoder and all validators are unchanged.
+
+**Contract as implemented**: `decodeRaydiumCpmmTransactionSwaps(payload, pool, { receiptTimestampMs })`.
+
+- **Inputs**: `pool` is the adapter's `RaydiumCpmmPoolStateSuccess`, and the result is the four-way union of item K. Events are the existing `TradeEvent`, deep-frozen, with exact `bigint` amounts and `eventId = signature:outer:position`.
+- **Scope**: compiled `json` encoding, legacy and v0, canonical SPL Token and `TransferChecked` only.
+- **Not present**: a plain `Transfer` fallback, a timestamp override, a clock default and partial results.
+
+**Implementation clarifications applied**:
+
+1. **Pool context**: validated consistently with the adapter.
+   - canonical, distinct pool, candidate, WSOL and vault identities;
+   - `wsolMint` must be canonical WSOL, and the candidate must not be WSOL;
+   - a known orientation;
+   - candidate decimals an integer from 0 to 18 (the adapter's bound, not the pseudocode's 0–255), and quote decimals exactly 9;
+   - all four adapter verification flags true.
+2. **Recorded failures**: in a transaction with `meta.err === null`, every log line of the form `Program <id> failed[: …]` is checked first, before log completeness is classified and before either shortcut. A recorded failure refuses the transaction (`CONFLICTING_EVIDENCE`, `FAILED_LOG_IN_SUCCESSFUL_TRANSACTION`) whether the logs are complete, truncated or unbalanced.
+3. **Validation order**, which resolves the inconsistency between pseudocode step 4 and item I:
+   - options and receipt time; the pool; the envelope (signature, slot, version, `meta.err` present);
+   - account resolution, then all top-level instructions;
+   - only then `TRANSACTION_FAILED`;
+   - then the log bounds and failure check, then full validation of any inner groups and heights present;
+   - only then the target-not-referenced shortcut.
+
+   So malformed accounts or instructions are `UNRESOLVED_EVIDENCE` before either shortcut. **Deviation found by testing**: the shortcut now requires that none of the pool or its two vaults appear among the transaction's accounts, not only the pool. A target vault referenced by another pool's swap is decoded in full and refused (`IDENTITY_MISMATCH`), where the pool-only rule would have reported `NO_MATCHING_SWAPS`.
+
+4. **Bounds enforced before expensive decoding** (pure-decoder policy; acquisition limits are unchanged):
+
+   | Bound                      | Limit                                                    |
+   | -------------------------- | -------------------------------------------------------- |
+   | Resolved account keys      | 256 (checked before canonical-key checks)                |
+   | Top-level instructions     | 64                                                       |
+   | Inner instructions         | 1,024 (cumulative, checked before each group is decoded) |
+   | Accounts per instruction   | 256 (added)                                              |
+   | Encoded instruction string | 14,000 characters, checked before base58 decoding        |
+   | Decoded instruction data   | 10,240 bytes                                             |
+   | Log lines                  | 10,000                                                   |
+   | Cumulative log payload     | 1 MiB of UTF-8                                           |
+   | Stack height               | 9                                                        |
+
+5. **Scope**: only what the design specifies; there is no fallback.
+
+**Small additions to the item K contract**:
+
+- `INVALID_OPTIONS`: options missing or carrying any key other than `receiptTimestampMs`. For example, `fallbackProvenance` or `clock` is refused at run time, not merely as a type error.
+- `logCorroboration: "NOT_EVALUATED"` on the shortcut. Logs are then only checked for bounds and recorded failures, not compared with a trace.
+- Conflict detail `USER_ACCOUNT_INVALID` for user token accounts equal to each other or to a vault.
+- `NON_WSOL_PAIR` is not emitted: with the adapter's context, the vault-to-mint binding already makes one side WSOL and the other the candidate, so the code would be unreachable.
+
+**SPL Token reference**: `TransferChecked` was confirmed in [`solana-program/token` `program@v9.0.0` (`dfb260231c761be7d9c8b63728e770a102b86495`), `interface/src/instruction.rs`](https://github.com/solana-program/token/blob/dfb260231c761be7d9c8b63728e770a102b86495/interface/src/instruction.rs). It packs tag 12, then the `u64` little-endian amount, then one decimals byte, and its single-owner accounts are `[source, mint, destination, authority]`. This closes uncertainty 7 in item 10.
+
+- **Trailing bytes**: the program's unpacker ignores trailing bytes. The decoder still requires exactly 10 bytes, because the transfers it accepts are CPMM's own, built by Anchor's wrapper with exactly that encoding.
+
+**Tests** (16 tests, all synthetic):
+
+- **Fixtures**: literal byte layouts for instruction data, `TransferChecked` and the 170-byte `SwapEvent`. Pool contexts are real `adaptRaydiumCpmmPoolState` outputs on the adapter's fixture buffers, in both orientations.
+- **Coverage by group**:
+  - C-00 literal layouts and discriminators;
+  - C-01 the full `TradeEvent`, freezing and ingestion by the existing `RollingTradeFlowTracker` (accepted once, deduplicated the second time);
+  - C-02 orientations, sides and pool-context bounds (decimals 0 and 18 accepted; 19, −1 and 6.5 refused);
+  - C-03 timestamps and receipt time, including the safe-integer edge `9,007,199,254,740`, its +1, and a throwing `Date.now`;
+  - C-04 envelope, encoding, version and account resolution;
+  - C-05 the validation order and both shortcuts' preconditions;
+  - C-06 recorded failures in complete, truncated, unbalanced and detail-free logs, and a routed swap without logs;
+  - C-07 inner groups and heights;
+  - C-08 bounds, including 14,001 characters refused before decoding and 10,240 bytes accepted;
+  - C-09 swap-frame shapes, including the withdrawn final-inner-instruction case;
+  - C-10 routed swaps:
+    - a non-signer router PDA payer, including one loaded from a lookup table, and a signer payer;
+    - sibling swaps with a router transfer between them;
+    - top-level plus routed swaps;
+    - swaps at heights 4 and 8, with height 10 refused;
+    - top-level payer signer rules;
+  - C-11 the `TransferChecked` binding (12 cases, with no plain `Transfer` fallback) and Token-2022;
+  - C-12 exact quantities up to `2^64 − 1` and parameter consistency;
+  - C-13 identity, vault and mint binding; non-target swaps; non-swap CPMM instructions; malformed unrelated instructions; transfers outside the subtree;
+  - C-14 log corroboration and contradiction;
+  - C-15 no partial results, stable IDs, no input mutation, and hostile getters.
+
+**Mutation checks**: 15 targeted mutants of the critical binding and refusal rules, each run under a 60 s limit, with the source restored byte-identical afterwards. All 15 are caught.
+
+The first run left two survivors, which exposed weak tests rather than code faults:
+
+- **K03**: the "source swapped" case also broke the destination binding, so a source-only substitution case and a destination-only case were added.
+- **K13**: a valid over-long string is also caught by the byte cap. The test now uses a string whose invalid final character would only be reached if decoding started.
+
+| Mutant | Change                                            | Caught by  |
+| ------ | ------------------------------------------------- | ---------- |
+| K01    | Swap-frame descendants not checked                | C-09       |
+| K02    | Transfer authority not checked                    | C-11       |
+| K03    | Transfer source not checked                       | C-11       |
+| K04    | Transfer decimals not checked                     | C-11       |
+| K05    | Exact 10-byte `TransferChecked` not required      | C-11       |
+| K06    | Top-level payer signer not checked                | C-10       |
+| K07    | `amount_in` not bound to the input transfer       | C-12       |
+| K08    | Recorded failure ignored when logs are incomplete | C-05, C-06 |
+| K09    | Missing `stackHeight` defaults to 2               | C-07       |
+| K10    | Shortcut on pool absence only                     | C-13       |
+| K11    | `TRANSACTION_FAILED` before account resolution    | C-05       |
+| K12    | Candidate decimals bound 255                      | C-02       |
+| K13    | Encoded length not capped before decoding         | C-08       |
+| K14    | `blockTime` floored instead of refused            | C-03       |
+| K15    | Event ID from a filtered swap counter             | C-10       |
+
+**Results**: under external 60 s limits, the decoder suite passes 16/16, the pool-state adapter 40/40, the CPMM market parser 43/43, `RollingTradeFlowTracker` 40/40 and the handoff suite 13/13 (152 in all). The backend typecheck, ESLint and Prettier pass.
+
+- **Pin**: `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly the two decoder files. H-12 asserts the list, accepts both as additions, refuses their modification or deletion, and refuses four neighbouring unlisted names (`.test-support.ts`, `…Extra.ts`, `.fixtures.ts` and `RaydiumCpmmTransactionSourceAdapter.ts`). The baseline `6855efb` and the two exact-version endpoint exceptions are unchanged.
+- **Nothing else touched**: no other source, configuration, dependency, wallet or sealed evidence changed. No provider request, socket or credential was used.
+
+**Limitations (unchanged or new)**:
+
+- **Inherited from item 10**: uncertainties 1–6 and 8–9 remain.
+- **Synthetic fixtures only**: no captured CPMM transaction has been decoded. Provider behaviour (for example `stackHeight` population, or log formats such as the `Program <id> failed` wording) is assumed from documentation, not observed.
+- **Not swaps**: token transfers into the target vaults by other programs (donations) are not swaps and are ignored. Reserve effects are outside this decoder.
+- **Tracker exercised once**: `RollingTradeFlowTracker` is used in one test to show compatibility. It is not an integration, and no flow provider consumes the decoder.
+- **Status**: CPMM remains quarantined from admission; `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
 ---
 
