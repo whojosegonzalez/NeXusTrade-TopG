@@ -7774,154 +7774,358 @@ The first run left two survivors, which exposed weak tests rather than code faul
 
 ##### 12. Proposed CPMM Transaction-Resolution Component (Design Only; Not Implemented)
 
-**Status**: proposal for review. No source, test or pin change exists. The accepted decoder, pool-state adapter and market parser stay unchanged.
+**Status**: the architectural direction is accepted, and this item makes the API and evidence rules concrete (revised 2026-11-19). No source, test or pin change exists. The accepted decoder, pool-state adapter and market parser stay unchanged.
 
-**Scope**: resolve one injected transaction notification for one verified CPMM pool:
+**Proposed files**: `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts` and `RaydiumCpmmTransactionSourceAdapter.test.ts`. Implementing them would also need the pin allowlist to gain exactly these two files, as a separate reviewed step.
 
-1. one `getTransaction` request through the shared `PaperRequestSession`;
-2. validation of the response;
-3. the accepted decoder;
-4. a frozen resolution fact;
-5. optionally, ingestion of decoded events into an injected tracker.
+**Scope**: one notification for one verified pool, then one `getTransaction` request through the shared `PaperRequestSession`, then strict checks, then the accepted decoder. The result is a frozen fact, and ingestion is a separate, optional step. Out of scope: enumeration, the bridge, provider wiring, gaps, coverage, failed-transaction validation and admission.
 
-Out of scope: history enumeration, the resolution bridge, provider registration, collection gaps, coverage, failed-transaction validation and admission.
+###### A. Contract
 
-**Proposed files**:
+```typescript
+import type { PaperRequestExchangeEvidence, PaperRequestSession } from "./PaperRequestSession.js";
+import type { RaydiumCpmmPoolStateSuccess } from "./RaydiumCpmmPoolStateAdapter.js";
+import type { DecodeRaydiumCpmmTransactionResult } from "./RaydiumCpmmSwapDecoder.js";
+import type { RollingTradeFlowTracker, TradeEvent } from "./RollingTradeFlowTracker.js";
 
-- `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts`
-- `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts`
+export const CPMM_TX_PURPOSE = "CPMM_GET_TRANSACTION" as const;
 
-Implementing them would also need the pin allowlist to gain exactly these two files, as a separate reviewed step.
+/** One notification. Fields are validated; unknown keys are refused. */
+export interface CpmmTransactionNotification {
+  readonly signature: string; // canonical 64-byte base58
+  readonly slot: number; // safe integer >= 0
+  readonly receivedAtMs: number; // host receipt, positive safe integer (no clock fallback)
+  readonly blockTime?: number | null; // integer seconds if the source reported one
+}
 
-**Inputs** (all injected; no defaults for time or limits):
+/** Session-scoped evidence: its observe() is the session's onExchangeComplete. */
+export interface CpmmExchangeEvidenceRecorder {
+  readonly observe: (e: PaperRequestExchangeEvidence) => void; // records CPMM_TX_PURPOSE only
+  bind(session: PaperRequestSession): void; // exactly once; a second bind throws
+  readonly boundSession: PaperRequestSession | null;
+  take(seq: number): PaperRequestExchangeEvidence | undefined; // removes the entry
+}
+export function createCpmmExchangeEvidenceRecorder(limits: {
+  readonly maxPendingEvidence: number; // injected; observe() drops beyond it (recorded as missing)
+}): CpmmExchangeEvidenceRecorder;
 
-| Input               | Content                                                                                                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pool`              | The adapter's `RaydiumCpmmPoolStateSuccess`, passed unchanged to the decoder                                                                                                                                        |
-| `session`           | An already-opened `PaperRequestSession`, owned by the caller                                                                                                                                                        |
-| `rpcUrl`            | Used only as the dispatch URL; never stored in facts                                                                                                                                                                |
-| `evidence`          | A read-only lookup from ledger `seq` to `PaperRequestExchangeEvidence`, populated by the session owner's `onExchangeComplete` observer. The session exposes raw body bytes only there; no session change is needed. |
-| `notification`      | `{ signature, slot, receivedAtMs, blockTime? }`: a canonical signature, a safe slot, a positive safe-integer host receipt time, and an optional integer `blockTime`                                                 |
-| `refusal`, `signal` | The caller's lifecycle refusal and cancellation                                                                                                                                                                     |
+export interface CpmmTransactionSourceOptions {
+  readonly pool: RaydiumCpmmPoolStateSuccess;
+  readonly session: PaperRequestSession; // already opened by its owner
+  readonly evidence: CpmmExchangeEvidenceRecorder; // boundSession === session, else construction fails
+  readonly rpcUrl: string; // dispatch URL only; never retained
+  readonly secrets: readonly string[]; // credentialSecrets(...) of the configured endpoints
+  readonly maxTrackedSignatures: number; // injected positive safe integer; no default
+  readonly maxResponseBytes: number; // must not exceed the session's SOLANA_RPC lane limit
+}
 
-**1. Signature binding, envelope and cross-checks before decoding**:
+export interface CpmmLifecycleGate {
+  readonly signal?: AbortSignal | undefined; // caller cancellation
+  readonly refusal?: (() => string | null) | undefined; // epoch / lifecycle refusal
+}
 
-1. **Request**: exactly one dispatch.
-   - Body: `{"jsonrpc":"2.0","id":<id>,"method":"getTransaction","params":[<signature>,{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}]}`.
-   - The ID comes from `session.nextJsonRpcId()`. It is passed as `jsonRpcId`, and `requestedIdentity` is the signature, so both are in the session ledger. Lane `SOLANA_RPC`, owner `FLOW`, purpose `CPMM_GET_TRANSACTION`.
-   - A v1 transaction then comes back as an RPC error, which the decoder would refuse anyway.
-2. **Transport**: the exchange must be dispatched, with no error, HTTP 200 and `bodyState` `COMPLETE`. The raw bytes come from `evidence.get(entry.seq)` and must match `observedBodyBytes`; strict UTF-8 is required. The session's lossy `text` is never parsed.
-3. **Envelope**: the keys must be exactly `{jsonrpc, id, result}` or `{jsonrpc, id, error}`, with `jsonrpc === "2.0"` and `id` strictly equal to the requested number. Any other ID or type is `MALFORMED_RESPONSE`.
-4. **Result**:
-   - `error`: an `RPC_ERROR` fact, with the code and redacted message;
-   - `null`: `TRANSACTION_NOT_FOUND`. This is not evidence of absence, because confirmed data may lag;
-   - otherwise an object, continuing below.
-5. **Signature binding**: `result.transaction.signatures[0]` must equal the requested signature exactly, with no trimming or case folding. Otherwise `SIGNATURE_MISMATCH`.
-6. **Slot and time cross-checks**:
-   - `result.slot` must be a safe integer equal to `notification.slot`. A missing or non-numeric slot is a contradiction, not a skip.
-   - If the notification carries `blockTime`, `result.blockTime` must be present and equal to it.
-   - A mismatch gives `METADATA_CONTRADICTION`.
-7. **Retention**: every fact that reached the network keeps:
-   - the request body (which contains no credential);
-   - the ledger entry (`seq`, `jsonRpcId`, dispatch and completion times, status, completeness, error);
-   - the response byte count, its SHA-256 and the bytes themselves, bounded by the lane limit and redacted at byte level with the reviewed capability-check primitive before storage.
+export declare class RaydiumCpmmTransactionSourceAdapter {
+  constructor(options: CpmmTransactionSourceOptions);
+  resolve(notification: unknown, gate?: CpmmLifecycleGate): Promise<CpmmResolutionFact>;
+  ingest(
+    fact: CpmmResolutionFact,
+    tracker: RollingTradeFlowTracker,
+    gate?: CpmmLifecycleGate,
+  ): CpmmIngestionResult;
+}
 
-   The URL and headers are never kept.
+/** Immutable retained body: strings only, never a Buffer. */
+export interface CpmmRetainedBody {
+  readonly state: "STORED" | "WITHHELD" | "NONE"; // NONE: the session read no body
+  readonly encoding: "utf8" | "base64" | null;
+  readonly payload: string | null; // the stored bytes, after redaction
+  readonly observedBytes: number | null; // the session's observedBodyBytes
+  readonly originalBytes: number | null; // bytes the session retained
+  readonly originalSha256: string | null;
+  readonly storedBytes: number | null;
+  readonly storedSha256: string | null;
+  readonly redactionChanged: boolean;
+  readonly withheldReason: "PARTIAL_BODY" | "CREDENTIAL_MATERIAL" | null;
+}
 
-**2. Session ownership**: the session alone paces, budgets, enforces deadlines, cancels, stops on the first 429 or redirect, and accounts for requests.
+export interface CpmmRetainedExchange {
+  readonly seq: number;
+  readonly lane: "SOLANA_RPC";
+  readonly owner: "FLOW";
+  readonly purpose: typeof CPMM_TX_PURPOSE;
+  readonly requestedIdentity: string; // the requested signature
+  readonly jsonRpcId: number;
+  readonly method: "POST";
+  readonly requestBody: string; // canonical JSON; contains no credential
+  readonly dispatchedAtMs: number;
+  readonly completedAtMs: number | null;
+  readonly httpStatus: number | null;
+  readonly bodyComplete: boolean;
+  readonly sessionError: string | null; // fixed session code, e.g. HTTP_429_RECEIVED
+  readonly bodyState: "COMPLETE" | "PARTIAL_OVERFLOW" | "NOT_READ";
+  readonly maxResponseBytes: number;
+  readonly body: CpmmRetainedBody;
+}
 
-- **Never in the adapter**: it does not open, stop, sleep, retry, pace, count attempts, or call `fetch` or a budget manager directly. It does not keep request counters that substitute for the ledger.
-- **Refusals**: a refused dispatch (`REQUEST_SESSION_STOPPED`, `LIFETIME_EXPIRED`, a ceiling or a caller refusal) becomes a `REQUEST_REFUSED` fact. The refusal is not counted and nothing is sent.
-- **Cancellation**: the caller's signal is passed as `waitSignals` and `linkSignals`. A cancelled in-flight request yields the session's `REQUEST_ABORTED` and a `CANCELLED` fact.
-- **Late responses**: `refusal()` and `signal` are rechecked after the await and before decoding and ingestion. A response that completed but is now late (lifecycle invalidated, deadline passed or cancelled) is retained as `LATE_RESPONSE` and not decoded or ingested.
-- **Body ceiling**: the adapter may pass a stricter `maxResponseBytes`; it never raises the lane's.
+export type CpmmResolutionKind =
+  | "RESOLVED_SWAPS" // the only ingestible kind
+  | "RESOLVED_NO_TARGET_SWAP"
+  | "RECORDED_FAILED_TRANSACTION"
+  | "UNRESOLVED"
+  | "EVIDENCE_NOT_REPLAYABLE"
+  | "INVALID_NOTIFICATION"
+  | "DUPLICATE_NOTIFICATION"
+  | "TRACKING_CAPACITY_REACHED"
+  | "REQUEST_REFUSED"
+  | "CANCELLED_IN_FLIGHT"
+  | "SESSION_STOPPED_IN_FLIGHT"
+  | "TRANSPORT_FAILED"
+  | "HTTP_ERROR"
+  | "EVIDENCE_MISSING"
+  | "EVIDENCE_MISMATCH"
+  | "LATE_RESPONSE"
+  | "MALFORMED_RESPONSE"
+  | "RPC_ERROR"
+  | "TRANSACTION_NOT_FOUND"
+  | "SIGNATURE_MISMATCH"
+  | "METADATA_CONTRADICTION";
 
-**3. Decoder outcomes as resolution facts**:
+export interface CpmmLifecycleCheck {
+  readonly atMs: number; // session.now()
+  readonly sessionState: "NOT_OPEN" | "OPEN" | "STOPPED";
+  readonly sessionStopReason: string | null; // fixed session code
+  readonly deadlineMs: number | null; // session.getDeadlineMs()
+  readonly callerCancelled: boolean;
+  readonly callerRefusal: string | null; // sanitized code (item D)
+  readonly passed: boolean;
+}
 
-The decoder is called with `{ receiptTimestampMs: notification.receivedAtMs }`. None of the facts below advances coverage, clears gaps or counts as zero-swap evidence.
+export interface CpmmResolutionFact {
+  readonly kind: CpmmResolutionKind;
+  readonly code: string | null; // fixed code only (session, decoder or this adapter)
+  readonly detail: string | null; // fixed detail code only
+  readonly notification: CpmmTransactionNotification | null; // null if invalid
+  readonly exchange: CpmmRetainedExchange | null; // null if never dispatched
+  readonly postAwaitCheck: CpmmLifecycleCheck | null;
+  readonly rpcErrorCode: number | null; // the RPC error message is not retained
+  readonly decoder: {
+    readonly status: DecodeRaydiumCpmmTransactionResult["status"];
+    readonly reason: string | null;
+    readonly detail: string | null;
+  } | null;
+  readonly events: readonly TradeEvent[]; // non-empty only for RESOLVED_SWAPS
+  readonly replay: "DECODER_REPLAYABLE" | "NOT_REPLAYABLE" | "NOT_DECODED";
+  readonly ingestible: boolean; // true only for RESOLVED_SWAPS with DECODER_REPLAYABLE
+}
 
-| Decoder result        | Fact                          | Meaning                                                                                                                                        |
-| --------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SWAP_DECODED`        | `RESOLVED_SWAPS`              | Frozen events for this signature. Only these may be ingested.                                                                                  |
-| `NO_MATCHING_SWAPS`   | `RESOLVED_NO_TARGET_SWAP`     | This transaction holds no target swap, with the decoder diagnostics (including `shortcut`). Not qualified coverage and not zero-swap evidence. |
-| `TRANSACTION_FAILED`  | `RECORDED_FAILED_TRANSACTION` | Unvalidated: no CPMM failed-transaction validator exists. Not zero-swap evidence.                                                              |
-| `UNRESOLVED_EVIDENCE` | `UNRESOLVED`                  | With the decoder's `reason` and `detail`. Never converted to any other fact.                                                                   |
+export interface CpmmIngestionResult {
+  readonly status:
+    | "COMPLETE"
+    | "PARTIAL"
+    | "NONE_ACCEPTED"
+    | "REFUSED_BEFORE_START"
+    | "NOT_INGESTIBLE";
+  readonly total: number;
+  readonly accepted: number;
+  readonly rejected: number;
+  readonly unattempted: number; // accepted + rejected + unattempted === total
+  readonly rejections: readonly { readonly eventId: string; readonly reason: string }[]; // tracker codes
+  readonly stopCheck: CpmmLifecycleCheck | null; // the check that stopped ingestion, if any
+}
+```
 
-The pre-decode facts are `INVALID_NOTIFICATION`, `DUPLICATE_NOTIFICATION`, `REQUEST_REFUSED`, `CANCELLED`, `TRANSPORT_FAILED`, `HTTP_ERROR`, `RESPONSE_LIMIT_EXCEEDED`, `MALFORMED_RESPONSE`, `RPC_ERROR`, `TRANSACTION_NOT_FOUND`, `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION` and `LATE_RESPONSE`. Every fact is frozen and carries the notification and the retained evidence it reached.
+Facts and results are deep-frozen: they contain only strings, numbers, booleans, `bigint` and `null`.
 
-**4. Ingestion, receipt time, deduplication and replay**:
+###### B. Evidence Binding (No Fallback to `exchange.text`)
 
-- **Ingestion is separate**: `ingestCpmmResolution(fact, tracker, refusal)` accepts only `RESOLVED_SWAPS`.
-  - Before anything is ingested, it rechecks `refusal()` and the tracker's pool and mint against the pool.
-  - Each event then goes to `ingestTrade` in order, and the per-event results are returned.
-  - Any refused event makes the result `PARTIAL_INGEST`. The tracker has no rollback, so this is reported, never promoted to success.
-- **Receipt time**: `receiptTimestampMs` is the notification's injected `receivedAtMs` (its arrival time); the adapter has no clock fallback. The response completion time is recorded separately from the ledger. Provenance stays the decoder's `ON_CHAIN_BLOCK_TIME`, with no override.
-- **Deduplication**: a bounded set of signatures already seen (default 1,000). A repeat is `DUPLICATE_NOTIFICATION`, with no request. When the set is full, new notifications are refused (`DEDUPLICATION_CAPACITY_REACHED`), never evicted, so an evicted signature can never be requested twice. The tracker's own `eventId` deduplication remains the second guard.
-- **Replay**: a fact's retained bytes, re-decoded offline with the same pool, must reproduce the same events, or the same refusal, exactly. Tests assert this for every fact that reached decoding.
+1. **Recorder**:
+   - **Timing**: the session calls `onExchangeComplete` in the exchange's `finally` block, before `dispatch` resolves. When `dispatch` returns, the evidence for a dispatched exchange is therefore already recorded.
+   - **Scope**: the recorder is bound to exactly one session, and the adapter refuses construction if `evidence.boundSession !== session`.
+   - **Purpose filter**: it keeps only `purpose === CPMM_TX_PURPOSE` entries, up to the injected `maxPendingEvidence`.
+2. **Missing evidence**: after a dispatched exchange, the adapter calls `evidence.take(exchange.entry.seq)`. No evidence is `EVIDENCE_MISSING`, never a fallback to `exchange.text`. That covers:
+   - an observer that threw (the session swallows observer errors);
+   - an unbound or overfull recorder;
+   - a second consumption.
+3. **Binding to the returned ledger entry and the exact request**: every field must equal, else `EVIDENCE_MISMATCH` with the first mismatching field as `detail`.
 
-**5. AMM v4 assumptions that prevent direct reuse**:
+   | Evidence field                                                                                                                                      | Must equal                                                                                                                                                  |
+   | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `entry.seq`, `lane`, `owner`, `purpose`, `requestedIdentity`, `jsonRpcId`, `dispatchedAtMs`, `completedAtMs`, `httpStatus`, `bodyComplete`, `error` | the same fields of the `entry` returned by `dispatch`                                                                                                       |
+   | `lane`, `owner`, `purpose`, `requestedIdentity`, `jsonRpcId`                                                                                        | `SOLANA_RPC`, `FLOW`, `CPMM_TX_PURPOSE`, the signature, the requested ID                                                                                    |
+   | `method`, `requestBody`                                                                                                                             | `POST` and the exact request body string sent                                                                                                               |
+   | `bodyState`, `body`, `observedBodyBytes`                                                                                                            | consistent per the decoder-independent accounting rules: `COMPLETE` (observed = body length ≤ `maxResponseBytes`), `PARTIAL_OVERFLOW`, `NOT_READ` (no body) |
 
-| AMM v4 component                       | Assumption                                                                                                      | CPMM component                                                     |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `RaydiumAmmV4TransactionSourceAdapter` | Owns `transport`, `budgetManager`, `pacingMs`, `sleepFn` and timeouts, calling `fetch` with `redirect: "error"` | Session only (item 2)                                              |
-|                                        | Fixed JSON-RPC `id: 1`                                                                                          | Session-unique ID bound in the ledger                              |
-|                                        | `signatures[0].trim() !== signature`                                                                            | Exact equality                                                     |
-|                                        | Slot and `blockTime` checked only when the response field is a number                                           | Missing fields are contradictions                                  |
-|                                        | `receiptTimestampMs: receivedAtMs ?? clock()`, `fallbackProvenance` passed through                              | Required receipt time; no override                                 |
-|                                        | Synthesises loss-gap times from the clock or `blockTime` and writes tracker gaps                                | No gaps in the isolated component                                  |
-|                                        | AMM v4 decoder and `TrackedRaydiumPoolContext`; PAPER failed-transaction policy through the AMM v4 validator    | The CPMM decoder and adapter success; no failed-transaction policy |
-| `ExactPoolTransactionResolutionBridge` | Typed to the AMM v4 adapter and its 8-field pool context                                                        | Unchanged; not used                                                |
-|                                        | Checks a shared `GlobalResourceBudgetManager` and `providerName` / `requestPurpose`                             |                                                                    |
-|                                        | `RESOLVED_FAILED_TRANSACTION` via the AMM v4 validator                                                          |                                                                    |
+4. **Copy before use**: the body is copied (`Buffer.from(evidence.body)`) before any processing. The observer's `Buffer` is never mutated, and only strings derived from the copy are retained.
 
-**Initial component versus later wiring**:
+###### C. Redaction, Withholding and Replay
 
-- **Initial**: only the two files above, with no change to the bridge, the provider, the session or the AMM v4 files.
-- **Later**: a bridge or provider generalisation, CPMM notification sourcing, gap recording and any coverage rule are later and separately reviewed steps.
+| Response body                                              | Stored as                                                                                                                     | `replay`                          | Fact consequence                          |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | ----------------------------------------- |
+| `NOT_READ`                                                 | `state: NONE`                                                                                                                 | `NOT_DECODED`                     | The transport or HTTP kind                |
+| `PARTIAL_OVERFLOW`                                         | `WITHHELD`, `PARTIAL_BODY` (no payload: a cut can end inside a credential, and the helper does not redact truncated prefixes) | `NOT_DECODED`                     | `TRANSPORT_FAILED` (`RESPONSE_TOO_LARGE`) |
+| `COMPLETE`, invalid UTF-8                                  | `base64` of the byte-redacted copy                                                                                            | `NOT_DECODED`                     | `MALFORMED_RESPONSE` (`INVALID_UTF8`)     |
+| `COMPLETE`, credential material detected (below)           | `WITHHELD`, `CREDENTIAL_MATERIAL` (counts and `originalSha256` only)                                                          | `NOT_REPLAYABLE`                  | `EVIDENCE_NOT_REPLAYABLE`                 |
+| `COMPLETE`, redaction changed the bytes                    | `utf8` redacted, `redactionChanged: true`                                                                                     | `NOT_REPLAYABLE`                  | `EVIDENCE_NOT_REPLAYABLE`                 |
+| `COMPLETE`, unchanged by redaction, no credential material | `utf8` with `storedSha256 === originalSha256`                                                                                 | `DECODER_REPLAYABLE` (if decoded) | The decoder's kind                        |
 
-**6. Synthetic test matrix** (injected fakes only):
+- **Credential material**: detected on the copied original bytes. It is any configured secret, or any prefix of at least 8 characters of a secret, found in any of these forms:
+  1. the raw bytes;
+  2. the `\u00xx`-escaped forms that the reviewed `redactCredentialBytes` covers;
+  3. every JSON string value and key after parsing, which resolves `\/`, `\u` and other escapes.
 
-- **Harness**: a real `PaperRequestSession` with virtual timers and a scripted fake `fetch`; the evidence lookup fed from `onExchangeComplete`; adapter-produced pool contexts; synthetic `json` payloads from the decoder tests' literal builders. No network.
+  When detected, the body is withheld rather than partially redacted, because escaped or partial forms cannot be guaranteed to be removed by the helper.
 
-| Group                    | Cases                                                                                                                                                                                                  |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| A1 Request               | Exact body, ID from the session, lane, owner, purpose and identity in the ledger; one dispatch; no retry after any failure                                                                             |
-| A2 Envelope              | ID mismatch (other number, string `"1"`, missing); `jsonrpc` ≠ 2.0; extra keys; both `result` and `error`; non-object; invalid UTF-8 bytes; lossy text never used                                      |
-| A3 Binding               | Returned signature different, with whitespace, missing; slot different, missing or a string; notification `blockTime` different from or missing in the result                                          |
-| A4 Results               | `result: null`; RPC error, with a credential-bearing message redacted; HTTP 503; body over the ceiling (partial and declared); network error                                                           |
-| A5 Session               | Stopped session; lifetime expired; ceiling reached; caller refusal (all refused and not counted); 429 and redirect stop the session; pacing owned by the session (two notifications spaced ≥ 2,500 ms) |
-| A6 Cancellation          | Before dispatch (no request); during the request (`CANCELLED`); after completion and before decoding, or before ingestion (`LATE_RESPONSE`, nothing ingested)                                          |
-| A7 Decoder mapping       | Each of the four outcomes gives its fact; `NO_MATCHING_SWAPS` and `TRANSACTION_FAILED` change no tracker coverage, gap or event count                                                                  |
-| A8 Ingestion             | Events ingested once; second ingestion deduplicated; a tracker for another pool or mint refused before any event; partial ingestion reported (one event refused by the tracker)                        |
-| A9 Duplicates            | The same signature twice gives `DUPLICATE_NOTIFICATION` with no second request; capacity reached refuses new signatures; no eviction                                                                   |
-| A10 Notification         | Invalid signature, slot or receipt time; missing receipt time (no clock fallback); a `fallbackProvenance`-like extra field refused                                                                     |
-| A11 Replay and retention | Re-decoding retained bytes reproduces each fact; no URL, header or credential in any fact; facts and events frozen                                                                                     |
+- **Never ingestible from changed or withheld bytes**: `EVIDENCE_NOT_REPLAYABLE` facts keep the decoder's `status`, `reason` and `detail` computed from the in-memory original, as diagnostics only. They carry no events and are never ingestible, and no original-byte replay is ever claimed for them.
+- **Two kinds of replay**:
+  - **Decoder replay** (`DECODER_REPLAYABLE`): re-decoding the stored UTF-8 payload with the same pool and `receivedAtMs` reproduces exactly the same decoder result and events.
+  - **Transport and lifecycle outcomes** (refusal codes, session errors, HTTP status, `postAwaitCheck`): these are recorded facts. Offline they can only be checked for internal consistency (ledger fields, accounting rules and precedence below), not re-derived.
+- **Messages**: no URL, header, exception message or free-text refusal is retained. RPC errors keep only their numeric code.
+
+###### D. Lifecycle and Classification Precedence
+
+The adapter reads only session-owned state: `session.now()`, `getStatus().state`, `getStopReason()` and `getDeadlineMs()`. It has no clock or scheduler of its own.
+
+**`resolve` order** (the first matching rule wins):
+
+1. **Notification**: validation gives `INVALID_NOTIFICATION`.
+2. **Reservation**: done synchronously, before any `await`. If the signature is already reserved: `DUPLICATE_NOTIFICATION`. If the set is full: `TRACKING_CAPACITY_REACHED`.
+3. **Pre-dispatch**: if `gate.signal` is already aborted, `REQUEST_REFUSED` with `CALLER_CANCELLED`.
+4. **Dispatch** through `session.dispatch`. The session itself enforces pacing, budgets, ceilings and the absolute deadline, and stops on 429 or redirect:
+   - `refusal: () => sanitize(gate.refusal?.())`;
+   - `waitSignals` and `linkSignals` set to `[gate.signal]`;
+   - a stricter `maxResponseBytes`.
+5. **Not dispatched**: `REQUEST_REFUSED` with the session's refusal code (fixed codes, or the sanitized caller code).
+6. **Session error**, recorded with its actual code and never relabelled as late:
+   - `HTTP_429_RECEIVED`, `HTTP_REDIRECT_REJECTED`, `REQUEST_TIMED_OUT`, `NETWORK_ERROR` and `RESPONSE_TOO_LARGE` are `TRANSPORT_FAILED`;
+   - `REQUEST_ABORTED` is `CANCELLED_IN_FLIGHT` if `gate.signal` is aborted, otherwise `SESSION_STOPPED_IN_FLIGHT` with the stop reason.
+7. **HTTP status** other than 200: `HTTP_ERROR`.
+8. **Evidence** (item B): `EVIDENCE_MISSING` or `EVIDENCE_MISMATCH`.
+9. **Authoritative post-await check**: it fails, giving `LATE_RESPONSE` with the failing cause as `code`, if any of these holds:
+   - the session is not `OPEN` (`SESSION_STOPPED`);
+   - `session.now() >= deadlineMs` (`ABSOLUTE_DEADLINE`);
+   - `gate.signal` is aborted (`CALLER_CANCELLED`);
+   - `gate.refusal()` is non-null (`LIFECYCLE_REFUSED`).
+
+   This also applies to a response that completed before the deadline when the deadline passes before the check. Evidence is retained, and nothing is decoded.
+
+10. **Body handling** (item C), then the envelope, signature binding and slot or time cross-checks (`MALFORMED_RESPONSE`, `RPC_ERROR`, `TRANSACTION_NOT_FOUND`, `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION`), then the decoder (item F).
+
+**Evidence for every dispatched exchange**: it is taken right after `dispatch` returns, including for steps 6 and 7. Those facts keep their transport or HTTP kind and carry the retained exchange. If the evidence is missing or mismatched there, `detail` records that, and `body.state` is `NONE`.
+
+**Sanitizing caller refusal codes**: a returned string is retained only if it matches `^[A-Z][A-Z0-9_]{0,63}$`; otherwise it is recorded as `CALLER_REFUSAL`.
+
+###### E. Ingestion
+
+`ingest(fact, tracker, gate)`:
+
+- **Not ingestible**: if `fact.ingestible` is false, the result is `NOT_INGESTIBLE` with all counts 0.
+- **Identity**: the tracker's `getPoolId()` and `getTokenMint()` must equal the pool, otherwise `REFUSED_BEFORE_START`.
+- **Before each event** (including the first), the item D step 9 check runs again. If it fails before the first event: `REFUSED_BEFORE_START`, with `unattempted = total`. If it fails between events, the remaining events are unattempted.
+- **Each event**: `tracker.ingestTrade(event)` either accepts it or rejects it with the tracker's reason code (including deduplication).
+- **Status**:
+
+  | Status                 | When                                         |
+  | ---------------------- | -------------------------------------------- |
+  | `COMPLETE`             | `accepted === total`                         |
+  | `PARTIAL`              | `0 < accepted < total`                       |
+  | `NONE_ACCEPTED`        | `accepted === 0`, after at least one attempt |
+  | `REFUSED_BEFORE_START` | Stopped before the first attempt             |
+
+  Counts always satisfy `accepted + rejected + unattempted === total`. The tracker has no rollback, so `PARTIAL` is final, and it is never retried or promoted.
+
+###### F. Decoder Outcomes as Facts
+
+The decoder runs with `{ receiptTimestampMs: notification.receivedAtMs }`. Provenance stays `ON_CHAIN_BLOCK_TIME`, with no override.
+
+| Decoder result        | Fact (replayable body)                            | Coverage or zero-swap evidence |
+| --------------------- | ------------------------------------------------- | ------------------------------ |
+| `SWAP_DECODED`        | `RESOLVED_SWAPS` (ingestible)                     | None by itself                 |
+| `NO_MATCHING_SWAPS`   | `RESOLVED_NO_TARGET_SWAP`                         | Never                          |
+| `TRANSACTION_FAILED`  | `RECORDED_FAILED_TRANSACTION` (unvalidated)       | Never                          |
+| `UNRESOLVED_EVIDENCE` | `UNRESOLVED` (`code` = reason, `detail` = detail) | Never                          |
+
+###### G. Deduplication
+
+- **When a signature is reserved**: in `resolve`, synchronously after notification validation and before the first `await`. Simultaneous notifications for one signature therefore dispatch at most once.
+- **Reservations are permanent** for the adapter instance: there is no eviction, release or automatic retry, even after failure. A later notification for the signature is `DUPLICATE_NOTIFICATION`.
+- **Capacity**: the injected `maxTrackedSignatures`. When it is reached, new signatures are `TRACKING_CAPACITY_REACHED`.
+- **Second guard**: the tracker's own `eventId` deduplication.
+
+###### H. AMM v4 Comparison (Corrected): Adapter API versus Its Current Composition
+
+- **Standalone `RaydiumAmmV4TransactionSourceAdapter` API**: does not take a session. It takes an injected `transport`, `budgetManager`, `pacingMs`, `timeoutMs`, `sleepFn` and `clock`, and runs its own budget admission, pacing waits and timeout around that transport.
+- **Current composition in `PaperRollingCandidateFlowProvider`**:
+  - Its `transport` is the provider's `adapterTransport`, which calls `dispatchRpc` and, through it, `session.dispatch`. So real dispatches are paced, counted and stopped by the shared session, with the provider's refusals, signals, timeout and byte limit.
+  - In that composition the ledger's `requestedIdentity` is the pool address (not the signature), and the `jsonRpcId` is parsed from the adapter's body: the fixed `id: 1`.
+  - The response is rebuilt as `new Response(exchange.text, …)` from the session's lossy UTF-8 text.
+  - A non-dispatched exchange becomes a thrown generic `Error`.
+  - The adapter's own budget and pacing layer still runs on top.
+- **What the CPMM component does instead**:
+  - takes the session directly, with no separate budget, pacing or sleep layer;
+  - records the signature as `requestedIdentity`, with a session-unique ID;
+  - reads strict bytes from bound evidence, never text;
+  - turns refusals into typed facts.
+- **AMM v4 behaviour not carried over**:
+  - `signatures[0].trim()` comparison;
+  - skipping the slot and `blockTime` checks when the response field is not a number;
+  - `receivedAtMs ?? clock()` and `fallbackProvenance`;
+  - synthesised loss gaps;
+  - the AMM v4 failed-transaction policy;
+  - the bridge's AMM v4 typing.
+- **Initial versus later**: the isolated component changes no provider, bridge, session or AMM v4 file. Later wiring would own composition, including fanning out the session's single `onExchangeComplete` slot.
+
+###### I. Synthetic Test Matrix (Injected Fakes Only)
+
+The harness is a real `PaperRequestSession` with virtual timers and a scripted fake `fetch`, a real recorder bound to that session, adapter-produced pools and the decoder tests' literal payload builders. No network.
+
+| Group                        | Cases                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1 Request                   | Exact body; session-unique ID; ledger lane, owner, purpose and signature identity; one dispatch; no retry                                                                                                                                                                                                                                                                                                                               |
+| A2 Envelope                  | ID mismatch (number, `"1"`, missing); bad `jsonrpc`; extra keys; both `result` and `error`; non-object                                                                                                                                                                                                                                                                                                                                  |
+| A3 Binding                   | Signature different, with whitespace, or missing; slot different, missing or a string; `blockTime` different or missing when notified                                                                                                                                                                                                                                                                                                   |
+| A4 Results                   | `result: null`; RPC error (code kept, message dropped); HTTP 503; network error; oversize (partial and declared)                                                                                                                                                                                                                                                                                                                        |
+| A5 Session                   | Stopped; lifetime expired; ceiling; caller refusal (refused, not counted); 429 and redirect stop the session; session-owned pacing                                                                                                                                                                                                                                                                                                      |
+| A6 Cancellation              | Before dispatch; in flight (`CANCELLED_IN_FLIGHT`); session stopped in flight (`SESSION_STOPPED_IN_FLIGHT`)                                                                                                                                                                                                                                                                                                                             |
+| A7 Decoder mapping           | Each outcome's fact; `RESOLVED_NO_TARGET_SWAP` and `RECORDED_FAILED_TRANSACTION` change no tracker state                                                                                                                                                                                                                                                                                                                                |
+| A8 Ingestion                 | `COMPLETE`; deduplicated second ingest (`NONE_ACCEPTED`); wrong pool or mint tracker (`REFUSED_BEFORE_START`); `PARTIAL` with exact counts; `NOT_INGESTIBLE`                                                                                                                                                                                                                                                                            |
+| A9 Notifications             | Invalid signature, slot or receipt time; missing receipt time; unknown keys (e.g. `provenance`)                                                                                                                                                                                                                                                                                                                                         |
+| B1 Evidence missing          | Recorder unbound; bound to another session (construction fails); observer threw; overfull recorder; evidence taken twice; never a `text` fallback (a scripted divergence between evidence and text follows the evidence or refuses)                                                                                                                                                                                                     |
+| B2 Evidence mismatch         | Each binding field in turn (`seq`, `lane`, `owner`, `purpose`, identity, ID, method, request body, status, completion, `bodyComplete`, error); inconsistent body accounting; mutating the observer's `Buffer` after `take` does not change the fact                                                                                                                                                                                     |
+| B3 Concurrent duplicates     | Two `resolve` calls for one signature started together: one dispatch, one `DUPLICATE_NOTIFICATION`; capacity reached; failed signatures not retried                                                                                                                                                                                                                                                                                     |
+| B4 Redaction and replay      | Echoed key (literal) gives `redactionChanged` and `EVIDENCE_NOT_REPLAYABLE`. Withheld as `CREDENTIAL_MATERIAL`: a `\u`-escaped key, a `\/`-escaped URL, or an 8-character key prefix. Withheld as `PARTIAL_BODY`: a partial body cut inside the key. Invalid UTF-8 containing key bytes is stored as base64 redacted. A clean body is `DECODER_REPLAYABLE` and its re-decode is identical. No fact contains the URL, a header or a key. |
+| B5 Deadline after completion | Response completes before the session deadline and the lifetime expires before the post-await check (`LATE_RESPONSE`, `SESSION_STOPPED`); caller refusal flips after completion (`LATE_RESPONSE`, `LIFECYCLE_REFUSED`); a 429, redirect or timeout coinciding with an expired deadline keeps its own `TRANSPORT_FAILED` code                                                                                                            |
+| B6 Ingestion lifecycle       | Cancellation or refusal before the first event (`REFUSED_BEFORE_START`, all unattempted); between events (`PARTIAL`, remaining unattempted); session stopped before ingestion                                                                                                                                                                                                                                                           |
 
 **Acceptance criteria**:
 
 - Every case above passes.
-- The session ledger shows exactly one entry per dispatched notification and none for refusals.
-- No adapter code path calls `fetch`, timers, a clock, `GlobalResourceBudgetManager` or `session.stop`; source checks assert this.
-- No fact other than `RESOLVED_SWAPS` changes the tracker.
-- Targeted mutants of ID binding, signature equality, the slot cross-check, the late-response recheck, deduplication without eviction, and the `NO_MATCHING_SWAPS` / `TRANSACTION_FAILED` non-promotion are all caught.
+- The ledger has one entry per dispatched notification and none for refusals or duplicates.
+- Source checks show the adapter calls no `fetch`, timer, `Date.now`, budget manager or `session.stop`, and never reads `exchange.text`.
+- Only `RESOLVED_SWAPS` with `DECODER_REPLAYABLE` changes a tracker.
+- Targeted mutants of evidence binding, the text fallback, reservation before the first await, the precedence order, the post-await check, withholding and non-replayable classification, and the ingestion counts are all caught.
 - Typecheck, lint and formatting pass. Only the two files, plus the reviewed pin addition, change.
 
-**7. Required before consuming a captured CPMM transaction or qualifying a flow window**:
+###### J. Remaining Decisions and Prerequisites
 
-- **Before a captured transaction**:
-  - a reviewed, separately approved single-capture plan, sealed and verified offline like the retrospective check;
-  - independent confirmation that the captured `json` response has the shape the decoder assumes (`version`, `header`, `stackHeight` on every inner instruction, log format);
-  - offline replay of the sealed bytes;
-  - an explicit decision on the unverified bytecode correspondence (item 10).
-- **Before qualifying a flow window**:
-  - a reviewed CPMM notification source and its completeness evidence;
-  - gap recording for every non-`RESOLVED_SWAPS` fact;
-  - a reviewed rule for whether `RESOLVED_NO_TARGET_SWAP` can ever count toward coverage;
-  - a CPMM failed-transaction validator before any failed transaction is credited;
+- **Decisions for review**:
+  1. **The session's single observer**: the recorder occupies the session's only `onExchangeComplete`, so composing it with other observers needs an owner-side fan-out at wiring time.
+  2. **Permanent reservations**: a failed signature cannot be retried by the same adapter instance. Whether a reviewed retry path is ever wanted is open.
+  3. **The 8-character prefix threshold** for credential material: conservative, and reviewable.
+  4. **Ingestion requires the session to be open** and before its deadline. Chosen, so that facts cannot be ingested after the session that produced them ended.
+- **Prerequisites before consuming a captured CPMM transaction**:
+  - a separately approved, sealed single-capture plan;
+  - independent confirmation of the response shape the decoder assumes;
+  - offline replay of a `DECODER_REPLAYABLE` capture;
+  - a decision on the unverified bytecode correspondence.
+- **Prerequisites before qualifying a flow window**:
+  - a reviewed CPMM notification source with completeness evidence;
+  - gap recording for every non-ingested fact;
+  - a rule for `RESOLVED_NO_TARGET_SWAP`;
+  - a CPMM failed-transaction validator;
   - Stage 4 LP and security evidence;
   - independent review of the wiring.
 
-  Until then, CPMM remains quarantined from admission.
+  CPMM remains quarantined from admission.
 
 ---
 
