@@ -6496,7 +6496,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
 > - **Stage 3**: Pure CPMM swap decoder ([`RaydiumCpmmSwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts), 16/16 tests, 15/15 targeted mutants caught) implemented and verified offline on 2026-11-19, following the corrected design (items 8–10) and the implementation clarifications in item 11. It is isolated: no flow, admission, failed-transaction or PAPER zero-swap integration.
-> - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 17/17 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12). It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
+> - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -7777,6 +7777,12 @@ The first run left two survivors, which exposed weak tests rather than code faul
 
 **Status**: implemented offline from the accepted direction, with the five implementation corrections of the review applied (items B–F below). The earlier design text of this item is superseded where it differs; in particular the literal-key redaction and invalid-UTF-8 base64 examples no longer apply (item D).
 
+**Review corrections (2026-11-19, against `2fe5b54`)**: an independent offline review reproduced three defects, all corrected in the adapter and its tests only (item I):
+
+1. **Scan crash**: credential scanning spread large arrays as call arguments. A valid response of about 302 KB, within a 1 MiB limit, made `resolve()` reject with `RangeError` after one recorded request, with no fact.
+2. **`__proto__` copy**: the data-record copier assigned into `{}`, so an own `__proto__` key ran the prototype setter. It disappeared from validation, and fields placed under it were inherited. Two such JSON notifications reached `RESOLVED_SWAPS` and dispatched.
+3. **Stale lifecycle snapshot**: the lifecycle check read session time, state and cancellation before running the caller's refusal callback. A callback that cancelled, stopped the session or moved the clock (and returned `null`) was not observed. The fact stayed ingestible, or an event was accepted and reported `COMPLETE`.
+
 - **Files**: `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts` and `RaydiumCpmmTransactionSourceAdapter.test.ts`. The pin allowlist gained exactly these two files (item I).
 - **Isolated**: nothing imports the adapter except its test. No provider, bridge, admission, failed-transaction validator or zero-swap policy uses it.
 - **Unchanged**: the shared `PaperRequestSession`, the CPMM decoder, pool-state adapter and market parser, all AMM v4 modules, configuration, dependencies, sealed captures and the wallet.
@@ -7967,6 +7973,7 @@ export interface CpmmRetainedExchange {
   - **Where**: in the raw bytes (read as Latin-1) and in every parsed JSON key and string value.
   - **Decoded forms**: each scanned string is checked as it is and after up to 4 rounds of decoding backslash escapes (`\uXXXX`, `\xXX`, `\/`) and percent-encoding.
   - **Inconclusive**: a string that still changes after the fourth round is `CREDENTIAL_SCAN_INCONCLUSIVE` and is withheld.
+  - **Traversal** (review correction 1): iterative, over an explicit work list. Array elements are pushed one by one, with no argument spreading and no recursion, and every element of every array and object is scanned however large it is, up to the response limit. Any exception during the scan withholds the body as `CREDENTIAL_SCAN_INCONCLUSIVE` (non-replayable), so `resolve()` neither rejects nor keeps unscanned content.
 - **Decoder replay**: re-parsing the stored payload and decoding it with the same pool and `receivedAtMs` reproduces the fact's events. Transport and lifecycle outcomes remain recorded facts.
 
 ###### E. Fixed Codes Only (Correction 4)
@@ -7993,6 +8000,8 @@ export interface CpmmRetainedExchange {
 `resolve` order (the first matching rule wins):
 
 1. **Notification**: `INVALID_NOTIFICATION`. Data properties only and no unknown keys, with fixed codes such as `UNKNOWN_KEY`, `SIGNATURE_INVALID`, `RECEIVED_AT_MISSING` and `BLOCK_TIME_INVALID`.
+   - **Copier** (review correction 2): notifications, gates, options and recorder limits are all read by one copier. It accepts only plain objects (prototype `Object.prototype` or `null`) and copies own string-keyed data properties with `Object.defineProperty` into a null-prototype object.
+   - **Effect**: an own `__proto__` key stays a visible key, which validation refuses as unknown (`UNKNOWN_KEY`, `INVALID_GATE`, or a construction error). Required fields can never be inherited.
 2. **Gate**: `INVALID_GATE`. Neither step 1 nor step 2 reserves anything.
 3. **Reservation**: synchronous, before the first `await`, and permanent. `DUPLICATE_NOTIFICATION` is checked first, then `TRACKING_CAPACITY_REACHED`.
 4. **Pre-dispatch**: an aborted signal gives `REQUEST_REFUSED` (`CALLER_CANCELLED`).
@@ -8003,7 +8012,12 @@ export interface CpmmRetainedExchange {
 9. **Post-await check**: if it fails, `LATE_RESPONSE` with the cause as `code`. The body stays retained, and nothing is decoded.
 10. **Body** (item D), then the envelope and binding (item B), then the decoder.
 
-**The lifecycle check**: it reads only `session.now()`, `isOpen()`, `getStopReason()` and `getDeadlineMs()`. `getStatus()` is not used, because it copies the whole ledger. It fails, in this order, on:
+**The lifecycle check**: it reads only `session.now()`, `isOpen()`, `getStopReason()` and `getDeadlineMs()`. `getStatus()` is not used, because it copies the whole ledger.
+
+- **Order** (review correction 3): the caller's refusal callback runs exactly once, first. Only then are the session time, open state, stop reason, deadline and signal cancellation read.
+- **Effect**: anything the callback does is seen by the same check, whether it cancels, stops the session or moves the clock. This applies to the post-await check and to the check before every ingested event. Transport-error precedence and the fixed `CALLER_REFUSAL` code are unchanged.
+
+It fails, in this order, on:
 
 - a stopped session;
 - a session never opened, or with no deadline;
@@ -8035,7 +8049,7 @@ No AMM v4 file changed.
 
 ###### I. Tests, Pin and Results
 
-**Tests**: 17 synthetic tests in `RaydiumCpmmTransactionSourceAdapter.test.ts`.
+**Tests**: 20 synthetic tests in `RaydiumCpmmTransactionSourceAdapter.test.ts`.
 
 - **Harness**:
   - a real `PaperRequestSession` with a virtual clock and timers;
@@ -8064,6 +8078,9 @@ No AMM v4 file changed.
   | T-14 (B5) | Deadline passed by the clock after completion with the timer unfired (`ABSOLUTE_DEADLINE`, state `OPEN`); lifetime timer fired after completion; late refusal and cancellation; 429, redirect and timeout coinciding with an expired deadline keep their transport codes                                                                                                                               |
   | T-15 (B6) | Refusal or cancellation before the first event (all unattempted); refusal between events (`PARTIAL` 1/0/1); a rejection then a stop (`NONE_ACCEPTED` 0/1/1); deadline by clock only; stopped session                                                                                                                                                                                                   |
   | T-16      | Source boundaries: no `fetch`, timers, `Date.now`, budget, `stop`, `open`, `getStatus`, environment or response text; exact imports                                                                                                                                                                                                                                                                    |
+  | T-17 (R1) | 1 MiB limit: a clean 150,000-element array (about 302 KB) is stored and decoded; a secret visible only after parsing, in the middle of 150,000- and 200,000-element arrays, in nested string arrays, and as an object key among 60,000 objects, is withheld                                                                                                                                            |
+  | T-18 (R2) | JSON-parsed notifications with an extra own `__proto__`, or with the required fields only under `__proto__`; inherited fields; a gate, options and recorder limits with own `__proto__`. Each gives `INVALID_NOTIFICATION` (`UNKNOWN_KEY`), `INVALID_GATE` or a construction error, with no reservation, request or ledger entry                                                                       |
+  | T-19 (R3) | A callback that cancels, stops the session or moves the clock to the deadline and returns `null`: `LATE_RESPONSE` at the post-await check; at ingestion, before the first event (`REFUSED_BEFORE_START` 0/0/2) or between events (`PARTIAL` 1/0/1); a one-event fact is never `COMPLETE`                                                                                                               |
 
 **Mutation checks**: 26 targeted mutants of the formatted source, each run under a 60-second limit. All 26 were caught, and the source was restored byte-identical (SHA-256 checked).
 
@@ -8099,6 +8116,31 @@ No AMM v4 file changed.
 - **An equivalent mutant**: a first variant of M01 inserted a bare `await` before the duplicate check. It survived, because microtask order still reserves the first call before the second resumes. It was replaced by the real hazard, reserving only after `dispatch` returns.
 - **A transient file-lock error**: one `open` failed while writing a mutant on U:. Nothing was written, and the file was verified unchanged. The script then retried writes, and the batch was re-run.
 
+**Review corrections: regressions shown to catch the committed defects** (each command under a 60-second limit):
+
+- **Against the committed `2fe5b54` adapter**: with T-17 to T-19 added, exactly those three tests fail, each with the reported symptom:
+  - T-17: `RangeError: Maximum call stack size exceeded`;
+  - T-18: `RESOLVED_SWAPS` instead of `INVALID_NOTIFICATION`;
+  - T-19: `RESOLVED_SWAPS` instead of `LATE_RESPONSE`.
+- **After correction**: 20/20 pass.
+- **Each defect re-introduced alone** into the corrected, formatted source, which was restored byte-identical afterwards:
+
+| Re-introduced                                                                 | Result                                                          |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| D1 argument spreading (the committed code)                                    | T-17 fails (the scan guard turns `RangeError` into withholding) |
+| D1b arrays over 100,000 elements skipped                                      | T-17 fails                                                      |
+| D1c argument spreading without the scan guard                                 | T-17 fails; `RangeError` rejects `resolve()`                    |
+| M09r parsed values not scanned                                                | T-13, T-17 fail                                                 |
+| M09k parsed object keys not scanned                                           | T-17 fails                                                      |
+| D2 assignment into `{}` (the committed code)                                  | T-18 fails                                                      |
+| D3 every read before the callback (the committed code)                        | T-19 fails                                                      |
+| D3a clock, D3b session state, D3d signal: each read alone before the callback | T-19 fails                                                      |
+
+- **Equivalent variants that pass, as expected**:
+  - **D2b** (null prototype with plain assignment) and **D2c** (`defineProperty` into `{}`): each measure alone already keeps an own `__proto__` key visible.
+  - **D3c** (deadline read early): a callback cannot change the session's fixed deadline.
+- **First-run gap fixed**: M09k first survived, because the existing JSON-key case uses a secret the raw-byte scan already finds. T-17 gained an object key visible only after parsing.
+
 **Pin**:
 
 - `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` gains exactly the two adapter files.
@@ -8110,11 +8152,11 @@ No AMM v4 file changed.
 
 | Check                                                                                                                    | Result                  |
 | ------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
-| Adapter tests                                                                                                            | 17/17                   |
-| Affected suites: adapter, CPMM decoder, pool-state adapter, CPMM market parser, `RollingTradeFlowTracker`, pilot handoff | 6 files, 169/169        |
+| Adapter tests (after the review corrections)                                                                             | 20/20                   |
+| Affected suites: adapter, CPMM decoder, pool-state adapter, CPMM market parser, `RollingTradeFlowTracker`, pilot handoff | 6 files, 172/172        |
 | Pilot handoff                                                                                                            | 13/13                   |
 | Backend typecheck (`tsc --noEmit`)                                                                                       | Pass                    |
-| ESLint and Prettier on the four changed source files                                                                     | Pass                    |
+| ESLint and Prettier on the changed source files                                                                          | Pass                    |
 | Wallet hash                                                                                                              | Unchanged (`7F2C2353…`) |
 
 No network request, socket, capture or long process was run.
@@ -8122,6 +8164,7 @@ No network request, socket, capture or long process was run.
 ###### J. Limitations and Remaining Prerequisites
 
 - **Synthetic only**: no captured CPMM transaction has been resolved, and the response shape and provider behaviour are assumed from documentation.
+- **Scan guard not exercised directly**: the guard that withholds on a scan exception cannot be reached from `JSON.parse` output once traversal is iterative. It is shown working only when spreading is re-introduced (D1).
 - **One observer slot**: the recorder occupies the session's single `onExchangeComplete`. Composing it with other observers needs an owner-side fan-out at wiring time.
 - **Conservative withholding**:
   - The `rpcUrl` must be listed as a secret, so its 8-character prefix `https://` withholds any body containing `https://` in a covered form.

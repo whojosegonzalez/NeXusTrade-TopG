@@ -303,6 +303,7 @@ interface HarnessOptions {
   maxPending?: number;
   maxTracked?: number;
   maxResponseBytes?: number;
+  laneMaxResponseBytes?: number;
   open?: boolean;
 }
 
@@ -363,7 +364,7 @@ function harness(o: HarnessOptions = {}) {
       maxHttpAttempts: max,
       requestTimeoutMs: 10_000,
       lanes: {
-        SOLANA_RPC: lane(max, 2_500, 200_000),
+        SOLANA_RPC: lane(max, 2_500, o.laneMaxResponseBytes ?? 200_000),
         RUGCHECK: lane(0, 1, 1),
         SOLANA_TRACKER: lane(0, 1, 1),
         DEXSCREENER: lane(0, 1, 1),
@@ -1535,5 +1536,182 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
       "./RaydiumCpmmSwapDecoder.js",
       "./RollingTradeFlowTracker.js",
     ]);
+  });
+  it("T-17 (review 1): large arrays within the response limit are scanned iteratively, never rejected", async () => {
+    const MIB = 1_048_576;
+    const h = harness({ maxResponseBytes: MIB, laneMaxResponseBytes: MIB });
+    // Clean: a 150,000-element array (about 300 KB) is scanned in full and stored.
+    const clean = txResult(signatureOf(1), [swapIx("BUY")]);
+    clean.meta.extra = Array(150_000).fill(0);
+    const fc = await h.resolve(notice(1), rpcResult(clean)());
+    expect(fc.exchange!.body.observedBytes).toBeGreaterThan(300_000);
+    expect(fc.exchange!.body.state).toBe("STORED");
+    expect(fc.kind).toBe("RESOLVED_SWAPS");
+    expect(fc.ingestible).toBe(true);
+    // Credential-bearing: a secret visible only after parsing, in the middle of a large array.
+    for (const [n, size] of [
+      [2, 150_000],
+      [3, 200_000],
+    ] as const) {
+      const dirty = txResult(signatureOf(n), [swapIx("BUY")]);
+      const arr: unknown[] = Array(size).fill(0);
+      arr[Math.floor(size / 2)] = `log ${QUOTED_SECRET}`;
+      dirty.meta.extra = arr;
+      const fd = await h.resolve(notice(n), rpcResult(dirty)());
+      expect(kindOf(fd)).toEqual(["EVIDENCE_NOT_REPLAYABLE", "CREDENTIAL_MATERIAL", null]);
+      expect(fd.exchange!.body).toMatchObject({ state: "WITHHELD", payload: null });
+      expect(fd.ingestible).toBe(false);
+      expectSecretFree(fd);
+    }
+    // Nested large arrays of strings are scanned too.
+    const nested = txResult(signatureOf(4), [swapIx("BUY")]);
+    nested.meta.extra = [Array(120_000).fill("a"), [Array(10).fill(`x ${QUOTED_SECRET}`)]];
+    const fn = await h.resolve(notice(4), rpcResult(nested)());
+    expect(kindOf(fn)).toEqual(["EVIDENCE_NOT_REPLAYABLE", "CREDENTIAL_MATERIAL", null]);
+    // An object key visible only after parsing, inside a large array of objects.
+    const keyed = txResult(signatureOf(5), [swapIx("BUY")]);
+    const objs: Record<string, number>[] = Array.from({ length: 60_000 }, () => ({ a: 0 }));
+    objs[30_000] = { [QUOTED_SECRET]: 0 };
+    keyed.meta.extra = objs;
+    const fk = await h.resolve(notice(5), rpcResult(keyed)());
+    expect(kindOf(fk)).toEqual(["EVIDENCE_NOT_REPLAYABLE", "CREDENTIAL_MATERIAL", null]);
+    expect(fk.exchange!.body.observedBytes).toBeGreaterThan(400_000);
+    expect(h.ledger()).toHaveLength(5);
+  });
+
+  it("T-18 (review 2): own __proto__ keys stay visible to validation (no prototype setter)", async () => {
+    const h = harness();
+    const n = notice(1);
+    // A normal notification plus an own __proto__ property.
+    const extra = JSON.parse(`{${JSON.stringify(n).slice(1, -1)},"__proto__":{"x":1}}`);
+    expect(Object.keys(extra)).toContain("__proto__");
+    // Only receivedAtMs is a normal own key; the required fields sit under __proto__.
+    const hidden = JSON.parse(
+      `{"receivedAtMs":${RECEIVED_AT},"__proto__":${JSON.stringify({
+        signature: n.signature,
+        slot: n.slot,
+        blockTime: n.blockTime,
+      })}}`,
+    );
+    // Responders are queued so that a defective copier would dispatch and resolve.
+    h.script.push(okSwap(1)(), okSwap(1)());
+    for (const v of [extra, hidden]) {
+      h.state.now += 2_500;
+      const f = await h.adapter.resolve(v);
+      expect(kindOf(f)).toEqual(["INVALID_NOTIFICATION", "UNKNOWN_KEY", null]);
+      expect(f.notification).toBeNull();
+    }
+    // Required fields may not come from an inherited prototype either.
+    const inherited = Object.create({ signature: n.signature, slot: n.slot }) as Record<
+      string,
+      unknown
+    >;
+    inherited.receivedAtMs = RECEIVED_AT;
+    expect((await h.adapter.resolve(inherited)).kind).toBe("INVALID_NOTIFICATION");
+    // The shared helper also guards gates, options and recorder limits.
+    expect(kindOf(await h.adapter.resolve(notice(2), JSON.parse('{"__proto__":{}}')))).toEqual([
+      "INVALID_GATE",
+      "INVALID_GATE",
+      null,
+    ]);
+    const opts = { ...h.options } as Record<string, unknown>;
+    Object.defineProperty(opts, "__proto__", {
+      value: { maxResponseBytes: 1 },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    expect(
+      () =>
+        new RaydiumCpmmTransactionSourceAdapter(opts as unknown as CpmmTransactionSourceOptions),
+    ).toThrow(/unsupported option __proto__/);
+    expect(() =>
+      createCpmmExchangeEvidenceRecorder(JSON.parse('{"maxPendingEvidence":1,"__proto__":{}}')),
+    ).toThrow(/maxPendingEvidence/);
+    expect(h.adapter.reservedSignatureCount).toBe(0);
+    expect(h.calls).toHaveLength(0);
+    expect(h.ledger()).toHaveLength(0);
+  });
+
+  it("T-19 (review 3): the caller's callback runs before fresh session, clock and signal reads", async () => {
+    type Effect = "ABORT" | "STOP" | "DEADLINE";
+    const cause = {
+      ABORT: "CALLER_CANCELLED",
+      STOP: "SESSION_STOPPED",
+      DEADLINE: "ABSOLUTE_DEADLINE",
+    } as const;
+    const setup = () => {
+      const h = harness();
+      const c = new AbortController();
+      const act = (e: Effect) => {
+        if (e === "ABORT") c.abort();
+        else if (e === "STOP") h.session.stop();
+        else h.state.now = h.deadline();
+      };
+      return { h, c, act };
+    };
+    // Post-await check: the callback acts after completion and returns null.
+    for (const e of ["ABORT", "STOP", "DEADLINE"] as const) {
+      const { h, c, act } = setup();
+      let completed = false;
+      h.tap.fn = (ev) => {
+        h.recorder.observe(ev);
+        completed = true;
+      };
+      const f = await h.resolve(notice(1), okSwap(1)(), {
+        signal: c.signal,
+        refusal: () => {
+          if (completed) act(e);
+          return null;
+        },
+      });
+      expect(kindOf(f), e).toEqual(["LATE_RESPONSE", cause[e], null]);
+      expect(f.postAwaitCheck, e).toMatchObject({
+        passed: false,
+        cause: cause[e],
+        callerRefusal: null,
+      });
+      expect(f.ingestible, e).toBe(false);
+      expect(f.events, e).toEqual([]);
+    }
+    // Ingestion: the callback acts before the first event, or between events.
+    for (const e of ["ABORT", "STOP", "DEADLINE"] as const) {
+      for (const at of [1, 2]) {
+        const { h, c, act } = setup();
+        const two = await h.resolve(
+          notice(1),
+          okSwap(1, [swapIx("BUY"), swapIx("SELL", 2_500_000n, 900_000_000n)])(),
+        );
+        expect(two.ingestible).toBe(true);
+        let calls = 0;
+        const r = h.adapter.ingest(two, tracker(), {
+          signal: c.signal,
+          refusal: () => {
+            if (++calls === at) act(e);
+            return null;
+          },
+        });
+        expect(r, `${e} at ${at}`).toMatchObject(
+          at === 1
+            ? { status: "REFUSED_BEFORE_START", total: 2, accepted: 0, rejected: 0, unattempted: 2 }
+            : { status: "PARTIAL", total: 2, accepted: 1, rejected: 0, unattempted: 1 },
+        );
+        expect(r.code).toBe("LIFECYCLE_STOPPED");
+        expect(r.stopCheck, `${e} at ${at}`).toMatchObject({ passed: false, cause: cause[e] });
+      }
+    }
+    // A single-event fact: a callback that cancels is never reported COMPLETE.
+    const { h, c } = setup();
+    const one = await h.resolve(notice(1), okSwap(1)());
+    const t = tracker();
+    const r = h.adapter.ingest(one, t, {
+      signal: c.signal,
+      refusal: () => {
+        c.abort();
+        return null;
+      },
+    });
+    expect(r).toMatchObject({ status: "REFUSED_BEFORE_START", accepted: 0, unattempted: 1 });
+    expect(t.ingestTrade(one.events[0]!).ok).toBe(true);
   });
 });

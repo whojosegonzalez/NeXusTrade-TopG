@@ -364,15 +364,24 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** Own data properties of a plain record, or null if any is an accessor or a symbol key. */
+/**
+ * Own data properties of a plain record, or null if any is an accessor or a symbol key. The copy
+ * has a null prototype and is filled with defineProperty, so an own `__proto__` key stays an
+ * ordinary visible key (never a prototype setter) and nothing can be inherited.
+ */
 function readDataRecord(v: unknown): Record<string, unknown> | null {
   if (!isPlainRecord(v)) return null;
-  const out: Record<string, unknown> = {};
+  const out = Object.create(null) as Record<string, unknown>;
   for (const k of Reflect.ownKeys(v)) {
     if (typeof k !== "string") return null;
     const d = Object.getOwnPropertyDescriptor(v, k);
     if (!d || !("value" in d)) return null;
-    out[k] = d.value;
+    Object.defineProperty(out, k, {
+      value: d.value,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
   return out;
 }
@@ -411,30 +420,47 @@ function scanString(s: string, needles: readonly string[]): "FOUND" | "INCONCLUS
   }
 }
 
-/** Scans the raw bytes and every parsed key and string value (iteratively; no recursion). */
+/**
+ * Scans the raw bytes and every parsed key and string value. Traversal is iterative with an
+ * explicit work list (no recursion and no argument spreading), so array and object size are
+ * bounded only by the response limit. Any failure while scanning is INCONCLUSIVE (withheld).
+ */
 function scanCredentialMaterial(
+  raw: Buffer,
+  parsed: unknown,
+  needles: readonly string[],
+): "FOUND" | "INCONCLUSIVE" | "CLEAN" {
+  try {
+    return scanAll(raw, parsed, needles);
+  } catch {
+    return "INCONCLUSIVE";
+  }
+}
+
+function scanAll(
   raw: Buffer,
   parsed: unknown,
   needles: readonly string[],
 ): "FOUND" | "INCONCLUSIVE" | "CLEAN" {
   let worst: "FOUND" | "INCONCLUSIVE" | "CLEAN" = scanString(raw.toString("latin1"), needles);
   if (worst === "FOUND") return worst;
-  const stack: unknown[] = [parsed];
-  while (stack.length > 0) {
-    const v = stack.pop();
-    const found: string[] = [];
-    if (typeof v === "string") found.push(v);
-    else if (Array.isArray(v)) stack.push(...v);
-    else if (v !== null && typeof v === "object") {
-      for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-        found.push(k);
-        stack.push(x);
+  const check = (s: string): boolean => {
+    const r = scanString(s, needles);
+    if (r === "INCONCLUSIVE") worst = r;
+    return r === "FOUND";
+  };
+  const work: unknown[] = [parsed];
+  while (work.length > 0) {
+    const v = work.pop();
+    if (typeof v === "string") {
+      if (check(v)) return "FOUND";
+    } else if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) work.push(v[i]);
+    } else if (v !== null && typeof v === "object") {
+      for (const k of Object.keys(v)) {
+        if (check(k)) return "FOUND";
+        work.push((v as Record<string, unknown>)[k]);
       }
-    }
-    for (const s of found) {
-      const r = scanString(s, needles);
-      if (r === "FOUND") return r;
-      if (r === "INCONCLUSIVE") worst = r;
     }
   }
   return worst;
@@ -1095,15 +1121,20 @@ export class RaydiumCpmmTransactionSourceAdapter {
 
   // --- lifecycle --------------------------------------------------------------------------------
 
-  /** Session-owned time, state and deadline (also when the clock passed it before its timer fired). */
+  /**
+   * Session-owned time, state and deadline (also when the clock passed it before its timer fired).
+   * The caller's callback runs exactly once and FIRST; every authoritative value (time, session
+   * state, stop reason, deadline and cancellation) is read afterwards, so whatever the callback
+   * did (cancel, stop the session, move the clock) is observed by this same check.
+   */
   private lifecycleCheck(g: ValidGate): CpmmLifecycleCheck {
     try {
+      const refusal = callerRefusal(g);
       const atMs = this.session.now();
       const open = this.session.isOpen();
       const stopReason = this.session.getStopReason();
       const deadlineMs = this.session.getDeadlineMs();
       const callerCancelled = g.signal?.aborted === true;
-      const refusal = callerRefusal(g);
       const sessionState = open ? "OPEN" : stopReason !== null ? "STOPPED" : "NOT_OPEN";
       const cause: CpmmLifecycleCause | null =
         sessionState === "STOPPED"
