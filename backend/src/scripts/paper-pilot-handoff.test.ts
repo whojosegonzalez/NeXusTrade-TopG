@@ -1205,6 +1205,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.test.ts",
       "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts",
       "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1248,7 +1250,10 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test-support.ts",
       "backend/src/candidate-scanner/RaydiumCpmmSwapDecoderExtra.ts",
       "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.fixtures.ts",
-      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test-support.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapterExtra.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.fixtures.ts",
+      "backend/src/candidate-scanner/RaydiumCpmmEvidenceRecorder.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch-handoff.ts",

@@ -115,6 +115,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated pure CPMM swap decoder and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts",
   "backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.test.ts",
+  // The isolated CPMM transaction source adapter and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts",
+  "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
