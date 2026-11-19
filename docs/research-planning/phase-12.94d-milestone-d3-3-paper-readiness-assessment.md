@@ -7772,6 +7772,157 @@ The first run left two survivors, which exposed weak tests rather than code faul
 - **Tracker exercised once**: `RollingTradeFlowTracker` is used in one test to show compatibility. It is not an integration, and no flow provider consumes the decoder.
 - **Status**: CPMM remains quarantined from admission; `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
+##### 12. Proposed CPMM Transaction-Resolution Component (Design Only; Not Implemented)
+
+**Status**: proposal for review. No source, test or pin change exists. The accepted decoder, pool-state adapter and market parser stay unchanged.
+
+**Scope**: resolve one injected transaction notification for one verified CPMM pool:
+
+1. one `getTransaction` request through the shared `PaperRequestSession`;
+2. validation of the response;
+3. the accepted decoder;
+4. a frozen resolution fact;
+5. optionally, ingestion of decoded events into an injected tracker.
+
+Out of scope: history enumeration, the resolution bridge, provider registration, collection gaps, coverage, failed-transaction validation and admission.
+
+**Proposed files**:
+
+- `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts`
+- `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts`
+
+Implementing them would also need the pin allowlist to gain exactly these two files, as a separate reviewed step.
+
+**Inputs** (all injected; no defaults for time or limits):
+
+| Input               | Content                                                                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pool`              | The adapter's `RaydiumCpmmPoolStateSuccess`, passed unchanged to the decoder                                                                                                                                        |
+| `session`           | An already-opened `PaperRequestSession`, owned by the caller                                                                                                                                                        |
+| `rpcUrl`            | Used only as the dispatch URL; never stored in facts                                                                                                                                                                |
+| `evidence`          | A read-only lookup from ledger `seq` to `PaperRequestExchangeEvidence`, populated by the session owner's `onExchangeComplete` observer. The session exposes raw body bytes only there; no session change is needed. |
+| `notification`      | `{ signature, slot, receivedAtMs, blockTime? }`: a canonical signature, a safe slot, a positive safe-integer host receipt time, and an optional integer `blockTime`                                                 |
+| `refusal`, `signal` | The caller's lifecycle refusal and cancellation                                                                                                                                                                     |
+
+**1. Signature binding, envelope and cross-checks before decoding**:
+
+1. **Request**: exactly one dispatch.
+   - Body: `{"jsonrpc":"2.0","id":<id>,"method":"getTransaction","params":[<signature>,{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}]}`.
+   - The ID comes from `session.nextJsonRpcId()`. It is passed as `jsonRpcId`, and `requestedIdentity` is the signature, so both are in the session ledger. Lane `SOLANA_RPC`, owner `FLOW`, purpose `CPMM_GET_TRANSACTION`.
+   - A v1 transaction then comes back as an RPC error, which the decoder would refuse anyway.
+2. **Transport**: the exchange must be dispatched, with no error, HTTP 200 and `bodyState` `COMPLETE`. The raw bytes come from `evidence.get(entry.seq)` and must match `observedBodyBytes`; strict UTF-8 is required. The session's lossy `text` is never parsed.
+3. **Envelope**: the keys must be exactly `{jsonrpc, id, result}` or `{jsonrpc, id, error}`, with `jsonrpc === "2.0"` and `id` strictly equal to the requested number. Any other ID or type is `MALFORMED_RESPONSE`.
+4. **Result**:
+   - `error`: an `RPC_ERROR` fact, with the code and redacted message;
+   - `null`: `TRANSACTION_NOT_FOUND`. This is not evidence of absence, because confirmed data may lag;
+   - otherwise an object, continuing below.
+5. **Signature binding**: `result.transaction.signatures[0]` must equal the requested signature exactly, with no trimming or case folding. Otherwise `SIGNATURE_MISMATCH`.
+6. **Slot and time cross-checks**:
+   - `result.slot` must be a safe integer equal to `notification.slot`. A missing or non-numeric slot is a contradiction, not a skip.
+   - If the notification carries `blockTime`, `result.blockTime` must be present and equal to it.
+   - A mismatch gives `METADATA_CONTRADICTION`.
+7. **Retention**: every fact that reached the network keeps:
+   - the request body (which contains no credential);
+   - the ledger entry (`seq`, `jsonRpcId`, dispatch and completion times, status, completeness, error);
+   - the response byte count, its SHA-256 and the bytes themselves, bounded by the lane limit and redacted at byte level with the reviewed capability-check primitive before storage.
+
+   The URL and headers are never kept.
+
+**2. Session ownership**: the session alone paces, budgets, enforces deadlines, cancels, stops on the first 429 or redirect, and accounts for requests.
+
+- **Never in the adapter**: it does not open, stop, sleep, retry, pace, count attempts, or call `fetch` or a budget manager directly. It does not keep request counters that substitute for the ledger.
+- **Refusals**: a refused dispatch (`REQUEST_SESSION_STOPPED`, `LIFETIME_EXPIRED`, a ceiling or a caller refusal) becomes a `REQUEST_REFUSED` fact. The refusal is not counted and nothing is sent.
+- **Cancellation**: the caller's signal is passed as `waitSignals` and `linkSignals`. A cancelled in-flight request yields the session's `REQUEST_ABORTED` and a `CANCELLED` fact.
+- **Late responses**: `refusal()` and `signal` are rechecked after the await and before decoding and ingestion. A response that completed but is now late (lifecycle invalidated, deadline passed or cancelled) is retained as `LATE_RESPONSE` and not decoded or ingested.
+- **Body ceiling**: the adapter may pass a stricter `maxResponseBytes`; it never raises the lane's.
+
+**3. Decoder outcomes as resolution facts**:
+
+The decoder is called with `{ receiptTimestampMs: notification.receivedAtMs }`. None of the facts below advances coverage, clears gaps or counts as zero-swap evidence.
+
+| Decoder result        | Fact                          | Meaning                                                                                                                                        |
+| --------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SWAP_DECODED`        | `RESOLVED_SWAPS`              | Frozen events for this signature. Only these may be ingested.                                                                                  |
+| `NO_MATCHING_SWAPS`   | `RESOLVED_NO_TARGET_SWAP`     | This transaction holds no target swap, with the decoder diagnostics (including `shortcut`). Not qualified coverage and not zero-swap evidence. |
+| `TRANSACTION_FAILED`  | `RECORDED_FAILED_TRANSACTION` | Unvalidated: no CPMM failed-transaction validator exists. Not zero-swap evidence.                                                              |
+| `UNRESOLVED_EVIDENCE` | `UNRESOLVED`                  | With the decoder's `reason` and `detail`. Never converted to any other fact.                                                                   |
+
+The pre-decode facts are `INVALID_NOTIFICATION`, `DUPLICATE_NOTIFICATION`, `REQUEST_REFUSED`, `CANCELLED`, `TRANSPORT_FAILED`, `HTTP_ERROR`, `RESPONSE_LIMIT_EXCEEDED`, `MALFORMED_RESPONSE`, `RPC_ERROR`, `TRANSACTION_NOT_FOUND`, `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION` and `LATE_RESPONSE`. Every fact is frozen and carries the notification and the retained evidence it reached.
+
+**4. Ingestion, receipt time, deduplication and replay**:
+
+- **Ingestion is separate**: `ingestCpmmResolution(fact, tracker, refusal)` accepts only `RESOLVED_SWAPS`.
+  - Before anything is ingested, it rechecks `refusal()` and the tracker's pool and mint against the pool.
+  - Each event then goes to `ingestTrade` in order, and the per-event results are returned.
+  - Any refused event makes the result `PARTIAL_INGEST`. The tracker has no rollback, so this is reported, never promoted to success.
+- **Receipt time**: `receiptTimestampMs` is the notification's injected `receivedAtMs` (its arrival time); the adapter has no clock fallback. The response completion time is recorded separately from the ledger. Provenance stays the decoder's `ON_CHAIN_BLOCK_TIME`, with no override.
+- **Deduplication**: a bounded set of signatures already seen (default 1,000). A repeat is `DUPLICATE_NOTIFICATION`, with no request. When the set is full, new notifications are refused (`DEDUPLICATION_CAPACITY_REACHED`), never evicted, so an evicted signature can never be requested twice. The tracker's own `eventId` deduplication remains the second guard.
+- **Replay**: a fact's retained bytes, re-decoded offline with the same pool, must reproduce the same events, or the same refusal, exactly. Tests assert this for every fact that reached decoding.
+
+**5. AMM v4 assumptions that prevent direct reuse**:
+
+| AMM v4 component                       | Assumption                                                                                                      | CPMM component                                                     |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `RaydiumAmmV4TransactionSourceAdapter` | Owns `transport`, `budgetManager`, `pacingMs`, `sleepFn` and timeouts, calling `fetch` with `redirect: "error"` | Session only (item 2)                                              |
+|                                        | Fixed JSON-RPC `id: 1`                                                                                          | Session-unique ID bound in the ledger                              |
+|                                        | `signatures[0].trim() !== signature`                                                                            | Exact equality                                                     |
+|                                        | Slot and `blockTime` checked only when the response field is a number                                           | Missing fields are contradictions                                  |
+|                                        | `receiptTimestampMs: receivedAtMs ?? clock()`, `fallbackProvenance` passed through                              | Required receipt time; no override                                 |
+|                                        | Synthesises loss-gap times from the clock or `blockTime` and writes tracker gaps                                | No gaps in the isolated component                                  |
+|                                        | AMM v4 decoder and `TrackedRaydiumPoolContext`; PAPER failed-transaction policy through the AMM v4 validator    | The CPMM decoder and adapter success; no failed-transaction policy |
+| `ExactPoolTransactionResolutionBridge` | Typed to the AMM v4 adapter and its 8-field pool context                                                        | Unchanged; not used                                                |
+|                                        | Checks a shared `GlobalResourceBudgetManager` and `providerName` / `requestPurpose`                             |                                                                    |
+|                                        | `RESOLVED_FAILED_TRANSACTION` via the AMM v4 validator                                                          |                                                                    |
+
+**Initial component versus later wiring**:
+
+- **Initial**: only the two files above, with no change to the bridge, the provider, the session or the AMM v4 files.
+- **Later**: a bridge or provider generalisation, CPMM notification sourcing, gap recording and any coverage rule are later and separately reviewed steps.
+
+**6. Synthetic test matrix** (injected fakes only):
+
+- **Harness**: a real `PaperRequestSession` with virtual timers and a scripted fake `fetch`; the evidence lookup fed from `onExchangeComplete`; adapter-produced pool contexts; synthetic `json` payloads from the decoder tests' literal builders. No network.
+
+| Group                    | Cases                                                                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A1 Request               | Exact body, ID from the session, lane, owner, purpose and identity in the ledger; one dispatch; no retry after any failure                                                                             |
+| A2 Envelope              | ID mismatch (other number, string `"1"`, missing); `jsonrpc` ≠ 2.0; extra keys; both `result` and `error`; non-object; invalid UTF-8 bytes; lossy text never used                                      |
+| A3 Binding               | Returned signature different, with whitespace, missing; slot different, missing or a string; notification `blockTime` different from or missing in the result                                          |
+| A4 Results               | `result: null`; RPC error, with a credential-bearing message redacted; HTTP 503; body over the ceiling (partial and declared); network error                                                           |
+| A5 Session               | Stopped session; lifetime expired; ceiling reached; caller refusal (all refused and not counted); 429 and redirect stop the session; pacing owned by the session (two notifications spaced ≥ 2,500 ms) |
+| A6 Cancellation          | Before dispatch (no request); during the request (`CANCELLED`); after completion and before decoding, or before ingestion (`LATE_RESPONSE`, nothing ingested)                                          |
+| A7 Decoder mapping       | Each of the four outcomes gives its fact; `NO_MATCHING_SWAPS` and `TRANSACTION_FAILED` change no tracker coverage, gap or event count                                                                  |
+| A8 Ingestion             | Events ingested once; second ingestion deduplicated; a tracker for another pool or mint refused before any event; partial ingestion reported (one event refused by the tracker)                        |
+| A9 Duplicates            | The same signature twice gives `DUPLICATE_NOTIFICATION` with no second request; capacity reached refuses new signatures; no eviction                                                                   |
+| A10 Notification         | Invalid signature, slot or receipt time; missing receipt time (no clock fallback); a `fallbackProvenance`-like extra field refused                                                                     |
+| A11 Replay and retention | Re-decoding retained bytes reproduces each fact; no URL, header or credential in any fact; facts and events frozen                                                                                     |
+
+**Acceptance criteria**:
+
+- Every case above passes.
+- The session ledger shows exactly one entry per dispatched notification and none for refusals.
+- No adapter code path calls `fetch`, timers, a clock, `GlobalResourceBudgetManager` or `session.stop`; source checks assert this.
+- No fact other than `RESOLVED_SWAPS` changes the tracker.
+- Targeted mutants of ID binding, signature equality, the slot cross-check, the late-response recheck, deduplication without eviction, and the `NO_MATCHING_SWAPS` / `TRANSACTION_FAILED` non-promotion are all caught.
+- Typecheck, lint and formatting pass. Only the two files, plus the reviewed pin addition, change.
+
+**7. Required before consuming a captured CPMM transaction or qualifying a flow window**:
+
+- **Before a captured transaction**:
+  - a reviewed, separately approved single-capture plan, sealed and verified offline like the retrospective check;
+  - independent confirmation that the captured `json` response has the shape the decoder assumes (`version`, `header`, `stackHeight` on every inner instruction, log format);
+  - offline replay of the sealed bytes;
+  - an explicit decision on the unverified bytecode correspondence (item 10).
+- **Before qualifying a flow window**:
+  - a reviewed CPMM notification source and its completeness evidence;
+  - gap recording for every non-`RESOLVED_SWAPS` fact;
+  - a reviewed rule for whether `RESOLVED_NO_TARGET_SWAP` can ever count toward coverage;
+  - a CPMM failed-transaction validator before any failed transaction is credited;
+  - Stage 4 LP and security evidence;
+  - independent review of the wiring.
+
+  Until then, CPMM remains quarantined from admission.
+
 ---
 
 #### 8.38.18 Integrity and Invariant Verification
