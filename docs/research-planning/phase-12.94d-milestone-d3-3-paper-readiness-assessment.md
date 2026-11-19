@@ -6491,12 +6491,13 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder and Transaction Source Adapter
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; RESOLUTION ACCOUNTING PROPOSED, DESIGN ONLY; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
 > - **Stage 3**: Pure CPMM swap decoder ([`RaydiumCpmmSwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts), 16/16 tests, 15/15 targeted mutants caught) implemented and verified offline on 2026-11-19, following the corrected design (items 8–10) and the implementation clarifications in item 11. It is isolated: no flow, admission, failed-transaction or PAPER zero-swap integration.
 > - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
+> - **Resolution accounting (design only)**: item 13 proposes an isolated per-signature accounting ledger over the item 12 adapter (`CpmmResolutionAccountingLedger.ts`, not implemented). Only fully ingested, replayable target swaps count as resolved. Every other outcome stays visible as a blocking record and gap, and the ledger never establishes notification completeness, a quiet window or qualification.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -8189,6 +8190,350 @@ No network request, socket, capture or long process was run.
   - Stage 4 LP and security evidence;
   - independent review of the wiring.
 - **Status**: CPMM remains quarantined from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
+
+##### 13. Proposed CPMM Resolution Accounting Ledger (Design Only; Not Implemented)
+
+**Status**: design only (2026-11-19). It builds on the corrected item 12 adapter (`f0b194d`), which the independent review accepted. No source, test, pin, configuration, capture or wallet change exists. CPMM remains excluded from admission.
+
+**Purpose**: turn CPMM resolution facts and ingestion results into explicit per-signature accounting, plus conservative gap information, so that no notified signature can disappear from completeness accounting.
+
+- **Not in scope**: discovery, history enumeration, reconciliation and qualification. It is deliberately smaller than a rolling provider.
+- **What it can say**: only "every notification it was given is accounted for, and these are ingested". It can never say that history is complete, that a window was quiet, or that a window qualifies.
+
+###### A. Read-Only Inspection: What Is Reusable and What Is AMM v4-Specific
+
+| Module                                    | Reusable for CPMM                                                                                                                                                                                                                                               | AMM v4-specific (not reused)                                                                                                                                                                                                                                                                       |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RollingTradeFlowTracker`                 | `TradeEvent`, `ingestTrade` (with its `eventId` and canonical swap-key deduplication), `getPoolId` and `getTokenMint`, `StreamGap`, and `recordCollectionGap` (which only adds uncertainty)                                                                     | Nothing. But `recordHeartbeat`, `recordObservationCheckpoint` and `recordCompletedRange` advance coverage and must not be called by this layer                                                                                                                                                     |
+| `ExactPoolTransactionResolutionBridge`    | Its principles: a duplicate is never credited as resolved (`DUPLICATE_UNRESOLVED`); work actually ingested is preserved; `isProductionCompletenessEstablished: false`; no cursor, coverage or gap clearing                                                      | The class: the 8-field `TrackedRaydiumPoolContext`, `RaydiumAmmV4TransactionSourceAdapter`, the identity of a separate `GlobalResourceBudgetManager`, `RESOLVED_FAILED_TRANSACTION` under the AMM v4 `PAPER_FAILED_TRANSACTION_POLICY`, and an enumeration-driven batch loop with its own deadline |
+| `ExactPoolHistoryEnumerator`              | `isValidSolanaSignature`; the `HistorySignatureRecord` shape; the outcome vocabulary; the frozen-target and witnessed-anchor principle                                                                                                                          | The class: bound to `TrackedRaydiumPoolContext` (validated by the AMM v4 decoder), its own injected `HistoryPageFetcher`, and budget admission with pacing waits. A CPMM history source would have to dispatch through the shared session instead (rule 6)                                         |
+| `ExactPoolWindowReconciliationEvaluator`  | The rule that resolution evidence is mandatory for every in-window signature; failure records are never overwritten by success; the `SourceCutoffEvidence` fields (slot, on-chain cutoff time, provenance, retrieval time); the provider-index assumptions list | Its inputs: `TransactionResolutionResult`, `ResolvedSignatureRecord`, `TrackedRaydiumPoolContext` and `budgetManager` projections. Also its PAPER quiet-window and active-window policies, including the AMM v4 failed-transaction policy                                                          |
+| `RaydiumCandidateSubscriptionCoordinator` | The connection-epoch concept: stale messages from an earlier transport generation are rejected; a drop records a gap. Also the generic `EnumerationLifecycleTarget` shape (`getStatus`, `getConnectionEpoch`)                                                   | The class: `logsSubscribe` for an AMM v4 adapter, the 8-field identity, and synthetic completeness-proof modes                                                                                                                                                                                     |
+
+**Conclusion**:
+
+- **New code**: the ledger is new. It imports only the CPMM adapter's types, the tracker and `isValidSolanaSignature`.
+- **AMM v4 types are not imported**, to avoid coupling. That includes the evaluator's `SourceCutoffEvidence`, which comes from a module that imports the AMM v4 decoder. The cutoff is mirrored in a small CPMM type instead (item B).
+
+###### B. Proposed Files, Interfaces and Ownership
+
+**Files** (a later implementation step, with exactly these two pin additions):
+
+- `backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts`
+- `backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts`
+
+**Ownership**:
+
+| Owner                               | What it owns                                                                                                                                                                                                                                                               |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The future CPMM flow owner (wiring) | Constructs the session (opens it, owns its lifetime), the recorder (and any fan-out), the adapter, the tracker and one ledger. It decides epochs and cutoffs                                                                                                               |
+| The shared session                  | Remains the sole request, pacing and budget owner                                                                                                                                                                                                                          |
+| The adapter                         | Remains the only code that dispatches                                                                                                                                                                                                                                      |
+| The ledger                          | Bound to exactly one adapter, one tracker, one pool and one mint. It calls only `adapter.resolve` and `adapter.ingest`. It has no session reference, transport, timer, clock, budget, queue or retry, and it writes nothing to the tracker except through `adapter.ingest` |
+
+```typescript
+import type {
+  CpmmIngestionResult,
+  CpmmLifecycleGate,
+  CpmmResolutionFact,
+  CpmmTransactionNotification,
+  RaydiumCpmmTransactionSourceAdapter,
+} from "./RaydiumCpmmTransactionSourceAdapter.js";
+import type { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
+
+export interface CpmmAccountingBinding {
+  readonly poolAddress: string; // equals the adapter's pool and tracker.getPoolId()
+  readonly candidateMint: string; // equals tracker.getTokenMint()
+}
+
+/** One observation epoch (for example a subscription connection generation), opened by the owner. */
+export interface CpmmObservationEpoch {
+  readonly epoch: number; // safe integer >= 0, strictly increasing
+  readonly observationStartMs: number; // host receipt clock: when this epoch began observing
+}
+
+/** On-chain cutoff for a window (mirrors the fields of the evaluator's SourceCutoffEvidence). */
+export interface CpmmWindowCutoff {
+  readonly slot: number;
+  readonly cutoffBlockTimeMs: number; // ON-CHAIN time domain
+  readonly provenance: "ON_CHAIN_BLOCK_TIME" | "SYNTHETIC_FIXTURE";
+  readonly evaluatedAtMs: number; // HOST time domain: when the owner asked
+}
+
+export interface CpmmAccountingWindow {
+  readonly epoch: number;
+  readonly windowStartMs: number; // on-chain time domain (blockTime x 1000)
+  readonly windowEndMs: number; // exclusive
+  readonly cutoff: CpmmWindowCutoff;
+}
+
+export interface CpmmNotificationEnvelope {
+  readonly notification: unknown; // passed verbatim to adapter.resolve (validated there)
+  readonly epoch: number; // the epoch the owner received it in
+  readonly hostReceivedAtMs: number; // owner receipt time; used when the notification is invalid
+}
+
+export type CpmmAccountingDisposition =
+  | "INGESTED" // the ONLY successful disposition
+  | "INGESTION_INCOMPLETE" // PARTIAL, NONE_ACCEPTED, REFUSED_BEFORE_START, or ingest not reached
+  | "POLICY_PENDING" // RESOLVED_NO_TARGET_SWAP or RECORDED_FAILED_TRANSACTION
+  | "UNRESOLVED" // every other fact kind (item C)
+  | "DUPLICATE" // a later notification of an already-accounted signature
+  | "INVALID_INPUT" // INVALID_NOTIFICATION or INVALID_GATE (signature not trusted)
+  | "PENDING"; // resolve() in flight
+
+export interface CpmmSignatureAccountingRecord {
+  readonly sequence: number; // the ledger's own order of first receipt
+  readonly signature: string | null; // null only for INVALID_INPUT
+  readonly poolAddress: string;
+  readonly candidateMint: string;
+  readonly epoch: number;
+  readonly notifiedSlot: number | null; // source claim; verified only if resolved past binding
+  readonly verifiedSlot: number | null; // set only when the adapter checked it against the response
+  readonly hostReceivedAtMs: number; // HOST time domain
+  readonly notifiedBlockTimeSec: number | null; // source claim
+  readonly verifiedBlockTimeSec: number | null; // ON-CHAIN, from decoded events or a matched claim
+  readonly disposition: CpmmAccountingDisposition;
+  readonly factKind: CpmmResolutionFact["kind"] | null; // verbatim, fixed codes only
+  readonly factCode: string | null;
+  readonly unresolvedClass: CpmmUnresolvedClass | null;
+  readonly policyPending:
+    | "NO_TARGET_SWAP_POLICY_UNREVIEWED"
+    | "FAILED_TRANSACTION_POLICY_UNREVIEWED"
+    | null;
+  readonly ingestion: {
+    readonly status: CpmmIngestionResult["status"] | "NOT_CALLED";
+    readonly total: number;
+    readonly accepted: number;
+    readonly rejected: number;
+    readonly unattempted: number; // accepted + rejected + unattempted === total
+  };
+  readonly duplicates: readonly { readonly epoch: number; readonly hostReceivedAtMs: number }[]; // bounded
+  readonly duplicatesDropped: number; // beyond the bound: counted, never silent
+}
+
+export type CpmmUnresolvedClass =
+  | "TRANSACTION_UNAVAILABLE" // TRANSACTION_NOT_FOUND, RPC_ERROR, HTTP_ERROR, TRANSPORT_FAILED
+  | "RESPONSE_CONTRADICTED" // MALFORMED_RESPONSE, SIGNATURE_MISMATCH, METADATA_CONTRADICTION
+  | "DECODER_UNRESOLVED" // UNRESOLVED
+  | "EVIDENCE_UNVERIFIED" // EVIDENCE_MISSING, EVIDENCE_MISMATCH
+  | "EVIDENCE_WITHHELD" // EVIDENCE_NOT_REPLAYABLE (credential material or inconclusive scan)
+  | "CANCELLED" // CALLER_CANCELLED (before dispatch, in flight, or late), LIFECYCLE_REFUSED, CALLER_REFUSAL
+  | "SESSION_ENDED" // session stopped, lifetime or ABSOLUTE_DEADLINE (in flight or late)
+  | "REQUEST_REFUSED" // ceilings, budget, session not open
+  | "CAPACITY_REFUSED" // TRACKING_CAPACITY_REACHED
+  | "DUPLICATE_WITHOUT_ORIGINAL"; // adapter DUPLICATE_NOTIFICATION with no ledger record (never credited)
+
+export interface CpmmAccountingGap {
+  readonly epoch: number;
+  readonly signature: string | null;
+  readonly timeBasis: "HOST_RECEIPT"; // the interval is in the HOST time domain
+  readonly startMs: number; // the epoch's observationStartMs (position unknown)
+  readonly endMs: number; // hostReceivedAtMs (the transaction cannot be later than its receipt)
+  readonly reason: string; // fixed: `CPMM_${disposition}` or `CPMM_${unresolvedClass}`
+}
+
+export interface CpmmWindowAccountingSummary {
+  readonly binding: CpmmAccountingBinding;
+  readonly window: CpmmAccountingWindow;
+  readonly ledgerVersion: number; // increments on every record change; stale summaries are detectable
+  readonly signatures: Readonly<Record<CpmmAccountingDisposition, number>>;
+  readonly unresolvedByClass: Readonly<Record<CpmmUnresolvedClass, number>>;
+  readonly policyPending: { readonly noTargetSwap: number; readonly failedTransaction: number };
+  readonly events: {
+    readonly total: number;
+    readonly accepted: number;
+    readonly rejected: number;
+    readonly unattempted: number;
+  };
+  readonly positionUnknown: number; // non-INGESTED records with no verified time, counted against this window
+  readonly afterCutoff: number; // verified slot > cutoff.slot (excluded, but counted)
+  readonly lateInWindow: number; // verified time in window, received after cutoff.evaluatedAtMs
+  readonly otherEpoch: number; // records of other epochs (not counted here)
+  readonly ledgerOverflow: number; // envelopes refused for ledger capacity (sticky)
+  readonly gaps: readonly CpmmAccountingGap[];
+  readonly accountingComplete: boolean; // see item E; never completeness of history
+  readonly notificationCompletenessEstablished: false;
+  readonly quietWindowEstablished: false;
+  readonly qualificationEligible: false;
+}
+
+export class CpmmResolutionAccountingLedger {
+  constructor(options: {
+    readonly binding: CpmmAccountingBinding;
+    readonly adapter: RaydiumCpmmTransactionSourceAdapter;
+    readonly tracker: RollingTradeFlowTracker;
+    readonly maxRecords: number; // injected; no default
+    readonly maxDuplicatesPerRecord: number; // injected; no default
+  });
+  openEpoch(epoch: CpmmObservationEpoch): void; // strictly increasing; closes the previous epoch
+  /** One awaited call per notification: resolve, ingest if ingestible, record. Never rejects. */
+  account(
+    envelope: CpmmNotificationEnvelope,
+    gate?: CpmmLifecycleGate,
+  ): Promise<CpmmSignatureAccountingRecord>;
+  summarize(window: CpmmAccountingWindow): CpmmWindowAccountingSummary; // pure snapshot
+  records(): readonly CpmmSignatureAccountingRecord[]; // frozen copies
+  get version(): number;
+}
+```
+
+- **Construction**:
+  - `tracker.getPoolId()` and `tracker.getTokenMint()` must equal the binding.
+  - Limits are positive safe integers. Unknown option keys are refused, using the corrected null-prototype copier from item 12.
+  - The adapter does not expose its pool, so equality with the binding is checked per record. Every event's `poolId` and `tokenMint` must equal the binding; a mismatch records a fixed `BINDING_MISMATCH` and marks the record as a conflict (`UNRESOLVED`).
+  - Exposing the adapter's pool read-only is an open decision (item I).
+- **Immutability**: records and summaries are deep-frozen and hold only strings, numbers, booleans and `null`. Facts are referenced by kind and code, not embedded, so no payload is retained twice.
+
+###### C. Disposition Mapping (Total: Every Fact Kind and Ingestion Status Is Mapped)
+
+| Adapter outcome                                                                                                                                                                                        | Disposition                                               | Unresolved class or policy             | Blocks `accountingComplete` |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- | -------------------------------------- | --------------------------- |
+| `RESOLVED_SWAPS`, `DECODER_REPLAYABLE`, and `ingest` `COMPLETE`                                                                                                                                        | `INGESTED`                                                | —                                      | No                          |
+| `RESOLVED_SWAPS` with `ingest` `PARTIAL`, `NONE_ACCEPTED` or `REFUSED_BEFORE_START`                                                                                                                    | `INGESTION_INCOMPLETE` (counts kept, final)               | —                                      | Yes                         |
+| `RESOLVED_SWAPS` where `ingest` returned `NOT_INGESTIBLE`, or was not reached                                                                                                                          | `INGESTION_INCOMPLETE` (`status: NOT_CALLED` or verbatim) | —                                      | Yes                         |
+| `RESOLVED_NO_TARGET_SWAP`                                                                                                                                                                              | `POLICY_PENDING`                                          | `NO_TARGET_SWAP_POLICY_UNREVIEWED`     | Yes                         |
+| `RECORDED_FAILED_TRANSACTION`                                                                                                                                                                          | `POLICY_PENDING`                                          | `FAILED_TRANSACTION_POLICY_UNREVIEWED` | Yes                         |
+| `TRANSACTION_NOT_FOUND`, `RPC_ERROR`, `HTTP_ERROR`, `TRANSPORT_FAILED`                                                                                                                                 | `UNRESOLVED`                                              | `TRANSACTION_UNAVAILABLE`              | Yes                         |
+| `MALFORMED_RESPONSE`, `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION`                                                                                                                                   | `UNRESOLVED`                                              | `RESPONSE_CONTRADICTED`                | Yes                         |
+| `UNRESOLVED` (decoder)                                                                                                                                                                                 | `UNRESOLVED`                                              | `DECODER_UNRESOLVED`                   | Yes                         |
+| `EVIDENCE_MISSING`, `EVIDENCE_MISMATCH`                                                                                                                                                                | `UNRESOLVED`                                              | `EVIDENCE_UNVERIFIED`                  | Yes                         |
+| `EVIDENCE_NOT_REPLAYABLE`                                                                                                                                                                              | `UNRESOLVED`                                              | `EVIDENCE_WITHHELD`                    | Yes                         |
+| `CANCELLED_IN_FLIGHT`; `REQUEST_REFUSED` (`CALLER_CANCELLED`, `CALLER_REFUSAL`); `LATE_RESPONSE` (`CALLER_CANCELLED`, `LIFECYCLE_REFUSED`)                                                             | `UNRESOLVED`                                              | `CANCELLED`                            | Yes                         |
+| `SESSION_STOPPED_IN_FLIGHT`; `REQUEST_REFUSED` (`LIFETIME_EXPIRED`, `REQUEST_SESSION_STOPPED`); `LATE_RESPONSE` (`SESSION_STOPPED`, `ABSOLUTE_DEADLINE`, `SESSION_NOT_OPEN`, `LIFECYCLE_CHECK_FAILED`) | `UNRESOLVED`                                              | `SESSION_ENDED`                        | Yes                         |
+| `REQUEST_REFUSED` (ceilings, `BUDGET_MANAGER_DENIED`, `REQUEST_SESSION_NOT_OPEN`, unrecognised)                                                                                                        | `UNRESOLVED`                                              | `REQUEST_REFUSED`                      | Yes                         |
+| `TRACKING_CAPACITY_REACHED`                                                                                                                                                                            | `UNRESOLVED`                                              | `CAPACITY_REFUSED`                     | Yes                         |
+| `DUPLICATE_NOTIFICATION`, with a ledger record for the signature                                                                                                                                       | `DUPLICATE` (appended to the first record)                | —                                      | Only via the first record   |
+| `DUPLICATE_NOTIFICATION`, with no ledger record                                                                                                                                                        | `UNRESOLVED`                                              | `DUPLICATE_WITHOUT_ORIGINAL`           | Yes                         |
+| `INVALID_NOTIFICATION`, `INVALID_GATE`                                                                                                                                                                 | `INVALID_INPUT` (no trusted signature)                    | —                                      | Yes (for the whole epoch)   |
+| `resolve` not yet settled                                                                                                                                                                              | `PENDING`                                                 | —                                      | Yes                         |
+| Ledger capacity reached (the adapter is not called)                                                                                                                                                    | Counted in `ledgerOverflow` (sticky)                      | —                                      | Yes (every later summary)   |
+
+- **The mapping is total**: an unknown kind, code or ingestion status maps to `UNRESOLVED` with the fixed code `UNRECOGNIZED_OUTCOME`, never to `INGESTED`.
+- **Requirement 2, successful ingestion**: `INGESTED` requires all of the following:
+  - `fact.kind === "RESOLVED_SWAPS"`;
+  - `fact.replay === "DECODER_REPLAYABLE"`;
+  - `fact.ingestible`;
+  - an `adapter.ingest` result of `COMPLETE` with `accepted === total === fact.events.length`;
+  - every event bound to the pool and mint.
+
+  `PARTIAL` is final: its accepted, rejected and unattempted counts are kept exactly, and it is never retried or promoted. A later notification of that signature is a `DUPLICATE` of the partial record and changes nothing.
+
+- **Requirement 4, separate policies**: `RESOLVED_NO_TARGET_SWAP` and `RECORDED_FAILED_TRANSACTION` stay distinct, are never merged with each other or with `INGESTED`, and are never zero-swap evidence. No AMM v4 rule is inherited: neither `RESOLVED_FAILED_TRANSACTION` nor `PAPER_FAILED_TRANSACTION_POLICY`. Each needs its own separately reviewed policy before it can count.
+- **Deduplication** is layered, and nothing is evicted:
+  1. the adapter's permanent reservation;
+  2. the ledger's first-record rule: a record is written once, and a duplicate never upgrades or overwrites it, because failure records are never replaced by success (the evaluator's rule);
+  3. the tracker's `eventId` and canonical-key deduplication.
+
+###### D. Binding and Time Domains (Requirement 5)
+
+- **Identity**: every record carries the pool, mint, signature, `notifiedSlot`, `verifiedSlot` and epoch.
+  - `verifiedSlot` is set only when the adapter compared the response slot with the notification, which is every decoded kind.
+  - The window carries its epoch and an on-chain cutoff (slot, block time and provenance) plus the host time it was evaluated.
+- **Two time domains, never mixed**:
+  - **Host receipt time** (`hostReceivedAtMs`, the notification's `receivedAtMs`): orders arrivals, bounds gaps and detects late notifications.
+  - **On-chain block time** (`verifiedBlockTimeSec × 1000`): the only basis for placing a record inside a window.
+  - **Unverified**: a notified block time is a source claim. It becomes `verifiedBlockTimeSec` only when the adapter matched it against the response (any decoded kind), or when it comes from decoded events.
+- **Window membership**:
+  - A record with a verified block time in `[windowStartMs, windowEndMs)` and `verifiedSlot <= cutoff.slot` is in the window.
+  - A verified slot after the cutoff is counted in `afterCutoff`, never silently dropped.
+  - A record of the same epoch that is not `INGESTED` and has no verified time is counted against every window of its epoch (`positionUnknown`), with a host-receipt gap from the epoch's `observationStartMs` to `hostReceivedAtMs`.
+- **Late notifications**: a record whose verified time falls in the window but whose `hostReceivedAtMs > cutoff.evaluatedAtMs` is counted in `lateInWindow`. It bumps `version`, so a summary taken earlier is visibly stale.
+- **Notifications are not history**: the absence of notifications never shows that a window was quiet. `notificationCompletenessEstablished`, `quietWindowEstablished` and `qualificationEligible` are literal `false` in this layer, and an empty window is never `accountingComplete`.
+
+###### E. `accountingComplete` and Gaps (Requirement 3)
+
+**`accountingComplete`** for a window is true only if all of the following hold:
+
+- the window's epoch was opened, and its cutoff provenance is `ON_CHAIN_BLOCK_TIME`;
+- the window contains at least one in-window record, and every in-window record is `INGESTED`;
+- `positionUnknown`, `lateInWindow`, `INVALID_INPUT` and `PENDING` for the epoch are 0;
+- `ledgerOverflow` is 0;
+- no binding conflict exists.
+
+Even then, it means only that every notification given to the ledger is accounted for. It says nothing about notifications never received.
+
+**Gaps**:
+
+- **One gap per non-`INGESTED` record** of the epoch, in the host time domain, with a fixed reason. `INVALID_INPUT` uses the envelope's `hostReceivedAtMs`.
+- **Overflow**: ledger overflow and a `DUPLICATE_WITHOUT_ORIGINAL` each add an epoch-wide gap.
+- **Not written to the tracker**: gaps are returned in summaries only. The ledger never calls `recordCollectionGap` or any coverage-advancing tracker method (item I, decision 1).
+
+###### F. Session Ownership, Concurrency and Lifecycle (Requirement 6)
+
+- **One request path**: `account()` is the only path to a request. It makes one `adapter.resolve` call, then at most one `adapter.ingest` call, both with the caller's gate. Pacing, budget, ceilings and the deadline remain the session's.
+- **Never added**: retry, eviction, re-resolution, a timer, a clock, a scheduler, a queue or a second transport.
+- **Concurrency**:
+  - A `PENDING` record is written synchronously, before the first `await`, keyed by the ledger sequence number and by the claimed signature when it is a canonical signature string.
+  - A concurrent duplicate that the adapter answers with `DUPLICATE_NOTIFICATION` while the first call is pending is attached to the pending record. It is never counted as `DUPLICATE_WITHOUT_ORIGINAL`.
+  - If the claimed signature was invalid, the pending record becomes `INVALID_INPUT` and its signature is discarded.
+- **Never rejects**: `account()` always settles to a record. An adapter or tracker exception maps to `UNRESOLVED` with the fixed code `ACCOUNTING_EXCEPTION`.
+- **Epochs**:
+  - `openEpoch` requires a strictly increasing epoch.
+  - An envelope for a closed or unknown epoch is not resolved, so no request is made. It is recorded as `INVALID_INPUT` with the fixed code `STALE_EPOCH` and blocks that epoch's completeness.
+  - Records keep their own epoch for life, and cross-epoch duplicates stay attached to the first record (`otherEpoch` in summaries).
+
+###### G. Synthetic Test Matrix (Proposed)
+
+Harness: the item 12 adapter harness (a real session with virtual clock and timers, scripted in-memory `fetch`, a real recorder, a real tracker), with no network.
+
+| Group                    | Cases                                                                                                                                                                                                                                                                                   |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| L1 Mapping               | Every adapter fact kind and ingestion status maps exactly as item C; an unknown kind or code gives `UNRECOGNIZED_OUTCOME`; the record is frozen and plain                                                                                                                               |
+| L2 Successful ingestion  | `COMPLETE` gives `INGESTED`; `PARTIAL` (1/1/0 and 1/0/1), `NONE_ACCEPTED` and `REFUSED_BEFORE_START` keep exact counts and block; a non-replayable or foreign fact never gives `INGESTED`                                                                                               |
+| L3 Duplicates            | Sequential and simultaneous duplicates (the second attaches to the `PENDING` first record); a duplicate of a `PARTIAL` or failed record changes nothing; `DUPLICATE_WITHOUT_ORIGINAL` (adapter used before the ledger); duplicate bound exceeded (`duplicatesDropped`)                  |
+| L4 Missing resolutions   | Not found, RPC and HTTP errors, transport failure, missing and mismatched evidence, credential withholding, capacity refusal, request refusal: each `UNRESOLVED` with its class, a gap, and a blocked window; `PENDING` blocks until it settles                                         |
+| L5 Policy pending        | `RESOLVED_NO_TARGET_SWAP` and `RECORDED_FAILED_TRANSACTION` stay distinct, block, never count as zero-swap, and leave the tracker unchanged                                                                                                                                             |
+| L6 Epochs                | Strictly increasing `openEpoch`; a stale-epoch envelope makes no request and blocks its epoch; a cross-epoch duplicate stays with the first record; summaries count `otherEpoch`                                                                                                        |
+| L7 Time domains          | Membership by verified on-chain time only; a matched notified block time is verified, an unmatched one is not; `afterCutoff`; a `SYNTHETIC_FIXTURE` cutoff is never complete; host receipt is used only for gaps and lateness                                                           |
+| L8 Late in-window        | A notification received after `cutoff.evaluatedAtMs` with an in-window verified time sets `lateInWindow`, bumps `version`, and makes the window incomplete; an earlier summary is detectably stale                                                                                      |
+| L9 Lifecycle             | Cancellation, session stop and the deadline before dispatch, in flight or at the post-await check (including inside the caller's callback) map to `CANCELLED` or `SESSION_ENDED`; between ingested events they give `INGESTION_INCOMPLETE` with exact counts; `account()` never rejects |
+| L10 Empty and quiet      | No notifications in a window: `accountingComplete: false`, `quietWindowEstablished: false`, `qualificationEligible: false`                                                                                                                                                              |
+| L11 Capacity and binding | Ledger overflow is sticky and counted, with no adapter call; a tracker of another pool or mint is refused at construction; an event bound to another pool gives a conflict                                                                                                              |
+| L12 Source boundaries    | No `fetch`, timers, `Date.now`, budget, session methods, `recordHeartbeat`, `recordObservationCheckpoint`, `recordCompletedRange` or `recordCollectionGap`; imports are limited to the CPMM adapter's types, the tracker and the signature validator                                    |
+
+**Acceptance**:
+
+- every case passes, with mutation checks on: the `INGESTED` conjunction, the totality of the mapping, first-record immutability, pending attachment, the time-domain separation, the late-in-window rule, the overflow stickiness and the literal-`false` flags;
+- typecheck, lint and formatting pass;
+- only the two files and their reviewed pin addition change.
+
+###### H. Smallest Recommended Implementation Step
+
+Implement exactly the two ledger files as an isolated, unwired module, using the item 12 test harness pattern, and add exactly those two files to the pin allowlist with focused regression coverage. Nothing else is in this step:
+
+- no notification source;
+- no history enumeration;
+- no reconciliation;
+- no tracker gap writing;
+- no provider, bridge or admission change.
+
+###### I. Unresolved Decisions and Remaining Prerequisites
+
+**Decisions for review**:
+
+1. **Tracker gaps**: should the ledger write its gaps into the tracker with `recordCollectionGap`? This is conservative, since it only lowers coverage. Recommended: not yet. Keep gaps in summaries until a CPMM coverage owner exists, because writing them now would also need a rule for gaps from other epochs.
+2. **Width of an unknown-position gap**: proposed from the epoch's `observationStartMs` to receipt. A narrower interval would need a verified lower bound, such as an anchored history cursor.
+3. **Invalid notifications**: proposed to block their whole epoch, because their signature and time cannot be trusted.
+4. **Adapter pool identity**: add a read-only `adapter.poolAddress` and `candidateMint` (a small adapter change, reviewed separately), or keep the per-event check plus owner discipline.
+5. **Late notifications after an epoch closes**: proposed `STALE_EPOCH` with no request. The alternative is to resolve them and only flag the epoch, which would spend requests on a closed epoch.
+6. **Bounds**: `maxRecords` and `maxDuplicatesPerRecord`, and whether ledger overflow should also stop the owner's notification intake.
+7. **Matched notified block times**: should a matched notified block time count as verified for non-swap kinds? Proposed: yes, because the adapter compares it with the response before decoding.
+
+**Prerequisites before any CPMM flow qualification**:
+
+- **Notification completeness**: a reviewed CPMM notification source with epochs, drop and stale handling, and gap evidence. Also an anchored, witnessed history enumeration that dispatches through the shared session. The existing enumerator uses its own budget manager and AMM v4 pool context.
+- **Reconciliation**: a CPMM reconciliation evaluator, or a generalisation of the existing one, that consumes ledger summaries plus witnessed history and an on-chain cutoff. It must preserve "resolution evidence mandatory for every in-window signature" and keep provider-index assumptions explicit.
+- **Policies**: separately reviewed policies for `RESOLVED_NO_TARGET_SWAP` and for CPMM failed transactions, including a CPMM failed-transaction validator.
+- **Evidence**: CPMM LP and security evidence (Stage 4).
+- **Captured-transaction validation**:
+  - a separately approved, sealed single capture;
+  - independent confirmation of the response shape;
+  - offline replay of a `DECODER_REPLAYABLE` capture;
+  - a decision on the unverified bytecode correspondence.
+- **Wiring**: the observer fan-out for the session's single `onExchangeComplete`, and independent review of the whole wiring.
+
+CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
 ---
 
