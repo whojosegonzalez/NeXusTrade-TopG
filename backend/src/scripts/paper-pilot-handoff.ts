@@ -121,6 +121,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated CPMM resolution accounting ledger and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts",
   "backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts",
+  // The isolated passive CPMM pool notification collector and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts",
+  "backend/src/candidate-scanner/CpmmPoolNotificationCollector.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

@@ -6491,14 +6491,14 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION PROPOSED, DESIGN ONLY; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
 > - **Stage 3**: Pure CPMM swap decoder ([`RaydiumCpmmSwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts), 16/16 tests, 15/15 targeted mutants caught) implemented and verified offline on 2026-11-19, following the corrected design (items 8–10) and the implementation clarifications in item 11. It is isolated: no flow, admission, failed-transaction or PAPER zero-swap integration.
 > - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
 > - **Resolution accounting**: isolated per-signature and per-occurrence accounting ledger over the item 12 adapter ([`CpmmResolutionAccountingLedger.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts), 24/24 tests, 29 of 30 targeted mutants caught, the survivor equivalent) implemented and verified offline on 2026-11-19 (item 13; one summary-boundary defect corrected the same day: a window must end at or before the cutoff block time), with a read-only adapter `getBinding()` (adapter suite 21/21). Only fully ingested, replayable, bound target swaps count as resolved. Every other outcome stays visible as a blocking record and gap. A ledger-owned epoch refusal is composed with the caller's gate, duplicates are accounted in their receiving epoch through bounded aggregates, results are tagged and bounded with exact conservation, and the ledger never establishes notification completeness, a quiet window or qualification. It is not wired to any source, provider, bridge or admission path.
-> - **Notification collection (design only)**: item 14 proposes a passive, bounded, exact-pool CPMM notification collector (`CpmmPoolNotificationCollector.ts`, not implemented). It binds one pool, mint, epoch and acknowledged subscription, checks byte limits before decoding, gives every frame an explicit disposition, forwards failed-transaction notifications, never invents a block time, and hands envelopes to the item 13 ledger through the future owner. It owns no connection, sends no request and establishes no completeness.
+> - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 17/17 tests, 22/22 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 14). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -8459,14 +8459,24 @@ L22 is adapter test T-20: `getBinding()` has exactly two keys, is frozen and the
 
 CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
-##### 14. Proposed Bounded Exact-Pool CPMM Notification Collector (Design Only; Not Implemented)
+##### 14. Bounded Exact-Pool CPMM Notification Collector (Implemented Offline 2026-11-19; Not Wired)
 
-**Status**: design only (2026-11-19). It builds on the accepted item 13 ledger (`6929030`; 125 focused tests, backend typecheck, 336 mixed-operation checks and eight cutoff-boundary cases passed independent review). No source, test, pin, configuration, dependency, capture or wallet change exists. No network, socket, live capture or operator command was run. CPMM remains excluded from admission.
+**Status**: implemented and verified offline (2026-11-19) from the design (`a009b19`), with seven review clarifications incorporated (below). The collector is passive, isolated and unwired. No connection owner, sealing, provider wiring, qualification policy, configuration or dependency change was made, and no request, socket, live capture or operator command was run. CPMM remains excluded from admission.
 
-**Purpose**: turn incoming WebSocket frames for one exact CPMM pool subscription into faithful, bounded notification records and ledger envelopes, with an explicit disposition for every frame, so that collection failures stay visible as uncertainty.
+**Purpose**: classify every incoming WebSocket frame for one exact CPMM pool subscription exactly once, and turn accepted notifications into faithful item 13 ledger envelopes, so that collection failures stay visible as uncertainty.
 
-- **Passive**: the collector receives frames from its owner. It holds no transport, sends nothing, owns no timer, and calls neither the adapter nor the ledger.
-- **What it can say**: only "these frames were received for this acknowledged subscription in this epoch, and this is what each one was". It never says that notifications or history are complete, that a window was quiet, or that a window qualifies.
+- **Passive**: it holds no transport, sends nothing, reads no clock, owns no timer, and calls neither the adapter, the ledger, the session nor the tracker. It never makes a request.
+- **What it can say**: only "these frames were received for this acknowledged subscription in this epoch, and this is what each one was". It never says that notifications or history are complete, that a window was quiet or qualifies, or that its metadata is a replayable capture.
+
+**Review clarifications incorporated**:
+
+1. **Failed-status claims stay uncertain**: a non-null `err` is forwarded and retained as `PRESENT`, but the frame is blocking and the epoch is never `collectionClean` while failure-status validation is pending.
+2. **Disconnect ownership**: the future owner stops outstanding ledger work after an abnormal collector closure through the existing `CpmmLifecycleGate.signal` and `refusal`. No ledger `closeEpoch()` is needed, and the collector never calls or cancels the ledger.
+3. **Monotonic terminal state**: the first close reason is permanent; repeated or later closes (including `OWNER_CLOSED`), later acknowledgements and supersession never make an abnormal or dirty epoch clean.
+4. **Retention separated from collection**: metadata-retention completeness is reported independently of `collectionClean`; raw protocol replay is unavailable.
+5. **Validate before processing**: frame envelopes and byte views are validated before any field is read; `acceptFrame()` never throws; acquisition limits are checked before copying, hashing or decoding; only the supplied range is read; a breach latches the epoch.
+6. **Strict protocol binding**: one acknowledged request and subscription per epoch, at most one unsubscribe request, observed acknowledgement retained, degenerate bindings refused, pool identity described as owner-supplied.
+7. **No hidden orchestration**: signature, slot and injected receipt only; no block time; duplicate envelopes preserved.
 
 ###### A. Read-Only Inspection: Reusable Components and AMM v4-Specific Behaviour
 
@@ -8476,304 +8486,152 @@ CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParse
 | `BoundedAmmV4CreationWatch`                                                                                                                           | Its principles: byte and message ceilings checked before decoding; strict acknowledgement binding by request ID; a wrong subscription ID is rejected, never re-routed; ack, keepalive and lifetime deadlines owned in one place; zero reconnects                                              | The class: it subscribes to the AMM v4 fee destination, treats a non-null `err` as a non-qualifying notification and stops at the first qualifying one, and embeds its own transport lifetime and keepalive                                                              |
 | `solana-subscription-capability.ts`                                                                                                                   | Its patterns: strict JSON-RPC 2.0 response shapes (exactly `{jsonrpc, id, result}` or `{jsonrpc, id, error:{code, message[, data]}}`), `decodeStrictUtf8` (fatal `TextDecoder`), length and SHA-256 taken from the original bytes before decoding, `logsUnsubscribe` acknowledgement handling | Import: it is a script module with fixed request IDs and file-sealing dependencies. The collector re-implements the few strict checks it needs                                                                                                                           |
 | `RaydiumCandidateSubscriptionCoordinator`                                                                                                             | The connection-epoch pattern: each attached transport captures its epoch, and stale-epoch messages and acknowledgements are dropped and counted. Also `logsSubscribe` with `mentions: [poolId]` for one exact pool                                                                            | The class: AMM v4 `TrackedRaydiumPoolContext`, direct `tracker.recordCollectionGap` writes, reconnection-gap bookkeeping and synthetic completeness-proof modes                                                                                                          |
-| Item 12 adapter and item 13 ledger                                                                                                                    | `CpmmAdapterBinding` (the pool and mint identity), `CpmmNotificationEnvelope` (the handoff shape) and `isValidSolanaSignature`. The adapter already accepts a notification with no `blockTime`                                                                                                | No change to either. The collector produces envelopes and the owner calls `ledger.account()`                                                                                                                                                                             |
+| Item 12 adapter and item 13 ledger                                                                                                                    | `CpmmAdapterBinding` (the pool and mint identity), `CpmmNotificationEnvelope` (the handoff shape) and `isValidSolanaSignature`. The adapter already accepts a notification with no `blockTime`                                                                                                | No change to either. The collector produces envelopes; the owner calls `ledger.account()` with a gate                                                                                                                                                                    |
 
-**Schema fact that drives the design**: a `logsNotification` carries `params.subscription`, `params.result.context.slot` and `params.result.value.{signature, err, logs}`. It carries **no block time**. The collector therefore emits notifications with `signature`, `slot` and the injected `receivedAtMs` only, and never a `blockTime`.
+**Schema fact**: a `logsNotification` carries `params.subscription`, `params.result.context.slot` and `params.result.value.{signature, err, logs}`. It carries **no block time**, so the collector never emits one.
 
-###### B. Proposed Files, Interfaces and Ownership
+###### B. Files, Ownership and API (as Implemented)
 
-**Files** (a later implementation step):
+| File                                                                                                                                    | Change                                                                                                         |
+| --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| [`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts)           | New, passive collector                                                                                         |
+| [`CpmmPoolNotificationCollector.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.test.ts) | New: 17 synthetic tests (N1–N15, with N13a–c)                                                                  |
+| `paper-pilot-handoff.ts` / `.test.ts`                                                                                                   | Exactly the two collector paths added to the allowlist; H-12 refuses six neighbouring unlisted collector files |
 
-- `backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts` (new);
-- `backend/src/candidate-scanner/CpmmPoolNotificationCollector.test.ts` (new);
-- the pin allowlist gains exactly these two files. No other file changes.
+**Ownership**: the future CPMM connection owner (not implemented) owns the transport, its lifetime, sending the frames the collector builds, the acknowledgement and keepalive deadlines, cancellation, closing, and handing envelopes to `ledger.account()` with a gate. It tags each frame with the epoch it captured at attach time and an injected receipt time, and it never reconnects, retries or falls back automatically. The ledger, adapter and shared session are unchanged; the session remains the sole request owner.
 
-**Ownership**:
-
-| Owner                                               | What it owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The future CPMM connection owner (not in this item) | The transport (created from an injected factory), its lifetime, sending the subscribe and unsubscribe frames the collector builds, the acknowledgement deadline, keepalive pings and pongs, cancellation, and closing. It tags each received frame with the epoch it captured at attach time and an injected host receipt time. It opens matching collector and ledger epochs, and it hands each returned envelope to `ledger.account()`. It never reconnects, retries or falls back automatically |
-| The collector                                       | Per-epoch subscription binding, frame classification, notification extraction, bounded records and counters, and epoch reports. No transport, timer, clock, `fetch`, session, adapter, ledger or tracker reference                                                                                                                                                                                                                                                                                 |
-| The ledger, adapter and shared session              | Unchanged: the ledger accounts envelopes, the adapter resolves through the session, and the session remains the sole request, pacing and budget owner                                                                                                                                                                                                                                                                                                                                              |
+**Imports**: `node:crypto` (SHA-256), the generic `isCanonicalSolanaBase58` (`research/pilot/RaydiumAmmParser.js`), `isValidSolanaSignature`, the CPMM decoder's program-ID constants (for refusing degenerate bindings), and types only from the adapter (`CpmmAdapterBinding`) and the ledger (`CpmmNotificationEnvelope`). No AMM v4 type is imported.
 
 ```typescript
-import type { CpmmAdapterBinding } from "./RaydiumCpmmTransactionSourceAdapter.js";
-import type { CpmmNotificationEnvelope } from "./CpmmResolutionAccountingLedger.js";
-
-/** All injected positive safe integers. No defaults and no live values. */
-export interface CpmmCollectorLimits {
-  readonly maxFrameBytes: number; // one frame; checked before decoding
-  readonly maxEpochFrames: number; // frames counted per epoch
-  readonly maxEpochBytes: number; // cumulative bytes per epoch
-  readonly maxRetainedFrameRecords: number; // frame metadata kept, collector-wide
-  readonly maxRetainedNotifications: number; // accepted-notification records kept, collector-wide
-  readonly maxEpochs: number; // retained epoch metadata
-}
-
-export interface CpmmCollectorEpochOpen {
-  readonly epoch: number; // safe integer >= 0, strictly increasing; the same number the owner gives the ledger
-  readonly observationStartMs: number; // HOST, positive safe integer
-  readonly subscribeRequestId: number; // positive safe integer, chosen by the owner
-}
-
-export type CpmmCollectorOpenResult =
-  | { readonly status: "OPENED"; readonly epoch: number; readonly subscribeFrame: Uint8Array } // the exact bytes to send
-  | {
-      readonly status: "REFUSED";
-      readonly code: "EPOCH_INVALID" | "EPOCH_NOT_INCREASING" | "EPOCH_CAPACITY";
-    };
-
-export interface CpmmCollectorFrame {
-  readonly epoch: number; // captured by the owner when it attached the transport
-  readonly bytes: Uint8Array; // the original message bytes (a string-delivering transport converts first)
-  readonly receivedAtMs: number; // HOST, injected; never read from a clock here
-}
-
-export type CpmmFrameDisposition =
-  // accepted
-  | "SUBSCRIBE_ACKNOWLEDGED"
-  | "NOTIFICATION_ACCEPTED"
-  | "UNSUBSCRIBE_ACKNOWLEDGED"
-  | "UNSUBSCRIBE_REJECTED"
-  // not decoded (counted only)
-  | "EPOCH_NOT_OPEN"
-  | "STALE_EPOCH"
-  | "RECEIPT_INVALID"
-  | "OVERSIZE_FRAME"
-  | "EPOCH_LIMIT_EXCEEDED"
-  // decoded but refused
-  | "INVALID_UTF8"
-  | "NOT_JSON"
-  | "MALFORMED_MESSAGE"
-  | "SUBSCRIBE_REJECTED"
-  | "DUPLICATE_ACKNOWLEDGEMENT"
-  | "MISMATCHED_RESPONSE_ID"
-  | "PRE_ACK_NOTIFICATION"
-  | "FOREIGN_SUBSCRIPTION"
-  | "UNEXPECTED_METHOD"
-  | "MALFORMED_NOTIFICATION";
-
-export interface CpmmCollectedNotification {
-  readonly sequence: number; // collector-wide order of acceptance
-  readonly epoch: number;
-  readonly subscriptionId: number;
-  readonly signature: string; // canonical, validated
-  readonly slot: number; // params.result.context.slot (source claim; the adapter later compares it)
-  readonly receivedAtMs: number; // HOST, injected
-  readonly notifiedTransactionError: "NULL" | "PRESENT"; // value.err; its content is never retained
-  readonly frameSha256: string;
-}
-
-export type CpmmFrameResult =
-  | {
-      readonly status: "ACCEPTED_NOTIFICATION";
-      readonly frameSequence: number;
-      readonly notification: CpmmCollectedNotification;
-      readonly envelope: CpmmNotificationEnvelope; // { notification: { signature, slot, receivedAtMs }, epoch, hostReceivedAtMs }
-      readonly recordRetained: boolean;
-    }
-  | {
-      readonly status: "RECORDED"; // every other disposition
-      readonly frameSequence: number;
-      readonly epoch: number | null; // null when unattributed
-      readonly disposition: CpmmFrameDisposition;
-      readonly blocking: boolean;
-      readonly code: string | null; // fixed detail code only
-    };
-
-export type CpmmEpochCloseReason =
-  | "OWNER_CLOSED" // after unsubscribe, or a deliberate owner stop
-  | "TRANSPORT_CLOSED"
-  | "TRANSPORT_ERROR"
-  | "CANCELLED"
-  | "ACK_TIMEOUT"
-  | "KEEPALIVE_TIMEOUT"
-  | "LIMIT_EXCEEDED"
-  | "SUPERSEDED"; // set by openEpoch() for the previous epoch
-
-export interface CpmmCollectionEpochReport {
-  readonly binding: CpmmAdapterBinding;
-  readonly epoch: number;
-  readonly observationStartMs: number;
-  readonly state: "AWAITING_ACK" | "SUBSCRIBED" | "UNSUBSCRIBE_PENDING" | "CLOSED";
-  readonly subscribeRequestId: number;
-  readonly subscriptionId: number | null;
-  readonly acknowledgedAtMs: number | null; // HOST receipt of the acknowledgement frame
-  readonly closedAtMs: number | null;
-  readonly closeReason: CpmmEpochCloseReason | null;
-  readonly frames: number; // exact, including frames not decoded
-  readonly bytes: number; // exact
-  readonly byDisposition: Readonly<Record<CpmmFrameDisposition, number>>;
-  readonly notificationsAccepted: number;
-  readonly notificationsWithTransactionError: number;
-  readonly blockingFrames: number;
-  readonly limitExceeded: boolean; // sticky
-  readonly collectionClean: boolean; // item F; never completeness
-  readonly notificationCompletenessEstablished: false;
-  readonly quietWindowEstablished: false;
-  readonly qualificationEligible: false;
-}
-
-export class CpmmPoolNotificationCollector {
-  constructor(options: {
-    readonly binding: CpmmAdapterBinding; // the adapter's getBinding()
-    readonly limits: CpmmCollectorLimits;
-    readonly commitment: "confirmed"; // matches the adapter's getTransaction commitment
-  });
-  openEpoch(open: CpmmCollectorEpochOpen): CpmmCollectorOpenResult; // closes the previous epoch (SUPERSEDED)
-  acceptFrame(frame: CpmmCollectorFrame): CpmmFrameResult; // synchronous; never throws
-  unsubscribeFrame(epoch: number, requestId: number): Uint8Array | null; // marks UNSUBSCRIBE_PENDING
-  closeEpoch(epoch: number, reason: CpmmEpochCloseReason, atMs: number): boolean;
-  epochReport(epoch: number): CpmmCollectionEpochReport | null;
-  notifications(): readonly CpmmCollectedNotification[]; // retained records, frozen copies
-  frameRecords(): readonly CpmmFrameRecord[]; // retained frame metadata, frozen copies
-  counters(): CpmmCollectorCounters; // collector-wide, exact, saturating
-  get version(): number;
-}
+new CpmmPoolNotificationCollector({ binding, limits, commitment: "confirmed" });
+// limits: maxFrameBytes, maxEpochFrames, maxEpochBytes, maxRetainedFrameRecords,
+//         maxRetainedNotifications, maxEpochs (injected positive safe integers, no defaults)
+openEpoch({ epoch, observationStartMs, subscribeRequestId }); // OPENED (+ exact subscribe bytes) | REFUSED
+acceptFrame({ epoch, bytes, receivedAtMs }); // ACCEPTED_NOTIFICATION (+ envelope) | RECORDED; never throws
+unsubscribeFrame(epoch, requestId); // the one logsUnsubscribe of an open, acknowledged epoch, or null
+closeEpoch(epoch, reason, atMs); // true only for the first close
+epochReport(epoch);
+notifications();
+frameRecords();
+counters();
+version;
+cpmmCollectorSaturatingAdd(value, delta); // the exported counter helper
 ```
 
-`CpmmFrameRecord` holds the frame sequence, epoch (or `null`), receipt time, byte length, SHA-256 of the original bytes (`null` when the frame was not hashed because it exceeded `maxFrameBytes`), disposition and fixed code. `CpmmCollectorCounters` holds total frames and bytes, unattributed frames, dropped frame records, dropped notification records, refused `openEpoch` calls, and a sticky `saturated` flag.
+**Binding**: the pool and mint are **owner-supplied** (from the adapter's `getBinding()`); the collector does not verify them on-chain. Construction refuses (`[CPMM_COLLECTOR_INIT]`) anything but exact options, `commitment: "confirmed"`, canonical base58 addresses, a pool different from the mint, and positive safe-integer limits. It also refuses obvious program-wide or degenerate bindings: the system, CPMM, AMM v4, SPL Token, Token-2022, associated-token, memo and compute-budget programs, the CPMM authority, the rent and clock sysvars, and the WSOL mint.
 
-**Construction** refuses (throws `[CPMM_COLLECTOR_INIT]`) unless options are exactly these keys, read with the null-prototype copier; `binding.poolAddress` and `binding.candidateMint` are canonical base58 public keys; `commitment` is `"confirmed"`; and every limit is a positive safe integer.
+###### C. Protocol Binding (as Implemented)
 
-###### C. Subscription Binding (Requirement 2)
+- **Subscribe frame**: `{"jsonrpc":"2.0","id":<subscribeRequestId>,"method":"logsSubscribe","params":[{"mentions":["<poolAddress>"]},{"commitment":"confirmed"}]}`, byte-exact, returned as a fresh copy.
+- **Epochs**: strictly increasing; the same numbers the owner gives the ledger. Every `openEpoch()` call, opened or refused, closes the open epoch with `SUPERSEDED`; an epoch that was already closed keeps its original cause.
+- **Acknowledgement**: only a response of exactly `{jsonrpc, id, result}` or `{jsonrpc, id, error:{code, message[, data]}}` with `id === subscribeRequestId` (a number, compared strictly) is considered. The first such response is consumed: a non-negative safe-integer `result` binds the subscription (`SUBSCRIBE_ACKNOWLEDGED`); a valid error is `SUBSCRIBE_REJECTED`; any other shape is `MALFORMED_MESSAGE` with the subscription marked `MALFORMED_RESPONSE`. Every later response with that ID is `DUPLICATE_RESPONSE` and never rebinds.
+- **Other responses** are `MISMATCHED_RESPONSE_ID`, unless they answer the epoch's one unsubscribe request.
+- **Unsubscribe**: `unsubscribeFrame()` builds at most one `logsUnsubscribe` per epoch, only for an open, acknowledged epoch and a request ID different from the subscribe ID. The report keeps `NOT_BUILT`, `SENT_UNOBSERVED`, `ACKNOWLEDGED` or `REJECTED`, so an acknowledgement that was never observed stays visible. A rejection is not blocking.
+- **Notifications** before an acknowledgement are `PRE_ACK_NOTIFICATION`; with another subscription ID, `FOREIGN_SUBSCRIPTION`; for a closed epoch, `STALE_EPOCH`; for an unopened epoch, `EPOCH_NOT_OPEN` (unattributed). None is forwarded.
+- **Diagnostics** are fixed codes only.
 
-- **Pool and mint**: the collector is bound to one `CpmmAdapterBinding`, which the owner takes from `adapter.getBinding()`, so collector, adapter, tracker and ledger agree on identity. The subscribe frame is built only from that pool address: `{"jsonrpc":"2.0","id":<subscribeRequestId>,"method":"logsSubscribe","params":[{"mentions":["<poolAddress>"]},{"commitment":"confirmed"}]}`, byte for byte. The mint is not part of the filter; it binds outputs and later resolution.
-- **Epoch**: `openEpoch()` requires a strictly increasing epoch and closes the previous one with `SUPERSEDED`. Any refusal also closes the open epoch (the accepted ledger policy). The owner uses the same epoch number for `ledger.openEpoch()`.
-- **Acknowledgement**: in `AWAITING_ACK`, only a response that is exactly `{jsonrpc:"2.0", id, result}` or `{jsonrpc:"2.0", id, error:{code, message[, data]}}` with `id === subscribeRequestId` is an acknowledgement. A `result` that is a non-negative safe integer gives `SUBSCRIBE_ACKNOWLEDGED` and binds the subscription ID. An `error` gives `SUBSCRIBE_REJECTED` (blocking, epoch stays unsubscribed). Any other `result` is `MALFORMED_MESSAGE`.
-- **Other responses**: a response with any other `id` is `MISMATCHED_RESPONSE_ID`. A second acknowledgement for the subscribe ID is `DUPLICATE_ACKNOWLEDGEMENT`. Both are blocking and never rebind the subscription.
-- **Unsubscribe**: `unsubscribeFrame(epoch, requestId)` builds `logsUnsubscribe` for the bound subscription with a different request ID and moves the epoch to `UNSUBSCRIBE_PENDING`. A matching `result: true` is `UNSUBSCRIBE_ACKNOWLEDGED`; `false` or an error is `UNSUBSCRIBE_REJECTED` (not blocking for frames already received; notifications keep being accepted until the owner closes the epoch).
-- **Pre-acknowledgement messages**: a `logsNotification` before the acknowledgement is `PRE_ACK_NOTIFICATION`, blocking. It cannot be bound to the subscription, so it is not forwarded.
-- **Unexpected subscription IDs**: a notification whose `params.subscription` differs from the bound ID is `FOREIGN_SUBSCRIPTION`, blocking, never re-routed.
-- **Stale and unopened epochs**: a frame tagged with a closed epoch is `STALE_EPOCH` (attributed to that epoch and blocking for it, because a late message for a closed epoch is lost to it). A frame tagged with an epoch that was never opened is `EPOCH_NOT_OPEN`, unattributed. Neither is decoded.
+###### D. Extraction and Failed-Status Claims (as Implemented)
 
-###### D. Faithful Extraction (Requirement 3)
+A notification is accepted only when it is exactly `{jsonrpc:"2.0", method:"logsNotification", params:{subscription, result:{context, value}}}`; `context` has `slot` (a non-negative safe integer) and optionally a string `apiVersion`; `value` has exactly `signature` (canonical), `err` (present, any value) and `logs` (an array of strings or `null`). Anything else claiming to be a notification is `MALFORMED_NOTIFICATION`; any other method is `UNEXPECTED_METHOD`.
 
-A notification is accepted only from a frame that decodes to exactly `{jsonrpc:"2.0", method:"logsNotification", params:{subscription, result:{context, value}}}` where:
+| Output                     | Source                                                         |
+| -------------------------- | -------------------------------------------------------------- |
+| `signature`                | `value.signature`                                              |
+| `slot`                     | `context.slot` (a source claim; the adapter later compares it) |
+| `receivedAtMs`             | the owner's injected receipt time                              |
+| `notifiedTransactionError` | `"NULL"` when `value.err === null`, otherwise `"PRESENT"`      |
+| block time                 | **never produced**                                             |
 
-- `params.subscription` equals the bound subscription ID;
-- `context.slot` is a non-negative safe integer (`context` may also carry `apiVersion`; any other key is malformed);
-- `value` has exactly `signature`, `err` and `logs`; `signature` passes `isValidSolanaSignature`; `err` is present (`null` or any non-null JSON value); `logs` is an array of strings or `null`.
+The envelope is exactly `{ notification: { signature, slot, receivedAtMs }, epoch, hostReceivedAtMs: receivedAtMs }`.
 
-Anything else that claims to be a `logsNotification` is `MALFORMED_NOTIFICATION` (blocking). Any other method is `UNEXPECTED_METHOD` (blocking).
+**Failed-status claims (clarification 1)**: a `PRESENT` claim is forwarded (never discarded, never zero-swap evidence), counted in `notificationsWithTransactionError`, and marked blocking, so the epoch cannot be `collectionClean`. The claim is not trusted either way: if retrieval agrees, the ledger records a policy-pending failed transaction; if retrieval contradicts it with a successful swap, the ledger alone could be complete, but the collector epoch still is not clean (N13b). The `err` content and the logs are never retained.
 
-**Fields populated**:
+###### E. Validation Order, Limits, Retention and Credentials (as Implemented)
 
-| Output field               | Source                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------ |
-| `signature`                | `params.result.value.signature`                                                            |
-| `slot`                     | `params.result.context.slot`                                                               |
-| `receivedAtMs`             | the owner's injected receipt time for the frame                                            |
-| `notifiedTransactionError` | `"NULL"` when `value.err === null`, otherwise `"PRESENT"`                                  |
-| `blockTime`                | **never set**: the schema has none, and receipt time is never converted into on-chain time |
+**Per frame** (nothing is copied, hashed or decoded before step 4):
 
-- **Failed transactions stay visible**: a notification with a non-null `err` is accepted like any other. Its envelope goes to the ledger, the adapter resolves it, and it becomes `RECORDED_FAILED_TRANSACTION`, which stays policy-pending and blocking. The collector also counts it in `notificationsWithTransactionError`. It is never dropped and never zero-swap evidence. The `err` content and the `logs` are not retained (the adapter retrieves the transaction itself).
-- **Envelope**: `{ notification: { signature, slot, receivedAtMs }, epoch, hostReceivedAtMs: receivedAtMs }`. It satisfies the ledger's receipt agreement by construction and carries no key the adapter would refuse.
+1. **Frame envelope**: a plain data record with exactly `epoch`, `bytes` and `receivedAtMs`, read through the null-prototype copier; `bytes` must be a genuine `Uint8Array` view (a `Buffer` is accepted; a string, array, `DataView` or proxy is not); `epoch` a non-negative safe integer. Otherwise `FRAME_INVALID`, unattributed. Any unexpected internal exception is also returned as `FRAME_INVALID` (`PROCESSING_EXCEPTION`): `acceptFrame()` never throws.
+2. **Epoch**: unopened gives `EPOCH_NOT_OPEN`; closed gives `STALE_EPOCH`.
+3. **Acquisition limits**: an epoch already latched gives `EPOCH_LIMIT_EXCEEDED` (`LATCHED`); a frame over `maxFrameBytes` gives `OVERSIZE_FRAME`; reaching beyond `maxEpochFrames` or `maxEpochBytes` gives `EPOCH_LIMIT_EXCEEDED` (`FRAMES` or `BYTES`). Each breach latches the epoch: no later frame of that epoch is decoded or forwarded.
+4. **Receipt**: positive safe integer, not before the epoch's start and not before the epoch's previous valid receipt; otherwise `RECEIPT_INVALID`.
+5. **Process**: one copy of exactly the supplied view range, SHA-256 of that copy, strict UTF-8 (`INVALID_UTF8`; a byte-order mark is kept and fails JSON), `JSON.parse` (`NOT_JSON`), then the shape checks of items C and D on null-prototype copies.
 
-###### E. Limits, Malformed Input, Omitted Evidence and Credentials (Requirement 4)
+**Collection versus retained evidence (clarification 4)**: frame records keep sequence, epoch, receipt, byte length, SHA-256 (or `null` when not hashed), disposition, blocking flag and fixed code; notification records keep the item D fields and the frame hash. **Raw payloads are never retained, so raw protocol replay is unavailable, and these metadata records are not a sealed or replayable capture** (`rawPayloadRetained: false`, `replayableCaptureEstablished: false`). Records beyond `maxRetainedFrameRecords` or `maxRetainedNotifications` are dropped and counted per epoch and collector-wide; `metadataRetention.complete` becomes `false`. This is reported independently of `collectionClean`: a clean collection can have incomplete metadata (N11). Dropping a record never drops an envelope.
 
-**Order of checks for each frame** (nothing is decoded before step 4):
+**Credentials**: the collector never sees the endpoint URL or a secret, built frames contain only the pool address and IDs, payloads are not retained, and diagnostics are fixed codes. A frame containing credential-like text leaves only its length and hash (N12).
 
-1. Assign a frame sequence; count the frame and its byte length (`bytes.byteLength`) collector-wide.
-2. **Epoch**: unopened gives `EPOCH_NOT_OPEN`; closed gives `STALE_EPOCH`. Not decoded.
-3. **Receipt**: `receivedAtMs` must be a positive safe integer, not before the epoch's `observationStartMs`, and not before the previous frame of the epoch; otherwise `RECEIPT_INVALID`. Not decoded.
-4. **Limits**: a frame over `maxFrameBytes` is `OVERSIZE_FRAME` (not hashed, not decoded). If the epoch would exceed `maxEpochFrames` or `maxEpochBytes`, or has already exceeded either, the frame is `EPOCH_LIMIT_EXCEEDED` (not decoded). Both set the epoch's sticky `limitExceeded`; the owner is expected to close with `LIMIT_EXCEEDED`.
-5. **Hash and decode**: SHA-256 of the original bytes, then strict UTF-8 (`INVALID_UTF8` on any invalid sequence, never replacement characters), then `JSON.parse` (`NOT_JSON`), then the shape checks of items C and D.
+**Immutability**: results, records, reports and counters are deep-frozen plain data. Built frames are fresh `Uint8Array` copies; the caller's input bytes are copied once and never retained, so mutating either side afterwards changes nothing (N1, N11).
 
-**Retention and omitted evidence**:
+###### F. Dispositions, Handoff and the Owner's Conjunction (as Implemented)
 
-- **No raw payload is retained.** Each frame keeps only its metadata record (sequence, epoch, receipt, byte length, SHA-256, disposition, fixed code), and accepted notifications keep only the fields in item D. This is explicit omitted evidence, not an omission by accident: raw-frame retention for replay belongs to a separate sealing step (item H, decision 1).
-- Frame records beyond `maxRetainedFrameRecords` and notification records beyond `maxRetainedNotifications` are not kept, but every counter stays exact (`frameRecordsDropped`, `notificationRecordsDropped`, and `recordRetained: false` on the result). Dropping a record never drops the envelope: accounting continues in the ledger.
-- Counters saturate at `Number.MAX_SAFE_INTEGER` with a sticky, blocking `saturated` flag.
+| Disposition                                                                                                                                                                                                          | Decoded                | Forwarded         | Blocking                              |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------- | ------------------------------------- |
+| `NOTIFICATION_ACCEPTED`                                                                                                                                                                                              | Yes                    | Yes, one envelope | Only when `err` is `PRESENT`          |
+| `SUBSCRIBE_ACKNOWLEDGED`, `UNSUBSCRIBE_ACKNOWLEDGED`, `UNSUBSCRIBE_REJECTED`                                                                                                                                         | Yes                    | No                | No                                    |
+| `FRAME_INVALID`, `EPOCH_NOT_OPEN`                                                                                                                                                                                    | No                     | No                | Unattributed: every report is unclean |
+| `STALE_EPOCH`, `RECEIPT_INVALID`, `OVERSIZE_FRAME`, `EPOCH_LIMIT_EXCEEDED`                                                                                                                                           | No                     | No                | Yes                                   |
+| `INVALID_UTF8`, `NOT_JSON`, `MALFORMED_MESSAGE`, `SUBSCRIBE_REJECTED`, `DUPLICATE_RESPONSE`, `MISMATCHED_RESPONSE_ID`, `PRE_ACK_NOTIFICATION`, `FOREIGN_SUBSCRIPTION`, `UNEXPECTED_METHOD`, `MALFORMED_NOTIFICATION` | Yes (as far as needed) | No                | Yes                                   |
 
-**Credentials**: the collector never receives the endpoint URL or any secret, and the subscribe and unsubscribe frames contain only the pool address, request IDs and subscription ID. Because payloads are not retained and diagnostics are fixed codes only, provider text (including any echoed credential) cannot reach outputs. The only payload-derived values kept are a validated base58 signature, integers and a whole-frame SHA-256.
+- **Duplicates stay visible**: the collector does not deduplicate; every accepted notification yields its own envelope, and the ledger records repeats as duplicate occurrences (N13a).
+- **`collectionClean`** is true only if the subscription was acknowledged, the epoch has no blocking frame and no failed-status claim, no acquisition limit was latched, the epoch is open or was first closed with `OWNER_CLOSED`, and the collector has no unattributed frame and no saturated counter. Every term is monotonic, so once false it stays false.
+- **Conjunction for the future owner**: a window can be considered only when the ledger summary is `accountingComplete` **and** the collector report for the same epoch is `collectionClean` (N13a–b). Both together still prove nothing about notifications the provider never sent, and the qualification flags stay literal `false`.
 
-**Immutability**: all results, records and reports are deep-frozen copies holding only strings, numbers, booleans and `null`. The subscribe and unsubscribe frames are returned as a fresh `Uint8Array` copy on each call (typed arrays cannot be frozen), so mutating one cannot affect the collector. The collector never keeps a reference to a caller's `bytes`.
+###### G. Closure, Monotonicity and Disconnect Ownership (as Implemented)
 
-###### F. Dispositions, Handoff and Uncertainty (Requirement 5)
+- **Close reasons**: `OWNER_CLOSED`, `TRANSPORT_CLOSED`, `TRANSPORT_ERROR`, `CANCELLED`, `ACK_TIMEOUT`, `KEEPALIVE_TIMEOUT`, `LIMIT_EXCEEDED`, `SUPERSEDED`. Only the first close of an epoch is recorded; a repeated close, a later `OWNER_CLOSED` cleanup, an invalid reason or time, or an unknown epoch returns `false` and changes nothing (not even the version). Frames after a close, including a late acknowledgement, are `STALE_EPOCH` and make the epoch dirty for good (N10).
+- **Disconnect ownership (clarification 2)**: after an abnormal collector closure, the future owner stops outstanding ledger work with the existing gate: a `refusal` that reads the collector report (refusing once the epoch closed with any reason other than `OWNER_CLOSED`) and its own `AbortSignal` for cancellation. N13c demonstrates both with an injected fake owner: an in-flight resolution is refused at the post-await check (`LATE_RESPONSE`, `CANCELLED`, nothing ingested), and an aborted one ends `CANCELLED_IN_FLIGHT`. No ledger `closeEpoch()` is needed, and the collector never calls or cancels the ledger. A graceful drain policy (waiting for the unsubscribe acknowledgement, or letting already-received notifications finish) remains outside this task.
 
-Every frame yields exactly one disposition, and every disposition is counted in its epoch (or unattributed).
+###### H. Tests, Mutation Checks and Results
 
-| Disposition                                                                                                                                                                                                                 | Decoded                | Forwarded to the ledger | Blocking for the epoch            |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------- | --------------------------------- |
-| `NOTIFICATION_ACCEPTED` (including a non-null `err`)                                                                                                                                                                        | Yes                    | Yes, as one envelope    | No (the ledger decides)           |
-| `SUBSCRIBE_ACKNOWLEDGED`, `UNSUBSCRIBE_ACKNOWLEDGED`, `UNSUBSCRIBE_REJECTED`                                                                                                                                                | Yes                    | No                      | No                                |
-| `STALE_EPOCH`, `RECEIPT_INVALID`, `OVERSIZE_FRAME`, `EPOCH_LIMIT_EXCEEDED`                                                                                                                                                  | No                     | No                      | Yes                               |
-| `EPOCH_NOT_OPEN`                                                                                                                                                                                                            | No                     | No                      | Unattributed; blocks every report |
-| `INVALID_UTF8`, `NOT_JSON`, `MALFORMED_MESSAGE`, `SUBSCRIBE_REJECTED`, `DUPLICATE_ACKNOWLEDGEMENT`, `MISMATCHED_RESPONSE_ID`, `PRE_ACK_NOTIFICATION`, `FOREIGN_SUBSCRIPTION`, `UNEXPECTED_METHOD`, `MALFORMED_NOTIFICATION` | Yes (as far as needed) | No                      | Yes                               |
+| Test | Covers                                                                                                                                                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| N1   | Construction, degenerate bindings, byte-exact subscribe and unsubscribe frames, one unsubscribe per epoch, mutable returned bytes                                                                                  |
+| N2   | Acknowledgement binding, rejection, malformed and duplicate responses, string IDs, unsubscribe acknowledgement and rejection                                                                                       |
+| N3   | Pre-acknowledgement and foreign-subscription notifications                                                                                                                                                         |
+| N4   | Extraction of signature, slot and receipt only; no block time; strict shapes                                                                                                                                       |
+| N5   | Failed-status claims forwarded, retained as `PRESENT` and blocking                                                                                                                                                 |
+| N6   | Acquisition limits before hashing and decoding (a `JSON.parse` spy), exact boundaries, latching, post-limit frames                                                                                                 |
+| N7   | Invalid UTF-8, byte-order mark, non-JSON, arrays, `__proto__`; malformed frame envelopes (null, extra keys, string, array, `DataView`, proxy, getter, negative epoch) never throw; only the supplied range is read |
+| N8   | Invalid and decreasing receipts refused before decoding                                                                                                                                                            |
+| N9   | Strictly increasing epochs, supersession preserving an earlier cause, stale and unopened frames, capacity                                                                                                          |
+| N10  | Every close reason, repeated and later closes, late frames, invalid close requests, unattributed frames, dirtiness before acknowledgement                                                                          |
+| N11  | Dropped frame and notification metadata, retention completeness independent of collection, saturation helper, frozen snapshots, mutable input bytes                                                                |
+| N12  | Credential-like content leaves no trace                                                                                                                                                                            |
+| N13a | Handoff to the real ledger; duplicates; a dirty collector epoch blocks the conjunction                                                                                                                             |
+| N13b | A failed-status claim with an agreeing failed response and with a contradictory successful swap: neither is eligible                                                                                               |
+| N13c | A fake owner stops outstanding ledger work after abnormal closure (refusal) and cancellation (abort)                                                                                                               |
+| N14  | Conservation after every step of a mixed multi-epoch sequence                                                                                                                                                      |
+| N15  | Source boundaries and exact imports                                                                                                                                                                                |
 
-- **Handoff**: the owner calls `ledger.account(result.envelope, gate)` for every `ACCEPTED_NOTIFICATION`, in frame order, without waiting for collection to end. The collector never calls the ledger, so it never causes a request.
-- **Duplicates remain visible**: the collector does not deduplicate. Every accepted notification, including a repeated signature, produces its own envelope, and the ledger records the repetition as a duplicate occurrence in its receiving epoch.
-- **Collection failures reach the owner as uncertainty**: `epochReport(epoch)` gives exact per-disposition counts. `collectionClean` is true only if the epoch was acknowledged, has zero blocking frames, never exceeded a limit, no unattributed frame or saturation exists collector-wide, and the epoch is open or was closed with `OWNER_CLOSED`. It is never completeness: the three flags stay literal `false`.
-- **Combination rule for the future owner and reconciliation**: a window can be considered only if the ledger summary is `accountingComplete` **and** the collector report for the same epoch is `collectionClean`. Neither alone is sufficient, and both together still prove nothing about notifications never sent by the provider.
+**Mutation checks** (each run under an external 60-second limit; source restored and hash-checked after each):
 
-###### G. Epoch Closure, Disconnect, Cancellation, Late Messages and Cleanup (Requirement 6)
+- Collector: 22 of 22 killed. They cover the oversize check, the latch, the byte boundary, the frame-count boundary, acknowledgement ID binding, foreign subscriptions, the pre-acknowledgement rule, a fabricated block time, failed-status blocking, failed-claim dropping, stale epochs, envelope-versus-record separation, abnormal-close cleanliness, first-close permanence, a second unsubscribe, reading the whole backing buffer, frame-envelope keys, receipt monotonicity, degenerate bindings, duplicate acknowledgements, retention completeness, and unattributed frames. One (retention completeness ignoring dropped notification records) survived at first; an N11 case with only notification records dropped now kills it.
+- Pin: 2 of 2 killed (a missing allowlisted collector file, an allowlisted neighbouring file).
 
-| Event (handled by the owner)                       | Owner action                                           | Collector effect                                                                     |
-| -------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| Deliberate stop                                    | Send `unsubscribeFrame(...)`, then close the transport | `UNSUBSCRIBE_PENDING`, then `closeEpoch(OWNER_CLOSED)`: clean if nothing else blocks |
-| Transport `close` or `error`                       | Stop; no reconnect                                     | `closeEpoch(TRANSPORT_CLOSED or TRANSPORT_ERROR)`: not clean                         |
-| Acknowledgement deadline passed (owner timer)      | Close the transport                                    | `closeEpoch(ACK_TIMEOUT)`: not clean                                                 |
-| Keepalive pong deadline passed (owner timer)       | Close the transport                                    | `closeEpoch(KEEPALIVE_TIMEOUT)`: not clean                                           |
-| Cancellation (owner's `AbortSignal`)               | Best-effort unsubscribe, close the transport           | `closeEpoch(CANCELLED)`: not clean                                                   |
-| A limit exceeded                                   | Close the transport                                    | `closeEpoch(LIMIT_EXCEEDED)`: not clean                                              |
-| A new connection (only by explicit owner decision) | `openEpoch(next)` on both collector and ledger         | The previous epoch closes with `SUPERSEDED`: not clean                               |
-| A frame arrives after its epoch closed             | Pass it with its captured epoch                        | `STALE_EPOCH`, counted and blocking for the closed epoch, never decoded or forwarded |
+**Results** (2026-11-19, each command under an external 60-second limit):
 
-- **Connection lifetime, subscription and keepalive** belong to the future CPMM connection owner, which may reuse `ISolanaKeepaliveWebSocketTransport` and the keepalive principles of `BoundedAmmV4CreationWatch`. No automatic retry, reconnect or provider fallback is added anywhere.
-- **The ledger epoch** stays open after a collector epoch closes, until the owner opens the next one. Notifications already received keep resolving, which is correct because they were genuinely received. The collector simply produces no further envelopes for the closed epoch (item H, decision 2).
-- **Cleanup**: the collector holds no resources; `closeEpoch` only records state. After all epochs close, reports stay readable and immutable.
+| Check                                                                                                  | Result                                     |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| Collector suite                                                                                        | 17/17                                      |
+| Focused set: collector, ledger, adapter, decoder, tracker, `paper-pilot-handoff`, `fresh-amm-v4-watch` | 142/142 (17 + 24 + 21 + 16 + 40 + 13 + 11) |
+| Backend typecheck (`tsc --noEmit`)                                                                     | Clean                                      |
+| ESLint and Prettier on the four changed source and test files                                          | Clean                                      |
+| Wallet `.tmp/virtual-wallet.json`                                                                      | Unchanged (`7F2C2353…ED9`)                 |
 
-###### H. Boundaries (Requirement 7) and Unresolved Tradeoffs
+###### I. Limitations
 
-**Boundaries**:
+- **Isolated and synthetic**: nothing constructs the collector outside tests, and every frame is a local literal. The real provider's notification shape for a CPMM pool `mentions` subscription is unconfirmed; strict shapes may refuse a provider that adds fields.
+- **Owner-supplied identity**: the pool and mint come from the owner and are not verified on-chain here.
+- **No raw replay**: only hashes and extracted fields are retained; a sealed, replayable capture needs a separate sealing step and a reviewed shared credential scanner.
+- **Failed-status claims block** until a failure-status validation policy exists.
+- **Graceful drain** (waiting for the unsubscribe acknowledgement before closing) is owner policy; without it, a late acknowledgement arrives as `STALE_EPOCH` and keeps the epoch dirty.
 
-- No HTTP call, `fetch`, transaction retrieval, session, adapter or ledger call, clock read, timer, socket, `AbortController` or tracker write inside the collector.
-- The shared session remains the only request owner; the adapter and ledger keep their existing responsibilities unchanged.
-- Collection alone proves neither complete history nor a quiet or qualified window; anchored history enumeration and reconciliation remain separate prerequisites.
+###### J. Remaining Prerequisites Before Any CPMM Flow Qualification
 
-**Routine choices settled by accepted policy**: limits are injected with no defaults; refused or superseded epochs fail closed; every frame is accounted; duplicates are not removed before the ledger; failed-transaction notifications are forwarded and stay policy-pending; strict UTF-8 and strict JSON-RPC shapes; fixed codes only; no `blockTime` is ever synthesised.
-
-**Material unresolved tradeoffs**:
-
-1. **Raw-frame retention**: this design keeps hashes and extracted fields only. Keeping raw frames for offline replay and sealing would need item 12's credential scanner shared by both components (a separately reviewed extraction from the adapter). Recommended: defer to a sealing step and keep the collector payload-free.
-2. **Disconnect and outstanding resolutions**: a transport loss does not stop ledger resolutions of notifications already received, because the ledger has no close-only call. Recommended: keep it so (those notifications are genuine). The alternative needs a reviewed ledger `closeEpoch()`.
-3. **Schema strictness**: unknown keys in `context` (other than `apiVersion`) or `value` make a notification `MALFORMED_NOTIFICATION`. This fails closed, but a provider that adds fields would make every notification blocking. Recommended: keep strict until a sealed CPMM subscription capture shows the provider's exact shape, then allowlist specific keys if needed.
-
-###### I. Synthetic Test Matrix (Proposed)
-
-Harness: synthetic frames as literal bytes with injected receipt times; no transport, socket or network. The handoff group also uses the item 13 ledger harness (real session with virtual clock, scripted in-memory `fetch`, real adapter and tracker).
-
-| Group                      | Cases                                                                                                                                                                                                                            |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| N1 Construction and frames | Exact options, canonical binding, injected limits with no defaults; the subscribe and unsubscribe frames are byte-exact and contain only the pool address and IDs                                                                |
-| N2 Acknowledgement         | Correct ID binds; error gives `SUBSCRIBE_REJECTED`; wrong ID, duplicate acknowledgement, non-integer, negative or extra-key responses are refused and never rebind                                                               |
-| N3 Pre-ack and foreign     | A notification before the acknowledgement and one with another subscription ID are blocking and produce no envelope                                                                                                              |
-| N4 Extraction              | Signature, `context.slot` and the injected receipt only; no `blockTime` key in the envelope; `apiVersion` tolerated; any other unknown key, a missing `err`, a non-canonical signature or a bad slot is `MALFORMED_NOTIFICATION` |
-| N5 Failed transactions     | A non-null `err` is accepted, counted, forwarded, and becomes `RECORDED_FAILED_TRANSACTION` / policy-pending in the ledger                                                                                                       |
-| N6 Byte and message limits | `maxFrameBytes` checked before hashing or decoding (a decoder spy is never called); per-epoch frame and byte ceilings; sticky `limitExceeded`; exact counts on both sides of each boundary                                       |
-| N7 Malformed input         | Invalid UTF-8, a byte-order mark, non-JSON, arrays, `__proto__` keys and wrong `jsonrpc`: each has its disposition, is blocking and is never forwarded                                                                           |
-| N8 Receipt                 | Non-positive, before the epoch start and decreasing receipts are `RECEIPT_INVALID` and not decoded                                                                                                                               |
-| N9 Epochs                  | Strictly increasing; refused or superseded opens close the previous epoch; stale and unopened frames are counted, attributed correctly and never decoded                                                                         |
-| N10 Close reasons          | Each reason in item G; only `OWNER_CLOSED` after a clean epoch is `collectionClean`; late frames after close are `STALE_EPOCH`                                                                                                   |
-| N11 Retention              | Record limits drop records but never envelopes; counters stay exact; saturation helper; outputs deep-frozen and unchanged by later frames                                                                                        |
-| N12 Credentials            | Frames containing a configured-looking secret leave no trace in any output except their length and hash; diagnostics are fixed codes                                                                                             |
-| N13 Handoff                | Envelopes accepted by the real ledger; a repeated signature becomes a ledger duplicate in its receiving epoch; a collector-dirty epoch with a ledger-complete window is never treated as clean                                   |
-| N14 Conservation           | After every step: collector frames equal the sum of per-epoch frames plus unattributed; each epoch's frames equal the sum of its dispositions; accepted notifications equal returned envelopes                                   |
-| N15 Source boundaries      | No `fetch`, timers, `Date.now`, `AbortController`, session, adapter or ledger calls, transport methods or tracker writes; imports limited to types from the adapter and ledger plus `isValidSolanaSignature`                     |
-
-**Acceptance**: every case passes, with targeted mutation checks on the pre-decode byte check, acknowledgement ID binding, subscription ID matching, the pre-ack rule, the no-`blockTime` rule, failed-transaction forwarding, stale-epoch handling, record-versus-envelope separation and the `collectionClean` conjunction; typecheck, lint and formatting pass; only the listed files change.
-
-###### J. Smallest Recommended Implementation Scope and Prerequisites
-
-**Smallest step**: implement `CpmmPoolNotificationCollector.ts` and its test file as an isolated, unwired, passive module, and add exactly those two files to the pin allowlist with focused refusal tests for neighbouring unlisted files. Nothing else: no connection owner, transport, keepalive, sealing, ledger or adapter change, provider or admission wiring.
-
-**Remaining prerequisites before any CPMM flow qualification**:
-
-- **Connection owner**: a reviewed CPMM connection owner (injected transport factory, subscribe and unsubscribe sending, acknowledgement and keepalive deadlines, cancellation, no reconnect) and the observer fan-out for the session's single `onExchangeComplete`.
+- **Connection owner**: a reviewed CPMM connection owner (injected transport factory, sending the built frames, acknowledgement and keepalive deadlines, cancellation, the gate described in item G, no reconnect) and the observer fan-out for the session's single `onExchangeComplete`.
 - **Live shape confirmation**: a separately approved, sealed CPMM pool subscription capture confirming that `logsSubscribe` with `mentions: [poolAddress]` delivers the expected notifications and their exact shape.
-- **History and reconciliation**: an anchored, witnessed history enumeration through the shared session and a CPMM reconciliation evaluator that combines ledger summaries, collector reports and a proven cutoff.
-- **Policies and evidence**: reviewed no-target-swap and failed-transaction policies, and CPMM LP and security evidence (Stage 4).
+- **History and reconciliation**: anchored, witnessed history through the shared session and a CPMM reconciliation evaluator combining ledger summaries, collector reports and a proven cutoff.
+- **Policies and evidence**: reviewed failure-status validation, no-target-swap and failed-transaction policies, and CPMM LP and security evidence (Stage 4).
 - **Wiring review**: independent review of the whole wiring.
 
 CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
