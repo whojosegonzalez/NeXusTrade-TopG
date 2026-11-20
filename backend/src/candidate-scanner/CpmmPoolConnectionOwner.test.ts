@@ -553,6 +553,8 @@ interface EnvOptions {
   trackerClock?: boolean;
   /** While `invalid`, only the owner's view of the session clock returns NaN. */
   ownerClock?: { invalid: boolean };
+  /** Runs inside every `clearTimeout` call (injected timer code outside the transport). */
+  onClearTimeout?: (e: Env) => void;
 }
 
 function env(o: EnvOptions = {}): Env {
@@ -567,6 +569,7 @@ function env(o: EnvOptions = {}): Env {
     },
     clearTimeout: (h) => {
       if (!o.ignoreClear) queue.delete(h as number);
+      o.onClearTimeout?.(e);
     },
   };
   const clock = () => (state.override.length > 0 ? state.override.shift()! : state.now);
@@ -2361,6 +2364,205 @@ describe("CPMM pool connection owner (synthetic, offline)", () => {
     expect(r.cleanup.endedAtMs).toBe(NOMINAL_END);
     expect(r.settledAtMs).toBe(NOMINAL_END + 5);
     expect(r.connectionRunClean).toBe(true);
+  });
+
+  // --- finalization boundary: changes made by external code during final disposal ------------
+
+  type FinalAction =
+    | "ABORT"
+    | "SESSION_STOP"
+    | "COLLECTOR_EPOCH"
+    | "COLLECTOR_FRAME"
+    | "LEDGER_EPOCH"
+    | "NONE";
+  const finalAction: Record<FinalAction, (e: Env) => void> = {
+    ABORT: (e) => e.abort.abort(),
+    SESSION_STOP: (e) => e.session.stop("FINALIZATION"),
+    COLLECTOR_EPOCH: (e) => {
+      const r = e.collector.openEpoch({
+        epoch: 2,
+        observationStartMs: e.state.now,
+        subscribeRequestId: SUB_REQ + 100,
+      });
+      expect(r.status).toBe("OPENED");
+    },
+    COLLECTOR_FRAME: (e) => {
+      // A foreign frame for the closed epoch 1: counted against that epoch by the collector.
+      e.collector.acceptFrame({ epoch: 1, bytes: notif(), receivedAtMs: e.state.now });
+    },
+    LEDGER_EPOCH: (e) => {
+      expect(e.ledger.openEpoch({ epoch: 2, observationStartMs: e.state.now }).status).toBe(
+        "OPENED",
+      );
+    },
+    NONE: () => undefined,
+  };
+  /** A normal run whose final `open`-listener disposal (during settlement) runs `action` once. */
+  async function finishWithDisposalAction(action: FinalAction) {
+    let fired = 0;
+    const e: Env = env({
+      fake: {
+        onDispose: (_x, ev) => {
+          if (ev !== "open" || fired++ > 0) return;
+          finalAction[action](e);
+        },
+      },
+    });
+    const { p } = await openAndAck(e);
+    await finishAtNominalEnd(e);
+    const r = await settledNow(p);
+    expect(r, action).not.toBeNull();
+    expect(fired).toBe(1);
+    // The first cause and the closed intake are kept; nothing new was acquired.
+    expect(r!.terminal).toMatchObject({ cause: "OBSERVATION_COMPLETED", atMs: NOMINAL_END });
+    expect(r!.intake).toMatchObject({ trigger: "UNSUBSCRIBE_RESPONSE", stoppedAtMs: NOMINAL_END });
+    expect(e.t.sent.length).toBe(2);
+    expect(r!.settledAtMs).toBe(NOMINAL_END);
+    expectConserved(e, r!);
+    return { e, r: r! };
+  }
+
+  it("O38a: a cancellation during final disposal is recorded before the report is frozen", async () => {
+    const { e, r } = await finishWithDisposalAction("ABORT");
+    expect(r.cancellation).toEqual({ requestedAtMs: NOMINAL_END, phase: "DRAINING" });
+    expect(r.uncertainties).toEqual(["CANCELLED_AFTER_TERMINAL"]);
+    expect(r.connectionRunClean).toBe(false);
+    expect(e.owner.lateEvents().abort).toBe(0);
+  });
+
+  it("O38b: a session stop during final disposal is recorded before the report is frozen", async () => {
+    const { e, r } = await finishWithDisposalAction("SESSION_STOP");
+    expect(r.sessionStopObserved).toBe(true);
+    expect(r.uncertainties).toEqual(["SESSION_STOPPED_AFTER_TERMINAL"]);
+    expect(r.connectionRunClean).toBe(false);
+    expect(e.owner.lateEvents().sessionStop).toBe(0);
+  });
+
+  it("O38c: a foreign collector epoch during final disposal is ownership loss", async () => {
+    const { e, r } = await finishWithDisposalAction("COLLECTOR_EPOCH");
+    expect(e.collector.version).toBeGreaterThan(0);
+    expect(r.ownership).toMatchObject({ collectorIntact: false, ledgerEpochIntact: true });
+    expect(r.uncertainties).toEqual(["EPOCH_OWNERSHIP_LOST"]);
+    // The epoch report is read after the final checks and agrees with them.
+    expect(r.collector).toMatchObject({ epoch: 1, state: "CLOSED" });
+    expect(r.connectionRunClean).toBe(false);
+  });
+
+  it("O38c2: collector evidence is read after the final checks and agrees with them", async () => {
+    const { e, r } = await finishWithDisposalAction("COLLECTOR_FRAME");
+    expect(r.ownership.collectorIntact).toBe(false);
+    expect(r.uncertainties).toEqual(["EPOCH_OWNERSHIP_LOST"]);
+    expect(r.collector).toEqual(e.collector.epochReport(1));
+    expect(r.collector!.collectionClean).toBe(false);
+    expect(r.connectionRunClean).toBe(false);
+  });
+
+  it("O38h: a re-entrant settlement attempt during finalization cannot freeze the report early", async () => {
+    // From a disposer (inside the transport barrier) and from injected timer code (outside it).
+    for (const via of ["DISPOSER", "CLEAR_TIMEOUT"] as const) {
+      let fired = 0;
+      let finalizing = false;
+      const act = (x: FakeTransport) => {
+        if (!finalizing || fired++ > 0) return;
+        x.emit("close", 1000); // reaches onClose, which would step and settle again
+        finalAction.LEDGER_EPOCH(e); // a later change in the same finalization
+      };
+      const e: Env = env({
+        fake: {
+          honorDispose: false,
+          onDispose: (x, ev) => {
+            if (ev === "open") finalizing = true;
+            if (via === "DISPOSER") act(x);
+          },
+        },
+        onClearTimeout: (x) => {
+          if (via === "CLEAR_TIMEOUT") act(x.t);
+        },
+      });
+      const { p } = await openAndAck(e);
+      await finishAtNominalEnd(e);
+      const r = await settledNow(p);
+      expect(r, via).not.toBeNull();
+      expect(fired, via).toBe(1);
+      expect(r!.ownership.ledgerEpochIntact, via).toBe(false);
+      expect(r!.uncertainties, via).toEqual(["EPOCH_OWNERSHIP_LOST"]);
+      expect(JSON.stringify(await e.owner.run())).toBe(JSON.stringify(r));
+      expect(r!.connectionRunClean).toBe(false);
+    }
+  });
+
+  it("O38d: a foreign ledger epoch during final disposal is ownership loss", async () => {
+    const { e, r } = await finishWithDisposalAction("LEDGER_EPOCH");
+    expect(e.ledger.epochs().at(-1)).toMatchObject({ epoch: 2, state: "OPEN" });
+    expect(r.ownership).toMatchObject({ collectorIntact: true, ledgerEpochIntact: false });
+    expect(r.uncertainties).toEqual(["EPOCH_OWNERSHIP_LOST"]);
+    expect(r.connectionRunClean).toBe(false);
+  });
+
+  it("O38g: callbacks during finalization belong to the run, re-arm nothing and keep intake closed", async () => {
+    let fired = 0;
+    const e: Env = env({
+      fake: {
+        complete: "never",
+        honorDispose: false,
+        onDispose: (x, ev) => {
+          if (ev !== "open" || fired++ > 0) return;
+          x.pendingDone.splice(0).forEach((d) => d(false));
+          x.emit("message", notif()); // after intake: counted, never handed off
+          x.emit("close", 1000); // a re-entrant settlement attempt
+        },
+      },
+    });
+    const { p } = await openAndAck(e);
+    await finishAtNominalEnd(e);
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(fired).toBe(1);
+    expect(r!.outgoing).toMatchObject({
+      subscribe: { local: "COMPLETED" },
+      unsubscribe: { local: "COMPLETED" },
+      pings: { reserved: 2, completed: 2, unresolved: 0 },
+    });
+    expect(r!.intake).toMatchObject({ stoppedAtMs: NOMINAL_END, framesAfterIntake: 1 });
+    expect(r!.handoff.envelopesAccepted).toBe(0);
+    expect(r!.uncertainties).toEqual(["FRAMES_AFTER_INTAKE"]);
+    expect(e.t.sent.length).toBe(2);
+    expectConserved(e, r!);
+    // No owner wake-up was re-armed during finalization (it would fire late here).
+    await e.to(RUN_CEILING + 60_000);
+    expect(e.owner.lateEvents()).toMatchObject({
+      message: 0,
+      close: 0,
+      localCompletion: 0,
+      timer: 0,
+    });
+  });
+
+  it("O38e (control): a finalization disposer that changes nothing leaves a normal run clean", async () => {
+    const { r } = await finishWithDisposalAction("NONE");
+    expect(r.uncertainties).toEqual([]);
+    expect(r.cancellation).toEqual({ requestedAtMs: null, phase: null });
+    expect(r.ownership).toMatchObject({ collectorIntact: true, ledgerEpochIntact: true });
+    expect(r.connectionRunClean).toBe(true);
+  });
+
+  it("O38f (control): changes after the report is frozen stay late and never mutate it", async () => {
+    const { e, r } = await finishWithDisposalAction("NONE");
+    const snapshot = JSON.stringify(r);
+    for (const a of [
+      "ABORT",
+      "SESSION_STOP",
+      "COLLECTOR_FRAME",
+      "COLLECTOR_EPOCH",
+      "LEDGER_EPOCH",
+    ] as const) {
+      finalAction[a](e);
+    }
+    e.t.emit("message", notif()); // the message listener was disposed at intake stop
+    await e.to(RUN_CEILING + 60_000);
+    expect(JSON.stringify(r)).toBe(snapshot);
+    expect(JSON.stringify(await e.owner.run())).toBe(snapshot);
+    expect(e.owner.lateEvents()).toMatchObject({ abort: 0, sessionStop: 1, message: 0 });
   });
 });
 

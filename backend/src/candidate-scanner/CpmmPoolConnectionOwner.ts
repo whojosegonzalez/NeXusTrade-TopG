@@ -561,6 +561,8 @@ export class CpmmPoolConnectionOwner {
   };
   private readonly holder: StopHolder;
   private settled = false;
+  /** True from the start of settlement until the report is frozen (then `settled`). */
+  private finalizing = false;
   private settledAt = 0;
   private phase: CpmmOwnerPhase = "BEFORE_TRANSPORT";
   private deadlines: CpmmOwnerDeadlines | null = null;
@@ -932,7 +934,8 @@ export class CpmmPoolConnectionOwner {
 
   /** Re-entrancy-safe: a nested call only requests another round. */
   private advance(): void {
-    if (this.settled) return;
+    // No step runs while finalizing: intake stays closed and nothing new is acquired.
+    if (this.settled || this.finalizing) return;
     if (this.advancing) {
       this.advanceAgain = true;
       return;
@@ -1271,8 +1274,11 @@ export class CpmmPoolConnectionOwner {
     this.armWake(now);
   }
 
-  /** Applies every check due at `now` (expired deadlines first); never settles. */
-  private enforce(now: number): void {
+  /**
+   * Observes the clock, ownership, session stop and cancellation (no new acquisition). Before a
+   * terminal cause a change ends the run; after one it is recorded as uncertainty.
+   */
+  private observe(now: number): void {
     if ((this.clockInvalid || this.clockRegressed) && !this.terminal) {
       this.terminate(
         "OWNER_INTERNAL_ERROR",
@@ -1302,6 +1308,11 @@ export class CpmmPoolConnectionOwner {
         this.forceTerminate();
       } else this.terminate("CANCELLED", null);
     }
+  }
+
+  /** Applies every check due at `now` (expired deadlines first); never settles. */
+  private enforce(now: number): void {
+    this.observe(now);
     const d = this.deadlines;
     if (!this.terminal && d) {
       if (!this.acked && now >= d.ackDeadlineMs) {
@@ -1963,33 +1974,17 @@ export class CpmmPoolConnectionOwner {
     if (this.cleanupStatus === "FAILED_STILL_OPEN") this.uncertain("CLEANUP_FAILED");
   }
 
+  /**
+   * Finalization, then the frozen report. While finalizing, re-entrant settlement and stepping are
+   * refused (intake stays closed and nothing new is acquired), but callbacks are still the run's:
+   * external code run by the final disposers is observed by fresh checks before the report is
+   * frozen. Only callbacks after the freeze are late events.
+   */
   private settle(): void {
-    if (this.settled) return;
+    if (this.settled || this.finalizing) return;
+    this.finalizing = true;
     if (this.cleanupStatus === "NOT_STARTED") this.cleanupStatus = "NOT_NEEDED";
-    this.checkOwnership();
-    for (const a of [this.subscribe, this.unsubscribe]) {
-      if (a.local === "PENDING") {
-        a.local = "UNRESOLVED";
-        this.uncertain("LOCAL_COMPLETION_UNRESOLVED");
-      }
-    }
-    for (const c of [this.pings, this.pongReplies]) {
-      if (c.pending > 0) {
-        c.unresolved = inc(c.unresolved, c.pending);
-        c.pending = 0;
-        this.uncertain("LOCAL_COMPLETION_UNRESOLVED");
-      }
-    }
-    let collectorReport: CpmmCollectionEpochReport | null = null;
-    if (this.collectorOpened) {
-      try {
-        collectorReport = this.collector.epochReport(this.epoch);
-      } catch {
-        collectorReport = null;
-      }
-    }
-    this.settled = true;
-    // Release listeners and timers; anything invoked from here on is a late event.
+    // External finalization: listener disposers may run arbitrary code synchronously.
     this.disposeAll(this.intakeDisposers);
     this.disposeAll(this.lifecycleDisposers);
     if (this.abortListener && this.signal) {
@@ -2004,11 +1999,39 @@ export class CpmmPoolConnectionOwner {
         // Counted as a late timer if it still fires.
       }
     }
-    // The actual settlement instant, read after the disposal bookkeeping above.
+    // Fresh checks after the external calls: clock, ownership, session stop and cancellation.
+    // The first terminal cause is kept; later blocking changes become uncertainty.
+    this.observe(this.readNow());
+    for (const a of [this.subscribe, this.unsubscribe]) {
+      if (a.local === "PENDING") {
+        a.local = "UNRESOLVED";
+        this.uncertain("LOCAL_COMPLETION_UNRESOLVED");
+      }
+    }
+    for (const c of [this.pings, this.pongReplies]) {
+      if (c.pending > 0) {
+        c.unresolved = inc(c.unresolved, c.pending);
+        c.pending = 0;
+        this.uncertain("LOCAL_COMPLETION_UNRESOLVED");
+      }
+    }
+    // Evidence read after the final checks, so the report agrees with them.
+    let collectorReport: CpmmCollectionEpochReport | null = null;
+    if (this.collectorOpened) {
+      try {
+        collectorReport = this.collector.epochReport(this.epoch);
+      } catch {
+        collectorReport = null;
+      }
+    }
+    // The actual settlement instant, read after the finalization bookkeeping above.
     this.settledAt = this.readNow();
     if (this.deadlines !== null && this.settledAt > this.deadlines.runCeilingMs) {
       this.uncertain("DEADLINE_OVERRUN");
     }
+    // Frozen from here on: anything invoked later is a late event.
+    this.settled = true;
+    this.finalizing = false;
     const report = this.buildReport(collectorReport);
     this.finalReport = report;
     // Release heavy run state; the session keeps only the holder and the late counters.
