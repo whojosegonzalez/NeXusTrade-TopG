@@ -353,6 +353,10 @@ interface FakeOptions {
     start?: boolean;
     on?: string;
   };
+  /** The call emits `close` synchronously (readyState 3), then throws. */
+  closeThenThrow?: readonly ("close" | "terminate" | "send" | "pong")[];
+  /** Called inside a listener disposer; a throw makes the disposer throw. */
+  onDispose?: (t: FakeTransport, event: string) => void;
   onRegister?: (t: FakeTransport, event: string) => void;
   onStart?: (t: FakeTransport) => void;
   onSend?: (t: FakeTransport, data: string) => void;
@@ -385,7 +389,14 @@ class FakeTransport implements CpmmOwnerTransport {
     return () => {
       this.disposed.push(event);
       if (this.o.honorDispose !== false) s.delete(l);
+      this.o.onDispose?.(this, event);
     };
+  }
+  private closeThenThrow(kind: "close" | "terminate" | "send" | "pong"): void {
+    if (!this.o.closeThenThrow?.includes(kind)) return;
+    this.readyState = 3;
+    this.emit("close", 1000);
+    throw new Error(`${kind} after close`);
   }
   count(event: string): number {
     return this.listeners.get(event)?.size ?? 0;
@@ -426,6 +437,7 @@ class FakeTransport implements CpmmOwnerTransport {
     this.sent.push(data);
     this.o.onSend?.(this, data);
     this.complete(done, "send");
+    this.closeThenThrow("send");
   }
   ping(payload: Uint8Array, done: Done): void {
     this.log.push("ping");
@@ -443,10 +455,12 @@ class FakeTransport implements CpmmOwnerTransport {
     this.ponged.push(payload.slice());
     this.complete(done, "pong");
     this.o.onPong?.(this);
+    this.closeThenThrow("pong");
   }
   close(code: 1000): void {
     this.log.push(`close:${code}`);
     if (this.o.throwOn?.close) throw new Error("close");
+    this.closeThenThrow("close");
     const fire = () => {
       this.readyState = 3;
       this.emit("close", 1000);
@@ -458,6 +472,7 @@ class FakeTransport implements CpmmOwnerTransport {
   terminate(): void {
     this.log.push("terminate");
     if (this.o.throwOn?.terminate) throw new Error("terminate");
+    this.closeThenThrow("terminate");
     if (this.o.terminateCloses) this.readyState = 3;
   }
   dispose(): void {
@@ -534,6 +549,10 @@ interface EnvOptions {
   lifetimeMs?: number;
   noOpen?: boolean;
   ignoreClear?: boolean;
+  /** The tracker reads the advancing virtual clock instead of a fixed instant. */
+  trackerClock?: boolean;
+  /** While `invalid`, only the owner's view of the session clock returns NaN. */
+  ownerClock?: { invalid: boolean };
 }
 
 function env(o: EnvOptions = {}): Env {
@@ -596,7 +615,7 @@ function env(o: EnvOptions = {}): Env {
     poolId: POOL.poolAddress,
     tokenMint: POOL.candidateMint,
     trackingStartedMs: OBS_START,
-    clock: () => TRACKER_NOW,
+    clock: o.trackerClock ? () => state.now : () => TRACKER_NOW,
   });
   const ledger = new CpmmResolutionAccountingLedger({
     binding: adapter.getBinding(),
@@ -650,8 +669,18 @@ function env(o: EnvOptions = {}): Env {
       await run(t);
     },
   };
+  const oc = o.ownerClock;
+  const ownerSession = oc
+    ? ({
+        now: () => (oc.invalid ? Number.NaN : session.now()),
+        isOpen: () => session.isOpen(),
+        getDeadlineMs: () => session.getDeadlineMs(),
+        getStopReason: () => session.getStopReason(),
+        onStop: (l: (reason: string) => void) => session.onStop(l),
+      } as unknown as PaperRequestSession)
+    : session;
   e.owner = new CpmmPoolConnectionOwner({
-    session,
+    session: ownerSession,
     collector,
     ledger: (o.ledgerWrap ? o.ledgerWrap(ledger, e) : ledger) as CpmmResolutionAccountingLedger,
     binding: o.binding ?? adapter.getBinding(),
@@ -1845,7 +1874,7 @@ describe("CPMM pool connection owner (synthetic, offline)", () => {
     expectConserved(e, r);
   });
 
-  it("O27: a refused collector closure (clock regression) is never masked by a normal cause", async () => {
+  it("O27: a clock regression at the collector closure is never masked by a normal cause", async () => {
     const e = env();
     const p = (await openAndAck(e)).p;
     await e.to(NOMINAL_END);
@@ -1854,12 +1883,15 @@ describe("CPMM pool connection owner (synthetic, offline)", () => {
     await e.to(NOMINAL_END + 10);
     const r = await p;
     expect(r.terminal.cause).toBe("OBSERVATION_COMPLETED");
+    // The closure uses the monotonic instant (never before the latest receipt), so the collector
+    // accepts it; the regression itself is latched as blocking uncertainty.
     expect(r.collectorClose).toMatchObject({
-      status: "REFUSED",
+      status: "CLOSED",
       reason: "OWNER_CLOSED",
-      atMs: null,
+      atMs: NOMINAL_END,
     });
-    expect(r.uncertainties).toContain("COLLECTOR_CLOSE_REFUSED");
+    expect(r.intake.stoppedAtMs).toBe(NOMINAL_END);
+    expect(r.uncertainties).toEqual(["CLOCK_REGRESSED"]);
     expect(r.connectionRunClean).toBe(false);
     expectConserved(e, r);
   });
@@ -2010,4 +2042,331 @@ describe("CPMM pool connection owner (synthetic, offline)", () => {
     expect(r.connectionRunClean).toBe(false);
     expectConserved(rejected, r);
   });
+
+  // --- review regressions: deadlines, clock regression and the settlement barrier -------------
+
+  /** The settled report, or null if the run has not settled by then (no hang). */
+  const settledNow = (p: Promise<CpmmConnectionRunReport>) =>
+    Promise.race([p, flush(8).then(() => null)]);
+  const DRAIN_DEADLINE = INTAKE_END + OWNER_LIMITS.drainMs;
+  const CLEANUP_DEADLINE = NOMINAL_END + OWNER_LIMITS.cleanupTimeoutMs;
+
+  it("O32: a resolution completing at or after the drain deadline is never credited, even with delayed timers", async () => {
+    expect(DRAIN_DEADLINE).toBe(RUN_CEILING);
+    for (const offset of [-1, 0, 1]) {
+      const e = env({ trackerClock: true });
+      const { p } = await openAndAck(e);
+      const h = held();
+      await note(e, 1, { at: NOMINAL_END - 500, responder: h.responder });
+      await finishNormally(e);
+      expect(e.timerCount()).toBeGreaterThan(0);
+      e.state.now = DRAIN_DEADLINE + offset; // no queued timer runs
+      h.result(txResult(signatureOf(1)));
+      const r = await settledNow(p);
+      expect(r, String(offset)).not.toBeNull();
+      expect(r!.deadlines).toMatchObject({
+        drainDeadlineMs: DRAIN_DEADLINE,
+        runCeilingMs: RUN_CEILING,
+      });
+      expect(r!.terminal).toMatchObject({ cause: "OBSERVATION_COMPLETED", atMs: NOMINAL_END });
+      expect(r!.settledAtMs).toBe(DRAIN_DEADLINE + offset);
+      if (offset < 0) {
+        expect(r!.drain.status).toBe("COMPLETED");
+        expect(r!.events.accepted).toBe(1);
+        expect(r!.connectionRunClean).toBe(true);
+      } else {
+        expect(r!.drain).toEqual({ status: "EXPIRED", outstandingAtDeadline: 1 });
+        expect(r!.handoff.outstandingAtSettlement).toBe(1);
+        expect(r!.events.recordsOwned).toBe(0);
+        expect(r!.uncertainties).toEqual(
+          offset === 0 ? ["DRAIN_EXPIRED"] : ["DRAIN_EXPIRED", "DEADLINE_OVERRUN"],
+        );
+        expect(r!.connectionRunClean).toBe(false);
+        // The gate refused ingestion at the authoritative clock: nothing reached the tracker.
+        expect(e.ledger.records()[0]!.ingestion.accepted).toBe(0);
+        expect(e.owner.lateEvents().accountSettlement).toBe(1);
+      }
+      expectConserved(e, r!);
+    }
+  });
+
+  it("O33: a close observed at or after the cleanup deadline never settles cleanup", async () => {
+    for (const at of [
+      CLEANUP_DEADLINE - 1,
+      CLEANUP_DEADLINE,
+      CLEANUP_DEADLINE + 1,
+      RUN_CEILING + 5,
+    ]) {
+      const e = env({ fake: { closeMode: "never" } });
+      const { p } = await openAndAck(e);
+      await e.to(NOMINAL_END);
+      e.t.message(unsubAck());
+      await flush();
+      expect(e.timerCount()).toBeGreaterThan(0);
+      e.state.now = at; // the cleanup-deadline wake-up has not run
+      e.t.readyState = 3;
+      e.t.emit("close", 1000);
+      const r = await settledNow(p);
+      expect(r, String(at)).not.toBeNull();
+      expect(r!.terminal).toMatchObject({ cause: "OBSERVATION_COMPLETED", atMs: NOMINAL_END });
+      expect(r!.cleanup).toMatchObject({
+        startedAtMs: NOMINAL_END,
+        deadlineMs: CLEANUP_DEADLINE,
+        endedAtMs: at,
+        closeObservedAtMs: at,
+      });
+      expect(r!.settledAtMs).toBe(at);
+      if (at < CLEANUP_DEADLINE) {
+        expect(r!.cleanup).toMatchObject({ status: "SETTLED", terminateAttempted: false });
+        expect(r!.connectionRunClean).toBe(true);
+      } else {
+        expect(r!.cleanup).toMatchObject({
+          status: "SETTLED_AFTER_TERMINATE",
+          terminateAttempted: true,
+        });
+        expect(r!.uncertainties).toEqual(at > RUN_CEILING ? ["DEADLINE_OVERRUN"] : []);
+        expect(r!.connectionRunClean).toBe(false);
+      }
+      expectConserved(e, r!);
+    }
+  });
+
+  it("O34: the clock is re-read after an external call returns", async () => {
+    // No local completion ever arrives, so nothing but the owner's own re-check can stop intake.
+    const e: Env = env({
+      fake: {
+        complete: "never",
+        onSend: (_t, d) => {
+          if (d.includes("logsUnsubscribe")) e.state.now = INTAKE_END + 7;
+        },
+      },
+    });
+    const { p } = await openAndAck(e);
+    await e.to(NOMINAL_END);
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(r!.outgoing.unsubscribe.reservedAtMs).toBe(NOMINAL_END);
+    expect(r!.terminal).toMatchObject({
+      cause: "OBSERVATION_COMPLETED",
+      code: "INTAKE_DEADLINE",
+      atMs: INTAKE_END + 7,
+    });
+    expect(r!.intake).toMatchObject({ trigger: "INTAKE_DEADLINE", stoppedAtMs: INTAKE_END + 7 });
+    expect(r!.cleanup.startedAtMs).toBe(INTAKE_END + 7);
+    expect(r!.settledAtMs).toBe(INTAKE_END + 7);
+    expect(r!.uncertainties).toContain("UNSUBSCRIBE_NOT_ACKNOWLEDGED");
+    expect(r!.connectionRunClean).toBe(false);
+    expectConserved(e, r!);
+  });
+
+  it("O35a: a clock regression after a normal intake closure is latched and never reversed", async () => {
+    const e = env({ fake: { closeMode: "never" } });
+    const { p } = await openAndAck(e);
+    await finishAtNominalEnd(e);
+    e.state.now = NOMINAL_END - 1;
+    e.t.readyState = 3;
+    e.t.emit("close", 1000);
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(r!.terminal).toMatchObject({ cause: "OBSERVATION_COMPLETED", atMs: NOMINAL_END });
+    // Reported instants never run backwards: the latest authoritative reading is kept.
+    expect(r!.cleanup).toMatchObject({
+      status: "SETTLED",
+      startedAtMs: NOMINAL_END,
+      endedAtMs: NOMINAL_END,
+      closeObservedAtMs: NOMINAL_END,
+    });
+    expect(r!.settledAtMs).toBe(NOMINAL_END);
+    expect(r!.deadlines).toMatchObject({
+      nominalEndMs: NOMINAL_END,
+      intakeEndMs: INTAKE_END,
+      runCeilingMs: RUN_CEILING,
+    });
+    expect(r!.uncertainties).toEqual(["CLOCK_REGRESSED"]);
+    expect(r!.connectionRunClean).toBe(false);
+    expectConserved(e, r!);
+  });
+
+  it("O35b: invalid time after a normal terminal cause is latched as blocking", async () => {
+    const e = env({ fake: { closeMode: "never" } });
+    const { p } = await openAndAck(e);
+    await finishAtNominalEnd(e);
+    e.state.override.push(Number.NaN);
+    e.t.readyState = 3;
+    e.t.emit("close", 1000);
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(r!.terminal).toMatchObject({ cause: "OBSERVATION_COMPLETED", atMs: NOMINAL_END });
+    expect(r!.cleanup).toMatchObject({ endedAtMs: NOMINAL_END, closeObservedAtMs: NOMINAL_END });
+    expect(r!.uncertainties).toEqual(["CLOCK_INVALID"]);
+    expect(r!.connectionRunClean).toBe(false);
+    expectConserved(e, r!);
+  });
+
+  it("O35c: a regression during observation is the first cause and the frame is refused", async () => {
+    const e = env();
+    const { p } = await openAndAck(e);
+    await e.to(RECEIVED_AT);
+    e.t.emit("ping", new Uint8Array(8)); // the owner reads RECEIVED_AT
+    await flush();
+    e.state.now = RECEIVED_AT - 1;
+    e.t.message(notif());
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(r!.terminal).toMatchObject({
+      cause: "OWNER_INTERNAL_ERROR",
+      code: "CLOCK_REGRESSED",
+      atMs: RECEIVED_AT,
+    });
+    expect(r!.intake.framesAfterIntake).toBe(1);
+    expect(r!.handoff.envelopesAccepted).toBe(0);
+    expect(r!.uncertainties).toContain("CLOCK_REGRESSED");
+    expectConserved(e, r!);
+  });
+
+  it("O35d: during the drain, a regressed or invalid clock refuses ingestion through the gate", async () => {
+    for (const mode of ["CLOCK_REGRESSED", "CLOCK_INVALID"] as const) {
+      const ownerClock = { invalid: false };
+      const e = env({ trackerClock: true, ownerClock });
+      const { p } = await openAndAck(e);
+      const h = held();
+      await note(e, 1, { at: NOMINAL_END - 500, responder: h.responder });
+      await finishNormally(e);
+      // The owner's latest reading was the intake stop at NOMINAL_END.
+      if (mode === "CLOCK_REGRESSED") e.state.now = NOMINAL_END - 1;
+      else ownerClock.invalid = true; // the session, adapter and tracker keep a valid clock
+      h.result(txResult(signatureOf(1)));
+      const r = await settledNow(p);
+      expect(r, mode).not.toBeNull();
+      expect(r!.terminal.cause).toBe("OBSERVATION_COMPLETED");
+      expect(r!.events.accepted).toBe(0);
+      expect(e.ledger.records()[0]!.ingestion.accepted).toBe(0);
+      expect(r!.uncertainties).toContain(mode);
+      expect(r!.connectionRunClean).toBe(false);
+      expectConserved(e, r!);
+    }
+  });
+
+  it("O37: a rejected resolution at or after the drain deadline is never credited", async () => {
+    let reject: ((e: Error) => void) | null = null;
+    const e = env({
+      ledgerWrap: (real) => ({
+        openEpoch: (x: never) => real.openEpoch(x),
+        epochs: () => real.epochs(),
+        counters: () => real.counters(),
+        getBinding: () => real.getBinding(),
+        account: (x: CpmmNotificationEnvelope, g: CpmmLifecycleGate) => {
+          void real.account(x, g);
+          return new Promise((_res, rej) => {
+            reject = rej;
+          });
+        },
+      }),
+    });
+    const { p } = await openAndAck(e);
+    await note(e, 1, { at: NOMINAL_END - 500 });
+    await finishNormally(e);
+    e.state.now = DRAIN_DEADLINE; // the drain wake-up has not run
+    reject!(new Error(SECRET_KEY));
+    const r = await settledNow(p);
+    expect(r).not.toBeNull();
+    expect(r!.drain).toEqual({ status: "EXPIRED", outstandingAtDeadline: 1 });
+    expect(r!.handoff).toMatchObject({ accountRejected: 0, outstandingAtSettlement: 1 });
+    expect(r!.settledAtMs).toBe(DRAIN_DEADLINE);
+    expect(r!.uncertainties).toEqual(["DRAIN_EXPIRED"]);
+    expect(e.owner.lateEvents().accountSettlement).toBe(1);
+    expect(JSON.stringify(r)).not.toContain(SECRET_KEY);
+    expectConserved(e, r!);
+  });
+
+  it("O36a: close() emitting close and then throwing is recorded before settlement", async () => {
+    const e = env({ fake: { closeThenThrow: ["close"] } });
+    const { p } = await openAndAck(e);
+    await finishNormally(e);
+    const r = await p;
+    expect(r.cleanup).toMatchObject({ status: "SETTLED", closeThrew: true });
+    expect(r.uncertainties).toEqual(["CLEANUP_FAILED"]);
+    expect(r.connectionRunClean).toBe(false);
+    expectConserved(e, r);
+  });
+
+  it("O36b: terminate() emitting close and then throwing is recorded before settlement", async () => {
+    const e = env({ fake: { closeMode: "never", closeThenThrow: ["terminate"] } });
+    const { p } = await openAndAck(e);
+    await finishNormally(e);
+    await e.to(CLEANUP_DEADLINE);
+    const r = await p;
+    expect(r.cleanup).toMatchObject({
+      status: "SETTLED_AFTER_TERMINATE",
+      terminateAttempted: true,
+      terminateThrew: true,
+    });
+    expect(r.uncertainties).toEqual(["CLEANUP_FAILED"]);
+    expect(r.connectionRunClean).toBe(false);
+    expectConserved(e, r);
+  });
+
+  it("O36c: a send that completes and closes synchronously, then throws, is recorded", async () => {
+    const e = env({ fake: { complete: "sync", closeThenThrow: ["send"] } });
+    const p = e.owner.run();
+    e.t.open();
+    const r = await p;
+    expect(r.terminal.cause).toBe("TRANSPORT_CLOSED");
+    expect(r.outgoing.subscribe.local).toBe("COMPLETED");
+    expect(r.uncertainties).toContain("LOCAL_SEND_FAILED");
+    expectConserved(e, r);
+  });
+
+  it("O36d: a pong reply that closes synchronously, then throws, is recorded", async () => {
+    const e = env({ fake: { closeThenThrow: ["pong"] } });
+    const { p } = await openAndAck(e);
+    e.t.emit("ping", new Uint8Array(8));
+    const r = await p;
+    expect(r.outgoing.pongReplies).toMatchObject({ reserved: 1, threw: 1, unresolved: 0 });
+    expect(r.uncertainties).toContain("LOCAL_SEND_FAILED");
+    expectConserved(e, r);
+  });
+
+  it("O36e: an intake disposer that closes synchronously, then throws, is recorded", async () => {
+    const e = env({
+      fake: {
+        onDispose: (x, ev) => {
+          if (ev !== "message") return;
+          x.readyState = 3;
+          x.emit("close", 1000);
+          throw new Error("dispose");
+        },
+      },
+    });
+    const { p } = await openAndAck(e);
+    await finishNormally(e);
+    const r = await p;
+    expect(r.transport.disposeFailures).toBe(1);
+    expect(r.uncertainties).toContain("DISPOSE_FAILED");
+    expect(r.connectionRunClean).toBe(false);
+    expectConserved(e, r);
+  });
+
+  it("O36f: the settlement instant is read after disposal bookkeeping", async () => {
+    const e: Env = env({
+      fake: {
+        onDispose: (_x, ev) => {
+          if (ev === "open") e.state.now += 5;
+        },
+      },
+    });
+    const { p } = await openAndAck(e);
+    await finishAtNominalEnd(e);
+    const r = await p;
+    expect(r.cleanup.endedAtMs).toBe(NOMINAL_END);
+    expect(r.settledAtMs).toBe(NOMINAL_END + 5);
+    expect(r.connectionRunClean).toBe(true);
+  });
 });
+
+/** A normal finish that leaves the clock at the nominal end (where settlement happens). */
+async function finishAtNominalEnd(e: Env): Promise<void> {
+  await e.to(NOMINAL_END);
+  e.t.message(unsubAck());
+  await flush();
+}

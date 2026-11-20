@@ -7,7 +7,13 @@
  * - Every incoming message goes through the collector; every accepted envelope reaches
  *   `ledger.account()` with the run's gate, or is counted as explicitly unprocessed.
  * - Deadlines are computed once at start. Timers only wake the owner: every callback and every
- *   return from external code re-checks the clock, session, cancellation and ownership.
+ *   return from external code re-checks the clock, session, cancellation and ownership, and an
+ *   overdue deadline is applied before anything is admitted, ingested or credited, so a delayed
+ *   timer never extends one. The clock is monotonic as observed: an invalid or regressed reading
+ *   is latched as blocking uncertainty and never moves a reported instant backwards.
+ * - Settlement waits while any external transport call (factory, registration, start, send,
+ *   ping, pong, close, terminate, readyState, dispose, listener disposers) is still running, and
+ *   the settlement instant is read after the final disposal bookkeeping.
  * - Attempts and resolution slots are reserved before external calls, so re-entrant callbacks
  *   cannot exceed any limit. The first terminal cause is kept apart from later uncertainty.
  * - Nothing here establishes notification completeness, a quiet window, a replayable capture or
@@ -148,7 +154,9 @@ export type CpmmOwnerUncertainty =
   | "EPOCH_OWNERSHIP_LOST"
   | "LEDGER_COUNTER_INCONSISTENT"
   | "CANCELLED_AFTER_TERMINAL"
-  | "SESSION_STOPPED_AFTER_TERMINAL";
+  | "SESSION_STOPPED_AFTER_TERMINAL"
+  | "CLOCK_INVALID"
+  | "CLOCK_REGRESSED";
 
 export type CpmmLocalOutcome = "NOT_ATTEMPTED" | "THREW" | "COMPLETED" | "FAILED" | "UNRESOLVED";
 
@@ -559,11 +567,14 @@ export class CpmmPoolConnectionOwner {
   private terminal: CpmmConnectionRunReport["terminal"] | null = null;
   private readonly uncertainties: CpmmOwnerUncertainty[] = [];
   private advancing = false;
-  /** > 0 while external startup code (factory, registration, start) is running. */
+  /** > 0 while external transport code is running; settlement and cleanup start wait for 0. */
   private busy = 0;
+  /** Counts external calls, so a step re-reads the clock after any of them returns. */
+  private callouts = 0;
   private advanceAgain = false;
   private lastNow = 0;
   private clockInvalid = false;
+  private clockRegressed = false;
 
   // transport
   private transport: CpmmOwnerTransport | null = null;
@@ -842,7 +853,7 @@ export class CpmmPoolConnectionOwner {
           atMs: this.lastNow,
         };
       }
-      this.settle(this.lastNow);
+      this.settle();
     } catch {
       // Unreachable by construction; the report builder only reads owner fields.
     }
@@ -852,6 +863,11 @@ export class CpmmPoolConnectionOwner {
     if (!this.uncertainties.includes(u)) this.uncertainties.push(u);
   }
 
+  /**
+   * The authoritative clock, monotonic as observed: an invalid or regressed reading is latched as
+   * blocking uncertainty (also after a terminal cause) and the latest valid reading is returned,
+   * so no reported instant runs backwards and no deadline is extended.
+   */
   private readNow(): number {
     let t: unknown;
     try {
@@ -861,20 +877,49 @@ export class CpmmPoolConnectionOwner {
     }
     if (!isSafePositive(t)) {
       this.clockInvalid = true;
+      this.uncertain("CLOCK_INVALID");
+      return this.lastNow;
+    }
+    if (t < this.lastNow) {
+      this.clockRegressed = true;
+      this.uncertain("CLOCK_REGRESSED");
       return this.lastNow;
     }
     this.lastNow = t;
     return t;
   }
 
+  /** Read by the ledger before ingestion: latched state plus a fresh clock reading. */
   private gateRefuses(): boolean {
-    return (
+    if (
       (this.terminal !== null && this.terminal.cause !== "OBSERVATION_COMPLETED") ||
       this.drainExpired ||
       this.ownershipLost ||
       this.cancelSeen ||
       this.sessionStopSeen
+    ) {
+      return true;
+    }
+    // An overdue drain deadline refuses even before its (possibly delayed) wake-up has run.
+    const now = this.readNow();
+    return (
+      this.clockInvalid ||
+      this.clockRegressed ||
+      (this.deadlines !== null && now >= this.deadlines.drainDeadlineMs)
     );
+  }
+
+  /** Runs external transport code; settlement waits until it returns. */
+  private callOut<T>(fn: () => T): { ok: true; value: T } | { ok: false } {
+    this.busy++;
+    this.callouts = inc(this.callouts);
+    try {
+      return { ok: true, value: fn() };
+    } catch {
+      return { ok: false };
+    } finally {
+      this.busy--;
+    }
   }
 
   private abortGate(): void {
@@ -910,7 +955,7 @@ export class CpmmPoolConnectionOwner {
   private finishEarly(cause: CpmmOwnerTerminalCause, code: string | null, now: number): void {
     this.terminal = { cause, code, phase: this.phase, atMs: now };
     this.cleanupStatus = "NOT_NEEDED";
-    this.settle(now);
+    this.settle();
   }
 
   private begin(): void {
@@ -989,7 +1034,7 @@ export class CpmmPoolConnectionOwner {
       };
       this.closeCollector("CANCELLED", this.readNow());
       this.cleanupStatus = "NOT_NEEDED";
-      return this.settle(this.lastNow);
+      return this.settle();
     }
     this.ledgerOpened = true;
     // Lifecycle listeners and the wake timer exist before the transport.
@@ -1069,11 +1114,8 @@ export class CpmmPoolConnectionOwner {
     this.resume();
   }
 
-  /** After external startup code returns: start any deferred cleanup, then re-check. */
+  /** After external startup code returns: a fresh step (which also starts deferred cleanup). */
   private resume(): void {
-    if (this.terminal && this.cleanupStatus === "NOT_STARTED" && this.busy === 0) {
-      this.beginCleanup(this.readNow());
-    }
     this.advance();
   }
 
@@ -1111,9 +1153,7 @@ export class CpmmPoolConnectionOwner {
   private disposeAll(list: (() => void)[]): void {
     const items = list.splice(0);
     for (const d of items) {
-      try {
-        d();
-      } catch {
+      if (!this.callOut(d).ok) {
         this.disposeFailures = inc(this.disposeFailures);
         this.uncertain("DISPOSE_FAILED");
       }
@@ -1202,6 +1242,7 @@ export class CpmmPoolConnectionOwner {
       !this.terminal &&
       !this.settled &&
       !this.clockInvalid &&
+      !this.clockRegressed &&
       stop === null &&
       this.signal?.aborted !== true &&
       this.deadlines !== null &&
@@ -1213,9 +1254,31 @@ export class CpmmPoolConnectionOwner {
 
   private step(): void {
     if (this.settled) return;
-    const now = this.readNow();
-    if (this.clockInvalid && !this.terminal)
-      this.terminate("OWNER_INTERNAL_ERROR", "CLOCK_INVALID");
+    let now = this.readNow();
+    // External calls made while enforcing may take time: re-read the clock after they return and
+    // enforce again, before anything is settled or a wake-up armed.
+    for (let round = 0; round < ADVANCE_ROUNDS; round++) {
+      const callouts = this.callouts;
+      this.enforce(now);
+      if (this.settled || this.callouts === callouts) break;
+      now = this.readNow();
+    }
+    if (this.settled) return;
+    if (this.canSettle(now)) {
+      this.settle();
+      return;
+    }
+    this.armWake(now);
+  }
+
+  /** Applies every check due at `now` (expired deadlines first); never settles. */
+  private enforce(now: number): void {
+    if ((this.clockInvalid || this.clockRegressed) && !this.terminal) {
+      this.terminate(
+        "OWNER_INTERNAL_ERROR",
+        this.clockInvalid ? "CLOCK_INVALID" : "CLOCK_REGRESSED",
+      );
+    }
     this.checkOwnership();
     let stop: unknown = null;
     try {
@@ -1257,15 +1320,20 @@ export class CpmmPoolConnectionOwner {
       }
     }
     if (this.drainStatus === "PENDING" && d) {
-      if (this.outstanding === 0) {
-        this.drainStatus = "COMPLETED";
-      } else if (now >= d.drainDeadlineMs) {
+      // The deadline is checked before completion is credited.
+      if (now >= d.drainDeadlineMs) {
         this.drainStatus = "EXPIRED";
         this.outstandingAtDeadline = this.outstanding;
         this.drainExpired = true;
         this.uncertain("DRAIN_EXPIRED");
         this.abortGate();
+      } else if (this.outstanding === 0) {
+        this.drainStatus = "COMPLETED";
       }
+    }
+    // Cleanup deferred while external code was running starts once it has returned.
+    if (this.terminal && this.cleanupStatus === "NOT_STARTED" && this.busy === 0) {
+      this.beginCleanup(now);
     }
     if (
       this.cleanupStatus === "PENDING" &&
@@ -1274,11 +1342,6 @@ export class CpmmPoolConnectionOwner {
     ) {
       this.forceTerminate();
     }
-    if (this.canSettle(now)) {
-      this.settle(now);
-      return;
-    }
-    this.armWake(now);
   }
 
   private abortDrain(): void {
@@ -1484,9 +1547,8 @@ export class CpmmPoolConnectionOwner {
         this.advance();
       });
     };
-    try {
-      this.transport!.send(text, done);
-    } catch {
+    const t = this.transport!;
+    if (!this.callOut(() => t.send(text, done)).ok) {
       if (attempt.local === "PENDING") {
         attempt.local = "THREW";
         attempt.localAtMs = this.readNow();
@@ -1532,10 +1594,9 @@ export class CpmmPoolConnectionOwner {
         this.advance();
       });
     };
-    try {
-      if (kind === "ping") this.transport!.ping(payload, done);
-      else this.transport!.pong(payload, done);
-    } catch {
+    const t = this.transport!;
+    const call = kind === "ping" ? () => t.ping(payload, done) : () => t.pong(payload, done);
+    if (!this.callOut(call).ok) {
       if (!finished) {
         finished = true;
         ctrl.pending--;
@@ -1595,8 +1656,12 @@ export class CpmmPoolConnectionOwner {
       this.closeCode = isSafeNonNegative(code) ? code : null;
     }
     if (this.cleanupStatus === "PENDING") {
-      this.cleanupStatus = this.terminateAttempted ? "SETTLED_AFTER_TERMINATE" : "SETTLED";
-      this.cleanupEndedAt = now;
+      // An overdue cleanup deadline applies first, even if its wake-up has not run yet.
+      if (this.cleanupDeadline !== null && now >= this.cleanupDeadline) this.forceTerminate();
+      if (this.cleanupStatus === "PENDING") {
+        this.cleanupStatus = this.terminateAttempted ? "SETTLED_AFTER_TERMINATE" : "SETTLED";
+        this.cleanupEndedAt = now;
+      }
     }
     if (!this.terminal) {
       if (code === 1009) this.terminate("ACQUISITION_LIMIT", "TRANSPORT_PAYLOAD_LIMIT");
@@ -1744,6 +1809,13 @@ export class CpmmPoolConnectionOwner {
       return;
     }
     this.guard(() => {
+      // Overdue deadlines first: an expired drain (or abort bound) may settle the run, and then
+      // this result is a late event rather than a credit.
+      this.advance();
+      if (this.settled) {
+        this.late.accountSettlement = inc(this.late.accountSettlement);
+        return;
+      }
       this.outstanding--;
       switch (res.status) {
         case "RECORDED": {
@@ -1779,6 +1851,11 @@ export class CpmmPoolConnectionOwner {
       return;
     }
     this.guard(() => {
+      this.advance();
+      if (this.settled) {
+        this.late.accountSettlement = inc(this.late.accountSettlement);
+        return;
+      }
       this.outstanding--;
       this.rejected = inc(this.rejected);
       this.uncertain("ACCOUNT_CALL_FAILED");
@@ -1848,10 +1925,9 @@ export class CpmmPoolConnectionOwner {
       return;
     }
     if (!this.started) {
-      try {
-        t.dispose();
+      if (this.callOut(() => t.dispose()).ok) {
         this.cleanupStatus = "DISPOSED_UNSTARTED";
-      } catch {
+      } else {
         this.cleanupStatus = "DISPOSE_FAILED";
         this.uncertain("CLEANUP_FAILED");
       }
@@ -1865,10 +1941,10 @@ export class CpmmPoolConnectionOwner {
     }
     // The state exists before close(), which may emit `close` synchronously.
     this.cleanupStatus = "PENDING";
-    try {
-      t.close(1000);
-    } catch {
+    if (!this.callOut(() => t.close(1000)).ok) {
+      // A known cleanup exception: recorded before settlement can happen, and never clean.
       this.closeThrew = true;
+      this.uncertain("CLEANUP_FAILED");
     }
   }
 
@@ -1876,24 +1952,18 @@ export class CpmmPoolConnectionOwner {
     if (this.cleanupStatus !== "PENDING" || this.terminateAttempted) return;
     this.terminateAttempted = true;
     const t = this.transport!;
-    try {
-      t.terminate();
-    } catch {
+    if (!this.callOut(() => t.terminate()).ok) {
       this.terminateThrew = true;
+      this.uncertain("CLEANUP_FAILED");
     }
     if (this.cleanupStatus !== "PENDING") return;
-    let rs: unknown = -1;
-    try {
-      rs = t.readyState;
-    } catch {
-      rs = -1;
-    }
-    this.cleanupStatus = rs === 3 ? "SETTLED_AFTER_TERMINATE" : "FAILED_STILL_OPEN";
+    const rs = this.callOut(() => t.readyState);
+    this.cleanupStatus = rs.ok && rs.value === 3 ? "SETTLED_AFTER_TERMINATE" : "FAILED_STILL_OPEN";
     this.cleanupEndedAt = this.readNow();
     if (this.cleanupStatus === "FAILED_STILL_OPEN") this.uncertain("CLEANUP_FAILED");
   }
 
-  private settle(now: number): void {
+  private settle(): void {
     if (this.settled) return;
     if (this.cleanupStatus === "NOT_STARTED") this.cleanupStatus = "NOT_NEEDED";
     this.checkOwnership();
@@ -1919,7 +1989,6 @@ export class CpmmPoolConnectionOwner {
       }
     }
     this.settled = true;
-    this.settledAt = now;
     // Release listeners and timers; anything invoked from here on is a late event.
     this.disposeAll(this.intakeDisposers);
     this.disposeAll(this.lifecycleDisposers);
@@ -1934,6 +2003,11 @@ export class CpmmPoolConnectionOwner {
       } catch {
         // Counted as a late timer if it still fires.
       }
+    }
+    // The actual settlement instant, read after the disposal bookkeeping above.
+    this.settledAt = this.readNow();
+    if (this.deadlines !== null && this.settledAt > this.deadlines.runCeilingMs) {
+      this.uncertain("DEADLINE_OVERRUN");
     }
     const report = this.buildReport(collectorReport);
     this.finalReport = report;
