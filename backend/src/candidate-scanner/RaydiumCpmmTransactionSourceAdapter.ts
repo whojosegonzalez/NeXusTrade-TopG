@@ -156,6 +156,12 @@ export interface CpmmTransactionNotification {
   readonly blockTime?: number | null | undefined;
 }
 
+/** The adapter's frozen pool and mint identity (item 13 binding); nothing else is exposed. */
+export interface CpmmAdapterBinding {
+  readonly poolAddress: string;
+  readonly candidateMint: string;
+}
+
 export interface CpmmLifecycleGate {
   /** Caller cancellation. */
   readonly signal?: AbortSignal | undefined;
@@ -609,6 +615,7 @@ export class RaydiumCpmmTransactionSourceAdapter {
   private readonly maxResponseBytes: number;
   private readonly reserved = new Set<string>();
   private readonly produced = new WeakSet<object>();
+  private readonly binding: CpmmAdapterBinding;
 
   constructor(options: CpmmTransactionSourceOptions) {
     const fail = (msg: string): never => {
@@ -686,6 +693,15 @@ export class RaydiumCpmmTransactionSourceAdapter {
     ]);
     this.maxTrackedSignatures = maxTracked as number;
     this.maxResponseBytes = maxBytes as number;
+    this.binding = Object.freeze({
+      poolAddress: this.pool.poolAddress,
+      candidateMint: this.pool.candidateMint,
+    });
+  }
+
+  /** Frozen pool and mint identity: the same object on every call; dispatches nothing. */
+  public getBinding(): CpmmAdapterBinding {
+    return this.binding;
   }
 
   /** Signatures reserved so far (permanent for this instance). */

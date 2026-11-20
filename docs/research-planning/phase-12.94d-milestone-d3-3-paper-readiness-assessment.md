@@ -6488,16 +6488,16 @@ Mutation checks for the corrections: all 11 caught.
 
 **Run**: the single approved request ran once on 2026-11-16 (`amm-v4-watch-02-01`); its capture, record schema version 2, offline reanalysis and the shutdown change are recorded in §8.38.19. No rerun is authorised.
 
-#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder and Transaction Source Adapter
+#### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; RESOLUTION ACCOUNTING PROPOSED, DESIGN ONLY; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
 > - **Stage 3**: Pure CPMM swap decoder ([`RaydiumCpmmSwapDecoder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmSwapDecoder.ts), 16/16 tests, 15/15 targeted mutants caught) implemented and verified offline on 2026-11-19, following the corrected design (items 8–10) and the implementation clarifications in item 11. It is isolated: no flow, admission, failed-transaction or PAPER zero-swap integration.
 > - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
-> - **Resolution accounting (design only, revised)**: item 13 proposes an isolated per-signature and per-occurrence accounting ledger over the item 12 adapter (`CpmmResolutionAccountingLedger.ts`, not implemented). Only fully ingested, replayable target swaps count as resolved. Every other outcome stays visible as a blocking record and gap, and the ledger never establishes notification completeness, a quiet window or qualification. The revision composes a ledger-owned epoch refusal with the caller's gate, accounts duplicates in their receiving epoch, returns tagged bounded results with exact conservation, and plans a read-only adapter `getBinding()`.
+> - **Resolution accounting**: isolated per-signature and per-occurrence accounting ledger over the item 12 adapter ([`CpmmResolutionAccountingLedger.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts), 23/23 tests, 29 of 30 targeted mutants caught, the survivor equivalent) implemented and verified offline on 2026-11-19 (item 13), with a read-only adapter `getBinding()` (adapter suite 21/21). Only fully ingested, replayable, bound target swaps count as resolved. Every other outcome stays visible as a blocking record and gap. A ledger-owned epoch refusal is composed with the caller's gate, duplicates are accounted in their receiving epoch through bounded aggregates, results are tagged and bounded with exact conservation, and the ledger never establishes notification completeness, a quiet window or qualification. It is not wired to any source, provider, bridge or admission path.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -8191,14 +8191,14 @@ No network request, socket, capture or long process was run.
   - independent review of the wiring.
 - **Status**: CPMM remains quarantined from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
-##### 13. Proposed CPMM Resolution Accounting Ledger (Design Only, Revised; Not Implemented)
+##### 13. CPMM Resolution Accounting Ledger (Implemented Offline 2026-11-19; Not Wired)
 
-**Status**: design only (2026-11-19). It builds on the corrected item 12 adapter (`f0b194d`). The architectural direction of the first draft (`bc24841`) was accepted. This revision closes six contract gaps found in review: epoch changes during outstanding work, duplicate accounting, boundedness, adapter identity binding, metadata and time claims, and conservation. No source, test, pin, configuration, capture or wallet change exists. CPMM remains excluded from admission.
+**Status**: implemented and verified offline (2026-11-19) from the revised design (`5e2d055`), with the three remaining choices accepted in review: limits stay injected with no live defaults; a refused `openEpoch()` closes the current epoch; an agreeing cross-epoch reference to an `INGESTED` in-window record may be non-blocking, subject to the conflict and lateness rules, and never supplies the non-empty-window requirement or counts events again. The ledger is isolated and unwired. No notification source, history enumeration, reconciliation, tracker gap writing, observer fan-out, provider, bridge or admission wiring, failed-transaction policy, configuration or dependency change was made. No request, socket, live capture or operator command was run. CPMM remains excluded from admission.
 
 **Purpose**: turn CPMM resolution facts and ingestion results into explicit per-signature and per-occurrence accounting, plus conservative gap information, so that no notification given to the ledger can disappear from completeness accounting.
 
-- **Not in scope**: discovery, history enumeration, reconciliation and qualification. It is deliberately smaller than a rolling provider.
-- **What it can say**: only "every notification it was given is accounted for, and these are ingested". It can never say that history is complete, that a window was quiet, or that a window qualifies.
+- **Not in scope**: discovery, history enumeration, reconciliation and qualification.
+- **What it can say**: only "every notification it was given is accounted for, and these are ingested". It never says that history is complete, that a window was quiet, or that a window qualifies.
 
 ###### A. Read-Only Inspection: What Is Reusable and What Is AMM v4-Specific
 
@@ -8212,290 +8212,48 @@ No network request, socket, capture or long process was run.
 
 **Conclusion**: the ledger is new code. It imports only the CPMM adapter (its class, for an `instanceof` check, and its types), the tracker type and `isValidSolanaSignature`. No AMM v4 type is imported. The window cutoff is a compact, owner-supplied accounting input (item D); it does not mirror or replace the evaluator's `SourceCutoffEvidence` proof (witnessed anchors and retrieval evidence), which remains the job of a future CPMM reconciliation layer.
 
-###### B. Proposed Files, Adapter Binding, Interfaces and Ownership
+###### B. Files, Adapter Binding and Ownership (as Implemented)
 
-**Files** (a later implementation step):
+| File                                                                                                                                                | Change                                                                                                                                            |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`CpmmResolutionAccountingLedger.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts)                     | New, isolated ledger                                                                                                                              |
+| [`CpmmResolutionAccountingLedger.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts)           | New: 23 synthetic tests (L1–L21, with L17b)                                                                                                       |
+| [`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts)           | Only `CpmmAdapterBinding` and `getBinding()`: the frozen `{ poolAddress, candidateMint }` built once at construction, returned as the same object |
+| [`RaydiumCpmmTransactionSourceAdapter.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts) | Only T-20 (L22); T-00–T-19 unchanged                                                                                                              |
+| `paper-pilot-handoff.ts` / `.test.ts`                                                                                                               | Exactly the two ledger paths added to `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER`; H-12 refuses six neighbouring unlisted ledger files              |
 
-- `backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts` (new);
-- `backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts` (new);
-- `backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts` and its `.test.ts`: one narrowly scoped addition, `getBinding()` (below). Both files are already on the pin allowlist.
-- The pin allowlist gains exactly the two new ledger files.
+**Ownership**: unchanged from the design. The future CPMM flow owner constructs and owns the session, recorder, adapter, tracker and one ledger, opens epochs, supplies windows and decides intake. The session stays the sole request, pacing, budget and deadline owner. The ledger calls only `adapter.getBinding` (at construction), `adapter.resolve` and `adapter.ingest`. Its source contains no `fetch`, timer, clock, `AbortController`, budget, session reference or coverage-advancing tracker call (L12).
 
-**Adapter identity binding (planned adapter change, not made now)**:
+**Imports**: `isValidSolanaSignature` (`ExactPoolHistoryEnumerator.js`), the CPMM adapter class and types, `MAX_BLOCK_TIME_SEC` from the CPMM decoder (so the ledger's notification validation uses the adapter's exact bound), and the tracker types. No AMM v4 type is imported.
 
-```typescript
-// RaydiumCpmmTransactionSourceAdapter.ts (future, narrow)
-export interface CpmmAdapterBinding {
-  readonly poolAddress: string; // the verified pool's poolAddress
-  readonly candidateMint: string; // the verified pool's candidateMint
-}
-/** Frozen pool and mint identity. The same object on every call; nothing else is exposed. */
-public getBinding(): CpmmAdapterBinding;
-```
-
-- It exposes no session, recorder, URL, secret, vault, configuration or reservation state, and calling it dispatches nothing.
-- Adapter tests: exactly two keys equal to the verified pool context; frozen; the same object on every call; no dispatch and no change to `reservedSignatureCount`; the existing 20 tests are unchanged.
-- **Why it is needed**: a per-event check cannot bind outcomes with no events (`RESOLVED_NO_TARGET_SWAP`, `RECORDED_FAILED_TRANSACTION`, every unresolved kind). The ledger constructor therefore requires `adapter.getBinding()`, `tracker.getPoolId()` / `tracker.getTokenMint()` and the supplied binding to agree, and refuses construction otherwise. The per-event check stays as a second defence.
-
-**Ownership**:
-
-| Owner                               | What it owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The future CPMM flow owner (wiring) | Constructs the session (opens it, owns its lifetime), the recorder (and any fan-out), the adapter, the tracker and one ledger. It opens epochs, supplies windows, cutoffs and receipt frontiers, and decides whether to stop its own intake after an overflow                                                                                                                                                                                                               |
-| The shared session                  | Remains the sole request, pacing, budget and deadline owner                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| The adapter                         | Remains the only code that dispatches                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| The ledger                          | Bound to exactly one adapter, one tracker, one pool and one mint. It owns its epoch state, its records and a composed refusal. It calls only `adapter.getBinding` (at construction), `adapter.resolve` and `adapter.ingest`. It has no session reference, transport, timer, clock, abort controller, budget, queue or retry. It never stops the session, aborts a request or stops the owner's intake, and it writes nothing to the tracker except through `adapter.ingest` |
+**API** (see the source for the full types):
 
 ```typescript
-import {
-  RaydiumCpmmTransactionSourceAdapter,
-  type CpmmAdapterBinding,
-  type CpmmIngestionResult,
-  type CpmmLifecycleGate,
-} from "./RaydiumCpmmTransactionSourceAdapter.js";
-import type { RollingTradeFlowTracker } from "./RollingTradeFlowTracker.js";
-
-/** All injected positive safe integers. There are no defaults and no live values. */
-export interface CpmmLedgerLimits {
-  readonly maxSignatureRecords: number; // unique signatures, PENDING included
-  readonly maxDuplicateDetailsPerRecord: number; // retained details; counts stay exact
-  readonly maxEpochs: number; // retained epoch metadata
-}
-
-export interface CpmmObservationEpoch {
-  readonly epoch: number; // safe integer >= 0, strictly increasing
-  readonly observationStartMs: number; // HOST: when this epoch began observing
-}
-
-/** Compact accounting input supplied by the owner. Not a cutoff proof. */
-export interface CpmmAccountingCutoff {
-  readonly slot: number;
-  readonly blockTimeMs: number; // ON-CHAIN
-  readonly provenance: "ON_CHAIN_BLOCK_TIME" | "SYNTHETIC_FIXTURE"; // asserted by the owner
-}
-
-export interface CpmmAccountingWindow {
-  readonly epoch: number;
-  readonly windowStartMs: number; // ON-CHAIN, inclusive
-  readonly windowEndMs: number; // ON-CHAIN, exclusive
-  readonly cutoff: CpmmAccountingCutoff;
-  readonly receiptFrontierMs: number; // HOST: the owner's frozen receipt frontier for this window
-}
-
-export interface CpmmNotificationEnvelope {
-  readonly notification: unknown; // validated by the ledger, then again by the adapter
-  readonly epoch: number; // the epoch the owner received it in
-  readonly hostReceivedAtMs: number; // must equal notification.receivedAtMs
-}
-
-export type CpmmAccountingDisposition =
-  | "PENDING" // the only non-terminal state
-  | "INGESTED" // the only successful state
-  | "INGESTION_INCOMPLETE"
-  | "POLICY_PENDING"
-  | "UNRESOLVED";
-
-export type CpmmBlockingClass =
-  // UNRESOLVED only
-  | "TRANSACTION_UNAVAILABLE"
-  | "RESPONSE_CONTRADICTED"
-  | "DECODER_UNRESOLVED"
-  | "EVIDENCE_UNVERIFIED"
-  | "EVIDENCE_WITHHELD"
-  | "CANCELLED"
-  | "SESSION_ENDED"
-  | "REQUEST_REFUSED"
-  | "ADAPTER_CAPACITY_REFUSED"
-  | "DUPLICATE_WITHOUT_ORIGINAL"
-  | "VALIDATION_DISAGREEMENT"
-  // INGESTION_INCOMPLETE only
-  | "INGEST_STOPPED"
-  | "INGEST_REJECTED"
-  | "NOT_INGESTIBLE"
-  // either
-  | "EPOCH_CLOSED"
-  | "BINDING_CONFLICT"
-  | "ACCOUNTING_EXCEPTION"
-  | "UNRECOGNIZED_OUTCOME";
-
-export interface CpmmSignatureAccountingRecord {
-  readonly sequence: number;
-  readonly signature: string; // ledger-validated canonical signature
-  readonly epoch: number; // receiving epoch of the first occurrence, for life
-  readonly hostReceivedAtMs: number; // HOST
-  readonly notifiedSlot: number; // source claim
-  readonly notifiedBlockTimeSec: number | null; // source claim
-  readonly verifiedSlot: number | null; // item D table only
-  readonly verifiedBlockTimeSec: number | null; // ON-CHAIN; item D table only
-  readonly disposition: CpmmAccountingDisposition;
-  readonly blockingClass: CpmmBlockingClass | null; // null for PENDING, INGESTED, POLICY_PENDING
-  readonly policyPending:
-    | "NO_TARGET_SWAP_POLICY_UNREVIEWED"
-    | "FAILED_TRANSACTION_POLICY_UNREVIEWED"
-    | null;
-  readonly factKind: string | null; // verbatim fixed adapter kind; null while PENDING
-  readonly factCode: string | null;
-  readonly ingestion: {
-    readonly status: CpmmIngestionResult["status"] | "NOT_CALLED" | "EXCEPTION";
-    readonly total: number;
-    readonly accepted: number;
-    readonly rejected: number;
-    readonly unattempted: number;
-    readonly indeterminate: number; // after an exception; the four counts sum to total
-  };
-  readonly metadataConflicts: number; // conflicting duplicate occurrences (sticky)
-  readonly duplicateOccurrences: number; // exact
-  readonly duplicateDetails: readonly CpmmDuplicateOccurrence[]; // first N only
-  readonly duplicateDetailsDropped: number; // duplicateOccurrences - duplicateDetails.length
-}
-
-export interface CpmmDuplicateOccurrence {
-  readonly occurrence: number;
-  readonly epoch: number; // receiving epoch
-  readonly hostReceivedAtMs: number;
-  readonly notifiedSlot: number;
-  readonly notifiedBlockTimeSec: number | null;
-  readonly agreement: "AGREES" | "SLOT_CONFLICT" | "BLOCK_TIME_CONFLICT";
-  readonly firstDispositionAtReceipt: CpmmAccountingDisposition; // informational; may be PENDING
-}
-
-export type CpmmInvalidCode =
-  | "ENVELOPE_INVALID"
-  | "GATE_INVALID"
-  | "NOTIFICATION_INVALID" // detail: the adapter-identical fixed code
-  | "RECEIPT_TIME_DISAGREEMENT"
-  | "RECEIPT_BEFORE_EPOCH_START"
-  | "STALE_EPOCH"
-  | "EPOCH_NOT_OPEN";
-
-export type CpmmAccountResult =
-  | {
-      readonly status: "RECORDED"; // first occurrence; record is terminal
-      readonly occurrence: number;
-      readonly record: CpmmSignatureAccountingRecord;
-    }
-  | {
-      readonly status: "DUPLICATE"; // no request, no ingestion
-      readonly occurrence: number;
-      readonly firstSequence: number;
-      readonly detail: CpmmDuplicateOccurrence;
-      readonly detailRetained: boolean;
-    }
-  | {
-      readonly status: "INVALID"; // no request
-      readonly occurrence: number;
-      readonly epoch: number | null; // null when unattributed
-      readonly code: CpmmInvalidCode;
-      readonly detail: string | null;
-    }
-  | {
-      readonly status: "CAPACITY_REFUSED"; // no request
-      readonly occurrence: number;
-      readonly epoch: number | null;
-      readonly code: "RECORD_CAPACITY" | "EPOCH_CAPACITY";
-    };
-
-export type CpmmOpenEpochResult =
-  | { readonly status: "OPENED"; readonly epoch: number }
-  | {
-      readonly status: "REFUSED"; // the previously open epoch is closed anyway
-      readonly code: "EPOCH_INVALID" | "EPOCH_NOT_INCREASING" | "EPOCH_CAPACITY";
-    };
-
-/** Exact counters that saturate at Number.MAX_SAFE_INTEGER; saturation is sticky and blocking. */
-export interface CpmmLedgerCounters {
-  readonly occurrences: number; // every account() call
-  readonly unattributedOccurrences: number; // epoch unreadable or not retained
-  readonly recordCapacityRefused: number;
-  readonly epochCapacityRefused: number; // envelopes refused for EPOCH_CAPACITY
-  readonly openEpochRefused: number;
-  readonly saturated: boolean;
-}
-
-export interface CpmmEpochAccounting {
-  readonly epoch: number;
-  readonly observationStartMs: number;
-  readonly state: "OPEN" | "CLOSED";
-  readonly occurrences: number; // first + duplicates + invalid + capacityRefused
-  readonly firstOccurrences: number; // records whose epoch is this one
-  readonly duplicates: {
-    readonly sameEpoch: number;
-    readonly crossEpoch: number;
-    readonly conflicting: number; // subset of the two above
-  };
-  readonly invalid: Readonly<Record<CpmmInvalidCode, number>>;
-  readonly capacityRefused: number; // RECORD_CAPACITY attributed to this epoch
-}
-
-export interface CpmmAccountingGap {
-  readonly epoch: number;
-  readonly signature: string | null;
-  readonly timeBasis: "HOST_RECEIPT"; // local observation uncertainty only
-  readonly startMs: number; // the epoch's observationStartMs
-  readonly endMs: number; // the occurrence's receipt, or receiptFrontierMs for epoch-wide gaps
-  readonly reason: string; // fixed: `CPMM_${class or code}`
-}
-
-export interface CpmmWindowAccountingSummary {
-  readonly binding: CpmmAdapterBinding;
-  readonly window: CpmmAccountingWindow;
-  readonly ledgerVersion: number; // stale summaries are detectable
-  readonly epoch: CpmmEpochAccounting;
-  readonly ledger: CpmmLedgerCounters;
-  readonly inWindow: Readonly<Record<CpmmAccountingDisposition, number>>; // first records of this epoch
-  readonly inWindowByClass: Readonly<Partial<Record<CpmmBlockingClass, number>>>;
-  readonly policyPending: { readonly noTargetSwap: number; readonly failedTransaction: number };
-  readonly events: {
-    readonly total: number;
-    readonly accepted: number;
-    readonly rejected: number;
-    readonly unattempted: number;
-    readonly indeterminate: number;
-  };
-  readonly positionUnknown: number;
-  readonly afterCutoff: number;
-  readonly lateInWindow: number;
-  readonly crossEpochDuplicates: { readonly referencedIngested: number; readonly blocking: number };
-  readonly otherEpochFirstRecords: number; // first records of other epochs (not this window)
-  readonly gaps: readonly CpmmAccountingGap[];
-  readonly accountingComplete: boolean; // item G; never completeness of history
-  readonly notificationCompletenessEstablished: false;
-  readonly quietWindowEstablished: false;
-  readonly qualificationEligible: false;
-}
-
-export type CpmmSummarizeResult =
-  | { readonly status: "SUMMARY"; readonly summary: CpmmWindowAccountingSummary }
-  | {
-      readonly status: "WINDOW_INVALID";
-      readonly code: "WINDOW_SHAPE" | "EPOCH_NOT_RETAINED" | "FRONTIER_BEFORE_EPOCH_START";
-    };
-
-export class CpmmResolutionAccountingLedger {
-  constructor(options: {
-    readonly binding: CpmmAdapterBinding;
-    readonly adapter: RaydiumCpmmTransactionSourceAdapter;
-    readonly tracker: RollingTradeFlowTracker;
-    readonly limits: CpmmLedgerLimits;
-  });
-  openEpoch(epoch: CpmmObservationEpoch): CpmmOpenEpochResult; // synchronous; re-entrant safe
-  account(envelope: CpmmNotificationEnvelope, gate?: CpmmLifecycleGate): Promise<CpmmAccountResult>; // never rejects
-  summarize(window: CpmmAccountingWindow): CpmmSummarizeResult; // pure snapshot
-  records(): readonly CpmmSignatureAccountingRecord[]; // frozen copies
-  epochs(): readonly CpmmEpochAccounting[];
-  counters(): CpmmLedgerCounters;
-  get version(): number;
-}
+new CpmmResolutionAccountingLedger({ binding, adapter, tracker, limits });
+// limits: { maxSignatureRecords, maxDuplicateDetailsPerRecord, maxEpochs } (injected, no defaults)
+openEpoch({ epoch, observationStartMs }): CpmmOpenEpochResult; // OPENED | REFUSED (closes the open epoch)
+account(envelope, gate?): Promise<CpmmAccountResult>; // RECORDED | DUPLICATE | INVALID | CAPACITY_REFUSED
+summarize(window): CpmmSummarizeResult; // SUMMARY | WINDOW_INVALID
+records(); epochs(); counters(); version;
+cpmmSaturatingIncrement(value); // the exported counter helper
 ```
 
-- **Construction** throws `[CPMM_LEDGER_INIT]` (it is owner wiring; no record exists yet) unless: options are read with the corrected null-prototype copier from item 12 and have exactly these keys; `adapter` is a `RaydiumCpmmTransactionSourceAdapter`; `adapter.getBinding()`, the tracker's pool and mint and `binding` agree field by field; and every limit is a positive safe integer.
-- **Immutability**: records, results, epochs, counters and summaries are deep-frozen and hold only strings, numbers, booleans and `null`. Facts are referenced by kind and code, never embedded, so no payload is retained twice.
+**Construction** throws `[CPMM_LEDGER_INIT]` unless the options are exactly `binding`, `adapter`, `tracker` and `limits` (read with the null-prototype copier); the adapter is a `RaydiumCpmmTransactionSourceAdapter`; `adapter.getBinding()`, the tracker's pool and mint and `binding` agree; and every limit is a positive safe integer.
+
+**Records, results, epochs, counters and summaries** are deep-frozen copies holding only strings, numbers, booleans and `null`. Earlier snapshots never change (L21).
+
+**Differences from the design text, made during implementation**:
+
+- The record carries a derived boolean `metadataConflict`, not a conflict count, and `CpmmEpochAccounting.duplicates` has only `sameEpoch` and `crossEpoch`. Conflicts are derived from bounded aggregates at snapshot and summary time (item E), so they cannot be lost to detail truncation. The summary reports them as `metadataConflicts: { references, records }`.
+- Window membership also treats a verified time after `cutoff.blockTimeMs` as `afterCutoff`, not only a slot after `cutoff.slot`.
+- An `ingest` result of `NOT_INGESTIBLE` (which by contract has total 0) is mapped before the count checks: `FOREIGN_FACT` is `UNRESOLVED` / `BINDING_CONFLICT`, otherwise `INGESTION_INCOMPLETE` / `NOT_INGESTIBLE`, with every event `unattempted`.
+- `UNRECOGNIZED_SESSION_CODE` from the adapter maps to `REQUEST_REFUSED`; any other unknown refusal or late code maps to `UNRECOGNIZED_OUTCOME`.
 
 ###### C. `account()` Order, Epoch Refusal and Disposition Mapping
 
 **Synchronous part** (before any `await`; each step that refuses returns without calling the adapter, so no request is possible):
 
-1. Assign an occurrence number; increment `occurrences` and `version`.
+1. Assign an occurrence number; increment `occurrences` and `version` (the occurrence's single version increment, which also covers a `PENDING` record written in step 9).
 2. **Envelope**: a plain data record with exactly `notification`, `epoch` and `hostReceivedAtMs`, a safe-integer epoch and a positive safe-integer receipt. Otherwise `INVALID` / `ENVELOPE_INVALID`, unattributed.
 3. **Epoch**: the envelope's epoch must be the currently open epoch. A retained but closed epoch, or an unretained epoch below the newest retained one, gives `INVALID` / `STALE_EPOCH`. A higher, unopened epoch gives `INVALID` / `EPOCH_NOT_OPEN`. If no epoch is open because epoch capacity was reached, the result is `CAPACITY_REFUSED` / `EPOCH_CAPACITY`. Unretained epochs are unattributed.
 4. **Gate**: the caller's gate is validated with the adapter's rules (data record; only `signal` and `refusal`). Otherwise `INVALID` / `GATE_INVALID`.
@@ -8503,7 +8261,7 @@ export class CpmmResolutionAccountingLedger {
 6. **Receipt agreement**: `notification.receivedAtMs` must equal `envelope.hostReceivedAtMs` (`RECEIPT_TIME_DISAGREEMENT`) and must not precede the epoch's `observationStartMs` (`RECEIPT_BEFORE_EPOCH_START`).
 7. **Known signature**: the occurrence is a `DUPLICATE` (item E). The adapter is not called.
 8. **Record capacity**: if `maxSignatureRecords` is reached, the result is `CAPACITY_REFUSED` / `RECORD_CAPACITY`, attributed to the epoch. The adapter is not called and makes no reservation.
-9. **First occurrence**: write a `PENDING` record (`version` + 1), compose the gate, and call `adapter.resolve(copy, composedGate)`.
+9. **First occurrence**: write a `PENDING` record (no separate version increment), compose the gate, and call `adapter.resolve(copy, composedGate)`.
 
 **Composed gate** (ledger-owned epoch refusal plus the caller's gate; no new timer, scheduler, abort controller or session ownership):
 
@@ -8580,135 +8338,118 @@ const composed = {
 
 **Two time domains, never mixed**:
 
-- **On-chain** (`verifiedBlockTimeSec × 1000`, `verifiedSlot`): the only basis for window membership. A record is in the window when its verified time is in `[windowStartMs, windowEndMs)` and `verifiedSlot <= cutoff.slot`. A verified slot after `cutoff.slot` is counted in `afterCutoff`, never dropped. A non-`INGESTED` record with no verified time is `positionUnknown` in every window of its epoch.
+- **On-chain** (`verifiedBlockTimeSec × 1000`, `verifiedSlot`): the only basis for window membership. A record is in the window when its verified time is in `[windowStartMs, windowEndMs)`, `verifiedSlot <= cutoff.slot` and the time is not after `cutoff.blockTimeMs`. A verified slot or time after the cutoff is counted in `afterCutoff`, never dropped. A non-`INGESTED` record with no verified time is `positionUnknown` in every window of its epoch.
 - **Host** (`hostReceivedAtMs`, `observationStartMs`, `receiptFrontierMs`): ordering, lateness and gaps only.
 
-**Lateness** uses the owner's frozen frontier, not summary evaluation time. `receiptFrontierMs` is the host receipt instant up to which the owner froze this window's decision input. A first record or a duplicate occurrence that affects the window and has `hostReceivedAtMs > receiptFrontierMs` is `lateInWindow` and blocks. The ledger has no clock; when `summarize()` is called never affects membership or lateness. Changes after a summary are detected through `ledgerVersion`.
+**Lateness** uses the owner's frozen frontier, not summary evaluation time. `receiptFrontierMs` is the host receipt instant up to which the owner froze this window's decision input. A first record or a duplicate occurrence that affects the window and has `hostReceivedAtMs > receiptFrontierMs` makes its signature late and blocks (unit and representation in item E). The ledger has no clock; when `summarize()` is called never affects membership or lateness. Changes after a summary are detected through `ledgerVersion`.
 
 **Cutoff**: `CpmmAccountingCutoff` is a compact accounting input. Its `provenance` is asserted by the owner, not verified by the ledger; `SYNTHETIC_FIXTURE` is never complete. It is not a `SourceCutoffEvidence` proof and carries no witnessed anchor or retrieval evidence.
 
 **Gaps describe local observation uncertainty**: a gap `[observationStartMs, endMs]` in the host domain says that, during that local observation interval, the ledger received something it cannot account for. It does not bound the transaction's on-chain time, and no on-chain timestamp is estimated from host receipt. Gaps are returned in summaries only; the ledger never calls `recordCollectionGap` or any coverage-advancing tracker method.
 
-###### E. Duplicates and Versioning
+###### E. Duplicates: Aggregates, Truncation and Effects
 
-- **One permanent first resolution per signature**, made by the first occurrence. It is never upgraded, overwritten or re-resolved, and the adapter's reservation is permanent.
-- **Every later occurrence is recorded where it was received**: no adapter call, no request, no ingestion and no tracker change. The receiving epoch's `duplicates` counters are incremented and, within `maxDuplicateDetailsPerRecord`, a detail is appended to the first record; beyond the bound only `duplicateDetailsDropped` grows, and every count stays exact.
-- **Metadata agreement** compares the occurrence's notified slot and block time with the first record's verified values when present, otherwise its notified claims. A different slot gives `SLOT_CONFLICT`. Two numeric block times that differ give `BLOCK_TIME_CONFLICT`. A block time absent on one side is not a conflict.
-- **Effect on accounting** (derived at summary time from the first record's current state, so nothing is stored twice):
+- **One permanent first resolution per signature**. A later occurrence of a known signature is recorded where it was received, with no adapter call, request, ingestion or tracker change. A concurrent duplicate returns `DUPLICATE` at once with `firstDispositionAtReceipt: "PENDING"` and never waits.
+- **Representation (independent of `duplicateDetails`)**: each epoch keeps one aggregate per referenced first record: the exact occurrence count, the latest host receipt, and the minimum and maximum claimed slot and numeric block time. There is at most one aggregate per (receiving epoch, signature), so the store is bounded by `maxEpochs × maxSignatureRecords`. `duplicateDetails` keeps only the first `maxDuplicateDetailsPerRecord` occurrences for inspection; it is never read for blocking, conflicts or lateness.
+- **Conflicts**: an aggregate conflicts when its claimed slots are not all equal to the first record's verified (otherwise notified) slot, or when its numeric block times differ from each other or from the first record's verified (otherwise notified) block time. A block time absent on either side is not a conflict. Because the first record's reference values only change from unknown to verified, and min/max never shrink, a conflict once present stays present. This also detects a claim made while the first was `PENDING` once the first is verified (L16). The per-occurrence `agreement` in a result is informational, evaluated at receipt.
+- **Lateness unit**: `lateInWindow` counts **distinct signatures**. A signature counts once for a window when its first record (if of the window's epoch) or any duplicate occurrence received in that epoch is placed in the window, or has unknown position, and was received after `receiptFrontierMs`. A late occurrence exists exactly when the aggregate's latest receipt exceeds the frontier, so the count is exact for this unit for any frontier, after any truncation. Exact per-occurrence late counts for arbitrary frontiers are not retained.
 
-| Occurrence                                                                      | Receiving epoch's windows                                                                                                                                                                            |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Same epoch, `AGREES`                                                            | No additional effect; the first record is accounted in this epoch                                                                                                                                    |
-| Cross-epoch, `AGREES`, first record `INGESTED` with verified time in the window | `crossEpochDuplicates.referencedIngested`: visible, not blocking, and not counted toward the window's non-empty requirement                                                                          |
-| Cross-epoch, `AGREES`, first record `PENDING` or any non-`INGESTED` disposition | `crossEpochDuplicates.blocking`, placed by the first record's verified time, or `positionUnknown` in every window of the receiving epoch                                                             |
-| Any conflict                                                                    | `duplicates.conflicting`; blocks every window of the receiving epoch **and** of the first record's epoch; the first record's `metadataConflicts` grows; its disposition, slot and time are unchanged |
+**Effect on a window of the receiving epoch** (lateness and conflicts override "no additional effect"):
 
-- **Concurrent duplicate**: while the first occurrence is `PENDING`, a duplicate returns `DUPLICATE` immediately with `firstDispositionAtReceipt: "PENDING"`. It never waits for the first call and never makes a request. Its effect follows the first record when that settles.
-- **Versioning**: `version` increases by 1 for every `account()` occurrence at its synchronous record (any status), by 1 for each `PENDING`-to-terminal transition, and by 1 for each `openEpoch()` call (opened or refused). A duplicate never causes a later version change by itself.
+| Occurrence                                                                           | Effect                                                                                                                                                       |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Same epoch, agreeing, on time                                                        | None beyond the first record                                                                                                                                 |
+| Same epoch, agreeing, received after the frontier, first record placed in the window | `lateInWindow`; blocks                                                                                                                                       |
+| Cross-epoch, agreeing, on time, first record `INGESTED` and in the window            | `crossEpochDuplicates.referencedIngested`: visible, non-blocking; never counts toward non-emptiness and never adds events (`events` sums first records only) |
+| Cross-epoch, first record `PENDING`, not `INGESTED`, or of unknown position          | `crossEpochDuplicates.blocking`                                                                                                                              |
+| Cross-epoch, received after the frontier, first record in the window                 | `lateInWindow`; blocks                                                                                                                                       |
+| Any conflicting aggregate                                                            | Blocks every window of the receiving epoch (`metadataConflicts.references`) and of the first record's epoch (`metadataConflicts.records`)                    |
 
-###### F. Boundedness and Conservation
+###### F. Versioning, Bounds and Conservation
 
-**Bounds** (all injected; no live defaults):
+**Versioning** (item C corrected): `version` increases by exactly 1 per `account()` occurrence (any status; the `PENDING` creation belongs to this increment), by exactly 1 per `PENDING`-to-terminal transition, and by exactly 1 per `openEpoch()` call (opened or refused). L21 checks `version = occurrences + terminal records + openEpoch calls`.
 
-| Store                  | Bound                                                                                        | At the bound                                                                                                                                  |
-| ---------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Signature records      | `maxSignatureRecords` (including `PENDING`)                                                  | A new signature gets `CAPACITY_REFUSED` / `RECORD_CAPACITY`, before the adapter is called; duplicates of known signatures are still accounted |
-| Duplicate details      | `maxDuplicateDetailsPerRecord` per record                                                    | `DUPLICATE` with `detailRetained: false`; counts stay exact                                                                                   |
-| Epoch metadata         | `maxEpochs`                                                                                  | `openEpoch` returns `EPOCH_CAPACITY` and the open epoch is closed; later envelopes get `CAPACITY_REFUSED` / `EPOCH_CAPACITY`, unattributed    |
-| Cross-epoch references | per epoch, at most one entry per first record (so at most `maxEpochs × maxSignatureRecords`) | Never exceeded by construction                                                                                                                |
-| Counters               | exact up to `Number.MAX_SAFE_INTEGER`                                                        | Saturate; `saturated` becomes `true` (sticky) and blocks every summary                                                                        |
-| Gaps per summary       | one per blocking record or reference of the epoch, plus one per non-zero blocking counter    | Derived from the bounded stores                                                                                                               |
+**Bounds**: records ≤ `maxSignatureRecords` (a new signature beyond it gets `CAPACITY_REFUSED` / `RECORD_CAPACITY` before the adapter is called and without a reservation); details ≤ `maxDuplicateDetailsPerRecord` per record (`detailRetained: false` beyond it, counts exact); epochs ≤ `maxEpochs` (`openEpoch` returns `EPOCH_CAPACITY`, closes the open epoch, and later envelopes get `CAPACITY_REFUSED` / `EPOCH_CAPACITY`, unattributed); counters saturate at `Number.MAX_SAFE_INTEGER` with a sticky, blocking `saturated` flag. Overflow is visible in every later summary; the ledger never stops the session or intake.
 
-- **Overflow never dispatches** and stays visible in every later summary through the sticky counters. The ledger never stops the session, aborts a request or stops intake; whether to stop intake is the owner's decision.
-- **Refused `openEpoch`**: any refusal (`EPOCH_INVALID`, `EPOCH_NOT_INCREASING`, `EPOCH_CAPACITY`) closes the currently open epoch, leaves no epoch open and increments `openEpochRefused`. This fails closed: work in flight for the closed epoch is refused at its next check.
+**Conservation** (asserted after every step in L1–L21):
 
-**Conservation** (exact, checked in tests after every step):
+- `counters.occurrences = Σ epoch.occurrences + unattributedOccurrences`;
+- per epoch, `occurrences = firstOccurrences + duplicates.sameEpoch + duplicates.crossEpoch + Σ invalid + capacityRefused`, and `firstOccurrences` equals that epoch's records;
+- `Σ record.duplicateOccurrences = Σ (sameEpoch + crossEpoch)`, and `duplicateDetails.length + duplicateDetailsDropped = duplicateOccurrences` per record;
+- per record, `accepted + rejected + unattempted + indeterminate = total`;
+- signatures are unique among records and sequences are `1..n`.
 
-- Ledger: `occurrences = Σ epoch.occurrences + unattributedOccurrences`.
-- Epoch: `occurrences = firstOccurrences + duplicates.sameEpoch + duplicates.crossEpoch + Σ invalid + capacityRefused`.
-- Records: `records().length = Σ epoch.firstOccurrences ≤ maxSignatureRecords`, and the records split exactly by disposition (`PENDING + INGESTED + INGESTION_INCOMPLETE + POLICY_PENDING + UNRESOLVED`).
-- Duplicates: `Σ record.duplicateOccurrences = Σ (sameEpoch + crossEpoch)`, and `duplicateDetails.length + duplicateDetailsDropped = duplicateOccurrences` per record.
-- Events: per record and per summary, `accepted + rejected + unattempted + indeterminate = total`.
-- Unique signatures versus notifications: every notification is exactly one occurrence; every valid signature that passed intake is exactly one record; invalid, stale-epoch, capacity-refused and unattributed occurrences create no record and make no request.
+###### G. `accountingComplete` and Gaps (as Implemented)
 
-###### G. `accountingComplete` and Gaps
+`accountingComplete` is true only if: the cutoff provenance is `ON_CHAIN_BLOCK_TIME`; at least one first record of the window's epoch is in the window; no first record of the epoch that is in the window or of unknown position is anything but `INGESTED`; `lateInWindow`, `crossEpochDuplicates.blocking` and both `metadataConflicts` counts are 0; the epoch has no invalid or capacity-refused occurrence; and the ledger's unattributed, record-capacity, epoch-capacity and refused-`openEpoch` counters are 0 and not saturated. `notificationCompletenessEstablished`, `quietWindowEstablished` and `qualificationEligible` are literal `false`, including on a complete window (L4).
 
-**`accountingComplete`** for a window is true only if all of the following hold:
+Gaps are host-domain observation uncertainty: one per blocking first record, late signature, conflict or blocking reference (`endMs` = its receipt), and one epoch-wide gap per non-zero blocking counter (`endMs` = `receiptFrontierMs`). They are returned in summaries only.
 
-- the window is valid, its epoch is retained, `receiptFrontierMs >= observationStartMs`, and the cutoff provenance is `ON_CHAIN_BLOCK_TIME`;
-- at least one first record of the window's epoch is in the window, and every such record is `INGESTED` with `metadataConflicts === 0`;
-- for the epoch: `PENDING`, `positionUnknown`, `lateInWindow`, `crossEpochDuplicates.blocking`, `duplicates.conflicting`, every `invalid` count and `capacityRefused` are 0, and no conflicting duplicate of this epoch's records was received in another epoch;
-- for the ledger: `unattributedOccurrences`, `recordCapacityRefused`, `epochCapacityRefused` and `openEpochRefused` are 0, and `saturated` is `false`.
+###### H. Tests, Mutation Checks and Results
 
-Even then, it means only that every notification given to the ledger is accounted for. It says nothing about notifications never received. An empty window is never complete, and the three literal-`false` flags never change.
+**Synthetic suite** (`CpmmResolutionAccountingLedger.test.ts`, 23 tests): a real session with a virtual clock and timers, a scripted in-memory `fetch`, a real recorder, a real adapter (a subclass only observes or replaces `resolve`, so `instanceof` holds), and a real tracker. No network.
 
-**Gaps**: one per blocking first record or blocking duplicate reference of the epoch (`endMs` = its receipt) and one epoch-wide gap per non-zero blocking counter (`endMs` = `receiptFrontierMs`), all with fixed reasons, in the host domain.
+| Test | Covers                                                                                                                                                                                           |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| L1a  | Every real-adapter outcome to its disposition and class                                                                                                                                          |
+| L1b  | Refusal, adapter capacity, validation disagreement, binding conflict, exception, unknown kinds and codes; decoded kinds verified only when every decoded precondition holds (each removed alone) |
+| L2   | `INGESTED` only on `COMPLETE`; `PARTIAL` and `NONE_ACCEPTED` exact and final; foreign fact is a binding conflict                                                                                 |
+| L3   | Duplicates make no adapter call; a concurrent duplicate returns against `PENDING`; version increments                                                                                            |
+| L4   | Unresolved outcomes give a class, a gap and a blocked window; literal-`false` flags on a complete window                                                                                         |
+| L5   | No-target and failed outcomes distinct, pending, no tracker change                                                                                                                               |
+| L6   | Epoch intake, stale and unopened epochs, refused `openEpoch` closes the epoch                                                                                                                    |
+| L7   | On-chain membership, after-cutoff, fixture provenance, window validation                                                                                                                         |
+| L8   | Frontier-based lateness, independent of summary time; version-detectable staleness                                                                                                               |
+| L9   | Cancellation, session stop before ingestion and a caller stop between events                                                                                                                     |
+| L10  | Empty window                                                                                                                                                                                     |
+| L11  | Construction binding refusals; an event of another slot is refused before `ingest`                                                                                                               |
+| L12  | Source boundaries and exact imports                                                                                                                                                              |
+| L13  | Epoch closed during the pacing wait (no dispatch), in flight, before ingestion, with a caller refusal, and with session stop or a genuine transport error (their class kept)                     |
+| L14  | Re-entrant `openEpoch` from the caller's callback between events: accepted event preserved, exact counts, `EPOCH_CLOSED`                                                                         |
+| L15  | Cross-epoch references: non-blocking, never non-emptiness or events; blocking for unresolved and `PENDING` firsts                                                                                |
+| L16  | Slot and block-time conflicts, against verified values, and a claim made while `PENDING`                                                                                                         |
+| L17  | Record overflow before the adapter, bounded details, saturation helper, overflow in a later epoch blocks an earlier one                                                                          |
+| L17b | Regression: after the detail limit, a late duplicate beyond the frontier, a conflict whose detail is dropped, and a late cross-epoch reference all still block                                   |
+| L18  | Epoch capacity                                                                                                                                                                                   |
+| L19  | Receipt agreement and epoch start; envelope, gate and notification codes identical to the adapter's                                                                                              |
+| L20  | Verified metadata only for decoded kinds; matched time positions but never resolves                                                                                                              |
+| L21  | Mixed concurrent occurrences: conservation, frozen unchanged snapshots and the version equation                                                                                                  |
 
-###### H. Synthetic Test Matrix (Proposed)
+L22 is adapter test T-20: `getBinding()` has exactly two keys, is frozen and the same object on every call, and dispatches nothing.
 
-Harness: the item 12 adapter harness (a real session with virtual clock and timers, scripted in-memory `fetch`, a real recorder, a real tracker), with no network.
+**Mutation checks** (each run with an external 60-second limit, source restored and hash-checked after each):
 
-| Group                           | Cases                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| L1 Mapping                      | Every row of item C, including `BINDING_CONFLICT`, `VALIDATION_DISAGREEMENT`, `ACCOUNTING_EXCEPTION` and `UNRECOGNIZED_OUTCOME`; results and records are frozen and plain                                                                                                                                                                                               |
-| L2 Successful ingestion         | `COMPLETE` gives `INGESTED`; `PARTIAL` (1/1/0 and 1/0/1), `NONE_ACCEPTED` and `REFUSED_BEFORE_START` keep exact counts and block; a non-replayable or foreign fact never gives `INGESTED`                                                                                                                                                                               |
-| L3 Duplicates (same epoch)      | Sequential and concurrent duplicates make zero adapter calls; a concurrent one returns `DUPLICATE` with `PENDING` before the first settles; a duplicate of a `PARTIAL` or failed record changes nothing; `DUPLICATE_WITHOUT_ORIGINAL`                                                                                                                                   |
-| L4 Missing resolutions          | Each unavailable, contradicted, evidence, withheld, refusal and adapter-capacity outcome is `UNRESOLVED` with its class, a gap, and a blocked window; `PENDING` blocks until it settles                                                                                                                                                                                 |
-| L5 Policy pending               | `RESOLVED_NO_TARGET_SWAP` and `RECORDED_FAILED_TRANSACTION` stay distinct, block, never count as zero-swap, and leave the tracker unchanged                                                                                                                                                                                                                             |
-| L6 Epoch intake                 | Strictly increasing `openEpoch`; `STALE_EPOCH` and `EPOCH_NOT_OPEN` make no adapter call and block (or are unattributed); a refused `openEpoch` closes the open epoch                                                                                                                                                                                                   |
-| L7 Time domains                 | Membership by verified on-chain time only; `afterCutoff`; a `SYNTHETIC_FIXTURE` cutoff is never complete; host receipt affects only gaps and lateness; a gap never changes a record's position                                                                                                                                                                          |
-| L8 Lateness                     | A first record or a duplicate received after `receiptFrontierMs` blocks; the same input summarized at different times gives the same membership and lateness; a later change bumps `ledgerVersion`                                                                                                                                                                      |
-| L9 Lifecycle                    | Cancellation, session stop and the deadline before dispatch, in flight, at the post-await check and between events map to `CANCELLED`, `SESSION_ENDED` or `INGEST_STOPPED` with exact counts; `account()` never rejects                                                                                                                                                 |
-| L10 Empty and quiet             | No notifications: `accountingComplete: false` and the three flags `false`                                                                                                                                                                                                                                                                                               |
-| L11 Binding                     | Construction refuses any disagreement between `adapter.getBinding()`, the tracker and `binding`; an event of another pool, mint, signature or slot gives `BINDING_CONFLICT` without ingestion                                                                                                                                                                           |
-| L12 Source boundaries           | No `fetch`, timers, `Date.now`, `AbortController`, budget, session methods, `recordHeartbeat`, `recordObservationCheckpoint`, `recordCompletedRange` or `recordCollectionGap`; imports limited to the CPMM adapter, the tracker type and the signature validator                                                                                                        |
-| L13 Epoch change during await   | `openEpoch` during the session's pacing wait (zero dispatches), while in flight (one dispatch, `LATE_RESPONSE`, nothing ingested), and between resolution and `ingest` (all events unattempted): each `EPOCH_CLOSED` in the old epoch; the new epoch's summary has no trace of it; epoch plus caller refusal gives `EPOCH_CLOSED`; a session stop keeps `SESSION_ENDED` |
-| L14 Epoch change between events | A re-entrant `openEpoch` from the caller's `refusal` callback after event k: k accepted events preserved in the tracker, exact remaining counts, `INGESTION_INCOMPLETE` / `EPOCH_CLOSED`, old epoch blocked                                                                                                                                                             |
-| L15 Cross-epoch duplicates      | Counted in the receiving epoch, never only in `otherEpochFirstRecords`; a reference to an `INGESTED` in-window record is visible and does not make an otherwise empty window complete; a reference to a `PENDING`, unresolved, policy-pending or position-unknown record blocks                                                                                         |
-| L16 Contradictory duplicates    | Slot conflict and block-time conflict against notified and against verified values block both epochs and increment `metadataConflicts`; the first record is otherwise unchanged; a block time absent on one side agrees                                                                                                                                                 |
-| L17 Overflow returns            | `RECORD_CAPACITY` with zero adapter calls, zero dispatches and no reservation; duplicates of known signatures still accounted at capacity; `detailRetained: false` with exact counts; counter saturation helper; every later summary blocked                                                                                                                            |
-| L18 Epoch capacity              | `maxEpochs` reached: `EPOCH_CAPACITY`, the open epoch closed, later envelopes refused without a request and visible in every summary                                                                                                                                                                                                                                    |
-| L19 Receipt time                | `RECEIPT_TIME_DISAGREEMENT` and `RECEIPT_BEFORE_EPOCH_START` make no adapter call and block the epoch; equality is accepted                                                                                                                                                                                                                                             |
-| L20 Metadata boundaries         | Each row of the item D table: contradicted and pre-decoding kinds have no verified slot or time; non-swap decoded kinds gain a verified block time only from a numeric notified value; a matched block time positions a `POLICY_PENDING` record that still blocks                                                                                                       |
-| L21 Conservation                | After every step of a fixed mixed sequence, every item F equation holds; each `account()` call yields exactly one tagged result; each record makes exactly one `PENDING`-to-terminal transition                                                                                                                                                                         |
-| L22 Adapter `getBinding()`      | In the adapter test file: exactly two frozen keys equal to the pool context, the same object each call, no dispatch and no reservation change                                                                                                                                                                                                                           |
+- Ledger: 30 mutants, 29 killed. They cover the `INGESTED` conjunction; event binding; caller-before-epoch order; epoch-witness attribution at resolve and at ingest; the composed epoch refusal; cross-epoch blocking and non-emptiness; aggregate conflicts, latest receipt and slot range; record and epoch capacity; receipt agreement; each decoded precondition; first-record and reference lateness; the literal-`false` flag; the terminal version increment and an extra `PENDING` increment; the empty-window rule; overflow blocking; refused-`openEpoch` closure; stale epochs; duplicate re-resolution; and unknown outcomes. The survivor removes only the epoch-level `capacityRefused` clause. It is equivalent because the ledger-wide `recordCapacityRefused` counter is always at least the epoch counter; removing both, or only the ledger-wide clause, is killed.
+- Adapter and pin: 5 of 5 killed (a fresh binding copy, an unfrozen binding, an extra binding field, a missing allowlisted ledger file, and an allowlisted neighbouring file).
 
-**Acceptance**:
+**Results** (2026-11-19, each command under an external 60-second limit):
 
-- every case passes, with mutation checks on: the `INGESTED` conjunction; the totality of the mapping; first-record immutability; the composed-refusal order and the epoch-witness attribution; the per-event epoch stop; cross-epoch blocking; conflict stickiness; capacity checks preceding the adapter call; receipt agreement; the item D verification preconditions; the frontier-based lateness rule; and the literal-`false` flags;
-- typecheck, lint and formatting pass;
-- only the files listed in item B change.
+| Check                                                                                       | Result                                |
+| ------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Ledger suite                                                                                | 23/23                                 |
+| Adapter suite (T-00–T-20)                                                                   | 21/21                                 |
+| Focused set: ledger, adapter, decoder, tracker, `paper-pilot-handoff`, `fresh-amm-v4-watch` | 124/124 (23 + 21 + 16 + 40 + 13 + 11) |
+| Backend typecheck (`tsc --noEmit`)                                                          | Clean                                 |
+| ESLint and Prettier on the six changed source and test files                                | Clean                                 |
+| Wallet `.tmp/virtual-wallet.json`                                                           | Unchanged (`7F2C2353…ED9`)            |
 
-###### I. Smallest Implementation Scope
+###### I. Limitations
 
-1. **Adapter**: add `CpmmAdapterBinding` and `getBinding()` to `RaydiumCpmmTransactionSourceAdapter.ts`, with the L22 cases in its test file. Nothing else in the adapter changes.
-2. **Ledger**: `CpmmResolutionAccountingLedger.ts` and its test file, as an isolated, unwired module (L1–L21).
-3. **Pin**: add exactly the two ledger files to the allowlist, with H-12-style regression coverage for refused extras.
+- **Isolated**: nothing constructs the ledger outside tests. It does not observe the session, so a real owner still needs the observer fan-out for the session's single `onExchangeComplete`.
+- **Synthetic only**: every response is a local literal; no captured transaction has been accounted.
+- **Lateness unit**: distinct signatures, not occurrences (item E).
+- **The cutoff is an input**: provenance is asserted by the owner and not verified; the ledger provides no `SourceCutoffEvidence` proof.
+- **Validation duplicated by design**: the ledger mirrors the adapter's notification rules (L19 checks parity on the invalid cases); a later adapter rule change must be mirrored.
+- **Owner discipline remains**: an adapter used outside the ledger appears only as `DUPLICATE_WITHOUT_ORIGINAL`.
 
-Nothing else is in this step: no notification source, history enumeration, reconciliation, tracker gap writing, observer fan-out, provider, bridge or admission change.
+###### J. Remaining Prerequisites Before Any CPMM Flow Qualification
 
-###### J. Settled Decisions, Remaining Decisions and Prerequisites
-
-**Settled in review**: gaps stay in summaries; invalid notifications block their epoch; stale-epoch input causes no request; adapter reservations stay permanent; no-target-swap and failed-transaction policies stay pending; adapter identity is bound through `getBinding()`; a matched notified block time positions non-swap outcomes but never resolves them; the owner, not the ledger, decides whether to stop intake after an overflow.
-
-**Remaining for review**:
-
-1. **Limit values**: the three injected limits are chosen with the future owner's profile; none is proposed here.
-2. **Cross-epoch duplicate of an `INGESTED` in-window record**: proposed visible, non-blocking, and not counting toward non-emptiness. The stricter alternative is to make it always block.
-3. **Refused `openEpoch`**: proposed to close the open epoch (fail closed). The alternative leaves it open, which risks attributing a new transport generation's notifications to the old epoch.
-
-**Prerequisites before any CPMM flow qualification**:
-
-- **Notification completeness**: a reviewed CPMM notification source with epochs, drop and stale handling, and gap evidence. Also an anchored, witnessed history enumeration that dispatches through the shared session. The existing enumerator uses its own budget manager and AMM v4 pool context.
-- **Reconciliation**: a CPMM reconciliation evaluator, or a generalisation of the existing one, that consumes ledger summaries plus witnessed history and a proven on-chain cutoff. It must preserve "resolution evidence mandatory for every in-window signature" and keep provider-index assumptions explicit.
-- **Policies**: separately reviewed policies for `RESOLVED_NO_TARGET_SWAP` and for CPMM failed transactions, including a CPMM failed-transaction validator.
+- **Notification completeness**: a reviewed CPMM notification source with epochs, drop and stale handling, and gap evidence; and an anchored, witnessed history enumeration that dispatches through the shared session.
+- **Reconciliation**: a CPMM reconciliation evaluator consuming ledger summaries plus witnessed history and a proven on-chain cutoff, preserving "resolution evidence mandatory for every in-window signature".
+- **Policies**: separately reviewed `RESOLVED_NO_TARGET_SWAP` and CPMM failed-transaction policies, including a CPMM failed-transaction validator.
 - **Evidence**: CPMM LP and security evidence (Stage 4).
-- **Captured-transaction validation**:
-  - a separately approved, sealed single capture;
-  - independent confirmation of the response shape;
-  - offline replay of a `DECODER_REPLAYABLE` capture;
-  - a decision on the unverified bytecode correspondence.
-- **Wiring**: the observer fan-out for the session's single `onExchangeComplete`, and independent review of the whole wiring.
+- **Captured-transaction validation**: a separately approved, sealed single capture; independent response-shape confirmation; offline replay of a `DECODER_REPLAYABLE` capture; a decision on the unverified bytecode correspondence.
+- **Wiring**: the observer fan-out and independent review of the whole wiring.
 
 CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 

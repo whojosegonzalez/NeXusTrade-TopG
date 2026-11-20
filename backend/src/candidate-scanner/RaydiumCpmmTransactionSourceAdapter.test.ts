@@ -1714,4 +1714,27 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     expect(r).toMatchObject({ status: "REFUSED_BEFORE_START", accepted: 0, unattempted: 1 });
     expect(t.ingestTrade(one.events[0]!).ok).toBe(true);
   });
+
+  it("T-20 (item 13, L22): getBinding() is the frozen, stable pool and mint identity only", async () => {
+    const h = harness();
+    const b = h.adapter.getBinding();
+    expect(b).toEqual({ poolAddress: POOL.poolAddress, candidateMint: POOL.candidateMint });
+    expect(Object.keys(b)).toEqual(["poolAddress", "candidateMint"]);
+    expect(Object.isFrozen(b)).toBe(true);
+    expect(Object.getPrototypeOf(b)).toBe(Object.prototype);
+    expect(h.adapter.getBinding()).toBe(b);
+    expect(() => {
+      (b as { poolAddress: string }).poolAddress = WSOL_MINT;
+    }).toThrow(TypeError);
+    expect(h.adapter.getBinding().poolAddress).toBe(POOL.poolAddress);
+    expectSecretFree(b);
+    // No request, reservation or session use.
+    expect(h.calls).toHaveLength(0);
+    expect(h.ledger()).toHaveLength(0);
+    expect(h.adapter.reservedSignatureCount).toBe(0);
+    // Resolution after reading the binding is unchanged.
+    const f = await h.resolve(notice(1), okSwap(1)());
+    expect(f.kind).toBe("RESOLVED_SWAPS");
+    expect(h.adapter.getBinding()).toBe(b);
+  });
 });

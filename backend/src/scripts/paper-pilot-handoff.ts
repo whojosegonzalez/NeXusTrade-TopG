@@ -118,6 +118,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated CPMM transaction source adapter and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts",
   "backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.test.ts",
+  // The isolated CPMM resolution accounting ledger and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts",
+  "backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
