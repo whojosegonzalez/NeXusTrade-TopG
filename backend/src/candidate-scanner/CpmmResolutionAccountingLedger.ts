@@ -304,7 +304,11 @@ export type CpmmSummarizeResult =
   | { readonly status: "SUMMARY"; readonly summary: CpmmWindowAccountingSummary }
   | {
       readonly status: "WINDOW_INVALID";
-      readonly code: "WINDOW_SHAPE" | "EPOCH_NOT_RETAINED" | "FRONTIER_BEFORE_EPOCH_START";
+      readonly code:
+        | "WINDOW_SHAPE"
+        | "WINDOW_BEYOND_CUTOFF"
+        | "EPOCH_NOT_RETAINED"
+        | "FRONTIER_BEFORE_EPOCH_START";
     };
 
 export interface CpmmResolutionAccountingLedgerOptions {
@@ -1300,6 +1304,12 @@ export class CpmmResolutionAccountingLedger {
       (c.provenance !== "ON_CHAIN_BLOCK_TIME" && c.provenance !== "SYNTHETIC_FIXTURE")
     ) {
       return shape();
+    }
+    // Input consistency only (it does not establish cutoff provenance): the cutoff must cover the
+    // whole window. The window end is exclusive, so windowEndMs === cutoff.blockTimeMs is accepted:
+    // every in-window time is then strictly before the cutoff block time.
+    if ((w.windowEndMs as number) > (c.blockTimeMs as number)) {
+      return Object.freeze({ status: "WINDOW_INVALID", code: "WINDOW_BEYOND_CUTOFF" });
     }
     const ep = this.epochMap.get(w.epoch as number);
     if (!ep) return Object.freeze({ status: "WINDOW_INVALID", code: "EPOCH_NOT_RETAINED" });

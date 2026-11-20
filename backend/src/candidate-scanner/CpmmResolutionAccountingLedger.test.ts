@@ -960,6 +960,67 @@ describe("CPMM resolution accounting ledger (synthetic, offline)", () => {
     });
   });
 
+  it("L7c (regression): a window must end at or before the cutoff block time; invalid requests change nothing", async () => {
+    const h = harness();
+    await h.account(
+      env(notice(1, { blockTime: BLOCK_TIME - 20 })),
+      okSwap(1, [swapIx("BUY")], { blockTime: BLOCK_TIME - 20 }),
+    );
+    await h.account(env(notice(2)), noTarget(2));
+    const cutoffAt = (blockTimeMs: number) => ({
+      slot: SLOT + 100,
+      blockTimeMs,
+      provenance: "ON_CHAIN_BLOCK_TIME" as const,
+    });
+    const BEYOND = { status: "WINDOW_INVALID", code: "WINDOW_BEYOND_CUTOFF" };
+    const state = () =>
+      JSON.stringify([
+        h.ledger.records(),
+        h.ledger.epochs(),
+        h.ledger.counters(),
+        h.ledger.version,
+        h.tracker.getEventsCount(),
+        h.dispatches(),
+      ]);
+    const before = state();
+    // Reproduction: the cutoff covers only part of [BT_MS - 30_000, BT_MS + 30_000).
+    expect(h.ledger.summarize(win({ cutoff: cutoffAt(BT_MS - 10_000) }))).toEqual(BEYOND);
+    // Cutoff before the window starts.
+    expect(h.ledger.summarize(win({ cutoff: cutoffAt(WINDOW.windowStartMs - 1) }))).toEqual(BEYOND);
+    // Window end one millisecond beyond the cutoff.
+    expect(h.ledger.summarize(win({ cutoff: cutoffAt(WINDOW.windowEndMs - 1) }))).toEqual(BEYOND);
+    // Invalid requests (this guard and the existing ones) leave every piece of state unchanged.
+    expect(h.ledger.summarize(win({ epoch: 9 })).status).toBe("WINDOW_INVALID");
+    expect(h.ledger.summarize(win({ windowEndMs: WINDOW.windowStartMs })).status).toBe(
+      "WINDOW_INVALID",
+    );
+    expect(state()).toBe(before);
+    // Window end exactly equal to the cutoff (the end is exclusive): accepted; the in-window
+    // policy-pending record blocks.
+    const equal = summary(h, win({ cutoff: cutoffAt(WINDOW.windowEndMs) }));
+    expect(equal).toMatchObject({
+      afterCutoff: 0,
+      policyPending: { noTargetSwap: 1 },
+      inWindow: { INGESTED: 1, POLICY_PENDING: 1 },
+      accountingComplete: false,
+    });
+    // Window end before the cutoff: accepted; same accounting.
+    expect(summary(h, win({ cutoff: cutoffAt(WINDOW.windowEndMs + 30_000) }))).toMatchObject({
+      afterCutoff: 0,
+      policyPending: { noTargetSwap: 1 },
+      accountingComplete: false,
+    });
+    // The window shrunk to the cutoff holds only the ingested record and may be complete.
+    expect(
+      summary(h, win({ windowEndMs: BT_MS - 10_000, cutoff: cutoffAt(BT_MS - 10_000) })),
+    ).toMatchObject({
+      inWindow: { INGESTED: 1, POLICY_PENDING: 0 },
+      afterCutoff: 1,
+      accountingComplete: true,
+    });
+    expect(state()).toBe(before);
+  });
+
   it("L8: lateness uses the owner's frozen frontier, not summary time; changes bump the version", async () => {
     const h = harness();
     await h.account(env(notice(1)), okSwap(1));
