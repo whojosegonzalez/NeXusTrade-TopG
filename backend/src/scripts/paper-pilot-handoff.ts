@@ -124,6 +124,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated passive CPMM pool notification collector and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts",
   "backend/src/candidate-scanner/CpmmPoolNotificationCollector.test.ts",
+  // The isolated bounded CPMM pool connection owner and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts",
+  "backend/src/candidate-scanner/CpmmPoolConnectionOwner.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

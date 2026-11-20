@@ -549,6 +549,14 @@ export class CpmmPoolNotificationCollector {
     return this.versionValue;
   }
 
+  /** The owner-supplied binding as a new frozen copy. Read-only: never changes `version`. */
+  public getBinding(): CpmmAdapterBinding {
+    return Object.freeze({
+      poolAddress: this.binding.poolAddress,
+      candidateMint: this.binding.candidateMint,
+    });
+  }
+
   private add(value: number, delta = 1): number {
     const r = cpmmCollectorSaturatingAdd(value, delta);
     if (r.saturated) this.saturated = true;

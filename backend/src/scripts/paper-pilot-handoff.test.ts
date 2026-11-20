@@ -1211,6 +1211,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/CpmmResolutionAccountingLedger.test.ts",
       "backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts",
       "backend/src/candidate-scanner/CpmmPoolNotificationCollector.test.ts",
+      "backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts",
+      "backend/src/candidate-scanner/CpmmPoolConnectionOwner.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1268,8 +1270,12 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/CpmmPoolNotificationCollectorExtra.ts",
       "backend/src/candidate-scanner/CpmmPoolNotificationCollector.fixtures.ts",
       "backend/src/candidate-scanner/CpmmNotificationCollector.ts",
-      "backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts",
       "backend/src/candidate-scanner/CpmmPoolNotificationSealer.ts",
+      "backend/src/candidate-scanner/CpmmPoolConnectionOwner.test-support.ts",
+      "backend/src/candidate-scanner/CpmmPoolConnectionOwnerExtra.ts",
+      "backend/src/candidate-scanner/CpmmPoolConnectionOwner.fixtures.ts",
+      "backend/src/candidate-scanner/CpmmConnectionOwner.ts",
+      "backend/src/candidate-scanner/CpmmPoolTransportWrapper.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch-handoff.ts",

@@ -1510,4 +1510,20 @@ describe("CPMM pool notification collector (synthetic, offline)", () => {
     expect(d.ack().disposition).toBe("SUBSCRIBE_ACKNOWLEDGED");
     expect(d.c.epochReport(1)!.collectionClean).toBe(false);
   });
+
+  it("N19 (item 15): getBinding() is a read-only frozen copy, available before any epoch", () => {
+    const { c } = collector({}, false);
+    const v = c.version;
+    const a = c.getBinding();
+    expect(a).toEqual(BINDING);
+    expect(Object.keys(a)).toEqual(["poolAddress", "candidateMint"]);
+    expect(Object.isFrozen(a)).toBe(true);
+    expect(a).not.toBe(c.getBinding());
+    expect(() => {
+      (a as { poolAddress: string }).poolAddress = "x";
+    }).toThrow();
+    expect(c.getBinding()).toEqual(BINDING);
+    expect(c.version).toBe(v);
+    expect(c.epochReport(1)).toBeNull();
+  });
 });

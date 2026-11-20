@@ -614,6 +614,14 @@ export class CpmmResolutionAccountingLedger {
     return this.versionValue;
   }
 
+  /** The construction binding as a new frozen copy. Read-only: never changes `version`. */
+  public getBinding(): CpmmAdapterBinding {
+    return Object.freeze({
+      poolAddress: this.binding.poolAddress,
+      candidateMint: this.binding.candidateMint,
+    });
+  }
+
   // --- counters -----------------------------------------------------------------------------------
 
   private inc(value: number): number {

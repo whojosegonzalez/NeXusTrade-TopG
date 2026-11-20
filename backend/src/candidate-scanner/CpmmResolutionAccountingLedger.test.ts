@@ -1666,4 +1666,20 @@ describe("CPMM resolution accounting ledger (synthetic, offline)", () => {
     expect(s1.lateInWindow).toBe(1);
     expect(s1.accountingComplete).toBe(false);
   });
+
+  it("L22 (item 15): getBinding() is a read-only frozen copy of the construction binding", () => {
+    const h = harness();
+    const v = h.ledger.version;
+    const a = h.ledger.getBinding();
+    const b = h.ledger.getBinding();
+    expect(a).toEqual(h.adapter.getBinding());
+    expect(Object.keys(a)).toEqual(["poolAddress", "candidateMint"]);
+    expect(Object.isFrozen(a)).toBe(true);
+    expect(a).not.toBe(b);
+    expect(() => {
+      (a as { poolAddress: string }).poolAddress = "x";
+    }).toThrow();
+    expect(h.ledger.getBinding()).toEqual(b);
+    expect(h.ledger.version).toBe(v);
+  });
 });
