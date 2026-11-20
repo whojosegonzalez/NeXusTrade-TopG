@@ -6,6 +6,7 @@
  * a virtual clock and timers, a scripted in-memory fetch, a real recorder, adapter, tracker and
  * ledger, with a fake owner that wires collector results to the ledger.
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PublicKey } from "@solana/web3.js";
@@ -583,7 +584,7 @@ describe("CPMM pool notification collector (synthetic, offline)", () => {
     expect(c.epochReport(1)).toMatchObject({
       subscription: "ACKNOWLEDGED",
       subscriptionId: SUB,
-      unsubscribe: { status: "SENT_UNOBSERVED", requestId: 8 },
+      unsubscribe: { status: "BUILT_UNOBSERVED", requestId: 8 },
     });
     for (const f of [opened.subscribeFrame, u]) {
       expect(new TextDecoder().decode(f)).not.toContain(SECRET_KEY);
@@ -1228,5 +1229,285 @@ describe("CPMM pool notification collector (synthetic, offline)", () => {
     ]);
     expect(src).toMatch(/import type \{ CpmmNotificationEnvelope \}/);
     expect(src).toMatch(/import type \{ CpmmAdapterBinding \}/);
+  });
+
+  // --- review regressions (after b06108c) ----------------------------------------------------------
+
+  const sha256Hex = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+  const decodeSpies = () => {
+    const parse = vi.spyOn(JSON, "parse");
+    const decode = vi.spyOn(TextDecoder.prototype, "decode");
+    const p0 = parse.mock.calls.length;
+    const d0 = decode.mock.calls.length;
+    return () => [parse.mock.calls.length - p0, decode.mock.calls.length - d0];
+  };
+
+  it("N16a (review 1): a shadowed byteLength never hides a genuine view's actual length", () => {
+    const decoded = decodeSpies();
+    const h = collector({ maxFrameBytes: 8 });
+    const bytes = ackFrame();
+    expect(bytes.byteLength).toBe(38);
+    Object.defineProperty(bytes, "byteLength", { value: 1 });
+    expect(bytes.byteLength).toBe(1);
+    const r = h.c.acceptFrame({ epoch: 1, bytes, receivedAtMs: OBS_START + 10 });
+    expect(disp(r)).toEqual(["OVERSIZE_FRAME", true, null]);
+    // Not copied, hashed or decoded; the genuine length is counted.
+    expect(decoded()).toEqual([0, 0]);
+    expect(h.c.frameRecords().at(-1)).toMatchObject({
+      byteLength: 38,
+      sha256: null,
+      receivedAtMs: null,
+    });
+    expect(h.c.epochReport(1)).toMatchObject({
+      subscription: "AWAITING_ACK",
+      frames: 1,
+      bytes: 38,
+      acquisitionLimitLatched: true,
+      collectionClean: false,
+    });
+    expect(h.c.counters().bytes).toBe(38);
+    // Under a generous limit the frame is accepted, but counted at its genuine length; shadowed
+    // offset, buffer, length and iterator are ignored and only the genuine range is read.
+    const g = collector();
+    const ack = ackFrame();
+    const backing = new Uint8Array(ack.byteLength + 10).fill(0xff);
+    backing.set(ack, 5);
+    const view = backing.subarray(5, 5 + ack.byteLength);
+    let iterated = 0;
+    for (const [k, value] of [
+      ["byteLength", 1],
+      ["byteOffset", 0],
+      ["length", 1],
+      ["buffer", new ArrayBuffer(1)],
+      [
+        Symbol.iterator,
+        () => {
+          iterated++;
+          return [0x7b][Symbol.iterator]();
+        },
+      ],
+    ] as const) {
+      Object.defineProperty(view, k, { value });
+    }
+    expect(disp(g.frame(view))).toEqual(["SUBSCRIBE_ACKNOWLEDGED", false, null]);
+    expect(iterated).toBe(0);
+    expect(g.c.frameRecords().at(-1)).toMatchObject({
+      byteLength: ack.byteLength,
+      sha256: sha256Hex(ack),
+    });
+    expect(g.c.epochReport(1)).toMatchObject({ bytes: ack.byteLength, collectionClean: true });
+    expect(g.c.counters().bytes).toBe(ack.byteLength);
+    expectConserved(g.c, [1]);
+  });
+
+  it("N16b (review 1): a proxy is rejected before any trap or iterator runs", () => {
+    const decoded = decodeSpies();
+    const ack = ackFrame();
+    let traps = 0;
+    let iterated = 0;
+    const proxy = new Proxy(ack, {
+      get(t, k) {
+        traps++;
+        if (k === "byteLength") return 1;
+        if (k === Symbol.iterator) {
+          return () => {
+            iterated++;
+            return t[Symbol.iterator]();
+          };
+        }
+        return Reflect.get(t, k) as unknown;
+      },
+      getPrototypeOf(t) {
+        traps++;
+        return Reflect.getPrototypeOf(t);
+      },
+      getOwnPropertyDescriptor(t, k) {
+        traps++;
+        return Reflect.getOwnPropertyDescriptor(t, k);
+      },
+    });
+    for (const max of [8, 4_096]) {
+      const h = collector({ maxFrameBytes: max });
+      const r = h.c.acceptFrame({ epoch: 1, bytes: proxy, receivedAtMs: OBS_START + 10 });
+      expect(disp(r)).toEqual(["FRAME_INVALID", true, "FRAME_ENVELOPE"]);
+      expect(r.epoch).toBeNull();
+      expect(h.c.epochReport(1)).toMatchObject({
+        subscription: "AWAITING_ACK",
+        frames: 0,
+        bytes: 0,
+        collectionClean: false,
+      });
+      expect(h.c.counters()).toMatchObject({ frames: 1, bytes: 0, unattributedFrames: 1 });
+      expect(h.c.frameRecords().at(-1)).toMatchObject({ byteLength: 0, sha256: null });
+    }
+    expect([traps, iterated]).toEqual([0, 0]);
+    expect(decoded()).toEqual([0, 0]);
+    // Other non-Uint8Array views stay refused.
+    const r = collector();
+    for (const bytes of [
+      new Uint8ClampedArray(ack),
+      new Int8Array(ack),
+      new DataView(ack.buffer),
+      Object.create(Uint8Array.prototype) as unknown,
+    ]) {
+      expect(r.frame(bytes as Uint8Array).disposition).toBe("FRAME_INVALID");
+    }
+  });
+
+  it("N16c (review 1): Buffer, offset and length-tracking views are read over exactly their validated range", () => {
+    const ack = ackFrame();
+    const note = notif();
+    const h = collector();
+    // A pooled Buffer (non-zero offset into a shared allocation).
+    const buf = Buffer.from(ack);
+    expect(disp(h.frame(buf))).toEqual(["SUBSCRIBE_ACKNOWLEDGED", false, null]);
+    // A length-tracking view at a non-zero offset into a resizable buffer.
+    const Resizable = ArrayBuffer as unknown as new (
+      n: number,
+      o: { maxByteLength: number },
+    ) => ArrayBuffer & { resize(n: number): void };
+    const rab = new Resizable(note.byteLength + 3, { maxByteLength: 4_096 });
+    const tracking = new Uint8Array(rab, 3);
+    tracking.set(note);
+    new Uint8Array(rab, 0, 3).fill(0xff);
+    const r = h.frame(tracking);
+    expect(r.disposition).toBe("NOTIFICATION_ACCEPTED");
+    expect(h.c.frameRecords().at(-1)).toMatchObject({
+      byteLength: note.byteLength,
+      sha256: sha256Hex(note),
+    });
+    // Growing the buffer afterwards changes nothing already recorded.
+    rab.resize(note.byteLength + 3 + 64);
+    expect(tracking.byteLength).toBe(note.byteLength + 64);
+    expect(h.c.frameRecords().at(-1)!.byteLength).toBe(note.byteLength);
+    expect(h.c.epochReport(1)).toMatchObject({
+      bytes: ack.byteLength + note.byteLength,
+      collectionClean: true,
+    });
+    // Its grown length is now what is validated: trailing zero bytes are not JSON.
+    expect(h.frame(tracking).disposition).toBe("NOT_JSON");
+    expect(h.c.frameRecords().at(-1)!.byteLength).toBe(note.byteLength + 64);
+    expectConserved(h.c, [1]);
+  });
+
+  it("N17 (review 2): close times before observation start or the latest valid receipt are refused", () => {
+    // Acknowledgement at OBS_START + 10, notification at OBS_START + 20.
+    const dirtyAfter = (h: ReturnType<typeof collector>) => {
+      h.ack();
+      expect(h.frame(notif()).disposition).toBe("NOTIFICATION_ACCEPTED");
+    };
+    for (const at of [OBS_START - 1, OBS_START, OBS_START + 15, OBS_START + 19]) {
+      for (const reason of ["OWNER_CLOSED", "TRANSPORT_CLOSED"] as const) {
+        const h = collector();
+        dirtyAfter(h);
+        const before = h.c.epochReport(1);
+        const v = h.c.version;
+        expect(h.c.closeEpoch(1, reason, at), `${reason} ${at}`).toBe(false);
+        expect(h.c.version).toBe(v);
+        expect(h.c.epochReport(1)).toEqual(before);
+        expect(before).toMatchObject({ state: "OPEN", closedAtMs: null, collectionClean: true });
+        // Still open: the next frame is attributed normally.
+        expect(h.frame(notif({ sig: signatureOf(2) })).disposition).toBe("NOTIFICATION_ACCEPTED");
+      }
+    }
+    // Equality with the latest valid receipt is accepted.
+    const e = collector();
+    dirtyAfter(e);
+    expect(e.c.closeEpoch(1, "OWNER_CLOSED", OBS_START + 20)).toBe(true);
+    expect(e.c.epochReport(1)).toMatchObject({
+      state: "CLOSED",
+      closedAtMs: OBS_START + 20,
+      closeReason: "OWNER_CLOSED",
+      collectionClean: true,
+    });
+    // With no frames, equality with observation start is accepted and earlier is refused.
+    const s = collector();
+    expect(s.c.closeEpoch(1, "CANCELLED", OBS_START - 1)).toBe(false);
+    expect(s.c.closeEpoch(1, "CANCELLED", OBS_START)).toBe(true);
+    expect(s.c.epochReport(1)).toMatchObject({ closedAtMs: OBS_START, closeReason: "CANCELLED" });
+    // A receipt-valid but undecodable frame still advances the latest receipt.
+    const m = collector();
+    m.ack();
+    m.frame(enc("not json"), { at: OBS_START + 30 });
+    expect(m.c.closeEpoch(1, "OWNER_CLOSED", OBS_START + 29)).toBe(false);
+    expect(m.c.closeEpoch(1, "OWNER_CLOSED", OBS_START + 30)).toBe(true);
+  });
+
+  it("N17b (review 2): supersession never fabricates a close time earlier than known receipts", () => {
+    const superseded = (start: number, frames = true) => {
+      const h = collector();
+      if (frames) {
+        h.ack();
+        h.frame(notif());
+      }
+      expect(
+        h.c.openEpoch({ epoch: 2, observationStartMs: start, subscribeRequestId: 11 }).status,
+      ).toBe("OPENED");
+      return h.c.epochReport(1);
+    };
+    for (const start of [OBS_START + 15, OBS_START + 19, OBS_START - 1, OBS_START]) {
+      expect(superseded(start), String(start)).toMatchObject({
+        state: "CLOSED",
+        closeReason: "SUPERSEDED",
+        closedAtMs: null,
+        collectionClean: false,
+      });
+    }
+    expect(superseded(OBS_START + 20)!.closedAtMs).toBe(OBS_START + 20);
+    expect(superseded(OBS_START + 99)!.closedAtMs).toBe(OBS_START + 99);
+    // Without frames: before the epoch's own observation start is unknown; equality is kept.
+    expect(superseded(OBS_START - 1, false)!.closedAtMs).toBeNull();
+    expect(superseded(OBS_START, false)!.closedAtMs).toBe(OBS_START);
+    // A refused but valid open closes with a truthful instant too; an invalid one with null.
+    const r = collector();
+    r.ack();
+    r.frame(notif());
+    expect(
+      r.c.openEpoch({ epoch: 0, observationStartMs: OBS_START + 5, subscribeRequestId: 11 }),
+    ).toEqual({ status: "REFUSED", code: "EPOCH_NOT_INCREASING" });
+    expect(r.c.epochReport(1)).toMatchObject({ closeReason: "SUPERSEDED", closedAtMs: null });
+    const i = collector();
+    expect(i.c.openEpoch({ epoch: 2 } as never).status).toBe("REFUSED");
+    expect(i.c.epochReport(1)).toMatchObject({ closeReason: "SUPERSEDED", closedAtMs: null });
+  });
+
+  it("N18 (review 3): building an unsubscribe is not sending it; clean only after a first valid acknowledgement", () => {
+    const h = collector();
+    expect(h.c.epochReport(1)).toMatchObject({
+      subscription: "AWAITING_ACK",
+      collectionClean: false,
+      unsubscribe: { status: "NOT_BUILT", requestId: null },
+    });
+    h.ack();
+    expect(h.c.epochReport(1)).toMatchObject({
+      subscription: "ACKNOWLEDGED",
+      collectionClean: true,
+    });
+    const frames = h.c.counters().frames;
+    expect(h.c.unsubscribeFrame(1, 8)).not.toBeNull();
+    // Only prepared: nothing observed, nothing counted, cleanliness unchanged.
+    expect(h.c.epochReport(1)).toMatchObject({
+      unsubscribe: { status: "BUILT_UNOBSERVED", requestId: 8 },
+      collectionClean: true,
+    });
+    expect(h.c.counters().frames).toBe(frames);
+    // The independently observed acknowledgement is kept; a contradicting duplicate never changes it.
+    expect(h.frame(enc({ jsonrpc: "2.0", id: 8, result: true })).disposition).toBe(
+      "UNSUBSCRIBE_ACKNOWLEDGED",
+    );
+    expect(disp(h.frame(enc({ jsonrpc: "2.0", id: 8, result: false })))).toEqual([
+      "DUPLICATE_RESPONSE",
+      true,
+      "UNSUBSCRIBE",
+    ]);
+    expect(h.c.epochReport(1)).toMatchObject({
+      unsubscribe: { status: "ACKNOWLEDGED", requestId: 8 },
+      collectionClean: false,
+    });
+    // Sticky uncertainty is never cleared: a valid acknowledgement after a dirty frame stays dirty.
+    const d = collector();
+    d.frame(enc("not json"));
+    expect(d.ack().disposition).toBe("SUBSCRIBE_ACKNOWLEDGED");
+    expect(d.c.epochReport(1)!.collectionClean).toBe(false);
   });
 });

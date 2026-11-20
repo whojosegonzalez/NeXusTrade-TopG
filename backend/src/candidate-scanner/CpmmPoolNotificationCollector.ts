@@ -236,9 +236,17 @@ export interface CpmmCollectionEpochReport {
   readonly subscriptionId: number | null;
   readonly acknowledgedAtMs: number | null;
   readonly unsubscribe: {
-    readonly status: "NOT_BUILT" | "SENT_UNOBSERVED" | "ACKNOWLEDGED" | "REJECTED";
+    /**
+     * BUILT_UNOBSERVED: the request bytes were prepared; whether the owner sent them is unknown.
+     * ACKNOWLEDGED and REJECTED come only from an observed response to that request ID.
+     */
+    readonly status: "NOT_BUILT" | "BUILT_UNOBSERVED" | "ACKNOWLEDGED" | "REJECTED";
     readonly requestId: number | null;
   };
+  /**
+   * Null while open, and null when the close instant is unknown: an epoch superseded by an invalid
+   * open, or by one whose observation start precedes this epoch's start or latest valid receipt.
+   */
   readonly closedAtMs: number | null;
   /** The first close reason; never replaced. */
   readonly closeReason: CpmmEpochCloseReason | null;
@@ -250,7 +258,13 @@ export interface CpmmCollectionEpochReport {
   readonly blockingFrames: number;
   /** Sticky once an acquisition limit was breached. */
   readonly acquisitionLimitLatched: boolean;
-  /** Collection only (monotonic: once false, never true again); never completeness. */
+  /**
+   * Collection only; never completeness. False while awaiting the subscribe acknowledgement (not
+   * yet clean); a valid first acknowledgement may make it true. Every other false term is sticky
+   * uncertainty that is never cleared: a blocking frame, a transaction-error claim, a rejected or
+   * malformed subscribe response, an acquisition limit, an abnormal close, an unattributed frame
+   * or counter saturation.
+   */
   readonly collectionClean: boolean;
   readonly metadataRetention: CpmmMetadataRetention;
   readonly notificationCompletenessEstablished: false;
@@ -341,16 +355,55 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** A genuine Uint8Array view and its length, or null (never throws). */
+// Intrinsics captured at module load. Validation reads internal slots through these, never through
+// properties of the supplied object, which a caller can shadow (an own `byteLength`) or a proxy
+// can fabricate (a `get` trap or a custom iterator).
+const NativeUint8Array = Uint8Array;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+function intrinsicGetter(key: PropertyKey): (this: unknown) => unknown {
+  const get = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, key)?.get;
+  if (typeof get !== "function")
+    throw new Error(`[CPMM_COLLECTOR_INIT] missing intrinsic ${String(key)}`);
+  return get;
+}
+const typedArrayName = intrinsicGetter(Symbol.toStringTag);
+const typedArrayBuffer = intrinsicGetter("buffer");
+const typedArrayByteOffset = intrinsicGetter("byteOffset");
+const typedArrayByteLength = intrinsicGetter("byteLength");
+const typedArraySet = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "set")!.value as (
+  this: Uint8Array,
+  source: ArrayLike<number>,
+) => void;
+
+/**
+ * A genuine Uint8Array (including Buffer) as a fixed-length view of exactly its current range, or
+ * null. Never throws and never invokes a property, trap or iterator of the supplied object:
+ * - `%TypedArray%.prototype[@@toStringTag]` returns "Uint8Array" only for an object with the
+ *   [[TypedArrayName]] internal slot, so proxies, DataViews, other element types and objects that
+ *   merely inherit from Uint8Array.prototype are refused without running any trap.
+ * - The buffer, offset and length come from the intrinsic getters (internal slots); a shadowing
+ *   own property is ignored.
+ * - The returned view has an explicit length, so a length-tracking view over a resizable or
+ *   growable buffer cannot widen the range that was checked against the limits.
+ */
 function byteView(v: unknown): { readonly view: Uint8Array; readonly length: number } | null {
   try {
-    if (!(v instanceof Uint8Array)) return null;
-    const length = v.byteLength; // throws for a proxy without the internal slot
-    if (!isSafeNonNegative(length)) return null;
-    return { view: v, length };
+    if (Reflect.apply(typedArrayName, v, []) !== "Uint8Array") return null;
+    const buffer = Reflect.apply(typedArrayBuffer, v, []) as ArrayBufferLike;
+    const offset = Reflect.apply(typedArrayByteOffset, v, []);
+    const length = Reflect.apply(typedArrayByteLength, v, []);
+    if (!isSafeNonNegative(offset) || !isSafeNonNegative(length)) return null;
+    return { view: new NativeUint8Array(buffer, offset, length), length };
   } catch {
     return null;
   }
+}
+
+/** One copy of exactly the validated range (internal slots only; no species or iterator). */
+function copyRange(view: Uint8Array, length: number): Uint8Array {
+  const copy = new NativeUint8Array(length);
+  Reflect.apply(typedArraySet, copy, [view]);
+  return copy;
 }
 
 /** Strict UTF-8: null for any invalid sequence (never replacement characters). */
@@ -537,7 +590,10 @@ export class CpmmPoolNotificationCollector {
     if (previous && !previous.closed) {
       previous.closed = true;
       previous.closeReason = "SUPERSEDED";
-      previous.closedAtMs = valid ? (r!.observationStartMs as number) : null;
+      // The new observation start is the close instant only when it is chronologically possible;
+      // otherwise the instant is unknown (null), never fabricated earlier than known receipts.
+      const start = valid ? (r!.observationStartMs as number) : null;
+      previous.closedAtMs = start !== null && this.closeTimeValid(previous, start) ? start : null;
     }
     this.openEpochNumber = null;
     const refuse = (
@@ -588,9 +644,16 @@ export class CpmmPoolNotificationCollector {
     return Object.freeze({ status: "OPENED", epoch: n, subscribeFrame: encodeUtf8(text) });
   }
 
+  /** A close instant is never before observation start or the latest valid frame receipt. */
+  private closeTimeValid(ep: EpochState, atMs: number): boolean {
+    return atMs >= ep.observationStartMs && (ep.lastReceiptMs === null || atMs >= ep.lastReceiptMs);
+  }
+
   /**
    * Records the first close of an epoch. A closed epoch is never reopened, and its first reason
-   * is never replaced: a repeated or later close (including OWNER_CLOSED) returns false.
+   * is never replaced: a repeated or later close (including OWNER_CLOSED) returns false. A close
+   * time before observation start or the latest valid frame receipt (equality is allowed) is
+   * refused. Every refusal returns false and changes neither state nor version.
    */
   public closeEpoch(epoch: number, reason: CpmmEpochCloseReason, atMs: number): boolean {
     if (
@@ -601,7 +664,7 @@ export class CpmmPoolNotificationCollector {
       return false;
     }
     const ep = this.epochMap.get(epoch);
-    if (!ep || ep.closed) return false;
+    if (!ep || ep.closed || !this.closeTimeValid(ep, atMs)) return false;
     this.bumpVersion();
     ep.closed = true;
     ep.closeReason = reason;
@@ -628,7 +691,8 @@ export class CpmmPoolNotificationCollector {
       return null;
     }
     this.bumpVersion();
-    ep.unsubscribeStatus = "SENT_UNOBSERVED";
+    // Built only: the collector cannot attest that the owner sent these bytes.
+    ep.unsubscribeStatus = "BUILT_UNOBSERVED";
     ep.unsubscribeRequestId = requestId;
     return encodeUtf8(
       JSON.stringify({
@@ -708,8 +772,8 @@ export class CpmmPoolNotificationCollector {
       return this.finish(ep, null, length, null, record("RECEIPT_INVALID"));
     }
     ep.lastReceiptMs = at;
-    // 5. One copy of exactly the supplied range; hash and decode the copy only.
-    const copy = new Uint8Array(bv.view);
+    // 5. One copy of exactly the validated range; hash and decode the copy only.
+    const copy = copyRange(bv.view, length);
     const sha256 = createHash("sha256").update(copy).digest("hex");
     const classified = this.classify(ep, copy, at);
     return this.finish(ep, at, length, sha256, classified);
@@ -922,7 +986,8 @@ export class CpmmPoolNotificationCollector {
   public epochReport(epoch: number): CpmmCollectionEpochReport | null {
     const ep = isSafeNonNegative(epoch) ? this.epochMap.get(epoch) : undefined;
     if (!ep) return null;
-    // Every term is monotonic, so a dirty epoch never becomes clean again.
+    // AWAITING_ACK is the only false term that can later become true (by a valid first
+    // acknowledgement). Every other false term is sticky, so uncertainty is never cleared.
     const collectionClean =
       ep.subscription === "ACKNOWLEDGED" &&
       ep.blockingFrames === 0 &&
