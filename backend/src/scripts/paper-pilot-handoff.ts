@@ -127,6 +127,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated bounded CPMM pool connection owner and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts",
   "backend/src/candidate-scanner/CpmmPoolConnectionOwner.test.ts",
+  // The isolated CPMM pool WebSocket transport wrapper and its synthetic tests (section 8.38.17).
+  "backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts",
+  "backend/src/candidate-scanner/CpmmPoolWebSocketTransport.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
