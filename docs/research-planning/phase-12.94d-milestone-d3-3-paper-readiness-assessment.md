@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER CONTRACT PROPOSED, DESIGN ONLY; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6499,6 +6499,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
 > - **Resolution accounting**: isolated per-signature and per-occurrence accounting ledger over the item 12 adapter ([`CpmmResolutionAccountingLedger.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts), 24/24 tests, 29 of 30 targeted mutants caught, the survivor equivalent) implemented and verified offline on 2026-11-19 (item 13; one summary-boundary defect corrected the same day: a window must end at or before the cutoff block time), with a read-only adapter `getBinding()` (adapter suite 21/21). Only fully ingested, replayable, bound target swaps count as resolved. Every other outcome stays visible as a blocking record and gap. A ledger-owned epoch refusal is composed with the caller's gate, duplicates are accounted in their receiving epoch through bounded aggregates, results are tagged and bounded with exact conservation, and the ledger never establishes notification completeness, a quiet window or qualification. It is not wired to any source, provider, bridge or admission path.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
+> - **Connection owner**: bounded, single-connection CPMM connection-owner contract **proposed, design only** (item 15, 2026-11-19). It would drive one injected transport, feed the collector and hand every accepted envelope to the ledger or count it as unprocessed. Nothing is implemented, and no transport, request, capture or operator command is authorized.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -8657,6 +8658,307 @@ On `b06108c`, N16a, N16b, N17, N17b and N18 fail (with the reviewer's reproducti
 - **History and reconciliation**: anchored, witnessed history through the shared session and a CPMM reconciliation evaluator combining ledger summaries, collector reports and a proven cutoff.
 - **Policies and evidence**: reviewed failure-status validation, no-target-swap and failed-transaction policies, and CPMM LP and security evidence (Stage 4).
 - **Wiring review**: independent review of the whole wiring.
+
+CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
+
+##### 15. Bounded CPMM Connection Owner (Proposed Contract, Design Only, 2026-11-19)
+
+**Status**: proposed, design only, after independent review accepted the corrected collector (`9d0af45`: 148 focused tests, the backend typecheck, 670 frame-accounting checks and 28 additional boundary cases pass). Nothing is implemented. No source, test, pin, configuration, dependency, capture or wallet change was made, and no request, socket, live capture or operator command was run. CPMM remains excluded from admission.
+
+**Purpose**: own exactly one WebSocket connection for one exact CPMM pool subscription, for one bounded run. The owner sends the collector's frames, passes every incoming message through the collector, hands every accepted envelope to the ledger (or counts it as unprocessed), stops outstanding ledger work on abnormal termination, and reports what happened, without qualifying anything.
+
+**Out of scope for the owner, permanently**: history enumeration, reconciliation, ledger window summaries, LP or security acquisition, candidate admission, trading, endpoint or credential resolution, sealing and any operator command. **Notification absence never establishes a quiet window**: a run with zero notifications proves only that none were classified.
+
+###### A. Read-Only Inspection
+
+| Module                                                                                                  | Relevant facts                                                                                                                                                                                                                                                                                                                                     | Consequence for the owner                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ISolanaWebSocketTransport` (`SolanaWebSocketSubscriptionClient.ts`)                                    | `send(data: string): void` with no completion signal; `close(code?, reason?)`; `message` delivers `string \| Buffer`; `error` delivers an `Error`; `close` delivers a reason string                                                                                                                                                                | Too weak to distinguish a send attempt from a locally completed send, and it carries free text (error messages, close reasons) that may contain credentials                                      |
+| `ISolanaKeepaliveWebSocketTransport` and `WsWebSocketTransport` (`RaydiumTransportObservationProbe.ts`) | Optional `ping(data, cb)`, `terminate()`, `readyState`, `ping` and `pong` events. `WsWebSocketTransport` constructs `ws` from a URL with default options, so incoming pings are answered automatically (unobserved), no `maxPayload` is set, `send` has no callback, and text and binary messages both arrive as `Buffer`                          | The owner defines its own narrower transport interface (item C). Binding it to `ws` needs a separate, reviewed wrapper (item K, tradeoff 5); automatic pongs are counted as unverified           |
+| `BoundedAmmV4CreationWatch`                                                                             | Accepted lifecycle policy: deadline timers armed before the transport factory runs, idempotent first-cause termination, byte-matched pongs with `pongTimeoutMs < pingIntervalMs`, ping and control-frame ceilings, bounded cleanup with `terminate()` at the ceiling, late events unable to change the result                                      | Reused as policy, not imported. Its free-text `err.message` and reason retention is not reused: the owner keeps fixed codes only                                                                 |
+| `solana-subscription-capability.ts` (§8.38.14)                                                          | One absolute deadline armed before construction; the failed-unsubscribe attempt is recorded before finishing; a send failure of the unsubscribe makes the run `TRANSPORT_ERROR`; "sending it proves nothing"                                                                                                                                       | Reused as policy                                                                                                                                                                                 |
+| `PaperRequestSession`                                                                                   | Opened once by its owner; `now()`, `isOpen()`, `getDeadlineMs()`, `getStopReason()`; `onStop(listener)` calls immediately when already stopped and cannot be unregistered; `stop()` aborts pending waits and in-flight requests and clears its timers; the sole HTTP owner with lane pacing (Solana RPC at least 2,500 ms) and one attempt ceiling | The owner neither opens, stops nor dispatches through the session. It reads its clock and deadline and listens for its stop. All resolution traffic stays inside the session's budget and pacing |
+| `CpmmResolutionAccountingLedger`                                                                        | `openEpoch()` closes the previous epoch; `account(envelope, gate)` never rejects and writes `PENDING` synchronously before any await; the caller gate `{signal, refusal}` is composed with the ledger-owned epoch witness; no `closeEpoch()`; `counters().occurrences`                                                                             | Every accepted envelope reaches `account()` synchronously in the message callback or is counted as unprocessed; the owner's gate stops outstanding work                                          |
+| `CpmmPoolNotificationCollector`                                                                         | `openEpoch()` returns the exact subscribe bytes; `acceptFrame()` never throws and classifies once; `unsubscribeFrame()` builds at most one request (`BUILT_UNOBSERVED`); `closeEpoch()` refuses times before observation start or the latest valid receipt; `epochReport()`, `counters()`                                                          | The owner never interprets payloads itself: the collector is the single classifier                                                                                                               |
+| `RaydiumCpmmTransactionSourceAdapter`                                                                   | `getBinding()` gives the frozen pool and mint; resolution runs through the session with the caller's gate                                                                                                                                                                                                                                          | The owner checks the collector's binding against the binding the caller takes from `getBinding()`; it never calls the adapter                                                                    |
+
+###### B. Files and Smallest Implementation Scope
+
+| File                                                            | Change in the implementation step                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts`      | New: the owner, its transport interface, limits, report types and fixed codes                                                                                                                                                                                                                                 |
+| `backend/src/candidate-scanner/CpmmPoolConnectionOwner.test.ts` | New: the synthetic tests in item J, with an in-file fake transport and virtual timers, the real collector, the real ledger and the item 13 session harness                                                                                                                                                    |
+| `backend/src/scripts/paper-pilot-handoff.ts` / `.test.ts`       | Allowlist exactly the two owner paths. H-12 currently refuses `CpmmPoolConnectionOwner.ts` as an unlisted neighbour, so that entry moves into the allowlisted set and new neighbours are refused instead (`CpmmPoolConnectionOwner.test-support.ts`, `CpmmConnectionOwner.ts`, `CpmmPoolTransportWrapper.ts`) |
+| This document                                                   | Item 15 results                                                                                                                                                                                                                                                                                               |
+
+Not in that step: a real transport wrapper, endpoint or credential resolution, sealing, a CLI or operator command, flow or admission wiring, and any change to the session, adapter, ledger or collector.
+
+###### C. Interfaces (Proposed)
+
+```typescript
+import type { PaperRequestSession, PaperRequestSessionTimers } from "./PaperRequestSession.js";
+import type { CpmmResolutionAccountingLedger } from "./CpmmResolutionAccountingLedger.js";
+import type {
+  CpmmCollectionEpochReport,
+  CpmmPoolNotificationCollector,
+} from "./CpmmPoolNotificationCollector.js";
+import type { CpmmAdapterBinding } from "./RaydiumCpmmTransactionSourceAdapter.js";
+
+/** Narrow, credential-free transport. A reviewed wrapper adapts a real socket later. */
+export interface CpmmOwnerTransport {
+  /** Read once, after every handler is registered: 0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED. */
+  readonly readyState: number;
+  /** One text frame. `done` reports local completion at most once, possibly synchronously. */
+  send(data: string, done: (failed: boolean) => void): void;
+  ping(payload: Uint8Array, done: (failed: boolean) => void): void;
+  close(code: 1000): void;
+  terminate(): void;
+  on(event: "open", listener: () => void): void;
+  on(event: "message", listener: (data: unknown) => void): void; // bytes expected
+  on(event: "error", listener: () => void): void; // no error object, no text
+  on(event: "close", listener: (code: number) => void): void; // no reason text
+  on(event: "ping", listener: (payload: unknown) => void): void;
+  on(event: "pong", listener: (payload: unknown) => void): void;
+}
+/** No URL argument: the endpoint and its credentials are bound outside the owner. */
+export type CpmmOwnerTransportFactory = () => CpmmOwnerTransport;
+
+/** Injected positive safe integers; no defaults and no live values. */
+export interface CpmmConnectionOwnerLimits {
+  readonly observationMs: number; // start + observationMs: the one acquisition/lifetime deadline
+  readonly ackTimeoutMs: number; // from start (before construction); < observationMs
+  readonly pingIntervalMs: number;
+  readonly pongTimeoutMs: number; // < pingIntervalMs
+  readonly maxPings: number; // >= ceil(observationMs / pingIntervalMs)
+  readonly maxControlFrames: number; // incoming pings + pongs
+  readonly maxOutstandingResolutions: number; // x MIN_SOLANA_RPC_PACING_MS <= drainMs
+  readonly maxRetainedUnprocessed: number;
+  readonly unsubscribeAckTimeoutMs: number;
+  readonly drainMs: number;
+  readonly cleanupTimeoutMs: number;
+}
+
+export interface CpmmConnectionOwnerOptions {
+  readonly session: PaperRequestSession; // already opened by its owner; never opened or stopped here
+  readonly collector: CpmmPoolNotificationCollector;
+  readonly ledger: CpmmResolutionAccountingLedger;
+  readonly binding: CpmmAdapterBinding; // the caller's adapter.getBinding()
+  readonly transportFactory: CpmmOwnerTransportFactory;
+  readonly timers: PaperRequestSessionTimers;
+  readonly signal?: AbortSignal | undefined;
+  readonly epoch: number; // the same number for collector and ledger
+  readonly subscribeRequestId: number;
+  readonly unsubscribeRequestId: number; // != subscribeRequestId
+  readonly limits: CpmmConnectionOwnerLimits;
+}
+
+export class CpmmPoolConnectionOwner {
+  constructor(options: CpmmConnectionOwnerOptions); // validates only; no side effects
+  run(): Promise<CpmmConnectionRunReport>; // once; never rejects
+  lateEvents(): CpmmOwnerLateEvents; // counts after settlement; never changes the report
+}
+
+export type CpmmOwnerPhase =
+  | "BEFORE_TRANSPORT"
+  | "CONNECTING"
+  | "AWAITING_ACK"
+  | "OBSERVING"
+  | "UNSUBSCRIBING"
+  | "DRAINING"
+  | "CLEANUP";
+
+export type CpmmOwnerTerminalCause =
+  | "OBSERVATION_COMPLETED" // the only normal cause
+  | "START_REFUSED"
+  | "CANCELLED"
+  | "SESSION_STOPPED"
+  | "TRANSPORT_FACTORY_FAILED"
+  | "TRANSPORT_ERROR"
+  | "TRANSPORT_CLOSED"
+  | "SUBSCRIBE_SEND_FAILED"
+  | "ACK_TIMEOUT"
+  | "SUBSCRIBE_REJECTED"
+  | "COLLECTION_DIRTY"
+  | "ACQUISITION_LIMIT"
+  | "PROCESSING_OVERFLOW"
+  | "CONTROL_FRAME_LIMIT"
+  | "KEEPALIVE_TIMEOUT"
+  | "KEEPALIVE_SEND_FAILED"
+  | "EPOCH_SUPERSEDED"
+  | "OWNER_INTERNAL_ERROR";
+
+export interface CpmmOutgoingAttempt {
+  readonly prepared: boolean; // the collector built the bytes
+  readonly preparedAtMs: number | null;
+  readonly attemptedAtMs: number | null; // send() was called
+  readonly local: "NOT_ATTEMPTED" | "THREW" | "COMPLETED" | "FAILED" | "UNKNOWN";
+  readonly localAtMs: number | null;
+  /** From the collector only; never implied by a local completion. */
+  readonly observed: "NOT_OBSERVED" | "ACKNOWLEDGED" | "REJECTED" | "MALFORMED";
+}
+
+export interface CpmmUnprocessedEnvelope {
+  readonly frameSequence: number;
+  readonly signature: string;
+  readonly slot: number;
+  readonly receivedAtMs: number;
+  readonly reason: "CAPACITY" | "AFTER_TERMINATION";
+}
+```
+
+`CpmmConnectionRunReport` is a deep-frozen plain object with these fields:
+
+| Field                                                                                                                                         | Content                                                                                                                                                                                                                              |
+| --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `binding`, `epoch`                                                                                                                            | As supplied and checked                                                                                                                                                                                                              |
+| `terminal`                                                                                                                                    | `{ cause, code, phase, atMs }`: the first cause only, with a fixed code (for example the refused disposition or `UNSUBSCRIBE_SEND_FAILED`)                                                                                           |
+| `times`                                                                                                                                       | `startedAtMs`, `lifetimeDeadlineMs`, `ackDeadlineMs`, `sessionDeadlineMs`, `transportConstructedAtMs`, `openedAtMs`, `settledAtMs` (null when absent)                                                                                |
+| `outgoing`                                                                                                                                    | `subscribe` and `unsubscribe` attempts, `applicationFramesAttempted` (at most 2), and pings `{ attempted, threw, completed, failed, unknown, pongsMatched, pongsUnmatched }`                                                         |
+| `incoming`                                                                                                                                    | `messageEvents`, `passedToCollector`, `pingsReceived`, `automaticResponses: "UNVERIFIED"`, `controlFrames`                                                                                                                           |
+| `handoff`                                                                                                                                     | `envelopesAccepted`, `accountCalls`, settled counts by result (`recorded`, `duplicate`, `invalid`, `capacityRefused`), `accountRejected`, `outstandingAtSettlement`, `unprocessed { capacity, afterTermination, retained, dropped }` |
+| `ledgerDelta`                                                                                                                                 | `occurrencesBefore`, `occurrencesAfter`, `foreignCalls`                                                                                                                                                                              |
+| `collector`, `collectorClose`                                                                                                                 | The final collector epoch report, and `CLOSED`, `ALREADY_CLOSED`, `REFUSED` or `NOT_OPENED`                                                                                                                                          |
+| `cleanup`                                                                                                                                     | `status` (`NOT_NEEDED`, `SETTLED`, `SETTLED_AFTER_TERMINATE`, `FAILED_STILL_OPEN`), `closeThrew`, `terminateAttempted`, `terminateThrew`, `closeObservedAtMs`, `closeCode`                                                           |
+| `drain`, `cancellation`                                                                                                                       | `drain.status` (`NOT_NEEDED`, `COMPLETED`, `EXPIRED`, `CANCELLED`); `cancellation { requestedAtMs, phase }`                                                                                                                          |
+| `uncertainty`                                                                                                                                 | Separate flags: `transportTerminated`, `collectionDirty`, `failedStatusClaims` (a count), `processingIncomplete`, `cleanupFailed`, `metadataIncomplete`, and literal `ledgerAccountingAssessed: false`                               |
+| `connectionRunClean`                                                                                                                          | True only for `OBSERVATION_COMPLETED`, an observed unsubscribe acknowledgement, a clean collector epoch, zero unprocessed, outstanding, rejected or foreign calls, settled cleanup, and no cancellation                              |
+| `notificationCompletenessEstablished`, `quietWindowEstablished`, `qualificationEligible`, `replayableCaptureEstablished`, `historyEnumerated` | Literal `false`                                                                                                                                                                                                                      |
+
+###### D. Ownership, Injection and the Session Deadline (Requirement 1)
+
+- **Everything injected**: transport factory, timers, cancellation signal, limits, the already-open session, collector and ledger. The owner's clock is `session.now()`, so collector receipts, ledger epochs and session deadlines share one time domain. There is no default transport, URL, timer, limit, environment or configuration lookup, and the owner never sees a credential: the factory takes no argument, and the interface carries no error objects or close-reason text.
+- **Construction** validates only (`[CPMM_OWNER_INIT]` on failure) and has no side effects. Ordering rules: `ackTimeoutMs < observationMs`, `pongTimeoutMs < pingIntervalMs`, `maxPings >= ceil(observationMs / pingIntervalMs)` (so the ceiling is never reached in a normal run), and `maxOutstandingResolutions × MIN_SOLANA_RPC_PACING_MS <= drainMs` (so a full queue can drain at the session's accepted pacing). The two request IDs differ.
+- **Within the session's deadline, without a second budget**: at start the owner requires `session.isOpen()` and `startedAtMs + observationMs + unsubscribeAckTimeoutMs + max(drainMs, cleanupTimeoutMs) <= session.getDeadlineMs()`; otherwise the run ends `START_REFUSED` (`SESSION_NOT_OPEN` or `SESSION_DEADLINE_TOO_SOON`) without a transport. The owner makes no HTTP request: resolutions are made by the ledger's adapter through the same session, under its one attempt ceiling, lane pacing and request timeout. The owner adds no budget, queue or pacing of its own; its only processing bound is `maxOutstandingResolutions`. A session stop (`onStop`) ends the run as `SESSION_STOPPED`; the session's own abort then cancels in-flight requests (the ledger records `SESSION_ENDED`).
+
+###### E. Lifecycle (Requirements 2 and 3)
+
+**Start**, in order:
+
+1. `run()` may be called once (a second call rejects with `[CPMM_OWNER_RUN_ONCE]`). `startedAtMs = session.now()`; compute the lifetime deadline (`startedAtMs + observationMs`) and the acknowledgement deadline (`startedAtMs + ackTimeoutMs`).
+2. Session and deadline checks (item D). An already-aborted signal ends the run `CANCELLED` in `BEFORE_TRANSPORT`, with no epoch opened and no factory call.
+3. Snapshot `ledger.counters().occurrences` and `collector.counters().frames`.
+4. Open the collector epoch (`observationStartMs = startedAtMs`), then the ledger epoch with the same number and start; both must be `OPENED`, and the collector report's binding must equal `options.binding`. Otherwise `START_REFUSED` (`COLLECTOR_EPOCH_REFUSED`, `LEDGER_EPOCH_REFUSED` or `BINDING_MISMATCH`). The subscribe bytes are now `prepared`.
+5. Register the abort listener (`once`) and the session stop listener, then arm the lifetime and acknowledgement timers. All three exist **before the transport is constructed**, so connection setup counts against both deadlines.
+6. Phase `CONNECTING`: call the factory inside `try` (a throw is `TRANSPORT_FACTORY_FAILED`).
+7. Register handlers in this order: `error`, `close`, `message`, `ping`, `pong`, `open`. A throwing `on()` is `TRANSPORT_ERROR` (`HANDLER_REGISTRATION`) and cleanup still runs.
+8. Read `readyState` once; if `1`, run the open handler.
+
+**Open** (idempotent): phase `AWAITING_ACK`, record `openedAtMs`, attempt the subscribe send. A throw or `done(true)` ends the run `SUBSCRIBE_SEND_FAILED`.
+
+**Messages**: while handlers are attached, every `message` event is one `collector.acceptFrame({ epoch, bytes: data, receivedAtMs: session.now() })`, with the data passed unchanged (a string or other non-byte payload becomes the collector's unattributed `FRAME_INVALID`). The owner then acts on the result:
+
+| Collector result                                                                                        | Owner action                                                                                      |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `NOTIFICATION_ACCEPTED` (`err` `NULL` or `PRESENT`)                                                     | Handoff (item F); a failed-status claim is forwarded and counted, and does not end the run        |
+| `SUBSCRIBE_ACKNOWLEDGED`                                                                                | Clear the acknowledgement timer, phase `OBSERVING`, start keepalive                               |
+| `UNSUBSCRIBE_ACKNOWLEDGED` / `UNSUBSCRIBE_REJECTED` during `UNSUBSCRIBING`                              | Proceed to the collector close                                                                    |
+| `SUBSCRIBE_REJECTED`, or a malformed subscribe response                                                 | `SUBSCRIBE_REJECTED` (`REJECTED` or `MALFORMED`)                                                  |
+| `OVERSIZE_FRAME`, `EPOCH_LIMIT_EXCEEDED`                                                                | `ACQUISITION_LIMIT`                                                                               |
+| `STALE_EPOCH` / `EPOCH_NOT_OPEN` while the owner has not closed the epoch                               | `EPOCH_SUPERSEDED`                                                                                |
+| Any other blocking disposition (malformed, foreign, pre-acknowledgement, duplicate, invalid receipt, …) | `COLLECTION_DIRTY` with the disposition as the code (fail fast; the epoch can no longer be clean) |
+
+**Keepalive** (accepted watch policy): only in `OBSERVING`; one ping per `pingIntervalMs` with an 8-byte sequence payload; a pong clears the deadline only if its bytes equal the outstanding payload; unmatched pongs are counted and never clear it; the pong deadline is `KEEPALIVE_TIMEOUT`; a ping that throws or reports `done(true)` is `KEEPALIVE_SEND_FAILED`; no ping is sent unless its pong deadline ends before the lifetime deadline. Incoming pings and pongs count against `maxControlFrames` (`CONTROL_FRAME_LIMIT`). Incoming pings may be answered automatically by the transport; those responses are not owner attempts, are not counted as outgoing frames, and are reported as `automaticResponses: "UNVERIFIED"`.
+
+**Planned completion** at the lifetime deadline: phase `UNSUBSCRIBING`; keepalive timers are cleared; the collector builds the unsubscribe (`prepared`) and the owner attempts it. A throw or `done(true)` ends the run `TRANSPORT_ERROR` (`UNSUBSCRIBE_SEND_FAILED`), as in the accepted probe. The owner waits for an observed response or `unsubscribeAckTimeoutMs`, while messages are still classified and envelopes still handed off. Then `collector.closeEpoch(epoch, "OWNER_CLOSED", now)` and the terminal cause `OBSERVATION_COMPLETED`. Phases `DRAINING` and `CLEANUP` run together: cleanup closes the transport, and the drain waits up to `drainMs` for outstanding `account()` promises, then aborts the rest. An unobserved unsubscribe acknowledgement leaves the cause `OBSERVATION_COMPLETED` but `connectionRunClean` false.
+
+**Abnormal termination** (first cause wins; later causes are counted, never stored): record `terminal`; close the collector epoch with the mapped reason (table below); abort the run's gate controller so outstanding ledger work stops; clear every owner timer except the cleanup timer; phase `CLEANUP`.
+
+| Owner cause                                                                                                                                   | Collector close reason                                          |
+| --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `TRANSPORT_CLOSED`, `TRANSPORT_ERROR`, `TRANSPORT_FACTORY_FAILED`, `SUBSCRIBE_SEND_FAILED`                                                    | `TRANSPORT_CLOSED` or `TRANSPORT_ERROR` as observed             |
+| `ACK_TIMEOUT`, `KEEPALIVE_TIMEOUT`                                                                                                            | Same name                                                       |
+| `ACQUISITION_LIMIT`, `PROCESSING_OVERFLOW`, `CONTROL_FRAME_LIMIT`                                                                             | `LIMIT_EXCEEDED`                                                |
+| `CANCELLED`, `SESSION_STOPPED`, `SUBSCRIBE_REJECTED`, `COLLECTION_DIRTY`, `KEEPALIVE_SEND_FAILED`, `EPOCH_SUPERSEDED`, `OWNER_INTERNAL_ERROR` | `CANCELLED` (owner-stopped; the owner's cause is authoritative) |
+
+A collector close the collector refuses (for example after a clock regression) is reported as `collectorClose: REFUSED`, never retried with an adjusted time.
+
+**Cleanup** (separately bounded): set the cleanup state and arm the cleanup timer first, then call `close(1000)` inside `try`, so a synchronous `close` event is handled. A `close` event settles cleanup. At `cleanupTimeoutMs`, `terminate()` is attempted inside `try`; `readyState === 3` then gives `SETTLED_AFTER_TERMINATE`, anything else `FAILED_STILL_OPEN`. Cleanup outcomes and cancellation during cleanup (which triggers `terminate()` at once) never replace the terminal cause, and a failed cleanup stays explicit in `cleanup` and `uncertainty.cleanupFailed`.
+
+**Settlement**: when cleanup has settled or failed and the drain has completed, expired or been cancelled, the owner freezes the report, clears all timers, removes the abort listener, detaches its handlers (a generation token; the session stop listener cannot be removed and is guarded the same way) and resolves `run()`.
+
+**Synchronous callbacks and re-entrancy**: all state exists before any external call. `on()` may replay an event synchronously; `send`, `ping` and `close` may call back synchronously; the abort and session-stop listeners may fire inside any handler. Termination and open handling are idempotent, a second `done` is ignored and counted, and every handler body runs inside `try` (an exception is `OWNER_INTERNAL_ERROR`). Events a factory emits before handlers exist are invisible; the reviewed wrapper must not emit before registration (item K).
+
+**Late events**: anything after settlement (messages, open, error, close, ping, pong, `done` callbacks, `account()` settlements, abort or session stop) only increments `lateEvents()`; the report never changes.
+
+###### F. Outgoing Attempts (Requirement 2)
+
+- **At most two application frames per run**: the subscribe, then optionally the one unsubscribe; no retry, reconnect, resubscribe or provider fallback, and one factory call at most.
+- Each attempt keeps four separate facts: **prepared** (the collector built the bytes), **attempted** (`send` was called), **locally completed** (`done(false)`, or `THREW`, `FAILED`, or `UNKNOWN` when `done` never came before settlement) and **observed** (the collector classified a response). None implies another: a local completion is not delivery, and an observed acknowledgement does not prove when or whether the local send completed.
+- Keepalive pings are counted separately; automatic transport responses are not owner attempts (item E).
+
+###### G. Faithful Handoff and the Processing Bound (Requirement 4)
+
+- **Tagging**: each frame carries the epoch captured at start and `session.now()` taken at the top of the message handler; the collector checks both.
+- **Handoff**: for each `ACCEPTED_NOTIFICATION`, synchronously in the same message callback: if the run is terminal, the envelope is `unprocessed` (`AFTER_TERMINATION`; zero by construction unless the collector close was refused). Else, if `outstanding === maxOutstandingResolutions`, the envelope is `unprocessed` (`CAPACITY`) and the run ends `PROCESSING_OVERFLOW`. Otherwise `ledger.account(envelope, gate)` is called at once (the ledger writes `PENDING` synchronously), `outstanding` is incremented, and the promise's settlement is tallied by result status; an impossible rejection is counted as `accountRejected`.
+- **Gate**: `{ signal: runAbort.signal, refusal: () => (abnormal ? "OWNER_TERMINATED" : null) }`. The ledger composes it with its own epoch witness and never retains the refusal value.
+- **Never silently dropped**: unprocessed envelopes keep `{ frameSequence, signature, slot, receivedAtMs, reason }` up to `maxRetainedUnprocessed`, and beyond that are counted as `dropped` metadata, still included in every equation.
+
+###### H. Failure Propagation and Distinct Uncertainty (Requirement 5)
+
+- **Abnormal closure** aborts the run's gate signal and makes its refusal non-null, so in-flight resolutions end `CANCELLED_IN_FLIGHT` or are refused at the ledger's post-await check (`LATE_RESPONSE`, nothing ingested), exactly as N13c demonstrated. Pending pacing waits are cancelled by the session through the same signal.
+- **Preserved**: accepted-event counts, settled results, outstanding work at settlement and unprocessed envelopes are all reported; no count is reset by termination.
+- **Kept distinct, never merged**: transport termination (`terminal.cause`, `cleanup`), dirty collection (`collector.collectionClean`), failed-status claims (`failedStatusClaims`), processing incompleteness (unprocessed, outstanding, rejected or foreign calls) and ledger incompleteness. The owner never calls `ledger.summarize()`, so `ledgerAccountingAssessed` is literal `false`. None of these can become a qualified result: the qualification flags are literal `false`, and even `connectionRunClean` only describes the run.
+
+###### I. Conservation Equations (Requirement 6)
+
+At settlement:
+
+1. `incoming.messageEvents = incoming.passedToCollector` (events after settlement appear only in `lateEvents()`).
+2. `collector.counters().frames` after − before = `passedToCollector`; any difference is foreign use and blocking.
+3. `handoff.envelopesAccepted` = the collector epoch's `notificationsAccepted`.
+4. `envelopesAccepted = accountCalls + unprocessed.capacity + unprocessed.afterTermination`.
+5. `accountCalls = recorded + duplicate + invalid + capacityRefused + accountRejected + outstandingAtSettlement`.
+6. `ledgerDelta.occurrencesAfter − occurrencesBefore = accountCalls + foreignCalls`; `foreignCalls > 0` is blocking.
+7. `unprocessed.retained.length + unprocessed.dropped = unprocessed.capacity + unprocessed.afterTermination`.
+8. `applicationFramesAttempted = [subscribe attempted] + [unsubscribe attempted] ≤ 2`; for each attempt, attempted implies prepared, and `local` is `NOT_ATTEMPTED` exactly when not attempted.
+9. `pings.attempted = threw + completed + failed + unknown ≤ maxPings`, and `pongsMatched ≤ pings.attempted`.
+10. Owner HTTP dispatches = 0 (no session dispatch in the source); session dispatches during the run come only from the ledger's adapter.
+
+**Credentials and diagnostics**: fixed codes only. The transport interface carries no error object or reason text, the owner never sees the URL, payloads are retained only as the collector's metadata, and a test feeds secret-bearing failures through a fake wrapper and checks that the serialized report contains none of it.
+
+**What later sealing will require** (not implemented, and nothing here is a capture): a bounded raw-frame recorder in the owner's message path before the collector, keeping exact bytes, order and receipt times, with the outgoing attempts, keepalive records, terminal cause and cleanup; a reviewed shared credential scanner over everything retained, before persistence; an exclusive-create (`wx`) evidence directory with a SHA-256 manifest; a re-derivation verifier that replays the recorded frames through a fresh collector with the same limits and reproduces every disposition, the epoch report and equations 1–9; and the redacted exchange evidence of each resolution, because ledger records cannot be re-derived from frames alone. Until then `replayableCaptureEstablished` stays `false`.
+
+###### J. Synthetic Validation (Requirement 7)
+
+| Test | Covers                                                                                                                                                                                                                                                                 |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| O1   | Construction: every limit and ordering rule, identical request IDs, inert construction (no factory call, no timer, no epoch)                                                                                                                                           |
+| O2   | Start refusals: session not open or already stopped, deadline too soon, collector or ledger epoch refused, binding mismatch; no factory call and no timer left                                                                                                         |
+| O3   | Normal run: byte-exact subscribe and unsubscribe, acknowledgement, notifications with `err` `NULL` and `PRESENT`, matched pongs, observed unsubscribe acknowledgement, drain, settled cleanup, every equation; `connectionRunClean` true only without the failed claim |
+| O4   | Acknowledgement rejection and a malformed acknowledgement                                                                                                                                                                                                              |
+| O5   | Malformed, foreign-subscription, pre-acknowledgement, duplicate-response and string payload frames: `COLLECTION_DIRTY` with the code, outstanding work stopped                                                                                                         |
+| O6   | Acquisition limits (oversize, frame count, bytes): `ACQUISITION_LIMIT`                                                                                                                                                                                                 |
+| O7   | Processing overflow with held resolutions: the overflowing envelope is unprocessed, retained up to the limit then counted, and the run ends `PROCESSING_OVERFLOW`                                                                                                      |
+| O8   | Disconnect (`close` and `error` events) in `CONNECTING`, `AWAITING_ACK`, `OBSERVING` with in-flight resolutions, and `UNSUBSCRIBING`                                                                                                                                   |
+| O9   | Keepalive: pong timeout, an unmatched pong that does not clear it, ping throw and `done(true)`, control-frame limit, incoming pings with unverified automatic responses                                                                                                |
+| O10  | Cancellation before `run()`, before and inside the factory, while connecting, awaiting acknowledgement, observing with in-flight resolution (`CANCELLED_IN_FLIGHT`), unsubscribing, draining and during cleanup (cause preserved)                                      |
+| O11  | Session stop at each phase, including a session already stopped at start and session expiry during the drain (`SESSION_ENDED` records)                                                                                                                                 |
+| O12  | Epoch changes during resolution: an external collector or ledger `openEpoch(epoch + 1)` while a resolution is in flight gives `EPOCH_SUPERSEDED`, the ledger's `EPOCH_CLOSED`, and foreign-call detection                                                              |
+| O13  | Send and close exceptions: subscribe throw, `done(true)`, `done` never called (`UNKNOWN`) and called twice; unsubscribe send failure (`TRANSPORT_ERROR`); `close()` and `terminate()` throwing                                                                         |
+| O14  | Late events of every kind after settlement, including `account()` settlements: only `lateEvents()` changes                                                                                                                                                             |
+| O15  | Cleanup failure (no `close` event, still open after `terminate()`): `FAILED_STILL_OPEN` with the original cause; a synchronous `close` inside `close()`                                                                                                                |
+| O16  | Synchronous callbacks: `on()` replaying `open`, a factory returning `readyState` 1, synchronous `done`, an abort fired inside a handler                                                                                                                                |
+| O17  | Deadlines: the acknowledgement deadline includes connection setup; unsubscribe acknowledgement timeout (`OBSERVATION_COMPLETED`, not clean); a late unsubscribe acknowledgement after the collector close is `STALE_EPOCH`                                             |
+| O18  | Conservation after every step of scripted mixed event orders                                                                                                                                                                                                           |
+| O19  | Credentials: secret-bearing wrapper failures leave no trace in the report                                                                                                                                                                                              |
+| O20  | Source boundaries: no `fetch`, `WebSocket`, `ws`, global timers, `Date.now`, `process.env`, file system, session `dispatch`/`open`/`stop`, adapter, tracker, enumerator, summary or sealing calls; exact imports                                                       |
+
+###### K. Material Tradeoffs Remaining
+
+1. **Resolution throughput**: each first occurrence costs at least one Solana RPC dispatch paced at 2,500 ms. A busy pool will fill `maxOutstandingResolutions` and end the run `PROCESSING_OVERFLOW`, so this design suits quiet pools or short runs only. Changing that needs a reviewed resolution policy, not a second pacing layer.
+2. **Failed-status claims** keep every affected epoch unclean until a failure-status validation policy exists. Failed transactions that mention a pool are common, so many real epochs will not be clean.
+3. **Fail fast** on the first blocking frame (chosen) saves request budget, but yields shorter observations than continuing to classify an epoch that can no longer be clean.
+4. **Unsubscribe acknowledgement** is required for a clean run; a slow acknowledgement ends unclean, and one arriving after the collector close keeps the epoch dirty.
+5. **Transport wrapper**: `WsWebSocketTransport` cannot report local send completion, passes free-text errors and reasons, answers pings automatically and sets no `maxPayload`. Before any live use a separate reviewed wrapper is needed that implements `CpmmOwnerTransport`, sets `maxPayload` at least `maxFrameBytes` (larger frames otherwise close the socket before classification), discards text and emits nothing before registration. Until then a real run's local completion would be `UNKNOWN`.
+6. **Coarse collector reasons**: owner-stopped causes map to the collector's `CANCELLED`. The owner's report is authoritative; extending the collector's reasons would change an accepted module.
+7. **Ledger epoch**: the owner cannot close a ledger epoch (no `closeEpoch()`, by accepted decision). It stays open until the next `openEpoch()`, and the run's gate is what stops its work.
+8. **One time domain**: `session.now()` is used everywhere; a clock regression produces `RECEIPT_INVALID` or a refused collector close, both of which make the run unclean.
+
+###### L. Smallest Offline Implementation Step and Prerequisites
+
+**Next step** (offline, on approval of this contract): implement `CpmmPoolConnectionOwner.ts` and its test (O1–O20) using an in-file fake transport and virtual timers, the real collector, the real ledger and the real session harness with a scripted in-memory fetch; update the pin as in item B; record results here.
+
+**Before any live use** (each separately approved): the reviewed transport wrapper (tradeoff 5) and endpoint binding outside the owner; a sealed CPMM pool subscription capture confirming the notification shape; sealing and re-derivation (item I); the resolution-throughput and failure-status policies; history, reconciliation and a CPMM evaluator; CPMM LP and security evidence; and an independent wiring review.
 
 CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
 
