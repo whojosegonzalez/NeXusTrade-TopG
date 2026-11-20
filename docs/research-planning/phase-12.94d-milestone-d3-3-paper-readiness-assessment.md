@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED MODULE; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER CONTRACT PROPOSED, NOT IMPLEMENTED; NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6499,7 +6499,8 @@ Mutation checks for the corrections: all 11 caught.
 > - **Transaction resolution**: Isolated CPMM transaction source adapter ([`RaydiumCpmmTransactionSourceAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmTransactionSourceAdapter.ts), 20/20 tests, 26/26 targeted mutants caught) implemented and verified offline on 2026-11-19 (item 12), with three independently reproduced defects corrected the same day. It resolves one notification through the shared `PaperRequestSession` with bound exchange evidence, withholds unsafe bodies, and decodes only unchanged credential-free bytes. It is not wired to any provider, bridge or admission path.
 > - **Resolution accounting**: isolated per-signature and per-occurrence accounting ledger over the item 12 adapter ([`CpmmResolutionAccountingLedger.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmResolutionAccountingLedger.ts), 24/24 tests, 29 of 30 targeted mutants caught, the survivor equivalent) implemented and verified offline on 2026-11-19 (item 13; one summary-boundary defect corrected the same day: a window must end at or before the cutoff block time), with a read-only adapter `getBinding()` (adapter suite 21/21). Only fully ingested, replayable, bound target swaps count as resolved. Every other outcome stays visible as a blocking record and gap. A ledger-owned epoch refusal is composed with the caller's gate, duplicates are accounted in their receiving epoch through bounded aggregates, results are tagged and bounded with exact conservation, and the ledger never establishes notification completeness, a quiet window or qualification. It is not wired to any source, provider, bridge or admission path.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
-> - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
+> - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
+> - **Transport wrapper**: contract and synthetic test plan proposed (item 16, documentation only): `CpmmPoolWebSocketTransport` over an injected `ws`-compatible client constructor, with ten open questions for review. Nothing is implemented.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -8663,7 +8664,7 @@ CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParse
 
 ##### 15. Bounded CPMM Connection Owner (Implemented Offline 2026-11-20; Not Wired)
 
-**Status**: implemented and verified offline (2026-11-20) as an isolated, unwired module. The contract below was first drafted in `396cac8` and revised in `43d0301` (six contract gaps); the implementation follows it with eight implementation clarifications and the refinements listed in item L. Three lifecycle defects found by independent review of `dfeee4c` (deadline credit, clock regression, settlement inside an unfinished external call) were then corrected and are recorded in item M. One finalization defect found by review of `5aaeef1` (changes made during final listener disposal were treated as late) was then corrected and is recorded in item N. No real transport wrapper, endpoint or configuration lookup, sealing, history, reconciliation, LP or security acquisition, provider or admission wiring was added; no dependency, capture or wallet change was made; and no request, socket, live capture or operator command was run. CPMM remains excluded from admission.
+**Status**: implemented and verified offline (2026-11-20) as an isolated, unwired module. The contract below was first drafted in `396cac8` and revised in `43d0301` (six contract gaps); the implementation follows it with eight implementation clarifications and the refinements listed in item L. Three lifecycle defects found by independent review of `dfeee4c` (deadline credit, clock regression, settlement inside an unfinished external call) were then corrected and are recorded in item M. One finalization defect found by review of `5aaeef1` (changes made during final listener disposal were treated as late) was then corrected and is recorded in item N. Independent review of `446eec4` accepted the isolated owner and its finalization correction (205 focused tests, backend typecheck and independent lifecycle reproductions passing); this records the outcome only and changes no owner behaviour. No real transport wrapper, endpoint or configuration lookup, sealing, history, reconciliation, LP or security acquisition, provider or admission wiring was added; no dependency, capture or wallet change was made; and no request, socket, live capture or operator command was run. CPMM remains excluded from admission.
 
 **Purpose**: own exactly one WebSocket connection for one exact CPMM pool subscription, for one bounded run. The owner sends the collector's frames, passes every incoming message through the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, stops outstanding ledger work on abnormal termination, and reports what happened, without qualifying anything.
 
@@ -8792,7 +8793,7 @@ The session's non-removable stop listener is a small closure over a holder `{ ru
 
 **Future wrapper requirements** (reviewed separately, before any live use):
 
-- **Payload ceiling**: the wrapper sets the `ws` `maxPayload` to exactly `maxFrameBytes`. `ws` then refuses a larger message with close code 1009, which the owner maps to `ACQUISITION_LIMIT` (`TRANSPORT_PAYLOAD_LIMIT`), so no message is buffered beyond that ceiling.
+- **Payload ceiling**: the wrapper sets the `ws` `maxPayload` to exactly `maxFrameBytes`. `ws` then refuses a larger message with close code 1009, which the owner maps to `ACQUISITION_LIMIT` (`TRANSPORT_PAYLOAD_LIMIT`), so no message is buffered beyond that ceiling. Correction from inspection of `ws` 8.22.1 (item 16 A): the local `close` event then reports 1006 and an `error` comes first, so the wrapper must suppress that error and report 1009 itself (item 16 B5).
 - **Messages**: delivered as `Uint8Array`, never decoded.
 - **Credential-free events**: no error object, error text or close-reason text is passed on.
 - **Disposers**: they really detach the listener.
@@ -9117,7 +9118,7 @@ The accessor tests from item B are in the collector and ledger suites.
 
 ###### K. Next Step and Prerequisites
 
-**Done** (offline, 2026-11-20): the item B file changes, with tests O1–O31 (item L). The next separately approved step is the reviewed transport wrapper (item E).
+**Done** (offline, 2026-11-20): the item B file changes, with tests O1–O31 (item L). The next separately approved step is the reviewed transport wrapper (item E), whose contract and test plan are proposed in item 16.
 
 **Before a first, unqualified diagnostic shape-confirmation capture** (it does not require any earlier successful capture; each item separately approved):
 
@@ -9324,6 +9325,212 @@ Each regression also checks that the first cause (`OBSERVATION_COMPLETED` at the
 **Remaining limitation**: finalization is synchronous. An asynchronous change after the freeze, such as a foreign epoch opened later, is not reflected in the report, and only callbacks into the owner are counted late. Nothing was wired or sealed. No transport wrapper was written, and no request, socket, live capture or operator command was run.
 
 CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
+
+##### 16. CPMM Pool WebSocket Transport Wrapper (Proposed Contract; Not Implemented)
+
+**Status**: documentation only (2026-11-20). This item proposes the reviewed wrapper that item 15 E requires before any live use, with a synthetic test plan. No source, test, pin, dependency, configuration, capture or wallet change was made, and no network call, socket (loopback included), capture or operator command was run. The owner (item 15) is unchanged. CPMM remains excluded from admission.
+
+**Proposed targets** (to be created only after this contract is approved):
+
+| File                                                                                        | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts`                               | The wrapper: implements `CpmmOwnerTransport` over an injected `ws`-compatible client constructor                                                                                                                                                                                                                                                                                                                                        |
+| `backend/src/candidate-scanner/CpmmPoolWebSocketTransport.test.ts`                          | Synthetic tests W1–W16 with an injected fake client constructor; no real client is constructed                                                                                                                                                                                                                                                                                                                                          |
+| `backend/src/scripts/paper-pilot-handoff.ts` / `.test.ts` (later, at implementation review) | Allowlist exactly the two paths above and add them to H-12's `added` list. Refuse new neighbours (`CpmmPoolWebSocketTransport.fixtures.ts`, `CpmmPoolWebSocketTransport.test-support.ts`, `CpmmWebSocketTransport.ts`, `CpmmPoolWebSocketTransportFactory.ts`); `CpmmPoolTransportWrapper.ts` stays refused. Baseline and endpoint exceptions unchanged; `ws` is already a dependency, so `package.json` and the lockfile do not change |
+
+###### A. Inspection Findings (`ws` 8.22.1 runtime, `@types/ws` 8.18.2)
+
+- **The client connects in its constructor**: `new WebSocket(url, options)` runs `initAsClient()`, which issues the HTTP upgrade request immediately. There is no dormant state, so the wrapper must not construct the client before `start()`.
+- **The constructor can throw credential-bearing text**: an unparsable address throws `SyntaxError("Invalid URL: <address>")`, and other option and URL checks throw synchronously too, before any request. The message would carry the full endpoint, query string and API key included.
+- **Unsafe defaults for this owner**: `autoPong: true` (pings are answered without the owner), `maxPayload` 100 MiB, `perMessageDeflate: true` (inflation work and zlib state), `maxRedirects: 10` (inactive only while `followRedirects` stays `false`), `maxFragments` 16 384, `closeTimeout` 30 s, no `handshakeTimeout`, `allowSynchronousEvents: true`. The receiver reads `maxPayload | 0`, so a limit must be 1 to 2^31 − 1 (0 means unlimited).
+- **Message representations**: a message arrives as `(data, isBinary)`. Text frames always arrive as a `Buffer`. Binary frames depend on `binaryType`: `Buffer` (`nodebuffer`, the default), `ArrayBuffer`, `Buffer[]` (`fragments`) or `Blob` (runtime only). `ws` concatenates fragments itself only after the cumulative `maxPayload` check, and it validates text frames as UTF-8 (close code 1007).
+- **The payload ceiling reports 1006, not 1009, locally**: above `maxPayload` the receiver fails with a `RangeError` (`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`). `ws` then sends a 1009 close frame to the peer and emits `error`. The local `close` event later carries the default code 1006, because no close frame is read after the receiver error. Item 15 E's note that the owner sees close code 1009 is therefore true only if the wrapper translates (B5). Passed through unchanged, the owner would end `TRANSPORT_ERROR` on the `error` event instead of `ACQUISITION_LIMIT`.
+- **Errors**: handshake failures (`Unexpected server response: <status>`, timeouts, invalid upgrade headers) and socket errors (DNS, TCP, TLS, carrying host and port details) are emitted asynchronously as `error`, usually followed by `close` (code 1006, reason a `Buffer`). An `error` emitted with no listener is thrown by `EventEmitter`, which would become an unhandled exception.
+- **Sending**: `send`, `ping` and `pong` throw synchronously while `CONNECTING`. While `CLOSING` or `CLOSED` they call back with an error on the next tick. Their callbacks report when the data is written to the socket, not when the peer receives it. `ping` and `pong` throw a `RangeError` above 125 bytes.
+- **Closing**:
+  - `close()` while `CONNECTING` aborts the handshake and emits `error` and `close` on the next tick. While `OPEN` it sends a close frame and arms the internal `closeTimeout` timer, which destroys the socket.
+  - `terminate()` destroys the socket. `readyState` becomes 2 at once and 3 only after the socket's own `close`, which is asynchronous.
+  - Listeners are never called synchronously from these calls.
+- **Events not needed**: `upgrade` (exposes response headers), `unexpected-response` (a listener takes over the request and response, which must then be handled by hand), and `redirect` (only with `followRedirects`).
+- **Typings lag the runtime**: `@types/ws` 8.18.2 lacks `closeTimeout`, `maxFragments` and `maxBufferedChunks`, which 8.22.1 supports, so the wrapper needs a local option type. `package.json` allows `^8.22.1`, while the lockfile pins 8.22.1.
+
+**Existing `WsWebSocketTransport` (`RaydiumTransportObservationProbe.ts`)**:
+
+- **Reusable**: the idea of fan-out over a copied listener list, and the `ws` dependency itself.
+- **Not reusable**, so a separate wrapper is required:
+  - it constructs the client, and therefore connects, in its constructor, with default options (`autoPong`, a 100 MiB payload, compression);
+  - it concatenates `Buffer[]` without a bound;
+  - it forwards raw `Error` objects and decoded close-reason text;
+  - `on()` returns no disposer;
+  - `send()` has no completion callback, and `pong()` is absent;
+  - `destroy()` calls `removeAllListeners()`, which removes the only `error` listener, so a later error is unhandled;
+  - `getUnderlyingSocket()` exposes the client and its URL.
+
+  The probe keeps using it unchanged.
+
+###### B. Proposed Contract
+
+```typescript
+export interface CpmmWsClientLike {
+  readonly readyState: number;
+  binaryType: string;
+  send(data: string, cb: (err?: unknown) => void): void; // text frame, masked by the client
+  ping(data: Uint8Array, mask: true, cb: (err?: unknown) => void): void;
+  pong(data: Uint8Array, mask: true, cb: (err?: unknown) => void): void;
+  close(code: 1000): void; // no reason argument
+  terminate(): void;
+  on(
+    event: "open" | "message" | "error" | "close" | "ping" | "pong",
+    l: (...a: unknown[]) => void,
+  ): unknown;
+}
+export type CpmmWsClientConstructor = new (
+  address: string,
+  options: CpmmWsClientOptions,
+) => CpmmWsClientLike;
+
+export interface CpmmPoolWebSocketTransportOptions {
+  readonly endpoint: string; // opaque, credential-bearing; held privately until start()
+  readonly clientConstructor: CpmmWsClientConstructor; // production: `ws`; tests: a fake
+  readonly limits: {
+    readonly maxFrameBytes: number; // 1..2^31-1; equal to the collector's maxFrameBytes
+    readonly maxFragments: number; // >= 1
+    readonly handshakeTimeoutMs: number; // < the owner's ackTimeoutMs
+    readonly closeTimeoutMs: number; // <= the owner's cleanupTimeoutMs
+  };
+}
+export class CpmmPoolWebSocketTransport implements CpmmOwnerTransport {
+  constructor(options: CpmmPoolWebSocketTransportOptions);
+  /** Fixed codes and counters only; never text, URLs, Error objects or payloads. */
+  diagnostics(): CpmmWsTransportDiagnostics;
+}
+```
+
+1. **Inert imports and construction.**
+   - The module imports only `ws` (for the production constructor) and types. It reads no environment, configuration, file or clock, starts no timer, and never logs.
+   - Construction validates the options with fixed `[CPMM_WS_INIT]` messages that never quote a value. The endpoint must be a non-empty `wss:` URL without a fragment, checked inside `try` with the parse error discarded. `ws:`, `http(s):` and `ws+unix:` are refused.
+   - Nothing else happens at construction. The endpoint is kept in a private field that is neither enumerable nor serialised.
+   - **`start()`** is a one-time call:
+     - **The first call** constructs exactly one client with a fixed, complete option object (`autoPong: false`, `maxPayload: maxFrameBytes`, `maxFragments`, `perMessageDeflate: false`, `followRedirects: false`, `maxRedirects: 0`, `handshakeTimeout`, `closeTimeout`, `skipUTF8Validation: false`, `allowSynchronousEvents: true`). It passes no headers, origin, protocols, agent or `finishRequest`, sets `binaryType = "nodebuffer"`, attaches the internal listeners (B5), and then clears its endpoint field.
+     - **A repeated call** throws `[CPMM_WS] ALREADY_STARTED` and changes nothing.
+     - **After `dispose()`** it throws `[CPMM_WS] DISPOSED` without constructing anything.
+     - **If the constructor throws**, `start()` clears the endpoint, marks the wrapper closed (`readyState` 3) and throws `[CPMM_WS] START_FAILED`. The original error is discarded: no `cause`, message or stack is kept.
+   - **`dispose()`**:
+     - **Before `start()`**: releases the endpoint and every owner listener and marks the wrapper disposed (`readyState` 3). It is idempotent.
+     - **After `start()`**: throws `[CPMM_WS] STARTED_USE_CLOSE` with no effect. The owner calls `dispose()` only on an unstarted transport.
+2. **One connection, owner-controlled.**
+   - There is no reconnect, retry, redirect, fallback endpoint or automatic keepalive. The wrapper never sends a frame, ping or pong of its own, and never closes or terminates on its own initiative.
+   - The only timers are the client's own `handshakeTimeout` and `closeTimeout`. They are bounded below the owner's acknowledgement and cleanup windows, so they shorten failures but never extend a run.
+   - The owner's deadlines, cleanup, and close or terminate decisions stay authoritative.
+3. **Frame size, pongs and completion.**
+   - **Incoming size**: `maxPayload` equals `maxFrameBytes`, and the wrapper re-checks every delivered message (B4).
+   - **Pongs**: `autoPong` is `false`. Incoming pings reach the owner, which replies explicitly.
+   - **`send(data, done)`**:
+     - It requires a string and readyState `OPEN`. Otherwise it throws `[CPMM_WS] NOT_OPEN` or `INVALID_ARGUMENT` without touching the client.
+     - It calls `client.send(data, cb)`, where `cb(err)` becomes `done(err == null ? false : true)`.
+     - Every callback invocation is forwarded, so the owner counts duplicates, and the wrapper also counts them.
+     - A `done` that throws is contained and counted.
+     - A client exception becomes `[CPMM_WS] SEND_THREW`.
+   - **`ping` and `pong`**:
+     - The payload must be a genuine `Uint8Array` of at most 125 bytes, checked through captured intrinsics as in the collector. It is copied before the call, so later owner mutation cannot change sent bytes.
+     - The call passes `mask: true`.
+     - Completion is mapped as for `send`.
+4. **Byte-preserving messages.**
+   - A `Buffer`, or any genuine `Uint8Array` view, is copied into a new `Uint8Array` of exactly its byte length, after a length check against `maxFrameBytes`. A non-zero `byteOffset` copies only the view's bytes.
+   - An `ArrayBuffer` is length-checked through the intrinsic getter, then copied.
+   - A `Buffer[]` is accepted only as a plain array of at most `maxFragments` genuine views. Lengths are summed with safe arithmetic, refusing as soon as the running total exceeds `maxFrameBytes` and before any allocation or later element is read. One buffer is then allocated and filled.
+   - A string, `Blob`, proxy, shadowed or detached view, or anything else is refused (`REPRESENTATION_REFUSED`).
+   - An oversize message is refused (`PAYLOAD_LIMIT`). A refusal emits the owner's `error` with no arguments, and nothing is delivered.
+   - `isBinary` is not decoded. Binary frames are delivered byte-for-byte and counted in diagnostics.
+   - There is no UTF-8 decoding beyond the client's own validation, no JSON parsing and no candidate logic.
+   - Incoming ping and pong payloads are copied the same way, bounded at 125 bytes.
+5. **Listeners and errors.**
+   - **Owner listeners**:
+     - `on()` accepts only the six owner events and a function, before or after `start()`, and returns an idempotent disposer.
+     - Listeners are kept in the wrapper's own sets. Dispatch iterates over a snapshot but skips a listener removed during that dispatch, so a disposer takes effect at once.
+     - A throwing owner listener is contained, counted, and never propagates into `ws`.
+   - **Internal client listeners**:
+     - Exactly one per client event (`open`, `message`, `error`, `close`, `ping`, `pong`), attached once at `start()`. `upgrade`, `unexpected-response` and `redirect` are not listened to.
+     - The listeners are never removed, so a late client `error` is always handled. The wrapper never calls `removeAllListeners()` on the client.
+     - They close over a small relay. The relay's target is cleared when the client reports `close`, or at `dispose()`, so a finished client retains neither the wrapper's run state nor owner listeners.
+   - **Error mapping**: a client `error` is mapped to a fixed category from a closed allowlist of `err.code` values (`HANDSHAKE_FAILED`, `NETWORK`, `TLS`, `PROTOCOL`, `INVALID_UTF8`, `PAYLOAD_LIMIT`, `CLOSED_BEFORE_OPEN`, `OTHER`). The error object is then dropped. The owner's `error` listeners are called with no arguments, except that `PAYLOAD_LIMIT` (`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`) is not forwarded as an error: it latches a local refusal.
+   - **Close code**: on the client `close`, the owner listeners receive one argument:
+     - 1009 if a local payload refusal was latched;
+     - otherwise the client's code if it is an integer in 1000–4999;
+     - otherwise `null`.
+
+     The reason `Buffer` is never read or forwarded. The client's raw code is kept in diagnostics.
+
+6. **Credential-free surface.**
+   - No event, thrown error, diagnostic or log carries error text, an endpoint, URL, host, port, HTTP status text or close-reason text.
+   - Thrown errors use fixed `[CPMM_WS] <CODE>` messages with no `cause`.
+   - The wrapper exposes no client, URL or socket. Its own fields hold the endpoint only until `start()` or `dispose()`.
+   - The client object keeps its URL internally until it is collected. Nothing the wrapper returns references it.
+7. **Close, terminate, ready state and disposal.**
+   - **`readyState`**: 0 before `start()`, since the owner interface has no dormant value, and 3 after `dispose()` or a failed `start()`. While started it is the client's own value, read inside `try`, where a throwing getter raises `[CPMM_WS] STATE_UNREADABLE`. Once the client has reported `close` it is 3, after the client reference is released.
+   - **`close(1000)`**: passes the code only. Any other code throws `INVALID_ARGUMENT`. Before `start()` it throws `NOT_STARTED`, and after `close` it is a no-op. A client exception becomes `[CPMM_WS] CLOSE_THREW`.
+   - **`terminate()`**: passes through, with the same exception mapping. The wrapper never fakes `readyState` 3 after `terminate()`: with `ws` it is truthfully 2 until the socket closes (question 1).
+   - **Synchronous delivery**: an event a fake client emits synchronously inside any of these calls is delivered synchronously. The owner already handles this through its settlement barrier.
+8. **Diagnostics**: a frozen snapshot containing:
+   - the lifecycle state;
+   - client constructions (0 or 1);
+   - counts of messages, bytes and binary frames delivered, and refusals by fixed code;
+   - error categories;
+   - the latched payload refusal and the raw close code;
+   - completion counts (completed, failed, duplicate, `done` threw);
+   - contained owner-listener exceptions;
+   - events received after the relay was cleared.
+
+   The owner does not read it. Later wiring may seal it.
+
+###### C. Synthetic Test Plan (Injected Fake Client Constructor; No Real Client)
+
+The fake constructor records its arguments and returns an `EventEmitter`-faithful client: `error` with no listener throws, listener order is kept, and events can be emitted synchronously or on later ticks. Its sends, pings, pongs, closes and terminates are scripted, and its errors can carry a credential-bearing message, stack and URL. No `ws` client is constructed, and nothing opens a socket.
+
+| Test | Covers                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| W1   | Construction is inert: no client constructed, no timer, nothing read. Every option and limit is validated (`wss:` only; `maxFrameBytes` 1..2^31 − 1; positive timeouts), and validation messages never quote the endpoint                                                                                                                                                                                                                  |
+| W2   | `start()` constructs exactly once with the exact option object and `binaryType`; exactly six internal listeners; no `upgrade`, `unexpected-response` or `redirect` listener; the endpoint is no longer held by the wrapper (own properties, `JSON.stringify`, `util.inspect`)                                                                                                                                                              |
+| W3   | A repeated `start()`; `start()` after `dispose()`; a constructor throwing a credential-bearing error gives `START_FAILED`, with no secret, `cause`, listener or retained endpoint                                                                                                                                                                                                                                                          |
+| W4   | `dispose()` before `start()` (idempotent, listeners and endpoint released); `dispose()` after `start()` refused without effect                                                                                                                                                                                                                                                                                                             |
+| W5   | Disposers detach, are idempotent, and take effect even during the same dispatch. Registration before and after `start()`; unknown events refused; a throwing owner listener contained while the others still run                                                                                                                                                                                                                           |
+| W6   | Messages: a `Buffer` text frame delivered as a fresh exact copy (source mutation after delivery has no effect; a non-zero offset copies only the view); `ArrayBuffer`; fragments at exactly `maxFrameBytes` delivered, one byte more refused before allocation and before later elements are read; too many fragments; string, `Blob`, proxy (zero traps), shadowed length and detached views refused; binary frames delivered and counted |
+| W7   | A payload-limit error then `close` 1006 delivers no `error`, and `close` is delivered as 1009; other errors are forwarded with zero arguments and categorised                                                                                                                                                                                                                                                                              |
+| W8   | Completion: success and failure callbacks; a callback that never comes; a duplicate callback forwarded and counted; synchronous callbacks; a throwing `done` contained; `NOT_OPEN` without a client call; a credential-bearing client throw becomes `SEND_THREW`; ping and pong payload bounds and genuineness; payload copied; `mask: true`                                                                                               |
+| W9   | Close and terminate: `close(1000)` with no reason argument; other codes refused; `close` before `start()`; `terminate()` passthrough; `readyState` truthfully 2 after a terminate until `close`, then 3; a throwing `readyState` getter; synchronous `close` inside `close()` or `terminate()`; close codes outside 1000–4999 become `null`; the reason never delivered                                                                    |
+| W10  | Credential-bearing failures from the constructor, handshake rejection, DNS, TLS and socket errors, close reasons and thrown client calls: no secret, URL or host in any event, thrown error, diagnostics, `JSON.stringify` or `util.inspect` of the wrapper                                                                                                                                                                                |
+| W11  | Unhandled-error safety: a client `error` after every owner listener is disposed, after `close`, and after `dispose()` never throws; `removeAllListeners` is never called on the client                                                                                                                                                                                                                                                     |
+| W12  | Lifetime: after `close` the relay is cleared, later client events are counted in diagnostics only, and the wrapper holds no client, payload or listener                                                                                                                                                                                                                                                                                    |
+| W13  | Owner integration (synthetic): the real `CpmmPoolConnectionOwner` over the wrapper and fake client. A normal clean run; a payload refusal ends `ACQUISITION_LIMIT` (`TRANSPORT_PAYLOAD_LIMIT`); a handshake failure ends `TRANSPORT_ERROR`; a cleanup terminate ends `FAILED_STILL_OPEN` while the fake keeps `readyState` 2 (question 1); no secret in the report                                                                         |
+| W14  | Source boundary: the wrapper imports only `ws` and types; no `http`, `https`, `net`, `tls`, `dns`, `fs`, `process.env`, `console`, `fetch` or `JSON.parse`                                                                                                                                                                                                                                                                                 |
+| W15  | Pin (at implementation review): H-12 allows exactly the two new paths and refuses the named neighbours                                                                                                                                                                                                                                                                                                                                     |
+| W16  | Diagnostics: frozen, plain, fixed codes only, and its counters conserve (delivered plus refused equals received message events)                                                                                                                                                                                                                                                                                                            |
+
+Mutation checks would target: the options object (each unsafe default restored); the endpoint clearing; the fragment pre-allocation bound; the payload-limit translation; the permanent error listener; disposer effect during dispatch; completion mapping; and error-text suppression.
+
+###### D. Open Questions (for Review Before Implementation)
+
+1. **Terminate and `readyState`**: with `ws`, `terminate()` leaves `readyState` at 2 until the socket's asynchronous `close`. The accepted owner reads `readyState` immediately, so every terminate-path cleanup reports `FAILED_STILL_OPEN` (unclean, truthful), and the real `close` arrives as a late event. Should the owner later gain a short, bounded post-terminate wait? That would be an owner change, out of scope here. The wrapper will not report 3 early.
+2. **Close code 1009 from the peer**: a peer close with 1009 means the peer refused one of ours. Passed through, the owner maps it to `ACQUISITION_LIMIT` as if it were a local refusal. Should the wrapper report a peer 1009 differently, for example as `null`, with the raw code kept in diagnostics?
+3. **Binary frames**: should they be refused at the wrapper (fixed code, owner `error`) instead of delivered byte-for-byte? The RPC's notifications are text.
+4. **`readyState` before `start()`**: the owner interface has no dormant value, so 0 is proposed. It is never read by the owner before `start()`.
+5. **`dispose()` after `start()`**: refused (proposed), or treated as `terminate()` plus listener release?
+6. **Handshake status**: recording the HTTP status as an integer requires listening to `unexpected-response`, and the wrapper would then have to abort the request and drain or destroy the response itself. The proposal records only `HANDSHAKE_FAILED`.
+7. **Resource lifetime after the owner settles**:
+   - `ws`'s own timers (`handshakeTimeout`, `closeTimeout`) run on the real clock, not the session's.
+   - A socket can outlive a `FAILED_STILL_OPEN` settlement by up to `closeTimeoutMs`.
+   - Completion callbacks may arrive late or never after a terminate.
+   - The client keeps its URL until it is collected.
+
+   Are these bounds acceptable, or should the wiring layer hold the process for the close?
+
+8. **Version drift**: `^8.22.1` allows newer 8.x releases with different defaults. The wrapper passes every option explicitly, but should the dependency be pinned exactly (a dependency change, not proposed here)? The local option type also covers options missing from `@types/ws` 8.18.2.
+9. **Optional pre-I/O check of the real client**: `ws` throws on an invalid URL before creating any request, so one test could construct the real client with such an address to prove the wrapper's redaction against the actual error text. It would open no socket, but it constructs the real client, so it needs explicit approval. It is not in the default plan.
+10. **Endpoint injection**: the endpoint is an opaque string from the future wiring layer, and lookup and configuration are out of scope. Should the wrapper accept a one-shot provider function instead, so that the string exists only during `start()`?
+
+###### E. Next Step
+
+The next step, after approval of this contract and the answers to D, is to implement the two files with tests W1–W14 and W16 and targeted mutations. The pin addition (W15) follows at implementation review. Sealing, endpoint and budget review, wiring and any capture remain separately approved steps (item 15 K).
 
 ---
 
