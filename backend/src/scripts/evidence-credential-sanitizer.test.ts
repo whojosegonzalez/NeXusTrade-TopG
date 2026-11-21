@@ -740,4 +740,168 @@ describe("evidence credential sanitizer (synthetic, offline)", () => {
     });
     expect(off).toMatchObject({ jsonInspection: "NOT_REQUESTED" });
   });
+  // --- review of c3bdae7: context-sensitive lower-casing (exact, case-preserving matching) -----
+
+  /** Supported decoded views of stored material: text, \u-decoded, percent-decoded, parsed JSON. */
+  function exactViews(r: SanitizedEvidenceBytes): string[] {
+    const text = stored(r).toString("utf8");
+    const pctRuns = (t: string) =>
+      t.replace(/(?:%[0-9a-fA-F]{2})+/g, (run) => {
+        try {
+          return decodeURIComponent(run);
+        } catch {
+          return run;
+        }
+      });
+    const views = [text, unescapeUnicode(text), pctRuns(text), pctRuns(unescapeUnicode(text))];
+    try {
+      const work: unknown[] = [JSON.parse(text)];
+      while (work.length > 0) {
+        const v = work.pop();
+        if (typeof v === "string") views.push(v, pctRuns(v));
+        else if (Array.isArray(v)) work.push(...v);
+        else if (v !== null && typeof v === "object") {
+          for (const [k, x] of Object.entries(v)) {
+            views.push(k);
+            work.push(x);
+          }
+        }
+      }
+    } catch {
+      // Not JSON (for example, a partial body).
+    }
+    return views;
+  }
+  /** The exact secret is absent, and (for partial bodies) no view ends in a 4+ character prefix. */
+  function exactlyProtected(r: SanitizedEvidenceBytes, secret: string, partial: boolean): boolean {
+    if (r.status === "WITHHELD") return true;
+    const views = exactViews(r);
+    if (views.some((v) => v.includes(secret))) return false;
+    if (!partial) return true;
+    const cps = Array.from(secret);
+    for (const v of views) {
+      for (let k = L.minTrailingFragmentChars; k < cps.length; k++) {
+        if (v.endsWith(cps.slice(0, k).join(""))) return false;
+      }
+    }
+    return true;
+  }
+  const escapeNonAscii = (t: string, upper = false) =>
+    t
+      .split("")
+      .map((u) => {
+        const c = u.charCodeAt(0);
+        if (c < 0x80) return u;
+        const h = c.toString(16).padStart(4, "0");
+        return "\\u" + (upper ? h.toUpperCase() : h);
+      })
+      .join("");
+
+  const COMPLETE_JSON = { partial: false, parseJson: true } as const;
+
+  it("S16a: an escaped Greek secret whose prefix ends in a capital sigma is protected exactly", () => {
+    // 1. A Greek secret whose 8-character prefix ends in a capital sigma, escaped in a JSON value.
+    const greek = "ΑΒΓΔΕΖΗΣΑ123";
+    const g = sanitizeEvidenceBytes(
+      utf8(`{"v":"${escapeNonAscii(greek)}"}`),
+      deriveEvidenceSecrets([RPC_URL], [greek]),
+      COMPLETE_JSON,
+    );
+    expect(exactlyProtected(g, greek, false)).toBe(true);
+    expect(g).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+  });
+
+  it("S16b: a short secret ending in a capital sigma, beside a following letter, is protected", () => {
+    // 2. A short secret ending in a capital sigma, embedded beside a following letter.
+    const short = "abcdeΣ";
+    const shortSecrets = deriveEvidenceSecrets([RPC_URL], [short]);
+    const s2 = sanitizeEvidenceBytes(utf8(`{"v":"abcde\\u03a3A"}`), shortSecrets, COMPLETE_JSON);
+    expect(exactlyProtected(s2, short, false)).toBe(true);
+    expect(s2).toMatchObject({ status: "WITHHELD" });
+    // Control: a delimiter after the secret.
+    expect(
+      sanitizeEvidenceBytes(utf8(`{"v":"abcde\\u03a3 "}`), shortSecrets, COMPLETE_JSON),
+    ).toMatchObject({ status: "WITHHELD" });
+  });
+
+  it("S16c: a partial tail ending in the escaped four-character prefix abc + sigma is withheld", () => {
+    // 3. A partial payload ending in the 4-character prefix "abcΣ" written as an escape.
+    const mid = "abcΣdef_9876";
+    const s3 = sanitizeEvidenceBytes(utf8("abc\\u03a3"), deriveEvidenceSecrets([RPC_URL], [mid]), {
+      partial: true,
+      parseJson: true,
+    });
+    expect(exactlyProtected(s3, mid, true)).toBe(true);
+    expect(s3).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+  });
+
+  it("S16d: case-variant credentials are still caught by the context-free fold", () => {
+    const sigma = "abcdeΣ";
+    const list = deriveEvidenceSecrets([RPC_URL], [sigma, "abcΣdef_9876"]);
+    // Upper-case ASCII around an escaped capital sigma followed by a letter: exact matching
+    // cannot see it, and plain lower-casing would give a final sigma for the secret only.
+    expect(sanitizeEvidenceBytes(utf8(`{"v":"ABCDE\\u03a3a"}`), list, COMPLETE_JSON)).toMatchObject(
+      { status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" },
+    );
+    // A percent-encoded upper-case variant of an ASCII credential.
+    expect(
+      sanitizeEvidenceBytes(utf8(`{"v":"${pct(KEY.toUpperCase())}"}`), SECRETS, COMPLETE_JSON),
+    ).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+    // A partial tail in another case: "ABC" + escaped capital sigma.
+    expect(
+      sanitizeEvidenceBytes(utf8("ABC\\u03a3"), list, { partial: true, parseJson: false }),
+    ).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+  });
+
+  it("S17: a bounded generated matrix of sigma positions, neighbours, escape forms and partial cuts", () => {
+    const base = "abcdefghijk";
+    const secrets = [
+      ...Array.from({ length: base.length + 1 }, (_, i) => base.slice(0, i) + "Σ" + base.slice(i)),
+      "ΑΒΓΔΕΖΗΣΑ123",
+      "abcdeΣ",
+      "ΣΣΣΣ_key_77",
+      "ΟΔΥΣΣΕΥΣ_99",
+    ];
+    const forms: [string, (t: string) => string][] = [
+      ["literal", (t) => t],
+      ["escaped", (t) => escapeNonAscii(t)],
+      ["escaped upper-case hex", (t) => escapeNonAscii(t, true)],
+      ["percent-encoded UTF-8", (t) => pctUtf8(t)],
+    ];
+    const neighbours: [string, string][] = [
+      ["", ""],
+      ["A", "A"],
+      ["ab", "Σz"],
+      [" ", "."],
+    ];
+    let complete = 0;
+    let partial = 0;
+    for (const secret of secrets) {
+      const list = deriveEvidenceSecrets([RPC_URL], [secret]);
+      const cps = Array.from(secret);
+      for (const [formName, form] of forms) {
+        for (const [before, after] of neighbours) {
+          const body = utf8(`{"v":"${before}${form(secret)}${form(after)}"}`);
+          const r = sanitizeEvidenceBytes(body, list, { partial: false, parseJson: true });
+          const label = `${secret} ${formName} [${before}|${after}]`;
+          expect(exactlyProtected(r, secret, false), label).toBe(true);
+          complete++;
+        }
+        for (let k = L.minTrailingFragmentChars; k < cps.length; k++) {
+          const cut = form(cps.slice(0, k).join(""));
+          for (const before of ["", "x ", "A"]) {
+            const r = sanitizeEvidenceBytes(utf8(`{"v":"${before}${cut}`), list, {
+              partial: true,
+              parseJson: true,
+            });
+            const label = `${secret} ${formName} cut ${k} after [${before}]`;
+            expect(exactlyProtected(r, secret, true), label).toBe(true);
+            partial++;
+          }
+        }
+      }
+    }
+    expect(complete).toBe(secrets.length * forms.length * neighbours.length);
+    expect(partial).toBeGreaterThan(400);
+  });
 });

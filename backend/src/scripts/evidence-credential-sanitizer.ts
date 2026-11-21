@@ -24,7 +24,9 @@
  *   least 4 leading characters of a secret, literal, escaped or mixed, possibly cut inside an escape.
  *   A partial payload ending in fewer than 4 leading characters of a secret is not redacted.
  * - DETECTED (payload withheld, never redacted): after redaction, any secret's first 8 characters
- *   (lower-cased; the whole secret when shorter) in two compatible representations: its UTF-8
+ *   (the whole secret when shorter), matched exactly (case-preserving) and also case-insensitively
+ *   through a context-free fold (`toLowerCase`, then final sigma `ς` mapped to `σ`, the only
+ *   context-sensitive mapping of `toLowerCase`), in two compatible representations: its UTF-8
  *   bytes mapped to Latin-1 (matching literal and byte-level percent-encoded material) and its
  *   Unicode text (matching `\uXXXX` escapes including surrogate pairs, UTF-8 percent-encoding and
  *   parsed JSON). Both are searched in the raw payload's byte view and in its UTF-8 decoded view
@@ -33,7 +35,8 @@
  *   `\uXXXX`, `\xXX`, `\/` and percent decoding (runs of `%XX` decoded as UTF-8 when valid,
  *   otherwise byte for byte). Still changing after 4 rounds: inconclusive (withheld).
  * - DETECTED in partial payloads: a decoded tail that ends in at least 4 leading characters of a
- *   secret (in either representation) is withheld; it cannot be redacted on bytes.
+ *   secret (in either representation, exactly or folded) is withheld; it cannot be redacted on
+ *   bytes. No Unicode normalization is applied.
  * - Derivation also protects the strictly decoded form of URL user names, passwords and qualifying
  *   path segments, and the raw encoded form of qualifying query values; malformed or unsupported
  *   percent-encoding is refused.
@@ -412,6 +415,14 @@ const percentDecode = (s: string) =>
 
 type ScanResult = "FOUND" | "INCONCLUSIVE" | "CLEAN";
 
+/**
+ * Context-free case fold: `toLowerCase` maps a capital sigma to `ς` or `σ` depending on what
+ * follows it (Final_Sigma), so the same credential could fold differently inside a prefix, a whole
+ * secret and a larger text. Mapping `ς` to `σ` afterwards removes that context. Exact,
+ * case-preserving matching is always applied as well.
+ */
+const fold = (t: string) => t.toLowerCase().replace(/ς/g, "σ");
+
 /** A lower-cased secret form for trailing-fragment checks, with its KMP failure table. */
 interface FragmentPattern {
   readonly pattern: string;
@@ -430,6 +441,7 @@ function fragmentPattern(pattern: string): FragmentPattern {
 
 /** Characters (code points) of the longest secret prefix that `lower` ends with (linear). */
 function trailingPrefixChars(lower: string, f: FragmentPattern, budget: { chars: number }): number {
+  // `lower` is the text in the same case form as the pattern (exact or folded).
   const m = f.pattern.length;
   if (m === 0) return 0;
   const start = Math.max(0, lower.length - m);
@@ -443,21 +455,32 @@ function trailingPrefixChars(lower: string, f: FragmentPattern, budget: { chars:
   return Array.from(f.pattern.slice(0, q)).length;
 }
 
-function scanString(
-  s: string,
-  needles: readonly string[],
-  budget: { chars: number },
-  fragments: readonly FragmentPattern[] | null = null,
-): ScanResult {
+/** Needles and partial-tail patterns, exact (case-preserving) and folded. */
+interface Matchers {
+  readonly exactNeedles: readonly string[];
+  readonly foldedNeedles: readonly string[];
+  /** Null unless the payload is partial. */
+  readonly exactFragments: readonly FragmentPattern[] | null;
+  readonly foldedFragments: readonly FragmentPattern[] | null;
+}
+
+function scanString(s: string, m: Matchers, budget: { chars: number }): ScanResult {
   let cur = s;
   for (let round = 0; ; round++) {
-    budget.chars += cur.length;
+    // Two passes per round: exact (case-preserving) and folded.
+    budget.chars += cur.length * 2;
     if (budget.chars > L.maxScanChars) throw new BudgetExhausted();
-    const lower = cur.toLowerCase();
-    if (needles.some((n) => lower.includes(n))) return "FOUND";
-    if (fragments !== null) {
-      for (const f of fragments) {
-        if (trailingPrefixChars(lower, f, budget) >= L.minTrailingFragmentChars) return "FOUND";
+    if (m.exactNeedles.some((n) => cur.includes(n))) return "FOUND";
+    if (m.exactFragments !== null) {
+      for (const f of m.exactFragments) {
+        if (trailingPrefixChars(cur, f, budget) >= L.minTrailingFragmentChars) return "FOUND";
+      }
+    }
+    const folded = fold(cur);
+    if (m.foldedNeedles.some((n) => folded.includes(n))) return "FOUND";
+    if (m.foldedFragments !== null) {
+      for (const f of m.foldedFragments) {
+        if (trailingPrefixChars(folded, f, budget) >= L.minTrailingFragmentChars) return "FOUND";
       }
     }
     const next = percentDecode(unescapeBackslash(cur));
@@ -468,7 +491,7 @@ function scanString(
 }
 
 /** Parsed keys and string values, traversed with an explicit work list (no recursion). */
-function scanParsed(parsed: unknown, needles: readonly string[], budget: { chars: number }) {
+function scanParsed(parsed: unknown, m: Matchers, budget: { chars: number }) {
   let worst: ScanResult = "CLEAN";
   const work: { v: unknown; depth: number }[] = [{ v: parsed, depth: 0 }];
   let nodes = 0;
@@ -477,14 +500,14 @@ function scanParsed(parsed: unknown, needles: readonly string[], budget: { chars
     if (++nodes > L.maxJsonNodes || item.depth > L.maxJsonDepth) throw new BudgetExhausted();
     const v = item.v;
     if (typeof v === "string") {
-      const r = scanString(v, needles, budget);
+      const r = scanString(v, m, budget);
       if (r === "FOUND") return "FOUND";
       if (r === "INCONCLUSIVE") worst = r;
     } else if (Array.isArray(v)) {
       for (let i = 0; i < v.length; i++) work.push({ v: v[i], depth: item.depth + 1 });
     } else if (v !== null && typeof v === "object") {
       for (const k of Object.keys(v)) {
-        const r = scanString(k, needles, budget);
+        const r = scanString(k, m, budget);
         if (r === "FOUND") return "FOUND";
         if (r === "INCONCLUSIVE") worst = r;
         work.push({ v: (v as Record<string, unknown>)[k], depth: item.depth + 1 });
@@ -503,31 +526,35 @@ const sha256Hex = (b: Uint8Array) => createHash("sha256").update(b).digest("hex"
 interface SecretForm {
   readonly latin1: string;
   readonly escaped: RegExp | null;
-  /** The first 8 characters of the UTF-8 bytes mapped to Latin-1, lower-cased. */
+  /** The first 8 characters of the UTF-8 bytes mapped to Latin-1 (exact). */
   readonly byteNeedle: string;
-  /** The first 8 code points of the Unicode text, lower-cased. */
+  /** The first 8 code points of the Unicode text (exact). */
   readonly unicodeNeedle: string;
-  /** Whole lower-cased secret in both representations, for partial-payload tails. */
-  readonly fragments: readonly FragmentPattern[];
+  /** Whole secret in both representations, exact and folded, for partial-payload tails. */
+  readonly exactFragments: readonly FragmentPattern[];
+  readonly foldedFragments: readonly FragmentPattern[];
 }
 
 function secretForms(secrets: readonly string[]): readonly SecretForm[] {
   const markers = [EVIDENCE_REDACTED.toLowerCase(), EVIDENCE_REDACTED_PARTIAL.toLowerCase()];
   return secrets.map((s) => {
     const latin1 = Buffer.from(s, "utf8").toString("latin1");
-    const byteNeedle = latin1.slice(0, L.detectionPrefixChars).toLowerCase();
-    const unicodeNeedle = Array.from(s).slice(0, L.detectionPrefixChars).join("").toLowerCase();
+    const byteNeedle = latin1.slice(0, L.detectionPrefixChars);
+    const unicodeNeedle = Array.from(s).slice(0, L.detectionPrefixChars).join("");
     // A secret (or its detection prefix) inside a marker could never be redacted to a marker.
-    if (markers.some((m) => m.includes(byteNeedle) || m.includes(unicodeNeedle))) {
+    if (markers.some((m) => m.includes(fold(byteNeedle)) || m.includes(fold(unicodeNeedle)))) {
       throw inputError("a secret collides with a redaction marker");
     }
-    const unicodeLower = s.toLowerCase();
-    const latin1Lower = latin1.toLowerCase();
-    const fragments =
-      unicodeLower === latin1Lower
-        ? [fragmentPattern(unicodeLower)]
-        : [fragmentPattern(unicodeLower), fragmentPattern(latin1Lower)];
-    return { latin1, escaped: escapedSecretRegex(latin1), byteNeedle, unicodeNeedle, fragments };
+    const patterns = (forms: readonly string[]) =>
+      [...new Set(forms)].map((f) => fragmentPattern(f));
+    return {
+      latin1,
+      escaped: escapedSecretRegex(latin1),
+      byteNeedle,
+      unicodeNeedle,
+      exactFragments: patterns([s, latin1]),
+      foldedFragments: patterns([fold(s), fold(latin1)]),
+    };
   });
 }
 
@@ -631,12 +658,18 @@ export function sanitizeEvidenceBytes(
     // 3. Detection after redaction, in both representations: the raw byte view and the UTF-8
     //    decoded view (each with trailing-fragment checks for partial payloads), then parsed JSON
     //    keys and string values.
-    const needles = [...new Set(forms.flatMap((f) => [f.byteNeedle, f.unicodeNeedle]))];
-    const fragments = sc.partial ? forms.flatMap((f) => f.fragments) : null;
+    const exactNeedles = [...new Set(forms.flatMap((f) => [f.byteNeedle, f.unicodeNeedle]))];
+    const matchers: Matchers = {
+      exactNeedles,
+      foldedNeedles: [...new Set(exactNeedles.map(fold))],
+      exactFragments: sc.partial ? forms.flatMap((f) => f.exactFragments) : null,
+      foldedFragments: sc.partial ? forms.flatMap((f) => f.foldedFragments) : null,
+    };
+    const parsedMatchers: Matchers = { ...matchers, exactFragments: null, foldedFragments: null };
     const budget = { chars: 0 };
     let worst: ScanResult = "CLEAN";
     for (const view of [text, lenientUtf8.decode(bytes)]) {
-      const r = scanString(view, needles, budget, fragments);
+      const r = scanString(view, matchers, budget);
       if (r === "FOUND") {
         worst = r;
         break;
@@ -663,7 +696,7 @@ export function sanitizeEvidenceBytes(
         if (!ok) jsonInspection = "NOT_JSON";
         else {
           jsonInspection = "INSPECTED";
-          const r = scanParsed(parsed, needles, budget);
+          const r = scanParsed(parsed, parsedMatchers, budget);
           if (r === "FOUND" || (r === "INCONCLUSIVE" && worst === "CLEAN")) worst = r;
         }
       }
