@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ONLY ITS PURE RESPONSE-ANALYSIS PREREQUISITE IMPLEMENTED); NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ONLY ITS PURE RESPONSE-ANALYSIS AND CREDENTIAL-SANITIZER PREREQUISITES IMPLEMENTED); NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6501,7 +6501,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 > - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
 > - **Transport wrapper**: bounded CPMM WebSocket transport wrapper ([`CpmmPoolWebSocketTransport.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts), 22/22 tests including the real accepted owner over it; 34 of 36 targeted mutants caught, the 2 survivors not observable) implemented and verified offline on 2026-11-20 (item 16). It uses an injected `ws`-compatible client constructor, constructs nothing before `start()`, passes a complete bounded option set, copies messages byte-for-byte under exact bounds, reports only fixed error categories, translates a latched local payload refusal to 1009 at the actual close, and keeps `readyState` truthful. Independent review of `87b50b3` accepted the isolated wrapper, with the 227 focused tests, the backend typecheck, 81 additional checks, static compatibility with the installed `ws` constructor and the runtime pin check passing. It is not wired: no production constructor, endpoint, sealing or operator command, and no socket, request or capture is authorized.
-> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. The recorder, sanitizer and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
+> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. Independent review accepted the export and its corrections. The item D credential-sanitizer prerequisite is also implemented offline (`evidence-credential-sanitizer.ts`; 12/12 tests; 18 of 21 targeted mutants caught, the 3 survivors not observable), with no consumer and no migration. The recorder and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -9544,11 +9544,11 @@ Corrections 4–8 are implemented as described in item B and tested as mapped in
 
 The evidence recording, sealing and re-derivation contract is proposed in item 17. These steps remain, each separately approved: wiring the production `ws` constructor and an endpoint through a reviewed factory (with the composition checks above); sealing, re-derivation and credential scanning; an endpoint and budget review; and a separate operator approval for a first unqualified diagnostic capture (item 15 K).
 
-##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; Only the G2 Prerequisite Implemented)
+##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; G2 and Item D Prerequisites Implemented)
 
-**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse` (item K). The recorder, sanitizer and sealer are not approved for implementation and do not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
+**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, two are implemented: G2, the pure adapter export `analyzeCpmmTransactionResponse` (item K, accepted in review), and item D's credential sanitizer, `evidence-credential-sanitizer.ts` (item L). The recorder and sealer are not approved for implementation and do not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
 
-- **Changed for G2 only**: the adapter and its tests. No session, ledger, owner, pin, configuration or dependency change.
+- **Changed for the prerequisites only**: the adapter and its tests (G2); the new sanitizer, its tests and the pin entry for exactly those two files (item D). No session, ledger, owner, wrapper, decoder, configuration or dependency change, and no consumer migrated.
 - **Not run**: no request, socket, capture, wallet change or operator command.
 - **Not selected**: no production factory, endpoint lookup or live limit.
 - **Scope**: the capture provides observation and decoding evidence only (item H). CPMM remains excluded from admission.
@@ -9727,7 +9727,7 @@ No time is copied from one reader to another, no identical timestamp is invented
 
 **Secrets** come from the supplied endpoint URLs (the whole URL, user information, query values of at least six characters, path segments of at least sixteen characters) plus explicitly supplied values. This is the reviewed `credentialSecrets` rule. They are supplied explicitly to the sealer, never read from the environment, and never persisted or logged.
 
-**Narrowest shared helper** (proposed for separate review; not extracted now):
+**Narrowest shared helper** (implemented offline as `backend/src/scripts/evidence-credential-sanitizer.ts`; results and the exact rules in item L):
 
 - **Location**: a new module, `backend/src/scripts/evidence-credential-sanitizer.ts`.
 - **Content**: the reviewed watch-evidence `byteSanitizer` rules, unchanged (bytes mapped 1:1 to Latin-1; literal and `\u00XX`-escaped forms; trailing fragments of partial prefixes; refusal on residue), plus a detection pass ported from the adapter's `scanCredentialMaterial` rules. The pass runs after redaction over the redacted text and, when the stored bytes are complete, valid UTF-8 and parsable JSON, over every parsed key and string value, through bounded percent and backslash decoding.
@@ -9901,7 +9901,7 @@ This capture is observation and decoding evidence. It does not establish notific
 - **G1, no resolution-fact hook** (out of scope): the ledger keeps the adapter fact private, and its records carry no request sequence. Binding uses the signature and session ledger (item C), relying on one request per first occurrence. A read-only accessor would make the binding direct, but it would be a ledger change, which is out of scope.
 - **G2, transaction re-derivation through accepted code**: resolved by implementing `analyzeCpmmTransactionResponse` (item K). The replay session with substituted ids and a re-implementation in the evidence script were both rejected. Fresh sessions could in principle recreate ids, since `nextJsonRpcId` is a counter, but only by reproducing every other id consumer in order; the pure export avoids coupling response analysis to session replay.
 - **G3, pool-account acquisition**: nothing acquires CPMM pool and vault accounts with exchange evidence. Until a reviewed acquisition exists, the context is `SUPPLIED_UNVERIFIED` (item E).
-- **G4, the shared sanitizer**: item D's helper is a new shared module needing its own review and pin entry. The existing modules keep their private copies until a separate migration.
+- **G4, the shared sanitizer**: implemented as a new module with its own pin entry (item L). The existing modules keep their private copies, and no consumer is migrated; any migration is a separate reviewed change.
 - **G5, typed composition** (out of scope): the owner's option type names the concrete ledger class, so the delegating ledger needs a cast. An owner-side port type would remove the cast, but owner changes are out of scope.
 - **G6, runtime accounting and ingestion**: lifecycle checks and tracker ingestion depend on session state, the clock and the tracker's state. Nothing replays them, and the pure analysis cannot (it is unbranded and never ingestible). Until a reviewed lifecycle and tracker replay exists, ledger re-derivation is structural, and runtime accounting is reported `RUNTIME_ACCOUNTING_NOT_REPRODUCED`.
 - **G7, composition checks for the future factory** (not selected here):
@@ -10030,6 +10030,124 @@ Valid contexts, response outcomes, byte bounds, validation order and `FOREIGN_FA
 | Wallet `.tmp/virtual-wallet.json`                                                                                      | Unchanged (`7F2C2353…ED9`)                           |
 
 No recorder, sanitizer, sealer, session, ledger, owner, decoder, pin, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
+
+###### L. Item D Prerequisite: Evidence Credential Sanitizer (Implemented Offline 2026-11-20)
+
+**Files**:
+
+| File                                                                                                                          | Change                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`evidence-credential-sanitizer.ts`](file:///u:/Projects/TopG/backend/src/scripts/evidence-credential-sanitizer.ts)           | New. It imports only `node:crypto` and `node:util` (for `types.isProxy`), and reads no file, environment, network, socket, clock or timer, and never logs. Credentials are supplied explicitly                                                                                                                                                                             |
+| [`evidence-credential-sanitizer.test.ts`](file:///u:/Projects/TopG/backend/src/scripts/evidence-credential-sanitizer.test.ts) | New. 12 synthetic tests (S1–S12)                                                                                                                                                                                                                                                                                                                                           |
+| `paper-pilot-handoff.ts` / `.test.ts`                                                                                         | Exactly the two new paths are allowlisted and added to H-12. New neighbours are refused: `evidence-credential-sanitizer.test-support.ts`, `.fixtures.ts`, `evidence-credential-sanitizer-extra.ts`, `evidence-sanitizer.ts`, and the not-yet-approved `cpmm-pool-observation-evidence.ts` and `CpmmPoolObservationRecorder.ts`. Baseline and endpoint exceptions unchanged |
+
+**API**:
+
+- `deriveEvidenceSecrets(urls, additional)` returns a frozen secret list, deduplicated and longest first.
+- `sanitizeEvidenceBytes(original, secrets, { partial, parseJson })` returns either:
+  - **`STORED`**: `encoding`, `stored`, `storedBytes`, `storedSha256`, `originalBytes`, `originalSha256`, `redacted`, `redactions`, `partialFragmentRedacted`, `preexistingMarkers` and `jsonInspection`; or
+  - **`WITHHELD`**: a fixed reason, the original length and digest, and `jsonInspection`.
+- It throws `[EVIDENCE_SANITIZER_INPUT] <fixed message>` for invalid input (never echoing a value) and `[SEAL_REFUSED] <fixed code>` for residue.
+
+**Provenance** (ported, not imported; every source module and its private helpers is unchanged):
+
+- **Derivation**: `credentialSecrets`, from `fresh-amm-v4-watch-evidence.ts`.
+- **Redaction**: `byteSanitizer`, `fragmentCharsToEnd` and `trailingFragmentStart`, from the same module, with the escaped-form pattern of `buildEscapedSecretRegex` from `SolanaTrackerBundlerCaptureTool.ts`. That module is not imported, because it imports `fs` and an environment loader.
+- **Detection**: `scanString` and `scanAll`, from `RaydiumCpmmTransactionSourceAdapter.ts`.
+
+**Rules as implemented**:
+
+- **Derivation**: the whole URL; its user name and password (any length, as reviewed); query values of at least 6 characters and path segments of at least 16; and each additional secret of at least 6 characters.
+  - **Bounds**: at most 16 URLs, 64 additional secrets and 128 resulting secrets, each at most 4,096 characters.
+  - **Reading**: inputs are read without coercion, getters or proxy traps (revoked proxies included; the proxy check precedes `Array.isArray`). They are never mutated or frozen.
+- **Redaction to `[REDACTED]`** happens on bytes (Latin-1 maps bytes 1:1), before UTF-8 or base64 storage:
+  - each secret's UTF-8 bytes literally;
+  - each character literally or as `\u00XX` (hex in either case), mixed freely, case-insensitively.
+- **Trailing fragments**, when `partial` is set: a fragment covering at least **4** leading characters of a secret (literal, escaped or mixed, possibly cut inside an escape) becomes `[REDACTED_PARTIAL]`. A tail of 3 or fewer characters is not redacted.
+- **Residue**: any redactable form still present after redaction throws a fixed `[SEAL_REFUSED]` code (`CREDENTIAL_BYTES_REMAIN`, `ESCAPED_CREDENTIAL_REMAINS` or `TRAILING_FRAGMENT_REMAINS`).
+- **Detection, which withholds the payload and never redacts**: after redaction, each secret's first **8** characters lower-cased (the whole secret when shorter) are searched for:
+  - in the raw text; and
+  - for complete, valid UTF-8 JSON with `parseJson` set, in every parsed key and string value, traversed iteratively with an explicit work list (no recursion or argument spreading);
+  - in both cases also after up to **4** rounds of `\uXXXX`, `\xXX`, `\/` and percent decoding.
+
+  Outcomes:
+  - **Found**: `CREDENTIAL_MATERIAL_DETECTED`.
+  - **Still changing after 4 rounds**: `CREDENTIAL_SCAN_INCONCLUSIVE`.
+  - **A parser failure other than a syntax error, or exhausted node, depth, scan or fragment budgets**: `SCAN_BUDGET_EXHAUSTED`.
+
+- **Marker collisions**: a secret whose detection prefix lies inside either marker is refused as input. Marker text already present in a payload is kept byte for byte and counted (`preexistingMarkers`), so markers are not taken as redactions.
+- **Digests and encoding**:
+  - `storedSha256` covers the sanitized bytes, before encoding.
+  - `originalSha256` covers the original bytes.
+  - A future manifest's file digest is a separate, third value outside this helper.
+  - UTF-8 is used only when the sanitized bytes round-trip exactly; otherwise base64 of those bytes.
+  - A parsed value is never reserialized.
+- **Clean material** (no secret form, no detectable prefix) is stored byte-identical.
+
+**Helper bounds** (independent of live request and response limits, which remain the session's and adapter's):
+
+- 8 MiB per payload;
+- stored output at most 2 x original + 4,096 bytes, with growth predicted before any larger string is built (otherwise `OUTPUT_LIMIT_EXCEEDED`);
+- 20,000,000 fragment-matching steps;
+- 2,000,000 JSON nodes and a depth of 100,000;
+- 256 Mi characters examined by detection.
+
+**Tests** (S1–S12, 12/12):
+
+| Test | Covers                                                                                                                                                                                                                                                                                                                                                   |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1   | The derivation rules (user name, password, the 6 and 16 thresholds, non-URL values, additional secrets), deduplication, longest-first order, a frozen result, and caller arrays unchanged                                                                                                                                                                |
+| S2   | Derivation input: non-arrays, ordinary and revoked proxies (zero traps), accessor elements (no getter runs), wrapped strings, counts and lengths; fixed, secret-free messages                                                                                                                                                                            |
+| S3   | Clean UTF-8 JSON and binary payloads round-trip exactly (`storedSha256` equals the original digest); an empty payload; offset views; shadowed lengths ignored                                                                                                                                                                                            |
+| S4   | Literal, escaped, upper-case-hex, mixed and case-varied credentials redacted; credential-bearing invalid UTF-8 stored as base64 whose decoded bytes hold the marker and not the secret; digests distinct and correct                                                                                                                                     |
+| S5   | Partial payloads: literal, escaped, mixed and truncated-escape fragments of 4 or more characters redacted; 3 characters not; a complete payload's tail not treated as a fragment                                                                                                                                                                         |
+| S6   | Percent-encoded, `\x`-escaped and 8-character-prefix forms withheld; credentials visible only in a parsed value or key (a JSON-escaped quote) withheld, and reported `NOT_REQUESTED` when parsing is off; raw-only detection in plain text, binary and unparsed JSON; nested escapes beyond 4 rounds inconclusive; clean decodable text stored unchanged |
+| S7   | Residue refused with a fixed `[SEAL_REFUSED]` code; marker-colliding secrets refused; pre-existing markers kept and counted                                                                                                                                                                                                                              |
+| S8   | 200,000-element arrays and 5,000-deep nesting inspected (hidden credentials found); beyond the node or depth bound withheld (`SCAN_BUDGET_EXHAUSTED`)                                                                                                                                                                                                    |
+| S9   | The payload limit at and beyond the edge; literal and escaped marker growth beyond the output bound withheld                                                                                                                                                                                                                                             |
+| S10  | Sanitize input: non-genuine, ordinary and revoked proxies (zero traps), detached and accessor values, counts, lengths and scope shape; caller payload, secrets and scope unchanged and never frozen                                                                                                                                                      |
+| S11  | Results frozen, secret-free, with correct and distinct digests                                                                                                                                                                                                                                                                                           |
+| S12  | Source boundary: only `node:crypto` and `node:util`; no file, network, environment, console, timer, clock or serialization                                                                                                                                                                                                                               |
+
+**Mutation checks**: 21 targeted mutants, each run under an external 60-second limit with the source restored and compared byte for byte afterwards. 18 were killed:
+
+- **Derivation**: the query and path thresholds; the user name.
+- **Proxy checks**: `Array.isArray` before the proxy check; the scope read without the proxy check.
+- **Redaction and encoding**: escaped forms not redacted; base64 of the original bytes; the stored digest over encoded text.
+- **Fragments**: the minimum lowered to 3; fragments not redacted.
+- **Residue**: residue not refused.
+- **Detection**: raw detection skipped (killed after S6 gained raw-only cases); parsed detection skipped; no decoding bound.
+- **Bounds and markers**: the node and depth bounds; the depth bound alone; marker collisions allowed; pre-existing markers not counted.
+
+Three survived, none observable here:
+
+- **N14**: treating every parser failure as "not JSON". The installed V8 `JSON.parse` accepted the deepest tested input, so the traversal depth bound applies first.
+- **N18 and N19**: removing the literal or escaped growth prediction. The final output check still withholds the payload. The prediction only stops the oversized string being built, a memory effect.
+
+**Results** (2026-11-20, each command under an external 60-second limit):
+
+| Check                                                                                                                                            | Result                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| Sanitizer suite                                                                                                                                  | 12/12                                                     |
+| Focused set plus sanitizer: sanitizer, wrapper, owner, collector, ledger, decoder, adapter, tracker, `fresh-amm-v4-watch`, `paper-pilot-handoff` | 246/246 (12 + 22 + 55 + 24 + 25 + 16 + 28 + 40 + 11 + 13) |
+| Backend typecheck (`tsc --noEmit`, actual exit code)                                                                                             | Clean                                                     |
+| ESLint and Prettier on the four changed files                                                                                                    | Clean                                                     |
+| Pin (`paper-pilot-handoff`, including H-12)                                                                                                      | 13/13                                                     |
+| Wallet `.tmp/virtual-wallet.json`                                                                                                                | Unchanged (`7F2C2353…ED9`)                                |
+
+**Remaining limitations**:
+
+- **Over-withholding by design (the adapter rule)**: detection prefixes come from every secret, including whole URLs. Any payload containing a URL secret's first 8 characters (for example `https://`) is withheld. A short URL user name or password (included at any length, as reviewed) can over-redact and over-withhold.
+- **Not covered**:
+  - credentials split across payloads;
+  - other encodings (base64, hex, compression);
+  - a partial payload that begins mid-credential (only trailing fragments are handled);
+  - trailing fragments of 3 or fewer characters.
+- **Coverage depends on `parseJson`**: parsed keys and values are inspected only for complete, valid UTF-8 JSON with `parseJson` set. Otherwise `jsonInspection` says why, truthfully.
+- **Worst-case cost**: the bounds above allow seconds of CPU per call. Trailing-fragment matching recurses at most once per secret character (at most 4,096 levels).
+- **No consumer**: the recorder and sealer are not implemented or approved, and no existing module is migrated.
+
+No adapter, decoder, session, ledger, owner, wrapper, recorder, sealer, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
 
 ---
 

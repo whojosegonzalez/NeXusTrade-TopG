@@ -130,6 +130,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The isolated CPMM pool WebSocket transport wrapper and its synthetic tests (section 8.38.17).
   "backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts",
   "backend/src/candidate-scanner/CpmmPoolWebSocketTransport.test.ts",
+  // The offline evidence credential sanitizer and its synthetic tests (section 8.38.17 item 17 D).
+  "backend/src/scripts/evidence-credential-sanitizer.ts",
+  "backend/src/scripts/evidence-credential-sanitizer.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
