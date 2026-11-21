@@ -491,7 +491,10 @@ const okTx =
 
 // --- integration harness --------------------------------------------------------------------------
 
-function env(limits: Partial<CpmmObservationRecorderLimits> = {}) {
+function env(
+  limits: Partial<CpmmObservationRecorderLimits> = {},
+  collectorLimits: Partial<CpmmCollectorLimits> = {},
+) {
   const state = { now: OBS_START };
   let nextTimer = 0;
   const queue = new Map<number, { at: number; fn: () => void }>();
@@ -553,7 +556,7 @@ function env(limits: Partial<CpmmObservationRecorderLimits> = {}) {
   });
   const collector = new CpmmPoolNotificationCollector({
     binding: adapter.getBinding(),
-    limits: COLLECTOR_LIMITS,
+    limits: { ...COLLECTOR_LIMITS, ...collectorLimits },
     commitment: "confirmed",
   });
   const f = fakeCtor({ autoPong: true });
@@ -621,9 +624,13 @@ function env(limits: Partial<CpmmObservationRecorderLimits> = {}) {
 
 /** A clean run: one resolved notification, a duplicate, a ping, a normal end. */
 async function genuineRun(
-  o: { limits?: Partial<CpmmObservationRecorderLimits>; responder?: Responder } = {},
+  o: {
+    limits?: Partial<CpmmObservationRecorderLimits>;
+    collectorLimits?: Partial<CpmmCollectorLimits>;
+    responder?: Responder;
+  } = {},
 ) {
-  const e = env(o.limits);
+  const e = env(o.limits, o.collectorLimits);
   const p = e.owner.run();
   e.c.open();
   await e.to(OBS_START + 10);
@@ -888,7 +895,7 @@ describe("CPMM observation evidence: sealing", () => {
     expect(v.retention.reasons).toEqual(
       expect.arrayContaining([
         "PAYLOAD_OMITTED:transport-records.json",
-        "RECORDS_MISSING:incoming",
+        "RECORDS_DROPPED:incoming",
       ]),
     );
     const records = readJson(result.outDir, CPMM_EVIDENCE_FILES.transportRecords).records as {
@@ -1426,11 +1433,8 @@ describe("CPMM observation evidence: verification", () => {
     );
     expect(r.ok).toBe(true);
     if (!r.ok) return;
+    // The report's informational copy of the recorder's flags is never consulted.
     const d = copyOf(r.outDir);
-    reseal(d, CPMM_EVIDENCE_FILES.recording, (rec) => {
-      (rec.retention as Record<string, unknown>).recorderRetentionComplete = true;
-      (rec.instrumentation as Record<string, unknown>).complete = true;
-    });
     reseal(d, CPMM_EVIDENCE_FILES.report, (rep) => {
       rep.recordedByRecorder = { recorderRetentionComplete: true, instrumentationComplete: true };
     });
@@ -1438,6 +1442,15 @@ describe("CPMM observation evidence: verification", () => {
     expect(v.integrity.ok).toBe(true);
     expect(v.retention.status).toBe("INCOMPLETE");
     expect(v.retention.reasons).toContain("PAYLOAD_OMITTED:transport-records.json");
+    // The recorder's own flag, rewritten against its own counts, is a contradiction.
+    const f = copyOf(r.outDir);
+    reseal(f, CPMM_EVIDENCE_FILES.recording, (rec) => {
+      (rec.retention as Record<string, unknown>).recorderRetentionComplete = true;
+    });
+    expect(verifyCpmmObservationEvidence(f)).toMatchObject({
+      integrity: { ok: false, problems: ["RECORDING_RETENTION_CONTRADICTORY"] },
+      retention: { status: "NOT_EVALUATED" },
+    });
     // Removing a CPMM request's exchange (index, file and manifest) is missing evidence.
     const { dir } = await shared;
     const e = copyOf(dir);
@@ -1453,7 +1466,9 @@ describe("CPMM observation evidence: verification", () => {
     });
     reseal(e, CPMM_EVIDENCE_FILES.exchangeIndex, (i) => (i.exchanges = []));
     reseal(e, CPMM_EVIDENCE_FILES.recording, (rec) => {
-      (rec.retention as Record<string, Record<string, number>>).exchanges!.observed = 0;
+      const x = (rec.retention as Record<string, Record<string, number>>).exchanges!;
+      x.observed = 0;
+      x.retained = 0;
     });
     const ve = verifyCpmmObservationEvidence(e);
     expect(ve.integrity).toEqual({ ok: true, problems: [] });
@@ -1505,3 +1520,385 @@ function get(v: unknown, ...keys: string[]): unknown {
   }
   return cur;
 }
+
+describe("Structural and retention boundaries (review of 84546f3)", () => {
+  const sealed = async (o: Parameters<typeof genuineRun>[0] = {}) => {
+    const run = await genuineRun(o);
+    const r = sealCpmmObservationEvidence(sealInput(run.snapshot, run.recorder));
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  const exchangeOf = (dir: string) =>
+    (readJson(dir, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges as { path: string }[])[0]!.path;
+  const integrityFails = (dir: string, expected: string) => {
+    const v = verifyCpmmObservationEvidence(dir);
+    expect(v.integrity.ok, expected).toBe(false);
+    expect(v.integrity.problems, expected).toContain(expected);
+    expect(v.retention, expected).toEqual({ status: "NOT_EVALUATED", reasons: [] });
+    expect(v.rederivation, expected).toEqual({ status: "NOT_ATTEMPTED" });
+  };
+
+  it("N1: faithfully recorded partial and unread response bodies pass integrity, and retention says what is missing", async () => {
+    const cases: [Responder, string, string][] = [
+      [
+        async () => new Response("x".repeat(200_001), { status: 200 }),
+        "PARTIAL_OVERFLOW",
+        "EXCHANGE_BODY_PARTIAL",
+      ],
+      [
+        async () => {
+          throw new Error("transport failure");
+        },
+        "NOT_READ",
+        "EXCHANGE_BODY_NOT_READ",
+      ],
+    ];
+    for (const [responder, state, reason] of cases) {
+      const dir = await sealed({ responder });
+      const ex = readJson(dir, exchangeOf(dir));
+      expect(ex.bodyState).toBe(state);
+      expect(get(ex, "entry", "bodyComplete")).toBe(false);
+      if (state === "NOT_READ") {
+        expect(ex.body).toBeNull();
+        expect(ex.observedBodyBytes).toBeNull();
+      } else {
+        expect(ex.body).toMatchObject({ payloadOmitted: null, withheldReason: null });
+        expect(ex.observedBodyBytes as number).toBeGreaterThan(
+          get(ex, "body", "originalBytes") as number,
+        );
+      }
+      const v = verifyCpmmObservationEvidence(dir);
+      expect(v.integrity).toEqual({ ok: true, problems: [] });
+      expect(v.retention.status).toBe("INCOMPLETE");
+      expect(v.retention.reasons).toContain(reason);
+      expect(v.rederivation).toEqual({ status: "NOT_IMPLEMENTED" });
+      expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    }
+  });
+
+  it("N2: collector retention comes from its arrays and counts; a completeness flag cannot override drops", async () => {
+    const cases: [Partial<CpmmCollectorLimits>, string, string][] = [
+      [
+        { maxRetainedFrameRecords: 1 },
+        "COLLECTOR_FRAME_RECORDS_DROPPED",
+        "COLLECTOR_FRAME_COUNT_INCONSISTENT",
+      ],
+      [
+        { maxRetainedNotifications: 1 },
+        "COLLECTOR_NOTIFICATION_RECORDS_DROPPED",
+        "COLLECTOR_NOTIFICATION_COUNT_INCONSISTENT",
+      ],
+    ];
+    const mrOf = (doc: Record<string, unknown>, section: string) =>
+      get(doc, section, "value", "metadataRetention") as Record<string, unknown>;
+    for (const [collectorLimits, reason, countProblem] of cases) {
+      const dir = await sealed({ collectorLimits });
+      const v = verifyCpmmObservationEvidence(dir);
+      expect(v.integrity).toEqual({ ok: true, problems: [] });
+      expect(v.retention.reasons).toContain(reason);
+      // Only the epoch report's flag rewritten (the review's reproduction): a contradiction.
+      const a = copyOf(dir);
+      reseal(a, CPMM_EVIDENCE_FILES.collector, (c) => (mrOf(c, "epochReport").complete = true));
+      integrityFails(a, "COLLECTOR_RETENTION_CONTRADICTORY:epochReport");
+      const b = copyOf(dir);
+      reseal(b, CPMM_EVIDENCE_FILES.collector, (c) => (mrOf(c, "counters").complete = true));
+      integrityFails(b, "COLLECTOR_RETENTION_CONTRADICTORY:counters");
+      // The epoch report rewritten consistently still cannot hide the collector's own drops.
+      const c = copyOf(dir);
+      reseal(c, CPMM_EVIDENCE_FILES.collector, (doc) => {
+        Object.assign(mrOf(doc, "epochReport"), {
+          frameRecordsDropped: 0,
+          notificationRecordsDropped: 0,
+          complete: true,
+        });
+      });
+      const vc = verifyCpmmObservationEvidence(c);
+      expect(vc.integrity).toEqual({ ok: true, problems: [] });
+      expect(vc.retention.reasons).toContain(reason);
+      // Both rewritten consistently: the frame and notification totals no longer add up.
+      const d = copyOf(dir);
+      reseal(d, CPMM_EVIDENCE_FILES.collector, (doc) => {
+        for (const s of ["epochReport", "counters"]) {
+          Object.assign(mrOf(doc, s), {
+            frameRecordsDropped: 0,
+            notificationRecordsDropped: 0,
+            complete: true,
+          });
+        }
+      });
+      integrityFails(d, countProblem);
+    }
+    // Retained counts must equal the arrays actually sealed; the epoch never exceeds the collector.
+    const { dir } = await shared;
+    const arrays: [(c: Record<string, unknown>) => void, string][] = [
+      [
+        (c) => (get(c, "frameRecords", "value") as unknown[]).pop(),
+        "COLLECTOR_FRAME_RECORDS_INCONSISTENT",
+      ],
+      [
+        (c) => (get(c, "notifications", "value") as unknown[]).pop(),
+        "COLLECTOR_NOTIFICATIONS_INCONSISTENT",
+      ],
+      [
+        (c) => {
+          const mr = mrOf(c, "epochReport");
+          mr.frameRecordsRetained = (mr.frameRecordsRetained as number) + 1;
+        },
+        "COLLECTOR_RETENTION_INCONSISTENT",
+      ],
+    ];
+    for (const [mutate, expected] of arrays) {
+      const d = copyOf(dir);
+      reseal(d, CPMM_EVIDENCE_FILES.collector, mutate);
+      integrityFails(d, expected);
+    }
+  });
+
+  it("N3: missing payloads and malformed required structures fail integrity and stop evaluation", async () => {
+    const { dir } = await shared;
+    const exchange = exchangeOf(dir);
+    const record = (t: Record<string, unknown>, pick: (r: Record<string, unknown>) => boolean) =>
+      (t.records as Record<string, unknown>[]).find(pick)!;
+    const isMessage = (r: Record<string, unknown>) => r.kind === "EVENT" && r.event === "message";
+    const TR = CPMM_EVIDENCE_FILES.transportRecords;
+    const COL = CPMM_EVIDENCE_FILES.collector;
+    const REC = CPMM_EVIDENCE_FILES.recording;
+    const cases: [string, (d: Record<string, unknown>) => void, string][] = [
+      [exchange, (x) => (x.body = null), "EXCHANGE_BODY_MISSING"],
+      [exchange, (x) => (x.requestBody = null), "EXCHANGE_REQUEST_BODY_INCONSISTENT"],
+      [exchange, (x) => (x.method = "PUT"), "EXCHANGE_METHOD_INVALID"],
+      [exchange, (x) => (x.bodyState = "UNRECOGNIZED"), "EXCHANGE_BODY_STATE_INVALID"],
+      [exchange, (x) => (x.bodyState = "NOT_READ"), "EXCHANGE_BODY_COMPLETENESS_INCONSISTENT"],
+      [
+        exchange,
+        (x) => (x.observedBodyBytes = (x.observedBodyBytes as number) + 1),
+        "EXCHANGE_BODY_INCONSISTENT",
+      ],
+      [exchange, (x) => (x.maxResponseBytes = null), "EXCHANGE_MALFORMED"],
+      [
+        exchange,
+        (x) => {
+          // Unread, yet carrying a body and an observed size.
+          x.bodyState = "NOT_READ";
+          (x.entry as Record<string, unknown>).bodyComplete = false;
+        },
+        "EXCHANGE_BODY_INCONSISTENT",
+      ],
+      [
+        exchange,
+        (x) => {
+          // A partial body whose observed size does not exceed what was retained.
+          x.bodyState = "PARTIAL_OVERFLOW";
+          (x.entry as Record<string, unknown>).bodyComplete = false;
+        },
+        "EXCHANGE_BODY_INCONSISTENT",
+      ],
+      [TR, (t) => (record(t, isMessage).payload = null), "TRANSPORT_RECORD_PAYLOAD_MISSING"],
+      [TR, (t) => delete record(t, isMessage).payload, "TRANSPORT_RECORD_PAYLOAD_MISSING"],
+      [
+        TR,
+        (t) =>
+          (record(t, (r) => r.kind === "EVENT" && r.event === "open").payload = record(
+            t,
+            isMessage,
+          ).payload),
+        "TRANSPORT_RECORD_PAYLOAD_UNEXPECTED",
+      ],
+      [
+        TR,
+        (t) => (record(t, (r) => r.kind === "COMPLETION").payload = null),
+        "TRANSPORT_RECORD_PAYLOAD_UNEXPECTED",
+      ],
+      [
+        TR,
+        (t) => (record(t, isMessage).category = "lifecycle"),
+        "TRANSPORT_RECORD_CATEGORY_INVALID",
+      ],
+      [TR, (t) => (record(t, isMessage).kind = "OTHER"), "TRANSPORT_RECORD_KIND_INVALID"],
+      [
+        COL,
+        (c) => (c.frameRecords = { status: "READ" }),
+        "COMPONENT_SECTION_MALFORMED:collectorFrameRecords",
+      ],
+      [
+        COL,
+        (c) => ((c.frameRecords as Record<string, unknown>).extra = 1),
+        "COMPONENT_SECTION_MALFORMED:collectorFrameRecords",
+      ],
+      [
+        COL,
+        (c) => (c.epochReport = { status: "READ_FAILED", code: "free text" }),
+        "COMPONENT_SECTION_MALFORMED:collectorEpochReport",
+      ],
+      [
+        COL,
+        (c) =>
+          ((
+            get(c, "counters", "value", "metadataRetention") as Record<string, unknown>
+          ).frameRecordsRetained = "4"),
+        "COMPONENT_SECTION_MALFORMED:collectorCounters",
+      ],
+      [
+        COL,
+        (c) => (c.notifications = { status: "MAYBE" }),
+        "COMPONENT_SECTION_MALFORMED:collectorNotifications",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.sessionLedger,
+        (s) => ((s.window as { value: unknown[] }).value = [{}]),
+        "COMPONENT_SECTION_MALFORMED:sessionLedgerWindow",
+      ],
+      [CPMM_EVIDENCE_FILES.sessionLedger, (s) => (s.start = "0"), "SESSION_LEDGER_START_MALFORMED"],
+      [
+        CPMM_EVIDENCE_FILES.ownerReport,
+        (o) => ((get(o, "lateEvents", "value") as Record<string, unknown>).close = "0"),
+        "COMPONENT_SECTION_MALFORMED:ownerLateEvents",
+      ],
+      [
+        REC,
+        (r) => (r.fanOut = { status: "READ" }),
+        "COMPONENT_SECTION_MALFORMED:fanOutDiagnostics",
+      ],
+      [
+        REC,
+        (r) => delete (r.pending as Record<string, unknown>).accountSettlementsPending,
+        "RECORDING_PENDING_MALFORMED",
+      ],
+      [
+        REC,
+        (r) =>
+          ((get(r, "pending", "completionsAwaitingFirstCall") as Record<string, unknown>).send =
+            "0"),
+        "RECORDING_PENDING_MALFORMED",
+      ],
+      [
+        REC,
+        (r) => ((r.pending as Record<string, unknown>).extra = 0),
+        "RECORDING_PENDING_MALFORMED",
+      ],
+      [
+        REC,
+        (r) => {
+          const s = get(r, "retention", "incoming") as Record<string, number>;
+          s.observed = s.observed! + 1;
+          s.retained = s.retained! + 1;
+        },
+        "RECORD_COUNT_INCONSISTENT:incoming",
+      ],
+      [
+        REC,
+        (r) => ((get(r, "retention", "outgoing") as Record<string, number>).observed = 99),
+        "RECORD_COUNT_INCONSISTENT:outgoing",
+      ],
+      [
+        REC,
+        (r) => ((r.instrumentation as Record<string, unknown>).complete = false),
+        "RECORDING_INSTRUMENTATION_INCONSISTENT",
+      ],
+      [REC, (r) => (r.ledgerRecorded = "yes"), "RECORDING_SCOPE_MALFORMED"],
+      [
+        CPMM_EVIDENCE_FILES.ledger,
+        (l) => (l.calls = [{ kind: "OTHER" }]),
+        "LEDGER_CALLS_MALFORMED",
+      ],
+    ];
+    for (const [file, mutate, expected] of cases) {
+      const d = copyOf(dir);
+      reseal(d, file, mutate);
+      integrityFails(d, expected);
+    }
+  });
+
+  it("N4: controls: legitimate nulls, fixed-code read failures and absent components pass integrity", async () => {
+    const { dir } = await shared;
+    const records = readJson(dir, CPMM_EVIDENCE_FILES.transportRecords).records as Record<
+      string,
+      unknown
+    >[];
+    const nulls = records.filter((r) => "payload" in r && r.payload === null);
+    expect(nulls.map((r) => `${String(r.kind)}:${String(r.event ?? r.method)}`)).toEqual(
+      expect.arrayContaining(["CALL:close", "CALL:start", "EVENT:close", "EVENT:open"]),
+    );
+    expect(records.some((r) => r.kind === "COMPLETION" && !("payload" in r))).toBe(true);
+    expect(verifyCpmmObservationEvidence(dir)).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE", reasons: [] },
+    });
+    const sections: [string, (d: Record<string, unknown>) => void, string][] = [
+      [
+        CPMM_EVIDENCE_FILES.ownerReport,
+        (o) => (o.lateEvents = { status: "READ_FAILED", code: "THREW" }),
+        "COMPONENT_UNAVAILABLE:ownerLateEvents",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.ledger,
+        (l) => (l.epochs = { status: "NOT_SUPPLIED" }),
+        "COMPONENT_UNAVAILABLE:ledgerEpochs",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.collector,
+        (c) => ((c.epochReport as Record<string, unknown>).value = null),
+        "COLLECTOR_EPOCH_REPORT_MISSING",
+      ],
+    ];
+    for (const [file, mutate, reason] of sections) {
+      const d = copyOf(dir);
+      reseal(d, file, mutate);
+      const v = verifyCpmmObservationEvidence(d);
+      expect(v.integrity, reason).toEqual({ ok: true, problems: [] });
+      expect(v.retention, reason).toEqual({ status: "INCOMPLETE", reasons: [reason] });
+    }
+  });
+
+  it("N5: sealing refuses the same contradictions in the snapshot before any directory exists", async () => {
+    const { run } = await shared;
+    const copy = () => JSON.parse(JSON.stringify(run.snapshot)) as Record<string, unknown>;
+    const comp = (s: Record<string, unknown>) =>
+      s.components as Record<string, Record<string, unknown>>;
+    const firstExchange = (s: Record<string, unknown>) =>
+      (s.exchanges as Record<string, unknown>[])[0]!;
+    const cases: [(s: Record<string, unknown>) => void, string][] = [
+      [
+        (s) =>
+          ((s.incoming as Record<string, unknown>[]).find((r) => r.event === "message")!.payload =
+            null),
+        "TRANSPORT_RECORD_PAYLOAD_MISSING",
+      ],
+      [(s) => (firstExchange(s).body = null), "EXCHANGE_BODY_MISSING"],
+      [(s) => (firstExchange(s).requestBody = null), "EXCHANGE_REQUEST_BODY_INCONSISTENT"],
+      [
+        (s) => (comp(s).collectorFrameRecords = { status: "READ" }),
+        "COMPONENT_SECTION_MALFORMED:collectorFrameRecords",
+      ],
+      [
+        (s) =>
+          ((
+            get(comp(s), "collectorCounters", "value", "metadataRetention") as Record<
+              string,
+              unknown
+            >
+          ).complete = false),
+        "COLLECTOR_RETENTION_CONTRADICTORY:counters",
+      ],
+      [
+        (s) => delete (s.pending as Record<string, unknown>).transportCallsInProgress,
+        "RECORDING_PENDING_MALFORMED",
+      ],
+      [
+        (s) => ((get(s, "retention", "lifecycle") as Record<string, number>).retained = 0),
+        "RECORD_COUNT_INCONSISTENT:lifecycle",
+      ],
+    ];
+    for (const [mutate, expected] of cases) {
+      const s = copy();
+      mutate(s);
+      const input = sealInput(s as unknown as CpmmObservationSnapshot, run.recorder);
+      expect(sealCpmmObservationEvidence(input), expected).toMatchObject({
+        ok: false,
+        status: "SEAL_INPUT_INVALID",
+        code: `SNAPSHOT_STRUCTURE_INVALID:${expected}`,
+      });
+      expect(existsSync(path.join(input.projectRoot, "data")), expected).toBe(false);
+    }
+  });
+});

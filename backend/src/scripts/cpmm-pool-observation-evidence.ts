@@ -789,6 +789,29 @@ function prepare(input: unknown): {
     invalid("RECORDER_LIMITS_MISMATCH");
   }
   const components = asRecord(snap.components, "SNAPSHOT_COMPONENTS_INVALID");
+  // The same structural rules verification applies, checked before anything is written.
+  const structural = structureProblems({
+    records: TRANSPORT_CATEGORIES.flatMap((category) =>
+      asArray(snap[category], "SNAPSHOT_RECORDS_INVALID").map((record) => ({ category, record })),
+    ),
+    exchanges: asArray(snap.exchanges, "SNAPSHOT_EXCHANGES_INVALID").map((x) => ({
+      method: get(x, "method"),
+      requestBody: get(x, "requestBody"),
+      bodyState: get(x, "bodyState"),
+      body: get(x, "body"),
+      bodyComplete: get(x, "entry", "bodyComplete"),
+      observedBodyBytes: get(x, "observedBodyBytes"),
+      maxResponseBytes: get(x, "maxResponseBytes"),
+    })),
+    originalBytesOf: (p) => get(p, "byteLength"),
+    sections: Object.fromEntries(SECTION_NAMES.map((n) => [n, components[n]])) as Record<
+      SectionName,
+      unknown
+    >,
+    recording: snap,
+    ledgerCalls: snap.ledgerCalls,
+  });
+  if (structural.length > 0) invalid(`SNAPSHOT_STRUCTURE_INVALID:${structural[0]!}`);
   const section = (k: string): unknown => {
     const s = asRecord(components[k], "SNAPSHOT_COMPONENTS_INVALID");
     if (s.status !== "READ" && s.status !== "NOT_SUPPLIED" && s.status !== "READ_FAILED") {
@@ -1299,6 +1322,369 @@ function payloadProblem(p: unknown): string | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Structural rules shared by sealing (on the snapshot copy) and verification (on sealed files)
+// ---------------------------------------------------------------------------------------------
+
+/** Component sections, in the recorder snapshot's naming. */
+const SECTION_NAMES = [
+  "report",
+  "ownerLateEvents",
+  "wrapperDiagnostics",
+  "collectorEpochReport",
+  "collectorFrameRecords",
+  "collectorNotifications",
+  "collectorCounters",
+  "ledgerRecords",
+  "ledgerEpochs",
+  "ledgerCounters",
+  "sessionLedgerWindow",
+  "sessionLedgerEndLength",
+  "fanOutDiagnostics",
+] as const;
+type SectionName = (typeof SECTION_NAMES)[number];
+
+const RETENTION_COUNTS = [
+  "frameRecordsRetained",
+  "frameRecordsDropped",
+  "notificationRecordsRetained",
+  "notificationRecordsDropped",
+] as const;
+const metadataRetentionOk = (mr: unknown): boolean =>
+  isRec(mr) && RETENTION_COUNTS.every((k) => isInt(mr[k])) && typeof mr.complete === "boolean";
+const arrayOfRecords = (v: unknown): boolean => Array.isArray(v) && v.every(isRec);
+
+/** The value shape each READ section must have (structure only; no component replay). */
+const SECTION_VALUE_OK: Readonly<Record<SectionName, (v: unknown) => boolean>> = {
+  report: isRec,
+  ownerLateEvents: (v) => isRec(v) && Object.values(v).every(isInt),
+  wrapperDiagnostics: isRec,
+  collectorEpochReport: (v) => v === null || (isRec(v) && metadataRetentionOk(v.metadataRetention)),
+  collectorFrameRecords: arrayOfRecords,
+  collectorNotifications: arrayOfRecords,
+  collectorCounters: (v) =>
+    isRec(v) &&
+    isInt(v.frames) &&
+    isInt(v.notificationsAccepted) &&
+    typeof v.saturated === "boolean" &&
+    metadataRetentionOk(v.metadataRetention),
+  ledgerRecords: arrayOfRecords,
+  ledgerEpochs: arrayOfRecords,
+  ledgerCounters: isRec,
+  sessionLedgerWindow: (v) =>
+    arrayOfRecords(v) && (v as unknown[]).every((e) => isInt(get(e, "seq"))),
+  sessionLedgerEndLength: isInt,
+  fanOutDiagnostics: (v) =>
+    isRec(v) && isInt(v.failures) && typeof v.instrumentationComplete === "boolean",
+};
+
+/** `READ` with a well-formed value, `NOT_SUPPLIED`, or `READ_FAILED` with a fixed code. */
+function sectionProblem(name: SectionName, s: unknown): string | null {
+  const status = get(s, "status");
+  const ok =
+    status === "READ"
+      ? sameKeys(s, ["status", "value"]) && SECTION_VALUE_OK[name](get(s, "value"))
+      : status === "NOT_SUPPLIED"
+        ? sameKeys(s, ["status"])
+        : status === "READ_FAILED" &&
+          sameKeys(s, ["status", "code"]) &&
+          typeof get(s, "code") === "string" &&
+          FIXED_CODE.test(get(s, "code") as string);
+  return ok ? null : `COMPONENT_SECTION_MALFORMED:${name}`;
+}
+
+const readValue = (s: unknown): unknown =>
+  get(s, "status") === "READ" ? get(s, "value") : undefined;
+
+/**
+ * Collector retention is consistent: the retained counts equal the arrays actually kept, every
+ * frame and accepted notification is either retained or dropped (unless saturated), the per-epoch
+ * counts never exceed the collector's, and no `complete` flag contradicts its own drop counts.
+ */
+function collectorProblems(sections: Readonly<Record<SectionName, unknown>>): string[] {
+  const problems: string[] = [];
+  const counters = readValue(sections.collectorCounters) as Record<string, unknown> | undefined;
+  const epoch = readValue(sections.collectorEpochReport) as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  const contradicts = (mr: Record<string, unknown>) =>
+    mr.complete !== (mr.frameRecordsDropped === 0 && mr.notificationRecordsDropped === 0);
+  if (counters !== undefined) {
+    const mr = counters.metadataRetention as Record<string, number>;
+    if (contradicts(mr)) problems.push("COLLECTOR_RETENTION_CONTRADICTORY:counters");
+    const frames = readValue(sections.collectorFrameRecords) as unknown[] | undefined;
+    if (frames !== undefined && frames.length !== mr.frameRecordsRetained) {
+      problems.push("COLLECTOR_FRAME_RECORDS_INCONSISTENT");
+    }
+    const notifications = readValue(sections.collectorNotifications) as unknown[] | undefined;
+    if (notifications !== undefined && notifications.length !== mr.notificationRecordsRetained) {
+      problems.push("COLLECTOR_NOTIFICATIONS_INCONSISTENT");
+    }
+    if (counters.saturated === false) {
+      if (counters.frames !== mr.frameRecordsRetained! + mr.frameRecordsDropped!) {
+        problems.push("COLLECTOR_FRAME_COUNT_INCONSISTENT");
+      }
+      if (
+        counters.notificationsAccepted !==
+        mr.notificationRecordsRetained! + mr.notificationRecordsDropped!
+      ) {
+        problems.push("COLLECTOR_NOTIFICATION_COUNT_INCONSISTENT");
+      }
+    }
+  }
+  if (epoch !== undefined && epoch !== null) {
+    const emr = epoch.metadataRetention as Record<string, number>;
+    if (contradicts(emr)) problems.push("COLLECTOR_RETENTION_CONTRADICTORY:epochReport");
+    if (counters !== undefined) {
+      const mr = counters.metadataRetention as Record<string, number>;
+      if (RETENTION_COUNTS.some((k) => emr[k]! > mr[k]!)) {
+        problems.push("COLLECTOR_RETENTION_INCONSISTENT");
+      }
+    }
+  }
+  return problems;
+}
+
+const EVENTS_WITH_PAYLOAD: ReadonlySet<unknown> = new Set(["message", "ping", "pong"]);
+const EVENTS_WITHOUT_PAYLOAD: ReadonlySet<unknown> = new Set(["open", "error", "close"]);
+const CALLS_WITH_PAYLOAD: ReadonlySet<unknown> = new Set(["send", "ping", "pong"]);
+const CALLS_WITHOUT_PAYLOAD: ReadonlySet<unknown> = new Set([
+  "start",
+  "close",
+  "terminate",
+  "dispose",
+]);
+
+/** The category a transport record belongs in, or null for an unknown kind. */
+function expectedCategory(r: Record<string, unknown>): string | null {
+  const control = (v: unknown) => v === "ping" || v === "pong";
+  switch (r.kind) {
+    case "EVENT":
+      if (r.event === "message") return "incoming";
+      if (control(r.event)) return "control";
+      return EVENTS_WITHOUT_PAYLOAD.has(r.event) ? "lifecycle" : null;
+    case "CALL":
+      if (r.method === "send") return "outgoing";
+      if (control(r.method)) return "control";
+      return CALLS_WITHOUT_PAYLOAD.has(r.method) ? "lifecycle" : null;
+    case "COMPLETION":
+      if (r.method === "send") return "outgoing";
+      return control(r.method) ? "control" : null;
+    case "READY_STATE":
+    case "REGISTER":
+    case "UNREGISTER":
+      return "lifecycle";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Payload presence by record kind: message, ping and pong events and send, ping and pong calls
+ * carry a payload object; other events and calls carry an explicit null; other kinds carry none.
+ */
+function recordProblem(category: unknown, r: unknown): string | null {
+  if (!isRec(r)) return "TRANSPORT_RECORD_MALFORMED";
+  const expected = expectedCategory(r);
+  if (expected === null) return "TRANSPORT_RECORD_KIND_INVALID";
+  if (category !== expected) return "TRANSPORT_RECORD_CATEGORY_INVALID";
+  const hasKey = Object.prototype.hasOwnProperty.call(r, "payload");
+  if (r.kind !== "EVENT" && r.kind !== "CALL") {
+    return hasKey ? "TRANSPORT_RECORD_PAYLOAD_UNEXPECTED" : null;
+  }
+  const carries =
+    r.kind === "EVENT" ? EVENTS_WITH_PAYLOAD.has(r.event) : CALLS_WITH_PAYLOAD.has(r.method);
+  if (!hasKey) return "TRANSPORT_RECORD_PAYLOAD_MISSING";
+  if (carries && !isRec(r.payload)) return "TRANSPORT_RECORD_PAYLOAD_MISSING";
+  if (!carries && r.payload !== null) return "TRANSPORT_RECORD_PAYLOAD_UNEXPECTED";
+  return null;
+}
+
+interface ExchangeView {
+  readonly method: unknown;
+  readonly requestBody: unknown;
+  readonly bodyState: unknown;
+  readonly body: unknown;
+  readonly bodyComplete: unknown;
+  readonly observedBodyBytes: unknown;
+  readonly maxResponseBytes: unknown;
+}
+
+/**
+ * The session's body rules: a POST carries a request body (a GET none); COMPLETE and
+ * PARTIAL_OVERFLOW carry a retained body with an observed size (equal to, or beyond, the
+ * original), NOT_READ carries neither; `bodyComplete` is true exactly for COMPLETE.
+ */
+function exchangeProblem(x: ExchangeView, originalBytesOf: (p: unknown) => unknown): string | null {
+  if (x.method !== "GET" && x.method !== "POST") return "EXCHANGE_METHOD_INVALID";
+  if (x.requestBody !== null && !isRec(x.requestBody)) return "EXCHANGE_REQUEST_BODY_INCONSISTENT";
+  if ((x.method === "POST") !== isRec(x.requestBody)) return "EXCHANGE_REQUEST_BODY_INCONSISTENT";
+  if (
+    x.bodyState !== "COMPLETE" &&
+    x.bodyState !== "PARTIAL_OVERFLOW" &&
+    x.bodyState !== "NOT_READ"
+  ) {
+    return "EXCHANGE_BODY_STATE_INVALID";
+  }
+  if (x.bodyComplete !== (x.bodyState === "COMPLETE"))
+    return "EXCHANGE_BODY_COMPLETENESS_INCONSISTENT";
+  if (!isInt(x.maxResponseBytes)) return "EXCHANGE_MALFORMED";
+  if (x.bodyState === "NOT_READ") {
+    return x.body === null && x.observedBodyBytes === null ? null : "EXCHANGE_BODY_INCONSISTENT";
+  }
+  if (!isRec(x.body)) return "EXCHANGE_BODY_MISSING";
+  if (!isInt(x.observedBodyBytes)) return "EXCHANGE_BODY_INCONSISTENT";
+  const original = originalBytesOf(x.body);
+  if (isInt(original)) {
+    if (x.bodyState === "COMPLETE" && x.observedBodyBytes !== original) {
+      return "EXCHANGE_BODY_INCONSISTENT";
+    }
+    if (x.bodyState === "PARTIAL_OVERFLOW" && x.observedBodyBytes <= original) {
+      return "EXCHANGE_BODY_INCONSISTENT";
+    }
+  }
+  return null;
+}
+
+const RETENTION_CATEGORIES = [
+  "incoming",
+  "outgoing",
+  "control",
+  "lifecycle",
+  "exchanges",
+  "ledgerCalls",
+] as const;
+const CATEGORY_STAT_KEYS = [
+  "observed",
+  "retained",
+  "dropped",
+  "payloadsOmitted",
+  "retainedPayloadBytes",
+];
+const PENDING_KEYS = [
+  "ownerRegistrationsLive",
+  "dispatchesAwaitingOwnerDelivery",
+  "transportCallsInProgress",
+  "completionsAwaitingFirstCall",
+  "accountCallsInProgress",
+  "accountSettlementsPending",
+];
+
+/**
+ * The recorder's own accounting: exact pending-work counters; per-category counts that add up
+ * (`observed = retained + dropped`) and match the records actually present; instrumentation
+ * counts that add up; and recorded completeness flags that do not contradict their own counts.
+ */
+function recordingProblems(
+  rec: Record<string, unknown>,
+  actual: Readonly<Record<string, number>>,
+  ledgerCalls: unknown,
+): string[] {
+  const problems: string[] = [];
+  const pending = rec.pending;
+  const awaiting = get(pending, "completionsAwaitingFirstCall");
+  if (
+    !sameKeys(pending, PENDING_KEYS) ||
+    !sameKeys(awaiting, ["send", "ping", "pong"]) ||
+    !Object.values(awaiting as object).every(isInt) ||
+    !PENDING_KEYS.every((k) => k === "completionsAwaitingFirstCall" || isInt(get(pending, k)))
+  ) {
+    problems.push("RECORDING_PENDING_MALFORMED");
+  }
+  const retention = rec.retention;
+  if (!sameKeys(retention, [...RETENTION_CATEGORIES, "recorderRetentionComplete"])) {
+    problems.push("RECORDING_RETENTION_MALFORMED");
+  } else {
+    let lossless = true;
+    for (const c of RETENTION_CATEGORIES) {
+      const stats = get(retention, c);
+      if (
+        !sameKeys(stats, CATEGORY_STAT_KEYS) ||
+        !CATEGORY_STAT_KEYS.every((k) => isInt(get(stats, k)))
+      ) {
+        problems.push(`RECORDING_RETENTION_MALFORMED:${c}`);
+        continue;
+      }
+      const s = stats as Record<string, number>;
+      if (s.observed !== s.retained! + s.dropped! || s.retained !== actual[c]) {
+        problems.push(`RECORD_COUNT_INCONSISTENT:${c}`);
+      }
+      if (s.dropped !== 0 || s.payloadsOmitted !== 0) lossless = false;
+    }
+    const droppedFailures = get(rec, "instrumentation", "droppedFailureRecords");
+    if (droppedFailures !== 0) lossless = false;
+    if (get(retention, "recorderRetentionComplete") !== lossless) {
+      problems.push("RECORDING_RETENTION_CONTRADICTORY");
+    }
+  }
+  const ins = rec.instrumentation;
+  const failures = get(ins, "failures");
+  const retained = get(ins, "retainedFailures");
+  const dropped = get(ins, "droppedFailureRecords");
+  if (
+    !sameKeys(ins, ["complete", "failures", "retainedFailures", "droppedFailureRecords"]) ||
+    !isInt(failures) ||
+    !isInt(dropped) ||
+    !arrayOfRecords(retained) ||
+    get(ins, "complete") !== (failures === 0) ||
+    (retained as unknown[]).length + dropped !== failures
+  ) {
+    problems.push("RECORDING_INSTRUMENTATION_INCONSISTENT");
+  }
+  if (typeof rec.transportRecorded !== "boolean" || typeof rec.ledgerRecorded !== "boolean") {
+    problems.push("RECORDING_SCOPE_MALFORMED");
+  }
+  if (!isInt(rec.ordinalsAssigned)) problems.push("RECORDING_ORDINALS_MALFORMED");
+  if (
+    !arrayOfRecords(ledgerCalls) ||
+    !(ledgerCalls as unknown[]).every(
+      (c) => get(c, "kind") === "ACCOUNT_CALL" || get(c, "kind") === "ACCOUNT_SETTLEMENT",
+    )
+  ) {
+    problems.push("LEDGER_CALLS_MALFORMED");
+  }
+  return problems;
+}
+
+interface StructureView {
+  readonly records: readonly { readonly category: unknown; readonly record: unknown }[];
+  readonly exchanges: readonly ExchangeView[];
+  readonly originalBytesOf: (p: unknown) => unknown;
+  readonly sections: Readonly<Record<SectionName, unknown>>;
+  readonly recording: Record<string, unknown>;
+  readonly ledgerCalls: unknown;
+}
+
+/** Every structural rule; an empty list means the structure is well formed and consistent. */
+function structureProblems(v: StructureView): string[] {
+  const problems: string[] = [];
+  const actual: Record<string, number> = {
+    incoming: 0,
+    outgoing: 0,
+    control: 0,
+    lifecycle: 0,
+    exchanges: v.exchanges.length,
+    ledgerCalls: Array.isArray(v.ledgerCalls) ? v.ledgerCalls.length : -1,
+  };
+  for (const { category, record } of v.records) {
+    const p = recordProblem(category, record);
+    if (p !== null) problems.push(p);
+    if (typeof category === "string" && category in actual) actual[category]!++;
+  }
+  for (const x of v.exchanges) {
+    const p = exchangeProblem(x, v.originalBytesOf);
+    if (p !== null) problems.push(p);
+  }
+  const sectionIssues = SECTION_NAMES.map((n) => sectionProblem(n, v.sections[n])).filter(
+    (p): p is string => p !== null,
+  );
+  problems.push(...sectionIssues);
+  if (sectionIssues.length === 0) problems.push(...collectorProblems(v.sections));
+  problems.push(...recordingProblems(v.recording, actual, v.ledgerCalls));
+  return [...new Set(problems)];
+}
+
 /** Fail-closed, read-only verification of one sealed run directory. */
 export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerification {
   const problems: string[] = [];
@@ -1503,6 +1889,50 @@ function checkDocuments(
     problems.push("POOL_CONTEXT_PROVENANCE_INVALID");
   }
 
+  // Structure: payload presence, component sections, recorder and collector accounting.
+  const recordsValue = get(docs.get(CPMM_EVIDENCE_FILES.transportRecords), "records");
+  const exchangeDocs = [...listed.keys()]
+    .filter((p) => EXCHANGE_FILE.test(p))
+    .map((p) => docs.get(p)!);
+  const doc = (f: string, ...keys: string[]) => get(docs.get(f), ...keys);
+  problems.push(
+    ...structureProblems({
+      records: Array.isArray(recordsValue)
+        ? recordsValue.map((record) => ({ category: get(record, "category"), record }))
+        : [{ category: null, record: null }],
+      exchanges: exchangeDocs.map((x) => ({
+        method: x.method,
+        requestBody: x.requestBody,
+        bodyState: x.bodyState,
+        body: x.body,
+        bodyComplete: get(x, "entry", "bodyComplete"),
+        observedBodyBytes: x.observedBodyBytes,
+        maxResponseBytes: x.maxResponseBytes,
+      })),
+      originalBytesOf: (p) => get(p, "originalBytes"),
+      sections: {
+        report: doc(CPMM_EVIDENCE_FILES.ownerReport, "report"),
+        ownerLateEvents: doc(CPMM_EVIDENCE_FILES.ownerReport, "lateEvents"),
+        wrapperDiagnostics: doc(CPMM_EVIDENCE_FILES.transportDiagnostics, "diagnostics"),
+        collectorEpochReport: doc(CPMM_EVIDENCE_FILES.collector, "epochReport"),
+        collectorFrameRecords: doc(CPMM_EVIDENCE_FILES.collector, "frameRecords"),
+        collectorNotifications: doc(CPMM_EVIDENCE_FILES.collector, "notifications"),
+        collectorCounters: doc(CPMM_EVIDENCE_FILES.collector, "counters"),
+        ledgerRecords: doc(CPMM_EVIDENCE_FILES.ledger, "records"),
+        ledgerEpochs: doc(CPMM_EVIDENCE_FILES.ledger, "epochs"),
+        ledgerCounters: doc(CPMM_EVIDENCE_FILES.ledger, "counters"),
+        sessionLedgerWindow: doc(CPMM_EVIDENCE_FILES.sessionLedger, "window"),
+        sessionLedgerEndLength: doc(CPMM_EVIDENCE_FILES.sessionLedger, "endLength"),
+        fanOutDiagnostics: doc(CPMM_EVIDENCE_FILES.recording, "fanOut"),
+      },
+      recording: docs.get(CPMM_EVIDENCE_FILES.recording)!,
+      ledgerCalls: doc(CPMM_EVIDENCE_FILES.ledger, "calls"),
+    }),
+  );
+  const start = doc(CPMM_EVIDENCE_FILES.sessionLedger, "start");
+  if (start !== null && !isInt(start)) problems.push("SESSION_LEDGER_START_MALFORMED");
+  if (problems.length > 0) return;
+
   // Payloads: transport records (in ordinal order), pool accounts, exchanges.
   const check = (p: unknown, where: string) => {
     if (p === null) return;
@@ -1520,9 +1950,6 @@ function checkDocuments(
         break;
       }
       last = ordinal;
-      if (!TRANSPORT_CATEGORIES.includes(get(r, "category") as never)) {
-        problems.push("TRANSPORT_RECORD_CATEGORY_INVALID");
-      }
       if (isRec(r) && "payload" in r)
         check(r.payload, `${CPMM_EVIDENCE_FILES.transportRecords}#${ordinal}`);
     }
@@ -1648,37 +2075,21 @@ function deriveRetention(docs: Map<string, Record<string, unknown>>): string[] {
     payload(get(docs.get(p), "body"), "exchanges");
   }
 
-  // Record counts: the files must hold every observed occurrence.
-  const recording = docs.get(CPMM_EVIDENCE_FILES.recording)!;
-  const actual: Record<string, number> = {
-    incoming: 0,
-    outgoing: 0,
-    control: 0,
-    lifecycle: 0,
-    exchanges: index.length,
-    ledgerCalls:
-      (get(docs.get(CPMM_EVIDENCE_FILES.ledger), "calls") as unknown[] | undefined)?.length ?? -1,
-  };
-  for (const r of records) {
-    const c = get(r, "category") as string;
-    actual[c] = (actual[c] ?? 0) + 1;
+  // Exchange bodies the session did not read completely (faithfully recorded, still missing).
+  for (const x of index) {
+    const state = get(docs.get(get(x, "path") as string), "bodyState");
+    if (state === "PARTIAL_OVERFLOW") reasons.add("EXCHANGE_BODY_PARTIAL");
+    if (state === "NOT_READ") reasons.add("EXCHANGE_BODY_NOT_READ");
   }
-  for (const c of Object.keys(actual)) {
-    const observed = get(recording, "retention", c, "observed");
-    if (!isInt(observed) || observed !== actual[c]) reasons.add(`RECORDS_MISSING:${c}`);
+
+  // Records the recorder dropped (its counts were checked against the records present).
+  const recording = docs.get(CPMM_EVIDENCE_FILES.recording)!;
+  for (const c of RETENTION_CATEGORIES) {
+    if (get(recording, "retention", c, "dropped") !== 0) reasons.add(`RECORDS_DROPPED:${c}`);
   }
 
   // Instrumentation, recording scope and pending work.
-  const failures = get(recording, "instrumentation", "failures");
-  const retainedFailures = get(recording, "instrumentation", "retainedFailures");
-  if (
-    failures !== 0 ||
-    !Array.isArray(retainedFailures) ||
-    retainedFailures.length > 0 ||
-    get(recording, "instrumentation", "droppedFailureRecords") !== 0
-  ) {
-    reasons.add("INSTRUMENTATION_FAILURES");
-  }
+  if (get(recording, "instrumentation", "failures") !== 0) reasons.add("INSTRUMENTATION_FAILURES");
   if (recording.transportRecorded !== true) reasons.add("TRANSPORT_NOT_RECORDED");
   if (recording.ledgerRecorded !== true) reasons.add("LEDGER_NOT_RECORDED");
   const pendingWork = (v: unknown, key: string): void => {
@@ -1708,16 +2119,22 @@ function deriveRetention(docs: Map<string, Record<string, unknown>>): string[] {
   for (const [name, s] of sections) {
     if (get(s, "status") !== "READ") reasons.add(`COMPONENT_UNAVAILABLE:${name}`);
   }
+  // Collector retention from its counts (checked against its arrays); never from `complete`.
+  const collector = docs.get(CPMM_EVIDENCE_FILES.collector);
+  for (const section of ["counters", "epochReport"]) {
+    const mr = get(collector, section, "value", "metadataRetention");
+    if (!isRec(mr)) continue;
+    if (mr.frameRecordsDropped !== 0) reasons.add("COLLECTOR_FRAME_RECORDS_DROPPED");
+    if (mr.notificationRecordsDropped !== 0) reasons.add("COLLECTOR_NOTIFICATION_RECORDS_DROPPED");
+  }
+  if (get(collector, "counters", "value", "saturated") === true) {
+    reasons.add("COLLECTOR_COUNTERS_SATURATED");
+  }
   if (
-    get(
-      docs.get(CPMM_EVIDENCE_FILES.collector),
-      "epochReport",
-      "value",
-      "metadataRetention",
-      "complete",
-    ) !== true
+    get(collector, "epochReport", "status") === "READ" &&
+    get(collector, "epochReport", "value") === null
   ) {
-    reasons.add("COLLECTOR_RETENTION_INCOMPLETE");
+    reasons.add("COLLECTOR_EPOCH_REPORT_MISSING");
   }
   const ledgerRecords = get(docs.get(CPMM_EVIDENCE_FILES.ledger), "records", "value");
   if (
