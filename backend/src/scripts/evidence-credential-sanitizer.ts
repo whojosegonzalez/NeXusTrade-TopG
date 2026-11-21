@@ -24,9 +24,19 @@
  *   least 4 leading characters of a secret, literal, escaped or mixed, possibly cut inside an escape.
  *   A partial payload ending in fewer than 4 leading characters of a secret is not redacted.
  * - DETECTED (payload withheld, never redacted): after redaction, any secret's first 8 characters
- *   (lower-cased; the whole secret when shorter) in the raw text or, for complete UTF-8 JSON, in
- *   any parsed key or string value, also after up to 4 rounds of `\uXXXX`, `\xXX`, `\/` and
- *   percent decoding. Still changing after 4 rounds: inconclusive (withheld).
+ *   (lower-cased; the whole secret when shorter) in two compatible representations: its UTF-8
+ *   bytes mapped to Latin-1 (matching literal and byte-level percent-encoded material) and its
+ *   Unicode text (matching `\uXXXX` escapes including surrogate pairs, UTF-8 percent-encoding and
+ *   parsed JSON). Both are searched in the raw payload's byte view and in its UTF-8 decoded view
+ *   (which also covers literal and escaped characters mixed in one credential) and, for complete
+ *   UTF-8 JSON, in every parsed key and string value, each also after up to 4 rounds of
+ *   `\uXXXX`, `\xXX`, `\/` and percent decoding (runs of `%XX` decoded as UTF-8 when valid,
+ *   otherwise byte for byte). Still changing after 4 rounds: inconclusive (withheld).
+ * - DETECTED in partial payloads: a decoded tail that ends in at least 4 leading characters of a
+ *   secret (in either representation) is withheld; it cannot be redacted on bytes.
+ * - Derivation also protects the strictly decoded form of URL user names, passwords and qualifying
+ *   path segments, and the raw encoded form of qualifying query values; malformed or unsupported
+ *   percent-encoding is refused.
  * Not redacted or detected: credentials split across separate payloads, transformed by other
  * encodings (base64, hex, compression), or shorter than the forms above.
  */
@@ -91,7 +101,9 @@ export type EvidenceJsonInspection =
   | "NOT_REQUESTED"
   | "NOT_APPLICABLE_PARTIAL"
   | "NOT_UTF8"
-  | "NOT_JSON";
+  | "NOT_JSON"
+  /** Parsing was requested, but the raw scan already found credential material. */
+  | "SKIPPED_RAW_DETECTED";
 
 export type EvidenceWithheldReason =
   | "CREDENTIAL_MATERIAL_DETECTED"
@@ -213,6 +225,15 @@ function readScope(v: unknown): EvidenceSanitizeScope | null {
 // Secret derivation (ported from fresh-amm-v4-watch-evidence.ts `credentialSecrets`)
 // ---------------------------------------------------------------------------------------------
 
+/** One round of strict percent-decoding; malformed or non-UTF-8 sequences are refused. */
+function decodeComponent(component: string): string {
+  try {
+    return decodeURIComponent(component);
+  } catch {
+    throw inputError("each url component must use valid percent-encoding");
+  }
+}
+
 /**
  * Secret values from explicitly supplied endpoint URLs and additional secrets: the whole URL, its
  * user name and password, query values of at least 6 characters and path segments of at least 16,
@@ -242,13 +263,32 @@ export function deriveEvidenceSecrets(
       // Not a URL: the whole value is the secret.
     }
     if (parsed !== null) {
-      if (parsed.username) secrets.add(parsed.username);
-      if (parsed.password) secrets.add(parsed.password);
+      // User name and password at any length (as reviewed), raw and strictly decoded.
+      for (const component of [parsed.username, parsed.password]) {
+        if (component) {
+          secrets.add(component);
+          const decoded = decodeComponent(component);
+          if (decoded) secrets.add(decoded);
+        }
+      }
+      // Query values: decoded (as reviewed) and raw encoded, each when it qualifies.
       for (const v of parsed.searchParams.values()) {
         if (v.length >= L.minQueryValueChars) secrets.add(v);
       }
+      for (const pair of parsed.search.slice(1).split("&")) {
+        const eq = pair.indexOf("=");
+        const rawValue = eq === -1 ? "" : pair.slice(eq + 1);
+        const decoded = decodeComponent(rawValue.replace(/\+/g, " "));
+        if (rawValue.length >= L.minQueryValueChars) secrets.add(rawValue);
+        if (decoded.length >= L.minQueryValueChars) secrets.add(decoded);
+      }
+      // Path segments: qualifying raw segments and their strictly decoded forms.
       for (const seg of parsed.pathname.split("/")) {
-        if (seg.length >= L.minPathSegmentChars) secrets.add(seg);
+        if (seg.length >= L.minPathSegmentChars) {
+          secrets.add(seg);
+          const decoded = decodeComponent(seg);
+          if (decoded) secrets.add(decoded);
+        }
       }
     }
   }
@@ -357,18 +397,69 @@ const unescapeBackslash = (s: string) =>
     .replace(/\\u([0-9a-fA-F]{4})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)))
     .replace(/\\x([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)))
     .replace(/\\\//g, "/");
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const lenientUtf8 = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+/** Runs of `%XX` decode as UTF-8 text when valid, otherwise byte for byte (Latin-1). */
 const percentDecode = (s: string) =>
-  s.replace(/%([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+  s.replace(/(?:%[0-9a-fA-F]{2})+/g, (run: string) => {
+    const bytes = Buffer.from(run.replace(/%/g, ""), "hex");
+    try {
+      return strictUtf8.decode(bytes);
+    } catch {
+      return bytes.toString("latin1");
+    }
+  });
 
 type ScanResult = "FOUND" | "INCONCLUSIVE" | "CLEAN";
 
-function scanString(s: string, needles: readonly string[], budget: { chars: number }): ScanResult {
+/** A lower-cased secret form for trailing-fragment checks, with its KMP failure table. */
+interface FragmentPattern {
+  readonly pattern: string;
+  readonly fail: Int32Array;
+}
+
+function fragmentPattern(pattern: string): FragmentPattern {
+  const fail = new Int32Array(pattern.length);
+  for (let i = 1, k = 0; i < pattern.length; i++) {
+    while (k > 0 && pattern[i] !== pattern[k]) k = fail[k - 1] as number;
+    if (pattern[i] === pattern[k]) k++;
+    fail[i] = k;
+  }
+  return { pattern, fail };
+}
+
+/** Characters (code points) of the longest secret prefix that `lower` ends with (linear). */
+function trailingPrefixChars(lower: string, f: FragmentPattern, budget: { chars: number }): number {
+  const m = f.pattern.length;
+  if (m === 0) return 0;
+  const start = Math.max(0, lower.length - m);
+  budget.chars += m;
+  if (budget.chars > L.maxScanChars) throw new BudgetExhausted();
+  let q = 0;
+  for (let i = start; i < lower.length; i++) {
+    while (q > 0 && (q === m || lower[i] !== f.pattern[q])) q = f.fail[q - 1] as number;
+    if (lower[i] === f.pattern[q]) q++;
+  }
+  return Array.from(f.pattern.slice(0, q)).length;
+}
+
+function scanString(
+  s: string,
+  needles: readonly string[],
+  budget: { chars: number },
+  fragments: readonly FragmentPattern[] | null = null,
+): ScanResult {
   let cur = s;
   for (let round = 0; ; round++) {
     budget.chars += cur.length;
     if (budget.chars > L.maxScanChars) throw new BudgetExhausted();
     const lower = cur.toLowerCase();
     if (needles.some((n) => lower.includes(n))) return "FOUND";
+    if (fragments !== null) {
+      for (const f of fragments) {
+        if (trailingPrefixChars(lower, f, budget) >= L.minTrailingFragmentChars) return "FOUND";
+      }
+    }
     const next = percentDecode(unescapeBackslash(cur));
     if (next === cur) return "CLEAN";
     if (round + 1 >= L.maxDecodeRounds) return "INCONCLUSIVE";
@@ -412,19 +503,31 @@ const sha256Hex = (b: Uint8Array) => createHash("sha256").update(b).digest("hex"
 interface SecretForm {
   readonly latin1: string;
   readonly escaped: RegExp | null;
-  readonly needle: string;
+  /** The first 8 characters of the UTF-8 bytes mapped to Latin-1, lower-cased. */
+  readonly byteNeedle: string;
+  /** The first 8 code points of the Unicode text, lower-cased. */
+  readonly unicodeNeedle: string;
+  /** Whole lower-cased secret in both representations, for partial-payload tails. */
+  readonly fragments: readonly FragmentPattern[];
 }
 
 function secretForms(secrets: readonly string[]): readonly SecretForm[] {
   const markers = [EVIDENCE_REDACTED.toLowerCase(), EVIDENCE_REDACTED_PARTIAL.toLowerCase()];
   return secrets.map((s) => {
     const latin1 = Buffer.from(s, "utf8").toString("latin1");
-    const needle = latin1.slice(0, L.detectionPrefixChars).toLowerCase();
+    const byteNeedle = latin1.slice(0, L.detectionPrefixChars).toLowerCase();
+    const unicodeNeedle = Array.from(s).slice(0, L.detectionPrefixChars).join("").toLowerCase();
     // A secret (or its detection prefix) inside a marker could never be redacted to a marker.
-    if (markers.some((m) => m.includes(needle))) {
+    if (markers.some((m) => m.includes(byteNeedle) || m.includes(unicodeNeedle))) {
       throw inputError("a secret collides with a redaction marker");
     }
-    return { latin1, escaped: escapedSecretRegex(latin1), needle };
+    const unicodeLower = s.toLowerCase();
+    const latin1Lower = latin1.toLowerCase();
+    const fragments =
+      unicodeLower === latin1Lower
+        ? [fragmentPattern(unicodeLower)]
+        : [fragmentPattern(unicodeLower), fragmentPattern(latin1Lower)];
+    return { latin1, escaped: escapedSecretRegex(latin1), byteNeedle, unicodeNeedle, fragments };
   });
 }
 
@@ -525,11 +628,24 @@ export function sanitizeEvidenceBytes(
     const bytes = Buffer.from(text, "latin1");
     const asUtf8 = bytes.toString("utf8");
     const isUtf8 = Buffer.from(asUtf8, "utf8").equals(bytes);
-    // 3. Detection after redaction: raw text, then parsed JSON keys and string values.
-    const needles = forms.map((f) => f.needle);
+    // 3. Detection after redaction, in both representations: the raw byte view and the UTF-8
+    //    decoded view (each with trailing-fragment checks for partial payloads), then parsed JSON
+    //    keys and string values.
+    const needles = [...new Set(forms.flatMap((f) => [f.byteNeedle, f.unicodeNeedle]))];
+    const fragments = sc.partial ? forms.flatMap((f) => f.fragments) : null;
     const budget = { chars: 0 };
-    let worst: ScanResult = scanString(text, needles, budget);
-    let jsonInspection: EvidenceJsonInspection = "NOT_REQUESTED";
+    let worst: ScanResult = "CLEAN";
+    for (const view of [text, lenientUtf8.decode(bytes)]) {
+      const r = scanString(view, needles, budget, fragments);
+      if (r === "FOUND") {
+        worst = r;
+        break;
+      }
+      if (r === "INCONCLUSIVE") worst = r;
+    }
+    let jsonInspection: EvidenceJsonInspection = sc.parseJson
+      ? "SKIPPED_RAW_DETECTED"
+      : "NOT_REQUESTED";
     if (worst !== "FOUND" && sc.parseJson) {
       if (sc.partial) jsonInspection = "NOT_APPLICABLE_PARTIAL";
       else if (!isUtf8) jsonInspection = "NOT_UTF8";

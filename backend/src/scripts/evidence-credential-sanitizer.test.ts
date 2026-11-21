@@ -518,4 +518,226 @@ describe("evidence credential sanitizer (synthetic, offline)", () => {
       expect(code, String(forbidden)).not.toMatch(forbidden);
     }
   });
+  // --- review of bafc6ec: Unicode representations and encoded URL components ------------------
+
+  const ACCENT = "clé_secrète_9876";
+  const CJK = "密钥测试秘密值九八七六";
+  const EMOJI = "🔑secret🗝key99";
+  /** JSON with every non-ASCII UTF-16 code unit written as a \uXXXX escape. */
+  const jsonEscapeAll = (v: unknown) =>
+    JSON.stringify(v).replace(
+      /[\u0080-￿]/g,
+      (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"),
+    );
+  const unescapeUnicode = (t: string) =>
+    t.replace(/\\u([0-9a-fA-F]{4})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+  /** Every supported decoded view of stored material: bytes, UTF-8 text, \u decoding, parsed JSON. */
+  function recoverable(r: SanitizedEvidenceBytes, secret: string): boolean {
+    if (r.status !== "STORED") return false;
+    const bytes = stored(r);
+    if (bytes.includes(utf8(secret))) return true;
+    const text = bytes.toString("utf8");
+    const views = [text, unescapeUnicode(text)];
+    try {
+      const work: unknown[] = [JSON.parse(text)];
+      while (work.length > 0) {
+        const v = work.pop();
+        if (typeof v === "string") views.push(v);
+        else if (Array.isArray(v)) work.push(...v);
+        else if (v !== null && typeof v === "object") {
+          for (const [k, x] of Object.entries(v)) {
+            views.push(k);
+            work.push(x);
+          }
+        }
+      }
+    } catch {
+      // Not JSON: the text views above remain.
+    }
+    return views.some((v) => v.toLowerCase().includes(secret.toLowerCase()));
+  }
+  const pctUtf8 = (t: string) =>
+    [...utf8(t)].map((b) => `%${b.toString(16).toUpperCase().padStart(2, "0")}`).join("");
+
+  it("S13: Unicode credentials are detected through escaped keys, values, mixed forms and percent encoding", () => {
+    for (const secret of [ACCENT, CJK, EMOJI]) {
+      const secrets = deriveEvidenceSecrets([RPC_URL], [secret]);
+      const mixed = (() => {
+        // The first non-ASCII character escaped, the rest literal UTF-8.
+        const chars = [...secret];
+        const i = chars.findIndex((c) => c.charCodeAt(0) > 0x7f);
+        return chars
+          .map((c, j) =>
+            j === i
+              ? // Every UTF-16 code unit, so an emoji becomes its full surrogate pair.
+                c
+                  .split("")
+                  .map((u) => "\\u" + u.charCodeAt(0).toString(16).padStart(4, "0"))
+                  .join("")
+              : c,
+          )
+          .join("");
+      })();
+      const withheldCases: [string, Buffer, { partial: boolean; parseJson: boolean }][] = [
+        ["escaped value", utf8(jsonEscapeAll({ v: `x ${secret} y` })), COMPLETE],
+        ["escaped key", utf8(jsonEscapeAll({ [secret]: 1 })), COMPLETE],
+        [
+          "escaped value, parsing off",
+          utf8(jsonEscapeAll({ v: secret })),
+          { partial: false, parseJson: false },
+        ],
+        ["mixed literal and escaped", utf8(`{"v":"${mixed}"}`), COMPLETE],
+        ["percent-encoded UTF-8 text", utf8(`log ${pctUtf8(secret)}`), COMPLETE],
+        [
+          "binary with escaped secret",
+          Buffer.concat([Buffer.from([0xff]), utf8(jsonEscapeAll(secret))]),
+          COMPLETE,
+        ],
+      ];
+      for (const [label, body, scope] of withheldCases) {
+        const r = sanitizeEvidenceBytes(body, secrets, scope);
+        expect(r.status === "WITHHELD" || !recoverable(r, secret), `${secret}: ${label}`).toBe(
+          true,
+        );
+        expect(r, `${secret}: ${label}`).toMatchObject({
+          status: "WITHHELD",
+          reason: "CREDENTIAL_MATERIAL_DETECTED",
+        });
+      }
+      // Literal UTF-8 is still redacted on bytes (stored, nothing recoverable).
+      const literal = sanitizeEvidenceBytes(utf8(`{"v":"a ${secret} b"}`), secrets, COMPLETE);
+      expect(literal).toMatchObject({ status: "STORED", redacted: true, redactions: 1 });
+      expect(recoverable(literal, secret)).toBe(false);
+      // Binary with a literal secret: base64 of sanitized bytes; decoded bytes inspected.
+      const bin = sanitizeEvidenceBytes(
+        Buffer.concat([Buffer.from([0xff, 0xfe]), utf8(secret), Buffer.from([0x80])]),
+        secrets,
+        COMPLETE,
+      );
+      expect(bin).toMatchObject({ status: "STORED", encoding: "base64", redacted: true });
+      expect(recoverable(bin, secret)).toBe(false);
+      // A partial body ending in four or more escaped Unicode credential characters is withheld;
+      // three are below the fragment minimum.
+      const escapedPrefix = (n: number) =>
+        jsonEscapeAll([...secret].slice(0, n).join("")).slice(1, -1);
+      const partial = { partial: true, parseJson: false } as const;
+      expect(
+        sanitizeEvidenceBytes(utf8(`{"v":"z ${escapedPrefix(5)}`), secrets, partial),
+        `${secret}: partial 5`,
+      ).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+      const short = sanitizeEvidenceBytes(utf8(`{"v":"z ${escapedPrefix(3)}`), secrets, partial);
+      expect(short.status, `${secret}: partial 3`).toBe("STORED");
+      // Clean Unicode and binary payloads stay byte-identical with unrelated credentials.
+      const clean = utf8(jsonEscapeAll({ v: "ünïcödé 中文 🙂 text" }) + " ünïcödé 中文 🙂");
+      expect(stored(sanitizeEvidenceBytes(clean, secrets, COMPLETE)).equals(clean)).toBe(true);
+      const cleanBin = Buffer.from([0xff, 0x00, 0xc3, 0x28, 0xe4, 0xb8]);
+      expect(stored(sanitizeEvidenceBytes(cleanBin, secrets, COMPLETE)).equals(cleanBin)).toBe(
+        true,
+      );
+    }
+  });
+
+  it("S13b: escaped and percent-encoded UTF-8 mixed inside one credential prefix are detected", () => {
+    const secret = "éè_secret_42";
+    const secrets = deriveEvidenceSecrets([RPC_URL], [secret]);
+    // é as a \u escape, è as percent-encoded UTF-8, both within the first 8 characters.
+    const body = utf8('{"v":"' + "\\u00e9" + '%C3%A8_secret_42"}');
+    expect(sanitizeEvidenceBytes(body, secrets, COMPLETE)).toMatchObject({
+      status: "WITHHELD",
+      reason: "CREDENTIAL_MATERIAL_DETECTED",
+    });
+    const noJson = { partial: false, parseJson: false } as const;
+    // é as a \u escape and è as literal UTF-8 in plain text: only the UTF-8 decoded view sees it.
+    const mixedLiteral = utf8("log " + "\\u00e9" + "è_secret_42 end");
+    expect(sanitizeEvidenceBytes(mixedLiteral, secrets, noJson)).toMatchObject({
+      status: "WITHHELD",
+      reason: "CREDENTIAL_MATERIAL_DETECTED",
+    });
+    // A percent run that is not valid UTF-8 as a whole decodes byte for byte: the byte form sees it.
+    const invalidRun = utf8(`log %FF${pctUtf8(secret)} end`);
+    expect(sanitizeEvidenceBytes(invalidRun, secrets, noJson)).toMatchObject({
+      status: "WITHHELD",
+      reason: "CREDENTIAL_MATERIAL_DETECTED",
+    });
+    // A self-overlapping prefix at the end of a partial payload (percent-encoded, so the byte-level
+    // fragment rule does not apply): "aaaaa" ends with the 4-character prefix "aaaa" of "aaaab...".
+    const overlap = deriveEvidenceSecrets([RPC_URL], ["aaaab_secret_77"]);
+    expect(
+      sanitizeEvidenceBytes(utf8("log %61%61%61%61%61"), overlap, {
+        partial: true,
+        parseJson: false,
+      }),
+    ).toMatchObject({ status: "WITHHELD", reason: "CREDENTIAL_MATERIAL_DETECTED" });
+  });
+
+  it("S14: credentials in URL components are protected in encoded and decoded forms", () => {
+    const encodedPassword = "wss://operator:%73ecret_98765@rpc.example.test/ws";
+    const encodedUser = "wss://%6Fperator_name_1:pw@rpc.example.test/ws";
+    const encodedPath = "wss://rpc.example.test/ws/%73ecretpathtoken_1234567";
+    const encodedQuery = "wss://rpc.example.test/ws?api-key=%73ecret_query_1";
+    const unicodeQuery = `wss://rpc.example.test/ws?api-key=${ACCENT}`;
+    const unicodePassword = `wss://op:${encodeURIComponent(ACCENT)}@rpc.example.test/ws`;
+    const s = deriveEvidenceSecrets(
+      [encodedPassword, encodedUser, encodedPath, encodedQuery, unicodeQuery, unicodePassword],
+      [],
+    );
+    for (const expected of [
+      "%73ecret_98765",
+      "secret_98765",
+      "%6Fperator_name_1",
+      "operator_name_1",
+      "%73ecretpathtoken_1234567",
+      "secretpathtoken_1234567",
+      "secret_query_1",
+      "%73ecret_query_1",
+      ACCENT,
+      encodeURIComponent(ACCENT),
+    ]) {
+      expect(s, expected).toContain(expected);
+    }
+    for (const secret of [
+      "secret_98765",
+      "operator_name_1",
+      "secretpathtoken_1234567",
+      "secret_query_1",
+      "%73ecret_query_1",
+    ]) {
+      const r = sanitizeEvidenceBytes(utf8(`{"v":"${secret}"}`), s, COMPLETE);
+      expect(recoverable(r, secret), secret).toBe(false);
+      expect(r, secret).toMatchObject({ status: "STORED", redacted: true });
+    }
+    // Unicode credentials from a query value or an encoded password, literal and escaped.
+    const literal = sanitizeEvidenceBytes(utf8(`{"v":"${ACCENT}"}`), s, COMPLETE);
+    expect(recoverable(literal, ACCENT)).toBe(false);
+    expect(sanitizeEvidenceBytes(utf8(jsonEscapeAll({ v: ACCENT })), s, COMPLETE)).toMatchObject({
+      status: "WITHHELD",
+      reason: "CREDENTIAL_MATERIAL_DETECTED",
+    });
+    // Malformed or unsupported percent-encoding is refused with a fixed message.
+    for (const bad of [
+      "wss://op:%zz-secret@rpc.example.test/ws",
+      "wss://%E0%A4@rpc.example.test/ws",
+      "wss://rpc.example.test/ws/%zzzzzzzzzzzzzzzzzzzz",
+      "wss://rpc.example.test/ws?api-key=100%-secret",
+    ]) {
+      const e = thrown(() => deriveEvidenceSecrets([bad], []));
+      expect(e.message, bad).toBe(
+        "[EVIDENCE_SANITIZER_INPUT] each url component must use valid percent-encoding",
+      );
+    }
+  });
+
+  it("S15: skipped parsed inspection is reported with an accurate fixed reason", () => {
+    const r = sanitizeEvidenceBytes(utf8(`{"v":"${pct(KEY)}"}`), SECRETS, COMPLETE);
+    expect(r).toMatchObject({
+      status: "WITHHELD",
+      reason: "CREDENTIAL_MATERIAL_DETECTED",
+      jsonInspection: "SKIPPED_RAW_DETECTED",
+    });
+    const off = sanitizeEvidenceBytes(utf8(`{"v":"${pct(KEY)}"}`), SECRETS, {
+      partial: false,
+      parseJson: false,
+    });
+    expect(off).toMatchObject({ jsonInspection: "NOT_REQUESTED" });
+  });
 });
